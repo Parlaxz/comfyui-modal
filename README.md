@@ -124,7 +124,7 @@ Models are stored in a Modal Volume (`comfyui-models`), not locally.
 | **View models** | Models section in the sidebar |
 | **Download a model** | Paste URL + filename in Add Model, click Download |
 | **Delete a model** | Click ✕ next to any model |
-| **Inject as local placeholder** | Click ⬇L — creates a zero-byte `modal-<filename>` locally so ComfyUI nodes can reference it |
+| **Create local placeholder** | Click **Create local** or **Create All Placeholders** — creates a zero-byte local file with the exact same filename so ComfyUI nodes can reference the remote Modal model |
 
 ### GPU options
 
@@ -170,7 +170,7 @@ Restart ComfyUI. If `comfyapp.py` changed, the new version deploys automatically
 | **Deploy timed out** | Click ↑ Deploy to retry |
 | **503 on Models** | App not deployed yet — click ↑ Deploy |
 | **Prompts not going to Modal** | Check the Modal ON toggle in the sidebar |
-| **Model not showing in node dropdowns** | Click ⬇L next to the model, or re-download — placeholder is now auto-created |
+| **Model not showing in node dropdowns** | Click **Create local** next to the model, or re-download — the local placeholder is auto-created |
 | **unet_name dropdown empty** | Download the model via Add Model — `unet` folder is supported |
 
 ---
@@ -243,9 +243,9 @@ Already patched. The URL field now auto-prepends `https://` if missing. Update t
 Modal Volume models are stored in the cloud. ComfyUI's local file scanner cannot see them.
 
 **Fix**
-A zero-byte placeholder file (`modal-<filename>`) is automatically created in the local `models/` directory after each download. This makes the model appear in ComfyUI dropdowns.
+A zero-byte placeholder file with the exact same filename is automatically created in the local `models/` directory after each download. This makes the model appear in ComfyUI dropdowns without downloading the real model locally.
 
-If a placeholder is missing, click **⬇L** next to the model in the Models list to create it manually.
+If placeholders are missing, click **Create local** next to a model or **Create All Placeholders** in the Models section. Placeholders only work when Modal/cloud execution is enabled.
 
 ---
 
@@ -255,13 +255,7 @@ Removing the custom node folder does **not** automatically clean up placeholder 
 
 **1. Remove placeholder files**
 
-```bash
-# Mac / Linux
-find /path/to/ComfyUI/models -name "modal-*" -delete
-
-# Windows (PowerShell)
-Get-ChildItem -Path "C:\ComfyUI_windows_portable\ComfyUI\models" -Recurse -Filter "modal-*" | Remove-Item
-```
+Placeholder files now use the exact same filenames as the remote Modal models. Remove the 0-byte files manually from `ComfyUI/models/...` if you no longer need them.
 
 **2. Remove the custom node**
 
