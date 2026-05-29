@@ -113,6 +113,13 @@ async def sync_custom_nodes(archive_data: bytes) -> dict:
 
 
 @_modal_error_handler
+async def refresh_custom_nodes(expected_nodes: list | None = None) -> dict:
+    return await asyncio.to_thread(
+        lambda: _api().refresh_custom_nodes.remote(expected_nodes or []),
+    )
+
+
+@_modal_error_handler
 async def get_sync_status() -> dict:
     return await asyncio.to_thread(
         lambda: _get_volume_status_fn.remote(),
@@ -131,3 +138,13 @@ async def upload_model_chunk(chunk_data: bytes, folder: str, filename: str, offs
     return await asyncio.to_thread(
         lambda: _upload_model_chunk_fn.remote(chunk_data, folder, filename, offset, is_last),
     )
+
+
+@_modal_error_handler
+async def resync_runtime(scope: str = "all") -> dict:
+    return await asyncio.to_thread(lambda: _api().resync_runtime.remote(scope))
+
+
+@_modal_error_handler
+async def get_runtime_state() -> dict:
+    return await asyncio.to_thread(lambda: _api().runtime_state.remote())

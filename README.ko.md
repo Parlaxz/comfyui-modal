@@ -124,7 +124,7 @@ Modal 앱이 백그라운드에서 자동으로 배포됩니다. 진행 상황�
 | **모델 목록 보기** | 사이드바 Models 섹션 |
 | **모델 다운로드** | Add Model에 URL + 파일명 입력 후 Download 클릭 |
 | **모델 삭제** | 모델 옆 ✕ 버튼 클릭 |
-| **로컬 플레이스홀더 생성** | ⬇L 클릭 — ComfyUI 노드에서 참조할 수 있도록 로컬에 `modal-<파일명>` 빈 파일 생성 |
+| **로컬 플레이스홀더 생성** | **Create local** 또는 **Create All Placeholders** 클릭 — ComfyUI 노드에서 참조할 수 있도록 같은 파일명으로 0바이트 로컬 파일 생성 |
 
 ### GPU 옵션
 
@@ -170,7 +170,7 @@ ComfyUI를 재시작하세요. `comfyapp.py`가 변경되었다면 시작 시 �
 | **배포 타임아웃** | ↑ Deploy 버튼으로 재시도 |
 | **Models에 503 표시** | 아직 배포 전 — ↑ Deploy 클릭 |
 | **프롬프트가 Modal로 가지 않음** | 사이드바 Modal ON 토글 확인 |
-| **노드 드롭다운에 모델이 안 보임** | 모델 옆 ⬇L 클릭, 또는 재다운로드 — placeholder가 자동 생성됨 |
+| **노드 드롭다운에 모델이 안 보임** | 모델 옆 **Create local** 클릭, 또는 재다운로드 — 로컬 placeholder가 자동 생성됨 |
 | **unet_name 드롭다운이 비어있음** | Add Model로 모델 다운로드 — `unet` 폴더 지원 |
 
 ---
@@ -243,9 +243,9 @@ URL에 `https://`가 없는 채로 전송됐습니다.
 Modal Volume의 모델은 클라우드에 저장됩니다. ComfyUI의 로컬 파일 스캐너가 이를 인식하지 못합니다.
 
 **해결**
-다운로드 완료 후 로컬 `models/` 디렉토리에 빈 placeholder 파일(`modal-<파일명>`)이 자동으로 생성됩니다. 이 파일 덕분에 ComfyUI 드롭다운에 모델이 표시됩니다.
+다운로드 완료 후 로컬 `models/` 디렉토리에 같은 파일명의 0바이트 placeholder 파일이 자동으로 생성됩니다. 실제 모델을 로컬에 받지 않아도 ComfyUI 드롭다운에 표시됩니다.
 
-placeholder가 없으면 Models 목록에서 해당 모델 옆 **⬇L** 버튼을 클릭해 수동으로 생성하세요.
+placeholder가 없으면 Models 목록에서 **Create local** 또는 **Create All Placeholders**를 사용하세요. placeholder는 Modal/클라우드 실행이 켜져 있을 때만 동작합니다.
 
 ---
 
@@ -255,13 +255,7 @@ placeholder가 없으면 Models 목록에서 해당 모델 옆 **⬇L** 버튼�
 
 **1. placeholder 파일 삭제**
 
-```bash
-# Mac / Linux
-find /path/to/ComfyUI/models -name "modal-*" -delete
-
-# Windows (PowerShell)
-Get-ChildItem -Path "C:\ComfyUI_windows_portable\ComfyUI\models" -Recurse -Filter "modal-*" | Remove-Item
-```
+이제 placeholder 파일은 Modal 원본과 **같은 파일명**을 사용합니다. 더 이상 필요 없으면 `ComfyUI/models/...` 아래의 0바이트 파일을 직접 삭제하세요.
 
 **2. 커스텀 노드 삭제**
 

@@ -1,14 +1,159 @@
+import hashlib
+import os
 import subprocess
 import sys
 import time
 import json
 import uuid
+from pathlib import Path
+
 import modal
+
+
+_EXCLUDED_CUSTOM_NODE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
+
+# ── Custom-node volume helpers ────────────────────────────────────────────
+# These are intentionally duplicated (inlined) here rather than imported from
+# `custom_node_sync.py` to keep Modal packaging simple.  Modal serialises the
+# entire module closure; importing a sibling module would require an explicit
+# `modal.Image` dependency or risk missing files at deploy time.  Keep these
+# helpers in sync with `custom_node_sync.py` if changes are made there.
+
+def _safe_listdir(path: str) -> list[str]:
+    if not os.path.isdir(path):
+        return []
+    return sorted(os.listdir(path))
+
+
+def _is_volume_managed_link(link_path: str, volume_root: str) -> bool:
+    if not os.path.islink(link_path):
+        return False
+    target = os.path.realpath(link_path)
+    try:
+        common = os.path.commonpath([os.path.abspath(volume_root), os.path.abspath(target)])
+    except ValueError:
+        return False
+    return common == os.path.abspath(volume_root)
+
+
+def custom_node_volume_state(volume_root: str) -> tuple:
+    volume_root = os.path.abspath(volume_root)
+    state = []
+    for name in _safe_listdir(volume_root):
+        path = os.path.join(volume_root, name)
+        if not os.path.isdir(path) or name in _EXCLUDED_CUSTOM_NODE_DIRS:
+            continue
+        stat = os.stat(path)
+        req_file = os.path.join(path, "requirements.txt")
+        req_mtime_ns = os.stat(req_file).st_mtime_ns if os.path.isfile(req_file) else None
+        state.append((name, stat.st_mtime_ns, req_mtime_ns))
+    return tuple(state)
+
+
+def missing_expected_nodes(state: tuple, expected_nodes: list[str]) -> list[str]:
+    visible = {name for name, *_ in state}
+    return [name for name in expected_nodes if name not in visible]
+
+
+def sync_custom_nodes_into_comfy(volume_root: str, comfy_custom_nodes_root: str) -> dict:
+    volume_root = os.path.abspath(volume_root)
+    comfy_custom_nodes_root = os.path.abspath(comfy_custom_nodes_root)
+    os.makedirs(comfy_custom_nodes_root, exist_ok=True)
+
+    volume_dirs = {
+        name
+        for name in _safe_listdir(volume_root)
+        if os.path.isdir(os.path.join(volume_root, name)) and name not in _EXCLUDED_CUSTOM_NODE_DIRS
+    }
+
+    removed = []
+    created = []
+    kept = []
+    blocked = []
+
+    for name in _safe_listdir(comfy_custom_nodes_root):
+        dst = os.path.join(comfy_custom_nodes_root, name)
+        if not _is_volume_managed_link(dst, volume_root):
+            continue
+        expected_src = os.path.join(volume_root, name)
+        if name not in volume_dirs or os.path.realpath(dst) != os.path.realpath(expected_src):
+            os.unlink(dst)
+            removed.append(name)
+
+    for name in sorted(volume_dirs):
+        src = os.path.join(volume_root, name)
+        dst = os.path.join(comfy_custom_nodes_root, name)
+        if os.path.islink(dst) and os.path.realpath(dst) == os.path.realpath(src):
+            kept.append(name)
+            continue
+        if os.path.lexists(dst):
+            blocked.append(name)
+            continue
+        os.symlink(src, dst)
+        created.append(name)
+
+    return {
+        "created": created,
+        "removed": removed,
+        "kept": kept,
+        "blocked": blocked,
+    }
+
+RUNTIME_METADATA_PATH = "/root/comfy/runtime_metadata.json"
+
+
+def requirements_file_hash(path: str) -> str | None:
+    """Return sha256 hex of a requirements.txt file, or None if missing."""
+    if not os.path.isfile(path):
+        return None
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def model_volume_state(volume_root: str) -> tuple:
+    """Snapshot of (folder, name, mtime_ns, size) for every file on a model volume."""
+    volume_root = os.path.abspath(volume_root)
+    state = []
+    for folder in _safe_listdir(volume_root):
+        folder_path = os.path.join(volume_root, folder)
+        if not os.path.isdir(folder_path):
+            continue
+        for name in _safe_listdir(folder_path):
+            path = os.path.join(folder_path, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                st = os.stat(path)
+            except (OSError, FileNotFoundError):
+                continue
+            state.append((folder, name, st.st_mtime_ns, st.st_size))
+    return tuple(state)
+
+
+def load_runtime_metadata() -> dict:
+    """Load JSON metadata from the container filesystem."""
+    if not os.path.isfile(RUNTIME_METADATA_PATH):
+        return {"requirements": {}, "runtime": {}}
+    try:
+        with open(RUNTIME_METADATA_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"requirements": {}, "runtime": {}}
+        return data
+    except (json.JSONDecodeError, OSError):
+        return {"requirements": {}, "runtime": {}}
+
+
+def save_runtime_metadata(data: dict) -> None:
+    """Persist JSON metadata to the container filesystem."""
+    os.makedirs(os.path.dirname(RUNTIME_METADATA_PATH), exist_ok=True)
+    with open(RUNTIME_METADATA_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
 
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.0.0"
+COMFYAPP_VERSION = "2.0.4"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
@@ -269,10 +414,77 @@ def upload_model_chunk(chunk_data: bytes, folder: str, filename: str, offset: in
 class _ComfyAPIMixin:
     """Shared implementation for all GPU-specific ComfyAPI classes."""
 
+    def _sync_custom_nodes_from_volume(self):
+        custom_nodes_vol.reload()
+        comfy_custom_nodes = "/root/comfy/ComfyUI/custom_nodes"
+        summary = sync_custom_nodes_into_comfy(CUSTOM_NODES_PATH, comfy_custom_nodes)
+        state = custom_node_volume_state(CUSTOM_NODES_PATH)
+        return summary, state
+
+    def _install_custom_node_requirements(self, force: bool = False) -> dict:
+        """Install requirements.txt for each custom node, skipping cached hashes."""
+        metadata = load_runtime_metadata()
+        cached = metadata.get("requirements", {})
+        installed = []
+        skipped = []
+        failures = []
+        updated_hashes = {}
+
+        for node_dir in sorted(os.listdir(CUSTOM_NODES_PATH)) if os.path.isdir(CUSTOM_NODES_PATH) else []:
+            src = os.path.join(CUSTOM_NODES_PATH, node_dir)
+            if not os.path.isdir(src):
+                continue
+            req_file = os.path.join(src, "requirements.txt")
+            if not os.path.isfile(req_file):
+                continue
+            current_hash = requirements_file_hash(req_file)
+            if not force and current_hash and cached.get(node_dir) == current_hash:
+                skipped.append(node_dir)
+                continue
+
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-r", req_file],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode != 0:
+                failures.append({
+                    "node": node_dir,
+                    "stderr": (result.stderr or result.stdout or "requirements install failed")[:1000],
+                })
+            else:
+                installed.append(node_dir)
+                if current_hash:
+                    updated_hashes[node_dir] = current_hash
+
+        if failures:
+            raise RuntimeError(f"Custom node requirements install failed: {failures}")
+
+        # Persist updated hashes
+        if updated_hashes or force:
+            metadata["requirements"] = {**cached, **updated_hashes}
+            save_runtime_metadata(metadata)
+
+        return {"installed": installed, "skipped": skipped}
+
+    def _restart_comfy(self):
+        if getattr(self, "_proc", None) and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        self._proc = subprocess.Popen(
+            ["comfy", "launch", "--", "--listen", "0.0.0.0", f"--port={COMFYUI_API_PORT}", "--disable-auto-launch"],
+        )
+        self._wait_for_comfy()
+
     @modal.enter(snap=True)
     def startup(self):
-        import os
         import shutil
+
+        t0 = time.time()
 
         # Symlink models from volume into ComfyUI
         comfy_models = "/root/comfy/ComfyUI/models"
@@ -280,34 +492,30 @@ class _ComfyAPIMixin:
             shutil.rmtree(comfy_models)
         os.symlink(MODELS_PATH, comfy_models)
 
-        # Sync custom nodes from volume into ComfyUI
         vol.reload()
-        custom_nodes_vol.reload()
-        comfy_custom_nodes = "/root/comfy/ComfyUI/custom_nodes"
-        vol_cn_path = CUSTOM_NODES_PATH
-        if os.path.isdir(vol_cn_path):
-            for node_dir in os.listdir(vol_cn_path):
-                src = os.path.join(vol_cn_path, node_dir)
-                dst = os.path.join(comfy_custom_nodes, node_dir)
-                if os.path.isdir(src) and not os.path.exists(dst):
-                    os.symlink(src, dst)
-                    # Install requirements if present
-                    req_file = os.path.join(src, "requirements.txt")
-                    if os.path.isfile(req_file):
-                        subprocess.run(
-                            [sys.executable, "-m", "pip", "install", "-r", req_file],
-                            capture_output=True, timeout=300
-                        )
+        _, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
+        install_summary = self._install_custom_node_requirements()
+        self._record_runtime_state()
+        self._restart_comfy()
 
-        self._proc = subprocess.Popen(
-            ["comfy", "launch", "--", "--listen", "0.0.0.0",
-             f"--port={COMFYUI_API_PORT}", "--disable-auto-launch"],
-        )
-        self._wait_for_comfy()
+        duration = time.time() - t0
+        print(f"[comfyapp] startup complete in {duration:.3f}s  "
+              f"req_installed={install_summary['installed']}")
 
     @modal.enter(snap=False)
     def restore(self):
-        self._wait_for_comfy()
+        """Snapshot restore: lightweight sanity check only.
+        No volume reloads, no custom-node sync, no requirements install,
+        no forced restart — the snapshot already captured a ready state."""
+        restore_start = time.time()
+        import shutil
+        # Tiny local sanity: ensure the symlink still exists
+        comfy_models = "/root/comfy/ComfyUI/models"
+        if not os.path.islink(comfy_models):
+            if os.path.isdir(comfy_models):
+                shutil.rmtree(comfy_models)
+            os.symlink(MODELS_PATH, comfy_models)
+        print(f"[comfyapp] restore sanity check done in {time.time() - restore_start:.3f}s")
 
     @modal.exit()
     def shutdown(self):
@@ -335,13 +543,28 @@ class _ComfyAPIMixin:
             return json.loads(r.read())
 
     @modal.method()
-    def run_prompt(self, workflow: dict, input_images: dict = None) -> dict:
+    def refresh_custom_nodes(self, expected_nodes: list[str] | None = None):
+        expected_nodes = expected_nodes or []
+        last_missing = []
+        summary = None
+        current_state = ()
+        for attempt in range(5):
+            summary, current_state = self._sync_custom_nodes_from_volume()
+            last_missing = missing_expected_nodes(current_state, expected_nodes)
+            if not last_missing:
+                self._custom_nodes_state = current_state
+                self._restart_comfy()
+                return {"status": "ok", **summary}
+            if attempt < 4:
+                time.sleep(1)
+        raise RuntimeError(f"Synced custom nodes not visible in Modal volume yet: {last_missing}")
+
+    @modal.method()
+    def run_prompt(self, workflow: dict, input_images: dict | None = None) -> dict:
         import urllib.request
         import urllib.error
         import base64
         from pathlib import Path
-
-        vol.reload()
 
         if input_images:
             input_dir = Path("/root/comfy/ComfyUI/input")
@@ -400,6 +623,7 @@ class _ComfyAPIMixin:
                 history = json.loads(r.read())
             if prompt_id in history:
                 outputs = history[prompt_id].get("outputs", {})
+                print(f"[comfyapp] prompt {prompt_id} finished in {elapsed:.3f}s")
                 return self._collect_outputs(outputs)
             time.sleep(delay)
             elapsed += delay
@@ -439,6 +663,62 @@ class _ComfyAPIMixin:
                 videos.append({"filename": vid["filename"], "data": data, "node_id": node_id})
 
         return {"images": images, "videos": videos}
+
+    def _record_runtime_state(self):
+        self._models_state = model_volume_state(MODELS_PATH)
+        self._custom_nodes_state = custom_node_volume_state(CUSTOM_NODES_PATH)
+
+    @modal.method()
+    def resync_runtime(self, scope: str = "all"):
+        """Explicit in-container resync: reload volumes, sync custom nodes,
+        reinstall changed requirements, and restart ComfyUI in place."""
+        if getattr(self, "_resync_in_progress", False):
+            return {"status": "conflict", "message": "resync already in progress"}
+        self._resync_in_progress = True
+        try:
+            started = time.time()
+            print(f"[comfyapp] resync_runtime scope={scope} starting")
+
+            if scope in {"models", "all"}:
+                vol.reload()
+            if scope in {"custom_nodes", "all"}:
+                custom_nodes_vol.reload()
+
+            summary: dict = {"scope": scope}
+            if scope in {"custom_nodes", "all"}:
+                node_summary, _ = self._sync_custom_nodes_from_volume()
+                summary["custom_nodes"] = node_summary
+                summary["requirements"] = self._install_custom_node_requirements()
+
+            self._record_runtime_state()
+            self._restart_comfy()
+
+            summary["runtime_state"] = self.runtime_state()
+            summary["duration_s"] = round(time.time() - started, 3)
+            print(f"[comfyapp] resync_runtime scope={scope} took {summary['duration_s']:.3f}s")
+            return {"status": "ok", **summary}
+        finally:
+            self._resync_in_progress = False
+
+    @modal.method()
+    def runtime_state(self) -> dict:
+        """Return stale-runtime info by comparing current volume state
+        against the last recorded in-memory state."""
+        current_models = model_volume_state(MODELS_PATH)
+        current_nodes = custom_node_volume_state(CUSTOM_NODES_PATH)
+        models_changed = current_models != getattr(self, "_models_state", None)
+        custom_nodes_changed = current_nodes != getattr(self, "_custom_nodes_state", None)
+        stale_reasons = []
+        if models_changed:
+            stale_reasons.append("models changed")
+        if custom_nodes_changed:
+            stale_reasons.append("custom nodes changed")
+        return {
+            "stale": bool(stale_reasons),
+            "stale_reasons": stale_reasons,
+            "models_changed": models_changed,
+            "custom_nodes_changed": custom_nodes_changed,
+        }
 
     @modal.method()
     def health(self):
@@ -498,8 +778,8 @@ class _ComfyAPIMixin:
     memory=16384,
     timeout=3600,
     min_containers=0,
-    # Keep containers warm for 60s to avoid cold-start costs during iterative workflows
-    scaledown_window=60,
+    # Scale down quickly to avoid holding GPU resources when idle
+    scaledown_window=4,
     volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
@@ -515,8 +795,8 @@ class ComfyAPI(_ComfyAPIMixin):
     memory=32768,
     timeout=3600,
     min_containers=0,
-    # Keep containers warm for 60s to avoid cold-start costs during iterative workflows
-    scaledown_window=60,
+    # Scale down quickly to avoid holding GPU resources when idle
+    scaledown_window=4,
     volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
@@ -532,8 +812,8 @@ class ComfyAPI_A100(_ComfyAPIMixin):
     memory=8192,
     timeout=3600,
     min_containers=0,
-    # Keep containers warm for 60s to avoid cold-start costs during iterative workflows
-    scaledown_window=60,
+    # Scale down quickly to avoid holding GPU resources when idle
+    scaledown_window=4,
     volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},

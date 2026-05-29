@@ -9,7 +9,18 @@ import copy
 import threading
 import subprocess
 import time
+
+_NODE_DIR = os.path.dirname(os.path.abspath(__file__))
+if _NODE_DIR not in sys.path:
+    sys.path.insert(0, _NODE_DIR)
+
 from aiohttp import web
+from local_placeholders import (
+    create_local_placeholder,
+    get_local_model_file_info,
+    normalize_model_filename,
+    normalize_model_folder,
+)
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
@@ -23,9 +34,6 @@ def _unique_path(directory: str, filename: str) -> str:
     stem, ext = os.path.splitext(filename)
     suffix = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1_000_000) % 1_000_000:06d}"
     return os.path.join(directory, f"{stem}_{suffix}{ext}")
-
-
-_NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 _COMFYAPP_PATH = os.path.join(_NODE_DIR, "comfyapp.py")
 _DEPLOY_STATE_FILE = os.path.join(_NODE_DIR, ".deployed_version")
 _DEPLOY_LOG_FILE = os.path.join(_NODE_DIR, ".deploy_log")
@@ -77,6 +85,8 @@ def _get_comfyapp_version():
     try:
         import importlib.util
         spec = importlib.util.spec_from_file_location("comfyapp_meta", _COMFYAPP_PATH)
+        assert spec is not None
+        assert spec.loader is not None
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return getattr(mod, "COMFYAPP_VERSION", "unknown")
@@ -218,7 +228,7 @@ sys.path.insert(0, _NODE_DIR)
 
 try:
     import modal as _modal_pkg
-    from modal_client import run_prompt, get_object_info, health_check, download_model, batch_download_models, list_models, delete_model, set_gpu, get_gpu, sync_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache
+    from modal_client import run_prompt, get_object_info, health_check, download_model, batch_download_models, list_models, delete_model, set_gpu, get_gpu, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state
     _modal_available = True
     _maybe_auto_deploy()
 except ImportError:
@@ -237,9 +247,12 @@ except ImportError:
     def list_models(*a, **kw): raise RuntimeError("modal not installed")
     def delete_model(*a, **kw): raise RuntimeError("modal not installed")
     def sync_custom_nodes(*a, **kw): raise RuntimeError("modal not installed")
+    def refresh_custom_nodes(*a, **kw): raise RuntimeError("modal not installed")
     def get_sync_status(*a, **kw): raise RuntimeError("modal not installed")
     def upload_model_to_volume(*a, **kw): raise RuntimeError("modal not installed")
     def upload_model_chunk(*a, **kw): raise RuntimeError("modal not installed")
+    def resync_runtime(*a, **kw): raise RuntimeError("modal not installed")
+    def get_runtime_state(*a, **kw): raise RuntimeError("modal not installed")
     def set_gpu(gpu): pass
     def get_gpu(): return "a10g"
 
@@ -247,6 +260,94 @@ _COMFYUI_ROOT = os.path.dirname(os.path.dirname(_NODE_DIR))
 
 _MODAL_TOML_PATH = os.path.expanduser("~/.modal.toml")
 _HF_TOKEN_PATH = os.path.join(os.path.dirname(__file__), ".hf_token")
+
+
+def _validate_model_location(folder: str, filename: str) -> tuple[str, str]:
+    return normalize_model_folder(folder), normalize_model_filename(filename)
+
+
+def _placeholder_info(folder: str, filename: str) -> dict:
+    return get_local_model_file_info(_COMFYUI_ROOT, folder, filename)
+
+
+def _create_placeholder(folder: str, filename: str) -> dict:
+    return create_local_placeholder(_COMFYUI_ROOT, folder, filename)
+
+
+def _remove_local_placeholder_if_needed(folder: str, filename: str) -> dict | None:
+    try:
+        info = _placeholder_info(folder, filename)
+    except Exception:
+        return None
+    if not info.get("is_placeholder"):
+        return None
+    try:
+        os.remove(info["local_path"])
+    except FileNotFoundError:
+        return None
+    return {"removed": True, "local_path": info["local_path"]}
+
+
+def _create_placeholder_batch(items: list[dict]) -> tuple[list[dict], list[dict]]:
+    placeholders = []
+    errors = []
+    for item in items:
+        folder = item.get("folder", "")
+        filename = item.get("filename", "")
+        try:
+            placeholders.append(_create_placeholder(folder, filename))
+        except Exception as e:
+            errors.append({"folder": folder, "filename": filename, "error": str(e)})
+    return placeholders, errors
+
+
+def _annotate_models_with_local_info(grouped_models: dict) -> dict:
+    annotated = {}
+    for section, files in grouped_models.items():
+        annotated[section] = []
+        for file in files:
+            item = dict(file)
+            folder = item.get("folder") or section
+            try:
+                item["local_placeholder"] = _placeholder_info(folder, item.get("name", ""))
+            except Exception as e:
+                item["local_placeholder"] = {
+                    "folder": folder,
+                    "filename": item.get("name", ""),
+                    "exists": False,
+                    "size": 0,
+                    "is_placeholder": False,
+                    "is_real_file": False,
+                    "error": str(e),
+                }
+            annotated[section].append(item)
+    return annotated
+
+
+def _batch_placeholder_message(placeholders: list[dict], errors: list[dict]) -> str:
+    created = sum(1 for item in placeholders if item.get("created"))
+    existing = sum(1 for item in placeholders if item.get("existed"))
+    if errors:
+        return (
+            f"Models downloaded to Modal. {created} local placeholder(s) created, "
+            f"{existing} already existed, {len(errors)} failed. Refresh ComfyUI if the dropdown does not update."
+        )
+    return (
+        f"Models downloaded to Modal. {created} local placeholder(s) created, "
+        f"{existing} already existed. Refresh ComfyUI if the dropdown does not update."
+    )
+
+
+def _inject_all_message(created: int, existing: int, error_count: int) -> str:
+    if error_count:
+        return (
+            f"Local placeholder sync complete. {created} created, {existing} already existed, "
+            f"{error_count} failed. Refresh ComfyUI if the dropdown does not update."
+        )
+    return (
+        f"Local placeholder sync complete. {created} created, {existing} already existed. "
+        "Refresh ComfyUI if the dropdown does not update."
+    )
 
 def _read_hf_token() -> str:
     try:
@@ -517,12 +618,32 @@ if _server:
         items = body.get("items", [])
         if not items:
             return web.json_response({"status": "error", "message": "items required"}, status=400)
+        normalized_items = []
         for it in items:
             if not it.get("url") or not it.get("filename"):
                 return web.json_response({"status": "error", "message": "each item needs url and filename"}, status=400)
+            try:
+                folder, filename = _validate_model_location(it.get("save_path", "checkpoints"), it.get("filename", ""))
+            except ValueError as e:
+                return web.json_response({"status": "error", "message": str(e)}, status=400)
+            normalized_items.append({
+                "url": it["url"],
+                "filename": filename,
+                "save_path": folder,
+            })
         try:
-            results = await batch_download_models(items, hf_token=_read_hf_token())
-            return web.json_response({"status": "ok", "results": results})
+            results = await batch_download_models(normalized_items, hf_token=_read_hf_token())
+            placeholders, placeholder_errors = _create_placeholder_batch([
+                {"folder": item["save_path"], "filename": item["filename"]}
+                for item in normalized_items
+            ])
+            return web.json_response({
+                "status": "ok",
+                "results": results,
+                "placeholders": placeholders,
+                "placeholder_errors": placeholder_errors,
+                "message": _batch_placeholder_message(placeholders, placeholder_errors),
+            })
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 
@@ -540,8 +661,28 @@ if _server:
             )
 
         try:
+            save_path, filename = _validate_model_location(save_path, filename)
             result = await download_model(url=url, filename=filename, save_path=save_path, hf_token=_read_hf_token())
-            return web.json_response({"status": "ok", **result})
+            placeholder = None
+            placeholder_error = None
+            message = "Model downloaded to Modal and local placeholder created. Refresh ComfyUI if the dropdown does not update."
+            try:
+                placeholder = _create_placeholder(save_path, filename)
+            except Exception as e:
+                placeholder_error = {"folder": save_path, "filename": filename, "error": str(e)}
+                message = (
+                    "Model downloaded to Modal, but local placeholder creation failed. "
+                    "Use Create local or Create All Placeholders, then refresh ComfyUI if the dropdown does not update."
+                )
+            return web.json_response({
+                "status": "ok",
+                **result,
+                "placeholder": placeholder,
+                "placeholder_error": placeholder_error,
+                "message": message,
+            })
+        except ValueError as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=400)
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 
@@ -627,9 +768,52 @@ if _server:
     async def modal_list_models(request: web.Request) -> web.Response:
         try:
             result = await list_models()
-            return web.json_response(result)
+            return web.json_response(_annotate_models_with_local_info(result))
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=503)
+
+    @_server.routes.post("/comfymodal/models/inject")
+    async def modal_inject_placeholder(request: web.Request) -> web.Response:
+        body = await request.json()
+        folder = body.get("folder", "")
+        filename = body.get("filename", "")
+        if not folder or not filename:
+            return web.json_response({"status": "error", "message": "folder and filename required"}, status=400)
+        try:
+            folder, filename = _validate_model_location(folder, filename)
+            placeholder = _create_placeholder(folder, filename)
+            return web.json_response({
+                "status": "ok",
+                "placeholder": placeholder,
+                "message": "Local placeholder created. Refresh ComfyUI if the dropdown does not update.",
+            })
+        except ValueError as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=400)
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/models/inject-all")
+    async def modal_inject_all_placeholders(request: web.Request) -> web.Response:
+        try:
+            remote = await get_sync_status()
+            remote_models = remote.get("models", [])
+            placeholders, errors = _create_placeholder_batch([
+                {"folder": item.get("folder", ""), "filename": item.get("name", "")}
+                for item in remote_models
+            ])
+            created = sum(1 for item in placeholders if item.get("created"))
+            existing = sum(1 for item in placeholders if item.get("existed"))
+            return web.json_response({
+                "status": "ok",
+                "total": len(remote_models),
+                "created": created,
+                "existing": existing,
+                "placeholders": placeholders,
+                "errors": errors,
+                "message": _inject_all_message(created, existing, len(errors)),
+            })
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
 
     @_server.routes.delete("/comfymodal/models/{folder}/{filename}")
     async def modal_delete_model(request: web.Request) -> web.Response:
@@ -639,6 +823,11 @@ if _server:
             return web.json_response({"status": "error", "message": "folder and filename required"}, status=400)
         try:
             result = await delete_model(folder=folder, filename=filename)
+            local_placeholder = None
+            if result.get("status") == "ok":
+                local_placeholder = _remove_local_placeholder_if_needed(folder, filename)
+                if local_placeholder:
+                    result["local_placeholder"] = local_placeholder
             return web.json_response(result)
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -807,8 +996,49 @@ if _server:
 
         try:
             result = await sync_custom_nodes(archive_data)
+            refresh_result = None
+            refresh_error = None
+            if result.get("status") == "ok":
+                try:
+                    refresh_result = await resync_runtime("custom_nodes")
+                except Exception as e:
+                    refresh_error = str(e)
+            if refresh_result is not None:
+                result["refresh"] = refresh_result
+            if refresh_error is not None:
+                result["refresh_error"] = refresh_error
+                result["message"] = (
+                    "Custom nodes synced to Modal Volume, but the running Modal ComfyUI process could not be refreshed automatically. "
+                    "Try again after the container sleeps, or redeploy if the node is still missing."
+                )
+            else:
+                result["message"] = "Custom nodes synced to Modal and the Modal ComfyUI process was refreshed."
             return web.json_response(result)
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 
-    print("[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes")
+    @_server.routes.post("/comfymodal/runtime/resync")
+    async def modal_runtime_resync(request: web.Request) -> web.Response:
+        scope = "all"
+        try:
+            body = await request.json()
+            scope = body.get("scope", "all")
+        except Exception:
+            pass
+        if scope not in ("models", "custom_nodes", "all"):
+            return web.json_response({"status": "error", "message": "scope must be 'models', 'custom_nodes', or 'all'"}, status=400)
+        try:
+            result = await resync_runtime(scope)
+            return web.json_response(result)
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.get("/comfymodal/runtime/state")
+    async def modal_runtime_state(request: web.Request) -> web.Response:
+        try:
+            result = await get_runtime_state()
+            return web.json_response(result)
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    print("[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state")

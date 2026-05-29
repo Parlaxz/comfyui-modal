@@ -11,6 +11,7 @@ const FOLDERS = ["checkpoints", "loras", "vae", "controlnet", "upscale_models", 
 const DOWNLOAD_FOLDERS = [
   "checkpoints",
   "diffusion_models",
+  "unet",
   "loras",
   "vae",
   "controlnet",
@@ -52,6 +53,7 @@ let dotEl = null;
 let statusEl = null;
 let modelListEl = null;
 let modelsCollapsibleRef = null;
+let injectAllBtn = null;
 let statusBannerEl = null;
 let statusBannerTextEl = null;
 let _deployPollTimer = null;
@@ -322,6 +324,32 @@ function fmtSize(bytes) {
   return (bytes / 1024).toFixed(0) + " KB";
 }
 
+function describeLocalFile(info) {
+  if (!info || info.error) return { label: "local unknown", color: "#888", border: "#444", title: info?.error || "Local file status unavailable" };
+  if (info.is_real_file) {
+    return {
+      label: "local file",
+      color: "#7ed321",
+      border: "#295c16",
+      title: "A real local model file already exists. It was not overwritten.",
+    };
+  }
+  if (info.is_placeholder) {
+    return {
+      label: "placeholder",
+      color: "#6a9fd8",
+      border: "#36506d",
+      title: "A 0-byte local placeholder already exists for this remote model.",
+    };
+  }
+  return {
+    label: "local missing",
+    color: "#aaa",
+    border: "#555",
+    title: "No local file exists yet. Create a local placeholder if you want this model to appear in local ComfyUI dropdowns.",
+  };
+}
+
 function debounce(fn, ms) {
   let timer;
   return (...args) => {
@@ -460,6 +488,8 @@ function renderModelList(data) {
     section.appendChild(folderLabel);
 
     for (const file of files) {
+      const localInfo = file.local_placeholder || null;
+      const localState = describeLocalFile(localInfo);
       const row = document.createElement("div");
       row.style.cssText = "display:flex; align-items:center; gap:6px; padding:4px 6px; border-radius:4px; background:#2a2a2a; margin-bottom:3px;";
 
@@ -472,6 +502,11 @@ function renderModelList(data) {
       size.style.cssText = "font-size:11px; color:#666; flex-shrink:0;";
       size.textContent = fmtSize(file.size);
 
+      const localBadge = document.createElement("span");
+      localBadge.style.cssText = `font-size:10px; color:${localState.color}; background:#222; border:1px solid ${localState.border}; border-radius:3px; padding:0 4px; flex-shrink:0;`;
+      localBadge.textContent = localState.label;
+      localBadge.title = localState.title;
+
       if (file.folder && file.folder !== folder) {
         const badge = document.createElement("span");
         badge.style.cssText = "font-size:10px; color:#888; background:#333; border:1px solid #444; border-radius:3px; padding:0 4px; flex-shrink:0;";
@@ -479,10 +514,65 @@ function renderModelList(data) {
         row.appendChild(name);
         row.appendChild(badge);
         row.appendChild(size);
+        row.appendChild(localBadge);
       } else {
         row.appendChild(name);
         row.appendChild(size);
+        row.appendChild(localBadge);
       }
+
+      const injectBtn = document.createElement("button");
+      injectBtn.style.cssText = "background: transparent; border: 1px solid #557; color: #99b; padding: 0 6px; height: 20px; border-radius: 3px; cursor: pointer; font-size: 10px; flex-shrink: 0; line-height: 1;";
+
+      const updateInjectState = (info) => {
+        const state = describeLocalFile(info);
+        localBadge.style.color = state.color;
+        localBadge.style.borderColor = state.border;
+        localBadge.textContent = state.label;
+        localBadge.title = state.title;
+
+        if (info?.is_real_file) {
+          injectBtn.textContent = "Local file";
+          injectBtn.title = "A real local file already exists and will not be overwritten.";
+          injectBtn.disabled = true;
+          injectBtn.style.opacity = "0.7";
+          injectBtn.style.cursor = "default";
+        } else if (info?.is_placeholder) {
+          injectBtn.textContent = "Placeholder";
+          injectBtn.title = "A local 0-byte placeholder already exists.";
+          injectBtn.disabled = true;
+          injectBtn.style.opacity = "0.7";
+          injectBtn.style.cursor = "default";
+        } else {
+          injectBtn.textContent = "Create local";
+          injectBtn.title = "Create a 0-byte local placeholder so this remote model appears in local ComfyUI dropdowns.";
+          injectBtn.disabled = false;
+          injectBtn.style.opacity = "1";
+          injectBtn.style.cursor = "pointer";
+        }
+      };
+
+      updateInjectState(localInfo);
+
+      injectBtn.onclick = async () => {
+        injectBtn.disabled = true;
+        injectBtn.textContent = "Creating...";
+        try {
+          const r = await api.fetchApi(`${MODAL_PREFIX}/models/inject`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ folder: file.folder ?? folder, filename: file.name }),
+          });
+          const result = await r.json();
+          if (result.status !== "ok") throw new Error(result.message || "Placeholder creation failed");
+          updateInjectState(result.placeholder);
+          showToast(result.message || "Local placeholder created. Refresh ComfyUI if the dropdown does not update.", "success");
+        } catch (e) {
+          injectBtn.disabled = false;
+          injectBtn.textContent = "Create local";
+          showToast("Error: " + e.message, "error");
+        }
+      };
 
       const delBtn = document.createElement("button");
       delBtn.textContent = "\u2715";
@@ -515,6 +605,7 @@ function renderModelList(data) {
         }
       };
 
+      row.appendChild(injectBtn);
       row.appendChild(delBtn);
       section.appendChild(row);
     }
@@ -955,6 +1046,17 @@ function buildPanel() {
   syncCNStatus.style.cssText = "font-size: 11px; color: #888; min-height: 14px;";
   syncContent.appendChild(syncCNStatus);
 
+  // Resync Remote Runtime button
+  const resyncRuntimeBtn = document.createElement("button");
+  resyncRuntimeBtn.textContent = "\u21BB Resync Remote Runtime";
+  resyncRuntimeBtn.title = "Reload the running Modal ComfyUI so new models or custom nodes become visible";
+  resyncRuntimeBtn.style.cssText = btnStyle("primary") + "margin-top: 8px; margin-bottom: 4px;";
+  syncContent.appendChild(resyncRuntimeBtn);
+
+  const resyncRuntimeStatus = document.createElement("div");
+  resyncRuntimeStatus.style.cssText = "font-size: 11px; color: #888; min-height: 14px;";
+  syncContent.appendChild(resyncRuntimeStatus);
+
   // Button handlers
   syncModelsBtn.onclick = async () => {
     syncModelsBtn.disabled = true;
@@ -967,7 +1069,7 @@ function buildPanel() {
       if (data.status === "ok") {
         syncModelsStatus.style.color = "#7ed321";
         syncModelsStatus.textContent = data.uploaded > 0
-          ? `Done! ${data.uploaded}/${data.total} model(s) uploaded.`
+          ? `Done! ${data.uploaded}/${data.total} model(s) uploaded. Resync runtime if models don't appear.`
           : data.message || "All models already synced.";
         showToast(data.uploaded > 0 ? `${data.uploaded} model(s) synced!` : "Models already synced", "success");
         await loadSyncStatus();
@@ -995,8 +1097,10 @@ function buildPanel() {
       if (data.status === "ok") {
         const count = (data.nodes || []).length;
         syncCNStatus.style.color = "#7ed321";
-        syncCNStatus.textContent = `Done! ${count} custom node(s) synced.`;
-        showToast(`${count} custom node(s) synced!`, "success");
+        syncCNStatus.textContent = data.message
+          ? data.message
+          : `Done! ${count} custom node(s) synced. Runtime refreshed.`;
+        showToast(data.message || `${count} custom node(s) synced!`, data.refresh_error ? "info" : "success");
         await loadSyncStatus();
       } else {
         throw new Error(data.message || "Sync failed");
@@ -1008,6 +1112,36 @@ function buildPanel() {
     }
     syncCNBtn.disabled = false;
     syncCNBtn.textContent = "\u2B06 Sync Custom Nodes";
+  };
+
+  resyncRuntimeBtn.onclick = async () => {
+    resyncRuntimeBtn.disabled = true;
+    resyncRuntimeBtn.textContent = "Resyncing...";
+    resyncRuntimeStatus.style.color = "#f5a623";
+    resyncRuntimeStatus.textContent = "Requesting runtime resync...";
+    try {
+      const resp = await api.fetchApi(`${MODAL_PREFIX}/runtime/resync`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope: "all" }),
+      });
+      const data = await resp.json();
+      if (data.status === "ok") {
+        resyncRuntimeStatus.style.color = "#7ed321";
+        resyncRuntimeStatus.textContent = data.message || "Runtime resynced successfully.";
+        showToast("Runtime resynced!", "success");
+        await loadSyncStatus();
+        await loadModels();
+      } else {
+        throw new Error(data.message || "Resync failed");
+      }
+    } catch (e) {
+      resyncRuntimeStatus.style.color = "#e05050";
+      resyncRuntimeStatus.textContent = "Error: " + e.message;
+      showToast("Resync failed: " + e.message, "error");
+    }
+    resyncRuntimeBtn.disabled = false;
+    resyncRuntimeBtn.textContent = "\u21BB Resync Remote Runtime";
   };
 
   async function loadSyncStatus() {
@@ -1045,11 +1179,42 @@ function buildPanel() {
         </div>
       `;
       syncCollapsible.updateBadge(pendingModels + pendingCN > 0 ? `${pendingModels + pendingCN}` : "\u2713");
+      await loadRuntimeState();
       syncCollapsible.refreshHeight();
     } catch (e) {
       syncStatusEl.style.color = "#e05050";
       syncStatusEl.textContent = "Error: " + e.message;
       syncCollapsible.refreshHeight();
+    }
+  }
+
+  async function loadRuntimeState() {
+    if (!syncStatusEl) return;
+    try {
+      const resp = await api.fetchApi(`${MODAL_PREFIX}/runtime/state`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const existing = syncStatusEl.querySelector("[data-stale-warning]");
+      if (existing) existing.remove();
+      if (data.stale === true) {
+        const warning = document.createElement("div");
+        warning.setAttribute("data-stale-warning", "1");
+        warning.style.cssText = "margin-top:6px; padding:6px 8px; background:#3d2e00; color:#f5a623; border-radius:4px; font-size:11px; line-height:1.4;";
+        warning.textContent = "\u26A0\ufe0f Remote runtime is stale. ";
+        const link = document.createElement("a");
+        link.href = "#";
+        link.textContent = "Resync runtime";
+        link.style.cssText = "color:#6a9fd8;text-decoration:underline;";
+        link.onclick = (e) => {
+          e.preventDefault();
+          if (resyncRuntimeBtn) resyncRuntimeBtn.click();
+        };
+        warning.appendChild(link);
+        warning.appendChild(document.createTextNode(" to pick up new models or custom nodes."));
+        syncStatusEl.appendChild(warning);
+      }
+    } catch (e) {
+      console.warn("[comfyui-modal] runtime/state check failed:", e);
     }
   }
 
@@ -1060,15 +1225,46 @@ function buildPanel() {
   modelsCollapsibleRef = modelsCollapsible;
   const modelsContent = modelsCollapsible.content;
 
+  const modelsHelp = document.createElement("div");
+  modelsHelp.style.cssText = "font-size:11px; color:#888; line-height:1.5; margin-bottom:8px;";
+  modelsHelp.textContent = "Create local 0-byte placeholders so Modal-only models appear in local ComfyUI dropdowns. Placeholders only work when Modal/cloud mode is enabled.";
+  modelsContent.appendChild(modelsHelp);
+
   modelListEl = document.createElement("div");
   modelListEl.style.cssText = "max-height: 300px; overflow-y: auto; min-height: 0;";
   modelsContent.appendChild(modelListEl);
 
+  const modelsBtnRow = document.createElement("div");
+  modelsBtnRow.style.cssText = "display:flex; gap:6px; margin-top:8px; flex-wrap:wrap;";
+
   const refreshBtn = document.createElement("button");
   refreshBtn.textContent = "\u21BA Refresh";
-  refreshBtn.style.cssText = btnStyle() + "margin-top:8px;";
+  refreshBtn.style.cssText = btnStyle() + "flex:1;";
   refreshBtn.onclick = loadModels;
-  modelsContent.appendChild(refreshBtn);
+
+  injectAllBtn = document.createElement("button");
+  injectAllBtn.textContent = "Create All Placeholders";
+  injectAllBtn.title = "Create local placeholders for every remote model stored in Modal.";
+  injectAllBtn.style.cssText = btnStyle() + "flex:1;";
+  injectAllBtn.onclick = async () => {
+    injectAllBtn.disabled = true;
+    injectAllBtn.textContent = "Creating...";
+    try {
+      const resp = await api.fetchApi(`${MODAL_PREFIX}/models/inject-all`, { method: "POST" });
+      const data = await resp.json();
+      if (data.status !== "ok") throw new Error(data.message || "Create all placeholders failed");
+      showToast(data.message || "Local placeholders created. Refresh ComfyUI if the dropdown does not update.", data.errors?.length ? "info" : "success");
+      await loadModels();
+    } catch (e) {
+      showToast("Error: " + e.message, "error");
+    }
+    injectAllBtn.disabled = false;
+    injectAllBtn.textContent = "Create All Placeholders";
+  };
+
+  modelsBtnRow.appendChild(refreshBtn);
+  modelsBtnRow.appendChild(injectAllBtn);
+  modelsContent.appendChild(modelsBtnRow);
 
   scrollContent.appendChild(modelsCollapsible.wrapper);
 
@@ -1083,7 +1279,7 @@ function buildPanel() {
 
   const addHelp = document.createElement("div");
   addHelp.style.cssText = "font-size:11px; color:#888; line-height:1.4;";
-  addHelp.textContent = "Download models to the Modal cloud volume. Use batch mode to download multiple models at once.";
+  addHelp.textContent = "Download models to the Modal cloud volume. A matching local 0-byte placeholder is created automatically so the model can appear in local ComfyUI dropdowns. Refresh/restart ComfyUI if the dropdown does not update.";
   addSection.appendChild(addHelp);
 
   const urlInput = document.createElement("input");
@@ -1161,14 +1357,14 @@ function buildPanel() {
     singleDownloadBtn.disabled = true;
     singleDownloadBtn.textContent = "Downloading...";
     try {
-      const resp = await api.fetchApi(`${MODAL_PREFIX}/models/batch-install`, {
+      const resp = await api.fetchApi(`${MODAL_PREFIX}/model/install`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ items: [{ url, filename, save_path: folder }] }),
+        body: JSON.stringify({ url, filename, save_path: folder }),
       });
       const data = await resp.json();
       if (data.status === "ok") {
-        showToast("Model downloaded!", "success");
+        showToast(data.message || "Model downloaded to Modal and local placeholder created. Refresh ComfyUI if the dropdown does not update.", "success");
         urlInput.value = "";
         filenameInput.value = "";
         await loadModels();
@@ -1274,8 +1470,8 @@ function buildPanel() {
           }
         });
         batchStatusEl.style.color = "#7ed321";
-        batchStatusEl.textContent = `Done - ${pending.length} model(s) downloaded.`;
-        showToast(`${pending.length} model(s) downloaded!`, "success");
+        batchStatusEl.textContent = data.message || `Done - ${pending.length} model(s) downloaded.`;
+        showToast(data.message || `${pending.length} model(s) downloaded!`, data.placeholder_errors?.length ? "info" : "success");
         await loadModels();
       } else {
         throw new Error(data.message || "Unknown error");
