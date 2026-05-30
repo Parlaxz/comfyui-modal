@@ -9,6 +9,8 @@ from pathlib import Path
 
 import modal
 
+from gpu_catalog import GPU_CATALOG, GPU_VALUES
+
 DEFAULT_EXECUTION_BACKEND = os.getenv("COMFYMODAL_EXECUTION_BACKEND", "subprocess")
 ENABLE_WARMUP = os.getenv("COMFYMODAL_ENABLE_WARMUP", "0") == "1"
 WARMUP_PROFILE = os.getenv("COMFYMODAL_WARMUP_PROFILE", "off")
@@ -246,10 +248,33 @@ def warmup_profile_matches_workflow(profile: dict, requested: dict) -> bool:
     return False
 
 
+def stack_to_profile(stack: dict) -> dict:
+    """Convert an extracted model stack into a warmup-profile-compatible dict.
+
+    The warmup profile uses either "checkpoint" mode (single ckpt_name) or
+    "split" mode (individual unet/clip1/clip2/vae).  The stack from
+    ``extract_requested_model_stack()`` uses lists; we pick the first
+    entry from each list.
+    """
+    if stack.get("checkpoint"):
+        return {"mode": "checkpoint", "checkpoint": stack["checkpoint"][0]}
+    if stack.get("unet") and stack.get("clip") and stack.get("vae"):
+        clips = stack["clip"]
+        return {
+            "mode": "split",
+            "unet": stack["unet"][0],
+            "clip1": clips[0],
+            "clip2": clips[-1] if len(clips) > 1 else clips[0],
+            "vae": stack["vae"][0],
+            "clip_type": "flux",
+        }
+    return {}
+
+
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.0.4"
+COMFYAPP_VERSION = "2.0.5"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
@@ -258,8 +283,15 @@ COMFYUI_PORT = 8188
 COMFYUI_API_PORT = 8189
 MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
+LAST_MODEL_STACK_PATH = "/root/models/.last_model_stack.json"
 
-SUPPORTED_GPUS = ["a10g", "a100", "t4"]
+SUPPORTED_GPUS = list(GPU_VALUES)
+
+GPU_PROFILES = {
+    "budget": {"cpu": 2, "memory": 8192, "target_inputs": 1, "max_inputs": 1},
+    "standard": {"cpu": 4, "memory": 16384, "target_inputs": 1, "max_inputs": 1},
+    "high_mem": {"cpu": 4, "memory": 32768, "target_inputs": 1, "max_inputs": 1},
+}
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -277,11 +309,13 @@ image = (
         "comfy --skip-prompt install --nvidia",
         gpu="a10g",
     )
+    .add_local_python_source("gpu_catalog")
 )
 
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("httpx>=0.27.0")
+    .add_local_python_source("gpu_catalog")
 )
 
 app = modal.App(APP_NAME, image=image)
@@ -361,7 +395,7 @@ def batch_download_models(items: list, hf_token: str = "") -> list:
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11"),
+    image=modal.Image.debian_slim(python_version="3.11").add_local_python_source("gpu_catalog"),
     cpu=2,
     memory=4096,
     timeout=1800,
@@ -424,7 +458,7 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11"),
+    image=modal.Image.debian_slim(python_version="3.11").add_local_python_source("gpu_catalog"),
     cpu=1,
     memory=512,
     timeout=60,
@@ -460,7 +494,7 @@ def get_volume_status() -> dict:
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11"),
+    image=modal.Image.debian_slim(python_version="3.11").add_local_python_source("gpu_catalog"),
     cpu=2,
     memory=4096,
     timeout=1800,
@@ -482,7 +516,7 @@ def upload_model_to_volume(file_data: bytes, folder: str, filename: str) -> dict
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11"),
+    image=modal.Image.debian_slim(python_version="3.11").add_local_python_source("gpu_catalog"),
     cpu=2,
     memory=4096,
     timeout=3600,
@@ -529,6 +563,25 @@ class _ComfyAPIMixin:
                 import shutil
                 shutil.rmtree(comfy_models)
             os.symlink(MODELS_PATH, comfy_models)
+
+    def _save_last_model_stack(self, stack: dict) -> None:
+        """Persist the model stack to the shared volume for auto-warmup."""
+        try:
+            os.makedirs(os.path.dirname(LAST_MODEL_STACK_PATH), exist_ok=True)
+            with open(LAST_MODEL_STACK_PATH, "w") as f:
+                json.dump(stack, f, indent=2, sort_keys=True)
+        except Exception as exc:
+            print(f"[comfyapp] failed to save last model stack: {exc}")
+
+    def _load_last_model_stack(self) -> dict:
+        """Read the previously-saved model stack from the volume."""
+        try:
+            if os.path.isfile(LAST_MODEL_STACK_PATH):
+                with open(LAST_MODEL_STACK_PATH) as f:
+                    return json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[comfyapp] failed to load last model stack: {exc}")
+        return {}
 
     def _sync_custom_nodes_from_volume(self):
         custom_nodes_vol.reload()
@@ -675,8 +728,15 @@ class _ComfyAPIMixin:
         }
 
     def _preload_warmup_profile(self) -> dict:
-        """Preload and warm the pinned model stack before snapshot capture."""
+        """Preload and warm the pinned or auto-detected model stack.
+
+        Priority: pinned env vars > auto-detected stack from last prompt.
+        Before snapshot capture, this loads models into GPU memory
+        so the snapshot preserves them for fast restores.
+        """
         profile = load_warmup_profile()
+        if not profile:
+            profile = stack_to_profile(self._load_last_model_stack())
         if not profile:
             return {"mode": "none", "status": "disabled"}
         started = time.time()
@@ -763,7 +823,9 @@ class _ComfyAPIMixin:
         """Snapshot restore: lightweight sanity check only.
         No volume reloads, no custom-node sync, no requirements install
         — the snapshot already captured a ready state.  A quick health
-        probe may trigger a restart if the subprocess is dead."""
+        probe may trigger a restart if the subprocess is dead.
+        After health check, auto-preload the last saved model stack
+        so models are in VRAM for the first prompt."""
         restore_start = time.time()
         print("[comfyapp] lifecycle=restore snap=False")
         self._ensure_models_symlink()
@@ -772,6 +834,11 @@ class _ComfyAPIMixin:
         except Exception:
             print("[comfyapp] ComfyUI unresponsive on restore, restarting")
             self._restart_comfy()
+        preload_result = self._preload_warmup_profile()
+        if preload_result.get("status") == "ok":
+            print(f"[comfyapp.profile] stage=auto_warmup "
+                  f"mode={preload_result.get('mode', '?')} "
+                  f"duration_ms={preload_result.get('duration_ms', 0)}")
         print(f"[comfyapp] restore sanity check done in {time.time() - restore_start:.3f}s")
 
     @modal.exit()
@@ -827,6 +894,7 @@ class _ComfyAPIMixin:
         changes before calling ``run_prompt()``.
         """
         import base64
+        import httpx
         from pathlib import Path
 
         total_started = time.time()
@@ -896,6 +964,11 @@ class _ComfyAPIMixin:
         prompt_id = queued["prompt_id"]
         profile: dict = {}
         result = self._poll_until_done(prompt_id, client_id, profile)
+
+        # Persist the model stack for auto-warmup on next restart
+        if requested_stack and any(requested_stack.values()):
+            self._save_last_model_stack(requested_stack)
+
         total_ms = round((time.time() - total_started) * 1000, 1)
         print(
             f"[comfyapp.profile] stage=remote_total prompt_id={prompt_id[:8]} duration_ms={total_ms} "
@@ -984,6 +1057,23 @@ class _ComfyAPIMixin:
         self._models_state = model_volume_state(MODELS_PATH)
         self._custom_nodes_state = custom_node_volume_state(CUSTOM_NODES_PATH)
 
+    def _runtime_state_payload(self) -> dict:
+        current_models = model_volume_state(MODELS_PATH)
+        current_nodes = custom_node_volume_state(CUSTOM_NODES_PATH)
+        models_changed = current_models != getattr(self, "_models_state", None)
+        custom_nodes_changed = current_nodes != getattr(self, "_custom_nodes_state", None)
+        stale_reasons = []
+        if models_changed:
+            stale_reasons.append("models changed")
+        if custom_nodes_changed:
+            stale_reasons.append("custom nodes changed")
+        return {
+            "stale": bool(stale_reasons),
+            "stale_reasons": stale_reasons,
+            "models_changed": models_changed,
+            "custom_nodes_changed": custom_nodes_changed,
+        }
+
     @modal.method()
     def resync_runtime(self, scope: str = "all"):
         """Explicit in-container resync: reload volumes, sync custom nodes,
@@ -1009,7 +1099,7 @@ class _ComfyAPIMixin:
             self._record_runtime_state()
             self._restart_comfy()
 
-            summary["runtime_state"] = self.runtime_state()
+            summary["runtime_state"] = self._runtime_state_payload()
             summary["duration_s"] = round(time.time() - started, 3)
             print(f"[comfyapp] resync_runtime scope={scope} took {summary['duration_s']:.3f}s")
             return {"status": "ok", **summary}
@@ -1020,21 +1110,7 @@ class _ComfyAPIMixin:
     def runtime_state(self) -> dict:
         """Return stale-runtime info by comparing current volume state
         against the last recorded in-memory state."""
-        current_models = model_volume_state(MODELS_PATH)
-        current_nodes = custom_node_volume_state(CUSTOM_NODES_PATH)
-        models_changed = current_models != getattr(self, "_models_state", None)
-        custom_nodes_changed = current_nodes != getattr(self, "_custom_nodes_state", None)
-        stale_reasons = []
-        if models_changed:
-            stale_reasons.append("models changed")
-        if custom_nodes_changed:
-            stale_reasons.append("custom nodes changed")
-        return {
-            "stale": bool(stale_reasons),
-            "stale_reasons": stale_reasons,
-            "models_changed": models_changed,
-            "custom_nodes_changed": custom_nodes_changed,
-        }
+        return self._runtime_state_payload()
 
     @modal.method()
     def health(self):
@@ -1088,52 +1164,29 @@ class _ComfyAPIMixin:
         return {"status": "ok", "deleted": f"{safe_folder}/{safe_file}"}
 
 
-@app.cls(
-    gpu="a10g",
-    cpu=4,
-    memory=16384,
-    timeout=3600,
-    min_containers=0,
-    # Scale down quickly to avoid holding GPU resources when idle
-    scaledown_window=4,
-    volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
-    enable_memory_snapshot=True,
-    experimental_options={"enable_gpu_snapshot": True},
-)
-@modal.concurrent(target_inputs=1, max_inputs=1)
-class ComfyAPI(_ComfyAPIMixin):
-    pass
+def _register_gpu_classes():
+    for entry in GPU_CATALOG:
+        profile = GPU_PROFILES[entry["profile"]]
+        # Backward compatibility: the a10g worker keeps the legacy class name "ComfyAPI".
+        class_name = entry["class_name"]
+        Generated = type(class_name, (_ComfyAPIMixin,), {})
+        Generated = modal.concurrent(
+            target_inputs=profile["target_inputs"],
+            max_inputs=profile["max_inputs"],
+        )(Generated)
+        Generated = app.cls(
+            gpu=entry["modal_gpu"],
+            cpu=profile["cpu"],
+            memory=profile["memory"],
+            timeout=3600,
+            min_containers=0,
+            # Scale down quickly to avoid holding GPU resources when idle
+            scaledown_window=4,
+            volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
+            enable_memory_snapshot=True,
+            experimental_options={"enable_gpu_snapshot": True},
+        )(Generated)
+        globals()[class_name] = Generated
 
 
-@app.cls(
-    gpu="a100",
-    cpu=4,
-    memory=32768,
-    timeout=3600,
-    min_containers=0,
-    # Scale down quickly to avoid holding GPU resources when idle
-    scaledown_window=4,
-    volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
-    enable_memory_snapshot=True,
-    experimental_options={"enable_gpu_snapshot": True},
-)
-@modal.concurrent(target_inputs=1, max_inputs=1)
-class ComfyAPI_A100(_ComfyAPIMixin):
-    pass
-
-
-@app.cls(
-    gpu="t4",
-    cpu=2,
-    memory=8192,
-    timeout=3600,
-    min_containers=0,
-    # Scale down quickly to avoid holding GPU resources when idle
-    scaledown_window=4,
-    volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
-    enable_memory_snapshot=True,
-    experimental_options={"enable_gpu_snapshot": True},
-)
-@modal.concurrent(target_inputs=1, max_inputs=1)
-class ComfyAPI_T4(_ComfyAPIMixin):
-    pass
+_register_gpu_classes()
