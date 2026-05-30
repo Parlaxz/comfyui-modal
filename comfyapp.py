@@ -1,13 +1,23 @@
 import hashlib
+import json
 import os
 import subprocess
 import sys
 import time
-import json
 import uuid
 from pathlib import Path
 
 import modal
+
+DEFAULT_EXECUTION_BACKEND = os.getenv("COMFYMODAL_EXECUTION_BACKEND", "subprocess")
+ENABLE_WARMUP = os.getenv("COMFYMODAL_ENABLE_WARMUP", "0") == "1"
+WARMUP_PROFILE = os.getenv("COMFYMODAL_WARMUP_PROFILE", "off")
+WARMUP_CHECKPOINT = os.getenv("COMFYMODAL_WARMUP_CHECKPOINT", "").strip()
+WARMUP_UNET = os.getenv("COMFYMODAL_WARMUP_UNET", "").strip()
+WARMUP_CLIP1 = os.getenv("COMFYMODAL_WARMUP_CLIP1", "").strip()
+WARMUP_CLIP2 = os.getenv("COMFYMODAL_WARMUP_CLIP2", "").strip()
+WARMUP_VAE = os.getenv("COMFYMODAL_WARMUP_VAE", "").strip()
+WARMUP_CLIP_TYPE = os.getenv("COMFYMODAL_WARMUP_CLIP_TYPE", "flux").strip() or "flux"
 
 
 _EXCLUDED_CUSTOM_NODE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
@@ -150,6 +160,92 @@ def save_runtime_metadata(data: dict) -> None:
         json.dump(data, f, indent=2, sort_keys=True)
 
 
+def set_manager_network_mode_offline() -> list[str]:
+    """Force ComfyUI-Manager into offline mode for runtime containers."""
+    config_paths = [
+        "/root/comfy/ComfyUI/user/default/__manager/config.ini",
+        "/root/comfy/ComfyUI/user/default/ComfyUI-Manager/config.ini",
+    ]
+    written = []
+    for config_path in config_paths:
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write("[default]\nnetwork_mode = offline\n")
+        written.append(config_path)
+    return written
+
+
+def load_warmup_profile() -> dict:
+    """Return the configured pinned warmup profile, if any."""
+    if WARMUP_CHECKPOINT:
+        return {
+            "mode": "checkpoint",
+            "checkpoint": WARMUP_CHECKPOINT,
+        }
+    if WARMUP_UNET and WARMUP_CLIP1 and WARMUP_CLIP2 and WARMUP_VAE:
+        return {
+            "mode": "split",
+            "unet": WARMUP_UNET,
+            "clip1": WARMUP_CLIP1,
+            "clip2": WARMUP_CLIP2,
+            "vae": WARMUP_VAE,
+            "clip_type": WARMUP_CLIP_TYPE,
+        }
+    return {}
+
+
+def extract_requested_model_stack(workflow: dict) -> dict:
+    """Extract a minimal model stack from a workflow for warmup matching."""
+    stack = {"checkpoint": [], "unet": [], "clip": [], "vae": []}
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type", "")
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        if class_type in {"CheckpointLoaderSimple", "CheckpointLoader"}:
+            value = inputs.get("ckpt_name")
+            if isinstance(value, str) and value and value not in stack["checkpoint"]:
+                stack["checkpoint"].append(value)
+        elif class_type == "UNETLoader":
+            value = inputs.get("unet_name")
+            if isinstance(value, str) and value and value not in stack["unet"]:
+                stack["unet"].append(value)
+        elif class_type == "DualCLIPLoader":
+            for key in ("clip_name1", "clip_name2"):
+                value = inputs.get(key)
+                if isinstance(value, str) and value and value not in stack["clip"]:
+                    stack["clip"].append(value)
+        elif class_type == "CLIPLoader":
+            value = inputs.get("clip_name")
+            if isinstance(value, str) and value and value not in stack["clip"]:
+                stack["clip"].append(value)
+        elif class_type == "VAELoader":
+            value = inputs.get("vae_name")
+            if isinstance(value, str) and value and value not in stack["vae"]:
+                stack["vae"].append(value)
+    return stack
+
+
+def warmup_profile_matches_workflow(profile: dict, requested: dict) -> bool:
+    """Return True when the requested workflow matches the pinned warmup profile."""
+    if not profile:
+        return True
+    mode = profile.get("mode")
+    if mode == "checkpoint":
+        checkpoint = profile.get("checkpoint", "")
+        return bool(checkpoint) and checkpoint in requested.get("checkpoint", [])
+    if mode == "split":
+        return (
+            profile.get("unet", "") in requested.get("unet", [])
+            and profile.get("clip1", "") in requested.get("clip", [])
+            and profile.get("clip2", "") in requested.get("clip", [])
+            and profile.get("vae", "") in requested.get("vae", [])
+        )
+    return False
+
+
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
@@ -176,7 +272,7 @@ image = (
         "libxext6",
         "ffmpeg",
     )
-    .pip_install("comfy-cli==1.3.7")
+    .pip_install("comfy-cli==1.3.7", "httpx>=0.27.0")
     .run_commands(
         "comfy --skip-prompt install --nvidia",
         gpu="a10g",
@@ -414,6 +510,26 @@ def upload_model_chunk(chunk_data: bytes, folder: str, filename: str, offset: in
 class _ComfyAPIMixin:
     """Shared implementation for all GPU-specific ComfyAPI classes."""
 
+    # Cached localhost HTTP client for ComfyUI API calls.
+    _http_client_obj = None
+
+    @property
+    def _http_client(self):
+        """Lazily-initialised httpx.Client pointed at the local ComfyUI API."""
+        import httpx
+        if self._http_client_obj is None:
+            self._http_client_obj = httpx.Client(base_url=f"http://127.0.0.1:{COMFYUI_API_PORT}")
+        return self._http_client_obj
+
+    def _ensure_models_symlink(self):
+        """Ensure /root/comfy/ComfyUI/models symlink → MODELS_PATH exists."""
+        comfy_models = "/root/comfy/ComfyUI/models"
+        if not os.path.islink(comfy_models):
+            if os.path.isdir(comfy_models):
+                import shutil
+                shutil.rmtree(comfy_models)
+            os.symlink(MODELS_PATH, comfy_models)
+
     def _sync_custom_nodes_from_volume(self):
         custom_nodes_vol.reload()
         comfy_custom_nodes = "/root/comfy/ComfyUI/custom_nodes"
@@ -468,7 +584,134 @@ class _ComfyAPIMixin:
 
         return {"installed": installed, "skipped": skipped}
 
+    # ── Backend scaffold (warmup + execution backend selection) ──────────
+
+    def _select_backend(self) -> str:
+        """Return the backend to use, sticky on subprocess fallback."""
+        if getattr(self, "_backend_fallback", False):
+            return "subprocess"
+        return DEFAULT_EXECUTION_BACKEND
+
+    def _start_in_process_backend(self):
+        """Start ComfyUI in-process (not yet implemented)."""
+        raise NotImplementedError(
+            "In-process execution backend is not yet implemented. "
+            "Falling back to subprocess backend."
+        )
+
+    def _start_backend(self):
+        """Select and start the execution backend."""
+        backend = self._select_backend()
+        print(f"[comfyapp] selected backend={backend}")
+        if backend == "in_process":
+            try:
+                self._start_in_process_backend()
+            except NotImplementedError:
+                print("[comfyapp] in_process backend unavailable, falling back to subprocess")
+                self._backend_fallback = True
+                self._restart_comfy()
+        else:
+            self._restart_comfy()
+        print(f"[comfyapp] active backend={self._select_backend()}")
+
+    def _submit_and_poll(self, workflow: dict) -> dict:
+        """Submit a workflow directly to the local ComfyUI API and wait for history."""
+        client_id = f"warmup-{uuid.uuid4()}"
+        r = self._http_client.post(
+            "/prompt",
+            json={"prompt": workflow, "client_id": client_id},
+        )
+        r.raise_for_status()
+        queued = r.json()
+        prompt_id = queued["prompt_id"]
+        delay = 0.25
+        elapsed = 0.0
+        while elapsed < 3600:
+            history = self._http_client.get(f"/history/{prompt_id}").json()
+            if prompt_id in history:
+                return history[prompt_id]
+            time.sleep(delay)
+            elapsed += delay
+        raise TimeoutError(f"Warmup prompt {prompt_id} timed out")
+
+    def _build_warmup_workflow(self, profile: dict) -> dict:
+        """Build a tiny 1-step warmup workflow from the pinned warmup profile."""
+        if profile.get("mode") == "checkpoint":
+            return {
+                "3": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": profile["checkpoint"]}},
+                "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "warmup", "clip": ["3", 1]}},
+                "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["3", 1]}},
+                "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+                "10": {"class_type": "KSampler", "inputs": {
+                    "seed": 1, "steps": 1, "cfg": 1.0,
+                    "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
+                    "model": ["3", 0], "positive": ["6", 0],
+                    "negative": ["7", 0], "latent_image": ["5", 0],
+                }},
+                "8": {"class_type": "VAEDecode", "inputs": {"samples": ["10", 0], "vae": ["3", 2]}},
+                "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "warmup", "images": ["8", 0]}},
+            }
+        return {
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": profile["unet"], "weight_dtype": "default"}},
+            "2": {"class_type": "DualCLIPLoader", "inputs": {
+                "clip_name1": profile["clip1"],
+                "clip_name2": profile["clip2"],
+                "type": profile.get("clip_type", "flux"),
+            }},
+            "3": {"class_type": "VAELoader", "inputs": {"vae_name": profile["vae"]}},
+            "4": {"class_type": "ModelSamplingFlux", "inputs": {
+                "model": ["1", 0], "max_shift": 1.15, "base_shift": 0.5, "width": 1024, "height": 1024,
+            }},
+            "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "warmup", "clip": ["2", 0]}},
+            "6": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+            "7": {"class_type": "KSampler", "inputs": {
+                "seed": 1, "steps": 1, "cfg": 1.0,
+                "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
+                "model": ["4", 0], "positive": ["5", 0],
+                "negative": ["5", 0], "latent_image": ["6", 0],
+            }},
+            "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["3", 0]}},
+            "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "warmup", "images": ["8", 0]}},
+        }
+
+    def _preload_warmup_profile(self) -> dict:
+        """Preload and warm the pinned model stack before snapshot capture."""
+        profile = load_warmup_profile()
+        if not profile:
+            return {"mode": "none", "status": "disabled"}
+        started = time.time()
+        try:
+            workflow = self._build_warmup_workflow(profile)
+            self._submit_and_poll(workflow)
+            duration_ms = round((time.time() - started) * 1000, 1)
+            return {"mode": profile.get("mode"), "status": "ok", "duration_ms": duration_ms}
+        except Exception as exc:
+            duration_ms = round((time.time() - started) * 1000, 1)
+            return {
+                "mode": profile.get("mode"),
+                "status": "error",
+                "duration_ms": duration_ms,
+                "error": str(exc)[:200],
+            }
+
+    def _warmup_runtime(self) -> dict:
+        """Warm up the ComfyUI runtime if enabled."""
+        if not ENABLE_WARMUP:
+            return {"enabled": False, "profile": WARMUP_PROFILE}
+        t0 = time.time()
+        try:
+            self._http_client.get("/object_info")
+            duration_s = round(time.time() - t0, 3)
+            return {"enabled": True, "profile": WARMUP_PROFILE, "duration_s": duration_s, "status": "ok"}
+        except Exception as exc:
+            duration_s = round(time.time() - t0, 3)
+            print(f"[comfyapp] warmup failed after {duration_s:.3f}s: {exc}")
+            return {"enabled": True, "profile": WARMUP_PROFILE, "duration_s": duration_s, "status": "error", "error": str(exc)[:200]}
+
     def _restart_comfy(self):
+        if self._http_client_obj is not None:
+            self._http_client_obj.close()
+            self._http_client_obj = None
         if getattr(self, "_proc", None) and self._proc.poll() is None:
             self._proc.terminate()
             try:
@@ -476,27 +719,40 @@ class _ComfyAPIMixin:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
         self._proc = subprocess.Popen(
-            ["comfy", "launch", "--", "--listen", "0.0.0.0", f"--port={COMFYUI_API_PORT}", "--disable-auto-launch"],
+            [
+                "comfy", "launch", "--", "--listen", "0.0.0.0",
+                f"--port={COMFYUI_API_PORT}", "--disable-auto-launch",
+                "--gpu-only", "--disable-smart-memory", "--cache-classic",
+            ],
         )
         self._wait_for_comfy()
 
     @modal.enter(snap=True)
     def startup(self):
-        import shutil
-
         t0 = time.time()
+        print("[comfyapp] lifecycle=startup snap=True")
 
-        # Symlink models from volume into ComfyUI
-        comfy_models = "/root/comfy/ComfyUI/models"
-        if os.path.isdir(comfy_models):
-            shutil.rmtree(comfy_models)
-        os.symlink(MODELS_PATH, comfy_models)
+        self._ensure_models_symlink()
+
+        manager_paths = set_manager_network_mode_offline()
+        print(
+            f"[comfyapp.profile] stage=manager_network_mode mode=offline paths={len(manager_paths)}"
+        )
 
         vol.reload()
         _, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
         install_summary = self._install_custom_node_requirements()
         self._record_runtime_state()
-        self._restart_comfy()
+        self._start_backend()
+
+        preload_result = self._preload_warmup_profile()
+        print(
+            f"[comfyapp.profile] stage=warmup_preload mode={preload_result.get('mode', 'none')} "
+            f"status={preload_result.get('status', 'unknown')} duration_ms={preload_result.get('duration_ms', 0)}"
+        )
+
+        warmup_result = self._warmup_runtime()
+        print(f"[comfyapp] warmup={warmup_result}")
 
         duration = time.time() - t0
         print(f"[comfyapp] startup complete in {duration:.3f}s  "
@@ -505,21 +761,25 @@ class _ComfyAPIMixin:
     @modal.enter(snap=False)
     def restore(self):
         """Snapshot restore: lightweight sanity check only.
-        No volume reloads, no custom-node sync, no requirements install,
-        no forced restart — the snapshot already captured a ready state."""
+        No volume reloads, no custom-node sync, no requirements install
+        — the snapshot already captured a ready state.  A quick health
+        probe may trigger a restart if the subprocess is dead."""
         restore_start = time.time()
-        import shutil
-        # Tiny local sanity: ensure the symlink still exists
-        comfy_models = "/root/comfy/ComfyUI/models"
-        if not os.path.islink(comfy_models):
-            if os.path.isdir(comfy_models):
-                shutil.rmtree(comfy_models)
-            os.symlink(MODELS_PATH, comfy_models)
+        print("[comfyapp] lifecycle=restore snap=False")
+        self._ensure_models_symlink()
+        try:
+            self._http_client.get("/system_stats", timeout=5)
+        except Exception:
+            print("[comfyapp] ComfyUI unresponsive on restore, restarting")
+            self._restart_comfy()
         print(f"[comfyapp] restore sanity check done in {time.time() - restore_start:.3f}s")
 
     @modal.exit()
     def shutdown(self):
-        if self._proc and self._proc.poll() is None:
+        if self._http_client_obj is not None:
+            self._http_client_obj.close()
+            self._http_client_obj = None
+        if getattr(self, "_proc", None) and self._proc.poll() is None:
             self._proc.terminate()
             try:
                 self._proc.wait(timeout=10)
@@ -527,10 +787,9 @@ class _ComfyAPIMixin:
                 self._proc.kill()
 
     def _wait_for_comfy(self):
-        import urllib.request
         for _ in range(120):
             try:
-                urllib.request.urlopen(f"http://127.0.0.1:{COMFYUI_API_PORT}/system_stats")
+                self._http_client.get("/system_stats")
                 return
             except Exception:
                 time.sleep(1)
@@ -538,9 +797,8 @@ class _ComfyAPIMixin:
 
     @modal.method()
     def object_info(self):
-        import urllib.request
-        with urllib.request.urlopen(f"http://127.0.0.1:{COMFYUI_API_PORT}/object_info") as r:
-            return json.loads(r.read())
+        r = self._http_client.get("/object_info")
+        return r.json()
 
     @modal.method()
     def refresh_custom_nodes(self, expected_nodes: list[str] | None = None):
@@ -561,35 +819,61 @@ class _ComfyAPIMixin:
 
     @modal.method()
     def run_prompt(self, workflow: dict, input_images: dict | None = None) -> dict:
-        import urllib.request
-        import urllib.error
+        """Submit a workflow for execution.
+
+        NOTE: This method does NOT reload Modal volumes or resync custom
+        nodes.  After any model/custom-node mutation, callers must invoke
+        ``resync_runtime()`` first so that the container picks up the
+        changes before calling ``run_prompt()``.
+        """
         import base64
         from pathlib import Path
 
+        total_started = time.time()
+        input_count = 0
+        input_bytes = 0
+
         if input_images:
+            input_started = time.time()
             input_dir = Path("/root/comfy/ComfyUI/input")
             input_dir.mkdir(parents=True, exist_ok=True)
             for filename, b64data in input_images.items():
                 dest = input_dir / Path(filename).name
-                dest.write_bytes(base64.b64decode(b64data))
+                raw = base64.b64decode(b64data)
+                dest.write_bytes(raw)
+                input_count += 1
+                input_bytes += len(raw)
+            input_decode_ms = round((time.time() - input_started) * 1000, 1)
+            print(
+                f"[comfyapp.profile] stage=input_decode_write duration_ms={input_decode_ms} "
+                f"count={input_count} bytes={input_bytes}"
+            )
 
         client_id = str(uuid.uuid4())
-        payload = json.dumps({"prompt": workflow, "client_id": client_id}).encode()
 
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{COMFYUI_API_PORT}/prompt",
-            data=payload,
-            headers={"Content-Type": "application/json"},
+        requested_stack = extract_requested_model_stack(workflow)
+        warmup_profile = load_warmup_profile()
+        warmup_match = warmup_profile_matches_workflow(warmup_profile, requested_stack)
+        print(
+            f"[comfyapp.profile] stage=warmup_profile_match match={1 if warmup_match else 0} "
+            f"requested={requested_stack} profile={warmup_profile}"
         )
+
         try:
-            with urllib.request.urlopen(req) as r:
-                queued = json.loads(r.read())
-        except urllib.error.HTTPError as e:
+            submit_started = time.time()
+            r = self._http_client.post(
+                "/prompt",
+                json={"prompt": workflow, "client_id": client_id},
+            )
+            r.raise_for_status()
+            queued = r.json()
+            submit_ms = round((time.time() - submit_started) * 1000, 1)
+            print(f"[comfyapp.profile] stage=prompt_submit duration_ms={submit_ms}")
+        except httpx.HTTPStatusError as e:
             # Read the response body for validation error details
             error_body = ""
             try:
-                error_body = e.read().decode("utf-8", errors="replace")
-                error_data = json.loads(error_body)
+                error_data = e.response.json()
                 # Extract meaningful error info from ComfyUI's response
                 node_errors = error_data.get("node_errors", {})
                 if node_errors:
@@ -607,46 +891,67 @@ class _ComfyAPIMixin:
             except (json.JSONDecodeError, RuntimeError):
                 if isinstance(sys.exc_info()[1], RuntimeError):
                     raise
-            raise RuntimeError(f"ComfyUI rejected the prompt (HTTP {e.code}): {error_body[:500]}") from e
+            raise RuntimeError(f"ComfyUI rejected the prompt (HTTP {e.response.status_code}): {e.response.text[:500]}") from e
 
         prompt_id = queued["prompt_id"]
-        return self._poll_until_done(prompt_id, client_id)
+        profile: dict = {}
+        result = self._poll_until_done(prompt_id, client_id, profile)
+        total_ms = round((time.time() - total_started) * 1000, 1)
+        print(
+            f"[comfyapp.profile] stage=remote_total prompt_id={prompt_id[:8]} duration_ms={total_ms} "
+            f"output_images={profile.get('output_images', 0)} output_videos={profile.get('output_videos', 0)} "
+            f"output_bytes={profile.get('output_bytes', 0)}"
+        )
+        return result
 
-    def _poll_until_done(self, prompt_id: str, client_id: str) -> dict:
-        import urllib.request
-        delay = 0.5
+    def _poll_until_done(self, prompt_id: str, client_id: str, profile: dict | None = None) -> dict:
+        delay = 0.25
         elapsed = 0.0
+        poll_count = 0
+        poll_started = time.time()
         while elapsed < 3600:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{COMFYUI_API_PORT}/history/{prompt_id}"
-            ) as r:
-                history = json.loads(r.read())
+            poll_count += 1
+            r = self._http_client.get(f"/history/{prompt_id}")
+            history = r.json()
             if prompt_id in history:
                 outputs = history[prompt_id].get("outputs", {})
                 print(f"[comfyapp] prompt {prompt_id} finished in {elapsed:.3f}s")
-                return self._collect_outputs(outputs)
+                poll_ms = round((time.time() - poll_started) * 1000, 1)
+                sleep_ms = round(elapsed * 1000, 1)
+                active_poll_ms = round(max(poll_ms - sleep_ms, 0.0), 1)
+                print(
+                    f"[comfyapp.profile] stage=poll prompt_id={prompt_id[:8]} duration_ms={poll_ms} "
+                    f"poll_count={poll_count} sleep_ms={sleep_ms} active_poll_ms={active_poll_ms}"
+                )
+                return self._collect_outputs(outputs, profile)
             time.sleep(delay)
             elapsed += delay
-            delay = min(delay * 1.5, 5.0)
         raise TimeoutError(f"Prompt {prompt_id} timed out")
 
-    def _collect_outputs(self, outputs: dict) -> dict:
-        import urllib.request
+    def _collect_outputs(self, outputs: dict, profile: dict | None = None) -> dict:
         import base64
+        import urllib.parse
 
+        collect_started = time.time()
         images = []
         videos = []
+        total_bytes = 0
 
         for node_id, node_output in outputs.items():
             for img in node_output.get("images", []):
-                animated = node_output.get("animated", (False,))
-                is_animated = animated[0] if animated else False
-                url = (
-                    f"http://127.0.0.1:{COMFYUI_API_PORT}/view"
-                    f"?filename={img['filename']}&subfolder={img.get('subfolder','')}&type={img.get('type','output')}"
-                )
-                with urllib.request.urlopen(url) as r:
-                    data = base64.b64encode(r.read()).decode()
+                raw = node_output.get("animated", False)
+                if isinstance(raw, bool):
+                    is_animated = raw
+                else:
+                    is_animated = raw[0] if raw else False
+                params = urllib.parse.urlencode({
+                    "filename": img["filename"],
+                    "subfolder": img.get("subfolder", ""),
+                    "type": img.get("type", "output"),
+                })
+                r = self._http_client.get(f"/view?{params}")
+                total_bytes += len(r.content)
+                data = base64.b64encode(r.content).decode()
                 entry = {"filename": img["filename"], "data": data, "node_id": node_id}
                 if is_animated:
                     videos.append(entry)
@@ -654,14 +959,25 @@ class _ComfyAPIMixin:
                     images.append(entry)
 
             for vid in node_output.get("gifs", []):
-                url = (
-                    f"http://127.0.0.1:{COMFYUI_API_PORT}/view"
-                    f"?filename={vid['filename']}&subfolder={vid.get('subfolder','')}&type={vid.get('type','output')}"
-                )
-                with urllib.request.urlopen(url) as r:
-                    data = base64.b64encode(r.read()).decode()
+                params = urllib.parse.urlencode({
+                    "filename": vid["filename"],
+                    "subfolder": vid.get("subfolder", ""),
+                    "type": vid.get("type", "output"),
+                })
+                r = self._http_client.get(f"/view?{params}")
+                total_bytes += len(r.content)
+                data = base64.b64encode(r.content).decode()
                 videos.append({"filename": vid["filename"], "data": data, "node_id": node_id})
 
+        collect_ms = round((time.time() - collect_started) * 1000, 1)
+        print(
+            f"[comfyapp.profile] stage=output_collect duration_ms={collect_ms} "
+            f"images={len(images)} videos={len(videos)} bytes={total_bytes}"
+        )
+        if profile is not None:
+            profile["output_images"] = len(images)
+            profile["output_videos"] = len(videos)
+            profile["output_bytes"] = total_bytes
         return {"images": images, "videos": videos}
 
     def _record_runtime_state(self):
@@ -784,7 +1100,7 @@ class _ComfyAPIMixin:
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
 )
-@modal.concurrent(max_inputs=4)
+@modal.concurrent(target_inputs=1, max_inputs=1)
 class ComfyAPI(_ComfyAPIMixin):
     pass
 
@@ -801,7 +1117,7 @@ class ComfyAPI(_ComfyAPIMixin):
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
 )
-@modal.concurrent(max_inputs=4)
+@modal.concurrent(target_inputs=1, max_inputs=1)
 class ComfyAPI_A100(_ComfyAPIMixin):
     pass
 
@@ -818,6 +1134,6 @@ class ComfyAPI_A100(_ComfyAPIMixin):
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
 )
-@modal.concurrent(max_inputs=4)
+@modal.concurrent(target_inputs=1, max_inputs=1)
 class ComfyAPI_T4(_ComfyAPIMixin):
     pass
