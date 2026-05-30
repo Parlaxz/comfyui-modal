@@ -735,20 +735,23 @@ class _ComfyAPIMixin:
         so the snapshot preserves them for fast restores.
         """
         profile = load_warmup_profile()
+        source = "pinned"
         if not profile:
             profile = stack_to_profile(self._load_last_model_stack())
+            source = "auto"
         if not profile:
-            return {"mode": "none", "status": "disabled"}
+            return {"mode": "none", "status": "disabled", "source": "none"}
         started = time.time()
         try:
             workflow = self._build_warmup_workflow(profile)
             self._submit_and_poll(workflow)
             duration_ms = round((time.time() - started) * 1000, 1)
-            return {"mode": profile.get("mode"), "status": "ok", "duration_ms": duration_ms}
+            return {"mode": profile.get("mode"), "source": source, "status": "ok", "duration_ms": duration_ms}
         except Exception as exc:
             duration_ms = round((time.time() - started) * 1000, 1)
             return {
                 "mode": profile.get("mode"),
+                "source": source,
                 "status": "error",
                 "duration_ms": duration_ms,
                 "error": str(exc)[:200],
@@ -806,9 +809,11 @@ class _ComfyAPIMixin:
         self._start_backend()
 
         preload_result = self._preload_warmup_profile()
+        source = preload_result.get("source", "none")
         print(
             f"[comfyapp.profile] stage=warmup_preload mode={preload_result.get('mode', 'none')} "
-            f"status={preload_result.get('status', 'unknown')} duration_ms={preload_result.get('duration_ms', 0)}"
+            f"source={source} status={preload_result.get('status', 'unknown')} "
+            f"duration_ms={preload_result.get('duration_ms', 0)}"
         )
 
         warmup_result = self._warmup_runtime()
@@ -824,8 +829,8 @@ class _ComfyAPIMixin:
         No volume reloads, no custom-node sync, no requirements install
         — the snapshot already captured a ready state.  A quick health
         probe may trigger a restart if the subprocess is dead.
-        After health check, auto-preload the last saved model stack
-        so models are in VRAM for the first prompt."""
+        Auto-warmup happens in ``startup()`` before snapshot capture,
+        not here, so restore stays fast."""
         restore_start = time.time()
         print("[comfyapp] lifecycle=restore snap=False")
         self._ensure_models_symlink()
@@ -834,11 +839,6 @@ class _ComfyAPIMixin:
         except Exception:
             print("[comfyapp] ComfyUI unresponsive on restore, restarting")
             self._restart_comfy()
-        preload_result = self._preload_warmup_profile()
-        if preload_result.get("status") == "ok":
-            print(f"[comfyapp.profile] stage=auto_warmup "
-                  f"mode={preload_result.get('mode', '?')} "
-                  f"duration_ms={preload_result.get('duration_ms', 0)}")
         print(f"[comfyapp] restore sanity check done in {time.time() - restore_start:.3f}s")
 
     @modal.exit()
