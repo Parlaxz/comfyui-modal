@@ -48,6 +48,16 @@ class ModalRuntimeRoutesASTTests(unittest.TestCase):
         routes = self._find_route_strings(source, "get")
         self.assertIn("/comfymodal/runtime/state", routes)
 
+    def test_config_get_route_exposes_available_gpus_and_default_gpu(self):
+        source = INIT_PATH.read_text(encoding="utf-8")
+        self.assertIn('"available_gpus"', source)
+        self.assertIn('"default_gpu"', source)
+
+    def test_config_post_route_handles_invalid_gpu(self):
+        source = INIT_PATH.read_text(encoding="utf-8")
+        self.assertIn("except ValueError", source)
+        self.assertIn("Unsupported GPU", source)
+
 
 if __name__ == "__main__":
     unittest.main()

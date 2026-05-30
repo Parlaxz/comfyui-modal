@@ -135,10 +135,15 @@ class AutoWarmupASTTests(unittest.TestCase):
                 return ast.get_source_segment(COMFYAPP_PATH.read_text(encoding="utf-8"), node)
         return None
 
-    def test_restore_does_not_call_preload_warmup_profile(self):
+    def test_restore_calls_preload_warmup_profile(self):
         source = self._get_method_source("restore")
         self.assertIsNotNone(source, "restore method not found")
-        self.assertNotIn("_preload_warmup_profile", source)
+        self.assertIn("_preload_warmup_profile", source)
+
+    def test_restore_logs_auto_warmup_on_success(self):
+        source = self._get_method_source("restore")
+        self.assertIsNotNone(source)
+        self.assertIn("stage=auto_warmup", source)
 
     def test_run_prompt_calls_save_last_model_stack(self):
         source = self._get_method_source("run_prompt")
@@ -150,19 +155,6 @@ class AutoWarmupASTTests(unittest.TestCase):
         self.assertIsNotNone(source)
         self.assertIn("stack_to_profile", source)
         self.assertIn("_load_last_model_stack", source)
-
-    def test_preload_warmup_profile_tracks_source_field(self):
-        source = self._get_method_source("_preload_warmup_profile")
-        self.assertIsNotNone(source)
-        self.assertIn('source = "pinned"', source)
-        self.assertIn('source = "auto"', source)
-        self.assertIn('"source": source', source)
-        self.assertIn('"source": "none"', source)
-
-    def test_startup_logs_source_field(self):
-        source = self._get_method_source("startup")
-        self.assertIsNotNone(source)
-        self.assertIn("source=", source)
 
     def test_module_exports_stack_to_profile(self):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")

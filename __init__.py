@@ -231,7 +231,7 @@ sys.path.insert(0, _NODE_DIR)
 
 try:
     import modal as _modal_pkg
-    from modal_client import run_prompt, get_object_info, health_check, download_model, batch_download_models, list_models, delete_model, set_gpu, get_gpu, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state
+    from modal_client import run_prompt, get_object_info, health_check, download_model, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state
     _modal_available = True
     _maybe_auto_deploy()
 except ImportError:
@@ -256,6 +256,8 @@ except ImportError:
     def upload_model_chunk(*a, **kw): raise RuntimeError("modal not installed")
     def resync_runtime(*a, **kw): raise RuntimeError("modal not installed")
     def get_runtime_state(*a, **kw): raise RuntimeError("modal not installed")
+    def get_default_gpu(): return "a10g"
+    def get_available_gpus(): return [{"value": "a10g", "label": "A10G"}]
     def set_gpu(gpu): pass
     def get_gpu(): return "a10g"
 
@@ -800,7 +802,11 @@ if _server:
 
     @_server.routes.get("/comfymodal/config")
     async def modal_get_config(request: web.Request) -> web.Response:
-        return web.json_response({"gpu": get_gpu()})
+        return web.json_response({
+            "gpu": get_gpu(),
+            "default_gpu": get_default_gpu(),
+            "available_gpus": get_available_gpus(),
+        })
 
     @_server.routes.post("/comfymodal/config")
     async def modal_set_config(request: web.Request) -> web.Response:
@@ -808,7 +814,11 @@ if _server:
         gpu = body.get("gpu", "")
         if not gpu:
             return web.json_response({"status": "error", "message": "gpu required"}, status=400)
-        set_gpu(gpu)
+        try:
+            set_gpu(gpu)
+        except ValueError as e:
+            message = str(e) or "Unsupported GPU"
+            return web.json_response({"status": "error", "message": message}, status=400)
         return web.json_response({"status": "ok", "gpu": get_gpu()})
 
     @_server.routes.get("/comfymodal/health")

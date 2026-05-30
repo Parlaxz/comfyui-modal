@@ -2,13 +2,21 @@ import asyncio
 import functools
 import modal
 
+from gpu_catalog import (
+    DEFAULT_GPU,
+    GPU_CATALOG,
+    get_available_gpu_options,
+    get_default_gpu,
+    get_supported_gpus,
+    normalize_gpu_value,
+)
+
 # Client-side backpressure: only one in-flight prompt execution at a time
 _run_prompt_semaphore = asyncio.Semaphore(1)
 
 _apis = {
-    "a10g": modal.Cls.from_name("comfyui", "ComfyAPI"),
-    "a100": modal.Cls.from_name("comfyui", "ComfyAPI_A100"),
-    "t4":   modal.Cls.from_name("comfyui", "ComfyAPI_T4"),
+    entry["value"]: modal.Cls.from_name("comfyui", entry["class_name"])
+    for entry in GPU_CATALOG
 }
 _download_fn = modal.Function.from_name("comfyui", "download_model_to_volume")
 _batch_download_fn = modal.Function.from_name("comfyui", "batch_download_models")
@@ -17,18 +25,24 @@ _get_volume_status_fn = modal.Function.from_name("comfyui", "get_volume_status")
 _upload_model_fn = modal.Function.from_name("comfyui", "upload_model_to_volume")
 _upload_model_chunk_fn = modal.Function.from_name("comfyui", "upload_model_chunk")
 
-_current_gpu = "a10g"
+_current_gpu = DEFAULT_GPU
 _api_instances = {}
 
 
 def set_gpu(gpu: str):
     global _current_gpu
-    if gpu in _apis:
-        _current_gpu = gpu
+    normalized = normalize_gpu_value(gpu)
+    if normalized not in _apis:
+        raise ValueError(f"Unsupported GPU: {normalized}")
+    _current_gpu = normalized
 
 
 def get_gpu() -> str:
     return _current_gpu
+
+
+def get_available_gpus() -> list[dict[str, str]]:
+    return get_available_gpu_options()
 
 
 def _api():
@@ -48,13 +62,13 @@ def _modal_error_handler(func):
     async def wrapper(*args, **kwargs):
         try:
             return await func(*args, **kwargs)
-        except (ConnectionError, OSError) as e:
-            raise ConnectionError(
-                "Modal connection failed. Check your internet connection and Modal token."
-            ) from e
         except TimeoutError as e:
             raise TimeoutError(
                 "Modal request timed out. The container may be cold-starting (1-3 min)."
+            ) from e
+        except (ConnectionError, OSError) as e:
+            raise ConnectionError(
+                "Modal connection failed. Check your internet connection and Modal token."
             ) from e
         except Exception as e:
             if getattr(type(e), "__module__", "").startswith("modal"):
@@ -66,7 +80,7 @@ def _modal_error_handler(func):
 
 
 @_modal_error_handler
-async def run_prompt(workflow: dict, input_images: dict = None) -> dict:
+async def run_prompt(workflow: dict, input_images: dict | None = None) -> dict:
     async with _run_prompt_semaphore:
         return await asyncio.to_thread(
             lambda: _api().run_prompt.remote(workflow, input_images or {}),

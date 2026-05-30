@@ -31,12 +31,6 @@ const DOWNLOAD_FOLDERS = [
   "frame_interpolation",
 ];
 
-const GPU_OPTIONS = [
-  { value: "a10g",  label: "A10G - 24GB VRAM (recommended, ~$0.60/hr)" },
-  { value: "a100",  label: "A100 - 40GB VRAM (large models, ~$1.10/hr)" },
-  { value: "t4",    label: "T4 - 16GB VRAM (budget, ~$0.30/hr)" },
-];
-
 const STORAGE_KEY_GPU    = "comfymodal_gpu";
 const STORAGE_KEY_ENABLED = "comfymodal_enabled";
 
@@ -68,6 +62,48 @@ const STATUS_STYLE = {
   [STATUS.OFFLINE]:    { color: "#888",    label: "Sleeping (will wake on use)" },
   [STATUS.GENERATING]: { color: "#4a90e2", label: "Generating..." },
 };
+
+function setGpuOptions(selectEl, options) {
+  selectEl.innerHTML = "";
+  for (const opt of options) {
+    const el = document.createElement("option");
+    el.value = opt.value;
+    el.textContent = opt.label;
+    selectEl.appendChild(el);
+  }
+}
+
+function pickInitialGpu(config, storedGpu) {
+  const values = new Set((config.available_gpus || []).map((opt) => opt.value));
+  if (storedGpu && values.has(storedGpu)) return storedGpu;
+  return config.gpu || config.default_gpu || "a10g";
+}
+
+// Sync GPU config on page load (used by setup() and buildPanel())
+async function syncGpuConfig() {
+  let config = { gpu: "a10g", default_gpu: "a10g", available_gpus: [] };
+  try {
+    const response = await api.fetchApi(`${MODAL_PREFIX}/config`);
+    config = await response.json();
+  } catch {}
+
+  const storedGpu = localStorage.getItem(STORAGE_KEY_GPU) || "";
+  const options = Array.isArray(config.available_gpus) ? config.available_gpus : [];
+  const selectedGpu = pickInitialGpu(config, storedGpu);
+
+  localStorage.setItem(STORAGE_KEY_GPU, selectedGpu);
+  window._comfyModalGpu = selectedGpu;
+
+  try {
+    await api.fetchApi(`${MODAL_PREFIX}/config`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gpu: selectedGpu }),
+    });
+  } catch {}
+
+  return { config, selectedGpu, options };
+}
 
 // --- Status Banner Logic ---
 function updateStatusBanner() {
@@ -933,16 +969,8 @@ function buildPanel() {
 
   const gpuSelect = document.createElement("select");
   gpuSelect.style.cssText = inputStyle() + "flex:1; margin:0;";
-  for (const opt of GPU_OPTIONS) {
-    const o = document.createElement("option");
-    o.value = opt.value;
-    o.textContent = opt.label;
-    gpuSelect.appendChild(o);
-  }
-
-  const savedGpu = localStorage.getItem(STORAGE_KEY_GPU) || "a10g";
-  gpuSelect.value = savedGpu;
-  window._comfyModalGpu = savedGpu;
+  const storedGpu = localStorage.getItem(STORAGE_KEY_GPU) || "";
+  window._comfyModalGpu = "a10g";
 
   gpuSelect.addEventListener("change", async () => {
     const gpu = gpuSelect.value;
@@ -1634,15 +1662,11 @@ function buildPanel() {
   updateModalSections(isCloudMode);
   window._comfyModalEnabled = isCloudMode;
 
-  // Sync GPU config on load
+  // Sync GPU config on load and populate dropdown
   (async () => {
-    try {
-      await api.fetchApi(`${MODAL_PREFIX}/config`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ gpu: savedGpu }),
-      });
-    } catch {}
+    const { config, selectedGpu, options } = await syncGpuConfig();
+    setGpuOptions(gpuSelect, options.length ? options : [{ value: selectedGpu, label: selectedGpu.toUpperCase() }]);
+    gpuSelect.value = selectedGpu;
   })();
 
   startDeployPoll();
@@ -1693,6 +1717,9 @@ app.registerExtension({
   name: "comfyui.modal.settings",
 
   async setup() {
+    // Apply saved GPU config on page load (before sidebar is opened)
+    syncGpuConfig();
+
     if (app?.extensionManager?.registerSidebarTab) {
       app.extensionManager.registerSidebarTab({
         id: "modal-gpu",

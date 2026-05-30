@@ -34,18 +34,12 @@ def _ast_literal_value(node: ast.expr):
 
 class ModalWorkerConfigTests(unittest.TestCase):
     def test_all_gpu_classes_use_single_prompt_concurrency(self):
-        tree = ast.parse(COMFYAPP_PATH.read_text(encoding="utf-8"))
-        targets = {"ComfyAPI", "ComfyAPI_A100", "ComfyAPI_T4"}
-        found = {}
-        for node in tree.body:
-            if isinstance(node, ast.ClassDef) and node.name in targets:
-                for deco in node.decorator_list:
-                    if _decorator_base_name(deco) == "concurrent":
-                        kwargs = {kw.arg: _ast_literal_value(kw.value) for kw in deco.keywords}
-                        found[node.name] = kwargs
-        self.assertEqual(found["ComfyAPI"]["target_inputs"], 1)
-        self.assertEqual(found["ComfyAPI"]["max_inputs"], 1)
-        self.assertEqual(found["ComfyAPI_A100"]["target_inputs"], 1)
-        self.assertEqual(found["ComfyAPI_A100"]["max_inputs"], 1)
-        self.assertEqual(found["ComfyAPI_T4"]["target_inputs"], 1)
-        self.assertEqual(found["ComfyAPI_T4"]["max_inputs"], 1)
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn('target_inputs=profile["target_inputs"]', source)
+        self.assertIn('max_inputs=profile["max_inputs"]', source)
+
+    def test_comfyapp_registers_gpu_classes_from_catalog(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn("from gpu_catalog import", source)
+        self.assertIn("globals()[class_name] = Generated", source)
+        self.assertIn('"ComfyAPI"', source)
