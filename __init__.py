@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import uuid
 import sys
@@ -21,6 +22,7 @@ from local_placeholders import (
     normalize_model_filename,
     normalize_model_folder,
 )
+from workflow_metadata import extract_model_stack, prompt_sha256, summarize_prompt_fields
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
@@ -69,6 +71,7 @@ _ensure_modal()
 
 
 _deploy_status = {"state": "idle", "message": ""}
+_last_successful_model_stack: dict = {}
 
 def _get_deployed_version():
     try:
@@ -462,6 +465,7 @@ def _collect_input_images(workflow: dict) -> dict:
 async def _execute_job(item: tuple, item_id: int):
     number, prompt_id, workflow, extra_data, _, _ = item
     sid = extra_data.get("client_id", "")
+    local_started = time.time()
 
     task_key = _register_running(item)
 
@@ -476,23 +480,72 @@ async def _execute_job(item: tuple, item_id: int):
     success = False
     outputs = {}
     try:
+        # Verify workflow integrity immediately before remote call
+        current_hash = prompt_sha256(workflow)
+        expected_hash = extra_data.get("workflow_hash", "")
+        if expected_hash and current_hash != expected_hash:
+            raise RuntimeError(
+                f"Workflow hash mismatch: expected {expected_hash[:12]}…, got {current_hash[:12]}…"
+            )
+
+        # Log prompt metadata before remote execution
+        prompt_hash = extra_data.get("workflow_hash", "")
+        prompt_summary = extra_data.get("prompt_summary", {})
+        model_stack = extra_data.get("model_stack", {})
+        print(f"[comfyui-modal] Running prompt {prompt_hash[:12]}… summary={prompt_summary} model_stack={model_stack}")
+
+        collect_started = time.time()
         input_images = _collect_input_images(workflow)
+        input_collect_ms = round((time.time() - collect_started) * 1000, 1)
+        input_collect_bytes = sum(len(base64.b64decode(data)) for data in input_images.values())
+        print(
+            f"[comfyui-modal.profile] stage=input_collect prompt_id={prompt_id[:8]} "
+            f"duration_ms={input_collect_ms} count={len(input_images)} bytes={input_collect_bytes}"
+        )
+
+        remote_started = time.time()
         result = await run_prompt(workflow, input_images)
+        remote_run_ms = round((time.time() - remote_started) * 1000, 1)
+        print(
+            f"[comfyui-modal.profile] stage=remote_run_prompt prompt_id={prompt_id[:8]} "
+            f"duration_ms={remote_run_ms}"
+        )
         success = True
     except asyncio.CancelledError:
+        total_ms = round((time.time() - local_started) * 1000, 1)
+        print(
+            f"[comfyui-modal.profile] stage=local_total prompt_id={prompt_id[:8]} "
+            f"duration_ms={total_ms} error=cancelled"
+        )
         _send(sid, "execution_error", {"message": "cancelled", "prompt_id": prompt_id})
         _finish_job(task_key, prompt_id, outputs, success=False)
         raise
     except Exception as e:
+        total_ms = round((time.time() - local_started) * 1000, 1)
+        print(
+            f"[comfyui-modal.profile] stage=local_total prompt_id={prompt_id[:8]} "
+            f"duration_ms={total_ms} error={type(e).__name__}"
+        )
         _send(sid, "execution_error", {"message": str(e), "prompt_id": prompt_id})
         _finish_job(task_key, prompt_id, outputs, success=False)
         return
 
+    # Update last successful model stack after successful remote result
+    global _last_successful_model_stack
+    _last_successful_model_stack.clear()
+    _last_successful_model_stack.update(extra_data.get("model_stack", {}))
+
     output_dir = os.path.join(_COMFYUI_ROOT, "output")
     os.makedirs(output_dir, exist_ok=True)
+    materialize_started = time.time()
+    output_bytes_written = 0
+    output_image_count = 0
+    output_video_count = 0
 
     for img in result.get("images", []):
         img_bytes = base64.b64decode(img["data"])
+        output_bytes_written += len(img_bytes)
+        output_image_count += 1
         local_filename = img["filename"]
         local_path = _unique_path(output_dir, local_filename)
         local_filename = os.path.basename(local_path)
@@ -515,6 +568,8 @@ async def _execute_job(item: tuple, item_id: int):
 
     for vid in result.get("videos", []):
         vid_bytes = base64.b64decode(vid["data"])
+        output_bytes_written += len(vid_bytes)
+        output_video_count += 1
         local_filename = vid["filename"]
         local_path = _unique_path(output_dir, local_filename)
         local_filename = os.path.basename(local_path)
@@ -536,9 +591,20 @@ async def _execute_job(item: tuple, item_id: int):
             "output": {"images": [vid_entry], "animated": [True]},
         })
 
+    materialize_ms = round((time.time() - materialize_started) * 1000, 1)
+    print(
+        f"[comfyui-modal.profile] stage=output_materialize prompt_id={prompt_id[:8]} "
+        f"duration_ms={materialize_ms} images={output_image_count} videos={output_video_count} bytes={output_bytes_written}"
+    )
+
     _send(sid, "executing", {"node": None, "display_node": None, "prompt_id": prompt_id})
     _send(sid, "execution_success", {"prompt_id": prompt_id})
     _finish_job(task_key, prompt_id, outputs, success=True)
+    total_ms = round((time.time() - local_started) * 1000, 1)
+    print(
+        f"[comfyui-modal.profile] stage=local_total prompt_id={prompt_id[:8]} "
+        f"duration_ms={total_ms} images={output_image_count} videos={output_video_count} bytes={output_bytes_written}"
+    )
 
 
 if _server:
@@ -586,11 +652,24 @@ if _server:
         client_id = body.get("client_id", str(uuid.uuid4()))
         prompt_id = str(uuid.uuid4())
 
+        # Compute prompt integrity metadata (carried in extra_data, never mutates workflow)
+        local_payload_hash = prompt_sha256(body)
+        workflow_hash = prompt_sha256(workflow)
+        prompt_summary = summarize_prompt_fields(workflow)
+        model_stack = extract_model_stack(workflow)
+
         import time
         async with _counter_lock:
             _item_counter += 1
             item_id = _item_counter
-            extra_data = {"client_id": client_id, "create_time": int(time.time() * 1000)}
+            extra_data = {
+                "client_id": client_id,
+                "create_time": int(time.time() * 1000),
+                "local_payload_hash": local_payload_hash,
+                "workflow_hash": workflow_hash,
+                "prompt_summary": prompt_summary,
+                "model_stack": model_stack,
+            }
             item = (_item_counter, prompt_id, workflow, extra_data, list(workflow.keys()), {})
 
         pq = _pq()

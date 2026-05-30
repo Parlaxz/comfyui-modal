@@ -2,6 +2,9 @@ import asyncio
 import functools
 import modal
 
+# Client-side backpressure: only one in-flight prompt execution at a time
+_run_prompt_semaphore = asyncio.Semaphore(1)
+
 _apis = {
     "a10g": modal.Cls.from_name("comfyui", "ComfyAPI"),
     "a100": modal.Cls.from_name("comfyui", "ComfyAPI_A100"),
@@ -64,9 +67,10 @@ def _modal_error_handler(func):
 
 @_modal_error_handler
 async def run_prompt(workflow: dict, input_images: dict = None) -> dict:
-    return await asyncio.to_thread(
-        lambda: _api().run_prompt.remote(workflow, input_images or {}),
-    )
+    async with _run_prompt_semaphore:
+        return await asyncio.to_thread(
+            lambda: _api().run_prompt.remote(workflow, input_images or {}),
+        )
 
 
 @_modal_error_handler
