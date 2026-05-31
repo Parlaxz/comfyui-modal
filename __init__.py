@@ -214,7 +214,7 @@ def _maybe_auto_deploy():
         print(f"[comfyui-modal] comfyapp.py v{current_version} already deployed — skipping deploy")
         return
 
-    print(f"[comfyui-modal] Version changed ({deployed_version} → {current_version}), starting background deploy...")
+    print(f"[comfyui-modal] Version changed ({deployed_version} -> {current_version}), starting background deploy...")
     t = threading.Thread(target=_run_deploy_background, daemon=True)
     t.start()
 

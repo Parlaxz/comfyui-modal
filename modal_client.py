@@ -8,15 +8,18 @@ from gpu_catalog import (
     get_available_gpu_options,
     get_default_gpu,
     get_supported_gpus,
+    is_gpu_hidden,
     normalize_gpu_value,
 )
 
 # Client-side backpressure: only one in-flight prompt execution at a time
 _run_prompt_semaphore = asyncio.Semaphore(1)
 
+# Build API handles only for GPUs that are NOT hidden
 _apis = {
     entry["value"]: modal.Cls.from_name("comfyui", entry["class_name"])
     for entry in GPU_CATALOG
+    if not is_gpu_hidden(entry["value"])
 }
 _download_fn = modal.Function.from_name("comfyui", "download_model_to_volume")
 _batch_download_fn = modal.Function.from_name("comfyui", "batch_download_models")
