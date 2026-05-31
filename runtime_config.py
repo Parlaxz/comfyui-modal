@@ -9,8 +9,14 @@ import os
 # ---------------------------------------------------------------------------
 
 DEFAULT_EXECUTION_BACKEND: str = os.environ.get(
-    "COMFYMODAL_EXECUTION_BACKEND", "subprocess"
+    "COMFYMODAL_EXECUTION_BACKEND", "in_process"
 )
+# Supported values:
+#   "in_process"  — (default) run ComfyUI in the same Python process.  Requires
+#                   Modal memory snapshotting (enable_memory_snapshot=True) for
+#                   fast restores (~2-4 s cold start).
+#   "subprocess"  — launch ComfyUI as a child process via `comfy launch`.
+#                   Set COMFYMODAL_EXECUTION_BACKEND=subprocess to opt out.
 ENABLE_WARMUP: bool = (
     os.environ.get("COMFYMODAL_ENABLE_WARMUP", "false").lower() == "true"
 )

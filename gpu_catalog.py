@@ -1,3 +1,5 @@
+import os
+
 DEFAULT_GPU = "a10g"
 
 GPU_CATALOG = [
@@ -17,22 +19,63 @@ GPU_CATALOG = [
 GPU_VALUES = [entry["value"] for entry in GPU_CATALOG]
 GPU_BY_VALUE = {entry["value"]: entry for entry in GPU_CATALOG}
 
+# ── Hidden GPU support ──────────────────────────────────────────────────
+# Controlled by the COMFYMODAL_HIDE_GPUS environment variable, which lists
+# comma-separated GPU *values* (e.g. "t4,l4,l40s").  Hidden GPUs are
+# excluded from registration, from the config endpoint, and from validation.
+# Uses lazy initialisation so tests can set the env var before calling.
+_HIDDEN_GPU_VALUES: frozenset | None = None
+
+
+def _get_hidden_gpus() -> frozenset:
+    global _HIDDEN_GPU_VALUES
+    if _HIDDEN_GPU_VALUES is None:
+        _HIDDEN_GPU_VALUES = frozenset(
+            v.strip().lower()
+            for v in os.environ.get("COMFYMODAL_HIDE_GPUS", "").split(",")
+            if v.strip()
+        )
+    return _HIDDEN_GPU_VALUES
+
+
+def _clear_hidden_cache():
+    """Forget cached hidden set (used by tests)."""
+    global _HIDDEN_GPU_VALUES
+    _HIDDEN_GPU_VALUES = None
+
 
 def normalize_gpu_value(gpu: str) -> str:
     return str(gpu or "").strip().lower()
 
 
+def is_gpu_hidden(gpu_value: str) -> bool:
+    """Return True if the given GPU value is in the hidden set."""
+    return normalize_gpu_value(gpu_value) in _get_hidden_gpus()
+
+
 def get_default_gpu() -> str:
-    return DEFAULT_GPU
+    hidden = _get_hidden_gpus()
+    if DEFAULT_GPU not in hidden:
+        return DEFAULT_GPU
+    for entry in GPU_CATALOG:
+        if entry["value"] not in hidden:
+            return entry["value"]
+    return ""
 
 
 def get_supported_gpus() -> list[str]:
-    return list(GPU_VALUES)
+    """Return GPU values that are NOT hidden."""
+    hidden = _get_hidden_gpus()
+    return [e["value"] for e in GPU_CATALOG if e["value"] not in hidden]
 
 
 def get_available_gpu_options() -> list[dict[str, str]]:
-    return [{"value": entry["value"], "label": entry["label"]} for entry in GPU_CATALOG]
+    """Return value/label options for GPUs that are NOT hidden."""
+    hidden = _get_hidden_gpus()
+    return [{"value": e["value"], "label": e["label"]} for e in GPU_CATALOG if e["value"] not in hidden]
 
 
 def is_supported_gpu(gpu: str) -> bool:
-    return normalize_gpu_value(gpu) in GPU_BY_VALUE
+    """Return True if the GPU value is in the catalog and NOT hidden."""
+    n = normalize_gpu_value(gpu)
+    return n in GPU_BY_VALUE and n not in _get_hidden_gpus()

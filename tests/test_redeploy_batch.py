@@ -22,6 +22,10 @@ class RedeployBatchTests(unittest.TestCase):
         self.assertIn("-File", source)
         self.assertNotIn("^|", source)
 
+    def test_batch_file_hides_t4_l4_l40s(self):
+        source = BATCH_PATH.read_text(encoding="utf-8")
+        self.assertIn("COMFYMODAL_HIDE_GPUS=t4,l4,l40s", source)
+
     def test_ps_checker_contents(self):
         source = PS_CHECKER_PATH.read_text(encoding="utf-8")
         self.assertIn("Get-CimInstance Win32_Process", source)

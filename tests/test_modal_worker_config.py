@@ -43,3 +43,7 @@ class ModalWorkerConfigTests(unittest.TestCase):
         self.assertIn("from gpu_catalog import", source)
         self.assertIn("globals()[class_name] = Generated", source)
         self.assertIn('"ComfyAPI"', source)
+
+    def test_comfyapp_skips_hidden_gpus_during_registration(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn("if is_gpu_hidden(entry", source)
