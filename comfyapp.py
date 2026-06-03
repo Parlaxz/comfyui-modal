@@ -79,7 +79,7 @@ def _resolve_wce() -> tuple[bool, str]:
                 return False, "file"
     except Exception:
         pass
-    _env = os.environ.get("COMFYMODAL_WARMUP_CLIP_ENCODE", "0").strip().lower()
+    _env = os.environ.get("COMFYMODAL_WARMUP_CLIP_ENCODE", "1").strip().lower()
     return _env in ("1", "true", "on"), "env"
 
 
