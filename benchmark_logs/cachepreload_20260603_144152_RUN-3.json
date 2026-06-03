@@ -1,0 +1,174 @@
+{
+  "cache_diagnostics": {
+    "cpu_hits": {
+      "flux-2-klein-9b-fp8.safetensors": 2,
+      "qwen_3_8b_fp8mixed.safetensors": 2
+    },
+    "cpu_misses": {
+      "flux2-vae.safetensors": 1
+    },
+    "gpu_eq": {
+      "calls": 3,
+      "class_hits": 0,
+      "details": {
+        "Flux2->AutoencoderKL": {
+          "hits": 0,
+          "last": "no_match_Flux2_vs_AutoencoderKL_sz9433054096_vs_168092750",
+          "misses": 1
+        },
+        "Flux2TEModel_->AutoencoderKL": {
+          "hits": 0,
+          "last": "no_match_Flux2TEModel__vs_AutoencoderKL_sz8664744122_vs_168092750",
+          "misses": 1
+        },
+        "Flux2TEModel_->Flux2": {
+          "hits": 0,
+          "last": "no_match_Flux2TEModel__vs_Flux2_sz8664744122_vs_9433054096",
+          "misses": 1
+        }
+      },
+      "misses": 3,
+      "modeltype_hits": 0
+    }
+  },
+  "restore_timing": {
+    "clip_cache": {
+      "keys": [
+        "('/__modal/volumes/vo-EaSq8GPuDoDi3ldVHxIA8v/text_encoders/qwen_3_8b_fp8mixed.safetensors', 'flux')"
+      ],
+      "size": 1
+    },
+    "cpu_cache_hits": {
+      "flux-2-klein-9b-fp8.safetensors": 1,
+      "qwen_3_8b_fp8mixed.safetensors": 1
+    },
+    "cpu_cache_misses": {},
+    "cuda_warmup_ms": 62.7,
+    "early_path_resolve_ms": 3.9,
+    "ensure_models_ms": 0.2,
+    "gpu_cache_eq": {
+      "calls": 0,
+      "class_hits": 0,
+      "details": {
+        "Flux2->AutoencoderKL": {
+          "hits": 0,
+          "last": "no_match_Flux2_vs_AutoencoderKL_sz9433054096_vs_168092750",
+          "misses": 1
+        },
+        "Flux2TEModel_->AutoencoderKL": {
+          "hits": 0,
+          "last": "no_match_Flux2TEModel__vs_AutoencoderKL_sz8664744122_vs_168092750",
+          "misses": 1
+        },
+        "Flux2TEModel_->Flux2": {
+          "hits": 0,
+          "last": "no_match_Flux2TEModel__vs_Flux2_sz8664744122_vs_9433054096",
+          "misses": 1
+        }
+      },
+      "misses": 0,
+      "modeltype_hits": 0
+    },
+    "gpu_state_ms": 298.6,
+    "restore_total_ms": 5058.8,
+    "sage_mode": "baked_cuda",
+    "sage_reason": "sageattn_qk_int8_pv_fp16_cuda",
+    "sage_runtime_ms": 21.1,
+    "warmup_direct_clip_encode_ms": 1064.0,
+    "warmup_direct_clip_load_ms": 666.4,
+    "warmup_direct_total_ms": 1762.1,
+    "warmup_direct_unet_load_ms": 30.7,
+    "warmup_flux_2_klein_9b_fp8_safetensors_ms": 2905.0,
+    "warmup_preload_ms": 2909.4,
+    "warmup_qwen_3_8b_fp8mixed_safetensors_ms": 2512.1,
+    "warmup_status": "ok"
+  },
+  "run": "RUN-3",
+  "timestamp": "20260603_144152",
+  "trace": {
+    "deltas_ms": {
+      "clip_encode": 0.25,
+      "clip_load": 452.31,
+      "graph_overhead": 660.78,
+      "image_io": 9.16,
+      "inference_total": 5233.13,
+      "sampler": 4408.49,
+      "t3_to_t3b": 4.49,
+      "t3b_to_t3c": 0.04,
+      "t3b_to_t8": 5893.91,
+      "t8b_to_t9": 1.87,
+      "vae_decode": 372.08
+    },
+    "prompt_id": "",
+    "restore": {
+      "clip_cache": {
+        "keys": [
+          "('/__modal/volumes/vo-EaSq8GPuDoDi3ldVHxIA8v/text_encoders/qwen_3_8b_fp8mixed.safetensors', 'flux')"
+        ],
+        "size": 1
+      },
+      "cpu_cache_hits": {
+        "flux-2-klein-9b-fp8.safetensors": 1,
+        "qwen_3_8b_fp8mixed.safetensors": 1
+      },
+      "cpu_cache_misses": {},
+      "cuda_warmup_ms": 62.7,
+      "early_path_resolve_ms": 3.9,
+      "ensure_models_ms": 0.2,
+      "gpu_cache_eq": {
+        "calls": 0,
+        "class_hits": 0,
+        "details": {
+          "Flux2->AutoencoderKL": {
+            "hits": 0,
+            "last": "no_match_Flux2_vs_AutoencoderKL_sz9433054096_vs_168092750",
+            "misses": 1
+          },
+          "Flux2TEModel_->AutoencoderKL": {
+            "hits": 0,
+            "last": "no_match_Flux2TEModel__vs_AutoencoderKL_sz8664744122_vs_168092750",
+            "misses": 1
+          },
+          "Flux2TEModel_->Flux2": {
+            "hits": 0,
+            "last": "no_match_Flux2TEModel__vs_Flux2_sz8664744122_vs_9433054096",
+            "misses": 1
+          }
+        },
+        "misses": 0,
+        "modeltype_hits": 0
+      },
+      "gpu_state_ms": 298.6,
+      "restore_total_ms": 5058.8,
+      "sage_mode": "baked_cuda",
+      "sage_reason": "sageattn_qk_int8_pv_fp16_cuda",
+      "sage_runtime_ms": 21.1,
+      "warmup_direct_clip_encode_ms": 1064.0,
+      "warmup_direct_clip_load_ms": 666.4,
+      "warmup_direct_total_ms": 1762.1,
+      "warmup_direct_unet_load_ms": 30.7,
+      "warmup_flux_2_klein_9b_fp8_safetensors_ms": 2905.0,
+      "warmup_preload_ms": 2909.4,
+      "warmup_qwen_3_8b_fp8mixed_safetensors_ms": 2512.1,
+      "warmup_status": "ok"
+    },
+    "stages": {
+      "t3_modal_entry": 1780515726.2245338,
+      "t3b_validate_done": 1780515726.2290218,
+      "t3c_prep_done": 1780515726.229065,
+      "t4_clip_load_end": 1780515726.8798409,
+      "t4_clip_load_start": 1780515726.4275336,
+      "t5_text_encode_end": 1780515726.8800888,
+      "t5_text_encode_start": 1780515726.8798409,
+      "t6_sampler_end": 1780515731.2898126,
+      "t6_sampler_start": 1780515726.8813179,
+      "t7_vae_decode_end": 1780515731.6618905,
+      "t7_vae_decode_start": 1780515731.2898126,
+      "t8_image_written": 1780515732.12293,
+      "t8b_outputs_collected": 1780515732.1320863,
+      "t9_modal_return": 1780515732.1339536
+    },
+    "t0": 1780515726.2245293
+  },
+  "wall_clock_s": 20.21
+}

@@ -1,0 +1,52 @@
+{
+  "restore_timing": {
+    "cuda_warmup_ms": 68.2,
+    "ensure_models_ms": 0.0,
+    "gpu_state_ms": 181.2,
+    "restore_total_ms": 5285.9,
+    "sage_mode": "baked_cuda",
+    "sage_reason": "sageattn_qk_int8_pv_fp16_cuda",
+    "sage_runtime_ms": 5.1,
+    "warmup_flux2_vae_safetensors_ms": 274.6,
+    "warmup_flux_2_klein_9b_fp8_safetensors_ms": 4028.6,
+    "warmup_preload_ms": 4033.2,
+    "warmup_qwen_3_8b_fp8mixed_safetensors_ms": 3753.7,
+    "warmup_status": "ok",
+    "warmup_wf_ms": 998.1
+  },
+  "run": "RUN-1",
+  "timestamp": "20260603_112909",
+  "trace": {
+    "deltas_ms": {
+      "inference_total": 0.0,
+      "t3_to_t3b": 2.68,
+      "t3b_to_t3c": 0.03,
+      "t8b_to_t9": 1.35
+    },
+    "prompt_id": "",
+    "restore": {
+      "cuda_warmup_ms": 68.2,
+      "ensure_models_ms": 0.0,
+      "gpu_state_ms": 181.2,
+      "restore_total_ms": 5285.9,
+      "sage_mode": "baked_cuda",
+      "sage_reason": "sageattn_qk_int8_pv_fp16_cuda",
+      "sage_runtime_ms": 5.1,
+      "warmup_flux2_vae_safetensors_ms": 274.6,
+      "warmup_flux_2_klein_9b_fp8_safetensors_ms": 4028.6,
+      "warmup_preload_ms": 4033.2,
+      "warmup_qwen_3_8b_fp8mixed_safetensors_ms": 3753.7,
+      "warmup_status": "ok",
+      "warmup_wf_ms": 998.1
+    },
+    "stages": {
+      "t3_modal_entry": 1780504201.925546,
+      "t3b_validate_done": 1780504201.9282267,
+      "t3c_prep_done": 1780504201.9282577,
+      "t8b_outputs_collected": 1780504201.9455233,
+      "t9_modal_return": 1780504201.9468737
+    },
+    "t0": 1780504201.9255443
+  },
+  "wall_clock_s": 53.93
+}

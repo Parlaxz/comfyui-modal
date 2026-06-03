@@ -1,0 +1,46 @@
+{
+  "restore_timing": {
+    "cuda_warmup_ms": 201.5,
+    "ensure_models_ms": 0.1,
+    "gpu_state_ms": 176.0,
+    "restore_total_ms": 4471.5,
+    "sage_runtime_ms": 20.3,
+    "warmup_flux2_vae_safetensors_ms": 186.6,
+    "warmup_flux_2_klein_9b_fp8_safetensors_ms": 3040.0,
+    "warmup_preload_ms": 4073.4,
+    "warmup_qwen_3_8b_fp8mixed_safetensors_ms": 4057.0,
+    "warmup_status": "ok"
+  },
+  "run": "RUN-1",
+  "timestamp": "20260603_000401",
+  "trace": {
+    "deltas_ms": {
+      "inference_total": 0.0,
+      "t3_to_t3b": 3.42,
+      "t3b_to_t3c": 0.04,
+      "t8b_to_t9": 1.33
+    },
+    "prompt_id": "",
+    "restore": {
+      "cuda_warmup_ms": 201.5,
+      "ensure_models_ms": 0.1,
+      "gpu_state_ms": 176.0,
+      "restore_total_ms": 4471.5,
+      "sage_runtime_ms": 20.3,
+      "warmup_flux2_vae_safetensors_ms": 186.6,
+      "warmup_flux_2_klein_9b_fp8_safetensors_ms": 3040.0,
+      "warmup_preload_ms": 4073.4,
+      "warmup_qwen_3_8b_fp8mixed_safetensors_ms": 4057.0,
+      "warmup_status": "ok"
+    },
+    "stages": {
+      "t3_modal_entry": 1780463042.4825633,
+      "t3b_validate_done": 1780463042.4859831,
+      "t3c_prep_done": 1780463042.4860203,
+      "t8b_outputs_collected": 1780463042.503577,
+      "t9_modal_return": 1780463042.5049038
+    },
+    "t0": 1780463042.4825618
+  },
+  "wall_clock_s": 2.102
+}
