@@ -28,6 +28,108 @@ WARMUP_VAE = os.getenv("COMFYMODAL_WARMUP_VAE", "").strip()
 WARMUP_CLIP_TYPE = os.getenv("COMFYMODAL_WARMUP_CLIP_TYPE", "flux").strip() or "flux"
 WARMUP_TEXT = "A Jew steals baby kittens from their mother cat. the mother cat is anthropamorphic and wearing an apron and chef's hat and crying. The jew is a rabbi and is wearing a suit and holding the kittens. The jew has a long nose and an evil smile. They are in a crowded market, and the mother cat has her hands outstretched longinly in the direction of the jew and her babies. The jew is running away with his back to the mother and looking back at her. He is wearing a kippa and is a rabbi, and is laughing"
 
+# Preload mode controls which model files are loaded to CPU during restore
+# and the concurrency/ordering:
+#   default      — UNET + CLIP concurrent, 4 workers
+#   sequential   — UNET first then CLIP, 1 worker
+#   unet_only    — UNET only
+#   clip_only    — CLIP only
+#   vae          — UNET + CLIP + VAE concurrent, 4 workers
+#   workers_1    — UNET + CLIP concurrent, 1 worker
+#   workers_2    — UNET + CLIP concurrent, 2 workers
+PRELOAD_MODE = os.getenv("COMFYMODAL_PRELOAD_MODE", "workers_2").strip().lower()
+PRELOAD_MODE_PATH = "/root/models/.preload_mode"
+RUNTIME_CONFIG_DIR = "/root/models/runtime_config"
+RUNTIME_WCE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "warmup_clip_encode.txt")
+RUNTIME_RETURN_MODE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "return_mode.txt")
+RUNTIME_CLIP_CACHE_CLEAR_PATH = os.path.join(RUNTIME_CONFIG_DIR, "clear_clip_encode_cache.txt")
+RUNTIME_EXEC_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "exec_profile.txt")
+
+
+def _resolve_preload_mode() -> str:
+    """Return the effective preload mode.
+
+    Priority:
+    1. File on the model volume (set by ``set_preload_mode``).
+    2. Module-level env-var default (``PRELOAD_MODE``).
+    """
+    try:
+        if os.path.isfile(PRELOAD_MODE_PATH):
+            _v = open(PRELOAD_MODE_PATH).read().strip().lower()
+            if _v:
+                return _v
+    except Exception:
+        pass
+    return PRELOAD_MODE
+
+
+def _resolve_wce() -> tuple[bool, str]:
+    """Return (enabled, source) for warmup CLIP encode.
+
+    Priority:
+    1. File on the model volume (set by ``set_warmup_clip_encode``).
+    2. Env var ``COMFYMODAL_WARMUP_CLIP_ENCODE`` (default ``"0"``).
+    """
+    try:
+        if os.path.isfile(RUNTIME_WCE_PATH):
+            _v = open(RUNTIME_WCE_PATH).read().strip().lower()
+            if _v in ("1", "true", "on"):
+                return True, "file"
+            if _v in ("0", "false", "off"):
+                return False, "file"
+    except Exception:
+        pass
+    _env = os.environ.get("COMFYMODAL_WARMUP_CLIP_ENCODE", "0").strip().lower()
+    return _env in ("1", "true", "on"), "env"
+
+
+def _resolve_return_mode() -> str:
+    """Return the effective return mode.
+
+    Priority:
+    1. File on the model volume (set by ``set_return_mode``).
+    2. Env var ``COMFYMODAL_RETURN_MODE`` (default ``"full_base64"``).
+    """
+    try:
+        if os.path.isfile(RUNTIME_RETURN_MODE_PATH):
+            _v = open(RUNTIME_RETURN_MODE_PATH).read().strip().lower()
+            if _v in ("full_base64", "first_image_only", "metadata_only", "paths_only", "urls_only"):
+                return _v
+    except Exception:
+        pass
+    return os.environ.get("COMFYMODAL_RETURN_MODE", "full_base64").strip().lower()
+
+
+def _resolve_exec_profile() -> bool:
+    """Return whether executor profiling is enabled.
+
+    Priority:
+    1. File on the model volume (set by ``set_exec_profile``).
+    2. Env var ``COMFYMODAL_EXEC_PROFILE`` (default ``"0"``).
+    """
+    try:
+        if os.path.isfile(RUNTIME_EXEC_PROFILE_PATH):
+            _v = open(RUNTIME_EXEC_PROFILE_PATH).read().strip().lower()
+            return _v in ("1", "true", "on")
+    except Exception:
+        pass
+    return os.environ.get("COMFYMODAL_EXEC_PROFILE", "0").strip().lower() in ("1", "true", "on")
+
+
+def _resolve_clip_cache_clear() -> bool:
+    """Return True if CLIP encode cache should be cleared on restore.
+
+    Priority:
+    1. File on the model volume (set by ``set_clear_clip_encode_cache``).
+    2. Env var ``COMFYMODAL_CLEAR_CLIP_ENCODE_CACHE`` (default ``"0"``).
+    """
+    try:
+        if os.path.isfile(RUNTIME_CLIP_CACHE_CLEAR_PATH):
+            _v = open(RUNTIME_CLIP_CACHE_CLEAR_PATH).read().strip().lower()
+            return _v in ("1", "true", "on")
+    except Exception:
+        pass
+    return os.environ.get("COMFYMODAL_CLEAR_CLIP_ENCODE_CACHE", "0").strip().lower() in ("1", "true", "on")
 
 
 _EXCLUDED_CUSTOM_NODE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
@@ -203,13 +305,18 @@ def _get_system_ram_gb() -> float:
 
 
 def load_warmup_profile() -> dict:
-    """Return the configured pinned warmup profile, if any."""
-    checkpoint = (WARMUP_CHECKPOINT or os.environ.get("COMFYMODAL_WARMUP_CHECKPOINT", "")).strip()
-    unet = (WARMUP_UNET or os.environ.get("COMFYMODAL_WARMUP_UNET", "")).strip()
-    clip1 = (WARMUP_CLIP1 or os.environ.get("COMFYMODAL_WARMUP_CLIP1", "")).strip()
-    clip2 = (WARMUP_CLIP2 or os.environ.get("COMFYMODAL_WARMUP_CLIP2", "")).strip()
-    vae = (WARMUP_VAE or os.environ.get("COMFYMODAL_WARMUP_VAE", "")).strip()
-    clip_type = (WARMUP_CLIP_TYPE or os.environ.get("COMFYMODAL_WARMUP_CLIP_TYPE", "flux")).strip() or "flux"
+    """Return the configured pinned warmup profile, if any.
+
+    Prefers runtime-set env vars over module-level constants so that
+    dynamically-set env vars (e.g. restore-time defaults) take effect.
+    """
+    _get = lambda k, dflt="": (os.environ.get(k) or dflt).strip()
+    checkpoint = _get("COMFYMODAL_WARMUP_CHECKPOINT", WARMUP_CHECKPOINT)
+    unet = _get("COMFYMODAL_WARMUP_UNET", WARMUP_UNET)
+    clip1 = _get("COMFYMODAL_WARMUP_CLIP1", WARMUP_CLIP1)
+    clip2 = _get("COMFYMODAL_WARMUP_CLIP2", WARMUP_CLIP2)
+    vae = _get("COMFYMODAL_WARMUP_VAE", WARMUP_VAE)
+    clip_type = _get("COMFYMODAL_WARMUP_CLIP_TYPE", WARMUP_CLIP_TYPE) or "flux"
     if checkpoint:
         return {
             "mode": "checkpoint",
@@ -439,7 +546,7 @@ def stack_to_profile(stack: dict) -> dict:
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.8.0"
+COMFYAPP_VERSION = "2.14.0"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
@@ -731,6 +838,149 @@ def get_volume_status() -> dict:
     image=modal.Image.debian_slim(python_version="3.11")
     .add_local_python_source("gpu_catalog")
     .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_preload_mode(mode: str) -> str:
+    """Set the preload mode for the next cold restore.
+
+    Writes the mode to ``/root/models/.preload_mode`` on the volume so
+    the lifecycle restore function reads it before CPU preload.
+    """
+    import os
+    mode = mode.strip().lower()
+    valid = {"default", "sequential", "unet_only", "clip_only", "vae", "workers_1", "workers_2"}
+    if mode not in valid:
+        return f"invalid mode: {mode}  valid={valid}"
+    os.makedirs("/root/models", exist_ok=True)
+    with open(PRELOAD_MODE_PATH, "w") as f:
+        f.write(mode)
+    vol.commit()
+    print(f"[comfyapp] set_preload_mode: {mode}")
+    return f"preload_mode={mode}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_warmup_clip_encode(enabled: bool) -> str:
+    """Set warmup CLIP encode for the next cold restore.
+
+    Writes to ``/root/models/runtime_config/warmup_clip_encode.txt``
+    so the lifecycle restore function reads it before warmup.
+    """
+    import os
+    val = "1" if enabled else "0"
+    os.makedirs("/root/models/runtime_config", exist_ok=True)
+    with open(RUNTIME_WCE_PATH, "w") as f:
+        f.write(val)
+    vol.commit()
+    print(f"[comfyapp] set_warmup_clip_encode: {val}")
+    return f"warmup_clip_encode={val}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_return_mode(mode: str) -> str:
+    """Set return mode for the next prompt execution.
+
+    Modes:
+      full_base64       — return all images as base64 (current behavior)
+      first_image_only  — return only the first image as base64
+      metadata_only     — no image bytes, only counts/sizes/filenames
+      paths_only        — return local output paths only (for local-volume testing)
+      urls_only         — placeholder for object storage URL mode
+
+    Writes to ``/root/models/runtime_config/return_mode.txt``
+    so run_prompt() reads it before returning results.
+    """
+    import os
+    mode = mode.strip().lower()
+    valid = {"full_base64", "first_image_only", "metadata_only", "paths_only", "urls_only"}
+    if mode not in valid:
+        return f"invalid mode: {mode}  valid={valid}"
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    with open(RUNTIME_RETURN_MODE_PATH, "w") as f:
+        f.write(mode)
+    vol.commit()
+    print(f"[comfyapp] set_return_mode: {mode}")
+    return f"return_mode={mode}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_clear_clip_encode_cache(enabled: bool) -> str:
+    """Set CLIP encode cache clear flag for the next restore.
+
+    When enabled, the CLIPTextEncode cache is cleared at restore start
+    before warmup, ensuring clean WCE comparison runs.
+
+    Writes to ``/root/models/runtime_config/clear_clip_encode_cache.txt``.
+    """
+    import os
+    val = "1" if enabled else "0"
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    with open(RUNTIME_CLIP_CACHE_CLEAR_PATH, "w") as f:
+        f.write(val)
+    vol.commit()
+    print(f"[comfyapp] set_clear_clip_encode_cache: {val}")
+    return f"clear_clip_encode_cache={val}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_exec_profile(enabled: bool) -> str:
+    """Enable/disable per-node executor profiling.
+
+    When enabled, ``execution.execute()`` is monkey-patched to collect
+    per-class-type timing data reported as ``_exec_profile`` in the
+    ``run_prompt`` result.
+
+    Writes to ``/root/models/runtime_config/exec_profile.txt``.
+    """
+    import os
+    val = "1" if enabled else "0"
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    with open(RUNTIME_EXEC_PROFILE_PATH, "w") as f:
+        f.write(val)
+    vol.commit()
+    print(f"[comfyapp] set_exec_profile: {val}")
+    return f"exec_profile={val}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
     cpu=2,
     memory=4096,
     timeout=1800,
@@ -818,14 +1068,22 @@ class _ComfyAPIMixin:
                   f"in {(time.time()-_t0)*1000:.1f}ms")
 
     def _save_last_model_stack(self, stack: dict) -> None:
-        """Persist the model stack to the shared volume for auto-warmup."""
+        """Persist the workflow's model stack to the volume for the next restore.
+
+        Writes the file synchronously but commits to volume in a background
+        thread to avoid blocking the response path with network I/O (~370ms).
+        """
+        import json
+        import threading
         try:
             os.makedirs(os.path.dirname(LAST_MODEL_STACK_PATH), exist_ok=True)
             tmp_path = f"{LAST_MODEL_STACK_PATH}.tmp"
             with open(tmp_path, "w") as f:
-                json.dump(stack, f, indent=2, sort_keys=True)
+                json.dump(stack, f)
             os.replace(tmp_path, LAST_MODEL_STACK_PATH)
-            vol.commit()
+            # Background commit so the response isn't blocked by volume I/O
+            t = threading.Thread(target=vol.commit, daemon=True)
+            t.start()
         except Exception as exc:
             print(f"[comfyapp] failed to save last model stack: {exc}")
 
@@ -1012,6 +1270,9 @@ class _ComfyAPIMixin:
         startup so Modal's memory snapshot captures them.  On restore, the
         cached state dicts are returned by ``_patch_model_cpu_cache``,
         eliminating volume reads during the first prompt execution.
+
+        Which files are preloaded is controlled by PRELOAD_MODE (env var
+        ``COMFYMODAL_PRELOAD_MODE``).
         """
         if not profile:
             print("[comfyapp] snapshot_preload_paths: no profile, nothing to preload")
@@ -1021,15 +1282,29 @@ class _ComfyAPIMixin:
         if profile_mode == "checkpoint":
             checks.append(("checkpoint", profile.get("checkpoint", "")))
         elif profile_mode == "split":
-            checks.extend([
-                ("unet", profile.get("unet", "")),
-                ("clip", profile.get("clip1", "")),
-                ("clip", profile.get("clip2", "")),
-                # VAE intentionally excluded: only ~192ms to preload but
-                # the warmup WF doesn't use it and inference loads VAE
-                # anyway as part of vae_decode.  Preloading VAE adds
-                # I/O without any measurable reuse benefit.
-            ])
+            unet_f = profile.get("unet", "")
+            clip1_f = profile.get("clip1", "")
+            clip2_f = profile.get("clip2", "")
+            vae_f = profile.get("vae", "")
+            _pm = _resolve_preload_mode()
+            if _pm == "unet_only":
+                checks.append(("unet", unet_f))
+            elif _pm == "clip_only":
+                checks.append(("clip", clip1_f))
+                checks.append(("clip", clip2_f))
+            elif _pm == "vae":
+                checks.extend([
+                    ("unet", unet_f),
+                    ("clip", clip1_f),
+                    ("clip", clip2_f),
+                    ("vae", vae_f),
+                ])
+            else:
+                checks.extend([
+                    ("unet", unet_f),
+                    ("clip", clip1_f),
+                    ("clip", clip2_f),
+                ])
         # Resolve paths concurrently: each _find_model_file call does FUSE
         # stat requests (network round-trips to Modal's volume service).
         # Running them sequentially adds ~50-150ms per stat → 200-600ms
@@ -1093,9 +1368,20 @@ class _ComfyAPIMixin:
                 _total_bytes += os.path.getsize(p)
             except OSError:
                 pass
+        # Determine worker count from PRELOAD_MODE
+        _preload_max_workers = 4
+        _pm = _resolve_preload_mode()
+        if _pm == "workers_1":
+            _preload_max_workers = 1
+        elif _pm == "workers_2":
+            _preload_max_workers = 2
+        elif _pm in ("sequential",):
+            _preload_max_workers = 1
+
         print(
             f"[comfyapp] preload_models_to_cpu: files={len(file_paths)} "
-            f"total_gb={round(_total_bytes / (1024**3), 2)} starting"
+            f"total_gb={round(_total_bytes / (1024**3), 2)} "
+            f"mode={_pm} workers={_preload_max_workers} starting"
         )
         original_loader = getattr(self, "_original_model_loader", None)
         if original_loader is None:
@@ -1123,7 +1409,7 @@ class _ComfyAPIMixin:
                 return filename, loaded, None, d_ms
 
             batch = _total_bytes
-            with ThreadPoolExecutor(max_workers=min(len(to_load), 4)) as pool:
+            with ThreadPoolExecutor(max_workers=min(len(to_load), _preload_max_workers)) as pool:
                 fut_map = {pool.submit(_load_one, p, f): f for p, f in to_load}
                 for future in as_completed(fut_map):
                     filename = fut_map[future]
@@ -1162,6 +1448,28 @@ class _ComfyAPIMixin:
 
         _total_ms = self._profile_ms(_total_start)
         _total_loaded_gb = sum(os.path.getsize(p) for p in file_paths if os.path.isfile(p)) / (1024**3)
+        # Detect preload outliers: any single file >5s
+        _slowest_fn = ""
+        _slowest_ms = 0.0
+        for _fn, _d in file_timing_ms.items():
+            if _d > _slowest_ms:
+                _slowest_ms = _d
+                _slowest_fn = _fn
+        if _total_ms > 5000 and _slowest_fn:
+            _slowest_size_gb = 0.0
+            for p in file_paths:
+                if os.path.basename(p) == _slowest_fn:
+                    try:
+                        _slowest_size_gb = os.path.getsize(p) / (1024**3)
+                    except OSError:
+                        pass
+                    break
+            _sl_throughput = round(_slowest_size_gb / max(_slowest_ms / 1000, 0.001), 2) if _slowest_size_gb else 0.0
+            print(f"[comfyapp] preload_outlier: true total_ms={_total_ms} "
+                  f"slowest_file={_slowest_fn} slowest_ms={_slowest_ms:.0f} "
+                  f"size_gb={_slowest_size_gb:.2f} throughput_gbps={_sl_throughput} "
+                  f"workers={_preload_max_workers}")
+
         print(
             f"[comfyapp] preload_models_to_cpu: done in {_total_ms}ms "
             f"loaded={len(cached)} files={len(file_paths)} "
@@ -1805,6 +2113,19 @@ class _ComfyAPIMixin:
         if not ENABLE_TORCH_COMPILE:
             return
 
+    def _compute_workflow_struct_hash(self, workflow: dict) -> str:
+        import hashlib
+        _mutable_keys = {"seed", "text", "width", "height", "batch_size"}
+        stripped = {}
+        for _nid, _spec in workflow.items():
+            if not isinstance(_spec, dict):
+                continue
+            _inp = dict(_spec.get("inputs", {}))
+            for _k in _mutable_keys:
+                _inp.pop(_k, None)
+            stripped[_nid] = {"class_type": _spec.get("class_type"), "inputs": _inp}
+        return hashlib.md5(json.dumps(stripped, sort_keys=True).encode()).hexdigest()[:16]
+
     def _execute_in_process(self, workflow: dict, input_images: dict | None = None, collect_outputs: bool = True, trace: Trace | None = None) -> dict:
         """Execute a ComfyUI workflow directly in-process.
 
@@ -1846,9 +2167,19 @@ class _ComfyAPIMixin:
         # generated outputs.
         prompt_start_time = time.time()
 
-        # ── Validate (async in ComfyUI v0.22+) ──
+        # ── Fixed-workflow fast path: skip validation if hash matches ──
+        _wf_hash = self._compute_workflow_struct_hash(workflow)
+        _wf_cache_key = f"wf_exec:{_wf_hash}"
+        _wf_cache = getattr(self, "_workflow_exec_cache", {})
+        _cached = _wf_cache.get(_wf_cache_key) if collect_outputs else None
         stage_started = time.time()
-        if not collect_outputs:
+        if _cached is not None and collect_outputs:
+            outputs_to_execute, node_errors = _cached
+            valid = True
+            error = {}
+            _validate_ms = self._profile_ms(stage_started)
+            self._log_profile("inproc_validate_cached", prompt_id=prompt_id[:8], hash=_wf_hash, duration_ms=_validate_ms)
+        elif not collect_outputs:
             # Warmup-only mode: skip output validation since warmup workflows
             # may have no output consumers (e.g. UNETLoader + DualCLIPLoader).
             # Treat all workflow nodes as outputs to execute.
@@ -1861,7 +2192,14 @@ class _ComfyAPIMixin:
             valid, error, outputs_to_execute, node_errors = self._event_loop.run_until_complete(
                 execution.validate_prompt(prompt_id, workflow, None)
             )
-            self._log_profile("inproc_validate", prompt_id=prompt_id[:8], valid=1 if valid else 0, outputs=len(outputs_to_execute or []), duration_ms=self._profile_ms(stage_started))
+            _validate_ms = self._profile_ms(stage_started)
+            self._log_profile("inproc_validate", prompt_id=prompt_id[:8], valid=1 if valid else 0, outputs=len(outputs_to_execute or []), duration_ms=_validate_ms)
+            # Cache for future requests with same structure
+            if valid and outputs_to_execute:
+                if not hasattr(self, '_workflow_exec_cache'):
+                    self._workflow_exec_cache = {}
+                self._workflow_exec_cache[_wf_cache_key] = (outputs_to_execute, node_errors)
+        self._last_graph_validate_ms = self._profile_ms(stage_started)
         if trace is not None:
             trace.mark("t3b_validate_done")
         if not valid:
@@ -1882,6 +2220,43 @@ class _ComfyAPIMixin:
         if trace is not None:
             trace.mark("t3c_prep_done")
         _exec_stage = time.time()
+
+        # ── Instrument executor for overhead breakdown ──
+        import execution as _exec_mod
+        _perf_data = {}
+        _exec_profiling = _resolve_exec_profile()
+        if _exec_profiling and not getattr(_exec_mod, '_comfy_modal_exec_patched', False):
+            _orig_exec_fn = _exec_mod.execute
+            _exec_prof_data = {"nodes": {}, "_first_call_start": None, "_last_call_end": None, "_call_count": 0}
+            async def _profiled_exec(*args, **kwargs):
+                _t0 = time.perf_counter()
+                if _exec_prof_data["_first_call_start"] is None:
+                    _exec_prof_data["_first_call_start"] = _t0
+                try:
+                    return await _orig_exec_fn(*args, **kwargs)
+                finally:
+                    _t1 = time.perf_counter()
+                    _exec_prof_data["_last_call_end"] = _t1
+                    _exec_prof_data["_call_count"] += 1
+                    _node_id = kwargs.get('current_item') or (args[3] if len(args) > 3 else None)
+                    _ct = "?"
+                    try:
+                        _dyn = kwargs.get('dynprompt') or (args[1] if len(args) > 1 else None)
+                        if _dyn and _node_id is not None:
+                            _n = _dyn.get_node(str(_node_id))
+                            if _n:
+                                _ct = _n.get('class_type', '?')
+                    except Exception:
+                        pass
+                    _duration_ms = (_t1 - _t0) * 1000
+                    _nodes = _exec_prof_data["nodes"]
+                    if _ct not in _nodes:
+                        _nodes[_ct] = {"ms": 0.0, "count": 0}
+                    _nodes[_ct]["ms"] += _duration_ms
+                    _nodes[_ct]["count"] += 1
+            _exec_mod.execute = _profiled_exec
+            _exec_mod._comfy_modal_exec_patched = True
+            _exec_mod._comfy_modal_exec_prof = _exec_prof_data
 
         # ── Execute ──
         stage_started = time.time()
@@ -2642,7 +3017,8 @@ class _ComfyAPIMixin:
     @modal.enter(snap=True)
     def startup(self):
         t0 = time.time()
-        print("[comfyapp] lifecycle=startup snap=True")
+        _snap_mode = os.environ.get("COMFYMODAL_SNAPSHOT_MODE", "full").strip().lower()
+        print(f"[comfyapp] lifecycle=startup snap=True snapshot_mode={_snap_mode}")
 
         is_in_proc = (self._select_backend() == "in_process")
 
@@ -2670,26 +3046,27 @@ class _ComfyAPIMixin:
         self._record_runtime_state()
         self._log_profile("runtime_state_record", duration_ms=self._profile_ms(stage_started))
 
-        if is_in_proc:
+        _need_backend = True
+        if _snap_mode == "none":
+            _need_backend = False
+            print("[comfyapp] snapshot_mode=none: skipping backend init during snap=True")
+        elif _snap_mode == "minimal":
+            # Minimal snapshot: import backend modules but skip heavy GPU init.
+            # ComfyUI will fully init on restore.
+            _need_backend = False
+            print("[comfyapp] snapshot_mode=minimal: backend init deferred to restore")
+        if _need_backend and is_in_proc:
             if ENABLE_GPU_SNAPSHOT:
-                # GPU snapshot: allow ComfyUI to initialise with GPU but block
-                # SageAttention C extensions via sys.meta_path.  SageAttention
-                # falls back to its Triton path (torch CUDA APIs), which Modal
-                # properly checkpoints.  The snapshot captures the CUDA context,
-                # compiled kernels, and warmup model tensors (if preloaded).
                 stage_started = time.time()
                 with self._force_triton_during_snapshot():
                     self._start_backend()
                 self._log_profile("backend_start", backend=self._select_backend(), duration_ms=self._profile_ms(stage_started))
             else:
-                # CPU-only snapshot: ComfyUI inits under force_cpu so the
-                # snapshot contains only CPU Python state — zero CUDA driver
-                # handles → no SIGSEGV on restore.
                 stage_started = time.time()
                 with self._force_cpu_during_snapshot():
                     self._start_backend()
                 self._log_profile("backend_start", backend=self._select_backend(), duration_ms=self._profile_ms(stage_started))
-        else:
+        elif _need_backend:
             stage_started = time.time()
             self._start_backend()
             self._log_profile("backend_start", backend=self._select_backend(), duration_ms=self._profile_ms(stage_started))
@@ -2819,16 +3196,19 @@ class _ComfyAPIMixin:
             else:
                 _phases["direct_clip_load_ms"] = 0.0
 
-            # 3 -- Prime CLIPTextEncode cache
-            # Costs ~1000ms for Qwen 8B forward pass but saves ~1000ms
-            # in inference when the same text is reused.  Net ~150ms win.
+            # 3 -- Prime CLIPTextEncode cache (optional)
+            # Costs ~1000ms for Qwen 8B forward pass but saves ~600ms
+            # during inference.  Net savings ~400ms by disabling.
+            _wce_enabled, _wce_source = _resolve_wce()
             _s = time.time()
-            if clip_out and WARMUP_TEXT:
+            if _wce_enabled and clip_out and WARMUP_TEXT:
                 enc_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
                 if enc_cls:
                     encoder = enc_cls()
                     encoder.encode(clip=clip_out[0], text=WARMUP_TEXT)
             _phases["direct_clip_encode_ms"] = round((time.time() - _s) * 1000, 1)
+            _phases["wce_enabled"] = _wce_enabled
+            _phases["wce_source"] = _wce_source
             _phases["direct_total_ms"] = round((time.time() - _t0) * 1000, 1)
             print(f"[comfyapp] direct warmup OK — {_phases}")
             return {"status": "ok", **_phases}
@@ -3163,9 +3543,12 @@ class _ComfyAPIMixin:
         if not os.environ.get("COMFYMODAL_WARMUP_CLIP_TYPE"):
             # Use "flux2" to match CLIPLoader in flux2 workflows
             os.environ["COMFYMODAL_WARMUP_CLIP_TYPE"] = "flux2"
+        if not os.environ.get("COMFYMODAL_PRELOAD_MODE"):
+            # Use env var for experiment flexibility, else module default
+            pass
 
         restore_start = time.time()
-        print("[comfyapp] lifecycle=restore snap=False")
+        print(f"[comfyapp] lifecycle=restore snap=False restore_start_unix={restore_start}")
         __stages: dict[str, float] = {}
         # Clear any stale restore timing from a previous call
         self._last_restore_timing = None
@@ -3175,6 +3558,8 @@ class _ComfyAPIMixin:
         _s = time.time()
         self._ensure_models_symlink()
         __stages["ensure_models_ms"] = self._profile_ms(_s)
+        __stages["preload_mode"] = _resolve_preload_mode()
+        __stages["preload_mode_source"] = "file" if os.path.isfile(PRELOAD_MODE_PATH) else "env_var"
 
         # ── Pre-resolve warmup profile + model paths ─────────────────────
         # FUSE stat calls for model file location are I/O-bound and
@@ -3193,7 +3578,19 @@ class _ComfyAPIMixin:
                   f"resolved_paths={len(_warmup_paths)} in {__stages['early_path_resolve_ms']}ms")
 
         if is_in_proc:
-            if ENABLE_GPU_SNAPSHOT:
+            # If backend was skipped during snap=True (snapshot_mode=none/minimal),
+            # initialize it now with full GPU access (no force_cpu).
+            _backend_inited = getattr(self, "_event_loop", None) is not None
+            _backend_deferred = False
+            if not _backend_inited:
+                _s = time.time()
+                print("[comfyapp] deferred backend init on restore (snapshot_mode=none)")
+                self._start_backend()
+                __stages["deferred_backend_init_ms"] = self._profile_ms(_s)
+                _backend_deferred = True
+                _backend_inited = True
+
+            if ENABLE_GPU_SNAPSHOT and _backend_inited and not _backend_deferred:
                 # GPU snapshot restored — ComfyUI already initialised with GPU
                 # (CUDA context, HIGH_VRAM mode, executor, etc. are captured).
                 # Skip _restore_in_process_gpu_state() but still recalculate
@@ -3228,12 +3625,17 @@ class _ComfyAPIMixin:
                     duration_ms=__stages["sage_runtime_ms"],
                 )
             else:
-                # CPU-only snapshot — the in-process backend was initialised
-                # under force_cpu, so no CUDA state was captured.  Reattach
-                # the GPU, warm CUDA, select Sage runtime.
-                _s = time.time()
-                self._restore_in_process_gpu_state()
-                __stages["gpu_state_ms"] = self._profile_ms(_s)
+                if not _backend_deferred:
+                    # CPU-only snapshot — the in-process backend was initialised
+                    # under force_cpu, so no CUDA state was captured.  Reattach
+                    # the GPU, warm CUDA, select Sage runtime.
+                    _s = time.time()
+                    self._restore_in_process_gpu_state()
+                    __stages["gpu_state_ms"] = self._profile_ms(_s)
+                else:
+                    # Deferred init: backend already started with GPU
+                    __stages["gpu_state_ms"] = 0.0
+                    __stages["gpu_state_source"] = "deferred"
 
                 _s = time.time()
                 self._warmup_cuda()
@@ -3244,6 +3646,28 @@ class _ComfyAPIMixin:
                 self._patch_model_cache_comparison()
                 self._patch_clip_text_encode_cache()
                 self._patch_clip_loader_cache()
+
+                # ── CLIP encode cache debug: clear if requested ──────────
+                _clip_cache_clear = _resolve_clip_cache_clear()
+                __stages["clip_cache_clear_requested"] = 1 if _clip_cache_clear else 0
+                if _clip_cache_clear:
+                    try:
+                        import nodes
+                        _te_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
+                        if _te_cls and hasattr(_te_cls, '_clip_text_cache'):
+                            _te_cls._clip_text_cache.clear()
+                            __stages["clip_cache_cleared"] = 1
+                            print("[comfyapp] clip_encode_cache: cleared by flag")
+                    except Exception as exc:
+                        print(f"[comfyapp] clip_encode_cache: clear failed: {exc}")
+                # Cache size at restore start
+                try:
+                    import nodes
+                    _te_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
+                    if _te_cls and hasattr(_te_cls, '_clip_text_cache'):
+                        __stages["clip_cache_size_at_start"] = len(_te_cls._clip_text_cache)
+                except Exception:
+                    pass
 
                 _s = time.time()
                 mode, reason = self._select_sage_runtime_mode()
@@ -3299,6 +3723,8 @@ class _ComfyAPIMixin:
                         _v = _dw.get(_k)
                         if _v is not None:
                             __stages[f"warmup_{_k}"] = _v
+                    __stages["wce_enabled"] = _dw.get("wce_enabled", False)
+                    __stages["wce_source"] = _dw.get("wce_source", "?")
                     if _dw.get("status") != "ok":
                         warmup_result["error"] = _dw.get("error", "direct warmup failed")
                         warmup_result["status"] = "error"
@@ -3321,6 +3747,15 @@ class _ComfyAPIMixin:
                 self._restart_comfy()
             __stages["subprocess_health_ms"] = self._profile_ms(_s)
 
+        # CLIP cache size after warmup
+        try:
+            import nodes
+            _te_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
+            if _te_cls and hasattr(_te_cls, '_clip_text_cache'):
+                __stages["clip_cache_size_after_warmup"] = len(_te_cls._clip_text_cache)
+        except Exception:
+            pass
+
         # Annotate warmup with per-node timing breakdown
         _wr = locals().get("warmup_result") or {}
         warmup_nodes = _wr.get("node_timing", {}) if isinstance(_wr, dict) else {}
@@ -3341,9 +3776,13 @@ class _ComfyAPIMixin:
             "size": len(_clip_cache),
             "keys": [str(k) for k in _clip_cache.keys()],
         }
+        _restore_end = time.time()
         self._last_restore_timing = {
             "restore_total_ms": self._profile_ms(restore_start),
+            "restore_start_unix_s": restore_start,
+            "restore_end_unix_s": _restore_end,
             "warmup_status": warmup_status,
+            "warmup_profile": _warmup_profile or {},  # actual profile used during restore
             **__stages,
             **({f"warmup_{k}": v for k, v in warmup_nodes.items()} if warmup_nodes else {}),
             "cpu_cache_hits": _cpu_hits,
@@ -3453,11 +3892,18 @@ class _ComfyAPIMixin:
         # ── In-process backend: direct execution, no HTTP ──
         if self._select_backend() == "in_process":
             total_started = time.time()
+            _last_graph_validate_ms = getattr(self, "_last_graph_validate_ms", None)
             result = self._execute_in_process(workflow, input_images, trace=server_trace)
+            _graph_validate_ms = getattr(self, "_last_graph_validate_ms", None)
+            _t8b_t0 = time.time()
+
+            _s = time.time()
             requested_stack = extract_requested_model_stack(workflow)
             if requested_stack and any(requested_stack.values()):
                 self._save_last_model_stack(requested_stack)
-            # Log warmup profile vs actual workflow diagnostics
+            _t8b_save_stack_ms = round((time.time() - _s) * 1000, 1)
+
+            _s = time.time()
             _wp = {}
             _rt = getattr(self, "_last_restore_timing", None) or {}
             for _k in ("warmup_status", "warmup_preload_ms", "warmup_direct_total_ms", "warmup_direct_clip_load_ms", "direct_unet_load_ms", "direct_clip_load_ms"):
@@ -3465,22 +3911,31 @@ class _ComfyAPIMixin:
                 if _v is not None:
                     _wp[_k] = _v
             print(f"[comfyapp] warmup_profile_during_restore: {_wp}")
-            _warmup_profile = load_warmup_profile()
-            self._log_warmup_vs_workflow_diagnostics(_warmup_profile, requested_stack, raw_workflow=workflow)
+            _diagnose_profile = _rt.get("warmup_profile") or load_warmup_profile()
+            self._log_warmup_vs_workflow_diagnostics(_diagnose_profile, requested_stack, raw_workflow=workflow)
+            _t8b_diag_ms = round((time.time() - _s) * 1000, 1)
+
+            _s = time.time()
             total_ms = round((time.time() - total_started) * 1000, 1)
             server_trace.mark("t9_modal_return")
+            _s = time.time()
             print(
                 f"[comfyapp.profile] stage=remote_total backend=in_process duration_ms={total_ms} "
                 f"output_images={len(result.get('images', []))} "
                 f"output_videos={len(result.get('videos', []))}"
             )
             print(server_trace.log_line())
+            _t8b_profile_print_ms = round((time.time() - _s) * 1000, 1)
+
+            _s = time.time()
             trace_summary = server_trace.summary()
             self._enrich_trace_with_restore_timing(trace_summary)
             result["trace"] = trace_summary
-            _rt = getattr(self, "_last_restore_timing", None)
-            result["_restore_timing"] = dict(_rt) if _rt else {}
-            # Attach live cache diagnostics to result for benchmark verification
+            _rt2 = getattr(self, "_last_restore_timing", None)
+            result["_restore_timing"] = dict(_rt2) if _rt2 else {}
+            _t8b_enrich_ms = round((time.time() - _s) * 1000, 1)
+
+            _s = time.time()
             _gpu_stats_raw = {}
             try:
                 import comfy.model_management as _mm
@@ -3494,13 +3949,108 @@ class _ComfyAPIMixin:
                 "clip_cache_hits": getattr(self, "_clip_cache_hits", 0),
                 "clip_cache_misses": getattr(self, "_clip_cache_misses", 0),
             }
+            # Executor profiling data
+            import execution as _exec_mod
+            _exec_prof_raw = getattr(_exec_mod, '_comfy_modal_exec_prof', None)
+            if _exec_prof_raw and _exec_prof_raw.get("nodes"):
+                _nodes = _exec_prof_raw.get("nodes", {})
+                _total_node_ms = round(sum(n["ms"] for n in _nodes.values()), 2)
+                _fcs = _exec_prof_raw.get("_first_call_start")
+                _lce = _exec_prof_raw.get("_last_call_end")
+                _execute_wall_ms = round((_lce - _fcs) * 1000, 2) if _fcs and _lce else 0.0
+                _exec_residual_ms = round(max(0.0, _execute_wall_ms - _total_node_ms), 2)
+                _flat = {f"node_{k}": round(v["ms"], 2) for k, v in _nodes.items()}
+                _flat["total_node_ms"] = _total_node_ms
+                _flat["execute_wall_ms"] = _execute_wall_ms
+                _flat["executor_residual_ms"] = _exec_residual_ms
+                _flat["node_counts"] = {k: v["count"] for k, v in _nodes.items()}
+                result["_exec_profile"] = _flat
+                print(f"[comfyapp] exec_profile: nodes={dict(_flat)}")
+                # Reset for next prompt (mutate in-place since patched function references this dict)
+                _exec_prof_raw.clear()
+                _exec_prof_raw["nodes"] = {}
+                _exec_prof_raw["_first_call_start"] = None
+                _exec_prof_raw["_last_call_end"] = None
+                _exec_prof_raw["_call_count"] = 0
             print(f"[comfyapp] cache_diagnostics: cpu_hits={result['_cache_diagnostics']['cpu_hits']} "
                   f"cpu_misses={result['_cache_diagnostics']['cpu_misses']} "
                   f"gpu_eq_calls={result['_cache_diagnostics']['gpu_eq'].get('calls', '?')} "
                   f"class_hits={result['_cache_diagnostics']['gpu_eq'].get('class_hits', '?')} "
                   f"misses={result['_cache_diagnostics']['gpu_eq'].get('misses', '?')} "
                   f"clip_hits={result['_cache_diagnostics']['clip_cache_hits']} "
-                  f"clip_misses={result['_cache_diagnostics']['clip_cache_misses']}")
+                   f"clip_misses={result['_cache_diagnostics']['clip_cache_misses']}")
+            _t8b_diag_print_ms = round((time.time() - _s) * 1000, 1)
+            # Return payload logging
+            _payload_images = result.get("images", [])
+            _payload_videos = result.get("videos", [])
+            _payload_image_count = len(_payload_images)
+            _payload_video_count = len(_payload_videos)
+            _payload_b64_bytes = sum(len(img.get("data", "")) for img in _payload_images)
+            _payload_b64_bytes += sum(len(vid.get("data", "")) for vid in _payload_videos)
+            _payload_json_approx = _payload_b64_bytes + len(json.dumps(result, separators=(",", ":")))
+            print(f"[comfyapp] return_payload: images={_payload_image_count} videos={_payload_video_count} "
+                  f"b64_bytes={_payload_b64_bytes} approx_json_bytes={_payload_json_approx}")
+            result["_return_payload_info"] = {
+                "image_count": _payload_image_count,
+                "video_count": _payload_video_count,
+                "b64_bytes": _payload_b64_bytes,
+                "approx_json_bytes": _payload_json_approx,
+            }
+            _t8b_total_ms = round((time.time() - _t8b_t0) * 1000, 1)
+            _t8b_unknown_ms = round(_t8b_total_ms - _t8b_save_stack_ms - _t8b_diag_ms - _t8b_profile_print_ms - _t8b_enrich_ms - _t8b_diag_print_ms, 1)
+            _graph_validate_ms = _graph_validate_ms or 0.0
+            print(f"[comfyapp] t8b_breakdown: total={_t8b_total_ms}ms "
+                  f"save_stack={_t8b_save_stack_ms}ms "
+                  f"diagnostics={_t8b_diag_ms}ms "
+                  f"profile_print={_t8b_profile_print_ms}ms "
+                  f"enrich={_t8b_enrich_ms}ms "
+                  f"diag_print={_t8b_diag_print_ms}ms "
+                  f"graph_validate={_graph_validate_ms}ms "
+                  f"unknown={_t8b_unknown_ms}ms")
+            result["_t8b_breakdown"] = {
+                "t8b_total_ms": _t8b_total_ms,
+                "t8b_save_stack_ms": _t8b_save_stack_ms,
+                "t8b_diagnostics_ms": _t8b_diag_ms,
+                "t8b_profile_print_ms": _t8b_profile_print_ms,
+                "t8b_enrich_ms": _t8b_enrich_ms,
+                "t8b_diag_print_ms": _t8b_diag_print_ms,
+                "graph_validate_ms": _graph_validate_ms,
+                "t8b_unknown_ms": _t8b_unknown_ms,
+            }
+
+            # ── Return mode filtering (after full payload logging) ──────
+            _return_mode = _resolve_return_mode()
+            result["_return_payload_info"]["return_mode"] = _return_mode
+            if _return_mode == "first_image_only" and result.get("images"):
+                result["images"] = result["images"][:1]
+                _new_b64 = sum(len(img.get("data", "")) for img in result["images"])
+                result["_return_payload_info"]["b64_bytes"] = _new_b64
+                print(f"[comfyapp] return_mode=first_image_only: kept 1/{_payload_image_count} images, b64={_new_b64}")
+            elif _return_mode == "metadata_only":
+                for _img in result.get("images", []):
+                    _img.pop("data", None)
+                for _vid in result.get("videos", []):
+                    _vid.pop("data", None)
+                result["_return_payload_info"]["b64_bytes"] = 0
+                print(f"[comfyapp] return_mode=metadata_only: stripped data from {_payload_image_count} images/{_payload_video_count} videos")
+            elif _return_mode == "paths_only":
+                import os as _os
+                for _img in result.get("images", []):
+                    _data = _img.pop("data", "")
+                    _img["path"] = _os.path.join("/root/comfy/ComfyUI/output", _img.get("filename", ""))
+                for _vid in result.get("videos", []):
+                    _data = _vid.pop("data", "")
+                    _vid["path"] = _os.path.join("/root/comfy/ComfyUI/output", _vid.get("filename", ""))
+                result["_return_payload_info"]["b64_bytes"] = 0
+                print(f"[comfyapp] return_mode=paths_only: {_payload_image_count} images, {_payload_video_count} videos")
+            # Cache size before real prompt
+            try:
+                import nodes
+                _te_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
+                if _te_cls and hasattr(_te_cls, '_clip_text_cache'):
+                    result["_return_payload_info"]["clip_cache_size_before_prompt"] = len(_te_cls._clip_text_cache)
+            except Exception:
+                pass
             return result
 
         # ── Subprocess backend: HTTP-based submission ──

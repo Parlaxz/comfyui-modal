@@ -165,6 +165,10 @@ class Trace:
         modal_to_return = self.delta_ms("t2_local_dispatch", "t9_modal_return")
         if modal_to_return is not None:
             out["deltas_ms"]["modal_to_return"] = modal_to_return
+
+        remote_total = self.delta_ms("t3_modal_entry", "t9_modal_return")
+        if remote_total is not None:
+            out["deltas_ms"]["remote_total"] = remote_total
         return out
 
     def log_line(self) -> str:
