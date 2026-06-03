@@ -1,0 +1,728 @@
+{
+  "history": {
+    "meta": {
+      "model_stack": {
+        "clip": [
+          "qwen_3_8b_fp8mixed.safetensors"
+        ],
+        "unet": [
+          "flux-2-klein-9b-fp8.safetensors"
+        ],
+        "vae": [
+          "flux2-vae.safetensors"
+        ]
+      },
+      "prompt_summary": {
+        "cfg": 1,
+        "height": [
+          "116",
+          1
+        ],
+        "steps": 6,
+        "width": [
+          "116",
+          0
+        ]
+      },
+      "trace": {
+        "deltas_ms": {
+          "clip_encode": 222.9,
+          "graph_overhead": 615.99,
+          "image_io": 10.67,
+          "inference_total": 5043.84,
+          "modal_to_browser": 23973.17,
+          "modal_to_return": 22327.89,
+          "sampler": 4556.04,
+          "t0_to_t1": 2.01,
+          "t1_to_t2": 9.76,
+          "t2_to_t3": 16653.04,
+          "t3_to_t3b": 2.82,
+          "t3b_to_t3c": 0.02,
+          "t3b_to_t8": 5659.83,
+          "t8b_to_t9": 1.52,
+          "t9_to_t10": 1645.28,
+          "vae_decode": 264.9
+        },
+        "prompt_id": "bc398397-787b-4b93-b5a0-ee1d34e34137",
+        "stages": {
+          "t0_client_press": 1780445201.443,
+          "t10_local_materialized": 1780445225.427943,
+          "t1_local_recv": 1780445201.4450107,
+          "t2_local_dispatch": 1780445201.4547732,
+          "t3_modal_entry": 1780445218.107816,
+          "t3b_validate_done": 1780445218.1106355,
+          "t3c_prep_done": 1780445218.1106591,
+          "t5_text_encode_end": 1780445218.496642,
+          "t5_text_encode_start": 1780445218.273744,
+          "t6_sampler_end": 1780445223.0542967,
+          "t6_sampler_start": 1780445218.4982588,
+          "t7_vae_decode_end": 1780445223.3191926,
+          "t7_vae_decode_start": 1780445223.0542967,
+          "t8_image_written": 1780445223.7704687,
+          "t8b_outputs_collected": 1780445223.7811358,
+          "t9_modal_return": 1780445223.78266
+        },
+        "t0": 1780445201.443
+      },
+      "workflow_hash": "e9d91c5322e10fa89ce4cbf8b059180720f81d36cde7e8c3a9780d18a96b705d"
+    },
+    "outputs": {
+      "0": {
+        "images": [
+          {
+            "filename": "warmup_00001__20260602_190705_413043.png",
+            "subfolder": "",
+            "type": "output"
+          },
+          {
+            "filename": "rgthree.compare._temp_iyezs_00002__20260602_190705_414198.png",
+            "subfolder": "",
+            "type": "output"
+          },
+          {
+            "filename": "rgthree.compare._temp_iyezs_00001__20260602_190705_425756.png",
+            "subfolder": "",
+            "type": "output"
+          }
+        ]
+      },
+      "349": {
+        "images": [
+          {
+            "filename": "flux_2-klein-9b_00001__20260602_190705_407452.png",
+            "subfolder": "",
+            "type": "output"
+          }
+        ]
+      }
+    },
+    "prompt": [
+      10,
+      "bc398397-787b-4b93-b5a0-ee1d34e34137",
+      {
+        "100": {
+          "_meta": {
+            "title": "KSamplerSelect"
+          },
+          "class_type": "KSamplerSelect",
+          "inputs": {
+            "sampler_name": "euler"
+          }
+        },
+        "101": {
+          "_meta": {
+            "title": "Flux2Scheduler"
+          },
+          "class_type": "Flux2Scheduler",
+          "inputs": {
+            "height": [
+              "116",
+              1
+            ],
+            "steps": 6,
+            "width": [
+              "116",
+              0
+            ]
+          }
+        },
+        "102": {
+          "_meta": {
+            "title": "CFGGuider"
+          },
+          "class_type": "CFGGuider",
+          "inputs": {
+            "cfg": 1,
+            "model": [
+              "258",
+              0
+            ],
+            "negative": [
+              "114",
+              0
+            ],
+            "positive": [
+              "314",
+              0
+            ]
+          }
+        },
+        "103": {
+          "_meta": {
+            "title": "SamplerCustomAdvanced"
+          },
+          "class_type": "SamplerCustomAdvanced",
+          "inputs": {
+            "guider": [
+              "102",
+              0
+            ],
+            "latent_image": [
+              "302",
+              0
+            ],
+            "noise": [
+              "105",
+              0
+            ],
+            "sampler": [
+              "100",
+              0
+            ],
+            "sigmas": [
+              "101",
+              0
+            ]
+          }
+        },
+        "104": {
+          "_meta": {
+            "title": "VAE Decode"
+          },
+          "class_type": "VAEDecode",
+          "inputs": {
+            "samples": [
+              "103",
+              0
+            ],
+            "vae": [
+              "266",
+              0
+            ]
+          }
+        },
+        "105": {
+          "_meta": {
+            "title": "RandomNoise"
+          },
+          "class_type": "RandomNoise",
+          "inputs": {
+            "noise_seed": [
+              "237",
+              0
+            ]
+          }
+        },
+        "114": {
+          "_meta": {
+            "title": "ConditioningZeroOut"
+          },
+          "class_type": "ConditioningZeroOut",
+          "inputs": {
+            "conditioning": [
+              "314",
+              0
+            ]
+          }
+        },
+        "116": {
+          "_meta": {
+            "title": "Get Image Size"
+          },
+          "class_type": "GetImageSize",
+          "inputs": {
+            "image": [
+              "305",
+              0
+            ]
+          }
+        },
+        "137": {
+          "_meta": {
+            "title": "VAE Encode"
+          },
+          "class_type": "VAEEncode",
+          "inputs": {
+            "pixels": [
+              "311",
+              0
+            ],
+            "vae": [
+              "266",
+              0
+            ]
+          }
+        },
+        "139": {
+          "_meta": {
+            "title": "Set Latent Noise Mask"
+          },
+          "class_type": "SetLatentNoiseMask",
+          "inputs": {
+            "mask": [
+              "310",
+              0
+            ],
+            "samples": [
+              "137",
+              0
+            ]
+          }
+        },
+        "208": {
+          "_meta": {
+            "title": "Empty Latent Image"
+          },
+          "class_type": "EmptyLatentImage",
+          "inputs": {
+            "batch_size": 1,
+            "height": [
+              "116",
+              1
+            ],
+            "width": [
+              "116",
+              0
+            ]
+          }
+        },
+        "235": {
+          "_meta": {
+            "title": "Prompt"
+          },
+          "class_type": "PrimitiveStringMultiline",
+          "inputs": {
+            "value": "A Jew steals baby kittens from their mother cat. the mother cat is anthropamorphic and wearing an apron and chef's hat and crying. The jew is a rabbi and is wearing a suit and holding the kittens. The jew has a long nose and an evil smile. They are in a crowded market, and the mother cat has her hands outstretched longinly in the direction of the jew and her babies. The jew is running away with his back to the mother and looking back at her. He is wearing a kippa and is a rabbi, and is laughing"
+          }
+        },
+        "237": {
+          "_meta": {
+            "title": "Seed"
+          },
+          "class_type": "PrimitiveInt",
+          "inputs": {
+            "value": 359396826347308
+          }
+        },
+        "239": {
+          "_meta": {
+            "title": "Use reference images"
+          },
+          "class_type": "PrimitiveBoolean",
+          "inputs": {
+            "value": false
+          }
+        },
+        "241": {
+          "_meta": {
+            "title": "Apply mask from Image 1"
+          },
+          "class_type": "PrimitiveBoolean",
+          "inputs": {
+            "value": false
+          }
+        },
+        "243": {
+          "_meta": {
+            "title": "Color match strength"
+          },
+          "class_type": "PrimitiveFloat",
+          "inputs": {
+            "value": 0
+          }
+        },
+        "245": {
+          "_meta": {
+            "title": "Use custom output dimensions"
+          },
+          "class_type": "PrimitiveBoolean",
+          "inputs": {
+            "value": false
+          }
+        },
+        "247": {
+          "_meta": {
+            "title": "Custom output image"
+          },
+          "class_type": "EmptyImage",
+          "inputs": {
+            "batch_size": 1,
+            "color": 0,
+            "height": 1088,
+            "width": 1920
+          }
+        },
+        "252": {
+          "_meta": {
+            "title": "CLIP Text Encode (Positive Prompt)"
+          },
+          "class_type": "CLIPTextEncode",
+          "inputs": {
+            "clip": [
+              "256",
+              0
+            ],
+            "text": [
+              "235",
+              0
+            ]
+          }
+        },
+        "256": {
+          "_meta": {
+            "title": "Load CLIP"
+          },
+          "class_type": "CLIPLoader",
+          "inputs": {
+            "clip_name": "qwen_3_8b_fp8mixed.safetensors",
+            "device": "default",
+            "type": "flux2"
+          }
+        },
+        "258": {
+          "_meta": {
+            "title": "Load Diffusion Model"
+          },
+          "class_type": "UNETLoader",
+          "inputs": {
+            "unet_name": "flux-2-klein-9b-fp8.safetensors",
+            "weight_dtype": "default"
+          }
+        },
+        "266": {
+          "_meta": {
+            "title": "Load VAE"
+          },
+          "class_type": "VAELoader",
+          "inputs": {
+            "vae_name": "flux2-vae.safetensors"
+          }
+        },
+        "302": {
+          "_meta": {
+            "title": "Switch"
+          },
+          "class_type": "ComfySwitchNode",
+          "inputs": {
+            "on_false": [
+              "208",
+              0
+            ],
+            "on_true": [
+              "139",
+              0
+            ],
+            "switch": [
+              "241",
+              0
+            ]
+          }
+        },
+        "305": {
+          "_meta": {
+            "title": "Switch"
+          },
+          "class_type": "ComfySwitchNode",
+          "inputs": {
+            "on_false": [
+              "247",
+              0
+            ],
+            "on_true": [
+              "311",
+              0
+            ],
+            "switch": [
+              "239",
+              0
+            ]
+          }
+        },
+        "307": {
+          "_meta": {
+            "title": "Any Switch (rgthree)"
+          },
+          "class_type": "Any Switch (rgthree)",
+          "inputs": {
+            "any_02": [
+              "247",
+              0
+            ]
+          }
+        },
+        "309": {
+          "_meta": {
+            "title": "Switch"
+          },
+          "class_type": "ComfySwitchNode",
+          "inputs": {
+            "switch": false
+          }
+        },
+        "310": {
+          "_meta": {
+            "title": "Any Switch (rgthree)"
+          },
+          "class_type": "Any Switch (rgthree)",
+          "inputs": {}
+        },
+        "311": {
+          "_meta": {
+            "title": "Switch"
+          },
+          "class_type": "ComfySwitchNode",
+          "inputs": {
+            "on_false": [
+              "307",
+              0
+            ],
+            "on_true": [
+              "247",
+              0
+            ],
+            "switch": [
+              "245",
+              0
+            ]
+          }
+        },
+        "314": {
+          "_meta": {
+            "title": "Switch"
+          },
+          "class_type": "ComfySwitchNode",
+          "inputs": {
+            "on_false": [
+              "252",
+              0
+            ],
+            "on_true": [
+              "252",
+              0
+            ],
+            "switch": [
+              "239",
+              0
+            ]
+          }
+        },
+        "328": {
+          "_meta": {
+            "title": "ImageCompositeMasked"
+          },
+          "class_type": "ImageCompositeMasked",
+          "inputs": {
+            "destination": [
+              "337",
+              0
+            ],
+            "mask": [
+              "333",
+              0
+            ],
+            "resize_source": false,
+            "source": [
+              "329",
+              0
+            ],
+            "x": 0,
+            "y": 0
+          }
+        },
+        "329": {
+          "_meta": {
+            "title": "ColorMatchV2"
+          },
+          "class_type": "ColorMatchV2",
+          "inputs": {
+            "image_ref": [
+              "337",
+              0
+            ],
+            "image_target": [
+              "104",
+              0
+            ],
+            "method": "mkl",
+            "multithread": true,
+            "strength": [
+              "243",
+              0
+            ]
+          }
+        },
+        "330": {
+          "_meta": {
+            "title": "Switch"
+          },
+          "class_type": "ComfySwitchNode",
+          "inputs": {
+            "on_false": [
+              "329",
+              0
+            ],
+            "on_true": [
+              "328",
+              0
+            ],
+            "switch": [
+              "241",
+              0
+            ]
+          }
+        },
+        "333": {
+          "_meta": {
+            "title": "Grow Mask With Blur"
+          },
+          "class_type": "GrowMaskWithBlur",
+          "inputs": {
+            "blur_radius": 4,
+            "decay_factor": 1,
+            "expand": 8,
+            "fill_holes": false,
+            "flip_input": false,
+            "incremental_expandrate": 0,
+            "lerp_alpha": 1,
+            "mask": [
+              "345",
+              0
+            ],
+            "tapered_corners": false
+          }
+        },
+        "335": {
+          "_meta": {
+            "title": "Image Comparer (rgthree)"
+          },
+          "class_type": "Image Comparer (rgthree)",
+          "inputs": {
+            "image_a": [
+              "330",
+              0
+            ],
+            "image_b": [
+              "337",
+              0
+            ],
+            "rgthree_comparer": {
+              "images": [
+                {
+                  "name": "A",
+                  "selected": true,
+                  "url": ""
+                },
+                {
+                  "name": "B",
+                  "selected": true,
+                  "url": ""
+                }
+              ]
+            }
+          }
+        },
+        "337": {
+          "_meta": {
+            "title": "Any Switch (rgthree)"
+          },
+          "class_type": "Any Switch (rgthree)",
+          "inputs": {
+            "any_02": [
+              "247",
+              0
+            ]
+          }
+        },
+        "345": {
+          "_meta": {
+            "title": "Any Switch (rgthree)"
+          },
+          "class_type": "Any Switch (rgthree)",
+          "inputs": {}
+        },
+        "349": {
+          "_meta": {
+            "title": "Save Image"
+          },
+          "class_type": "SaveImage",
+          "inputs": {
+            "filename_prefix": "flux_2-klein-9b",
+            "images": [
+              "330",
+              0
+            ]
+          }
+        }
+      },
+      {
+        "client_id": "benchmark-run2-17e64842-901c-41b6-a82f-ba077d2da8ed",
+        "create_time": 1780445201445,
+        "local_payload_hash": "1c7b524338f45268e791e40d2b93aab9ed02b7d56b1fd53eaeff6b0ea84581d3",
+        "model_stack": {
+          "clip": [
+            "qwen_3_8b_fp8mixed.safetensors"
+          ],
+          "unet": [
+            "flux-2-klein-9b-fp8.safetensors"
+          ],
+          "vae": [
+            "flux2-vae.safetensors"
+          ]
+        },
+        "prompt_summary": {
+          "cfg": 1,
+          "height": [
+            "116",
+            1
+          ],
+          "steps": 6,
+          "width": [
+            "116",
+            0
+          ]
+        },
+        "trace": {
+          "prompt_id": "bc398397-787b-4b93-b5a0-ee1d34e34137",
+          "t0_client_press": 1780445201.443,
+          "t1_local_recv": 1780445201.4450107
+        },
+        "workflow_hash": "e9d91c5322e10fa89ce4cbf8b059180720f81d36cde7e8c3a9780d18a96b705d"
+      },
+      [
+        "100",
+        "101",
+        "102",
+        "103",
+        "104",
+        "105",
+        "114",
+        "116",
+        "137",
+        "139",
+        "208",
+        "235",
+        "237",
+        "239",
+        "241",
+        "243",
+        "245",
+        "247",
+        "252",
+        "256",
+        "258",
+        "266",
+        "302",
+        "305",
+        "307",
+        "309",
+        "310",
+        "311",
+        "314",
+        "328",
+        "329",
+        "330",
+        "333",
+        "335",
+        "337",
+        "345",
+        "349"
+      ]
+    ],
+    "status": {
+      "completed": true,
+      "messages": [],
+      "status_str": "success"
+    }
+  },
+  "prompt_id": "bc398397-787b-4b93-b5a0-ee1d34e34137"
+}

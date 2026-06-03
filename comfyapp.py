@@ -1,6 +1,8 @@
+import contextlib
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -10,9 +12,11 @@ from pathlib import Path
 import modal
 
 from gpu_catalog import GPU_CATALOG, get_supported_gpus, is_gpu_hidden
+from timing_trace import Trace, coerce_t0_from_browser
 
+PROFILING_ENABLED = os.getenv("COMFYMODAL_PROFILING", "0") == "1"
 DEFAULT_EXECUTION_BACKEND = os.getenv("COMFYMODAL_EXECUTION_BACKEND", "in_process")
-ENABLE_WARMUP = os.getenv("COMFYMODAL_ENABLE_WARMUP", "0") == "1"
+ENABLE_WARMUP = os.getenv("COMFYMODAL_ENABLE_WARMUP", "1") == "1"
 WARMUP_PROFILE = os.getenv("COMFYMODAL_WARMUP_PROFILE", "off")
 WARMUP_CHECKPOINT = os.getenv("COMFYMODAL_WARMUP_CHECKPOINT", "").strip()
 WARMUP_UNET = os.getenv("COMFYMODAL_WARMUP_UNET", "").strip()
@@ -282,6 +286,63 @@ def normalize_flux_clip_pair(clip1: str, clip2: str) -> tuple[str, str]:
     return clip1, clip2
 
 
+def list_sageattention_extension_files(site_packages_root: str) -> list[Path]:
+    root = Path(site_packages_root) / "sageattention"
+    if not root.is_dir():
+        return []
+    return sorted(root.glob("*.so"))
+
+
+def choose_sage_runtime_mode(enabled: bool, extension_files: list[Path], import_ok: bool, smoke_ok: bool) -> tuple[str, str]:
+    if not enabled:
+        return "disabled", "explicitly-disabled"
+    if not extension_files:
+        return "triton_fallback", "compiled-extensions-missing"
+    if not import_ok:
+        return "triton_fallback", "compiled-extensions-unusable"
+    if not smoke_ok:
+        return "triton_fallback", "smoke-test-failed"
+    return "baked_cuda", "compiled-extensions-usable"
+
+
+def patch_kjnodes_get_sage_func(module, baked_cuda_available: bool) -> bool:
+    original = getattr(module, "get_sage_func", None)
+    fallback = getattr(module, "attention_pytorch", None)
+    wrap_attn_fn = getattr(module, "wrap_attn", None)
+    if original is None or fallback is None or wrap_attn_fn is None:
+        return False
+
+    module._comfy_modal_baked_cuda_available = baked_cuda_available
+    if getattr(module, "_comfy_modal_get_sage_func_patched", False):
+        return True
+
+    def wrapped_get_sage_func(sage_attention, allow_compile=False):
+        if getattr(module, "_comfy_modal_baked_cuda_available", False) or sage_attention == "disabled":
+            return original(sage_attention, allow_compile=allow_compile)
+        if sage_attention != "auto" and "sageattn" not in str(sage_attention):
+            return original(sage_attention, allow_compile=allow_compile)
+
+        @wrap_attn_fn
+        def attention_fallback(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+            return fallback(
+                q,
+                k,
+                v,
+                heads,
+                mask=mask,
+                attn_precision=attn_precision,
+                skip_reshape=skip_reshape,
+                skip_output_reshape=skip_output_reshape,
+                **kwargs,
+            )
+
+        return attention_fallback
+
+    module.get_sage_func = wrapped_get_sage_func
+    module._comfy_modal_get_sage_func_patched = True
+    return True
+
+
 def build_replay_warmup_workflow(workflow: dict) -> dict:
     """Create a lightweight warmup from a real successful workflow.
 
@@ -355,7 +416,7 @@ def stack_to_profile(stack: dict) -> dict:
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.3.0"
+COMFYAPP_VERSION = "2.3.10"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
@@ -375,8 +436,15 @@ GPU_PROFILES = {
     "high_mem": {"cpu": 4, "memory": 32768, "target_inputs": 1, "max_inputs": 1},
 }
 
+SAGEATTENTION_GIT_REF = "v2.2.0"
+SAGEATTENTION_SITE_PACKAGES = "/usr/local/lib/python3.11/site-packages"
+
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.from_registry(
+        "nvidia/cuda:13.0.0-devel-ubuntu24.04",
+        add_python="3.11",
+    )
+    .entrypoint([])
     .apt_install(
         "git",
         "libgl1",
@@ -385,19 +453,58 @@ image = (
         "libxrender1",
         "libxext6",
         "ffmpeg",
+        "build-essential",
+        "ninja-build",
+        # CUDA 13.0 on Ubuntu 24.04 supports both GCC 13 (default) and clang
+        # as host compilers for nvcc.  We install clang as a reliable fallback
+        # since the nvidia/cuda:13.0.0-devel-ubuntu24.04 image may not ship a
+        # full GCC toolchain.
+        "clang",
     )
     .pip_install("comfy-cli==1.3.7", "httpx>=0.27.0")
     .run_commands(
         "comfy --skip-prompt install --nvidia",
         gpu="a10g",
     )
+    # Force CUDA 13.0 PyTorch after comfy install (which may install older CUDA build)
+    .run_commands(
+        "python -m pip install --upgrade --force-reinstall "
+        "torch torchvision torchaudio "
+        "--index-url https://download.pytorch.org/whl/cu130",
+        gpu="a10g",
+    )
+    # Triton >= 3.0 required for SageAttention2 on Blackwell
+    .run_commands(
+        "python -m pip install --upgrade 'triton>=3.0.0'",
+    )
+    .run_commands(
+        "CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=12.0+PTX MAX_JOBS=4 "
+        "python -m pip install --upgrade --force-reinstall "
+        "git+https://github.com/thu-ml/SageAttention.git@v2.2.0 "
+        "--no-build-isolation --no-deps",
+        gpu="a10g",
+    )
+    .run_commands(
+        "python -X utf8 -c \"import pathlib, site; "
+        "site_root = next((p for p in site.getsitepackages() if 'site-packages' in p), site.getsitepackages()[0]); "
+        "files = list(pathlib.Path(site_root).joinpath('sageattention').glob('*.so')); "
+        "print([f.name for f in files]); "
+        "assert files, 'no sageattention shared objects built'\"",
+        gpu="a10g",
+    )
+    .run_commands(
+        'python -X utf8 -c "import sageattention._fused; print(\'sageattention._fused ok\')"',
+        gpu="a10g",
+    )
     .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace")
 )
 
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("httpx>=0.27.0")
     .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace")
 )
 
 app = modal.App(APP_NAME, image=image)
@@ -477,7 +584,9 @@ def batch_download_models(items: list, hf_token: str = "") -> list:
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11").add_local_python_source("gpu_catalog"),
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
     cpu=2,
     memory=4096,
     timeout=1800,
@@ -540,7 +649,9 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11").add_local_python_source("gpu_catalog"),
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
     cpu=1,
     memory=512,
     timeout=60,
@@ -576,7 +687,9 @@ def get_volume_status() -> dict:
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11").add_local_python_source("gpu_catalog"),
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
     cpu=2,
     memory=4096,
     timeout=1800,
@@ -598,7 +711,9 @@ def upload_model_to_volume(file_data: bytes, folder: str, filename: str) -> dict
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11").add_local_python_source("gpu_catalog"),
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
     cpu=2,
     memory=4096,
     timeout=3600,
@@ -633,6 +748,8 @@ class _ComfyAPIMixin:
         return round((time.time() - started_at) * 1000, 1)
 
     def _log_profile(self, stage: str, **fields) -> None:
+        if not PROFILING_ENABLED:
+            return
         payload = " ".join(f"{k}={v}" for k, v in fields.items())
         print(f"[comfyapp.profile] stage={stage} {payload}".rstrip())
 
@@ -646,12 +763,18 @@ class _ComfyAPIMixin:
 
     def _ensure_models_symlink(self):
         """Ensure /root/comfy/ComfyUI/models symlink → MODELS_PATH exists."""
+        _t0 = time.time()
         comfy_models = "/root/comfy/ComfyUI/models"
         if not os.path.islink(comfy_models):
             if os.path.isdir(comfy_models):
                 import shutil
                 shutil.rmtree(comfy_models)
             os.symlink(MODELS_PATH, comfy_models)
+            print(f"[comfyapp] models_symlink created -> {MODELS_PATH} "
+                  f"in {(time.time()-_t0)*1000:.1f}ms")
+        else:
+            print(f"[comfyapp] models_symlink already exists -> {os.readlink(comfy_models)} "
+                  f"in {(time.time()-_t0)*1000:.1f}ms")
 
     def _save_last_model_stack(self, stack: dict) -> None:
         """Persist the model stack to the shared volume for auto-warmup."""
@@ -960,14 +1083,449 @@ class _ComfyAPIMixin:
 
         return {"installed": installed, "skipped": skipped}
 
+    # ── sageattention runtime policy helpers ──────────────────────────────
+
+    def _preferred_sage_backend(self):
+        import sageattention
+
+        for name, kwargs in (
+            ("sageattn_qk_int8_pv_fp16_cuda", {"pv_accum_dtype": "fp32"}),
+            ("sageattn_qk_int8_pv_fp8_cuda", {"pv_accum_dtype": "fp32+fp32"}),
+        ):
+            candidate = getattr(sageattention, name, None)
+            if callable(candidate):
+                return name, candidate, kwargs
+        return None, None, {}
+
+    def _verify_baked_sageattention_runtime(self) -> tuple[bool, list[str]]:
+        import importlib
+        import torch
+
+        extension_files = list_sageattention_extension_files(SAGEATTENTION_SITE_PACKAGES)
+        if not extension_files:
+            return False, ["compiled-extensions-missing"]
+
+        try:
+            import sageattention._fused  # noqa: F401
+            importlib.invalidate_caches()
+            import sageattention  # noqa: F401
+        except Exception as exc:
+            return False, [f"_fused-import-failed:{type(exc).__name__}"]
+
+        try:
+            backend_name, backend, backend_kwargs = self._preferred_sage_backend()
+            if backend is None:
+                return False, ["no-supported-kjnodes-backend-symbol"]
+            q = torch.randn(1, 16, 8, 64, device="cuda", dtype=torch.float16)
+            k = torch.randn(1, 16, 8, 64, device="cuda", dtype=torch.float16)
+            v = torch.randn(1, 16, 8, 64, device="cuda", dtype=torch.float16)
+            _ = backend(q, k, v, is_causal=False, attn_mask=None, tensor_layout="NHD", **backend_kwargs)
+            torch.cuda.synchronize()
+            return True, [str(backend_name or "unknown-backend"), *[p.name for p in extension_files]]
+        except Exception as exc:
+            return False, [f"cuda-smoke-test-failed:{type(exc).__name__}"]
+
+    def _select_sage_runtime_mode(self) -> tuple[str, str]:
+        if getattr(self, "_sage_runtime_mode", None) is not None:
+            return self._sage_runtime_mode, getattr(self, "_sage_runtime_reason", "sticky")
+
+        extension_files = list_sageattention_extension_files(SAGEATTENTION_SITE_PACKAGES)
+        ok, details = self._verify_baked_sageattention_runtime()
+        mode, reason = choose_sage_runtime_mode(
+            enabled=True,
+            extension_files=extension_files,
+            import_ok=ok,
+            smoke_ok=ok,
+        )
+        self._sage_runtime_mode = mode
+        self._sage_runtime_reason = details[0] if details else reason
+        print(f"[comfyapp] sage_runtime_mode={self._sage_runtime_mode} reason={self._sage_runtime_reason}")
+        return self._sage_runtime_mode, self._sage_runtime_reason
+
+    def _apply_sage_attention_policy(self):
+        _t0 = time.time()
+        baked_cuda_available = getattr(self, "_sage_runtime_mode", "triton_fallback") == "baked_cuda"
+        found = False
+        patched = False
+        for mod in list(sys.modules.values()):
+            file_name = getattr(mod, "__file__", "") or ""
+            if file_name.endswith("model_optimization_nodes.py"):
+                found = True
+                patched = patch_kjnodes_get_sage_func(mod, baked_cuda_available=baked_cuda_available)
+                _dur = round((time.time() - _t0) * 1000, 1)
+                print(f"[comfyapp] sage_policy module=model_optimization_nodes.py "
+                      f"found=True patched={patched} "
+                      f"baked_cuda_available={baked_cuda_available} "
+                      f"duration={_dur}ms")
+                return patched
+        _dur = round((time.time() - _t0) * 1000, 1)
+        print(f"[comfyapp] sage_policy module=model_optimization_nodes.py "
+              f"found=False baked_cuda_available={baked_cuda_available} "
+              f"duration={_dur}ms")
+        return False
+
     # ── Backend scaffold (warmup + execution backend selection) ──────────
 
-    def _execute_in_process(self, workflow: dict, input_images: dict | None = None, collect_outputs: bool = True) -> dict:
+    def _begin_prompt_profile(self, workflow: dict, prompt_id: str, outputs_to_execute) -> None:
+        node_map: dict[str, str] = {}
+        class_counts: dict[str, int] = {}
+        for node_id, spec in (workflow or {}).items():
+            if not isinstance(spec, dict):
+                continue
+            class_type = str(spec.get("class_type", "?"))
+            node_map[str(node_id)] = class_type
+            class_counts[class_type] = class_counts.get(class_type, 0) + 1
+
+        self._current_prompt_node_map = node_map
+        self._current_prompt_id = prompt_id[:8]
+        self._perf_last_node = None
+        self._perf_last_ts = None
+        self._ksampler_state = None
+
+        # Stage windows for the per-node timing trace (t4..t7).
+        # Each window records first/last seen timestamps for a given
+        # class_type so that CLIPLoader, CLIPTextEncode, Sampler and
+        # VAEDecode each have a clean start/end pair even when a single
+        # node execution spans multiple event dispatches.
+        self._stage_windows: dict[str, dict[str, float]] = {
+            "unet_load": {},
+            "clip_load": {},
+            "vae_load": {},
+            "clip_encode": {},
+            "sampler": {},
+            "vae_decode": {},
+        }
+
+        if not PROFILING_ENABLED:
+            return
+
+        self._log_profile(
+            "inproc_node_map",
+            prompt_id=prompt_id[:8],
+            outputs=len(outputs_to_execute or []),
+            map=json.dumps(node_map, sort_keys=True, separators=(",", ":")),
+        )
+        self._log_profile(
+            "inproc_node_counts",
+            prompt_id=prompt_id[:8],
+            counts=json.dumps(class_counts, sort_keys=True, separators=(",", ":")),
+        )
+
+    def _node_class_type(self, node_id) -> str:
+        return getattr(self, "_current_prompt_node_map", {}).get(str(node_id), "?")
+
+    def _begin_profiled_node(self, node, now: float) -> None:
+        node = str(node)
+        class_type = self._node_class_type(node)
+        self._perf_last_node = node
+        self._perf_last_ts = now
+        if "Sampler" in class_type:
+            self._ksampler_state = {
+                "node": node,
+                "class_type": class_type,
+                "started": now,
+                "first_progress": None,
+                "last_progress": None,
+                "progress_events": 0,
+                "max_step": 0,
+                "max_steps": 0,
+            }
+        # Trace t4..t7 stage windows: record the first time a node of the
+        # given class starts so we have a clean t<N>_start timestamp even
+        # when the class appears multiple times in the graph (e.g. dual
+        # CLIPTextEncode nodes).  The matching t<N>_end is recorded in
+        # _finish_profiled_node.
+        stage = self._stage_for_class(class_type)
+        if stage:
+            windows = getattr(self, "_stage_windows", None)
+            if windows is not None and stage != "sampler" and "start" not in windows[stage]:
+                windows[stage]["start"] = now
+                windows[stage]["start_node"] = node
+                windows[stage]["start_class"] = class_type
+        if not PROFILING_ENABLED:
+            return
+        self._log_profile(
+            "inproc_exec_progress",
+            event="executing_node",
+            node=node[:40],
+            class_type=class_type[:80],
+        )
+
+    @staticmethod
+    def _stage_for_class(class_type: str) -> str | None:
+        """Map a node class_type to one of the t4..t7 or warmup trace stages."""
+        ct = class_type or ""
+        if "UNETLoader" in ct:
+            return "unet_load"
+        if "CLIPLoader" in ct or "DualCLIPLoader" in ct:
+            return "clip_load"
+        if "VAELoader" in ct:
+            return "vae_load"
+        if "TextEncode" in ct or "CLIPTextEncode" in ct:
+            return "clip_encode"
+        if "Sampler" in ct or "SamplerAdvanced" in ct or "SamplerCustom" in ct:
+            return "sampler"
+        if "VAEDecode" in ct:
+            return "vae_decode"
+        return None
+
+    def _commit_stage_windows_to_trace(self, trace: Trace) -> None:
+        """Copy the t4..t7 stage windows onto the given trace."""
+        windows = getattr(self, "_stage_windows", None) or {}
+        for stage, fields in windows.items():
+            if not fields:
+                continue
+            start = fields.get("start")
+            end = fields.get("end")
+            if start is not None and end is not None:
+                trace._t[f"t4_clip_load_start" if stage == "clip_load"
+                         else f"t5_text_encode_start" if stage == "clip_encode"
+                         else f"t6_sampler_start" if stage == "sampler"
+                         else f"t7_vae_decode_start"] = start
+                trace._t[f"t4_clip_load_end" if stage == "clip_load"
+                         else f"t5_text_encode_end" if stage == "clip_encode"
+                         else f"t6_sampler_end" if stage == "sampler"
+                         else f"t7_vae_decode_end"] = end
+
+    def _note_progress_event(self, data: dict) -> None:
+        state = getattr(self, "_ksampler_state", None)
+        if not state:
+            return
+        node = str(data.get("node", ""))
+        if node != str(state.get("node")):
+            return
+        now = time.time()
+        if state["first_progress"] is None:
+            state["first_progress"] = now
+        state["last_progress"] = now
+        state["progress_events"] += 1
+        state["max_step"] = max(state["max_step"], int(data.get("step", 0)))
+        state["max_steps"] = max(state["max_steps"], int(data.get("max", 0)))
+
+    def _finish_profiled_node(self, now: float) -> None:
+        last_node = getattr(self, "_perf_last_node", None)
+        last_ts = getattr(self, "_perf_last_ts", None)
+        if last_node is None or last_ts is None:
+            return
+        class_type = self._node_class_type(last_node)
+        duration_ms = round((now - last_ts) * 1000, 1)
+        # Trace: close the matching t<N>_end timestamp for this stage.
+        stage = self._stage_for_class(class_type)
+        windows = getattr(self, "_stage_windows", None)
+        if stage and windows and stage != "sampler" and "start" in windows[stage] and "end" not in windows[stage]:
+            windows[stage]["end"] = now
+            windows[stage]["end_node"] = last_node
+
+        sampler_phase = None
+        state = getattr(self, "_ksampler_state", None)
+        if stage == "sampler" and state and str(state.get("node")) == str(last_node):
+            first = state.get("first_progress")
+            last = state.get("last_progress")
+            if first is None:
+                prep_ms = duration_ms
+                denoise_ms = 0.0
+                teardown_ms = 0.0
+            else:
+                prep_ms = round(max(0.0, (first - state["started"]) * 1000), 1)
+                denoise_ms = round(max(0.0, ((last or first) - first) * 1000), 1)
+                teardown_ms = round(max(0.0, duration_ms - prep_ms - denoise_ms), 1)
+            if windows and stage in windows:
+                # Prefer the sampler node that actually emitted progress callbacks.
+                # This avoids latching onto earlier light-weight sampler-like
+                # nodes that finish instantly but still match the class-name heuristic.
+                if first is not None:
+                    windows[stage]["node_start"] = state["started"]
+                    windows[stage]["start"] = first
+                    windows[stage]["end"] = last or first
+                    windows[stage]["progress_start"] = first
+                    windows[stage]["progress_end"] = last or first
+                    windows[stage]["progress_events"] = state.get("progress_events", 0)
+                    windows[stage]["max_step"] = state.get("max_step", 0)
+                    windows[stage]["max_steps"] = state.get("max_steps", 0)
+                    windows[stage]["duration_ms"] = duration_ms
+                    windows[stage]["source"] = "progress"
+                else:
+                    previous_duration = float(windows[stage].get("duration_ms", -1.0))
+                    if duration_ms > previous_duration:
+                        windows[stage]["start"] = state["started"]
+                        windows[stage]["end"] = now
+                        windows[stage]["duration_ms"] = duration_ms
+                        windows[stage]["source"] = "node_duration"
+            sampler_phase = {
+                "prep_ms": prep_ms,
+                "denoise_ms": denoise_ms,
+                "teardown_ms": teardown_ms,
+                "progress_events": state.get("progress_events", 0),
+                "max_step": state.get("max_step", 0),
+                "max_steps": state.get("max_steps", 0),
+                "duration_ms": duration_ms,
+            }
+            self._ksampler_state = None
+
+        if not PROFILING_ENABLED:
+            return
+        print(f"[comfyapp.perf] node={last_node} class_type={class_type} duration_ms={duration_ms:.1f}")
+
+        if sampler_phase is not None:
+            self._log_profile(
+                "ksampler_phase",
+                node=str(last_node)[:40],
+                class_type=class_type[:80],
+                prep_ms=sampler_phase["prep_ms"],
+                denoise_ms=sampler_phase["denoise_ms"],
+                teardown_ms=sampler_phase["teardown_ms"],
+                progress_events=sampler_phase["progress_events"],
+                max_step=sampler_phase["max_step"],
+                max_steps=sampler_phase["max_steps"],
+                duration_ms=sampler_phase["duration_ms"],
+            )
+
+    def _patch_model_clone_profiling(self, model_patcher_module) -> None:
+        if getattr(self, "_model_clone_profile_patched", False):
+            return
+
+        for method_name in ("clone", "patch_model", "unpatch_model"):
+            original = getattr(model_patcher_module.ModelPatcher, method_name, None)
+            if not callable(original):
+                continue
+
+            def _wrapped(patcher, *args, __orig=original, __name=method_name, **kwargs):
+                started = time.time()
+                result = __orig(patcher, *args, **kwargs)
+                model_obj = getattr(patcher, "model", None)
+                self._log_profile(
+                    "model_clone",
+                    call=__name,
+                    patcher=type(patcher).__name__,
+                    model=type(model_obj).__name__[:80],
+                    duration_ms=self._profile_ms(started),
+                )
+                return result
+
+            setattr(model_patcher_module.ModelPatcher, method_name, _wrapped)
+
+        self._model_clone_profile_patched = True
+
+    def _loaded_model_names(self, model_management_module) -> list[str]:
+        names: list[str] = []
+        loaded = getattr(model_management_module, "current_loaded_models", None)
+        if not isinstance(loaded, list):
+            loaded = getattr(model_management_module, "loaded_models", None)
+        if not isinstance(loaded, list):
+            return names
+        for entry in loaded:
+            candidate = entry
+            model_obj = getattr(candidate, "model", None)
+            if model_obj is not None:
+                names.append(type(model_obj).__name__[:80])
+                continue
+            model = getattr(candidate, "model_patcher", None)
+            model_obj = getattr(model, "model", None)
+            if model_obj is not None:
+                names.append(type(model_obj).__name__[:80])
+                continue
+            names.append(type(candidate).__name__[:80])
+        names.sort()
+        return names
+
+    def _gpu_mem_profile(self):
+        alloc_gb = reserved_gb = None
+        try:
+            import torch
+            if torch.cuda.is_available():
+                alloc_gb = round(torch.cuda.memory_allocated() / (1024 ** 3), 3)
+                reserved_gb = round(torch.cuda.memory_reserved() / (1024 ** 3), 3)
+        except Exception:
+            pass
+        return alloc_gb, reserved_gb
+
+    def _patch_model_management_profiling(self, model_management_module) -> None:
+        if getattr(self, "_model_management_profile_patched", False):
+            return
+
+        for func_name in ("load_models_gpu", "load_model_gpu", "cleanup_models_gc", "soft_empty_cache", "free_memory"):
+            original = getattr(model_management_module, func_name, None)
+            if not callable(original):
+                continue
+
+            def _wrapped(*args, __orig=original, __name=func_name, **kwargs):
+                loaded_before = self._loaded_model_names(model_management_module)
+                alloc_before_gb, reserved_before_gb = self._gpu_mem_profile()
+                vram_state_before = getattr(model_management_module, "vram_state", None)
+                disable_smart_memory = getattr(model_management_module, "DISABLE_SMART_MEMORY", None)
+                started = time.time()
+                result = __orig(*args, **kwargs)
+                loaded_after = self._loaded_model_names(model_management_module)
+                alloc_after_gb, reserved_after_gb = self._gpu_mem_profile()
+                vram_state_after = getattr(model_management_module, "vram_state", None)
+                model_count = "?"
+                if args:
+                    first = args[0]
+                    if isinstance(first, (list, tuple, set)):
+                        model_count = len(first)
+                    elif first is not None:
+                        model_count = 1
+                self._log_profile(
+                    "model_mgmt",
+                    call=__name,
+                    models=model_count,
+                    loaded_count_before=len(loaded_before),
+                    loaded_count_after=len(loaded_after),
+                    loaded_before=json.dumps(loaded_before, separators=(",", ":")),
+                    loaded_after=json.dumps(loaded_after, separators=(",", ":")),
+                    alloc_before_gb=alloc_before_gb if alloc_before_gb is not None else "?",
+                    alloc_after_gb=alloc_after_gb if alloc_after_gb is not None else "?",
+                    reserved_before_gb=reserved_before_gb if reserved_before_gb is not None else "?",
+                    reserved_after_gb=reserved_after_gb if reserved_after_gb is not None else "?",
+                    vram_state_before=vram_state_before if vram_state_before is not None else "?",
+                    vram_state_after=vram_state_after if vram_state_after is not None else "?",
+                    disable_smart_memory=disable_smart_memory if disable_smart_memory is not None else "?",
+                    duration_ms=self._profile_ms(started),
+                )
+                return result
+
+            setattr(model_management_module, func_name, _wrapped)
+
+        self._model_management_profile_patched = True
+
+    def _patch_offload_devices_for_high_vram(self, model_management_module) -> None:
+        """When vram_state is HIGH_VRAM, keep text encoders, VAE, and
+        intermediate tensors on GPU instead of offloading to CPU.
+
+        ComfyUI's ``unet_offload_device()`` already respects HIGH_VRAM,
+        but ``text_encoder_offload_device()``, ``vae_offload_device()`` and
+        ``intermediate_device()`` only check ``args.gpu_only``.  This patch
+        makes them consistent so that HIGH_VRAM truly means "keep everything
+        on GPU when possible".
+        """
+        if getattr(self, "_offload_devices_patched", False):
+            return
+        mm = model_management_module
+        torch_dev = mm.get_torch_device()
+        high_vram = mm.VRAMState.HIGH_VRAM
+
+        for func_name in ("text_encoder_offload_device", "vae_offload_device", "intermediate_device"):
+            original = getattr(mm, func_name, None)
+            if not callable(original):
+                continue
+
+            def _wrapper(*args, __orig=original, **kwargs):
+                if getattr(mm, "vram_state", None) == high_vram:
+                    return torch_dev
+                return __orig(*args, **kwargs)
+
+            setattr(mm, func_name, _wrapper)
+
+        self._offload_devices_patched = True
+
+    def _execute_in_process(self, workflow: dict, input_images: dict | None = None, collect_outputs: bool = True, trace: Trace | None = None) -> dict:
         """Execute a ComfyUI workflow directly in-process.
 
         Args:
             workflow: ComfyUI workflow (dict of node-id → node-spec).
             input_images: Optional mapping of filename → base64-encoded data.
+            collect_outputs: When False, skip output collection (warmup mode).
+            trace: Optional Trace to populate with timing markers.
 
         Returns:
             ``{"images": [...], "videos": [...]}`` where each entry contains
@@ -978,6 +1536,7 @@ class _ComfyAPIMixin:
         from pathlib import Path
 
         prompt_id = str(uuid.uuid4())
+        prompt_start_time: float | None = None
 
         # ── Write input images to ComfyUI's input directory ──
         stage_started = time.time()
@@ -988,12 +1547,19 @@ class _ComfyAPIMixin:
                 (inp / Path(fname).name).write_bytes(base64.b64decode(b64))
         self._log_profile("inproc_input_prepare", prompt_id=prompt_id[:8], count=len(input_images or {}), duration_ms=self._profile_ms(stage_started))
 
+        # Start the execution window after source-image uploads land on
+        # disk so the fallback output scan does not echo them back as
+        # generated outputs.
+        prompt_start_time = time.time()
+
         # ── Validate (async in ComfyUI v0.22+) ──
         stage_started = time.time()
         valid, error, outputs_to_execute, node_errors = self._event_loop.run_until_complete(
             execution.validate_prompt(prompt_id, workflow, None)
         )
         self._log_profile("inproc_validate", prompt_id=prompt_id[:8], valid=1 if valid else 0, outputs=len(outputs_to_execute or []), duration_ms=self._profile_ms(stage_started))
+        if trace is not None:
+            trace.mark("t3b_validate_done")
         if not valid:
             parts = [error.get("message", str(error)) if isinstance(error, dict) else str(error)]
             if node_errors:
@@ -1003,10 +1569,14 @@ class _ComfyAPIMixin:
                         parts.append(f"{ct}: {e.get('message', 'unknown error')}")
             raise RuntimeError(f"Workflow validation failed: {'; '.join(parts)}")
 
+        self._begin_prompt_profile(workflow, prompt_id, outputs_to_execute)
+
         # ── Reset execution-level accumulators ──
         self._exec_model_load_io_ms = 0.0
         self._exec_deepcopy_ms = 0.0
         self._log_profile("inproc_prep_done", prompt_id=prompt_id[:8], duration_ms=self._profile_ms(stage_started))
+        if trace is not None:
+            trace.mark("t3c_prep_done")
         _exec_stage = time.time()
 
         # ── Execute ──
@@ -1027,6 +1597,32 @@ class _ComfyAPIMixin:
             non_io_exec_ms=round(max(0.0, total_exec_ms - self._exec_model_load_io_ms - _deepcopy_total), 1),
             success=1 if getattr(self._executor, "success", True) else 0,
         )
+        # Commit t4..t7 stage windows from the node events to the trace.
+        if trace is not None:
+            self._commit_stage_windows_to_trace(trace)
+        # t8 — final image was written by SaveImage.  The actual file
+        # mtime is a more truthful marker than "executor returned" so we
+        # query the youngest png/jpg in the output directory that
+        # appeared during this prompt's window.
+        if trace is not None and collect_outputs:
+            try:
+                from pathlib import Path as _P
+                out_dir = _P("/root/comfy/ComfyUI/output")
+                if out_dir.is_dir():
+                    candidates = []
+                    for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm"):
+                        for f in out_dir.glob(f"*{ext}"):
+                            try:
+                                mt = f.stat().st_mtime
+                            except OSError:
+                                continue
+                            if mt >= prompt_start_time - 1.0:
+                                candidates.append((mt, f))
+                    if candidates:
+                        latest_mt = max(c[0] for c in candidates)
+                        trace.mark("t8_image_written", t=latest_mt)
+            except Exception as exc:
+                print(f"[comfyapp] trace t8 lookup failed: {exc}")
         if getattr(self._executor, "success", True) is False:
             messages = getattr(self._executor, "status_messages", [])
             error_messages = []
@@ -1039,77 +1635,164 @@ class _ComfyAPIMixin:
         if not collect_outputs:
             return {"images": [], "videos": []}
         stage_started = time.time()
-        result = self._collect_in_process_outputs(prompt_id)
+        result = self._collect_in_process_outputs(prompt_id, prompt_start_time=prompt_start_time)
         self._log_profile("inproc_collect", prompt_id=prompt_id[:8], images=len(result.get("images", [])), videos=len(result.get("videos", [])), duration_ms=self._profile_ms(stage_started))
+        if trace is not None:
+            trace.mark("t8b_outputs_collected")
         return result
 
-    def _collect_in_process_outputs(self, prompt_id: str) -> dict:
+    def _collect_in_process_outputs(self, prompt_id: str, prompt_start_time: float | None = None) -> dict:
         """Read generated outputs after an in-process execution.
 
-        Prefers structured metadata from the prompt-queue history (which
-        maps node-ids to filenames).  Falls back to scanning the output
-        directory if history is not available.
+        Tries four sources, in priority order, returning the union:
+
+        1. ``self._executor.history_result`` — set by ``PromptExecutor.execute()``
+           when the last execution populated it.
+        2. ``self._dummy_server.prompt_queue.history[prompt_id]`` — populated
+           by the PromptQueue (typically empty for direct executor calls).
+        3. **Directory scan scoped to the prompt's execution window** —
+           finds any image/video file written to ComfyUI's ``output``,
+           ``temp``, or ``input`` directory *after* ``prompt_start_time``.
+           This catches every file the workflow actually wrote regardless
+           of whether history metadata is structured as expected.
+        4. **Directory scan of the most-recent 20 files** — last-resort
+           fallback when no ``prompt_start_time`` is available (e.g. older
+           callers).
+
+        Each image/video entry is ``{"filename", "data" (base64), "node_id"}``.
+
+        The ``type`` field on image metadata is honoured: ``output`` is
+        looked up under ``ComfyUI/output``, ``temp`` under ``ComfyUI/temp``,
+        ``input`` under ``ComfyUI/input``.  The supplemental directory-scan
+        path only walks ``output`` and ``temp`` so uploaded source images do
+        not get returned as generated outputs.
         """
         import base64
         from pathlib import Path
 
         images: list[dict] = []
         videos: list[dict] = []
-        outputs: dict = {}
-        out_dir = Path("/root/comfy/ComfyUI/output")
+        seen_filenames: set[str] = set()  # de-dupe across sources
 
-        # ── Try executor history first (direct PromptExecutor execution does
-        #    not necessarily populate PromptQueue.history). ──
+        comfy_root = Path("/root/comfy/ComfyUI")
+        dir_for_type = {
+            "output": comfy_root / "output",
+            "temp": comfy_root / "temp",
+            "input": comfy_root / "input",
+        }
+
+        def _try_read_file(fp: Path, node_id: str, animated: bool) -> None:
+            """Read a single file and append to images/videos if successful."""
+            if not fp.is_file():
+                return
+            key = str(fp)
+            if key in seen_filenames:
+                return
+            seen_filenames.add(key)
+            _r_start = time.time()
+            raw = fp.read_bytes()
+            _r_ms = round((time.time() - _r_start) * 1000, 1)
+            if _r_ms > 100:
+                print(f"[comfyapp] slow output read: file={fp.name} size={len(raw)} duration_ms={_r_ms}")
+            entry = {"filename": fp.name, "data": base64.b64encode(raw).decode(), "node_id": node_id}
+            if animated or fp.suffix.lower() in (".gif", ".mp4", ".webm", ".webp"):
+                videos.append(entry)
+            else:
+                images.append(entry)
+
+        def _scan_dir_for_files(base: Path, since_ts: float | None, limit: int = 20) -> None:
+            """Scan a base directory for image/video files, optionally
+            filtered to ``mtime >= since_ts``.  Adds to images/videos via
+            ``_try_read_file``."""
+            if not base.is_dir():
+                return
+            candidates: list[Path] = []
+            for f in base.iterdir():
+                if not f.is_file():
+                    continue
+                if f.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm"):
+                    continue
+                if since_ts is not None:
+                    try:
+                        if f.stat().st_mtime < since_ts - 1.0:  # 1s slack for clock drift
+                            continue
+                    except OSError:
+                        continue
+                candidates.append(f)
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            for f in candidates[:limit]:
+                _try_read_file(f, node_id="0", animated=f.suffix.lower() in (".gif", ".mp4", ".webm"))
+
+        # ── Source 1: executor.history_result ─────────────────────────
+        outputs: dict = {}
         try:
             history_result = getattr(self._executor, "history_result", None)
             if isinstance(history_result, dict):
                 outputs = history_result.get("outputs", {}) or {}
-        except Exception:
-            pass
-
-        # ── Try structured queue history as a secondary source ──
-        try:
-            history = self._dummy_server.prompt_queue.history
-            if not outputs and prompt_id in history:
-                outputs = history[prompt_id].get("outputs", {})
-        except Exception:
-            pass
-
+        except Exception as exc:
+            print(f"[comfyapp] executor.history_result read failed: {exc}")
         if outputs:
             for node_id, node_out in outputs.items():
+                if not isinstance(node_out, dict):
+                    continue
                 for img in node_out.get("images", []):
-                    fp = out_dir / img.get("subfolder", "") / img["filename"]
-                    if not fp.is_file():
+                    if not isinstance(img, dict):
                         continue
-                    _r_start = time.time()
-                    raw = fp.read_bytes()
-                    _r_ms = round((time.time() - _r_start) * 1000, 1)
-                    if _r_ms > 100:
-                        print(f"[comfyapp] slow output read: file={img['filename']} size={len(raw)} duration_ms={_r_ms}")
+                    base = dir_for_type.get(img.get("type", "output"), comfy_root / "output")
+                    sub = img.get("subfolder", "") or ""
+                    fp = base / sub / img.get("filename", "")
+                    if not fp.is_file():
+                        print(f"[comfyapp] history-listed file not found: {fp}")
                     animated = bool(node_out.get("animated", False))
-                    entry = {"filename": img["filename"], "data": base64.b64encode(raw).decode(), "node_id": node_id}
-                    if animated:
-                        videos.append(entry)
-                    else:
-                        images.append(entry)
-
+                    _try_read_file(fp, node_id=node_id, animated=animated)
                 for vid in node_out.get("gifs", []):
-                    fp = out_dir / vid["filename"]
-                    if fp.is_file():
-                        _r_start = time.time()
-                        raw = fp.read_bytes()
-                        _r_ms = round((time.time() - _r_start) * 1000, 1)
-                        if _r_ms > 100:
-                            print(f"[comfyapp] slow output read: file={vid['filename']} size={len(raw)} duration_ms={_r_ms}")
-                        videos.append({"filename": vid["filename"], "data": base64.b64encode(raw).decode(), "node_id": node_id})
-        else:
-            # ── Fallback: scan for most recent files ──
-            print("[comfyapp] output history not found, scanning output directory")
-            if out_dir.is_dir():
-                for f in sorted(out_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)[:20]:
-                    if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm"):
-                        images.append({"filename": f.name, "data": base64.b64encode(f.read_bytes()).decode(), "node_id": "0"})
+                    if not isinstance(vid, dict):
+                        continue
+                    base = dir_for_type.get(vid.get("type", "output"), comfy_root / "output")
+                    sub = vid.get("subfolder", "") or ""
+                    fp = base / sub / vid.get("filename", "")
+                    animated = True
+                    _try_read_file(fp, node_id=node_id, animated=animated)
 
+        # ── Source 2: dummy_server.prompt_queue.history[prompt_id] ───
+        if not seen_filenames:
+            try:
+                history = self._dummy_server.prompt_queue.history
+                if isinstance(history, dict) and prompt_id in history:
+                    queue_outputs = history[prompt_id].get("outputs", {}) or {}
+                    if queue_outputs:
+                        for node_id, node_out in queue_outputs.items():
+                            if not isinstance(node_out, dict):
+                                continue
+                            for img in node_out.get("images", []):
+                                if not isinstance(img, dict):
+                                    continue
+                                base = dir_for_type.get(img.get("type", "output"), comfy_root / "output")
+                                sub = img.get("subfolder", "") or ""
+                                fp = base / sub / img.get("filename", "")
+                                animated = bool(node_out.get("animated", False))
+                                _try_read_file(fp, node_id=node_id, animated=animated)
+            except Exception as exc:
+                print(f"[comfyapp] prompt_queue.history read failed: {exc}")
+
+        # ── Source 3: directory scan scoped to the prompt's time window ─
+        # Always run as a supplement — catches files the workflow wrote
+        # that the executor didn't return in its history metadata.
+        if prompt_start_time is not None:
+            for base in (comfy_root / "output", comfy_root / "temp"):
+                _scan_dir_for_files(base, since_ts=prompt_start_time)
+
+        # ── Source 4: most-recent-files fallback ──────────────────────
+        if not seen_filenames and prompt_start_time is None:
+            print("[comfyapp] output history not found, scanning output directory")
+            _scan_dir_for_files(comfy_root / "output", since_ts=None)
+
+        if not seen_filenames:
+            print(
+                f"[comfyapp] no outputs found for prompt_id={prompt_id[:8]} "
+                f"(history_result_empty={not bool(outputs)} "
+                f"prompt_start_time={'set' if prompt_start_time else 'none'})"
+            )
         print(f"[comfyapp] collected {len(images)} images, {len(videos)} videos")
         return {"images": images, "videos": videos}
 
@@ -1118,6 +1801,124 @@ class _ComfyAPIMixin:
         if getattr(self, "_backend_fallback", False):
             return "subprocess"
         return DEFAULT_EXECUTION_BACKEND
+
+    @contextlib.contextmanager
+    def _force_cpu_during_snapshot(self):
+        """Lie to PyTorch about CUDA availability during snap=True.
+
+        Modal's GPU memory snapshot captures the parent's CUDA driver state
+        (context handles, streams, events) along with the Python state.
+        On restore the driver context is fresh — the captured handles are
+        dangling pointers → SIGSEGV (exit code 139) the first time the
+        restored process touches a CUDA tensor.
+
+        Workaround: monkey-patch ``torch.cuda.is_available()`` and
+        ``torch.cuda.current_device()`` to lie about CUDA during snap=True
+        so ComfyUI's ``model_management`` thinks there is no GPU and skips
+        all CUDA initialisation.  The snapshot then captures a CPU-only
+        Python state (imported modules, registered nodes, PromptExecutor,
+        DummyServer, etc.) with zero CUDA driver state.
+
+        On restore, ``_warmup_cuda()`` reconnects the real GPU; the first
+        ``executor.execute()`` allocates fresh CUDA tensors.
+
+        Additionally, this context manager blocks imports of CUDA C
+        extension modules (``sageattn_qk_int8_pv_fp16_cuda``,
+        ``sageattn_qk_int8_pv_fp8_cuda``, and any other module matching
+        the ``*_cuda`` / ``cuda_*`` pattern).  These C extensions'
+        ``PyInit_*`` functions call CUDA APIs directly (bypassing the
+        ``torch.cuda.is_available()`` patch) and allocate GPU memory
+        during module load — which would land in the snapshot and
+        trigger SIGSEGV on restore.  The block makes any custom node
+        that imports sageattention fall back to Triton mode for the
+        duration of the snapshot; restore later selects a baked runtime
+        mode after CUDA is available again.
+
+        This is the technique used by tolgaouz/modal-comfy-worker for the
+        "ComfyUI Cold Starts Down to Under 3 Seconds on Modal" example.
+        The patch is removed in the ``finally`` block, so the snapshot
+        does **not** contain the monkey-patched functions.
+        """
+        import sys
+        import warnings
+        import torch
+
+        comfy_path = "/root/comfy/ComfyUI"
+        if comfy_path not in sys.path:
+            sys.path.insert(0, comfy_path)
+        import comfy.cli_args
+
+        # ── Monkey-patch torch.cuda query functions ──
+        # The first access to torch.cuda triggers its __init__.py which calls
+        # _check_driver() — this detects the real GPU and emits a noisy
+        # "compute capability (CC) 12.0 is unsupported" warning.  During
+        # snap=True we deliberately hide the GPU; suppress the warning at
+        # the import point.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            original_is_available = torch.cuda.is_available
+            original_current_device = torch.cuda.current_device
+        original_args_cpu = getattr(comfy.cli_args.args, "cpu", False)
+        torch.cuda.is_available = lambda: False
+        torch.cuda.current_device = lambda: torch.device("cpu")
+        # ComfyUI's model_management defaults cpu_state=GPU at import time
+        # unless CLI args explicitly force CPU mode. During snap=True we
+        # must also lie at the ComfyUI argument layer so its import-time
+        # feature probes don't touch CUDA.
+        comfy.cli_args.args.cpu = True
+
+        # ── Block CUDA C extension imports during snapshot creation ─────
+        # The C extension's PyInit_* runs CUDA driver calls (cudaGetDevice,
+        # cudaMalloc, …) that bypass torch.cuda.is_available and create
+        # state in the captured snapshot.  Raising ImportError makes
+        # sageattention's __init__.py fall back to its Triton path.
+        class _BlockCudaModuleImport:
+            def find_spec(self, name, path=None, target=None):
+                if self._is_cuda_module(name):
+                    raise ImportError(
+                        f"[comfyapp] blocked CUDA module import "
+                        f"{name!r} during snap=True to keep snapshot clean"
+                    )
+                return None
+
+            def find_module(self, name, path=None):
+                if self._is_cuda_module(name):
+                    return self
+                return None
+
+            def load_module(self, name):
+                raise ImportError(
+                    f"[comfyapp] blocked CUDA module import "
+                    f"{name!r} during snap=True to keep snapshot clean"
+                )
+
+            @staticmethod
+            def _is_cuda_module(name: str) -> bool:
+                # Matches:
+                #   sageattn_qk_int8_pv_fp16_cuda
+                #   sageattn_qk_int8_pv_fp8_cuda
+                #   comfy_*/cuda_*
+                #   *_cuda
+                #   cuda_*
+                return (
+                    name.endswith("_cuda")
+                    or name.startswith("cuda_")
+                    or "_cuda_" in name
+                )
+
+        blocker = _BlockCudaModuleImport()
+        sys.meta_path.insert(0, blocker)
+
+        try:
+            yield
+        finally:
+            try:
+                sys.meta_path.remove(blocker)
+            except ValueError:
+                pass
+            comfy.cli_args.args.cpu = original_args_cpu
+            torch.cuda.is_available = original_is_available
+            torch.cuda.current_device = original_current_device
 
     def _start_in_process_backend(self):
         """Initialize ComfyUI in-process for snapshot-friendly execution.
@@ -1154,6 +1955,8 @@ class _ComfyAPIMixin:
         import utils.mime_types  # reinforces utils package before comfy loads
 
         import asyncio
+        import comfy.model_management
+        import comfy.model_patcher
         import comfy.utils
         import execution
         import nodes
@@ -1161,7 +1964,14 @@ class _ComfyAPIMixin:
         self._log_profile("inproc_imports", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
+        comfy.model_management.DISABLE_SMART_MEMORY = False
+        if hasattr(comfy.model_management, "VRAMState") and hasattr(comfy.model_management.VRAMState, "HIGH_VRAM"):
+            comfy.model_management.vram_state = comfy.model_management.VRAMState.HIGH_VRAM
+            self._patch_offload_devices_for_high_vram(comfy.model_management)
         self._patch_model_cpu_cache(comfy.utils)
+        if PROFILING_ENABLED:
+            self._patch_model_clone_profiling(comfy.model_patcher)
+            self._patch_model_management_profiling(comfy.model_management)
         self._log_profile("inproc_patch", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
@@ -1209,34 +2019,30 @@ class _ComfyAPIMixin:
         # ── Wire up send_sync for execution-progress logging ──
         def _on_sync(event, data, sid):
             if event == "execution_start":
-                self._log_profile("inproc_exec_progress", event="execution_start", prompt_id=data.get("prompt_id","")[:8])
+                if PROFILING_ENABLED:
+                    self._log_profile("inproc_exec_progress", event="execution_start", prompt_id=data.get("prompt_id","")[:8])
             elif event == "executing":
                 node = data.get("node", None)
                 now = time.time()
                 if node is None:
-                    # Log wall-clock time the PREVIOUS node consumed
-                    if hasattr(self, "_perf_last_node") and self._perf_last_node is not None:
-                        _pn = self._perf_last_node
-                        _ps = (now - self._perf_last_ts) * 1000
-                        print(f"[comfyapp.perf] node={_pn} duration_ms={_ps:.1f}")
-                        # Also log total sampling time if this was a KSampler node
-                    self._log_profile("inproc_exec_progress", event="execution_done")
+                    self._finish_profiled_node(now)
+                    if PROFILING_ENABLED:
+                        self._log_profile("inproc_exec_progress", event="execution_done")
                 else:
-                    if hasattr(self, "_perf_last_node") and self._perf_last_node is not None:
-                        _pn = self._perf_last_node
-                        _ps = (now - self._perf_last_ts) * 1000
-                        print(f"[comfyapp.perf] node={_pn} duration_ms={_ps:.1f}")
-                    self._perf_last_node = node
-                    self._perf_last_ts = now
-                    self._log_profile("inproc_exec_progress", event="executing_node", node=str(node)[:40])
+                    self._finish_profiled_node(now)
+                    self._begin_profiled_node(node, now)
             elif event == "progress":
-                self._log_profile("inproc_exec_progress", event="progress", node=str(data.get("node",""))[:40], step=data.get("step",0), max=data.get("max",0))
+                self._note_progress_event(data)
+                if PROFILING_ENABLED:
+                    self._log_profile("inproc_exec_progress", event="progress", node=str(data.get("node",""))[:40], step=data.get("step",0), max=data.get("max",0))
             elif event == "execution_error":
-                self._log_profile("inproc_exec_progress", event="execution_error", node=str(data.get("node",""))[:40])
+                if PROFILING_ENABLED:
+                    self._log_profile("inproc_exec_progress", event="execution_error", node=str(data.get("node",""))[:40])
         dummy._send_sync_callback = _on_sync
 
         # Register built-in + custom nodes (async in ComfyUI v0.22+)
         self._event_loop.run_until_complete(nodes.init_extra_nodes())
+        self._apply_sage_attention_policy()
         self._log_profile("inproc_node_init", duration_ms=self._profile_ms(_stage))
 
         self._in_process_ready = True
@@ -1329,33 +2135,74 @@ class _ComfyAPIMixin:
         ``is_in_proc=True`` — it only runs on the ``restore()`` path where
         the GPU is available.
         """
+        _t0 = time.time()
         profile = load_warmup_profile()
+        t_load_profile = round((time.time() - _t0) * 1000, 1)
+
         replay_workflow = {}
+        t_load_replay = 0.0
         if not profile:
+            _t0 = time.time()
             replay_workflow = self._load_last_warmup_workflow()
+            t_load_replay = round((time.time() - _t0) * 1000, 1)
+
+        t_load_stack = 0.0
         if not profile and not replay_workflow:
+            _t0 = time.time()
             profile = stack_to_profile(self._load_last_model_stack())
+            t_load_stack = round((time.time() - _t0) * 1000, 1)
+
         if not profile and not replay_workflow:
+            print(f"[comfyapp] warmup disabled (no profile, no replay, no stack)")
             return {"mode": "none", "status": "disabled"}
         started = time.time()
         try:
             if replay_workflow:
                 workflow = replay_workflow
                 mode = "workflow"
+                t_validate = 0.0
+                t_build = 0.0
             else:
+                _t0 = time.time()
                 self._validate_warmup_profile_files(profile)
+                t_validate = round((time.time() - _t0) * 1000, 1)
+                _t0 = time.time()
                 workflow = self._build_warmup_workflow(profile)
+                t_build = round((time.time() - _t0) * 1000, 1)
                 mode = profile.get("mode")
             if self._select_backend() == "in_process":
+                _t0 = time.time()
                 self._execute_in_process(workflow, collect_outputs=False)
+                t_exec = round((time.time() - _t0) * 1000, 1)
             else:
+                _t0 = time.time()
                 self._submit_and_poll(workflow)
+                t_exec = round((time.time() - _t0) * 1000, 1)
             duration_ms = round((time.time() - started) * 1000, 1)
-            return {"mode": mode, "status": "ok", "duration_ms": duration_ms}
+            t_overhead = round(duration_ms - t_exec - t_validate - t_build - t_load_profile - t_load_replay - t_load_stack, 1)
+            # Extract per-node timing breakdown from stage windows
+            node_timing: dict[str, float] = {}
+            windows = getattr(self, "_stage_windows", None) or {}
+            for stage, fields in windows.items():
+                s = fields.get("start")
+                e = fields.get("end")
+                if s is not None and e is not None:
+                    node_timing[f"{stage}_ms"] = round((e - s) * 1000, 1)
+            print(f"[comfyapp] warmup mode={mode} total={duration_ms}ms "
+                  f"load_profile={t_load_profile}ms "
+                  f"load_replay={t_load_replay}ms "
+                  f"load_stack={t_load_stack}ms "
+                  f"validate={t_validate}ms "
+                  f"build={t_build}ms "
+                  f"exec={t_exec}ms "
+                  f"overhead={t_overhead}ms "
+                  f"node_timing={node_timing}")
+            return {"mode": mode, "status": "ok", "duration_ms": duration_ms, "node_timing": node_timing}
         except Exception as exc:
             import traceback
             duration_ms = round((time.time() - started) * 1000, 1)
-            print(f"[comfyapp] auto-warmup failed after {duration_ms}ms:\n{traceback.format_exc()}")
+            print(f"[comfyapp] warmup failed after {duration_ms}ms "
+                  f"mode={'workflow' if replay_workflow else profile.get('mode')}:\n{traceback.format_exc()}")
             return {
                 "mode": "workflow" if replay_workflow else profile.get("mode"),
                 "status": "error",
@@ -1423,75 +2270,66 @@ class _ComfyAPIMixin:
 
         is_in_proc = (self._select_backend() == "in_process")
 
+        stage_started = time.time()
+        self._ensure_models_symlink()
+        self._log_profile("startup_symlink", duration_ms=self._profile_ms(stage_started))
+
+        stage_started = time.time()
+        manager_paths = set_manager_network_mode_offline()
+        self._log_profile("manager_network_mode", mode="offline", paths=len(manager_paths), duration_ms=self._profile_ms(stage_started))
+
+        stage_started = time.time()
+        vol.reload()
+        self._log_profile("volume_reload", duration_ms=self._profile_ms(stage_started))
+
+        stage_started = time.time()
+        _, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
+        self._log_profile("custom_nodes_sync", duration_ms=self._profile_ms(stage_started), state_count=len(self._custom_nodes_state))
+
+        stage_started = time.time()
+        install_summary = self._install_custom_node_requirements()
+        self._log_profile("requirements_install", duration_ms=self._profile_ms(stage_started), installed=len(install_summary.get("installed", [])), skipped=len(install_summary.get("skipped", [])))
+
+        stage_started = time.time()
+        self._record_runtime_state()
+        self._log_profile("runtime_state_record", duration_ms=self._profile_ms(stage_started))
+
         if is_in_proc:
+            # Wrap in-process backend init in force_cpu_during_snapshot.
+            # ComfyUI's model_management thinks there is no GPU and skips
+            # all CUDA initialisation, so the snapshot contains only the
+            # CPU-only Python state (modules, nodes, executor, dummy
+            # server) with zero CUDA driver handles — no SIGSEGV on
+            # restore. On restore we just warm CUDA, choose a baked Sage runtime
+            # mode, and keep the in-process backend alive.
             stage_started = time.time()
-            self._ensure_models_symlink()
-            self._log_profile("startup_symlink", duration_ms=self._profile_ms(stage_started))
+            with self._force_cpu_during_snapshot():
+                self._start_backend()
 
-            stage_started = time.time()
-            manager_paths = set_manager_network_mode_offline()
-            self._log_profile("manager_network_mode", mode="offline", paths=len(manager_paths), duration_ms=self._profile_ms(stage_started))
-
-            stage_started = time.time()
-            vol.reload()
-            self._log_profile("volume_reload", duration_ms=self._profile_ms(stage_started))
-
-            stage_started = time.time()
-            _, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
-            self._log_profile("custom_nodes_sync", duration_ms=self._profile_ms(stage_started), state_count=len(self._custom_nodes_state))
-
-            stage_started = time.time()
-            install_summary = self._install_custom_node_requirements()
-            self._log_profile("requirements_install", duration_ms=self._profile_ms(stage_started), installed=len(install_summary.get("installed", [])), skipped=len(install_summary.get("skipped", [])))
-
-            stage_started = time.time()
-            self._record_runtime_state()
-            self._log_profile("runtime_state_record", duration_ms=self._profile_ms(stage_started))
-
-            stage_started = time.time()
-            self._start_backend()
-
+                # CPU cache preload is intentionally disabled — loading model
+                # state dicts (17+ GB) into the snapshot made Modal restore
+                # ~3× slower (7.9s → 26.4s), far outweighing the ~1s volume
+                # read savings.  The lean snapshot keeps restore fast; model
+                # files are loaded from the volume on restore (the warmup
+                # profile handles this) or on first use during prompt execution.
+                # The _preload_models_to_cpu infrastructure remains available
+                # if a cheaper preload strategy is found in the future.
             self._log_profile("backend_start", backend=self._select_backend(), duration_ms=self._profile_ms(stage_started))
-
-            preload_profile = self._snapshot_preload_profile()
-            preload_paths = self._snapshot_preload_paths(preload_profile)
-            stage_started = time.time()
-            preload_summary = self._preload_models_to_cpu(preload_paths)
-            self._log_profile(
-                "snapshot_preload_cpu",
-                mode=preload_profile.get("mode", "none") if preload_profile else "none",
-                requested=len(preload_paths),
-                cached=preload_summary.get("count", 0),
-                duration_ms=self._profile_ms(stage_started),
-            )
         else:
-            self._ensure_models_symlink()
-            manager_paths = set_manager_network_mode_offline()
-            print(
-                f"[comfyapp.profile] stage=manager_network_mode mode=offline paths={len(manager_paths)}"
-            )
-            vol.reload()
-            _, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
-            install_summary = self._install_custom_node_requirements()
-            self._record_runtime_state()
+            stage_started = time.time()
             self._start_backend()
-
-            # Warmup preload always runs during cold start (snap=True) for
-            # subprocess — it populates ComfyUI's GPU model cache so that
-            # subsequent scale-from-zero restores get instant cache hits.
-            # ENABLE_WARMUP only gates the replay on *restore* (see restore()).
-            preload_result = self._preload_warmup_profile()
-            print(
-                f"[comfyapp.profile] stage=warmup_preload mode={preload_result.get('mode', 'none')} "
-                f"status={preload_result.get('status', 'unknown')} duration_ms={preload_result.get('duration_ms', 0)}"
-            )
-
+            self._log_profile("backend_start", backend=self._select_backend(), duration_ms=self._profile_ms(stage_started))
+            # Skip the GPU warmup preload during snap=True — loading ~9GB
+            # of Flux/Qwen weights into the subprocess's GPU memory would
+            # be captured in the snapshot, costing ~30+ seconds of GPU
+            # memory transfer on every restore.  The first prompt after
+            # restore pays the model load cost.
             warmup_result = self._warmup_runtime()
             print(f"[comfyapp] warmup={warmup_result}")
 
         duration = time.time() - t0
         print(f"[comfyapp] startup complete in {duration:.3f}s  "
-              f"req_installed={install_summary['installed']}")
+              f"req_installed={len(install_summary.get('installed', []))}")
 
     def _warmup_cuda(self):
         """Revitalise CUDA driver context and force GPU clock ramp-up.
@@ -1510,48 +2348,150 @@ class _ComfyAPIMixin:
             print("[comfyapp] CUDA warmup skipped — no GPU")
             return
         dev = torch.device(torch.cuda.current_device())
+        _t0 = time.time()
         # Force CUDA context reconnection (first call is slow if stale)
         torch.cuda.synchronize(dev)
+        _ctx_ms = round((time.time() - _t0) * 1000, 1)
+        _t0 = time.time()
         # Run a handful of GEMMs to coax GPU Boost out of its low-power state
         a = torch.randn(2048, 2048, device=dev)
         b = torch.randn(2048, 2048, device=dev)
         for _ in range(5):
             a = a @ b
         torch.cuda.synchronize(dev)
+        _gemm_ms = round((time.time() - _t0) * 1000, 1)
         # Use print to make it visible in container logs (log_profile may be buffered)
-        print(f"[comfyapp] CUDA warmup done device={torch.cuda.get_device_name(dev)}")
+        print(f"[comfyapp] CUDA warmup done device={torch.cuda.get_device_name(dev)} "
+              f"ctx_sync={_ctx_ms}ms gemm={_gemm_ms}ms")
+
+    def _restore_in_process_gpu_state(self):
+        """Re-enable ComfyUI GPU mode after a CPU-only snapshot import.
+
+        During ``snap=True`` we force ComfyUI's CLI args and import-time
+        model-management state into CPU mode so snapshot creation doesn't
+        touch CUDA. The in-process backend is then snapshotted with that
+        CPU-mode state. On restore we must explicitly flip ComfyUI back to
+        GPU/HIGH_VRAM mode before the first real execution, otherwise model
+        placement and tensor creation stay on CPU and CUDA-only attention
+        paths fail with "Input tensors must be on cuda".
+        """
+        _t0 = time.time()
+        import comfy.cli_args
+        import comfy.model_management
+        import psutil
+
+        comfy.cli_args.args.cpu = False
+        comfy.model_management.cpu_state = comfy.model_management.CPUState.GPU
+        comfy.model_management.total_vram = (
+            comfy.model_management.get_total_memory(comfy.model_management.get_torch_device())
+            / (1024 * 1024)
+        )
+        comfy.model_management.total_ram = psutil.virtual_memory().total / (1024 * 1024)
+        comfy.model_management.DISABLE_SMART_MEMORY = False
+        if hasattr(comfy.model_management, "VRAMState") and hasattr(comfy.model_management.VRAMState, "HIGH_VRAM"):
+            comfy.model_management.vram_state = comfy.model_management.VRAMState.HIGH_VRAM
+        _t1 = time.time()
+        print(f"[comfyapp] gpu_state restored vram={comfy.model_management.total_vram:.0f}MB "
+              f"ram={comfy.model_management.total_ram:.0f}MB "
+              f"vram_state={comfy.model_management.vram_state} "
+              f"in {(_t1-_t0)*1000:.1f}ms")
 
     @modal.enter(snap=False)
     def restore(self):
-        """Snapshot restore: lightweight sanity check only.
+        """Snapshot restore: reattach the GPU to the pre-initialised backend.
 
-        No volume reloads, no custom-node sync, no requirements install
-        — the snapshot already captured a ready state.
+        ``startup()`` initialises the in-process ComfyUI backend under
+        ``_force_cpu_during_snapshot()`` so the snapshot already contains
+        the fully loaded Python state (modules, registered nodes,
+        PromptExecutor, DummyServer) with **zero CUDA driver handles** —
+        no SIGSEGV on restore.
 
-        * Subprocess backend:  a quick HTTP health probe may trigger a
-          subprocess restart if the old process is dead.
-        * In-process backend:  GPU is warmed up so the first prompt
-          does not pay a cold-CUDA penalty.
+        On restore we just need to:
+
+        1. Reconnect the real GPU (``_warmup_cuda``).
+        2. Select and apply the SageAttention runtime policy once the
+           CUDA context is fresh.
+        3. Force eager safetensors reads so model-load I/O happens up
+           front instead of during compute.
+        4. Optionally rebuild the GPU model cache via the warmup
+           profile so the first prompt is fast.
+
+        For the subprocess backend, the subprocess is still running from
+        snap=True; we just probe ``/system_stats`` and restart on failure.
         """
         restore_start = time.time()
         print("[comfyapp] lifecycle=restore snap=False")
+        __stages: dict[str, float] = {}
 
         is_in_proc = (self._select_backend() == "in_process")
 
+        _s = time.time()
         self._ensure_models_symlink()
+        __stages["ensure_models_ms"] = self._profile_ms(_s)
 
         if is_in_proc:
-            _warm_start = time.time()
+            # In-process backend is already initialised in the snapshot
+            # (imports done, nodes registered, executor + dummy server
+            # built under force_cpu so no CUDA state captured).  We only
+            # need to reattach the GPU.
+            _s = time.time()
+            self._restore_in_process_gpu_state()
+            __stages["gpu_state_ms"] = self._profile_ms(_s)
+
+            _s = time.time()
             self._warmup_cuda()
-            self._log_profile("restore_warmup", mode="cuda_warmup", duration_ms=self._profile_ms(_warm_start))
+            __stages["cuda_warmup_ms"] = self._profile_ms(_s)
+            self._log_profile("restore_warmup", mode="cuda_warmup", duration_ms=__stages["cuda_warmup_ms"])
+            import comfy.utils
+
+            comfy.utils.DISABLE_MMAP = True
+
+            _s = time.time()
+            mode, reason = self._select_sage_runtime_mode()
+            self._apply_sage_attention_policy()
+            __stages["sage_runtime_ms"] = self._profile_ms(_s)
+            self._log_profile(
+                "restore_sage_runtime",
+                mode=mode,
+                reason=reason,
+                duration_ms=__stages["sage_runtime_ms"],
+            )
+
+            # Log intermediate restore phases
+            phases = {k: round(v, 1) for k, v in __stages.items() if not k.startswith("warmup_")}
+            print(f"[comfyapp] restore phases (pre-warmup): {phases}")
+
+            # Rebuild GPU model cache so the first prompt after restore
+            # doesn't pay the full ~12s Flux/Qwen model load cost.
+            if ENABLE_WARMUP:
+                _s = time.time()
+                warmup_result = self._preload_warmup_profile()
+                __stages["warmup_preload_ms"] = self._profile_ms(_s)
+                self._log_profile(
+                    "restore_warmup_preload",
+                    mode=warmup_result.get("mode", "none"),
+                    status=warmup_result.get("status", "unknown"),
+                    duration_ms=__stages["warmup_preload_ms"],
+                )
         else:
+            _s = time.time()
             try:
                 self._http_client.get("/system_stats", timeout=5)
             except Exception:
                 print("[comfyapp] ComfyUI unresponsive on restore, restarting")
                 self._restart_comfy()
+            __stages["subprocess_health_ms"] = self._profile_ms(_s)
 
-        print(f"[comfyapp] restore sanity check done in {time.time() - restore_start:.3f}s")
+        # Annotate warmup with per-node timing breakdown
+        _wr = locals().get("warmup_result") or {}
+        warmup_nodes = _wr.get("node_timing", {}) if isinstance(_wr, dict) else {}
+        self._last_restore_timing = {
+            "restore_total_ms": self._profile_ms(restore_start),
+            **__stages,
+            **({f"warmup_{k}": v for k, v in warmup_nodes.items()} if warmup_nodes else {}),
+        }
+        print(f"[comfyapp] restore sanity check done in {time.time() - restore_start:.3f}s "
+              f"perf={self._last_restore_timing}")
 
     @modal.exit()
     def shutdown(self):
@@ -1608,28 +2548,68 @@ class _ComfyAPIMixin:
         raise RuntimeError(f"Synced custom nodes not visible in Modal volume yet: {last_missing}")
 
     @modal.method()
-    def run_prompt(self, workflow: dict, input_images: dict | None = None) -> dict:
+    def run_prompt(
+        self,
+        workflow: dict,
+        input_images: dict | None = None,
+        trace: dict | None = None,
+    ) -> dict:
         """Submit a workflow for execution.
 
         NOTE: This method does NOT reload Modal volumes or resync custom
         nodes.  After any model/custom-node mutation, callers must invoke
         ``resync_runtime()`` first so that the container picks up the
         changes before calling ``run_prompt()``.
+
+        The optional ``trace`` parameter is a dict of pre-collected
+        timestamps from the local ComfyUI server (browser t0, local t1,
+        local t2).  The Modal side merges its own t3..t8 markers into
+        the trace and returns the merged dict in the response under
+        the ``"trace"`` key.
         """
+
+        # Build a Trace anchored at the earliest known wall-clock time
+        # we can find (t0 from the browser).  When no browser t0 is
+        # available the anchor falls back to "right now", so all later
+        # timestamps are still consistent with each other.
+        t0 = coerce_t0_from_browser(trace or {})
+        prompt_id_hint = ""
+        if isinstance(trace, dict):
+            prompt_id_hint = str(trace.get("prompt_id") or "")
+        if not prompt_id_hint and isinstance(workflow, dict):
+            for node in workflow.values():
+                if isinstance(node, dict) and "prompt_id" in node:
+                    prompt_id_hint = str(node["prompt_id"])
+        server_trace = Trace(prompt_id=prompt_id_hint, t0=t0)
+        server_trace.update(trace)
+        # t3 = Modal handler entry.  On a cold container this is *after*
+        # snapshot restore + CUDA warmup; on a warm container it is just
+        # the time the function was dispatched.
+        server_trace.mark("t3_modal_entry")
 
         # ── In-process backend: direct execution, no HTTP ──
         if self._select_backend() == "in_process":
             total_started = time.time()
-            result = self._execute_in_process(workflow, input_images)
+            result = self._execute_in_process(workflow, input_images, trace=server_trace)
             requested_stack = extract_requested_model_stack(workflow)
             if requested_stack and any(requested_stack.values()):
                 self._save_last_model_stack(requested_stack)
             total_ms = round((time.time() - total_started) * 1000, 1)
+            server_trace.mark("t9_modal_return")
             print(
                 f"[comfyapp.profile] stage=remote_total backend=in_process duration_ms={total_ms} "
                 f"output_images={len(result.get('images', []))} "
                 f"output_videos={len(result.get('videos', []))}"
             )
+            print(server_trace.log_line())
+            trace_summary = server_trace.summary()
+            self._enrich_trace_with_restore_timing(trace_summary)
+            result["trace"] = trace_summary
+            _rt = getattr(self, "_last_restore_timing", None)
+            print(f"[comfyapp] DEBUG _last_restore_timing={_rt}")
+            result["_restore_timing"] = dict(_rt) if _rt else {}
+            # DEBUG: verify trace and restore_timing are in result
+            print(f"[comfyapp] DEBUG result keys={list(result.keys())} trace_has_restore={'restore' in result.get('trace', {})} restore_timing_is={result.get('_restore_timing', '__MISSING')}")
             return result
 
         # ── Subprocess backend: HTTP-based submission ──
@@ -1715,7 +2695,19 @@ class _ComfyAPIMixin:
             f"output_images={profile.get('output_images', 0)} output_videos={profile.get('output_videos', 0)} "
             f"output_bytes={profile.get('output_bytes', 0)}"
         )
+        server_trace.mark("t9_modal_return")
+        print(server_trace.log_line())
+        trace_summary = server_trace.summary()
+        self._enrich_trace_with_restore_timing(trace_summary)
+        result["trace"] = trace_summary
+        result["_restore_timing"] = dict(getattr(self, "_last_restore_timing", {}))
         return result
+
+    def _enrich_trace_with_restore_timing(self, trace_summary: dict) -> None:
+        """Merge per-phase restore timing into the trace summary (mutates in-place)."""
+        restore_data = getattr(self, "_last_restore_timing", None)
+        if restore_data:
+            trace_summary["restore"] = dict(restore_data)
 
     def _poll_until_done(self, prompt_id: str, client_id: str, profile: dict | None = None) -> dict:
         delay = 0.25

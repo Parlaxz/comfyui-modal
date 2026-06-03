@@ -1,0 +1,8 @@
+{
+  "error": "Modal error: Function call was cancelled by user.. Try redeploying with the Deploy button.",
+  "run1_total_ms": null,
+  "run1_trace": {},
+  "run2_total_ms": null,
+  "run2_trace": {},
+  "status": "run1_failed"
+}

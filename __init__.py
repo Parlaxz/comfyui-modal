@@ -23,6 +23,7 @@ from local_placeholders import (
     normalize_model_folder,
 )
 from workflow_metadata import extract_model_stack, prompt_sha256, summarize_prompt_fields
+from timing_trace import Trace, coerce_t0_from_browser
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
@@ -39,6 +40,7 @@ def _unique_path(directory: str, filename: str) -> str:
 _COMFYAPP_PATH = os.path.join(_NODE_DIR, "comfyapp.py")
 _DEPLOY_STATE_FILE = os.path.join(_NODE_DIR, ".deployed_version")
 _DEPLOY_LOG_FILE = os.path.join(_NODE_DIR, ".deploy_log")
+_LATEST_BENCHMARK_WORKFLOW_FILE = os.path.join(_NODE_DIR, "latest_benchmark_workflow.json")
 
 _pip_install_error = ""
 
@@ -72,6 +74,38 @@ _ensure_modal()
 
 _deploy_status = {"state": "idle", "message": ""}
 _last_successful_model_stack: dict = {}
+_latest_benchmark_workflow: dict = {}
+
+
+def _load_latest_benchmark_workflow() -> dict:
+    global _latest_benchmark_workflow
+    if _latest_benchmark_workflow:
+        return dict(_latest_benchmark_workflow)
+    try:
+        with open(_LATEST_BENCHMARK_WORKFLOW_FILE, "r", encoding="utf-8") as f:
+            snapshot = json.load(f)
+        if isinstance(snapshot, dict) and snapshot:
+            _latest_benchmark_workflow = snapshot
+            return dict(snapshot)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return {}
+
+
+def _save_latest_benchmark_workflow(payload: dict) -> dict:
+    global _latest_benchmark_workflow
+    workflow = payload.get("prompt", payload) if isinstance(payload, dict) else payload
+    snapshot = {
+        "captured_at": time.time(),
+        "workflow_hash": prompt_sha256(workflow if isinstance(workflow, dict) else payload),
+        "payload": payload,
+    }
+    tmp_path = f"{_LATEST_BENCHMARK_WORKFLOW_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(snapshot, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, _LATEST_BENCHMARK_WORKFLOW_FILE)
+    _latest_benchmark_workflow = snapshot
+    return dict(snapshot)
 
 def _get_deployed_version():
     try:
@@ -413,7 +447,7 @@ def _register_running(item: tuple) -> int:
     return key
 
 
-def _finish_job(item_id: int, prompt_id: str, outputs: dict, success: bool):
+def _finish_job(item_id: int, prompt_id: str, outputs: dict, success: bool, meta: dict | None = None):
     pq = _pq()
     if pq is None:
         return
@@ -422,7 +456,7 @@ def _finish_job(item_id: int, prompt_id: str, outputs: dict, success: bool):
         completed=success,
         messages=[],
     )
-    history_result = {"outputs": outputs, "meta": {}}
+    history_result = {"outputs": outputs, "meta": dict(meta or {})}
     pq.task_done(item_id, history_result, status=status,
                  process_item=lambda prompt: prompt[:5] + prompt[6:])
 
@@ -468,6 +502,9 @@ async def _execute_job(item: tuple, item_id: int):
     number, prompt_id, workflow, extra_data, _, _ = item
     sid = extra_data.get("client_id", "")
     local_started = time.time()
+    trace_payload = extra_data.get("trace", {}) if isinstance(extra_data, dict) else {}
+    trace = Trace(prompt_id=prompt_id, t0=coerce_t0_from_browser(trace_payload) or local_started)
+    trace.update(trace_payload)
 
     task_key = _register_running(item)
 
@@ -481,6 +518,9 @@ async def _execute_job(item: tuple, item_id: int):
 
     success = False
     outputs = {}
+    prompt_hash = extra_data.get("workflow_hash", "")
+    prompt_summary = extra_data.get("prompt_summary", {})
+    model_stack = extra_data.get("model_stack", {})
     try:
         # Verify workflow integrity immediately before remote call
         current_hash = prompt_sha256(workflow)
@@ -491,9 +531,6 @@ async def _execute_job(item: tuple, item_id: int):
             )
 
         # Log prompt metadata before remote execution
-        prompt_hash = extra_data.get("workflow_hash", "")
-        prompt_summary = extra_data.get("prompt_summary", {})
-        model_stack = extra_data.get("model_stack", {})
         print(f"[comfyui-modal] Running prompt {prompt_hash[:12]}… summary={prompt_summary} model_stack={model_stack}")
 
         collect_started = time.time()
@@ -506,12 +543,20 @@ async def _execute_job(item: tuple, item_id: int):
         )
 
         remote_started = time.time()
-        result = await run_prompt(workflow, input_images)
+        trace.mark("t2_local_dispatch")
+        result = await run_prompt(
+            workflow,
+            input_images,
+            trace={**trace.fields(), "prompt_id": prompt_id},
+        )
         remote_run_ms = round((time.time() - remote_started) * 1000, 1)
         print(
             f"[comfyui-modal.profile] stage=remote_run_prompt prompt_id={prompt_id[:8]} "
             f"duration_ms={remote_run_ms}"
         )
+        remote_trace = result.get("trace") if isinstance(result, dict) else {}
+        if isinstance(remote_trace, dict):
+            trace.update(remote_trace.get("stages", {}))
         success = True
     except asyncio.CancelledError:
         total_ms = round((time.time() - local_started) * 1000, 1)
@@ -520,7 +565,7 @@ async def _execute_job(item: tuple, item_id: int):
             f"duration_ms={total_ms} error=cancelled"
         )
         _send(sid, "execution_error", {"message": "cancelled", "prompt_id": prompt_id})
-        _finish_job(task_key, prompt_id, outputs, success=False)
+        _finish_job(task_key, prompt_id, outputs, success=False, meta={"error": "cancelled"})
         raise
     except Exception as e:
         total_ms = round((time.time() - local_started) * 1000, 1)
@@ -529,7 +574,12 @@ async def _execute_job(item: tuple, item_id: int):
             f"duration_ms={total_ms} error={type(e).__name__}"
         )
         _send(sid, "execution_error", {"message": str(e), "prompt_id": prompt_id})
-        _finish_job(task_key, prompt_id, outputs, success=False)
+        _finish_job(task_key, prompt_id, outputs, success=False, meta={
+            "error": str(e),
+            "model_stack": model_stack,
+            "prompt_summary": prompt_summary,
+            "workflow_hash": prompt_hash,
+        })
         return
 
     # Update last successful model stack after successful remote result
@@ -599,9 +649,25 @@ async def _execute_job(item: tuple, item_id: int):
         f"duration_ms={materialize_ms} images={output_image_count} videos={output_video_count} bytes={output_bytes_written}"
     )
 
+    trace.mark("t10_local_materialized")
+    _merged_trace = trace.summary()
+    # Preserve restore timing from the Modal container's trace
+    _remote_full = result.get("trace", {})
+    if isinstance(_remote_full, dict) and "restore" in _remote_full:
+        _merged_trace["restore"] = _remote_full["restore"]
+    result["trace"] = _merged_trace
+    print(trace.log_line())
+
     _send(sid, "executing", {"node": None, "display_node": None, "prompt_id": prompt_id})
-    _send(sid, "execution_success", {"prompt_id": prompt_id})
-    _finish_job(task_key, prompt_id, outputs, success=True)
+    _send(sid, "execution_success", {"prompt_id": prompt_id, "trace": result.get("trace")})
+    _meta = {
+        "model_stack": model_stack,
+        "prompt_summary": prompt_summary,
+        "trace": result.get("trace"),
+        "workflow_hash": prompt_hash,
+        "restore_timing": result.get("_restore_timing", {}),
+    }
+    _finish_job(task_key, prompt_id, outputs, success=True, meta=_meta)
     total_ms = round((time.time() - local_started) * 1000, 1)
     print(
         f"[comfyui-modal.profile] stage=local_total prompt_id={prompt_id[:8]} "
@@ -653,6 +719,11 @@ if _server:
         workflow = body.get("prompt", body)
         client_id = body.get("client_id", str(uuid.uuid4()))
         prompt_id = str(uuid.uuid4())
+        browser_t0 = coerce_t0_from_browser(body)
+        trace = Trace(prompt_id=prompt_id, t0=browser_t0 or time.time())
+        if browser_t0 is not None:
+            trace.mark("t0_client_press", browser_t0)
+        trace.mark("t1_local_recv")
 
         # Compute prompt integrity metadata (carried in extra_data, never mutates workflow)
         local_payload_hash = prompt_sha256(body)
@@ -671,6 +742,7 @@ if _server:
                 "workflow_hash": workflow_hash,
                 "prompt_summary": prompt_summary,
                 "model_stack": model_stack,
+                "trace": {**trace.fields(), "prompt_id": prompt_id},
             }
             item = (_item_counter, prompt_id, workflow, extra_data, list(workflow.keys()), {})
 
@@ -847,6 +919,25 @@ if _server:
             return web.json_response(result)
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=503)
+
+    @_server.routes.get("/comfymodal/benchmark/workflow")
+    async def modal_benchmark_workflow_get(request: web.Request) -> web.Response:
+        snapshot = _load_latest_benchmark_workflow()
+        if not snapshot:
+            return web.json_response({"status": "error", "message": "no benchmark workflow snapshot available"}, status=404)
+        return web.json_response({"status": "ok", **snapshot})
+
+    @_server.routes.post("/comfymodal/benchmark/workflow")
+    async def modal_benchmark_workflow_post(request: web.Request) -> web.Response:
+        body = await request.json()
+        if not isinstance(body, dict) or not body:
+            return web.json_response({"status": "error", "message": "workflow payload required"}, status=400)
+        snapshot = _save_latest_benchmark_workflow(body)
+        return web.json_response({
+            "status": "ok",
+            "captured_at": snapshot.get("captured_at"),
+            "workflow_hash": snapshot.get("workflow_hash", ""),
+        })
 
     @_server.routes.delete("/comfymodal/cancel/{client_id}")
     async def modal_cancel(request: web.Request) -> web.Response:

@@ -1,0 +1,29 @@
+[      26ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/userdata/user.css:0
+[      34ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/user.css:0
+[     228ms] [WARNING] [ComfyUI] The legacy queue/history menu is deprecated. Core functionality in this menu may break at any time. Issues and feature requests related to the legacy menu will not be addressed. To switch to the new menu: Settings → search "Use new menu" → change from "Disabled" to "Top". @ http://127.0.0.1:8188/assets/dialogService-DSBgqcNn.js:161
+[     228ms] [WARNING] [ComfyUI] The legacy queue/history menu is deprecated. Core functionality in this menu may break at any time. Issues and feature requests related to the legacy menu will not be addressed. To switch to the new menu: Settings → search "Use new menu" → change from "Disabled" to "Top". @ http://127.0.0.1:8188/assets/dialogService-DSBgqcNn.js:161
+[     312ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/favicon.ico:0
+[     370ms] [ERROR] ComfyApp graph accessed before initialization @ http://127.0.0.1:8188/assets/dialogService-DSBgqcNn.js:177
+[     410ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/userdata?dir=subgraphs&recurse=true&split=false&full_info=true:0
+[     494ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/userdata/comfy.templates.json:0
+[     615ms] [WARNING] [ComfyUI Deprecated] Importing from "scripts/ui.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/scripts/ui.js:1
+[     620ms] [WARNING] [ComfyUI Deprecated] Importing from "extensions/core/groupNode.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/extensions/core/groupNode.js:1
+[     624ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/extensions/ComfyUI-Impact-Pack/impact-pack.js:0
+[     628ms] [ERROR] [Inspire Pack] Failed to import Impact Pack module: TypeError: Failed to fetch dynamically imported module: http://127.0.0.1:8188/extensions/ComfyUI-Impact-Pack/impact-pack.js @ http://127.0.0.1:8188/extensions/comfyui-inspire-pack/prompt.js:23
+[     628ms] [WARNING] [Inspire Pack] get_wildcards_list not available. Using fallback. @ http://127.0.0.1:8188/extensions/comfyui-inspire-pack/prompt.js:28
+[     629ms] [WARNING] [ComfyUI Notice] "scripts/widgets.js" is an internal module, not part of the public API. Future updates may break this import. @ http://127.0.0.1:8188/scripts/widgets.js:1
+[     645ms] [WARNING] [MaskEditor] ComfyApp.open_maskeditor is deprecated. Plugins should migrate to using the command system or direct node context menu integration. @ http://127.0.0.1:8188/assets/core-2CicHcyz.js:2
+[    1048ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-inspire-pack:LoadPromptsFromFile //Inspire:text_data_opt is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-DSBgqcNn.js:1
+[    1048ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-inspire-pack:LoadSinglePromptFromFile //Inspire:text_data_opt is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-DSBgqcNn.js:1
+[    1050ms] [WARNING] Use of defaultInput on required input custom_nodes.comfyui-inspire-pack:RGB_HexToHSV //Inspire:rgb_hex is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-DSBgqcNn.js:1
+[    1083ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-inspire-pack:LoadPromptsFromFile //Inspire:text_data_opt is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-DSBgqcNn.js:1
+[    1083ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-inspire-pack:LoadSinglePromptFromFile //Inspire:text_data_opt is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-DSBgqcNn.js:1
+[    1084ms] [WARNING] Use of defaultInput on required input custom_nodes.comfyui-inspire-pack:RGB_HexToHSV //Inspire:rgb_hex is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-DSBgqcNn.js:1
+[    1092ms] [LOG] [comfyui-modal] Extension loaded. Patching fetchApi... @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-node.js:10
+[    1092ms] [LOG] [comfyui-modal] fetchApi patched. All /prompt POST requests -> Modal GPU. @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-node.js:10
+[    1092ms] [WARNING] %c[DEPRECATED]%c Monkey-patching getCanvasMenuOptions is deprecated. (Extension: "rgthree.QueueNode")
+Please use the new context menu API instead.
+
+See: https://docs.comfy.org/custom-nodes/js/context-menu-migration color: orange; font-weight: bold color: inherit @ http://127.0.0.1:8188/assets/dialogService-DSBgqcNn.js:2
+[    1100ms] [WARNING] [ComfyUI Deprecated] Importing from "scripts/ui/components/buttonGroup.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/scripts/ui/components/buttonGroup.js:1
+[    1104ms] [WARNING] [ComfyUI Deprecated] Importing from "scripts/ui/components/button.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/scripts/ui/components/button.js:1

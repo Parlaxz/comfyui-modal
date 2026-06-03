@@ -113,6 +113,49 @@ class ComfyAppVolumeLifecycleTests(unittest.TestCase):
             "restore() must use _http_client to probe local ComfyUI health",
         )
 
+    def test_startup_defers_sageattention_cuda_compile_until_restore(self):
+        startup = _get_method("startup")
+        startup_source = ast.get_source_segment(COMFYAPP_PATH.read_text(encoding="utf-8"), startup) or ""
+        self.assertNotIn("downloading sageattention source from GitHub", startup_source)
+        self.assertNotIn("compiling sageattention CUDA kernels", startup_source)
+        self.assertNotIn("_import_sage_cuda()", startup_source)
+        self.assertNotIn("get_device_capability", startup_source)
+
+    def test_restore_applies_sage_runtime_mode(self):
+        restore = _get_method("restore")
+        restore_source = ast.get_source_segment(COMFYAPP_PATH.read_text(encoding="utf-8"), restore) or ""
+        self.assertIn("self._select_sage_runtime_mode()", restore_source,
+                      "restore() must perform sage runtime mode detection")
+        self.assertIn("self._apply_sage_attention_policy()", restore_source,
+                      "restore() must apply sage policy during restore")
+        self.assertIn("DISABLE_MMAP", restore_source,
+                      "restore() must enable eager safetensors reads")
+        self.assertNotIn("downloading sageattention source from GitHub", restore_source)
+        self.assertNotIn("compiling sageattention CUDA kernels", restore_source)
+        self.assertNotIn("pip install", restore_source)
+
+    def test_restore_reenables_in_process_gpu_state(self):
+        restore = _get_method("restore")
+        restore_source = ast.get_source_segment(COMFYAPP_PATH.read_text(encoding="utf-8"), restore) or ""
+        self.assertIn("self._restore_in_process_gpu_state()", restore_source)
+
+    def test_run_prompt_does_not_perform_deferred_sage_steps(self):
+        run_prompt = _get_method("run_prompt")
+        rp_source = ast.get_source_segment(COMFYAPP_PATH.read_text(encoding="utf-8"), run_prompt) or ""
+        self.assertNotIn("_select_sage_runtime_mode", rp_source,
+                         "run_prompt() must not repeat restore-time sage runtime detection")
+        self.assertNotIn("_apply_sage_attention_policy", rp_source,
+                         "run_prompt() must not repeat restore-time sage policy application")
+        self.assertNotIn("run_prompt_deferred_sage", rp_source)
+
+    def test_force_cpu_during_snapshot_patches_comfy_cli_args(self):
+        method = _get_method("_force_cpu_during_snapshot")
+        method_source = ast.get_source_segment(COMFYAPP_PATH.read_text(encoding="utf-8"), method) or ""
+        self.assertIn('comfy_path = "/root/comfy/ComfyUI"', method_source)
+        self.assertIn("sys.path.insert(0, comfy_path)", method_source)
+        self.assertIn("import comfy.cli_args", method_source)
+        self.assertIn("comfy.cli_args.args.cpu = True", method_source)
+
 
 if __name__ == "__main__":
     unittest.main()
