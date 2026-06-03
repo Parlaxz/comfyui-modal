@@ -9,6 +9,7 @@ Prerequisites:
 """
 
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -23,6 +24,54 @@ def main() -> int:
     import modal
 
     BENCHMARK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── Optional preload mode ────────────────────────────────────────
+    _preload_mode = os.environ.get("COMFYMODAL_PRELOAD_MODE", "").strip().lower()
+    if _preload_mode:
+        try:
+            _r = modal.Function.from_name("comfyui", "set_preload_mode").remote(_preload_mode)
+            print(f"Preload mode set: {_r}")
+        except Exception as exc:
+            print(f"WARNING: could not set preload_mode={_preload_mode}: {exc}")
+
+    # ── Optional warmup CLIP encode toggle ──────────────────────────
+    _wce_env = os.environ.get("COMFYMODAL_WARMUP_CLIP_ENCODE", "").strip().lower()
+    if _wce_env:
+        _wce_val = _wce_env in ("1", "true", "on")
+        try:
+            _r = modal.Function.from_name("comfyui", "set_warmup_clip_encode").remote(_wce_val)
+            print(f"WCE set: {_r}")
+        except Exception as exc:
+            print(f"WARNING: could not set WCE={_wce_val}: {exc}")
+
+    # ── Optional return mode ────────────────────────────────────────
+    _return_mode = os.environ.get("COMFYMODAL_RETURN_MODE", "").strip().lower()
+    if _return_mode:
+        try:
+            _r = modal.Function.from_name("comfyui", "set_return_mode").remote(_return_mode)
+            print(f"Return mode set: {_r}")
+        except Exception as exc:
+            print(f"WARNING: could not set return_mode={_return_mode}: {exc}")
+
+    # ── Optional CLIP encode cache clear ────────────────────────────
+    _cache_clear = os.environ.get("COMFYMODAL_CLEAR_CLIP_ENCODE_CACHE", "").strip().lower()
+    if _cache_clear:
+        _cc_val = _cache_clear in ("1", "true", "on")
+        try:
+            _r = modal.Function.from_name("comfyui", "set_clear_clip_encode_cache").remote(_cc_val)
+            print(f"CLIP cache clear set: {_r}")
+        except Exception as exc:
+            print(f"WARNING: could not set clear_clip_encode_cache={_cc_val}: {exc}")
+
+    # ── Optional executor profiling toggle ──────────────────────────
+    _exec_profile_env = os.environ.get("COMFYMODAL_EXEC_PROFILE", "").strip().lower()
+    if _exec_profile_env:
+        _ep_val = _exec_profile_env in ("1", "true", "on")
+        try:
+            _r = modal.Function.from_name("comfyui", "set_exec_profile").remote(_ep_val)
+            print(f"Exec profile set: {_r}")
+        except Exception as exc:
+            print(f"WARNING: could not set exec_profile={_ep_val}: {exc}")
 
     # ── Load workflow ────────────────────────────────────────────────
     with open(WORKFLOW_FILE, "r", encoding="utf-8") as f:
@@ -42,34 +91,105 @@ def main() -> int:
     api = modal.Cls.from_name("comfyui", GPU_CLASS)()
     print(f"Connected to Modal {GPU_CLASS} (Blackwell RTX PRO 6000)\n")
 
-    # ── Run 3 cold benchmarks with 10s gaps ──────────────────────────
+    # ── Run 3 cold benchmarks with 20s gaps ──────────────────────────
     results = []
     for i in range(3):
         label = f"RUN-{i + 1}"
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = BENCHMARK_LOGS_DIR / f"cachepreload_{ts}_{label}.json"
 
-        wall_start = time.time()
+        # ── Local benchmark timestamps ──
+        bench_t0_start = time.time()
+
+        bench_t1_workflow_loaded = time.time()
+
+        bench_t2_before_modal_call = time.time()
         try:
             result = api.run_prompt.remote(workflow)
         except Exception as exc:
             print(f"[{label}] FAILED: {exc}")
             results.append({"run": label, "error": str(exc)})
             continue
-        wall_s = round(time.time() - wall_start, 3)
+        bench_t3_after_modal_call = time.time()
 
         trace = result.get("trace", {})
         restore = result.get("_restore_timing", {})
         cache_diag = result.get("_cache_diagnostics", {})
+        t8b_breakdown = result.get("_t8b_breakdown", {})
+        return_payload_info = result.get("_return_payload_info", {})
+        # Add return_mode if not present (pre-2.11.0 compatibility)
+        if "return_mode" not in return_payload_info:
+            return_payload_info["return_mode"] = "full_base64"
+
+        # Capture WCE info from restore_timing
+        wce_enabled = restore.get("wce_enabled", "?")
+        wce_source = restore.get("wce_source", "?")
+        warmup_clip_encode_ms = restore.get("warmup_direct_clip_encode_ms", "?")
+
+        bench_t4_after_result_parse = time.time()
+
+        # Compute local timings
+        workflow_load_ms = round((bench_t1_workflow_loaded - bench_t0_start) * 1000, 1)
+        modal_call_wall_ms = round((bench_t3_after_modal_call - bench_t2_before_modal_call) * 1000, 1)
+        result_parse_ms = round((bench_t4_after_result_parse - bench_t3_after_modal_call) * 1000, 1)
+
+        # ── Waterfall from Modal container timestamps ──
+        # app_restore_start/end from restore_timing (unix seconds)
+        app_restore_start_ts = restore.get("restore_start_unix_s")
+        app_restore_end_ts = restore.get("restore_end_unix_s")
+        # remote_execute start/end from trace stages (unix seconds)
+        _stages = trace.get("stages", {}) if isinstance(trace, dict) else {}
+        remote_exec_start_ts = _stages.get("t3_modal_entry")
+        remote_exec_end_ts = _stages.get("t9_modal_return")
+
+        # Compute waterfall components (all in ms)
+        platform_restore_ms = 0.0
+        if app_restore_start_ts and bench_t2_before_modal_call:
+            platform_restore_ms = round((app_restore_start_ts - bench_t2_before_modal_call) * 1000, 1)
+        app_restore_ms = restore.get("restore_total_ms", 0.0) or 0.0
+        remote_execute_ms = 0.0
+        if remote_exec_start_ts and remote_exec_end_ts:
+            remote_execute_ms = round((remote_exec_end_ts - remote_exec_start_ts) * 1000, 1)
+
+        # Time from Modal return to benchmark receiving result
+        modal_return_to_client_ms = round((bench_t3_after_modal_call - (remote_exec_end_ts or bench_t3_after_modal_call)) * 1000, 1) if remote_exec_end_ts else 0.0
+
+        # Local post-processing time (result saved, printed, etc. — measured after)
+        bench_t5_done = time.time()
+        local_postprocess_ms = round((bench_t5_done - bench_t4_after_result_parse) * 1000, 1)
+
+        app_controlled_ms = round(app_restore_ms + remote_execute_ms, 1)
+        known_cold_ms = round(platform_restore_ms + app_restore_ms + remote_execute_ms, 1)
+        benchmark_wall_ms = round((bench_t5_done - bench_t0_start) * 1000, 1)
+        untracked_after_platform_ms = round(max(0.0, benchmark_wall_ms - known_cold_ms), 1)
+
+        # Build waterfall dict
+        waterfall = {
+            "benchmark_wall_ms": benchmark_wall_ms,
+            "workflow_load_ms": workflow_load_ms,
+            "platform_restore_ms": platform_restore_ms,
+            "app_restore_ms": app_restore_ms,
+            "remote_execute_ms": remote_execute_ms,
+            "modal_return_to_client_ms": modal_return_to_client_ms,
+            "local_postprocess_ms": local_postprocess_ms,
+            "app_controlled_ms": app_controlled_ms,
+            "known_cold_ms": known_cold_ms,
+            "untracked_after_platform_ms": untracked_after_platform_ms,
+        }
 
         # Include cache diagnostics in the saved JSON
+        _exec_profile = result.get("_exec_profile", {})
         output = {
             "timestamp": ts,
             "run": label,
-            "wall_clock_s": wall_s,
+            "wall_clock_s": round(benchmark_wall_ms / 1000, 3),
             "restore_timing": restore,
             "trace": trace,
             "cache_diagnostics": cache_diag,
+            "t8b_breakdown": t8b_breakdown,
+            "return_payload_info": return_payload_info,
+            "exec_profile": _exec_profile,
+            "waterfall": waterfall,
         }
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(output, f, indent=2, sort_keys=True)
@@ -80,6 +200,7 @@ def main() -> int:
         infer_total = deltas.get("inference_total", "?")
         clip_load = deltas.get("clip_load", "?")
         sampler = deltas.get("sampler", "?")
+        graph_overhead = deltas.get("graph_overhead", "?")
         restore_total = restore.get("restore_total_ms", "?")
         warmup_preload = restore.get("warmup_preload_ms", "?")
         warmup_wf = restore.get("warmup_wf_ms", "?")
@@ -100,15 +221,19 @@ def main() -> int:
         clip_m = cache_diag.get("clip_cache_misses", 0)
         clip_str = f"clip_h={clip_h}/m={clip_m}" if clip_h or clip_m else ""
 
-        print(f"[{label}] wall={wall_s}s  "
-              f"t3b_to_t8={t3b_to_t8}ms  "
+        remote_total_ms = deltas.get("remote_total", "?")
+        preload_mode = restore.get("preload_mode", "?")
+
+        print(f"[{label}] wall={round(benchmark_wall_ms/1000,1)}s  "
+              f"remote={remote_total_ms}ms  "
+              f"restore={restore_total}ms  "
               f"inference={infer_total}ms  "
               f"clip_load={clip_load}ms  "
               f"sampler={sampler}ms  "
-              f"restore_total={restore_total}ms  "
+              f"graph_oh={graph_overhead}ms  "
               f"preload={warmup_preload}ms  "
               f"wf={warmup_wf}ms  "
-              f"sage={saddle}  gpu_eq={eq_str}  {cpu_str}  {clip_str}")
+              f"sage={saddle}  mode={preload_mode}  gpu_eq={eq_str}  {cpu_str}  {clip_str}")
         # Print per-file and phase timing
         for key, val in restore.items():
             if isinstance(val, (int, float)):
@@ -118,10 +243,75 @@ def main() -> int:
                     print(f"  ├─ {key}={val}ms")
                 if key in ("early_path_resolve_ms", "cpu_cache_hits", "cpu_cache_misses"):
                     print(f"  ├─ {key}={val}")
+        # Print t8b breakdown
+        _graph_oh = deltas.get("graph_overhead", "?")
+        if t8b_breakdown:
+            _gv = t8b_breakdown.get('graph_validate_ms')
+            _gv_str = f" graph_validate={_gv}" if _gv is not None else ""
+            print(f"  ├─ t8b: {t8b_breakdown.get('t8b_total_ms','?')}ms "
+                  f"save={t8b_breakdown.get('t8b_save_stack_ms','?')} "
+                  f"diag={t8b_breakdown.get('t8b_diagnostics_ms','?')} "
+                  f"print={t8b_breakdown.get('t8b_profile_print_ms','?')} "
+                  f"enrich={t8b_breakdown.get('t8b_enrich_ms','?')} "
+                  f"diag_print={t8b_breakdown.get('t8b_diag_print_ms','?')}"
+                  f"{_gv_str}"
+                  f" graph_oh={_graph_oh}"
+                  f" unk={t8b_breakdown.get('t8b_unknown_ms','?')}")
+        # Print waterfall summary
+        bucket = "excellent" if platform_restore_ms < 2000 else "normal" if platform_restore_ms < 4000 else "bad"
+        _payload_str = ""
+        if return_payload_info:
+            _payload_str = f" imgs={return_payload_info.get('image_count','?')} b64_mb={round(return_payload_info.get('b64_bytes',0)/1048576,2)}"
+        print(f"  └─ waterfall: wall={benchmark_wall_ms:.0f}ms "
+              f"load={workflow_load_ms}ms "
+              f"platform_restore={platform_restore_ms:.0f}ms[{bucket}] "
+              f"app_restore={app_restore_ms:.0f} "
+              f"remote_exec={remote_execute_ms:.0f} "
+              f"return_to_client={modal_return_to_client_ms:.0f} "
+              f"postprocess={local_postprocess_ms:.0f} "
+              f"app_controlled={app_controlled_ms:.0f} "
+              f"known_cold={known_cold_ms:.0f} "
+              f"untracked={untracked_after_platform_ms:.0f}"
+              f"{_payload_str}")
+        # Print WCE info
+        if wce_enabled != "?":
+            print(f"     ├─ wce: enabled={wce_enabled} source={wce_source} warmup_encode_ms={warmup_clip_encode_ms}")
+        # Print return mode info
+        _ret_mode = return_payload_info.get("return_mode", "full_base64")
+        _ret_b64 = return_payload_info.get("b64_bytes", 0)
+        _ret_imgs = return_payload_info.get("image_count", 0)
+        _ret_cache_size = return_payload_info.get("clip_cache_size_before_prompt", None)
+        _cc_line = f" return_mode={_ret_mode} b64_mb={round(_ret_b64/1048576,2)} imgs={_ret_imgs}"
+        if _ret_cache_size is not None:
+            _cc_line += f" clip_cache_size={_ret_cache_size}"
+        print(f"     ├─ return:{_cc_line}")
+        # Print cache size from restore timing
+        _cs_start = restore.get("clip_cache_size_at_start")
+        _cs_after = restore.get("clip_cache_size_after_warmup")
+        if _cs_start is not None or _cs_after is not None:
+            _cls_line = "clip_cache_sizes:"
+            if _cs_start is not None:
+                _cls_line += f" at_restore_start={_cs_start}"
+            if _cs_after is not None:
+                _cls_line += f" after_warmup={_cs_after}"
+            print(f"     ├─ {_cls_line}")
         # Print gpu cache eq details (from live diagnostics)
         _gpu_details = gpu_eq_live.get("details", {})
         if _gpu_details:
-            print(f"  └─ gpu_eq_details: {_gpu_details}")
+            print(f"     └─ gpu_eq_details: {_gpu_details}")
+        # Print executor profile
+        _exec_prof = result.get("_exec_profile", {})
+        if _exec_prof:
+            _exec_resid = _exec_prof.get("executor_residual_ms")
+            _exec_total = _exec_prof.get("total_node_ms")
+            _exec_wall = _exec_prof.get("execute_wall_ms")
+            print(f"     ├─ exec: total_node={_exec_total}ms wall={_exec_wall}ms residual={_exec_resid}ms")
+            _prof_parts = [f"{k}={v}" for k, v in _exec_prof.items() if k not in ("node_counts", "total_node_ms", "execute_wall_ms", "executor_residual_ms")]
+            if _prof_parts:
+                print(f"     ├─ exec_profile: {' '.join(_prof_parts)}")
+            _nc = _exec_prof.get("node_counts", {})
+            if _nc:
+                print(f"     ├─ node_counts: {_nc}")
         print(f"     saved to {filename.name}")
 
         results.append(output)
@@ -130,56 +320,46 @@ def main() -> int:
             print(f"  → waiting 20s for container scaledown...")
             time.sleep(20)
 
-    # ── Summary table ────────────────────────────────────────────────
-    print("\n" + "=" * 80)
-    print("BENCHMARK SUMMARY")
-    print("=" * 80)
+    # ── Waterfall table ──────────────────────────────────────────────
+    print("\n" + "=" * 150)
+    print("WATERFALL TABLE")
+    print("=" * 150)
+    hdr = f"{'Run':>6}  {'wall':>7}  {'load':>6}  {'platform':>10}  {'app_res':>8}  {'rem_exe':>8}  {'ret_cli':>8}  {'post':>6}  {'app_ctrl':>9}  {'known_cold':>10}  {'untracked':>10}  {'ret_mode':>14}  {'payload_mb':>10}"
+    print(hdr)
+    print("-" * 150)
     for r in results:
         if r.get("error"):
-            print(f"  {r['run']}: FAILED - {r['error']}")
+            print(f"  {r['run']:>6}  FAILED")
             continue
-        r_trace = r.get("trace", {}) or {}
-        r_deltas = r_trace.get("deltas_ms", {}) or {}
-        r_restore = r.get("restore_timing", {}) or {}
-        r_cache = r.get("cache_diagnostics", {}) or {}
-        print(f"  {r['run']}:")
-        print(f"    wall_clock         = {r['wall_clock_s']:>8.1f}s")
-        print(f"    t3b_to_t8 (primary)= {r_deltas.get('t3b_to_t8', '?'):>8}")
-        print(f"    inference_total    = {r_deltas.get('inference_total', '?'):>8}ms")
-        print(f"    clip_load          = {r_deltas.get('clip_load', '?'):>8}ms")
-        print(f"    clip_encode        = {r_deltas.get('clip_encode', '?'):>8}ms")
-        print(f"    sampler            = {r_deltas.get('sampler', '?'):>8}ms")
-        print(f"    vae_decode         = {r_deltas.get('vae_decode', '?'):>8}ms")
-        print(f"    graph_overhead     = {r_deltas.get('graph_overhead', '?'):>8}ms")
-        print(f"    restore_total      = {r_restore.get('restore_total_ms', '?'):>8}ms")
-        print(f"    warmup_preload     = {r_restore.get('warmup_preload_ms', '?'):>8}ms")
-        print(f"    warmup_wf          = {r_restore.get('warmup_wf_ms', '?'):>8}ms")
-        print(f"    early_path_resolve = {r_restore.get('early_path_resolve_ms', '?'):>8}ms")
-        print(f"    sage_mode          = {r_restore.get('sage_mode', '?'):>8}")
-        for k, v in sorted(r_restore.items()):
-            if isinstance(v, (int, float)):
-                if k.startswith("warmup_wf_") and k.endswith("_ms"):
-                    print(f"      {k:<30} = {v:>8.1f}ms")
-        # GPU cache eq stats from LIVE diagnostics (not stale restore copy)
-        gpu_eq_live = r_cache.get("gpu_eq", r_restore.get("gpu_cache_eq", {}))
-        if gpu_eq_live:
-            print(f"    gpu_eq_calls       = {gpu_eq_live.get('calls', '?'):>8}")
-            print(f"    gpu_eq_class_hits  = {gpu_eq_live.get('class_hits', '?'):>8}")
-            print(f"    gpu_eq_modeltype   = {gpu_eq_live.get('modeltype_hits', '?'):>8}")
-            print(f"    gpu_eq_misses      = {gpu_eq_live.get('misses', '?'):>8}")
-        # CPU cache
-        cpu_hits = r_cache.get("cpu_hits", {})
-        cpu_misses = r_cache.get("cpu_misses", {})
-        if cpu_hits or cpu_misses:
-            print(f"    cpu_hits           = {cpu_hits}")
-            print(f"    cpu_misses         = {cpu_misses}")
-        # CLIP cache
-        clip_h = r_cache.get("clip_cache_hits", 0)
-        clip_m = r_cache.get("clip_cache_misses", 0)
-        if clip_h or clip_m:
-            print(f"    clip_cache_hits    = {clip_h}")
-            print(f"    clip_cache_misses  = {clip_m}")
-    print("=" * 80)
+        wf = r.get("waterfall", {})
+        _rpi = r.get("return_payload_info", {})
+        _rmode = _rpi.get("return_mode", "full_base64")
+        _pmb = round(_rpi.get("b64_bytes", 0) / 1048576, 2)
+        print(f"{r['run']:>6}  "
+              f"{wf.get('benchmark_wall_ms',0):>7.0f}  "
+              f"{wf.get('workflow_load_ms',0):>6.1f}  "
+              f"{wf.get('platform_restore_ms',0):>10.0f}  "
+              f"{wf.get('app_restore_ms',0):>8.0f}  "
+              f"{wf.get('remote_execute_ms',0):>8.0f}  "
+              f"{wf.get('modal_return_to_client_ms',0):>8.0f}  "
+              f"{wf.get('local_postprocess_ms',0):>6.1f}  "
+              f"{wf.get('app_controlled_ms',0):>9.0f}  "
+              f"{wf.get('known_cold_ms',0):>10.0f}  "
+              f"{wf.get('untracked_after_platform_ms',0):>10.0f}  "
+              f"{_rmode:>14}  {_pmb:>10.2f}")
+    print("=" * 150)
+    print("Field legend:")
+    print("  wall       = benchmark wall clock (t0 → t5)")
+    print("  load       = workflow file load time")
+    print("  platform   = Modal platform restore (pre-app) [excellent<2s | normal 2-4s | bad 4s+]")
+    print("  app_res    = app_restore_ms (lifecycle_restore)")
+    print("  rem_exe    = remote_execute_ms (t3 → t9 inside Modal)")
+    print("  ret_cli    = time from t9_modal_return to benchmark receiving result")
+    print("  post       = local result parse + save + print")
+    print("  app_ctrl   = app_restore + remote_execute (app-controlled total)")
+    print("  known_cold = platform + app_restore + remote_execute (known total)")
+    print("  untracked  = wall − known_cold (everything else)")
+    print()
 
     return 0
 
