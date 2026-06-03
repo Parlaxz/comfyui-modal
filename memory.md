@@ -67,3 +67,60 @@ as KJNodes (or any other custom node that loads a `*_cuda` extension) is registe
 - CPU snapshot preload of 17+ GB model state dicts remains disabled. It made snapshot
   restore much slower (roughly 7.9s → 26.4s) and is still considered a bad trade-off
   for this branch.
+
+## GPU Memory Snapshot implementation (June 2026)
+
+**Goal.** Enable Modal's `enable_gpu_snapshot=True` to capture ComfyUI's CUDA context
+and compiled kernels in the memory snapshot, eliminating the need for
+`_restore_in_process_gpu_state()` (~few ms) and potentially speeding up
+`_warmup_cuda()` (Modal restores CUDA context directly).
+
+**Approach.** Previously, `_force_cpu_during_snapshot()` blocked ALL CUDA access during
+snap=True because SageAttention's C extensions (`_qattn_sm80`, `_fused`, etc.) call
+CUDA driver APIs directly in `PyInit_*` — creating raw CUDA driver handles that
+become dangling pointers on GPU snapshot restore → SIGSEGV.
+
+The new `_force_triton_during_snapshot()` context manager:
+- Blocks SageAttention C extension imports via `sys.meta_path` (same as before)
+- Does NOT monkey-patch `torch.cuda.is_available` → ComfyUI detects and inits with GPU
+- Does NOT set `comfy.cli_args.args.cpu = True` → model_management uses HIGH_VRAM
+- Explicitly sets `comfy.cli_args.args.cpu = False` for safety
+
+SageAttention falls back to its Triton path which uses torch CUDA APIs — these are
+properly checkpointed by Modal's GPU snapshot. On restore, `_select_sage_runtime_mode()`
+detects the real GPU and switches to the baked CUDA path.
+
+**Control.** Gated by `COMFYMODAL_ENABLE_GPU_SNAPSHOT` env var (default `"0"`).
+Set to `"1"` in the Modal image's `.env({...})` block or via secret to enable.
+
+**snap=True flow (GPU snapshot enabled):**
+1. `_force_triton_during_snapshot()` — blocks C extensions, allows GPU
+2. `_start_in_process_backend()` — ComfyUI inits with GPU
+3. SageAttention uses Triton fallback (C extensions blocked)
+4. Snapshot captures: Python state + CUDA context (no model weights loaded yet)
+
+**snap=False/restore flow (GPU snapshot enabled):**
+1. Modal restores snapshot with CUDA context preserved
+2. Recalculate `total_vram` / `total_ram` (host may differ)
+3. `_warmup_cuda()` — faster since CUDA context is already restored
+4. `_select_sage_runtime_mode()` — detects baked CUDA available → "baked_cuda"
+5. `_apply_sage_attention_policy()` — re-patches KJNodes for CUDA path
+6. `_preload_models_to_cpu()` — same CPU state dict cache (models not in snapshot)
+
+**What we skip vs CPU-snapshot path:**
+- No `_restore_in_process_gpu_state()` — ComfyUI already in GPU mode
+- `_warmup_cuda()` expected faster — Modal restores CUDA context directly
+- Restore total expected: ~2.0-2.5s (down from ~3.0s baseline)
+
+**What we DON'T yet capture (future work):**
+- Model weights are NOT preloaded during snap=True (would bloat snapshot to ~22GB)
+- Warmup preload still runs during restore (~2.7s) — same as CPU path
+- Future: if warmup is moved into snap=True, restore drops below ~500ms but
+  cold blob restore gets ~50s penalty (same trade-off as subprocess backend)
+
+**How to enable:**
+```bash
+modal deploy comfyapp.py
+# Set in Modal secret:
+# COMFYMODAL_ENABLE_GPU_SNAPSHOT=1
+```

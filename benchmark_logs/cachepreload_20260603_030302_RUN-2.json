@@ -1,0 +1,70 @@
+{
+  "restore_timing": {
+    "cuda_warmup_ms": 1239.1,
+    "ensure_models_ms": 0.1,
+    "gpu_state_ms": 640.6,
+    "restore_total_ms": 31599.5,
+    "sage_mode": "baked_cuda",
+    "sage_reason": "sageattn_qk_int8_pv_fp16_cuda",
+    "sage_runtime_ms": 34.0,
+    "warmup_flux2_vae_safetensors_ms": 638.2,
+    "warmup_flux_2_klein_9b_fp8_safetensors_ms": 24984.1,
+    "warmup_preload_ms": 26495.3,
+    "warmup_qwen_3_8b_fp8mixed_safetensors_ms": 26344.3,
+    "warmup_status": "ok",
+    "warmup_wf_ms": 3190.2,
+    "warmup_wf_unet_load_ms": 1721.2
+  },
+  "run": "RUN-2",
+  "timestamp": "20260603_030302",
+  "trace": {
+    "deltas_ms": {
+      "clip_encode": 955.39,
+      "clip_load": 376.7,
+      "graph_overhead": 394.57,
+      "image_io": 181.71,
+      "inference_total": 18940.57,
+      "sampler": 5151.68,
+      "t3_to_t3b": 3.27,
+      "t3b_to_t3c": 0.02,
+      "t3b_to_t8": 19335.14,
+      "t8b_to_t9": 1.42,
+      "vae_decode": 12456.8
+    },
+    "prompt_id": "",
+    "restore": {
+      "cuda_warmup_ms": 1239.1,
+      "ensure_models_ms": 0.1,
+      "gpu_state_ms": 640.6,
+      "restore_total_ms": 31599.5,
+      "sage_mode": "baked_cuda",
+      "sage_reason": "sageattn_qk_int8_pv_fp16_cuda",
+      "sage_runtime_ms": 34.0,
+      "warmup_flux2_vae_safetensors_ms": 638.2,
+      "warmup_flux_2_klein_9b_fp8_safetensors_ms": 24984.1,
+      "warmup_preload_ms": 26495.3,
+      "warmup_qwen_3_8b_fp8mixed_safetensors_ms": 26344.3,
+      "warmup_status": "ok",
+      "warmup_wf_ms": 3190.2,
+      "warmup_wf_unet_load_ms": 1721.2
+    },
+    "stages": {
+      "t3_modal_entry": 1780473826.573465,
+      "t3b_validate_done": 1780473826.5767357,
+      "t3c_prep_done": 1780473826.5767558,
+      "t4_clip_load_end": 1780473827.074338,
+      "t4_clip_load_start": 1780473826.69764,
+      "t5_text_encode_end": 1780473828.0297282,
+      "t5_text_encode_start": 1780473827.074338,
+      "t6_sampler_end": 1780473833.184019,
+      "t6_sampler_start": 1780473828.0323348,
+      "t7_vae_decode_end": 1780473845.640818,
+      "t7_vae_decode_start": 1780473833.184019,
+      "t8_image_written": 1780473845.9118755,
+      "t8b_outputs_collected": 1780473846.0935822,
+      "t9_modal_return": 1780473846.095007
+    },
+    "t0": 1780473826.5734618
+  },
+  "wall_clock_s": 65.133
+}

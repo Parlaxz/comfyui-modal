@@ -1,0 +1,28 @@
+{
+  "restore_timing": {
+    "ensure_models_ms": 0.0,
+    "restore_total_ms": 2.7,
+    "subprocess_health_ms": 2.7,
+    "warmup_status": "?"
+  },
+  "run": "RUN-1",
+  "timestamp": "20260603_025052",
+  "trace": {
+    "deltas_ms": {
+      "inference_total": 0.0
+    },
+    "prompt_id": "",
+    "restore": {
+      "ensure_models_ms": 0.0,
+      "restore_total_ms": 2.7,
+      "subprocess_health_ms": 2.7,
+      "warmup_status": "?"
+    },
+    "stages": {
+      "t3_modal_entry": 1780473238.3985772,
+      "t9_modal_return": 1780473248.8502493
+    },
+    "t0": 1780473238.3985739
+  },
+  "wall_clock_s": 197.828
+}

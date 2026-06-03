@@ -1,0 +1,66 @@
+{
+  "restore_timing": {
+    "cuda_warmup_ms": 209.4,
+    "ensure_models_ms": 0.1,
+    "gpu_state_ms": 424.2,
+    "restore_total_ms": 4437.5,
+    "sage_mode": "baked_cuda",
+    "sage_reason": "sageattn_qk_int8_pv_fp16_cuda",
+    "sage_runtime_ms": 19.9,
+    "warmup_flux2_vae_safetensors_ms": 223.5,
+    "warmup_flux_2_klein_9b_fp8_safetensors_ms": 2621.8,
+    "warmup_preload_ms": 2627.2,
+    "warmup_qwen_3_8b_fp8mixed_safetensors_ms": 2339.3,
+    "warmup_status": "ok"
+  },
+  "run": "RUN-2",
+  "timestamp": "20260603_022459",
+  "trace": {
+    "deltas_ms": {
+      "clip_encode": 1001.44,
+      "clip_load": 535.36,
+      "graph_overhead": 451.48,
+      "image_io": 190.89,
+      "inference_total": 7197.04,
+      "sampler": 5256.7,
+      "t3_to_t3b": 5.26,
+      "t3b_to_t3c": 0.04,
+      "t3b_to_t8": 7648.52,
+      "t8b_to_t9": 1.72,
+      "vae_decode": 403.54
+    },
+    "prompt_id": "",
+    "restore": {
+      "cuda_warmup_ms": 209.4,
+      "ensure_models_ms": 0.1,
+      "gpu_state_ms": 424.2,
+      "restore_total_ms": 4437.5,
+      "sage_mode": "baked_cuda",
+      "sage_reason": "sageattn_qk_int8_pv_fp16_cuda",
+      "sage_runtime_ms": 19.9,
+      "warmup_flux2_vae_safetensors_ms": 223.5,
+      "warmup_flux_2_klein_9b_fp8_safetensors_ms": 2621.8,
+      "warmup_preload_ms": 2627.2,
+      "warmup_qwen_3_8b_fp8mixed_safetensors_ms": 2339.3,
+      "warmup_status": "ok"
+    },
+    "stages": {
+      "t3_modal_entry": 1780471512.476292,
+      "t3b_validate_done": 1780471512.4815474,
+      "t3c_prep_done": 1780471512.4815834,
+      "t4_clip_load_end": 1780471513.1657536,
+      "t4_clip_load_start": 1780471512.6303952,
+      "t5_text_encode_end": 1780471514.1671958,
+      "t5_text_encode_start": 1780471513.1657536,
+      "t6_sampler_end": 1780471519.427112,
+      "t6_sampler_start": 1780471514.1704087,
+      "t7_vae_decode_end": 1780471519.8306525,
+      "t7_vae_decode_start": 1780471519.427112,
+      "t8_image_written": 1780471520.1300638,
+      "t8b_outputs_collected": 1780471520.3209581,
+      "t9_modal_return": 1780471520.322683
+    },
+    "t0": 1780471512.4762855
+  },
+  "wall_clock_s": 20.941
+}

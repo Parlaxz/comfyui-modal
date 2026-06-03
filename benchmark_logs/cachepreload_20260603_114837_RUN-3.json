@@ -1,0 +1,68 @@
+{
+  "restore_timing": {
+    "cuda_warmup_ms": 55.7,
+    "ensure_models_ms": 0.1,
+    "gpu_state_ms": 280.2,
+    "restore_total_ms": 3964.5,
+    "sage_mode": "baked_cuda",
+    "sage_reason": "sageattn_qk_int8_pv_fp16_cuda",
+    "sage_runtime_ms": 18.4,
+    "warmup_flux2_vae_safetensors_ms": 197.5,
+    "warmup_flux_2_klein_9b_fp8_safetensors_ms": 2869.0,
+    "warmup_preload_ms": 2875.4,
+    "warmup_qwen_3_8b_fp8mixed_safetensors_ms": 2612.3,
+    "warmup_status": "ok",
+    "warmup_wf_ms": 734.4
+  },
+  "run": "RUN-3",
+  "timestamp": "20260603_114837",
+  "trace": {
+    "deltas_ms": {
+      "clip_encode": 1026.3,
+      "clip_load": 440.23,
+      "graph_overhead": 429.02,
+      "image_io": 201.09,
+      "inference_total": 7018.4,
+      "sampler": 5174.43,
+      "t3_to_t3b": 4.18,
+      "t3b_to_t3c": 0.03,
+      "t3b_to_t8": 7447.42,
+      "t8b_to_t9": 37.53,
+      "vae_decode": 377.44
+    },
+    "prompt_id": "",
+    "restore": {
+      "cuda_warmup_ms": 55.7,
+      "ensure_models_ms": 0.1,
+      "gpu_state_ms": 280.2,
+      "restore_total_ms": 3964.5,
+      "sage_mode": "baked_cuda",
+      "sage_reason": "sageattn_qk_int8_pv_fp16_cuda",
+      "sage_runtime_ms": 18.4,
+      "warmup_flux2_vae_safetensors_ms": 197.5,
+      "warmup_flux_2_klein_9b_fp8_safetensors_ms": 2869.0,
+      "warmup_preload_ms": 2875.4,
+      "warmup_qwen_3_8b_fp8mixed_safetensors_ms": 2612.3,
+      "warmup_status": "ok",
+      "warmup_wf_ms": 734.4
+    },
+    "stages": {
+      "t3_modal_entry": 1780505326.0482674,
+      "t3b_validate_done": 1780505326.0524442,
+      "t3c_prep_done": 1780505326.0524783,
+      "t4_clip_load_end": 1780505326.6330829,
+      "t4_clip_load_start": 1780505326.1928554,
+      "t5_text_encode_end": 1780505327.6593866,
+      "t5_text_encode_start": 1780505326.6330829,
+      "t6_sampler_end": 1780505332.8368728,
+      "t6_sampler_start": 1780505327.6624384,
+      "t7_vae_decode_end": 1780505333.214308,
+      "t7_vae_decode_start": 1780505332.8368728,
+      "t8_image_written": 1780505333.4998593,
+      "t8b_outputs_collected": 1780505333.7009478,
+      "t9_modal_return": 1780505333.738482
+    },
+    "t0": 1780505326.048263
+  },
+  "wall_clock_s": 17.668
+}

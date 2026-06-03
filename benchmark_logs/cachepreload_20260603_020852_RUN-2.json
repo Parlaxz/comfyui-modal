@@ -1,0 +1,66 @@
+{
+  "restore_timing": {
+    "cuda_warmup_ms": 181.9,
+    "ensure_models_ms": 0.1,
+    "gpu_state_ms": 313.1,
+    "restore_total_ms": 3024.1,
+    "sage_mode": "baked_cuda",
+    "sage_reason": "sageattn_qk_int8_pv_fp16_cuda",
+    "sage_runtime_ms": 20.1,
+    "warmup_flux2_vae_safetensors_ms": 238.5,
+    "warmup_flux_2_klein_9b_fp8_safetensors_ms": 2502.0,
+    "warmup_preload_ms": 2508.7,
+    "warmup_qwen_3_8b_fp8mixed_safetensors_ms": 2266.4,
+    "warmup_status": "ok"
+  },
+  "run": "RUN-2",
+  "timestamp": "20260603_020852",
+  "trace": {
+    "deltas_ms": {
+      "clip_encode": 1061.84,
+      "clip_load": 517.36,
+      "graph_overhead": 448.26,
+      "image_io": 185.16,
+      "inference_total": 7537.2,
+      "sampler": 5212.46,
+      "t3_to_t3b": 4.87,
+      "t3b_to_t3c": 0.04,
+      "t3b_to_t8": 7985.46,
+      "t8b_to_t9": 1.46,
+      "vae_decode": 745.54
+    },
+    "prompt_id": "",
+    "restore": {
+      "cuda_warmup_ms": 181.9,
+      "ensure_models_ms": 0.1,
+      "gpu_state_ms": 313.1,
+      "restore_total_ms": 3024.1,
+      "sage_mode": "baked_cuda",
+      "sage_reason": "sageattn_qk_int8_pv_fp16_cuda",
+      "sage_runtime_ms": 20.1,
+      "warmup_flux2_vae_safetensors_ms": 238.5,
+      "warmup_flux_2_klein_9b_fp8_safetensors_ms": 2502.0,
+      "warmup_preload_ms": 2508.7,
+      "warmup_qwen_3_8b_fp8mixed_safetensors_ms": 2266.4,
+      "warmup_status": "ok"
+    },
+    "stages": {
+      "t3_modal_entry": 1780470544.8527842,
+      "t3b_validate_done": 1780470544.8576548,
+      "t3c_prep_done": 1780470544.8576932,
+      "t4_clip_load_end": 1780470545.520714,
+      "t4_clip_load_start": 1780470545.0033557,
+      "t5_text_encode_end": 1780470546.5825546,
+      "t5_text_encode_start": 1780470545.520714,
+      "t6_sampler_end": 1780470551.797828,
+      "t6_sampler_start": 1780470546.5853696,
+      "t7_vae_decode_end": 1780470552.543371,
+      "t7_vae_decode_start": 1780470551.797828,
+      "t8_image_written": 1780470552.8431122,
+      "t8b_outputs_collected": 1780470553.028273,
+      "t9_modal_return": 1780470553.0297287
+    },
+    "t0": 1780470544.8527808
+  },
+  "wall_clock_s": 21.502
+}
