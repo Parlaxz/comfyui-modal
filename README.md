@@ -148,6 +148,59 @@ To force a manual re-deploy at any time, click **↑ Deploy** in the sidebar.
 
 ---
 
+## Headless benchmark harness
+
+This repo includes a local benchmark script:
+
+```bash
+python benchmark_modal.py
+```
+
+What it does:
+
+1. closes any previous local `ComfyUI\main.py` Python process
+2. runs `redeploy_modal_and_run_comfyui.bat`
+3. waits for local ComfyUI health on `127.0.0.1:8188`
+4. runs the latest captured workflow once
+5. waits `10s`
+6. runs the same workflow a second time
+7. saves all artifacts to `benchmark_runs/<timestamp>/`
+
+### Important: capture the workflow first
+
+The benchmark script reuses the **exact workflow payload** from the last normal generation you ran in ComfyUI.
+
+Before using `benchmark_modal.py`:
+
+1. restart/reload ComfyUI so the updated `comfyui-modal` node is active
+2. load the workflow you want to benchmark
+3. run one normal generation from the UI
+
+That normal generation silently saves the latest workflow snapshot to:
+
+- `latest_benchmark_workflow.json`
+
+No visible UI changes are added for this capture step.
+
+### Benchmark output
+
+Each run creates a new timestamped folder under:
+
+- `benchmark_runs/`
+
+Typical contents:
+
+- `workflow_snapshot.json`
+- `run1_response.json`
+- `run2_response.json`
+- `run1_trace.json`
+- `run2_trace.json`
+- `summary.json`
+- `summary.md`
+- `benchmark.log`
+
+---
+
 ## Updating
 
 ```bash

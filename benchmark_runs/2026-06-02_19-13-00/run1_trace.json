@@ -1,0 +1,40 @@
+{
+  "deltas_ms": {
+    "clip_encode": 225.04,
+    "graph_overhead": 599.3,
+    "image_io": 9.84,
+    "inference_total": 5029.44,
+    "modal_to_browser": 68991.29,
+    "modal_to_return": 67058.65,
+    "sampler": 4547.98,
+    "t0_to_t1": 1.71,
+    "t1_to_t2": 7.69,
+    "t2_to_t3": 61415.54,
+    "t3_to_t3b": 2.92,
+    "t3b_to_t3c": 0.03,
+    "t3b_to_t8": 5628.74,
+    "t8b_to_t9": 1.61,
+    "t9_to_t10": 1932.64,
+    "vae_decode": 256.42
+  },
+  "prompt_id": "ac10057b-c070-4e00-9f4f-68c29c2b53ba",
+  "stages": {
+    "t0_client_press": 1780445588.998,
+    "t10_local_materialized": 1780445657.9986935,
+    "t1_local_recv": 1780445588.9997065,
+    "t2_local_dispatch": 1780445589.0074012,
+    "t3_modal_entry": 1780445650.4229393,
+    "t3b_validate_done": 1780445650.4258635,
+    "t3c_prep_done": 1780445650.4258919,
+    "t5_text_encode_end": 1780445650.802527,
+    "t5_text_encode_start": 1780445650.5774875,
+    "t6_sampler_end": 1780445655.3517208,
+    "t6_sampler_start": 1780445650.803745,
+    "t7_vae_decode_end": 1780445655.608143,
+    "t7_vae_decode_start": 1780445655.3517208,
+    "t8_image_written": 1780445656.0545998,
+    "t8b_outputs_collected": 1780445656.0644422,
+    "t9_modal_return": 1780445656.0660522
+  },
+  "t0": 1780445588.998
+}

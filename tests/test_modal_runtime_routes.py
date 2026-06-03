@@ -48,6 +48,16 @@ class ModalRuntimeRoutesASTTests(unittest.TestCase):
         routes = self._find_route_strings(source, "get")
         self.assertIn("/comfymodal/runtime/state", routes)
 
+    def test_benchmark_workflow_get_route_registered_in_init(self):
+        source = INIT_PATH.read_text(encoding="utf-8")
+        routes = self._find_route_strings(source, "get")
+        self.assertIn("/comfymodal/benchmark/workflow", routes)
+
+    def test_benchmark_workflow_post_route_registered_in_init(self):
+        source = INIT_PATH.read_text(encoding="utf-8")
+        routes = self._find_route_strings(source, "post")
+        self.assertIn("/comfymodal/benchmark/workflow", routes)
+
     def test_config_get_route_exposes_available_gpus_and_default_gpu(self):
         source = INIT_PATH.read_text(encoding="utf-8")
         self.assertIn('"available_gpus"', source)

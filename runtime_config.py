@@ -21,7 +21,7 @@ ENABLE_WARMUP: bool = (
     os.environ.get("COMFYMODAL_ENABLE_WARMUP", "false").lower() == "true"
 )
 WARMUP_PROFILE: str = os.environ.get("COMFYMODAL_WARMUP_PROFILE", "off")
-RUNTIME_VERSION: str = os.environ.get("COMFYMODAL_RUNTIME_VERSION", "1")
+RUNTIME_VERSION: str = os.environ.get("COMFYMODAL_RUNTIME_VERSION", "2")
 SNAPSHOT_SCHEMA_VERSION: str = os.environ.get(
     "COMFYMODAL_SNAPSHOT_SCHEMA_VERSION", "1"
 )

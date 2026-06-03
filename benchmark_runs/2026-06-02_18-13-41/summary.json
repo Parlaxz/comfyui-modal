@@ -1,0 +1,8 @@
+{
+  "error": "Workflow validation failed: Prompt outputs failed validation; CheckpointLoaderSimple: Value not in list",
+  "run1_total_ms": null,
+  "run1_trace": {},
+  "run2_total_ms": null,
+  "run2_trace": {},
+  "status": "run1_failed"
+}

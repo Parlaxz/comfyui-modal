@@ -269,16 +269,209 @@ class AutoWarmupASTTests(unittest.TestCase):
                 return ast.get_source_segment(COMFYAPP_PATH.read_text(encoding="utf-8"), node)
         return None
 
-    def test_restore_does_not_call_preload_warmup_profile(self):
+    def test_restore_warms_cuda_and_applies_sage_detection(self):
+        """Restore warms CUDA and applies SageAttention runtime mode detection.
+
+        Startup initialises the in-process backend under
+        ``_force_cpu_during_snapshot()`` so the snapshot already contains
+        the loaded Python state.  Restore must NOT re-init the backend;
+        it should just warm CUDA, and (optionally) rebuild the GPU model
+        cache via the warmup profile.  SageAttention runtime mode
+        detection must also happen here so the first ``run_prompt()``
+        avoids the extra startup tax before first GPU work.
+        """
         source = self._get_method_source("restore")
         self.assertIsNotNone(source, "restore method not found")
-        self.assertNotIn("_preload_warmup_profile", source)
+        # Restore does NOT re-init the in-process backend
+        self.assertNotIn("_start_in_process_backend", source,
+                         "restore() must not re-init the in-process backend "
+                         "— it is pre-initialised in the snapshot under "
+                         "_force_cpu_during_snapshot()")
+        # Restore DOES rebuild the GPU model cache (when ENABLE_WARMUP)
+        self.assertIn("_preload_warmup_profile", source)
+        self.assertIn("restore_warmup_preload", source)
+        self.assertIn("ENABLE_WARMUP", source)
+        # Restore DOES warm CUDA
+        self.assertIn("_warmup_cuda", source)
+        # Restore now performs sage runtime selection and policy application.
+        self.assertIn("_select_sage_runtime_mode", source,
+                      "restore() must select sage runtime mode after CUDA warmup")
+        self.assertIn("_apply_sage_attention_policy", source,
+                      "restore() must apply sage attention policy during restore")
+        self.assertIn("restore_sage_runtime", source,
+                      "restore() must log the sage runtime detection stage")
+        self.assertIn("DISABLE_MMAP", source,
+                      "restore() must enable eager safetensors reads after restore")
 
     def test_restore_logs_warmup_cuda_warmup_for_in_process(self):
         source = self._get_method_source("restore")
         self.assertIsNotNone(source)
         self.assertIn("restore_warmup", source)
         self.assertIn("cuda_warmup", source)
+
+    def test_startup_wraps_in_process_init_in_force_cpu(self):
+        """Startup initialises the in-process backend under
+        ``_force_cpu_during_snapshot()`` so the snapshot has zero CUDA
+        driver state.  This avoids the SIGSEGV on restore that the
+        previous design hit when GPU memory snapshot captured in-process
+        CUDA handles.
+        """
+        source = self._get_method_source("startup")
+        self.assertIsNotNone(source, "startup method not found")
+        self.assertIn("_force_cpu_during_snapshot", source,
+                      "startup() must wrap in-process backend init in "
+                      "_force_cpu_during_snapshot() to keep the snapshot "
+                      "free of CUDA driver state")
+        self.assertIn("_start_backend", source,
+                      "startup() must initialise the backend under "
+                      "_force_cpu_during_snapshot() so in-process startup "
+                      "keeps its subprocess fallback path")
+        # The wrap must be `with self._force_cpu_during_snapshot():`
+        # containing the backend start call.
+        self.assertRegex(
+            source,
+            r"with\s+self\._force_cpu_during_snapshot\(\):\s*\n\s+self\._start_backend\(\)",
+            "backend start must be wrapped in "
+            "with self._force_cpu_during_snapshot(): ...",
+        )
+
+    def test_startup_does_not_force_subprocess_fallback(self):
+        """The previous design forced the subprocess backend during
+        snap=True (``self._backend_fallback = True``) to keep CUDA out
+        of the parent snapshot.  The new design uses the in-process
+        backend under ``_force_cpu_during_snapshot()`` so that override
+        is no longer needed.
+        """
+        source = self._get_method_source("startup")
+        self.assertIsNotNone(source)
+        self.assertNotIn(
+            "self._backend_fallback = True",
+            source,
+            "startup() must not force subprocess fallback — the in-process "
+            "backend under _force_cpu_during_snapshot() now handles "
+            "snapshot safety",
+        )
+
+    def test_force_cpu_during_snapshot_method_exists(self):
+        """The ``_force_cpu_during_snapshot`` context manager must exist
+        and monkey-patch ``torch.cuda.is_available`` /
+        ``torch.cuda.current_device`` so ComfyUI's ``model_management``
+        skips CUDA initialisation during snap=True.
+
+        It must ALSO block imports of CUDA C extension modules
+        (``*_cuda``, ``cuda_*``) via ``sys.meta_path`` so that
+        ``PyInit_*`` of e.g. ``sageattn_qk_int8_pv_fp16_cuda`` does
+        not allocate GPU memory that ends up in the snapshot.
+        """
+        source = self._get_method_source("_force_cpu_during_snapshot")
+        self.assertIsNotNone(source, "_force_cpu_during_snapshot method not found")
+        # Patches the two torch.cuda functions that ComfyUI checks
+        self.assertIn("torch.cuda.is_available", source)
+        self.assertIn("torch.cuda.current_device", source)
+        # Restores the originals in finally (snapshot doesn't capture the patch)
+        self.assertIn("original_is_available", source)
+        self.assertIn("original_current_device", source)
+        self.assertIn("finally", source)
+        # Blocks CUDA C extension imports via sys.meta_path
+        self.assertIn("sys.meta_path", source,
+                      "must insert an import blocker into sys.meta_path so "
+                      "CUDA C extensions (e.g. sageattn_*_cuda) don't allocate "
+                      "GPU state during snap=True")
+        self.assertIn("_is_cuda_module", source)
+        self.assertIn("_cuda", source)
+        # The blocker must be removed in the finally block
+        self.assertIn("sys.meta_path.remove", source)
+        # It's a context manager (try / yield / finally — the
+        # @contextlib.contextmanager decorator lives above the def line
+        # so ast.get_source_segment omits it; the function-body pattern
+        # is the canonical signature of a contextlib.contextmanager).
+        self.assertIn("yield", source)
+        self.assertRegex(source, r"try:\s*\n\s+yield\s*\n\s+finally:")
+        # Decorator is present (read full file)
+        full_source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertRegex(
+            full_source,
+            r"@contextlib\.contextmanager\s*\n\s*def\s+_force_cpu_during_snapshot",
+        )
+
+    def test_force_cpu_blocker_matches_sageattn_modules(self):
+        """The import blocker must recognise the sageattention CUDA
+        extension module names so KJNodes falls back to Triton mode
+        during snap=True (and doesn't allocate GPU memory that would
+        SIGSEGV on restore).
+        """
+        source = self._get_method_source("_force_cpu_during_snapshot")
+        self.assertIsNotNone(source)
+        # The pattern must match both Blackwell (fp16) and older (fp8) variants
+        self.assertTrue(
+            "endswith" in source and "_cuda" in source,
+            "blocker must use endswith('_cuda') to match sageattn_*_cuda",
+        )
+        # Full source check — should explicitly mention the sageattn modules
+        # somewhere in the docstring or comments as rationale
+        full_source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn("sageattn", full_source)
+
+    def test_startup_preloads_cpu_cache(self):
+        """CPU cache preload is intentionally disabled in startup — loading
+        model state dicts (17+ GB) into the snapshot made Modal restore
+        ~3× slower (7.9s → 26.4s), far outweighing the ~1s volume read
+        savings.  The lean snapshot keeps restore fast; model files are
+        loaded from the volume on restore or on first use during prompt
+        execution.
+        """
+        source = self._get_method_source("startup")
+        self.assertIsNotNone(source, "startup method not found")
+        # The preload infrastructure methods must NOT be called in startup
+        self.assertNotIn("_snapshot_preload_profile", source,
+                         "CPU cache preload is disabled — see comment in startup()")
+        self.assertNotIn("_snapshot_preload_paths", source,
+                         "CPU cache preload is disabled — see comment in startup()")
+        # _preload_models_to_cpu does appear in the explanatory comment (as
+        # documentation for why preload is disabled), so we don't assertNotIn for it.
+        # The explanatory comment must be present
+        self.assertIn("CPU cache preload is intentionally disabled", source,
+                       "startup() must document why CPU cache preload is disabled")
+        self.assertIn("17+ GB", source,
+                      "startup() must mention the snapshot size cost")
+        self.assertIn("7.9s → 26.4s", source,
+                      "startup() must mention the restore time regression")
+        # The infrastructure still exists as dead code for future use
+        full_source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn("_snapshot_preload_profile", full_source,
+                      "_snapshot_preload_profile must remain as reusable infrastructure")
+        self.assertIn("_snapshot_preload_paths", full_source,
+                      "_snapshot_preload_paths must remain as reusable infrastructure")
+        self.assertIn("_preload_models_to_cpu", full_source,
+                      "_preload_models_to_cpu must remain as reusable infrastructure")
+
+    def test_run_prompt_does_not_repeat_sage_detection(self):
+        """run_prompt() should not repeat restore-time sage setup."""
+        source = self._get_method_source("run_prompt")
+        self.assertIsNotNone(source)
+        self.assertNotIn("_select_sage_runtime_mode", source,
+                         "run_prompt() must not repeat restore-time sage detection")
+        self.assertNotIn("_apply_sage_attention_policy", source,
+                         "run_prompt() must not repeat restore-time sage policy setup")
+        self.assertNotIn("run_prompt_deferred_sage", source,
+                         "run_prompt() must not log the removed deferred sage stage")
+
+    def test_enable_warmup_defaults_to_one(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn('ENABLE_WARMUP = os.getenv("COMFYMODAL_ENABLE_WARMUP", "1") == "1"', source)
+
+    def test_restore_gpu_state_recomputes_total_vram(self):
+        source = self._get_method_source("_restore_in_process_gpu_state")
+        self.assertIsNotNone(source)
+        self.assertIn("total_vram", source)
+        self.assertIn("get_total_memory", source)
+        self.assertIn("get_torch_device", source)
+
+    def test_restore_gpu_state_imports_psutil_for_total_ram(self):
+        source = self._get_method_source("_restore_in_process_gpu_state")
+        self.assertIsNotNone(source)
+        self.assertIn("import psutil", source)
+        self.assertIn("virtual_memory", source)
 
     def test_run_prompt_calls_save_last_model_stack(self):
         source = self._get_method_source("run_prompt")
@@ -294,6 +487,58 @@ class AutoWarmupASTTests(unittest.TestCase):
     def test_module_exports_stack_to_profile(self):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
         self.assertIn("def stack_to_profile", source)
+
+    def test_collect_in_process_outputs_has_time_scoped_scan(self):
+        """The output collector must scope its directory-scan fallback to
+        the prompt's start time so it picks up files written *during*
+        the prompt (not stale images from earlier prompts in the same
+        container).  Without this, multi-prompt containers either
+        return wrong files or zero files when executor history metadata
+        is not populated.
+        """
+        source = self._get_method_source("_collect_in_process_outputs")
+        self.assertIsNotNone(source, "_collect_in_process_outputs method not found")
+        # Method signature must accept prompt_start_time
+        self.assertIn("prompt_start_time", source,
+                      "collector must accept a prompt_start_time parameter "
+                      "to scope its directory-scan fallback")
+        # The scan helper must filter by mtime
+        self.assertIn("since_ts", source,
+                      "directory scan must filter by mtime >= since_ts")
+        self.assertIn("st_mtime", source)
+        # The collector must de-dupe across sources
+        self.assertIn("seen_filenames", source,
+                      "collector must de-dupe results across history + scan sources")
+        # The collector must scan generated-output directories only.
+        for d in ("output", "temp"):
+            self.assertIn(d, source,
+                          f"collector must scan the {d}/ directory")
+        self.assertIn('"input": comfy_root / "input"', source,
+                      "history metadata may still point at input/ files explicitly")
+        self.assertNotIn('for base in (comfy_root / "output", comfy_root / "temp", comfy_root / "input")', source,
+                         "directory-scan fallback must not sweep uploaded source images from input/")
+        # Diagnostic logging for the empty-output case
+        self.assertIn("no outputs found", source,
+                      "collector must log when no outputs are found, "
+                      "with diagnostic context")
+
+    def test_execute_in_process_passes_prompt_start_time_to_collector(self):
+        """The prompt execution path must capture prompt_start_time and
+        pass it to the collector so the directory-scan fallback is
+        scoped correctly.
+        """
+        source = self._get_method_source("_execute_in_process")
+        self.assertIsNotNone(source, "_execute_in_process method not found")
+        # Captures a start time
+        self.assertIn("prompt_start_time", source,
+                      "_execute_in_process must capture prompt_start_time")
+        # Passes it to the collector
+        self.assertIn("_collect_in_process_outputs", source)
+        self.assertRegex(
+            source,
+            r"_collect_in_process_outputs\([^)]*prompt_start_time=",
+            "_execute_in_process must pass prompt_start_time=… to the collector",
+        )
 
 
 if __name__ == "__main__":

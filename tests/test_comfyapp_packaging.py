@@ -26,6 +26,23 @@ class ComfyAppPackagingTests(unittest.TestCase):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
         self.assertGreaterEqual(source.count('add_local_python_source("gpu_catalog")'), 6)
 
+    def test_all_modal_images_include_timing_trace_source(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertGreaterEqual(source.count('add_local_python_source("timing_trace")'), 2)
+
+    def test_image_pins_sageattention_220(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn("git+https://github.com/thu-ml/SageAttention.git@v2.2.0", source)
+
+    def test_image_verifies_compiled_sageattention_artifacts(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn("glob('*.so')", source)
+        self.assertIn("import sageattention._fused", source)
+
+    def test_image_fused_verification_command_uses_safe_quotes(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn("print('sageattention._fused ok')", source)
+
 
 if __name__ == "__main__":
     unittest.main()
