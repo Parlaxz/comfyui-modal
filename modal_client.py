@@ -54,6 +54,15 @@ def _api():
     return _api_instances[_current_gpu]
 
 
+def _api_for_gpu(gpu: str | None = None):
+    selected_gpu = _current_gpu if gpu is None else normalize_gpu_value(gpu)
+    if selected_gpu not in _apis:
+        raise ValueError(f"Unsupported GPU: {selected_gpu}")
+    if selected_gpu not in _api_instances:
+        _api_instances[selected_gpu] = _apis[selected_gpu]()
+    return _api_instances[selected_gpu]
+
+
 def clear_cache():
     """Clear cached API instance handles so subsequent requests use fresh handles."""
     _api_instances.clear()
@@ -87,10 +96,11 @@ async def run_prompt(
     workflow: dict,
     input_images: dict | None = None,
     trace: dict | None = None,
+    gpu: str | None = None,
 ) -> dict:
     async with _run_prompt_semaphore:
         return await asyncio.to_thread(
-            lambda: _api().run_prompt.remote(workflow, input_images or {}, trace or {}),
+            lambda: _api_for_gpu(gpu).run_prompt.remote(workflow, input_images or {}, trace or {}),
         )
 
 

@@ -10,6 +10,7 @@ import copy
 import threading
 import subprocess
 import time
+from collections import namedtuple
 
 _NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 if _NODE_DIR not in sys.path:
@@ -44,10 +45,12 @@ _LATEST_BENCHMARK_WORKFLOW_FILE = os.path.join(_NODE_DIR, "latest_benchmark_work
 
 _pip_install_error = ""
 _WORKFLOW_IMAGE_SUFFIX_DIRS = {
-    "[output]": "output",
-    "[input]": "input",
-    "[temp]": "temp",
+    " [output]": "output",
+    " [input]": "input",
+    " [temp]": "temp",
 }
+
+_ExecutionStatusFallback = namedtuple("ExecutionStatusFallback", ["status_str", "completed", "messages"])
 
 
 def _split_workflow_image_reference(filename: str) -> tuple[str, str | None]:
@@ -69,7 +72,7 @@ def _workflow_image_parts(filename: str) -> list[str]:
 def _resolve_local_workflow_image_candidates(filename: str) -> list[str]:
     relative_name, annotated_dir = _split_workflow_image_reference(filename)
     parts = _workflow_image_parts(relative_name)
-    search_dirs = [annotated_dir] if annotated_dir else ["input", "output", "temp"]
+    search_dirs = [annotated_dir] if annotated_dir else ["input", "output"]
     return [os.path.join(_COMFYUI_ROOT, directory, *parts) for directory in search_dirs]
 
 def _ensure_modal():
@@ -479,11 +482,22 @@ def _finish_job(item_id: int, prompt_id: str, outputs: dict, success: bool, meta
     pq = _pq()
     if pq is None:
         return
-    status = execution.PromptQueue.ExecutionStatus(
-        status_str='success' if success else 'error',
-        completed=success,
-        messages=[],
-    )
+    status_cls = None
+    if execution is not None:
+        prompt_queue = getattr(execution, "PromptQueue", None)
+        status_cls = getattr(prompt_queue, "ExecutionStatus", None) if prompt_queue is not None else None
+    if status_cls is not None:
+        status = status_cls(
+            status_str='success' if success else 'error',
+            completed=success,
+            messages=[],
+        )
+    else:
+        status = _ExecutionStatusFallback(
+            status_str='success' if success else 'error',
+            completed=success,
+            messages=[],
+        )
     history_result = {"outputs": outputs, "meta": dict(meta or {})}
     pq.task_done(item_id, history_result, status=status,
                  process_item=lambda prompt: prompt[:5] + prompt[6:])
@@ -576,6 +590,7 @@ async def _execute_job(item: tuple, item_id: int):
             workflow,
             input_images,
             trace={**trace.fields(), "prompt_id": prompt_id},
+            gpu=extra_data.get("gpu"),
         )
         remote_run_ms = round((time.time() - remote_started) * 1000, 1)
         print(
@@ -763,6 +778,7 @@ if _server:
         async with _counter_lock:
             _item_counter += 1
             item_id = _item_counter
+            selected_gpu = get_gpu()
             extra_data = {
                 "client_id": client_id,
                 "create_time": int(time.time() * 1000),
@@ -770,6 +786,7 @@ if _server:
                 "workflow_hash": workflow_hash,
                 "prompt_summary": prompt_summary,
                 "model_stack": model_stack,
+                "gpu": selected_gpu,
                 "trace": {**trace.fields(), "prompt_id": prompt_id},
             }
             item = (_item_counter, prompt_id, workflow, extra_data, list(workflow.keys()), {})

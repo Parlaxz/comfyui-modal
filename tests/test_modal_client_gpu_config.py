@@ -1,4 +1,5 @@
 import importlib
+import asyncio
 import os
 import sys
 import unittest
@@ -85,6 +86,39 @@ class ModalClientGpuConfigTests(unittest.TestCase):
         _clear_hidden_cache()
         mod = self.load_module()
         self.assertNotIn("b200", mod.get_supported_gpus())
+
+    def test_run_prompt_can_target_explicit_gpu_without_global_mutation(self):
+        calls = []
+
+        class FakeRemote:
+            def __init__(self, gpu):
+                self.gpu = gpu
+
+            def remote(self, workflow, input_images, trace):
+                calls.append((self.gpu, workflow, input_images, trace))
+                return {"gpu": self.gpu}
+
+        class FakeAPI:
+            def __init__(self, gpu):
+                self.run_prompt = FakeRemote(gpu)
+
+        fake_modal = ModuleType("modal")
+        setattr(
+            fake_modal,
+            "Cls",
+            SimpleNamespace(from_name=lambda app, cls: lambda: FakeAPI(cls)),
+        )
+        setattr(fake_modal, "Function", SimpleNamespace(from_name=lambda app, fn: f"{app}:{fn}"))
+        sys.modules["modal"] = fake_modal
+        sys.modules.pop("modal_client", None)
+        mod = importlib.import_module("modal_client")
+
+        mod.set_gpu("a10g")
+        result = asyncio.run(mod.run_prompt({"prompt": 1}, {}, {}, gpu="l4"))
+
+        self.assertEqual(result, {"gpu": "ComfyAPI_L4"})
+        self.assertEqual(calls[0][0], "ComfyAPI_L4")
+        self.assertEqual(mod.get_gpu(), "a10g")
 
 
 if __name__ == "__main__":

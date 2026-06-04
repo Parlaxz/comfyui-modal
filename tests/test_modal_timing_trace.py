@@ -77,8 +77,8 @@ class TimingTraceWiringTests(unittest.TestCase):
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_prompt"
         )
         arg_names = [arg.arg for arg in run_prompt.args.args]
-        self.assertEqual(arg_names, ["workflow", "input_images", "trace"])
-        self.assertIn("run_prompt.remote(workflow, input_images or {}, trace or {})", source)
+        self.assertEqual(arg_names, ["workflow", "input_images", "trace", "gpu"])
+        self.assertIn("_api_for_gpu(gpu).run_prompt.remote(workflow, input_images or {}, trace or {})", source)
 
     def test_init_tracks_local_and_browser_trace_stamps(self):
         source = INIT_PATH.read_text(encoding="utf-8")

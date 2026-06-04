@@ -90,6 +90,7 @@ class TestRestoreTimingDataFlow(unittest.TestCase):
             self.assertIn(prompt_id, self.history)
             entry = self.history[prompt_id]
             self.assertIn("meta", entry)
+            self.assertTrue(hasattr(entry["status"], "_asdict"))
             meta = entry["meta"]
             self.assertIn("restore_timing", meta,
                           f"meta keys: {list(meta.keys())}")
