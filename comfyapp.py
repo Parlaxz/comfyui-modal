@@ -49,6 +49,8 @@ RUNTIME_GUIDER_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "guider_profile.t
 RUNTIME_DEEP_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "deep_profile.txt")
 RUNTIME_LMG_FASTPATH_DRYRUN_PATH = os.path.join(RUNTIME_CONFIG_DIR, "lmg_fastpath_dryrun.txt")
 RUNTIME_LMG_FASTPATH_PATH = os.path.join(RUNTIME_CONFIG_DIR, "lmg_fastpath.txt")
+RUNTIME_MODELPATCHER_CACHE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "modelpatcher_cache.txt")
+RUNTIME_MODELPATCHER_CACHE_DRYRUN_PATH = os.path.join(RUNTIME_CONFIG_DIR, "modelpatcher_cache_dryrun.txt")
 
 
 def _resolve_preload_mode() -> str:
@@ -215,6 +217,28 @@ def _resolve_lmg_fastpath() -> bool:
     except Exception:
         pass
     return os.environ.get("COMFYMODAL_LMG_FASTPATH", "0").strip().lower() in ("1", "true", "on")
+
+
+def _resolve_modelpatcher_cache() -> bool:
+    """Return whether canonical ModelPatcher cache is enabled."""
+    try:
+        if os.path.isfile(RUNTIME_MODELPATCHER_CACHE_PATH):
+            _v = open(RUNTIME_MODELPATCHER_CACHE_PATH).read().strip().lower()
+            return _v in ("1", "true", "on")
+    except Exception:
+        pass
+    return os.environ.get("COMFYMODAL_MODELPATCHER_CACHE", "0").strip().lower() in ("1", "true", "on")
+
+
+def _resolve_modelpatcher_cache_dryrun() -> bool:
+    """Return whether canonical ModelPatcher cache dry-run is enabled."""
+    try:
+        if os.path.isfile(RUNTIME_MODELPATCHER_CACHE_DRYRUN_PATH):
+            _v = open(RUNTIME_MODELPATCHER_CACHE_DRYRUN_PATH).read().strip().lower()
+            return _v in ("1", "true", "on")
+    except Exception:
+        pass
+    return os.environ.get("COMFYMODAL_MODELPATCHER_CACHE_DRYRUN", "0").strip().lower() in ("1", "true", "on")
 
 
 _EXCLUDED_CUSTOM_NODE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
@@ -1185,6 +1209,48 @@ def set_lmg_fastpath(enabled: bool) -> str:
     vol.commit()
     print(f"[comfyapp] set_lmg_fastpath: {val}")
     return f"lmg_fastpath={val}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_modelpatcher_cache(enabled: bool) -> str:
+    """Enable/disable canonical ModelPatcher cache for warmup→prompt reuse."""
+    import os
+    val = "1" if enabled else "0"
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    with open(RUNTIME_MODELPATCHER_CACHE_PATH, "w") as f:
+        f.write(val)
+    vol.commit()
+    print(f"[comfyapp] set_modelpatcher_cache: {val}")
+    return f"modelpatcher_cache={val}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_modelpatcher_cache_dryrun(enabled: bool) -> str:
+    """Enable/disable canonical ModelPatcher cache dry-run diagnostics."""
+    import os
+    val = "1" if enabled else "0"
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    with open(RUNTIME_MODELPATCHER_CACHE_DRYRUN_PATH, "w") as f:
+        f.write(val)
+    vol.commit()
+    print(f"[comfyapp] set_modelpatcher_cache_dryrun: {val}")
+    return f"modelpatcher_cache_dryrun={val}"
 
 
 @app.function(
@@ -2571,12 +2637,13 @@ class _ComfyAPIMixin:
                         "patcher_id": id(m) if hasattr(m, 'model') else 0,
                         "model_id": id(m.model) if hasattr(m, 'model') else 0,
                         "matched_idx": -1,
-                        "same_model_object": False,
+                        "same_patcher": False,
                     }
                     for li, lm in enumerate(_lm_models):
-                        if hasattr(lm, 'model') and hasattr(lm.model, 'model') and hasattr(m, 'model') and lm.model.model is m.model:
+                        _lm_p = lm.model if hasattr(lm, 'model') else None
+                        if _lm_p is not None and _lm_p is m:
                             _md["matched_idx"] = li
-                            _md["same_model_object"] = True
+                            _md["same_patcher"] = True
                             _matched_idx = li
                             break
                     _diag.append(_md)
@@ -4088,6 +4155,39 @@ class _ComfyAPIMixin:
                     duration_ms=__stages["warmup_preload_ms"],
                 )
                 warmup_result = {"mode": profile.get("mode", "none") if profile else "none", "status": "ok", "preload_count": preload_result.get("count", 0)}
+
+                # ── Canonical ModelPatcher cache (warmup→prompt reuse) ──
+                # Patches comfy.sd.load_diffusion_model so the real prompt
+                # receives the same ModelPatcher object as warmup.
+                # This makes LoadedModel.__eq__ match naturally, avoiding
+                # redundant load_models_gpu work for already-loaded models.
+                _mp_cache = _resolve_modelpatcher_cache()
+                _mp_cache_dryrun = _resolve_modelpatcher_cache_dryrun()
+                _mp_cache_store = {}
+                if _mp_cache or _mp_cache_dryrun:
+                    try:
+                        import comfy.sd as _csd
+                        import os as _os
+                        _orig_load_diff = _csd.load_diffusion_model
+                        def _cached_load_diff(unet_path, model_options={}, disable_dynamic=False):
+                            _real = _os.path.realpath(unet_path) if hasattr(_os.path, 'realpath') else unet_path
+                            _opts_str = str(sorted(model_options.items())) if model_options else "default"
+                            _key = (_real, _opts_str)
+                            _hit = _key in _mp_cache_store
+                            if _mp_cache_dryrun or _mp_cache:
+                                print(f"[comfyapp] modelpatcher_cache: key={_key} hit={_hit} dryrun={_mp_cache_dryrun} active={_mp_cache}")
+                            if _mp_cache and _hit:
+                                _cached = _mp_cache_store[_key]
+                                print(f"[comfyapp] modelpatcher_cache HIT — returning cached ModelPatcher id={id(_cached)}")
+                                return _cached
+                            _result = _orig_load_diff(unet_path, model_options=model_options, disable_dynamic=disable_dynamic)
+                            if not _hit:
+                                _mp_cache_store[_key] = _result
+                                print(f"[comfyapp] modelpatcher_cache STORE — key={_key} patcher_id={id(_result)} model_id={id(_result.model) if hasattr(_result,'model') else 0}")
+                            return _result
+                        _csd.load_diffusion_model = _cached_load_diff
+                    except Exception as _mp_exc:
+                        print(f"[comfyapp] modelpatcher_cache install FAILED: {_mp_exc}")
 
                 # ── Direct warmup (no ComfyUI executor) ──────────────────
                 # Calls UNETLoader, CLIPLoader, and CLIPTextEncode node
