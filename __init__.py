@@ -23,7 +23,13 @@ from local_placeholders import (
     normalize_model_filename,
     normalize_model_folder,
 )
-from workflow_metadata import extract_model_stack, prompt_sha256, summarize_prompt_fields
+from workflow_metadata import (
+    extract_model_stack,
+    extract_warmup_stack,
+    prompt_sha256,
+    stack_to_warmup_profile,
+    summarize_prompt_fields,
+)
 from timing_trace import Trace, coerce_t0_from_browser
 
 NODE_CLASS_MAPPINGS = {}
@@ -296,7 +302,7 @@ sys.path.insert(0, _NODE_DIR)
 
 try:
     import modal as _modal_pkg
-    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state
+    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile
     _modal_available = True
     _maybe_auto_deploy()
 except ImportError:
@@ -321,6 +327,7 @@ except ImportError:
     def upload_model_chunk(*a, **kw): raise RuntimeError("modal not installed")
     def resync_runtime(*a, **kw): raise RuntimeError("modal not installed")
     def get_runtime_state(*a, **kw): raise RuntimeError("modal not installed")
+    def set_active_warmup_profile(*a, **kw): raise RuntimeError("modal not installed")
     def get_default_gpu(): return "rtx-pro-6000"
     def get_available_gpus(): return [{"value": "rtx-pro-6000", "label": "RTX PRO 6000"}]
     def set_gpu(gpu): pass
@@ -540,6 +547,23 @@ def _collect_input_images(workflow: dict) -> dict:
     return images
 
 
+def _build_next_warmup_activation(workflow: dict, workflow_hash: str) -> dict:
+    stack = extract_warmup_stack(workflow) if isinstance(workflow, dict) else {}
+    profile = stack_to_warmup_profile(stack)
+    now = time.time()
+    return {
+        "profile_token": str(uuid.uuid4()),
+        "workflow_hash": workflow_hash,
+        "created_at": now,
+        "expires_at": now + 60.0,
+        "mode": profile.get("mode", "none") if profile else "none",
+        "model_stack": stack,
+        "warmup_profile": profile,
+        "disable_warmup": not bool(profile),
+        "selected_at": None,
+    }
+
+
 async def _execute_job(item: tuple, item_id: int):
     number, prompt_id, workflow, extra_data, _, _ = item
     sid = extra_data.get("client_id", "")
@@ -579,6 +603,16 @@ async def _execute_job(item: tuple, item_id: int):
             f"[comfyui-modal.profile] stage=input_collect prompt_id={prompt_id[:8]} "
             f"duration_ms={input_collect_ms} count={len(input_images)} bytes={input_collect_bytes}"
         )
+
+        activation_payload = _build_next_warmup_activation(workflow, prompt_hash)
+        try:
+            activation_result = await set_active_warmup_profile(activation_payload)
+            print(
+                f"[comfyui-modal] Armed active warmup profile token={activation_payload['profile_token']} "
+                f"workflow_hash={prompt_hash[:12]} disable_warmup={1 if activation_payload['disable_warmup'] else 0} result={activation_result}"
+            )
+        except Exception as exc:
+            print(f"[comfyui-modal] Failed to arm active warmup profile for {prompt_hash[:12]}: {exc}")
 
         remote_started = time.time()
         trace.mark("t2_local_dispatch")

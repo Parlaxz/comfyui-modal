@@ -32,6 +32,12 @@ class ModalRuntimeRoutesASTTests(unittest.TestCase):
         }
         self.assertIn("get_runtime_state", funcs)
 
+    def test_set_active_warmup_profile_defined_in_modal_client(self):
+        source = MODAL_CLIENT_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        funcs = {n.name for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)}
+        self.assertIn("set_active_warmup_profile", funcs)
+
     def _find_route_strings(self, source: str, method: str) -> set[str]:
         """Return set of route strings registered via @_server.routes.{method}(...)."""
         import re
