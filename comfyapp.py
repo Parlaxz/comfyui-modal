@@ -53,9 +53,9 @@ RUNTIME_MODELPATCHER_CACHE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "modelpatcher
 RUNTIME_MODELPATCHER_CACHE_DRYRUN_PATH = os.path.join(RUNTIME_CONFIG_DIR, "modelpatcher_cache_dryrun.txt")
 RUNTIME_MODELPATCHER_TRACE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "modelpatcher_trace.txt")
 _WORKFLOW_IMAGE_SUFFIX_DIRS = {
-    "[output]": "output",
-    "[input]": "input",
-    "[temp]": "temp",
+    " [output]": "output",
+    " [input]": "input",
+    " [temp]": "temp",
 }
 
 
@@ -3853,22 +3853,15 @@ class _ComfyAPIMixin:
     def _patch_model_cache_comparison(self):
         """Patch LoadedModel.__eq__ to match by class+size+device.
 
+        Gated behind ``deep_profile`` — no measurable production win for the
+        current Flux2 workflow (0 hits out of 3 calls; class names differ
+        between warmup and prompt wrappers).  Retained as a diagnostic tool.
+
         ComfyUI's GPU model cache (``current_loaded_models``) uses Python
         identity to determine if a model is already loaded:
-        ``self.model is other.model``.  This means the warmup workflow's
-        entries are never reused by the real prompt because each
-        ``executor.execute()`` creates fresh ``ModelPatcher`` objects.
-
-        The patch changes the comparison to model class name + model size
-        (bytes) + load device.  Models from the same file produce the same
-        structure and size, so the warmup's GPU cache entries are found
-        by the real prompt — no volume re-read for model weights.
-
-        Also tries model_type fallback when class names differ (handles
-        CLIPLoader vs DualCLIPLoader wrapper differences).
-
-        Logs cache hit/miss stats in ``comfy.model_management._gpu_cache_eq_stats``
-        which ``restore()`` reads and includes in ``_last_restore_timing``.
+        ``self.model is other.model``.  This patch logs cache hit/miss stats
+        in ``comfy.model_management._gpu_cache_eq_stats`` for diagnostic
+        visibility.
         """
         import comfy.model_management
         if getattr(comfy.model_management.LoadedModel, '_comfy_modal_patched', False):
@@ -4172,7 +4165,8 @@ class _ComfyAPIMixin:
                 self._log_profile("restore_warmup", mode="cuda_warmup", duration_ms=__stages["cuda_warmup_ms"])
                 import comfy.utils
                 comfy.utils.DISABLE_MMAP = True
-                self._patch_model_cache_comparison()
+                if _resolve_deep_profile():
+                    self._patch_model_cache_comparison()
                 self._patch_clip_text_encode_cache()
                 self._patch_clip_loader_cache()
 
