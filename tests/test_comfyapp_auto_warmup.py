@@ -305,6 +305,62 @@ class ModelCpuCachePatchTests(unittest.TestCase):
         self.assertEqual(result, {"tensor": "b"})
 
 
+class SnapshotPreloadProfileTests(unittest.TestCase):
+    """Tests for _snapshot_preload_profile fallback precedence."""
+
+    def _make_instance(self):
+        from comfyapp import _ComfyAPIMixin
+        return object.__new__(_ComfyAPIMixin)
+
+    def test_snapshot_preload_profile_prefers_last_stack_over_env_profile(self):
+        inst = self._make_instance()
+        inst._load_last_model_stack = lambda: {
+            "checkpoint": [],
+            "unet": ["actual-unet.safetensors"],
+            "clip": ["clip_l.safetensors", "t5xxl_fp16.safetensors"],
+            "vae": ["actual-vae.safetensors"],
+        }
+        with mock.patch.dict(os.environ, {
+            "COMFYMODAL_WARMUP_UNET": "env-unet.safetensors",
+            "COMFYMODAL_WARMUP_CLIP1": "env-clip-1.safetensors",
+            "COMFYMODAL_WARMUP_CLIP2": "env-clip-2.safetensors",
+            "COMFYMODAL_WARMUP_VAE": "env-vae.safetensors",
+            "COMFYMODAL_WARMUP_CLIP_TYPE": "flux2",
+        }, clear=False):
+            profile = inst._snapshot_preload_profile()
+
+        self.assertEqual(profile["_source"], "last_stack")
+        self.assertEqual(profile["mode"], "split", "stack with UNET+dual-CLIP+VAE should produce split mode")
+        self.assertEqual(profile["unet"], "actual-unet.safetensors")
+        self.assertEqual(profile["clip1"], "clip_l.safetensors")
+        self.assertEqual(profile["clip2"], "t5xxl_fp16.safetensors")
+        self.assertEqual(profile["vae"], "actual-vae.safetensors")
+        self.assertEqual(profile["clip_type"], "flux", "split stack should default to flux clip_type")
+
+    def test_snapshot_preload_profile_returns_empty_without_stack_or_env_profile(self):
+        import comfyapp as _ca
+
+        inst = self._make_instance()
+        inst._load_last_model_stack = lambda: {}
+        with mock.patch.dict(os.environ, {
+            "COMFYMODAL_WARMUP_CHECKPOINT": "",
+            "COMFYMODAL_WARMUP_UNET": "",
+            "COMFYMODAL_WARMUP_CLIP1": "",
+            "COMFYMODAL_WARMUP_CLIP2": "",
+            "COMFYMODAL_WARMUP_VAE": "",
+            "COMFYMODAL_WARMUP_CLIP_TYPE": "",
+        }, clear=False), \
+            mock.patch.object(_ca, "WARMUP_CHECKPOINT", ""), \
+            mock.patch.object(_ca, "WARMUP_UNET", ""), \
+            mock.patch.object(_ca, "WARMUP_CLIP1", ""), \
+            mock.patch.object(_ca, "WARMUP_CLIP2", ""), \
+            mock.patch.object(_ca, "WARMUP_VAE", ""), \
+            mock.patch.object(_ca, "WARMUP_CLIP_TYPE", ""):
+            profile = inst._snapshot_preload_profile()
+
+        self.assertIsNone(profile)
+
+
 class AutoWarmupASTTests(unittest.TestCase):
     """Structural tests via AST parsing (no Modal dependency)."""
 
@@ -595,6 +651,23 @@ class AutoWarmupASTTests(unittest.TestCase):
             r"_collect_in_process_outputs\([^)]*prompt_start_time=",
             "_execute_in_process must pass prompt_start_time=… to the collector",
         )
+
+    def test_restore_does_not_seed_hardcoded_warmup_env_vars(self):
+        source = self._get_method_source("restore")
+        self.assertIsNotNone(source)
+        self.assertNotIn("COMFYMODAL_WARMUP_UNET", source)
+        self.assertNotIn("COMFYMODAL_WARMUP_CLIP1", source)
+        self.assertNotIn("COMFYMODAL_WARMUP_CLIP2", source)
+        self.assertNotIn("COMFYMODAL_WARMUP_VAE", source)
+        self.assertNotIn("COMFYMODAL_WARMUP_CLIP_TYPE", source)
+
+    def test_modal_image_env_does_not_pin_flux2_warmup_profile(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertNotIn('"COMFYMODAL_WARMUP_UNET": "flux-2-klein-9b-fp8.safetensors"', source)
+        self.assertNotIn('"COMFYMODAL_WARMUP_CLIP1": "qwen_3_8b_fp8mixed.safetensors"', source)
+        self.assertNotIn('"COMFYMODAL_WARMUP_CLIP2": "qwen_3_8b_fp8mixed.safetensors"', source)
+        self.assertNotIn('"COMFYMODAL_WARMUP_VAE": "flux2-vae.safetensors"', source)
+        self.assertNotIn('"COMFYMODAL_WARMUP_CLIP_TYPE": "flux2"', source)
 
 
 if __name__ == "__main__":

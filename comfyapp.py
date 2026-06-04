@@ -840,11 +840,6 @@ image = (
             "TORCHINDUCTOR_COMPILE_THREADS": "1",
             "COMFYMODAL_ENABLE_TORCH_COMPILE": "0",
             "COMFYMODAL_ENABLE_GPU_SNAPSHOT": "0",
-            "COMFYMODAL_WARMUP_UNET": "flux-2-klein-9b-fp8.safetensors",
-            "COMFYMODAL_WARMUP_CLIP1": "qwen_3_8b_fp8mixed.safetensors",
-            "COMFYMODAL_WARMUP_CLIP2": "qwen_3_8b_fp8mixed.safetensors",
-            "COMFYMODAL_WARMUP_VAE": "flux2-vae.safetensors",
-            "COMFYMODAL_WARMUP_CLIP_TYPE": "flux2",
             "COMFYMODAL_WARMUP_TEXT": "warmup",
         }
     )
@@ -4113,18 +4108,6 @@ class _ComfyAPIMixin:
         For the subprocess backend, the subprocess is still running from
         snap=True; we just probe ``/system_stats`` and restart on failure.
         """
-        # Ensure warmup profile env vars are set for testing
-        if not os.environ.get("COMFYMODAL_WARMUP_UNET"):
-            os.environ["COMFYMODAL_WARMUP_UNET"] = "flux-2-klein-9b-fp8.safetensors"
-        if not os.environ.get("COMFYMODAL_WARMUP_CLIP1"):
-            os.environ["COMFYMODAL_WARMUP_CLIP1"] = "qwen_3_8b_fp8mixed.safetensors"
-        if not os.environ.get("COMFYMODAL_WARMUP_CLIP2"):
-            os.environ["COMFYMODAL_WARMUP_CLIP2"] = "qwen_3_8b_fp8mixed.safetensors"
-        if not os.environ.get("COMFYMODAL_WARMUP_VAE"):
-            os.environ["COMFYMODAL_WARMUP_VAE"] = "flux2-vae.safetensors"
-        if not os.environ.get("COMFYMODAL_WARMUP_CLIP_TYPE"):
-            # Use "flux2" to match CLIPLoader in flux2 workflows
-            os.environ["COMFYMODAL_WARMUP_CLIP_TYPE"] = "flux2"
         if not os.environ.get("COMFYMODAL_PRELOAD_MODE"):
             # Use env var for experiment flexibility, else module default
             pass
