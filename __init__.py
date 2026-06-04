@@ -43,6 +43,34 @@ _DEPLOY_LOG_FILE = os.path.join(_NODE_DIR, ".deploy_log")
 _LATEST_BENCHMARK_WORKFLOW_FILE = os.path.join(_NODE_DIR, "latest_benchmark_workflow.json")
 
 _pip_install_error = ""
+_WORKFLOW_IMAGE_SUFFIX_DIRS = {
+    "[output]": "output",
+    "[input]": "input",
+    "[temp]": "temp",
+}
+
+
+def _split_workflow_image_reference(filename: str) -> tuple[str, str | None]:
+    name = (filename or "").strip()
+    for suffix, directory in _WORKFLOW_IMAGE_SUFFIX_DIRS.items():
+        if name.endswith(suffix):
+            return name[:-len(suffix)].rstrip(), directory
+    return name, None
+
+
+def _workflow_image_parts(filename: str) -> list[str]:
+    normalized = (filename or "").replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError(f"unsafe workflow image path: {filename}")
+    return parts
+
+
+def _resolve_local_workflow_image_candidates(filename: str) -> list[str]:
+    relative_name, annotated_dir = _split_workflow_image_reference(filename)
+    parts = _workflow_image_parts(relative_name)
+    search_dirs = [annotated_dir] if annotated_dir else ["input", "output", "temp"]
+    return [os.path.join(_COMFYUI_ROOT, directory, *parts) for directory in search_dirs]
 
 def _ensure_modal():
     global _pip_install_error
@@ -472,10 +500,6 @@ async def _process_queue():
 
 def _collect_input_images(workflow: dict) -> dict:
     images = {}
-    search_dirs = [
-        os.path.join(_COMFYUI_ROOT, "input"),
-        os.path.join(_COMFYUI_ROOT, "output"),
-    ]
     for node in workflow.values():
         if not isinstance(node, dict):
             continue
@@ -487,10 +511,14 @@ def _collect_input_images(workflow: dict) -> dict:
             continue
         if filename.startswith("http://") or filename.startswith("https://"):
             continue
-        for d in search_dirs:
-            candidate = os.path.join(d, filename)
-            if os.path.isfile(candidate):
-                with open(candidate, "rb") as f:
+        try:
+            candidates = _resolve_local_workflow_image_candidates(filename)
+        except ValueError:
+            print(f"[comfyui-modal] Warning: unsafe input image path skipped: {filename}")
+            continue
+        for filepath in candidates:
+            if os.path.isfile(filepath):
+                with open(filepath, "rb") as f:
                     images[filename] = base64.b64encode(f.read()).decode()
                 break
         else:
