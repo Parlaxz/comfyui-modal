@@ -103,6 +103,26 @@ def main() -> int:
         except Exception as exc:
             print(f"WARNING: could not set deep_profile={_dp_val}: {exc}")
 
+    # ── Optional LMG fast-path dry-run toggle ───────────────────────
+    _lmg_dryrun_env = os.environ.get("COMFYMODAL_LMG_FASTPATH_DRYRUN", "").strip().lower()
+    if _lmg_dryrun_env:
+        _ld_val = _lmg_dryrun_env in ("1", "true", "on")
+        try:
+            _r = modal.Function.from_name("comfyui", "set_lmg_fastpath_dryrun").remote(_ld_val)
+            print(f"LMG fastpath dry-run set: {_r}")
+        except Exception as exc:
+            print(f"WARNING: could not set lmg_fastpath_dryrun={_ld_val}: {exc}")
+
+    # ── Optional LMG fast-path active toggle ────────────────────────
+    _lmg_fp_env = os.environ.get("COMFYMODAL_LMG_FASTPATH", "").strip().lower()
+    if _lmg_fp_env:
+        _lf_val = _lmg_fp_env in ("1", "true", "on")
+        try:
+            _r = modal.Function.from_name("comfyui", "set_lmg_fastpath").remote(_lf_val)
+            print(f"LMG fastpath set: {_r}")
+        except Exception as exc:
+            print(f"WARNING: could not set lmg_fastpath={_lf_val}: {exc}")
+
     # ── Load workflow ────────────────────────────────────────────────
     with open(WORKFLOW_FILE, "r", encoding="utf-8") as f:
         snapshot = json.load(f)
@@ -370,8 +390,14 @@ def main() -> int:
                     print(f"     ├─ {_dp_section}: {_dp_line}")
                 elif isinstance(_dp_data, list):
                     for _i, _call in enumerate(_dp_data):
-                        _call_line = " ".join([f"{k}={v}" for k, v in sorted(_call.items())])
+                        _simple = {k: v for k, v in _call.items() if not isinstance(v, (list, dict))}
+                        _call_line = " ".join([f"{k}={v}" for k, v in sorted(_simple.items())])
                         print(f"     ├─ lmg_call_{_i}: {_call_line}")
+                        _identity = _call.get("identity", [])
+                        for _ent in _identity:
+                            if isinstance(_ent, dict):
+                                _id_line = " ".join([f"{k}={v}" for k, v in sorted(_ent.items())])
+                                print(f"     │   └─ identity: {_id_line}")
                 else:
                     print(f"     ├─ {_dp_section}: {_dp_data}")
         print(f"     saved to {filename.name}")
