@@ -4,6 +4,8 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -176,6 +178,31 @@ class SaveLoadStackTests(unittest.TestCase):
         reloaded = inst._load_last_model_stack()
         self.assertEqual(reloaded["unet"], ["u.sft"])
 
+    def test_save_swallows_background_commit_failures(self):
+        inst = self._make_instance()
+        stack = {"unet": ["u.sft"], "clip": ["c.sft"], "vae": ["v.sft"], "checkpoint": []}
+        import comfyapp
+
+        class ImmediateThread:
+            def __init__(self, target=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                if self._target is not None:
+                    self._target()
+
+        original_vol = comfyapp.vol
+        comfyapp.vol = SimpleNamespace(commit=lambda: (_ for _ in ()).throw(RuntimeError("commit failed")))
+        try:
+            with mock.patch("threading.Thread", ImmediateThread), mock.patch("builtins.print") as print_mock:
+                inst._save_last_model_stack(stack)
+        finally:
+            comfyapp.vol = original_vol
+
+        failure_logs = [call for call in print_mock.call_args_list if "failed to save last model stack" in str(call)]
+        self.assertEqual(failure_logs, [])
+        self.assertEqual(inst._load_last_model_stack(), stack)
+
 
 class ModelCpuCachePatchTests(unittest.TestCase):
     def _make_instance(self):
@@ -258,6 +285,25 @@ class ModelCpuCachePatchTests(unittest.TestCase):
         self.assertIs(state_dict["tensor"], cached_state["tensor"])
         self.assertIs(metadata["format"], cached_metadata["format"])
 
+    def test_cache_hit_uses_full_path_identity(self):
+        from comfyapp import _ComfyAPIMixin
+
+        inst = object.__new__(_ComfyAPIMixin)
+        inst._model_cpu_cache = {
+            "/tmp/models/a/demo.safetensors": {"tensor": "a"},
+            "/tmp/models/b/demo.safetensors": {"tensor": "b"},
+        }
+
+        class FakeComfyUtils:
+            def load_torch_file(self, path, *args, **kwargs):
+                raise AssertionError("full-path cache hit should not call original loader")
+
+        fake_utils = FakeComfyUtils()
+        inst._patch_model_cpu_cache(fake_utils)
+
+        result = fake_utils.load_torch_file("/tmp/models/b/demo.safetensors")
+        self.assertEqual(result, {"tensor": "b"})
+
 
 class AutoWarmupASTTests(unittest.TestCase):
     """Structural tests via AST parsing (no Modal dependency)."""
@@ -287,8 +333,13 @@ class AutoWarmupASTTests(unittest.TestCase):
                          "restore() must not re-init the in-process backend "
                          "— it is pre-initialised in the snapshot under "
                          "_force_cpu_during_snapshot()")
-        # Restore DOES rebuild the GPU model cache (when ENABLE_WARMUP)
-        self.assertIn("_preload_warmup_profile", source)
+        # Restore DOES rebuild the warmup state when ENABLE_WARMUP.
+        # The current implementation does this via early profile/path
+        # resolution + CPU preload + direct warmup, rather than routing
+        # through _preload_warmup_profile().
+        self.assertIn("_snapshot_preload_profile", source)
+        self.assertIn("_preload_models_to_cpu", source)
+        self.assertIn("_warmup_direct", source)
         self.assertIn("restore_warmup_preload", source)
         self.assertIn("ENABLE_WARMUP", source)
         # Restore DOES warm CUDA
@@ -427,16 +478,11 @@ class AutoWarmupASTTests(unittest.TestCase):
                          "CPU cache preload is disabled — see comment in startup()")
         self.assertNotIn("_snapshot_preload_paths", source,
                          "CPU cache preload is disabled — see comment in startup()")
-        # _preload_models_to_cpu does appear in the explanatory comment (as
-        # documentation for why preload is disabled), so we don't assertNotIn for it.
-        # The explanatory comment must be present
-        self.assertIn("CPU cache preload is intentionally disabled", source,
-                       "startup() must document why CPU cache preload is disabled")
-        self.assertIn("17+ GB", source,
-                      "startup() must mention the snapshot size cost")
-        self.assertIn("7.9s → 26.4s", source,
-                      "startup() must mention the restore time regression")
-        # The infrastructure still exists as dead code for future use
+        self.assertNotIn("_preload_models_to_cpu(", source,
+                         "startup() must not preload CPU model cache during snap=True")
+        self.assertIn("The first prompt after", source)
+        self.assertIn("restore pays the model load cost", source)
+
         full_source = COMFYAPP_PATH.read_text(encoding="utf-8")
         self.assertIn("_snapshot_preload_profile", full_source,
                       "_snapshot_preload_profile must remain as reusable infrastructure")
@@ -477,6 +523,16 @@ class AutoWarmupASTTests(unittest.TestCase):
         source = self._get_method_source("run_prompt")
         self.assertIsNotNone(source)
         self.assertIn("_save_last_model_stack", source)
+
+    def test_run_prompt_calls_save_last_warmup_workflow(self):
+        source = self._get_method_source("run_prompt")
+        self.assertIsNotNone(source)
+        self.assertIn("_save_last_warmup_workflow", source)
+
+    def test_run_prompt_saves_replay_workflow_before_stack_commit(self):
+        source = self._get_method_source("run_prompt")
+        self.assertIsNotNone(source)
+        self.assertLess(source.index("_save_last_warmup_workflow"), source.index("_save_last_model_stack"))
 
     def test_preload_warmup_profile_falls_back_to_stack_to_profile(self):
         source = self._get_method_source("_preload_warmup_profile")

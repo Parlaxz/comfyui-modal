@@ -95,6 +95,48 @@ def _materialize_input_images(input_images: dict | None, comfy_root: str = "/roo
     return input_count, input_bytes
 
 
+def _model_cpu_cache_key(path: str) -> str:
+    normalized = os.path.realpath(path) if path else path
+    return os.path.normcase(os.path.normpath(normalized))
+
+
+def _model_cpu_cache_lookup_keys(path: str) -> tuple[str, ...]:
+    full_key = _model_cpu_cache_key(path)
+    raw_norm = os.path.normcase(os.path.normpath(path)) if path else path
+    basename = os.path.basename(path)
+    candidates = []
+    for candidate in (full_key, raw_norm, path, basename):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return tuple(candidates)
+
+
+def _apply_return_mode(result: dict, return_mode: str, payload_image_count: int, payload_video_count: int) -> dict:
+    result.setdefault("_return_payload_info", {})["return_mode"] = return_mode
+    if return_mode == "first_image_only" and result.get("images"):
+        result["images"] = result["images"][:1]
+        new_b64 = sum(len(img.get("data", "")) for img in result["images"])
+        result["_return_payload_info"]["b64_bytes"] = new_b64
+        print(f"[comfyapp] return_mode=first_image_only: kept 1/{payload_image_count} images, b64={new_b64}")
+    elif return_mode == "metadata_only":
+        for img in result.get("images", []):
+            img.pop("data", None)
+        for vid in result.get("videos", []):
+            vid.pop("data", None)
+        result["_return_payload_info"]["b64_bytes"] = 0
+        print(f"[comfyapp] return_mode=metadata_only: stripped data from {payload_image_count} images/{payload_video_count} videos")
+    elif return_mode == "paths_only":
+        for img in result.get("images", []):
+            img.pop("data", None)
+            img["path"] = f"/root/comfy/ComfyUI/output/{img.get('filename', '')}"
+        for vid in result.get("videos", []):
+            vid.pop("data", None)
+            vid["path"] = f"/root/comfy/ComfyUI/output/{vid.get('filename', '')}"
+        result["_return_payload_info"]["b64_bytes"] = 0
+        print(f"[comfyapp] return_mode=paths_only: {payload_image_count} images, {payload_video_count} videos")
+    return result
+
+
 def _resolve_preload_mode() -> str:
     """Return the effective preload mode.
 
@@ -786,7 +828,7 @@ image = (
         gpu="a10g",
     )
     .run_commands(
-        'python -X utf8 -c "import sageattention._fused; print(\'sageattention._fused ok\')"',
+        "python -X utf8 -c \"import sageattention._fused; print('sageattention._fused ok')\"",
         gpu="a10g",
     )
     .env(
@@ -1432,7 +1474,13 @@ class _ComfyAPIMixin:
                 json.dump(stack, f)
             os.replace(tmp_path, LAST_MODEL_STACK_PATH)
             # Background commit so the response isn't blocked by volume I/O
-            t = threading.Thread(target=vol.commit, daemon=True)
+            def _commit_in_background():
+                try:
+                    vol.commit()
+                except Exception as exc:
+                    print(f"[comfyapp] background volume commit failed: {exc}")
+
+            t = threading.Thread(target=_commit_in_background, daemon=True)
             t.start()
         except Exception as exc:
             print(f"[comfyapp] failed to save last model stack: {exc}")
@@ -1739,10 +1787,15 @@ class _ComfyAPIMixin:
 
         # Determine which files need loading (skip already-cached)
         to_load = []
+        seen_cache_keys = set()
         for path in file_paths:
+            cache_key = _model_cpu_cache_key(path)
+            if cache_key in seen_cache_keys:
+                continue
+            seen_cache_keys.add(cache_key)
             filename = os.path.basename(path)
-            if filename not in self._model_cpu_cache:
-                to_load.append((path, filename))
+            if not any(key in self._model_cpu_cache for key in _model_cpu_cache_lookup_keys(path)):
+                to_load.append((path, filename, cache_key))
 
         cached = []
         file_timing_ms: dict[str, float] = {}
@@ -1750,22 +1803,22 @@ class _ComfyAPIMixin:
         if to_load:
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            def _load_one(path: str, filename: str) -> tuple[str, object, object | None, float]:
+            def _load_one(path: str, filename: str, cache_key: str) -> tuple[str, str, object, object | None, float]:
                 started = time.time()
                 loaded = original_loader(path, return_metadata=True)
                 d_ms = round((time.time() - started) * 1000, 1)
                 if isinstance(loaded, tuple) and len(loaded) == 2:
-                    return filename, loaded[0], loaded[1], d_ms
-                return filename, loaded, None, d_ms
+                    return filename, cache_key, loaded[0], loaded[1], d_ms
+                return filename, cache_key, loaded, None, d_ms
 
             batch = _total_bytes
             with ThreadPoolExecutor(max_workers=min(len(to_load), _preload_max_workers)) as pool:
-                fut_map = {pool.submit(_load_one, p, f): f for p, f in to_load}
+                fut_map = {pool.submit(_load_one, p, f, cache_key): (f, cache_key) for p, f, cache_key in to_load}
                 for future in as_completed(fut_map):
-                    filename = fut_map[future]
+                    filename, cache_key = fut_map[future]
                     try:
-                        fn, state_dict, metadata, d_ms = future.result()
-                        self._model_cpu_cache[fn] = (state_dict, metadata)
+                        fn, cache_key, state_dict, metadata, d_ms = future.result()
+                        self._model_cpu_cache[cache_key] = (state_dict, metadata)
                         file_timing_ms[fn] = d_ms
                         cached.append(fn)
                         if callable(on_file_loaded):
@@ -1774,7 +1827,7 @@ class _ComfyAPIMixin:
                             except Exception:
                                 pass
                         size_mb = "?"
-                        for p, f in to_load:
+                        for p, f, _cache_key in to_load:
                             if f == fn:
                                 try:
                                     size_mb = round(os.path.getsize(p) / (1024 * 1024), 1)
@@ -1847,10 +1900,16 @@ class _ComfyAPIMixin:
 
             filename = os.path.basename(path)
             cache = getattr(self, "_model_cpu_cache", {})
-            if filename in cache:
-                self._cpu_cache_hits[filename] = self._cpu_cache_hits.get(filename, 0) + 1
+            cache_key = None
+            cached = None
+            for candidate in _model_cpu_cache_lookup_keys(path):
+                if candidate in cache:
+                    cache_key = candidate
+                    cached = cache[candidate]
+                    break
+            if cache_key is not None:
+                self._cpu_cache_hits[cache_key] = self._cpu_cache_hits.get(cache_key, 0) + 1
                 _dc_start = time.time()
-                cached = cache[filename]
                 if isinstance(cached, tuple) and len(cached) == 2:
                     state_dict, metadata = copy.copy(cached[0]), copy.copy(cached[1])
                 else:
@@ -1862,7 +1921,8 @@ class _ComfyAPIMixin:
                 if kwargs.get("return_metadata"):
                     return state_dict, metadata
                 return state_dict
-            self._cpu_cache_misses[filename] = self._cpu_cache_misses.get(filename, 0) + 1
+            miss_key = _model_cpu_cache_key(path)
+            self._cpu_cache_misses[miss_key] = self._cpu_cache_misses.get(miss_key, 0) + 1
             started = time.time()
             result = original_load(path, *args, **kwargs)
             duration_ms = self._profile_ms(started)
@@ -4549,6 +4609,7 @@ class _ComfyAPIMixin:
             _s = time.time()
             requested_stack = extract_requested_model_stack(workflow)
             if requested_stack and any(requested_stack.values()):
+                self._save_last_warmup_workflow(workflow)
                 self._save_last_model_stack(requested_stack)
             _t8b_save_stack_ms = round((time.time() - _s) * 1000, 1)
 
@@ -4703,29 +4764,7 @@ class _ComfyAPIMixin:
 
             # ── Return mode filtering (after full payload logging) ──────
             _return_mode = _resolve_return_mode()
-            result["_return_payload_info"]["return_mode"] = _return_mode
-            if _return_mode == "first_image_only" and result.get("images"):
-                result["images"] = result["images"][:1]
-                _new_b64 = sum(len(img.get("data", "")) for img in result["images"])
-                result["_return_payload_info"]["b64_bytes"] = _new_b64
-                print(f"[comfyapp] return_mode=first_image_only: kept 1/{_payload_image_count} images, b64={_new_b64}")
-            elif _return_mode == "metadata_only":
-                for _img in result.get("images", []):
-                    _img.pop("data", None)
-                for _vid in result.get("videos", []):
-                    _vid.pop("data", None)
-                result["_return_payload_info"]["b64_bytes"] = 0
-                print(f"[comfyapp] return_mode=metadata_only: stripped data from {_payload_image_count} images/{_payload_video_count} videos")
-            elif _return_mode == "paths_only":
-                import os as _os
-                for _img in result.get("images", []):
-                    _data = _img.pop("data", "")
-                    _img["path"] = _os.path.join("/root/comfy/ComfyUI/output", _img.get("filename", ""))
-                for _vid in result.get("videos", []):
-                    _data = _vid.pop("data", "")
-                    _vid["path"] = _os.path.join("/root/comfy/ComfyUI/output", _vid.get("filename", ""))
-                result["_return_payload_info"]["b64_bytes"] = 0
-                print(f"[comfyapp] return_mode=paths_only: {_payload_image_count} images, {_payload_video_count} videos")
+            result = _apply_return_mode(result, _return_mode, _payload_image_count, _payload_video_count)
             # Cache size before real prompt
             try:
                 import nodes
@@ -4801,9 +4840,22 @@ class _ComfyAPIMixin:
         prompt_id = queued["prompt_id"]
         profile: dict = {}
         result = self._poll_until_done(prompt_id, client_id, profile)
+        _payload_images = result.get("images", [])
+        _payload_videos = result.get("videos", [])
+        _payload_image_count = len(_payload_images)
+        _payload_video_count = len(_payload_videos)
+        _payload_b64_bytes = sum(len(img.get("data", "")) for img in _payload_images)
+        _payload_b64_bytes += sum(len(vid.get("data", "")) for vid in _payload_videos)
+        result["_return_payload_info"] = {
+            "image_count": _payload_image_count,
+            "video_count": _payload_video_count,
+            "b64_bytes": _payload_b64_bytes,
+        }
+        result = _apply_return_mode(result, _resolve_return_mode(), _payload_image_count, _payload_video_count)
 
         # Persist the model stack for auto-warmup on next restart
         if requested_stack and any(requested_stack.values()):
+            self._save_last_warmup_workflow(workflow)
             self._save_last_model_stack(requested_stack)
 
         total_ms = round((time.time() - total_started) * 1000, 1)

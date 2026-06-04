@@ -6,3 +6,7 @@ __pycache__/
 .hf_token
 .custom_nodes.json
 .deploy_log
+benchmark_logs/
+benchmark_runs/
+optimization_logs/
+latest_benchmark_workflow.json

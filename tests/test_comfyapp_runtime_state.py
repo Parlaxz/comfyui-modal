@@ -32,6 +32,10 @@ def _make_modal_stub():
     stub.Volume = MagicMock()
     stub.Volume.from_name.return_value = MagicMock()
 
+    # Secret — used when registering GPU worker classes
+    stub.Secret = MagicMock()
+    stub.Secret.from_name.return_value = MagicMock()
+
     # Decorators used on methods / classes
     stub.web_server = lambda *a, **kw: (lambda f: f)
     stub.enter = lambda **kw: (lambda f: f)
@@ -92,6 +96,24 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
     def test_missing_requirements_hash_is_none(self):
         module = load_module()
         self.assertIsNone(module.requirements_file_hash(_nonexistent_path()))
+
+    def test_apply_return_mode_paths_only_strips_payload_data(self):
+        module = load_module()
+        result = {
+            "images": [{"data": "abc", "filename": "one.png"}],
+            "videos": [{"data": "xyz", "filename": "two.mp4"}],
+            "_return_payload_info": {"b64_bytes": 6},
+        }
+
+        filtered = module._apply_return_mode(result, "paths_only", 1, 1)
+
+        self.assertEqual(filtered["images"], [{"filename": "one.png", "path": "/root/comfy/ComfyUI/output/one.png"}])
+        self.assertEqual(filtered["videos"], [{"filename": "two.mp4", "path": "/root/comfy/ComfyUI/output/two.mp4"}])
+        self.assertEqual(filtered["_return_payload_info"]["b64_bytes"], 0)
+
+    def test_run_prompt_uses_shared_return_mode_filter_in_both_backends(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertGreaterEqual(source.count("_apply_return_mode("), 3)
 
 
 if __name__ == "__main__":
