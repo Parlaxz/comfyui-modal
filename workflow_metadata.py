@@ -18,6 +18,17 @@ _LOADER_MAPPINGS: dict[str, tuple[str, str]] = {
 }
 
 
+def normalize_flux_clip_pair(clip1: str, clip2: str) -> tuple[str, str]:
+    """Return ComfyUI's expected FLUX DualCLIPLoader order."""
+    a = clip1.lower()
+    b = clip2.lower()
+    a_is_t5 = "t5" in a
+    b_is_clip_l = "clip_l" in b or "clip-l" in b or "clip-vit" in b
+    if a_is_t5 and b_is_clip_l:
+        return clip2, clip1
+    return clip1, clip2
+
+
 def prompt_sha256(prompt: dict) -> str:
     """Return a deterministic SHA-256 hex digest for a prompt dict.
 
@@ -83,3 +94,82 @@ def extract_model_stack(prompt: dict) -> dict[str, list[str]]:
         if isinstance(value, str) and value != "":
             stack.setdefault(bucket, []).append(value)
     return stack
+
+
+def extract_warmup_stack(prompt: dict) -> dict:
+    """Extract the warmup-relevant model stack from a workflow prompt."""
+    stack: dict = {"checkpoint": [], "unet": [], "clip": [], "vae": [], "clip_type": "flux"}
+    for node in prompt.values():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type", "")
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+
+        if class_type in {"CheckpointLoaderSimple", "CheckpointLoader"}:
+            value = inputs.get("ckpt_name")
+            if isinstance(value, str) and value and value not in stack["checkpoint"]:
+                stack["checkpoint"].append(value)
+        elif class_type == "UNETLoader":
+            value = inputs.get("unet_name")
+            if isinstance(value, str) and value and value not in stack["unet"]:
+                stack["unet"].append(value)
+        elif class_type == "DualCLIPLoader":
+            for key in ("clip_name1", "clip_name2"):
+                value = inputs.get(key)
+                if isinstance(value, str) and value and value not in stack["clip"]:
+                    stack["clip"].append(value)
+            clip_type = inputs.get("type", "")
+            if isinstance(clip_type, str) and clip_type:
+                stack["clip_type"] = clip_type
+        elif class_type == "CLIPLoader":
+            value = inputs.get("clip_name")
+            if isinstance(value, str) and value and value not in stack["clip"]:
+                stack["clip"].append(value)
+            clip_type = inputs.get("type", "")
+            if isinstance(clip_type, str) and clip_type:
+                stack["clip_type"] = clip_type
+        elif class_type == "VAELoader":
+            value = inputs.get("vae_name")
+            if isinstance(value, str) and value and value not in stack["vae"]:
+                stack["vae"].append(value)
+    return stack
+
+
+def stack_to_warmup_profile(stack: dict) -> dict:
+    """Convert an extracted warmup stack into a warmup profile."""
+    if stack.get("checkpoint"):
+        return {"mode": "checkpoint", "checkpoint": stack["checkpoint"][0]}
+    if stack.get("unet") and stack.get("clip") and stack.get("vae"):
+        clips = stack["clip"]
+        clip1, clip2 = normalize_flux_clip_pair(clips[0], clips[-1] if len(clips) > 1 else clips[0])
+        clip_type = stack.get("clip_type", "flux")
+        return {
+            "mode": "split",
+            "unet": stack["unet"][0],
+            "clip1": clip1,
+            "clip2": clip2,
+            "vae": stack["vae"][0],
+            "clip_type": clip_type,
+        }
+    return {}
+
+
+def warmup_profile_matches_stack(profile: dict, requested: dict) -> bool:
+    """Return True when the requested stack matches the pinned warmup profile."""
+    if not profile:
+        return True
+    mode = profile.get("mode")
+    if mode == "checkpoint":
+        checkpoint = profile.get("checkpoint", "")
+        return bool(checkpoint) and checkpoint in requested.get("checkpoint", [])
+    if mode == "split":
+        return (
+            profile.get("clip_type", "flux") == requested.get("clip_type", "flux")
+            and profile.get("unet", "") in requested.get("unet", [])
+            and profile.get("clip1", "") in requested.get("clip", [])
+            and profile.get("clip2", "") in requested.get("clip", [])
+            and profile.get("vae", "") in requested.get("vae", [])
+        )
+    return False

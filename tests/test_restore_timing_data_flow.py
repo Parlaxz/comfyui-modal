@@ -8,8 +8,9 @@ We patch the critical points:
   - modal_client.run_prompt returns a result with _restore_timing
 """
 
+import asyncio
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 import os
 import sys
 import json
@@ -29,6 +30,7 @@ class TestRestoreTimingDataFlow(unittest.TestCase):
             """Minimal PromptQueue mock that stores history like the real one."""
             def __init__(self, history_store):
                 self.history = history_store
+                self.queue = []
                 self.mutex = MagicMock()  # with self.mutex: works in with statement
                 self.currently_running = {}
                 self.task_counter = 0
@@ -172,6 +174,69 @@ class TestRestoreTimingDataFlow(unittest.TestCase):
         self.assertIn("restore_timing", meta,
                       f"meta keys: {list(meta.keys())}")
         self.assertEqual(meta["restore_timing"], restore_data)
+
+    # ---- Task 3: Arm the active-next profile before dispatch ----
+
+    def test_build_next_warmup_activation_returns_disable_for_unknown_stack(self):
+        from __init__ import _build_next_warmup_activation
+
+        payload = _build_next_warmup_activation({"3": {"class_type": "KSampler", "inputs": {}}}, "hash-unknown")
+
+        self.assertEqual(payload["workflow_hash"], "hash-unknown")
+        self.assertTrue(payload["disable_warmup"])
+        self.assertEqual(payload["warmup_profile"], {})
+        self.assertIn("profile_token", payload)
+
+    def test_build_next_warmup_activation_builds_split_profile_for_known_stack(self):
+        from __init__ import _build_next_warmup_activation
+
+        workflow = {
+            "10": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux-2-klein-base-9b-fp8.safetensors"}},
+            "11": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_3_8b_fp8mixed.safetensors", "type": "flux"}},
+            "12": {"class_type": "VAELoader", "inputs": {"vae_name": "full_encoder_small_decoder.safetensors"}},
+        }
+        payload = _build_next_warmup_activation(workflow, "hash-known")
+
+        self.assertFalse(payload["disable_warmup"])
+        self.assertEqual(payload["warmup_profile"]["unet"], "flux-2-klein-base-9b-fp8.safetensors")
+        self.assertEqual(payload["warmup_profile"]["vae"], "full_encoder_small_decoder.safetensors")
+
+    def test_execute_job_arms_active_warmup_before_stream(self):
+        from __init__ import _execute_job
+
+        item = (
+            1,
+            "prompt-1",
+            {"10": {"class_type": "UNETLoader", "inputs": {"unet_name": "u.safetensors"}}, "11": {"class_type": "CLIPLoader", "inputs": {"clip_name": "c.safetensors"}}, "12": {"class_type": "VAELoader", "inputs": {"vae_name": "v.safetensors"}}},
+            {"client_id": "test", "workflow_hash": "hash-1", "prompt_summary": {}, "model_stack": {}, "trace": {}, "gpu": "a10g"},
+            [],
+            {},
+        )
+
+        calls = []
+
+        async def fake_set_active(payload):
+            calls.append(("set", payload["workflow_hash"], payload["disable_warmup"]))
+            return {"status": "ok"}
+
+        async def fake_stream(*args, **kwargs):
+            calls.append(("stream", kwargs.get("gpu")))
+            return {"images": [], "videos": [], "trace": {"stages": {}}, "_restore_timing": {}}
+
+        fake_pq = self.fake_pq
+        fake_pq.currently_running[1] = item
+
+        with patch("__init__._pq", return_value=fake_pq), \
+             patch("__init__._send", return_value=None), \
+             patch("__init__._collect_input_images", return_value={}), \
+             patch("__init__.set_active_warmup_profile", side_effect=fake_set_active), \
+             patch("__init__.run_prompt", side_effect=fake_stream), \
+             patch("__init__.prompt_sha256", return_value="hash-1"), \
+             patch("builtins.print", return_value=None):
+            asyncio.run(_execute_job(item, 1))
+
+        self.assertEqual(calls[0][0], "set")
+        self.assertEqual(calls[1][0], "stream")
 
 
 if __name__ == "__main__":
