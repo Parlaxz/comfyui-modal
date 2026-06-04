@@ -1,6 +1,6 @@
 import os
 
-DEFAULT_GPU = "a10g"
+DEFAULT_GPU = "rtx-pro-6000"
 
 GPU_CATALOG = [
     {"value": "t4", "label": "T4", "modal_gpu": "t4", "class_name": "ComfyAPI_T4", "profile": "budget"},

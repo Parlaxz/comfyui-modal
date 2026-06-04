@@ -296,7 +296,7 @@ sys.path.insert(0, _NODE_DIR)
 
 try:
     import modal as _modal_pkg
-    from modal_client import run_prompt, get_object_info, health_check, download_model, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state
+    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state
     _modal_available = True
     _maybe_auto_deploy()
 except ImportError:
@@ -321,10 +321,10 @@ except ImportError:
     def upload_model_chunk(*a, **kw): raise RuntimeError("modal not installed")
     def resync_runtime(*a, **kw): raise RuntimeError("modal not installed")
     def get_runtime_state(*a, **kw): raise RuntimeError("modal not installed")
-    def get_default_gpu(): return "a10g"
-    def get_available_gpus(): return [{"value": "a10g", "label": "A10G"}]
+    def get_default_gpu(): return "rtx-pro-6000"
+    def get_available_gpus(): return [{"value": "rtx-pro-6000", "label": "RTX PRO 6000"}]
     def set_gpu(gpu): pass
-    def get_gpu(): return "a10g"
+    def get_gpu(): return "rtx-pro-6000"
 
 _COMFYUI_ROOT = os.path.dirname(os.path.dirname(_NODE_DIR))
 
@@ -550,13 +550,8 @@ async def _execute_job(item: tuple, item_id: int):
 
     task_key = _register_running(item)
 
-    node_ids = list(workflow.keys())
     _send(sid, "execution_start", {"prompt_id": prompt_id})
     _send(sid, "execution_cached", {"nodes": [], "prompt_id": prompt_id})
-
-    for node_id in node_ids:
-        _send(sid, "executing", {"node": node_id, "display_node": node_id, "prompt_id": prompt_id})
-        await asyncio.sleep(0)
 
     success = False
     outputs = {}
@@ -564,6 +559,7 @@ async def _execute_job(item: tuple, item_id: int):
     prompt_summary = extra_data.get("prompt_summary", {})
     model_stack = extra_data.get("model_stack", {})
     try:
+        _send(sid, "modal_status", {"prompt_id": prompt_id, "message": "Starting up", "phase": "startup"})
         # Verify workflow integrity immediately before remote call
         current_hash = prompt_sha256(workflow)
         expected_hash = extra_data.get("workflow_hash", "")
@@ -586,12 +582,45 @@ async def _execute_job(item: tuple, item_id: int):
 
         remote_started = time.time()
         trace.mark("t2_local_dispatch")
-        result = await run_prompt(
+        # Stream prompt execution with real-time progress from the Modal
+        # container.  Progress events (executing, progress, execution_start)
+        # are forwarded to the ComfyUI frontend as they arrive.
+        _modal_result = None
+        async for _msg in run_prompt_stream(
             workflow,
             input_images,
             trace={**trace.fields(), "prompt_id": prompt_id},
             gpu=extra_data.get("gpu"),
-        )
+        ):
+            if not isinstance(_msg, dict):
+                continue
+            if _msg["type"] == "progress":
+                _evt = _msg["event"]
+                if not isinstance(_msg.get("data"), dict):
+                    continue
+                _data = dict(_msg["data"])
+                # Remote execution uses its own internal prompt_id, but the
+                # local ComfyUI frontend is tracking the local prompt_id.
+                # Rewrite streamed events so the frontend associates them with
+                # the active local prompt and updates aggregate UI correctly.
+                _data["prompt_id"] = prompt_id
+                _send(sid, _evt, _data)
+                await asyncio.sleep(0)
+            elif _msg["type"] == "status":
+                _send(sid, "modal_status", {
+                    "prompt_id": prompt_id,
+                    "message": _msg.get("message") or "Starting up",
+                    "phase": _msg.get("phase") or "startup",
+                })
+                await asyncio.sleep(0)
+            elif _msg["type"] == "result":
+                _modal_result = _msg["data"]
+                break
+            elif _msg["type"] == "error":
+                raise RuntimeError(_msg["message"])
+        if _modal_result is None:
+            raise RuntimeError("run_prompt_stream ended without result")
+        result = _modal_result
         remote_run_ms = round((time.time() - remote_started) * 1000, 1)
         print(
             f"[comfyui-modal.profile] stage=remote_run_prompt prompt_id={prompt_id[:8]} "
@@ -611,6 +640,8 @@ async def _execute_job(item: tuple, item_id: int):
         _finish_job(task_key, prompt_id, outputs, success=False, meta={"error": "cancelled"})
         raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         total_ms = round((time.time() - local_started) * 1000, 1)
         print(
             f"[comfyui-modal.profile] stage=local_total prompt_id={prompt_id[:8]} "
@@ -702,6 +733,7 @@ async def _execute_job(item: tuple, item_id: int):
     print(trace.log_line())
 
     _send(sid, "executing", {"node": None, "display_node": None, "prompt_id": prompt_id})
+    _send(sid, "modal_status", {"prompt_id": prompt_id, "message": None, "phase": "done"})
     _send(sid, "execution_success", {"prompt_id": prompt_id, "trace": result.get("trace")})
     _meta = {
         "model_stack": model_stack,

@@ -37,6 +37,7 @@ const STORAGE_KEY_ENABLED = "comfymodal_enabled";
 const STATUS = {
   UNKNOWN:    "unknown",
   CHECKING:   "checking",
+  STARTING:   "starting",
   ONLINE:     "online",
   OFFLINE:    "offline",
   GENERATING: "generating",
@@ -54,10 +55,13 @@ let _deployPollTimer = null;
 let _deployState = "idle";
 let _hasChanges = false;
 let _deployWarning = "";
+let _runtimeStatusText = "";
+let _runtimeStatusPhase = "";
 
 const STATUS_STYLE = {
   [STATUS.UNKNOWN]:    { color: "#888",    label: "Unknown" },
   [STATUS.CHECKING]:   { color: "#f5a623", label: "Checking..." },
+  [STATUS.STARTING]:   { color: "#6a9fd8", label: "Starting up" },
   [STATUS.ONLINE]:     { color: "#7ed321", label: "Ready (container running)" },
   [STATUS.OFFLINE]:    { color: "#888",    label: "Sleeping (will wake on use)" },
   [STATUS.GENERATING]: { color: "#4a90e2", label: "Generating..." },
@@ -76,12 +80,12 @@ function setGpuOptions(selectEl, options) {
 function pickInitialGpu(config, storedGpu) {
   const values = new Set((config.available_gpus || []).map((opt) => opt.value));
   if (storedGpu && values.has(storedGpu)) return storedGpu;
-  return config.gpu || config.default_gpu || "a10g";
+  return config.gpu || config.default_gpu || "rtx-pro-6000";
 }
 
 // Sync GPU config on page load (used by setup() and buildPanel())
 async function syncGpuConfig() {
-  let config = { gpu: "a10g", default_gpu: "a10g", available_gpus: [] };
+  let config = { gpu: "rtx-pro-6000", default_gpu: "rtx-pro-6000", available_gpus: [] };
   try {
     const response = await api.fetchApi(`${MODAL_PREFIX}/config`);
     config = await response.json();
@@ -130,6 +134,11 @@ function updateStatusBanner() {
     text = _deployWarning;
     bg = "#3d2e00";
     color = "#f5a623";
+  } else if (_runtimeStatusText) {
+    text = _runtimeStatusText;
+    bg = _runtimeStatusPhase === "warmup" ? "#1b2438" : "#1a2a3a";
+    color = "#6a9fd8";
+    animation = "statusPulse 1.5s ease-in-out infinite";
   } else if (currentStatus === STATUS.ONLINE) {
     text = "Ready to generate";
     bg = "#1a3a1a";
@@ -269,6 +278,76 @@ async function showDeployLogOverlay() {
   }
 }
 
+/**
+ * Custom confirm dialog overlay — avoids native confirm() which silently
+ * returns false when the user has dismissed the "Prevent this page from
+ * creating additional dialogs" checkbox.
+ * @param {string} message - Confirmation prompt text
+ * @returns {Promise<boolean>} resolves to true if confirmed, false if cancelled
+ */
+function showConfirmDialog(message) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.id = "modal-confirm-overlay";
+    overlay.style.cssText = `
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0,0,0,0.7); z-index: 99999;
+      display: flex; align-items: center; justify-content: center;
+    `;
+
+    const box = document.createElement("div");
+    box.style.cssText = `
+      background: #1e1e2e; border: 1px solid #444; border-radius: 8px;
+      padding: 24px; max-width: 420px; width: 90%;
+    `;
+
+    const msgEl = document.createElement("div");
+    msgEl.style.cssText = "color: #ddd; font-size: 14px; margin-bottom: 20px; line-height: 1.5;";
+    msgEl.textContent = message;
+
+    const btnRow = document.createElement("div");
+    btnRow.style.cssText = "display: flex; gap: 8px; justify-content: flex-end;";
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.style.cssText = `
+      background: transparent; border: 1px solid #555; color: #aaa;
+      padding: 6px 16px; border-radius: 4px; cursor: pointer; font-size: 13px;
+    `;
+
+    const confirmBtn = document.createElement("button");
+    confirmBtn.textContent = "Delete";
+    confirmBtn.style.cssText = `
+      background: #c53030; border: none; color: #fff;
+      padding: 6px 16px; border-radius: 4px; cursor: pointer; font-size: 13px;
+    `;
+
+    btnRow.appendChild(cancelBtn);
+    btnRow.appendChild(confirmBtn);
+    box.appendChild(msgEl);
+    box.appendChild(btnRow);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    function close(result) {
+      overlay.remove();
+      document.removeEventListener("keydown", escHandler);
+      resolve(result);
+    }
+
+    const escHandler = (e) => {
+      if (e.key === "Escape") close(false);
+    };
+    document.addEventListener("keydown", escHandler);
+
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) close(false);
+    });
+    cancelBtn.onclick = () => close(false);
+    confirmBtn.onclick = () => close(true);
+  });
+}
+
 async function pollDeployStatus() {
   try {
     const resp = await api.fetchApi(`${MODAL_PREFIX}/deploy/status`);
@@ -298,9 +377,19 @@ function setStatus(s) {
   }
   if (statusEl) {
     const { label } = STATUS_STYLE[s] || STATUS_STYLE[STATUS.UNKNOWN];
-    statusEl.textContent = label;
+    statusEl.textContent = _runtimeStatusText || label;
   }
   updateStatusBanner();
+}
+
+function setRuntimeStatus(message, phase = "startup") {
+  _runtimeStatusText = message || "";
+  _runtimeStatusPhase = phase || "startup";
+  if (_runtimeStatusText) {
+    setStatus(STATUS.STARTING);
+  } else {
+    updateStatusBanner();
+  }
 }
 
 async function checkHealth(ping = false) {
@@ -327,11 +416,32 @@ async function checkHealth(ping = false) {
   }
 }
 
-api.addEventListener("execution_start", () => setStatus(STATUS.GENERATING));
-api.addEventListener("executing", (e) => {
-  if (e?.detail?.node === null) setStatus(STATUS.OFFLINE);
+api.addEventListener("execution_start", () => {
+  if (!_runtimeStatusText) setStatus(STATUS.GENERATING);
 });
-api.addEventListener("execution_error", () => setStatus(STATUS.OFFLINE));
+api.addEventListener("executing", (e) => {
+  if (e?.detail?.node === null) {
+    setRuntimeStatus("");
+    setStatus(STATUS.OFFLINE);
+  } else {
+    setRuntimeStatus("");
+    setStatus(STATUS.GENERATING);
+  }
+});
+api.addEventListener("execution_error", () => {
+  setRuntimeStatus("");
+  setStatus(STATUS.OFFLINE);
+});
+api.addEventListener("progress", () => {
+  // Keep status as GENERATING while progress events are flowing
+  setRuntimeStatus("");
+  if (currentStatus !== STATUS.GENERATING) setStatus(STATUS.GENERATING);
+});
+api.addEventListener("modal_status", (e) => {
+  const detail = e?.detail || {};
+  if (!detail.prompt_id) return;
+  setRuntimeStatus(detail.message || "", detail.phase || "startup");
+});
 
 // --- Toast notification ---
 function showToast(message, type) {
@@ -620,7 +730,7 @@ function renderModelList(data) {
         display: flex; align-items: center; justify-content: center;
       `;
       delBtn.onclick = async () => {
-        if (!confirm(`Delete ${file.folder ?? folder}/${file.name}?`)) return;
+        if (!(await showConfirmDialog(`Delete ${file.folder ?? folder}/${file.name}?`))) return;
         delBtn.disabled = true;
         delBtn.textContent = "\u2026";
         try {
@@ -970,7 +1080,7 @@ function buildPanel() {
   const gpuSelect = document.createElement("select");
   gpuSelect.style.cssText = inputStyle() + "flex:1; margin:0;";
   const storedGpu = localStorage.getItem(STORAGE_KEY_GPU) || "";
-  window._comfyModalGpu = "a10g";
+  window._comfyModalGpu = "rtx-pro-6000";
 
   gpuSelect.addEventListener("change", async () => {
     const gpu = gpuSelect.value;

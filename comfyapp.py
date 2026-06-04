@@ -3357,6 +3357,16 @@ class _ComfyAPIMixin:
 
         # ── Wire up send_sync for execution-progress logging ──
         def _on_sync(event, data, sid):
+            # Forward only JSON-style execution events to progress streaming.
+            # ComfyUI also emits binary preview-image events via send_sync;
+            # those payloads are not dicts and will break the local forwarder,
+            # which expects standard websocket event payload objects.
+            _prog_q = getattr(self, "_prog_queue", None)
+            if _prog_q is not None and event in {"execution_start", "executing", "progress", "progress_state", "execution_error"} and isinstance(data, dict):
+                try:
+                    _prog_q.put_nowait((event, data))
+                except Exception:
+                    pass
             if event == "execution_start":
                 if PROFILING_ENABLED:
                     self._log_profile("inproc_exec_progress", event="execution_start", prompt_id=data.get("prompt_id","")[:8])
@@ -4123,6 +4133,20 @@ class _ComfyAPIMixin:
         _s = time.time()
         self._ensure_models_symlink()
         __stages["ensure_models_ms"] = self._profile_ms(_s)
+
+        # Reload custom nodes volume and sync any nodes added since the snapshot
+        # was taken.  The snapshot filesystem only contains custom_nodes symlinks
+        # from the time of snap=True; post-snapshot volume writes must be picked
+        # up explicitly here or the restored container won't see them.
+        _s2 = time.time()
+        custom_nodes_vol.reload()
+        _cn_summary, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
+        _cn_created = _cn_summary.get("created", [])
+        __stages["custom_nodes_sync_ms"] = self._profile_ms(_s2)
+        __stages["custom_nodes_created"] = len(_cn_created)
+        if _cn_created:
+            print(f"[comfyapp] restore synced new custom nodes: {_cn_created}")
+
         __stages["preload_mode"] = _resolve_preload_mode()
         __stages["preload_mode_source"] = "file" if os.path.isfile(PRELOAD_MODE_PATH) else "env_var"
 
@@ -4154,6 +4178,16 @@ class _ComfyAPIMixin:
                 __stages["deferred_backend_init_ms"] = self._profile_ms(_s)
                 _backend_deferred = True
                 _backend_inited = True
+
+            # Register any custom node classes that were added to the volume
+            # after the snapshot was taken.  _start_backend() already called
+            # nodes.init_extra_nodes() for the deferred case above, but for the
+            # snapshot-restored case the NODE_CLASS_MAPPINGS is stale.
+            if _backend_inited and not _backend_deferred and _cn_created:
+                _s_cn = time.time()
+                import nodes as _restore_nodes
+                self._event_loop.run_until_complete(_restore_nodes.init_extra_nodes())
+                __stages["custom_nodes_reinit_ms"] = self._profile_ms(_s_cn)
 
             if ENABLE_GPU_SNAPSHOT and _backend_inited and not _backend_deferred:
                 # GPU snapshot restored — ComfyUI already initialised with GPU
@@ -4438,6 +4472,12 @@ class _ComfyAPIMixin:
                 print("[comfyapp] ComfyUI unresponsive on restore, restarting")
                 self._restart_comfy()
             __stages["subprocess_health_ms"] = self._profile_ms(_s)
+            # Subprocess backend: restart to pick up new custom node symlinks
+            if _cn_created:
+                _s_cn = time.time()
+                print(f"[comfyapp] restarting subprocess due to new custom nodes: {_cn_created}")
+                self._restart_comfy()
+                __stages["custom_nodes_restart_ms"] = self._profile_ms(_s_cn)
 
         # CLIP cache size after warmup
         try:
@@ -4550,10 +4590,11 @@ class _ComfyAPIMixin:
     ) -> dict:
         """Submit a workflow for execution.
 
-        NOTE: This method does NOT reload Modal volumes or resync custom
-        nodes.  After any model/custom-node mutation, callers must invoke
-        ``resync_runtime()`` first so that the container picks up the
-        changes before calling ``run_prompt()``.
+        Custom nodes volume is reloaded and symlinks are synced before
+        every prompt so the container always sees the latest set of
+        custom nodes.  When new nodes are detected their Python
+        dependencies are installed and ComfyUI node classes are
+        re-registered automatically.
 
         The optional ``trace`` parameter is a dict of pre-collected
         timestamps from the local ComfyUI server (browser t0, local t1,
@@ -4580,6 +4621,30 @@ class _ComfyAPIMixin:
         # snapshot restore + CUDA warmup; on a warm container it is just
         # the time the function was dispatched.
         server_trace.mark("t3_modal_entry")
+
+        # ── Refresh custom nodes to pick up post-sync additions ─────
+        # Every prompt reloads the volume metadata and syncs symlinks.
+        # When new nodes are found we also re-register classes
+        # (in-process) or restart the subprocess so ComfyUI sees them.
+        # This is cheap in the common case (no new nodes) and avoids
+        # "Node 'X' not found" errors after a volume sync.
+        _cn_sync_start = time.time()
+        custom_nodes_vol.reload()
+        _cn_summary, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
+        _cn_created = _cn_summary.get("created", [])
+        if _cn_created:
+            print(f"[comfyapp] run_prompt synced new custom nodes: {_cn_created}")
+            _cn_reqs = self._install_custom_node_requirements()
+            _in_proc = self._select_backend() == "in_process"
+            if _in_proc and self._event_loop is not None:
+                import nodes as _rp_nodes
+                self._event_loop.run_until_complete(_rp_nodes.init_extra_nodes())
+            elif not _in_proc:
+                self._restart_comfy()
+        __stages = getattr(self, "_last_restore_timing", None)
+        if isinstance(__stages, dict):
+            __stages["run_prompt_cn_sync_ms"] = round((time.time() - _cn_sync_start) * 1000, 1)
+            __stages["run_prompt_cn_created"] = len(_cn_created)
 
         # ── In-process backend: direct execution, no HTTP ──
         if self._select_backend() == "in_process":
@@ -4864,6 +4929,154 @@ class _ComfyAPIMixin:
                 self._comfy_modal_eq_samples.clear()
             print(f"[comfyapp] eq: hits={result['_restore_timing']['eq_hits']} misses={result['_restore_timing']['eq_misses']} {dict(c)}")
         return result
+
+    @modal.method(is_generator=True)
+    def run_prompt_stream(
+        self,
+        workflow: dict,
+        input_images: dict | None = None,
+        trace: dict | None = None,
+    ):
+        """Execute workflow with streaming progress events.
+
+        Yields dicts with these types:
+          ``{"type": "status", "message": "..."}`` — phase status (restore, startup).
+          ``{"type": "progress", "event": "...", "data": {...}}`` — ComfyUI execution
+          events (execution_start, executing, progress, execution_error).
+          ``{"type": "result", "data": {...}}`` — final result dict.
+          ``{"type": "error", "message": "..."}`` — fatal error.
+
+        The caller iterates via ``.remote_gen()`` and forwards progress events
+        to the ComfyUI frontend in real-time.
+        """
+        import queue as _qm
+        import threading
+
+        # Mirror run_prompt() trace setup so streaming path preserves
+        # the same timing/restore metadata as the non-streaming path.
+        t0 = coerce_t0_from_browser(trace or {})
+        prompt_id_hint = ""
+        if isinstance(trace, dict):
+            prompt_id_hint = str(trace.get("prompt_id") or "")
+        if not prompt_id_hint and isinstance(workflow, dict):
+            for node in workflow.values():
+                if isinstance(node, dict) and "prompt_id" in node:
+                    prompt_id_hint = str(node["prompt_id"])
+        server_trace = Trace(prompt_id=prompt_id_hint, t0=t0)
+        server_trace.update(trace)
+        server_trace.mark("t3_modal_entry")
+
+        _prog_q = _qm.Queue()
+        self._prog_queue = _prog_q
+
+        try:
+            # ── Ensure backend is initialised before _execute_in_process ──
+            # The in-process backend (and its self._event_loop) is created
+            # lazily in _start_backend().  When snapshot_mode is "none" or
+            # "minimal" startup() defers init to restore(), but a streaming
+            # prompt can still arrive before restore() has run.  Without
+            # this guard self._event_loop is None and
+            # `_execute_in_process()` raises "'NoneType' object has no
+            # attribute 'run_until_complete'" on its first
+            # run_until_complete() call.  Lazy-start the backend here.
+            _in_proc = self._select_backend() == "in_process"
+            if _in_proc and self._event_loop is None:
+                yield {"type": "status", "message": "Initializing backend", "phase": "backend_init"}
+                try:
+                    self._start_backend()
+                except Exception as _init_exc:
+                    import traceback as _tb
+                    _tb.print_exc()
+                    yield {"type": "error", "message": f"Failed to start backend: {_init_exc}"}
+                    return
+                yield {"type": "status", "message": "Backend ready", "phase": "backend_ready"}
+
+            # ── Mirror run_prompt()'s custom-node sync so post-snapshot
+            #    custom nodes (added by the local user since the snapshot
+            #    was taken) are visible to the executor on the streaming
+            #    path too.  Without this the first prompt after a sync
+            #    fails with "Node 'X' not found" exactly like run_prompt()
+            #    used to.  Only re-registers new classes; symlinks are
+            #    already in place.
+            try:
+                _cn_summary, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
+                _cn_created = (_cn_summary or {}).get("created", [])
+                if _cn_created and _in_proc and self._event_loop is not None:
+                    print(f"[comfyapp] run_prompt_stream synced new custom nodes: {_cn_created}")
+                    self._install_custom_node_requirements()
+                    import nodes as _stream_nodes
+                    self._event_loop.run_until_complete(_stream_nodes.init_extra_nodes())
+            except Exception as _cn_exc:
+                # Custom-node sync is best-effort; don't fail the prompt
+                # just because volume stat or init_extra_nodes raised.
+                print(f"[comfyapp] run_prompt_stream custom-node sync skipped: {_cn_exc}")
+
+            # ── Yield human-readable startup phases (no percentages) ─────
+            _rt = getattr(self, "_last_restore_timing", None) or {}
+            if _rt.get("restore_total_ms"):
+                yield {"type": "status", "message": "Restoring container", "phase": "restore"}
+            if _rt.get("custom_nodes_sync_ms"):
+                yield {"type": "status", "message": "Loading custom nodes", "phase": "custom_nodes"}
+            if _rt.get("gpu_state_ms") or _rt.get("cuda_warmup_ms") or _rt.get("sage_runtime_ms"):
+                yield {"type": "status", "message": "Reconnecting GPU", "phase": "gpu"}
+            if _rt.get("warmup_preload_ms") or _rt.get("warmup_direct_total_ms"):
+                yield {"type": "status", "message": "Warming models", "phase": "warmup"}
+            yield {"type": "status", "message": "Starting execution", "phase": "execution"}
+
+            # ── Run execution in a background thread ─────────────────────
+            # _execute_in_process is synchronous and blocking.  Running it
+            # in a daemon thread lets the main generator yield progress
+            # events from the _on_sync callback as they fire.
+            _result: list[dict] = []
+            _error: list[Exception] = []
+
+            def _exec() -> None:
+                try:
+                    _r = self._execute_in_process(workflow, input_images or {}, trace=server_trace)
+                    server_trace.mark("t9_modal_return")
+                    trace_summary = server_trace.summary()
+                    self._enrich_trace_with_restore_timing(trace_summary)
+                    _r["trace"] = trace_summary
+                    _rt2 = getattr(self, "_last_restore_timing", None)
+                    _r["_restore_timing"] = dict(_rt2) if _rt2 else {}
+                    _result.append(_r)
+                except Exception as _exc:
+                    _error.append(_exc)
+                    import traceback as _tb
+                    _tb.print_exc()
+                finally:
+                    _prog_q.put(("__done__", None))
+
+            _t = threading.Thread(target=_exec, daemon=True)
+            _t.start()
+
+            # ── Drain progress events until execution finishes ───────────
+            while _t.is_alive():
+                try:
+                    _ev, _data = _prog_q.get(timeout=0.2)
+                    if _ev == "__done__":
+                        break
+                    yield {"type": "progress", "event": _ev, "data": _data}
+                except _qm.Empty:
+                    pass
+
+            # Drain any events that arrived between the last get and thread exit
+            while True:
+                try:
+                    _ev, _data = _prog_q.get_nowait()
+                    if _ev != "__done__":
+                        yield {"type": "progress", "event": _ev, "data": _data}
+                except _qm.Empty:
+                    break
+
+            if _error:
+                yield {"type": "error", "message": str(_error[0])}
+                return
+
+            yield {"type": "result", "data": _result[0]}
+
+        finally:
+            self._prog_queue = None
 
     def _enrich_trace_with_restore_timing(self, trace_summary: dict) -> None:
         """Merge per-phase restore timing into the trace summary (mutates in-place)."""
