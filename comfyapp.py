@@ -52,6 +52,47 @@ RUNTIME_LMG_FASTPATH_PATH = os.path.join(RUNTIME_CONFIG_DIR, "lmg_fastpath.txt")
 RUNTIME_MODELPATCHER_CACHE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "modelpatcher_cache.txt")
 RUNTIME_MODELPATCHER_CACHE_DRYRUN_PATH = os.path.join(RUNTIME_CONFIG_DIR, "modelpatcher_cache_dryrun.txt")
 RUNTIME_MODELPATCHER_TRACE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "modelpatcher_trace.txt")
+_WORKFLOW_IMAGE_SUFFIX_DIRS = {
+    "[output]": "output",
+    "[input]": "input",
+    "[temp]": "temp",
+}
+
+
+def _split_workflow_image_reference(filename: str) -> tuple[str, str]:
+    name = (filename or "").strip()
+    for suffix, directory in _WORKFLOW_IMAGE_SUFFIX_DIRS.items():
+        if name.endswith(suffix):
+            return name[:-len(suffix)].rstrip(), directory
+    return name, "input"
+
+
+def _workflow_image_parts(filename: str) -> list[str]:
+    normalized = (filename or "").replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError(f"unsafe workflow image path: {filename}")
+    return parts
+
+
+def _resolve_input_image_destination(filename: str, comfy_root: str = "/root/comfy/ComfyUI") -> Path:
+    relative_name, directory = _split_workflow_image_reference(filename)
+    return Path(comfy_root) / directory / Path(*_workflow_image_parts(relative_name))
+
+
+def _materialize_input_images(input_images: dict | None, comfy_root: str = "/root/comfy/ComfyUI") -> tuple[int, int]:
+    import base64
+
+    input_count = 0
+    input_bytes = 0
+    for filename, b64data in (input_images or {}).items():
+        dest = _resolve_input_image_destination(filename, comfy_root=comfy_root)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        raw = base64.b64decode(b64data)
+        dest.write_bytes(raw)
+        input_count += 1
+        input_bytes += len(raw)
+    return input_count, input_bytes
 
 
 def _resolve_preload_mode() -> str:
@@ -2455,9 +2496,7 @@ class _ComfyAPIMixin:
         # first forward pass during the denoising loop.
         self._enable_torch_compile_on_unet()
 
-        import base64
         import execution
-        from pathlib import Path
 
         prompt_id = str(uuid.uuid4())
         prompt_start_time: float | None = None
@@ -2465,10 +2504,7 @@ class _ComfyAPIMixin:
         # ── Write input images to ComfyUI's input directory ──
         stage_started = time.time()
         if input_images:
-            inp = Path("/root/comfy/ComfyUI/input")
-            inp.mkdir(parents=True, exist_ok=True)
-            for fname, b64 in input_images.items():
-                (inp / Path(fname).name).write_bytes(base64.b64decode(b64))
+            _materialize_input_images(input_images)
         self._log_profile("inproc_input_prepare", prompt_id=prompt_id[:8], count=len(input_images or {}), duration_ms=self._profile_ms(stage_started))
 
         # Start the execution window after source-image uploads land on
@@ -4717,14 +4753,7 @@ class _ComfyAPIMixin:
 
         if input_images:
             input_started = time.time()
-            input_dir = Path("/root/comfy/ComfyUI/input")
-            input_dir.mkdir(parents=True, exist_ok=True)
-            for filename, b64data in input_images.items():
-                dest = input_dir / Path(filename).name
-                raw = base64.b64decode(b64data)
-                dest.write_bytes(raw)
-                input_count += 1
-                input_bytes += len(raw)
+            input_count, input_bytes = _materialize_input_images(input_images)
             input_decode_ms = round((time.time() - input_started) * 1000, 1)
             print(
                 f"[comfyapp.profile] stage=input_decode_write duration_ms={input_decode_ms} "
