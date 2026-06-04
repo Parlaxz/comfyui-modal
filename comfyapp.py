@@ -51,6 +51,7 @@ RUNTIME_LMG_FASTPATH_DRYRUN_PATH = os.path.join(RUNTIME_CONFIG_DIR, "lmg_fastpat
 RUNTIME_LMG_FASTPATH_PATH = os.path.join(RUNTIME_CONFIG_DIR, "lmg_fastpath.txt")
 RUNTIME_MODELPATCHER_CACHE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "modelpatcher_cache.txt")
 RUNTIME_MODELPATCHER_CACHE_DRYRUN_PATH = os.path.join(RUNTIME_CONFIG_DIR, "modelpatcher_cache_dryrun.txt")
+RUNTIME_MODELPATCHER_TRACE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "modelpatcher_trace.txt")
 
 
 def _resolve_preload_mode() -> str:
@@ -239,6 +240,17 @@ def _resolve_modelpatcher_cache_dryrun() -> bool:
     except Exception:
         pass
     return os.environ.get("COMFYMODAL_MODELPATCHER_CACHE_DRYRUN", "0").strip().lower() in ("1", "true", "on")
+
+
+def _resolve_modelpatcher_trace() -> bool:
+    """Return whether ModelPatcher lineage trace is enabled."""
+    try:
+        if os.path.isfile(RUNTIME_MODELPATCHER_TRACE_PATH):
+            _v = open(RUNTIME_MODELPATCHER_TRACE_PATH).read().strip().lower()
+            return _v in ("1", "true", "on")
+    except Exception:
+        pass
+    return os.environ.get("COMFYMODAL_MODELPATCHER_TRACE", "0").strip().lower() in ("1", "true", "on")
 
 
 _EXCLUDED_CUSTOM_NODE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
@@ -1251,6 +1263,27 @@ def set_modelpatcher_cache_dryrun(enabled: bool) -> str:
     vol.commit()
     print(f"[comfyapp] set_modelpatcher_cache_dryrun: {val}")
     return f"modelpatcher_cache_dryrun={val}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_modelpatcher_trace(enabled: bool) -> str:
+    """Enable/disable ModelPatcher lineage trace (init/clone/flow)."""
+    import os
+    val = "1" if enabled else "0"
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    with open(RUNTIME_MODELPATCHER_TRACE_PATH, "w") as f:
+        f.write(val)
+    vol.commit()
+    print(f"[comfyapp] set_modelpatcher_trace: {val}")
+    return f"modelpatcher_trace={val}"
 
 
 @app.function(
@@ -4156,11 +4189,78 @@ class _ComfyAPIMixin:
                 )
                 warmup_result = {"mode": profile.get("mode", "none") if profile else "none", "status": "ok", "preload_count": preload_result.get("count", 0)}
 
+                # ── ModelPatcher lineage trace (creation / clone / flow) ─
+                # Logs every ModelPatcher.__init__ and .clone() with caller
+                # context to find where identity diverges from warmup.
+                _mp_trace = _resolve_modelpatcher_trace()
+                if _mp_trace:
+                    try:
+                        import comfy.model_patcher as _cmpat
+                        import traceback as _ctb
+                        _orig_mp_init = _cmpat.ModelPatcher.__init__
+                        _orig_mp_clone = _cmpat.ModelPatcher.clone
+                        def _traced_init(self, model, load_device, offload_device, size=0, weight_inplace_update=False):
+                            _orig_mp_init(self, model, load_device, offload_device, size, weight_inplace_update)
+                            import comfy.samplers as _mp_samp
+                            if not hasattr(_mp_samp, '_comfy_modal_mp_trace'):
+                                _mp_samp._comfy_modal_mp_trace = []
+                            _mp_trace_list = _mp_samp._comfy_modal_mp_trace
+                            _frames = list(_ctb.walk_stack(None))[-10:-1]
+                            _short = []
+                            for _f in _frames:
+                                _fn = _f[0].f_code.co_filename.split('/')[-1].split('\\')[-1] if _f[0] else '?'
+                                _ln = _f[1]
+                                _nm = _f[0].f_code.co_name if _f[0] else '?'
+                                _short.append("{}:{}:{}".format(_fn, _ln, _nm))
+                            _mp_trace_list.append({"event":"CREATE","patcher_id":id(self),"model_id":id(model),"model_class":model.__class__.__name__,"callers":_short})
+                        def _traced_clone(self, disable_dynamic=False, model_override=None):
+                            _result = _orig_mp_clone(self, disable_dynamic, model_override)
+                            import comfy.samplers as _mp_samp2
+                            if hasattr(_mp_samp2, '_comfy_modal_mp_trace'):
+                                _tl = _mp_samp2._comfy_modal_mp_trace
+                                _frames = list(_ctb.walk_stack(None))[-10:-1]
+                                _short = []
+                                for _f2 in _frames:
+                                    _fn2 = _f2[0].f_code.co_filename.split('/')[-1].split('\\')[-1] if _f2[0] else '?'
+                                    _ln2 = _f2[1]
+                                    _nm2 = _f2[0].f_code.co_name if _f2[0] else '?'
+                                    _short.append("{}:{}:{}".format(_fn2, _ln2, _nm2))
+                                _same = hasattr(_result, 'model') and hasattr(self, 'model') and _result.model is self.model
+                                _tl.append({"event":"CLONE","from_id":id(self),"to_id":id(_result),"model_id":id(self.model) if hasattr(self,'model') else '?',"same_model":_same,"callers":_short})
+                            return _result
+                        _cmpat.ModelPatcher.__init__ = _traced_init
+                        _cmpat.ModelPatcher.clone = _traced_clone
+                        print("[comfyapp] modelpatcher_trace INSTALLED")
+                    except Exception as _mpt_exc:
+                        print(f"[comfyapp] modelpatcher_trace FAILED: {_mpt_exc}")
+                    # Also trace key node functions
+                    try:
+                        import comfy_extras.nodes_custom_sampler as _mpncs
+                        _orig_cfg_exec = _mpncs.CFGGuider.execute
+                        _orig_sca_exec = _mpncs.SamplerCustomAdvanced.execute
+                        @classmethod
+                        def _traced_cfg_exec(cls, model, positive, negative, cfg):
+                            import comfy.samplers as _mp_samp3
+                            if hasattr(_mp_samp3, '_comfy_modal_mp_trace'):
+                                _mp_samp3._comfy_modal_mp_trace.append({"event":"CFGGuider_INPUT","patcher_id":id(model),"model_id":id(model.model) if hasattr(model,'model') else '?'})
+                            result = _orig_cfg_exec(model, positive, negative, cfg)
+                            return result
+                        @classmethod
+                        def _traced_sca_exec(cls, noise, guider, sampler, sigmas, latent_image):
+                            import comfy.samplers as _mp_samp4
+                            _mp = getattr(guider, 'model_patcher', None)
+                            if _mp and hasattr(_mp_samp4, '_comfy_modal_mp_trace'):
+                                _mp_samp4._comfy_modal_mp_trace.append({"event":"SamplerCustomAdvanced_GUIDER_MP","patcher_id":id(_mp),"model_id":id(_mp.model) if hasattr(_mp,'model') else '?'})
+                            result = _orig_sca_exec(noise, guider, sampler, sigmas, latent_image)
+                            return result
+                        _mpncs.CFGGuider.execute = _traced_cfg_exec
+                        _mpncs.CFGGuider.get_guider = _traced_cfg_exec
+                        _mpncs.SamplerCustomAdvanced.execute = _traced_sca_exec
+                        _mpncs.SamplerCustomAdvanced.sample = _traced_sca_exec
+                    except Exception as _mptn_exc:
+                        print(f"[comfyapp] modelpatcher_trace node patch FAILED: {_mptn_exc}")
+
                 # ── Canonical ModelPatcher cache (warmup→prompt reuse) ──
-                # Patches comfy.sd.load_diffusion_model so the real prompt
-                # receives the same ModelPatcher object as warmup.
-                # This makes LoadedModel.__eq__ match naturally, avoiding
-                # redundant load_models_gpu work for already-loaded models.
                 _mp_cache = _resolve_modelpatcher_cache()
                 _mp_cache_dryrun = _resolve_modelpatcher_cache_dryrun()
                 _mp_cache_store = {}
@@ -4459,6 +4559,11 @@ class _ComfyAPIMixin:
                 result["_sampler_profile"] = dict(_sampler_prof)
                 print(f"[comfyapp] sampler_profile: {_sampler_prof}")
                 _sampler_prof.clear()
+            # ModelPatcher trace data
+            _mp_trace_data = getattr(_samplers_mod, '_comfy_modal_mp_trace', None)
+            if _mp_trace_data:
+                result["_modelpatcher_trace"] = list(_mp_trace_data)
+                _mp_trace_data.clear()
             # Guider profiling data
             _guider_prof = getattr(_samplers_mod, '_comfy_modal_guider_prof', None)
             if _guider_prof and _guider_prof.get("segments"):

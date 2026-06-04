@@ -140,6 +140,14 @@ def main() -> int:
             print(f"ModelPatcher cache dry-run set: {_r}")
         except Exception as exc:
             print(f"WARNING: could not set modelpatcher_cache_dryrun={_md_val}: {exc}")
+    _mp_trace_env = os.environ.get("COMFYMODAL_MODELPATCHER_TRACE", "").strip().lower()
+    if _mp_trace_env:
+        _mt_val = _mp_trace_env in ("1", "true", "on")
+        try:
+            _r = modal.Function.from_name("comfyui", "set_modelpatcher_trace").remote(_mt_val)
+            print(f"ModelPatcher trace set: {_r}")
+        except Exception as exc:
+            print(f"WARNING: could not set modelpatcher_trace={_mt_val}: {exc}")
 
     # ── Load workflow ────────────────────────────────────────────────
     with open(WORKFLOW_FILE, "r", encoding="utf-8") as f:
@@ -260,6 +268,7 @@ def main() -> int:
             "sampler_profile": result.get("_sampler_profile", {}),
             "guider_profile": result.get("_guider_profile", {}),
             "deep_profile": result.get("_deep_profile", {}),
+            "modelpatcher_trace": result.get("_modelpatcher_trace", []),
             "waterfall": waterfall,
         }
         with open(filename, "w", encoding="utf-8") as f:
