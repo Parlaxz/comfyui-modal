@@ -760,6 +760,8 @@ COMFYUI_API_PORT = 8189
 MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
 LAST_MODEL_STACK_PATH = "/root/models/.last_model_stack.json"
+ACTIVE_NEXT_PROFILE_PATH = "/root/models/runtime_config/active_next_profile.json"
+ACTIVE_NEXT_PROFILE_TTL_S = 60
 LAST_WARMUP_WORKFLOW_PATH = "/root/models/.last_warmup_workflow.json"
 SAGE_RUNTIME_CACHE_PATH = "/root/models/.sage_runtime_cache.json"
 
@@ -1392,6 +1394,30 @@ def upload_model_to_volume(file_data: bytes, folder: str, filename: str) -> dict
     image=modal.Image.debian_slim(python_version="3.11")
     .add_local_python_source("gpu_catalog")
     .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_active_warmup_profile(payload: dict) -> dict:
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    profile = dict(payload or {})
+    tmp_path = f"{ACTIVE_NEXT_PROFILE_PATH}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(profile, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, ACTIVE_NEXT_PROFILE_PATH)
+    vol.commit()
+    print(
+        f"[comfyapp] set_active_warmup_profile token={profile.get('profile_token','')} "
+        f"workflow_hash={profile.get('workflow_hash','')} disable_warmup={1 if profile.get('disable_warmup') else 0}"
+    )
+    return {"status": "ok", "profile_token": profile.get("profile_token", "")}
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
     cpu=2,
     memory=4096,
     timeout=3600,
@@ -1490,6 +1516,36 @@ class _ComfyAPIMixin:
             print(f"[comfyapp] failed to load last model stack: {exc}")
         return {}
 
+    def _write_active_next_profile(self, payload: dict) -> None:
+        try:
+            os.makedirs(os.path.dirname(ACTIVE_NEXT_PROFILE_PATH), exist_ok=True)
+            tmp_path = f"{ACTIVE_NEXT_PROFILE_PATH}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+            os.replace(tmp_path, ACTIVE_NEXT_PROFILE_PATH)
+            vol.commit()
+        except Exception as exc:
+            print(f"[comfyapp] failed to write active next profile: {exc}")
+            raise
+
+    def _load_active_next_profile(self, now: float | None = None) -> dict:
+        try:
+            if not os.path.isfile(ACTIVE_NEXT_PROFILE_PATH):
+                return {}
+            with open(ACTIVE_NEXT_PROFILE_PATH, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict) or not payload:
+                return {}
+            current = time.time() if now is None else now
+            expires_at = float(payload.get("expires_at", 0) or 0)
+            if expires_at and current > expires_at:
+                print(f"[comfyapp] active_next_profile expired token={payload.get('profile_token','?')} now={current} expires_at={expires_at}")
+                return {}
+            return payload
+        except (json.JSONDecodeError, OSError, ValueError, TypeError) as exc:
+            print(f"[comfyapp] failed to load active next profile: {exc}")
+            return {}
+
     def _save_last_warmup_workflow(self, workflow: dict) -> None:
         """Persist a cheap warmup replay derived from a successful prompt."""
         try:
@@ -1571,45 +1627,34 @@ class _ComfyAPIMixin:
         return summary, state
 
     def _snapshot_preload_profile(self) -> dict:
-        """Return the warmup profile, preferring actual workflow history over env vars.
-
-        Priority:
-        1. last_model_stack from the most recent real prompt — this matches the
-           actual workflow being served.
-        2. env var profile — fallback for first cold run when no history exists.
-        3. Empty dict — no warmup.
-
-        Logs the source and warns when env profile differs from actual workflow.
-        Returns the profile with a ``_source`` key added.
-        """
-        last_stack = self._load_last_model_stack()
+        active = self._load_active_next_profile()
         env_profile = load_warmup_profile()
         profile = None
         source = "none"
-
-        if last_stack:
-            profile = stack_to_profile(last_stack)
-            source = "last_stack"
-            if env_profile and profile != env_profile:
-                print(f"[comfyapp] snapshot_preload_profile WARNING: "
-                      f"env profile {env_profile} differs from "
-                      f"last_workflow stack {last_stack}")
-            print(f"[comfyapp] snapshot_preload_profile source={source} "
-                  f"mode={profile.get('mode','?') if profile else 'none'} "
-                  f"data={profile}")
-        elif env_profile:
-            profile = env_profile
-            source = "env_vars"
-            print(f"[comfyapp] snapshot_preload_profile source={source} "
-                  f"mode={profile.get('mode','?')} data={profile}")
-            print(f"[comfyapp] snapshot_preload_profile WARNING: using env "
-                  f"warmup profile; may not match actual workflow")
-
-        if profile:
-            profile["_source"] = source
-        else:
-            print(f"[comfyapp] snapshot_preload_profile source=none — no warmup profile configured")
-        return profile
+        if active:
+            if active.get("disable_warmup"):
+                print(
+                    f"[comfyapp] snapshot_preload_profile source=active_next_profile profile_token={active.get('profile_token','?')} disable_warmup=1"
+                )
+                return None
+            profile = dict(active.get("warmup_profile") or {})
+            source = "active_next_profile"
+            if profile:
+                profile["_source"] = source
+                profile["_profile_token"] = active.get("profile_token", "")
+                profile["_workflow_hash"] = active.get("workflow_hash", "")
+                profile["_current_workflow_stack"] = dict(active.get("model_stack") or {})
+                print(
+                    f"[comfyapp] snapshot_preload_profile source={source} profile_token={profile.get('_profile_token','')} workflow_hash={profile.get('_workflow_hash','')} data={profile}"
+                )
+                return profile
+        if env_profile:
+            profile = dict(env_profile)
+            profile["_source"] = "env_default"
+            print(f"[comfyapp] snapshot_preload_profile source=env_default mode={profile.get('mode','?')} data={profile}")
+            return profile
+        print("[comfyapp] snapshot_preload_profile source=none - no warmup profile configured")
+        return None
 
     def _log_warmup_vs_workflow_diagnostics(self, warmup_profile: dict, workflow_model_stack: dict, raw_workflow: dict | None = None) -> dict:
         """Compare what the warmup loaded vs what the workflow actually needs.
@@ -4139,8 +4184,12 @@ class _ComfyAPIMixin:
             if _warmup_profile:
                 _warmup_paths = self._snapshot_preload_paths(_warmup_profile)
             __stages["early_path_resolve_ms"] = self._profile_ms(_s)
-            print(f"[comfyapp] early warmup profile={_warmup_profile.get('mode','none') if _warmup_profile else 'none'} "
-                  f"resolved_paths={len(_warmup_paths)} in {__stages['early_path_resolve_ms']}ms")
+            print(
+                f"[comfyapp] restore warmup selection current_workflow_stack={_warmup_profile.get('_current_workflow_stack', {}) if _warmup_profile else {}} "
+                f"selected_warmup_profile={_warmup_profile or {}} profile_source={_warmup_profile.get('_source', 'none') if _warmup_profile else 'none'} "
+                f"workflow_hash={_warmup_profile.get('_workflow_hash', '') if _warmup_profile else ''} "
+                f"profile_token={_warmup_profile.get('_profile_token', '') if _warmup_profile else ''}"
+            )
 
         if is_in_proc:
             # If backend was skipped during snap=True (snapshot_mode=none/minimal),
@@ -4475,6 +4524,8 @@ class _ComfyAPIMixin:
             "restore_end_unix_s": _restore_end,
             "warmup_status": warmup_status,
             "warmup_profile": _warmup_profile or {},  # actual profile used during restore
+            "warmup_profile_source": (_warmup_profile or {}).get("_source", "none"),
+            "warmup_profile_token": (_warmup_profile or {}).get("_profile_token", ""),
             **__stages,
             **({f"warmup_{k}": v for k, v in warmup_nodes.items()} if warmup_nodes else {}),
             "cpu_cache_hits": _cpu_hits,
@@ -4604,8 +4655,13 @@ class _ComfyAPIMixin:
                 if _v is not None:
                     _wp[_k] = _v
             print(f"[comfyapp] warmup_profile_during_restore: {_wp}")
-            _diagnose_profile = _rt.get("warmup_profile") or load_warmup_profile()
-            self._log_warmup_vs_workflow_diagnostics(_diagnose_profile, requested_stack, raw_workflow=workflow)
+            selected_profile = dict((_rt.get("warmup_profile") or {}))
+            match_info = self._log_warmup_vs_workflow_diagnostics(selected_profile, requested_stack, raw_workflow=workflow)
+            print(
+                f"[comfyapp.profile] WARMUP_PROFILE_MATCH={'true' if all(v is not False for v in match_info.get('match', {}).values()) else 'false'} "
+                f"profile_source={selected_profile.get('_source', 'none')} profile_token={selected_profile.get('_profile_token', '')} "
+                f"workflow_hash={selected_profile.get('_workflow_hash', '')}"
+            )
             _t8b_diag_ms = round((time.time() - _s) * 1000, 1)
 
             _s = time.time()
@@ -4779,11 +4835,15 @@ class _ComfyAPIMixin:
         client_id = str(uuid.uuid4())
 
         requested_stack = extract_requested_model_stack(workflow)
-        warmup_profile = load_warmup_profile()
-        warmup_match = warmup_profile_matches_workflow(warmup_profile, requested_stack)
+        selected_profile = dict((getattr(self, "_last_restore_timing", None) or {}).get("warmup_profile") or {})
+        if not selected_profile:
+            selected_profile = self._snapshot_preload_profile() or {}
+        warmup_match = warmup_profile_matches_workflow(selected_profile, requested_stack)
         print(
-            f"[comfyapp.profile] stage=warmup_profile_match match={1 if warmup_match else 0} "
-            f"requested={requested_stack} profile={warmup_profile}"
+            f"[comfyapp.profile] WARMUP_PROFILE_MATCH={'true' if warmup_match else 'false'} "
+            f"profile_source={selected_profile.get('_source', 'none')} "
+            f"profile_token={selected_profile.get('_profile_token', '')} workflow_hash={selected_profile.get('_workflow_hash', '')} "
+            f"requested={requested_stack} profile={selected_profile}"
         )
 
         try:

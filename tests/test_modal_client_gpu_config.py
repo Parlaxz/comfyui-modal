@@ -120,6 +120,31 @@ class ModalClientGpuConfigTests(unittest.TestCase):
         self.assertEqual(calls[0][0], "ComfyAPI_L4")
         self.assertEqual(mod.get_gpu(), "a10g")
 
+    def test_set_active_warmup_profile_calls_modal_function(self):
+        calls = []
+
+        class FakeFunctionRemote:
+            def remote(self, payload):
+                calls.append(payload)
+                return {"status": "ok", "payload": payload}
+
+        fake_modal = ModuleType("modal")
+        setattr(fake_modal, "Cls", SimpleNamespace(from_name=lambda app, cls: lambda: f"{app}:{cls}"))
+        setattr(
+            fake_modal,
+            "Function",
+            SimpleNamespace(from_name=lambda app, fn: SimpleNamespace(remote=FakeFunctionRemote().remote)),
+        )
+        sys.modules["modal"] = fake_modal
+        sys.modules.pop("modal_client", None)
+        mod = importlib.import_module("modal_client")
+
+        payload = {"profile_token": "tok-1", "workflow_hash": "hash-1"}
+        result = asyncio.run(mod.set_active_warmup_profile(payload))
+
+        self.assertEqual(calls, [payload])
+        self.assertEqual(result["status"], "ok")
+
 
 if __name__ == "__main__":
     unittest.main()
