@@ -2665,20 +2665,33 @@ class _ComfyAPIMixin:
                 _matched_idx = None
                 _model_patcher = models[0] if models else None
                 for mi, m in enumerate(models):
+                    _m_key = getattr(m, '_comfy_modal_stable_key', None) if hasattr(m, 'model') else None
                     _md = {
                         "class": m.model.__class__.__name__ if hasattr(m, 'model') else '?',
                         "patcher_id": id(m) if hasattr(m, 'model') else 0,
                         "model_id": id(m.model) if hasattr(m, 'model') else 0,
                         "matched_idx": -1,
                         "same_patcher": False,
+                        "stable_key_match": False,
+                        "lm_stable_key": None,
                     }
                     for li, lm in enumerate(_lm_models):
                         _lm_p = lm.model if hasattr(lm, 'model') else None
-                        if _lm_p is not None and _lm_p is m:
-                            _md["matched_idx"] = li
-                            _md["same_patcher"] = True
-                            _matched_idx = li
-                            break
+                        if _lm_p is not None:
+                            if _lm_p is m:
+                                _md["matched_idx"] = li
+                                _md["same_patcher"] = True
+                                _matched_idx = li
+                                break
+                            # Stable key fallback match
+                            _lm_key = getattr(_lm_p, '_comfy_modal_stable_key', None)
+                            if _m_key and _lm_key and _m_key.get("resolved_path") and _lm_key.get("resolved_path"):
+                                if _m_key["resolved_path"] == _lm_key["resolved_path"] and _m_key["options_str"] == _lm_key["options_str"]:
+                                    _md["matched_idx"] = li
+                                    _md["stable_key_match"] = True
+                                    _md["lm_stable_key"] = _lm_key
+                                    _matched_idx = li
+                                    break
                     _diag.append(_md)
                 # Fastpath decision
                 _would_fastpath = _matched_idx is not None and len(models) == 1
@@ -4201,18 +4214,34 @@ class _ComfyAPIMixin:
                         _orig_mp_clone = _cmpat.ModelPatcher.clone
                         def _traced_init(self, model, load_device, offload_device, size=0, weight_inplace_update=False):
                             _orig_mp_init(self, model, load_device, offload_device, size, weight_inplace_update)
+                            # Attach stable key from cached_patcher_init if available
+                            _stable_key = getattr(self, '_comfy_modal_stable_key', None)
+                            if _stable_key is None and hasattr(self, 'cached_patcher_init') and self.cached_patcher_init:
+                                try:
+                                    _func, _args = self.cached_patcher_init
+                                    if _func and len(_args) >= 1:
+                                        import os as _mp_os
+                                        _path = _mp_os.path.realpath(_args[0]) if hasattr(_mp_os.path, 'realpath') else str(_args[0])
+                                        _opts = str(sorted(_args[1].items())) if len(_args) > 1 and _args[1] else "default"
+                                        self._comfy_modal_stable_key = {"resolved_path": _path, "options_str": _opts, "model_class": model.__class__.__name__}
+                                        _stable_key = self._comfy_modal_stable_key
+                                except Exception:
+                                    pass
+                            # Fallback: compute from model attributes
+                            if _stable_key is None:
+                                self._comfy_modal_stable_key = {
+                                    "resolved_path": "unknown",
+                                    "options_str": "unknown",
+                                    "model_class": model.__class__.__name__ if hasattr(model, '__class__') else '?',
+                                }
+                                _stable_key = self._comfy_modal_stable_key
                             import comfy.samplers as _mp_samp
                             if not hasattr(_mp_samp, '_comfy_modal_mp_trace'):
                                 _mp_samp._comfy_modal_mp_trace = []
                             _mp_trace_list = _mp_samp._comfy_modal_mp_trace
                             _frames = list(_ctb.walk_stack(None))[-10:-1]
-                            _short = []
-                            for _f in _frames:
-                                _fn = _f[0].f_code.co_filename.split('/')[-1].split('\\')[-1] if _f[0] else '?'
-                                _ln = _f[1]
-                                _nm = _f[0].f_code.co_name if _f[0] else '?'
-                                _short.append("{}:{}:{}".format(_fn, _ln, _nm))
-                            _mp_trace_list.append({"event":"CREATE","patcher_id":id(self),"model_id":id(model),"model_class":model.__class__.__name__,"callers":_short})
+                            _short = ["{}:{}:{}".format(f[0].f_code.co_filename.split('/')[-1].split('\\')[-1] if f[0] else '?', f[1], f[0].f_code.co_name if f[0] else '?') for f in _frames]
+                            _mp_trace_list.append({"event":"CREATE","patcher_id":id(self),"model_id":id(model),"model_class":model.__class__.__name__,"stable_key":str(_stable_key),"callers":_short})
                         def _traced_clone(self, disable_dynamic=False, model_override=None):
                             _result = _orig_mp_clone(self, disable_dynamic, model_override)
                             import comfy.samplers as _mp_samp2
@@ -4284,6 +4313,16 @@ class _ComfyAPIMixin:
                             if not _hit:
                                 _mp_cache_store[_key] = _result
                                 print(f"[comfyapp] modelpatcher_cache STORE — key={_key} patcher_id={id(_result)} model_id={id(_result.model) if hasattr(_result,'model') else 0}")
+                            # Tag with stable key for identity matching
+                            try:
+                                _result._comfy_modal_stable_key = {
+                                    "resolved_path": _real,
+                                    "options_str": _opts_str,
+                                    "model_class": _result.model.__class__.__name__ if hasattr(_result, 'model') else '?',
+                                    "model_id": id(_result.model) if hasattr(_result, 'model') else 0,
+                                }
+                            except Exception:
+                                pass
                             return _result
                         _csd.load_diffusion_model = _cached_load_diff
                     except Exception as _mp_exc:
