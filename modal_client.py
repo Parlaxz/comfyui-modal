@@ -27,6 +27,7 @@ _sync_custom_nodes_fn = modal.Function.from_name("comfyui", "sync_custom_nodes_t
 _get_volume_status_fn = modal.Function.from_name("comfyui", "get_volume_status")
 _upload_model_fn = modal.Function.from_name("comfyui", "upload_model_to_volume")
 _upload_model_chunk_fn = modal.Function.from_name("comfyui", "upload_model_chunk")
+_set_active_warmup_profile_fn = modal.Function.from_name("comfyui", "set_active_warmup_profile")
 
 _current_gpu = DEFAULT_GPU
 _api_instances = {}
@@ -183,3 +184,8 @@ async def resync_runtime(scope: str = "all") -> dict:
 @_modal_error_handler
 async def get_runtime_state() -> dict:
     return await asyncio.to_thread(lambda: _api().runtime_state.remote())
+
+
+@_modal_error_handler
+async def set_active_warmup_profile(payload: dict) -> dict:
+    return await asyncio.to_thread(lambda: _set_active_warmup_profile_fn.remote(payload))

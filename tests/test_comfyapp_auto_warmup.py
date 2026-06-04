@@ -204,6 +204,52 @@ class SaveLoadStackTests(unittest.TestCase):
         self.assertEqual(inst._load_last_model_stack(), stack)
 
 
+class SaveLoadActiveProfileTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mktemp(suffix=".json")
+        import comfyapp
+        comfyapp.ACTIVE_NEXT_PROFILE_PATH = self.tmp
+        comfyapp.ACTIVE_NEXT_PROFILE_TTL_S = 60
+        self._vol_patch = mock.patch.object(comfyapp.vol, "commit", return_value=None)
+        self._vol_patch.start()
+
+    def tearDown(self):
+        self._vol_patch.stop()
+        if os.path.isfile(self.tmp):
+            os.remove(self.tmp)
+
+    def _make_instance(self):
+        from comfyapp import _ComfyAPIMixin
+        return object.__new__(_ComfyAPIMixin)
+
+    def test_write_and_load_active_profile_roundtrip(self):
+        inst = self._make_instance()
+        payload = {
+            "profile_token": "tok-1",
+            "workflow_hash": "hash-1",
+            "created_at": 1000.0,
+            "expires_at": 1060.0,
+            "disable_warmup": False,
+            "model_stack": {"unet": ["u.safetensors"], "clip": ["c.safetensors"], "vae": ["v.safetensors"], "checkpoint": [], "clip_type": "flux"},
+            "warmup_profile": {"mode": "split", "unet": "u.safetensors", "clip1": "c.safetensors", "clip2": "c.safetensors", "vae": "v.safetensors", "clip_type": "flux"},
+        }
+        inst._write_active_next_profile(payload)
+        self.assertEqual(inst._load_active_next_profile(now=1001.0)["profile_token"], "tok-1")
+
+    def test_load_active_profile_returns_empty_when_expired(self):
+        inst = self._make_instance()
+        inst._write_active_next_profile({
+            "profile_token": "tok-expired",
+            "workflow_hash": "hash-old",
+            "created_at": 1000.0,
+            "expires_at": 1001.0,
+            "disable_warmup": False,
+            "model_stack": {},
+            "warmup_profile": {"mode": "checkpoint", "checkpoint": "old.safetensors"},
+        })
+        self.assertEqual(inst._load_active_next_profile(now=1002.0), {})
+
+
 class ModelCpuCachePatchTests(unittest.TestCase):
     def _make_instance(self):
         from comfyapp import _ComfyAPIMixin
@@ -312,13 +358,13 @@ class SnapshotPreloadProfileTests(unittest.TestCase):
         from comfyapp import _ComfyAPIMixin
         return object.__new__(_ComfyAPIMixin)
 
-    def test_snapshot_preload_profile_prefers_last_stack_over_env_profile(self):
+    def test_snapshot_preload_profile_falls_back_to_env_default_when_no_active_profile(self):
         inst = self._make_instance()
         inst._load_last_model_stack = lambda: {
             "checkpoint": [],
-            "unet": ["actual-unet.safetensors"],
-            "clip": ["clip_l.safetensors", "t5xxl_fp16.safetensors"],
-            "vae": ["actual-vae.safetensors"],
+            "unet": ["stale-unet.safetensors"],
+            "clip": ["stale-clip.safetensors"],
+            "vae": ["stale-vae.safetensors"],
         }
         with mock.patch.dict(os.environ, {
             "COMFYMODAL_WARMUP_UNET": "env-unet.safetensors",
@@ -329,13 +375,13 @@ class SnapshotPreloadProfileTests(unittest.TestCase):
         }, clear=False):
             profile = inst._snapshot_preload_profile()
 
-        self.assertEqual(profile["_source"], "last_stack")
-        self.assertEqual(profile["mode"], "split", "stack with UNET+dual-CLIP+VAE should produce split mode")
-        self.assertEqual(profile["unet"], "actual-unet.safetensors")
-        self.assertEqual(profile["clip1"], "clip_l.safetensors")
-        self.assertEqual(profile["clip2"], "t5xxl_fp16.safetensors")
-        self.assertEqual(profile["vae"], "actual-vae.safetensors")
-        self.assertEqual(profile["clip_type"], "flux", "split stack should default to flux clip_type")
+        self.assertEqual(profile["_source"], "env_default")
+        self.assertEqual(profile["mode"], "split", "env vars should produce split mode")
+        self.assertEqual(profile["unet"], "env-unet.safetensors")
+        self.assertEqual(profile["clip1"], "env-clip-1.safetensors")
+        self.assertEqual(profile["clip2"], "env-clip-2.safetensors")
+        self.assertEqual(profile["vae"], "env-vae.safetensors")
+        self.assertEqual(profile["clip_type"], "flux2", "env clip_type should be preserved")
 
     def test_snapshot_preload_profile_returns_empty_without_stack_or_env_profile(self):
         import comfyapp as _ca
@@ -359,6 +405,52 @@ class SnapshotPreloadProfileTests(unittest.TestCase):
             profile = inst._snapshot_preload_profile()
 
         self.assertIsNone(profile)
+
+    def test_snapshot_preload_profile_prefers_active_next_over_env_and_ignores_last_stack(self):
+        inst = self._make_instance()
+        inst._load_last_model_stack = lambda: {"unet": ["stale-unet.safetensors"], "clip": ["stale-clip.safetensors"], "vae": ["stale-vae.safetensors"], "checkpoint": []}
+        inst._load_active_next_profile = lambda now=None: {
+            "profile_token": "tok-new",
+            "workflow_hash": "hash-new",
+            "created_at": 1000.0,
+            "expires_at": 1060.0,
+            "disable_warmup": False,
+            "model_stack": {"unet": ["new-unet.safetensors"], "clip": ["new-clip.safetensors"], "vae": ["new-vae.safetensors"], "checkpoint": [], "clip_type": "flux"},
+            "warmup_profile": {"mode": "split", "unet": "new-unet.safetensors", "clip1": "new-clip.safetensors", "clip2": "new-clip.safetensors", "vae": "new-vae.safetensors", "clip_type": "flux"},
+        }
+        with mock.patch.dict(os.environ, {"COMFYMODAL_WARMUP_UNET": "env-unet.safetensors"}, clear=False):
+            profile = inst._snapshot_preload_profile()
+        self.assertEqual(profile["_source"], "active_next_profile")
+        self.assertEqual(profile["unet"], "new-unet.safetensors")
+        self.assertEqual(profile["_profile_token"], "tok-new")
+
+    def test_snapshot_preload_profile_uses_env_default_when_no_active_profile(self):
+        inst = self._make_instance()
+        inst._load_active_next_profile = lambda now=None: {}
+        inst._load_last_model_stack = lambda: {"unet": ["stale-unet.safetensors"], "clip": ["stale-clip.safetensors"], "vae": ["stale-vae.safetensors"], "checkpoint": []}
+        with mock.patch.dict(os.environ, {
+            "COMFYMODAL_WARMUP_UNET": "env-unet.safetensors",
+            "COMFYMODAL_WARMUP_CLIP1": "env-clip.safetensors",
+            "COMFYMODAL_WARMUP_CLIP2": "env-clip.safetensors",
+            "COMFYMODAL_WARMUP_VAE": "env-vae.safetensors",
+            "COMFYMODAL_WARMUP_CLIP_TYPE": "flux",
+        }, clear=False):
+            profile = inst._snapshot_preload_profile()
+        self.assertEqual(profile["_source"], "env_default")
+        self.assertEqual(profile["unet"], "env-unet.safetensors")
+
+    def test_snapshot_preload_profile_returns_none_when_active_profile_disables_warmup(self):
+        inst = self._make_instance()
+        inst._load_active_next_profile = lambda now=None: {
+            "profile_token": "tok-disable",
+            "workflow_hash": "hash-disable",
+            "created_at": 1000.0,
+            "expires_at": 1060.0,
+            "disable_warmup": True,
+            "model_stack": {},
+            "warmup_profile": {},
+        }
+        self.assertIsNone(inst._snapshot_preload_profile())
 
 
 class AutoWarmupASTTests(unittest.TestCase):
@@ -668,6 +760,19 @@ class AutoWarmupASTTests(unittest.TestCase):
         self.assertNotIn('"COMFYMODAL_WARMUP_CLIP2": "qwen_3_8b_fp8mixed.safetensors"', source)
         self.assertNotIn('"COMFYMODAL_WARMUP_VAE": "flux2-vae.safetensors"', source)
         self.assertNotIn('"COMFYMODAL_WARMUP_CLIP_TYPE": "flux2"', source)
+
+    def test_snapshot_preload_profile_no_longer_prefers_last_stack(self):
+        source = self._get_method_source("_snapshot_preload_profile")
+        self.assertIsNotNone(source)
+        self.assertIn("_load_active_next_profile", source)
+        self.assertNotIn('source = "last_stack"', source)
+
+    def test_run_prompt_logs_warmup_profile_match_flag(self):
+        source = self._get_method_source("run_prompt")
+        self.assertIsNotNone(source)
+        self.assertIn("WARMUP_PROFILE_MATCH", source)
+        self.assertIn("profile_source", source)
+        self.assertIn("profile_token", source)
 
 
 if __name__ == "__main__":
