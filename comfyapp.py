@@ -44,6 +44,9 @@ RUNTIME_WCE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "warmup_clip_encode.txt")
 RUNTIME_RETURN_MODE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "return_mode.txt")
 RUNTIME_CLIP_CACHE_CLEAR_PATH = os.path.join(RUNTIME_CONFIG_DIR, "clear_clip_encode_cache.txt")
 RUNTIME_EXEC_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "exec_profile.txt")
+RUNTIME_SAMPLER_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "sampler_profile.txt")
+RUNTIME_GUIDER_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "guider_profile.txt")
+RUNTIME_DEEP_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "deep_profile.txt")
 
 
 def _resolve_preload_mode() -> str:
@@ -130,6 +133,54 @@ def _resolve_clip_cache_clear() -> bool:
     except Exception:
         pass
     return os.environ.get("COMFYMODAL_CLEAR_CLIP_ENCODE_CACHE", "0").strip().lower() in ("1", "true", "on")
+
+
+def _resolve_sampler_profile() -> bool:
+    """Return whether sampler internal profiling is enabled.
+
+    Priority:
+    1. File on the model volume (set by ``set_sampler_profile``).
+    2. Env var ``COMFYMODAL_SAMPLER_PROFILE`` (default ``"0"``).
+    """
+    try:
+        if os.path.isfile(RUNTIME_SAMPLER_PROFILE_PATH):
+            _v = open(RUNTIME_SAMPLER_PROFILE_PATH).read().strip().lower()
+            return _v in ("1", "true", "on")
+    except Exception:
+        pass
+    return os.environ.get("COMFYMODAL_SAMPLER_PROFILE", "0").strip().lower() in ("1", "true", "on")
+
+
+def _resolve_guider_profile() -> bool:
+    """Return whether guider overhead profiling is enabled.
+
+    Priority:
+    1. File on the model volume (set by ``set_guider_profile``).
+    2. Env var ``COMFYMODAL_GUIDER_PROFILE`` (default ``"0"``).
+    """
+    try:
+        if os.path.isfile(RUNTIME_GUIDER_PROFILE_PATH):
+            _v = open(RUNTIME_GUIDER_PROFILE_PATH).read().strip().lower()
+            return _v in ("1", "true", "on")
+    except Exception:
+        pass
+    return os.environ.get("COMFYMODAL_GUIDER_PROFILE", "0").strip().lower() in ("1", "true", "on")
+
+
+def _resolve_deep_profile() -> bool:
+    """Return whether deep sampler wrapper profiling is enabled.
+
+    Priority:
+    1. File on the model volume (set by ``set_deep_profile``).
+    2. Env var ``COMFYMODAL_DEEP_PROFILE`` (default ``"0"``).
+    """
+    try:
+        if os.path.isfile(RUNTIME_DEEP_PROFILE_PATH):
+            _v = open(RUNTIME_DEEP_PROFILE_PATH).read().strip().lower()
+            return _v in ("1", "true", "on")
+    except Exception:
+        pass
+    return os.environ.get("COMFYMODAL_DEEP_PROFILE", "0").strip().lower() in ("1", "true", "on")
 
 
 _EXCLUDED_CUSTOM_NODE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
@@ -975,6 +1026,89 @@ def set_exec_profile(enabled: bool) -> str:
     vol.commit()
     print(f"[comfyapp] set_exec_profile: {val}")
     return f"exec_profile={val}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_sampler_profile(enabled: bool) -> str:
+    """Enable/disable per-step sampler profiling.
+
+    When enabled, ``KSAMPLER.sample`` is monkey-patched to capture
+    per-step timing (setup, step_1..step_N, teardown) reported as
+    ``_sampler_profile`` in the ``run_prompt`` result.
+
+    Writes to ``/root/models/runtime_config/sampler_profile.txt``.
+    """
+    import os
+    val = "1" if enabled else "0"
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    with open(RUNTIME_SAMPLER_PROFILE_PATH, "w") as f:
+        f.write(val)
+    vol.commit()
+    print(f"[comfyapp] set_sampler_profile: {val}")
+    return f"sampler_profile={val}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_guider_profile(enabled: bool) -> str:
+    """Enable/disable guider overhead profiling.
+
+    When enabled, CFGGuider methods (sample/outer_sample/inner_sample)
+    and sampler_helpers (prepare_sampling/cleanup_models) are
+    monkey-patched to capture per-segment timing.
+
+    Writes to ``/root/models/runtime_config/guider_profile.txt``.
+    """
+    import os
+    val = "1" if enabled else "0"
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    with open(RUNTIME_GUIDER_PROFILE_PATH, "w") as f:
+        f.write(val)
+    vol.commit()
+    print(f"[comfyapp] set_guider_profile: {val}")
+    return f"guider_profile={val}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_deep_profile(enabled: bool) -> str:
+    """Enable/disable deep sampler wrapper profiling.
+
+    Instruments prepare_sampling internals, SamplerCustomAdvanced
+    pre/post, and KSAMPLER.sample setup.
+
+    Writes to ``/root/models/runtime_config/deep_profile.txt``.
+    """
+    import os
+    val = "1" if enabled else "0"
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    with open(RUNTIME_DEEP_PROFILE_PATH, "w") as f:
+        f.write(val)
+    vol.commit()
+    print(f"[comfyapp] set_deep_profile: {val}")
+    return f"deep_profile={val}"
 
 
 @app.function(
@@ -2257,6 +2391,134 @@ class _ComfyAPIMixin:
             _exec_mod.execute = _profiled_exec
             _exec_mod._comfy_modal_exec_patched = True
             _exec_mod._comfy_modal_exec_prof = _exec_prof_data
+
+        # ── Instrument sampler for per-step breakdown ──
+        _sampler_profiling = _resolve_sampler_profile()
+        if _sampler_profiling:
+            import comfy.samplers as _samplers_mod
+            if not getattr(_samplers_mod, '_comfy_modal_sampler_prof_patched', False):
+                _orig_ksampler_sample = _samplers_mod.KSAMPLER.sample
+                _sampler_prof_data = {}
+                def _profiled_ksampler_sample(self, model_wrap, sigmas, extra_args, callback, noise, latent_image=None, denoise_mask=None, disable_pbar=False):
+                    _t0 = time.perf_counter()
+                    _times = {}
+                    _last_cb_time = None
+                    _step_count = 0
+                    if callback is not None:
+                        _orig_cb = callback
+                        def _ts_cb(step_idx, denoised, x, total_steps):
+                            nonlocal _last_cb_time, _step_count
+                            _now = time.perf_counter()
+                            if _last_cb_time is None:
+                                _times["setup_ms"] = (_now - _t0) * 1000
+                            else:
+                                _step_count += 1
+                                _times[f"step_{_step_count}_ms"] = (_now - _last_cb_time) * 1000
+                            _last_cb_time = _now
+                            return _orig_cb(step_idx, denoised, x, total_steps)
+                        callback = _ts_cb
+                    result = _orig_ksampler_sample(self, model_wrap, sigmas, extra_args, callback, noise, latent_image, denoise_mask, disable_pbar)
+                    _t1 = time.perf_counter()
+                    if _last_cb_time is not None:
+                        _times["teardown_ms"] = (_t1 - _last_cb_time) * 1000
+                    _times["total_ms"] = (_t1 - _t0) * 1000
+                    _sampler_prof_data.update(_times)
+                    return result
+                _samplers_mod.KSAMPLER.sample = _profiled_ksampler_sample
+                _samplers_mod._comfy_modal_sampler_prof_patched = True
+                _samplers_mod._comfy_modal_sampler_prof = _sampler_prof_data
+
+        # ── Instrument guider for overhead breakdown ──
+        _guider_profiling = _resolve_guider_profile()
+        if _guider_profiling:
+            import comfy.samplers as _gs_mod
+            import comfy.sampler_helpers as _gsh_mod
+            if not getattr(_gs_mod, '_comfy_modal_guider_prof_patched', False):
+                _guider_prof_data = {"segments": {}}
+                def _gwrap(label):
+                    def _deco(orig_fn):
+                        def _wrapper(*args, **kwargs):
+                            _t0 = time.perf_counter()
+                            try:
+                                return orig_fn(*args, **kwargs)
+                            finally:
+                                _d = (time.perf_counter() - _t0) * 1000
+                                segs = _guider_prof_data["segments"]
+                                segs[label] = segs.get(label, 0.0) + _d
+                        return _wrapper
+                    return _deco
+                _gs_mod.CFGGuider.sample = _gwrap("guider_sample")(_gs_mod.CFGGuider.sample)
+                _gs_mod.CFGGuider.outer_sample = _gwrap("guider_outer_sample")(_gs_mod.CFGGuider.outer_sample)
+                _gs_mod.CFGGuider.inner_sample = _gwrap("guider_inner_sample")(_gs_mod.CFGGuider.inner_sample)
+                _gsh_mod.prepare_sampling = _gwrap("prepare_sampling")(_gsh_mod.prepare_sampling)
+                _gsh_mod.cleanup_models = _gwrap("cleanup_models")(_gsh_mod.cleanup_models)
+                _gs_mod._comfy_modal_guider_prof_patched = True
+                _gs_mod._comfy_modal_guider_prof = _guider_prof_data
+
+        # ── Deep sampler wrapper profiling ──
+        _deep_profiling = _resolve_deep_profile()
+        if _deep_profiling:
+            import comfy.sampler_helpers as _dsh_mod
+            import comfy.model_management as _dmm_mod
+            import comfy_extras.nodes_custom_sampler as _dcs_mod
+            _deep_prof = {}
+            def _dp_wrap(module, name, label):
+                orig = getattr(module, name, None)
+                if orig is None:
+                    return
+                def _dp(*args, **kwargs):
+                    _t0 = time.perf_counter()
+                    try:
+                        return orig(*args, **kwargs)
+                    finally:
+                        _deep_prof[label] = _deep_prof.get(label, 0) + (time.perf_counter() - _t0) * 1000
+                setattr(module, name, _dp)
+            # Instrument prepare_sampling internals
+            _dp_wrap(_dsh_mod, 'get_additional_models', 'ps_get_additional_models')
+            _dp_wrap(_dsh_mod, 'get_additional_models_from_model_options', 'ps_get_additional_models_opts')
+            _dp_wrap(_dsh_mod, 'estimate_memory', 'ps_estimate_memory')
+            # Instrument load_models_gpu: capture metadata + total time
+            _orig_lmg = _dmm_mod.load_models_gpu
+            _lmg_calls = []
+            def _profiled_lmg(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
+                _classes = [m.model.__class__.__name__ for m in models if hasattr(m, 'model')]
+                _loaded_before = len(getattr(_dmm_mod, 'current_loaded_models', []))
+                _mem_req = memory_required
+                _t0 = time.perf_counter()
+                try:
+                    return _orig_lmg(models, memory_required, force_patch_weights, minimum_memory_required, force_full_load)
+                finally:
+                    _t1 = time.perf_counter()
+                    _lmg_calls.append({
+                        "ms": round((_t1 - _t0) * 1000, 1),
+                        "models": _classes,
+                        "count": len(models),
+                        "loaded_before": _loaded_before,
+                        "loaded_after": len(getattr(_dmm_mod, 'current_loaded_models', [])),
+                    })
+                    _deep_prof["lmg"] = list(_lmg_calls)
+            _dmm_mod.load_models_gpu = _profiled_lmg
+            # Instrument SamplerCustomAdvanced pre/post
+            import comfy.sample as _cs_sample
+            import latent_preview as _cs_lp
+            _orig_sca_exec = _dcs_mod.SamplerCustomAdvanced.__dict__['execute'].__func__
+            _sca_prof = {"pre_dur": 0.0, "guider_dur": 0.0, "post_dur": 0.0}
+            import functools as _functools
+            @_functools.wraps(_orig_sca_exec)
+            def _profiled_wrapper(cls, noise, guider, sampler, sigmas, latent_image):
+                _t0 = time.perf_counter()
+                try:
+                    result = _orig_sca_exec(cls, noise, guider, sampler, sigmas, latent_image)
+                    return result
+                finally:
+                    _sca_prof["total_ms"] = (time.perf_counter() - _t0) * 1000
+            _dcs_mod.SamplerCustomAdvanced.execute = classmethod(_profiled_wrapper)
+            _dcs_mod.SamplerCustomAdvanced.sample = classmethod(_profiled_wrapper)
+            _deep_prof["sca"] = _sca_prof
+            # KSAMPLER.sample setup proved ~0.35ms — no further breakdown needed
+            # Store ref
+            import comfy as _comfy_mod
+            _comfy_mod._comfy_modal_deep_prof = _deep_prof
 
         # ── Execute ──
         stage_started = time.time()
@@ -3972,6 +4234,35 @@ class _ComfyAPIMixin:
                 _exec_prof_raw["_first_call_start"] = None
                 _exec_prof_raw["_last_call_end"] = None
                 _exec_prof_raw["_call_count"] = 0
+            # Sampler profiling data
+            import comfy.samplers as _samplers_mod
+            _sampler_prof = getattr(_samplers_mod, '_comfy_modal_sampler_prof', None)
+            if _sampler_prof and _sampler_prof.get("total_ms"):
+                result["_sampler_profile"] = dict(_sampler_prof)
+                print(f"[comfyapp] sampler_profile: {_sampler_prof}")
+                _sampler_prof.clear()
+            # Guider profiling data
+            _guider_prof = getattr(_samplers_mod, '_comfy_modal_guider_prof', None)
+            if _guider_prof and _guider_prof.get("segments"):
+                result["_guider_profile"] = dict(_guider_prof["segments"])
+                _seg = _guider_prof["segments"]
+                print(f"[comfyapp] guider_profile: {dict(_seg)}")
+                _guider_prof["segments"].clear()
+            # Deep profiling data
+            import comfy as _comfy_mod
+            _deep_prof = getattr(_comfy_mod, '_comfy_modal_deep_prof', None)
+            if _deep_prof:
+                result["_deep_profile"] = dict(_deep_prof)
+                _dp_clean = {}
+                for k, v in _deep_prof.items():
+                    if isinstance(v, dict):
+                        _dp_clean[k] = {kk: round(vv, 2) if isinstance(vv, (int, float)) else vv for kk, vv in v.items()}
+                    elif isinstance(v, list):
+                        _dp_clean[k] = [{kk: round(vv, 2) if isinstance(vv, (int, float)) else vv for kk, vv in c.items()} for c in v]
+                    else:
+                        _dp_clean[k] = round(v, 2) if isinstance(v, (int, float)) else v
+                print(f"[comfyapp] deep_profile: {_dp_clean}")
+                _deep_prof.clear()
             print(f"[comfyapp] cache_diagnostics: cpu_hits={result['_cache_diagnostics']['cpu_hits']} "
                   f"cpu_misses={result['_cache_diagnostics']['cpu_misses']} "
                   f"gpu_eq_calls={result['_cache_diagnostics']['gpu_eq'].get('calls', '?')} "

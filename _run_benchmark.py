@@ -73,6 +73,36 @@ def main() -> int:
         except Exception as exc:
             print(f"WARNING: could not set exec_profile={_ep_val}: {exc}")
 
+    # ── Optional sampler profiling toggle ───────────────────────────
+    _sampler_profile_env = os.environ.get("COMFYMODAL_SAMPLER_PROFILE", "").strip().lower()
+    if _sampler_profile_env:
+        _sp_val = _sampler_profile_env in ("1", "true", "on")
+        try:
+            _r = modal.Function.from_name("comfyui", "set_sampler_profile").remote(_sp_val)
+            print(f"Sampler profile set: {_r}")
+        except Exception as exc:
+            print(f"WARNING: could not set sampler_profile={_sp_val}: {exc}")
+
+    # ── Optional guider profiling toggle ────────────────────────────
+    _guider_profile_env = os.environ.get("COMFYMODAL_GUIDER_PROFILE", "").strip().lower()
+    if _guider_profile_env:
+        _gp_val = _guider_profile_env in ("1", "true", "on")
+        try:
+            _r = modal.Function.from_name("comfyui", "set_guider_profile").remote(_gp_val)
+            print(f"Guider profile set: {_r}")
+        except Exception as exc:
+            print(f"WARNING: could not set guider_profile={_gp_val}: {exc}")
+
+    # ── Optional deep profiling toggle ──────────────────────────────
+    _deep_profile_env = os.environ.get("COMFYMODAL_DEEP_PROFILE", "").strip().lower()
+    if _deep_profile_env:
+        _dp_val = _deep_profile_env in ("1", "true", "on")
+        try:
+            _r = modal.Function.from_name("comfyui", "set_deep_profile").remote(_dp_val)
+            print(f"Deep profile set: {_r}")
+        except Exception as exc:
+            print(f"WARNING: could not set deep_profile={_dp_val}: {exc}")
+
     # ── Load workflow ────────────────────────────────────────────────
     with open(WORKFLOW_FILE, "r", encoding="utf-8") as f:
         snapshot = json.load(f)
@@ -189,6 +219,9 @@ def main() -> int:
             "t8b_breakdown": t8b_breakdown,
             "return_payload_info": return_payload_info,
             "exec_profile": _exec_profile,
+            "sampler_profile": result.get("_sampler_profile", {}),
+            "guider_profile": result.get("_guider_profile", {}),
+            "deep_profile": result.get("_deep_profile", {}),
             "waterfall": waterfall,
         }
         with open(filename, "w", encoding="utf-8") as f:
@@ -312,6 +345,35 @@ def main() -> int:
             _nc = _exec_prof.get("node_counts", {})
             if _nc:
                 print(f"     ├─ node_counts: {_nc}")
+        # Print sampler profile
+        _sampler_prof = result.get("_sampler_profile", {})
+        if _sampler_prof:
+            _sp_total = _sampler_prof.get("total_ms", 0)
+            _sp_setup = _sampler_prof.get("setup_ms", 0)
+            _sp_teardown = _sampler_prof.get("teardown_ms", 0)
+            _sp_steps = {k: round(v, 2) for k, v in _sampler_prof.items() if k.startswith("step_")}
+            print(f"     ├─ sampler: total={_sp_total:.1f}ms setup={_sp_setup:.1f} teardown={_sp_teardown:.1f}")
+            if _sp_steps:
+                _step_line = " ".join([f"{k}={v}ms" for k, v in sorted(_sp_steps.items())])
+                print(f"     ├─ sampler_steps: {_step_line}")
+        # Print guider profile
+        _guider_prof = result.get("_guider_profile", {})
+        if _guider_prof:
+            _gp_line = " ".join([f"{k}={round(v,1)}ms" for k, v in sorted(_guider_prof.items())])
+            print(f"     ├─ guider: {_gp_line}")
+        # Print deep profile
+        _deep_prof = result.get("_deep_profile", {})
+        if _deep_prof:
+            for _dp_section, _dp_data in sorted(_deep_prof.items()):
+                if isinstance(_dp_data, dict):
+                    _dp_line = " ".join([f"{k}={v}ms" if not k.startswith("sca_") else f"{k}={v:.1f}ms" for k, v in sorted(_dp_data.items())])
+                    print(f"     ├─ {_dp_section}: {_dp_line}")
+                elif isinstance(_dp_data, list):
+                    for _i, _call in enumerate(_dp_data):
+                        _call_line = " ".join([f"{k}={v}" for k, v in sorted(_call.items())])
+                        print(f"     ├─ lmg_call_{_i}: {_call_line}")
+                else:
+                    print(f"     ├─ {_dp_section}: {_dp_data}")
         print(f"     saved to {filename.name}")
 
         results.append(output)
