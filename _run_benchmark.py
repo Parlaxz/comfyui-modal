@@ -123,6 +123,24 @@ def main() -> int:
         except Exception as exc:
             print(f"WARNING: could not set lmg_fastpath={_lf_val}: {exc}")
 
+    # ── Optional ModelPatcher cache toggles ─────────────────────────
+    _mp_cache_env = os.environ.get("COMFYMODAL_MODELPATCHER_CACHE", "").strip().lower()
+    if _mp_cache_env:
+        _mc_val = _mp_cache_env in ("1", "true", "on")
+        try:
+            _r = modal.Function.from_name("comfyui", "set_modelpatcher_cache").remote(_mc_val)
+            print(f"ModelPatcher cache set: {_r}")
+        except Exception as exc:
+            print(f"WARNING: could not set modelpatcher_cache={_mc_val}: {exc}")
+    _mp_dryrun_env = os.environ.get("COMFYMODAL_MODELPATCHER_CACHE_DRYRUN", "").strip().lower()
+    if _mp_dryrun_env:
+        _md_val = _mp_dryrun_env in ("1", "true", "on")
+        try:
+            _r = modal.Function.from_name("comfyui", "set_modelpatcher_cache_dryrun").remote(_md_val)
+            print(f"ModelPatcher cache dry-run set: {_r}")
+        except Exception as exc:
+            print(f"WARNING: could not set modelpatcher_cache_dryrun={_md_val}: {exc}")
+
     # ── Load workflow ────────────────────────────────────────────────
     with open(WORKFLOW_FILE, "r", encoding="utf-8") as f:
         snapshot = json.load(f)
