@@ -47,6 +47,8 @@ RUNTIME_EXEC_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "exec_profile.txt")
 RUNTIME_SAMPLER_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "sampler_profile.txt")
 RUNTIME_GUIDER_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "guider_profile.txt")
 RUNTIME_DEEP_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "deep_profile.txt")
+RUNTIME_LMG_FASTPATH_DRYRUN_PATH = os.path.join(RUNTIME_CONFIG_DIR, "lmg_fastpath_dryrun.txt")
+RUNTIME_LMG_FASTPATH_PATH = os.path.join(RUNTIME_CONFIG_DIR, "lmg_fastpath.txt")
 
 
 def _resolve_preload_mode() -> str:
@@ -181,6 +183,38 @@ def _resolve_deep_profile() -> bool:
     except Exception:
         pass
     return os.environ.get("COMFYMODAL_DEEP_PROFILE", "0").strip().lower() in ("1", "true", "on")
+
+
+def _resolve_lmg_fastpath_dryrun() -> bool:
+    """Return whether LMG fast-path dry-run diagnostics are enabled.
+
+    Priority:
+    1. File on the model volume.
+    2. Env var ``COMFYMODAL_LMG_FASTPATH_DRYRUN`` (default ``"0"``).
+    """
+    try:
+        if os.path.isfile(RUNTIME_LMG_FASTPATH_DRYRUN_PATH):
+            _v = open(RUNTIME_LMG_FASTPATH_DRYRUN_PATH).read().strip().lower()
+            return _v in ("1", "true", "on")
+    except Exception:
+        pass
+    return os.environ.get("COMFYMODAL_LMG_FASTPATH_DRYRUN", "0").strip().lower() in ("1", "true", "on")
+
+
+def _resolve_lmg_fastpath() -> bool:
+    """Return whether LMG fast-path is enabled (active skip).
+
+    Priority:
+    1. File on the model volume.
+    2. Env var ``COMFYMODAL_LMG_FASTPATH`` (default ``"0"``).
+    """
+    try:
+        if os.path.isfile(RUNTIME_LMG_FASTPATH_PATH):
+            _v = open(RUNTIME_LMG_FASTPATH_PATH).read().strip().lower()
+            return _v in ("1", "true", "on")
+    except Exception:
+        pass
+    return os.environ.get("COMFYMODAL_LMG_FASTPATH", "0").strip().lower() in ("1", "true", "on")
 
 
 _EXCLUDED_CUSTOM_NODE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
@@ -1109,6 +1143,48 @@ def set_deep_profile(enabled: bool) -> str:
     vol.commit()
     print(f"[comfyapp] set_deep_profile: {val}")
     return f"deep_profile={val}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_lmg_fastpath_dryrun(enabled: bool) -> str:
+    """Enable/disable LMG fast-path dry-run diagnostics (no behavior change)."""
+    import os
+    val = "1" if enabled else "0"
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    with open(RUNTIME_LMG_FASTPATH_DRYRUN_PATH, "w") as f:
+        f.write(val)
+    vol.commit()
+    print(f"[comfyapp] set_lmg_fastpath_dryrun: {val}")
+    return f"lmg_fastpath_dryrun={val}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_lmg_fastpath(enabled: bool) -> str:
+    """Enable/disable LMG fast-path (skips load_models_gpu for already-loaded models)."""
+    import os
+    val = "1" if enabled else "0"
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    with open(RUNTIME_LMG_FASTPATH_PATH, "w") as f:
+        f.write(val)
+    vol.commit()
+    print(f"[comfyapp] set_lmg_fastpath: {val}")
+    return f"lmg_fastpath={val}"
 
 
 @app.function(
@@ -2473,50 +2549,92 @@ class _ComfyAPIMixin:
                     finally:
                         _deep_prof[label] = _deep_prof.get(label, 0) + (time.perf_counter() - _t0) * 1000
                 setattr(module, name, _dp)
-            # Instrument prepare_sampling internals
             _dp_wrap(_dsh_mod, 'get_additional_models', 'ps_get_additional_models')
             _dp_wrap(_dsh_mod, 'get_additional_models_from_model_options', 'ps_get_additional_models_opts')
             _dp_wrap(_dsh_mod, 'estimate_memory', 'ps_estimate_memory')
-            # Instrument load_models_gpu: capture metadata + total time
+            # ── Comprehensive load_models_gpu profiler + fastpath diagnostics ──
+            _fp_dryrun = _resolve_lmg_fastpath_dryrun()
+            _fp_enabled = _resolve_lmg_fastpath()
             _orig_lmg = _dmm_mod.load_models_gpu
             _lmg_calls = []
             def _profiled_lmg(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
                 _classes = [m.model.__class__.__name__ for m in models if hasattr(m, 'model')]
-                _loaded_before = len(getattr(_dmm_mod, 'current_loaded_models', []))
-                _mem_req = memory_required
-                _t0 = time.perf_counter()
-                try:
-                    return _orig_lmg(models, memory_required, force_patch_weights, minimum_memory_required, force_full_load)
-                finally:
+                _lm_models = list(getattr(_dmm_mod, 'current_loaded_models', []))
+                _loaded_before = len(_lm_models)
+                # Identity diagnostics for each requested model
+                _diag = []
+                _matched_idx = None
+                _model_patcher = models[0] if models else None
+                for mi, m in enumerate(models):
+                    _md = {
+                        "class": m.model.__class__.__name__ if hasattr(m, 'model') else '?',
+                        "patcher_id": id(m) if hasattr(m, 'model') else 0,
+                        "model_id": id(m.model) if hasattr(m, 'model') else 0,
+                        "matched_idx": -1,
+                        "same_model_object": False,
+                    }
+                    for li, lm in enumerate(_lm_models):
+                        if hasattr(lm, 'model') and hasattr(lm.model, 'model') and hasattr(m, 'model') and lm.model.model is m.model:
+                            _md["matched_idx"] = li
+                            _md["same_model_object"] = True
+                            _matched_idx = li
+                            break
+                    _diag.append(_md)
+                # Fastpath decision
+                _would_fastpath = _matched_idx is not None and len(models) == 1
+                _fp_reject = "none" if _would_fastpath else ("no_identity_match" if _matched_idx is None else "multiple_models")
+                _vram_ok = getattr(_dmm_mod, 'vram_state', None) == _dmm_mod.VRAMState.HIGH_VRAM
+                # ── Guarded fast path execution ──
+                if _fp_enabled and _would_fastpath and _vram_ok:
+                    _t0 = time.perf_counter()
+                    _lm = _lm_models[_matched_idx]
+                    _lm.currently_used = True
                     _t1 = time.perf_counter()
-                    _lmg_calls.append({
+                    _call_data = {
                         "ms": round((_t1 - _t0) * 1000, 1),
                         "models": _classes,
                         "count": len(models),
                         "loaded_before": _loaded_before,
                         "loaded_after": len(getattr(_dmm_mod, 'current_loaded_models', [])),
-                    })
+                        "identity": _diag,
+                        "fastpath_hit": True,
+                        "fastpath_saved_ms": 0,
+                    }
+                    _lmg_calls.append(_call_data)
                     _deep_prof["lmg"] = list(_lmg_calls)
+                    return
+                else:
+                    _t0 = time.perf_counter()
+                    try:
+                        return _orig_lmg(models, memory_required, force_patch_weights, minimum_memory_required, force_full_load)
+                    finally:
+                        _t1 = time.perf_counter()
+                        _call_data = {
+                            "ms": round((_t1 - _t0) * 1000, 1),
+                            "models": _classes,
+                            "count": len(models),
+                            "loaded_before": _loaded_before,
+                            "loaded_after": len(getattr(_dmm_mod, 'current_loaded_models', [])),
+                            "identity": _diag,
+                            "would_fastpath": _would_fastpath,
+                            "fp_reject": _fp_reject if not _would_fastpath else ("not_high_vram" if not _vram_ok else "none"),
+                            "fastpath_hit": False,
+                        }
+                        _lmg_calls.append(_call_data)
+                        _deep_prof["lmg"] = list(_lmg_calls)
             _dmm_mod.load_models_gpu = _profiled_lmg
-            # Instrument SamplerCustomAdvanced pre/post
-            import comfy.sample as _cs_sample
-            import latent_preview as _cs_lp
-            _orig_sca_exec = _dcs_mod.SamplerCustomAdvanced.__dict__['execute'].__func__
-            _sca_prof = {"pre_dur": 0.0, "guider_dur": 0.0, "post_dur": 0.0}
-            import functools as _functools
-            @_functools.wraps(_orig_sca_exec)
-            def _profiled_wrapper(cls, noise, guider, sampler, sigmas, latent_image):
-                _t0 = time.perf_counter()
-                try:
-                    result = _orig_sca_exec(cls, noise, guider, sampler, sigmas, latent_image)
-                    return result
-                finally:
-                    _sca_prof["total_ms"] = (time.perf_counter() - _t0) * 1000
-            _dcs_mod.SamplerCustomAdvanced.execute = classmethod(_profiled_wrapper)
-            _dcs_mod.SamplerCustomAdvanced.sample = classmethod(_profiled_wrapper)
-            _deep_prof["sca"] = _sca_prof
+            # ── Warmup registration logging ──
+            _warmup_lm = list(getattr(_dmm_mod, 'current_loaded_models', []))
+            _deep_prof["warmup"] = {
+                "registered_count": len(_warmup_lm),
+                "entries": [{
+                    "class": lm.model.__class__.__name__ if hasattr(lm, 'model') else '?',
+                    "actual_model": lm.model.model.__class__.__name__ if hasattr(lm, 'model') and hasattr(lm.model, 'model') else '?',
+                    "actual_model_id": id(lm.model.model) if hasattr(lm, 'model') and hasattr(lm.model, 'model') else 0,
+                    "patcher_id": id(lm) if hasattr(lm, 'model') else 0,
+                } for lm in _warmup_lm],
+            }
             # KSAMPLER.sample setup proved ~0.35ms — no further breakdown needed
-            # Store ref
             import comfy as _comfy_mod
             _comfy_mod._comfy_modal_deep_prof = _deep_prof
 
