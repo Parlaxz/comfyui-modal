@@ -104,6 +104,45 @@ async def run_prompt(
         )
 
 
+# NOTE: no @_modal_error_handler here — that decorator does `await func()`
+# which breaks async generator functions.  Error handling is inline.
+async def run_prompt_stream(
+    workflow: dict,
+    input_images: dict | None = None,
+    trace: dict | None = None,
+    gpu: str | None = None,
+):
+    """Execute workflow on Modal and stream progress events back to the caller.
+
+    Yields dicts with types:
+      ``{"type": "status", "message": "..."}`` — startup/restore phase.
+      ``{"type": "progress", "event": "...", "data": {...}}`` — ComfyUI events.
+      ``{"type": "result", "data": {...}}`` — final result (last yield).
+      ``{"type": "error", "message": "..."}`` — fatal error.
+    """
+    async with _run_prompt_semaphore:
+        try:
+            gen = _api_for_gpu(gpu).run_prompt_stream.remote_gen.aio(
+                workflow, input_images or {}, trace or {},
+            )
+            async for msg in gen:
+                yield msg
+        except TimeoutError:
+            raise TimeoutError(
+                "Modal request timed out. The container may be cold-starting (1-3 min)."
+            )
+        except (ConnectionError, OSError) as e:
+            raise ConnectionError(
+                "Modal connection failed. Check your internet connection and Modal token."
+            ) from e
+        except Exception as e:
+            if getattr(type(e), "__module__", "").startswith("modal"):
+                raise RuntimeError(
+                    f"Modal error: {e}. Try redeploying with the Deploy button."
+                ) from e
+            raise
+
+
 @_modal_error_handler
 async def get_object_info() -> dict:
     return await asyncio.to_thread(lambda: _api().object_info.remote())
