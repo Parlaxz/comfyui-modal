@@ -44,6 +44,35 @@ def main() -> int:
         except Exception as exc:
             print(f"WARNING: could not set WCE={_wce_val}: {exc}")
 
+    # ── P1 direct warmup runtime flags ──────────────────────────────
+    for _flag in ("DIRECT_WARMUP_LOAD_UNET", "DIRECT_WARMUP_LOAD_CLIP",
+                  "DIRECT_WARMUP_CLIP_ENCODE", "DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT"):
+        _val = os.environ.get(f"COMFYMODAL_{_flag}", "").strip().lower()
+        if _val in ("0", "1"):
+            try:
+                _r = modal.Function.from_name("comfyui", "set_runtime_flag").remote(_flag, _val)
+                print(f"Runtime flag {_flag}={_val}: {_r}")
+            except Exception as exc:
+                print(f"WARNING: could not set {_flag}={_val}: {exc}")
+
+    # ── P2 Sage runtime config ──────────────────────────────────────
+    _sage_mode = os.environ.get("COMFYMODAL_SAGE_RUNTIME_MODE", "").strip().lower()
+    if _sage_mode in ("baked_cuda", "triton_fallback", "auto"):
+        try:
+            _r = modal.Function.from_name("comfyui", "set_sage_runtime_mode").remote(_sage_mode)
+            print(f"Sage runtime mode set: {_r}")
+        except Exception as exc:
+            print(f"WARNING: could not set sage_runtime_mode={_sage_mode}: {exc}")
+
+    _sage_probe = os.environ.get("COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE", "").strip().lower()
+    if _sage_probe in ("0", "1"):
+        _sp_val = _sage_probe == "1"
+        try:
+            _r = modal.Function.from_name("comfyui", "set_sage_runtime_probe").remote(_sp_val)
+            print(f"Sage runtime probe set: {_r}")
+        except Exception as exc:
+            print(f"WARNING: could not set sage_runtime_probe={_sp_val}: {exc}")
+
     # ── Optional return mode ────────────────────────────────────────
     _return_mode = os.environ.get("COMFYMODAL_RETURN_MODE", "").strip().lower()
     if _return_mode:
@@ -160,12 +189,81 @@ def main() -> int:
 
     print(f"Workflow loaded: {len(workflow)} nodes")
 
+    # ── Build input_images for LoadImage nodes ───────────────────────
+    # Scan the workflow for LoadImage nodes and create a dummy black
+    # image for each referenced file.  This avoids workflow validation
+    # failures when the expected image isn't on the container.
+    _input_images: dict[str, str] = {}
+    for _nid, _nspec in workflow.items():
+        if isinstance(_nspec, dict) and _nspec.get("class_type") == "LoadImage":
+            _fname = _nspec.get("inputs", {}).get("image", "")
+            if _fname:
+                import base64, io
+                from PIL import Image
+                _img = Image.new("RGB", (512, 768), color=(0, 0, 0))
+                _buf = io.BytesIO()
+                _img.save(_buf, format="PNG")
+                _b64 = base64.b64encode(_buf.getvalue()).decode("ascii")
+                _input_images[_fname] = _b64
+                print(f"Created dummy input image: {_fname} (512x768 black PNG, {len(_b64)} b64 chars)")
+    if _input_images:
+        print(f"Total input images prepared: {len(_input_images)}")
+
+    # ── Set warmup profile from workflow models ──────────────────────
+    # Extract UNET/CLIP/VAE from the workflow so preload + direct warmup
+    # actually loads models during restore.
+    _warmup_profile = {"mode": "split", "clip_type": "flux"}
+    _warmup_profile_models = {}
+    for _nspec in workflow.values():
+        if isinstance(_nspec, dict):
+            _ct = _nspec.get("class_type", "")
+            _inp = _nspec.get("inputs", {}) or {}
+            if _ct == "UNETLoader":
+                _warmup_profile["unet"] = _inp.get("unet_name", "")
+            elif _ct == "CLIPLoader":
+                _warmup_profile["clip1"] = _inp.get("clip_name", "")
+                _warmup_profile["clip2"] = _inp.get("clip_name", "")  # same for flux
+                _warmup_profile_models["clip_type"] = _inp.get("type", "flux")
+            elif _ct == "VAELoader":
+                _warmup_profile["vae"] = _inp.get("vae_name", "")
+    _clip_t = _warmup_profile_models.get("clip_type", "flux")
+    if _clip_t:
+        _warmup_profile["clip_type"] = _clip_t
+    has_models = bool(_warmup_profile.get("unet") and _warmup_profile.get("clip1"))
+    if has_models:
+        _wp_payload = {
+            "warmup_profile": _warmup_profile,
+            "workflow_hash": snapshot.get("workflow_hash", "benchmark"),
+            "model_stack": {
+                "unet": [_warmup_profile.get("unet", "")],
+                "clip": [_warmup_profile.get("clip1", ""), _warmup_profile.get("clip2", "")],
+                "vae": [_warmup_profile.get("vae", "")],
+            },
+            "profile_token": f"benchmark_{int(time.time())}",
+            "disable_warmup": False,
+        }
+        try:
+            _r = modal.Function.from_name("comfyui", "set_active_warmup_profile").remote(_wp_payload)
+            print(f"Warmup profile set: {_r} | split unet={_warmup_profile.get('unet','')} clip1={_warmup_profile.get('clip1','')}")
+        except Exception as exc:
+            print(f"WARNING: could not set warmup profile: {exc}")
+    else:
+        print("WARNING: could not extract warmup profile from workflow — no UNET/CLIP found")
+
     # ── Connect to deployed Modal app ────────────────────────────────
     # NOTE: Must use RTX PRO 6000 (Blackwell). A10G SageAttention kernels
     # are compiled for SM 12.0 and produce CUDA errors on Ampere GPUs.
-    GPU_CLASS = "ComfyAPI_RTX_PRO_6000"
+    GPU_CLASS = os.environ.get("COMFYMODAL_BENCHMARK_GPU_CLASS", "ComfyAPI_RTX_PRO_6000").strip()
+    # Map shorthand names
+    _gpu_map = {
+        "rtx6000": "ComfyAPI_RTX_PRO_6000",
+        "a10g": "ComfyAPI",
+        "l4": "ComfyAPI_L4",
+        "l40s": "ComfyAPI_L40S",
+    }
+    GPU_CLASS = _gpu_map.get(GPU_CLASS.lower(), GPU_CLASS)
     api = modal.Cls.from_name("comfyui", GPU_CLASS)()
-    print(f"Connected to Modal {GPU_CLASS} (Blackwell RTX PRO 6000)\n")
+    print(f"Connected to Modal {GPU_CLASS}\n")
 
     # ── Run 3 cold benchmarks with 20s gaps ──────────────────────────
     results = []
@@ -181,7 +279,7 @@ def main() -> int:
 
         bench_t2_before_modal_call = time.time()
         try:
-            result = api.run_prompt.remote(workflow)
+            result = api.run_prompt.remote(workflow, input_images=_input_images if _input_images else None)
         except Exception as exc:
             print(f"[{label}] FAILED: {exc}")
             results.append({"run": label, "error": str(exc)})
