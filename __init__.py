@@ -337,6 +337,7 @@ _COMFYUI_ROOT = os.path.dirname(os.path.dirname(_NODE_DIR))
 
 _MODAL_TOML_PATH = os.path.expanduser("~/.modal.toml")
 _HF_TOKEN_PATH = os.path.join(os.path.dirname(__file__), ".hf_token")
+_CIVITAI_TOKEN_PATH = os.path.join(os.path.dirname(__file__), ".civitai_token")
 
 
 def _validate_model_location(folder: str, filename: str) -> tuple[str, str]:
@@ -435,6 +436,17 @@ def _read_hf_token() -> str:
 
 def _write_hf_token(token: str):
     with open(_HF_TOKEN_PATH, "w") as f:
+        f.write(token.strip())
+
+def _read_civitai_token() -> str:
+    try:
+        with open(_CIVITAI_TOKEN_PATH, "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+def _write_civitai_token(token: str):
+    with open(_CIVITAI_TOKEN_PATH, "w") as f:
         f.write(token.strip())
 
 def _is_modal_token_set() -> bool:
@@ -839,6 +851,18 @@ if _server:
         _write_hf_token(token)
         return web.json_response({"status": "ok"})
 
+    @_server.routes.get("/comfymodal/civitai-token")
+    async def modal_civitai_token_get(request: web.Request) -> web.Response:
+        token = _read_civitai_token()
+        return web.json_response({"token": token[:8] + "..." if len(token) > 8 else ("set" if token else "")})
+
+    @_server.routes.post("/comfymodal/civitai-token")
+    async def modal_civitai_token_set(request: web.Request) -> web.Response:
+        body = await request.json()
+        token = body.get("token", "").strip()
+        _write_civitai_token(token)
+        return web.json_response({"status": "ok"})
+
     @_server.routes.post("/comfymodal/auth/setup")
     async def modal_auth_setup(request: web.Request) -> web.Response:
         body = await request.json()
@@ -932,7 +956,7 @@ if _server:
                 "save_path": folder,
             })
         try:
-            results = await batch_download_models(normalized_items, hf_token=_read_hf_token())
+            results = await batch_download_models(normalized_items, hf_token=_read_hf_token(), civitai_token=_read_civitai_token())
             placeholders, placeholder_errors = _create_placeholder_batch([
                 {"folder": item["save_path"], "filename": item["filename"]}
                 for item in normalized_items
@@ -962,7 +986,7 @@ if _server:
 
         try:
             save_path, filename = _validate_model_location(save_path, filename)
-            result = await download_model(url=url, filename=filename, save_path=save_path, hf_token=_read_hf_token())
+            result = await download_model(url=url, filename=filename, save_path=save_path, hf_token=_read_hf_token(), civitai_token=_read_civitai_token())
             placeholder = None
             placeholder_error = None
             message = "Model downloaded to Modal and local placeholder created. Refresh ComfyUI if the dropdown does not update."

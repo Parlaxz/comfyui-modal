@@ -155,17 +155,19 @@ async def health_check() -> dict:
 
 
 @_modal_error_handler
-async def download_model(url: str, filename: str, save_path: str = "checkpoints", hf_token: str = "") -> dict:
-    return await asyncio.to_thread(
-        lambda: _download_fn.remote(url=url, filename=filename, save_path=save_path, hf_token=hf_token),
-    )
+async def download_model(url: str, filename: str, save_path: str = "checkpoints", hf_token: str = "", civitai_token: str = "") -> dict:
+    kwargs = dict(url=url, filename=filename, save_path=save_path, hf_token=hf_token)
+    if civitai_token:
+        kwargs["civitai_token"] = civitai_token
+    return await asyncio.to_thread(lambda: _download_fn.remote(**kwargs))
 
 
 @_modal_error_handler
-async def batch_download_models(items: list, hf_token: str = "") -> list:
-    return await asyncio.to_thread(
-        lambda: _batch_download_fn.remote(items, hf_token=hf_token),
-    )
+async def batch_download_models(items: list, hf_token: str = "", civitai_token: str = "") -> list:
+    kwargs = dict(hf_token=hf_token)
+    if civitai_token:
+        kwargs["civitai_token"] = civitai_token
+    return await asyncio.to_thread(lambda: _batch_download_fn.remote(items, **kwargs))
 
 
 @_modal_error_handler

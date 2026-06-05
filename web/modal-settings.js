@@ -1719,6 +1719,88 @@ function buildPanel() {
   };
   hfInput.addEventListener("keydown", (e) => { if (e.key === "Enter") hfSaveBtn.click(); });
 
+  // -- Civitai API Key --
+  const civitaiDivider = document.createElement("div");
+  civitaiDivider.style.cssText = "border-top: 1px solid #3a3a3a; margin: 10px 0;";
+  settingsContent.appendChild(civitaiDivider);
+
+  const civitaiTitle = document.createElement("div");
+  civitaiTitle.style.cssText = "font-weight:600; font-size:12px; margin-bottom:4px;";
+  civitaiTitle.textContent = "\uD83C\uDFF0 Civitai API Key";
+  settingsContent.appendChild(civitaiTitle);
+
+  const civitaiDesc = document.createElement("div");
+  civitaiDesc.style.cssText = "font-size:11px; color:#888; line-height:1.5; margin-bottom:6px;";
+  civitaiDesc.innerHTML = `Required for gated/private/purchased models on Civitai. Get your key at <a href="https://civitai.com/user/account" target="_blank" style="color:#6a9fd8;">civitai.com/user/account</a>`;
+  settingsContent.appendChild(civitaiDesc);
+
+  const civitaiRow = document.createElement("div");
+  civitaiRow.style.cssText = "display:flex; gap:6px;";
+
+  const civitaiInput = document.createElement("input");
+  civitaiInput.type = "password";
+  civitaiInput.placeholder = "Civitai API Key";
+  civitaiInput.style.cssText = inputStyle() + "flex:1;";
+
+  const civitaiSaveBtn = document.createElement("button");
+  civitaiSaveBtn.textContent = "Save";
+  civitaiSaveBtn.style.cssText = btnStyle();
+
+  civitaiRow.appendChild(civitaiInput);
+  civitaiRow.appendChild(civitaiSaveBtn);
+  settingsContent.appendChild(civitaiRow);
+
+  const civitaiStatus = document.createElement("div");
+  civitaiStatus.style.cssText = "font-size:11px; color:#888; min-height:14px; margin-top:4px;";
+  settingsContent.appendChild(civitaiStatus);
+
+  (async () => {
+    try {
+      const r = await api.fetchApi(`${MODAL_PREFIX}/civitai-token`);
+      const d = await r.json();
+      if (d.token) {
+        civitaiStatus.innerHTML = "";
+        const badge = document.createElement("span");
+        badge.style.cssText = "color:#7ed321; background:#1a3a1a; padding:2px 6px; border-radius:3px; font-size:10px;";
+        badge.textContent = "Saved";
+        const tokenSpan = document.createElement("span");
+        tokenSpan.style.cssText = "color:#666; margin-left:6px;";
+        tokenSpan.textContent = d.token;
+        civitaiStatus.appendChild(badge);
+        civitaiStatus.appendChild(tokenSpan);
+      }
+    } catch {}
+  })();
+
+  civitaiSaveBtn.onclick = async () => {
+    const token = civitaiInput.value.trim();
+    civitaiStatus.textContent = "";
+    civitaiSaveBtn.disabled = true;
+    try {
+      const r = await api.fetchApi(`${MODAL_PREFIX}/civitai-token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token }),
+      });
+      const d = await r.json();
+      if (d.status === "ok") {
+        civitaiStatus.innerHTML = token
+          ? `<span style="color:#7ed321; background:#1a3a1a; padding:2px 6px; border-radius:3px; font-size:10px;">Saved</span>`
+          : `<span style="color:#888;">Cleared</span>`;
+        civitaiInput.value = "";
+        showToast(token ? "Civitai key saved" : "Civitai key cleared", "success");
+      } else {
+        civitaiStatus.style.color = "#e05";
+        civitaiStatus.textContent = d.message || "Error saving key.";
+      }
+    } catch (e) {
+      civitaiStatus.style.color = "#e05";
+      civitaiStatus.textContent = `Error: ${e.message}`;
+    }
+    civitaiSaveBtn.disabled = false;
+  };
+  civitaiInput.addEventListener("keydown", (e) => { if (e.key === "Enter") civitaiSaveBtn.click(); });
+
   // -- Change API Key --
   const keyDivider = document.createElement("div");
   keyDivider.style.cssText = "border-top: 1px solid #3a3a3a; margin: 10px 0;";
