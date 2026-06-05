@@ -29,15 +29,41 @@ WARMUP_CLIP_TYPE = os.getenv("COMFYMODAL_WARMUP_CLIP_TYPE", "flux").strip() or "
 WARMUP_TEXT = "A Jew steals baby kittens from their mother cat. the mother cat is anthropamorphic and wearing an apron and chef's hat and crying. The jew is a rabbi and is wearing a suit and holding the kittens. The jew has a long nose and an evil smile. They are in a crowded market, and the mother cat has her hands outstretched longinly in the direction of the jew and her babies. The jew is running away with his back to the mother and looking back at her. He is wearing a kippa and is a rabbi, and is laughing"
 
 # Preload mode controls which model files are loaded to CPU during restore
-# and the concurrency/ordering:
-#   default      — UNET + CLIP concurrent, 4 workers
-#   sequential   — UNET first then CLIP, 1 worker
-#   unet_only    — UNET only
-#   clip_only    — CLIP only
-#   vae          — UNET + CLIP + VAE concurrent, 4 workers
-#   workers_1    — UNET + CLIP concurrent, 1 worker
-#   workers_2    — UNET + CLIP concurrent, 2 workers
+# and how loading behaves:
+#   workers_2      — (default fallback) UNET + CLIP concurrent, 2 workers
+#   default        — UNET + CLIP concurrent, 4 workers
+#   sequential     — UNET first then CLIP, 1 worker
+#   workers_1      — UNET + CLIP concurrent, 1 worker
+#   unet_only      — UNET only
+#   clip_only      — CLIP only
+#   vae            — UNET + CLIP + VAE concurrent, 4 workers
+#   off            — skip CPU preload entirely
+#   async_no_wait  — fire preload in background thread, don't block restore
+#   budgeted_1500ms — preload with 1500ms time budget, stop when exceeded
 PRELOAD_MODE = os.getenv("COMFYMODAL_PRELOAD_MODE", "workers_2").strip().lower()
+
+# P1 — Direct warmup granular flags.
+# DIRECT_WARMUP_LOAD_UNET/LOAD_CLIP gate whether UNET/CLIP are loaded
+# during direct warmup at all.  Default both to 0 so that synchronous
+# model reads during restore (16+ GB) are opt-in rather than the default.
+# DIRECT_WARMUP_CLIP_ENCODE gates the dummy CLIPTextEncode forward pass.
+DIRECT_WARMUP_LOAD_UNET = os.getenv("COMFYMODAL_DIRECT_WARMUP_LOAD_UNET", "0") == "1"
+DIRECT_WARMUP_LOAD_CLIP = os.getenv("COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP", "0") == "1"
+DIRECT_WARMUP_CLIP_ENCODE = os.getenv("COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE", "0") == "1"
+# When enabled, direct warmup only loads a model file if it is already
+# present in the CPU cache (populated by CPU preload).  This prevents
+# direct warmup from becoming a synchronous 16.85 GB volume read when
+# CPU preload is disabled or async.
+DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT = os.getenv("COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT", "1") == "1"
+
+# P2 — Sage runtime policy.
+#   auto           — (default) probe and select automatically
+#   baked_cuda     — skip probing, assume Blackwell baked CUDA path
+#   triton_fallback — skip probing, force Triton fallback
+SAGE_RUNTIME_MODE = os.getenv("COMFYMODAL_SAGE_RUNTIME_MODE", "auto").strip().lower()
+# When 0, skip the Sage CUDA extension smoke test during restore.
+# Use the persistent volume cache if available, or SAGE_RUNTIME_MODE default.
+SAGE_RUNTIME_PROBE_ON_RESTORE = os.getenv("COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE", "1") == "1"
 PRELOAD_MODE_PATH = "/root/models/.preload_mode"
 RUNTIME_CONFIG_DIR = "/root/models/runtime_config"
 RUNTIME_WCE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "warmup_clip_encode.txt")
@@ -111,6 +137,21 @@ def _model_cpu_cache_lookup_keys(path: str) -> tuple[str, ...]:
     return tuple(candidates)
 
 
+def _iter_image_entries(node_out: dict):
+    """Yield ``(output_key, entry)`` for each entry in ``node_out`` that looks
+    like an image/video file reference (dict with a ``"filename"`` key).
+
+    Skips non-list values (e.g. ``"animated"``).  The caller still needs to
+    check ``node_out.get("animated", False)`` for the per-node animation flag.
+    """
+    for key, value in node_out.items():
+        if not isinstance(value, list):
+            continue
+        for entry in value:
+            if isinstance(entry, dict) and "filename" in entry:
+                yield key, entry
+
+
 def _apply_return_mode(result: dict, return_mode: str, payload_image_count: int, payload_video_count: int) -> dict:
     result.setdefault("_return_payload_info", {})["return_mode"] = return_mode
     if return_mode == "first_image_only" and result.get("images"):
@@ -135,6 +176,62 @@ def _apply_return_mode(result: dict, return_mode: str, payload_image_count: int,
         result["_return_payload_info"]["b64_bytes"] = 0
         print(f"[comfyapp] return_mode=paths_only: {payload_image_count} images, {payload_video_count} videos")
     return result
+
+
+def _resolve_runtime_flag(name: str, default: str) -> bool:
+    """Read a runtime ``0``/``1`` flag from file or env var.
+
+    Priority:
+    1. File on the model volume at ``runtime_config/{name}.txt``.
+    2. Env var ``COMFYMODAL_{name}``.
+    3. ``default`` string (``"0"`` or ``"1"``).
+    """
+    path = os.path.join(RUNTIME_CONFIG_DIR, f"{name}.txt")
+    try:
+        if os.path.isfile(path):
+            v = open(path).read().strip().lower()
+            if v in ("0", "1"):
+                return v == "1"
+    except Exception:
+        pass
+    env = os.environ.get(f"COMFYMODAL_{name}", default)
+    return env == "1"
+
+
+def _resolve_sage_runtime_env_override() -> str:
+    """Return the effective SAGE_RUNTIME_MODE from file, env, or module default.
+
+    Priority:
+    1. File ``runtime_config/sage_runtime_mode.txt``.
+    2. Module-level ``SAGE_RUNTIME_MODE`` (from env var ``COMFYMODAL_SAGE_RUNTIME_MODE``).
+    """
+    path = os.path.join(RUNTIME_CONFIG_DIR, "sage_runtime_mode.txt")
+    try:
+        if os.path.isfile(path):
+            v = open(path).read().strip().lower()
+            if v in ("auto", "baked_cuda", "triton_fallback"):
+                return v
+    except Exception:
+        pass
+    return SAGE_RUNTIME_MODE
+
+
+def _resolve_sage_probe_on_restore() -> bool:
+    """Return whether to probe Sage runtime during restore.
+
+    Priority:
+    1. File ``runtime_config/sage_runtime_probe.txt``.
+    2. Module-level ``SAGE_RUNTIME_PROBE_ON_RESTORE``.
+    """
+    path = os.path.join(RUNTIME_CONFIG_DIR, "sage_runtime_probe.txt")
+    try:
+        if os.path.isfile(path):
+            v = open(path).read().strip().lower()
+            if v in ("0", "1"):
+                return v == "1"
+    except Exception:
+        pass
+    return SAGE_RUNTIME_PROBE_ON_RESTORE
 
 
 def _resolve_preload_mode() -> str:
@@ -750,7 +847,7 @@ def stack_to_profile(stack: dict) -> dict:
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.14.0"
+COMFYAPP_VERSION = "2.14.1"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
@@ -775,6 +872,9 @@ GPU_PROFILES = {
 
 SAGEATTENTION_GIT_REF = "v2.2.0"
 SAGEATTENTION_SITE_PACKAGES = "/usr/local/lib/python3.11/site-packages"
+
+# File-based custom node exclusion list (set at runtime, read during startup)
+EXCLUDED_NODES_PATH = os.path.join(RUNTIME_CONFIG_DIR, "excluded_nodes.txt")
 
 image = (
     modal.Image.from_registry(
@@ -843,6 +943,13 @@ image = (
             "COMFYMODAL_ENABLE_TORCH_COMPILE": "0",
             "COMFYMODAL_ENABLE_GPU_SNAPSHOT": "0",
             "COMFYMODAL_WARMUP_TEXT": "warmup",
+            # Restore latency fix — default production profile (Config D)
+            "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
+            "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
+            "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "1",
+            "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
+            "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "0",
+            "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "0",
         }
     )
     .add_local_python_source("gpu_catalog")
@@ -1052,8 +1159,10 @@ def set_preload_mode(mode: str) -> str:
     """
     import os
     mode = mode.strip().lower()
-    valid = {"default", "sequential", "unet_only", "clip_only", "vae", "workers_1", "workers_2"}
-    if mode not in valid:
+    valid = {"default", "sequential", "unet_only", "clip_only", "vae", "workers_1", "workers_2",
+             "off", "async_no_wait"}
+    if mode not in valid and not mode.startswith("budgeted_"):
+        return f"invalid mode: {mode}  valid={valid} or budgeted_<ms>"
         return f"invalid mode: {mode}  valid={valid}"
     os.makedirs("/root/models", exist_ok=True)
     with open(PRELOAD_MODE_PATH, "w") as f:
@@ -1061,6 +1170,88 @@ def set_preload_mode(mode: str) -> str:
     vol.commit()
     print(f"[comfyapp] set_preload_mode: {mode}")
     return f"preload_mode={mode}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_runtime_flag(name: str, value: str) -> str:
+    """Set a runtime ``0``/``1`` flag for the next cold restore.
+
+    Writes to ``/root/models/runtime_config/{name}.txt`` which is read
+    by ``_resolve_runtime_flag()`` during restore.
+    """
+    import os
+    value = value.strip().lower()
+    if value not in ("0", "1"):
+        return f"invalid value: {value}  expected 0 or 1"
+    os.makedirs("/root/models/runtime_config", exist_ok=True)
+    path = os.path.join("/root/models/runtime_config", f"{name}.txt")
+    with open(path, "w") as f:
+        f.write(value)
+    vol.commit()
+    print(f"[comfyapp] set_runtime_flag: {name}={value}")
+    return f"runtime_flag {name}={value}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_sage_runtime_mode(mode: str) -> str:
+    """Set Sage runtime mode for the next cold restore (no redeploy needed).
+
+    Values: ``auto``, ``baked_cuda``, ``triton_fallback``.
+    Writes to ``/root/models/runtime_config/sage_runtime_mode.txt``.
+    """
+    import os
+    mode = mode.strip().lower()
+    if mode not in ("auto", "baked_cuda", "triton_fallback"):
+        return f"invalid sage_runtime_mode: {mode}  expected auto|baked_cuda|triton_fallback"
+    os.makedirs("/root/models/runtime_config", exist_ok=True)
+    path = os.path.join("/root/models/runtime_config", "sage_runtime_mode.txt")
+    with open(path, "w") as f:
+        f.write(mode)
+    vol.commit()
+    print(f"[comfyapp] set_sage_runtime_mode: {mode}")
+    return f"sage_runtime_mode={mode}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_sage_runtime_probe(enabled: bool) -> str:
+    """Set whether Sage runtime probes during restore.
+
+    When 0, skips the CUDA extension smoke test and uses cached mode
+    or default.  Writes to ``/root/models/runtime_config/sage_runtime_probe.txt``.
+    """
+    import os
+    val = "1" if enabled else "0"
+    os.makedirs("/root/models/runtime_config", exist_ok=True)
+    path = os.path.join("/root/models/runtime_config", "sage_runtime_probe.txt")
+    with open(path, "w") as f:
+        f.write(val)
+    vol.commit()
+    print(f"[comfyapp] set_sage_runtime_probe: {val}")
+    return f"sage_runtime_probe={val}"
 
 
 @app.function(
@@ -1397,6 +1588,31 @@ def upload_model_to_volume(file_data: bytes, folder: str, filename: str) -> dict
     cpu=1,
     memory=512,
     timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def set_excluded_nodes(nodes_csv: str) -> str:
+    """Set custom node directories to exclude on next cold restore.
+
+    Provide a comma-separated list of directory names (e.g. ``ComfyUI-Manager``).
+    Writes to ``/root/models/runtime_config/excluded_nodes.txt``.
+    """
+    import os
+    nodes_csv = nodes_csv.strip()
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    with open(EXCLUDED_NODES_PATH, "w") as f:
+        f.write(nodes_csv)
+    vol.commit()
+    print(f"[comfyapp] set_excluded_nodes: {nodes_csv}")
+    return f"excluded_nodes={nodes_csv}"
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=2,
+    memory=4096,
+    timeout=3600,
     volumes={MODELS_PATH: vol},
 )
 def set_active_warmup_profile(payload: dict) -> dict:
@@ -1743,11 +1959,22 @@ class _ComfyAPIMixin:
                     ("clip", clip1_f),
                     ("clip", clip2_f),
                 ])
-        # Resolve paths concurrently: each _find_model_file call does FUSE
-        # stat requests (network round-trips to Modal's volume service).
-        # Running them sequentially adds ~50-150ms per stat → 200-600ms
-        # for a full profile.  ThreadPoolExecutor hides this latency.
+        # Deduplicate paths before resolution.
+        # When clip1 and clip2 are the same model file (e.g. Qwen 8B used
+        # as both text_encoders in Flux), we only need one FUSE stat call.
+        # Use filename as the dedup key since bucket is cosmetic.
         active = [(b, f) for b, f in checks if f]
+        _active_deduped: list[tuple[str, str]] = []
+        _seen_filenames: set[str] = set()
+        for b, f in active:
+            if f not in _seen_filenames:
+                _seen_filenames.add(f)
+                _active_deduped.append((b, f))
+        if len(_active_deduped) < len(active):
+            print(f"[comfyapp] snapshot_preload_paths: deduped {len(active)}→{len(_active_deduped)} "
+                  f"duplicates={set(f for _, f in active) - set(f for _, f in _active_deduped)}")
+        active = _active_deduped
+
         paths = []
         seen = set()
         path_times: dict[str, float] = {}
@@ -1775,7 +2002,7 @@ class _ComfyAPIMixin:
         print(f"[comfyapp] snapshot_preload_paths: resolved {len(paths)} paths: {[os.path.basename(p) for p in paths]} per-file: {path_times}")
         return paths
 
-    def _preload_models_to_cpu(self, file_paths: list[str], on_file_loaded=None) -> dict:
+    def _preload_models_to_cpu(self, file_paths: list[str], on_file_loaded=None, budget_ms: float | None = None) -> dict:
         """Preload model state dicts into CPU RAM.
 
         Loaded state dicts are stored in ``_model_cpu_cache``.  The
@@ -1794,6 +2021,10 @@ class _ComfyAPIMixin:
         When ``on_file_loaded`` is callable, it's invoked with ``(filename,)``
         as each file completes loading.  Used by the parallel warmup to
         start text encoding as soon as the CLIP state dict is available.
+
+        When ``budget_ms`` is set, loading stops after approximately that
+        many milliseconds have elapsed.  Already-submitted workers continue
+        but their results are discarded to avoid blocking.
         """
         if not file_paths:
             return {"count": 0, "cached": [], "file_timing_ms": {}}
@@ -1851,10 +2082,18 @@ class _ComfyAPIMixin:
                     return filename, cache_key, loaded[0], loaded[1], d_ms
                 return filename, cache_key, loaded, None, d_ms
 
-            batch = _total_bytes
+            _budget_deadline = (time.time() + budget_ms / 1000.0) if budget_ms is not None else None
             with ThreadPoolExecutor(max_workers=min(len(to_load), _preload_max_workers)) as pool:
                 fut_map = {pool.submit(_load_one, p, f, cache_key): (f, cache_key) for p, f, cache_key in to_load}
                 for future in as_completed(fut_map):
+                    # Check budget before processing each completed result.
+                    if _budget_deadline is not None and time.time() >= _budget_deadline:
+                        _exceeded_by = round((time.time() - _budget_deadline) * 1000, 1)
+                        print(f"[comfyapp] preload_models_to_cpu: budget exceeded by {_exceeded_by}ms, "
+                              f"loaded {len(cached)}/{len(to_load)} files so far — cancelling remaining")
+                        for _f in fut_map:
+                            _f.cancel()
+                        break
                     filename, cache_key = fut_map[future]
                     try:
                         fn, cache_key, state_dict, metadata, d_ms = future.result()
@@ -1919,11 +2158,30 @@ class _ComfyAPIMixin:
             f"loaded_gb={round(_total_loaded_gb, 2)} "
             f"throughput_gbps={round(_total_loaded_gb / max(_total_ms/1000, 0.001), 2)}"
         )
+        _budget_exceeded = False
+        if budget_ms is not None:
+            _elapsed = (time.time() - _total_start) * 1000 if _total_start else 0
+            _budget_exceeded = _elapsed > budget_ms
         return {
             "count": len(cached),
             "cached": cached,
             "file_timing_ms": file_timing_ms,
+            "budget_exceeded": _budget_exceeded,
         }
+
+    def _model_in_cpu_cache(self, path: str) -> bool:
+        """Return True if a model file is already in ``_model_cpu_cache``.
+
+        Uses ``_model_cpu_cache_lookup_keys`` to check all key variants
+        (realpath, normcase, basename).
+        """
+        cache = getattr(self, "_model_cpu_cache", {})
+        if not cache:
+            return False
+        for key in _model_cpu_cache_lookup_keys(path):
+            if key in cache:
+                return True
+        return False
 
     def _patch_model_cpu_cache(self, comfy_utils) -> None:
         """Patch ComfyUI model loading to reuse CPU-cached state dicts."""
@@ -2075,10 +2333,40 @@ class _ComfyAPIMixin:
             return False, [f"cuda-smoke-test-failed:{type(exc).__name__}"]
 
     def _select_sage_runtime_mode(self) -> tuple[str, str]:
+        # Sticky — already selected earlier in this restore
         if getattr(self, "_sage_runtime_mode", None) is not None:
             return self._sage_runtime_mode, getattr(self, "_sage_runtime_reason", "sticky")
 
-        # Check persistent cache on volume
+        # P2 — runtime-configurable env override (file → env → module)
+        _rt_sage_mode = _resolve_sage_runtime_env_override()
+        _rt_sage_probe = _resolve_sage_probe_on_restore()
+        if _rt_sage_mode in ("baked_cuda", "triton_fallback"):
+            self._sage_runtime_mode = _rt_sage_mode
+            self._sage_runtime_reason = f"runtime_override"
+            print(f"[comfyapp] sage_runtime_mode={self._sage_runtime_mode} reason={self._sage_runtime_reason} "
+                  f"(SAGE_RUNTIME_MODE={_rt_sage_mode})")
+            return self._sage_runtime_mode, self._sage_runtime_reason
+
+        # P2 — skip probe on restore: prefer cached value, else env default
+        if not _rt_sage_probe:
+            cached = self._load_sage_runtime_cache()
+            if cached:
+                print(f"[comfyapp] sage_runtime_cache hit mode={cached['mode']} reason={cached['reason']} "
+                      f"gpu={cached['gpu_name']} sage_v={cached['sage_version']} (probe skipped)")
+                self._sage_runtime_mode = cached["mode"]
+                self._sage_runtime_reason = cached["reason"]
+                return self._sage_runtime_mode, self._sage_runtime_reason
+            # No cache available — fall back to baked_cuda (safe on Blackwell,
+            # and Triton fallback works even if baked CUDA import fails later)
+            import torch
+            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unknown"
+            _default_mode = "baked_cuda" if "Blackwell" in gpu_name or "RTX PRO 6000" in gpu_name else "triton_fallback"
+            self._sage_runtime_mode = _default_mode
+            self._sage_runtime_reason = f"no_cache_restore_default_gpu={gpu_name}"
+            print(f"[comfyapp] sage_runtime_mode={self._sage_runtime_mode} reason={self._sage_runtime_reason} (probe skipped, no cache)")
+            return self._sage_runtime_mode, self._sage_runtime_reason
+
+        # Normal path: check persistent cache, probe if needed
         import json, os
         cached = self._load_sage_runtime_cache()
         if cached:
@@ -2973,6 +3261,12 @@ class _ComfyAPIMixin:
            fallback when no ``prompt_start_time`` is available (e.g. older
            callers).
 
+        Returns ``{"images": [...], "videos": [...], "outputs": {node_id: {key: [...]}}}``.
+        The ``outputs`` map preserves the original per-node output-key structure
+        (e.g. ``"a_images"``, ``"b_images"``) so the caller can forward it to the
+        frontend intact.  ``images`` and ``videos`` are flat lists of the same
+        entries for backward compatibility.
+
         Each image/video entry is ``{"filename", "data" (base64), "node_id"}``.
 
         The ``type`` field on image metadata is honoured: ``output`` is
@@ -2987,6 +3281,7 @@ class _ComfyAPIMixin:
         images: list[dict] = []
         videos: list[dict] = []
         seen_filenames: set[str] = set()  # de-dupe across sources
+        per_node_outputs: dict[str, dict[str, list[dict]]] = {}
 
         comfy_root = Path("/root/comfy/ComfyUI")
         dir_for_type = {
@@ -2995,8 +3290,12 @@ class _ComfyAPIMixin:
             "input": comfy_root / "input",
         }
 
-        def _try_read_file(fp: Path, node_id: str, animated: bool) -> None:
-            """Read a single file and append to images/videos if successful."""
+        def _read_and_store(fp: Path, node_id: str, animated: bool, output_key: str | None = None) -> None:
+            """Read a single file and append to images/videos.
+
+            When ``output_key`` is given the entry is also recorded in
+            ``per_node_outputs[node_id][output_key]``.
+            """
             if not fp.is_file():
                 return
             key = str(fp)
@@ -3013,11 +3312,13 @@ class _ComfyAPIMixin:
                 videos.append(entry)
             else:
                 images.append(entry)
+            if output_key is not None:
+                per_node_outputs.setdefault(node_id, {}).setdefault(output_key, []).append(entry)
 
         def _scan_dir_for_files(base: Path, since_ts: float | None, limit: int = 20) -> None:
             """Scan a base directory for image/video files, optionally
             filtered to ``mtime >= since_ts``.  Adds to images/videos via
-            ``_try_read_file``."""
+            ``_read_and_store`` (flat lists only, no per-node tracking)."""
             if not base.is_dir():
                 return
             candidates: list[Path] = []
@@ -3035,7 +3336,19 @@ class _ComfyAPIMixin:
                 candidates.append(f)
             candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             for f in candidates[:limit]:
-                _try_read_file(f, node_id="0", animated=f.suffix.lower() in (".gif", ".mp4", ".webm"))
+                animated = f.suffix.lower() in (".gif", ".mp4", ".webm")
+                _read_and_store(f, node_id="0", animated=animated)
+
+        def _process_history_source(node_out: dict, node_id: str) -> None:
+            """Read all image-bearing entries from a history output dict."""
+            for output_key, img in _iter_image_entries(node_out):
+                base = dir_for_type.get(img.get("type", "output"), comfy_root / "output")
+                sub = img.get("subfolder", "") or ""
+                fp = base / sub / img.get("filename", "")
+                if not fp.is_file():
+                    print(f"[comfyapp] history-listed file not found: {fp}")
+                animated = bool(node_out.get("animated", False)) or output_key == "gifs"
+                _read_and_store(fp, node_id=node_id, animated=animated, output_key=output_key)
 
         # ── Source 1: executor.history_result ─────────────────────────
         outputs: dict = {}
@@ -3049,24 +3362,7 @@ class _ComfyAPIMixin:
             for node_id, node_out in outputs.items():
                 if not isinstance(node_out, dict):
                     continue
-                for img in node_out.get("images", []):
-                    if not isinstance(img, dict):
-                        continue
-                    base = dir_for_type.get(img.get("type", "output"), comfy_root / "output")
-                    sub = img.get("subfolder", "") or ""
-                    fp = base / sub / img.get("filename", "")
-                    if not fp.is_file():
-                        print(f"[comfyapp] history-listed file not found: {fp}")
-                    animated = bool(node_out.get("animated", False))
-                    _try_read_file(fp, node_id=node_id, animated=animated)
-                for vid in node_out.get("gifs", []):
-                    if not isinstance(vid, dict):
-                        continue
-                    base = dir_for_type.get(vid.get("type", "output"), comfy_root / "output")
-                    sub = vid.get("subfolder", "") or ""
-                    fp = base / sub / vid.get("filename", "")
-                    animated = True
-                    _try_read_file(fp, node_id=node_id, animated=animated)
+                _process_history_source(node_out, node_id)
 
         # ── Source 2: dummy_server.prompt_queue.history[prompt_id] ───
         if not seen_filenames:
@@ -3078,14 +3374,7 @@ class _ComfyAPIMixin:
                         for node_id, node_out in queue_outputs.items():
                             if not isinstance(node_out, dict):
                                 continue
-                            for img in node_out.get("images", []):
-                                if not isinstance(img, dict):
-                                    continue
-                                base = dir_for_type.get(img.get("type", "output"), comfy_root / "output")
-                                sub = img.get("subfolder", "") or ""
-                                fp = base / sub / img.get("filename", "")
-                                animated = bool(node_out.get("animated", False))
-                                _try_read_file(fp, node_id=node_id, animated=animated)
+                            _process_history_source(node_out, node_id)
             except Exception as exc:
                 print(f"[comfyapp] prompt_queue.history read failed: {exc}")
 
@@ -3108,7 +3397,7 @@ class _ComfyAPIMixin:
                 f"prompt_start_time={'set' if prompt_start_time else 'none'})"
             )
         print(f"[comfyapp] collected {len(images)} images, {len(videos)} videos")
-        return {"images": images, "videos": videos}
+        return {"images": images, "videos": videos, "outputs": per_node_outputs}
 
     def _select_backend(self) -> str:
         """Return the backend to use, sticky on subprocess fallback."""
@@ -3304,6 +3593,58 @@ class _ComfyAPIMixin:
             except ValueError:
                 pass
 
+    def _filter_custom_nodes(self, _cn_dir: str = "/root/comfy/ComfyUI/custom_nodes") -> list[str]:
+        """Move excluded custom node dirs out of the load path.
+
+        Reads the exclusion list from ``EXCLUDED_NODES_PATH`` (set at runtime
+        via ``set_excluded_nodes`` remote function).  Returns list of
+        (original_path, disabled_path) tuples for restore.
+        """
+        _renamed = []
+        _excluded = set()
+        try:
+            if os.path.isfile(EXCLUDED_NODES_PATH):
+                with open(EXCLUDED_NODES_PATH) as _f:
+                    _raw = _f.read().strip()
+                _excluded = {n.strip() for n in _raw.split(",") if n.strip()}
+        except Exception:
+            pass
+        if not _excluded or not os.path.isdir(_cn_dir):
+            return _renamed
+        for _entry in sorted(os.listdir(_cn_dir)):
+            _entry_path = os.path.join(_cn_dir, _entry)
+            if os.path.isdir(_entry_path) and _entry in _excluded:
+                _disabled = _entry_path + ".disabled"
+                try:
+                    os.rename(_entry_path, _disabled)
+                    _renamed.append((_entry_path, _disabled))
+                    print(f"[comfyapp] excluded custom node: {_entry}")
+                except Exception as _exc:
+                    print(f"[comfyapp] failed to exclude {_entry}: {_exc}")
+        return _renamed
+
+    @staticmethod
+    def _restore_custom_nodes(_renamed: list[tuple[str, str]]) -> None:
+        """Restore previously disabled custom node directories."""
+        for _orig, _disabled in _renamed:
+            try:
+                if os.path.isdir(_disabled):
+                    os.rename(_disabled, _orig)
+            except Exception as _exc:
+                print(f"[comfyapp] failed to restore {_orig}: {_exc}")
+
+    def _log_mem(self, label: str) -> None:
+        """Log approximate RSS and module count for snapshot-sizing diagnostics."""
+        try:
+            with open("/proc/self/status") as _f:
+                for _line in _f:
+                    if _line.startswith("VmRSS:"):
+                        _rss_kb = int(_line.split()[1])
+                        print(f"[snapshot_mem] {label} rss_mb={_rss_kb / 1024:.1f} modules={len(sys.modules)}")
+                        break
+        except Exception:
+            print(f"[snapshot_mem] {label} (rss_unavailable) modules={len(sys.modules)}")
+
     def _start_in_process_backend(self):
         """Initialize ComfyUI in-process for snapshot-friendly execution.
 
@@ -3317,6 +3658,7 @@ class _ComfyAPIMixin:
         """
         t0 = time.time()
         _stage = time.time()
+        self._log_mem("start")
 
         # ── Match comfy launch CWD — ComfyUI modules use relative path
         #    resolution (e.g. ``from utils.install_util import ...``). ──
@@ -3337,6 +3679,7 @@ class _ComfyAPIMixin:
         import folder_paths  # safe — no comfy deps
         import utils.extra_config  # establishes utils as the /utils/ package
         import utils.mime_types  # reinforces utils package before comfy loads
+        self._log_mem("after_folder_paths")
 
         import asyncio
         import comfy.model_management
@@ -3345,6 +3688,7 @@ class _ComfyAPIMixin:
         import execution
         import nodes
         import server as comfy_server
+        self._log_mem("after_comfy_imports")
         self._log_profile("inproc_imports", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
@@ -3377,6 +3721,7 @@ class _ComfyAPIMixin:
                     self._send_sync_callback(event, data, sid)
 
         dummy = _DummyServer(event_loop)
+        self._log_mem("after_server_init")
         self._log_profile("inproc_server_init", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
@@ -3397,6 +3742,7 @@ class _ComfyAPIMixin:
         )
         self._dummy_server = dummy
         self._event_loop = event_loop
+        self._log_mem("after_executor_init")
         self._log_profile("inproc_executor_init", ram_gb=total_ram_gb, cache_gb=cache_ram_gb, duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
@@ -3435,11 +3781,16 @@ class _ComfyAPIMixin:
         dummy._send_sync_callback = _on_sync
 
         # Register built-in + custom nodes (async in ComfyUI v0.22+)
+        self._log_mem("before_custom_nodes")
+        _excluded = self._filter_custom_nodes()
         self._event_loop.run_until_complete(nodes.init_extra_nodes())
+        _ = self._restore_custom_nodes(_excluded)  # restore after load
+        self._log_mem("after_custom_nodes")
         self._apply_sage_attention_policy()
         self._log_profile("inproc_node_init", duration_ms=self._profile_ms(_stage))
 
         self._in_process_ready = True
+        self._log_mem("backend_ready")
         duration = time.time() - t0
         print(f"[comfyapp] in-process backend initialized in {duration:.3f}s")
 
@@ -3790,31 +4141,77 @@ class _ComfyAPIMixin:
 
         The loaded models still land in ComfyUI's GPU model cache via
         ``load_models_gpu()`` which the node functions call internally.
+
+        Model loading is further gated by:
+        - ``DIRECT_WARMUP_LOAD_UNET`` / ``DIRECT_WARMUP_LOAD_CLIP`` — enable
+          UNET / CLIP loading in direct warmup (both default 0).
+        - ``DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT`` — when 1 (default), only
+          load a model if it is already present in the CPU cache (populated
+          by ``_preload_models_to_cpu``).  This prevents direct warmup from
+          becoming a blocking 16.85 GB volume read when CPU preload is
+          disabled or async.
+        - ``DIRECT_WARMUP_CLIP_ENCODE`` — enable dummy CLIPTextEncode forward
+          pass (default 0).
         """
         _t0 = time.time()
         _phases: dict[str, float] = {}
         try:
             import nodes
+            import folder_paths
 
             unet_name = profile.get("unet", "")
             clip_name = profile.get("clip1", "")
             clip_type = profile.get("clip_type", "flux")
 
-            # 1 -- Load UNET via UNETLoader
+            # ── Resolve model paths for CPU cache checks ──────────────
+            _unet_full_path = folder_paths.get_full_path("unet", unet_name) or "" if unet_name else ""
+            _clip_full_path = folder_paths.get_full_path("text_encoders", clip_name) or "" if clip_name else ""
+
+            # Resolve runtime-configurable flags (file → env → module default)
+            _rt_load_unet = _resolve_runtime_flag("DIRECT_WARMUP_LOAD_UNET", "0")
+            _rt_load_clip = _resolve_runtime_flag("DIRECT_WARMUP_LOAD_CLIP", "0")
+            _rt_clip_encode = _resolve_runtime_flag("DIRECT_WARMUP_CLIP_ENCODE", "0")
+            _rt_require_cpu_hit = _resolve_runtime_flag("DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT", "1")
+
+            # ── 1. Load UNET via UNETLoader (if enabled) ─────────────
+            _phases["direct_warmup_load_unet"] = 1.0 if _rt_load_unet else 0.0
+            _phases["direct_warmup_require_cpu_cache_hit"] = 1.0 if _rt_require_cpu_hit else 0.0
             _s = time.time()
-            unet_cls = nodes.NODE_CLASS_MAPPINGS.get("UNETLoader")
-            if unet_cls and unet_name:
-                unet_loader = unet_cls()
-                unet_loader.load_unet(unet_name=unet_name, weight_dtype="default")
-                _phases["direct_unet_load_ms"] = round((time.time() - _s) * 1000, 1)
+            _skip_unet = False
+            if _rt_require_cpu_hit and _unet_full_path:
+                if not self._model_in_cpu_cache(_unet_full_path):
+                    print(f"[comfyapp] direct warmup: UNET {unet_name} not in CPU cache, skipping (REQUIRE_CPU_CACHE_HIT)")
+                    _skip_unet = True
+                    _phases["direct_unet_cpu_hit"] = 0.0
+                else:
+                    _phases["direct_unet_cpu_hit"] = 1.0
+            _unet_loaded = False
+            if _rt_load_unet and unet_name and not _skip_unet:
+                unet_cls = nodes.NODE_CLASS_MAPPINGS.get("UNETLoader")
+                if unet_cls:
+                    unet_loader = unet_cls()
+                    unet_loader.load_unet(unet_name=unet_name, weight_dtype="default")
+                    _unet_loaded = True
+                    _phases["direct_unet_load_ms"] = round((time.time() - _s) * 1000, 1)
+                else:
+                    _phases["direct_unet_load_ms"] = 0.0
             else:
                 _phases["direct_unet_load_ms"] = 0.0
 
-            # 2 -- Load CLIP via CLIPLoader, cache for real prompt reuse
+            # ── 2. Load CLIP via CLIPLoader (if enabled) ─────────────
+            _phases["direct_warmup_load_clip"] = 1.0 if _rt_load_clip else 0.0
             _s = time.time()
             clip_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPLoader")
             clip_out = None
-            if clip_cls and clip_name:
+            _skip_clip = False
+            if _rt_require_cpu_hit and _clip_full_path:
+                if not self._model_in_cpu_cache(_clip_full_path):
+                    print(f"[comfyapp] direct warmup: CLIP {clip_name} not in CPU cache, skipping (REQUIRE_CPU_CACHE_HIT)")
+                    _skip_clip = True
+                    _phases["direct_clip_cpu_hit"] = 0.0
+                else:
+                    _phases["direct_clip_cpu_hit"] = 1.0
+            if _rt_load_clip and clip_cls and clip_name and not _skip_clip:
                 clip_loader = clip_cls()
                 clip_out = clip_loader.load_clip(clip_name=clip_name, type=clip_type)
                 _phases["direct_clip_load_ms"] = round((time.time() - _s) * 1000, 1)
@@ -3822,10 +4219,8 @@ class _ComfyAPIMixin:
                 if clip_out:
                     self._init_clip_cache()
                     try:
-                        import folder_paths
-                        clip_path = folder_paths.get_full_path("text_encoders", clip_name) or ""
-                        if clip_path:
-                            _key = self._clip_cache_key(clip_path, clip_type)
+                        if _clip_full_path:
+                            _key = self._clip_cache_key(_clip_full_path, clip_type)
                             self._clip_object_cache[_key] = clip_out[0]
                             _phases["direct_clip_cached"] = 1.0
                             print(f"[comfyapp] direct warmup: CLIP cached key={_key} "
@@ -3835,19 +4230,17 @@ class _ComfyAPIMixin:
             else:
                 _phases["direct_clip_load_ms"] = 0.0
 
-            # 3 -- Prime CLIPTextEncode cache (optional)
+            # ── 3. Prime CLIPTextEncode cache (if enabled) ───────────
             # Costs ~1000ms for Qwen 8B forward pass but saves ~600ms
             # during inference.  Net savings ~400ms by disabling.
-            _wce_enabled, _wce_source = _resolve_wce()
+            _phases["direct_warmup_clip_encode"] = 1.0 if _rt_clip_encode else 0.0
             _s = time.time()
-            if _wce_enabled and clip_out and WARMUP_TEXT:
+            if _rt_clip_encode and clip_out and WARMUP_TEXT:
                 enc_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
                 if enc_cls:
                     encoder = enc_cls()
                     encoder.encode(clip=clip_out[0], text=WARMUP_TEXT)
             _phases["direct_clip_encode_ms"] = round((time.time() - _s) * 1000, 1)
-            _phases["wce_enabled"] = _wce_enabled
-            _phases["wce_source"] = _wce_source
             _phases["direct_total_ms"] = round((time.time() - _t0) * 1000, 1)
             print(f"[comfyapp] direct warmup OK — {_phases}")
             return {"status": "ok", **_phases}
@@ -4168,6 +4561,7 @@ class _ComfyAPIMixin:
             pass
 
         restore_start = time.time()
+        self._log_mem("restore_entry")
         print(f"[comfyapp] lifecycle=restore snap=False restore_start_unix={restore_start}")
         __stages: dict[str, float] = {}
         # Clear any stale restore timing from a previous call
@@ -4266,6 +4660,8 @@ class _ComfyAPIMixin:
                 __stages["sage_runtime_ms"] = self._profile_ms(_s)
                 __stages["sage_mode"] = mode
                 __stages["sage_reason"] = reason
+                __stages["sage_env_mode"] = SAGE_RUNTIME_MODE
+                __stages["sage_probe_on_restore"] = 1 if SAGE_RUNTIME_PROBE_ON_RESTORE else 0
                 self._log_profile(
                     "restore_sage_runtime",
                     mode=mode,
@@ -4324,6 +4720,8 @@ class _ComfyAPIMixin:
                 __stages["sage_runtime_ms"] = self._profile_ms(_s)
                 __stages["sage_mode"] = mode
                 __stages["sage_reason"] = reason
+                __stages["sage_env_mode"] = SAGE_RUNTIME_MODE
+                __stages["sage_probe_on_restore"] = 1 if SAGE_RUNTIME_PROBE_ON_RESTORE else 0
                 self._log_profile(
                     "restore_sage_runtime",
                     mode=mode,
@@ -4342,9 +4740,31 @@ class _ComfyAPIMixin:
                 preload_paths = _warmup_paths
                 __stages["warmup_profile_source"] = profile.get("_source", "?") if profile else "none"
                 preload_result = {"count": 0, "file_timing_ms": {}}
+                _pm = _resolve_preload_mode()
                 _s = time.time()
-                if preload_paths:
-                    preload_result = self._preload_models_to_cpu(preload_paths)
+                if preload_paths and _pm != "off":
+                    if _pm == "async_no_wait":
+                        import threading
+                        _preload_thread = threading.Thread(
+                            target=self._preload_models_to_cpu,
+                            args=(preload_paths,),
+                            kwargs={"budget_ms": None},
+                            daemon=True,
+                        )
+                        _preload_thread.start()
+                        preload_result = {"count": 0, "file_timing_ms": {}, "async": True}
+                        print(f"[comfyapp] preload async_no_wait: thread started for {len(preload_paths)} files, not blocking restore")
+                    elif _pm.startswith("budgeted_"):
+                        # Extract budget from suffix: budgeted_1500ms → 1500, budgeted_2000ms → 2000
+                        try:
+                            _budget = float(_pm.replace("budgeted_", "").replace("ms", ""))
+                        except (ValueError, TypeError):
+                            _budget = 1500.0
+                        preload_result = self._preload_models_to_cpu(preload_paths, budget_ms=_budget)
+                        if preload_result.get("budget_exceeded"):
+                            print(f"[comfyapp] preload budgeted_{int(_budget)}ms: budget exceeded, loaded {preload_result.get('count', 0)}/{len(preload_paths)} files")
+                    else:
+                        preload_result = self._preload_models_to_cpu(preload_paths)
                 __stages["warmup_preload_ms"] = self._profile_ms(_s)
                 for fname, d_ms in preload_result.get("file_timing_ms", {}).items():
                     safe_key = f"warmup_{fname.replace('.','_').replace('-','_').lower()}_ms"
@@ -4498,8 +4918,12 @@ class _ComfyAPIMixin:
                         _v = _dw.get(_k)
                         if _v is not None:
                             __stages[f"warmup_{_k}"] = _v
-                    __stages["wce_enabled"] = _dw.get("wce_enabled", False)
-                    __stages["wce_source"] = _dw.get("wce_source", "?")
+                    for _flag in ("direct_warmup_load_unet", "direct_warmup_load_clip",
+                                  "direct_warmup_clip_encode", "direct_warmup_require_cpu_cache_hit",
+                                  "direct_unet_cpu_hit", "direct_clip_cpu_hit"):
+                        _v = _dw.get(_flag)
+                        if _v is not None:
+                            __stages[_flag] = _v
                     if _dw.get("status") != "ok":
                         warmup_result["error"] = _dw.get("error", "direct warmup failed")
                         warmup_result["status"] = "error"
@@ -4575,6 +4999,7 @@ class _ComfyAPIMixin:
         }
         if warmup_error:
             self._last_restore_timing["warmup_error"] = warmup_error
+        self._log_mem("restore_done")
         print(f"[comfyapp] restore sanity check done in {time.time() - restore_start:.3f}s "
               f"perf={self._last_restore_timing}")
 
@@ -4745,7 +5170,33 @@ class _ComfyAPIMixin:
             trace_summary = server_trace.summary()
             self._enrich_trace_with_restore_timing(trace_summary)
             result["trace"] = trace_summary
+
+            # P3 — end-to-end timing: stitch browser t0 to restore phases
             _rt2 = getattr(self, "_last_restore_timing", None)
+            if isinstance(_rt2, dict):
+                _t0 = trace_summary.get("t0") or 0.0
+                _rs = _rt2.get("restore_start_unix_s") or 0.0
+                _re = _rt2.get("restore_end_unix_s") or 0.0
+                if _t0 > 0 and _rs > 0:
+                    _rt2["request_received_to_restore_start_ms"] = round((_rs - _t0) * 1000, 1)
+                if _t0 > 0 and _re > 0:
+                    _rt2["request_received_to_restore_end_ms"] = round((_re - _t0) * 1000, 1)
+                # request_received_to_first_sampler_ms / images_collected_ms
+                # come from trace stages (already ms from t0)
+                _stages = trace_summary.get("stages", {})
+                _t6 = _stages.get("t6_sampler_start")
+                if _t6 is not None:
+                    _rt2["request_received_to_first_sampler_ms"] = _t6
+                _t8 = _stages.get("t8_image_written")
+                if _t8 is not None:
+                    _rt2["request_received_to_images_collected_ms"] = _t8
+                # modal_restore_gap_ms = time from Modal's "Restoring Function"
+                # log to first user code.  Can't measure from within the
+                # container; benchmark tool fills this from Modal infrastructure
+                # logs by comparing "Restoring Function" timestamp to
+                # restore_start_unix_s.
+                _rt2["modal_restore_gap_ms"] = 0.0
+
             result["_restore_timing"] = dict(_rt2) if _rt2 else {}
             _t8b_enrich_ms = round((time.time() - _s) * 1000, 1)
 
@@ -5176,14 +5627,13 @@ class _ComfyAPIMixin:
         images = []
         videos = []
         total_bytes = 0
+        per_node_outputs: dict[str, dict[str, list[dict]]] = {}
 
         for node_id, node_output in outputs.items():
-            for img in node_output.get("images", []):
-                raw = node_output.get("animated", False)
-                if isinstance(raw, bool):
-                    is_animated = raw
-                else:
-                    is_animated = raw[0] if raw else False
+            raw_animated = node_output.get("animated", False)
+            animated_val = raw_animated if isinstance(raw_animated, bool) else (raw_animated[0] if raw_animated else False)
+
+            for output_key, img in _iter_image_entries(node_output):
                 params = urllib.parse.urlencode({
                     "filename": img["filename"],
                     "subfolder": img.get("subfolder", ""),
@@ -5193,21 +5643,18 @@ class _ComfyAPIMixin:
                 total_bytes += len(r.content)
                 data = base64.b64encode(r.content).decode()
                 entry = {"filename": img["filename"], "data": data, "node_id": node_id}
+
+                if output_key == "gifs":
+                    is_animated = True
+                else:
+                    is_animated = animated_val
+
                 if is_animated:
                     videos.append(entry)
                 else:
                     images.append(entry)
 
-            for vid in node_output.get("gifs", []):
-                params = urllib.parse.urlencode({
-                    "filename": vid["filename"],
-                    "subfolder": vid.get("subfolder", ""),
-                    "type": vid.get("type", "output"),
-                })
-                r = self._http_client.get(f"/view?{params}")
-                total_bytes += len(r.content)
-                data = base64.b64encode(r.content).decode()
-                videos.append({"filename": vid["filename"], "data": data, "node_id": node_id})
+                per_node_outputs.setdefault(node_id, {}).setdefault(output_key, []).append(entry)
 
         collect_ms = round((time.time() - collect_started) * 1000, 1)
         print(
@@ -5218,7 +5665,7 @@ class _ComfyAPIMixin:
             profile["output_images"] = len(images)
             profile["output_videos"] = len(videos)
             profile["output_bytes"] = total_bytes
-        return {"images": images, "videos": videos}
+        return {"images": images, "videos": videos, "outputs": per_node_outputs}
 
     def _record_runtime_state(self):
         self._models_state = model_volume_state(MODELS_PATH)
@@ -5360,6 +5807,299 @@ def _register_gpu_classes():
             secrets=[modal.Secret.from_name("comfyui-warmup-dev")],
         )(Generated)
         globals()[class_name] = Generated
+
+
+# ── Platform Test B: production image, same GPU/volumes, no Comfy imports ──
+# Measures the lower bound of platform_restore with the full production
+# image and volume setup but NO ComfyUI import during snap=True.
+@app.cls(
+    gpu="rtx-pro-6000",
+    enable_memory_snapshot=True,
+    cpu=4,
+    memory=32768,
+    timeout=120,
+    min_containers=0,
+    scaledown_window=4,
+    volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
+    secrets=[modal.Secret.from_name("comfyui-warmup-dev")],
+)
+class PlatformTestB:
+    """Production image, same volumes.  No Comfy imports in snap=True."""
+    _restore_start: float = 0.0
+    _restore_count: int = 0
+
+    @modal.enter(snap=True)
+    def startup(self):
+        self._startup_t = __import__("time").time()
+        self._restore_count = 0
+        # Intentionally NO ComfyUI imports — this tests whether the
+        # production image/volume base alone adds restore overhead.
+
+    @modal.enter(snap=False)
+    def restore(self):
+        import time
+        self._restore_count += 1
+        self._restore_start = time.time()
+
+    @modal.method()
+    def ping(self) -> dict:
+        import time
+        return {
+            "restore_start_unix_s": self._restore_start,
+            "restore_end_unix_s": time.time(),
+            "restore_count": self._restore_count,
+        }
+
+
+# ── Platform Test E: No memory snapshot Blackwell ───────────────────
+# Same production image/GPU/volumes as Config D but enable_memory_snapshot=False.
+# Every request is a true cold start: ComfyUI initialises from scratch.
+@app.cls(
+    gpu="rtx-pro-6000",
+    enable_memory_snapshot=False,
+    cpu=4,
+    memory=32768,
+    timeout=600,
+    min_containers=0,
+    scaledown_window=4,
+    volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
+    secrets=[modal.Secret.from_name("comfyui-warmup-dev")],
+)
+class PlatformTestE:
+    """No snapshot — ComfyUI initialises from scratch each time."""
+
+    def __init__(self):
+        self._event_loop = None
+        self._executor = None
+        self._dummy_server = None
+        self._prog_queue = None
+        self._startup_t = 0.0
+        self._startup_done_t = 0.0
+
+    def _log_mem(self, label: str) -> None:
+        try:
+            with open("/proc/self/status") as _f:
+                for _line in _f:
+                    if _line.startswith("VmRSS:"):
+                        _rss_kb = int(_line.split()[1])
+                        print(f"[snapshot_mem] {label} rss_mb={_rss_kb / 1024:.1f} modules={len(__import__('sys').modules)}")
+                        break
+        except Exception:
+            print(f"[snapshot_mem] {label} (rss_unavailable) modules={len(__import__('sys').modules)}")
+
+    @modal.enter()
+    def _startup(self):
+        import time as _t
+        self._startup_t = _t.time()
+        self._log_mem("no_snap_start")
+        self._init_comfy_backend()
+        self._startup_done_t = _t.time()
+        self._log_mem("no_snap_startup_done")
+        print(f"[platform_e] comfy init done in {(_t.time()-self._startup_t)*1000:.1f}ms")
+
+    def _init_comfy_backend(self):
+        """Initialize ComfyUI backend (mirrors _start_in_process_backend)."""
+        import os, sys, asyncio
+
+        # 1. chdir + sys.path
+        comfy_path = "/root/comfy/ComfyUI"
+        os.chdir(comfy_path)
+        if comfy_path not in sys.path:
+            sys.path.insert(0, comfy_path)
+        sys.stdout.reconfigure(line_buffering=True)
+
+        # 2. imports
+        import folder_paths
+        import utils.extra_config
+        import utils.mime_types
+        import asyncio
+        import comfy.model_management
+        import comfy.model_patcher
+        import comfy.utils
+        import execution
+        import nodes
+        import server as comfy_server
+
+        # 3. model management
+        comfy.model_management.DISABLE_SMART_MEMORY = False
+        if hasattr(comfy.model_management, "VRAMState") and hasattr(comfy.model_management.VRAMState, "HIGH_VRAM"):
+            comfy.model_management.vram_state = comfy.model_management.VRAMState.HIGH_VRAM
+
+        # 4. event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._event_loop = loop
+
+        # 5. DummyServer
+        class _DummyServer(comfy_server.PromptServer):
+            def __init__(self, loop):
+                super().__init__(loop)
+                comfy_server.PromptServer.instance = self
+                q = execution.PromptQueue(comfy_server.PromptServer.instance)
+                self.client_id = "in-process"
+                self.prompt_queue = q
+                self._send_sync_callback = None
+            def send_sync(self, event, data, sid=None):
+                _prog_q = getattr(self, "_prog_queue_ref", None)
+                if _prog_q is not None and event in ("execution_start", "executing", "progress", "execution_error"):
+                    try:
+                        _prog_q.put_nowait((event, data))
+                    except Exception:
+                        pass
+
+        dummy = _DummyServer(loop)
+        self._dummy_server = dummy
+
+        # 6. PromptExecutor
+        _ram_gb = _get_system_ram_gb()
+        cache_ram_gb = round(max(4.0, min(_ram_gb * 0.5, 24.0)), 1)
+        self._executor = execution.PromptExecutor(
+            dummy,
+            cache_args={"lru": 0, "ram": cache_ram_gb, "ram_inactive": 96.0},
+        )
+
+        # 7. progress queue
+        import queue as _queue
+        self._prog_queue = _queue.Queue()
+        dummy._prog_queue_ref = self._prog_queue
+
+        # 8. send_sync callback for execution logging
+        def _on_sync(event, data, sid):
+            _prog_q = self._prog_queue
+            if _prog_q is not None and event in ("execution_start", "executing", "progress", "execution_error") and isinstance(data, dict):
+                try:
+                    _prog_q.put_nowait((event, data))
+                except Exception:
+                    pass
+        dummy._send_sync_callback = _on_sync
+
+        # 9. Sync custom nodes from volume (same as production startup)
+        try:
+            vol.reload()
+            # Minimal custom node sync: ensure symlink and copy from volume
+            _cn_path = "/root/comfy/ComfyUI/custom_nodes"
+            if not os.path.isdir(_cn_path):
+                os.makedirs(_cn_path, exist_ok=True)
+            if os.path.isdir(CUSTOM_NODES_PATH):
+                for _entry in os.listdir(CUSTOM_NODES_PATH):
+                    _src = os.path.join(CUSTOM_NODES_PATH, _entry)
+                    _dst = os.path.join(_cn_path, _entry)
+                    if os.path.isdir(_src) and not os.path.exists(_dst):
+                        os.symlink(_src, _dst)
+                        print(f"[platform_e] synced custom node: {_entry}")
+                    elif os.path.isfile(_src) and _entry.endswith(".py") and not os.path.exists(_dst):
+                        os.symlink(_src, _dst)
+        except Exception as _cn_exc:
+            print(f"[platform_e] custom node sync skipped: {_cn_exc}")
+
+        # 10. custom nodes (with exclusions if configured)
+        _excluded = self._filter_custom_nodes()
+        self._event_loop.run_until_complete(nodes.init_extra_nodes())
+        _ = self._restore_custom_nodes(_excluded)
+
+        # 10. Register model folder paths from the shared volume
+        folder_paths.add_model_folder_path("checkpoints", os.path.join(MODELS_PATH, "checkpoints"))
+        folder_paths.add_model_folder_path("diffusion_models", os.path.join(MODELS_PATH, "diffusion_models"))
+        folder_paths.add_model_folder_path("unet", os.path.join(MODELS_PATH, "unet"))
+        folder_paths.add_model_folder_path("vae", os.path.join(MODELS_PATH, "vae"))
+        folder_paths.add_model_folder_path("clip", os.path.join(MODELS_PATH, "clip"))
+        folder_paths.add_model_folder_path("text_encoders", os.path.join(MODELS_PATH, "text_encoders"))
+        folder_paths.add_model_folder_path("loras", os.path.join(MODELS_PATH, "loras"))
+
+        # 11. DISABLE_MMAP
+        comfy.utils.DISABLE_MMAP = True
+
+    @modal.method()
+    def run_prompt(self, workflow: dict, input_images: dict | None = None) -> dict:
+        """Execute a workflow (simplified, no profiling/restore patching)."""
+        import time, uuid, base64
+        _entry = time.time()
+
+        # Materialize input images
+        if input_images:
+            _materialize_input_images(input_images)
+
+        import execution, nodes as _nodes
+
+        prompt_id = str(uuid.uuid4())
+
+        _exec_t0 = time.time()
+        # Validate workflow to get the execution list
+        try:
+            if self._event_loop and self._event_loop.is_running():
+                _valid, _err, _outputs, _ = self._event_loop.run_until_complete(
+                    _nodes.validate_prompt(workflow, prompt_id, {"client_id": "platform_e"})
+                )
+            else:
+                _outputs = list(workflow.keys())
+        except Exception:
+            _outputs = list(workflow.keys())
+
+        if not _outputs:
+            _outputs = list(workflow.keys())
+        print(f"[platform_e] execute start outputs={len(_outputs)}")
+
+        try:
+            self._executor.execute(
+                prompt=workflow,
+                prompt_id=prompt_id,
+                extra_data={"client_id": "platform_e"},
+                execute_outputs=_outputs,
+            )
+        except Exception as exc:
+            print(f"[platform_e] execution failed: {exc}")
+            raise
+        _exec_t1 = time.time()
+        _exec_ok = getattr(self._executor, "success", True)
+        print(f"[platform_e] execute returned in {(_exec_t1-_exec_t0)*1000:.1f}ms success={_exec_ok}")
+        if _exec_ok is False:
+            _msgs = getattr(self._executor, "status_messages", [])
+            _errs = [p.get("exception_message", str(p)) for e, p in _msgs if e == "execution_error" and isinstance(p, dict)]
+            _detail = "; ".join(_errs) if _errs else "executor reported failure"
+            raise RuntimeError(_detail)
+
+        # Collect outputs: scan output dirs for recent files (matches Config D's approach)
+        import base64
+        images = []
+        _prompt_start = _entry - 1.0
+        try:
+            for _sub_dir in ("output", "temp", "input"):
+                _scan_root = f"/root/comfy/ComfyUI/{_sub_dir}"
+                if not os.path.isdir(_scan_root):
+                    continue
+                for _root, _dirs, _files in os.walk(_scan_root):
+                    for _fname in _files:
+                        if not _fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm")):
+                            continue
+                        _fpath = os.path.join(_root, _fname)
+                        _mtime = os.path.getmtime(_fpath)
+                        if _mtime < _prompt_start:
+                            continue
+                        _rel = os.path.relpath(_root, _scan_root)
+                        _sf = "" if _rel == "." else _rel
+                        with open(_fpath, "rb") as _imgf:
+                            _data = base64.b64encode(_imgf.read()).decode("utf-8")
+                        images.append({"filename": _fname, "subfolder": _sf, "type": _sub_dir, "data": _data})
+        except Exception as _scan_exc:
+            print(f"[platform_e] output scan error: {_scan_exc}")
+
+        _done = time.time()
+        startup_ms = round((self._startup_done_t - self._startup_t) * 1000, 1) if self._startup_t and self._startup_done_t else 0
+        total_ms = round((_done - self._startup_t) * 1000, 1) if self._startup_t else 0
+        exec_ms = round((_done - _exec_t0) * 1000, 1)
+
+        print(f"[platform_e] prompt done startup={startup_ms}ms exec={exec_ms}ms total={total_ms}ms images={len(images)}")
+        return {
+            "images": images,
+            "videos": [],
+            "_restore_timing": {
+                "startup_start_unix_s": self._startup_t,
+                "startup_done_unix_s": self._startup_done_t,
+                "startup_ms": startup_ms,
+                "exec_ms": exec_ms,
+                "total_ms": total_ms,
+            },
+        }
 
 
 _register_gpu_classes()

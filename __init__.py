@@ -701,8 +701,49 @@ async def _execute_job(item: tuple, item_id: int):
     output_bytes_written = 0
     output_image_count = 0
     output_video_count = 0
+    handled_fnames: set[str] = set()
 
+    # ── Phase 1: Structured per-node outputs ──────────────────────────
+    # Preserves the original output-key structure (e.g. "a_images", "b_images")
+    # so the frontend receives the exact keys rgthree and other nodes expect.
+    for node_id, node_outputs in result.get("outputs", {}).items():
+        event_output: dict = {}
+        for output_key, entries in node_outputs.items():
+            local_entries = []
+            is_video_key = output_key == "gifs"
+            for entry in entries:
+                img_bytes = base64.b64decode(entry["data"])
+                output_bytes_written += len(img_bytes)
+                if is_video_key:
+                    output_video_count += 1
+                else:
+                    output_image_count += 1
+                local_filename = entry["filename"]
+                local_path = _unique_path(output_dir, local_filename)
+                local_filename = os.path.basename(local_path)
+                with open(local_path, "wb") as f:
+                    f.write(img_bytes)
+                local_entry = {"filename": local_filename, "subfolder": "", "type": "output"}
+                local_entries.append(local_entry)
+                handled_fnames.add(entry["filename"])
+            if local_entries:
+                event_output[output_key] = local_entries
+                if is_video_key:
+                    event_output.setdefault("animated", [True] * len(local_entries))
+        if not event_output:
+            continue
+        outputs[node_id] = event_output
+        _send(sid, "executed", {
+            "node": node_id,
+            "display_node": node_id,
+            "prompt_id": prompt_id,
+            "output": event_output,
+        })
+
+    # ── Phase 2: Flat images (backward compat / directory-scan fallback) ─
     for img in result.get("images", []):
+        if img["filename"] in handled_fnames:
+            continue
         img_bytes = base64.b64decode(img["data"])
         output_bytes_written += len(img_bytes)
         output_image_count += 1
@@ -711,21 +752,19 @@ async def _execute_job(item: tuple, item_id: int):
         local_filename = os.path.basename(local_path)
         with open(local_path, "wb") as f:
             f.write(img_bytes)
-
+        local_entry = {"filename": local_filename, "subfolder": "", "type": "output"}
         node_id = img["node_id"]
-        img_entry = {"filename": local_filename, "subfolder": "", "type": "output"}
-
         if node_id not in outputs:
             outputs[node_id] = {"images": []}
-        outputs[node_id]["images"].append(img_entry)
-
+        outputs[node_id].setdefault("images", []).append(local_entry)
         _send(sid, "executed", {
             "node": node_id,
             "display_node": node_id,
             "prompt_id": prompt_id,
-            "output": {"images": [img_entry]},
+            "output": {"images": [local_entry]},
         })
 
+    # ── Phase 3: Flat videos ──────────────────────────────────────────
     for vid in result.get("videos", []):
         vid_bytes = base64.b64decode(vid["data"])
         output_bytes_written += len(vid_bytes)
@@ -735,20 +774,17 @@ async def _execute_job(item: tuple, item_id: int):
         local_filename = os.path.basename(local_path)
         with open(local_path, "wb") as f:
             f.write(vid_bytes)
-
+        local_entry = {"filename": local_filename, "subfolder": "", "type": "output"}
         node_id = vid["node_id"]
-        vid_entry = {"filename": local_filename, "subfolder": "", "type": "output"}
-
         if node_id not in outputs:
             outputs[node_id] = {"images": [], "animated": (True,)}
-        outputs[node_id].setdefault("images", []).append(vid_entry)
+        outputs[node_id].setdefault("images", []).append(local_entry)
         outputs[node_id]["animated"] = (True,)
-
         _send(sid, "executed", {
             "node": node_id,
             "display_node": node_id,
             "prompt_id": prompt_id,
-            "output": {"images": [vid_entry], "animated": [True]},
+            "output": {"images": [local_entry], "animated": [True]},
         })
 
     materialize_ms = round((time.time() - materialize_started) * 1000, 1)
