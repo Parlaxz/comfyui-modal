@@ -873,8 +873,7 @@ GPU_PROFILES = {
 SAGEATTENTION_GIT_REF = "v2.2.0"
 SAGEATTENTION_SITE_PACKAGES = "/usr/local/lib/python3.11/site-packages"
 
-# File-based custom node exclusion list (set at runtime, read during startup)
-EXCLUDED_NODES_PATH = os.path.join(RUNTIME_CONFIG_DIR, "excluded_nodes.txt")
+
 
 image = (
     modal.Image.from_registry(
@@ -992,7 +991,7 @@ def ui():
     timeout=1800,
     volumes={MODELS_PATH: vol},
 )
-def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoints", hf_token: str = ""):
+def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoints", hf_token: str = "", civitai_token: str = ""):
     import httpx
     from pathlib import Path
 
@@ -1005,6 +1004,8 @@ def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoi
     headers = {}
     if hf_token and "huggingface.co" in url:
         headers["Authorization"] = f"Bearer {hf_token}"
+    if civitai_token and ("civitai" in url or "civitai.red" in url):
+        headers["Authorization"] = f"Bearer {civitai_token}"
 
     with httpx.stream("GET", url, headers=headers, follow_redirects=True, timeout=1800) as r:
         r.raise_for_status()
@@ -1030,12 +1031,14 @@ def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoi
     timeout=1800,
     volumes={MODELS_PATH: vol},
 )
-def batch_download_models(items: list, hf_token: str = "") -> list:
-    results = list(
-        download_model_to_volume.starmap(
-            [(item["url"], item["filename"], item.get("save_path", "checkpoints"), hf_token) for item in items]
-        )
-    )
+def batch_download_models(items: list, hf_token: str = "", civitai_token: str = "") -> list:
+    starmap_args = []
+    for item in items:
+        args = [item["url"], item["filename"], item.get("save_path", "checkpoints"), hf_token]
+        if civitai_token:
+            args.append(civitai_token)
+        starmap_args.append(tuple(args))
+    results = list(download_model_to_volume.starmap(starmap_args))
     return results
 
 
@@ -1579,31 +1582,6 @@ def upload_model_to_volume(file_data: bytes, folder: str, filename: str) -> dict
 
     vol.commit()
     return {"status": "ok", "path": str(dest), "size": len(file_data)}
-
-
-@app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
-    cpu=1,
-    memory=512,
-    timeout=30,
-    volumes={MODELS_PATH: vol},
-)
-def set_excluded_nodes(nodes_csv: str) -> str:
-    """Set custom node directories to exclude on next cold restore.
-
-    Provide a comma-separated list of directory names (e.g. ``ComfyUI-Manager``).
-    Writes to ``/root/models/runtime_config/excluded_nodes.txt``.
-    """
-    import os
-    nodes_csv = nodes_csv.strip()
-    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
-    with open(EXCLUDED_NODES_PATH, "w") as f:
-        f.write(nodes_csv)
-    vol.commit()
-    print(f"[comfyapp] set_excluded_nodes: {nodes_csv}")
-    return f"excluded_nodes={nodes_csv}"
 
 
 @app.function(
@@ -3593,58 +3571,6 @@ class _ComfyAPIMixin:
             except ValueError:
                 pass
 
-    def _filter_custom_nodes(self, _cn_dir: str = "/root/comfy/ComfyUI/custom_nodes") -> list[str]:
-        """Move excluded custom node dirs out of the load path.
-
-        Reads the exclusion list from ``EXCLUDED_NODES_PATH`` (set at runtime
-        via ``set_excluded_nodes`` remote function).  Returns list of
-        (original_path, disabled_path) tuples for restore.
-        """
-        _renamed = []
-        _excluded = set()
-        try:
-            if os.path.isfile(EXCLUDED_NODES_PATH):
-                with open(EXCLUDED_NODES_PATH) as _f:
-                    _raw = _f.read().strip()
-                _excluded = {n.strip() for n in _raw.split(",") if n.strip()}
-        except Exception:
-            pass
-        if not _excluded or not os.path.isdir(_cn_dir):
-            return _renamed
-        for _entry in sorted(os.listdir(_cn_dir)):
-            _entry_path = os.path.join(_cn_dir, _entry)
-            if os.path.isdir(_entry_path) and _entry in _excluded:
-                _disabled = _entry_path + ".disabled"
-                try:
-                    os.rename(_entry_path, _disabled)
-                    _renamed.append((_entry_path, _disabled))
-                    print(f"[comfyapp] excluded custom node: {_entry}")
-                except Exception as _exc:
-                    print(f"[comfyapp] failed to exclude {_entry}: {_exc}")
-        return _renamed
-
-    @staticmethod
-    def _restore_custom_nodes(_renamed: list[tuple[str, str]]) -> None:
-        """Restore previously disabled custom node directories."""
-        for _orig, _disabled in _renamed:
-            try:
-                if os.path.isdir(_disabled):
-                    os.rename(_disabled, _orig)
-            except Exception as _exc:
-                print(f"[comfyapp] failed to restore {_orig}: {_exc}")
-
-    def _log_mem(self, label: str) -> None:
-        """Log approximate RSS and module count for snapshot-sizing diagnostics."""
-        try:
-            with open("/proc/self/status") as _f:
-                for _line in _f:
-                    if _line.startswith("VmRSS:"):
-                        _rss_kb = int(_line.split()[1])
-                        print(f"[snapshot_mem] {label} rss_mb={_rss_kb / 1024:.1f} modules={len(sys.modules)}")
-                        break
-        except Exception:
-            print(f"[snapshot_mem] {label} (rss_unavailable) modules={len(sys.modules)}")
-
     def _start_in_process_backend(self):
         """Initialize ComfyUI in-process for snapshot-friendly execution.
 
@@ -3658,7 +3584,6 @@ class _ComfyAPIMixin:
         """
         t0 = time.time()
         _stage = time.time()
-        self._log_mem("start")
 
         # ── Match comfy launch CWD — ComfyUI modules use relative path
         #    resolution (e.g. ``from utils.install_util import ...``). ──
@@ -3679,7 +3604,6 @@ class _ComfyAPIMixin:
         import folder_paths  # safe — no comfy deps
         import utils.extra_config  # establishes utils as the /utils/ package
         import utils.mime_types  # reinforces utils package before comfy loads
-        self._log_mem("after_folder_paths")
 
         import asyncio
         import comfy.model_management
@@ -3688,7 +3612,6 @@ class _ComfyAPIMixin:
         import execution
         import nodes
         import server as comfy_server
-        self._log_mem("after_comfy_imports")
         self._log_profile("inproc_imports", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
@@ -3721,7 +3644,6 @@ class _ComfyAPIMixin:
                     self._send_sync_callback(event, data, sid)
 
         dummy = _DummyServer(event_loop)
-        self._log_mem("after_server_init")
         self._log_profile("inproc_server_init", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
@@ -3742,7 +3664,6 @@ class _ComfyAPIMixin:
         )
         self._dummy_server = dummy
         self._event_loop = event_loop
-        self._log_mem("after_executor_init")
         self._log_profile("inproc_executor_init", ram_gb=total_ram_gb, cache_gb=cache_ram_gb, duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
@@ -3781,16 +3702,11 @@ class _ComfyAPIMixin:
         dummy._send_sync_callback = _on_sync
 
         # Register built-in + custom nodes (async in ComfyUI v0.22+)
-        self._log_mem("before_custom_nodes")
-        _excluded = self._filter_custom_nodes()
         self._event_loop.run_until_complete(nodes.init_extra_nodes())
-        _ = self._restore_custom_nodes(_excluded)  # restore after load
-        self._log_mem("after_custom_nodes")
         self._apply_sage_attention_policy()
         self._log_profile("inproc_node_init", duration_ms=self._profile_ms(_stage))
 
         self._in_process_ready = True
-        self._log_mem("backend_ready")
         duration = time.time() - t0
         print(f"[comfyapp] in-process backend initialized in {duration:.3f}s")
 
@@ -4561,7 +4477,6 @@ class _ComfyAPIMixin:
             pass
 
         restore_start = time.time()
-        self._log_mem("restore_entry")
         print(f"[comfyapp] lifecycle=restore snap=False restore_start_unix={restore_start}")
         __stages: dict[str, float] = {}
         # Clear any stale restore timing from a previous call
@@ -4999,7 +4914,6 @@ class _ComfyAPIMixin:
         }
         if warmup_error:
             self._last_restore_timing["warmup_error"] = warmup_error
-        self._log_mem("restore_done")
         print(f"[comfyapp] restore sanity check done in {time.time() - restore_start:.3f}s "
               f"perf={self._last_restore_timing}")
 
@@ -5807,299 +5721,6 @@ def _register_gpu_classes():
             secrets=[modal.Secret.from_name("comfyui-warmup-dev")],
         )(Generated)
         globals()[class_name] = Generated
-
-
-# ── Platform Test B: production image, same GPU/volumes, no Comfy imports ──
-# Measures the lower bound of platform_restore with the full production
-# image and volume setup but NO ComfyUI import during snap=True.
-@app.cls(
-    gpu="rtx-pro-6000",
-    enable_memory_snapshot=True,
-    cpu=4,
-    memory=32768,
-    timeout=120,
-    min_containers=0,
-    scaledown_window=4,
-    volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
-    secrets=[modal.Secret.from_name("comfyui-warmup-dev")],
-)
-class PlatformTestB:
-    """Production image, same volumes.  No Comfy imports in snap=True."""
-    _restore_start: float = 0.0
-    _restore_count: int = 0
-
-    @modal.enter(snap=True)
-    def startup(self):
-        self._startup_t = __import__("time").time()
-        self._restore_count = 0
-        # Intentionally NO ComfyUI imports — this tests whether the
-        # production image/volume base alone adds restore overhead.
-
-    @modal.enter(snap=False)
-    def restore(self):
-        import time
-        self._restore_count += 1
-        self._restore_start = time.time()
-
-    @modal.method()
-    def ping(self) -> dict:
-        import time
-        return {
-            "restore_start_unix_s": self._restore_start,
-            "restore_end_unix_s": time.time(),
-            "restore_count": self._restore_count,
-        }
-
-
-# ── Platform Test E: No memory snapshot Blackwell ───────────────────
-# Same production image/GPU/volumes as Config D but enable_memory_snapshot=False.
-# Every request is a true cold start: ComfyUI initialises from scratch.
-@app.cls(
-    gpu="rtx-pro-6000",
-    enable_memory_snapshot=False,
-    cpu=4,
-    memory=32768,
-    timeout=600,
-    min_containers=0,
-    scaledown_window=4,
-    volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
-    secrets=[modal.Secret.from_name("comfyui-warmup-dev")],
-)
-class PlatformTestE:
-    """No snapshot — ComfyUI initialises from scratch each time."""
-
-    def __init__(self):
-        self._event_loop = None
-        self._executor = None
-        self._dummy_server = None
-        self._prog_queue = None
-        self._startup_t = 0.0
-        self._startup_done_t = 0.0
-
-    def _log_mem(self, label: str) -> None:
-        try:
-            with open("/proc/self/status") as _f:
-                for _line in _f:
-                    if _line.startswith("VmRSS:"):
-                        _rss_kb = int(_line.split()[1])
-                        print(f"[snapshot_mem] {label} rss_mb={_rss_kb / 1024:.1f} modules={len(__import__('sys').modules)}")
-                        break
-        except Exception:
-            print(f"[snapshot_mem] {label} (rss_unavailable) modules={len(__import__('sys').modules)}")
-
-    @modal.enter()
-    def _startup(self):
-        import time as _t
-        self._startup_t = _t.time()
-        self._log_mem("no_snap_start")
-        self._init_comfy_backend()
-        self._startup_done_t = _t.time()
-        self._log_mem("no_snap_startup_done")
-        print(f"[platform_e] comfy init done in {(_t.time()-self._startup_t)*1000:.1f}ms")
-
-    def _init_comfy_backend(self):
-        """Initialize ComfyUI backend (mirrors _start_in_process_backend)."""
-        import os, sys, asyncio
-
-        # 1. chdir + sys.path
-        comfy_path = "/root/comfy/ComfyUI"
-        os.chdir(comfy_path)
-        if comfy_path not in sys.path:
-            sys.path.insert(0, comfy_path)
-        sys.stdout.reconfigure(line_buffering=True)
-
-        # 2. imports
-        import folder_paths
-        import utils.extra_config
-        import utils.mime_types
-        import asyncio
-        import comfy.model_management
-        import comfy.model_patcher
-        import comfy.utils
-        import execution
-        import nodes
-        import server as comfy_server
-
-        # 3. model management
-        comfy.model_management.DISABLE_SMART_MEMORY = False
-        if hasattr(comfy.model_management, "VRAMState") and hasattr(comfy.model_management.VRAMState, "HIGH_VRAM"):
-            comfy.model_management.vram_state = comfy.model_management.VRAMState.HIGH_VRAM
-
-        # 4. event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._event_loop = loop
-
-        # 5. DummyServer
-        class _DummyServer(comfy_server.PromptServer):
-            def __init__(self, loop):
-                super().__init__(loop)
-                comfy_server.PromptServer.instance = self
-                q = execution.PromptQueue(comfy_server.PromptServer.instance)
-                self.client_id = "in-process"
-                self.prompt_queue = q
-                self._send_sync_callback = None
-            def send_sync(self, event, data, sid=None):
-                _prog_q = getattr(self, "_prog_queue_ref", None)
-                if _prog_q is not None and event in ("execution_start", "executing", "progress", "execution_error"):
-                    try:
-                        _prog_q.put_nowait((event, data))
-                    except Exception:
-                        pass
-
-        dummy = _DummyServer(loop)
-        self._dummy_server = dummy
-
-        # 6. PromptExecutor
-        _ram_gb = _get_system_ram_gb()
-        cache_ram_gb = round(max(4.0, min(_ram_gb * 0.5, 24.0)), 1)
-        self._executor = execution.PromptExecutor(
-            dummy,
-            cache_args={"lru": 0, "ram": cache_ram_gb, "ram_inactive": 96.0},
-        )
-
-        # 7. progress queue
-        import queue as _queue
-        self._prog_queue = _queue.Queue()
-        dummy._prog_queue_ref = self._prog_queue
-
-        # 8. send_sync callback for execution logging
-        def _on_sync(event, data, sid):
-            _prog_q = self._prog_queue
-            if _prog_q is not None and event in ("execution_start", "executing", "progress", "execution_error") and isinstance(data, dict):
-                try:
-                    _prog_q.put_nowait((event, data))
-                except Exception:
-                    pass
-        dummy._send_sync_callback = _on_sync
-
-        # 9. Sync custom nodes from volume (same as production startup)
-        try:
-            vol.reload()
-            # Minimal custom node sync: ensure symlink and copy from volume
-            _cn_path = "/root/comfy/ComfyUI/custom_nodes"
-            if not os.path.isdir(_cn_path):
-                os.makedirs(_cn_path, exist_ok=True)
-            if os.path.isdir(CUSTOM_NODES_PATH):
-                for _entry in os.listdir(CUSTOM_NODES_PATH):
-                    _src = os.path.join(CUSTOM_NODES_PATH, _entry)
-                    _dst = os.path.join(_cn_path, _entry)
-                    if os.path.isdir(_src) and not os.path.exists(_dst):
-                        os.symlink(_src, _dst)
-                        print(f"[platform_e] synced custom node: {_entry}")
-                    elif os.path.isfile(_src) and _entry.endswith(".py") and not os.path.exists(_dst):
-                        os.symlink(_src, _dst)
-        except Exception as _cn_exc:
-            print(f"[platform_e] custom node sync skipped: {_cn_exc}")
-
-        # 10. custom nodes (with exclusions if configured)
-        _excluded = self._filter_custom_nodes()
-        self._event_loop.run_until_complete(nodes.init_extra_nodes())
-        _ = self._restore_custom_nodes(_excluded)
-
-        # 10. Register model folder paths from the shared volume
-        folder_paths.add_model_folder_path("checkpoints", os.path.join(MODELS_PATH, "checkpoints"))
-        folder_paths.add_model_folder_path("diffusion_models", os.path.join(MODELS_PATH, "diffusion_models"))
-        folder_paths.add_model_folder_path("unet", os.path.join(MODELS_PATH, "unet"))
-        folder_paths.add_model_folder_path("vae", os.path.join(MODELS_PATH, "vae"))
-        folder_paths.add_model_folder_path("clip", os.path.join(MODELS_PATH, "clip"))
-        folder_paths.add_model_folder_path("text_encoders", os.path.join(MODELS_PATH, "text_encoders"))
-        folder_paths.add_model_folder_path("loras", os.path.join(MODELS_PATH, "loras"))
-
-        # 11. DISABLE_MMAP
-        comfy.utils.DISABLE_MMAP = True
-
-    @modal.method()
-    def run_prompt(self, workflow: dict, input_images: dict | None = None) -> dict:
-        """Execute a workflow (simplified, no profiling/restore patching)."""
-        import time, uuid, base64
-        _entry = time.time()
-
-        # Materialize input images
-        if input_images:
-            _materialize_input_images(input_images)
-
-        import execution, nodes as _nodes
-
-        prompt_id = str(uuid.uuid4())
-
-        _exec_t0 = time.time()
-        # Validate workflow to get the execution list
-        try:
-            if self._event_loop and self._event_loop.is_running():
-                _valid, _err, _outputs, _ = self._event_loop.run_until_complete(
-                    _nodes.validate_prompt(workflow, prompt_id, {"client_id": "platform_e"})
-                )
-            else:
-                _outputs = list(workflow.keys())
-        except Exception:
-            _outputs = list(workflow.keys())
-
-        if not _outputs:
-            _outputs = list(workflow.keys())
-        print(f"[platform_e] execute start outputs={len(_outputs)}")
-
-        try:
-            self._executor.execute(
-                prompt=workflow,
-                prompt_id=prompt_id,
-                extra_data={"client_id": "platform_e"},
-                execute_outputs=_outputs,
-            )
-        except Exception as exc:
-            print(f"[platform_e] execution failed: {exc}")
-            raise
-        _exec_t1 = time.time()
-        _exec_ok = getattr(self._executor, "success", True)
-        print(f"[platform_e] execute returned in {(_exec_t1-_exec_t0)*1000:.1f}ms success={_exec_ok}")
-        if _exec_ok is False:
-            _msgs = getattr(self._executor, "status_messages", [])
-            _errs = [p.get("exception_message", str(p)) for e, p in _msgs if e == "execution_error" and isinstance(p, dict)]
-            _detail = "; ".join(_errs) if _errs else "executor reported failure"
-            raise RuntimeError(_detail)
-
-        # Collect outputs: scan output dirs for recent files (matches Config D's approach)
-        import base64
-        images = []
-        _prompt_start = _entry - 1.0
-        try:
-            for _sub_dir in ("output", "temp", "input"):
-                _scan_root = f"/root/comfy/ComfyUI/{_sub_dir}"
-                if not os.path.isdir(_scan_root):
-                    continue
-                for _root, _dirs, _files in os.walk(_scan_root):
-                    for _fname in _files:
-                        if not _fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm")):
-                            continue
-                        _fpath = os.path.join(_root, _fname)
-                        _mtime = os.path.getmtime(_fpath)
-                        if _mtime < _prompt_start:
-                            continue
-                        _rel = os.path.relpath(_root, _scan_root)
-                        _sf = "" if _rel == "." else _rel
-                        with open(_fpath, "rb") as _imgf:
-                            _data = base64.b64encode(_imgf.read()).decode("utf-8")
-                        images.append({"filename": _fname, "subfolder": _sf, "type": _sub_dir, "data": _data})
-        except Exception as _scan_exc:
-            print(f"[platform_e] output scan error: {_scan_exc}")
-
-        _done = time.time()
-        startup_ms = round((self._startup_done_t - self._startup_t) * 1000, 1) if self._startup_t and self._startup_done_t else 0
-        total_ms = round((_done - self._startup_t) * 1000, 1) if self._startup_t else 0
-        exec_ms = round((_done - _exec_t0) * 1000, 1)
-
-        print(f"[platform_e] prompt done startup={startup_ms}ms exec={exec_ms}ms total={total_ms}ms images={len(images)}")
-        return {
-            "images": images,
-            "videos": [],
-            "_restore_timing": {
-                "startup_start_unix_s": self._startup_t,
-                "startup_done_unix_s": self._startup_done_t,
-                "startup_ms": startup_ms,
-                "exec_ms": exec_ms,
-                "total_ms": total_ms,
-            },
-        }
 
 
 _register_gpu_classes()
