@@ -33,6 +33,12 @@ const DOWNLOAD_FOLDERS = [
 
 const STORAGE_KEY_GPU    = "comfymodal_gpu";
 const STORAGE_KEY_ENABLED = "comfymodal_enabled";
+const STORAGE_KEY_OUTPUT_FORMAT = "comfymodal_output_format";
+const STORAGE_KEY_OUTPUT_QUALITY = "comfymodal_quality";
+const STORAGE_KEY_OUTPUT_WEBP_LC = "comfymodal_webp_lossless_compression";
+const STORAGE_KEY_OUTPUT_AUTOSAVE = "comfymodal_auto_save_local";
+const STORAGE_KEY_OUTPUT_SAVEFOLDER = "comfymodal_save_folder";
+const STORAGE_KEY_OUTPUT_SIDECAR = "comfymodal_save_metadata_sidecar";
 
 const STATUS = {
   UNKNOWN:    "unknown",
@@ -57,6 +63,14 @@ let _hasChanges = false;
 let _deployWarning = "";
 let _runtimeStatusText = "";
 let _runtimeStatusPhase = "";
+let _deployLogTimer = null;
+let _deployLogInlineEl = null;
+let _deployLogPreEl = null;
+let _deploySuccessTimer = null;
+let _prevDeployState = "idle";
+let _showDeploySuccess = false;
+let _logViewerMinimized = false;
+let _showLogLinkEl = null;
 
 const STATUS_STYLE = {
   [STATUS.UNKNOWN]:    { color: "#888",    label: "Unknown" },
@@ -109,6 +123,44 @@ async function syncGpuConfig() {
   return { config, selectedGpu, options };
 }
 
+async function syncOutputOptions() {
+  let config = {
+    output_format: "original",
+    quality: 75,
+    webp_lossless_compression: "balanced",
+    auto_save_local: false,
+    save_folder: "ComfyUI/output/modal/",
+    save_metadata_sidecar: true,
+  };
+  try {
+    const response = await api.fetchApi(`${MODAL_PREFIX}/config`);
+    config = { ...config, ...(await response.json()) };
+  } catch {}
+
+  const outputOptions = {
+    output_format: localStorage.getItem(STORAGE_KEY_OUTPUT_FORMAT) || config.output_format || "original",
+    quality: parseInt(localStorage.getItem(STORAGE_KEY_OUTPUT_QUALITY), 10) || config.quality || 75,
+    webp_lossless_compression: localStorage.getItem(STORAGE_KEY_OUTPUT_WEBP_LC) || config.webp_lossless_compression || "balanced",
+    auto_save_local: localStorage.getItem(STORAGE_KEY_OUTPUT_AUTOSAVE) === "true"
+      ? true
+      : (config.auto_save_local === true),
+    save_folder: localStorage.getItem(STORAGE_KEY_OUTPUT_SAVEFOLDER) || config.save_folder || "ComfyUI/output/modal/",
+    save_metadata_sidecar: localStorage.getItem(STORAGE_KEY_OUTPUT_SIDECAR) === "false"
+      ? false
+      : (config.save_metadata_sidecar !== false),
+  };
+
+  localStorage.setItem(STORAGE_KEY_OUTPUT_FORMAT, outputOptions.output_format);
+  localStorage.setItem(STORAGE_KEY_OUTPUT_QUALITY, String(outputOptions.quality));
+  localStorage.setItem(STORAGE_KEY_OUTPUT_WEBP_LC, outputOptions.webp_lossless_compression);
+  localStorage.setItem(STORAGE_KEY_OUTPUT_AUTOSAVE, String(outputOptions.auto_save_local));
+  localStorage.setItem(STORAGE_KEY_OUTPUT_SAVEFOLDER, outputOptions.save_folder);
+  localStorage.setItem(STORAGE_KEY_OUTPUT_SIDECAR, String(outputOptions.save_metadata_sidecar));
+  window._comfyModalOutputOptions = outputOptions;
+
+  return outputOptions;
+}
+
 // --- Status Banner Logic ---
 function updateStatusBanner() {
   if (!statusBannerEl || !statusBannerTextEl) return;
@@ -117,7 +169,12 @@ function updateStatusBanner() {
   let color = "#aaa";
   let animation = "";
 
-  if (_deployState === "deploying") {
+  if (_showDeploySuccess) {
+    text = "\u2713 Deploy succeeded";
+    bg = "#1a5a1a";
+    color = "#7ed321";
+    animation = "successPulse 0.6s ease-in-out 2";
+  } else if (_deployState === "deploying") {
     text = "Deploying...";
     bg = "#3d2e00";
     color = "#f5a623";
@@ -160,10 +217,44 @@ function updateStatusBanner() {
 }
 
 function setDeployBanner(state, message) {
+  const prev = _prevDeployState;
+  _prevDeployState = _deployState;
   _deployState = state;
-  if (state === "error" && statusBannerTextEl) {
-    statusBannerTextEl.textContent = "Error: " + (message || "Unknown error");
+
+  // Clear any pending success indicator when state changes
+  if (state !== "ready" && _deploySuccessTimer) {
+    clearTimeout(_deploySuccessTimer);
+    _deploySuccessTimer = null;
+    _showDeploySuccess = false;
   }
+
+  if (state === "error") {
+    stopDeployLogPoll();
+    if (statusBannerTextEl) {
+      statusBannerTextEl.textContent = "Error: " + (message || "Unknown error");
+    }
+    _logViewerMinimized = false;
+    if (_showLogLinkEl) _showLogLinkEl.style.display = "none";
+    toggleDeployLogViewer(true);
+  } else if (state === "deploying") {
+    _logViewerMinimized = false;
+    if (_showLogLinkEl) _showLogLinkEl.style.display = "none";
+    toggleDeployLogViewer(true);
+    startDeployLogPoll();
+  } else if (state === "ready" && prev === "deploying") {
+    // Fresh deploy completed — show success indicator, stop log poll
+    stopDeployLogPoll();
+    _showDeploySuccess = true;
+    if (_deploySuccessTimer) clearTimeout(_deploySuccessTimer);
+    _deploySuccessTimer = setTimeout(() => {
+      _showDeploySuccess = false;
+      _deploySuccessTimer = null;
+      updateStatusBanner();
+    }, 4000);
+    // Auto-collapse the log viewer after a brief delay
+    setTimeout(() => toggleDeployLogViewer(false), 1200);
+  }
+
   updateStatusBanner();
   updateDeployLogButton();
 }
@@ -275,6 +366,118 @@ async function showDeployLogOverlay() {
   } catch (e) {
     pre.textContent = `Error loading log: ${e.message}`;
     pre.style.color = "#e05050";
+  }
+}
+
+// ─── Inline Deploy Log Viewer ──────────────────────────────────────────
+function createDeployLogInline() {
+  const wrapper = document.createElement("div");
+  wrapper.id = "deploy-log-inline";
+  wrapper.style.cssText = `
+    max-height: 0; overflow: hidden; transition: max-height 0.35s ease, opacity 0.35s ease;
+    opacity: 0; border-radius: 6px; background: #111; margin-top: 6px;
+    border: 1px solid #333;
+  `;
+
+  const inner = document.createElement("div");
+  inner.style.cssText = "padding: 8px;";
+
+  const headerRow = document.createElement("div");
+  headerRow.style.cssText = `
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 6px;
+  `;
+
+  const label = document.createElement("span");
+  label.style.cssText = "font-size: 11px; color: #888; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;";
+  label.textContent = "Deploy Log";
+
+  const headerActions = document.createElement("div");
+  headerActions.style.cssText = "display: flex; align-items: center; gap: 6px;";
+
+  const minimizeBtn = document.createElement("button");
+  minimizeBtn.textContent = "\u2013";
+  minimizeBtn.title = "Minimize";
+  minimizeBtn.style.cssText = `
+    background: transparent; border: 1px solid #555; color: #888;
+    width: 18px; height: 18px; border-radius: 3px; cursor: pointer;
+    font-size: 12px; padding: 0; display: flex; align-items: center; justify-content: center;
+    line-height: 1;
+  `;
+  minimizeBtn.onclick = () => {
+    _logViewerMinimized = true;
+    toggleDeployLogViewer(false);
+    if (_showLogLinkEl) _showLogLinkEl.style.display = "block";
+  };
+
+  const fullLogBtn = document.createElement("button");
+  fullLogBtn.textContent = "View Full Log \u2197";
+  fullLogBtn.style.cssText = `
+    background: transparent; border: none; color: #6a9fd8; cursor: pointer;
+    font-size: 10px; padding: 0; text-decoration: none;
+  `;
+  fullLogBtn.onclick = () => showDeployLogOverlay();
+
+  headerActions.appendChild(minimizeBtn);
+  headerActions.appendChild(fullLogBtn);
+
+  headerRow.appendChild(label);
+  headerRow.appendChild(headerActions);
+
+  const pre = document.createElement("pre");
+  pre.style.cssText = `
+    margin: 0; font-size: 11px; color: #aaa; white-space: pre-wrap;
+    word-break: break-all; font-family: monospace; line-height: 1.5;
+    max-height: 120px; overflow-y: auto;
+  `;
+  pre.textContent = "Waiting for log output...";
+
+  inner.appendChild(headerRow);
+  inner.appendChild(pre);
+  wrapper.appendChild(inner);
+
+  _deployLogInlineEl = wrapper;
+  _deployLogPreEl = pre;
+  return wrapper;
+}
+
+function toggleDeployLogViewer(show) {
+  if (!_deployLogInlineEl) return;
+  if (show) {
+    _deployLogInlineEl.style.maxHeight = "200px";
+    _deployLogInlineEl.style.opacity = "1";
+  } else {
+    _deployLogInlineEl.style.maxHeight = "0";
+    _deployLogInlineEl.style.opacity = "0";
+  }
+}
+
+async function updateDeployLogInline() {
+  if (!_deployLogPreEl) return;
+  try {
+    const resp = await api.fetchApi(`${MODAL_PREFIX}/deploy/log`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (!data.log) return;
+    const lines = data.log.split("\n");
+    const tail = lines.slice(-50).join("\n");
+    _deployLogPreEl.textContent = tail || "(empty log)";
+    _deployLogPreEl.scrollTop = _deployLogPreEl.scrollHeight;
+  } catch {
+    // silent — poll will retry
+  }
+}
+
+function startDeployLogPoll() {
+  stopDeployLogPoll();
+  updateDeployLogInline();
+  _deployLogTimer = setInterval(updateDeployLogInline, 2000);
+}
+
+function stopDeployLogPoll() {
+  if (_deployLogTimer) {
+    clearInterval(_deployLogTimer);
+    _deployLogTimer = null;
   }
 }
 
@@ -946,6 +1149,10 @@ function buildPanel() {
         0%, 100% { opacity: 1; }
         50% { opacity: 0.6; }
       }
+      @keyframes successPulse {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.8; transform: scale(1.02); }
+      }
     `;
     document.head.appendChild(styleTag);
   }
@@ -995,6 +1202,7 @@ function buildPanel() {
   redeployBtn.onclick = async () => {
     redeployBtn.disabled = true;
     redeployBtn.textContent = "Deploying...";
+    setDeployBanner("deploying", ""); // immediate local state update
     try {
       await api.fetchApi(`${MODAL_PREFIX}/deploy`, { method: "POST" });
       startDeployPoll();
@@ -1008,6 +1216,25 @@ function buildPanel() {
     }, 3000);
   };
   stickyTop.appendChild(redeployBtn);
+
+  // Inline deploy log viewer (hidden by default, shown during deploy)
+  const logViewer = createDeployLogInline();
+  stickyTop.appendChild(logViewer);
+
+  // Re-open link shown when the log viewer is minimized
+  _showLogLinkEl = document.createElement("button");
+  _showLogLinkEl.textContent = "+ Show deploy log";
+  _showLogLinkEl.style.cssText = `
+    display: none; background: transparent; border: 1px dashed #555; color: #888;
+    padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;
+    width: 100%; text-align: center;
+  `;
+  _showLogLinkEl.onclick = () => {
+    _logViewerMinimized = false;
+    _showLogLinkEl.style.display = "none";
+    toggleDeployLogViewer(true);
+  };
+  stickyTop.appendChild(_showLogLinkEl);
 
   // -- Run Mode Toggle --
   const modeSection = document.createElement("div");
@@ -1140,6 +1367,250 @@ function buildPanel() {
 
   scrollContent.appendChild(gpuSection);
 
+  // === OUTPUT OPTIONS SECTION (Collapsible) ===
+  const _STORAGE_FORMAT = "comfymodal_output_format";
+  const _STORAGE_QUALITY = "comfymodal_quality";
+  const _STORAGE_WEBP_LC = "comfymodal_webp_lossless_compression";
+  const _STORAGE_AUTOSAVE = "comfymodal_auto_save_local";
+  const _STORAGE_SAVEFOLDER = "comfymodal_save_folder";
+  const _STORAGE_SIDECAR = "comfymodal_save_metadata_sidecar";
+
+  let _outFmtValue = localStorage.getItem(_STORAGE_FORMAT) || "original";
+  let _qualValue = parseInt(localStorage.getItem(_STORAGE_QUALITY), 10) || 75;
+  let _webpLcValue = localStorage.getItem(_STORAGE_WEBP_LC) || "balanced";
+  let _autoSaveValue = localStorage.getItem(_STORAGE_AUTOSAVE) === "true";
+  let _saveFolderValue = localStorage.getItem(_STORAGE_SAVEFOLDER) || "ComfyUI/output/modal/";
+  let _sidecarValue = localStorage.getItem(_STORAGE_SIDECAR) !== "false";
+
+  function _persistOutputSettings() {
+    localStorage.setItem(_STORAGE_FORMAT, _outFmtValue);
+    localStorage.setItem(_STORAGE_QUALITY, _qualValue);
+    localStorage.setItem(_STORAGE_WEBP_LC, _webpLcValue);
+    localStorage.setItem(_STORAGE_AUTOSAVE, String(_autoSaveValue));
+    localStorage.setItem(_STORAGE_SAVEFOLDER, _saveFolderValue);
+    localStorage.setItem(_STORAGE_SIDECAR, String(_sidecarValue));
+    window._comfyModalOutputOptions = {
+      output_format: _outFmtValue,
+      quality: _qualValue,
+      webp_lossless_compression: _webpLcValue,
+      auto_save_local: _autoSaveValue,
+      save_folder: _saveFolderValue,
+      save_metadata_sidecar: _sidecarValue,
+    };
+    // Sync to server
+    try {
+      api.fetchApi(`${MODAL_PREFIX}/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          output_format: _outFmtValue,
+          quality: _qualValue,
+          webp_lossless_compression: _webpLcValue,
+          auto_save_local: _autoSaveValue,
+          save_folder: _saveFolderValue,
+          save_metadata_sidecar: _sidecarValue,
+        }),
+      });
+    } catch {}
+  }
+
+  // Init from server config
+  (async () => {
+    try {
+      const r = await api.fetchApi(`${MODAL_PREFIX}/config`);
+      const cfg = await r.json();
+      if (cfg.output_format !== undefined && !localStorage.getItem(_STORAGE_FORMAT))
+        _outFmtValue = cfg.output_format;
+      if (cfg.quality !== undefined && !localStorage.getItem(_STORAGE_QUALITY))
+        _qualValue = cfg.quality;
+      if (cfg.webp_lossless_compression !== undefined && !localStorage.getItem(_STORAGE_WEBP_LC))
+        _webpLcValue = cfg.webp_lossless_compression;
+      if (cfg.auto_save_local !== undefined && !localStorage.getItem(_STORAGE_AUTOSAVE))
+        _autoSaveValue = Boolean(cfg.auto_save_local);
+      if (cfg.save_folder && !localStorage.getItem(_STORAGE_SAVEFOLDER))
+        _saveFolderValue = cfg.save_folder;
+      if (cfg.save_metadata_sidecar !== undefined && !localStorage.getItem(_STORAGE_SIDECAR))
+        _sidecarValue = cfg.save_metadata_sidecar !== false;
+      _persistOutputSettings();
+    } catch {}
+  })();
+
+  const outputCollapsible = createCollapsibleSection("Output Options", { defaultOpen: false, badge: null });
+  outputCollapsible.wrapper.querySelector("span:last-of-type").style.display = "none";
+  const outContent = outputCollapsible.content;
+
+  // -- Output format dropdown --
+  const fmtRow = document.createElement("div");
+  fmtRow.style.cssText = "display:flex; flex-direction:column; gap:4px; margin-bottom:8px;";
+
+  const fmtLabel = document.createElement("span");
+  fmtLabel.style.cssText = "font-size:12px; color:#aaa; font-weight:600;";
+  fmtLabel.textContent = "Output format";
+
+  const fmtSelect = document.createElement("select");
+  fmtSelect.style.cssText = inputStyle();
+  ["original", "webp_lossless", "webp_lossy", "jpeg"].forEach(v => {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v === "original" ? "Original / PNG" : v === "webp_lossless" ? "WebP Lossless" : v === "webp_lossy" ? "WebP Lossy" : "JPEG";
+    fmtSelect.appendChild(opt);
+  });
+  fmtSelect.value = _outFmtValue;
+
+  fmtRow.appendChild(fmtLabel);
+  fmtRow.appendChild(fmtSelect);
+  outContent.appendChild(fmtRow);
+
+  // -- Quality slider (visible for webp_lossy and jpeg) --
+  const qualRow = document.createElement("div");
+  qualRow.style.cssText = "display:flex; flex-direction:column; gap:4px; margin-bottom:8px;";
+
+  const qualLabelRow = document.createElement("div");
+  qualLabelRow.style.cssText = "display:flex; align-items:center; justify-content:space-between;";
+
+  const qualLabel = document.createElement("span");
+  qualLabel.style.cssText = "font-size:12px; color:#aaa; font-weight:600;";
+  qualLabel.textContent = "Quality";
+
+  const qualValueEl = document.createElement("span");
+  qualValueEl.style.cssText = "font-size:11px; color:#888;";
+
+  qualLabelRow.appendChild(qualLabel);
+  qualLabelRow.appendChild(qualValueEl);
+
+  const qualSlider = document.createElement("input");
+  qualSlider.type = "range";
+  qualSlider.min = "0";
+  qualSlider.max = "100";
+  qualSlider.step = "1";
+  qualSlider.value = String(_qualValue);
+  qualSlider.style.cssText = "width:100%; margin:0; accent-color:#3a6fcc;";
+  qualValueEl.textContent = _qualValue;
+
+  qualRow.appendChild(qualLabelRow);
+  qualRow.appendChild(qualSlider);
+  outContent.appendChild(qualRow);
+
+  // -- WebP lossless compression dropdown --
+  const wlcRow = document.createElement("div");
+  wlcRow.style.cssText = "display:flex; flex-direction:column; gap:4px; margin-bottom:8px;";
+
+  const wlcLabel = document.createElement("span");
+  wlcLabel.style.cssText = "font-size:12px; color:#aaa; font-weight:600;";
+  wlcLabel.textContent = "WebP lossless compression";
+
+  const wlcSelect = document.createElement("select");
+  wlcSelect.style.cssText = inputStyle();
+  ["fast", "balanced", "max"].forEach(v => {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v === "fast" ? "Fast" : v === "balanced" ? "Balanced" : "Max Compression";
+    wlcSelect.appendChild(opt);
+  });
+  wlcSelect.value = _webpLcValue;
+
+  wlcRow.appendChild(wlcLabel);
+  wlcRow.appendChild(wlcSelect);
+  outContent.appendChild(wlcRow);
+
+  function _updateOutputVisibility() {
+    const fmt = fmtSelect.value;
+    qualRow.style.display = (fmt === "webp_lossy" || fmt === "jpeg") ? "" : "none";
+    wlcRow.style.display = (fmt === "webp_lossless") ? "" : "none";
+  }
+  _updateOutputVisibility();
+
+  fmtSelect.addEventListener("change", () => {
+    _outFmtValue = fmtSelect.value;
+    _updateOutputVisibility();
+    _persistOutputSettings();
+  });
+  qualSlider.addEventListener("input", () => {
+    _qualValue = parseInt(qualSlider.value, 10);
+    qualValueEl.textContent = _qualValue;
+    _persistOutputSettings();
+  });
+  wlcSelect.addEventListener("change", () => { _webpLcValue = wlcSelect.value; _persistOutputSettings(); });
+
+  // -- Divider --
+  const outDivider = document.createElement("div");
+  outDivider.style.cssText = "border-top: 1px solid #3a3a3a; margin: 8px 0;";
+  outContent.appendChild(outDivider);
+
+  // -- Auto-save toggle --
+  const autoSaveRow = document.createElement("div");
+  autoSaveRow.style.cssText = "display:flex; align-items:center; gap:8px; margin-bottom:8px;";
+
+  const autoSaveLabel = document.createElement("span");
+  autoSaveLabel.style.cssText = "font-size:12px; color:#aaa; font-weight:600;";
+  autoSaveLabel.textContent = "Auto-save outputs locally";
+
+  const autoSaveToggle = document.createElement("input");
+  autoSaveToggle.type = "checkbox";
+  autoSaveToggle.checked = _autoSaveValue;
+  autoSaveToggle.style.cssText = "width:16px; height:16px; accent-color:#3a6fcc;";
+
+  autoSaveRow.appendChild(autoSaveToggle);
+  autoSaveRow.appendChild(autoSaveLabel);
+  outContent.appendChild(autoSaveRow);
+
+  // -- Save folder --
+  const saveFolderRow = document.createElement("div");
+  saveFolderRow.style.cssText = "display:flex; flex-direction:column; gap:4px; margin-bottom:8px;";
+
+  const saveFolderLabel = document.createElement("span");
+  saveFolderLabel.style.cssText = "font-size:12px; color:#aaa; font-weight:600;";
+  saveFolderLabel.textContent = "Save folder";
+
+  const saveFolderInput = document.createElement("input");
+  saveFolderInput.type = "text";
+  saveFolderInput.value = _saveFolderValue;
+  saveFolderInput.style.cssText = inputStyle();
+  saveFolderInput.placeholder = "ComfyUI/output/modal/";
+
+  saveFolderRow.appendChild(saveFolderLabel);
+  saveFolderRow.appendChild(saveFolderInput);
+  outContent.appendChild(saveFolderRow);
+
+  // -- Sidecar checkbox --
+  const sidecarRow = document.createElement("div");
+  sidecarRow.style.cssText = "display:flex; align-items:center; gap:8px; margin-bottom:8px;";
+
+  const sidecarToggle = document.createElement("input");
+  sidecarToggle.type = "checkbox";
+  sidecarToggle.checked = _sidecarValue;
+  sidecarToggle.style.cssText = "width:16px; height:16px; accent-color:#3a6fcc;";
+
+  const sidecarLabel = document.createElement("span");
+  sidecarLabel.style.cssText = "font-size:12px; color:#aaa;";
+  sidecarLabel.textContent = "Save metadata JSON sidecar";
+
+  sidecarRow.appendChild(sidecarToggle);
+  sidecarRow.appendChild(sidecarLabel);
+  outContent.appendChild(sidecarRow);
+
+  // -- Open output folder button --
+  const openFolderBtn = document.createElement("button");
+  openFolderBtn.textContent = "Open output folder";
+  openFolderBtn.style.cssText = btnStyle() + "width:100%;";
+  openFolderBtn.onclick = () => {
+    const folder = saveFolderInput.value.trim() || "ComfyUI/output/modal/";
+    try {
+      api.fetchApi(`${MODAL_PREFIX}/open-folder`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: folder }),
+      });
+    } catch {}
+  };
+  outContent.appendChild(openFolderBtn);
+
+  autoSaveToggle.addEventListener("change", () => { _autoSaveValue = autoSaveToggle.checked; _persistOutputSettings(); });
+  saveFolderInput.addEventListener("change", () => { _saveFolderValue = saveFolderInput.value; _persistOutputSettings(); });
+  sidecarToggle.addEventListener("change", () => { _sidecarValue = sidecarToggle.checked; _persistOutputSettings(); });
+
+  scrollContent.appendChild(outputCollapsible.wrapper);
+
   // === SYNC SECTION (Collapsible) ===
   const syncCollapsible = createCollapsibleSection("Sync", { defaultOpen: true, badge: "..." });
   const syncContent = syncCollapsible.content;
@@ -1194,6 +1665,40 @@ function buildPanel() {
   const resyncRuntimeStatus = document.createElement("div");
   resyncRuntimeStatus.style.cssText = "font-size: 11px; color: #888; min-height: 14px;";
   syncContent.appendChild(resyncRuntimeStatus);
+
+  // Check Runtime State button (manual — not called automatically on sidebar open)
+  const runtimeStateBtn = document.createElement("button");
+  runtimeStateBtn.textContent = "\u2139 Check Runtime State";
+  runtimeStateBtn.title = "Check if the remote runtime is stale and needs a resync";
+  runtimeStateBtn.style.cssText = btnStyle("primary") + "margin-top: 8px; margin-bottom: 4px;";
+  syncContent.appendChild(runtimeStateBtn);
+
+  const runtimeStateStatus = document.createElement("div");
+  runtimeStateStatus.style.cssText = "font-size: 11px; color: #888; min-height: 14px;";
+  syncContent.appendChild(runtimeStateStatus);
+
+  runtimeStateBtn.onclick = async () => {
+    runtimeStateBtn.disabled = true;
+    runtimeStateBtn.textContent = "Checking...";
+    runtimeStateStatus.textContent = "";
+    try {
+      const resp = await api.fetchApi(`${MODAL_PREFIX}/runtime/state`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      if (data.stale === true) {
+        runtimeStateStatus.style.color = "#f5a623";
+        runtimeStateStatus.textContent = "\u26A0 Runtime is stale — use Resync to refresh.";
+      } else {
+        runtimeStateStatus.style.color = "#7ed321";
+        runtimeStateStatus.textContent = "\u2713 Runtime is current.";
+      }
+    } catch (e) {
+      runtimeStateStatus.style.color = "#e05050";
+      runtimeStateStatus.textContent = "Error: " + e.message;
+    }
+    runtimeStateBtn.disabled = false;
+    runtimeStateBtn.textContent = "\u2139 Check Runtime State";
+  };
 
   // Button handlers
   syncModelsBtn.onclick = async () => {
@@ -1317,42 +1822,11 @@ function buildPanel() {
         </div>
       `;
       syncCollapsible.updateBadge(pendingModels + pendingCN > 0 ? `${pendingModels + pendingCN}` : "\u2713");
-      await loadRuntimeState();
       syncCollapsible.refreshHeight();
     } catch (e) {
       syncStatusEl.style.color = "#e05050";
       syncStatusEl.textContent = "Error: " + e.message;
       syncCollapsible.refreshHeight();
-    }
-  }
-
-  async function loadRuntimeState() {
-    if (!syncStatusEl) return;
-    try {
-      const resp = await api.fetchApi(`${MODAL_PREFIX}/runtime/state`);
-      if (!resp.ok) return;
-      const data = await resp.json();
-      const existing = syncStatusEl.querySelector("[data-stale-warning]");
-      if (existing) existing.remove();
-      if (data.stale === true) {
-        const warning = document.createElement("div");
-        warning.setAttribute("data-stale-warning", "1");
-        warning.style.cssText = "margin-top:6px; padding:6px 8px; background:#3d2e00; color:#f5a623; border-radius:4px; font-size:11px; line-height:1.4;";
-        warning.textContent = "\u26A0\ufe0f Remote runtime is stale. ";
-        const link = document.createElement("a");
-        link.href = "#";
-        link.textContent = "Resync runtime";
-        link.style.cssText = "color:#6a9fd8;text-decoration:underline;";
-        link.onclick = (e) => {
-          e.preventDefault();
-          if (resyncRuntimeBtn) resyncRuntimeBtn.click();
-        };
-        warning.appendChild(link);
-        warning.appendChild(document.createTextNode(" to pick up new models or custom nodes."));
-        syncStatusEl.appendChild(warning);
-      }
-    } catch (e) {
-      console.warn("[comfyui-modal] runtime/state check failed:", e);
     }
   }
 
@@ -1911,6 +2385,7 @@ app.registerExtension({
   async setup() {
     // Apply saved GPU config on page load (before sidebar is opened)
     syncGpuConfig();
+    syncOutputOptions();
 
     if (app?.extensionManager?.registerSidebarTab) {
       app.extensionManager.registerSidebarTab({

@@ -31,6 +31,12 @@ from workflow_metadata import (
     stack_to_warmup_profile,
     summarize_prompt_fields,
 )
+from output_converter import (
+    OUTPUT_FORMATS,
+    WEBP_LOSSLESS_COMPRESSION,
+    DEFAULTS as _CONVERTER_DEFAULTS,
+)
+from output_saver import save_output_image, DEFAULTS as _SAVER_DEFAULTS
 from timing_trace import Trace, coerce_t0_from_browser
 
 NODE_CLASS_MAPPINGS = {}
@@ -50,6 +56,18 @@ _DEPLOY_STATE_FILE = os.path.join(_NODE_DIR, ".deployed_version")
 _DEPLOY_STATE_JSON_FILE = os.path.join(_NODE_DIR, ".deployed_state.json")
 _DEPLOY_LOG_FILE = os.path.join(_NODE_DIR, ".deploy_log")
 _LATEST_BENCHMARK_WORKFLOW_FILE = os.path.join(_NODE_DIR, "latest_benchmark_workflow.json")
+_MODAL_SETTINGS_FILE = os.path.join(_NODE_DIR, ".modal_settings.json")
+
+# ── Output settings (server-side, persisted to .modal_settings.json) ──
+def _default_modal_settings() -> dict:
+    return {
+        "output_format": _CONVERTER_DEFAULTS["output_format"],
+        "quality": _CONVERTER_DEFAULTS["quality"],
+        "webp_lossless_compression": _CONVERTER_DEFAULTS["webp_lossless_compression"],
+        "auto_save_local": _SAVER_DEFAULTS["auto_save_local"],
+        "save_folder": _SAVER_DEFAULTS["save_folder"],
+        "save_metadata_sidecar": _SAVER_DEFAULTS["save_metadata_sidecar"],
+    }
 
 _CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
 _CUSTOM_NODE_SYNC_EXCLUDE_EXTENSIONS = {".pyc", ".pyo"}
@@ -148,6 +166,48 @@ def _save_latest_benchmark_workflow(payload: dict) -> dict:
     os.replace(tmp_path, _LATEST_BENCHMARK_WORKFLOW_FILE)
     _latest_benchmark_workflow = snapshot
     return dict(snapshot)
+
+
+# ── Modal settings persistence ────────────────────────────────────────
+_modal_settings_cache: dict | None = None
+
+
+def _load_modal_settings() -> dict:
+    """Load persisted output/auto-save settings from disk."""
+    global _modal_settings_cache
+    if _modal_settings_cache is not None:
+        return dict(_modal_settings_cache)
+    defaults = _default_modal_settings()
+    try:
+        with open(_MODAL_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            merged = dict(defaults)
+            for key in defaults:
+                if key in saved and isinstance(saved[key], type(defaults[key])):
+                    merged[key] = saved[key]
+            _modal_settings_cache = merged
+            return dict(merged)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    _modal_settings_cache = defaults
+    return dict(defaults)
+
+
+def _save_modal_settings(settings: dict) -> dict:
+    """Persist settings to disk, merging with defaults."""
+    global _modal_settings_cache
+    defaults = _default_modal_settings()
+    merged = dict(defaults)
+    for key in defaults:
+        if key in settings and isinstance(settings[key], type(defaults[key])):
+            merged[key] = settings[key]
+    tmp_path = f"{_MODAL_SETTINGS_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(merged, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, _MODAL_SETTINGS_FILE)
+    _modal_settings_cache = merged
+    return dict(merged)
 
 def _custom_nodes_root() -> str:
     return os.path.join(os.path.dirname(os.path.dirname(_NODE_DIR)), "custom_nodes")
@@ -296,25 +356,38 @@ def _run_deploy_background(custom_nodes_fingerprint: str | None = None):
     print(f"[comfyui-modal] Deploying comfyapp.py (modal: {modal_cmd})")
 
     try:
-        result = subprocess.run(
-            [modal_cmd, "deploy", _COMFYAPP_PATH],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=600,
-            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-        )
-        combined_output = (result.stdout or "") + "\n" + (result.stderr or "")
+        # Stream deploy output to log file in real-time so the inline log
+        # viewer shows progress as the build runs, not just the final output.
+        combined_lines: list[str] = []
+        with open(_DEPLOY_LOG_FILE, "w", encoding="utf-8") as log_f:
+            process = subprocess.Popen(
+                [modal_cmd, "deploy", _COMFYAPP_PATH],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            )
+            # Kill the process if it exceeds 10 minutes (matches original
+            # subprocess.run(timeout=600) behavior).
+            _kill_timer = threading.Timer(
+                600, lambda: process.kill() if process.poll() is None else None,
+            )
+            _kill_timer.start()
+            try:
+                # Read line-by-line so the file gets written as output arrives
+                for line in iter(process.stdout.readline, ""):
+                    log_f.write(line)
+                    log_f.flush()
+                    combined_lines.append(line)
+                process.wait(timeout=30)
+            finally:
+                _kill_timer.cancel()
+        combined_output = "".join(combined_lines)
+        returncode = process.returncode
 
-        # Always write full log
-        try:
-            with open(_DEPLOY_LOG_FILE, "w", encoding="utf-8") as f:
-                f.write(combined_output)
-        except Exception as e:
-            print(f"[comfyui-modal] Warning: could not write deploy log: {e}")
-
-        if result.returncode == 0:
+        if returncode == 0:
             version = _get_comfyapp_version()
             _save_deploy_state(version, custom_nodes_fingerprint)
             _deploy_status = {"state": "ready", "message": f"Deployed v{version}"}
@@ -744,6 +817,7 @@ async def _execute_job(item: tuple, item_id: int):
             input_images,
             trace={**trace.fields(), "prompt_id": prompt_id},
             gpu=extra_data.get("gpu"),
+            modal_options=extra_data.get("modal_options"),
         ):
             if not isinstance(_msg, dict):
                 continue
@@ -912,6 +986,106 @@ async def _execute_job(item: tuple, item_id: int):
         f"duration_ms={materialize_ms} images={output_image_count} videos={output_video_count} bytes={output_bytes_written}"
     )
 
+    # ── Auto-save ────────────────────────────────────────────────────
+    _mo = extra_data.get("modal_options") if isinstance(extra_data, dict) else None
+    _auto_save_enabled = bool((_mo or {}).get("auto_save_local", False))
+    _save_results: list[dict] = []
+    _save_warnings: list[str] = []
+    if _auto_save_enabled:
+        _settings = _load_modal_settings()
+        _save_folder = (_mo or {}).get("save_folder") or _settings.get("save_folder", "")
+        _save_sidecar = bool((_mo or {}).get("save_metadata_sidecar", _settings.get("save_metadata_sidecar", True)))
+        _conv_meta_list = result.get("_conversion_meta", []) if isinstance(result, dict) else []
+        _conv_by_nodefile: dict[tuple[str, str], dict] = {}
+        for cm in _conv_meta_list:
+            _conv_by_nodefile[(cm.get("node_id", ""), cm.get("filename", ""))] = cm
+
+        _seed = str(prompt_summary.get("seed", "0"))
+        _w = prompt_summary.get("width", 0)
+        _h = prompt_summary.get("height", 0)
+        _autosave_idx = 0
+        _saved_count = 0
+
+        # Collect all output entries from outputs dict
+        for _node_id, _node_out in outputs.items():
+            if not isinstance(_node_out, dict):
+                continue
+            for _out_key, _entries in _node_out.items():
+                if not isinstance(_entries, list):
+                    continue
+                if _out_key == "animated":
+                    continue
+                for _entry in _entries:
+                    if not isinstance(_entry, dict):
+                        continue
+                    _fname = _entry.get("filename", "")
+                    _fpath = os.path.join(output_dir, _fname)
+                    if not os.path.isfile(_fpath):
+                        continue
+                    try:
+                        _img_bytes = open(_fpath, "rb").read()
+                    except OSError as exc:
+                        _save_warnings.append(f"cannot read {_fpath}: {exc}")
+                        continue
+
+                    # Find matching conversion metadata
+                    _conv_meta = _conv_by_nodefile.get((_node_id, _fname), {})
+                    _fmt = _conv_meta.get("output_format", (_mo or {}).get("output_format", "original"))
+                    _ext = _conv_meta.get("file_ext", os.path.splitext(_fname)[1] or ".png")
+                    _mime = _conv_meta.get("mime_type", "image/png")
+                    _orig_size = _conv_meta.get("original_size_bytes", len(_img_bytes))
+                    _conv_time = _conv_meta.get("conversion_time_ms", 0)
+                    _qp = _conv_meta.get("quality")
+                    _wlc = _conv_meta.get("webp_lossless_compression")
+
+                    _save_result = save_output_image(
+                        _img_bytes,
+                        output_format=_fmt,
+                        file_ext=_ext,
+                        mime_type=_mime,
+                        quality=_qp,
+                        webp_lossless_compression=_wlc,
+                        original_size_bytes=_orig_size,
+                        conversion_time_ms=_conv_time,
+                        save_folder=_save_folder,
+                        save_metadata_sidecar=_save_sidecar,
+                        workflow_hash=prompt_hash,
+                        workflow_name="",
+                        seed=_seed,
+                        width=_w,
+                        height=_h,
+                        index=_autosave_idx,
+                        comfyui_root=_COMFYUI_ROOT,
+                    )
+                    _autosave_idx += 1
+                    _save_results.append(_save_result)
+                    if _save_result.get("saved"):
+                        _saved_count += 1
+                        print(
+                            f"[comfyui-modal.auto_save] saved: {_save_result.get('path', '')} "
+                            f"size={len(_img_bytes)}B"
+                        )
+                    if _save_result.get("error"):
+                        _save_warnings.append(_save_result["error"])
+
+        if _save_warnings:
+            print(f"[comfyui-modal.auto_save] warnings: {'; '.join(_save_warnings)}")
+        if _saved_count:
+            _send(sid, "modal_status", {
+                "prompt_id": prompt_id,
+                "message": f"Auto-saved {_saved_count} file(s)",
+                "phase": "auto_save",
+                "save_results": _save_results,
+                "save_warnings": _save_warnings,
+            })
+        elif _save_warnings:
+            _send(sid, "modal_status", {
+                "prompt_id": prompt_id,
+                "message": f"Auto-save warning: {'; '.join(_save_warnings)}",
+                "phase": "auto_save",
+                "save_warnings": _save_warnings,
+            })
+
     trace.mark("t10_local_materialized")
     _merged_trace = trace.summary()
     # Preserve restore timing from the Modal container's trace
@@ -1052,6 +1226,11 @@ if _server:
         prompt_summary = summarize_prompt_fields(workflow)
         model_stack = extract_model_stack(workflow)
 
+        # Extract modal_options from the body (set by frontend sidebar)
+        modal_options = body.get("modal_options", None)
+        if not isinstance(modal_options, dict):
+            modal_options = None
+
         import time
         async with _counter_lock:
             _item_counter += 1
@@ -1066,6 +1245,7 @@ if _server:
                 "model_stack": model_stack,
                 "gpu": selected_gpu,
                 "trace": {**trace.fields(), "prompt_id": prompt_id},
+                "modal_options": modal_options,
             }
             item = (_item_counter, prompt_id, workflow, extra_data, list(workflow.keys()), {})
 
@@ -1197,24 +1377,94 @@ if _server:
 
     @_server.routes.get("/comfymodal/config")
     async def modal_get_config(request: web.Request) -> web.Response:
+        settings = _load_modal_settings()
         return web.json_response({
             "gpu": get_gpu(),
             "default_gpu": get_default_gpu(),
             "available_gpus": get_available_gpus(),
+            "output_format": settings.get("output_format", "original"),
+            "quality": settings.get("quality", 75),
+            "webp_lossless_compression": settings.get("webp_lossless_compression", "balanced"),
+            "auto_save_local": settings.get("auto_save_local", False),
+            "save_folder": settings.get("save_folder", ""),
+            "save_metadata_sidecar": settings.get("save_metadata_sidecar", True),
         })
 
     @_server.routes.post("/comfymodal/config")
     async def modal_set_config(request: web.Request) -> web.Response:
         body = await request.json()
+        response_data = {"status": "ok"}
+
+        # Handle GPU setting (existing behavior)
         gpu = body.get("gpu", "")
-        if not gpu:
-            return web.json_response({"status": "error", "message": "gpu required"}, status=400)
+        if gpu:
+            try:
+                set_gpu(gpu)
+                response_data["gpu"] = get_gpu()
+            except ValueError as e:
+                return web.json_response({"status": "error", "message": str(e) or "Unsupported GPU"}, status=400)
+
+        # Handle output settings
+        _setting_keys = {
+            "output_format",
+            "quality",
+            "webp_lossless_compression",
+            "auto_save_local",
+            "save_folder",
+            "save_metadata_sidecar",
+        }
+        _settings_update = {}
+        for key in _setting_keys:
+            if key in body:
+                _settings_update[key] = body[key]
+        if _settings_update:
+            # Validate enum values
+            valid = True
+            _err_key = ""
+            if "output_format" in _settings_update and _settings_update["output_format"] not in OUTPUT_FORMATS:
+                valid = False
+                _err_key = "output_format"
+            if "quality" in _settings_update:
+                _q = _settings_update["quality"]
+                if not isinstance(_q, (int, float)) or _q < 0 or _q > 100:
+                    valid = False
+                    _err_key = "quality"
+            if "webp_lossless_compression" in _settings_update and _settings_update["webp_lossless_compression"] not in WEBP_LOSSLESS_COMPRESSION:
+                valid = False
+                _err_key = "webp_lossless_compression"
+            if not valid:
+                return web.json_response(
+                    {"status": "error", "message": f"invalid value for {_err_key}"}, status=400
+                )
+            _save_modal_settings(_settings_update)
+
+        return web.json_response(response_data)
+
+    @_server.routes.post("/comfymodal/open-folder")
+    async def modal_open_folder(request: web.Request) -> web.Response:
+        import platform
+        import subprocess as _sp
+        body = await request.json()
+        folder = (body.get("path") or body.get("folder") or "").strip()
+        if not folder:
+            return web.json_response({"status": "error", "message": "no path provided"}, status=400)
+        # Resolve relative paths against ComfyUI root
+        if not os.path.isabs(folder):
+            folder = os.path.join(_COMFYUI_ROOT, folder)
+        folder = os.path.normpath(folder)
+        if not os.path.isdir(folder):
+            os.makedirs(folder, exist_ok=True)
         try:
-            set_gpu(gpu)
-        except ValueError as e:
-            message = str(e) or "Unsupported GPU"
-            return web.json_response({"status": "error", "message": message}, status=400)
-        return web.json_response({"status": "ok", "gpu": get_gpu()})
+            _sys_name = platform.system()
+            if _sys_name == "Windows":
+                _sp.Popen(["explorer", folder], shell=True)
+            elif _sys_name == "Darwin":
+                _sp.Popen(["open", folder])
+            else:
+                _sp.Popen(["xdg-open", folder])
+        except Exception as exc:
+            return web.json_response({"status": "error", "message": str(exc)}, status=500)
+        return web.json_response({"status": "ok", "path": folder})
 
     @_server.routes.get("/comfymodal/health")
     async def modal_health(request: web.Request) -> web.Response:
