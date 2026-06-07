@@ -796,22 +796,33 @@ async def _execute_job(item: tuple, item_id: int):
             f"duration_ms={input_collect_ms} count={len(input_images)} bytes={input_collect_bytes}"
         )
 
-        activation_payload = _build_next_warmup_activation(workflow, prompt_hash)
-        try:
-            activation_result = await set_active_warmup_profile(activation_payload)
-            print(
-                f"[comfyui-modal] Armed active warmup profile token={activation_payload['profile_token']} "
-                f"workflow_hash={prompt_hash[:12]} disable_warmup={1 if activation_payload['disable_warmup'] else 0} result={activation_result}"
-            )
-        except Exception as exc:
-            print(f"[comfyui-modal] Failed to arm active warmup profile for {prompt_hash[:12]}: {exc}")
+        print(f"[predispatch] phase=before_active_next_write t={time.time()}")
+        if not os.environ.get("DISABLE_ACTIVE_NEXT_WRITE"):
+            activation_payload = _build_next_warmup_activation(workflow, prompt_hash)
+
+            async def _fire_and_forget_warmup():
+                try:
+                    activation_result = await set_active_warmup_profile(activation_payload)
+                    print(
+                        f"[comfyui-modal] Armed active warmup profile token={activation_payload['profile_token']} "
+                        f"workflow_hash={prompt_hash[:12]} disable_warmup={1 if activation_payload['disable_warmup'] else 0} result={activation_result}"
+                    )
+                except Exception as exc:
+                    print(f"[comfyui-modal] Failed to arm active warmup profile for {prompt_hash[:12]}: {exc}")
+
+            asyncio.create_task(_fire_and_forget_warmup())
+        else:
+            print(f"[predispatch] active_next_write SKIPPED (DISABLE_ACTIVE_NEXT_WRITE=1)")
+        print(f"[predispatch] phase=after_active_next_write t={time.time()}")
 
         remote_started = time.time()
         trace.mark("t2_local_dispatch")
+        print(f"[predispatch] phase=before_gpu_spawn t={time.time()}")
         # Stream prompt execution with real-time progress from the Modal
         # container.  Progress events (executing, progress, execution_start)
         # are forwarded to the ComfyUI frontend as they arrive.
         _modal_result = None
+        _first_msg = True
         async for _msg in run_prompt_stream(
             workflow,
             input_images,
@@ -819,6 +830,9 @@ async def _execute_job(item: tuple, item_id: int):
             gpu=extra_data.get("gpu"),
             modal_options=extra_data.get("modal_options"),
         ):
+            if _first_msg:
+                _first_msg = False
+                print(f"[predispatch] phase=first_gpu_response t={time.time()}")
             if not isinstance(_msg, dict):
                 continue
             if _msg["type"] == "progress":
@@ -1219,19 +1233,21 @@ if _server:
         if browser_t0 is not None:
             trace.mark("t0_client_press", browser_t0)
         trace.mark("t1_local_recv")
+        print(f"[predispatch] phase=recv t={time.time()}")
 
         # Compute prompt integrity metadata (carried in extra_data, never mutates workflow)
+        print(f"[predispatch] phase=before_stack_extract t={time.time()}")
         local_payload_hash = prompt_sha256(body)
         workflow_hash = prompt_sha256(workflow)
         prompt_summary = summarize_prompt_fields(workflow)
         model_stack = extract_model_stack(workflow)
+        print(f"[predispatch] phase=after_stack_extract t={time.time()}")
 
         # Extract modal_options from the body (set by frontend sidebar)
         modal_options = body.get("modal_options", None)
         if not isinstance(modal_options, dict):
             modal_options = None
 
-        import time
         async with _counter_lock:
             _item_counter += 1
             item_id = _item_counter
@@ -1248,6 +1264,7 @@ if _server:
                 "modal_options": modal_options,
             }
             item = (_item_counter, prompt_id, workflow, extra_data, list(workflow.keys()), {})
+            print(f"[predispatch] prompt_bytes={len(json.dumps(body).encode('utf-8'))}")
 
         pq = _pq()
         if pq:
