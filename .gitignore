@@ -2,10 +2,12 @@ __pycache__/
 *.pyc
 *.pyo
 .deployed_version
+.deployed_state.json
 .env
 .hf_token
 .custom_nodes.json
 .deploy_log
+.custom_node_requirements/
 benchmark_logs/
 benchmark_runs/
 optimization_logs/

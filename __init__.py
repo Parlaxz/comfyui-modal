@@ -11,6 +11,7 @@ import threading
 import subprocess
 import time
 from collections import namedtuple
+from pathlib import Path
 
 _NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 if _NODE_DIR not in sys.path:
@@ -46,8 +47,12 @@ def _unique_path(directory: str, filename: str) -> str:
     return os.path.join(directory, f"{stem}_{suffix}{ext}")
 _COMFYAPP_PATH = os.path.join(_NODE_DIR, "comfyapp.py")
 _DEPLOY_STATE_FILE = os.path.join(_NODE_DIR, ".deployed_version")
+_DEPLOY_STATE_JSON_FILE = os.path.join(_NODE_DIR, ".deployed_state.json")
 _DEPLOY_LOG_FILE = os.path.join(_NODE_DIR, ".deploy_log")
 _LATEST_BENCHMARK_WORKFLOW_FILE = os.path.join(_NODE_DIR, "latest_benchmark_workflow.json")
+
+_CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
+_CUSTOM_NODE_SYNC_EXCLUDE_EXTENSIONS = {".pyc", ".pyo"}
 
 _pip_install_error = ""
 _WORKFLOW_IMAGE_SUFFIX_DIRS = {
@@ -144,16 +149,83 @@ def _save_latest_benchmark_workflow(payload: dict) -> dict:
     _latest_benchmark_workflow = snapshot
     return dict(snapshot)
 
-def _get_deployed_version():
+def _custom_nodes_root() -> str:
+    return os.path.join(os.path.dirname(os.path.dirname(_NODE_DIR)), "custom_nodes")
+
+
+def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
+    if not os.path.isdir(cn_root):
+        return []
+    names = []
+    for node_dir in os.listdir(cn_root):
+        node_path = os.path.join(cn_root, node_dir)
+        if not os.path.isdir(node_path):
+            continue
+        if node_dir.startswith(".") or node_dir in _CUSTOM_NODE_SYNC_EXCLUDE_DIRS:
+            continue
+        names.append(node_dir)
+    return sorted(names)
+
+
+def _build_custom_node_fingerprint(cn_root: str) -> str:
+    manifest = []
+    for node_dir in _iter_syncable_custom_node_dirs(cn_root):
+        req_path = os.path.join(cn_root, node_dir, "requirements.txt")
+        req_text = ""
+        if os.path.isfile(req_path):
+            req_text = Path(req_path).read_text(encoding="utf-8")
+        manifest.append({
+            "node": node_dir,
+            "requirements_txt": req_text,
+        })
+    payload = json.dumps(manifest, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _load_deploy_state() -> dict:
     try:
-        with open(_DEPLOY_STATE_FILE, "r") as f:
-            return f.read().strip()
+        with open(_DEPLOY_STATE_JSON_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            return {
+                "comfyapp_version": payload.get("comfyapp_version"),
+                "custom_nodes_fingerprint": payload.get("custom_nodes_fingerprint"),
+            }
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+
+    legacy_version = None
+    try:
+        with open(_DEPLOY_STATE_FILE, "r", encoding="utf-8") as f:
+            legacy_version = f.read().strip() or None
     except FileNotFoundError:
-        return None
+        legacy_version = None
+
+    return {
+        "comfyapp_version": legacy_version,
+        "custom_nodes_fingerprint": None,
+    }
+
+
+def _save_deploy_state(version: str | None, fingerprint: str | None) -> None:
+    payload = {
+        "comfyapp_version": version,
+        "custom_nodes_fingerprint": fingerprint,
+    }
+    with open(_DEPLOY_STATE_JSON_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def _get_deployed_version():
+    return _load_deploy_state().get("comfyapp_version")
+
 
 def _set_deployed_version(version: str):
-    with open(_DEPLOY_STATE_FILE, "w") as f:
-        f.write(version)
+    _save_deploy_state(version, _get_deployed_custom_nodes_fingerprint())
+
+
+def _get_deployed_custom_nodes_fingerprint():
+    return _load_deploy_state().get("custom_nodes_fingerprint")
 
 def _get_comfyapp_version():
     try:
@@ -208,7 +280,7 @@ def _parse_deploy_error(output):
     return ""
 
 
-def _run_deploy_background():
+def _run_deploy_background(custom_nodes_fingerprint: str | None = None):
     global _deploy_status
 
     modal_cmd = _find_modal_executable()
@@ -244,7 +316,7 @@ def _run_deploy_background():
 
         if result.returncode == 0:
             version = _get_comfyapp_version()
-            _set_deployed_version(version)
+            _save_deploy_state(version, custom_nodes_fingerprint)
             _deploy_status = {"state": "ready", "message": f"Deployed v{version}"}
             print(f"[comfyui-modal] Deploy succeeded (v{version})")
             if _modal_available:
@@ -275,19 +347,54 @@ def _run_deploy_background():
         _deploy_status = {"state": "error", "message": str(e), "details": str(e)}
         print(f"[comfyui-modal] Deploy error: {e}")
 
-def _maybe_auto_deploy():
+def _start_background_deploy(custom_nodes_fingerprint: str | None, reason: str) -> dict:
+    global _deploy_status
+    if _deploy_status.get("state") == "deploying":
+        return {"started": False, "reason": "deploy_already_running"}
+    _deploy_status = {"state": "deploying", "message": "Running modal deploy..."}
+    thread = threading.Thread(
+        target=_run_deploy_background,
+        kwargs={"custom_nodes_fingerprint": custom_nodes_fingerprint},
+        daemon=True,
+    )
+    thread.start()
+    return {"started": True, "reason": reason}
+
+
+def _ensure_modal_deploy_current(custom_nodes_fingerprint: str | None = None) -> dict:
     current_version = _get_comfyapp_version()
-    deployed_version = _get_deployed_version()
+    deployed = _load_deploy_state()
+    deployed_version = deployed.get("comfyapp_version")
+    deployed_fingerprint = deployed.get("custom_nodes_fingerprint")
 
-    if current_version == deployed_version:
-        _deploy_status["state"] = "ready"
-        _deploy_status["message"] = f"Already deployed v{current_version}"
-        print(f"[comfyui-modal] comfyapp.py v{current_version} already deployed — skipping deploy")
+    if current_version != deployed_version:
+        return _start_background_deploy(
+            custom_nodes_fingerprint=custom_nodes_fingerprint,
+            reason="version_changed",
+        )
+
+    if custom_nodes_fingerprint != deployed_fingerprint:
+        return _start_background_deploy(
+            custom_nodes_fingerprint=custom_nodes_fingerprint,
+            reason="custom_nodes_changed",
+        )
+
+    return {"started": False, "reason": "already_current"}
+
+
+def _maybe_auto_deploy():
+    if os.environ.get("COMFYMODAL_RUNTIME") == "1":
         return
-
-    print(f"[comfyui-modal] Version changed ({deployed_version} -> {current_version}), starting background deploy...")
-    t = threading.Thread(target=_run_deploy_background, daemon=True)
-    t.start()
+    if not _find_modal_executable():
+        return
+    fingerprint = _build_custom_node_fingerprint(_custom_nodes_root())
+    decision = _ensure_modal_deploy_current(fingerprint)
+    if decision["started"]:
+        print(f"[comfyui-modal] background deploy started ({decision['reason']})")
+    else:
+        _deploy_status["state"] = "ready"
+        _deploy_status["message"] = "Already deployed and current"
+        print("[comfyui-modal] deploy state already current - skipping deploy")
 
 try:
     from server import PromptServer
@@ -832,6 +939,51 @@ async def _execute_job(item: tuple, item_id: int):
     )
 
 
+def _build_custom_nodes_archive(cn_root: str) -> bytes:
+    import io
+    import tarfile
+
+    def tar_filter(tarinfo):
+        parts = tarinfo.name.split("/")
+        for part in parts:
+            if part in _CUSTOM_NODE_SYNC_EXCLUDE_DIRS:
+                return None
+        if any(tarinfo.name.endswith(ext) for ext in _CUSTOM_NODE_SYNC_EXCLUDE_EXTENSIONS):
+            return None
+        return tarinfo
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for node_dir in _iter_syncable_custom_node_dirs(cn_root):
+            tar.add(os.path.join(cn_root, node_dir), arcname=node_dir, filter=tar_filter)
+    return buf.getvalue()
+
+
+async def _sync_custom_nodes_and_maybe_deploy(cn_root: str) -> dict:
+    fingerprint = _build_custom_node_fingerprint(cn_root)
+    archive_data = _build_custom_nodes_archive(cn_root)
+    result = await sync_custom_nodes(archive_data)
+
+    if result.get("status") != "ok":
+        return result
+
+    result["deploy"] = _ensure_modal_deploy_current(fingerprint)
+
+    try:
+        refresh_result = await resync_runtime("custom_nodes")
+        result["refresh"] = refresh_result
+    except Exception as e:
+        result["refresh_error"] = str(e)
+        result["message"] = (
+            "Custom nodes synced to Modal Volume, but the running Modal ComfyUI process could not be refreshed automatically. "
+            "Try again after the container sleeps, or redeploy if the node is still missing."
+        )
+    else:
+        result.setdefault("message", "Custom nodes synced to Modal.")
+
+    return result
+
+
 if _server:
     @_server.routes.get("/comfymodal/auth/status")
     async def modal_auth_status(request: web.Request) -> web.Response:
@@ -1310,61 +1462,13 @@ if _server:
 
     @_server.routes.post("/comfymodal/sync/custom-nodes")
     async def modal_sync_custom_nodes(request: web.Request) -> web.Response:
-        """Package local custom_nodes directory and upload to Modal volume."""
-        import tarfile
-        import io
-
         cn_root = os.path.join(_COMFYUI_ROOT, "custom_nodes")
         if not os.path.isdir(cn_root):
             return web.json_response({"status": "error", "message": "custom_nodes directory not found"}, status=400)
 
-        # Exclusion patterns
-        exclude_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv"}
-        exclude_extensions = {".pyc", ".pyo"}
-
-        def tar_filter(tarinfo):
-            # Skip excluded directories and files
-            parts = tarinfo.name.split("/")
-            for part in parts:
-                if part in exclude_dirs:
-                    return None
-            if any(tarinfo.name.endswith(ext) for ext in exclude_extensions):
-                return None
-            return tarinfo
-
-        # Create tar.gz archive
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            for node_dir in os.listdir(cn_root):
-                node_path = os.path.join(cn_root, node_dir)
-                if not os.path.isdir(node_path):
-                    continue
-                if node_dir.startswith(".") or node_dir == "__pycache__":
-                    continue
-                tar.add(node_path, arcname=node_dir, filter=tar_filter)
-
-        archive_data = buf.getvalue()
-
         try:
-            result = await sync_custom_nodes(archive_data)
-            refresh_result = None
-            refresh_error = None
-            if result.get("status") == "ok":
-                try:
-                    refresh_result = await resync_runtime("custom_nodes")
-                except Exception as e:
-                    refresh_error = str(e)
-            if refresh_result is not None:
-                result["refresh"] = refresh_result
-            if refresh_error is not None:
-                result["refresh_error"] = refresh_error
-                result["message"] = (
-                    "Custom nodes synced to Modal Volume, but the running Modal ComfyUI process could not be refreshed automatically. "
-                    "Try again after the container sleeps, or redeploy if the node is still missing."
-                )
-            else:
-                result["message"] = "Custom nodes synced to Modal and the Modal ComfyUI process was refreshed."
-            return web.json_response(result)
+            result = await _sync_custom_nodes_and_maybe_deploy(cn_root)
+            return web.json_response(result, status=200 if result.get("status") == "ok" else 500)
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 

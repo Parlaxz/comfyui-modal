@@ -1,0 +1,12 @@
+.git/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+node_modules/
+.gitignore
+*.md
+.deploy_log
+.tmp
+*.tmp

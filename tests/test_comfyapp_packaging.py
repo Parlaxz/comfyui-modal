@@ -43,6 +43,25 @@ class ComfyAppPackagingTests(unittest.TestCase):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
         self.assertIn("print('sageattention._fused ok')", source)
 
+    def test_image_build_uses_dedicated_requirements_path(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn("/root/comfy-build/custom_node_requirements", source)
+
+    def test_requirements_add_local_dir_appears_before_pip_install(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        req_add = '"/root/comfy-build/custom_node_requirements"'
+        pip_install = 'pip install -r "$req"'
+        self.assertLess(source.index(req_add), source.index(pip_install))
+
+    def test_image_uses_per_node_add_local_dir_not_monolithic(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        # The monolithic add_local_dir for _LOCAL_CUSTOM_NODES must be gone.
+        # The f-string pattern (with the "f" prefix before the opening quote)
+        # is the new per-node form, which should be present.
+        self.assertNotIn("add_local_dir(\n        _LOCAL_CUSTOM_NODES,", source)
+        self.assertIn("_iter_syncable_custom_node_dirs", source)
+        self.assertIn('f"/root/comfy/ComfyUI/custom_nodes/{_node_name}"', source)
+
 
 if __name__ == "__main__":
     unittest.main()
