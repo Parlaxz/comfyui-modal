@@ -5609,6 +5609,7 @@ class _ComfyAPIMixin:
         server_trace = Trace(prompt_id=prompt_id_hint, t0=t0)
         server_trace.update(trace)
         server_trace.mark("t3_modal_entry")
+        print(f"[predispatch] phase=modal_entry t={time.time()}")
 
         _prog_q = _qm.Queue()
         self._prog_queue = _prog_q
