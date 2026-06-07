@@ -3,11 +3,11 @@ import os
 DEFAULT_GPU = "rtx-pro-6000"
 
 GPU_CATALOG = [
+    {"value": "rtx-pro-6000", "label": "RTX PRO 6000", "modal_gpu": "rtx-pro-6000", "class_name": "ComfyAPI_RTX_PRO_6000", "profile": "high_mem"},
     {"value": "t4", "label": "T4", "modal_gpu": "t4", "class_name": "ComfyAPI_T4", "profile": "budget"},
     {"value": "l4", "label": "L4", "modal_gpu": "l4", "class_name": "ComfyAPI_L4", "profile": "standard"},
     {"value": "a10g", "label": "A10G", "modal_gpu": "a10g", "class_name": "ComfyAPI", "profile": "standard"},
     {"value": "l40s", "label": "L40S", "modal_gpu": "l40s", "class_name": "ComfyAPI_L40S", "profile": "high_mem"},
-    {"value": "rtx-pro-6000", "label": "RTX PRO 6000", "modal_gpu": "rtx-pro-6000", "class_name": "ComfyAPI_RTX_PRO_6000", "profile": "high_mem"},
     {"value": "a100", "label": "A100 (default 40GB)", "modal_gpu": "a100", "class_name": "ComfyAPI_A100", "profile": "high_mem"},
     {"value": "a100-40gb", "label": "A100-40GB", "modal_gpu": "a100-40gb", "class_name": "ComfyAPI_A100_40GB", "profile": "high_mem"},
     {"value": "a100-80gb", "label": "A100-80GB", "modal_gpu": "a100-80gb", "class_name": "ComfyAPI_A100_80GB", "profile": "high_mem"},

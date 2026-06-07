@@ -43,6 +43,18 @@ def _collect_call_attrs(method_body):
     }
 
 
+def _count_direct_calls(method_body, obj_name: str, attr_name: str) -> int:
+    return sum(
+        1
+        for node in ast.walk(method_body)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == obj_name
+        and node.func.attr == attr_name
+    )
+
+
 def _collect_attribute_reads(method_body):
     """Return {(obj_name, attr_name)} for every attribute read obj.attr in an AST node body."""
     return {
@@ -54,6 +66,16 @@ def _collect_attribute_reads(method_body):
 
 
 class ComfyAppVolumeLifecycleTests(unittest.TestCase):
+    def test_sync_helper_reloads_custom_node_volume_once(self):
+        helper = _get_method("_sync_custom_nodes_from_volume")
+        self.assertEqual(_count_direct_calls(helper, "custom_nodes_vol", "reload"), 1)
+
+    def test_restore_and_run_prompt_do_not_directly_reload_custom_node_volume(self):
+        restore = _get_method("restore")
+        run_prompt = _get_method("run_prompt")
+        self.assertEqual(_count_direct_calls(restore, "custom_nodes_vol", "reload"), 0)
+        self.assertEqual(_count_direct_calls(run_prompt, "custom_nodes_vol", "reload"), 0)
+
     def test_run_prompt_does_not_reload_modal_volume(self):
         # NOTE: AST-level check only catches *direct* calls (same limitation
         # as test_restore_does_not_reload_or_sync).  Indirect calls via a
@@ -66,18 +88,15 @@ class ComfyAppVolumeLifecycleTests(unittest.TestCase):
         seen = _collect_call_attrs(run_prompt)
         self.assertTrue(forbidden.isdisjoint(seen), f"Found reload calls in run_prompt: {seen & forbidden}")
 
-    def test_restore_does_not_reload_or_sync(self):
-        # NOTE: This AST-level check only catches *direct* calls within the
-        # restore() method body.  Calls hidden behind delegation (e.g.
-        # _sync_custom_nodes_from_volume → custom_nodes_vol.reload) are
-        # NOT visible to this parser.  The intent is to enforce that
-        # restore() stays trivially lightweight at the source level so
-        # snapshot restore is nearly free.
+    def test_restore_delegates_sync_to_helper(self):
+        # restore() must NOT call custom_nodes_vol.reload() directly;
+        # that is handled by _sync_custom_nodes_from_volume().
+        # vol.reload() IS allowed — the models volume must be refreshed
+        # before _snapshot_preload_paths resolves model file locations,
+        # otherwise stale FUSE cache causes NOT FOUND errors.
         restore = _get_method("restore")
         forbidden = {
-            ("vol", "reload"),
             ("custom_nodes_vol", "reload"),
-            ("self", "_sync_custom_nodes_from_volume"),
         }
         seen = _collect_call_attrs(restore)
         self.assertTrue(forbidden.isdisjoint(seen), f"Found forbidden calls in restore: {seen & forbidden}")
@@ -111,6 +130,27 @@ class ComfyAppVolumeLifecycleTests(unittest.TestCase):
             ("self", "_http_client"),
             read_attrs,
             "restore() must use _http_client to probe local ComfyUI health",
+        )
+
+    def test_restore_installs_custom_node_requirements_before_reinit(self):
+        restore = _get_method("restore")
+        restore_source = ast.get_source_segment(COMFYAPP_PATH.read_text(encoding="utf-8"), restore) or ""
+        install_idx = restore_source.find("self._install_custom_node_requirements()")
+        reinit_idx = restore_source.find("_restore_nodes.init_extra_nodes()")
+        self.assertGreaterEqual(
+            install_idx,
+            0,
+            "restore() must install custom node requirements before re-registering new nodes",
+        )
+        self.assertGreaterEqual(
+            reinit_idx,
+            0,
+            "restore() must still re-register synced custom nodes",
+        )
+        self.assertLess(
+            install_idx,
+            reinit_idx,
+            "restore() must install custom node requirements before init_extra_nodes()",
         )
 
     def test_startup_defers_sageattention_cuda_compile_until_restore(self):

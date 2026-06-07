@@ -2,6 +2,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,7 @@ DEFAULT_EXECUTION_BACKEND = os.getenv("COMFYMODAL_EXECUTION_BACKEND", "in_proces
 ENABLE_WARMUP = os.getenv("COMFYMODAL_ENABLE_WARMUP", "1") == "1"
 ENABLE_TORCH_COMPILE = os.getenv("COMFYMODAL_ENABLE_TORCH_COMPILE", "0") == "1"
 ENABLE_GPU_SNAPSHOT = os.getenv("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1"
+CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S = int(os.getenv("COMFYMODAL_CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S", "180"))
 WARMUP_PROFILE = os.getenv("COMFYMODAL_WARMUP_PROFILE", "off")
 WARMUP_CHECKPOINT = os.getenv("COMFYMODAL_WARMUP_CHECKPOINT", "").strip()
 WARMUP_UNET = os.getenv("COMFYMODAL_WARMUP_UNET", "").strip()
@@ -66,18 +68,8 @@ SAGE_RUNTIME_MODE = os.getenv("COMFYMODAL_SAGE_RUNTIME_MODE", "auto").strip().lo
 SAGE_RUNTIME_PROBE_ON_RESTORE = os.getenv("COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE", "1") == "1"
 PRELOAD_MODE_PATH = "/root/models/.preload_mode"
 RUNTIME_CONFIG_DIR = "/root/models/runtime_config"
-RUNTIME_WCE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "warmup_clip_encode.txt")
 RUNTIME_RETURN_MODE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "return_mode.txt")
-RUNTIME_CLIP_CACHE_CLEAR_PATH = os.path.join(RUNTIME_CONFIG_DIR, "clear_clip_encode_cache.txt")
-RUNTIME_EXEC_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "exec_profile.txt")
-RUNTIME_SAMPLER_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "sampler_profile.txt")
-RUNTIME_GUIDER_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "guider_profile.txt")
-RUNTIME_DEEP_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "deep_profile.txt")
-RUNTIME_LMG_FASTPATH_DRYRUN_PATH = os.path.join(RUNTIME_CONFIG_DIR, "lmg_fastpath_dryrun.txt")
-RUNTIME_LMG_FASTPATH_PATH = os.path.join(RUNTIME_CONFIG_DIR, "lmg_fastpath.txt")
-RUNTIME_MODELPATCHER_CACHE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "modelpatcher_cache.txt")
-RUNTIME_MODELPATCHER_CACHE_DRYRUN_PATH = os.path.join(RUNTIME_CONFIG_DIR, "modelpatcher_cache_dryrun.txt")
-RUNTIME_MODELPATCHER_TRACE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "modelpatcher_trace.txt")
+
 _WORKFLOW_IMAGE_SUFFIX_DIRS = {
     " [output]": "output",
     " [input]": "input",
@@ -251,26 +243,6 @@ def _resolve_preload_mode() -> str:
     return PRELOAD_MODE
 
 
-def _resolve_wce() -> tuple[bool, str]:
-    """Return (enabled, source) for warmup CLIP encode.
-
-    Priority:
-    1. File on the model volume (set by ``set_warmup_clip_encode``).
-    2. Env var ``COMFYMODAL_WARMUP_CLIP_ENCODE`` (default ``"0"``).
-    """
-    try:
-        if os.path.isfile(RUNTIME_WCE_PATH):
-            _v = open(RUNTIME_WCE_PATH).read().strip().lower()
-            if _v in ("1", "true", "on"):
-                return True, "file"
-            if _v in ("0", "false", "off"):
-                return False, "file"
-    except Exception:
-        pass
-    _env = os.environ.get("COMFYMODAL_WARMUP_CLIP_ENCODE", "1").strip().lower()
-    return _env in ("1", "true", "on"), "env"
-
-
 def _resolve_return_mode() -> str:
     """Return the effective return mode.
 
@@ -285,162 +257,14 @@ def _resolve_return_mode() -> str:
                 return _v
     except Exception:
         pass
-    return os.environ.get("COMFYMODAL_RETURN_MODE", "full_base64").strip().lower()
-
-
-def _resolve_exec_profile() -> bool:
-    """Return whether executor profiling is enabled.
-
-    Priority:
-    1. File on the model volume (set by ``set_exec_profile``).
-    2. Env var ``COMFYMODAL_EXEC_PROFILE`` (default ``"0"``).
-    """
-    try:
-        if os.path.isfile(RUNTIME_EXEC_PROFILE_PATH):
-            _v = open(RUNTIME_EXEC_PROFILE_PATH).read().strip().lower()
-            return _v in ("1", "true", "on")
-    except Exception:
-        pass
-    return os.environ.get("COMFYMODAL_EXEC_PROFILE", "0").strip().lower() in ("1", "true", "on")
-
-
-def _resolve_clip_cache_clear() -> bool:
-    """Return True if CLIP encode cache should be cleared on restore.
-
-    Priority:
-    1. File on the model volume (set by ``set_clear_clip_encode_cache``).
-    2. Env var ``COMFYMODAL_CLEAR_CLIP_ENCODE_CACHE`` (default ``"0"``).
-    """
-    try:
-        if os.path.isfile(RUNTIME_CLIP_CACHE_CLEAR_PATH):
-            _v = open(RUNTIME_CLIP_CACHE_CLEAR_PATH).read().strip().lower()
-            return _v in ("1", "true", "on")
-    except Exception:
-        pass
-    return os.environ.get("COMFYMODAL_CLEAR_CLIP_ENCODE_CACHE", "0").strip().lower() in ("1", "true", "on")
-
-
-def _resolve_sampler_profile() -> bool:
-    """Return whether sampler internal profiling is enabled.
-
-    Priority:
-    1. File on the model volume (set by ``set_sampler_profile``).
-    2. Env var ``COMFYMODAL_SAMPLER_PROFILE`` (default ``"0"``).
-    """
-    try:
-        if os.path.isfile(RUNTIME_SAMPLER_PROFILE_PATH):
-            _v = open(RUNTIME_SAMPLER_PROFILE_PATH).read().strip().lower()
-            return _v in ("1", "true", "on")
-    except Exception:
-        pass
-    return os.environ.get("COMFYMODAL_SAMPLER_PROFILE", "0").strip().lower() in ("1", "true", "on")
-
-
-def _resolve_guider_profile() -> bool:
-    """Return whether guider overhead profiling is enabled.
-
-    Priority:
-    1. File on the model volume (set by ``set_guider_profile``).
-    2. Env var ``COMFYMODAL_GUIDER_PROFILE`` (default ``"0"``).
-    """
-    try:
-        if os.path.isfile(RUNTIME_GUIDER_PROFILE_PATH):
-            _v = open(RUNTIME_GUIDER_PROFILE_PATH).read().strip().lower()
-            return _v in ("1", "true", "on")
-    except Exception:
-        pass
-    return os.environ.get("COMFYMODAL_GUIDER_PROFILE", "0").strip().lower() in ("1", "true", "on")
-
-
-def _resolve_deep_profile() -> bool:
-    """Return whether deep sampler wrapper profiling is enabled.
-
-    Priority:
-    1. File on the model volume (set by ``set_deep_profile``).
-    2. Env var ``COMFYMODAL_DEEP_PROFILE`` (default ``"0"``).
-    """
-    try:
-        if os.path.isfile(RUNTIME_DEEP_PROFILE_PATH):
-            _v = open(RUNTIME_DEEP_PROFILE_PATH).read().strip().lower()
-            return _v in ("1", "true", "on")
-    except Exception:
-        pass
-    return os.environ.get("COMFYMODAL_DEEP_PROFILE", "0").strip().lower() in ("1", "true", "on")
-
-
-def _resolve_lmg_fastpath_dryrun() -> bool:
-    """Return whether LMG fast-path dry-run diagnostics are enabled.
-
-    Priority:
-    1. File on the model volume.
-    2. Env var ``COMFYMODAL_LMG_FASTPATH_DRYRUN`` (default ``"0"``).
-    """
-    try:
-        if os.path.isfile(RUNTIME_LMG_FASTPATH_DRYRUN_PATH):
-            _v = open(RUNTIME_LMG_FASTPATH_DRYRUN_PATH).read().strip().lower()
-            return _v in ("1", "true", "on")
-    except Exception:
-        pass
-    return os.environ.get("COMFYMODAL_LMG_FASTPATH_DRYRUN", "0").strip().lower() in ("1", "true", "on")
-
-
-def _resolve_lmg_fastpath() -> bool:
-    """Return whether LMG fast-path is enabled (active skip).
-
-    Priority:
-    1. File on the model volume.
-    2. Env var ``COMFYMODAL_LMG_FASTPATH`` (default ``"0"``).
-    """
-    try:
-        if os.path.isfile(RUNTIME_LMG_FASTPATH_PATH):
-            _v = open(RUNTIME_LMG_FASTPATH_PATH).read().strip().lower()
-            return _v in ("1", "true", "on")
-    except Exception:
-        pass
-    return os.environ.get("COMFYMODAL_LMG_FASTPATH", "0").strip().lower() in ("1", "true", "on")
-
-
-def _resolve_modelpatcher_cache() -> bool:
-    """Return whether canonical ModelPatcher cache is enabled."""
-    try:
-        if os.path.isfile(RUNTIME_MODELPATCHER_CACHE_PATH):
-            _v = open(RUNTIME_MODELPATCHER_CACHE_PATH).read().strip().lower()
-            return _v in ("1", "true", "on")
-    except Exception:
-        pass
-    return os.environ.get("COMFYMODAL_MODELPATCHER_CACHE", "0").strip().lower() in ("1", "true", "on")
-
-
-def _resolve_modelpatcher_cache_dryrun() -> bool:
-    """Return whether canonical ModelPatcher cache dry-run is enabled."""
-    try:
-        if os.path.isfile(RUNTIME_MODELPATCHER_CACHE_DRYRUN_PATH):
-            _v = open(RUNTIME_MODELPATCHER_CACHE_DRYRUN_PATH).read().strip().lower()
-            return _v in ("1", "true", "on")
-    except Exception:
-        pass
-    return os.environ.get("COMFYMODAL_MODELPATCHER_CACHE_DRYRUN", "0").strip().lower() in ("1", "true", "on")
-
-
-def _resolve_modelpatcher_trace() -> bool:
-    """Return whether ModelPatcher lineage trace is enabled."""
-    try:
-        if os.path.isfile(RUNTIME_MODELPATCHER_TRACE_PATH):
-            _v = open(RUNTIME_MODELPATCHER_TRACE_PATH).read().strip().lower()
-            return _v in ("1", "true", "on")
-    except Exception:
-        pass
-    return os.environ.get("COMFYMODAL_MODELPATCHER_TRACE", "0").strip().lower() in ("1", "true", "on")
-
 
 _EXCLUDED_CUSTOM_NODE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
 
 # ── Custom-node volume helpers ────────────────────────────────────────────
 # These are intentionally duplicated (inlined) here rather than imported from
-# `custom_node_sync.py` to keep Modal packaging simple.  Modal serialises the
+# a sibling module to keep Modal packaging simple.  Modal serialises the
 # entire module closure; importing a sibling module would require an explicit
-# `modal.Image` dependency or risk missing files at deploy time.  Keep these
-# helpers in sync with `custom_node_sync.py` if changes are made there.
+# `modal.Image` dependency or risk missing files at deploy time.
 
 def _safe_listdir(path: str) -> list[str]:
     if not os.path.isdir(path):
@@ -478,16 +302,23 @@ def missing_expected_nodes(state: tuple, expected_nodes: list[str]) -> list[str]
     return [name for name in expected_nodes if name not in visible]
 
 
-def sync_custom_nodes_into_comfy(volume_root: str, comfy_custom_nodes_root: str) -> dict:
+def sync_custom_nodes_into_comfy(volume_root: str, comfy_custom_nodes_root: str, include_state: bool = False) -> dict:
     volume_root = os.path.abspath(volume_root)
     comfy_custom_nodes_root = os.path.abspath(comfy_custom_nodes_root)
     os.makedirs(comfy_custom_nodes_root, exist_ok=True)
 
-    volume_dirs = {
-        name
-        for name in _safe_listdir(volume_root)
-        if os.path.isdir(os.path.join(volume_root, name)) and name not in _EXCLUDED_CUSTOM_NODE_DIRS
-    }
+    volume_dirs = []
+    state = []
+    for name in _safe_listdir(volume_root):
+        path = os.path.join(volume_root, name)
+        if not os.path.isdir(path) or name in _EXCLUDED_CUSTOM_NODE_DIRS:
+            continue
+        volume_dirs.append(name)
+        if include_state:
+            stat = os.stat(path)
+            req_file = os.path.join(path, "requirements.txt")
+            req_mtime_ns = os.stat(req_file).st_mtime_ns if os.path.isfile(req_file) else None
+            state.append((name, stat.st_mtime_ns, req_mtime_ns))
 
     removed = []
     created = []
@@ -510,19 +341,33 @@ def sync_custom_nodes_into_comfy(volume_root: str, comfy_custom_nodes_root: str)
             kept.append(name)
             continue
         if os.path.lexists(dst):
-            blocked.append(name)
-            continue
+            # A real directory (not a volume-managed symlink) is blocking
+            # the symlink.  The volume is the source of truth for custom
+            # nodes, so remove the directory and replace it with a symlink.
+            # This handles the case where a previous image or snapshot
+            # installed the node as a real directory.
+            if os.path.isdir(dst) and not os.path.islink(dst):
+                import shutil
+                shutil.rmtree(dst)
+                print(f"[comfyapp] sync: replaced real directory with volume symlink name={name}")
+            else:
+                os.unlink(dst)
         os.symlink(src, dst)
         created.append(name)
 
-    return {
+    result = {
         "created": created,
         "removed": removed,
         "kept": kept,
         "blocked": blocked,
     }
+    if include_state:
+        result["state"] = tuple(state)
+    print(f"[comfyapp] sync_custom_nodes_into_comfy: created={len(created)} kept={len(kept)} "
+          f"removed={len(removed)} blocked={len(blocked)} volume_dirs={len(volume_dirs)}")
+    return result
 
-RUNTIME_METADATA_PATH = "/root/comfy/runtime_metadata.json"
+RUNTIME_METADATA_PATH = "/root/models/runtime_config/runtime_metadata.json"
 
 
 def requirements_file_hash(path: str) -> str | None:
@@ -530,6 +375,91 @@ def requirements_file_hash(path: str) -> str | None:
     if not os.path.isfile(path):
         return None
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+_REQ_TOP_LEVEL_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]*")
+
+
+def _iter_top_level_requirement_names(req_path: str) -> list[str]:
+    """Yield top-level distribution names from a requirements.txt.
+
+    Skips comments, blank lines, pip flags (``-r``, ``--editable``), local
+    paths (``./foo``), and VCS / URL sources. Extras like ``package[gpu]==1.0``
+    are normalised to the base distribution name.
+    """
+    if not os.path.isfile(req_path):
+        return []
+    names: list[str] = []
+    for raw in Path(req_path).read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Strip inline environment markers
+        line = line.split(";", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("-r") or line.startswith("--requirement"):
+            continue
+        if line.startswith("-c") or line.startswith("--constraint"):
+            continue
+        if line.startswith("-e ") or line.startswith("--editable "):
+            line = line.split(" ", 1)[1].strip()
+        if line.startswith("./") or line.startswith("../") or line.startswith("/"):
+            continue
+        if "://" in line:
+            continue
+        match = _REQ_TOP_LEVEL_NAME.match(line)
+        if not match:
+            continue
+        # Skip packages whose platform marker doesn't match the current platform.
+        # This avoids false missing-distribution detection for conditionally-
+        # required packages (e.g. triton-windows on Linux, triton on Windows).
+        if ";" in raw:
+            marker_text = raw.split(";", 1)[1].strip().lower()
+            if "sys_platform" in marker_text:
+                if "== 'win32'" in marker_text and sys.platform != "win32":
+                    continue
+                if "== 'linux'" in marker_text and sys.platform != "linux":
+                    continue
+                if "!= 'win32'" in marker_text and sys.platform == "win32":
+                    continue
+                if "!= 'linux'" in marker_text and sys.platform == "linux":
+                    continue
+        names.append(match.group(0))
+    return names
+
+
+def _canonicalize_dist_name(name: str) -> str:
+    """Normalize a distribution name per PEP 503 (lowercase, ``[-_.]+`` → ``-``)."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _requirements_have_importable_packages(req_path: str) -> bool:
+    """Return True if every top-level requirement listed in ``req_path``
+    corresponds to an installed distribution (by metadata ``Name`` field).
+
+    Uses distribution metadata (``importlib.metadata.distributions()``)
+    rather than import-module guesses so that packages whose distribution
+    name differs from their module name (e.g. ``Pillow`` → ``PIL``,
+    ``opencv-python-headless`` → ``cv2``) are correctly recognised.
+
+    Returns ``True`` when the file is empty or contains only local paths /
+    VCS sources / pip flags (no top-level packages to verify). Returns
+    ``False`` as soon as one named distribution is not found among the
+    currently installed packages, indicating the cache entry is stale and
+    ``_install_custom_node_requirements`` should reinstall.
+    """
+    names = _iter_top_level_requirement_names(req_path)
+    if not names:
+        return True
+    import importlib.metadata
+    installed = set()
+    for dist in importlib.metadata.distributions():
+        dist_name = dist.metadata.get("Name")
+        if dist_name:
+            installed.add(_canonicalize_dist_name(dist_name))
+    req_names = {_canonicalize_dist_name(n) for n in names}
+    return req_names.issubset(installed)
 
 
 def model_volume_state(volume_root: str) -> tuple:
@@ -847,12 +777,106 @@ def stack_to_profile(stack: dict) -> dict:
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.14.1"
+COMFYAPP_VERSION = "2.14.2"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
 CUSTOM_NODES_VOLUME_NAME = "comfyui-custom-nodes"
 COMFYUI_PORT = 8188
+
+# Resolved at deploy time to copy local custom nodes into the image.
+_COMFYUI_MODAL_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOCAL_CUSTOM_NODES = os.path.abspath(os.path.join(_COMFYUI_MODAL_DIR, ".."))
+
+# Requirements-only build context so pip-install layers cache independently of
+# non-requirements custom node source changes.
+_LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR = os.path.join(
+    _COMFYUI_MODAL_DIR, ".custom_node_requirements"
+)
+
+_CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
+
+
+def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
+    """Return sorted, filtered list of top-level custom node directory names."""
+    if not os.path.isdir(cn_root):
+        return []
+    names = []
+    for node_name in sorted(os.listdir(cn_root)):
+        node_path = os.path.join(cn_root, node_name)
+        if not os.path.isdir(node_path):
+            continue
+        if node_name.startswith(".") or node_name in _CUSTOM_NODE_SYNC_EXCLUDE_DIRS:
+            continue
+        names.append(node_name)
+    return names
+
+
+def _rmtree_robust(path: str) -> None:
+    """Remove a directory tree, handling Windows deep-path limitations."""
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["powershell.exe", "-Command",
+                 f"Remove-Item -Recurse -Force -LiteralPath {path!r}"],
+                capture_output=True, timeout=60,
+            )
+        else:
+            raise
+
+
+def _prepare_custom_node_requirements_build_context(source_root: str, target_root: str) -> None:
+    """Copy only requirements.txt from each top-level custom node into target_root.
+
+    This creates a minimal directory tree that shares the same top-level node
+    directory names as *source_root* but contains only ``requirements.txt``
+    files.  Excluded dirs (``.git``, ``__pycache__``, etc.) are skipped.
+    The resulting tree is used as a separate ``add_local_dir`` build context
+    so that Docker layer caching only busts the pip-install step when
+    requirements content actually changes.
+    """
+    if os.path.exists(target_root):
+        _rmtree_robust(target_root)
+    os.makedirs(target_root, exist_ok=True)
+
+    for node_name in _iter_syncable_custom_node_dirs(source_root):
+        node_path = os.path.join(source_root, node_name)
+        src_req = os.path.join(node_path, "requirements.txt")
+        if not os.path.isfile(src_req):
+            continue
+        dst_node_dir = os.path.join(target_root, node_name)
+        os.makedirs(dst_node_dir, exist_ok=True)
+        shutil.copy2(src_req, os.path.join(dst_node_dir, "requirements.txt"))
+
+        # Copy local path dependencies (e.g. ./src/sam3) so that
+        # pip install -r ... from the build context resolves correctly.
+        req_text = Path(src_req).read_text(encoding="utf-8")
+        for line in req_text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            stripped = stripped.split(";", 1)[0].strip()
+            if stripped.startswith("-e "):
+                stripped = stripped[3:].strip()
+            if not (stripped.startswith("./") or stripped.startswith("../")):
+                continue
+            local_path = os.path.abspath(os.path.join(node_path, stripped))
+            if not os.path.exists(local_path):
+                continue
+            rel_local = os.path.relpath(local_path, node_path)
+            dst_local = os.path.join(dst_node_dir, rel_local)
+            if os.path.isdir(local_path):
+                shutil.copytree(local_path, dst_local)
+            elif os.path.isfile(local_path):
+                os.makedirs(os.path.dirname(dst_local), exist_ok=True)
+                shutil.copy2(local_path, dst_local)
+
+
+_prepare_custom_node_requirements_build_context(
+    _LOCAL_CUSTOM_NODES, _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR
+)
 COMFYUI_API_PORT = 8189
 MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
@@ -875,7 +899,7 @@ SAGEATTENTION_SITE_PACKAGES = "/usr/local/lib/python3.11/site-packages"
 
 
 
-image = (
+_image_base = (
     modal.Image.from_registry(
         "nvidia/cuda:13.0.0-devel-ubuntu24.04",
         add_python="3.11",
@@ -949,8 +973,36 @@ image = (
             "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
             "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "0",
             "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "0",
+            "COMFYMODAL_RUNTIME": "1",
         }
     )
+    # Bake custom-node requirements into the image *before* copying the
+    # full source tree so Docker layer caching only busts the pip-install
+    # step when requirements content actually changes.
+    .add_local_dir(
+        _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR,
+        "/root/comfy-build/custom_node_requirements",
+        copy=True,
+    )
+    .run_commands(
+        'for req in /root/comfy-build/custom_node_requirements/*/requirements.txt; do '
+        '  [ -f "$req" ] && pip install -r "$req" --quiet; '
+        'done'
+    )
+)
+
+# Add each custom node as its own layer so only changed nodes bust their
+# Docker layer cache, avoiding full rebuilds on any single-node change.
+for _node_name in _iter_syncable_custom_node_dirs(_LOCAL_CUSTOM_NODES):
+    _node_src = os.path.join(_LOCAL_CUSTOM_NODES, _node_name)
+    _image_base = _image_base.add_local_dir(
+        _node_src,
+        f"/root/comfy/ComfyUI/custom_nodes/{_node_name}",
+        copy=True,
+    )
+
+image = (
+    _image_base
     .add_local_python_source("gpu_catalog")
     .add_local_python_source("timing_trace")
 )
@@ -965,23 +1017,6 @@ download_image = (
 app = modal.App(APP_NAME, image=image)
 vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 custom_nodes_vol = modal.Volume.from_name(CUSTOM_NODES_VOLUME_NAME, create_if_missing=True)
-
-
-@app.function(
-    gpu="a10g",
-    cpu=4,
-    memory=16384,
-    timeout=3600,
-    min_containers=0,
-    scaledown_window=2,
-    volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
-)
-@modal.web_server(COMFYUI_PORT, startup_timeout=300)
-def ui():
-    subprocess.Popen(
-        f"comfy launch -- --listen 0.0.0.0 --port {COMFYUI_PORT}",
-        shell=True,
-    )
 
 
 @app.function(
@@ -1022,6 +1057,23 @@ def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoi
 
     vol.commit()
     return {"status": "ok", "path": str(dest)}
+
+
+@app.function(
+    gpu="a10g",
+    cpu=4,
+    memory=16384,
+    timeout=3600,
+    min_containers=0,
+    scaledown_window=2,
+    volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
+)
+@modal.web_server(COMFYUI_PORT, startup_timeout=300)
+def ui():
+    subprocess.Popen(
+        f"comfy launch -- --listen 0.0.0.0 --port {COMFYUI_PORT}",
+        shell=True,
+    )
 
 
 @app.function(
@@ -1185,379 +1237,19 @@ def set_preload_mode(mode: str) -> str:
     volumes={MODELS_PATH: vol},
 )
 def set_runtime_flag(name: str, value: str) -> str:
-    """Set a runtime ``0``/``1`` flag for the next cold restore.
+    """Set a runtime config value for the next cold restore.
 
-    Writes to ``/root/models/runtime_config/{name}.txt`` which is read
-    by ``_resolve_runtime_flag()`` during restore.
+    Writes ``value`` to ``/root/models/runtime_config/{name}.txt`` which is read
+    by ``_resolve_runtime_flag()`` (for bool flags) or inline readers during restore.
     """
     import os
-    value = value.strip().lower()
-    if value not in ("0", "1"):
-        return f"invalid value: {value}  expected 0 or 1"
     os.makedirs("/root/models/runtime_config", exist_ok=True)
     path = os.path.join("/root/models/runtime_config", f"{name}.txt")
     with open(path, "w") as f:
-        f.write(value)
+        f.write(value.strip())
     vol.commit()
     print(f"[comfyapp] set_runtime_flag: {name}={value}")
     return f"runtime_flag {name}={value}"
-
-
-@app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
-    cpu=1,
-    memory=512,
-    timeout=30,
-    volumes={MODELS_PATH: vol},
-)
-def set_sage_runtime_mode(mode: str) -> str:
-    """Set Sage runtime mode for the next cold restore (no redeploy needed).
-
-    Values: ``auto``, ``baked_cuda``, ``triton_fallback``.
-    Writes to ``/root/models/runtime_config/sage_runtime_mode.txt``.
-    """
-    import os
-    mode = mode.strip().lower()
-    if mode not in ("auto", "baked_cuda", "triton_fallback"):
-        return f"invalid sage_runtime_mode: {mode}  expected auto|baked_cuda|triton_fallback"
-    os.makedirs("/root/models/runtime_config", exist_ok=True)
-    path = os.path.join("/root/models/runtime_config", "sage_runtime_mode.txt")
-    with open(path, "w") as f:
-        f.write(mode)
-    vol.commit()
-    print(f"[comfyapp] set_sage_runtime_mode: {mode}")
-    return f"sage_runtime_mode={mode}"
-
-
-@app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
-    cpu=1,
-    memory=512,
-    timeout=30,
-    volumes={MODELS_PATH: vol},
-)
-def set_sage_runtime_probe(enabled: bool) -> str:
-    """Set whether Sage runtime probes during restore.
-
-    When 0, skips the CUDA extension smoke test and uses cached mode
-    or default.  Writes to ``/root/models/runtime_config/sage_runtime_probe.txt``.
-    """
-    import os
-    val = "1" if enabled else "0"
-    os.makedirs("/root/models/runtime_config", exist_ok=True)
-    path = os.path.join("/root/models/runtime_config", "sage_runtime_probe.txt")
-    with open(path, "w") as f:
-        f.write(val)
-    vol.commit()
-    print(f"[comfyapp] set_sage_runtime_probe: {val}")
-    return f"sage_runtime_probe={val}"
-
-
-@app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
-    cpu=1,
-    memory=512,
-    timeout=30,
-    volumes={MODELS_PATH: vol},
-)
-def set_warmup_clip_encode(enabled: bool) -> str:
-    """Set warmup CLIP encode for the next cold restore.
-
-    Writes to ``/root/models/runtime_config/warmup_clip_encode.txt``
-    so the lifecycle restore function reads it before warmup.
-    """
-    import os
-    val = "1" if enabled else "0"
-    os.makedirs("/root/models/runtime_config", exist_ok=True)
-    with open(RUNTIME_WCE_PATH, "w") as f:
-        f.write(val)
-    vol.commit()
-    print(f"[comfyapp] set_warmup_clip_encode: {val}")
-    return f"warmup_clip_encode={val}"
-
-
-@app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
-    cpu=1,
-    memory=512,
-    timeout=30,
-    volumes={MODELS_PATH: vol},
-)
-def set_return_mode(mode: str) -> str:
-    """Set return mode for the next prompt execution.
-
-    Modes:
-      full_base64       — return all images as base64 (current behavior)
-      first_image_only  — return only the first image as base64
-      metadata_only     — no image bytes, only counts/sizes/filenames
-      paths_only        — return local output paths only (for local-volume testing)
-      urls_only         — placeholder for object storage URL mode
-
-    Writes to ``/root/models/runtime_config/return_mode.txt``
-    so run_prompt() reads it before returning results.
-    """
-    import os
-    mode = mode.strip().lower()
-    valid = {"full_base64", "first_image_only", "metadata_only", "paths_only", "urls_only"}
-    if mode not in valid:
-        return f"invalid mode: {mode}  valid={valid}"
-    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
-    with open(RUNTIME_RETURN_MODE_PATH, "w") as f:
-        f.write(mode)
-    vol.commit()
-    print(f"[comfyapp] set_return_mode: {mode}")
-    return f"return_mode={mode}"
-
-
-@app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
-    cpu=1,
-    memory=512,
-    timeout=30,
-    volumes={MODELS_PATH: vol},
-)
-def set_clear_clip_encode_cache(enabled: bool) -> str:
-    """Set CLIP encode cache clear flag for the next restore.
-
-    When enabled, the CLIPTextEncode cache is cleared at restore start
-    before warmup, ensuring clean WCE comparison runs.
-
-    Writes to ``/root/models/runtime_config/clear_clip_encode_cache.txt``.
-    """
-    import os
-    val = "1" if enabled else "0"
-    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
-    with open(RUNTIME_CLIP_CACHE_CLEAR_PATH, "w") as f:
-        f.write(val)
-    vol.commit()
-    print(f"[comfyapp] set_clear_clip_encode_cache: {val}")
-    return f"clear_clip_encode_cache={val}"
-
-
-@app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
-    cpu=1,
-    memory=512,
-    timeout=30,
-    volumes={MODELS_PATH: vol},
-)
-def set_exec_profile(enabled: bool) -> str:
-    """Enable/disable per-node executor profiling.
-
-    When enabled, ``execution.execute()`` is monkey-patched to collect
-    per-class-type timing data reported as ``_exec_profile`` in the
-    ``run_prompt`` result.
-
-    Writes to ``/root/models/runtime_config/exec_profile.txt``.
-    """
-    import os
-    val = "1" if enabled else "0"
-    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
-    with open(RUNTIME_EXEC_PROFILE_PATH, "w") as f:
-        f.write(val)
-    vol.commit()
-    print(f"[comfyapp] set_exec_profile: {val}")
-    return f"exec_profile={val}"
-
-
-@app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
-    cpu=1,
-    memory=512,
-    timeout=30,
-    volumes={MODELS_PATH: vol},
-)
-def set_sampler_profile(enabled: bool) -> str:
-    """Enable/disable per-step sampler profiling.
-
-    When enabled, ``KSAMPLER.sample`` is monkey-patched to capture
-    per-step timing (setup, step_1..step_N, teardown) reported as
-    ``_sampler_profile`` in the ``run_prompt`` result.
-
-    Writes to ``/root/models/runtime_config/sampler_profile.txt``.
-    """
-    import os
-    val = "1" if enabled else "0"
-    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
-    with open(RUNTIME_SAMPLER_PROFILE_PATH, "w") as f:
-        f.write(val)
-    vol.commit()
-    print(f"[comfyapp] set_sampler_profile: {val}")
-    return f"sampler_profile={val}"
-
-
-@app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
-    cpu=1,
-    memory=512,
-    timeout=30,
-    volumes={MODELS_PATH: vol},
-)
-def set_guider_profile(enabled: bool) -> str:
-    """Enable/disable guider overhead profiling.
-
-    When enabled, CFGGuider methods (sample/outer_sample/inner_sample)
-    and sampler_helpers (prepare_sampling/cleanup_models) are
-    monkey-patched to capture per-segment timing.
-
-    Writes to ``/root/models/runtime_config/guider_profile.txt``.
-    """
-    import os
-    val = "1" if enabled else "0"
-    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
-    with open(RUNTIME_GUIDER_PROFILE_PATH, "w") as f:
-        f.write(val)
-    vol.commit()
-    print(f"[comfyapp] set_guider_profile: {val}")
-    return f"guider_profile={val}"
-
-
-@app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
-    cpu=1,
-    memory=512,
-    timeout=30,
-    volumes={MODELS_PATH: vol},
-)
-def set_deep_profile(enabled: bool) -> str:
-    """Enable/disable deep sampler wrapper profiling.
-
-    Instruments prepare_sampling internals, SamplerCustomAdvanced
-    pre/post, and KSAMPLER.sample setup.
-
-    Writes to ``/root/models/runtime_config/deep_profile.txt``.
-    """
-    import os
-    val = "1" if enabled else "0"
-    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
-    with open(RUNTIME_DEEP_PROFILE_PATH, "w") as f:
-        f.write(val)
-    vol.commit()
-    print(f"[comfyapp] set_deep_profile: {val}")
-    return f"deep_profile={val}"
-
-
-@app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
-    cpu=1,
-    memory=512,
-    timeout=30,
-    volumes={MODELS_PATH: vol},
-)
-def set_lmg_fastpath_dryrun(enabled: bool) -> str:
-    """Enable/disable LMG fast-path dry-run diagnostics (no behavior change)."""
-    import os
-    val = "1" if enabled else "0"
-    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
-    with open(RUNTIME_LMG_FASTPATH_DRYRUN_PATH, "w") as f:
-        f.write(val)
-    vol.commit()
-    print(f"[comfyapp] set_lmg_fastpath_dryrun: {val}")
-    return f"lmg_fastpath_dryrun={val}"
-
-
-@app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
-    cpu=1,
-    memory=512,
-    timeout=30,
-    volumes={MODELS_PATH: vol},
-)
-def set_lmg_fastpath(enabled: bool) -> str:
-    """Enable/disable LMG fast-path (skips load_models_gpu for already-loaded models)."""
-    import os
-    val = "1" if enabled else "0"
-    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
-    with open(RUNTIME_LMG_FASTPATH_PATH, "w") as f:
-        f.write(val)
-    vol.commit()
-    print(f"[comfyapp] set_lmg_fastpath: {val}")
-    return f"lmg_fastpath={val}"
-
-
-@app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
-    cpu=1,
-    memory=512,
-    timeout=30,
-    volumes={MODELS_PATH: vol},
-)
-def set_modelpatcher_cache(enabled: bool) -> str:
-    """Enable/disable canonical ModelPatcher cache for warmup→prompt reuse."""
-    import os
-    val = "1" if enabled else "0"
-    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
-    with open(RUNTIME_MODELPATCHER_CACHE_PATH, "w") as f:
-        f.write(val)
-    vol.commit()
-    print(f"[comfyapp] set_modelpatcher_cache: {val}")
-    return f"modelpatcher_cache={val}"
-
-
-@app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
-    cpu=1,
-    memory=512,
-    timeout=30,
-    volumes={MODELS_PATH: vol},
-)
-def set_modelpatcher_cache_dryrun(enabled: bool) -> str:
-    """Enable/disable canonical ModelPatcher cache dry-run diagnostics."""
-    import os
-    val = "1" if enabled else "0"
-    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
-    with open(RUNTIME_MODELPATCHER_CACHE_DRYRUN_PATH, "w") as f:
-        f.write(val)
-    vol.commit()
-    print(f"[comfyapp] set_modelpatcher_cache_dryrun: {val}")
-    return f"modelpatcher_cache_dryrun={val}"
-
-
-@app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
-    cpu=1,
-    memory=512,
-    timeout=30,
-    volumes={MODELS_PATH: vol},
-)
-def set_modelpatcher_trace(enabled: bool) -> str:
-    """Enable/disable ModelPatcher lineage trace (init/clone/flow)."""
-    import os
-    val = "1" if enabled else "0"
-    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
-    with open(RUNTIME_MODELPATCHER_TRACE_PATH, "w") as f:
-        f.write(val)
-    vol.commit()
-    print(f"[comfyapp] set_modelpatcher_trace: {val}")
-    return f"modelpatcher_trace={val}"
 
 
 @app.function(
@@ -1634,6 +1326,92 @@ def upload_model_chunk(chunk_data: bytes, folder: str, filename: str, offset: in
         return {"status": "ok", "path": str(dest), "size": os.path.getsize(dest)}
 
     return {"status": "partial", "offset": offset + len(chunk_data)}
+
+
+# ── CPU-only standalone functions ─────────────────────────────────────────
+# These used to be GPU-bound @modal.method() on the ComfyAPI class, wasting
+# expensive GPU containers for trivial filesystem/health ops.
+# Names end with ``_cpu`` to avoid collision with the existing
+# ``@modal.method()`` of the same name on the GPU-tagged ComfyAPI class.
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11"),
+    cpu=1,
+    memory=128,
+    timeout=10,
+)
+def health_cpu():
+    """Minimal health probe.  CPU-only — no GPU cost."""
+    return {"status": "ok"}
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=60,
+    volumes={MODELS_PATH: vol},
+)
+def list_models_cpu() -> dict:
+    """List all models on the volume.  CPU-only — no GPU cost."""
+    import os
+
+    vol.reload()
+
+    solo_folders = [
+        "loras", "vae", "controlnet", "upscale_models",
+        "embeddings", "clip", "text_encoders",
+    ]
+    result = {}
+    for folder in solo_folders:
+        folder_path = os.path.join(MODELS_PATH, folder)
+        if not os.path.isdir(folder_path):
+            result[folder] = []
+            continue
+        files = []
+        for fname in sorted(os.listdir(folder_path)):
+            fpath = os.path.join(folder_path, fname)
+            if os.path.isfile(fpath):
+                files.append({"name": fname, "size": os.path.getsize(fpath), "folder": folder})
+        result[folder] = files
+
+    checkpoint_family = ["checkpoints", "diffusion_models", "unet"]
+    result["checkpoints"] = []
+    for folder in checkpoint_family:
+        folder_path = os.path.join(MODELS_PATH, folder)
+        if not os.path.isdir(folder_path):
+            continue
+        for fname in sorted(os.listdir(folder_path)):
+            fpath = os.path.join(folder_path, fname)
+            if os.path.isfile(fpath):
+                result["checkpoints"].append({"name": fname, "size": os.path.getsize(fpath), "folder": folder})
+    return result
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def delete_model_cpu(folder: str, filename: str) -> dict:
+    """Delete a model file from the volume.  CPU-only — no GPU cost."""
+    import os
+
+    safe_folder = os.path.basename(folder)
+    safe_file = os.path.basename(filename)
+    target = os.path.join(MODELS_PATH, safe_folder, safe_file)
+    if not os.path.isfile(target):
+        return {"status": "error", "message": "File not found"}
+    os.remove(target)
+    vol.commit()
+    return {"status": "ok", "deleted": f"{safe_folder}/{safe_file}"}
 
 
 class _ComfyAPIMixin:
@@ -1816,8 +1594,8 @@ class _ComfyAPIMixin:
     def _sync_custom_nodes_from_volume(self):
         custom_nodes_vol.reload()
         comfy_custom_nodes = "/root/comfy/ComfyUI/custom_nodes"
-        summary = sync_custom_nodes_into_comfy(CUSTOM_NODES_PATH, comfy_custom_nodes)
-        state = custom_node_volume_state(CUSTOM_NODES_PATH)
+        summary = sync_custom_nodes_into_comfy(CUSTOM_NODES_PATH, comfy_custom_nodes, include_state=True)
+        state = summary.pop("state", custom_node_volume_state(CUSTOM_NODES_PATH))
         return summary, state
 
     def _snapshot_preload_profile(self) -> dict:
@@ -2222,13 +2000,37 @@ class _ComfyAPIMixin:
         self._model_cpu_cache_patched = True
 
     def _install_custom_node_requirements(self, force: bool = False) -> dict:
-        """Install requirements.txt for each custom node, skipping cached hashes."""
+        """Install requirements.txt for each custom node, skipping cached hashes.
+
+        The hash cache is invalidated when:
+
+        * ``force=True`` is passed (used by the workflow-repair path).
+        * The cached ``comfyapp_version`` differs from the current
+          ``COMFYAPP_VERSION`` — a fresh image means the previous install
+          is gone even though the cache file persists on the volume.
+        * A "skipped" node has a top-level package in its requirements.txt
+          that is no longer importable — the previous install was either
+          never persisted (caller was using a different Python) or has been
+          lost across an image rebuild.
+        """
         metadata = load_runtime_metadata()
+        cached_version = metadata.get("comfyapp_version")
+        if not force and cached_version and cached_version != COMFYAPP_VERSION:
+            print(
+                f"[comfyapp] requirements cache stale: comfyapp_version "
+                f"{cached_version} != {COMFYAPP_VERSION}, invalidating all hashes"
+            )
+            metadata.pop("requirements", None)
+            metadata["comfyapp_version"] = COMFYAPP_VERSION
+            save_runtime_metadata(metadata)
         cached = metadata.get("requirements", {})
         installed = []
         skipped = []
         failures = []
         updated_hashes = {}
+        _t0 = time.time()
+        _hash_hit_count = 0
+        _import_checked_count = 0
 
         for node_dir in sorted(os.listdir(CUSTOM_NODES_PATH)) if os.path.isdir(CUSTOM_NODES_PATH) else []:
             src = os.path.join(CUSTOM_NODES_PATH, node_dir)
@@ -2238,35 +2040,104 @@ class _ComfyAPIMixin:
             if not os.path.isfile(req_file):
                 continue
             current_hash = requirements_file_hash(req_file)
-            if not force and current_hash and cached.get(node_dir) == current_hash:
-                skipped.append(node_dir)
+            if not force and current_hash:
+                if cached.get(node_dir) == current_hash:
+                    # Hash match — packages were confirmed installed during
+                    # a previous startup. Skip pip, no importability check needed.
+                    _hash_hit_count += 1
+                    skipped.append(node_dir)
+                    continue
+                if _requirements_have_importable_packages(req_file):
+                    # Packages importable from image build but hash not yet
+                    # cached — seed the hash so next startup skips the check.
+                    _import_checked_count += 1
+                    updated_hashes[node_dir] = current_hash
+                    skipped.append(node_dir)
+                    continue
+
+            req_lines = Path(req_file).read_text(encoding="utf-8").splitlines()
+            req_dir = os.path.dirname(req_file)
+            missing_local_paths = []
+            for line in req_lines:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                requirement = stripped.split(";", 1)[0].strip()
+                if requirement.startswith("-e "):
+                    requirement = requirement[3:].strip()
+                elif requirement.startswith("--editable "):
+                    requirement = requirement[len("--editable "):].strip()
+                if requirement.startswith("./") or requirement.startswith("../"):
+                    resolved = os.path.abspath(os.path.join(req_dir, requirement))
+                    if not os.path.exists(resolved):
+                        missing_local_paths.append(requirement)
+
+            if missing_local_paths:
+                failures.append({
+                    "node": node_dir,
+                    "stderr": (
+                        "Missing local requirement path(s): "
+                        f"{', '.join(missing_local_paths)} relative to {req_dir}"
+                    )[:1000],
+                })
                 continue
 
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-r", req_file],
-                capture_output=True,
-                text=True,
-                timeout=300,
+            print(
+                f"[comfyapp] installing custom node requirements node={node_dir} "
+                f"timeout_s={CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S}"
             )
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "-r", req_file],
+                    capture_output=True,
+                    text=True,
+                    timeout=CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S,
+                    cwd=src,
+                )
+            except subprocess.TimeoutExpired as exc:
+                failures.append({
+                    "node": node_dir,
+                    "stderr": (
+                        f"requirements install timed out after {CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S}s"
+                    )[:1000],
+                })
+                print(
+                    f"[comfyapp] custom node requirements timed out node={node_dir} "
+                    f"timeout_s={CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S}"
+                )
+                continue
             if result.returncode != 0:
+                print(f"[comfyapp] custom node requirements install FAILED node={node_dir}: "
+                      f"{result.stderr[:500] or result.stdout[:500] or 'no output'}")
                 failures.append({
                     "node": node_dir,
                     "stderr": (result.stderr or result.stdout or "requirements install failed")[:1000],
                 })
             else:
+                print(f"[comfyapp] installed custom node requirements node={node_dir}")
                 installed.append(node_dir)
                 if current_hash:
                     updated_hashes[node_dir] = current_hash
 
-        if failures:
-            raise RuntimeError(f"Custom node requirements install failed: {failures}")
-
-        # Persist updated hashes
+        # Persist updated hashes (and the version marker that gates them)
         if updated_hashes or force:
             metadata["requirements"] = {**cached, **updated_hashes}
+            metadata["comfyapp_version"] = COMFYAPP_VERSION
             save_runtime_metadata(metadata)
 
-        return {"installed": installed, "skipped": skipped}
+        if failures:
+            print(f"[comfyapp] custom node requirements had {len(failures)} failure(s) — continuing "
+                  f"(affects: {[f['node'] for f in failures]})")
+
+        _total_ms = round((time.time() - _t0) * 1000, 1)
+        print(
+            f"[comfyapp] requirements check complete in {_total_ms}ms "
+            f"total_with_reqs={len(installed) + len(skipped)} "
+            f"hash_hit={_hash_hit_count} importability_checked={_import_checked_count} "
+            f"installed={len(installed)} skipped={len(skipped)} failed={len(failures)}"
+        )
+
+        return {"installed": installed, "skipped": skipped, "failed": [f["node"] for f in failures]}
 
     # ── sageattention runtime policy helpers ──────────────────────────────
 
@@ -2842,6 +2713,37 @@ class _ComfyAPIMixin:
             stripped[_nid] = {"class_type": _spec.get("class_type"), "inputs": _inp}
         return hashlib.md5(json.dumps(stripped, sort_keys=True).encode()).hexdigest()[:16]
 
+    def _repair_missing_workflow_nodes(self, workflow: dict) -> dict:
+        import nodes
+
+        requested = sorted({
+            _spec.get("class_type")
+            for _spec in workflow.values()
+            if isinstance(_spec, dict) and _spec.get("class_type")
+        })
+        missing_before = [name for name in requested if name not in nodes.NODE_CLASS_MAPPINGS]
+        if not missing_before or self._event_loop is None:
+            return {
+                "attempted": False,
+                "missing_before": missing_before,
+                "missing_after": missing_before,
+                "installed": [],
+                "skipped": [],
+            }
+
+        print(f"[comfyapp] missing workflow nodes before validation: {missing_before}")
+        req_summary = self._install_custom_node_requirements(force=True)
+        self._event_loop.run_until_complete(nodes.init_extra_nodes())
+        missing_after = [name for name in requested if name not in nodes.NODE_CLASS_MAPPINGS]
+        print(f"[comfyapp] missing workflow nodes after repair: {missing_after}")
+        return {
+            "attempted": True,
+            "missing_before": missing_before,
+            "missing_after": missing_after,
+            "installed": req_summary.get("installed", []),
+            "skipped": req_summary.get("skipped", []),
+        }
+
     def _execute_in_process(self, workflow: dict, input_images: dict | None = None, collect_outputs: bool = True, trace: Trace | None = None) -> dict:
         """Execute a ComfyUI workflow directly in-process.
 
@@ -2877,6 +2779,19 @@ class _ComfyAPIMixin:
         # disk so the fallback output scan does not echo them back as
         # generated outputs.
         prompt_start_time = time.time()
+
+        repair_started = time.time()
+        repair_summary = self._repair_missing_workflow_nodes(workflow)
+        self._log_profile(
+            "inproc_missing_node_repair",
+            prompt_id=prompt_id[:8],
+            attempted=1 if repair_summary.get("attempted") else 0,
+            missing_before=len(repair_summary.get("missing_before", [])),
+            missing_after=len(repair_summary.get("missing_after", [])),
+            installed=len(repair_summary.get("installed", [])),
+            skipped=len(repair_summary.get("skipped", [])),
+            duration_ms=self._profile_ms(repair_started),
+        )
 
         # ── Fixed-workflow fast path: skip validation if hash matches ──
         _wf_hash = self._compute_workflow_struct_hash(workflow)
@@ -2935,7 +2850,7 @@ class _ComfyAPIMixin:
         # ── Instrument executor for overhead breakdown ──
         import execution as _exec_mod
         _perf_data = {}
-        _exec_profiling = _resolve_exec_profile()
+        _exec_profiling = _resolve_runtime_flag('exec_profile', '0')
         if _exec_profiling and not getattr(_exec_mod, '_comfy_modal_exec_patched', False):
             _orig_exec_fn = _exec_mod.execute
             _exec_prof_data = {"nodes": {}, "_first_call_start": None, "_last_call_end": None, "_call_count": 0}
@@ -2970,7 +2885,7 @@ class _ComfyAPIMixin:
             _exec_mod._comfy_modal_exec_prof = _exec_prof_data
 
         # ── Instrument sampler for per-step breakdown ──
-        _sampler_profiling = _resolve_sampler_profile()
+        _sampler_profiling = _resolve_runtime_flag('sampler_profile', '0')
         if _sampler_profiling:
             import comfy.samplers as _samplers_mod
             if not getattr(_samplers_mod, '_comfy_modal_sampler_prof_patched', False):
@@ -3006,7 +2921,7 @@ class _ComfyAPIMixin:
                 _samplers_mod._comfy_modal_sampler_prof = _sampler_prof_data
 
         # ── Instrument guider for overhead breakdown ──
-        _guider_profiling = _resolve_guider_profile()
+        _guider_profiling = _resolve_runtime_flag('guider_profile', '0')
         if _guider_profiling:
             import comfy.samplers as _gs_mod
             import comfy.sampler_helpers as _gsh_mod
@@ -3033,7 +2948,7 @@ class _ComfyAPIMixin:
                 _gs_mod._comfy_modal_guider_prof = _guider_prof_data
 
         # ── Deep sampler wrapper profiling ──
-        _deep_profiling = _resolve_deep_profile()
+        _deep_profiling = _resolve_runtime_flag('deep_profile', '0')
         if _deep_profiling:
             import comfy.sampler_helpers as _dsh_mod
             import comfy.model_management as _dmm_mod
@@ -3054,8 +2969,8 @@ class _ComfyAPIMixin:
             _dp_wrap(_dsh_mod, 'get_additional_models_from_model_options', 'ps_get_additional_models_opts')
             _dp_wrap(_dsh_mod, 'estimate_memory', 'ps_estimate_memory')
             # ── Comprehensive load_models_gpu profiler + fastpath diagnostics ──
-            _fp_dryrun = _resolve_lmg_fastpath_dryrun()
-            _fp_enabled = _resolve_lmg_fastpath()
+            _fp_dryrun = _resolve_runtime_flag('lmg_fastpath_dryrun', '0')
+            _fp_enabled = _resolve_runtime_flag('lmg_fastpath', '0')
             _orig_lmg = _dmm_mod.load_models_gpu
             _lmg_calls = []
             def _profiled_lmg(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
@@ -4488,12 +4403,37 @@ class _ComfyAPIMixin:
         self._ensure_models_symlink()
         __stages["ensure_models_ms"] = self._profile_ms(_s)
 
+        # ── Wait for FUSE volume mounts to become accessible ─────────────
+        # After snapshot restore, the Modal FUSE daemon re-establishes its
+        # backend connection asynchronously.  If we access the volume mount
+        # point before the daemon is ready, os.path.isdir() returns False
+        # and the volume appears empty.  This retry loop ensures both models
+        # and custom nodes volumes are usable before we proceed.
+        _s_vol_mount = time.time()
+        _wait_seconds = [0.2, 0.5, 1.0, 2.0, 3.0]
+        for vol_obj, mount_path, label in [
+            (vol, MODELS_PATH, "models"),
+            (custom_nodes_vol, CUSTOM_NODES_PATH, "custom_nodes"),
+        ]:
+            for _attempt in range(len(_wait_seconds)):
+                vol_obj.reload()
+                if os.path.isdir(mount_path):
+                    if _attempt > 0:
+                        print(f"[comfyapp] volume_mount_ready label={label} attempt={_attempt + 1}")
+                    break
+                if _attempt < len(_wait_seconds) - 1:
+                    _delay = _wait_seconds[_attempt]
+                    print(f"[comfyapp] volume_mount_wait label={label} attempt={_attempt + 1} delay_s={_delay}")
+                    time.sleep(_delay)
+            else:
+                print(f"[comfyapp] volume_mount_failed label={label} mount_path={mount_path}")
+        __stages["volume_mount_wait_ms"] = self._profile_ms(_s_vol_mount)
+
         # Reload custom nodes volume and sync any nodes added since the snapshot
         # was taken.  The snapshot filesystem only contains custom_nodes symlinks
         # from the time of snap=True; post-snapshot volume writes must be picked
         # up explicitly here or the restored container won't see them.
         _s2 = time.time()
-        custom_nodes_vol.reload()
         _cn_summary, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
         _cn_created = _cn_summary.get("created", [])
         __stages["custom_nodes_sync_ms"] = self._profile_ms(_s2)
@@ -4542,6 +4482,11 @@ class _ComfyAPIMixin:
             # nodes.init_extra_nodes() for the deferred case above, but for the
             # snapshot-restored case the NODE_CLASS_MAPPINGS is stale.
             if _backend_inited and not _backend_deferred and _cn_created:
+                _s_cn_req = time.time()
+                _cn_reqs = self._install_custom_node_requirements()
+                __stages["custom_node_requirements_ms"] = self._profile_ms(_s_cn_req)
+                __stages["custom_node_requirements_installed"] = len(_cn_reqs.get("installed", []))
+                __stages["custom_node_requirements_skipped"] = len(_cn_reqs.get("skipped", []))
                 _s_cn = time.time()
                 import nodes as _restore_nodes
                 self._event_loop.run_until_complete(_restore_nodes.init_extra_nodes())
@@ -4602,13 +4547,13 @@ class _ComfyAPIMixin:
                 self._log_profile("restore_warmup", mode="cuda_warmup", duration_ms=__stages["cuda_warmup_ms"])
                 import comfy.utils
                 comfy.utils.DISABLE_MMAP = True
-                if _resolve_deep_profile():
+                if _resolve_runtime_flag('deep_profile', '0'):
                     self._patch_model_cache_comparison()
                 self._patch_clip_text_encode_cache()
                 self._patch_clip_loader_cache()
 
                 # ── CLIP encode cache debug: clear if requested ──────────
-                _clip_cache_clear = _resolve_clip_cache_clear()
+                _clip_cache_clear = _resolve_runtime_flag('clear_clip_encode_cache', '0')
                 __stages["clip_cache_clear_requested"] = 1 if _clip_cache_clear else 0
                 if _clip_cache_clear:
                     try:
@@ -4696,7 +4641,7 @@ class _ComfyAPIMixin:
                 # ── ModelPatcher lineage trace (creation / clone / flow) ─
                 # Logs every ModelPatcher.__init__ and .clone() with caller
                 # context to find where identity diverges from warmup.
-                _mp_trace = _resolve_modelpatcher_trace()
+                _mp_trace = _resolve_runtime_flag('modelpatcher_trace', '0')
                 if _mp_trace:
                     try:
                         import comfy.model_patcher as _cmpat
@@ -4781,8 +4726,8 @@ class _ComfyAPIMixin:
                         print(f"[comfyapp] modelpatcher_trace node patch FAILED: {_mptn_exc}")
 
                 # ── Canonical ModelPatcher cache (warmup→prompt reuse) ──
-                _mp_cache = _resolve_modelpatcher_cache()
-                _mp_cache_dryrun = _resolve_modelpatcher_cache_dryrun()
+                _mp_cache = _resolve_runtime_flag('modelpatcher_cache', '0')
+                _mp_cache_dryrun = _resolve_runtime_flag('modelpatcher_cache_dryrun', '0')
                 _mp_cache_store = {}
                 if _mp_cache or _mp_cache_dryrun:
                     try:
@@ -5019,7 +4964,6 @@ class _ComfyAPIMixin:
         # This is cheap in the common case (no new nodes) and avoids
         # "Node 'X' not found" errors after a volume sync.
         _cn_sync_start = time.time()
-        custom_nodes_vol.reload()
         _cn_summary, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
         _cn_created = _cn_summary.get("created", [])
         if _cn_created:
@@ -5615,9 +5559,6 @@ class _ComfyAPIMixin:
 
             if scope in {"models", "all"}:
                 vol.reload()
-            if scope in {"custom_nodes", "all"}:
-                custom_nodes_vol.reload()
-
             summary: dict = {"scope": scope}
             if scope in {"custom_nodes", "all"}:
                 node_summary, _ = self._sync_custom_nodes_from_volume()

@@ -29,6 +29,10 @@ _upload_model_fn = modal.Function.from_name("comfyui", "upload_model_to_volume")
 _upload_model_chunk_fn = modal.Function.from_name("comfyui", "upload_model_chunk")
 _set_active_warmup_profile_fn = modal.Function.from_name("comfyui", "set_active_warmup_profile")
 
+_list_models_fn = modal.Function.from_name("comfyui", "list_models_cpu")
+_delete_model_fn = modal.Function.from_name("comfyui", "delete_model_cpu")
+_health_fn = modal.Function.from_name("comfyui", "health_cpu")
+
 _current_gpu = DEFAULT_GPU
 _api_instances = {}
 
@@ -151,7 +155,7 @@ async def get_object_info() -> dict:
 
 @_modal_error_handler
 async def health_check() -> dict:
-    return await asyncio.to_thread(lambda: _api().health.remote())
+    return await asyncio.to_thread(lambda: _health_fn.remote())
 
 
 @_modal_error_handler
@@ -172,13 +176,13 @@ async def batch_download_models(items: list, hf_token: str = "", civitai_token: 
 
 @_modal_error_handler
 async def list_models() -> dict:
-    return await asyncio.to_thread(lambda: _api().list_models.remote())
+    return await asyncio.to_thread(lambda: _list_models_fn.remote())
 
 
 @_modal_error_handler
 async def delete_model(folder: str, filename: str) -> dict:
     return await asyncio.to_thread(
-        lambda: _api().delete_model.remote(folder=folder, filename=filename),
+        lambda: _delete_model_fn.remote(folder=folder, filename=filename),
     )
 
 
