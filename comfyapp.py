@@ -15,6 +15,147 @@ import modal
 from gpu_catalog import GPU_CATALOG, get_supported_gpus, is_gpu_hidden
 from timing_trace import Trace, coerce_t0_from_browser
 
+# ── Inline output-converter constants & helpers (self-contained for Modal) ──
+_OUTPUT_FORMATS = ("original", "webp_lossless", "webp_lossy", "jpeg")
+_WEBP_LOSSLESS_COMPRESSION = ("fast", "balanced", "max")
+_WEBP_LOSSLESS_METHOD = {"fast": 0, "balanced": 4, "max": 6}
+_WEBP_LOSSY_METHOD = 4
+_FORMAT_META = {
+    "original":       {"ext": ".png",  "mime": "image/png"},
+    "webp_lossless":  {"ext": ".webp", "mime": "image/webp"},
+    "webp_lossy":     {"ext": ".webp", "mime": "image/webp"},
+    "jpeg":           {"ext": ".jpg",  "mime": "image/jpeg"},
+}
+_CONVERTER_DEFAULTS = {
+    "output_format":              "original",
+    "quality":                    75,
+    "webp_lossless_compression":  "balanced",
+}
+
+
+def _change_extension(filename: str, new_ext: str) -> str:
+    """Replace the file extension of *filename* with *new_ext*."""
+    import os as _os
+    stem, _ = _os.path.splitext(filename)
+    return stem + new_ext
+
+
+def _convert_image_bytes(
+    input_bytes: bytes,
+    output_format: str = "original",
+    quality: int = 75,
+    webp_lossless_compression: str = "balanced",
+) -> dict:
+    """Convert raw PNG bytes to target format.  Returns metadata dict."""
+    import io as _io
+    import time as _time
+
+    _t0 = _time.time()
+    meta = {
+        "bytes": input_bytes,
+        "mime_type": "image/png",
+        "file_ext": ".png",
+        "output_format": output_format,
+        "original_size_bytes": len(input_bytes),
+        "returned_size_bytes": len(input_bytes),
+        "conversion_time_ms": 0,
+        "quality": None,
+        "webp_lossless_compression": None,
+        "fallback": False,
+        "error": None,
+    }
+
+    if output_format not in _OUTPUT_FORMATS:
+        meta["error"] = f"unknown output_format: {output_format!r}"
+        meta["output_format"] = "original"
+        output_format = "original"
+    if not isinstance(quality, (int, float)):
+        quality = 75
+    quality = max(0, min(100, int(quality)))
+    if webp_lossless_compression not in _WEBP_LOSSLESS_COMPRESSION:
+        webp_lossless_compression = "balanced"
+
+    fmt_ext = _FORMAT_META.get(output_format, _FORMAT_META["original"])
+    meta["mime_type"] = fmt_ext["mime"]
+    meta["file_ext"] = fmt_ext["ext"]
+
+    if output_format == "original":
+        meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
+        return meta
+
+    try:
+        from PIL import Image as _PillowImage
+    except ImportError:
+        meta["error"] = "Pillow not available; returning original PNG"
+        meta["fallback"] = True
+        meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
+        return meta
+
+    try:
+        img = _PillowImage.open(_io.BytesIO(input_bytes))
+    except Exception as exc:
+        meta["error"] = f"failed to open image: {exc}"
+        meta["fallback"] = True
+        meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
+        return meta
+
+    out_buf = _io.BytesIO()
+    try:
+        if output_format == "webp_lossless":
+            meta["quality"] = None
+            meta["webp_lossless_compression"] = webp_lossless_compression
+            method = _WEBP_LOSSLESS_METHOD.get(webp_lossless_compression, 4)
+            img.save(out_buf, format="WEBP", lossless=True, method=method)
+        elif output_format == "webp_lossy":
+            meta["quality"] = quality
+            meta["webp_lossless_compression"] = None
+            img.save(out_buf, format="WEBP", lossless=False, quality=quality, method=_WEBP_LOSSY_METHOD)
+        elif output_format == "jpeg":
+            meta["quality"] = quality
+            meta["webp_lossless_compression"] = None
+            # Composite alpha onto white background
+            if img.mode in ("RGBA", "LA", "PA"):
+                if img.mode == "RGBA":
+                    bg = _PillowImage.new("RGB", img.size, (255, 255, 255))
+                    bg.paste(img, mask=img.split()[3])
+                    img = bg
+                elif img.mode == "LA":
+                    bg = _PillowImage.new("L", img.size, 255)
+                    bg.paste(img, mask=img.split()[1])
+                    img = bg.convert("RGB")
+                elif img.mode == "PA":
+                    img = img.convert("RGBA")
+                    bg = _PillowImage.new("RGB", img.size, (255, 255, 255))
+                    bg.paste(img, mask=img.split()[3])
+                    img = bg
+            elif img.mode == "P":
+                if "transparency" in img.info:
+                    img = img.convert("RGBA")
+                    bg = _PillowImage.new("RGB", img.size, (255, 255, 255))
+                    bg.paste(img, mask=img.split()[3])
+                    img = bg
+                else:
+                    img = img.convert("RGB")
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(out_buf, format="JPEG", quality=quality)
+
+        out_buf.seek(0)
+        meta["bytes"] = out_buf.read()
+        meta["returned_size_bytes"] = len(meta["bytes"])
+    except Exception as exc:
+        meta["error"] = f"conversion failed: {exc}"
+        meta["fallback"] = True
+        meta["bytes"] = input_bytes
+        meta["returned_size_bytes"] = len(input_bytes)
+        meta["file_ext"] = ".png"
+        meta["mime_type"] = "image/png"
+
+    meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
+    if meta.get("fallback"):
+        print(f"[comfyapp.convert] FALLBACK to PNG: fmt={output_format} err={meta['error']}")
+    return meta
+
 PROFILING_ENABLED = os.getenv("COMFYMODAL_PROFILING", "0") == "1"
 DEFAULT_EXECUTION_BACKEND = os.getenv("COMFYMODAL_EXECUTION_BACKEND", "in_process")
 ENABLE_WARMUP = os.getenv("COMFYMODAL_ENABLE_WARMUP", "1") == "1"
@@ -69,6 +210,7 @@ SAGE_RUNTIME_PROBE_ON_RESTORE = os.getenv("COMFYMODAL_SAGE_RUNTIME_PROBE_ON_REST
 PRELOAD_MODE_PATH = "/root/models/.preload_mode"
 RUNTIME_CONFIG_DIR = "/root/models/runtime_config"
 RUNTIME_RETURN_MODE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "return_mode.txt")
+RUNTIME_STATE_SNAPSHOT_PATH = os.path.join(RUNTIME_CONFIG_DIR, ".runtime_state_snapshot.json")
 
 _WORKFLOW_IMAGE_SUFFIX_DIRS = {
     " [output]": "output",
@@ -777,7 +919,7 @@ def stack_to_profile(stack: dict) -> dict:
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.14.2"
+COMFYAPP_VERSION = "2.14.3"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
@@ -999,6 +1141,7 @@ for _node_name in _iter_syncable_custom_node_dirs(_LOCAL_CUSTOM_NODES):
         _node_src,
         f"/root/comfy/ComfyUI/custom_nodes/{_node_name}",
         copy=True,
+        ignore=[".git/", "__pycache__/", "*.pyc", ".venv/", "venv/", "node_modules/"],
     )
 
 image = (
@@ -1412,6 +1555,57 @@ def delete_model_cpu(folder: str, filename: str) -> dict:
     os.remove(target)
     vol.commit()
     return {"status": "ok", "deleted": f"{safe_folder}/{safe_file}"}
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("gpu_catalog")
+    .add_local_python_source("timing_trace"),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
+)
+def runtime_state_cpu() -> dict:
+    """Check if the remote runtime state is stale relative to the volumes.
+    CPU-only — no GPU cost."""
+    import json
+
+    vol.reload()
+    custom_nodes_vol.reload()
+
+    current_models = model_volume_state(MODELS_PATH)
+    current_nodes = custom_node_volume_state(CUSTOM_NODES_PATH)
+
+    stale_reasons = []
+    try:
+        if os.path.isfile(RUNTIME_STATE_SNAPSHOT_PATH):
+            saved = json.loads(open(RUNTIME_STATE_SNAPSHOT_PATH, "r").read())
+            saved_models = tuple(tuple(e) for e in saved.get("models", []))
+            saved_nodes = tuple(tuple(e) for e in saved.get("custom_nodes", []))
+            if current_models != saved_models:
+                stale_reasons.append("models changed")
+            if current_nodes != saved_nodes:
+                stale_reasons.append("custom nodes changed")
+    except Exception:
+        stale_reasons.append("no previous snapshot")
+
+    # Write current state as snapshot for next comparison
+    os.makedirs(os.path.dirname(RUNTIME_STATE_SNAPSHOT_PATH), exist_ok=True)
+    snapshot = {
+        "models": [list(e) for e in current_models],
+        "custom_nodes": [list(e) for e in current_nodes],
+    }
+    with open(RUNTIME_STATE_SNAPSHOT_PATH, "w") as f:
+        json.dump(snapshot, f)
+    vol.commit()
+
+    return {
+        "stale": bool(stale_reasons),
+        "stale_reasons": stale_reasons,
+        "models_changed": "models changed" in stale_reasons,
+        "custom_nodes_changed": "custom nodes changed" in stale_reasons,
+    }
 
 
 class _ComfyAPIMixin:
@@ -2744,7 +2938,7 @@ class _ComfyAPIMixin:
             "skipped": req_summary.get("skipped", []),
         }
 
-    def _execute_in_process(self, workflow: dict, input_images: dict | None = None, collect_outputs: bool = True, trace: Trace | None = None) -> dict:
+    def _execute_in_process(self, workflow: dict, input_images: dict | None = None, collect_outputs: bool = True, trace: Trace | None = None, modal_options: dict | None = None) -> dict:
         """Execute a ComfyUI workflow directly in-process.
 
         Args:
@@ -2752,6 +2946,7 @@ class _ComfyAPIMixin:
             input_images: Optional mapping of filename → base64-encoded data.
             collect_outputs: When False, skip output collection (warmup mode).
             trace: Optional Trace to populate with timing markers.
+            modal_options: Optional output-format / conversion options dict.
 
         Returns:
             ``{"images": [...], "videos": [...]}`` where each entry contains
@@ -3130,13 +3325,13 @@ class _ComfyAPIMixin:
             }
             return {"images": [], "videos": []}
         stage_started = time.time()
-        result = self._collect_in_process_outputs(prompt_id, prompt_start_time=prompt_start_time)
+        result = self._collect_in_process_outputs(prompt_id, prompt_start_time=prompt_start_time, modal_options=modal_options)
         self._log_profile("inproc_collect", prompt_id=prompt_id[:8], images=len(result.get("images", [])), videos=len(result.get("videos", [])), duration_ms=self._profile_ms(stage_started))
         if trace is not None:
             trace.mark("t8b_outputs_collected")
         return result
 
-    def _collect_in_process_outputs(self, prompt_id: str, prompt_start_time: float | None = None) -> dict:
+    def _collect_in_process_outputs(self, prompt_id: str, prompt_start_time: float | None = None, modal_options: dict | None = None) -> dict:
         """Read generated outputs after an in-process execution.
 
         Tries four sources, in priority order, returning the union:
@@ -3183,6 +3378,13 @@ class _ComfyAPIMixin:
             "input": comfy_root / "input",
         }
 
+        # ── Conversion state ──────────────────────────────────────────
+        _mo = modal_options or {}
+        _output_fmt = _mo.get("output_format", _CONVERTER_DEFAULTS["output_format"])
+        _quality = _mo.get("quality", _CONVERTER_DEFAULTS["quality"])
+        _wlc = _mo.get("webp_lossless_compression", _CONVERTER_DEFAULTS["webp_lossless_compression"])
+        _conversion_meta: list[dict] = []
+
         def _read_and_store(fp: Path, node_id: str, animated: bool, output_key: str | None = None) -> None:
             """Read a single file and append to images/videos.
 
@@ -3200,7 +3402,51 @@ class _ComfyAPIMixin:
             _r_ms = round((time.time() - _r_start) * 1000, 1)
             if _r_ms > 100:
                 print(f"[comfyapp] slow output read: file={fp.name} size={len(raw)} duration_ms={_r_ms}")
-            entry = {"filename": fp.name, "data": base64.b64encode(raw).decode(), "node_id": node_id}
+
+            # ── Apply output format conversion ──────────────────────
+            is_animated = animated or fp.suffix.lower() in (".gif", ".mp4", ".webm")
+            do_convert = (
+                _output_fmt != "original"
+                and not is_animated
+                and fp.suffix.lower() in (".png", ".jpg", ".jpeg")
+            )
+            converted = None
+            if do_convert:
+                converted = _convert_image_bytes(
+                    raw,
+                    output_format=_output_fmt,
+                    quality=_quality,
+                    webp_lossless_compression=_wlc,
+                )
+                out_bytes = converted["bytes"]
+                out_filename = _change_extension(fp.name, converted["file_ext"])
+                _conversion_meta.append({
+                    "filename": out_filename,
+                    "node_id": node_id,
+                    "output_format": converted["output_format"],
+                    "mime_type": converted["mime_type"],
+                    "file_ext": converted["file_ext"],
+                    "original_size_bytes": converted["original_size_bytes"],
+                    "returned_size_bytes": converted["returned_size_bytes"],
+                    "conversion_time_ms": converted["conversion_time_ms"],
+                    "quality": converted.get("quality"),
+                    "webp_lossless_compression": converted.get("webp_lossless_compression"),
+                    "fallback": converted.get("fallback", False),
+                    "error": converted.get("error"),
+                })
+                print(
+                    f"[comfyapp.convert] fmt={_output_fmt} "
+                    f"orig={converted['original_size_bytes']}B "
+                    f"out={converted['returned_size_bytes']}B "
+                    f"time={converted['conversion_time_ms']}ms "
+                    f"file={out_filename}"
+                    + (f" fallback_err={converted['error']}" if converted.get("fallback") else "")
+                )
+            else:
+                out_bytes = raw
+                out_filename = fp.name
+
+            entry = {"filename": out_filename, "data": base64.b64encode(out_bytes).decode(), "node_id": node_id}
             if animated or fp.suffix.lower() in (".gif", ".mp4", ".webm", ".webp"):
                 videos.append(entry)
             else:
@@ -3290,7 +3536,12 @@ class _ComfyAPIMixin:
                 f"prompt_start_time={'set' if prompt_start_time else 'none'})"
             )
         print(f"[comfyapp] collected {len(images)} images, {len(videos)} videos")
-        return {"images": images, "videos": videos, "outputs": per_node_outputs}
+        return {
+            "images": images,
+            "videos": videos,
+            "outputs": per_node_outputs,
+            "_conversion_meta": _conversion_meta,
+        }
 
     def _select_backend(self) -> str:
         """Return the backend to use, sticky on subprocess fallback."""
@@ -3615,6 +3866,28 @@ class _ComfyAPIMixin:
                 if PROFILING_ENABLED:
                     self._log_profile("inproc_exec_progress", event="execution_error", node=str(data.get("node",""))[:40])
         dummy._send_sync_callback = _on_sync
+
+        # ── Install progress hook (mirrors main.py:hijack_progress) ──────
+        # Without this, sampler step progress is never emitted in in-process
+        # mode, so the frontend never receives "progress" events.
+        from comfy_execution.utils import get_executing_context
+
+        def _progress_hook(value, total, preview_image, prompt_id=None, node_id=None):
+            ctx = get_executing_context()
+            if prompt_id is None and ctx is not None:
+                prompt_id = ctx.prompt_id
+            if node_id is None and ctx is not None:
+                node_id = ctx.node_id
+            if prompt_id is None or node_id is None:
+                return
+            dummy.send_sync("progress", {
+                "value": value,
+                "max": total,
+                "prompt_id": prompt_id,
+                "node": node_id,
+            })
+
+        comfy.utils.set_progress_bar_global_hook(_progress_hook)
 
         # Register built-in + custom nodes (async in ComfyUI v0.22+)
         self._event_loop.run_until_complete(nodes.init_extra_nodes())
@@ -4922,6 +5195,7 @@ class _ComfyAPIMixin:
         workflow: dict,
         input_images: dict | None = None,
         trace: dict | None = None,
+        modal_options: dict | None = None,
     ) -> dict:
         """Submit a workflow for execution.
 
@@ -4984,7 +5258,7 @@ class _ComfyAPIMixin:
         if self._select_backend() == "in_process":
             total_started = time.time()
             _last_graph_validate_ms = getattr(self, "_last_graph_validate_ms", None)
-            result = self._execute_in_process(workflow, input_images, trace=server_trace)
+            result = self._execute_in_process(workflow, input_images, trace=server_trace, modal_options=modal_options)
             _graph_validate_ms = getattr(self, "_last_graph_validate_ms", None)
             _t8b_t0 = time.time()
 
@@ -5305,6 +5579,7 @@ class _ComfyAPIMixin:
         workflow: dict,
         input_images: dict | None = None,
         trace: dict | None = None,
+        modal_options: dict | None = None,
     ):
         """Execute workflow with streaming progress events.
 
@@ -5401,7 +5676,7 @@ class _ComfyAPIMixin:
 
             def _exec() -> None:
                 try:
-                    _r = self._execute_in_process(workflow, input_images or {}, trace=server_trace)
+                    _r = self._execute_in_process(workflow, input_images or {}, trace=server_trace, modal_options=modal_options)
                     server_trace.mark("t9_modal_return")
                     trace_summary = server_trace.summary()
                     self._enrich_trace_with_restore_timing(trace_summary)

@@ -32,6 +32,7 @@ _set_active_warmup_profile_fn = modal.Function.from_name("comfyui", "set_active_
 _list_models_fn = modal.Function.from_name("comfyui", "list_models_cpu")
 _delete_model_fn = modal.Function.from_name("comfyui", "delete_model_cpu")
 _health_fn = modal.Function.from_name("comfyui", "health_cpu")
+_runtime_state_fn = modal.Function.from_name("comfyui", "runtime_state_cpu")
 
 _current_gpu = DEFAULT_GPU
 _api_instances = {}
@@ -102,10 +103,11 @@ async def run_prompt(
     input_images: dict | None = None,
     trace: dict | None = None,
     gpu: str | None = None,
+    modal_options: dict | None = None,
 ) -> dict:
     async with _run_prompt_semaphore:
         return await asyncio.to_thread(
-            lambda: _api_for_gpu(gpu).run_prompt.remote(workflow, input_images or {}, trace or {}),
+            lambda: _api_for_gpu(gpu).run_prompt.remote(workflow, input_images or {}, trace or {}, modal_options or {}),
         )
 
 
@@ -116,6 +118,7 @@ async def run_prompt_stream(
     input_images: dict | None = None,
     trace: dict | None = None,
     gpu: str | None = None,
+    modal_options: dict | None = None,
 ):
     """Execute workflow on Modal and stream progress events back to the caller.
 
@@ -128,7 +131,7 @@ async def run_prompt_stream(
     async with _run_prompt_semaphore:
         try:
             gen = _api_for_gpu(gpu).run_prompt_stream.remote_gen.aio(
-                workflow, input_images or {}, trace or {},
+                workflow, input_images or {}, trace or {}, modal_options or {},
             )
             async for msg in gen:
                 yield msg
@@ -228,7 +231,8 @@ async def resync_runtime(scope: str = "all") -> dict:
 
 @_modal_error_handler
 async def get_runtime_state() -> dict:
-    return await asyncio.to_thread(lambda: _api().runtime_state.remote())
+    """Check runtime state — CPU-only, no GPU needed."""
+    return await asyncio.to_thread(lambda: _runtime_state_fn.remote())
 
 
 @_modal_error_handler
