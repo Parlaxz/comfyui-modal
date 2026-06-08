@@ -47,11 +47,16 @@ class ComfyAppPackagingTests(unittest.TestCase):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
         self.assertIn("/root/comfy-build/custom_node_requirements", source)
 
-    def test_requirements_add_local_dir_appears_before_pip_install(self):
+    def test_image_uses_per_node_requirements_add_local_dir(self):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
-        req_add = '"/root/comfy-build/custom_node_requirements"'
-        pip_install = 'pip install -r "$req"'
-        self.assertLess(source.index(req_add), source.index(pip_install))
+        self.assertIn("_custom_node_requirements_context_dir(_node_name)", source)
+        self.assertIn('f"/root/comfy-build/custom_node_requirements/{_node_name}"', source)
+        self.assertIn('cd "/root/comfy-build/custom_node_requirements/{_node_name}/{_node_name}"', source)
+
+    def test_image_does_not_use_monolithic_requirements_install_loop(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertNotIn('for req in /root/comfy-build/custom_node_requirements/*/requirements.txt; do ', source)
+        self.assertIn('cd "/root/comfy-build/custom_node_requirements/{_node_name}/{_node_name}" && pip install -r requirements.txt --quiet', source)
 
     def test_image_uses_per_node_add_local_dir_not_monolithic(self):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
@@ -61,6 +66,10 @@ class ComfyAppPackagingTests(unittest.TestCase):
         self.assertNotIn("add_local_dir(\n        _LOCAL_CUSTOM_NODES,", source)
         self.assertIn("_iter_syncable_custom_node_dirs", source)
         self.assertIn('f"/root/comfy/ComfyUI/custom_nodes/{_node_name}"', source)
+
+    def test_per_node_add_local_dir_uses_custom_ignore_helper(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn("ignore=_custom_node_image_ignore_patterns(_node_name)", source)
 
 
 if __name__ == "__main__":

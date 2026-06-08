@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import uuid
 import unittest
@@ -116,6 +117,22 @@ def _nonexistent_path() -> str:
 
 
 class ComfyAppRuntimeStateTests(unittest.TestCase):
+    def test_patch_cachedit_node_class_returns_model_tuple(self):
+        module = load_module()
+
+        class FakeCacheDiTModelOptimizer:
+            FUNCTION = "optimize"
+
+            def optimize(self, model, enable=True):
+                return ("unexpected",)
+
+        patched = module._patch_cachedit_node_class(FakeCacheDiTModelOptimizer)
+        result = FakeCacheDiTModelOptimizer().optimize("model-obj", True)
+
+        self.assertTrue(patched)
+        self.assertEqual(result, ("model-obj",))
+        self.assertTrue(getattr(FakeCacheDiTModelOptimizer.optimize, "_comfy_modal_disabled", False))
+
     def test_requirements_hash_changes_with_file_contents(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -172,6 +189,7 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
             with (
                 patch.object(module, "CUSTOM_NODES_PATH", tmp),
                 patch.object(module, "RUNTIME_METADATA_PATH", str(meta_path)),
+                patch.object(module, "_requirements_have_importable_packages", return_value=False),
                 patch.object(module.subprocess, "run", side_effect=[
                     types.SimpleNamespace(returncode=0, stdout="", stderr=""),
                     timeout_exc,
@@ -201,6 +219,7 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
                 patch.object(module, "CUSTOM_NODES_PATH", tmp),
                 patch.object(module, "load_runtime_metadata", return_value={"requirements": {}, "runtime": {}}),
                 patch.object(module, "save_runtime_metadata"),
+                patch.object(module, "_requirements_have_importable_packages", return_value=False),
                 patch.object(module.subprocess, "run", side_effect=AssertionError("pip should not run")) as run_mock,
             ):
                 with self.assertRaises(RuntimeError) as exc:
@@ -456,6 +475,122 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
     def test_run_prompt_uses_shared_return_mode_filter_in_both_backends(self):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
         self.assertGreaterEqual(source.count("_apply_return_mode("), 3)
+
+    def test_execute_in_process_refreshes_executor_outputs_between_same_workflow_runs(self):
+        module = load_module()
+        mixin = module._ComfyAPIMixin()
+
+        class FakeExecutor:
+            def __init__(self):
+                self.reset_calls = 0
+                self.execute_calls = 0
+                self.success = True
+                self.status_messages = []
+                self.history_result = {}
+                self._fresh = True
+
+            def reset(self):
+                self.reset_calls += 1
+                self._fresh = True
+                self.history_result = {}
+
+            def execute(self, prompt, prompt_id, extra_data=None, execute_outputs=None):
+                self.execute_calls += 1
+                if self._fresh:
+                    filename = f"fresh_{self.execute_calls}.png"
+                    self.history_result = {
+                        "outputs": {
+                            "1": {
+                                "images": [{"filename": filename, "subfolder": "", "type": "output"}],
+                            }
+                        }
+                    }
+                self._fresh = False
+
+        async def fake_validate_prompt(prompt_id, workflow, partial_execution_list):
+            return True, {}, ["1"], {}
+
+        def fake_collect(prompt_id, prompt_start_time=None, modal_options=None):
+            filename = mixin._executor.history_result["outputs"]["1"]["images"][0]["filename"]
+            entry = {"filename": filename, "data": "ZmFrZQ==", "node_id": "1"}
+            return {"images": [entry], "videos": [], "outputs": {"1": {"images": [entry]}}}
+
+        mixin._executor = FakeExecutor()
+        mixin._event_loop = types.SimpleNamespace(run_until_complete=lambda coro: asyncio.run(coro))
+        mixin._enable_torch_compile_on_unet = MagicMock()
+        mixin._log_profile = MagicMock()
+        mixin._profile_ms = lambda started: 0.0
+        mixin._repair_missing_workflow_nodes = MagicMock(return_value={
+            "attempted": False,
+            "missing_before": [],
+            "missing_after": [],
+            "installed": [],
+            "skipped": [],
+        })
+        mixin._compute_workflow_struct_hash = MagicMock(return_value="same-workflow")
+        mixin._begin_prompt_profile = MagicMock()
+        mixin._collect_in_process_outputs = MagicMock(side_effect=fake_collect)
+
+        workflow = {"1": {"class_type": "SaveImage", "inputs": {"filename_prefix": "test"}}}
+
+        with patch.dict(sys.modules, {"execution": types.SimpleNamespace(validate_prompt=fake_validate_prompt)}):
+            first = mixin._execute_in_process(workflow)
+            second = mixin._execute_in_process(workflow)
+
+        self.assertEqual(first["images"][0]["filename"], "fresh_1.png")
+        self.assertEqual(second["images"][0]["filename"], "fresh_2.png")
+        self.assertEqual(mixin._executor.reset_calls, 2)
+
+    def test_collect_in_process_outputs_keeps_explicit_rgthree_temp_history_entries(self):
+        module = load_module()
+        mixin = module._ComfyAPIMixin()
+        filename = "rgthree.compare._temp_abcde_00001_.png"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            comfy_root = Path(tmp)
+            temp_dir = comfy_root / "temp"
+            temp_dir.mkdir(parents=True)
+            (temp_dir / filename).write_bytes(b"fake-image-bytes")
+
+            mixin._executor = types.SimpleNamespace(
+                history_result={
+                    "outputs": {
+                        "7": {
+                            "a_images": [{"filename": filename, "subfolder": "", "type": "temp"}],
+                        }
+                    }
+                }
+            )
+            mixin._dummy_server = types.SimpleNamespace(prompt_queue=types.SimpleNamespace(history={}))
+
+            real_path_cls = type(comfy_root)
+
+            def fake_path(*parts):
+                path = real_path_cls(*parts)
+                if str(path).replace("\\", "/") == "/root/comfy/ComfyUI":
+                    return comfy_root
+                return path
+
+            with patch("pathlib.Path", side_effect=fake_path):
+                result = mixin._collect_in_process_outputs("prompt-1", prompt_start_time=time.time() - 1)
+
+        self.assertIn("7", result["outputs"])
+        self.assertEqual(result["outputs"]["7"]["a_images"][0]["filename"], filename)
+
+    def test_collect_outputs_keeps_explicit_rgthree_temp_entries(self):
+        module = load_module()
+        mixin = module._ComfyAPIMixin()
+        filename = "rgthree.compare._temp_abcde_00001_.png"
+        mixin._http_client_obj = types.SimpleNamespace(get=lambda url: types.SimpleNamespace(content=b"fake-image-bytes"))
+
+        result = mixin._collect_outputs({
+            "7": {
+                "a_images": [{"filename": filename, "subfolder": "", "type": "temp"}],
+            }
+        })
+
+        self.assertIn("7", result["outputs"])
+        self.assertEqual(result["outputs"]["7"]["a_images"][0]["filename"], filename)
 
 
 if __name__ == "__main__":
