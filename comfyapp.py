@@ -191,6 +191,7 @@ PROMPT_ASYNC_ACTUAL_LOAD = os.getenv("PROMPT_ASYNC_ACTUAL_LOAD", "0") == "1"
 PROMPT_ASYNC_ACTUAL_LOAD_UNET = os.getenv("PROMPT_ASYNC_ACTUAL_LOAD_UNET", "0") == "1"
 DISABLE_CACHEDIT_FOR_Z_IMAGE = os.getenv("DISABLE_CACHEDIT_FOR_Z_IMAGE", "0") == "1"
 DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE = os.getenv("DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE", "0") == "1"
+ACTUAL_LOAD_MODE = os.getenv("ACTUAL_LOAD_MODE", "clip_vae_only").strip().lower()
 
 # P1 — Direct warmup granular flags.
 # DIRECT_WARMUP_LOAD_UNET/LOAD_CLIP gate whether UNET/CLIP are loaded
@@ -971,11 +972,32 @@ _COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = [
 _CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE = shutil.ignore_patterns(
     ".git",
     "__pycache__",
+    ".ipynb_checkpoints",
     "*.pyc",
     "*.pyo",
     "node_modules",
     ".venv",
     "venv",
+    # Image/media/docs — not needed for pip install
+    "*.jpg",
+    "*.jpeg",
+    "*.png",
+    "*.gif",
+    "*.tiff",
+    "*.bmp",
+    "*.webp",
+    "*.ico",
+    "*.mp4",
+    "*.avi",
+    "*.mov",
+    "*.mkv",
+    "*.webm",
+    "*.ipynb",
+    "*.md",
+    "*.rst",
+    "*.gz",
+    "*.zip",
+    "*.tar",
 )
 
 
@@ -1265,25 +1287,30 @@ _image_base = (
             "PROMPT_ASYNC_PRELOAD": "0",
             "PROMPT_PRELOAD_WORKERS": "2",
             "PROMPT_ASYNC_ACTUAL_LOAD": "1",
-            "PROMPT_ASYNC_ACTUAL_LOAD_UNET": "0",
+            "PROMPT_ASYNC_ACTUAL_LOAD_UNET": "1",
+            "ACTUAL_LOAD_MODE": "unet_vae_only",
             "DISABLE_CACHEDIT_FOR_Z_IMAGE": "0",
             "DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE": "1",
         }
     )
 )
 
-# Add requirements per node first so source-only node changes do not force
-# unrelated pip-install steps to rerun.
-for _node_name in _iter_syncable_custom_node_dirs(_LOCAL_CUSTOM_NODES):
-    _requirements_src = _custom_node_requirements_context_dir(_node_name)
-    if os.path.isfile(os.path.join(_requirements_src, _node_name, "requirements.txt")):
-        _image_base = _image_base.add_local_dir(
-            _requirements_src,
-            f"/root/comfy-build/custom_node_requirements/{_node_name}",
-            copy=True,
-        ).run_commands(
-            f'cd "/root/comfy-build/custom_node_requirements/{_node_name}/{_node_name}" && pip install -r requirements.txt --quiet'
-        )
+# Combined requirements layer: one COPY + one pip loop (single cache unit).
+# When no requirements.txt changes, the layer is cached (~5s deploy).
+# Changed requirements cause all pip installs to re-run within this layer.
+_image_base = _image_base.add_local_dir(
+    _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR,
+    "/root/comfy-build/custom_node_requirements",
+    copy=True,
+).run_commands(
+    '_pip_node() { local n="$1"; local d="$2"; '
+    '  [ -f "$d/$n/requirements.txt" ] || return 0; '
+    '  cd "$d/$n" && pip install -r requirements.txt --quiet; '
+    '}; '
+    'for d in /root/comfy-build/custom_node_requirements/*/; do '
+    '  _pip_node "$(basename "$d")" "$d"; '
+    'done'
+)
 
 # Add each custom node as its own source layer after all requirements layers.
 for _node_name in _iter_syncable_custom_node_dirs(_LOCAL_CUSTOM_NODES):
@@ -2381,59 +2408,16 @@ class _ComfyAPIMixin:
         import os as _al_os, nodes as _al_nodes, folder_paths as _al_fp, threading as _al_thr
         self._init_actual_load_registry()
         resolved_keys = []
+        _mode_clip = ACTUAL_LOAD_MODE not in ("unet_vae_only", "unet_only")
+        _mode_vae = ACTUAL_LOAD_MODE not in ("unet_only",)
+        _mode_unet = ACTUAL_LOAD_MODE not in ("clip_vae_only",)
+        print(f"[actual_load] mode={ACTUAL_LOAD_MODE} will_start_clip={1 if _mode_clip else 0} will_start_vae={1 if _mode_vae else 0} will_start_unet={1 if _mode_unet else 0}")
+
         # ── CLIP (single file) ──
-        for clip_name in stack.get("clip", []):
-            clip_type = stack.get("clip_type", "stable_diffusion")
-            clip_path = (_al_fp.get_full_path("text_encoders", clip_name) or clip_name) if clip_name else ""
-            if not clip_path:
-                continue
-            try:
-                clip_real = _al_os.path.realpath(clip_path)
-            except Exception:
-                clip_real = clip_path
-            key = (clip_real, clip_type)
-            resolved_keys.append(key)
-            lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
-            with lock:
-                if key in self._actual_load_futures:
-                    self._actual_load_duplicates_prevented += 1
-                    print(f"[actual_load] duplicate_prevented key={key}")
-                    continue
-                if hasattr(self, "_clip_object_cache") and key in self._clip_object_cache:
-                    print(f"[actual_load] cache_hit key={key}")
-                    continue
-                def _load_clip(k=key, cn=clip_name, ct=clip_type):
-                    import threading as _thr_lc
-                    _tid = _thr_lc.current_thread().ident
-                    self._actual_load_owner_thread[k] = _tid
-                    print(f"[actual_load] worker_start loader=CLIP key={k} thread_id={_tid}")
-                    t0 = time.time()
-                    try:
-                        _orig_fn = self._original_loaders.get("CLIPLoader.load_clip")
-                        if _orig_fn:
-                            print(f"[actual_load] using_original_loader loader=CLIP key={k}")
-                            obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["CLIPLoader"](), clip_name=cn, type=ct)
-                        else:
-                            obj = _al_nodes.NODE_CLASS_MAPPINGS["CLIPLoader"]().load_clip(clip_name=cn, type=ct)
-                        self._clip_object_cache[k] = obj[0]
-                        d_ms = round((time.time() - t0) * 1000, 1)
-                        print(f"[actual_load] done loader=CLIP key={k} ms={d_ms}")
-                    except Exception as e:
-                        print(f"[actual_load] failed loader=CLIP key={k} err={e}")
-                    finally:
-                        self._actual_load_owner_thread.pop(k, None)
-                _t = _al_thr.Thread(target=_load_clip, daemon=True)
-                _t.start()
-                self._actual_load_futures[key] = _t
-                result["submitted"].append(f"CLIP key={key}")
-                print(f"[actual_load] submit_raw_key=({clip_path}, {clip_type}) submit_canonical_key={key}")
-        # ── CLIP (DualCLIP — second file if different) ──
-        clips = stack.get("clip", [])
-        if len(clips) >= 2:
-            clip_type = stack.get("clip_type", "stable_diffusion")
-            for ci in range(1, len(clips)):
-                clip_name = clips[ci]
-                clip_path = _al_fp.get_full_path("text_encoders", clip_name) or clip_name
+        if _mode_clip:
+            for clip_name in stack.get("clip", []):
+                clip_type = stack.get("clip_type", "stable_diffusion")
+                clip_path = (_al_fp.get_full_path("text_encoders", clip_name) or clip_name) if clip_name else ""
                 if not clip_path:
                     continue
                 try:
@@ -2441,135 +2425,197 @@ class _ComfyAPIMixin:
                 except Exception:
                     clip_real = clip_path
                 key = (clip_real, clip_type)
-                if key in resolved_keys:
-                    continue
                 resolved_keys.append(key)
                 lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
                 with lock:
                     if key in self._actual_load_futures:
                         self._actual_load_duplicates_prevented += 1
+                        print(f"[actual_load] duplicate_prevented key={key}")
                         continue
                     if hasattr(self, "_clip_object_cache") and key in self._clip_object_cache:
                         print(f"[actual_load] cache_hit key={key}")
                         continue
-                    def _load_clip2(k=key, cn=clip_name, ct=clip_type):
-                        import threading as _thr_lc2
-                        _tid = _thr_lc2.current_thread().ident
+                    def _load_clip(k=key, cn=clip_name, ct=clip_type):
+                        import threading as _thr_lc
+                        _tid = _thr_lc.current_thread().ident
                         self._actual_load_owner_thread[k] = _tid
-                        print(f"[actual_load] worker_start loader=DualCLIP key={k} thread_id={_tid}")
+                        print(f"[actual_load] worker_start loader=CLIP key={k} thread_id={_tid}")
                         t0 = time.time()
                         try:
-                            _orig_fn = self._original_loaders.get("DualCLIPLoader.load_clip")
+                            _orig_fn = self._original_loaders.get("CLIPLoader.load_clip")
                             if _orig_fn:
-                                print(f"[actual_load] using_original_loader loader=DualCLIP key={k}")
-                                obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["DualCLIPLoader"](), clip_name1=clips[0], clip_name2=cn, type=ct)
+                                print(f"[actual_load] using_original_loader loader=CLIP key={k}")
+                                obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["CLIPLoader"](), clip_name=cn, type=ct)
                             else:
-                                obj = _al_nodes.NODE_CLASS_MAPPINGS["DualCLIPLoader"]().load_clip(clip_name1=clips[0], clip_name2=cn, type=ct)
-                            self._clip_object_cache[k] = obj[0] if obj else None
+                                obj = _al_nodes.NODE_CLASS_MAPPINGS["CLIPLoader"]().load_clip(clip_name=cn, type=ct)
+                            self._clip_object_cache[k] = obj[0]
                             d_ms = round((time.time() - t0) * 1000, 1)
-                            print(f"[actual_load] done loader=DualCLIP key={k} ms={d_ms}")
+                            print(f"[actual_load] done loader=CLIP key={k} ms={d_ms}")
                         except Exception as e:
-                            print(f"[actual_load] failed loader=DualCLIP key={k} err={e}")
+                            print(f"[actual_load] failed loader=CLIP key={k} err={e}")
                         finally:
                             self._actual_load_owner_thread.pop(k, None)
-                    _t = _al_thr.Thread(target=_load_clip2, daemon=True)
+                    _t = _al_thr.Thread(target=_load_clip, daemon=True)
                     _t.start()
                     self._actual_load_futures[key] = _t
-                    result["submitted"].append(f"DualCLIP key={key}")
+                    result["submitted"].append(f"CLIP key={key}")
                     print(f"[actual_load] submit_raw_key=({clip_path}, {clip_type}) submit_canonical_key={key}")
+            # ── CLIP (DualCLIP — second file if different) ──
+            clips = stack.get("clip", [])
+            if len(clips) >= 2:
+                clip_type = stack.get("clip_type", "stable_diffusion")
+                for ci in range(1, len(clips)):
+                    clip_name = clips[ci]
+                    clip_path = _al_fp.get_full_path("text_encoders", clip_name) or clip_name
+                    if not clip_path:
+                        continue
+                    try:
+                        clip_real = _al_os.path.realpath(clip_path)
+                    except Exception:
+                        clip_real = clip_path
+                    key = (clip_real, clip_type)
+                    if key in resolved_keys:
+                        continue
+                    resolved_keys.append(key)
+                    lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
+                    with lock:
+                        if key in self._actual_load_futures:
+                            self._actual_load_duplicates_prevented += 1
+                            continue
+                        if hasattr(self, "_clip_object_cache") and key in self._clip_object_cache:
+                            print(f"[actual_load] cache_hit key={key}")
+                            continue
+                        def _load_clip2(k=key, cn=clip_name, ct=clip_type):
+                            import threading as _thr_lc2
+                            _tid = _thr_lc2.current_thread().ident
+                            self._actual_load_owner_thread[k] = _tid
+                            print(f"[actual_load] worker_start loader=DualCLIP key={k} thread_id={_tid}")
+                            t0 = time.time()
+                            try:
+                                _orig_fn = self._original_loaders.get("DualCLIPLoader.load_clip")
+                                if _orig_fn:
+                                    print(f"[actual_load] using_original_loader loader=DualCLIP key={k}")
+                                    obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["DualCLIPLoader"](), clip_name1=clips[0], clip_name2=cn, type=ct)
+                                else:
+                                    obj = _al_nodes.NODE_CLASS_MAPPINGS["DualCLIPLoader"]().load_clip(clip_name1=clips[0], clip_name2=cn, type=ct)
+                                self._clip_object_cache[k] = obj[0] if obj else None
+                                d_ms = round((time.time() - t0) * 1000, 1)
+                                print(f"[actual_load] done loader=DualCLIP key={k} ms={d_ms}")
+                            except Exception as e:
+                                print(f"[actual_load] failed loader=DualCLIP key={k} err={e}")
+                            finally:
+                                self._actual_load_owner_thread.pop(k, None)
+                        _t = _al_thr.Thread(target=_load_clip2, daemon=True)
+                        _t.start()
+                        self._actual_load_futures[key] = _t
+                        result["submitted"].append(f"DualCLIP key={key}")
+                        print(f"[actual_load] submit_raw_key=({clip_path}, {clip_type}) submit_canonical_key={key}")
+        elif ACTUAL_LOAD_MODE in ("unet_vae_only", "unet_only"):
+            print(f"[actual_load] mode_violation_check mode={ACTUAL_LOAD_MODE} started_clip=0 correct=1")
+
         # ── VAE ──
-        for vae_name in stack.get("vae", []):
-            vae_path = _al_fp.get_full_path("vae", vae_name) or vae_name
-            if not vae_path:
-                continue
-            try:
-                vae_real = _al_os.path.realpath(vae_path)
-            except Exception:
-                vae_real = vae_path
-            key = ("VAELoader", vae_real)
-            resolved_keys.append(key)
-            lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
-            with lock:
-                if key in self._actual_load_futures:
-                    self._actual_load_duplicates_prevented += 1
-                    print(f"[actual_load] duplicate_prevented key={key}")
+        if _mode_vae:
+            for vae_name in stack.get("vae", []):
+                vae_path = _al_fp.get_full_path("vae", vae_name) or vae_name
+                if not vae_path:
                     continue
-                self._init_vae_cache()
-                if hasattr(self, "_vae_object_cache") and key in self._vae_object_cache:
-                    print(f"[actual_load] cache_hit key={key}")
-                    continue
-                def _load_vae(k=key, vn=vae_name):
-                    import threading as _thr_lv
-                    _tid = _thr_lv.current_thread().ident
-                    self._actual_load_owner_thread[k] = _tid
-                    print(f"[actual_load] worker_start loader=VAE key={k} thread_id={_tid}")
-                    t0 = time.time()
-                    try:
-                        _orig_fn = self._original_loaders.get("VAELoader.load_vae")
-                        if _orig_fn:
-                            print(f"[actual_load] using_original_loader loader=VAE key={k}")
-                            obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["VAELoader"](), vae_name=vn)
-                        else:
-                            obj = _al_nodes.NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=vn)
-                        self._vae_object_cache[k] = obj[0]
-                        d_ms = round((time.time() - t0) * 1000, 1)
-                        print(f"[actual_load] done loader=VAE key={k} ms={d_ms}")
-                    except Exception as e:
-                        print(f"[actual_load] failed loader=VAE key={k} err={e}")
-                    finally:
-                        self._actual_load_owner_thread.pop(k, None)
-                _t = _al_thr.Thread(target=_load_vae, daemon=True)
-                _t.start()
-                self._actual_load_futures[key] = _t
-                result["submitted"].append(f"VAE key={key}")
-                print(f"[actual_load] submitted loader=VAE key={key}")
+                try:
+                    vae_real = _al_os.path.realpath(vae_path)
+                except Exception:
+                    vae_real = vae_path
+                key = ("VAELoader", vae_real)
+                resolved_keys.append(key)
+                lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
+                with lock:
+                    if key in self._actual_load_futures:
+                        self._actual_load_duplicates_prevented += 1
+                        print(f"[actual_load] duplicate_prevented key={key}")
+                        continue
+                    self._init_vae_cache()
+                    if hasattr(self, "_vae_object_cache") and key in self._vae_object_cache:
+                        print(f"[actual_load] cache_hit key={key}")
+                        continue
+                    def _load_vae(k=key, vn=vae_name):
+                        import threading as _thr_lv
+                        _tid = _thr_lv.current_thread().ident
+                        self._actual_load_owner_thread[k] = _tid
+                        print(f"[actual_load] worker_start loader=VAE key={k} thread_id={_tid}")
+                        t0 = time.time()
+                        try:
+                            _orig_fn = self._original_loaders.get("VAELoader.load_vae")
+                            if _orig_fn:
+                                print(f"[actual_load] using_original_loader loader=VAE key={k}")
+                                obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["VAELoader"](), vae_name=vn)
+                            else:
+                                obj = _al_nodes.NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=vn)
+                            self._vae_object_cache[k] = obj[0]
+                            d_ms = round((time.time() - t0) * 1000, 1)
+                            print(f"[actual_load] done loader=VAE key={k} ms={d_ms}")
+                        except Exception as e:
+                            print(f"[actual_load] failed loader=VAE key={k} err={e}")
+                        finally:
+                            self._actual_load_owner_thread.pop(k, None)
+                    _t = _al_thr.Thread(target=_load_vae, daemon=True)
+                    _t.start()
+                    self._actual_load_futures[key] = _t
+                    result["submitted"].append(f"VAE key={key}")
+                    print(f"[actual_load] submitted loader=VAE key={key}")
+
         # ── UNET ──
-        unet_names = stack.get("unet", []) or stack.get("checkpoint", [])
-        for unet_name in unet_names:
-            unet_path = _al_fp.get_full_path("unet", unet_name) or unet_name
-            if not unet_path:
-                continue
-            key = ("UNETLoader", unet_path)
-            resolved_keys.append(key)
-            lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
-            with lock:
-                if not PROMPT_ASYNC_ACTUAL_LOAD_UNET:
-                    result["skipped_unet"] = True
-                    print(f"[actual_load] skipped_unet flag_disabled=1 key={key}")
+        if _mode_unet:
+            unet_names = stack.get("unet", []) or stack.get("checkpoint", [])
+            for unet_name in unet_names:
+                unet_path = _al_fp.get_full_path("unet", unet_name) or unet_name
+                if not unet_path:
                     continue
-                self._init_unet_cache()
-                if hasattr(self, "_unet_object_cache") and key in self._unet_object_cache:
-                    print(f"[actual_load] cache_hit key={key}")
-                    continue
-                if key in self._actual_load_futures:
-                    self._actual_load_duplicates_prevented += 1
-                    print(f"[actual_load] duplicate_prevented key={key}")
-                    continue
-                def _load_unet(k=key, un=unet_name):
-                    import threading as _thr_lu
-                    _tid = _thr_lu.current_thread().ident
-                    self._actual_load_owner_thread[k] = _tid
-                    print(f"[actual_load] worker_start loader=UNET key={k} thread_id={_tid}")
-                    t0 = time.time()
-                    try:
-                        _orig_fn = self._original_loaders.get("UNETLoader.load_unet")
-                        if _orig_fn:
-                            print(f"[actual_load] using_original_loader loader=UNET key={k}")
-                            obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["UNETLoader"](), unet_name=un, weight_dtype="default")
-                        else:
-                            obj = _al_nodes.NODE_CLASS_MAPPINGS["UNETLoader"]().load_unet(unet_name=un, weight_dtype="default")
-                        self._unet_object_cache[k] = obj[0]
-                        d_ms = round((time.time() - t0) * 1000, 1)
-                        print(f"[actual_load] done loader=UNET key={k} ms={d_ms}")
-                    except Exception as e:
-                        print(f"[actual_load] failed loader=UNET key={k} err={e}")
-                    finally:
-                        self._actual_load_owner_thread.pop(k, None)
-                _t = _al_thr.Thread(target=_load_unet, daemon=True)
-                _t.start()
-                self._actual_load_futures[key] = _t
-                result["submitted"].append(f"UNET key={key}")
-                print(f"[actual_load] submitted loader=UNET key={key}")
+                try:
+                    unet_real = _al_os.path.realpath(unet_path)
+                except Exception:
+                    unet_real = unet_path
+                key = (unet_real, "default")
+                resolved_keys.append(key)
+                lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
+                with lock:
+                    if not PROMPT_ASYNC_ACTUAL_LOAD_UNET:
+                        result["skipped_unet"] = True
+                        print(f"[actual_load] skipped_unet flag_disabled=1 key={key}")
+                        continue
+                    self._init_unet_cache()
+                    if hasattr(self, "_unet_object_cache") and key in self._unet_object_cache:
+                        print(f"[actual_load] cache_hit key={key}")
+                        continue
+                    if key in self._actual_load_futures:
+                        self._actual_load_duplicates_prevented += 1
+                        print(f"[actual_load] duplicate_prevented key={key}")
+                        continue
+                    def _load_unet(k=key, un=unet_name):
+                        import threading as _thr_lu
+                        _tid = _thr_lu.current_thread().ident
+                        self._actual_load_owner_thread[k] = _tid
+                        print(f"[actual_load] worker_start loader=UNET key={k} thread_id={_tid}")
+                        t0 = time.time()
+                        try:
+                            _orig_fn = self._original_loaders.get("UNETLoader.load_unet")
+                            if _orig_fn:
+                                print(f"[actual_load] using_original_loader loader=UNET key={k}")
+                                obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["UNETLoader"](), unet_name=un, weight_dtype="default")
+                            else:
+                                obj = _al_nodes.NODE_CLASS_MAPPINGS["UNETLoader"]().load_unet(unet_name=un, weight_dtype="default")
+                            self._unet_object_cache[k] = obj[0]
+                            d_ms = round((time.time() - t0) * 1000, 1)
+                            print(f"[actual_load] done loader=UNET key={k} ms={d_ms}")
+                        except Exception as e:
+                            print(f"[actual_load] failed loader=UNET key={k} err={e}")
+                        finally:
+                            self._actual_load_owner_thread.pop(k, None)
+                    _t = _al_thr.Thread(target=_load_unet, daemon=True)
+                    _t.start()
+                    self._actual_load_futures[key] = _t
+                    result["submitted"].append(f"UNET key={key}")
+                    print(f"[actual_load] submitted loader=UNET key={key}")
+        else:
+            result["skipped_unet"] = True
+            print(f"[actual_load] skipped_unet mode={ACTUAL_LOAD_MODE}")
         result["enabled"] = True
         print(f"[actual_load] resolved_keys={resolved_keys}")
         return result
@@ -4957,12 +5003,12 @@ class _ComfyAPIMixin:
                 _api._unet_cache_hits = getattr(_api, '_unet_cache_hits', 0) + 1
                 print(f"[unet_loader_cache] cache_hit path={unet_name}")
                 return (_cache[key],)
+            print(f"[unet_loader_cache] canonical_key={key} object_cache_exists={'1' if key in _cache else '0'}")
             # Self-future detection
             import threading as _thr_sfu
             _owner_map = getattr(_api, "_actual_load_owner_thread", {})
-            _al_key = ("UNETLoader", key[0] if key else path)
-            if _owner_map.get(_al_key) == _thr_sfu.current_thread().ident:
-                print(f"[loader_future] self_future_detected key={_al_key} -> using original loader directly")
+            if _owner_map.get(key) == _thr_sfu.current_thread().ident:
+                print(f"[loader_future] self_future_detected key={key} -> using original loader directly")
                 return orig_load(self_node, **kwargs)
             # Check CPU cache next: if the state dict is cached, load normally
             # (the CPU cache deepcopy will be fast)
@@ -4982,12 +5028,13 @@ class _ComfyAPIMixin:
                         _api._unet_cache_hits = getattr(_api, '_unet_cache_hits', 0) + 1
                         return (_cache[key],)
             # Check in-flight actual-load future
-            _al_key = ("UNETLoader", key[0] if key else path)
-            if _api._consume_actual_load_future(_al_key):
-                if _al_key in _cache:
-                    print(f"[loader_future] returned_future_result loader=UNET key={_al_key}")
+            _futures_exists = getattr(_api, '_actual_load_futures', {})
+            print(f"[unet_loader_cache] future_exists={'1' if key in _futures_exists else '0'}")
+            if _api._consume_actual_load_future(key):
+                if key in _cache:
+                    print(f"[loader_future] returned_future_result loader=UNET key={key}")
                     _api._unet_cache_hits = getattr(_api, '_unet_cache_hits', 0) + 1
-                    return (_cache[_al_key],)
+                    return (_cache[key],)
             _api._unet_cache_misses = getattr(_api, '_unet_cache_misses', 0) + 1
             t0 = time.time()
             result = orig_load(self_node, **kwargs)
