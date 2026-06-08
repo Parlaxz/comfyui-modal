@@ -5,7 +5,7 @@ import types
 import unittest
 import uuid
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call, patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMFYAPP_PATH = REPO_ROOT / "comfyapp.py"
@@ -49,6 +49,18 @@ def load_module():
 
 
 class ComfyAppBuildContextTests(unittest.TestCase):
+    def test_comfyui_modal_node_ignores_generated_deploy_artifacts(self):
+        module = load_module()
+
+        patterns = module._custom_node_image_ignore_patterns("comfyui-modal")
+
+        self.assertIn(".deploy_log", patterns)
+        self.assertIn(".custom_node_requirements/", patterns)
+        self.assertIn(".deployed_state.json", patterns)
+        self.assertIn(".hf_token", patterns)
+        self.assertIn(".civitai_token", patterns)
+        self.assertIn("latest_benchmark_workflow.json", patterns)
+
     def test_prepare_requirements_build_context_copies_only_requirements_files(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -69,12 +81,12 @@ class ComfyAppBuildContextTests(unittest.TestCase):
 
             module._prepare_custom_node_requirements_build_context(str(source_root), str(target_root))
 
-            self.assertTrue((target_root / "node-a" / "requirements.txt").is_file())
-            self.assertTrue((target_root / "node-b" / "requirements.txt").is_file())
-            self.assertFalse((target_root / "node-a" / "nodes.py").exists())
+            self.assertTrue((target_root / "node-a" / "node-a" / "requirements.txt").is_file())
+            self.assertTrue((target_root / "node-b" / "node-b" / "requirements.txt").is_file())
+            self.assertFalse((target_root / "node-a" / "node-a" / "nodes.py").exists())
             self.assertFalse((target_root / "__pycache__").exists())
-            self.assertEqual((target_root / "node-a" / "requirements.txt").read_text(encoding="utf-8"), "numpy\n")
-            self.assertEqual((target_root / "node-b" / "requirements.txt").read_text(encoding="utf-8"), "torch\n")
+            self.assertEqual((target_root / "node-a" / "node-a" / "requirements.txt").read_text(encoding="utf-8"), "numpy\n")
+            self.assertEqual((target_root / "node-b" / "node-b" / "requirements.txt").read_text(encoding="utf-8"), "torch\n")
 
     def test_prepare_requirements_build_context_copies_local_path_dependencies(self):
         """Local path deps (e.g. ./src/sam3) in requirements.txt are copied
@@ -93,11 +105,85 @@ class ComfyAppBuildContextTests(unittest.TestCase):
             module._prepare_custom_node_requirements_build_context(str(source_root), str(target_root))
 
             # requirements.txt copied
-            self.assertTrue((target_root / "comfyui_sam3" / "requirements.txt").is_file())
+            self.assertTrue((target_root / "comfyui_sam3" / "comfyui_sam3" / "requirements.txt").is_file())
             # Local path dep directory copied
-            self.assertTrue((target_root / "comfyui_sam3" / "src" / "sam3" / "__init__.py").is_file())
+            self.assertTrue((target_root / "comfyui_sam3" / "comfyui_sam3" / "src" / "sam3" / "__init__.py").is_file())
             # Non-requirements files from other imaginary nodes NOT copied
-            self.assertFalse((target_root / "comfyui_sam3" / "__pycache__").exists())
+            self.assertFalse((target_root / "comfyui_sam3" / "comfyui_sam3" / "__pycache__").exists())
+
+    def test_prepare_requirements_build_context_preserves_parent_relative_local_paths(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "custom_nodes"
+            target_root = Path(tmp) / "requirements_ctx"
+
+            shared = source_root / "sharedlib"
+            node = source_root / "node-a"
+            shared.mkdir(parents=True)
+            node.mkdir(parents=True)
+            (shared / "pyproject.toml").write_text("[build-system]\nrequires=[]\n", encoding="utf-8")
+            (node / "requirements.txt").write_text("--editable ../sharedlib\n", encoding="utf-8")
+
+            module._prepare_custom_node_requirements_build_context(str(source_root), str(target_root))
+
+            self.assertTrue((target_root / "node-a" / "node-a" / "requirements.txt").is_file())
+            self.assertTrue((target_root / "node-a" / "sharedlib" / "pyproject.toml").is_file())
+
+    def test_prepare_requirements_build_context_copies_included_requirement_files(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "custom_nodes"
+            target_root = Path(tmp) / "requirements_ctx"
+
+            node = source_root / "node-a"
+            local_src = node / "src" / "sam3"
+            local_src.mkdir(parents=True)
+            (local_src / "__init__.py").write_text("print('sam3')\n", encoding="utf-8")
+            (node / "requirements.txt").write_text("-r extras.txt\n", encoding="utf-8")
+            (node / "extras.txt").write_text("./src/sam3\n", encoding="utf-8")
+
+            module._prepare_custom_node_requirements_build_context(str(source_root), str(target_root))
+
+            self.assertTrue((target_root / "node-a" / "node-a" / "requirements.txt").is_file())
+            self.assertTrue((target_root / "node-a" / "node-a" / "extras.txt").is_file())
+            self.assertTrue((target_root / "node-a" / "node-a" / "src" / "sam3" / "__init__.py").is_file())
+
+    def test_prepare_requirements_build_context_does_not_rewrite_unchanged_nodes(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "custom_nodes"
+            target_root = Path(tmp) / "requirements_ctx"
+            node = source_root / "node-a"
+            node.mkdir(parents=True)
+            (node / "requirements.txt").write_text("numpy\n", encoding="utf-8")
+
+            module._prepare_custom_node_requirements_build_context(str(source_root), str(target_root))
+
+            with patch.object(module, "_rmtree_robust") as rmtree_mock:
+                module._prepare_custom_node_requirements_build_context(str(source_root), str(target_root))
+
+        rmtree_mock.assert_not_called()
+
+    def test_prepare_requirements_build_context_rewrites_only_changed_node(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "custom_nodes"
+            target_root = Path(tmp) / "requirements_ctx"
+            node_a = source_root / "node-a"
+            node_b = source_root / "node-b"
+            node_a.mkdir(parents=True)
+            node_b.mkdir(parents=True)
+            (node_a / "requirements.txt").write_text("numpy\n", encoding="utf-8")
+            (node_b / "requirements.txt").write_text("torch\n", encoding="utf-8")
+
+            module._prepare_custom_node_requirements_build_context(str(source_root), str(target_root))
+            (node_a / "requirements.txt").write_text("numpy==2.0.0\n", encoding="utf-8")
+
+            with patch.object(module, "_rmtree_robust", wraps=module._rmtree_robust) as rmtree_mock:
+                module._prepare_custom_node_requirements_build_context(str(source_root), str(target_root))
+
+        rmtree_mock.assert_has_calls([call(str(target_root / "node-a"))])
+        self.assertEqual(rmtree_mock.call_count, 1)
 
 
 if __name__ == "__main__":

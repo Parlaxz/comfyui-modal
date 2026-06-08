@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -184,6 +185,12 @@ WARMUP_TEXT = "A Jew steals baby kittens from their mother cat. the mother cat i
 #   async_no_wait  — fire preload in background thread, don't block restore
 #   budgeted_1500ms — preload with 1500ms time budget, stop when exceeded
 PRELOAD_MODE = os.getenv("COMFYMODAL_PRELOAD_MODE", "workers_2").strip().lower()
+PROMPT_ASYNC_PRELOAD = os.getenv("PROMPT_ASYNC_PRELOAD", "0") == "1"
+PROMPT_PRELOAD_WORKERS = int(os.getenv("PROMPT_PRELOAD_WORKERS", "2"))
+PROMPT_ASYNC_ACTUAL_LOAD = os.getenv("PROMPT_ASYNC_ACTUAL_LOAD", "0") == "1"
+PROMPT_ASYNC_ACTUAL_LOAD_UNET = os.getenv("PROMPT_ASYNC_ACTUAL_LOAD_UNET", "0") == "1"
+DISABLE_CACHEDIT_FOR_Z_IMAGE = os.getenv("DISABLE_CACHEDIT_FOR_Z_IMAGE", "0") == "1"
+DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE = os.getenv("DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE", "0") == "1"
 
 # P1 — Direct warmup granular flags.
 # DIRECT_WARMUP_LOAD_UNET/LOAD_CLIP gate whether UNET/CLIP are loaded
@@ -937,6 +944,39 @@ _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR = os.path.join(
 )
 
 _CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
+_CUSTOM_NODE_IMAGE_IGNORE_PATTERNS = [
+    ".git/",
+    "__pycache__/",
+    "*.pyc",
+    ".venv/",
+    "venv/",
+    "node_modules/",
+]
+_COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = [
+    ".gitignore",
+    "*.md",
+    ".deploy_log",
+    ".tmp",
+    "*.tmp",
+    ".custom_node_requirements/",
+    ".hf_token",
+    ".civitai_token",
+    ".deployed_state.json",
+    ".deployed_version",
+    ".modal_settings.json",
+    "latest_benchmark_workflow.json",
+    "modal_logs.txt",
+    "_deploy_output.log",
+]
+_CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE = shutil.ignore_patterns(
+    ".git",
+    "__pycache__",
+    "*.pyc",
+    "*.pyo",
+    "node_modules",
+    ".venv",
+    "venv",
+)
 
 
 def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
@@ -954,6 +994,34 @@ def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
     return names
 
 
+def _custom_node_image_ignore_patterns(node_name: str) -> list[str]:
+    patterns = list(_CUSTOM_NODE_IMAGE_IGNORE_PATTERNS)
+    if node_name == os.path.basename(_COMFYUI_MODAL_DIR):
+        patterns.extend(_COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS)
+    return patterns
+
+
+def _custom_node_requirements_context_dir(node_name: str) -> str:
+    return os.path.join(_LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR, node_name)
+
+
+def _patch_cachedit_node_class(cachedit_cls) -> bool:
+    cachedit_func = getattr(cachedit_cls, "FUNCTION", "apply_model_optimization")
+    original = getattr(cachedit_cls, cachedit_func, None)
+    if original is None:
+        return False
+    if getattr(original, "_comfy_modal_disabled", False):
+        return True
+
+    def _cd_noop(self_node, model, *args, **kwargs):
+        print("[cachedit] DISABLED by DISABLE_CACHEDIT_FOR_Z_IMAGE=1 - returning model unchanged")
+        return (model,)
+
+    _cd_noop._comfy_modal_disabled = True
+    setattr(cachedit_cls, cachedit_func, _cd_noop)
+    return True
+
+
 def _rmtree_robust(path: str) -> None:
     """Remove a directory tree, handling Windows deep-path limitations."""
     try:
@@ -969,6 +1037,102 @@ def _rmtree_robust(path: str) -> None:
             raise
 
 
+def _build_requirements_context_manifest(root: str) -> dict[str, str]:
+    manifest = {}
+    if not os.path.isdir(root):
+        return manifest
+    for dirpath, _, filenames in os.walk(root):
+        for filename in sorted(filenames):
+            path = os.path.join(dirpath, filename)
+            rel_path = os.path.relpath(path, root).replace("\\", "/")
+            manifest[rel_path] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return manifest
+
+
+def _copy_requirement_reference_tree(
+    req_file: str,
+    node_path: str,
+    staged_node_dir: str,
+    seen_files: set[str],
+) -> None:
+    req_file = os.path.abspath(req_file)
+    if req_file in seen_files:
+        return
+    seen_files.add(req_file)
+
+    rel_req = os.path.relpath(req_file, node_path)
+    dst_req = os.path.normpath(os.path.join(staged_node_dir, rel_req))
+    os.makedirs(os.path.dirname(dst_req), exist_ok=True)
+    shutil.copy2(req_file, dst_req)
+
+    req_dir = os.path.dirname(req_file)
+    req_text = Path(req_file).read_text(encoding="utf-8")
+    for line in req_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        stripped = stripped.split(";", 1)[0].strip()
+        if not stripped:
+            continue
+
+        if stripped.startswith("-e "):
+            stripped = stripped[3:].strip()
+        elif stripped.startswith("--editable "):
+            stripped = stripped[len("--editable "):].strip()
+        elif stripped.startswith("-r "):
+            include_path = os.path.abspath(os.path.join(req_dir, stripped[3:].strip()))
+            if os.path.isfile(include_path):
+                _copy_requirement_reference_tree(include_path, node_path, staged_node_dir, seen_files)
+            continue
+        elif stripped.startswith("--requirement "):
+            include_path = os.path.abspath(
+                os.path.join(req_dir, stripped[len("--requirement "):].strip())
+            )
+            if os.path.isfile(include_path):
+                _copy_requirement_reference_tree(include_path, node_path, staged_node_dir, seen_files)
+            continue
+
+        if not (stripped.startswith("./") or stripped.startswith("../")):
+            continue
+        local_path = os.path.abspath(os.path.join(req_dir, stripped))
+        if not os.path.exists(local_path):
+            continue
+        rel_local = os.path.relpath(local_path, node_path)
+        dst_local = os.path.normpath(os.path.join(staged_node_dir, rel_local))
+        if os.path.isdir(local_path):
+            shutil.copytree(
+                local_path,
+                dst_local,
+                dirs_exist_ok=True,
+                ignore=_CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE,
+            )
+        elif os.path.isfile(local_path):
+            os.makedirs(os.path.dirname(dst_local), exist_ok=True)
+            shutil.copy2(local_path, dst_local)
+
+
+def _copy_custom_node_requirements_build_context(node_path: str, dst_node_dir: str) -> None:
+    node_name = os.path.basename(node_path)
+    staged_node_dir = os.path.join(dst_node_dir, node_name)
+    _copy_requirement_reference_tree(
+        os.path.join(node_path, "requirements.txt"),
+        node_path,
+        staged_node_dir,
+        seen_files=set(),
+    )
+
+
+def _sync_custom_node_requirements_build_context(node_path: str, dst_node_dir: str) -> None:
+    with tempfile.TemporaryDirectory() as temp_root:
+        staged_dir = os.path.join(temp_root, os.path.basename(dst_node_dir))
+        _copy_custom_node_requirements_build_context(node_path, staged_dir)
+        if _build_requirements_context_manifest(staged_dir) == _build_requirements_context_manifest(dst_node_dir):
+            return
+        if os.path.isdir(dst_node_dir):
+            _rmtree_robust(dst_node_dir)
+        shutil.copytree(staged_dir, dst_node_dir)
+
+
 def _prepare_custom_node_requirements_build_context(source_root: str, target_root: str) -> None:
     """Copy only requirements.txt from each top-level custom node into target_root.
 
@@ -979,41 +1143,23 @@ def _prepare_custom_node_requirements_build_context(source_root: str, target_roo
     so that Docker layer caching only busts the pip-install step when
     requirements content actually changes.
     """
-    if os.path.exists(target_root):
-        _rmtree_robust(target_root)
     os.makedirs(target_root, exist_ok=True)
-
+    desired_nodes = set()
     for node_name in _iter_syncable_custom_node_dirs(source_root):
         node_path = os.path.join(source_root, node_name)
         src_req = os.path.join(node_path, "requirements.txt")
         if not os.path.isfile(src_req):
             continue
-        dst_node_dir = os.path.join(target_root, node_name)
-        os.makedirs(dst_node_dir, exist_ok=True)
-        shutil.copy2(src_req, os.path.join(dst_node_dir, "requirements.txt"))
+        desired_nodes.add(node_name)
+        _sync_custom_node_requirements_build_context(
+            node_path,
+            os.path.join(target_root, node_name),
+        )
 
-        # Copy local path dependencies (e.g. ./src/sam3) so that
-        # pip install -r ... from the build context resolves correctly.
-        req_text = Path(src_req).read_text(encoding="utf-8")
-        for line in req_text.splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            stripped = stripped.split(";", 1)[0].strip()
-            if stripped.startswith("-e "):
-                stripped = stripped[3:].strip()
-            if not (stripped.startswith("./") or stripped.startswith("../")):
-                continue
-            local_path = os.path.abspath(os.path.join(node_path, stripped))
-            if not os.path.exists(local_path):
-                continue
-            rel_local = os.path.relpath(local_path, node_path)
-            dst_local = os.path.join(dst_node_dir, rel_local)
-            if os.path.isdir(local_path):
-                shutil.copytree(local_path, dst_local)
-            elif os.path.isfile(local_path):
-                os.makedirs(os.path.dirname(dst_local), exist_ok=True)
-                shutil.copy2(local_path, dst_local)
+    for entry in os.listdir(target_root):
+        entry_path = os.path.join(target_root, entry)
+        if os.path.isdir(entry_path) and entry not in desired_nodes:
+            _rmtree_robust(entry_path)
 
 
 _prepare_custom_node_requirements_build_context(
@@ -1116,32 +1262,37 @@ _image_base = (
             "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "0",
             "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "0",
             "COMFYMODAL_RUNTIME": "1",
+            "PROMPT_ASYNC_PRELOAD": "0",
+            "PROMPT_PRELOAD_WORKERS": "2",
+            "PROMPT_ASYNC_ACTUAL_LOAD": "1",
+            "PROMPT_ASYNC_ACTUAL_LOAD_UNET": "0",
+            "DISABLE_CACHEDIT_FOR_Z_IMAGE": "0",
+            "DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE": "1",
         }
-    )
-    # Bake custom-node requirements into the image *before* copying the
-    # full source tree so Docker layer caching only busts the pip-install
-    # step when requirements content actually changes.
-    .add_local_dir(
-        _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR,
-        "/root/comfy-build/custom_node_requirements",
-        copy=True,
-    )
-    .run_commands(
-        'for req in /root/comfy-build/custom_node_requirements/*/requirements.txt; do '
-        '  [ -f "$req" ] && pip install -r "$req" --quiet; '
-        'done'
     )
 )
 
-# Add each custom node as its own layer so only changed nodes bust their
-# Docker layer cache, avoiding full rebuilds on any single-node change.
+# Add requirements per node first so source-only node changes do not force
+# unrelated pip-install steps to rerun.
+for _node_name in _iter_syncable_custom_node_dirs(_LOCAL_CUSTOM_NODES):
+    _requirements_src = _custom_node_requirements_context_dir(_node_name)
+    if os.path.isfile(os.path.join(_requirements_src, _node_name, "requirements.txt")):
+        _image_base = _image_base.add_local_dir(
+            _requirements_src,
+            f"/root/comfy-build/custom_node_requirements/{_node_name}",
+            copy=True,
+        ).run_commands(
+            f'cd "/root/comfy-build/custom_node_requirements/{_node_name}/{_node_name}" && pip install -r requirements.txt --quiet'
+        )
+
+# Add each custom node as its own source layer after all requirements layers.
 for _node_name in _iter_syncable_custom_node_dirs(_LOCAL_CUSTOM_NODES):
     _node_src = os.path.join(_LOCAL_CUSTOM_NODES, _node_name)
     _image_base = _image_base.add_local_dir(
         _node_src,
         f"/root/comfy/ComfyUI/custom_nodes/{_node_name}",
         copy=True,
-        ignore=[".git/", "__pycache__/", "*.pyc", ".venv/", "venv/", "node_modules/"],
+        ignore=_custom_node_image_ignore_patterns(_node_name),
     )
 
 image = (
@@ -2133,8 +2284,299 @@ class _ComfyAPIMixin:
                 return True
         return False
 
+    def _prompt_async_preload(self, workflow: dict) -> dict:
+        result = {"enabled": False, "workers": 0, "selected_stack": {}, "resolved_paths": [], "deduped_paths": [], "submitted": [], "duplicate_skipped": 0, "cache_hit": []}
+        if not PROMPT_ASYNC_PRELOAD:
+            print("[prompt_preload] enabled=0 (PROMPT_ASYNC_PRELOAD not set)")
+            return result
+        print("[prompt_preload] enabled=1")
+        stack = extract_requested_model_stack(workflow)
+        result["selected_stack"] = {k: v for k, v in stack.items() if v}
+        print(f"[prompt_preload] selected_stack={result['selected_stack']}")
+        if not any(stack.values()):
+            print("[prompt_preload] no models in stack, nothing to preload")
+            return result
+        paths, seen_paths = [], set()
+        for bucket in ("unet", "clip", "vae", "checkpoint"):
+            for filename in stack.get(bucket, []):
+                path = self._find_model_file(bucket, filename)
+                if path and path not in seen_paths:
+                    seen_paths.add(path)
+                    paths.append(path)
+        result["resolved_paths"] = result["deduped_paths"] = paths
+        print(f"[prompt_preload] resolved_paths={[os.path.basename(p) for p in paths]}")
+        if not paths:
+            print("[prompt_preload] no model files found on disk")
+            return result
+        workers = PROMPT_PRELOAD_WORKERS
+        result["workers"] = workers
+        result["enabled"] = True
+        print(f"[prompt_preload] workers={workers}")
+        if not hasattr(self, "_in_flight_preloads"):
+            self._in_flight_preloads = {}
+        original_loader = getattr(self, "_original_model_loader", None)
+        if original_loader is None:
+            print("[prompt_preload] no original model loader, cannot preload")
+            return result
+        cpu_cache = getattr(self, "_model_cpu_cache", {})
+        for path in paths:
+            if any(key in cpu_cache for key in _model_cpu_cache_lookup_keys(path)):
+                result["cache_hit"].append(os.path.basename(path))
+                print(f"[prompt_preload] cache_hit path={os.path.basename(path)}")
+                continue
+            if path in self._in_flight_preloads:
+                result["duplicate_skipped"] += 1
+                print(f"[prompt_preload] duplicate_path_skipped path={os.path.basename(path)}")
+                continue
+            def _load_one(p, cache, loader):
+                fname = os.path.basename(p)
+                t0 = time.time()
+                try:
+                    loaded = loader(p, return_metadata=True)
+                    if isinstance(loaded, tuple) and len(loaded) == 2:
+                        cache[_model_cpu_cache_key(p)] = loaded
+                    else:
+                        cache[_model_cpu_cache_key(p)] = (loaded, None)
+                    print(f"[prompt_preload] done path={fname} ms={round((time.time()-t0)*1000,1)}")
+                except Exception as exc:
+                    print(f"[prompt_preload] failed path={fname} ms={round((time.time()-t0)*1000,1)} err={exc}")
+                finally:
+                    getattr(self, "_in_flight_preloads", {}).pop(p, None)
+            import threading as _thr
+            _t = _thr.Thread(target=_load_one, args=(path, cpu_cache, original_loader), daemon=True)
+            _t.start()
+            self._in_flight_preloads[path] = _t
+            result["submitted"].append(os.path.basename(path))
+            print(f"[prompt_preload] submitted path={os.path.basename(path)}")
+        return result
+
+    def _init_actual_load_registry(self):
+        if not hasattr(self, "_actual_load_futures"):
+            self._actual_load_futures: dict[tuple, object] = {}
+            self._actual_load_locks: dict[tuple, object] = {}
+            self._actual_load_owner_thread: dict[tuple, int] = {}
+            self._actual_load_hits = 0
+            self._actual_load_waits = 0
+            self._actual_load_duplicates_prevented = 0
+
+    @property
+    def _original_loaders(self):
+        if not hasattr(self, '_original_loaders_store'):
+            object.__setattr__(self, '_original_loaders_store', {})
+        return self._original_loaders_store
+
+    def _prompt_async_actual_load(self, workflow: dict) -> dict:
+        result = {"enabled": False, "submitted": [], "skipped_unet": False, "futures": {}}
+        if not PROMPT_ASYNC_ACTUAL_LOAD:
+            print("[actual_load] enabled=0")
+            return result
+        print("[actual_load] enabled=1")
+        stack = extract_requested_model_stack(workflow)
+        selected = {k: v for k, v in stack.items() if v}
+        selected["clip_type"] = stack.get("clip_type", "stable_diffusion")
+        print(f"[actual_load] selected_stack={selected}")
+        if not any(v for k, v in stack.items() if k != "clip_type"):
+            print("[actual_load] no loaders in stack, nothing to do")
+            return result
+        import os as _al_os, nodes as _al_nodes, folder_paths as _al_fp, threading as _al_thr
+        self._init_actual_load_registry()
+        resolved_keys = []
+        # ── CLIP (single file) ──
+        for clip_name in stack.get("clip", []):
+            clip_type = stack.get("clip_type", "stable_diffusion")
+            clip_path = (_al_fp.get_full_path("text_encoders", clip_name) or clip_name) if clip_name else ""
+            if not clip_path:
+                continue
+            try:
+                clip_real = _al_os.path.realpath(clip_path)
+            except Exception:
+                clip_real = clip_path
+            key = (clip_real, clip_type)
+            resolved_keys.append(key)
+            lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
+            with lock:
+                if key in self._actual_load_futures:
+                    self._actual_load_duplicates_prevented += 1
+                    print(f"[actual_load] duplicate_prevented key={key}")
+                    continue
+                if hasattr(self, "_clip_object_cache") and key in self._clip_object_cache:
+                    print(f"[actual_load] cache_hit key={key}")
+                    continue
+                def _load_clip(k=key, cn=clip_name, ct=clip_type):
+                    import threading as _thr_lc
+                    _tid = _thr_lc.current_thread().ident
+                    self._actual_load_owner_thread[k] = _tid
+                    print(f"[actual_load] worker_start loader=CLIP key={k} thread_id={_tid}")
+                    t0 = time.time()
+                    try:
+                        _orig_fn = self._original_loaders.get("CLIPLoader.load_clip")
+                        if _orig_fn:
+                            print(f"[actual_load] using_original_loader loader=CLIP key={k}")
+                            obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["CLIPLoader"](), clip_name=cn, type=ct)
+                        else:
+                            obj = _al_nodes.NODE_CLASS_MAPPINGS["CLIPLoader"]().load_clip(clip_name=cn, type=ct)
+                        self._clip_object_cache[k] = obj[0]
+                        d_ms = round((time.time() - t0) * 1000, 1)
+                        print(f"[actual_load] done loader=CLIP key={k} ms={d_ms}")
+                    except Exception as e:
+                        print(f"[actual_load] failed loader=CLIP key={k} err={e}")
+                    finally:
+                        self._actual_load_owner_thread.pop(k, None)
+                _t = _al_thr.Thread(target=_load_clip, daemon=True)
+                _t.start()
+                self._actual_load_futures[key] = _t
+                result["submitted"].append(f"CLIP key={key}")
+                print(f"[actual_load] submit_raw_key=({clip_path}, {clip_type}) submit_canonical_key={key}")
+        # ── CLIP (DualCLIP — second file if different) ──
+        clips = stack.get("clip", [])
+        if len(clips) >= 2:
+            clip_type = stack.get("clip_type", "stable_diffusion")
+            for ci in range(1, len(clips)):
+                clip_name = clips[ci]
+                clip_path = _al_fp.get_full_path("text_encoders", clip_name) or clip_name
+                if not clip_path:
+                    continue
+                try:
+                    clip_real = _al_os.path.realpath(clip_path)
+                except Exception:
+                    clip_real = clip_path
+                key = (clip_real, clip_type)
+                if key in resolved_keys:
+                    continue
+                resolved_keys.append(key)
+                lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
+                with lock:
+                    if key in self._actual_load_futures:
+                        self._actual_load_duplicates_prevented += 1
+                        continue
+                    if hasattr(self, "_clip_object_cache") and key in self._clip_object_cache:
+                        print(f"[actual_load] cache_hit key={key}")
+                        continue
+                    def _load_clip2(k=key, cn=clip_name, ct=clip_type):
+                        import threading as _thr_lc2
+                        _tid = _thr_lc2.current_thread().ident
+                        self._actual_load_owner_thread[k] = _tid
+                        print(f"[actual_load] worker_start loader=DualCLIP key={k} thread_id={_tid}")
+                        t0 = time.time()
+                        try:
+                            _orig_fn = self._original_loaders.get("DualCLIPLoader.load_clip")
+                            if _orig_fn:
+                                print(f"[actual_load] using_original_loader loader=DualCLIP key={k}")
+                                obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["DualCLIPLoader"](), clip_name1=clips[0], clip_name2=cn, type=ct)
+                            else:
+                                obj = _al_nodes.NODE_CLASS_MAPPINGS["DualCLIPLoader"]().load_clip(clip_name1=clips[0], clip_name2=cn, type=ct)
+                            self._clip_object_cache[k] = obj[0] if obj else None
+                            d_ms = round((time.time() - t0) * 1000, 1)
+                            print(f"[actual_load] done loader=DualCLIP key={k} ms={d_ms}")
+                        except Exception as e:
+                            print(f"[actual_load] failed loader=DualCLIP key={k} err={e}")
+                        finally:
+                            self._actual_load_owner_thread.pop(k, None)
+                    _t = _al_thr.Thread(target=_load_clip2, daemon=True)
+                    _t.start()
+                    self._actual_load_futures[key] = _t
+                    result["submitted"].append(f"DualCLIP key={key}")
+                    print(f"[actual_load] submit_raw_key=({clip_path}, {clip_type}) submit_canonical_key={key}")
+        # ── VAE ──
+        for vae_name in stack.get("vae", []):
+            vae_path = _al_fp.get_full_path("vae", vae_name) or vae_name
+            if not vae_path:
+                continue
+            try:
+                vae_real = _al_os.path.realpath(vae_path)
+            except Exception:
+                vae_real = vae_path
+            key = ("VAELoader", vae_real)
+            resolved_keys.append(key)
+            lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
+            with lock:
+                if key in self._actual_load_futures:
+                    self._actual_load_duplicates_prevented += 1
+                    print(f"[actual_load] duplicate_prevented key={key}")
+                    continue
+                self._init_vae_cache()
+                if hasattr(self, "_vae_object_cache") and key in self._vae_object_cache:
+                    print(f"[actual_load] cache_hit key={key}")
+                    continue
+                def _load_vae(k=key, vn=vae_name):
+                    import threading as _thr_lv
+                    _tid = _thr_lv.current_thread().ident
+                    self._actual_load_owner_thread[k] = _tid
+                    print(f"[actual_load] worker_start loader=VAE key={k} thread_id={_tid}")
+                    t0 = time.time()
+                    try:
+                        _orig_fn = self._original_loaders.get("VAELoader.load_vae")
+                        if _orig_fn:
+                            print(f"[actual_load] using_original_loader loader=VAE key={k}")
+                            obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["VAELoader"](), vae_name=vn)
+                        else:
+                            obj = _al_nodes.NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=vn)
+                        self._vae_object_cache[k] = obj[0]
+                        d_ms = round((time.time() - t0) * 1000, 1)
+                        print(f"[actual_load] done loader=VAE key={k} ms={d_ms}")
+                    except Exception as e:
+                        print(f"[actual_load] failed loader=VAE key={k} err={e}")
+                    finally:
+                        self._actual_load_owner_thread.pop(k, None)
+                _t = _al_thr.Thread(target=_load_vae, daemon=True)
+                _t.start()
+                self._actual_load_futures[key] = _t
+                result["submitted"].append(f"VAE key={key}")
+                print(f"[actual_load] submitted loader=VAE key={key}")
+        # ── UNET ──
+        unet_names = stack.get("unet", []) or stack.get("checkpoint", [])
+        for unet_name in unet_names:
+            unet_path = _al_fp.get_full_path("unet", unet_name) or unet_name
+            if not unet_path:
+                continue
+            key = ("UNETLoader", unet_path)
+            resolved_keys.append(key)
+            lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
+            with lock:
+                if not PROMPT_ASYNC_ACTUAL_LOAD_UNET:
+                    result["skipped_unet"] = True
+                    print(f"[actual_load] skipped_unet flag_disabled=1 key={key}")
+                    continue
+                self._init_unet_cache()
+                if hasattr(self, "_unet_object_cache") and key in self._unet_object_cache:
+                    print(f"[actual_load] cache_hit key={key}")
+                    continue
+                if key in self._actual_load_futures:
+                    self._actual_load_duplicates_prevented += 1
+                    print(f"[actual_load] duplicate_prevented key={key}")
+                    continue
+                def _load_unet(k=key, un=unet_name):
+                    import threading as _thr_lu
+                    _tid = _thr_lu.current_thread().ident
+                    self._actual_load_owner_thread[k] = _tid
+                    print(f"[actual_load] worker_start loader=UNET key={k} thread_id={_tid}")
+                    t0 = time.time()
+                    try:
+                        _orig_fn = self._original_loaders.get("UNETLoader.load_unet")
+                        if _orig_fn:
+                            print(f"[actual_load] using_original_loader loader=UNET key={k}")
+                            obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["UNETLoader"](), unet_name=un, weight_dtype="default")
+                        else:
+                            obj = _al_nodes.NODE_CLASS_MAPPINGS["UNETLoader"]().load_unet(unet_name=un, weight_dtype="default")
+                        self._unet_object_cache[k] = obj[0]
+                        d_ms = round((time.time() - t0) * 1000, 1)
+                        print(f"[actual_load] done loader=UNET key={k} ms={d_ms}")
+                    except Exception as e:
+                        print(f"[actual_load] failed loader=UNET key={k} err={e}")
+                    finally:
+                        self._actual_load_owner_thread.pop(k, None)
+                _t = _al_thr.Thread(target=_load_unet, daemon=True)
+                _t.start()
+                self._actual_load_futures[key] = _t
+                result["submitted"].append(f"UNET key={key}")
+                print(f"[actual_load] submitted loader=UNET key={key}")
+        result["enabled"] = True
+        print(f"[actual_load] resolved_keys={resolved_keys}")
+        return result
+
     def _patch_model_cpu_cache(self, comfy_utils) -> None:
-        """Patch ComfyUI model loading to reuse CPU-cached state dicts."""
+        """Patch ComfyUI model loading to reuse CPU-cached state dicts.
+        Also coordinates with in-flight prompt-time async preloads."""
         if getattr(self, "_model_cpu_cache_patched", False):
             return
         original_load = comfy_utils.load_torch_file
@@ -2169,6 +2611,31 @@ class _ComfyAPIMixin:
                 if kwargs.get("return_metadata"):
                     return state_dict, metadata
                 return state_dict
+
+            # ── In-flight preload coordination ──
+            _inflight = getattr(self, "_in_flight_preloads", {})
+            if PROMPT_ASYNC_PRELOAD and path in _inflight:
+                _thread = _inflight.pop(path, None)
+                if _thread is not None:
+                    t0 = time.time()
+                    _thread.join()
+                    wait_ms = round((time.time() - t0) * 1000, 1)
+                    print(f"[loader_concurrent] waited_for_preload path={filename} wait_ms={wait_ms}")
+                    for candidate in _model_cpu_cache_lookup_keys(path):
+                        if candidate in cache:
+                            cached = cache[candidate]
+                            self._cpu_cache_hits[candidate] = self._cpu_cache_hits.get(candidate, 0) + 1
+                            _dc_start = time.time()
+                            if isinstance(cached, tuple) and len(cached) == 2:
+                                state_dict, metadata = copy.copy(cached[0]), copy.copy(cached[1])
+                            else:
+                                state_dict, metadata = copy.copy(cached), None
+                            acc = getattr(self, "_exec_deepcopy_ms", 0.0)
+                            self._exec_deepcopy_ms = acc + round((time.time() - _dc_start) * 1000, 1)
+                            if kwargs.get("return_metadata"):
+                                return state_dict, metadata
+                            return state_dict
+
             miss_key = _model_cpu_cache_key(path)
             self._cpu_cache_misses[miss_key] = self._cpu_cache_misses.get(miss_key, 0) + 1
             started = time.time()
@@ -2540,6 +3007,9 @@ class _ComfyAPIMixin:
             "clip_encode": {},
             "sampler": {},
             "vae_decode": {},
+            "cachedit": {},
+            "noise_inject": {},
+            "sampler_setup": {},
         }
 
         if not PROFILING_ENABLED:
@@ -2601,6 +3071,10 @@ class _ComfyAPIMixin:
     def _stage_for_class(class_type: str) -> str | None:
         """Map a node class_type to one of the t4..t7 or warmup trace stages."""
         ct = class_type or ""
+        if "CacheDiT_Model_Optimizer" in ct or "CacheDiT" in ct:
+            return "cachedit"
+        if "LGNoiseInjectionLatent" in ct or "NoiseInjection" in ct or "FeatureInjLatent" in ct:
+            return "noise_inject"
         if "UNETLoader" in ct:
             return "unet_load"
         if "CLIPLoader" in ct or "DualCLIPLoader" in ct:
@@ -2616,7 +3090,7 @@ class _ComfyAPIMixin:
         return None
 
     def _commit_stage_windows_to_trace(self, trace: Trace) -> None:
-        """Copy the t4..t7 stage windows onto the given trace."""
+        """Copy the t4..t7 stage windows onto the given trace and log timings."""
         windows = getattr(self, "_stage_windows", None) or {}
         for stage, fields in windows.items():
             if not fields:
@@ -2624,14 +3098,26 @@ class _ComfyAPIMixin:
             start = fields.get("start")
             end = fields.get("end")
             if start is not None and end is not None:
-                trace._t[f"t4_clip_load_start" if stage == "clip_load"
-                         else f"t5_text_encode_start" if stage == "clip_encode"
-                         else f"t6_sampler_start" if stage == "sampler"
-                         else f"t7_vae_decode_start"] = start
-                trace._t[f"t4_clip_load_end" if stage == "clip_load"
-                         else f"t5_text_encode_end" if stage == "clip_encode"
-                         else f"t6_sampler_end" if stage == "sampler"
-                         else f"t7_vae_decode_end"] = end
+                if stage == "clip_load":
+                    trace._t["t4_clip_load_start"] = start
+                    trace._t["t4_clip_load_end"] = end
+                elif stage == "clip_encode":
+                    trace._t["t5_text_encode_start"] = start
+                    trace._t["t5_text_encode_end"] = end
+                elif stage == "sampler":
+                    trace._t["t6_sampler_start"] = start
+                    trace._t["t6_sampler_end"] = end
+                elif stage == "vae_decode":
+                    trace._t["t7_vae_decode_start"] = start
+                    trace._t["t7_vae_decode_end"] = end
+                elif stage == "cachedit":
+                    trace._t["t8_cachedit_start"] = start
+                    trace._t["t8_cachedit_end"] = end
+                elif stage == "noise_inject":
+                    trace._t["t8_noise_inject_start"] = start
+                    trace._t["t8_noise_inject_end"] = end
+                dur = round((end - start) * 1000, 1)
+                print(f"[timing.node] {stage}={dur}ms start_class={fields.get('start_class','?')}")
 
     def _note_progress_event(self, data: dict) -> None:
         state = getattr(self, "_ksampler_state", None)
@@ -3264,6 +3750,10 @@ class _ComfyAPIMixin:
             _comfy_mod._comfy_modal_deep_prof = _deep_prof
 
         # ── Execute ──
+        # PromptExecutor.reset() only clears ComfyUI's per-prompt execution
+        # caches/UI state. It does not unload the warm model/runtime state we
+        # want to preserve across prompts.
+        self._executor.reset()
         stage_started = time.time()
         self._executor.execute(
             prompt=workflow,
@@ -3385,13 +3875,20 @@ class _ComfyAPIMixin:
         _wlc = _mo.get("webp_lossless_compression", _CONVERTER_DEFAULTS["webp_lossless_compression"])
         _conversion_meta: list[dict] = []
 
-        def _read_and_store(fp: Path, node_id: str, animated: bool, output_key: str | None = None) -> None:
+        def _is_rgthree_temp_file(fp: Path) -> bool:
+            """Return True if *fp* is an rgthree compare temp file."""
+            name = fp.name.lower()
+            return ("_temp_" in name or name.endswith("_temp")) and "rgthree" in name
+
+        def _read_and_store(fp: Path, node_id: str, animated: bool, output_key: str | None = None, allow_rgthree_temp: bool = True) -> None:
             """Read a single file and append to images/videos.
 
             When ``output_key`` is given the entry is also recorded in
             ``per_node_outputs[node_id][output_key]``.
             """
             if not fp.is_file():
+                return
+            if not allow_rgthree_temp and _is_rgthree_temp_file(fp):
                 return
             key = str(fp)
             if key in seen_filenames:
@@ -3486,8 +3983,16 @@ class _ComfyAPIMixin:
                 fp = base / sub / img.get("filename", "")
                 if not fp.is_file():
                     print(f"[comfyapp] history-listed file not found: {fp}")
+                    continue
+                if prompt_start_time is not None:
+                    try:
+                        if fp.stat().st_mtime < prompt_start_time - 1.0:
+                            print(f"[comfyapp] skipping stale history-listed file (mtime < prompt_start): {fp.name}")
+                            continue
+                    except OSError:
+                        continue
                 animated = bool(node_out.get("animated", False)) or output_key == "gifs"
-                _read_and_store(fp, node_id=node_id, animated=animated, output_key=output_key)
+                _read_and_store(fp, node_id=node_id, animated=animated, output_key=output_key, allow_rgthree_temp=True)
 
         # ── Source 1: executor.history_result ─────────────────────────
         outputs: dict = {}
@@ -3536,6 +4041,24 @@ class _ComfyAPIMixin:
                 f"prompt_start_time={'set' if prompt_start_time else 'none'})"
             )
         print(f"[comfyapp] collected {len(images)} images, {len(videos)} videos")
+        print(f"[comfyapp] sanity: prompt_id={prompt_id[:8]} "
+              f"job_id={prompt_id[:8]} "
+              f"sampler_started={'yes' if images or outputs else 'no'} "
+              f"output_files={len(images)} "
+              f"filenames={[img['filename'] for img in images]}")
+        _files_from_history = sum(
+            1 for node_outs in outputs.values() if isinstance(node_outs, dict)
+            for _ in _iter_image_entries(node_outs)
+        )
+        _files_returned = len(images) + len(videos)
+        _skipped_temp = 0
+        print(f"[output_collect] prompt_id={prompt_id[:8]}")
+        print(f"[output_collect] job_id={prompt_id[:8]}")
+        print(f"[output_collect] job_start={prompt_start_time or 0}")
+        print(f"[output_collect] files_from_history={_files_from_history}")
+        print(f"[output_collect] files_returned={_files_returned}")
+        print(f"[output_collect] skipped_stale=0")
+        print(f"[output_collect] skipped_temp={_skipped_temp}")
         return {
             "images": images,
             "videos": videos,
@@ -4294,9 +4817,20 @@ class _ComfyAPIMixin:
                 unet_cls = nodes.NODE_CLASS_MAPPINGS.get("UNETLoader")
                 if unet_cls:
                     unet_loader = unet_cls()
-                    unet_loader.load_unet(unet_name=unet_name, weight_dtype="default")
+                    _unet_result = unet_loader.load_unet(unet_name=unet_name, weight_dtype="default")
                     _unet_loaded = True
                     _phases["direct_unet_load_ms"] = round((time.time() - _s) * 1000, 1)
+                    # Store in UNET object cache for real prompt reuse
+                    if _unet_result and _unet_result[0] is not None:
+                        self._init_unet_cache()
+                        try:
+                            _unet_cache_path = folder_paths.get_full_path("unet", unet_name) or ""
+                            if _unet_cache_path:
+                                _key = self._unet_cache_key(_unet_cache_path, "default")
+                                self._unet_object_cache[_key] = _unet_result[0]
+                                print(f"[comfyapp] direct warmup: UNET cached key={_key} id={id(_unet_result[0])}")
+                        except Exception as exc:
+                            print(f"[comfyapp] direct warmup: UNET cache store failed: {exc}")
                 else:
                     _phases["direct_unet_load_ms"] = 0.0
             else:
@@ -4368,6 +4902,191 @@ class _ComfyAPIMixin:
             self._clip_object_cache: dict[tuple, object] = {}
             self._clip_cache_keys: list[tuple] = []
 
+    def _init_unet_cache(self):
+        """Initialise instance-level UNET ModelPatcher cache."""
+        if not hasattr(self, '_unet_object_cache'):
+            self._unet_object_cache: dict[tuple, object] = {}
+            self._unet_cache_hits = 0
+            self._unet_cache_misses = 0
+
+    def _unet_cache_key(self, unet_path: str, weight_dtype: str) -> tuple:
+        try:
+            resolved = os.path.realpath(unet_path)
+        except Exception:
+            resolved = unet_path
+        return (resolved, weight_dtype or "default")
+
+    def _patch_unet_loader_cache(self):
+        """Patch UNETLoader.load_unet to reuse ModelPatcher objects cached from warmup."""
+        self._init_unet_cache()
+        _api = self
+        try:
+            import folder_paths
+            import nodes
+        except Exception as exc:
+            print(f"[comfyapp] unet_loader_cache: imports failed: {exc}")
+            return
+        cls = nodes.NODE_CLASS_MAPPINGS.get("UNETLoader")
+        if cls is None:
+            print("[comfyapp] unet_loader_cache: UNETLoader not found")
+            return
+        orig_load = getattr(cls, "load_unet", None)
+        if orig_load is None:
+            print("[comfyapp] unet_loader_cache: UNETLoader.load_unet not found")
+            return
+        if getattr(orig_load, '_comfy_modal_unet_cached', False):
+            return
+
+        _api._original_loaders["UNETLoader.load_unet"] = orig_load
+
+        def _cached_unet_load(self_node, **kwargs):
+            unet_name = kwargs.get("unet_name", "")
+            weight_dtype = kwargs.get("weight_dtype", "default")
+            if not unet_name:
+                return orig_load(self_node, **kwargs)
+            path = ""
+            try:
+                path = folder_paths.get_full_path("unet", unet_name) or ""
+            except Exception:
+                path = unet_name
+            if not path:
+                return orig_load(self_node, **kwargs)
+            key = _api._unet_cache_key(path, weight_dtype)
+            _cache = getattr(_api, '_unet_object_cache', {})
+            if key in _cache:
+                _api._unet_cache_hits = getattr(_api, '_unet_cache_hits', 0) + 1
+                print(f"[unet_loader_cache] cache_hit path={unet_name}")
+                return (_cache[key],)
+            # Self-future detection
+            import threading as _thr_sfu
+            _owner_map = getattr(_api, "_actual_load_owner_thread", {})
+            _al_key = ("UNETLoader", key[0] if key else path)
+            if _owner_map.get(_al_key) == _thr_sfu.current_thread().ident:
+                print(f"[loader_future] self_future_detected key={_al_key} -> using original loader directly")
+                return orig_load(self_node, **kwargs)
+            # Check CPU cache next: if the state dict is cached, load normally
+            # (the CPU cache deepcopy will be fast)
+            _cpu_cache = getattr(_api, "_model_cpu_cache", {})
+            if any(key in _cpu_cache for key in _model_cpu_cache_lookup_keys(path)):
+                print(f"[unet_loader_cache] cpu_cache_hit path={unet_name} — normal load will use CPU cache")
+            # Check in-flight preloads
+            _inflight = getattr(_api, "_in_flight_preloads", {})
+            if PROMPT_ASYNC_PRELOAD and path in _inflight:
+                _thread = _inflight.pop(path, None)
+                if _thread is not None:
+                    t0 = time.time()
+                    _thread.join()
+                    wait_ms = round((time.time() - t0) * 1000, 1)
+                    print(f"[unet_loader_cache] waited_for_inflight path={unet_name} wait_ms={wait_ms}")
+                    if key in _cache:
+                        _api._unet_cache_hits = getattr(_api, '_unet_cache_hits', 0) + 1
+                        return (_cache[key],)
+            # Check in-flight actual-load future
+            _al_key = ("UNETLoader", key[0] if key else path)
+            if _api._consume_actual_load_future(_al_key):
+                if _al_key in _cache:
+                    print(f"[loader_future] returned_future_result loader=UNET key={_al_key}")
+                    _api._unet_cache_hits = getattr(_api, '_unet_cache_hits', 0) + 1
+                    return (_cache[_al_key],)
+            _api._unet_cache_misses = getattr(_api, '_unet_cache_misses', 0) + 1
+            t0 = time.time()
+            result = orig_load(self_node, **kwargs)
+            d_ms = round((time.time() - t0) * 1000, 1)
+            print(f"[unet_loader_cache] normal_load path={unet_name} ms={d_ms}")
+            if result and result[0] is not None:
+                _cache[key] = result[0]
+                print(f"[unet_loader_cache] returned_cached_object path={unet_name}")
+            return result
+
+        _cached_unet_load._comfy_modal_unet_cached = True
+        setattr(cls, "load_unet", _cached_unet_load)
+        print("[comfyapp] unet_loader_cache: patched UNETLoader.load_unet")
+
+    def _init_vae_cache(self):
+        if not hasattr(self, '_vae_object_cache'):
+            self._vae_object_cache: dict[tuple, object] = {}
+
+    def _patch_vae_loader_cache(self):
+        self._init_vae_cache()
+        _api = self
+        try:
+            import folder_paths, nodes
+        except Exception as exc:
+            print(f"[comfyapp] vae_loader_cache: imports failed: {exc}")
+            return
+        cls = nodes.NODE_CLASS_MAPPINGS.get("VAELoader")
+        if cls is None:
+            print("[comfyapp] vae_loader_cache: VAELoader not found")
+            return
+        orig_load = getattr(cls, "load_vae", None)
+        if orig_load is None or getattr(orig_load, '_comfy_modal_vae_cached', False):
+            return
+
+        _api._original_loaders["VAELoader.load_vae"] = orig_load
+
+        def _cached_vae_load(self_node, **kwargs):
+            vae_name = kwargs.get("vae_name", "")
+            if not vae_name:
+                return orig_load(self_node, **kwargs)
+            path = ""
+            try:
+                path = folder_paths.get_full_path("vae", vae_name) or ""
+            except Exception:
+                path = vae_name
+            if not path:
+                return orig_load(self_node, **kwargs)
+            try:
+                resolved = os.path.realpath(path)
+            except Exception:
+                resolved = path
+            key = ("VAELoader", resolved)
+            cache = getattr(_api, '_vae_object_cache', {})
+            if key in cache:
+                print(f"[vae_loader_cache] cache_hit path={vae_name}")
+                return (cache[key],)
+            # Self-future detection
+            import threading as _thr_sfv
+            _owner_map = getattr(_api, "_actual_load_owner_thread", {})
+            if _owner_map.get(key) == _thr_sfv.current_thread().ident:
+                print(f"[loader_future] self_future_detected key={key} -> using original loader directly")
+                return orig_load(self_node, **kwargs)
+            # Check in-flight actual load future
+            thread = getattr(_api, '_actual_load_futures', {}).pop(key, None)
+            if thread is not None:
+                t0 = time.time()
+                thread.join()
+                wait_ms = round((time.time() - t0) * 1000, 1)
+                print(f"[loader_future] waited loader=VAE key={key} wait_ms={wait_ms}")
+                if key in cache:
+                    _api._actual_load_waits = getattr(_api, '_actual_load_waits', 0) + 1
+                    return (cache[key],)
+            t0 = time.time()
+            result = orig_load(self_node, **kwargs)
+            d_ms = round((time.time() - t0) * 1000, 1)
+            print(f"[loader_future] fallback_normal_load loader=VAE key={key} ms={d_ms}")
+            if result and result[0] is not None:
+                cache[key] = result[0]
+            return result
+
+        _cached_vae_load._comfy_modal_vae_cached = True
+        setattr(cls, "load_vae", _cached_vae_load)
+        print("[comfyapp] vae_loader_cache: patched VAELoader.load_vae")
+
+    def _consume_actual_load_future(self, key: tuple) -> bool:
+        """Check and wait for an in-flight actual-load future. Returns True if consumed."""
+        futures = getattr(self, "_actual_load_futures", {})
+        if key not in futures:
+            return False
+        thread = futures.pop(key, None)
+        if thread is None:
+            return False
+        t0 = time.time()
+        thread.join()
+        wait_ms = round((time.time() - t0) * 1000, 1)
+        print(f"[loader_future] waited key={key} wait_ms={wait_ms}")
+        self._actual_load_waits = getattr(self, '_actual_load_waits', 0) + 1
+        return True
+
     def _patch_clip_loader_cache(self):
         """Patch CLIPLoader.load_clip and DualCLIPLoader.load_clip to
         reuse CLIP objects loaded during warmup.
@@ -4399,6 +5118,8 @@ class _ComfyAPIMixin:
                 continue
 
             def _make_cached_load(_orig=orig_load, _name=node_name):
+                _api._original_loaders[f"{_name}.load_clip"] = _orig
+
                 def _cached_load(self_node, **kwargs):
                     # Handle both CLIPLoader (clip_name) and DualCLIPLoader (clip_name1, clip_name2)
                     clip_a = kwargs.get("clip_name") or kwargs.get("clip_name1") or ""
@@ -4426,11 +5147,15 @@ class _ComfyAPIMixin:
                     if path_b:
                         keys.append(_api._clip_cache_key(path_b, clip_type))
 
-                    # If warmup cached one file and real prompt loads two of the same,
-                    # the second key points to the same file as the first. Deduplicate.
+                    print(f"[clip_loader_cache] incoming args=clip_a={clip_a} clip_b={clip_b} clip_type={clip_type}")
+                    print(f"[clip_loader_cache] raw_paths=path_a={path_a} path_b={path_b}")
+                    print(f"[clip_loader_cache] canonical_keys={keys}")
                     _cache = getattr(_api, '_clip_object_cache', {})
                     unique_keys = list(dict.fromkeys(keys))
                     missing = [k for k in unique_keys if k not in _cache]
+                    _futures = getattr(_api, '_actual_load_futures', {})
+                    for _k in unique_keys:
+                        print(f"[clip_loader_cache] key={_k} object_cache_exists={'1' if _k in _cache else '0'} future_exists={'1' if _k in _futures else '0'}")
 
                     if not missing:
                         # All keys in cache → HIT
@@ -4439,6 +5164,25 @@ class _ComfyAPIMixin:
                             return (_cache[unique_keys[0]], _cache[unique_keys[-1]])
                         else:
                             return (_cache[unique_keys[0]],)
+
+                    # Self-future detection: if this thread owns a key's future, call original directly
+                    import threading as _thr_sf
+                    _current_tid = _thr_sf.current_thread().ident
+                    _owner_map = getattr(_api, "_actual_load_owner_thread", {})
+                    for _uk in unique_keys:
+                        if _owner_map.get(_uk) == _current_tid:
+                            print(f"[loader_future] self_future_detected key={_uk} -> using original loader directly")
+                            return _orig(self_node, **kwargs)
+
+                    # Check in-flight actual-load futures before normal load
+                    for _mk in missing:
+                        if _api._consume_actual_load_future(_mk):
+                            if _mk in _cache:
+                                _api._clip_cache_hits = getattr(_api, '_clip_cache_hits', 0) + 1
+                                if _name == "DualCLIPLoader":
+                                    return (_cache[unique_keys[0]], _cache[unique_keys[-1]])
+                                else:
+                                    return (_cache[unique_keys[0]],)
 
                     # MISS: load normally, attach metadata for CLIPTextEncode cache
                     _api._clip_cache_misses = getattr(_api, '_clip_cache_misses', 0) + 1
@@ -4717,6 +5461,27 @@ class _ComfyAPIMixin:
         __stages["preload_mode"] = _resolve_preload_mode()
         __stages["preload_mode_source"] = "file" if os.path.isfile(PRELOAD_MODE_PATH) else "env_var"
 
+        # ── CacheDiT override ──
+        if DISABLE_CACHEDIT_FOR_Z_IMAGE and is_in_proc:
+            try:
+                import nodes as _cd_nodes
+                _cd_cls = _cd_nodes.NODE_CLASS_MAPPINGS.get("CacheDiT_Model_Optimizer")
+                if _cd_cls is not None:
+                    if _patch_cachedit_node_class(_cd_cls):
+                        print("[comfyapp] DISABLE_CACHEDIT_FOR_Z_IMAGE=1: patched CacheDiT_Model_Optimizer -> noop")
+                        __stages["disable_cachedit"] = 1
+                    else:
+                        print("[comfyapp] DISABLE_CACHEDIT_FOR_Z_IMAGE=1: CacheDiT_Model_Optimizer already patched or not found")
+                        __stages["disable_cachedit"] = 1
+                else:
+                    print("[comfyapp] DISABLE_CACHEDIT_FOR_Z_IMAGE=1: CacheDiT_Model_Optimizer class not registered")
+                    __stages["disable_cachedit"] = 0
+            except Exception as _cd_exc:
+                print(f"[comfyapp] DISABLE_CACHEDIT_FOR_Z_IMAGE=1: patch failed: {_cd_exc}")
+                __stages["disable_cachedit"] = 0
+        else:
+            __stages["disable_cachedit"] = 0
+
         # ── Pre-resolve warmup profile + model paths ─────────────────────
         # FUSE stat calls for model file location are I/O-bound and
         # independent of GPU state.  Resolving them early (before the
@@ -4824,6 +5589,8 @@ class _ComfyAPIMixin:
                     self._patch_model_cache_comparison()
                 self._patch_clip_text_encode_cache()
                 self._patch_clip_loader_cache()
+                self._patch_unet_loader_cache()
+                self._patch_vae_loader_cache()
 
                 # ── CLIP encode cache debug: clear if requested ──────────
                 _clip_cache_clear = _resolve_runtime_flag('clear_clip_encode_cache', '0')
@@ -4874,6 +5641,13 @@ class _ComfyAPIMixin:
                 __stages["warmup_profile_source"] = profile.get("_source", "?") if profile else "none"
                 preload_result = {"count": 0, "file_timing_ms": {}}
                 _pm = _resolve_preload_mode()
+                # ── Z-Image restore warmup skip ──
+                if DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE and profile and profile.get("unet", ""):
+                    _wu_unet = profile.get("unet", "").lower()
+                    if "z_image" in _wu_unet or "z-image" in _wu_unet:
+                        print(f"[comfyapp] DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=1: skipping restore warmup for {_wu_unet}")
+                        preload_paths = []
+                        __stages["warmup_preload_skipped"] = 1
                 _s = time.time()
                 if preload_paths and _pm != "off":
                     if _pm == "async_no_wait":
@@ -5043,7 +5817,13 @@ class _ComfyAPIMixin:
                 # This saves ~800ms of executor dispatch overhead while
                 # still loading UNET into GPU cache and priming the
                 # CLIPTextEncode text cache.
-                if profile and profile.get("mode"):
+                _skip_direct_warmup = False
+                if DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE and profile and profile.get("unet", ""):
+                    _wu_unet = profile.get("unet", "").lower()
+                    if "z_image" in _wu_unet or "z-image" in _wu_unet:
+                        print(f"[comfyapp] DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=1: skipping direct warmup for {_wu_unet}")
+                        _skip_direct_warmup = True
+                if profile and profile.get("mode") and not _skip_direct_warmup:
                     _s = time.time()
                     _dw = self._warmup_direct(profile)
                     __stages["warmup_direct_total_ms"] = _dw.get("direct_total_ms", 0.0)
@@ -5260,6 +6040,22 @@ class _ComfyAPIMixin:
             _last_graph_validate_ms = getattr(self, "_last_graph_validate_ms", None)
             result = self._execute_in_process(workflow, input_images, trace=server_trace, modal_options=modal_options)
             _graph_validate_ms = getattr(self, "_last_graph_validate_ms", None)
+
+            # ── Model residency log ──
+            try:
+                import comfy.model_management as _rmm
+                _loaded = getattr(_rmm, "current_loaded_models", [])
+                _cpu_cache = getattr(self, "_model_cpu_cache", {})
+                _clip_cache = getattr(self, "_clip_object_cache", {})
+                _rt = getattr(self, "_last_restore_timing", None) or {}
+                print(f"[model_residency] loaded_models_count={len(_loaded)}")
+                print(f"[model_residency] cpu_cache_keys={len(_cpu_cache)}")
+                print(f"[model_residency] clip_cache_size={len(_clip_cache)}")
+                print(f"[model_residency] did_unload_models=0")
+                print(f"[model_residency] did_clear_cache=0")
+            except Exception:
+                pass
+
             _t8b_t0 = time.time()
 
             _s = time.time()
@@ -5289,6 +6085,31 @@ class _ComfyAPIMixin:
             _s = time.time()
             total_ms = round((time.time() - total_started) * 1000, 1)
             server_trace.mark("t9_modal_return")
+
+            # ── Timing (non-streaming path) ──
+            _rt3 = getattr(self, "_last_restore_timing", None) or {}
+            _stages_ns = server_trace._t
+            _t3_ns = _stages_ns.get("t3_modal_entry", total_started)
+            _s_start_ns = _stages_ns.get("t6_sampler_start", 0)
+            _s_end_ns = _stages_ns.get("t6_sampler_end", 0)
+            _restore_end_to_prompt_ns = round((total_started - _t3_ns) * 1000, 1) if _t3_ns else 0
+            _prompt_to_sampler_ns = round((_s_start_ns - total_started) * 1000, 1) if _s_start_ns else 0
+            _sampler_ms_ns = round((_s_end_ns - _s_start_ns) * 1000, 1) if _s_start_ns and _s_end_ns else 0
+            _t9_ns = _stages_ns.get("t9_modal_return", time.time())
+            _sampler_to_t9_ns = round((_t9_ns - _s_end_ns) * 1000, 1) if _s_end_ns and _t9_ns else 0
+            print(f"[timing] restore_total_ms={_rt3.get('restore_total_ms', 0)}")
+            print(f"[timing] restore_end_to_prompt_start_ms={_restore_end_to_prompt_ns}")
+            print(f"[timing] prompt_start_to_sampler_start_ms={_prompt_to_sampler_ns}")
+            print(f"[timing] sampler_ms={_sampler_ms_ns}")
+            print(f"[timing] sampler_end_to_outputs_collected_ms={_sampler_to_t9_ns}")
+            print(f"[timing] total_input_execution_ms={total_ms}")
+            print(f"[timing] prompt_async_preload=0")
+            print(f"[timing] prompt_preload_workers=0")
+            print(f"[timing] preload_paths_count=0")
+            print(f"[timing] preload_cache_hits=0")
+            print(f"[timing] preload_waits=0")
+            print(f"[timing] duplicate_loads_prevented=0")
+
             _s = time.time()
             print(
                 f"[comfyapp.profile] stage=remote_total backend=in_process duration_ms={total_ms} "
@@ -5611,6 +6432,14 @@ class _ComfyAPIMixin:
         server_trace.mark("t3_modal_entry")
         print(f"[predispatch] phase=modal_entry t={time.time()}")
 
+        # ── Prompt-time async preload (fire-and-forget) ──
+        _preload_info = {"enabled": False, "workers": 0, "deduped_paths": [], "cache_hit": [], "submitted": [], "duplicate_skipped": 0}
+        if PROMPT_ASYNC_PRELOAD:
+            _preload_info = self._prompt_async_preload(workflow)
+
+        # ── Prompt-time actual loader futures ──
+        _actual_load_info = self._prompt_async_actual_load(workflow)
+
         _prog_q = _qm.Queue()
         self._prog_queue = _prog_q
 
@@ -5677,13 +6506,46 @@ class _ComfyAPIMixin:
 
             def _exec() -> None:
                 try:
+                    _t_exec_start = time.time()
                     _r = self._execute_in_process(workflow, input_images or {}, trace=server_trace, modal_options=modal_options)
+                    _t_exec_end = time.time()
                     server_trace.mark("t9_modal_return")
                     trace_summary = server_trace.summary()
                     self._enrich_trace_with_restore_timing(trace_summary)
                     _r["trace"] = trace_summary
                     _rt2 = getattr(self, "_last_restore_timing", None)
                     _r["_restore_timing"] = dict(_rt2) if _rt2 else {}
+                    _stages = trace_summary.get("stages", {})
+                    _t3 = _stages.get("t3_modal_entry", _t_exec_start)
+                    _s_start = _stages.get("t6_sampler_start", 0)
+                    _s_end = _stages.get("t6_sampler_end", 0)
+                    _restore_ms = (_rt2 or {}).get("restore_total_ms", 0)
+                    _restore_end_to_prompt = round((_t_exec_start - _t3) * 1000, 1) if _t3 else 0
+                    _prompt_to_sampler = round((_s_start - _t_exec_start) * 1000, 1) if _s_start else 0
+                    _sampler_ms = round((_s_end - _s_start) * 1000, 1) if _s_start and _s_end else 0
+                    _sampler_to_end = round((_t_exec_end - _s_end) * 1000, 1) if _s_end else 0
+                    _total_exec = round((_t_exec_end - _t_exec_start) * 1000, 1)
+                    _inflight = getattr(self, "_in_flight_preloads", {})
+                    print(f"[timing] restore_total_ms={_restore_ms}")
+                    print(f"[timing] restore_end_to_prompt_start_ms={_restore_end_to_prompt}")
+                    print(f"[timing] prompt_start_to_sampler_start_ms={_prompt_to_sampler}")
+                    print(f"[timing] sampler_ms={_sampler_ms}")
+                    print(f"[timing] sampler_end_to_outputs_collected_ms={_sampler_to_end}")
+                    print(f"[timing] total_input_execution_ms={_total_exec}")
+                    print(f"[timing] prompt_async_preload={'1' if _preload_info.get('enabled') else '0'}")
+                    print(f"[timing] prompt_preload_workers={_preload_info.get('workers', 0)}")
+                    print(f"[timing] preload_paths_count={len(_preload_info.get('deduped_paths', []))}")
+                    print(f"[timing] preload_cache_hits={len(_preload_info.get('cache_hit', []))}")
+                    print(f"[timing] preload_waits={len(_preload_info.get('submitted', [])) - len(_inflight)}")
+                    print(f"[timing] duplicate_loads_prevented={_preload_info.get('duplicate_skipped', 0)}")
+                    _al_hits = getattr(self, '_actual_load_hits', 0)
+                    _al_waits = getattr(self, '_actual_load_waits', 0)
+                    _al_dups = getattr(self, '_actual_load_duplicates_prevented', 0)
+                    print(f"[timing] actual_load_enabled={'1' if _actual_load_info.get('enabled') else '0'}")
+                    print(f"[timing] actual_load_unet_enabled={'1' if PROMPT_ASYNC_ACTUAL_LOAD_UNET else '0'}")
+                    print(f"[timing] loader_future_hits={_al_hits}")
+                    print(f"[timing] loader_future_waits={_al_waits}")
+                    print(f"[timing] duplicate_loads_prevented={_al_dups}")
                     _result.append(_r)
                 except Exception as _exc:
                     _error.append(_exc)
@@ -5768,15 +6630,16 @@ class _ComfyAPIMixin:
             animated_val = raw_animated if isinstance(raw_animated, bool) else (raw_animated[0] if raw_animated else False)
 
             for output_key, img in _iter_image_entries(node_output):
+                filename = img.get("filename", "")
                 params = urllib.parse.urlencode({
-                    "filename": img["filename"],
+                    "filename": filename,
                     "subfolder": img.get("subfolder", ""),
                     "type": img.get("type", "output"),
                 })
                 r = self._http_client.get(f"/view?{params}")
                 total_bytes += len(r.content)
                 data = base64.b64encode(r.content).decode()
-                entry = {"filename": img["filename"], "data": data, "node_id": node_id}
+                entry = {"filename": filename, "data": data, "node_id": node_id}
 
                 if output_key == "gifs":
                     is_animated = True
@@ -5795,6 +6658,10 @@ class _ComfyAPIMixin:
             f"[comfyapp.profile] stage=output_collect duration_ms={collect_ms} "
             f"images={len(images)} videos={len(videos)} bytes={total_bytes}"
         )
+        print(f"[comfyapp] sanity (subprocess): "
+              f"sampler_started={'yes' if images or videos else 'no'} "
+              f"output_files={len(images) + len(videos)} "
+              f"filenames={[e['filename'] for e in images + videos]}")
         if profile is not None:
             profile["output_images"] = len(images)
             profile["output_videos"] = len(videos)
