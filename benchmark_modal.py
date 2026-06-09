@@ -200,11 +200,94 @@ def _poll_history(prompt_id: str, timeout_s: int = 1800) -> dict:
     raise TimeoutError(f"history timeout for prompt_id={prompt_id}")
 
 
-def _extract_total(trace: dict) -> float | None:
+# ── Trace validation ──────────────────────────────────────────────────────────
+
+
+def _validate_trace(trace: dict) -> dict:
+    """Lightweight schema check.  Returns quality info, does not raise."""
+    result: dict = {
+        "schema_ok": False,
+        "missing_major_fields": [],
+        "missing_optional_fields": [],
+        "bad_reason": "",
+    }
+    if not isinstance(trace, dict):
+        result["bad_reason"] = "trace_is_not_a_dict"
+        return result
+    major = [
+        "trace_version", "deltas_ms", "derived_ms",
+        "timing_quality", "timing_quality_reason", "missing_timing_fields",
+    ]
+    for key in major:
+        if key not in trace:
+            result["missing_major_fields"].append(key)
+    if result["missing_major_fields"]:
+        result["bad_reason"] = f"missing_top_level_keys={result['missing_major_fields']}"
+        return result
+    if not isinstance(trace.get("deltas_ms"), dict):
+        result["missing_major_fields"].append("deltas_ms(not_dict)")
+        result["bad_reason"] = "deltas_ms_is_not_a_dict"
+        return result
+    if not isinstance(trace.get("derived_ms"), dict):
+        result["missing_major_fields"].append("derived_ms(not_dict)")
+        result["bad_reason"] = "derived_ms_is_not_a_dict"
+        return result
+    # Check execution-critical derived fields
+    exec_derived = [
+        "prompt_start_to_sampler_start_ms", "sampler_ms",
+        "total_input_execution_ms", "output_collection_total_ms",
+    ]
+    derived = trace.get("derived_ms", {})
+    for key in exec_derived:
+        if key not in derived or derived[key] is None:
+            result["missing_major_fields"].append(key)
+    if result["missing_major_fields"]:
+        result["bad_reason"] = f"missing_derived_fields={result['missing_major_fields']}"
+        return result
+    result["schema_ok"] = True
+    return result
+
+
+# ── Timing extraction helpers ────────────────────────────────────────────────
+
+
+def _extract_modal_to_browser(trace: dict) -> float | None:
     if not isinstance(trace, dict):
         return None
     deltas = trace.get("deltas_ms", {}) if isinstance(trace.get("deltas_ms", {}), dict) else {}
     return deltas.get("modal_to_browser") or deltas.get("modal_to_return")
+
+
+def _extract_derived(trace: dict, field: str) -> float | None:
+    if not isinstance(trace, dict):
+        return None
+    derived = trace.get("derived_ms", {}) if isinstance(trace.get("derived_ms", {}), dict) else {}
+    return derived.get(field)
+
+
+def _get_t0_wall_ms(trace: dict) -> float | None:
+    """Estimate wall time from t0 (client press) to t10 if both exist."""
+    if not isinstance(trace, dict):
+        return None
+    stages = trace.get("stages", {}) if isinstance(trace.get("stages", {}), dict) else {}
+    deltas = trace.get("deltas_ms", {}) if isinstance(trace.get("deltas_ms", {}), dict) else {}
+    t0 = stages.get("t0_client_press")
+    t10_key = "t10_browser_recv" if stages.get("t10_browser_recv") is not None else "t10_local_materialized"
+    t10 = stages.get(t10_key)
+    if t0 is not None and t10 is not None:
+        return round((t10 - t0) * 1000, 2)
+    # Fall back to t0_to_t10 delta
+    return deltas.get("t0_to_t1") if deltas.get("t0_to_t1") is not None else None
+
+
+def _extract_restore(trace: dict, field: str) -> float | None:
+    if not isinstance(trace, dict):
+        return None
+    restore = trace.get("restore", {})
+    if not isinstance(restore, dict):
+        return None
+    v = restore.get(field)
+    return float(v) if isinstance(v, (int, float)) else None
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -224,15 +307,91 @@ def _classify_failure_status(stage: str, exc: Exception, run1_completed: bool) -
     return "run1_failed"
 
 
+def _pick_traced(trace: dict, field: str, default: str = "") -> str:
+    """Return str(value) from derived_ms, or default."""
+    v = _extract_derived(trace, field)
+    return str(v) if v is not None else default
+
+
+def _write_runs_csv(run_dir: Path, run1_trace: dict, run2_trace: dict) -> None:
+    import csv
+    fields = [
+        "modal_to_return_ms",
+        "total_input_execution_ms",
+        "modal_entry_to_prompt_start_ms",
+        "restore_end_to_prompt_start_ms",
+        "prompt_start_to_sampler_start_ms",
+        "sampler_ms",
+        "sampler_end_to_outputs_collected_ms",
+        "output_collection_total_ms",
+        "restore_total_ms",
+        "timing_quality",
+        "timing_quality_reason",
+        "missing_timing_fields",
+    ]
+    row: dict[str, str] = {}
+    for f in fields:
+        if f == "timing_quality":
+            row[f] = str(run2_trace.get("timing_quality", "")) if isinstance(run2_trace, dict) else ""
+        elif f == "timing_quality_reason":
+            row[f] = str(run2_trace.get("timing_quality_reason", "")) if isinstance(run2_trace, dict) else ""
+        elif f == "missing_timing_fields":
+            mf = run2_trace.get("missing_timing_fields", []) if isinstance(run2_trace, dict) else []
+            row[f] = "; ".join(mf)
+        else:
+            # try run2 first, fall back run1
+            for trace in (run2_trace, run1_trace):
+                if not isinstance(trace, dict):
+                    continue
+                val = _extract_derived(trace, f)
+                if val is not None:
+                    row[f] = str(val)
+                    break
+            else:
+                row[f] = ""
+    with open(run_dir / "runs.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerow(row)
+
+
 def _write_summary(run_dir: Path, status: str, run1_trace: dict, run2_trace: dict, extra: dict | None = None) -> None:
+    # ── Extract wall/return/execution separately ──
+    run1_wall_ms = _get_t0_wall_ms(run1_trace)
+    run2_wall_ms = _get_t0_wall_ms(run2_trace)
+    run1_modal_to_return_ms = _extract_modal_to_browser(run1_trace)
+    run2_modal_to_return_ms = _extract_modal_to_browser(run2_trace)
+    run1_modal_to_browser_ms = _extract_derived(run1_trace, "modal_to_browser_ms")
+    run2_modal_to_browser_ms = _extract_derived(run2_trace, "modal_to_browser_ms")
+    run1_total_input_exec_ms = _extract_derived(run1_trace, "total_input_execution_ms")
+    run2_total_input_exec_ms = _extract_derived(run2_trace, "total_input_execution_ms")
+
+    # legacy fallback: modal_to_browser > modal_to_return > None (NOT exec time)
+    run1_total_ms = run1_modal_to_browser_ms or run1_modal_to_return_ms or run1_wall_ms
+    run2_total_ms = run2_modal_to_browser_ms or run2_modal_to_return_ms or run2_wall_ms
+
     summary = {
         "status": status,
-        "run1_total_ms": _extract_total(run1_trace),
-        "run2_total_ms": _extract_total(run2_trace),
+        "run1_total_ms": run1_total_ms,
+        "run2_total_ms": run2_total_ms,
+        "run1_wall_ms": run1_wall_ms,
+        "run2_wall_ms": run2_wall_ms,
+        "run1_modal_to_return_ms": run1_modal_to_return_ms,
+        "run2_modal_to_return_ms": run2_modal_to_return_ms,
+        "run1_modal_to_browser_ms": run1_modal_to_browser_ms,
+        "run2_modal_to_browser_ms": run2_modal_to_browser_ms,
+        "run1_total_input_execution_ms": run1_total_input_exec_ms,
+        "run2_total_input_execution_ms": run2_total_input_exec_ms,
         "run1_trace": run1_trace,
         "run2_trace": run2_trace,
     }
-    # Extract restore timing from the runs that have it
+    # Validate traces
+    run1_val = _validate_trace(run1_trace) if isinstance(run1_trace, dict) else {"schema_ok": False, "bad_reason": "not_a_dict"}
+    run2_val = _validate_trace(run2_trace) if isinstance(run2_trace, dict) else {"schema_ok": False, "bad_reason": "not_a_dict"}
+    summary["run1_schema_ok"] = run1_val.get("schema_ok", False)
+    summary["run2_schema_ok"] = run2_val.get("schema_ok", False)
+
+    # Restore timing
     for label, trace in [("run1", run1_trace), ("run2", run2_trace)]:
         if isinstance(trace, dict):
             restore = trace.get("restore", {})
@@ -240,27 +399,92 @@ def _write_summary(run_dir: Path, status: str, run1_trace: dict, run2_trace: dic
                 for k, v in restore.items():
                     if isinstance(v, (int, float)):
                         summary[f"{label}_{k}"] = v
+    # Derived timing
+    for label, trace in [("run1", run1_trace), ("run2", run2_trace)]:
+        if isinstance(trace, dict):
+            derived = trace.get("derived_ms", {})
+            if isinstance(derived, dict) and derived:
+                for k, v in derived.items():
+                    if isinstance(v, (int, float)):
+                        summary[f"{label}_{k}"] = v
     if extra:
         summary.update(extra)
     _write_json(run_dir / "summary.json", summary)
+
+    # ── summary.md ──
     lines = [
         f"status: {status}",
-        f"run1_total_ms: {summary['run1_total_ms']}",
-        f"run2_total_ms: {summary['run2_total_ms']}",
+        f"",
+        f"## Wall / Return Timing",
+        f"run1_wall_ms: {run1_wall_ms}",
+        f"run2_wall_ms: {run2_wall_ms}",
+        f"run1_modal_to_return_ms: {run1_modal_to_return_ms}",
+        f"run2_modal_to_return_ms: {run2_modal_to_return_ms}",
+        f"run1_modal_to_browser_ms: {run1_modal_to_browser_ms}",
+        f"run2_modal_to_browser_ms: {run2_modal_to_browser_ms}",
+        f"",
+        f"## Internal Execution",
+        f"run1_total_input_execution_ms: {run1_total_input_exec_ms}",
+        f"run2_total_input_execution_ms: {run2_total_input_exec_ms}",
+        "",
     ]
-    if isinstance(run2_trace, dict):
-        deltas = run2_trace.get("deltas_ms", {}) if isinstance(run2_trace.get("deltas_ms", {}), dict) else {}
-        for key in ("t2_to_t3", "clip_load", "clip_encode", "sampler", "vae_decode", "graph_overhead", "inference_total", "modal_to_return", "modal_to_browser"):
-            if key in deltas:
-                lines.append(f"run2_{key}: {deltas[key]}")
-        restore = run2_trace.get("restore", {}) if isinstance(run2_trace.get("restore", {}), dict) else {}
-        for key in ("restore_total_ms", "cuda_warmup_ms", "sage_runtime_ms", "warmup_preload_ms", "gpu_state_ms", "ensure_models_ms"):
-            if key in restore:
-                lines.append(f"run2_{key}: {restore[key]}")
+    for label, trace in [("run1", run1_trace), ("run2", run2_trace)]:
+        if not isinstance(trace, dict):
+            continue
+        derived = trace.get("derived_ms", {}) if isinstance(trace.get("derived_ms", {}), dict) else {}
+        lines.append(f"### {label} derived")
+        for key in ("prompt_start_to_sampler_start_ms", "sampler_ms",
+                     "sampler_end_to_outputs_collected_ms", "output_collection_total_ms",
+                     "modal_entry_to_prompt_start_ms", "restore_end_to_prompt_start_ms",
+                     "sampler_prep_ms", "sampler_denoise_ms", "sampler_teardown_ms",
+                     "clip_node_wait_ms", "unet_node_wait_ms", "vae_node_wait_ms",
+                     "modal_to_return_ms", "modal_to_browser_ms"):
+            if key in derived and derived[key] is not None:
+                lines.append(f"  {label}_{key}: {derived[key]}")
+        # Restore timing
+        restore = trace.get("restore", {}) if isinstance(trace.get("restore", {}), dict) else {}
+        restore_keys = [k for k in ("restore_total_ms", "cuda_warmup_ms", "sage_runtime_ms",
+                                     "warmup_preload_ms", "gpu_state_ms", "ensure_models_ms")
+                        if k in restore and restore[k] is not None]
+        if restore_keys:
+            lines.append(f"### {label} Restore Timing")
+            for key in restore_keys:
+                lines.append(f"  {label}_{key}: {restore[key]}")
+        # Deltas
+        deltas = trace.get("deltas_ms", {}) if isinstance(trace.get("deltas_ms", {}), dict) else {}
+        delta_keys = [k for k in ("clip_load", "clip_encode", "unet_load", "vae_load",
+                                   "t2_to_t3", "graph_overhead", "inference_total")
+                      if k in deltas and deltas[k] is not None]
+        if delta_keys:
+            lines.append(f"### {label} Deltas")
+            for key in delta_keys:
+                lines.append(f"  {label}_{key}: {deltas[key]}")
+        # Timing quality
+        qual = trace.get("timing_quality")
+        if qual:
+            lines.append(f"  {label}_timing_quality: {qual}")
+        reason = trace.get("timing_quality_reason")
+        if reason:
+            lines.append(f"  {label}_timing_quality_reason: {reason}")
+        missing = trace.get("missing_timing_fields", [])
+        if missing:
+            lines.append(f"  {label}_missing_fields: {', '.join(missing)}")
+        val_result = _validate_trace(trace)
+        lines.append(f"  {label}_schema_ok: {val_result.get('schema_ok', False)}")
+
+    # legacy compat
+    lines.append("")
+    lines.append(f"## Legacy Total")
+    lines.append(f"run1_total_ms: {run1_total_ms}")
+    lines.append(f"run2_total_ms: {run2_total_ms}")
+
     with open(run_dir / "summary.md", "w", encoding="utf-8") as f:
         f.write("# Benchmark Summary\n\n")
         for line in lines:
             f.write(f"- {line}\n")
+
+    # ── runs.csv ──
+    _write_runs_csv(run_dir, run1_trace, run2_trace)
 
 
 def main() -> int:

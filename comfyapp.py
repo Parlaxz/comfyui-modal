@@ -181,6 +181,10 @@ ENABLE_WARMUP = os.getenv("COMFYMODAL_ENABLE_WARMUP", "1") == "1"
 ENABLE_TORCH_COMPILE = os.getenv("COMFYMODAL_ENABLE_TORCH_COMPILE", "0") == "1"
 ENABLE_GPU_SNAPSHOT = os.getenv("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1"
 CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S = int(os.getenv("COMFYMODAL_CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S", "180"))
+CUSTOM_NODE_COPY_MODE = os.getenv("COMFYMODAL_CUSTOM_NODE_COPY_MODE", "combined").strip().lower()
+if CUSTOM_NODE_COPY_MODE not in ("combined", "per_node"):
+    print(f"[comfyapp] WARNING: invalid COMFYMODAL_CUSTOM_NODE_COPY_MODE={CUSTOM_NODE_COPY_MODE!r}, falling back to 'combined'")
+    CUSTOM_NODE_COPY_MODE = "combined"
 
 # Generic collector for custom-node import/entrypoint failures during startup.
 # Populated by the logging.warning patch in _start_in_process_backend.
@@ -1985,6 +1989,33 @@ _COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = [
     "modal_logs.txt",
     "_deploy_output.log",
 ]
+_COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = [
+    "*/.git/",
+    "*/__pycache__/",
+    "*/.ipynb_checkpoints/",
+    "*/node_modules/",
+    "*/.venv/",
+    "*/venv/",
+    "*.pyc",
+    "*.pyo",
+    "comfyui-modal/.gitignore",
+    "comfyui-modal/.deploy_log",
+    "comfyui-modal/.tmp",
+    "comfyui-modal/*.tmp",
+    "comfyui-modal/*.log",
+    "comfyui-modal/modal_logs.txt",
+    "comfyui-modal/_deploy_output.log",
+    "comfyui-modal/latest_benchmark_workflow.json",
+    "comfyui-modal/.hf_token",
+    "comfyui-modal/.civitai_token",
+    "comfyui-modal/.deployed_state.json",
+    "comfyui-modal/.deployed_version",
+    "comfyui-modal/.modal_settings.json",
+    "comfyui-modal/.last_custom_node_context_manifest.json",
+    "comfyui-modal/.custom_node_requirements/",
+    "comfyui-modal/.baked_custom_node_deps/",
+    "comfyui-modal/*.md",
+]
 _CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE = shutil.ignore_patterns(
     ".git",
     "__pycache__",
@@ -1994,6 +2025,7 @@ _CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE = shutil.ignore_patterns(
     "node_modules",
     ".venv",
     "venv",
+    ".last_context_manifest.json",
     # Image/media/docs — not needed for pip install
     "*.jpg",
     "*.jpeg",
@@ -2094,6 +2126,327 @@ def _build_requirements_context_manifest(root: str) -> dict[str, str]:
             rel_path = os.path.relpath(path, root).replace("\\", "/")
             manifest[rel_path] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
     return manifest
+
+
+LAST_CONTEXT_MANIFEST_FILENAME = ".last_custom_node_context_manifest.json"
+_LAST_CONTEXT_MANIFEST_PATH = os.path.join(
+    _COMFYUI_MODAL_DIR, LAST_CONTEXT_MANIFEST_FILENAME
+)
+
+
+def _compute_deterministic_context_hash(requirements_dir: str) -> dict:
+    if not os.path.isdir(requirements_dir):
+        return {
+            "context_hash": "", "file_count": 0, "total_bytes": 0,
+            "node_dirs": 0, "top_20_largest": [], "file_hashes": {},
+        }
+    hasher = hashlib.sha256()
+    file_hashes = {}
+    file_sizes: list[tuple[int, str]] = []
+    total_bytes = 0
+    node_dirs = set()
+    for dirpath, _, filenames in os.walk(requirements_dir):
+        rel_dir = os.path.relpath(dirpath, requirements_dir).replace("\\", "/")
+        if rel_dir != ".":
+            node_dirs.add(rel_dir.split("/")[0])
+        for filename in sorted(filenames):
+            path = os.path.join(dirpath, filename)
+            rel_path = os.path.relpath(path, requirements_dir).replace("\\", "/")
+            if rel_path.replace("\\", "/") == LAST_CONTEXT_MANIFEST_FILENAME:
+                continue
+            try:
+                data = Path(path).read_bytes()
+            except OSError:
+                data = b""
+            h = hashlib.sha256(data).hexdigest()
+            file_hashes[rel_path] = h
+            hasher.update(f"{rel_path}:{h}".encode())
+            size = len(data)
+            total_bytes += size
+            file_sizes.append((size, rel_path))
+    file_sizes.sort(reverse=True)
+    return {
+        "context_hash": hasher.hexdigest(),
+        "file_count": len(file_hashes),
+        "total_bytes": total_bytes,
+        "node_dirs": len(node_dirs),
+        "top_20_largest": [{"path": p, "bytes": s} for s, p in file_sizes[:20]],
+        "file_hashes": file_hashes,
+    }
+
+
+def _save_last_context_manifest(manifest: dict) -> None:
+    try:
+        payload = {k: v for k, v in manifest.items() if k != "file_hashes"}
+        payload["file_hashes"] = manifest.get("file_hashes", {})
+        os.makedirs(os.path.dirname(_LAST_CONTEXT_MANIFEST_PATH), exist_ok=True)
+        tmp = _LAST_CONTEXT_MANIFEST_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+        os.replace(tmp, _LAST_CONTEXT_MANIFEST_PATH)
+    except Exception as exc:
+        print(f"[comfyapp] WARNING: failed to save context manifest: {exc}")
+
+
+def _load_last_context_manifest() -> dict:
+    try:
+        if os.path.isfile(_LAST_CONTEXT_MANIFEST_PATH):
+            with open(_LAST_CONTEXT_MANIFEST_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[comfyapp] WARNING: failed to load context manifest: {exc}")
+    return {}
+
+
+def _diff_context_manifests(current: dict, previous: dict) -> dict:
+    cur_hashes = current.get("file_hashes", {})
+    prev_hashes = previous.get("file_hashes", {})
+    cur_files = set(cur_hashes.keys())
+    prev_files = set(prev_hashes.keys())
+    added = sorted(cur_files - prev_files)
+    removed = sorted(prev_files - cur_files)
+    changed = sorted(f for f in cur_files & prev_files if cur_hashes[f] != prev_hashes.get(f))
+    changed_nodes = sorted(set(
+        f.split("/")[0] for f in changed + added + removed if "/" in f
+    ))
+    return {
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "changed_node_names": changed_nodes,
+        "added_count": len(added),
+        "removed_count": len(removed),
+        "changed_count": len(changed),
+        "total_changed": len(added) + len(removed) + len(changed),
+    }
+
+
+def _classify_dependency_file(rel_path: str) -> str:
+    name = os.path.basename(rel_path)
+    if name == "requirements.txt":
+        return "requirements.txt"
+    if name.startswith("requirements") and name.endswith(".txt"):
+        return "requirements/*.txt"
+    if name.startswith("constraints") and name.endswith(".txt"):
+        return "constraint file"
+    if name == "pyproject.toml":
+        return "pyproject.toml"
+    if name == "setup.py":
+        return "setup.py"
+    if name == "setup.cfg":
+        return "setup.cfg"
+    if name == "install.py":
+        return "install.py"
+    if name.endswith(".whl"):
+        return "wheel file"
+    if name.endswith(".txt") or name.endswith(".pip"):
+        return "requirements/*.txt"
+    return "unknown"
+
+
+def _scan_local_editable_dependencies(source_root: str) -> list[dict]:
+    results = []
+    for node_name in _iter_syncable_custom_node_dirs(source_root):
+        node_path = os.path.join(source_root, node_name)
+        for req_file in ("requirements.txt",):
+            req_path = os.path.join(node_path, req_file)
+            if not os.path.isfile(req_path):
+                continue
+            try:
+                for line in Path(req_path).read_text(encoding="utf-8").splitlines():
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    stripped = stripped.split(";", 1)[0].strip()
+                    if not stripped:
+                        continue
+                    is_editable = stripped.startswith("-e ") or stripped.startswith("--editable ")
+                    is_local_path = stripped.startswith("./") or stripped.startswith("../")
+                    if not (is_editable or is_local_path):
+                        continue
+                    prefix = stripped.split(" ", 1)[1].strip() if is_editable else stripped
+                    resolved = os.path.abspath(os.path.join(os.path.dirname(req_path), prefix))
+                    file_count = 0
+                    total_bytes = 0
+                    if os.path.isdir(resolved):
+                        for dp, dn, fn in os.walk(resolved):
+                            dn[:] = [d for d in dn if d not in (".git", "__pycache__", "node_modules", ".venv", "venv")]
+                            file_count += len(fn)
+                            for f in fn:
+                                try:
+                                    total_bytes += os.path.getsize(os.path.join(dp, f))
+                                except OSError:
+                                    pass
+                    elif os.path.isfile(resolved):
+                        file_count = 1
+                        try:
+                            total_bytes = os.path.getsize(resolved)
+                        except OSError:
+                            pass
+                    cache_risk = "high" if (is_editable and ".." in prefix) or file_count > 50 else "medium" if file_count > 10 else "low"
+                    results.append({
+                        "node_name": node_name,
+                        "req_file": f"{node_name}/{req_file}",
+                        "raw_line": line.strip(),
+                        "resolved_path": resolved,
+                        "file_count": file_count,
+                        "total_bytes": total_bytes,
+                        "cache_risk": cache_risk,
+                    })
+            except (OSError, UnicodeDecodeError):
+                pass
+    return results
+
+
+def _scan_raw_build_files(source_root: str) -> list[dict]:
+    RAW_BUILD_FILES = {"pyproject.toml", "setup.py", "setup.cfg", "install.py"}
+    results = []
+    for node_name in _iter_syncable_custom_node_dirs(source_root):
+        node_path = os.path.join(source_root, node_name)
+        has_reqs = os.path.isfile(os.path.join(node_path, "requirements.txt"))
+        for bf in RAW_BUILD_FILES:
+            bf_path = os.path.join(node_path, bf)
+            if os.path.isfile(bf_path):
+                try:
+                    data = Path(bf_path).read_bytes()
+                    fhash = hashlib.sha256(data).hexdigest()
+                    fsize = len(data)
+                except OSError:
+                    fhash = ""
+                    fsize = 0
+                results.append({
+                    "node_name": node_name,
+                    "file_path": bf,
+                    "hash": fhash,
+                    "size": fsize,
+                    "has_requirements_txt": has_reqs,
+                })
+    return results
+
+
+def _diagnose_custom_node_requirements_context(source_root: str, requirements_dir: str, dep_manifest: dict) -> None:
+    print("[comfyapp] === Requirements Context Diagnostics ===")
+    print(f"[comfyapp] COMFYAPP_VERSION={COMFYAPP_VERSION}")
+    print(f"[comfyapp] source_root={source_root}")
+    print(f"[comfyapp] requirements_dir={requirements_dir}")
+
+    # Task 7: Cache killer flags
+    modal_force_build = os.environ.get("MODAL_FORCE_BUILD", "")
+    modal_ignore_cache = os.environ.get("MODAL_IGNORE_CACHE", "")
+    force_build_env = os.environ.get("FORCE_BUILD", "")
+    print(f"[comfyapp] MODAL_FORCE_BUILD={modal_force_build!r}")
+    print(f"[comfyapp] MODAL_IGNORE_CACHE={modal_ignore_cache!r}")
+    print(f"[comfyapp] FORCE_BUILD={force_build_env!r}")
+
+    _scan_ignore_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules", ".ipynb_checkpoints", ".custom_node_requirements"}
+    _node_sizes: list[tuple[int, str]] = []
+    for _n in _iter_syncable_custom_node_dirs(source_root):
+        _p = os.path.join(source_root, _n)
+        _sz = 0
+        try:
+            for _dp, _dn, _fn in os.walk(_p):
+                _dn[:] = [d for d in _dn if d not in _scan_ignore_dirs]
+                _sz += sum(os.path.getsize(os.path.join(_dp, f)) for f in _fn if not f.endswith((".pyc", ".pyo")))
+        except OSError:
+            pass
+        _node_sizes.append((_sz, _n))
+    _node_sizes.sort(reverse=True)
+    print(f"[comfyapp] source_copy_node_count={len(_node_sizes)}")
+    print(f"[comfyapp] source_copy_top_20_largest_nodes (best-effort bytes after ignore):")
+    for _sz, _n in _node_sizes[:20]:
+        print(f"  {_n}: {_sz} bytes ({round(_sz/1024/1024, 1)} MB)")
+
+    current = _compute_deterministic_context_hash(requirements_dir)
+    previous = _load_last_context_manifest()
+    dep_hash = dep_manifest.get("overall_dependency_hash", "") if dep_manifest else ""
+
+    print(f"[comfyapp] custom_node_requirements_context_hash={current['context_hash'][:16] if current['context_hash'] else '<empty>'}...")
+    print(f"[comfyapp] requirements_context_file_count={current['file_count']}")
+    print(f"[comfyapp] requirements_context_total_bytes={current['total_bytes']}")
+    print(f"[comfyapp] requirements_context_node_dirs={current['node_dirs']}")
+    if current["top_20_largest"]:
+        print(f"[comfyapp] requirements_context_top_20_largest:")
+        for entry in current["top_20_largest"]:
+            print(f"  {entry['path']}: {entry['bytes']} bytes")
+    print(f"[comfyapp] dependency_manifest_hash={dep_hash[:16] if dep_hash else '<none>'}...")
+
+    # Task 2: Context diff
+    if previous.get("context_hash"):
+        diff = _diff_context_manifests(current, previous)
+        if diff["total_changed"] == 0:
+            print(f"[comfyapp] requirements_context_unchanged=1")
+        else:
+            print(f"[comfyapp] requirements_context_changed=1 total_changed={diff['total_changed']}")
+            print(f"[comfyapp]   added_files={diff['added']}")
+            print(f"[comfyapp]   removed_files={diff['removed']}")
+            print(f"[comfyapp]   changed_files={diff['changed']}")
+            print(f"[comfyapp]   changed_node_names={diff['changed_node_names']}")
+
+            # Task 3: Classify changed files
+            all_changed = diff["added"] + diff["removed"] + diff["changed"]
+            classified: dict[str, list[str]] = {}
+            for f in all_changed:
+                cls = _classify_dependency_file(f)
+                classified.setdefault(cls, []).append(f)
+            print(f"[comfyapp] changed_files_by_type:")
+            for cls, files in sorted(classified.items()):
+                print(f"  {cls}: {files}")
+
+            dep_only_changed = all(
+                _classify_dependency_file(f) != "unknown" for f in all_changed
+            )
+            if not dep_only_changed:
+                print(f"[comfyapp] WARNING: dependency context changed even though no dependency files should have changed")
+    else:
+        print(f"[comfyapp] requirements_context_first_deploy=1 (no previous manifest)")
+
+    # Task 4: Local editable/path dependencies
+    local_deps = _scan_local_editable_dependencies(source_root)
+    if local_deps:
+        print(f"[comfyapp] local_editable_path_dependencies ({len(local_deps)}):")
+        for dep in local_deps:
+            print(f"  node={dep['node_name']} req={dep['req_file']} "
+                  f"line={dep['raw_line']} "
+                  f"files={dep['file_count']} bytes={dep['total_bytes']} "
+                  f"cache_risk={dep['cache_risk']}")
+
+    # Task 5: Raw setup/pyproject/setup.cfg/install.py
+    raw_build = _scan_raw_build_files(source_root)
+    if raw_build:
+        print(f"[comfyapp] raw_build_file_contributors ({len(raw_build)}):")
+        for entry in raw_build:
+            print(f"  node={entry['node_name']} file={entry['file_path']} "
+                  f"hash={entry['hash'][:16]} size={entry['size']} "
+                  f"has_reqtxt={entry['has_requirements_txt']}")
+
+    # Task 8: Verify actual build order
+    _node_names = _iter_syncable_custom_node_dirs(source_root)
+    print(f"[comfyapp] custom_node_copy_mode={CUSTOM_NODE_COPY_MODE}")
+    print(f"[comfyapp] syncable_custom_nodes={len(_node_names)}")
+    _combined_layers = 1 if CUSTOM_NODE_COPY_MODE == "combined" else len(_node_names)
+    print(f"[comfyapp] source_copy_layers={_combined_layers}")
+    print(f"[comfyapp] local_custom_node_root={source_root}")
+    combined_excluded_ok = (
+        os.path.isdir(os.path.join(requirements_dir, "..", "comfyui-modal", ".custom_node_requirements"))
+        if CUSTOM_NODE_COPY_MODE == "combined" else True
+    )
+    print(f"[comfyapp] comfyui_modal_excluded_custom_node_requirements={'yes' if combined_excluded_ok else 'check_logs'}")
+    print(f"[comfyapp] comfyui_modal_excluded_baked_custom_node_deps={'yes' if combined_excluded_ok else 'check_logs'}")
+    print(f"[comfyapp] build_order:")
+    print(f"  1. base CUDA image (nvidia/cuda:13.0.0-devel-ubuntu24.04)")
+    print(f"  2. comfy-cli install")
+    print(f"  3. PyTorch CUDA reinstall (cu130)")
+    print(f"  4. triton install")
+    print(f"  5. SageAttention build")
+    print(f"  6. env vars")
+    print(f"  7. add .custom_node_requirements (as local_dir)")
+    print(f"  8. run custom-node prereq pip loop")
+    print(f"  9. add custom-node source (mode={CUSTOM_NODE_COPY_MODE}, layers={_combined_layers})")
+    print(f"  10. generate/add baked dependency manifest")
+    print(f"  11. add helper Python sources")
+    print(f"[comfyapp] ===========================================")
+
+    _save_last_context_manifest(current)
 
 
 def _safe_dependency_relpath(filepath: str, node_root: str) -> str:
@@ -2364,24 +2717,52 @@ _image_base = _image_base.add_local_dir(
     "/root/comfy-build/custom_node_requirements",
     copy=True,
 ).run_commands(
+    '__ts_ms() { python3 -c "import time; print(int(time.time()*1000))"; }; '
+    'echo "CUSTOM_NODE_PREREQ_INSTALL_START ts_ms=$(__ts_ms)"; '
+    '_total_req=0; _total_installed=0; _total_skipped=0; '
     '_pip_node() { local d="$1"; '
-    '  [ -f "$d/requirements.txt" ] || return 0; '
+    '  local name; name=$(basename "$d"); '
+    '  [ -f "$d/requirements.txt" ] || { _total_skipped=$((_total_skipped+1)); return 0; }; '
+    '  _total_req=$((_total_req+1)); '
+    '  local t0; t0=$(__ts_ms); '
+    '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name start_ts=$t0"; '
     '  cd "$d" && pip install -r requirements.txt --quiet; '
+    '  local t1; t1=$(__ts_ms); '
+    '  local dur; dur=$((t1 - t0)); '
+    '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name end_ts=$t1 duration_ms=$dur"; '
+    '  _total_installed=$((_total_installed+1)); '
     '}; '
     'for d in /root/comfy-build/custom_node_requirements/*/; do '
     '  _pip_node "$d"; '
-    'done'
+    'done; '
+    '_end_ts=$(__ts_ms); '
+    'echo "CUSTOM_NODE_PREREQ_INSTALL_END ts_ms=$_end_ts total_nodes=$_total_req installed=$_total_installed skipped_no_req=$_total_skipped"'
 )
 
-# Add each custom node as its own source layer after all requirements layers.
-for _node_name in _iter_syncable_custom_node_dirs(_LOCAL_CUSTOM_NODES):
-    _node_src = os.path.join(_LOCAL_CUSTOM_NODES, _node_name)
+# ── PART 3b: Custom-node source copy (combined or per-node) ──
+_syncable_node_names = _iter_syncable_custom_node_dirs(_LOCAL_CUSTOM_NODES)
+_cn_copy_layer_count = 0
+if CUSTOM_NODE_COPY_MODE == "combined":
     _image_base = _image_base.add_local_dir(
-        _node_src,
-        f"/root/comfy/ComfyUI/custom_nodes/{_node_name}",
+        _LOCAL_CUSTOM_NODES,
+        "/root/comfy/ComfyUI/custom_nodes",
         copy=True,
-        ignore=_custom_node_image_ignore_patterns(_node_name),
+        ignore=_COMBINED_CUSTOM_NODE_IGNORE_PATTERNS,
     )
+    _cn_copy_layer_count = 1
+    print(f"[comfyapp] custom_node_copy_mode=combined nodes={len(_syncable_node_names)} layers=1 "
+          f"src={_LOCAL_CUSTOM_NODES} dst=/root/comfy/ComfyUI/custom_nodes")
+else:
+    for _node_name in _syncable_node_names:
+        _node_src = os.path.join(_LOCAL_CUSTOM_NODES, _node_name)
+        _image_base = _image_base.add_local_dir(
+            _node_src,
+            f"/root/comfy/ComfyUI/custom_nodes/{_node_name}",
+            copy=True,
+            ignore=_custom_node_image_ignore_patterns(_node_name),
+        )
+    _cn_copy_layer_count = len(_syncable_node_names)
+    print(f"[comfyapp] custom_node_copy_mode=per_node nodes={len(_syncable_node_names)} layers={_cn_copy_layer_count}")
 
 # ── PART 4: Generate baked dependency manifest and copy into image ──
 _BAKED_MANIFEST_DIR = os.path.join(_COMFYUI_MODAL_DIR, ".baked_custom_node_deps")
@@ -2420,6 +2801,19 @@ except Exception as _bake_exc:
     # Write empty manifest so the file exists in the image
     with open(_BAKED_MANIFEST_TEMP, "w", encoding="utf-8") as _f:
         json.dump({"schema_version": 1, "nodes": {}, "overall_dependency_hash": ""}, _f)
+
+# ── Dependency build-context diagnostics ──
+_baked_manifest_for_diag = locals().get("_baked_manifest", {})
+if not _baked_manifest_for_diag:
+    try:
+        if os.path.isfile(_BAKED_MANIFEST_TEMP):
+            with open(_BAKED_MANIFEST_TEMP, "r", encoding="utf-8") as _f:
+                _baked_manifest_for_diag = json.load(_f)
+    except Exception:
+        pass
+_diagnose_custom_node_requirements_context(
+    _LOCAL_CUSTOM_NODES, _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR, _baked_manifest_for_diag
+)
 
 _image_base = _image_base.add_local_file(
     _BAKED_MANIFEST_TEMP,
@@ -5681,9 +6075,22 @@ class _ComfyAPIMixin:
                 elif stage == "sampler":
                     trace._t["t6_sampler_start"] = start
                     trace._t["t6_sampler_end"] = end
+                    # Sub-millisecond sampler phases
+                    ps = fields.get("progress_start")
+                    pe = fields.get("progress_end")
+                    if ps is not None:
+                        trace._t["t6_sampler_progress_start"] = ps
+                    if pe is not None:
+                        trace._t["t6_sampler_progress_end"] = pe
                 elif stage == "vae_decode":
                     trace._t["t7_vae_decode_start"] = start
                     trace._t["t7_vae_decode_end"] = end
+                elif stage == "unet_load":
+                    trace._t["t4b_unet_load_start"] = start
+                    trace._t["t4b_unet_load_end"] = end
+                elif stage == "vae_load":
+                    trace._t["t4c_vae_load_start"] = start
+                    trace._t["t4c_vae_load_end"] = end
                 elif stage == "cachedit":
                     trace._t["t8_cachedit_start"] = start
                     trace._t["t8_cachedit_end"] = end
@@ -6310,6 +6717,8 @@ class _ComfyAPIMixin:
         # disk so the fallback output scan does not echo them back as
         # generated outputs.
         prompt_start_time = time.time()
+        if trace is not None:
+            trace.mark("t3d_prompt_start", t=prompt_start_time)
 
         repair_started = time.time()
         repair_summary = self._repair_missing_workflow_nodes(workflow)
@@ -6615,6 +7024,8 @@ class _ComfyAPIMixin:
         # want to preserve across prompts.
         self._executor.reset()
         stage_started = time.time()
+        if trace is not None:
+            trace.mark("t3e_execution_start", t=stage_started)
         self._executor.execute(
             prompt=workflow,
             prompt_id=prompt_id,
@@ -6693,6 +7104,8 @@ class _ComfyAPIMixin:
         except Exception as _kg_exc:
             print(f"[comfyapp] failed to mark known-good: {_kg_exc}")
         stage_started = time.time()
+        if trace is not None:
+            trace.mark("t7b_collect_start", t=stage_started)
         result = self._collect_in_process_outputs(prompt_id, prompt_start_time=prompt_start_time, modal_options=modal_options)
         self._log_profile("inproc_collect", prompt_id=prompt_id[:8], images=len(result.get("images", [])), videos=len(result.get("videos", [])), duration_ms=self._profile_ms(stage_started))
         if trace is not None:
@@ -9230,6 +9643,17 @@ class _ComfyAPIMixin:
             _s = time.time()
             trace_summary = server_trace.summary()
             self._enrich_trace_with_restore_timing(trace_summary)
+            # Merge derived timing from the non-streaming path.
+            # Fields that depend on restore dict or total_started (not in trace):
+            _prompt_start_ts = _stages_ns.get("t3d_prompt_start", total_started)
+            trace_summary["derived_ms"]["restore_total_ms"] = _rt3.get("restore_total_ms", 0)
+            # restore_end_to_prompt_start_ms: only when real restore end exists (cold container)
+            if _rt3.get("restore_end_unix_s") is not None:
+                trace_summary["derived_ms"]["restore_end_to_prompt_start_ms"] = round((_prompt_start_ts - _rt3["restore_end_unix_s"]) * 1000, 1)
+            # modal_entry_to_prompt_start_ms: always computed from trace entry
+            if _t3_ns is not None and _prompt_start_ts is not None:
+                trace_summary["derived_ms"]["modal_entry_to_prompt_start_ms"] = round((_prompt_start_ts - _t3_ns) * 1000, 1)
+            trace_summary["derived_ms"]["total_input_execution_ms"] = total_ms
             result["trace"] = trace_summary
             if isinstance(_scheduler_trace_ns, dict):
                 result["scheduler_trace"] = dict(_scheduler_trace_ns)
@@ -9524,6 +9948,19 @@ class _ComfyAPIMixin:
         print(server_trace.log_line())
         trace_summary = server_trace.summary()
         self._enrich_trace_with_restore_timing(trace_summary)
+        # Derive what we can for the subprocess path
+        _rt3 = getattr(self, "_last_restore_timing", None) or {}
+        _stages_sp = server_trace._t
+        _prompt_start_ts_sp = _stages_sp.get("t3d_prompt_start", total_started)
+        trace_summary["derived_ms"]["restore_total_ms"] = _rt3.get("restore_total_ms", 0)
+        _t3_entry_sp = _stages_sp.get("t3_modal_entry", total_started)
+        # restore_end_to_prompt_start_ms: only when real restore end exists
+        if _rt3.get("restore_end_unix_s") is not None:
+            trace_summary["derived_ms"]["restore_end_to_prompt_start_ms"] = round((_prompt_start_ts_sp - _rt3["restore_end_unix_s"]) * 1000, 1)
+        # modal_entry_to_prompt_start_ms: always computed
+        if _t3_entry_sp is not None and _prompt_start_ts_sp is not None:
+            trace_summary["derived_ms"]["modal_entry_to_prompt_start_ms"] = round((_prompt_start_ts_sp - _t3_entry_sp) * 1000, 1)
+        trace_summary["derived_ms"]["total_input_execution_ms"] = total_ms
         result["trace"] = trace_summary
         result["_restore_timing"] = dict(getattr(self, "_last_restore_timing", {}))
         # Attach __eq__ hit/miss counters to restore_timing for diagnostics
@@ -9712,19 +10149,29 @@ class _ComfyAPIMixin:
                     server_trace.mark("t9_modal_return")
                     trace_summary = server_trace.summary()
                     self._enrich_trace_with_restore_timing(trace_summary)
-                    _r["trace"] = trace_summary
-                    if isinstance(_scheduler_trace, dict):
-                        _r["scheduler_trace"] = dict(_scheduler_trace)
+                    # Merge derived timing from the streaming path
                     _rt2 = getattr(self, "_last_restore_timing", None)
-                    _r["_restore_timing"] = dict(_rt2) if _rt2 else {}
                     _stages = trace_summary.get("stages", {})
                     _t3 = _stages.get("t3_modal_entry", _t_exec_start)
+                    _prompt_start_ts = _stages.get("t3d_prompt_start", _t_exec_start)
                     _s_start = _stages.get("t6_sampler_start", 0)
                     _s_end = _stages.get("t6_sampler_end", 0)
                     _restore_ms = (_rt2 or {}).get("restore_total_ms", 0)
-                    _restore_end_to_prompt = round((_t_exec_start - _t3) * 1000, 1) if _t3 else 0
+                    _restore_end_to_prompt = round((_prompt_start_ts - _t3) * 1000, 1)
                     _prompt_to_sampler = round((_s_start - _t_exec_start) * 1000, 1) if _s_start else 0
                     _sampler_ms = round((_s_end - _s_start) * 1000, 1) if _s_start and _s_end else 0
+                    trace_summary["derived_ms"]["restore_total_ms"] = (_rt2 or {}).get("restore_total_ms", 0)
+                    # restore_end_to_prompt_start_ms: only when real restore end exists
+                    if (_rt2 or {}).get("restore_end_unix_s") is not None:
+                        trace_summary["derived_ms"]["restore_end_to_prompt_start_ms"] = round((_prompt_start_ts - _rt2["restore_end_unix_s"]) * 1000, 1)
+                    # modal_entry_to_prompt_start_ms: always computed
+                    if _t3 is not None and _prompt_start_ts is not None:
+                        trace_summary["derived_ms"]["modal_entry_to_prompt_start_ms"] = round((_prompt_start_ts - _t3) * 1000, 1)
+                    trace_summary["derived_ms"]["total_input_execution_ms"] = round((_t_exec_end - _t_exec_start) * 1000, 1)
+                    _r["trace"] = trace_summary
+                    if isinstance(_scheduler_trace, dict):
+                        _r["scheduler_trace"] = dict(_scheduler_trace)
+                    _r["_restore_timing"] = dict(_rt2) if _rt2 else {}
                     _sampler_to_end = round((_t_exec_end - _s_end) * 1000, 1) if _s_end else 0
                     _total_exec = round((_t_exec_end - _t_exec_start) * 1000, 1)
                     _inflight = getattr(self, "_in_flight_preloads", {})

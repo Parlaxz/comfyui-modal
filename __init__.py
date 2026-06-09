@@ -1192,6 +1192,17 @@ async def _execute_job(item: tuple, item_id: int):
     if isinstance(_remote_full, dict) and "restore" in _remote_full:
         _merged_trace["restore"] = _remote_full["restore"]
     result["trace"] = _merged_trace
+    _dbg_path = os.path.join(_NODE_DIR, "_trace_debug.log")
+    with open(_dbg_path, "a", encoding="utf-8") as _f:
+        _f.write(f"[timing_trace.final] trace_version={_merged_trace.get('trace_version')} "
+                 f"has_derived={'derived_ms' in _merged_trace} "
+                 f"derived_keys={list(_merged_trace.get('derived_ms', {}).keys())} "
+                 f"quality={_merged_trace.get('timing_quality')} "
+                 f"quality_reason={_merged_trace.get('timing_quality_reason')} "
+                 f"missing={_merged_trace.get('missing_timing_fields', [])}\n")
+        _f.write(f"[timing_trace.final] DELTAS keys: {list(_merged_trace.get('deltas_ms', {}).keys())}\n")
+        _f.write(f"[timing_trace.final] STAGES keys: {list(_merged_trace.get('stages', {}).keys())}\n")
+        _f.flush()
     print(trace.log_line())
 
     _send(sid, "executing", {"node": None, "display_node": None, "prompt_id": prompt_id})
