@@ -16,7 +16,7 @@ container adds the bulk.  Each side appends its own field to a shared dict
 that is finally aggregated at the local server.
 
 Field naming
-------------
+-----------
 Timestamps are prefixed ``t_`` and stored as epoch seconds (float).
 
 * ``t0_client_press``  – browser captured the click
@@ -25,10 +25,13 @@ Timestamps are prefixed ``t_`` and stored as epoch seconds (float).
 * ``t3_modal_entry``   – Modal ``run_prompt`` method body entered
 * ``t3b_validate_done`` – Comfy workflow validation finished
 * ``t3c_prep_done``    – input images written, in-process prep complete
+* ``t3d_prompt_start`` – ``_execute_in_process``: prompt execution started
+* ``t3e_execution_start`` – ``_execute_in_process``: ``executor.execute`` began
 * ``t4_clip_load_start`` / ``t4_clip_load_end`` – CLIPLoader load window
 * ``t5_text_encode_start`` / ``t5_text_encode_end`` – CLIPTextEncode window
 * ``t6_sampler_start`` / ``t6_sampler_end`` – KSampler denoise window
 * ``t7_vae_decode_start`` / ``t7_vae_decode_end`` – VAEDecode window
+* ``t7b_collect_start`` – ``_collect_in_process_outputs`` began
 * ``t8_image_written`` – final image file written by SaveImage
 * ``t8b_outputs_collected`` – ``_collect_in_process_outputs`` finished
 * ``t9_modal_return`` – Modal ``run_prompt`` returned to the local server
@@ -45,8 +48,18 @@ Real GPU inference time is the union of ``t4..t7`` (model load → text encode
 between ``t3b`` and ``t8``.
 """
 
+TRACE_VERSION = "2.0.0"
+
+import os
+import sys
 import time
 from typing import Any
+
+# Diagnostic: verify the correct timing_trace module is loaded
+print(f"[timing_trace] module loaded __file__={__file__} TRACE_VERSION={TRACE_VERSION}", flush=True)
+_pyi_path = os.path.dirname(__file__)
+if _pyi_path in sys.path:
+    print(f"[timing_trace] module directory in sys.path: {_pyi_path}", flush=True)
 
 
 class Trace:
@@ -102,6 +115,13 @@ class Trace:
                     self._t[k] = float(v)
 
     def summary(self) -> dict[str, Any]:
+        try:
+            _dbg_path = os.path.join(os.path.dirname(__file__), "_trace_dbg.log")
+            with open(_dbg_path, "a") as _f:
+                _f.write(f"summary() CALLED trace_version={TRACE_VERSION} "
+                         f"stages={len(self._t)} t3d={'t3d_prompt_start' in self._t}\n")
+        except Exception:
+            pass
         """Return a dict with absolute timestamps and key delta pairs.
 
         The deltas are the values most people actually care about:
@@ -121,8 +141,10 @@ class Trace:
         out: dict[str, Any] = {
             "prompt_id": self.prompt_id,
             "t0": self._t0,
+            "trace_version": TRACE_VERSION,
             "stages": dict(t),
             "deltas_ms": {},
+            "derived_ms": {},
         }
 
         t10_key = "t10_browser_recv" if t.get("t10_browser_recv") is not None else "t10_local_materialized"
@@ -137,6 +159,8 @@ class Trace:
             ("clip_encode", "t5_text_encode_start", "t5_text_encode_end"),
             ("sampler", "t6_sampler_start", "t6_sampler_end"),
             ("vae_decode", "t7_vae_decode_start", "t7_vae_decode_end"),
+            ("unet_load", "t4b_unet_load_start", "t4b_unet_load_end"),
+            ("vae_load", "t4c_vae_load_start", "t4c_vae_load_end"),
             ("image_io", "t8_image_written", "t8b_outputs_collected"),
             ("t8b_to_t9", "t8b_outputs_collected", "t9_modal_return"),
             ("t9_to_t10", "t9_modal_return", t10_key),
@@ -146,7 +170,18 @@ class Trace:
             if d is not None:
                 out["deltas_ms"][key] = d
 
-        inference_keys = ("clip_load", "clip_encode", "sampler", "vae_decode")
+        # Derived: sampler phase breakdown from sub-millisecond markers
+        sp = self.delta_ms("t6_sampler_start", "t6_sampler_progress_start")
+        if sp is not None:
+            out["derived_ms"]["sampler_prep_ms"] = sp
+        sd = self.delta_ms("t6_sampler_progress_start", "t6_sampler_progress_end")
+        if sd is not None:
+            out["derived_ms"]["sampler_denoise_ms"] = sd
+        st = self.delta_ms("t6_sampler_progress_end", "t6_sampler_end")
+        if st is not None:
+            out["derived_ms"]["sampler_teardown_ms"] = st
+
+        inference_keys = ("clip_load", "clip_encode", "sampler", "vae_decode", "unet_load", "vae_load")
         inference_ms = sum(
             out["deltas_ms"].get(k, 0.0) for k in inference_keys
         )
@@ -169,6 +204,110 @@ class Trace:
         remote_total = self.delta_ms("t3_modal_entry", "t9_modal_return")
         if remote_total is not None:
             out["deltas_ms"]["remote_total"] = remote_total
+
+        # Derive additional fields from stages if available
+        # NOTE: restore_end_to_prompt_start_ms is computed in run_prompt()
+        # only when real restore_end_unix_s exists (cold container).
+        prompt_to_sampler = self.delta_ms("t3d_prompt_start", "t6_sampler_start")
+        if prompt_to_sampler is not None:
+            out["derived_ms"]["prompt_start_to_sampler_start_ms"] = prompt_to_sampler
+
+        sampler_ms = out["deltas_ms"].get("sampler")
+        if sampler_ms is not None:
+            out["derived_ms"]["sampler_ms"] = sampler_ms
+
+        s_to_outputs = self.delta_ms("t6_sampler_end", "t8b_outputs_collected")
+        if s_to_outputs is not None:
+            out["derived_ms"]["sampler_end_to_outputs_collected_ms"] = s_to_outputs
+
+        output_total = self.delta_ms("t7b_collect_start", "t8b_outputs_collected")
+        if output_total is not None:
+            out["derived_ms"]["output_collection_total_ms"] = output_total
+
+        total_exec = self.delta_ms("t3d_prompt_start", "t9_modal_return")
+        if total_exec is not None:
+            out["derived_ms"]["total_input_execution_ms"] = total_exec
+
+        modal_to_return_ms = out["deltas_ms"].get("modal_to_return")
+        if modal_to_return_ms is not None:
+            out["derived_ms"]["modal_to_return_ms"] = modal_to_return_ms
+
+        modal_to_browser_ms = out["deltas_ms"].get("modal_to_browser")
+        if modal_to_browser_ms is not None:
+            out["derived_ms"]["modal_to_browser_ms"] = modal_to_browser_ms
+
+        # Always-computed: modal_entry_to_prompt_start_ms (not restore-dependent)
+        modal_entry_to_ps = self.delta_ms("t3_modal_entry", "t3d_prompt_start")
+        if modal_entry_to_ps is not None:
+            out["derived_ms"]["modal_entry_to_prompt_start_ms"] = modal_entry_to_ps
+
+        # Node-level wall times (alias with clearer naming).
+        # These measure the node's wall-clock window which may include
+        # future/cache resolution, not just pure model I/O.
+        cw = out["deltas_ms"].get("clip_load")
+        if cw is not None:
+            out["derived_ms"]["clip_node_wait_ms"] = cw
+        uw = out["deltas_ms"].get("unet_load")
+        if uw is not None:
+            out["derived_ms"]["unet_node_wait_ms"] = uw
+        vw = out["deltas_ms"].get("vae_load")
+        if vw is not None:
+            out["derived_ms"]["vae_node_wait_ms"] = vw
+
+        # Trace metadata: timing_quality / missing_timing_fields
+        _exec_required = [
+            "t3d_prompt_start", "t3e_execution_start",
+            "t6_sampler_start", "t6_sampler_end",
+            "t7b_collect_start", "t8b_outputs_collected",
+        ]
+        _exec_present = [k for k in _exec_required if k in t]
+        _exec_missing = [k for k in _exec_required if k not in t]
+
+        # Cold-restore fields are conditional — only required if restore
+        # was actually observed on this container.
+        _restore_start = t.get("t3_modal_entry")
+        _restore_present = _restore_start is not None
+        _cold_fields = []
+        if _restore_present:
+            _cold_fields = ["t3b_validate_done", "t3c_prep_done"]
+
+        _context_fields = []
+        for f in _cold_fields:
+            if f not in t:
+                _context_fields.append(f)
+
+        _optional_fields = [
+            "t0_client_press", "t1_local_recv", "t2_local_dispatch",
+            "t4_clip_load_start", "t4_clip_load_end",
+            "t5_text_encode_start", "t5_text_encode_end",
+            "t7_vae_decode_start", "t7_vae_decode_end",
+            "t8_image_written", "t9_modal_return", t10_key,
+        ]
+        _opt_missing = [k for k in _optional_fields if k not in t]
+
+        _missing = _exec_missing + _context_fields + _opt_missing
+        out["missing_timing_fields"] = _missing
+
+        _reason_parts = []
+        if not _exec_missing and not _context_fields:
+            out["timing_quality"] = "complete"
+            _reason_parts.append("all_required_fields_present")
+        elif len(_exec_present) >= 4:
+            out["timing_quality"] = "partial"
+            _reason_parts.append(f"missing_exec_fields={_exec_missing}" if _exec_missing else "context_only")
+        else:
+            out["timing_quality"] = "bad"
+            _reason_parts.append(f"cannot_trust_timing:missing_exec={_exec_missing}")
+        if _context_fields:
+            _reason_parts.append(f"missing_cold_context={_context_fields}")
+        if _opt_missing:
+            _reason_parts.append(f"optional_missing={_opt_missing}")
+        out["timing_quality_reason"] = "; ".join(_reason_parts)
+
+        print(f"[timing_trace] summary: trace_version={out.get('trace_version')} "
+              f"quality={out.get('timing_quality')} "
+              f"derived_keys={list(out.get('derived_ms', {}).keys())} "
+              f"missing={len(out.get('missing_timing_fields', []))}", flush=True)
         return out
 
     def log_line(self) -> str:
@@ -184,14 +323,21 @@ class Trace:
             "t3_modal_entry",
             "t3b_validate_done",
             "t3c_prep_done",
+            "t3d_prompt_start",
+            "t3e_execution_start",
             "t4_clip_load_start",
             "t4_clip_load_end",
+            "t4b_unet_load_start",
+            "t4b_unet_load_end",
+            "t4c_vae_load_start",
+            "t4c_vae_load_end",
             "t5_text_encode_start",
             "t5_text_encode_end",
             "t6_sampler_start",
             "t6_sampler_end",
             "t7_vae_decode_start",
             "t7_vae_decode_end",
+            "t7b_collect_start",
             "t8_image_written",
             "t8b_outputs_collected",
             "t9_modal_return",
@@ -212,6 +358,8 @@ class Trace:
             "clip_encode",
             "sampler",
             "vae_decode",
+            "unet_load",
+            "vae_load",
             "image_io",
             "t8b_to_t9",
             "t9_to_t10",
@@ -221,7 +369,29 @@ class Trace:
             "modal_to_browser",
         ]
         delta_parts = [f"{k}={d[k]}ms" for k in delta_keys if k in d and d[k] is not None]
-        return "[comfyui-modal.timing] " + " ".join(parts) + " | " + " ".join(delta_parts)
+        derived = s.get("derived_ms", {})
+        derived_keys = [
+            "restore_end_to_prompt_start_ms",
+            "prompt_start_to_sampler_start_ms",
+            "sampler_ms",
+            "sampler_end_to_outputs_collected_ms",
+            "output_collection_total_ms",
+            "total_input_execution_ms",
+            "modal_to_return_ms",
+        ]
+        derived_keys += [
+            "modal_entry_to_prompt_start_ms",
+            "clip_node_wait_ms",
+            "unet_node_wait_ms",
+            "vae_node_wait_ms",
+        ]
+        derived_parts = [f"{k}={derived[k]}ms" for k in derived_keys if k in derived and derived[k] is not None]
+        msg = "[comfyui-modal.timing] " + " ".join(parts)
+        if delta_parts:
+            msg += " | " + " ".join(delta_parts)
+        if derived_parts:
+            msg += " | " + " ".join(derived_parts)
+        return msg
 
 
 _TRACE_KEYS_FROM_BROWSER = ("t0_client_press",)
