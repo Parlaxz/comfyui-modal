@@ -31,6 +31,12 @@ from workflow_metadata import (
     stack_to_warmup_profile,
     summarize_prompt_fields,
 )
+from api_prompt_validator import (
+    assert_valid_api_prompt_structure,
+    validate_api_prompt_structure,
+    validate_class_types_exist,
+)
+from failure_summary import FailureSummary
 from output_converter import (
     OUTPUT_FORMATS,
     WEBP_LOSSLESS_COMPRESSION,
@@ -38,6 +44,26 @@ from output_converter import (
 )
 from output_saver import save_output_image, DEFAULTS as _SAVER_DEFAULTS
 from timing_trace import Trace, coerce_t0_from_browser
+from comparison import (
+    create_profile,
+    update_profile,
+    delete_profile,
+    duplicate_profile,
+    list_profiles,
+    get_profile,
+    auto_detect_slots,
+    set_slots,
+    validate_profile,
+    run_comparison,
+    save_comparison_manifest,
+    save_comparison_result,
+    get_comparison_results,
+    list_comparison_runs,
+    detect_slots,
+    load_comparison_config,
+    save_comparison_config,
+    get_workflow_nodes,
+)
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
@@ -135,6 +161,7 @@ _ensure_modal()
 _deploy_status = {"state": "idle", "message": ""}
 _last_successful_model_stack: dict = {}
 _latest_benchmark_workflow: dict = {}
+_download_progress: dict = {}
 
 
 def _load_latest_benchmark_workflow() -> dict:
@@ -456,7 +483,12 @@ def _ensure_modal_deploy_current(custom_nodes_fingerprint: str | None = None) ->
 
 
 def _maybe_auto_deploy():
+    # ── PART 7: Gate remote background deploy ──
     if os.environ.get("COMFYMODAL_RUNTIME") == "1":
+        return
+    if os.environ.get("COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY", "0") != "1":
+        _deploy_status["state"] = "ready"
+        _deploy_status["message"] = "Background deploy disabled by config"
         return
     if not _find_modal_executable():
         return
@@ -482,7 +514,7 @@ sys.path.insert(0, _NODE_DIR)
 
 try:
     import modal as _modal_pkg
-    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile
+    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, download_model_stream, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile
     _modal_available = True
     _maybe_auto_deploy()
 except ImportError:
@@ -497,6 +529,7 @@ except ImportError:
     def get_object_info(*a, **kw): raise RuntimeError("modal not installed")
     def health_check(*a, **kw): raise RuntimeError("modal not installed")
     def download_model(*a, **kw): raise RuntimeError("modal not installed")
+    async def download_model_stream(*a, **kw): raise RuntimeError("modal not installed")  # noqa: E704
     def batch_download_models(*a, **kw): raise RuntimeError("modal not installed")
     def list_models(*a, **kw): raise RuntimeError("modal not installed")
     def delete_model(*a, **kw): raise RuntimeError("modal not installed")
@@ -745,6 +778,7 @@ def _build_next_warmup_activation(workflow: dict, workflow_hash: str) -> dict:
     now = time.time()
     return {
         "profile_token": str(uuid.uuid4()),
+        "validation_token": str(uuid.uuid4()),
         "workflow_hash": workflow_hash,
         "created_at": now,
         "expires_at": now + 60.0,
@@ -753,6 +787,7 @@ def _build_next_warmup_activation(workflow: dict, workflow_hash: str) -> dict:
         "warmup_profile": profile,
         "disable_warmup": not bool(profile),
         "selected_at": None,
+        "preflight_validated": True,
     }
 
 
@@ -783,6 +818,35 @@ async def _execute_job(item: tuple, item_id: int):
             raise RuntimeError(
                 f"Workflow hash mismatch: expected {expected_hash[:12]}…, got {current_hash[:12]}…"
             )
+
+        # API prompt structure validation (local defense-in-depth)
+        assert_valid_api_prompt_structure(workflow)
+
+        # ── PART 2: Class-type validation before warmup profile write ──
+        # Also validate that referenced node class types exist in the
+        # local ComfyUI registry.  Missing nodes should fail fast rather
+        # than wasting Modal worker time.
+        try:
+            import nodes as _validate_nodes
+            _requested_types = set()
+            for _spec in workflow.values():
+                if isinstance(_spec, dict):
+                    _ct = _spec.get("class_type")
+                    if isinstance(_ct, str) and _ct:
+                        _requested_types.add(_ct)
+            _missing = sorted(
+                ct for ct in _requested_types
+                if ct not in _validate_nodes.NODE_CLASS_MAPPINGS
+            )
+            if _missing:
+                raise RuntimeError(
+                    f"Missing custom node class(es): {_missing}. "
+                    f"Install the missing custom nodes or fix the workflow."
+                )
+        except RuntimeError:
+            raise
+        except Exception as _val_exc:
+            print(f"[comfyui-modal] Warning: class-type validation failed: {_val_exc}")
 
         # Log prompt metadata before remote execution
         print(f"[comfyui-modal] Running prompt {prompt_hash[:12]}… summary={prompt_summary} model_stack={model_stack}")
@@ -823,12 +887,16 @@ async def _execute_job(item: tuple, item_id: int):
         # are forwarded to the ComfyUI frontend as they arrive.
         _modal_result = None
         _first_msg = True
+        _mo = dict(extra_data.get("modal_options") or {})
+        _st = extra_data.get("scheduler_test")
+        if isinstance(_st, dict):
+            _mo["comfymodal_scheduler_test"] = _st
         async for _msg in run_prompt_stream(
             workflow,
             input_images,
             trace={**trace.fields(), "prompt_id": prompt_id},
             gpu=extra_data.get("gpu"),
-            modal_options=extra_data.get("modal_options"),
+            modal_options=_mo if _mo else None,
         ):
             if _first_msg:
                 _first_msg = False
@@ -888,6 +956,23 @@ async def _execute_job(item: tuple, item_id: int):
             f"[comfyui-modal.profile] stage=local_total prompt_id={prompt_id[:8]} "
             f"duration_ms={total_ms} error={type(e).__name__}"
         )
+        # ── PART 8: Structured failure summary ──
+        summary = FailureSummary(phase="execution")
+        summary.fatal_error = str(e)[:500]
+        summary.time_restore_ms = 0.0
+        summary.time_requirements_ms = 0.0
+        error_str = str(e).lower()
+        if "class_type" in error_str or "missing" in error_str:
+            summary.run_failed_phase = "validation"
+            summary.recommendation = (
+                "Fix the workflow's custom node references and retry."
+            )
+        elif "hash mismatch" in error_str:
+            summary.run_failed_phase = "integrity"
+            summary.recommendation = (
+                "Workflow was modified after submission. Re-submit."
+            )
+        print(f"[comfyui-modal] FAILURE SUMMARY: {summary}")
         _send(sid, "execution_error", {"message": str(e), "prompt_id": prompt_id})
         _finish_job(task_key, prompt_id, outputs, success=False, meta={
             "error": str(e),
@@ -1118,6 +1203,7 @@ async def _execute_job(item: tuple, item_id: int):
         "trace": result.get("trace"),
         "workflow_hash": prompt_hash,
         "restore_timing": result.get("_restore_timing", {}),
+        "scheduler_trace": result.get("scheduler_trace"),
     }
     _finish_job(task_key, prompt_id, outputs, success=True, meta=_meta)
     total_ms = round((time.time() - local_started) * 1000, 1)
@@ -1235,6 +1321,33 @@ if _server:
         trace.mark("t1_local_recv")
         print(f"[predispatch] phase=recv t={time.time()}")
 
+        # ── PART 1: Preflight validation before any Modal interaction ──
+        # Validate API prompt structure before extracting model stack or
+        # warmup profile.  Invalid prompts fail fast (under 1s locally).
+        validation_errors = validate_api_prompt_structure(workflow)
+        if validation_errors:
+            summary = FailureSummary(phase="preflight")
+            summary.fatal_error = "; ".join(validation_errors)
+            summary.modal_invoked = False
+            summary.recommendation = (
+                "Re-export the workflow as API prompt JSON or remove "
+                "corrupt/UI-only nodes."
+            )
+            print(f"[comfyui-modal] PREFLIGHT FAILED: {summary}")
+            _send(client_id, "execution_error", {
+                "message": f"Preflight validation failed: {summary.fatal_error}",
+                "prompt_id": prompt_id,
+            })
+            raise web.HTTPBadRequest(
+                text=json.dumps({
+                    "status": "error",
+                    "error": f"Preflight validation failed",
+                    "details": summary.fatal_error,
+                    "recommendation": summary.recommendation,
+                }),
+                content_type="application/json",
+            )
+
         # Compute prompt integrity metadata (carried in extra_data, never mutates workflow)
         print(f"[predispatch] phase=before_stack_extract t={time.time()}")
         local_payload_hash = prompt_sha256(body)
@@ -1247,6 +1360,8 @@ if _server:
         modal_options = body.get("modal_options", None)
         if not isinstance(modal_options, dict):
             modal_options = None
+
+        scheduler_test = body.get("comfymodal_scheduler_test")
 
         async with _counter_lock:
             _item_counter += 1
@@ -1262,6 +1377,7 @@ if _server:
                 "gpu": selected_gpu,
                 "trace": {**trace.fields(), "prompt_id": prompt_id},
                 "modal_options": modal_options,
+                "scheduler_test": scheduler_test,
             }
             item = (_item_counter, prompt_id, workflow, extra_data, list(workflow.keys()), {})
             print(f"[predispatch] prompt_bytes={len(json.dumps(body).encode('utf-8'))}")
@@ -1320,6 +1436,35 @@ if _server:
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 
+    async def _background_download(download_id: str, url: str, filename: str, save_path: str):
+        try:
+            _download_progress[download_id] = {"state": "starting", "pct": 0, "filename": filename, "save_path": save_path}
+            async for update in download_model_stream(url=url, filename=filename, save_path=save_path, hf_token=_read_hf_token(), civitai_token=_read_civitai_token()):
+                if update["type"] == "progress":
+                    _download_progress[download_id] = {
+                        "state": "downloading",
+                        "pct": update["pct"],
+                        "downloaded_mb": update["downloaded_mb"],
+                        "total_mb": update["total_mb"],
+                        "filename": filename,
+                        "save_path": save_path,
+                    }
+                elif update["type"] == "complete":
+                    placeholder = None
+                    placeholder_error = None
+                    try:
+                        placeholder = _create_placeholder(save_path, filename)
+                    except Exception as e:
+                        placeholder_error = {"folder": save_path, "filename": filename, "error": str(e)}
+                    _download_progress[download_id] = {
+                        "state": "complete",
+                        "result": {**update, "placeholder": placeholder, "placeholder_error": placeholder_error},
+                        "filename": filename,
+                        "save_path": save_path,
+                    }
+        except Exception as e:
+            _download_progress[download_id] = {"state": "error", "error": str(e), "filename": filename, "save_path": save_path}
+
     @_server.routes.post("/comfymodal/model/install")
     async def modal_model_install(request: web.Request) -> web.Response:
         body = await request.json()
@@ -1335,29 +1480,30 @@ if _server:
 
         try:
             save_path, filename = _validate_model_location(save_path, filename)
-            result = await download_model(url=url, filename=filename, save_path=save_path, hf_token=_read_hf_token(), civitai_token=_read_civitai_token())
-            placeholder = None
-            placeholder_error = None
-            message = "Model downloaded to Modal and local placeholder created. Refresh ComfyUI if the dropdown does not update."
-            try:
-                placeholder = _create_placeholder(save_path, filename)
-            except Exception as e:
-                placeholder_error = {"folder": save_path, "filename": filename, "error": str(e)}
-                message = (
-                    "Model downloaded to Modal, but local placeholder creation failed. "
-                    "Use Create local or Create All Placeholders, then refresh ComfyUI if the dropdown does not update."
-                )
-            return web.json_response({
-                "status": "ok",
-                **result,
-                "placeholder": placeholder,
-                "placeholder_error": placeholder_error,
-                "message": message,
-            })
         except ValueError as e:
             return web.json_response({"status": "error", "message": str(e)}, status=400)
-        except Exception as e:
-            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+        download_id = str(uuid.uuid4())
+        asyncio.create_task(_background_download(download_id, url, filename, save_path))
+        return web.json_response({
+            "status": "ok",
+            "download_id": download_id,
+            "filename": filename,
+            "save_path": save_path,
+        })
+
+    @_server.routes.get("/comfymodal/download/status/{download_id}")
+    async def modal_download_status(request: web.Request) -> web.Response:
+        did = request.match_info.get("download_id", "")
+        info = _download_progress.get(did)
+        if info is None:
+            return web.json_response({"status": "not_found", "download_id": did}, status=404)
+        return web.json_response({"status": "ok", "download_id": did, **info})
+
+    @_server.routes.get("/comfymodal/download/active")
+    async def modal_download_active(request: web.Request) -> web.Response:
+        active = {k: v for k, v in _download_progress.items() if v.get("state") in ("starting", "downloading")}
+        return web.json_response({"status": "ok", "active": {k: dict(v) for k, v in active.items()}})
 
     @_server.routes.get("/comfymodal/deploy/status")
     async def modal_deploy_status(request: web.Request) -> web.Response:
@@ -1763,4 +1909,540 @@ if _server:
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 
-    print("[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state")
+    # ── Comparison profile execution helper ───────────────────────────
+    # Submits a single resolved comparison-profile workflow to the Modal
+    # pipeline and saves the result image + metadata to the comparison folder.
+    async def _execute_comparison_profile(
+        entry: dict,
+        original_body: dict,
+        manifest: dict,
+        output_format: str,
+        quality: int,
+        webp_lossless_compression: str,
+        auto_save_local: bool,
+        save_folder: str,
+        save_metadata_sidecar: bool,
+    ) -> dict:
+        import time as _time_module
+        import base64 as _b64
+
+        pid = entry.get("profile_id", "unknown")
+        pname = entry.get("profile_name", pid)
+        workflow = entry.get("workflow", {})
+        workflow_hash = entry.get("workflow_hash", "")
+        model_stack = entry.get("model_stack", {})
+        slots = entry.get("slots", {})
+
+        comparison_id = manifest["comparison_id"]
+        prompt_text = manifest.get("prompt", "")
+        seed = manifest.get("seed", 0)
+        width = manifest.get("width", 0)
+        height = manifest.get("height", 0)
+        steps = manifest.get("steps")
+        guidance = manifest.get("guidance")
+        inp_img = manifest.get("input_image", "")
+
+        trace_payload = original_body.get("trace", {}) if isinstance(original_body, dict) else {}
+
+        # Build extra_data like _execute_job does
+        extra_data = {
+            "client_id": original_body.get("client_id", str(uuid.uuid4())),
+            "workflow_hash": workflow_hash,
+            "prompt_summary": {
+                "seed": seed,
+                "width": width,
+                "height": height,
+                "steps": steps,
+                "cfg": guidance,
+            },
+            "model_stack": model_stack,
+            "gpu": get_gpu(),
+            "modal_options": {
+                "output_format": output_format,
+                "quality": quality,
+                "webp_lossless_compression": webp_lossless_compression,
+                "auto_save_local": auto_save_local,
+                "save_folder": save_folder,
+                "save_metadata_sidecar": save_metadata_sidecar,
+            },
+            "comparison": {
+                "comparison_id": comparison_id,
+                "profile_id": pid,
+                "profile_name": pname,
+            },
+            "trace": trace_payload,
+        }
+        prompt_id = str(uuid.uuid4())
+
+        result_data = {
+            "comparison_id": comparison_id,
+            "profile_id": pid,
+            "profile_name": pname,
+            "workflow_hash": workflow_hash,
+            "model_stack": model_stack,
+            "prompt": prompt_text,
+            "seed": seed,
+            "width": width,
+            "height": height,
+            "steps": steps,
+            "guidance": guidance,
+            "output_format": output_format,
+        }
+
+        try:
+            t0 = _time_module.time()
+            input_images = _collect_input_images(workflow)
+
+            # Submit to Modal via the existing streaming pipeline
+            _modal_result = None
+            async for _msg in run_prompt_stream(
+                workflow,
+                input_images,
+                trace=extra_data.get("trace", {}),
+                gpu=extra_data.get("gpu"),
+                modal_options=extra_data.get("modal_options"),
+            ):
+                if not isinstance(_msg, dict):
+                    continue
+                if _msg["type"] == "result":
+                    _modal_result = _msg["data"]
+                    break
+                elif _msg["type"] == "error":
+                    raise RuntimeError(_msg.get("message", "Modal error"))
+
+            if _modal_result is None:
+                raise RuntimeError("No result from Modal pipeline")
+
+            wall_time_sec = round(_time_module.time() - t0, 2)
+
+            # Extract images from result
+            image_data_b64 = None
+            mime_type = "image/png"
+            file_ext = ".png"
+
+            outputs = _modal_result.get("outputs", {})
+            for node_id, node_outputs in outputs.items():
+                for out_key, entries in node_outputs.items():
+                    if not isinstance(entries, list):
+                        continue
+                    for entry_item in entries:
+                        if isinstance(entry_item, dict) and "data" in entry_item:
+                            image_data_b64 = entry_item["data"]
+                            mime_type = entry_item.get("mime_type", "image/png")
+                            file_ext = entry_item.get("file_ext", ".png")
+                            break
+                    if image_data_b64:
+                        break
+                if image_data_b64:
+                    break
+
+            if not image_data_b64:
+                # Fall back to flat images list
+                for img in _modal_result.get("images", []):
+                    image_data_b64 = img.get("data")
+                    if image_data_b64:
+                        mime_type = img.get("mime_type", "image/png")
+                        file_ext = img.get("file_ext", ".png")
+                        break
+
+            if not image_data_b64:
+                raise RuntimeError("No image data in Modal result")
+
+            # Save output image
+            img_bytes = _b64.b64decode(image_data_b64)
+
+            # Save to comparison folder
+            compare_result = save_comparison_result(
+                _COMFYUI_ROOT, comparison_id, {
+                    **result_data,
+                    "mime_type": mime_type,
+                    "file_ext": file_ext,
+                    "wall_time_sec": wall_time_sec,
+                    "status": "success",
+                },
+                image_bytes=img_bytes,
+            )
+
+            # Apply format conversion if needed
+            converted_bytes = img_bytes
+            if output_format != "original":
+                from output_converter import convert_image_bytes
+                conv = convert_image_bytes(
+                    img_bytes,
+                    output_format=output_format,
+                    quality=quality,
+                    webp_lossless_compression=webp_lossless_compression,
+                )
+                if not conv.get("fallback") and not conv.get("error"):
+                    converted_bytes = conv["bytes"]
+                    mime_type = conv.get("mime_type", mime_type)
+                    file_ext = conv.get("file_ext", file_ext)
+
+            # Auto-save to the standard output location if enabled
+            if auto_save_local:
+                try:
+                    from output_saver import save_output_image
+                    saver_result = save_output_image(
+                        converted_bytes,
+                        output_format=output_format,
+                        file_ext=file_ext,
+                        mime_type=mime_type,
+                        quality=quality,
+                        webp_lossless_compression=webp_lossless_compression,
+                        original_size_bytes=len(img_bytes),
+                        conversion_time_ms=0,
+                        save_folder=save_folder,
+                        save_metadata_sidecar=save_metadata_sidecar,
+                        workflow_hash=workflow_hash,
+                        workflow_name=pname,
+                        seed=str(seed),
+                        width=width,
+                        height=height,
+                        index=0,
+                        comfyui_root=_COMFYUI_ROOT,
+                        extra_meta={
+                            "comparison_id": comparison_id,
+                            "profile_id": pid,
+                            "comparison": True,
+                        },
+                    )
+                    if saver_result.get("error"):
+                        compare_result["auto_save_error"] = saver_result["error"]
+                    else:
+                        compare_result["auto_save_path"] = saver_result.get("path", "")
+                except Exception as save_exc:
+                    compare_result["auto_save_error"] = str(save_exc)
+
+            compare_result["mime_type"] = mime_type
+            compare_result["file_ext"] = file_ext
+
+            return compare_result
+
+        except Exception as e:
+            import traceback as _tb
+            _tb.print_exc()
+            error_result = {
+                **result_data,
+                "status": "error",
+                "error": str(e),
+            }
+            save_comparison_result(_COMFYUI_ROOT, comparison_id, error_result)
+            return error_result
+
+    # ── Comparison Runner Routes ──────────────────────────────────────
+
+    @_server.routes.get("/comfymodal/comparison/profiles")
+    async def comparison_list_profiles(request: web.Request) -> web.Response:
+        try:
+            profiles = list_profiles(_COMFYUI_ROOT)
+            return web.json_response({"status": "ok", "profiles": profiles})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/comparison/profiles")
+    async def comparison_create_profile(request: web.Request) -> web.Response:
+        body = await request.json()
+        name = body.get("name", "").strip()
+        workflow_api = body.get("workflow_api")
+        workflow = body.get("workflow")
+        if not name:
+            return web.json_response({"status": "error", "message": "Profile name required"}, status=400)
+        if not workflow_api or not isinstance(workflow_api, dict):
+            return web.json_response({"status": "error", "message": "workflow_api required"}, status=400)
+        try:
+            profile = create_profile(_COMFYUI_ROOT, name, workflow_api, workflow=workflow)
+            return web.json_response({"status": "ok", "profile": profile})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.get("/comfymodal/comparison/profiles/{profile_id}")
+    async def comparison_get_profile(request: web.Request) -> web.Response:
+        profile_id = request.match_info.get("profile_id", "")
+        try:
+            profile = get_profile(_COMFYUI_ROOT, profile_id)
+            if profile is None:
+                return web.json_response({"status": "error", "message": "Profile not found"}, status=404)
+            return web.json_response({"status": "ok", "profile": profile})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.put("/comfymodal/comparison/profiles/{profile_id}")
+    async def comparison_update_profile(request: web.Request) -> web.Response:
+        profile_id = request.match_info.get("profile_id", "")
+        body = await request.json()
+        try:
+            profile = update_profile(_COMFYUI_ROOT, profile_id, body)
+            if profile is None:
+                return web.json_response({"status": "error", "message": "Profile not found"}, status=404)
+            return web.json_response({"status": "ok", "profile": profile})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.delete("/comfymodal/comparison/profiles/{profile_id}")
+    async def comparison_delete_profile(request: web.Request) -> web.Response:
+        profile_id = request.match_info.get("profile_id", "")
+        try:
+            ok = delete_profile(_COMFYUI_ROOT, profile_id)
+            if not ok:
+                return web.json_response({"status": "error", "message": "Profile not found"}, status=404)
+            return web.json_response({"status": "ok"})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/comparison/profiles/{profile_id}/duplicate")
+    async def comparison_duplicate_profile(request: web.Request) -> web.Response:
+        profile_id = request.match_info.get("profile_id", "")
+        body = await request.json()
+        new_name = body.get("name", "").strip()
+        if not new_name:
+            return web.json_response({"status": "error", "message": "New profile name required"}, status=400)
+        try:
+            profile = duplicate_profile(_COMFYUI_ROOT, profile_id, new_name)
+            if profile is None:
+                return web.json_response({"status": "error", "message": "Profile not found"}, status=404)
+            return web.json_response({"status": "ok", "profile": profile})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/comparison/profiles/{profile_id}/validate")
+    async def comparison_validate_profile(request: web.Request) -> web.Response:
+        profile_id = request.match_info.get("profile_id", "")
+        try:
+            validation = validate_profile(_COMFYUI_ROOT, profile_id)
+            return web.json_response({"status": "ok", "validation": validation})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/comparison/profiles/{profile_id}/detect-slots")
+    async def comparison_detect_slots(request: web.Request) -> web.Response:
+        profile_id = request.match_info.get("profile_id", "")
+        try:
+            candidates = auto_detect_slots(_COMFYUI_ROOT, profile_id)
+            if candidates is None:
+                return web.json_response({"status": "error", "message": "Profile or workflow not found"}, status=404)
+            return web.json_response({"status": "ok", "candidates": candidates})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/comparison/profiles/{profile_id}/slots")
+    async def comparison_set_slots(request: web.Request) -> web.Response:
+        profile_id = request.match_info.get("profile_id", "")
+        body = await request.json()
+        slots = body.get("slots", {})
+        try:
+            profile = set_slots(_COMFYUI_ROOT, profile_id, slots)
+            if profile is None:
+                return web.json_response({"status": "error", "message": "Profile not found"}, status=404)
+            return web.json_response({"status": "ok", "profile": profile})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/comparison/run")
+    async def comparison_run(request: web.Request) -> web.Response:
+        """Execute a comparison run by preparing manifests and submitting each
+        resolved workflow to the Modal pipeline.
+
+        The comparison may run sequentially or in parallel (up to
+        max_parallel_jobs concurrently).  Results are saved to the comparison
+        output folder.
+        """
+        body = await request.json()
+        profile_ids = body.get("profile_ids", [])
+        prompt_text = body.get("prompt", "").strip()
+        seed = body.get("seed", 0)
+        width = body.get("width", 1024)
+        height = body.get("height", 1024)
+        steps = body.get("steps")
+        guidance = body.get("guidance")
+        negative_prompt = body.get("negative_prompt", "").strip() or None
+        input_image = body.get("input_image", "").strip() or None
+        execution_mode = body.get("execution_mode", "sequential")
+        max_parallel_jobs = int(body.get("max_parallel_jobs", 2))
+
+        # Per-profile override settings (skip shared steps/guidance/resolution)
+        per_profile_overrides = body.get("per_profile_overrides", {})
+
+        # Output settings
+        output_format = body.get("output_format", "original")
+        quality = int(body.get("quality", 75))
+        webp_lossless_compression = body.get("webp_lossless_compression", "balanced")
+        auto_save_local = bool(body.get("auto_save_local", False))
+        save_folder = body.get("save_folder", "")
+        save_metadata_sidecar = bool(body.get("save_metadata_sidecar", True))
+
+        if not profile_ids:
+            return web.json_response({"status": "error", "message": "No profiles selected"}, status=400)
+        if not prompt_text:
+            prompt_text = ""
+        if not isinstance(seed, int):
+            try:
+                seed = int(seed)
+            except (TypeError, ValueError):
+                seed = 0
+
+        try:
+            manifest = run_comparison(
+                comfyui_root=_COMFYUI_ROOT,
+                prompt_text=prompt_text,
+                seed=seed,
+                width=width,
+                height=height,
+                steps=steps,
+                guidance=guidance,
+                negative_prompt=negative_prompt,
+                input_image=input_image,
+                profile_ids=profile_ids,
+                execution_mode=execution_mode,
+                max_parallel_jobs=max_parallel_jobs,
+                output_format=output_format,
+                quality=quality,
+                webp_lossless_compression=webp_lossless_compression,
+                auto_save_local=auto_save_local,
+                save_folder=save_folder,
+                save_metadata_sidecar=save_metadata_sidecar,
+                per_profile_overrides=per_profile_overrides,
+            )
+
+            resolved = manifest.get("resolved_profiles", [])
+
+            # Persist the manifest immediately (results appended as they arrive)
+            save_comparison_manifest(_COMFYUI_ROOT, manifest)
+
+            # Dispatch resolved workflows to the Modal pipeline
+            results = []
+            errors = []
+
+            if execution_mode == "parallel":
+                import asyncio
+                sem = asyncio.Semaphore(max_parallel_jobs)
+
+                async def _run_one(entry: dict) -> dict:
+                    async with sem:
+                        return await _execute_comparison_profile(
+                            entry, body, manifest, output_format, quality,
+                            webp_lossless_compression, auto_save_local,
+                            save_folder, save_metadata_sidecar,
+                        )
+
+                tasks = [_run_one(e) for e in resolved if e.get("status") == "ready"]
+                outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+                for outcome in outcomes:
+                    if isinstance(outcome, Exception):
+                        errors.append({"error": str(outcome)})
+                    elif outcome:
+                        results.append(outcome)
+            else:
+                for entry in resolved:
+                    if entry.get("status") != "ready":
+                        if entry.get("error"):
+                            errors.append({
+                                "profile_id": entry.get("profile_id", ""),
+                                "profile_name": entry.get("profile_name", ""),
+                                "error": entry.get("error", "Unknown error"),
+                            })
+                        continue
+                    try:
+                        result = await _execute_comparison_profile(
+                            entry, body, manifest, output_format, quality,
+                            webp_lossless_compression, auto_save_local,
+                            save_folder, save_metadata_sidecar,
+                        )
+                        if result:
+                            results.append(result)
+                    except Exception as e:
+                        errors.append({
+                            "profile_id": entry.get("profile_id", ""),
+                            "profile_name": entry.get("profile_name", ""),
+                            "error": str(e),
+                        })
+
+            manifest["results"] = results
+            manifest["errors"] = errors
+            manifest["completed_at"] = __import__("time").time()
+
+            # Update manifest on disk with results
+            save_comparison_manifest(_COMFYUI_ROOT, manifest)
+
+            return web.json_response({
+                "status": "ok",
+                "comparison_id": manifest["comparison_id"],
+                "results": results,
+                "errors": errors,
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.get("/comfymodal/comparison/results")
+    async def comparison_list_runs(request: web.Request) -> web.Response:
+        try:
+            runs = list_comparison_runs(_COMFYUI_ROOT)
+            return web.json_response({"status": "ok", "runs": runs})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.get("/comfymodal/comparison/results/{comparison_id}")
+    async def comparison_get_results(request: web.Request) -> web.Response:
+        comparison_id = request.match_info.get("comparison_id", "")
+        try:
+            manifest = get_comparison_results(_COMFYUI_ROOT, comparison_id)
+            if manifest is None:
+                return web.json_response({"status": "error", "message": "Comparison not found"}, status=404)
+            return web.json_response({"status": "ok", "manifest": manifest})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.get("/comfymodal/comparison/profiles/{profile_id}/workflow/nodes")
+    async def comparison_workflow_nodes(request: web.Request) -> web.Response:
+        profile_id = request.match_info.get("profile_id", "")
+        try:
+            nodes = get_workflow_nodes(_COMFYUI_ROOT, profile_id)
+            if nodes is None:
+                return web.json_response({"status": "error", "message": "Workflow not found"}, status=404)
+            return web.json_response({"status": "ok", "nodes": nodes})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.get("/comfymodal/comparison/config")
+    async def comparison_get_config(request: web.Request) -> web.Response:
+        try:
+            config = load_comparison_config(_COMFYUI_ROOT)
+            return web.json_response({"status": "ok", "config": config})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/comparison/config")
+    async def comparison_set_config(request: web.Request) -> web.Response:
+        body = await request.json()
+        try:
+            config = save_comparison_config(_COMFYUI_ROOT, body)
+            return web.json_response({"status": "ok", "config": config})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.get("/comfymodal/comparison/gallery/{comparison_id}")
+    async def comparison_gallery(request: web.Request) -> web.Response:
+        """Return gallery data for a completed comparison run, including
+        base64-encoded thumbnail images for each result."""
+        comparison_id = request.match_info.get("comparison_id", "")
+        try:
+            manifest = get_comparison_results(_COMFYUI_ROOT, comparison_id)
+            if manifest is None:
+                return web.json_response({"status": "error", "message": "Comparison not found"}, status=404)
+            gallery = []
+            for result in manifest.get("results", []):
+                entry = dict(result)
+                out_path = result.get("output_path", "")
+                if out_path and os.path.isfile(out_path):
+                    import base64
+                    with open(out_path, "rb") as f:
+                        entry["image_data_b64"] = base64.b64encode(f.read()).decode()
+                else:
+                    entry["image_data_b64"] = None
+                gallery.append(entry)
+            return web.json_response({"status": "ok", "gallery": gallery, "manifest": manifest})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    print("[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*")

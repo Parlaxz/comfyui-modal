@@ -72,6 +72,14 @@ let _showDeploySuccess = false;
 let _logViewerMinimized = false;
 let _showLogLinkEl = null;
 
+// Download progress tracking
+let _downloadProgressEl = null;
+let _downloadProgressTrackEl = null;
+let _downloadProgressPctEl = null;
+let _downloadProgressInfoEl = null;
+let _downloadPollTimer = null;
+let _activeDownloadId = null;
+
 const STATUS_STYLE = {
   [STATUS.UNKNOWN]:    { color: "#888",    label: "Unknown" },
   [STATUS.CHECKING]:   { color: "#f5a623", label: "Checking..." },
@@ -1153,6 +1161,10 @@ function buildPanel() {
         0%, 100% { opacity: 1; transform: scale(1); }
         50% { opacity: 0.8; transform: scale(1.02); }
       }
+      @keyframes cm-dl-pulse {
+        0%, 100% { opacity: 0.5; }
+        50% { opacity: 1; }
+      }
     `;
     document.head.appendChild(styleTag);
   }
@@ -1884,10 +1896,26 @@ function buildPanel() {
   const addSection = document.createElement("div");
   addSection.style.cssText = "display:flex; flex-direction:column; gap:8px; background:#1e1e2e; border-radius:6px; padding:10px;";
 
+  const addTitleRow = document.createElement("div");
+  addTitleRow.style.cssText = "display:flex; align-items:center; gap:6px;";
+
   const addTitle = document.createElement("div");
-  addTitle.style.cssText = "font-weight:600; font-size:13px;";
+  addTitle.style.cssText = "font-weight:600; font-size:13px; flex:1;";
   addTitle.textContent = "Add Model";
-  addSection.appendChild(addTitle);
+
+  const resumeBtn = document.createElement("button");
+  resumeBtn.textContent = "\u21BA Get Download Progress";
+  resumeBtn.title = "Check for active Modal downloads and resume progress tracking";
+  resumeBtn.style.cssText = `
+    background:transparent; border:1px solid #3a5a3a; color:#6a9fd8;
+    padding:2px 6px; border-radius:3px; cursor:pointer; font-size:9px;
+    flex-shrink:0; line-height:1.4;
+  `;
+  resumeBtn.onclick = checkActiveDownloads;
+
+  addTitleRow.appendChild(addTitle);
+  addTitleRow.appendChild(resumeBtn);
+  addSection.appendChild(addTitleRow);
 
   const addHelp = document.createElement("div");
   addHelp.style.cssText = "font-size:11px; color:#888; line-height:1.4;";
@@ -1920,6 +1948,9 @@ function buildPanel() {
   row2.appendChild(folderSelect);
   row2.appendChild(filenameInput);
   addSection.appendChild(row2);
+
+  // Download progress bar
+  addSection.appendChild(createDownloadProgressBar());
 
   // Auto-detect filename on URL input (debounced)
   const autoDetectFilename = debounce(() => {
@@ -1967,7 +1998,7 @@ function buildPanel() {
     if (!filename) return;
 
     singleDownloadBtn.disabled = true;
-    singleDownloadBtn.textContent = "Downloading...";
+    singleDownloadBtn.textContent = "Starting...";
     try {
       const resp = await api.fetchApi(`${MODAL_PREFIX}/model/install`, {
         method: "POST",
@@ -1976,15 +2007,16 @@ function buildPanel() {
       });
       const data = await resp.json();
       if (data.status === "ok") {
-        showToast(data.message || "Model downloaded to Modal and local placeholder created. Refresh ComfyUI if the dropdown does not update.", "success");
+        showDownloadProgress({ state: "starting", filename });
+        startDownloadPoll(data.download_id, filename, folder);
         urlInput.value = "";
         filenameInput.value = "";
-        await loadModels();
       } else {
         throw new Error(data.message || "Download failed");
       }
     } catch (e) {
       showToast("Error: " + e.message, "error");
+      hideDownloadProgress();
     }
     singleDownloadBtn.disabled = false;
     singleDownloadBtn.textContent = "Download";
@@ -2338,8 +2370,173 @@ function buildPanel() {
   startDeployPoll();
   loadModels();
   loadSyncStatus();
+  checkActiveDownloads();
 
   return panel;
+}
+
+// --- Download Progress Bar ---
+function createDownloadProgressBar() {
+  const wrap = document.createElement("div");
+  wrap.id = "cm-download-progress";
+  wrap.style.cssText = "display:none; flex-direction:column; gap:4px; padding:6px 8px; background:#1a2a1a; border:1px solid #2a4a2a; border-radius:4px;";
+
+  const headerRow = document.createElement("div");
+  headerRow.style.cssText = "display:flex; align-items:center; gap:6px;";
+
+  const label = document.createElement("span");
+  label.style.cssText = "font-size:10px; font-weight:600; color:#7ed321; text-transform:uppercase; letter-spacing:0.05em; flex:1;";
+  label.textContent = "Downloading...";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.textContent = "\u2715";
+  cancelBtn.title = "Dismiss";
+  cancelBtn.style.cssText = `
+    background:transparent; border:1px solid #555; color:#888;
+    width:16px; height:16px; border-radius:3px; cursor:pointer;
+    font-size:9px; padding:0; display:flex; align-items:center; justify-content:center; line-height:1;
+    flex-shrink:0;
+  `;
+  cancelBtn.onclick = () => hideDownloadProgress();
+
+  headerRow.appendChild(label);
+  headerRow.appendChild(cancelBtn);
+
+  const track = document.createElement("div");
+  track.style.cssText = "width:100%; height:8px; background:#222; border-radius:4px; overflow:hidden;";
+
+  const fill = document.createElement("div");
+  fill.style.cssText = "width:0%; height:100%; background:#4caf50; border-radius:4px; transition:width 0.3s ease;";
+
+  track.appendChild(fill);
+
+  const info = document.createElement("div");
+  info.style.cssText = "font-size:10px; color:#aaa; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;";
+
+  wrap.appendChild(headerRow);
+  wrap.appendChild(track);
+  wrap.appendChild(info);
+
+  _downloadProgressEl = wrap;
+  _downloadProgressTrackEl = fill;
+  _downloadProgressPctEl = label;
+  _downloadProgressInfoEl = info;
+
+  return wrap;
+}
+
+function showDownloadProgress(state) {
+  if (!_downloadProgressEl) return;
+  _downloadProgressEl.style.display = "flex";
+
+  if (state.state === "downloading") {
+    const pct = state.pct || 0;
+    _downloadProgressTrackEl.style.width = pct + "%";
+    _downloadProgressPctEl.textContent = `Downloading  ${pct}%`;
+    _downloadProgressInfoEl.textContent = `${state.filename || ""}  (${fmtSize((state.downloaded_mb || 0) * 1048576)} / ${fmtSize((state.total_mb || 0) * 1048576)})`;
+    _downloadProgressEl.style.borderColor = "#2a4a2a";
+    _downloadProgressEl.style.background = "#1a2a1a";
+  } else if (state.state === "starting") {
+    _downloadProgressTrackEl.style.width = "100%";
+    _downloadProgressTrackEl.style.background = "#555";
+    _downloadProgressTrackEl.style.animation = "cm-dl-pulse 1.5s ease-in-out infinite";
+    _downloadProgressPctEl.textContent = "Starting download...";
+    _downloadProgressInfoEl.textContent = state.filename || "";
+    _downloadProgressEl.style.borderColor = "#3a3a2a";
+    _downloadProgressEl.style.background = "#1a1a2a";
+  } else if (state.state === "complete") {
+    _downloadProgressTrackEl.style.width = "100%";
+    _downloadProgressTrackEl.style.background = "#4caf50";
+    _downloadProgressTrackEl.style.animation = "";
+    _downloadProgressPctEl.textContent = "\u2713 Complete";
+    _downloadProgressInfoEl.textContent = state.filename || "";
+    _downloadProgressEl.style.borderColor = "#2a4a2a";
+    _downloadProgressEl.style.background = "#1a3a1a";
+    setTimeout(hideDownloadProgress, 4000);
+  } else if (state.state === "error") {
+    _downloadProgressTrackEl.style.width = "100%";
+    _downloadProgressTrackEl.style.background = "#e05050";
+    _downloadProgressTrackEl.style.animation = "";
+    _downloadProgressPctEl.textContent = "\u2717 Failed";
+    _downloadProgressInfoEl.textContent = state.error || "Download failed";
+    _downloadProgressPctEl.style.color = "#e05050";
+    _downloadProgressEl.style.borderColor = "#4a2a2a";
+    _downloadProgressEl.style.background = "#2a1a1a";
+    setTimeout(hideDownloadProgress, 8000);
+  }
+}
+
+function hideDownloadProgress() {
+  if (_downloadProgressEl) _downloadProgressEl.style.display = "none";
+  if (_downloadProgressTrackEl) {
+    _downloadProgressTrackEl.style.width = "0%";
+    _downloadProgressTrackEl.style.background = "#4caf50";
+    _downloadProgressTrackEl.style.animation = "";
+  }
+  if (_downloadProgressPctEl) {
+    _downloadProgressPctEl.textContent = "Downloading...";
+    _downloadProgressPctEl.style.color = "#7ed321";
+  }
+  _activeDownloadId = null;
+}
+
+function stopDownloadPoll() {
+  if (_downloadPollTimer) {
+    clearInterval(_downloadPollTimer);
+    _downloadPollTimer = null;
+  }
+}
+
+function startDownloadPoll(downloadId, filename, savePath) {
+  stopDownloadPoll();
+  _activeDownloadId = downloadId;
+  _downloadPollTimer = setInterval(async () => {
+    try {
+      const resp = await api.fetchApi(`${MODAL_PREFIX}/download/status/${downloadId}`);
+      if (!resp.ok) {
+        if (resp.status === 404) {
+          stopDownloadPoll();
+          hideDownloadProgress();
+        }
+        return;
+      }
+      const data = await resp.json();
+      if (data.state === "downloading" || data.state === "starting") {
+        showDownloadProgress(data);
+      } else if (data.state === "complete") {
+        stopDownloadPoll();
+        showDownloadProgress(data);
+        showToast("Model downloaded successfully!", "success");
+        loadModels();
+      } else if (data.state === "error") {
+        stopDownloadPoll();
+        showDownloadProgress(data);
+        showToast("Download failed: " + (data.error || "Unknown error"), "error");
+      }
+    } catch (e) {
+      // Silently retry on next poll
+    }
+  }, 2000);
+}
+
+async function checkActiveDownloads() {
+  try {
+    const resp = await api.fetchApi(`${MODAL_PREFIX}/download/active`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data.status !== "ok") return;
+    const active = data.active || {};
+    const ids = Object.keys(active);
+    if (ids.length > 0) {
+      const firstId = ids[0];
+      const first = active[firstId];
+      showDownloadProgress(first);
+      startDownloadPoll(firstId, first.filename, first.save_path);
+      showToast("Resumed tracking download progress", "info");
+    }
+  } catch {
+    // silent
+  }
 }
 
 // --- Style helpers ---

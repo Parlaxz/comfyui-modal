@@ -236,7 +236,7 @@ class SaveLoadActiveProfileTests(unittest.TestCase):
         inst._write_active_next_profile(payload)
         self.assertEqual(inst._load_active_next_profile(now=1001.0)["profile_token"], "tok-1")
 
-    def test_load_active_profile_returns_empty_when_expired(self):
+    def test_load_active_profile_returns_expired_diagnostic_when_expired(self):
         inst = self._make_instance()
         inst._write_active_next_profile({
             "profile_token": "tok-expired",
@@ -247,7 +247,9 @@ class SaveLoadActiveProfileTests(unittest.TestCase):
             "model_stack": {},
             "warmup_profile": {"mode": "checkpoint", "checkpoint": "old.safetensors"},
         })
-        self.assertEqual(inst._load_active_next_profile(now=1002.0), {})
+        result = inst._load_active_next_profile(now=1002.0)
+        self.assertEqual(result.get("_diagnostic", {}).get("status"), "expired")
+        self.assertIn("warmup_profile", result)
 
 
 class ModelCpuCachePatchTests(unittest.TestCase):

@@ -13,8 +13,10 @@ from pathlib import Path
 
 import modal
 
+from api_prompt_validator import assert_valid_api_prompt_structure
 from gpu_catalog import GPU_CATALOG, get_supported_gpus, is_gpu_hidden
 from timing_trace import Trace, coerce_t0_from_browser
+from failure_summary import FailureSummary
 
 # ── Inline output-converter constants & helpers (self-contained for Modal) ──
 _OUTPUT_FORMATS = ("original", "webp_lossless", "webp_lossy", "jpeg")
@@ -157,12 +159,179 @@ def _convert_image_bytes(
         print(f"[comfyapp.convert] FALLBACK to PNG: fmt={output_format} err={meta['error']}")
     return meta
 
+# ── PART 12: Silent exception logging helper ──
+_SILENT_EXCEPTION_DEBUG = os.getenv("COMFYMODAL_SILENT_EXCEPTION_DEBUG", "0") == "1"
+
+
+def _log_silent_exception(context: str, exc: Exception, detail: str = "") -> None:
+    """Log an exception that would otherwise be silently swallowed.
+
+    Only emits logs when PROFILING_ENABLED or _SILENT_EXCEPTION_DEBUG is set,
+    to avoid log spam in the hot path.  Use this for expected optional failures
+    where the ``pass`` is intentional but the detail is useful for debugging.
+    """
+    if PROFILING_ENABLED or _SILENT_EXCEPTION_DEBUG:
+        detail_str = f" {detail}" if detail else ""
+        print(f"[comfyapp.silent] context={context} error={exc}{detail_str}")
+
+
 PROFILING_ENABLED = os.getenv("COMFYMODAL_PROFILING", "0") == "1"
 DEFAULT_EXECUTION_BACKEND = os.getenv("COMFYMODAL_EXECUTION_BACKEND", "in_process")
 ENABLE_WARMUP = os.getenv("COMFYMODAL_ENABLE_WARMUP", "1") == "1"
 ENABLE_TORCH_COMPILE = os.getenv("COMFYMODAL_ENABLE_TORCH_COMPILE", "0") == "1"
 ENABLE_GPU_SNAPSHOT = os.getenv("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1"
 CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S = int(os.getenv("COMFYMODAL_CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S", "180"))
+
+# Generic collector for custom-node import/entrypoint failures during startup.
+# Populated by the logging.warning patch in _start_in_process_backend.
+# Each record is a dict with keys: phase, custom_node_name, custom_node_path,
+# entrypoint_name, exception_type, exception_message, traceback, timestamp.
+_CUSTOM_NODE_IMPORT_FAILURES: list[dict] = []
+
+# Module paths of custom nodes whose entrypoint/schema failed during CPU snapshot.
+# Retried after GPU warmup so schema generation has real device availability.
+_CUSTOM_NODE_REGISTRATION_PENDING_RETRY: set[str] = set()
+
+# ── PART 2: Custom-node retry registry ──
+class CustomNodeRetryEntry:
+    __slots__ = (
+        "path", "first_seen_at", "retry_count", "last_retry_at",
+        "last_status", "last_exception_type", "last_exception_message",
+        "last_traceback", "registered_delta", "retryable_reason", "resolved",
+    )
+
+    def __init__(self, path: str):
+        self.path = path
+        self.first_seen_at = time.time()
+        self.retry_count = 0
+        self.last_retry_at = 0.0
+        self.last_status = "pending"
+        self.last_exception_type = ""
+        self.last_exception_message = ""
+        self.last_traceback = ""
+        self.registered_delta = 0.0
+        self.retryable_reason = ""
+        self.resolved = False
+
+    def record_failure(self, exc_type: str, exc_msg: str, tb: str) -> None:
+        self.last_status = "failed"
+        self.last_exception_type = exc_type
+        self.last_exception_message = exc_msg
+        self.last_traceback = tb
+
+    def record_retry(self) -> None:
+        self.retry_count += 1
+        self.last_retry_at = time.time()
+        self.last_status = "retrying"
+
+    def mark_resolved(self) -> None:
+        self.resolved = True
+        self.last_status = "succeeded"
+
+    def to_dict(self) -> dict:
+        return {
+            "path": self.path,
+            "first_seen_at": self.first_seen_at,
+            "retry_count": self.retry_count,
+            "last_retry_at": self.last_retry_at,
+            "last_status": self.last_status,
+            "last_exception_type": self.last_exception_type,
+            "last_exception_message": self.last_exception_message[:500] if self.last_exception_message else "",
+            "last_traceback_available": bool(self.last_traceback),
+            "registered_delta": self.registered_delta,
+            "retryable_reason": self.retryable_reason,
+            "resolved": self.resolved,
+        }
+
+
+class CustomNodeRetryRegistry:
+    MAX_RETRIES = 2
+
+    def __init__(self):
+        self._entries: dict[str, CustomNodeRetryEntry] = {}
+
+    def register_failure(self, path: str, exc_type: str = "", exc_msg: str = "", tb: str = "",
+                         retryable_reason: str = "") -> None:
+        if path not in self._entries:
+            self._entries[path] = CustomNodeRetryEntry(path)
+        entry = self._entries[path]
+        entry.record_failure(exc_type, exc_msg, tb)
+        if retryable_reason:
+            entry.retryable_reason = retryable_reason
+
+    def should_retry(self, path: str) -> bool:
+        entry = self._entries.get(path)
+        if entry is None:
+            return False
+        if entry.resolved:
+            return False
+        if entry.last_status == "succeeded":
+            return False
+        if entry.retry_count >= self.MAX_RETRIES:
+            return False
+        if entry.last_exception_type == "ModuleNotFoundError" and not entry.retryable_reason:
+            return False
+        return True
+
+    def record_retry(self, path: str) -> None:
+        entry = self._entries.get(path)
+        if entry is not None:
+            entry.record_retry()
+
+    def mark_resolved(self, path: str) -> None:
+        entry = self._entries.get(path)
+        if entry is not None:
+            entry.mark_resolved()
+
+    def get_entry(self, path: str) -> CustomNodeRetryEntry | None:
+        return self._entries.get(path)
+
+    def get_pending_paths(self) -> list[str]:
+        return [p for p, e in self._entries.items() if e.last_status == "pending" and not e.resolved]
+
+    def get_failed_paths(self) -> list[dict]:
+        return [e.to_dict() for e in self._entries.values() if e.last_status == "failed" and not e.resolved]
+
+    def get_all(self) -> list[dict]:
+        return [e.to_dict() for e in self._entries.values()]
+
+    def clear_resolved(self) -> None:
+        self._entries = {p: e for p, e in self._entries.items() if not e.resolved}
+
+
+_CUSTOM_NODE_RETRY_REGISTRY = CustomNodeRetryRegistry()
+
+# ── PART 3: Preload guardrails ──
+# Controls whether unknown (never-seen-before) workflow profiles get
+# expensive CPU preload.  Set to 1 to always preload regardless.
+PRELOAD_UNKNOWN_PROFILES = os.getenv("COMFYMODAL_PRELOAD_UNKNOWN_PROFILES", "0") == "1"
+# Maximum total preload size in GB across all files.
+PRELOAD_MAX_TOTAL_GB = float(os.getenv("COMFYMODAL_PRELOAD_MAX_TOTAL_GB", "12"))
+# Maximum single-file preload size in GB.
+PRELOAD_MAX_FILE_GB = float(os.getenv("COMFYMODAL_PRELOAD_MAX_FILE_GB", "10"))
+# Minimum observed throughput (GB/s) to continue preloading.
+# If measured throughput stays below this after the outlier_abort window,
+# preloading is cancelled and falls back to lazy loading.
+PRELOAD_MIN_THROUGHPUT_GBPS = float(os.getenv("COMFYMODAL_PRELOAD_MIN_THROUGHPUT_GBPS", "0.5"))
+# After this many seconds of preload, evaluate throughput and abort if below threshold.
+PRELOAD_OUTLIER_ABORT_SECONDS = float(os.getenv("COMFYMODAL_PRELOAD_OUTLIER_ABORT_SECONDS", "10"))
+
+# ── PART 4: Custom-node requirements repair mode ──
+#   off        - Never install requirements during prompt execution.
+#   fail_fast  - If requirements hash is missing/stale, fail with
+#                actionable error before model preload.
+#   dev        - Allow runtime repair for development.
+REQUIREMENTS_REPAIR_MODE = os.getenv("COMFYMODAL_REQUIREMENTS_REPAIR_MODE", "fail_fast").strip().lower()
+# When fail_fast is active, this message is included in the error.
+_FAIL_FAST_REQ_MSG = (
+    "Custom node requirements are not prepared for this image. "
+    "Missing/stale requirements detected. "
+    "Run the custom-node sync/build step before inference, "
+    "or set COMFYMODAL_REQUIREMENTS_REPAIR_MODE=dev for runtime install."
+)
+
+# ── PART 7: Remote background deploy gating ──
+ENABLE_REMOTE_BACKGROUND_DEPLOY = os.getenv("COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY", "0") == "1"
 WARMUP_PROFILE = os.getenv("COMFYMODAL_WARMUP_PROFILE", "off")
 WARMUP_CHECKPOINT = os.getenv("COMFYMODAL_WARMUP_CHECKPOINT", "").strip()
 WARMUP_UNET = os.getenv("COMFYMODAL_WARMUP_UNET", "").strip()
@@ -170,7 +339,11 @@ WARMUP_CLIP1 = os.getenv("COMFYMODAL_WARMUP_CLIP1", "").strip()
 WARMUP_CLIP2 = os.getenv("COMFYMODAL_WARMUP_CLIP2", "").strip()
 WARMUP_VAE = os.getenv("COMFYMODAL_WARMUP_VAE", "").strip()
 WARMUP_CLIP_TYPE = os.getenv("COMFYMODAL_WARMUP_CLIP_TYPE", "flux").strip() or "flux"
-WARMUP_TEXT = "A Jew steals baby kittens from their mother cat. the mother cat is anthropamorphic and wearing an apron and chef's hat and crying. The jew is a rabbi and is wearing a suit and holding the kittens. The jew has a long nose and an evil smile. They are in a crowded market, and the mother cat has her hands outstretched longinly in the direction of the jew and her babies. The jew is running away with his back to the mother and looking back at her. He is wearing a kippa and is a rabbi, and is laughing"
+WARMUP_TEXT = os.getenv("COMFYMODAL_WARMUP_TEXT", "warmup")
+
+# Comma-separated custom-node names to ignore in baked vs. volume node-set mismatch validation.
+# Default empty — all node set mismatches are reported.
+_CUSTOM_NODE_SET_MISMATCH_IGNORE_ENV = os.getenv("COMFYMODAL_CUSTOM_NODE_SET_MISMATCH_IGNORE", "")
 
 # Preload mode controls which model files are loaded to CPU during restore
 # and how loading behaves:
@@ -184,7 +357,7 @@ WARMUP_TEXT = "A Jew steals baby kittens from their mother cat. the mother cat i
 #   off            — skip CPU preload entirely
 #   async_no_wait  — fire preload in background thread, don't block restore
 #   budgeted_1500ms — preload with 1500ms time budget, stop when exceeded
-PRELOAD_MODE = os.getenv("COMFYMODAL_PRELOAD_MODE", "workers_2").strip().lower()
+PRELOAD_MODE = os.getenv("COMFYMODAL_PRELOAD_MODE", "off").strip().lower()
 PROMPT_ASYNC_PRELOAD = os.getenv("PROMPT_ASYNC_PRELOAD", "0") == "1"
 PROMPT_PRELOAD_WORKERS = int(os.getenv("PROMPT_PRELOAD_WORKERS", "2"))
 PROMPT_ASYNC_ACTUAL_LOAD = os.getenv("PROMPT_ASYNC_ACTUAL_LOAD", "0") == "1"
@@ -219,6 +392,13 @@ PRELOAD_MODE_PATH = "/root/models/.preload_mode"
 RUNTIME_CONFIG_DIR = "/root/models/runtime_config"
 RUNTIME_RETURN_MODE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "return_mode.txt")
 RUNTIME_STATE_SNAPSHOT_PATH = os.path.join(RUNTIME_CONFIG_DIR, ".runtime_state_snapshot.json")
+
+# ── PART 4: Baked dependency manifest (inside the image, NOT on volume) ──
+BAKED_CUSTOM_NODE_DEPS_MANIFEST_PATH = "/opt/comfymodal/custom_node_deps_baked.json"
+
+# ── PART 11: Known-good workflow profiles (for preload eligibility) ──
+KNOWN_GOOD_WORKFLOW_PROFILES_PATH = "/root/models/runtime_config/known_good_workflow_profiles.json"
+CURRENT_CUSTOM_NODE_DEPS_CACHE_PATH = "/root/models/runtime_config/current_custom_node_dependency_manifest_cache.json"
 
 _WORKFLOW_IMAGE_SUFFIX_DIRS = {
     " [output]": "output",
@@ -398,7 +578,8 @@ def _resolve_return_mode() -> str:
 
     Priority:
     1. File on the model volume (set by ``set_return_mode``).
-    2. Env var ``COMFYMODAL_RETURN_MODE`` (default ``"full_base64"``).
+    2. Env var ``COMFYMODAL_RETURN_MODE``.
+    3. ``"full_base64"`` (default).
     """
     try:
         if os.path.isfile(RUNTIME_RETURN_MODE_PATH):
@@ -407,19 +588,58 @@ def _resolve_return_mode() -> str:
                 return _v
     except Exception:
         pass
-
-_EXCLUDED_CUSTOM_NODE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
+    _valid = ("full_base64", "first_image_only", "metadata_only", "paths_only", "urls_only")
+    _env = os.environ.get("COMFYMODAL_RETURN_MODE", "").strip().lower()
+    if _env in _valid:
+        return _env
+    return "full_base64"
 
 # ── Custom-node volume helpers ────────────────────────────────────────────
-# These are intentionally duplicated (inlined) here rather than imported from
-# a sibling module to keep Modal packaging simple.  Modal serialises the
-# entire module closure; importing a sibling module would require an explicit
-# `modal.Image` dependency or risk missing files at deploy time.
 
 def _safe_listdir(path: str) -> list[str]:
     if not os.path.isdir(path):
         return []
     return sorted(os.listdir(path))
+
+
+def custom_node_source_fingerprint(source_root: str) -> dict:
+    """Return a fingerprint of the top-level custom-node directory structure
+    including file content hashes (not just topology)."""
+    nodes = []
+    for name in _iter_syncable_custom_node_dirs(source_root):
+        node_path = os.path.join(source_root, name)
+        entry = {"name": name, "is_dir": True}
+        if os.path.islink(node_path):
+            entry["realpath_if_symlink"] = os.path.realpath(node_path)
+        _hasher = hashlib.sha256()
+        _tracked_exts = {".py", ".txt", ".toml", ".cfg"}
+        _tracked_files = {"requirements.txt", "pyproject.toml", "setup.py", "setup.cfg"}
+        try:
+            for _dirpath, _dirnames, _filenames in os.walk(node_path):
+                _dirnames[:] = [d for d in _dirnames if d not in (".git", "__pycache__", "node_modules", ".venv", "venv")]
+                for _fn in sorted(_filenames):
+                    _ext = os.path.splitext(_fn)[1].lower()
+                    if _ext in _tracked_exts or _fn in _tracked_files:
+                        _fp = os.path.join(_dirpath, _fn)
+                        _rel = os.path.relpath(_fp, node_path).replace("\\", "/")
+                        _hasher.update(f"{_rel}:".encode())
+                        try:
+                            _hasher.update(Path(_fp).read_bytes())
+                        except OSError:
+                            pass
+        except Exception:
+            pass
+        entry["content_hash"] = _hasher.hexdigest()[:16]
+        nodes.append(entry)
+    return {
+        "schema_version": 2,
+        "source_root": source_root,
+        "nodes": nodes,
+    }
+
+
+# Alias for backward compatibility
+custom_node_topology_fingerprint = custom_node_source_fingerprint
 
 
 def _is_volume_managed_link(link_path: str, volume_root: str) -> bool:
@@ -436,10 +656,8 @@ def _is_volume_managed_link(link_path: str, volume_root: str) -> bool:
 def custom_node_volume_state(volume_root: str) -> tuple:
     volume_root = os.path.abspath(volume_root)
     state = []
-    for name in _safe_listdir(volume_root):
+    for name in _iter_syncable_custom_node_dirs(volume_root):
         path = os.path.join(volume_root, name)
-        if not os.path.isdir(path) or name in _EXCLUDED_CUSTOM_NODE_DIRS:
-            continue
         stat = os.stat(path)
         req_file = os.path.join(path, "requirements.txt")
         req_mtime_ns = os.stat(req_file).st_mtime_ns if os.path.isfile(req_file) else None
@@ -459,10 +677,8 @@ def sync_custom_nodes_into_comfy(volume_root: str, comfy_custom_nodes_root: str,
 
     volume_dirs = []
     state = []
-    for name in _safe_listdir(volume_root):
+    for name in _iter_syncable_custom_node_dirs(volume_root):
         path = os.path.join(volume_root, name)
-        if not os.path.isdir(path) or name in _EXCLUDED_CUSTOM_NODE_DIRS:
-            continue
         volume_dirs.append(name)
         if include_state:
             stat = os.stat(path)
@@ -525,6 +741,672 @@ def requirements_file_hash(path: str) -> str | None:
     if not os.path.isfile(path):
         return None
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def collect_custom_node_dependency_files(node_path: str) -> dict[str, str]:
+    """Collect dependency-relevant file paths under *node_path*.
+
+    This is the single source of truth for dependency file scanning.
+    Used by both ``build_custom_node_dependency_manifest`` (hashing)
+    and ``_prepare_custom_node_requirements_build_context`` (copying).
+
+    Returns a dict of ``relative_path -> sha256_hex`` for:
+    - requirements.txt
+    - any file included by -r / --requirement
+    - pyproject.toml, setup.py, setup.cfg
+    - local wheel files referenced by requirements
+    - local packages/folders referenced by -e, --editable, ./path, ../path
+    - constraints files included by -c / --constraint
+
+    Does NOT hash the whole source tree.  Ignores .git, __pycache__,
+    node_modules, venv, .venv, image files, videos, markdown docs,
+    notebooks, model files.
+    """
+    _IGNORE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".tiff", ".bmp",
+                    ".webp", ".ico", ".mp4", ".avi", ".mov", ".mkv",
+                    ".webm", ".md", ".rst", ".ipynb", ".gz", ".zip",
+                    ".tar", ".pyc", ".pyo", ".safetensors", ".ckpt",
+                    ".pt", ".pth", ".bin"}
+    _IGNORE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv",
+                    ".ipynb_checkpoints"}
+
+    files: dict[str, str] = {}
+    _seen_real: set[str] = set()
+
+    def _add_file(filepath: str, node_root: str) -> None:
+        if not os.path.isfile(filepath):
+            return
+        real = os.path.realpath(filepath)
+        if real in _seen_real:
+            return
+        _seen_real.add(real)
+        rel = _safe_dependency_relpath(filepath, node_root)
+        files[rel] = hashlib.sha256(Path(filepath).read_bytes()).hexdigest()
+
+    def _scan_requirements(req_path: str, node_root: str, seen_req: set[str]) -> None:
+        req_path = os.path.abspath(req_path)
+        if req_path in seen_req:
+            return
+        seen_req.add(req_path)
+        if not os.path.isfile(req_path):
+            return
+        _add_file(req_path, node_root)
+        req_dir = os.path.dirname(req_path)
+        try:
+            for line in Path(req_path).read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                stripped = stripped.split(";", 1)[0].strip()
+                if not stripped:
+                    continue
+                if stripped.startswith("-r ") or stripped.startswith("--requirement "):
+                    prefix = stripped.split(" ", 1)[1].strip()
+                    included = os.path.abspath(os.path.join(req_dir, prefix))
+                    if os.path.isfile(included):
+                        _scan_requirements(included, node_root, seen_req)
+                elif stripped.startswith("-c ") or stripped.startswith("--constraint "):
+                    prefix = stripped.split(" ", 1)[1].strip()
+                    included = os.path.abspath(os.path.join(req_dir, prefix))
+                    _add_file(included, node_root)
+                elif stripped.startswith("-e ") or stripped.startswith("--editable "):
+                    local_path = stripped.split(" ", 1)[1].strip()
+                    resolved = os.path.abspath(os.path.join(req_dir, local_path))
+                    _add_tree(resolved, node_root)
+                elif stripped.startswith("./") or stripped.startswith("../"):
+                    local_path = os.path.abspath(os.path.join(req_dir, stripped))
+                    _add_tree(local_path, node_root)
+        except (OSError, UnicodeDecodeError):
+            pass
+
+    def _add_tree(path: str, node_root: str) -> None:
+        if not os.path.exists(path):
+            return
+        real = os.path.realpath(path)
+        if real in _seen_real:
+            return
+        _seen_real.add(real)
+        if os.path.isfile(path):
+            rel = _safe_dependency_relpath(path, node_root)
+            files[rel] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        elif os.path.isdir(path):
+            for dirpath, dirnames, filenames in os.walk(path):
+                dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIRS]
+                for fn in filenames:
+                    ext = os.path.splitext(fn)[1].lower()
+                    if ext in _IGNORE_EXTS:
+                        continue
+                    fp = os.path.join(dirpath, fn)
+                    _add_file(fp, node_root)
+
+    req_path = os.path.join(node_path, "requirements.txt")
+    _scan_requirements(req_path, node_path, set())
+
+    req_dir = os.path.join(node_path, "requirements")
+    if os.path.isdir(req_dir):
+        for _rf in sorted(os.listdir(req_dir)):
+            if _rf.endswith(".txt") or _rf.endswith(".pip"):
+                _scan_requirements(os.path.join(req_dir, _rf), node_path, set())
+
+    for base_name in ("pyproject.toml", "setup.py", "setup.cfg", "install.py"):
+        base_path = os.path.join(node_path, base_name)
+        if os.path.isfile(base_path):
+            _add_file(base_path, node_path)
+
+    return files
+
+
+def _collect_dependency_file_paths(node_path: str) -> dict[str, str]:
+    """Backward-compatible alias for ``collect_custom_node_dependency_files``."""
+    return collect_custom_node_dependency_files(node_path)
+
+
+class RequestPipelineState:
+    """Structured request pipeline state for truthful summary generation.
+
+    Tracks every phase of a prompt request through the pipeline so the
+    summary dict is populated from real state rather than best-effort kwargs.
+    """
+
+    __slots__ = (
+        "request_id", "mode", "stream",
+        "workflow_hash", "model_stack",
+        "local_preflight_validated", "remote_preflight_validated",
+        "custom_node_sync_result", "custom_node_sync_skipped",
+        "custom_node_sync_skip_reason",
+        "dependency_result", "dependency_manifest_cache_hit",
+        "missing_node_result",
+        "active_profile_result", "active_profile_expired",
+        "active_profile_source", "preload_skip_reason",
+        "prompt_preload_result", "actual_load_result",
+        "execution_started", "execution_success",
+        "known_good_marked", "known_good_mark_result",
+        "failure_phase", "failure_reason",
+        "clip_actual_load_submitted", "clip_actual_load_cache_hit",
+        "clip_actual_load_duration_ms",
+        "_timestamps",
+    )
+
+    def __init__(self, request_id: str = "", mode: str = "", stream: bool = False):
+        self.request_id = request_id
+        self.mode = mode
+        self.stream = stream
+        self.workflow_hash = ""
+        self.model_stack = {}
+        self.local_preflight_validated = False
+        self.remote_preflight_validated = False
+        self.custom_node_sync_result = ""
+        self.custom_node_sync_skipped = False
+        self.custom_node_sync_skip_reason = ""
+        self.dependency_result = ""
+        self.dependency_manifest_cache_hit = False
+        self.missing_node_result = ""
+        self.active_profile_result = ""
+        self.active_profile_expired = False
+        self.active_profile_source = ""
+        self.preload_skip_reason = ""
+        self.prompt_preload_result = ""
+        self.actual_load_result = ""
+        self.execution_started = False
+        self.execution_success = False
+        self.known_good_marked = False
+        self.known_good_mark_result = ""
+        self.failure_phase = ""
+        self.failure_reason = ""
+        self.clip_actual_load_submitted = False
+        self.clip_actual_load_cache_hit = False
+        self.clip_actual_load_duration_ms = 0.0
+        self._timestamps: dict[str, float] = {}
+
+    def mark(self, phase: str) -> None:
+        self._timestamps[phase] = time.time()
+
+    def fail(self, phase: str, reason: str) -> None:
+        self.failure_phase = phase
+        self.failure_reason = reason
+        self.mark(f"fail_{phase}")
+
+    def to_summary(self) -> dict:
+        return {
+            "request_id": self.request_id,
+            "mode": self.mode,
+            "stream": self.stream,
+            "workflow_hash": self.workflow_hash,
+            "model_stack": self.model_stack,
+            "local_preflight_validated": self.local_preflight_validated,
+            "remote_preflight_validated": self.remote_preflight_validated,
+            "custom_node_sync_result": self.custom_node_sync_result,
+            "custom_node_sync_skipped": self.custom_node_sync_skipped,
+            "custom_node_sync_skip_reason": self.custom_node_sync_skip_reason,
+            "dependency_result": self.dependency_result,
+            "dependency_manifest_cache_hit": self.dependency_manifest_cache_hit,
+            "missing_node_result": self.missing_node_result,
+            "active_profile_result": self.active_profile_result,
+            "active_profile_expired": self.active_profile_expired,
+            "active_profile_source": self.active_profile_source,
+            "preload_skip_reason": self.preload_skip_reason,
+            "prompt_preload_result": self.prompt_preload_result,
+            "actual_load_result": self.actual_load_result,
+            "execution_started": self.execution_started,
+            "execution_success": self.execution_success,
+            "known_good_marked": self.known_good_marked,
+            "known_good_mark_result": self.known_good_mark_result,
+            "failure_phase": self.failure_phase,
+            "failure_reason": self.failure_reason,
+            "clip_actual_load_submitted": self.clip_actual_load_submitted,
+            "clip_actual_load_cache_hit": self.clip_actual_load_cache_hit,
+            "clip_actual_load_duration_ms": self.clip_actual_load_duration_ms,
+        }
+
+
+def make_request_pipeline_summary(**kwargs) -> dict:
+    """Build a compact request pipeline summary for log/metadata.
+
+    Passes all kwargs matching ``RequestPipelineState`` fields through
+    to the state object so callers provide real data rather than defaults.
+    """
+    state = RequestPipelineState(
+        request_id=kwargs.get("request_id", ""),
+        mode=kwargs.get("mode", ""),
+        stream=kwargs.get("stream", False),
+    )
+    for field in RequestPipelineState.__slots__:
+        if field in kwargs and field not in ("request_id", "mode", "stream"):
+            setattr(state, field, kwargs[field])
+    return state.to_summary()
+
+
+def custom_node_dependency_fingerprint(source_root: str) -> dict:
+    """Build a dependency-only fingerprint for caching.
+
+    Uses ``collect_custom_node_dependency_files`` for every top-level
+    custom node.  Includes only dependency-relevant files (no ordinary
+    .py source, no mtimes).  The ``overall_dependency_hash`` changes
+    only when dependency-relevant files change.
+
+    Returns:
+        ``{"schema_version": 1, "source_root": str, "nodes": {...},
+          "overall_dependency_hash": str}``
+    """
+    hasher = hashlib.sha256()
+    nodes_out: dict = {}
+    for entry in _iter_syncable_custom_node_dirs(source_root):
+        node_path = os.path.join(source_root, entry)
+        dep_files = collect_custom_node_dependency_files(node_path)
+        if not dep_files:
+            continue
+        nodes_out[entry] = {"dependency_files": dep_files}
+        for rel_path in sorted(dep_files):
+            hasher.update(f"{entry}/{rel_path}:{dep_files[rel_path]}".encode())
+
+    return {
+        "schema_version": 1,
+        "source_root": source_root,
+        "nodes": nodes_out,
+        "overall_dependency_hash": hasher.hexdigest(),
+    }
+
+
+def build_custom_node_dependency_manifest(source_root: str) -> dict:
+    """Build a deterministic dependency manifest for all custom nodes under
+    *source_root*.
+
+    Scans dependency-relevant files only — not entire source trees.
+    """
+    import sys as _sys
+    nodes_manifest: dict[str, dict] = {}
+    overall_input: dict[str, dict] = {}
+    for node_name in _iter_syncable_custom_node_dirs(source_root):
+        node_path = os.path.join(source_root, node_name)
+        dep_files = _collect_dependency_file_paths(node_path)
+        has_reqs = "requirements.txt" in dep_files
+        req_hash = ""
+        if has_reqs:
+            req_hash = dep_files["requirements.txt"]
+        nodes_manifest[node_name] = {
+            "has_requirements": has_reqs,
+            "dependency_files": dep_files,
+            "requirements_hash": req_hash,
+        }
+        # Only include nodes with non-empty dependency_files in overall hash
+        # so adding/removing a no-dependency node does not force a rebuild.
+        if dep_files:
+            overall_input[node_name] = dep_files
+
+    syncable_node_names = _iter_syncable_custom_node_dirs(source_root)
+    dependency_node_names = sorted([
+        name for name, data in nodes_manifest.items() if data.get("dependency_files")
+    ])
+    stable = json.dumps(overall_input, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    overall_hash = hashlib.sha256(stable.encode("utf-8")).hexdigest()
+    return {
+        "schema_version": 2,
+        "created_by": "comfyapp.py",
+        "python_version": f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
+        "comfyapp_version": COMFYAPP_VERSION,
+        "source_root": source_root,
+        "syncable_node_names": syncable_node_names,
+        "nodes": nodes_manifest,
+        "dependency_nodes": dependency_node_names,
+        "overall_dependency_hash": overall_hash,
+    }
+
+
+def load_baked_custom_node_dependency_manifest() -> dict:
+    """Read the baked dependency manifest from inside the image.
+
+    Returns an empty dict if the manifest does not exist (image was not
+    built with the manifest — compatibility fallback).
+    """
+    if not os.path.isfile(BAKED_CUSTOM_NODE_DEPS_MANIFEST_PATH):
+        return {}
+    try:
+        with open(BAKED_CUSTOM_NODE_DEPS_MANIFEST_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("schema_version") in (1, 2):
+            return data
+        return {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def get_runtime_custom_node_source_root_for_dependency_validation() -> str:
+    """Return the custom-node source root that actually controls runtime nodes.
+
+    The volume (``CUSTOM_NODES_PATH``) is authoritative for dynamic custom
+    nodes.  When the volume is empty or contains only non-syncable entries
+    (``.staging``, ``__pycache__``, etc.), the image-baked nodes at
+    ``/root/comfy/ComfyUI/custom_nodes`` are used as fallback.
+
+    Uses ``_iter_syncable_custom_node_dirs`` to filter out non-node entries
+    so that stray artifacts do not cause false dependency mismatches.
+    """
+    _raw_entries = len(_safe_listdir(CUSTOM_NODES_PATH)) if os.path.isdir(CUSTOM_NODES_PATH) else 0
+    _syncable = _iter_syncable_custom_node_dirs(CUSTOM_NODES_PATH) if os.path.isdir(CUSTOM_NODES_PATH) else []
+    if os.path.isdir(CUSTOM_NODES_PATH) and _syncable:
+        _used_root = CUSTOM_NODES_PATH
+        _source = "volume"
+    else:
+        _used_root = "/root/comfy/ComfyUI/custom_nodes"
+        _source = "image_baked"
+    print(
+        f"[comfyapp] dependency_validation source_root={_used_root} "
+        f"source={_source} "
+        f"volume_syncable_nodes={len(_syncable)} "
+        f"raw_volume_entries={_raw_entries}"
+    )
+    return _used_root
+
+
+def build_current_custom_node_dependency_manifest() -> dict:
+    """Build a current dependency manifest from the runtime source root.
+
+    Uses the same scanning rules as ``build_custom_node_dependency_manifest``.
+    The source root is determined by
+    ``get_runtime_custom_node_source_root_for_dependency_validation()``:
+    volume if it has content, otherwise the image-baked custom nodes path.
+    """
+    return build_custom_node_dependency_manifest(
+        get_runtime_custom_node_source_root_for_dependency_validation()
+    )
+
+
+def validate_custom_node_dependencies_prepared() -> dict:
+    """Compare the baked image manifest against the current custom-node volume.
+
+    Returns a dict with keys:
+    - prepared: bool
+    - reason: str
+    - baked_hash: str | None
+    - current_hash: str | None
+    - changed_nodes: list[str]
+    """
+    baked = load_baked_custom_node_dependency_manifest()
+    if not baked:
+        return {
+            "prepared": False,
+            "reason": "baked_manifest_missing",
+            "baked_hash": None,
+            "current_hash": None,
+            "changed_nodes": [],
+        }
+    try:
+        current = build_current_custom_node_dependency_manifest_cached()
+    except Exception as exc:
+        return {
+            "prepared": False,
+            "reason": f"current_manifest_invalid:{exc}",
+            "baked_hash": baked.get("overall_dependency_hash"),
+            "current_hash": None,
+            "changed_nodes": [],
+        }
+    baked_hash = baked.get("overall_dependency_hash", "")
+    current_hash = current.get("overall_dependency_hash", "")
+
+    baked_node_names = set(baked.get("syncable_node_names", baked.get("nodes", {}).keys()) or [])
+    current_node_names = set(current.get("syncable_node_names", current.get("nodes", {}).keys()) or [])
+
+    # Node set mismatch detection: if baked manifest has no nodes but current does
+    if current_node_names and not baked_node_names:
+        return {
+            "prepared": False,
+            "reason": "baked_manifest_has_no_custom_nodes",
+            "baked_hash": baked_hash,
+            "current_hash": current_hash,
+            "changed_nodes": sorted(current_node_names),
+        }
+
+    if baked_node_names != current_node_names:
+        _ignored_env = os.environ.get("COMFYMODAL_CUSTOM_NODE_SET_MISMATCH_IGNORE", "").strip()
+        _ignored = {x.strip() for x in _ignored_env.split(",")} if _ignored_env else set()
+        missing_in_baked = sorted(current_node_names - baked_node_names - _ignored)
+        extra_in_baked = sorted(baked_node_names - current_node_names - _ignored)
+        effective_mismatch = bool(missing_in_baked or extra_in_baked)
+        if _ignored:
+            print(
+                f"[comfyapp] node_set_mismatch_ignored={sorted(_ignored & (current_node_names ^ baked_node_names))} "
+                f"(configured via COMFYMODAL_CUSTOM_NODE_SET_MISMATCH_IGNORE)"
+            )
+        if not effective_mismatch:
+            if baked_hash == current_hash:
+                return {
+                    "prepared": True,
+                    "reason": "hash_match_after_ignored_mismatches",
+                    "baked_hash": baked_hash,
+                    "current_hash": current_hash,
+                    "changed_nodes": [],
+                }
+        return {
+            "prepared": False,
+            "reason": "custom_node_set_mismatch",
+            "baked_hash": baked_hash,
+            "current_hash": current_hash,
+            "changed_nodes": missing_in_baked,
+        }
+
+    if baked_hash == current_hash:
+        return {
+            "prepared": True,
+            "reason": "hash_match",
+            "baked_hash": baked_hash,
+            "current_hash": current_hash,
+            "changed_nodes": [],
+        }
+    # Find changed nodes
+    baked_nodes = baked.get("nodes", {})
+    current_nodes = current.get("nodes", {})
+    changed = []
+    all_names = set(baked_nodes) | set(current_nodes)
+    for name in sorted(all_names):
+        bn = baked_nodes.get(name, {})
+        cn = current_nodes.get(name, {})
+        if bn.get("requirements_hash") != cn.get("requirements_hash"):
+            changed.append(name)
+        elif bn.get("dependency_files") != cn.get("dependency_files"):
+            changed.append(name)
+    return {
+        "prepared": False,
+        "reason": "dependency_hash_mismatch",
+        "baked_hash": baked_hash,
+        "current_hash": current_hash,
+        "changed_nodes": changed,
+    }
+
+
+# ── PART 11: Known-good workflow profiles ──
+def load_known_good_workflow_profiles() -> dict:
+    """Load known-good workflow profiles from the volume."""
+    try:
+        if os.path.isfile(KNOWN_GOOD_WORKFLOW_PROFILES_PATH):
+            with open(KNOWN_GOOD_WORKFLOW_PROFILES_PATH, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+import threading as _threading
+_volume_commit_lock = _threading.Lock()
+_volume_commit_inflight_labels: set[str] = set()
+_volume_commit_dirty_labels: set[str] = set()
+
+
+def _commit_volume_async(label: str = "") -> None:
+    """Schedule an asynchronous ``vol.commit()`` in a daemon thread.
+
+    Uses a loop‑based worker per label so no follow‑up depth cap can
+    drop a dirty write:
+
+    * If no commit is running for *label*, start one.
+    * If a commit is already running, mark *label* dirty and return.
+    * The running worker loops until no dirty marker remains.
+    """
+    import threading
+    with _volume_commit_lock:
+        if label and label in _volume_commit_inflight_labels:
+            _volume_commit_dirty_labels.add(label)
+            print(
+                f"[comfyapp] volume_commit_async_deferred "
+                f"label={label} reason=already_in_flight_marked_dirty"
+            )
+            return
+        if label:
+            _volume_commit_inflight_labels.add(label)
+    if label:
+        print(f"[comfyapp] volume_commit_async_started label={label}")
+    t = threading.Thread(target=_commit_worker, args=(label,), daemon=True)
+    t.start()
+
+
+def _commit_worker(label: str) -> None:
+    """Loop: commit until no dirty marker remains for this label."""
+    while True:
+        try:
+            vol.commit()
+            print(f"[comfyapp] volume_commit_async_finished label={label}")
+        except Exception as exc:
+            print(f"[comfyapp] volume_commit_async_failed label={label} error={exc}")
+        with _volume_commit_lock:
+            if label and label in _volume_commit_dirty_labels:
+                _volume_commit_dirty_labels.discard(label)
+                print(f"[comfyapp] volume_commit_async_followup_started label={label}")
+                continue
+            if label:
+                _volume_commit_inflight_labels.discard(label)
+            break
+
+
+def save_known_good_workflow_profiles(profiles: dict) -> None:
+    """Persist known-good workflow profiles to the volume."""
+    try:
+        os.makedirs(os.path.dirname(KNOWN_GOOD_WORKFLOW_PROFILES_PATH), exist_ok=True)
+        tmp = f"{KNOWN_GOOD_WORKFLOW_PROFILES_PATH}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(profiles, f, indent=2, sort_keys=True)
+        os.replace(tmp, KNOWN_GOOD_WORKFLOW_PROFILES_PATH)
+        _commit_volume_async(label="known_good_profiles")
+    except Exception as exc:
+        print(f"[comfyapp] failed to save known-good profiles: {exc}")
+
+
+def _is_known_good_workflow_profile(workflow_hash: str, profile: dict) -> bool:
+    """Return True if this workflow/profile is known-good (previously succeeded)."""
+    profiles = load_known_good_workflow_profiles()
+    if workflow_hash in profiles:
+        return True
+    mode = profile.get("mode", "")
+    if mode == "checkpoint":
+        ckpt = profile.get("checkpoint", "")
+        return any(
+            p.get("mode") == "checkpoint" and p.get("checkpoint") == ckpt
+            for p in profiles.values()
+        )
+    elif mode == "split":
+        unet = profile.get("unet", "")
+        return any(
+            p.get("mode") == "split" and p.get("unet") == unet
+            for p in profiles.values()
+        )
+    return False
+
+
+def _mark_known_good_workflow_profile(workflow_hash: str, profile: dict) -> bool:
+    """Mark a workflow/profile as known-good after successful execution.
+
+    Returns True if a new or changed entry was persisted and a volume
+    commit was scheduled.  Returns False when the entry already exists
+    and is identical (no commit scheduled).
+    """
+    profiles = load_known_good_workflow_profiles()
+    new_entry = {
+        "mode": profile.get("mode", ""),
+        "workflow_hash": workflow_hash,
+        **profile,
+    }
+    existing = profiles.get(workflow_hash)
+    if existing is not None and existing == new_entry:
+        print(f"[comfyapp] marked known-good workflow hash={workflow_hash} changed=0 (identical)")
+        return False
+    profiles[workflow_hash] = new_entry
+    save_known_good_workflow_profiles(profiles)
+    print(f"[comfyapp] marked known-good workflow hash={workflow_hash} changed=1")
+    return True
+
+
+def load_current_dependency_manifest_cache() -> dict:
+    """Load the cached current dependency manifest.
+
+    Returns an empty dict when the cache does not exist or is corrupt.
+    """
+    try:
+        if os.path.isfile(CURRENT_CUSTOM_NODE_DEPS_CACHE_PATH):
+            with open(CURRENT_CUSTOM_NODE_DEPS_CACHE_PATH, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("schema_version") == 1:
+                return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def save_current_dependency_manifest_cache(cache: dict) -> None:
+    """Persist the current dependency manifest cache to volume storage."""
+    try:
+        os.makedirs(os.path.dirname(CURRENT_CUSTOM_NODE_DEPS_CACHE_PATH), exist_ok=True)
+        tmp = f"{CURRENT_CUSTOM_NODE_DEPS_CACHE_PATH}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(cache, f, indent=2, sort_keys=True)
+        os.replace(tmp, CURRENT_CUSTOM_NODE_DEPS_CACHE_PATH)
+        _commit_volume_async(label="dependency_manifest_cache")
+    except Exception as exc:
+        print(f"[comfyapp] failed to save dependency manifest cache: {exc}")
+
+
+def build_current_custom_node_dependency_manifest_cached() -> dict:
+    """Build current dependency manifest using the dependency-only fingerprint cache.
+
+    When the dependency fingerprint is unchanged since the last call, the
+    previously-built manifest is returned.  The cache is invalidated only
+    when dependency-relevant file content changes (requirements.txt,
+    pyproject.toml, setup.py, etc.) — ordinary .py source changes do not
+    invalidate it.
+    """
+    source_root = get_runtime_custom_node_source_root_for_dependency_validation()
+    dep_fp = custom_node_dependency_fingerprint(source_root)
+    dep_hash = dep_fp.get("overall_dependency_hash", "")
+
+    cache = load_current_dependency_manifest_cache()
+    cache_manifest = cache.get("manifest") if isinstance(cache, dict) else None
+    if (
+        cache
+        and isinstance(cache_manifest, dict)
+        and cache.get("source_root") == source_root
+        and cache.get("dependency_fingerprint_hash") == dep_hash
+    ):
+        print(f"[comfyapp] dependency_manifest_cache hit hash={dep_hash[:16]}...")
+        return cache_manifest
+
+    reason = "miss"
+    if not cache:
+        reason = "no_cache"
+    elif cache.get("source_root") != source_root:
+        reason = "source_root_changed"
+    elif cache.get("dependency_fingerprint_hash") != dep_hash:
+        reason = "fingerprint_changed"
+
+    manifest = build_custom_node_dependency_manifest(source_root)
+    new_cache = {
+        "schema_version": 1,
+        "source_root": source_root,
+        "dependency_fingerprint_hash": dep_hash,
+        "manifest": manifest,
+        "created_at": time.time(),
+    }
+    save_current_dependency_manifest_cache(new_cache)
+    print(f"[comfyapp] dependency_manifest_cache miss reason={reason} hash={dep_hash[:16]}...")
+    return manifest
 
 
 _REQ_TOP_LEVEL_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]*")
@@ -647,10 +1529,28 @@ def load_runtime_metadata() -> dict:
 
 
 def save_runtime_metadata(data: dict) -> None:
-    """Persist JSON metadata to the container filesystem."""
+    """Persist JSON metadata to the volume, scheduling an async commit.
+
+    Skips write when the content is identical to the existing file to
+    avoid unnecessary volume commits in the hot path.
+    """
+    payload = json.dumps(data, indent=2, sort_keys=True)
+    if os.path.isfile(RUNTIME_METADATA_PATH):
+        try:
+            with open(RUNTIME_METADATA_PATH, "r", encoding="utf-8") as f:
+                if f.read() == payload:
+                    return
+        except (OSError, UnicodeDecodeError):
+            pass
     os.makedirs(os.path.dirname(RUNTIME_METADATA_PATH), exist_ok=True)
-    with open(RUNTIME_METADATA_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
+    tmp_path = f"{RUNTIME_METADATA_PATH}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp_path, RUNTIME_METADATA_PATH)
+        _commit_volume_async(label="runtime_metadata")
+    except Exception as exc:
+        print(f"[comfyapp] failed to save runtime metadata: {exc}")
 
 
 def set_manager_network_mode_offline() -> list[str]:
@@ -924,19 +1824,135 @@ def stack_to_profile(stack: dict) -> dict:
     return {}
 
 
+# ── PART 8: Runtime model-download policy ──
+#   off       — Never download model files during request execution.
+#   explicit  — Only download via explicit preinstall/precache functions.
+#   dev       — Allow runtime model downloads (current default for dev).
+COMFYMODAL_ALLOW_RUNTIME_MODEL_DOWNLOADS = os.getenv("COMFYMODAL_ALLOW_RUNTIME_MODEL_DOWNLOADS", "0") == "1"
+COMFYMODAL_MODEL_DOWNLOAD_MODE = os.getenv("COMFYMODAL_MODEL_DOWNLOAD_MODE", "dev").strip().lower()
+
+
+def _check_runtime_model_download_policy(context: str = "") -> bool:
+    """Check whether runtime model downloads are allowed.
+
+    Returns True if downloads are permitted.  Logs a warning if blocked.
+    """
+    if COMFYMODAL_MODEL_DOWNLOAD_MODE in ("off", "explicit") and not COMFYMODAL_ALLOW_RUNTIME_MODEL_DOWNLOADS:
+        context_str = f" ({context})" if context else ""
+        print(
+            f"[comfyapp] runtime_model_download BLOCKED by policy "
+            f"mode={COMFYMODAL_MODEL_DOWNLOAD_MODE}{context_str}"
+        )
+        return False
+    return True
+
+
+def _verify_model_file(path: str, expected_size: int | None = None, expected_sha256: str | None = None) -> dict:
+    """Verify a model file exists and optionally matches size/hash.
+
+    Returns dict with keys: exists, size_ok, sha256_ok, actual_size, actual_sha256.
+    """
+    result = {"exists": False, "size_ok": None, "sha256_ok": None, "actual_size": None, "actual_sha256": None}
+    if not os.path.isfile(path):
+        return result
+    result["exists"] = True
+    try:
+        actual_size = os.path.getsize(path)
+        result["actual_size"] = actual_size
+        if expected_size is not None:
+            result["size_ok"] = actual_size == expected_size
+    except OSError:
+        pass
+    if expected_sha256 is not None:
+        try:
+            actual_sha256 = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            result["actual_sha256"] = actual_sha256
+            result["sha256_ok"] = actual_sha256 == expected_sha256
+        except OSError:
+            pass
+    return result
+
+
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.14.3"
+COMFYAPP_VERSION = "2.15.0"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
 CUSTOM_NODES_VOLUME_NAME = "comfyui-custom-nodes"
 COMFYUI_PORT = 8188
 
+
+def _looks_like_custom_nodes_source_root(path: str) -> bool:
+    if not path or not os.path.isdir(path):
+        return False
+    real = os.path.realpath(path)
+    if real in ("/", "/root", "/home", "/mnt", "/tmp", "/usr", "/opt"):
+        return False
+    try:
+        entries = sorted(os.listdir(path))
+    except OSError:
+        return False
+    candidate_count = 0
+    for name in entries:
+        p = os.path.join(path, name)
+        if not os.path.isdir(p) or os.path.islink(p) or name.startswith("."):
+            continue
+        if os.path.isfile(os.path.join(p, "__init__.py")) or os.path.isfile(os.path.join(p, "requirements.txt")):
+            candidate_count += 1
+    return candidate_count >= 3
+
+
+def _resolve_local_custom_nodes_root() -> str:
+    explicit = os.getenv("COMFYMODAL_LOCAL_CUSTOM_NODES", "").strip()
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = []
+    if explicit:
+        candidates.append(explicit)
+    candidates.extend([
+        os.path.abspath(os.path.join(here, "..")),
+        os.path.abspath(os.path.join(here, "..", "custom_nodes")),
+        os.path.abspath(os.path.join(here, "..", "ComfyUI", "custom_nodes")),
+        "/root/comfy/ComfyUI/custom_nodes",
+        os.path.abspath(os.path.join(here, "comfy", "ComfyUI", "custom_nodes")),
+    ])
+    for candidate in candidates:
+        candidate = os.path.abspath(candidate)
+        if _looks_like_custom_nodes_source_root(candidate):
+            return candidate
+    if os.environ.get("COMFYMODAL_RUNTIME") == "1":
+        return "/root/comfy/ComfyUI/custom_nodes"
+    raise RuntimeError(
+        "Could not resolve local custom-node source root. "
+        "Set env COMFYMODAL_LOCAL_CUSTOM_NODES to the local directory "
+        "that contains your custom node folders (the parent directory "
+        "containing 'comfyui-modal' and other custom-node directories). "
+        f"Tried: {candidates}"
+    )
+
+
+def _assert_valid_local_custom_nodes_root(path: str) -> None:
+    real = os.path.realpath(path)
+    if real in ("/", "/root", "/home", "/mnt", "/tmp", "/usr", "/opt"):
+        raise RuntimeError(f"Refusing to use unsafe local custom-node root: {real}")
+    nodes = _iter_syncable_custom_node_dirs(path)
+    if not nodes:
+        raise RuntimeError(
+            f"Local custom-node root has no syncable nodes: {real} "
+            f"(resolve sources tried: {[os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), p)) for p in ['..', '../custom_nodes', '../ComfyUI/custom_nodes']]})"
+        )
+    suspicious_system_names = {"bin", "boot", "dev", "etc", "lib", "proc", "sys", "usr", "var"}
+    if len(set(nodes) & suspicious_system_names) >= 3:
+        raise RuntimeError(
+            f"Local custom-node root looks like a system root, not custom nodes: {real}; "
+            f"nodes={nodes[:30]}"
+        )
+
+
 # Resolved at deploy time to copy local custom nodes into the image.
 _COMFYUI_MODAL_DIR = os.path.dirname(os.path.abspath(__file__))
-_LOCAL_CUSTOM_NODES = os.path.abspath(os.path.join(_COMFYUI_MODAL_DIR, ".."))
+_LOCAL_CUSTOM_NODES = _resolve_local_custom_nodes_root()
 
 # Requirements-only build context so pip-install layers cache independently of
 # non-requirements custom node source changes.
@@ -944,7 +1960,7 @@ _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR = os.path.join(
     _COMFYUI_MODAL_DIR, ".custom_node_requirements"
 )
 
-_CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
+_CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".ipynb_checkpoints"}
 _CUSTOM_NODE_IMAGE_IGNORE_PATTERNS = [
     ".git/",
     "__pycache__/",
@@ -1002,13 +2018,22 @@ _CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE = shutil.ignore_patterns(
 
 
 def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
-    """Return sorted, filtered list of top-level custom node directory names."""
+    """Return sorted, filtered list of top-level custom node directory names.
+
+    Filters:
+    - must be a regular directory (not a symlink, not a file)
+    - must not start with ``.``
+    - must not be in the exclude set (``.git``, ``__pycache__``, …)
+    - broken symlinks are excluded (``os.path.isdir`` returns ``False``)
+    """
     if not os.path.isdir(cn_root):
         return []
     names = []
     for node_name in sorted(os.listdir(cn_root)):
         node_path = os.path.join(cn_root, node_name)
         if not os.path.isdir(node_path):
+            continue
+        if os.path.islink(node_path):
             continue
         if node_name.startswith(".") or node_name in _CUSTOM_NODE_SYNC_EXCLUDE_DIRS:
             continue
@@ -1071,83 +2096,108 @@ def _build_requirements_context_manifest(root: str) -> dict[str, str]:
     return manifest
 
 
-def _copy_requirement_reference_tree(
-    req_file: str,
-    node_path: str,
-    staged_node_dir: str,
-    seen_files: set[str],
-) -> None:
-    req_file = os.path.abspath(req_file)
-    if req_file in seen_files:
+def _safe_dependency_relpath(filepath: str, node_root: str) -> str:
+    """Return a POSIX-style relative path from *node_root* to *filepath*.
+
+    Raises ``RuntimeError`` if *filepath* is outside *node_root* or contains
+    path traversal (``../``).  External local editable/path dependencies are
+    not supported for the cached build context.
+    """
+    resolved_file = os.path.realpath(filepath)
+    resolved_root = os.path.realpath(node_root)
+    try:
+        common = os.path.commonpath([resolved_file, resolved_root])
+    except ValueError:
+        raise RuntimeError(
+            f"Local dependency path is outside custom node root and is not "
+            f"supported for cached build context: {filepath} relative to "
+            f"{node_root}. Move the dependency inside the custom node folder "
+            f"or package it as a wheel."
+        )
+    if common != resolved_root:
+        raise RuntimeError(
+            f"Local dependency path is outside custom node root and is not "
+            f"supported for cached build context: {filepath} relative to "
+            f"{node_root}. Move the dependency inside the custom node folder "
+            f"or package it as a wheel."
+        )
+    rel = os.path.relpath(resolved_file, resolved_root).replace("\\", "/")
+    if rel.startswith("/"):
+        raise RuntimeError(
+            f"Path {rel} is absolute after resolution. "
+            f"Move the dependency inside {node_root}."
+        )
+    parts = rel.split("/")
+    if any(part == ".." for part in parts):
+        raise RuntimeError(
+            f"Path {rel} escapes the custom node root and is not supported. "
+            f"Move the dependency inside {node_root}."
+        )
+    return rel
+
+
+# _copy_requirement_reference_tree was intentionally removed.
+# All dependency copying uses collect_custom_node_dependency_files +
+# _sync_custom_node_dependency_files, which is the single source of truth.
+
+
+def _sync_custom_node_dependency_files(node_path: str, dst_node_dir: str) -> None:
+    """Sync dependency files from *node_path* to *dst_node_dir*.
+
+    Copies the exact set of files returned by
+    ``collect_custom_node_dependency_files``.  Only overwrites the target
+    when file content actually differs.
+    """
+    dep_files = collect_custom_node_dependency_files(node_path)
+    if not dep_files:
         return
-    seen_files.add(req_file)
-
-    rel_req = os.path.relpath(req_file, node_path)
-    dst_req = os.path.normpath(os.path.join(staged_node_dir, rel_req))
-    os.makedirs(os.path.dirname(dst_req), exist_ok=True)
-    shutil.copy2(req_file, dst_req)
-
-    req_dir = os.path.dirname(req_file)
-    req_text = Path(req_file).read_text(encoding="utf-8")
-    for line in req_text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        stripped = stripped.split(";", 1)[0].strip()
-        if not stripped:
-            continue
-
-        if stripped.startswith("-e "):
-            stripped = stripped[3:].strip()
-        elif stripped.startswith("--editable "):
-            stripped = stripped[len("--editable "):].strip()
-        elif stripped.startswith("-r "):
-            include_path = os.path.abspath(os.path.join(req_dir, stripped[3:].strip()))
-            if os.path.isfile(include_path):
-                _copy_requirement_reference_tree(include_path, node_path, staged_node_dir, seen_files)
-            continue
-        elif stripped.startswith("--requirement "):
-            include_path = os.path.abspath(
-                os.path.join(req_dir, stripped[len("--requirement "):].strip())
-            )
-            if os.path.isfile(include_path):
-                _copy_requirement_reference_tree(include_path, node_path, staged_node_dir, seen_files)
-            continue
-
-        if not (stripped.startswith("./") or stripped.startswith("../")):
-            continue
-        local_path = os.path.abspath(os.path.join(req_dir, stripped))
-        if not os.path.exists(local_path):
-            continue
-        rel_local = os.path.relpath(local_path, node_path)
-        dst_local = os.path.normpath(os.path.join(staged_node_dir, rel_local))
-        if os.path.isdir(local_path):
-            shutil.copytree(
-                local_path,
-                dst_local,
-                dirs_exist_ok=True,
-                ignore=_CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE,
-            )
-        elif os.path.isfile(local_path):
-            os.makedirs(os.path.dirname(dst_local), exist_ok=True)
-            shutil.copy2(local_path, dst_local)
-
-
-def _copy_custom_node_requirements_build_context(node_path: str, dst_node_dir: str) -> None:
-    node_name = os.path.basename(node_path)
-    staged_node_dir = os.path.join(dst_node_dir, node_name)
-    _copy_requirement_reference_tree(
-        os.path.join(node_path, "requirements.txt"),
-        node_path,
-        staged_node_dir,
-        seen_files=set(),
-    )
-
-
-def _sync_custom_node_requirements_build_context(node_path: str, dst_node_dir: str) -> None:
     with tempfile.TemporaryDirectory() as temp_root:
         staged_dir = os.path.join(temp_root, os.path.basename(dst_node_dir))
-        _copy_custom_node_requirements_build_context(node_path, staged_dir)
+        os.makedirs(staged_dir, exist_ok=True)
+        for rel_path in dep_files:
+            # Normalize separators before any safety check
+            normalized_rel = rel_path.replace("\\", "/")
+            if normalized_rel.startswith("/") or any(part == ".." for part in normalized_rel.split("/")):
+                raise RuntimeError(
+                    f"Unsafe dependency path key in manifest: {rel_path!r}. "
+                    f"This indicates a corrupted or malicious manifest. "
+                    f"Skipping copy for {node_path}."
+                )
+            src = os.path.join(node_path, normalized_rel.replace("/", os.sep))
+            if not os.path.isfile(src):
+                continue
+            # Defense-in-depth: verify src stays within node_path
+            src_real = os.path.realpath(src)
+            node_root_real = os.path.realpath(node_path)
+            try:
+                src_common = os.path.commonpath([node_root_real, src_real])
+            except ValueError:
+                raise RuntimeError(
+                    f"Source dependency {rel_path} is on a different drive than "
+                    f"{node_path}. Aborting copy."
+                )
+            if src_common != node_root_real:
+                raise RuntimeError(
+                    f"Source dependency {rel_path} is outside {node_path}. "
+                    f"Aborting copy."
+                )
+            dst = os.path.join(staged_dir, normalized_rel.replace("/", os.sep))
+            dst_real = os.path.realpath(dst)
+            staged_real = os.path.realpath(staged_dir)
+            try:
+                dst_common = os.path.commonpath([staged_real, dst_real])
+            except ValueError:
+                raise RuntimeError(
+                    f"Dependency path {rel_path} resolves to a different drive "
+                    f"than staging. Aborting copy."
+                )
+            if dst_common != staged_real:
+                raise RuntimeError(
+                    f"Dependency path {rel_path} would copy outside staged "
+                    f"directory. Aborting copy for {node_path}."
+                )
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
         if _build_requirements_context_manifest(staged_dir) == _build_requirements_context_manifest(dst_node_dir):
             return
         if os.path.isdir(dst_node_dir):
@@ -1156,24 +2206,26 @@ def _sync_custom_node_requirements_build_context(node_path: str, dst_node_dir: s
 
 
 def _prepare_custom_node_requirements_build_context(source_root: str, target_root: str) -> None:
-    """Copy only requirements.txt from each top-level custom node into target_root.
+    """Copy dependency files from each custom node into target_root.
 
-    This creates a minimal directory tree that shares the same top-level node
-    directory names as *source_root* but contains only ``requirements.txt``
-    files.  Excluded dirs (``.git``, ``__pycache__``, etc.) are skipped.
+    Uses ``collect_custom_node_dependency_files`` as the single source of
+    truth (same scanner used by ``build_custom_node_dependency_manifest``).
+    Copies only dependency-relevant files (requirements.txt, pyproject.toml,
+    setup.py, setup.cfg, -r/-c references, local editable deps).
+
     The resulting tree is used as a separate ``add_local_dir`` build context
-    so that Docker layer caching only busts the pip-install step when
-    requirements content actually changes.
+    so that Docker layer caching busts the pip-install step when any
+    dependency-relevant file changes.
     """
     os.makedirs(target_root, exist_ok=True)
     desired_nodes = set()
     for node_name in _iter_syncable_custom_node_dirs(source_root):
         node_path = os.path.join(source_root, node_name)
-        src_req = os.path.join(node_path, "requirements.txt")
-        if not os.path.isfile(src_req):
+        dep_files = collect_custom_node_dependency_files(node_path)
+        if not dep_files:
             continue
         desired_nodes.add(node_name)
-        _sync_custom_node_requirements_build_context(
+        _sync_custom_node_dependency_files(
             node_path,
             os.path.join(target_root, node_name),
         )
@@ -1184,6 +2236,7 @@ def _prepare_custom_node_requirements_build_context(source_root: str, target_roo
             _rmtree_robust(entry_path)
 
 
+_assert_valid_local_custom_nodes_root(_LOCAL_CUSTOM_NODES)
 _prepare_custom_node_requirements_build_context(
     _LOCAL_CUSTOM_NODES, _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR
 )
@@ -1279,10 +2332,10 @@ _image_base = (
             # Restore latency fix — default production profile (Config D)
             "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
             "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
-            "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "1",
-            "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
+            "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "0",
+            "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "0",
             "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "0",
-            "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "0",
+            "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "1",
             "COMFYMODAL_RUNTIME": "1",
             "PROMPT_ASYNC_PRELOAD": "0",
             "PROMPT_PRELOAD_WORKERS": "2",
@@ -1291,6 +2344,14 @@ _image_base = (
             "ACTUAL_LOAD_MODE": "unet_vae_only",
             "DISABLE_CACHEDIT_FOR_Z_IMAGE": "0",
             "DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE": "1",
+            # Production guardrails (PART 3, 4, 7)
+            "COMFYMODAL_REQUIREMENTS_REPAIR_MODE": "fail_fast",
+            "COMFYMODAL_PRELOAD_UNKNOWN_PROFILES": "0",
+            "COMFYMODAL_PRELOAD_MAX_TOTAL_GB": "12",
+            "COMFYMODAL_PRELOAD_MAX_FILE_GB": "10",
+            "COMFYMODAL_PRELOAD_MIN_THROUGHPUT_GBPS": "0.5",
+            "COMFYMODAL_PRELOAD_OUTLIER_ABORT_SECONDS": "10",
+            "COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY": "0",
         }
     )
 )
@@ -1303,12 +2364,12 @@ _image_base = _image_base.add_local_dir(
     "/root/comfy-build/custom_node_requirements",
     copy=True,
 ).run_commands(
-    '_pip_node() { local n="$1"; local d="$2"; '
-    '  [ -f "$d/$n/requirements.txt" ] || return 0; '
-    '  cd "$d/$n" && pip install -r requirements.txt --quiet; '
+    '_pip_node() { local d="$1"; '
+    '  [ -f "$d/requirements.txt" ] || return 0; '
+    '  cd "$d" && pip install -r requirements.txt --quiet; '
     '}; '
     'for d in /root/comfy-build/custom_node_requirements/*/; do '
-    '  _pip_node "$(basename "$d")" "$d"; '
+    '  _pip_node "$d"; '
     'done'
 )
 
@@ -1322,17 +2383,67 @@ for _node_name in _iter_syncable_custom_node_dirs(_LOCAL_CUSTOM_NODES):
         ignore=_custom_node_image_ignore_patterns(_node_name),
     )
 
-image = (
-    _image_base
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace")
+# ── PART 4: Generate baked dependency manifest and copy into image ──
+_BAKED_MANIFEST_DIR = os.path.join(_COMFYUI_MODAL_DIR, ".baked_custom_node_deps")
+os.makedirs(_BAKED_MANIFEST_DIR, exist_ok=True)
+_BAKED_MANIFEST_TEMP = os.path.join(_BAKED_MANIFEST_DIR, "custom_node_deps_baked.json")
+try:
+    _baked_manifest = build_custom_node_dependency_manifest(_LOCAL_CUSTOM_NODES)
+    with open(_BAKED_MANIFEST_TEMP, "w", encoding="utf-8") as _f:
+        json.dump(_baked_manifest, _f, indent=2, sort_keys=True)
+    _baked_nodes = _baked_manifest.get("nodes", {})
+    _baked_node_names = sorted(_baked_nodes.keys())
+    _baked_node_count = len(_baked_node_names)
+    _baked_with_deps = sum(1 for n in _baked_nodes.values() if n.get("dependency_files"))
+    _baked_dep_nodes = sorted([n for n in _baked_nodes if _baked_nodes[n].get("dependency_files")])
+    _staged_reqs = _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR
+    _staged_count = len(os.listdir(_staged_reqs)) if os.path.isdir(_staged_reqs) else 0
+    print(f"[comfyapp] build-context: comfyapp_dir={_COMFYUI_MODAL_DIR}")
+    print(f"[comfyapp] build-context: local_source={_LOCAL_CUSTOM_NODES}")
+    print(f"[comfyapp] build-context: local_syncable_nodes={_baked_node_count} "
+          f"nodes_with_dep_files={_baked_with_deps}")
+    if _baked_node_names:
+        _truncated = _baked_node_names[:50]
+        print(f"[comfyapp] build-context: local_node_names={_truncated}"
+              f"{'...' if len(_baked_node_names) > 50 else ''}")
+    if _baked_dep_nodes:
+        _deps_truncated = _baked_dep_nodes[:30]
+        print(f"[comfyapp] build-context: nodes_with_dep_files={len(_baked_dep_nodes)} "
+              f"dep_nodes={_deps_truncated}"
+              f"{'...' if len(_baked_dep_nodes) > 30 else ''}")
+    print(f"[comfyapp] build-context: staged_requirements={_staged_reqs} staged_nodes={_staged_count}")
+    print(f"[comfyapp] baked manifest generated: nodes={_baked_node_count} "
+          f"deps_nodes={len(_baked_dep_nodes)} "
+          f"hash={_baked_manifest.get('overall_dependency_hash', '')[:16]}...")
+except Exception as _bake_exc:
+    print(f"[comfyapp] WARNING: baked manifest generation failed: {_bake_exc}")
+    # Write empty manifest so the file exists in the image
+    with open(_BAKED_MANIFEST_TEMP, "w", encoding="utf-8") as _f:
+        json.dump({"schema_version": 1, "nodes": {}, "overall_dependency_hash": ""}, _f)
+
+_image_base = _image_base.add_local_file(
+    _BAKED_MANIFEST_TEMP,
+    "/opt/comfymodal/custom_node_deps_baked.json",
+    copy=True,
 )
 
-download_image = (
+_COMFYMODAL_LOCAL_PYTHON_SOURCES = (
+    "gpu_catalog",
+    "timing_trace",
+    "api_prompt_validator",
+    "failure_summary",
+)
+
+def _add_comfymodal_local_python_sources(img):
+    for _module_name in _COMFYMODAL_LOCAL_PYTHON_SOURCES:
+        img = img.add_local_python_source(_module_name)
+    return img
+
+image = _add_comfymodal_local_python_sources(_image_base)
+
+download_image = _add_comfymodal_local_python_sources(
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("httpx>=0.27.0")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace")
 )
 
 app = modal.App(APP_NAME, image=image)
@@ -1363,11 +2474,17 @@ def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoi
     if civitai_token and ("civitai" in url or "civitai.red" in url):
         headers["Authorization"] = f"Bearer {civitai_token}"
 
+    # Atomic download: write to .part file, then rename on success
+    _part = dest.parent / f"{filename}.part"
+    if _part.exists():
+        _part.unlink()
+    total = 0
+    downloaded = 0
     with httpx.stream("GET", url, headers=headers, follow_redirects=True, timeout=1800) as r:
         r.raise_for_status()
         total = int(r.headers.get("content-length", 0))
         downloaded = 0
-        with open(dest, "wb") as f:
+        with open(_part, "wb") as f:
             for chunk in r.iter_bytes(chunk_size=1048576):
                 f.write(chunk)
                 downloaded += len(chunk)
@@ -1376,25 +2493,71 @@ def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoi
                     sys.stdout.write(f"\r  {pct:.1f}%  ({downloaded // 1024**2} MB / {total // 1024**2} MB)")
                     sys.stdout.flush()
 
+    if total and downloaded != total:
+        _part.unlink(missing_ok=True)
+        raise RuntimeError(f"Download size mismatch: expected {total} bytes, got {downloaded} bytes")
+
+    os.replace(str(_part), str(dest))
     vol.commit()
     return {"status": "ok", "path": str(dest)}
 
 
 @app.function(
-    gpu="a10g",
-    cpu=4,
-    memory=16384,
-    timeout=3600,
-    min_containers=0,
-    scaledown_window=2,
-    volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
+    image=download_image,
+    cpu=2,
+    memory=512,
+    timeout=1800,
+    volumes={MODELS_PATH: vol},
 )
-@modal.web_server(COMFYUI_PORT, startup_timeout=300)
-def ui():
-    subprocess.Popen(
-        f"comfy launch -- --listen 0.0.0.0 --port {COMFYUI_PORT}",
-        shell=True,
-    )
+def download_model_stream(url: str, filename: str, save_path: str = "checkpoints", hf_token: str = "", civitai_token: str = ""):
+    import httpx
+    from pathlib import Path
+
+    dest = Path(MODELS_PATH) / save_path / filename
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if dest.exists():
+        yield {"type": "complete", "status": "ok", "skipped": True, "path": str(dest), "filename": filename}
+        return
+
+    headers = {}
+    if hf_token and "huggingface.co" in url:
+        headers["Authorization"] = f"Bearer {hf_token}"
+    if civitai_token and ("civitai" in url or "civitai.red" in url):
+        headers["Authorization"] = f"Bearer {civitai_token}"
+
+    _part = dest.parent / f"{filename}.part"
+    if _part.exists():
+        _part.unlink()
+    total = 0
+    downloaded = 0
+    with httpx.stream("GET", url, headers=headers, follow_redirects=True, timeout=1800) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        downloaded = 0
+        with open(_part, "wb") as f:
+            for chunk in r.iter_bytes(chunk_size=1048576):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total:
+                    pct = downloaded / total * 100
+                    yield {
+                        "type": "progress",
+                        "pct": round(pct, 1),
+                        "downloaded_mb": downloaded // 1024**2,
+                        "total_mb": total // 1024**2,
+                        "filename": filename,
+                        "save_path": save_path,
+                    }
+
+    if total and downloaded != total:
+        _part.unlink(missing_ok=True)
+        yield {"type": "error", "message": f"Download size mismatch: expected {total} bytes, got {downloaded} bytes", "filename": filename}
+        return
+
+    os.replace(str(_part), str(dest))
+    vol.commit()
+    yield {"type": "complete", "status": "ok", "path": str(dest), "filename": filename}
 
 
 @app.function(
@@ -1415,10 +2578,59 @@ def batch_download_models(items: list, hf_token: str = "", civitai_token: str = 
     return results
 
 
+def _safe_remove_path(path: str) -> None:
+    """Remove a filesystem entry safely (symlink, dir, file, or missing)."""
+    if os.path.islink(path):
+        os.unlink(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+def _validate_safe_tar_member(member, staging_dir: str) -> None:
+    """Validate a tar member is safe to extract.
+
+    Rejects:
+    - absolute paths, parent references (``..``)
+    - empty/root target (``""``, ``"."``)
+    - symlinks, hardlinks, devices, FIFOs, and other specials
+    - members whose resolved path escapes *staging_dir*
+
+    Uses ``os.path.commonpath`` for containment rather than string
+    prefix checks to avoid path-component sibling attacks.
+    """
+    name = member.name or ""
+    normalized = name.replace("\\", "/")
+    parts = [p for p in normalized.split("/") if p not in ("", ".")]
+    if not parts:
+        raise ValueError(
+            f"Tar member {member.name!r} is empty or targets archive root — not allowed"
+        )
+    if name.startswith("/") or normalized.startswith("/") or any(part == ".." for part in parts):
+        raise ValueError(f"Tar member '{member.name}' contains unsafe path")
+    if member.issym() or member.islnk():
+        raise ValueError(
+            f"Tar member '{member.name}' is a symlink/hardlink — not allowed"
+        )
+    if member.isdev() or member.ischr() or member.isblk() or member.isfifo():
+        raise ValueError(f"Tar member '{member.name}' is a special file type — not allowed")
+    if not (member.isfile() or member.isdir()):
+        raise ValueError(f"Tar member '{member.name}' is an unsupported file type")
+    staging_real = os.path.realpath(staging_dir)
+    dest_real = os.path.realpath(os.path.join(staging_real, *parts))
+    try:
+        common = os.path.commonpath([staging_real, dest_real])
+    except ValueError:
+        raise ValueError(f"Tar member '{member.name}' would extract outside target directory")
+    if common != staging_real:
+        raise ValueError(f"Tar member '{member.name}' would extract outside target directory")
+
+
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
     cpu=2,
     memory=4096,
     timeout=1800,
@@ -1433,33 +2645,37 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
 
     staging_dir = os.path.join(CUSTOM_NODES_PATH, ".staging")
 
-    # Clean any leftover staging dir
-    if os.path.exists(staging_dir):
-        shutil.rmtree(staging_dir)
+    # Clean any leftover staging dir (safe regardless of type)
+    _safe_remove_path(staging_dir)
     os.makedirs(staging_dir)
 
-    # Extract to staging with path traversal protection
-    buf = io.BytesIO(archive_data)
-    with tarfile.open(fileobj=buf, mode="r:gz") as tar:
-        for member in tar.getmembers():
-            # Reject absolute paths and parent references
-            if member.name.startswith("/") or ".." in member.name.split("/"):
-                raise ValueError(f"Tar member '{member.name}' contains unsafe path")
-            # Verify resolved path stays within staging directory
-            member_path = os.path.normpath(os.path.join(staging_dir, member.name))
-            if not member_path.startswith(os.path.normpath(staging_dir)):
-                raise ValueError(f"Tar member '{member.name}' would extract outside target directory")
-        # Reset buffer and extract after validation
-        buf.seek(0)
-        with tarfile.open(fileobj=buf, mode="r:gz") as tar2:
-            tar2.extractall(path=staging_dir)
+    # Extract to staging with path traversal and symlink protection.
+    # NOTE: old content is NOT removed until the new archive has been
+    # fully validated AND extracted into staging.
+    try:
+        buf = io.BytesIO(archive_data)
+        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+            # Validate all members before any extraction
+            for member in tar.getmembers():
+                _validate_safe_tar_member(member, staging_dir)
+            buf.seek(0)
+            with tarfile.open(fileobj=buf, mode="r:gz") as tar2:
+                for member in tar2.getmembers():
+                    _validate_safe_tar_member(member, staging_dir)
+                    tar2.extract(member, path=staging_dir)
+    except Exception:
+        _safe_remove_path(staging_dir)
+        raise
 
-    # Swap: remove old content, move staging content into place
+    # ── Old content removal (only after new archive is in staging) ──
+    _staging_name = os.path.basename(staging_dir)
     for item in os.listdir(CUSTOM_NODES_PATH):
-        if item == ".staging":
+        if item == _staging_name:
             continue
         item_path = os.path.join(CUSTOM_NODES_PATH, item)
-        if os.path.isdir(item_path):
+        if os.path.islink(item_path):
+            os.unlink(item_path)
+        elif os.path.isdir(item_path):
             shutil.rmtree(item_path)
         else:
             os.remove(item_path)
@@ -1471,19 +2687,24 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
         shutil.move(src, dst)
 
     # Clean up staging
-    shutil.rmtree(staging_dir)
+    _safe_remove_path(staging_dir)
 
     custom_nodes_vol.commit()
 
-    # List what was extracted
-    nodes = [d for d in os.listdir(CUSTOM_NODES_PATH) if os.path.isdir(os.path.join(CUSTOM_NODES_PATH, d))]
-    return {"status": "ok", "nodes": nodes}
+    # Return runtime-syncable nodes (not artifacts)
+    nodes = _iter_syncable_custom_node_dirs(CUSTOM_NODES_PATH)
+    raw_dirs = sorted(
+        d for d in os.listdir(CUSTOM_NODES_PATH)
+        if os.path.isdir(os.path.join(CUSTOM_NODES_PATH, d))
+    ) if os.path.isdir(CUSTOM_NODES_PATH) else []
+    print(f"[comfyapp] sync_custom_nodes_to_volume extracted syncable_nodes={len(nodes)} raw_dirs={len(raw_dirs)}")
+    return {"status": "ok", "nodes": nodes, "raw_dirs": raw_dirs}
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
     cpu=1,
     memory=512,
     timeout=60,
@@ -1508,20 +2729,23 @@ def get_volume_status() -> dict:
                 if os.path.isfile(fpath):
                     models.append({"folder": folder, "name": fname, "size": os.path.getsize(fpath)})
 
-    # Scan custom nodes
-    custom_nodes = []
-    if os.path.isdir(CUSTOM_NODES_PATH):
-        for d in os.listdir(CUSTOM_NODES_PATH):
-            if os.path.isdir(os.path.join(CUSTOM_NODES_PATH, d)):
-                custom_nodes.append(d)
+    # Scan custom nodes (syncable only for runtime; raw dirs available separately)
+    custom_nodes = _iter_syncable_custom_node_dirs(CUSTOM_NODES_PATH)
 
-    return {"models": models, "custom_nodes": custom_nodes}
+    return {
+        "models": models,
+        "custom_nodes": custom_nodes,
+        "custom_nodes_raw_dirs": sorted(
+            d for d in os.listdir(CUSTOM_NODES_PATH)
+            if os.path.isdir(os.path.join(CUSTOM_NODES_PATH, d))
+        ) if os.path.isdir(CUSTOM_NODES_PATH) else [],
+    }
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
     cpu=1,
     memory=512,
     timeout=30,
@@ -1539,7 +2763,6 @@ def set_preload_mode(mode: str) -> str:
              "off", "async_no_wait"}
     if mode not in valid and not mode.startswith("budgeted_"):
         return f"invalid mode: {mode}  valid={valid} or budgeted_<ms>"
-        return f"invalid mode: {mode}  valid={valid}"
     os.makedirs("/root/models", exist_ok=True)
     with open(PRELOAD_MODE_PATH, "w") as f:
         f.write(mode)
@@ -1549,9 +2772,9 @@ def set_preload_mode(mode: str) -> str:
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
     cpu=1,
     memory=512,
     timeout=30,
@@ -1574,9 +2797,9 @@ def set_runtime_flag(name: str, value: str) -> str:
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
     cpu=2,
     memory=4096,
     timeout=1800,
@@ -1598,15 +2821,56 @@ def upload_model_to_volume(file_data: bytes, folder: str, filename: str) -> dict
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
     cpu=2,
     memory=4096,
     timeout=3600,
     volumes={MODELS_PATH: vol},
 )
 def set_active_warmup_profile(payload: dict) -> dict:
+    validate_active_warmup_profile_payload(payload)
+    return _write_active_warmup_profile_payload(payload)
+
+
+def validate_active_warmup_profile_payload(payload: dict) -> None:
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            "Refusing to write active_next_profile: payload must be a dict, "
+            f"got {type(payload).__name__}"
+        )
+    if not payload.get("preflight_validated"):
+        raise RuntimeError(
+            "Refusing to write active_next_profile: payload was not "
+            "preflight validated. Validate API prompt locally before "
+            "writing active_next_profile."
+        )
+    if not isinstance(payload.get("workflow_hash"), str) or not payload["workflow_hash"]:
+        raise RuntimeError(
+            "Refusing to write active_next_profile: workflow_hash "
+            "must be a non-empty string."
+        )
+    if not isinstance(payload.get("validation_token"), str) or not payload["validation_token"]:
+        raise RuntimeError(
+            "Refusing to write active_next_profile: validation_token "
+            "must be a non-empty string."
+        )
+    if not isinstance(payload.get("model_stack"), dict):
+        raise RuntimeError(
+            "Refusing to write active_next_profile: model_stack "
+            "must be a dict."
+        )
+    wp = payload.get("warmup_profile")
+    if not (isinstance(wp, dict) or payload.get("disable_warmup")):
+        raise RuntimeError(
+            "Refusing to write active_next_profile: warmup_profile "
+            "must be a dict or disable_warmup must be True."
+        )
+
+
+def _write_active_warmup_profile_payload(payload: dict) -> dict:
+    validate_active_warmup_profile_payload(payload)
     os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
     profile = dict(payload or {})
     tmp_path = f"{ACTIVE_NEXT_PROFILE_PATH}.tmp"
@@ -1615,34 +2879,58 @@ def set_active_warmup_profile(payload: dict) -> dict:
     os.replace(tmp_path, ACTIVE_NEXT_PROFILE_PATH)
     vol.commit()
     print(
-        f"[comfyapp] set_active_warmup_profile token={profile.get('profile_token','')} "
+        f"[comfyapp] _write_active_warmup_profile_payload token={profile.get('profile_token','')} "
         f"workflow_hash={profile.get('workflow_hash','')} disable_warmup={1 if profile.get('disable_warmup') else 0}"
     )
     return {"status": "ok", "profile_token": profile.get("profile_token", "")}
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
     cpu=2,
     memory=4096,
     timeout=3600,
     volumes={MODELS_PATH: vol},
 )
 def upload_model_chunk(chunk_data: bytes, folder: str, filename: str, offset: int, is_last: bool) -> dict:
-    """Upload a model file chunk to the volume. Chunks are appended sequentially."""
+    """Upload a model file chunk to the volume. Chunks are appended sequentially.
+
+    Uses a ``.part`` file until the final chunk arrives.  Validates that
+    the offset matches the current partial file size before appending to
+    prevent silent corruption from out-of-order chunks.
+    """
     import os
     from pathlib import Path
 
     dest = Path(MODELS_PATH) / folder / filename
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    mode = "ab" if offset > 0 else "wb"
-    with open(dest, mode) as f:
+    part = dest.parent / f"{filename}.part"
+
+    # Validate offset equals current part file size
+    if offset == 0:
+        if part.exists():
+            part.unlink()
+        if dest.exists():
+            dest.unlink()
+    else:
+        if not part.exists():
+            return {"status": "error", "message": f"offset={offset} but no partial file exists"}
+        current_size = part.stat().st_size
+        if current_size != offset:
+            return {
+                "status": "error",
+                "message": f"offset mismatch: expected {current_size}, got {offset}",
+                "expected_offset": current_size,
+            }
+
+    with open(part, "ab") as f:
         f.write(chunk_data)
 
     if is_last:
+        os.replace(str(part), str(dest))
         vol.commit()
         return {"status": "ok", "path": str(dest), "size": os.path.getsize(dest)}
 
@@ -1657,7 +2945,9 @@ def upload_model_chunk(chunk_data: bytes, folder: str, filename: str, offset: in
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11"),
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
     cpu=1,
     memory=128,
     timeout=10,
@@ -1668,9 +2958,9 @@ def health_cpu():
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
     cpu=1,
     memory=512,
     timeout=60,
@@ -1713,9 +3003,9 @@ def list_models_cpu() -> dict:
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
     cpu=1,
     memory=512,
     timeout=30,
@@ -1736,9 +3026,9 @@ def delete_model_cpu(folder: str, filename: str) -> dict:
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("gpu_catalog")
-    .add_local_python_source("timing_trace"),
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
     cpu=1,
     memory=512,
     timeout=30,
@@ -1786,6 +3076,108 @@ def runtime_state_cpu() -> dict:
     }
 
 
+def _filter_preload_paths_by_size(file_paths: list[str]) -> tuple[list[str], dict]:
+    """Filter preload candidate paths by size guardrails.
+
+    Returns ``(filtered_paths, result_dict)`` where ``result_dict``
+    contains the decision reason and per-file details.
+
+    Policy:
+    1. Remove individual files above ``PRELOAD_MAX_FILE_GB``.
+    2. Compute total size of remaining candidates.
+    3. If total exceeds ``PRELOAD_MAX_TOTAL_GB``, return empty list
+       with ``reason=max_total_gb_exceeded`` — no partial preload.
+    4. Otherwise return the filtered list.
+    """
+    result: dict = {
+        "total_gb": 0.0,
+        "files_input": len(file_paths),
+        "files_kept": 0,
+        "files_skipped": [],
+        "skipped_reason": "",
+    }
+    kept: list[str] = []
+    _total_gb = 0.0
+
+    # Phase 1: remove files above PRELOAD_MAX_FILE_GB
+    for _p in file_paths:
+        try:
+            _sz_gb = os.path.getsize(_p) / (1024**3)
+        except OSError:
+            continue
+        if _sz_gb > PRELOAD_MAX_FILE_GB:
+            result["files_skipped"].append({
+                "path": _p,
+                "size_gb": round(_sz_gb, 2),
+                "reason": "max_file_gb_exceeded",
+            })
+            print(
+                f"[comfyapp] preload_skipped reason=max_file_gb_exceeded "
+                f"file={os.path.basename(_p)} size_gb={round(_sz_gb, 2)} "
+                f"max_file_gb={PRELOAD_MAX_FILE_GB}"
+            )
+            continue
+        kept.append(_p)
+        _total_gb += _sz_gb
+
+    # Phase 2: if total exceeds max_total_gb, reject everything
+    if _total_gb > PRELOAD_MAX_TOTAL_GB:
+        result["total_gb"] = round(_total_gb, 2)
+        result["files_kept"] = 0
+        result["reason"] = "max_total_gb_exceeded"
+        print(
+            f"[comfyapp] preload_skipped reason=max_total_gb_exceeded "
+            f"total_gb={round(_total_gb, 2)} "
+            f"max_total_gb={PRELOAD_MAX_TOTAL_GB}"
+        )
+        return [], result
+
+    result["total_gb"] = round(_total_gb, 2)
+    result["files_kept"] = len(kept)
+    if not kept and file_paths:
+        result["reason"] = result["files_skipped"][0]["reason"] if result["files_skipped"] else "all_files_filtered"
+    return kept, result
+
+
+class _MemoizedValidationCache:
+    """Per-container memoization for expensive-but-stable validation results.
+
+    Results are invalidated when the underlying fingerprint changes,
+    when a volume reload indicates changed state, or on explicit reset.
+    """
+
+    def __init__(self):
+        self._data: dict[str, object] = {}
+        self._fingerprints: dict[str, str] = {}
+
+    def get(self, key: str) -> object | None:
+        return self._data.get(key)
+
+    def set(self, key: str, value: object, fingerprint: str = "") -> None:
+        self._data[key] = value
+        if fingerprint:
+            self._fingerprints[key] = fingerprint
+
+    def has(self, key: str, fingerprint: str = "") -> bool:
+        if key not in self._data:
+            return False
+        if fingerprint and self._fingerprints.get(key) != fingerprint:
+            return False
+        return True
+
+    def invalidate(self, key: str = "") -> None:
+        if key:
+            self._data.pop(key, None)
+            self._fingerprints.pop(key, None)
+        else:
+            self._data.clear()
+            self._fingerprints.clear()
+
+    def invalidate_all(self) -> None:
+        self._data.clear()
+        self._fingerprints.clear()
+
+
 class _ComfyAPIMixin:
     """Shared implementation for all GPU-specific ComfyAPI classes."""
 
@@ -1800,6 +3192,167 @@ class _ComfyAPIMixin:
             return
         payload = " ".join(f"{k}={v}" for k, v in fields.items())
         print(f"[comfyapp.profile] stage={stage} {payload}".rstrip())
+
+    # ── PART 7: Shared custom-node sync and dependency policy ────────────
+    def _handle_custom_node_sync_and_dependency_policy(self, workflow: dict, stream: bool = False) -> dict:
+        """Validate prompt, sync custom nodes, and enforce dependency policy.
+
+        Used by both ``run_prompt`` and ``run_prompt_stream``.  In production
+        modes (``off``, ``fail_fast``) dependency mismatch raises immediately;
+        sync errors are fatal.  In ``dev`` mode runtime repair is allowed.
+
+        Returns a structured summary dict.
+        """
+        # 1. Validate API prompt structure
+        assert_valid_api_prompt_structure(workflow)
+
+        # 2. Sync custom nodes from volume
+        _cn_start = time.time()
+        summary, state = self._sync_custom_nodes_from_volume()
+        _cn_created = summary.get("created", [])
+        _cn_sync_ms = round((time.time() - _cn_start) * 1000, 1)
+
+        # 3. Determine repair mode
+        mode = self._resolve_requirements_repair_mode()
+
+        dep_prepared = True
+        dep_reason = ""
+        installed = []
+        skipped = []
+        failed = []
+
+        # 4. Production modes: never pip install
+        if mode in ("off", "fail_fast"):
+            dep_check = validate_custom_node_dependencies_prepared()
+            dep_prepared = dep_check.get("prepared", False)
+            dep_reason = dep_check.get("reason", "")
+            if not dep_prepared:
+                baked_hash = dep_check.get("baked_hash", "?") or "?"
+                current_hash = dep_check.get("current_hash", "?") or "?"
+                changed_nodes = dep_check.get("changed_nodes", [])
+                error_msg = (
+                    "Custom node dependencies are not prepared for this image. "
+                    f"Runtime pip install is disabled in {mode} mode. "
+                    "Rebuild/deploy the Modal image after syncing "
+                    "custom-node requirements. "
+                    f"reason={dep_reason} "
+                    f"baked_hash={baked_hash} "
+                    f"current_hash={current_hash} "
+                    f"changed_nodes={changed_nodes}"
+                )
+                if stream:
+                    # Streaming path: raise so the stream yields a fatal error
+                    raise RuntimeError(error_msg)
+                else:
+                    raise RuntimeError(error_msg)
+
+        # 5. Dev mode: runtime repair is allowed
+        if mode == "dev":
+            req_result = self._install_custom_node_requirements(force=False)
+            installed = req_result.get("installed", [])
+            skipped = req_result.get("skipped", [])
+            failed = req_result.get("failed", [])
+            _in_proc = self._select_backend() == "in_process"
+            if _cn_created and _in_proc and self._event_loop is not None:
+                import nodes as _pol_nodes
+                self._event_loop.run_until_complete(_pol_nodes.init_extra_nodes())
+
+        # ── 6. Enforce node classes available before model work ─────
+        _missing_node_result = self._enforce_workflow_node_classes_available_before_model_work(workflow)
+
+        return {
+            "sync_created_count": len(_cn_created),
+            "sync_kept_count": len(summary.get("kept", [])),
+            "sync_removed_count": len(summary.get("removed", [])),
+            "repair_mode": mode,
+            "dependency_prepared": dep_prepared,
+            "dependency_reason": dep_reason,
+            "sync_ms": _cn_sync_ms,
+            "installed": installed,
+            "skipped": skipped,
+            "failed": failed,
+            "missing_node_check_ran": _missing_node_result.get("missing_node_check_ran", False),
+            "missing_nodes_before_model_work": _missing_node_result.get("missing_nodes_before_model_work", []),
+            "missing_node_repair_attempted": _missing_node_result.get("missing_node_repair_attempted", False),
+            "missing_nodes_after_repair": _missing_node_result.get("missing_nodes_after_repair", []),
+            "missing_node_blocked_by_mode": _missing_node_result.get("missing_node_blocked_by_mode", False),
+        }
+
+    # ── PART 7: Preflight before prompt execution ────────────────────────
+    def _preflight_before_prompt_execution(self, workflow: dict) -> dict:
+        """Run preflight checks before any prompt execution.
+
+        Must run before: missing-node repair, async preload, actual load,
+        CPU preload, direct warmup, ComfyUI validate_prompt.
+
+        Returns a structured preflight summary dict.
+        """
+        _repair_mode = self._resolve_requirements_repair_mode()
+
+        # 1. API prompt structure validation
+        try:
+            assert_valid_api_prompt_structure(workflow)
+            valid_prompt = True
+        except RuntimeError as exc:
+            summary = FailureSummary(phase="preflight")
+            summary.fatal_error = str(exc)
+            summary.modal_invoked = True
+            summary.recommendation = (
+                "Remote worker was invoked, but prompt execution was blocked "
+                "before model preload/execution due to malformed workflow. "
+                "Re-export workflow as API prompt JSON or remove "
+                "corrupt/UI-only nodes."
+            )
+            print(f"[comfyapp] FAILURE SUMMARY: {summary}")
+            raise
+
+        # 2. Dependency validation for production modes
+        dep_prepared = True
+        dep_reason = ""
+        if _repair_mode in ("off", "fail_fast"):
+            dep_check = validate_custom_node_dependencies_prepared()
+            dep_prepared = dep_check.get("prepared", False)
+            dep_reason = dep_check.get("reason", "")
+            if not dep_prepared:
+                baked_hash = dep_check.get("baked_hash", "?") or "?"
+                current_hash = dep_check.get("current_hash", "?") or "?"
+                changed_nodes = dep_check.get("changed_nodes", [])
+                summary = FailureSummary(phase="dependency_preflight")
+                summary.fatal_error = "custom node dependencies not prepared"
+                summary.modal_invoked = True
+                summary.recommendation = (
+                    "Rebuild/deploy Modal image after syncing "
+                    "custom-node requirements."
+                )
+                print(f"[comfyapp] FAILURE SUMMARY: {summary}")
+                raise RuntimeError(
+                    "Custom node dependencies are not prepared for this image. "
+                    "Runtime pip install is disabled in "
+                    f"{_repair_mode} mode. "
+                    f"Rebuild/deploy the Modal image after syncing "
+                    f"custom-node requirements. "
+                    f"reason={dep_reason} "
+                    f"baked_hash={baked_hash} "
+                    f"current_hash={current_hash} "
+                    f"changed_nodes={changed_nodes}"
+                )
+
+        result = {
+            "valid_prompt": valid_prompt,
+            "dependency_prepared": dep_prepared,
+            "repair_mode": _repair_mode,
+            "dependency_reason": dep_reason,
+        }
+        print(f"[comfyapp] preflight result: {result}")
+        return result
+
+    @staticmethod
+    def _resolve_requirements_repair_mode() -> str:
+        """Normalize REQUIREMENTS_REPAIR_MODE, defaulting to fail_fast."""
+        mode = REQUIREMENTS_REPAIR_MODE.strip().lower()
+        if mode not in ("off", "fail_fast", "dev"):
+            mode = "fail_fast"
+        return mode
 
     @property
     def _http_client(self):
@@ -1829,24 +3382,22 @@ class _ComfyAPIMixin:
 
         Writes the file synchronously but commits to volume in a background
         thread to avoid blocking the response path with network I/O (~370ms).
+        Skips write when the content is identical to the existing file.
         """
         import json
-        import threading
         try:
+            stack_json = json.dumps(stack, indent=2, sort_keys=True)
+            if os.path.isfile(LAST_MODEL_STACK_PATH):
+                with open(LAST_MODEL_STACK_PATH, "r") as f:
+                    existing = f.read()
+                if existing == stack_json:
+                    return
             os.makedirs(os.path.dirname(LAST_MODEL_STACK_PATH), exist_ok=True)
             tmp_path = f"{LAST_MODEL_STACK_PATH}.tmp"
             with open(tmp_path, "w") as f:
-                json.dump(stack, f)
+                f.write(stack_json)
             os.replace(tmp_path, LAST_MODEL_STACK_PATH)
-            # Background commit so the response isn't blocked by volume I/O
-            def _commit_in_background():
-                try:
-                    vol.commit()
-                except Exception as exc:
-                    print(f"[comfyapp] background volume commit failed: {exc}")
-
-            t = threading.Thread(target=_commit_in_background, daemon=True)
-            t.start()
+            _commit_volume_async(label="last_model_stack")
         except Exception as exc:
             print(f"[comfyapp] failed to save last model stack: {exc}")
 
@@ -1873,32 +3424,73 @@ class _ComfyAPIMixin:
             raise
 
     def _load_active_next_profile(self, now: float | None = None) -> dict:
+        reason = ""
         try:
             if not os.path.isfile(ACTIVE_NEXT_PROFILE_PATH):
-                return {}
+                reason = "missing_file"
+                return {"_diagnostic": {"status": reason, "source_path": ACTIVE_NEXT_PROFILE_PATH}}
             with open(ACTIVE_NEXT_PROFILE_PATH, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             if not isinstance(payload, dict) or not payload:
-                return {}
+                reason = "invalid_payload"
+                return {"_diagnostic": {"status": reason, "source_path": ACTIVE_NEXT_PROFILE_PATH}}
             current = time.time() if now is None else now
             expires_at = float(payload.get("expires_at", 0) or 0)
+            payload_diag = {
+                "source_path": ACTIVE_NEXT_PROFILE_PATH,
+                "now": current,
+                "expires_at": expires_at,
+                "age_seconds": round(current - float(payload.get("created_at", current)), 1) if payload.get("created_at") else None,
+                "ttl_seconds": ACTIVE_NEXT_PROFILE_TTL_S,
+                "profile_token": payload.get("profile_token", ""),
+                "workflow_hash": payload.get("workflow_hash", ""),
+            }
+            if payload.get("disable_warmup"):
+                reason = "disable_warmup"
+                payload_diag["status"] = reason
+                print(
+                    f"[comfyapp] active_next_profile_skipped reason={reason} "
+                    f"token={payload.get('profile_token','?')}"
+                )
+                payload["_diagnostic"] = payload_diag
+                return payload
             if expires_at and current > expires_at:
-                print(f"[comfyapp] active_next_profile expired token={payload.get('profile_token','?')} now={current} expires_at={expires_at}")
-                return {}
+                reason = "expired"
+                payload_diag["status"] = reason
+                print(
+                    f"[comfyapp] active_next_profile expired token={payload.get('profile_token','?')} "
+                    f"now={current} expires_at={expires_at} age_s={payload_diag.get('age_seconds','?')} "
+                    f"ttl_s={ACTIVE_NEXT_PROFILE_TTL_S}"
+                )
+                payload["_diagnostic"] = payload_diag
+                return payload
+            payload_diag["status"] = "valid"
+            payload["_diagnostic"] = payload_diag
             return payload
-        except (json.JSONDecodeError, OSError, ValueError, TypeError) as exc:
-            print(f"[comfyapp] failed to load active next profile: {exc}")
-            return {}
+        except json.JSONDecodeError as exc:
+            reason = "invalid_json"
+            print(f"[comfyapp] active_next_profile failed reason={reason} error={exc} path={ACTIVE_NEXT_PROFILE_PATH}")
+            return {"_diagnostic": {"status": reason, "source_path": ACTIVE_NEXT_PROFILE_PATH, "error": str(exc)}}
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"[comfyapp] active_next_profile failed reason=read_error error={exc} path={ACTIVE_NEXT_PROFILE_PATH}")
+            return {"_diagnostic": {"status": "read_error", "source_path": ACTIVE_NEXT_PROFILE_PATH, "error": str(exc)}}
 
     def _save_last_warmup_workflow(self, workflow: dict) -> None:
         """Persist a cheap warmup replay derived from a successful prompt."""
         try:
             os.makedirs(os.path.dirname(LAST_WARMUP_WORKFLOW_PATH), exist_ok=True)
             warmup = build_replay_warmup_workflow(workflow)
+            warmup_json = json.dumps(warmup, indent=2, sort_keys=True)
+            if os.path.isfile(LAST_WARMUP_WORKFLOW_PATH):
+                with open(LAST_WARMUP_WORKFLOW_PATH, "r") as f:
+                    existing = f.read()
+                if existing == warmup_json:
+                    return
             tmp_path = f"{LAST_WARMUP_WORKFLOW_PATH}.tmp"
             with open(tmp_path, "w") as f:
-                json.dump(warmup, f, indent=2, sort_keys=True)
+                f.write(warmup_json)
             os.replace(tmp_path, LAST_WARMUP_WORKFLOW_PATH)
+            _commit_volume_async(label="last_warmup_workflow")
         except Exception as exc:
             print(f"[comfyapp] failed to save last warmup workflow: {exc}")
 
@@ -1963,12 +3555,80 @@ class _ComfyAPIMixin:
                 f"missing={missing or []}; too_small={too_small or []}"
             )
 
+    def _ensure_validation_cache(self):
+        if not hasattr(self, "_validation_cache"):
+            self._validation_cache = _MemoizedValidationCache()
+
     def _sync_custom_nodes_from_volume(self):
         custom_nodes_vol.reload()
         comfy_custom_nodes = "/root/comfy/ComfyUI/custom_nodes"
+        self._ensure_validation_cache()
+
+        # Step 1: Cheap volume state (names + mtimes) for restore hot path.
+        # Avoids expensive content hashing of every .py file on every restore.
+        cheap_state = custom_node_volume_state(CUSTOM_NODES_PATH)
+        cheap_hash = hashlib.md5(str(cheap_state).encode()).hexdigest()
+        node_count = len(cheap_state)
+
+        # Check memoized result using cheap volume state
+        if self._validation_cache.has("custom_node_sync", fingerprint=cheap_hash):
+            _cached = self._validation_cache.get("custom_node_sync")
+            if _cached is not None:
+                print(
+                    f"[comfyapp] custom_node_sync memoized_hit reason=source_fingerprint_unchanged "
+                    f"nodes={node_count} created=0"
+                )
+                _sanitized = (
+                    {
+                        "created": [],
+                        "removed": [],
+                        "kept": _cached[0].get("kept", []),
+                        "blocked": [],
+                        "skipped": True,
+                        "skip_reason": "source_fingerprint_unchanged",
+                        "node_count": node_count,
+                    },
+                    _cached[1],
+                )
+                return _sanitized
+
+        # Step 2: Volume state changed — compute full content fingerprint
+        current_fp = custom_node_source_fingerprint(CUSTOM_NODES_PATH)
+        current_fp_hash = hashlib.md5(json.dumps(current_fp, sort_keys=True).encode()).hexdigest()
+        last_fp = getattr(self, "_last_custom_node_source_fingerprint", None)
+
+        if last_fp is not None and last_fp == current_fp:
+            node_count_fp = len(current_fp.get("nodes", []))
+            print(
+                f"[comfyapp] custom_node_sync_skipped reason=source_fingerprint_unchanged "
+                f"nodes={node_count_fp}"
+            )
+            _result = (
+                {
+                    "created": [],
+                    "removed": [],
+                    "kept": [],
+                    "blocked": [],
+                    "skipped": True,
+                    "skip_reason": "source_fingerprint_unchanged",
+                },
+                cheap_state,
+            )
+            self._validation_cache.set("custom_node_sync", _result, fingerprint=cheap_hash)
+            return _result
+
+        # Step 3: Content actually changed — run the real sync
         summary = sync_custom_nodes_into_comfy(CUSTOM_NODES_PATH, comfy_custom_nodes, include_state=True)
-        state = summary.pop("state", custom_node_volume_state(CUSTOM_NODES_PATH))
-        return summary, state
+        state = summary.pop("state", cheap_state)
+        node_count_fp = len(current_fp.get("nodes", []))
+        print(
+            f"[comfyapp] custom_node_sync_ran reason=source_fingerprint_changed "
+            f"nodes={node_count_fp}"
+        )
+        self._last_custom_node_source_fingerprint = current_fp
+        _result = (summary, state)
+        self._validation_cache.set("custom_node_sync", _result, fingerprint=cheap_hash)
+        return _result
 
     def _snapshot_preload_profile(self) -> dict:
         active = self._load_active_next_profile()
@@ -1976,22 +3636,31 @@ class _ComfyAPIMixin:
         profile = None
         source = "none"
         if active:
-            if active.get("disable_warmup"):
+            diag = active.get("_diagnostic", {})
+            diag_status = diag.get("status", "")
+            if diag_status == "expired":
+                print(
+                    f"[comfyapp] snapshot_preload_profile source=none reason=active_profile_expired "
+                    f"token={active.get('profile_token','?')} "
+                    f"now={diag.get('now','?')} expires_at={diag.get('expires_at','?')}"
+                )
+            elif active.get("disable_warmup"):
                 print(
                     f"[comfyapp] snapshot_preload_profile source=active_next_profile profile_token={active.get('profile_token','?')} disable_warmup=1"
                 )
                 return None
-            profile = dict(active.get("warmup_profile") or {})
-            source = "active_next_profile"
-            if profile:
-                profile["_source"] = source
-                profile["_profile_token"] = active.get("profile_token", "")
-                profile["_workflow_hash"] = active.get("workflow_hash", "")
-                profile["_current_workflow_stack"] = dict(active.get("model_stack") or {})
-                print(
-                    f"[comfyapp] snapshot_preload_profile source={source} profile_token={profile.get('_profile_token','')} workflow_hash={profile.get('_workflow_hash','')} data={profile}"
-                )
-                return profile
+            elif diag_status not in ("expired", "missing_file", "invalid_payload", "invalid_json", "read_error"):
+                profile = dict(active.get("warmup_profile") or {})
+                source = "active_next_profile"
+                if profile:
+                    profile["_source"] = source
+                    profile["_profile_token"] = active.get("profile_token", "")
+                    profile["_workflow_hash"] = active.get("workflow_hash", "")
+                    profile["_current_workflow_stack"] = dict(active.get("model_stack") or {})
+                    print(
+                        f"[comfyapp] snapshot_preload_profile source={source} profile_token={profile.get('_profile_token','')} workflow_hash={profile.get('_workflow_hash','')} data={profile}"
+                    )
+                    return profile
         if env_profile:
             profile = dict(env_profile)
             profile["_source"] = "env_default"
@@ -2155,147 +3824,288 @@ class _ComfyAPIMixin:
         but their results are discarded to avoid blocking.
         """
         if not file_paths:
-            return {"count": 0, "cached": [], "file_timing_ms": {}}
+            return {"count": 0, "cached": [], "file_timing_ms": {},
+                    "budget_exceeded": False, "aborted": False, "abort_reason": "",
+                    "completed_bytes": 0, "completed_files": 0, "failed_files": 0,
+                    "cancelled_futures": 0, "running_threads_not_killable": 0,
+                    "pending_not_submitted": 0, "shutdown_wait_false": False}
         if not hasattr(self, "_model_cpu_cache"):
             self._model_cpu_cache = {}
-        _total_start = time.time()
-        _total_bytes = 0
-        for p in file_paths:
-            try:
-                _total_bytes += os.path.getsize(p)
-            except OSError:
-                pass
-        # Determine worker count from PRELOAD_MODE
-        _preload_max_workers = 4
-        _pm = _resolve_preload_mode()
-        if _pm == "workers_1":
-            _preload_max_workers = 1
-        elif _pm == "workers_2":
-            _preload_max_workers = 2
-        elif _pm in ("sequential",):
-            _preload_max_workers = 1
-
-        print(
-            f"[comfyapp] preload_models_to_cpu: files={len(file_paths)} "
-            f"total_gb={round(_total_bytes / (1024**3), 2)} "
-            f"mode={_pm} workers={_preload_max_workers} starting"
-        )
-        original_loader = getattr(self, "_original_model_loader", None)
-        if original_loader is None:
-            raise RuntimeError("Original ComfyUI model loader unavailable for CPU preload")
-
-        # Determine which files need loading (skip already-cached)
-        to_load = []
-        seen_cache_keys = set()
-        for path in file_paths:
-            cache_key = _model_cpu_cache_key(path)
-            if cache_key in seen_cache_keys:
-                continue
-            seen_cache_keys.add(cache_key)
-            filename = os.path.basename(path)
-            if not any(key in self._model_cpu_cache for key in _model_cpu_cache_lookup_keys(path)):
-                to_load.append((path, filename, cache_key))
-
-        cached = []
-        file_timing_ms: dict[str, float] = {}
-
-        if to_load:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-
-            def _load_one(path: str, filename: str, cache_key: str) -> tuple[str, str, object, object | None, float]:
-                started = time.time()
-                loaded = original_loader(path, return_metadata=True)
-                d_ms = round((time.time() - started) * 1000, 1)
-                if isinstance(loaded, tuple) and len(loaded) == 2:
-                    return filename, cache_key, loaded[0], loaded[1], d_ms
-                return filename, cache_key, loaded, None, d_ms
-
-            _budget_deadline = (time.time() + budget_ms / 1000.0) if budget_ms is not None else None
-            with ThreadPoolExecutor(max_workers=min(len(to_load), _preload_max_workers)) as pool:
-                fut_map = {pool.submit(_load_one, p, f, cache_key): (f, cache_key) for p, f, cache_key in to_load}
-                for future in as_completed(fut_map):
-                    # Check budget before processing each completed result.
-                    if _budget_deadline is not None and time.time() >= _budget_deadline:
-                        _exceeded_by = round((time.time() - _budget_deadline) * 1000, 1)
-                        print(f"[comfyapp] preload_models_to_cpu: budget exceeded by {_exceeded_by}ms, "
-                              f"loaded {len(cached)}/{len(to_load)} files so far — cancelling remaining")
-                        for _f in fut_map:
-                            _f.cancel()
-                        break
-                    filename, cache_key = fut_map[future]
-                    try:
-                        fn, cache_key, state_dict, metadata, d_ms = future.result()
-                        self._model_cpu_cache[cache_key] = (state_dict, metadata)
-                        file_timing_ms[fn] = d_ms
-                        cached.append(fn)
-                        if callable(on_file_loaded):
-                            try:
-                                on_file_loaded(fn)
-                            except Exception:
-                                pass
-                        size_mb = "?"
-                        for p, f, _cache_key in to_load:
-                            if f == fn:
-                                try:
-                                    size_mb = round(os.path.getsize(p) / (1024 * 1024), 1)
-                                except OSError:
-                                    pass
-                                break
-                        self._log_profile(
-                            "snapshot_preload_model",
-                            file=fn,
-                            size_mb=size_mb,
-                            duration_ms=d_ms,
-                        )
-                    except Exception as exc:
-                        file_timing_ms[filename] = -1.0
-                        self._log_profile("snapshot_preload_model_failed", file=filename, error=str(exc)[:200])
-        else:
-            # All files already cached — just report them
-            for path in file_paths:
-                filename = os.path.basename(path)
-                cached.append(filename)
-
-        _total_ms = self._profile_ms(_total_start)
-        _total_loaded_gb = sum(os.path.getsize(p) for p in file_paths if os.path.isfile(p)) / (1024**3)
-        # Detect preload outliers: any single file >5s
-        _slowest_fn = ""
-        _slowest_ms = 0.0
-        for _fn, _d in file_timing_ms.items():
-            if _d > _slowest_ms:
-                _slowest_ms = _d
-                _slowest_fn = _fn
-        if _total_ms > 5000 and _slowest_fn:
-            _slowest_size_gb = 0.0
+        # Session guard: each preload call gets a unique id.  On abort the
+        # session is invalidated so abandoned thread results never mutate
+        # the CPU cache after the caller has moved on.
+        _preload_session_id = str(uuid.uuid4())
+        self._active_cpu_preload_session_id = _preload_session_id
+        try:
+            _total_start = time.time()
+            _total_bytes = 0
+            _abort_deadline = time.time() + PRELOAD_OUTLIER_ABORT_SECONDS if PRELOAD_OUTLIER_ABORT_SECONDS > 0 else None
             for p in file_paths:
-                if os.path.basename(p) == _slowest_fn:
+                try:
+                    _total_bytes += os.path.getsize(p)
+                except OSError:
+                    pass
+            # Determine worker count from PRELOAD_MODE
+            _preload_max_workers = 4
+            _pm = _resolve_preload_mode()
+            if _pm == "workers_1":
+                _preload_max_workers = 1
+            elif _pm == "workers_2":
+                _preload_max_workers = 2
+            elif _pm in ("sequential",):
+                _preload_max_workers = 1
+
+            print(
+                f"[comfyapp] preload_models_to_cpu: files={len(file_paths)} "
+                f"total_gb={round(_total_bytes / (1024**3), 2)} "
+                f"mode={_pm} workers={_preload_max_workers} starting"
+            )
+            original_loader = getattr(self, "_original_model_loader", None)
+            if original_loader is None:
+                raise RuntimeError("Original ComfyUI model loader unavailable for CPU preload")
+
+            # Determine which files need loading (skip already-cached)
+            to_load = []
+            seen_cache_keys = set()
+            for path in file_paths:
+                cache_key = _model_cpu_cache_key(path)
+                if cache_key in seen_cache_keys:
+                    continue
+                seen_cache_keys.add(cache_key)
+                filename = os.path.basename(path)
+                if not any(key in self._model_cpu_cache for key in _model_cpu_cache_lookup_keys(path)):
+                    to_load.append((path, filename, cache_key))
+
+            cached = []
+            file_timing_ms: dict[str, float] = {}
+            _aborted = False
+            _abort_reason = ""
+            _completed_bytes = 0
+            _completed_files = 0
+            _failed_files = 0
+            _cancelled_futures = 0
+            _running_threads_not_killable = 0
+            _pending_not_submitted = 0
+            _shutdown_wait_false = False
+
+            if to_load:
+                from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+
+                def _load_one(path: str, filename: str, cache_key: str) -> tuple[str, str, object, object | None, float, int]:
+                    started = time.time()
+                    loaded = original_loader(path, return_metadata=True)
+                    d_ms = round((time.time() - started) * 1000, 1)
+                    _read_bytes = 0
                     try:
-                        _slowest_size_gb = os.path.getsize(p) / (1024**3)
+                        _read_bytes = os.path.getsize(path)
                     except OSError:
                         pass
-                    break
-            _sl_throughput = round(_slowest_size_gb / max(_slowest_ms / 1000, 0.001), 2) if _slowest_size_gb else 0.0
-            print(f"[comfyapp] preload_outlier: true total_ms={_total_ms} "
-                  f"slowest_file={_slowest_fn} slowest_ms={_slowest_ms:.0f} "
-                  f"size_gb={_slowest_size_gb:.2f} throughput_gbps={_sl_throughput} "
-                  f"workers={_preload_max_workers}")
+                    if isinstance(loaded, tuple) and len(loaded) == 2:
+                        return filename, cache_key, loaded[0], loaded[1], d_ms, _read_bytes
+                    return filename, cache_key, loaded, None, d_ms, _read_bytes
 
-        print(
-            f"[comfyapp] preload_models_to_cpu: done in {_total_ms}ms "
-            f"loaded={len(cached)} files={len(file_paths)} "
-            f"loaded_gb={round(_total_loaded_gb, 2)} "
-            f"throughput_gbps={round(_total_loaded_gb / max(_total_ms/1000, 0.001), 2)}"
-        )
-        _budget_exceeded = False
-        if budget_ms is not None:
-            _elapsed = (time.time() - _total_start) * 1000 if _total_start else 0
-            _budget_exceeded = _elapsed > budget_ms
-        return {
-            "count": len(cached),
-            "cached": cached,
-            "file_timing_ms": file_timing_ms,
-            "budget_exceeded": _budget_exceeded,
-        }
+                def _check_abort() -> bool:
+                    nonlocal _aborted, _abort_reason, _abort_throughput_checked, _last_throughput_check_time, _last_throughput_check_bytes
+                    if _aborted:
+                        return True
+                    if _budget_deadline is not None and time.time() >= _budget_deadline:
+                        _aborted = True
+                        _abort_reason = "budget_exceeded"
+                        _exceeded_by = round((time.time() - _budget_deadline) * 1000, 1)
+                        print(f"[comfyapp] preload_models_to_cpu: budget exceeded by {_exceeded_by}ms, "
+                              f"loaded {len(cached)}/{len(to_load)} files so far — stopping")
+                        return True
+                    if _abort_deadline is not None and time.time() >= _abort_deadline:
+                        if not _abort_throughput_checked and _completed_bytes == 0:
+                            _aborted = True
+                            _abort_reason = "no_completed_files_within_abort_window"
+                            print(
+                                f"[comfyapp] preload_abort_eval: "
+                                f"no_completed_files_within_abort_window "
+                                f"elapsed_s={round(time.time() - _total_start, 1)}"
+                            )
+                            return True
+                        if not _abort_throughput_checked and _completed_bytes > 0:
+                            _elapsed = max(time.time() - _last_throughput_check_time, 0.001)
+                            _delta_bytes = _completed_bytes - _last_throughput_check_bytes
+                            _observed_gbps = (_delta_bytes) / (1024**3) / _elapsed
+                            if _observed_gbps < PRELOAD_MIN_THROUGHPUT_GBPS:
+                                _aborted = True
+                                _abort_reason = "low_throughput"
+                                print(
+                                    f"[comfyapp] preload_aborted reason=low_throughput "
+                                    f"observed_gbps={round(_observed_gbps, 3)} "
+                                    f"threshold_gbps={PRELOAD_MIN_THROUGHPUT_GBPS} "
+                                    f"completed_bytes_this_window={_delta_bytes} "
+                                    f"elapsed_s={round(time.time() - _total_start, 1)}"
+                                )
+                                return True
+                            _abort_throughput_checked = True
+                            _last_throughput_check_time = time.time()
+                            _last_throughput_check_bytes = _completed_bytes
+                    return False
+
+                _budget_deadline = (time.time() + budget_ms / 1000.0) if budget_ms is not None else None
+                _abort_throughput_checked = False
+                _last_throughput_check_time = _total_start
+                _last_throughput_check_bytes = 0
+                _pending = list(to_load)
+
+                pool = ThreadPoolExecutor(max_workers=min(len(to_load), _preload_max_workers))
+                try:
+                    # Submit initial batch up to max_workers
+                    fut_to_item: dict = {}
+                    while _pending and len(fut_to_item) < _preload_max_workers:
+                        p, f, cache_key = _pending.pop(0)
+                        fut = pool.submit(_load_one, p, f, cache_key)
+                        fut_to_item[fut] = (f, cache_key, p)
+
+                    while fut_to_item and not _aborted:
+                        # Wait for any one future to complete
+                        done_set, _ = wait(fut_to_item, timeout=1, return_when=FIRST_COMPLETED)
+                        if not done_set:
+                            if _check_abort():
+                                break
+                            continue
+                        future = done_set.pop()
+                        if future not in fut_to_item:
+                            if _check_abort():
+                                break
+                            continue
+                        # Remove before processing to ensure exactly-once
+                        _fname, _cache_key, _path = fut_to_item.pop(future)
+                        filename = _fname
+                        cache_key = _cache_key
+                        try:
+                            fn, cache_key, state_dict, metadata, d_ms, _read_bytes = future.result()
+                            _completed_bytes += _read_bytes
+                            _completed_files += 1
+                            _session_valid = getattr(self, "_active_cpu_preload_session_id", None) == _preload_session_id
+                            if _session_valid:
+                                self._model_cpu_cache[cache_key] = (state_dict, metadata)
+                                cached.append(fn)
+                                if callable(on_file_loaded):
+                                    try:
+                                        on_file_loaded(fn)
+                                    except Exception:
+                                        pass
+                            file_timing_ms[fn] = d_ms
+                            size_mb = "?"
+                            for p, f, _cache_key in to_load:
+                                if f == fn:
+                                    try:
+                                        size_mb = round(os.path.getsize(p) / (1024 * 1024), 1)
+                                    except OSError:
+                                        pass
+                                    break
+                            self._log_profile(
+                                "snapshot_preload_model",
+                                file=fn,
+                                size_mb=size_mb,
+                                duration_ms=d_ms,
+                            )
+                        except Exception as exc:
+                            _failed_files += 1
+                            file_timing_ms[filename] = -1.0
+                            self._log_profile("snapshot_preload_model_failed", file=filename, error=str(exc)[:200])
+
+                        # Submit next pending if not aborted
+                        if not _check_abort() and _pending:
+                            p, f, cache_key = _pending.pop(0)
+                            fut = pool.submit(_load_one, p, f, cache_key)
+                            fut_to_item[fut] = (f, cache_key, p)
+
+                    if _aborted:
+                        for _f in list(fut_to_item.keys()):
+                            if _f.cancel():
+                                _cancelled_futures += 1
+                            else:
+                                _running_threads_not_killable += 1
+                        _pending_not_submitted = len(_pending)
+                        _pending.clear()
+                        _shutdown_wait_false = True
+                        print(
+                            f"[comfyapp] preload_abort_requested reason={_abort_reason} "
+                            f"cancelled_futures={_cancelled_futures} "
+                            f"running_threads_not_killable={_running_threads_not_killable} "
+                            f"pending_not_submitted={_pending_not_submitted} "
+                            f"shutdown_wait_false=1"
+                        )
+                        if _running_threads_not_killable:
+                            print(
+                                f"[comfyapp] preload_session_abandoned "
+                                f"session={_preload_session_id} "
+                                f"running_threads_not_killable={_running_threads_not_killable} — "
+                                f"results discarded"
+                            )
+                finally:
+                    if _aborted:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                    else:
+                        pool.shutdown(wait=True)
+            else:
+                # All files already cached — just report them
+                for path in file_paths:
+                    filename = os.path.basename(path)
+                    cached.append(filename)
+
+            _total_ms = self._profile_ms(_total_start)
+            _loaded_gb = _completed_bytes / (1024**3)
+            # Detect preload outliers: any single file >5s
+            _slowest_fn = ""
+            _slowest_ms = 0.0
+            for _fn, _d in file_timing_ms.items():
+                if _d > _slowest_ms:
+                    _slowest_ms = _d
+                    _slowest_fn = _fn
+            if _total_ms > 5000 and _slowest_fn:
+                _slowest_size_gb = 0.0
+                for p in file_paths:
+                    if os.path.basename(p) == _slowest_fn:
+                        try:
+                            _slowest_size_gb = os.path.getsize(p) / (1024**3)
+                        except OSError:
+                            pass
+                        break
+                _sl_throughput = round(_slowest_size_gb / max(_slowest_ms / 1000, 0.001), 2) if _slowest_size_gb else 0.0
+                print(f"[comfyapp] preload_outlier: true total_ms={_total_ms} "
+                      f"slowest_file={_slowest_fn} slowest_ms={_slowest_ms:.0f} "
+                      f"size_gb={_slowest_size_gb:.2f} throughput_gbps={_sl_throughput} "
+                      f"workers={_preload_max_workers}")
+
+            _throughput_gbps = round(_loaded_gb / max(_total_ms / 1000, 0.001), 2) if _loaded_gb else 0.0
+            print(
+                f"[comfyapp] preload_models_to_cpu: done in {_total_ms}ms "
+                f"loaded={_completed_files} files={len(file_paths)} "
+                f"failed={_failed_files} "
+                f"cancelled_futures={_cancelled_futures} "
+                f"running_threads_not_killable={_running_threads_not_killable} "
+                f"loaded_gb={round(_loaded_gb, 2)} "
+                f"throughput_gbps={_throughput_gbps}"
+            )
+            _budget_exceeded = False
+            if budget_ms is not None:
+                _elapsed = (time.time() - _total_start) * 1000 if _total_start else 0
+                _budget_exceeded = _elapsed > budget_ms
+            _result = {
+                "count": len(cached),
+                "cached": cached,
+                "file_timing_ms": file_timing_ms,
+                "budget_exceeded": _budget_exceeded,
+                "aborted": _aborted,
+                "abort_reason": _abort_reason,
+                "completed_bytes": _completed_bytes,
+                "completed_files": _completed_files,
+                "failed_files": _failed_files,
+                "cancelled_futures": _cancelled_futures,
+                "running_threads_not_killable": _running_threads_not_killable,
+                "pending_not_submitted": _pending_not_submitted,
+                "shutdown_wait_false": _shutdown_wait_false,
+            }
+            return _result
+        finally:
+            if getattr(self, "_active_cpu_preload_session_id", None) == _preload_session_id:
+                self._active_cpu_preload_session_id = None
 
     def _model_in_cpu_cache(self, path: str) -> bool:
         """Return True if a model file is already in ``_model_cpu_cache``.
@@ -2393,7 +4203,12 @@ class _ComfyAPIMixin:
         return self._original_loaders_store
 
     def _prompt_async_actual_load(self, workflow: dict) -> dict:
-        result = {"enabled": False, "submitted": [], "skipped_unet": False, "futures": {}}
+        _al_t0 = time.time()
+        result = {
+            "enabled": False, "submitted": [], "skipped_unet": False, "futures": {},
+            "clip_submitted": False, "clip_cache_hit": False, "clip_duration_ms": 0.0,
+            "actual_load_mode": ACTUAL_LOAD_MODE,
+        }
         if not PROMPT_ASYNC_ACTUAL_LOAD:
             print("[actual_load] enabled=0")
             return result
@@ -2431,9 +4246,11 @@ class _ComfyAPIMixin:
                     if key in self._actual_load_futures:
                         self._actual_load_duplicates_prevented += 1
                         print(f"[actual_load] duplicate_prevented key={key}")
+                        result["clip_cache_hit"] = True
                         continue
                     if hasattr(self, "_clip_object_cache") and key in self._clip_object_cache:
                         print(f"[actual_load] cache_hit key={key}")
+                        result["clip_cache_hit"] = True
                         continue
                     def _load_clip(k=key, cn=clip_name, ct=clip_type):
                         import threading as _thr_lc
@@ -2450,6 +4267,8 @@ class _ComfyAPIMixin:
                                 obj = _al_nodes.NODE_CLASS_MAPPINGS["CLIPLoader"]().load_clip(clip_name=cn, type=ct)
                             self._clip_object_cache[k] = obj[0]
                             d_ms = round((time.time() - t0) * 1000, 1)
+                            result["clip_submitted"] = True
+                            result["clip_duration_ms"] = d_ms
                             print(f"[actual_load] done loader=CLIP key={k} ms={d_ms}")
                         except Exception as e:
                             print(f"[actual_load] failed loader=CLIP key={k} err={e}")
@@ -2459,6 +4278,7 @@ class _ComfyAPIMixin:
                     _t.start()
                     self._actual_load_futures[key] = _t
                     result["submitted"].append(f"CLIP key={key}")
+                    result["clip_submitted"] = True
                     print(f"[actual_load] submit_raw_key=({clip_path}, {clip_type}) submit_canonical_key={key}")
             # ── CLIP (DualCLIP — second file if different) ──
             clips = stack.get("clip", [])
@@ -2620,6 +4440,642 @@ class _ComfyAPIMixin:
         print(f"[actual_load] resolved_keys={resolved_keys}")
         return result
 
+    def _patch_scheduler_clip_encode_prefetch(self, prefetch_cache: dict):
+        """Patch CLIPTextEncode to check scheduler prefetch cache first.
+
+        Called by``_start_scheduler_test`` when prefetch is active.
+        The prefetch worker populates *prefetch_cache* with keys:
+
+          (text_hash, clip_paths_tuple, clip_type)
+
+        This wrapper checks that cache before the normal CLIPTextEncode
+        logic.  Hits are counted on ``self._scheduler_prefetch_real_hit``.
+        """
+        try:
+            import nodes as _ps_nodes
+        except Exception:
+            return
+        _enc_cls = _ps_nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
+        if _enc_cls is None:
+            return
+        _func_name = getattr(_enc_cls, "FUNCTION", "encode")
+        _orig = getattr(_enc_cls, _func_name)
+        _api = self
+        if not hasattr(_api, "_scheduler_prefetch_real_hit"):
+            _api._scheduler_prefetch_real_hit = 0
+
+        def _with_scheduler_prefetch(self_node, clip, text):
+            _paths = tuple(getattr(clip, '_warmup_model_paths', None) or [])
+            _clip_type = getattr(clip, '_warmup_clip_type', '') or ''
+            _text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
+            _key = (_text_hash, _paths, _clip_type)
+            if _key in prefetch_cache:
+                _api._scheduler_prefetch_real_hit += 1
+                return prefetch_cache[_key]
+            return _orig(self_node, clip, text)
+
+        setattr(_enc_cls, _func_name, _with_scheduler_prefetch)
+        print(f"[scheduler_test] prefetch_cache patch installed on {_enc_cls.__name__}.{_func_name}")
+
+    def _start_scheduler_test(self, workflow: dict, scheduler_config: dict) -> dict:
+        """Start controlled scheduler benchmark: dependency validation + model loads.
+
+        Returns a scheduler_trace dict populated asynchronously.
+        The caller (run_prompt_stream) waits via ``_scheduler_wait_and_finalize``.
+
+        Modes:
+          baseline_current           — no override, existing pipeline
+          early_unet_vae             — UNET+VAE at request start, no CLIP
+          clip_first                 — CLIP at start_clip_ms, UNET at start_unet_ms, …
+          unet_first                 — UNET at start_unet_ms, CLIP at start_clip_ms, …
+          clip_serial_then_unet      — CLIP first, then UNET+VAE+encode after CLIP done
+          parallel_matrix            — all loads start at configured delays
+          clip_load_then_unet_and_encode — CLIP first, then UNET+VAE+encode
+          unet_load_then_clip        — UNET first, then CLIP+encode
+        """
+        import threading
+        import os as _st_os
+        import nodes as _st_nodes
+        import folder_paths as _st_fp
+
+        t_start = time.time()
+        mode = scheduler_config.get("mode", "baseline_current")
+
+        trace = {
+            "enabled": True,
+            "mode": mode,
+            "request_start_unix": t_start,
+            "scheduler_origin": "comfyapp._start_scheduler_test",
+        }
+
+        if mode == "baseline_current":
+            trace["enabled"] = False
+            trace["notes"] = "baseline — no scheduler override"
+            return trace
+
+        # ── 1. Validate prompt structure (cheap) ──────────────
+        assert_valid_api_prompt_structure(workflow)
+
+        # ── 2. Sync custom nodes (needed for node classes) ───
+        _cn_sync_start = time.time()
+        _cn_summary, _cn_state = self._sync_custom_nodes_from_volume()
+        _cn_sync_ms = round((time.time() - _cn_sync_start) * 1000, 1)
+        trace["custom_nodes_sync_ms"] = _cn_sync_ms
+        trace["custom_nodes_created"] = len(_cn_summary.get("created", []))
+
+        # ── 3. Start dependency validation in background ─────
+        dep_result = {"prepared": None, "reason": "", "error": None, "changed_nodes": []}
+        dep_done = threading.Event()
+        dep_start_ms = round((time.time() - t_start) * 1000, 1)
+        trace["dependency_validation_start_ms"] = dep_start_ms
+
+        def _dep_worker():
+            try:
+                dep_check = validate_custom_node_dependencies_prepared()
+                dep_result["prepared"] = dep_check.get("prepared", False)
+                dep_result["reason"] = dep_check.get("reason", "")
+                dep_result["changed_nodes"] = dep_check.get("changed_nodes", [])
+            except Exception as e:
+                dep_result["error"] = str(e)
+            finally:
+                dep_done.set()
+
+        dep_thread = threading.Thread(target=_dep_worker, daemon=True)
+        dep_thread.start()
+
+        # ── 4. Extract model stack ───────────────────────────
+        stack = extract_requested_model_stack(workflow)
+        clip_type = stack.get("clip_type", "stable_diffusion")
+        trace["model_stack"] = {k: v for k, v in stack.items() if v}
+
+        # ── 5. Init caches/registry ──────────────────────────
+        self._init_actual_load_registry()
+        self._init_clip_cache()
+        self._init_unet_cache()
+        self._init_vae_cache()
+
+        # ── 6. Start model loads based on mode ───────────────
+        prefetch = scheduler_config.get("prefetch_clip_encode", False)
+        start_clip_ms = scheduler_config.get("start_clip_ms")
+        start_unet_ms = scheduler_config.get("start_unet_ms")
+        start_vae_ms = scheduler_config.get("start_vae_ms")
+        unet_after_clip = scheduler_config.get("start_unet_after_clip_load", False)
+        vae_after_clip = scheduler_config.get("start_vae_after_clip_load", False)
+        clip_after_unet = scheduler_config.get("start_clip_after_unet_load", False)
+
+        # Threads + result dicts for each loader type
+        clip_thread = None
+        unet_thread = None
+        vae_thread = None
+        clip_encode_thread = None
+
+        _resolve = lambda bucket, name: _st_fp.get_full_path(
+            {"clip": "text_encoders", "unet": "diffusion_models", "vae": "vae"}.get(bucket, bucket), name
+        ) or name
+
+        clip_names = stack.get("clip", [])
+        unet_names = stack.get("unet", []) or stack.get("checkpoint", [])
+        vae_names = stack.get("vae", [])
+
+        # Prefetch cache: populated by the worker, checked by real graph
+        _scheduler_prefetch_cache: dict = {}
+        # Counter for real graph hits (patched in _patch_scheduler_clip_encode_prefetch)
+        self._scheduler_prefetch_real_hit = 0
+
+        # ── Shared loader helpers ────────────────────────────
+        _loaded_models: list[dict] = []
+
+        def _record_load(label, basename, filepath, size_gb, t0, t1, sched_ms=0, error=None):
+            wall = round((t1 - t0) * 1000, 1) if t0 and t1 else 0
+            gbps = round(size_gb / (wall / 1000), 2) if wall > 0 and size_gb > 0 else 0
+            rec = {
+                "label": label, "basename": basename, "path": filepath,
+                "size_gb": size_gb, "effective_gbps": gbps,
+                "scheduled_start_ms": sched_ms,
+                "actual_start_ms": round((t0 - t_start) * 1000, 1) if t0 else 0,
+                "ready_ms": round((t1 - t_start) * 1000, 1) if t1 else 0,
+                "load_wall_ms": wall, "error": error,
+            }
+            _loaded_models.append(rec)
+            return rec
+
+        def _load_clip_worker(clip_name, ct, delay_ms, label):
+            if delay_ms:
+                time.sleep(delay_ms / 1000.0)
+            t0 = time.time()
+            trace[f"clip_scheduled_start_ms"] = delay_ms
+            trace[f"clip_start_ms"] = round((t0 - t_start) * 1000, 1)
+            clip_path = _resolve("clip", clip_name)
+            try:
+                clip_real = _st_os.path.realpath(clip_path) if _st_os.path.exists(clip_path) else clip_path
+            except Exception:
+                clip_real = clip_path
+            key = (clip_real, ct)
+            try:
+                obj = _st_nodes.NODE_CLASS_MAPPINGS["CLIPLoader"]().load_clip(clip_name=clip_name, type=ct)
+                self._clip_object_cache[key] = obj[0]
+            except Exception as e:
+                t_err = time.time()
+                trace["clip_error"] = str(e)
+                trace["clip_ready_ms"] = round((t_err - t_start) * 1000, 1)
+                trace["clip_load_wall_ms"] = round((t_err - t0) * 1000, 1)
+                trace["clip_size_gb"] = 0
+                trace["clip_gbps"] = 0
+                _record_load(label, _st_os.path.basename(clip_path), clip_real, 0, t0, t_err, sched_ms=delay_ms, error=str(e))
+                return
+            t1 = time.time()
+            try:
+                sz = _st_os.path.getsize(clip_real)
+            except Exception:
+                sz = 0
+            size_gb = sz / (1024**3)
+            trace["clip_start_ms"] = round((t0 - t_start) * 1000, 1)
+            trace["clip_ready_ms"] = round((t1 - t_start) * 1000, 1)
+            trace["clip_load_wall_ms"] = round((t1 - t0) * 1000, 1)
+            trace["clip_size_gb"] = size_gb
+            trace["clip_gbps"] = round(size_gb / (max(t1 - t0, 0.001)), 2)
+            _record_load(label, _st_os.path.basename(clip_path), clip_real, size_gb, t0, t1, sched_ms=delay_ms)
+
+        def _load_unet_worker(unet_name, delay_ms, label):
+            if delay_ms:
+                time.sleep(delay_ms / 1000.0)
+            t0 = time.time()
+            trace[f"unet_scheduled_start_ms"] = delay_ms
+            trace[f"unet_start_ms"] = round((t0 - t_start) * 1000, 1)
+            unet_path = _resolve("unet", unet_name)
+            try:
+                unet_real = _st_os.path.realpath(unet_path) if _st_os.path.exists(unet_path) else unet_path
+            except Exception:
+                unet_real = unet_path
+            try:
+                obj = _st_nodes.NODE_CLASS_MAPPINGS["UNETLoader"]().load_unet(unet_name=unet_name, weight_dtype="default")
+                self._unet_object_cache[(unet_real, "default")] = obj[0]
+            except Exception as e:
+                t_err = time.time()
+                trace["unet_error"] = str(e)
+                trace["unet_ready_ms"] = round((t_err - t_start) * 1000, 1)
+                trace["unet_load_wall_ms"] = round((t_err - t0) * 1000, 1)
+                trace["unet_size_gb"] = 0
+                trace["unet_gbps"] = 0
+                _record_load(label, _st_os.path.basename(unet_path), unet_real, 0, t0, t_err, sched_ms=delay_ms, error=str(e))
+                return
+            t1 = time.time()
+            try:
+                sz = _st_os.path.getsize(unet_real)
+            except Exception:
+                sz = 0
+            size_gb = sz / (1024**3)
+            trace["unet_start_ms"] = round((t0 - t_start) * 1000, 1)
+            trace["unet_ready_ms"] = round((t1 - t_start) * 1000, 1)
+            trace["unet_load_wall_ms"] = round((t1 - t0) * 1000, 1)
+            trace["unet_size_gb"] = size_gb
+            trace["unet_gbps"] = round(size_gb / (max(t1 - t0, 0.001)), 2)
+            _record_load(label, _st_os.path.basename(unet_path), unet_real, size_gb, t0, t1, sched_ms=delay_ms)
+
+        def _load_vae_worker(vae_name, delay_ms, label):
+            if delay_ms:
+                time.sleep(delay_ms / 1000.0)
+            t0 = time.time()
+            trace[f"vae_scheduled_start_ms"] = delay_ms
+            trace[f"vae_start_ms"] = round((t0 - t_start) * 1000, 1)
+            vae_path = _resolve("vae", vae_name)
+            try:
+                vae_real = _st_os.path.realpath(vae_path) if _st_os.path.exists(vae_path) else vae_path
+            except Exception:
+                vae_real = vae_path
+            try:
+                obj = _st_nodes.NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=vae_name)
+                self._vae_object_cache[("VAELoader", vae_real)] = obj[0]
+            except Exception as e:
+                t_err = time.time()
+                trace["vae_error"] = str(e)
+                trace["vae_ready_ms"] = round((t_err - t_start) * 1000, 1)
+                trace["vae_load_wall_ms"] = round((t_err - t0) * 1000, 1)
+                trace["vae_size_gb"] = 0
+                trace["vae_gbps"] = 0
+                _record_load(label, _st_os.path.basename(vae_path), vae_real, 0, t0, t_err, sched_ms=delay_ms, error=str(e))
+                return
+            t1 = time.time()
+            try:
+                sz = _st_os.path.getsize(vae_real)
+            except Exception:
+                sz = 0
+            size_gb = sz / (1024**3)
+            trace["vae_start_ms"] = round((t0 - t_start) * 1000, 1)
+            trace["vae_ready_ms"] = round((t1 - t_start) * 1000, 1)
+            trace["vae_load_wall_ms"] = round((t1 - t0) * 1000, 1)
+            trace["vae_size_gb"] = size_gb
+            trace["vae_gbps"] = round(size_gb / (max(t1 - t0, 0.001)), 2)
+            _record_load(label, _st_os.path.basename(vae_path), vae_real, size_gb, t0, t1, sched_ms=delay_ms)
+
+        def _find_eligible_clip_encode_nodes():
+            eligible = []
+            for node_id, node in workflow.items():
+                if not isinstance(node, dict):
+                    continue
+                if node.get("class_type") != "CLIPTextEncode":
+                    continue
+                inputs = node.get("inputs", {})
+                if not isinstance(inputs, dict):
+                    continue
+                text = inputs.get("text")
+                if not isinstance(text, str) or not text:
+                    continue
+                clip_src = inputs.get("clip")
+                if not isinstance(clip_src, list) or len(clip_src) < 2:
+                    continue
+                clip_node_id = clip_src[0]
+                clip_node = workflow.get(str(clip_node_id))
+                if not isinstance(clip_node, dict):
+                    continue
+                clip_ct = clip_node.get("class_type", "")
+                if clip_ct not in ("CLIPLoader", "DualCLIPLoader"):
+                    continue
+                eligible.append({
+                    "node_id": node_id,
+                    "text": text,
+                    "text_hash": hashlib.md5(text.encode('utf-8')).hexdigest(),
+                    "clip_node_id": clip_node_id,
+                    "clip_class_type": clip_ct,
+                })
+            return eligible
+
+        def _run_clip_encode_prefetch():
+            start = time.time()
+            trace["clip_encode_start_ms"] = round((start - t_start) * 1000, 1)
+            eligible = _find_eligible_clip_encode_nodes()
+            trace["clip_encode_prefetch_eligible_count"] = len(eligible)
+            if not eligible:
+                trace["clip_encode_prefetch_done_count"] = 0
+                trace["clip_encode_ready_ms"] = trace["clip_encode_start_ms"]
+                trace["clip_encode_wall_ms"] = 0
+                trace["clip_encode_prefetch_hit"] = 0
+                trace["clip_encode_prefetch_miss_reason"] = "no_eligible_nodes"
+                return
+            try:
+                import nodes as _ec_nodes
+                enc_cls = _ec_nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
+                if enc_cls is None:
+                    trace["clip_encode_ready_ms"] = trace["clip_encode_start_ms"]
+                    trace["clip_encode_wall_ms"] = 0
+                    trace["clip_encode_prefetch_hit"] = 0
+                    trace["clip_encode_prefetch_done_count"] = 0
+                    trace["clip_encode_prefetch_miss_reason"] = "CLIPTextEncode_not_found"
+                    return
+                done = 0
+                for info in eligible:
+                    try:
+                        clip_node = workflow.get(str(info["clip_node_id"]))
+                        if not isinstance(clip_node, dict):
+                            continue
+                        clip_inputs = clip_node.get("inputs", {})
+                        ct = clip_inputs.get("type", clip_type)
+
+                        if info["clip_class_type"] == "CLIPLoader":
+                            cn = clip_inputs.get("clip_name", "")
+                            if not cn:
+                                continue
+                            clip_path = _resolve("clip", cn)
+                            clip_real = _st_os.path.realpath(clip_path) if _st_os.path.exists(clip_path) else clip_path
+                            key = (clip_real, ct)
+                            clip_obj = self._clip_object_cache.get(key)
+                            if clip_obj is None:
+                                continue
+                            if not hasattr(clip_obj, '_warmup_model_paths'):
+                                clip_obj._warmup_model_paths = (clip_real,)
+                                clip_obj._warmup_clip_type = ct
+                            enc_node = enc_cls()
+                            result = enc_node.encode(clip_obj, info["text"])
+                            # Store in prefetch cache for real-execution patch
+                            _pkey = (info["text_hash"], (clip_real,), ct)
+                            _scheduler_prefetch_cache[_pkey] = result
+                        elif info["clip_class_type"] == "DualCLIPLoader":
+                            cn1 = clip_inputs.get("clip_name1", "")
+                            cn2 = clip_inputs.get("clip_name2", "")
+                            if not cn1 or not cn2:
+                                continue
+                            clip1_path = _resolve("clip", cn1)
+                            clip2_path = _resolve("clip", cn2)
+                            clip1_real = _st_os.path.realpath(clip1_path) if _st_os.path.exists(clip1_path) else clip1_path
+                            clip2_real = _st_os.path.realpath(clip2_path) if _st_os.path.exists(clip2_path) else clip2_path
+                            key1 = (clip1_real, ct)
+                            key2 = (clip2_real, ct)
+                            clip_obj1 = self._clip_object_cache.get(key1)
+                            clip_obj2 = self._clip_object_cache.get(key2)
+                            if clip_obj1 is None or clip_obj2 is None:
+                                continue
+                            for clip_obj, cr in [(clip_obj1, clip1_real), (clip_obj2, clip2_real)]:
+                                if not hasattr(clip_obj, '_warmup_model_paths'):
+                                    clip_obj._warmup_model_paths = (clip1_real, clip2_real)
+                                    clip_obj._warmup_clip_type = ct
+                            from comfy.sd import CLIP
+                            combined = CLIP(
+                                clip_target = clip_obj1.clip_target,
+                                embedding_directory = getattr(clip_obj1, 'embedding_directory', None)
+                            )
+                            combined.clip = clip_obj1.clip
+                            combined.tokenizer = clip_obj1.tokenizer
+                            combined.patcher = clip_obj1.patcher
+                            combined.load_clip(clip_name2=cn2, type=ct)
+                            enc_node = enc_cls()
+                            result = enc_node.encode(combined, info["text"])
+                            _pkey = (info["text_hash"], (clip1_real, clip2_real), ct)
+                            _scheduler_prefetch_cache[_pkey] = result
+                        done += 1
+                    except Exception as exc:
+                        print(f"[scheduler_test] prefetch node {info.get('node_id','?')} failed: {exc}")
+                        continue
+                end = time.time()
+                trace["clip_encode_ready_ms"] = round((end - t_start) * 1000, 1)
+                trace["clip_encode_wall_ms"] = round((end - start) * 1000, 1)
+                trace["clip_encode_prefetch_hit"] = done
+                trace["clip_encode_prefetch_done_count"] = done
+                if done == 0 and eligible:
+                    trace["clip_encode_prefetch_miss_reason"] = "clip_not_in_cache"
+                print(f"[scheduler_test] clip_encode_prefetch done={done} eligible={len(eligible)} ms={trace['clip_encode_wall_ms']}")
+            except Exception as exc:
+                trace["clip_encode_error"] = str(exc)
+                trace["clip_encode_prefetch_hit"] = 0
+                trace["clip_encode_prefetch_done_count"] = 0
+                trace["clip_encode_prefetch_miss_reason"] = str(exc)
+                trace["clip_encode_ready_ms"] = trace.get("clip_encode_start_ms", round((time.time() - t_start) * 1000, 1))
+                trace["clip_encode_wall_ms"] = 0
+                print(f"[scheduler_test] clip_encode_prefetch failed: {exc}")
+
+        # Install prefetch cache patch on CLIPTextEncode
+        if prefetch:
+            self._patch_scheduler_clip_encode_prefetch(_scheduler_prefetch_cache)
+
+        # ── Launch loads per mode ────────────────────────────
+        if mode == "early_unet_vae":
+            for un in unet_names:
+                d = start_unet_ms if start_unet_ms is not None else 0
+                unet_thread = threading.Thread(target=_load_unet_worker, args=(un, d, "unet"), daemon=True)
+                unet_thread.start()
+            for vn in vae_names:
+                d = start_vae_ms if start_vae_ms is not None else 0
+                vae_thread = threading.Thread(target=_load_vae_worker, args=(vn, d, "vae"), daemon=True)
+                vae_thread.start()
+
+        elif mode in ("clip_first", "parallel_matrix"):
+            if start_clip_ms is not None:
+                for cn in clip_names:
+                    ct = clip_type
+                    clip_thread = threading.Thread(target=_load_clip_worker, args=(cn, ct, start_clip_ms, "clip"), daemon=True)
+                    clip_thread.start()
+            if start_unet_ms is not None:
+                for un in unet_names:
+                    unet_thread = threading.Thread(target=_load_unet_worker, args=(un, start_unet_ms, "unet"), daemon=True)
+                    unet_thread.start()
+            if start_vae_ms is not None:
+                for vn in vae_names:
+                    vae_thread = threading.Thread(target=_load_vae_worker, args=(vn, start_vae_ms, "vae"), daemon=True)
+                    vae_thread.start()
+            # Post-CLIP prefetch
+            if prefetch and clip_thread is not None:
+                def _prefetch_after_clip():
+                    clip_thread.join()
+                    _run_clip_encode_prefetch()
+                clip_encode_thread = threading.Thread(target=_prefetch_after_clip, daemon=True)
+                clip_encode_thread.start()
+
+        elif mode == "unet_first":
+            if start_unet_ms is not None:
+                for un in unet_names:
+                    unet_thread = threading.Thread(target=_load_unet_worker, args=(un, start_unet_ms, "unet"), daemon=True)
+                    unet_thread.start()
+            if start_vae_ms is not None:
+                for vn in vae_names:
+                    vae_thread = threading.Thread(target=_load_vae_worker, args=(vn, start_vae_ms, "vae"), daemon=True)
+                    vae_thread.start()
+            if start_clip_ms is not None:
+                for cn in clip_names:
+                    ct = clip_type
+                    clip_thread = threading.Thread(target=_load_clip_worker, args=(cn, ct, start_clip_ms, "clip"), daemon=True)
+                    clip_thread.start()
+            # Post-CLIP prefetch
+            if prefetch and clip_thread is not None:
+                def _prefetch_after_clip_unet():
+                    clip_thread.join()
+                    _run_clip_encode_prefetch()
+                clip_encode_thread = threading.Thread(target=_prefetch_after_clip_unet, daemon=True)
+                clip_encode_thread.start()
+
+        elif mode in ("clip_serial_then_unet", "clip_load_then_unet_and_encode"):
+            for cn in clip_names[:1]:
+                ct = clip_type
+                clip_thread = threading.Thread(target=_load_clip_worker, args=(cn, ct, 0, "clip"), daemon=True)
+                clip_thread.start()
+            if clip_thread is not None:
+                clip_thread.join()
+            for un in unet_names:
+                unet_thread = threading.Thread(target=_load_unet_worker, args=(un, 0, "unet"), daemon=True)
+                unet_thread.start()
+            for vn in vae_names:
+                vae_thread = threading.Thread(target=_load_vae_worker, args=(vn, 0, "vae"), daemon=True)
+                vae_thread.start()
+            if prefetch and clip_thread is not None:
+                def _prefetch_serial():
+                    _run_clip_encode_prefetch()
+                clip_encode_thread = threading.Thread(target=_prefetch_serial, daemon=True)
+                clip_encode_thread.start()
+
+        elif mode in ("unet_load_then_clip",):
+            for un in unet_names:
+                unet_thread = threading.Thread(target=_load_unet_worker, args=(un, 0, "unet"), daemon=True)
+                unet_thread.start()
+            for vn in vae_names:
+                vae_thread = threading.Thread(target=_load_vae_worker, args=(vn, 0, "vae"), daemon=True)
+                vae_thread.start()
+            if unet_thread is not None:
+                unet_thread.join()
+            for cn in clip_names[:1]:
+                ct = clip_type
+                clip_thread = threading.Thread(target=_load_clip_worker, args=(cn, ct, 0, "clip"), daemon=True)
+                clip_thread.start()
+            if prefetch and clip_thread is not None:
+                def _prefetch_after_clip_unet_first():
+                    clip_thread.join()
+                    _run_clip_encode_prefetch()
+                clip_encode_thread = threading.Thread(target=_prefetch_after_clip_unet_first, daemon=True)
+                clip_encode_thread.start()
+
+        # ── 7. Store threads for caller to wait on ───────────
+        self._scheduler_dep_thread = dep_thread
+        self._scheduler_dep_done = dep_done
+        self._scheduler_dep_result = dep_result
+        self._scheduler_workflow = workflow
+        self._scheduler_trace = trace
+        self._scheduler_clip_thread = clip_thread
+        self._scheduler_unet_thread = unet_thread
+        self._scheduler_vae_thread = vae_thread
+        self._scheduler_clip_encode_thread = clip_encode_thread
+        self._scheduler_prefetch = prefetch
+        self._scheduler_t_start = t_start
+        self._scheduler_clip_names = clip_names
+        self._scheduler_unet_names = unet_names
+        self._scheduler_prefetch_cache = _scheduler_prefetch_cache
+
+        print(f"[scheduler_test] config={json.dumps(scheduler_config, default=str)} mode={mode}")
+        trace["loaded_models"] = _loaded_models
+        return trace
+
+    def _scheduler_wait_and_finalize(self) -> dict:
+        """Wait for all scheduler test tasks and finalize the trace.
+
+        Called by run_prompt_stream after scheduler test is started.
+        Blocks until dependency validation passes (or fails) and
+        required model loads complete. Returns the finalized trace.
+        """
+        trace = getattr(self, "_scheduler_trace", {})
+        if not trace.get("enabled"):
+            return trace
+
+        t_start = getattr(self, "_scheduler_t_start", time.time())
+        dep_thread = getattr(self, "_scheduler_dep_thread", None)
+        dep_done = getattr(self, "_scheduler_dep_done", None)
+        dep_result = getattr(self, "_scheduler_dep_result", None)
+        clip_thread = getattr(self, "_scheduler_clip_thread", None)
+        unet_thread = getattr(self, "_scheduler_unet_thread", None)
+        vae_thread = getattr(self, "_scheduler_vae_thread", None)
+        clip_encode_thread = getattr(self, "_scheduler_clip_encode_thread", None)
+        prefetch = getattr(self, "_scheduler_prefetch", False)
+        mode = trace.get("mode", "")
+
+        _repair_mode = self._resolve_requirements_repair_mode()
+
+        # Wait for dependency validation
+        if dep_thread is not None and dep_thread.is_alive():
+            dep_thread.join()
+        if dep_done is not None and dep_done.is_set():
+            trace["dependency_gate_done_ms"] = round((time.time() - t_start) * 1000, 1)
+            if dep_result:
+                trace["dependency_prepared"] = dep_result.get("prepared")
+                trace["dependency_reason"] = dep_result.get("reason", "")
+                if dep_result.get("error"):
+                    trace["dependency_error"] = dep_result["error"]
+        else:
+            trace["dependency_gate_done_ms"] = trace.get("dependency_validation_start_ms")
+
+        if _repair_mode in ("off", "fail_fast"):
+            if dep_result and not dep_result.get("prepared"):
+                raise RuntimeError(
+                    f"Custom node dependencies are not prepared. "
+                    f"Runtime repair is disabled in {_repair_mode} mode. "
+                    f"reason={dep_result.get('reason','')} "
+                    f"changed_nodes={dep_result.get('changed_nodes',[])} "
+                )
+
+        # Missing-node gate
+        _mn_workflow = getattr(self, "_scheduler_workflow", None) or {}
+        try:
+            _mn_result = self._enforce_workflow_node_classes_available_before_model_work(_mn_workflow)
+            trace["missing_node_gate_done_ms"] = round((time.time() - t_start) * 1000, 1)
+            trace["missing_nodes"] = _mn_result.get("missing_nodes_before_model_work", [])
+            if _mn_result.get("missing_node_blocked_by_mode") and _mn_result.get("missing_nodes_before_model_work"):
+                raise RuntimeError(
+                    f"Missing custom node class(es): "
+                    f"{_mn_result['missing_nodes_before_model_work']}"
+                )
+        except RuntimeError:
+            raise
+        except Exception as e:
+            trace["missing_node_error"] = str(e)
+
+        # Wait for model loads
+        for t in (clip_thread, unet_thread, vae_thread):
+            if t is not None and t.is_alive():
+                t.join()
+
+        if prefetch and clip_encode_thread is not None and clip_encode_thread.is_alive():
+            clip_encode_thread.join()
+
+        # Read real-execution prefetch hit counter
+        real_hit = getattr(self, "_scheduler_prefetch_real_hit", 0)
+        if real_hit > 0:
+            trace["clip_encode_prefetch_real_hit"] = real_hit
+            trace["clip_encode_prefetch_hit"] = real_hit
+
+        # ── Compute sampler gate ────────────────────────────
+        gate_candidates = []
+        dep_gate = trace.get("dependency_gate_done_ms")
+        if isinstance(dep_gate, (int, float)):
+            gate_candidates.append(dep_gate)
+        mn_gate = trace.get("missing_node_gate_done_ms")
+        if isinstance(mn_gate, (int, float)):
+            gate_candidates.append(mn_gate)
+        unet_ready = trace.get("unet_ready_ms")
+        if isinstance(unet_ready, (int, float)):
+            gate_candidates.append(unet_ready)
+        has_clip = bool(getattr(self, "_scheduler_clip_names", []))
+        if has_clip:
+            clip_encode_ready = trace.get("clip_encode_ready_ms")
+            if prefetch and isinstance(clip_encode_ready, (int, float)):
+                gate_candidates.append(clip_encode_ready)
+            else:
+                clip_ready = trace.get("clip_ready_ms")
+                if isinstance(clip_ready, (int, float)):
+                    gate_candidates.append(clip_ready)
+        vae_ready = trace.get("vae_ready_ms")
+        sampler_gate_without_vae = max(gate_candidates) if gate_candidates else 0
+        if isinstance(vae_ready, (int, float)):
+            gate_candidates.append(vae_ready)
+        trace["sampler_gate_ready_ms"] = max(gate_candidates) if gate_candidates else 0
+        trace["sampler_gate_ready_without_vae_ms"] = sampler_gate_without_vae
+        trace["sampler_gate_ready_with_vae_ms"] = max(gate_candidates) if gate_candidates else 0
+
+        # ── Notes ─────────────────────────────────────────
+        notes_parts = []
+        if trace.get("clip_encode_prefetch_hit", 0) > 0:
+            notes_parts.append(f"clip_encode_prefetch_hit={trace['clip_encode_prefetch_hit']}")
+        if real_hit > 0:
+            notes_parts.append(f"prefetch_real_hit={real_hit}")
+        trace["notes"] = (trace.get("notes") or "") + " " + "; ".join(notes_parts)
+        trace["notes"] = trace["notes"].strip()
+
+        print(f"[scheduler_test] finalized mode={mode} sampler_gate_ready_ms={trace.get('sampler_gate_ready_ms')}")
+        return trace
+
     def _patch_model_cpu_cache(self, comfy_utils) -> None:
         """Patch ComfyUI model loading to reuse CPU-cached state dicts.
         Also coordinates with in-flight prompt-time async preloads."""
@@ -2706,20 +5162,98 @@ class _ComfyAPIMixin:
         comfy_utils.load_torch_file = cached_load
         self._model_cpu_cache_patched = True
 
-    def _install_custom_node_requirements(self, force: bool = False) -> dict:
-        """Install requirements.txt for each custom node, skipping cached hashes.
+    def _count_requirement_cache_hits(self) -> tuple[int, int]:
+        """Return (hits, misses) for custom node requirements hashes.
 
-        The hash cache is invalidated when:
-
-        * ``force=True`` is passed (used by the workflow-repair path).
-        * The cached ``comfyapp_version`` differs from the current
-          ``COMFYAPP_VERSION`` — a fresh image means the previous install
-          is gone even though the cache file persists on the volume.
-        * A "skipped" node has a top-level package in its requirements.txt
-          that is no longer importable — the previous install was either
-          never persisted (caller was using a different Python) or has been
-          lost across an image rebuild.
+        Used by ``off`` and ``fail_fast`` modes to decide whether runtime
+        install would be needed.
         """
+        metadata = load_runtime_metadata()
+        cached = metadata.get("requirements", {})
+        hits = 0
+        misses = 0
+        for node_dir in _iter_syncable_custom_node_dirs(CUSTOM_NODES_PATH):
+            src = os.path.join(CUSTOM_NODES_PATH, node_dir)
+            req_file = os.path.join(src, "requirements.txt")
+            if not os.path.isfile(req_file):
+                continue
+            current_hash = requirements_file_hash(req_file)
+            if current_hash and cached.get(node_dir) == current_hash:
+                hits += 1
+            else:
+                misses += 1
+        return hits, misses
+
+    def _install_custom_node_requirements(self, force: bool = False) -> dict:
+        """Install requirements.txt for each custom node.
+
+        Respects ``COMFYMODAL_REQUIREMENTS_REPAIR_MODE``:
+
+        * ``off`` — Never pip install.  Validate baked manifest.  Return.
+        * ``fail_fast`` — Never pip install.  Validate baked manifest.
+          Raise RuntimeError if not prepared.
+        * ``dev`` — Runtime pip install allowed.  ``force=True`` works only
+          in dev mode.
+
+        CRITICAL: ``force=True`` must NOT override ``off`` or ``fail_fast``.
+        """
+        mode = self._resolve_requirements_repair_mode()
+
+        if mode == "off":
+            dep_check = validate_custom_node_dependencies_prepared()
+            print(
+                f"[comfyapp] requirements repair=off: "
+                f"prepared={dep_check.get('prepared')} "
+                f"reason={dep_check.get('reason', '')}"
+            )
+            return {
+                "installed": [], "skipped": [], "failed": [],
+                "mode": "off",
+                "prepared": dep_check.get("prepared", False),
+                "dependency_reason": dep_check.get("reason", ""),
+            }
+
+        if mode == "fail_fast":
+            dep_check = validate_custom_node_dependencies_prepared()
+            if not dep_check.get("prepared", False):
+                baked_hash = dep_check.get("baked_hash", "?") or "?"
+                current_hash = dep_check.get("current_hash", "?") or "?"
+                changed_nodes = dep_check.get("changed_nodes", [])
+                raise RuntimeError(
+                    "Custom node dependencies are not prepared for this image. "
+                    "Runtime pip install is disabled in fail_fast mode. "
+                    "Rebuild/deploy the Modal image after syncing "
+                    "custom-node requirements. "
+                    f"reason={dep_check.get('reason', '')} "
+                    f"baked_hash={baked_hash} "
+                    f"current_hash={current_hash} "
+                    f"changed_nodes={changed_nodes}"
+                )
+            skipped = []
+            for node_dir in _iter_syncable_custom_node_dirs(CUSTOM_NODES_PATH):
+                src = os.path.join(CUSTOM_NODES_PATH, node_dir)
+                req_file = os.path.join(src, "requirements.txt")
+                if os.path.isfile(req_file):
+                    skipped.append(node_dir)
+            return {
+                "installed": [], "skipped": skipped, "failed": [],
+                "mode": "fail_fast", "prepared": True,
+            }
+
+        # ── dev mode: runtime pip install allowed ──
+        if force:
+            print(
+                "[comfyapp] WARNING: requirements repair mode=dev: "
+                "force=True requested runtime pip install; "
+                "this is slow and not production-safe."
+            )
+        else:
+            print(
+                "[comfyapp] requirements repair mode=dev: "
+                "runtime pip install allowed; "
+                "this is slow and not production-safe."
+            )
+
         metadata = load_runtime_metadata()
         cached_version = metadata.get("comfyapp_version")
         if not force and cached_version and cached_version != COMFYAPP_VERSION:
@@ -2739,24 +5273,18 @@ class _ComfyAPIMixin:
         _hash_hit_count = 0
         _import_checked_count = 0
 
-        for node_dir in sorted(os.listdir(CUSTOM_NODES_PATH)) if os.path.isdir(CUSTOM_NODES_PATH) else []:
+        for node_dir in _iter_syncable_custom_node_dirs(CUSTOM_NODES_PATH):
             src = os.path.join(CUSTOM_NODES_PATH, node_dir)
-            if not os.path.isdir(src):
-                continue
             req_file = os.path.join(src, "requirements.txt")
             if not os.path.isfile(req_file):
                 continue
             current_hash = requirements_file_hash(req_file)
             if not force and current_hash:
                 if cached.get(node_dir) == current_hash:
-                    # Hash match — packages were confirmed installed during
-                    # a previous startup. Skip pip, no importability check needed.
                     _hash_hit_count += 1
                     skipped.append(node_dir)
                     continue
                 if _requirements_have_importable_packages(req_file):
-                    # Packages importable from image build but hash not yet
-                    # cached — seed the hash so next startup skips the check.
                     _import_checked_count += 1
                     updated_hashes[node_dir] = current_hash
                     skipped.append(node_dir)
@@ -2826,7 +5354,6 @@ class _ComfyAPIMixin:
                 if current_hash:
                     updated_hashes[node_dir] = current_hash
 
-        # Persist updated hashes (and the version marker that gates them)
         if updated_hashes or force:
             metadata["requirements"] = {**cached, **updated_hashes}
             metadata["comfyapp_version"] = COMFYAPP_VERSION
@@ -2997,6 +5524,7 @@ class _ComfyAPIMixin:
             with open(tmp, "w") as f:
                 json.dump(data, f, indent=2, sort_keys=True)
             os.replace(tmp, SAGE_RUNTIME_CACHE_PATH)
+            _commit_volume_async(label="sage_runtime_cache")
             print(f"[comfyapp] sage_runtime_cache saved mode={mode} gpu={gpu_name} sage_v={sage_version}")
         except Exception as exc:
             print(f"[comfyapp] sage_runtime_cache save error: {exc}")
@@ -3439,31 +5967,298 @@ class _ComfyAPIMixin:
             stripped[_nid] = {"class_type": _spec.get("class_type"), "inputs": _inp}
         return hashlib.md5(json.dumps(stripped, sort_keys=True).encode()).hexdigest()[:16]
 
-    def _repair_missing_workflow_nodes(self, workflow: dict) -> dict:
-        import nodes
+    def _find_missing_workflow_node_classes(self, workflow: dict) -> list[str]:
+        """Return sorted list of class_type values referenced in *workflow*
+        that are NOT registered in ``nodes.NODE_CLASS_MAPPINGS``.
 
+        Pure read-only scan: no pip install, no model load, no repair.
+        """
+        import nodes
         requested = sorted({
-            _spec.get("class_type")
-            for _spec in workflow.values()
-            if isinstance(_spec, dict) and _spec.get("class_type")
+            spec.get("class_type")
+            for spec in workflow.values()
+            if isinstance(spec, dict) and spec.get("class_type")
         })
-        missing_before = [name for name in requested if name not in nodes.NODE_CLASS_MAPPINGS]
+        return [name for name in requested if name not in nodes.NODE_CLASS_MAPPINGS]
+
+    def _compute_near_matches(self, missing_name: str, max_matches: int = 5) -> list[tuple[str, float]]:
+        """Return up to *max_matches* registered node class names that
+        share tokens with *missing_name*, scored by token overlap.
+
+        Tokenizes on CamelCase, underscores, hyphens, and digit boundaries.
+        Scores are ``matched_token_count / union_token_count`` (0-1).
+        """
+        import re as _re
+        import nodes as _near_nodes
+        registered = list(getattr(_near_nodes, "NODE_CLASS_MAPPINGS", {}).keys())
+        _tokens = set(_re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|$)|\d+|[a-z]+", missing_name))
+        if not _tokens:
+            return []
+        scored = []
+        for _cls in registered:
+            _cls_tokens = set(_re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|$)|\d+|[a-z]+", _cls))
+            if not _cls_tokens:
+                continue
+            shared = _tokens & _cls_tokens
+            if not shared:
+                continue
+            score = len(shared) / len(_tokens | _cls_tokens)
+            scored.append((_cls, round(score, 3)))
+        scored.sort(key=lambda x: (-x[1], x[0]))
+        return scored[:max_matches]
+
+    def _enforce_workflow_node_classes_available_before_model_work(self, workflow: dict) -> dict:
+        """Gate: fail fast if workflow references missing node classes.
+
+        Must be called AFTER custom-node sync and AFTER dependency validation,
+        but BEFORE ``_prompt_async_preload``, ``_prompt_async_actual_load``,
+        or ``_execute_in_process``.
+
+        Production modes (``off``, ``fail_fast``) raise immediately.
+        Dev mode attempts runtime repair then re-checks.
+        """
+        missing = self._find_missing_workflow_node_classes(workflow)
+        mode = self._resolve_requirements_repair_mode()
+
+        if not missing:
+            return {
+                "missing_node_check_ran": True,
+                "missing_nodes_before_model_work": [],
+                "missing_node_repair_attempted": False,
+                "missing_nodes_after_repair": [],
+                "missing_node_blocked_by_mode": False,
+            }
+
+        print(
+            f"[comfyapp] missing workflow nodes pre_model_work: {missing} "
+            f"repair_mode={mode}"
+        )
+
+        if mode != "dev":
+            _diag = self._collect_missing_node_diagnostics(workflow)
+            _near = {m: self._compute_near_matches(m) for m in missing}
+            _near_strs = []
+            for _m, _matches in _near.items():
+                if _matches:
+                    _top = ", ".join(f"{n}({s})" for n, s in _matches[:3])
+                    _near_strs.append(f"{_m}->[{_top}]")
+            _near_msg = ""
+            if _near_strs:
+                _near_msg = " Near matches (top scored): " + "; ".join(_near_strs[:6]) + "."
+            raise RuntimeError(
+                "These node classes are missing from nodes.NODE_CLASS_MAPPINGS "
+                "after custom-node sync: "
+                f"{missing}. "
+                "This usually means the corresponding custom node package is "
+                "not present, did not import successfully, or changed class "
+                "names. "
+                "Check ComfyUI custom-node import logs before this request."
+                f"{_near_msg} "
+                f"repair_mode={mode} "
+                f"{_diag}"
+            )
+
+        # ── dev mode: attempt runtime repair ──
+        req_summary = self._install_custom_node_requirements(force=True)
+        import nodes as _repair_nodes
+        if self._event_loop is not None:
+            self._event_loop.run_until_complete(_repair_nodes.init_extra_nodes())
+        missing_after = self._find_missing_workflow_node_classes(workflow)
+        if missing_after:
+            raise RuntimeError(
+                "Workflow still references missing custom node class(es) "
+                f"after dev repair: {missing_after}. "
+                "Install/sync the required custom nodes manually."
+            )
+        return {
+            "missing_node_check_ran": True,
+            "missing_nodes_before_model_work": missing,
+            "missing_node_repair_attempted": True,
+            "missing_nodes_after_repair": missing_after,
+            "missing_node_blocked_by_mode": False,
+            "installed": req_summary.get("installed", []),
+            "skipped": req_summary.get("skipped", []),
+            "failed": req_summary.get("failed", []),
+        }
+
+    def _retry_pending_custom_node_registrations(self) -> list[str]:
+        """Re-register custom nodes whose entrypoint/schema failed during CPU snapshot.
+
+        After GPU warmup makes CUDA available, retry load_custom_node for each
+        pending path.  Uses the retry registry for bookkeeping.
+        Returns list of paths that succeeded on retry.
+        """
+        import nodes as _retry_nodes
+        global _CUSTOM_NODE_REGISTRATION_PENDING_RETRY, _CUSTOM_NODE_RETRY_REGISTRY
+        _pending = list(_CUSTOM_NODE_REGISTRATION_PENDING_RETRY)
+        if not _pending:
+            # Also check registry for any failed entries
+            _registered_pending = _CUSTOM_NODE_RETRY_REGISTRY.get_pending_paths()
+            if _registered_pending:
+                _CUSTOM_NODE_REGISTRATION_PENDING_RETRY.update(_registered_pending)
+                _pending = list(_CUSTOM_NODE_REGISTRATION_PENDING_RETRY)
+            if not _pending:
+                return []
+        _succeeded = []
+        print(
+            f"[comfyapp] retrying custom node registration after GPU warmup: "
+            f"pending={len(_pending)} paths={_pending}"
+        )
+        for _path in _pending:
+            _CUSTOM_NODE_RETRY_REGISTRY.record_retry(_path)
+            try:
+                _ok = self._event_loop.run_until_complete(
+                    _retry_nodes.load_custom_node(_path)
+                )
+                if _ok:
+                    _succeeded.append(_path)
+                    _CUSTOM_NODE_RETRY_REGISTRY.mark_resolved(_path)
+                    print(
+                        f"[comfyapp] custom_node_retry_success path={_path}"
+                    )
+                else:
+                    _entry = _CUSTOM_NODE_RETRY_REGISTRY.get_entry(_path)
+                    if _entry:
+                        _entry.record_failure("still_failed", "load_custom_node returned False", "")
+                    print(
+                        f"[comfyapp] custom_node_retry_still_failed path={_path}"
+                    )
+            except Exception as _e:
+                import traceback as _tb
+                _tb.print_exc()
+                _exc_type = type(_e).__name__
+                _exc_msg = str(_e)
+                _tb_text = "".join(_tb.format_exception(_e))
+                _CUSTOM_NODE_RETRY_REGISTRY.register_failure(_path, _exc_type, _exc_msg, _tb_text)
+                print(
+                    f"[comfyapp] custom_node_retry_exception "
+                    f"path={_path} error={_e}"
+                )
+        # Clear only paths that succeeded or are no longer retryable
+        for _path in list(_CUSTOM_NODE_REGISTRATION_PENDING_RETRY):
+            if not _CUSTOM_NODE_RETRY_REGISTRY.should_retry(_path):
+                _CUSTOM_NODE_REGISTRATION_PENDING_RETRY.discard(_path)
+        # Log remaining failed entries for diagnostics
+        _failed = _CUSTOM_NODE_RETRY_REGISTRY.get_failed_paths()
+        if _failed:
+            print(f"[comfyapp] custom_node_retry_failed_remaining: {[f['path'] for f in _failed]}")
+        return _succeeded
+
+    def _collect_custom_node_import_health(self) -> dict:
+        """Log structured summary of custom-node import state after ComfyUI node init."""
+        import nodes as _health_nodes
+        registered_count = len(getattr(_health_nodes, "NODE_CLASS_MAPPINGS", {}) or {})
+        volume_dirs = _iter_syncable_custom_node_dirs(CUSTOM_NODES_PATH) if os.path.isdir(CUSTOM_NODES_PATH) else []
+        comfy_root = "/root/comfy/ComfyUI/custom_nodes"
+        comfy_entries = sorted(os.listdir(comfy_root)) if os.path.isdir(comfy_root) else []
+        symlink_dirs = []
+        for _name in comfy_entries:
+            _path = os.path.join(comfy_root, _name)
+            if os.path.islink(_path):
+                try:
+                    if os.path.commonpath([os.path.realpath(_path), os.path.realpath(CUSTOM_NODES_PATH)]) == os.path.realpath(CUSTOM_NODES_PATH):
+                        symlink_dirs.append(_name)
+                except ValueError:
+                    pass
+        _failures = list(_CUSTOM_NODE_IMPORT_FAILURES)
+        result = {
+            "registered_node_classes": registered_count,
+            "volume_syncable_custom_node_count": len(volume_dirs),
+            "volume_syncable_custom_node_dirs": volume_dirs,
+            "comfy_custom_node_entry_count": len(comfy_entries),
+            "comfy_volume_symlink_count": len(symlink_dirs),
+            "comfy_volume_symlink_dirs": symlink_dirs,
+            "import_failure_count": len(_failures),
+            "import_failures": _failures,
+        }
+        print(f"[comfyapp] custom_node_import_health: "
+              f"registered={registered_count} "
+              f"volume_syncable={len(volume_dirs)} "
+              f"comfy_entries={len(comfy_entries)} "
+              f"comfy_symlinks={len(symlink_dirs)} "
+              f"failures={len(_failures)}")
+        for _f in _failures:
+            print(f"[comfyapp] custom_node_import_failure: "
+                  f"name={os.path.basename(_f.get('custom_node_path', '?'))} "
+                  f"phase={_f.get('phase', '?')} "
+                  f"exception_type={_f.get('exception_type', '?')} "
+                  f"message={_f.get('exception_message', '?')[:200]} "
+                  f"traceback_available={'yes' if _f.get('traceback') else 'no'}")
+        if volume_dirs:
+            print(f"[comfyapp] custom_node_import_health: volume_dirs={volume_dirs}")
+        if symlink_dirs:
+            print(f"[comfyapp] custom_node_import_health: comfy_volume_symlink_dirs={symlink_dirs}")
+        return result
+
+    def _collect_missing_node_diagnostics(self, workflow: dict) -> str:
+        """Build a short diagnostic string for missing-node error messages."""
+        import nodes as _diag_nodes
+        parts = []
+        try:
+            volume_dirs = _iter_syncable_custom_node_dirs(CUSTOM_NODES_PATH) if os.path.isdir(CUSTOM_NODES_PATH) else []
+            parts.append(f"volume_syncable_custom_node_dirs={len(volume_dirs)}")
+            if len(volume_dirs) <= 50:
+                parts.append(f"volume_dirs={sorted(volume_dirs)}")
+        except Exception:
+            pass
+        try:
+            cn_root = "/root/comfy/ComfyUI/custom_nodes"
+            if os.path.isdir(cn_root):
+                raw_entries = sorted(os.listdir(cn_root))
+                symlink_dirs = []
+                for _name in raw_entries:
+                    _path = os.path.join(cn_root, _name)
+                    if os.path.islink(_path):
+                        try:
+                            if os.path.commonpath([os.path.realpath(_path), os.path.realpath(CUSTOM_NODES_PATH)]) == os.path.realpath(CUSTOM_NODES_PATH):
+                                symlink_dirs.append(_name)
+                        except ValueError:
+                            pass
+                parts.append(f"comfy_entries={len(raw_entries)}")
+                parts.append(f"comfy_symlink_dirs={len(symlink_dirs)}")
+        except Exception:
+            pass
+        parts.append(f"registered_node_classes={len(_diag_nodes.NODE_CLASS_MAPPINGS)}")
+        return " | ".join(parts)
+
+    def _repair_missing_workflow_nodes(self, workflow: dict) -> dict:
+        missing_before = self._find_missing_workflow_node_classes(workflow)
         if not missing_before or self._event_loop is None:
             return {
                 "attempted": False,
+                "blocked_by_mode": False,
                 "missing_before": missing_before,
                 "missing_after": missing_before,
                 "installed": [],
                 "skipped": [],
             }
 
-        print(f"[comfyapp] missing workflow nodes before validation: {missing_before}")
+        mode = self._resolve_requirements_repair_mode()
+        print(f"[comfyapp] missing workflow nodes: {missing_before} (repair_mode={mode})")
+
+        if mode != "dev":
+            # Production: never repair. Validation must fail with
+            # a clear missing-node message.
+            missing_after = missing_before
+            print(f"[comfyapp] missing workflow nodes (repair blocked by mode={mode}): {missing_after}")
+            return {
+                "attempted": False,
+                "blocked_by_mode": True,
+                "missing_before": missing_before,
+                "missing_after": missing_after,
+                "installed": [],
+                "skipped": [],
+            }
+
+        # ── dev mode: attempt runtime repair ──
+        import nodes as _repair_nodes
         req_summary = self._install_custom_node_requirements(force=True)
-        self._event_loop.run_until_complete(nodes.init_extra_nodes())
-        missing_after = [name for name in requested if name not in nodes.NODE_CLASS_MAPPINGS]
+        self._event_loop.run_until_complete(_repair_nodes.init_extra_nodes())
+        missing_after = self._find_missing_workflow_node_classes(workflow)
         print(f"[comfyapp] missing workflow nodes after repair: {missing_after}")
         return {
             "attempted": True,
+            "blocked_by_mode": False,
             "missing_before": missing_before,
             "missing_after": missing_after,
             "installed": req_summary.get("installed", []),
@@ -3496,6 +6291,15 @@ class _ComfyAPIMixin:
         prompt_id = str(uuid.uuid4())
         prompt_start_time: float | None = None
 
+        # ── PART 7: Preflight before any model operations ──
+        # Must run before: missing-node repair, async preload, actual load,
+        # CPU preload, direct warmup, ComfyUI validate_prompt.
+        # When called from run_prompt/run_prompt_stream, the preflight already
+        # ran via _handle_custom_node_sync_and_dependency_policy().  Skip
+        # redundant re-validation to avoid double dependency scanning.
+        if not getattr(self, "_preflight_already_ran", False):
+            self._preflight_before_prompt_execution(workflow)
+
         # ── Write input images to ComfyUI's input directory ──
         stage_started = time.time()
         if input_images:
@@ -3517,8 +6321,18 @@ class _ComfyAPIMixin:
             missing_after=len(repair_summary.get("missing_after", [])),
             installed=len(repair_summary.get("installed", [])),
             skipped=len(repair_summary.get("skipped", [])),
+            blocked=1 if repair_summary.get("blocked_by_mode") else 0,
             duration_ms=self._profile_ms(repair_started),
         )
+        if repair_summary.get("blocked_by_mode") and repair_summary.get("missing_before"):
+            _mode = self._resolve_requirements_repair_mode()
+            raise RuntimeError(
+                f"Workflow references missing custom node class(es): "
+                f"{repair_summary['missing_before']}. "
+                f"Runtime repair is disabled in {_mode} mode. "
+                f"Install/sync the custom node and rebuild/deploy the "
+                f"Modal image if dependencies changed."
+            )
 
         # ── Fixed-workflow fast path: skip validation if hash matches ──
         _wf_hash = self._compute_workflow_struct_hash(workflow)
@@ -3859,12 +6673,31 @@ class _ComfyAPIMixin:
                 "we_deepcopy_ms": round(_deepcopy_total, 1),
                 "we_non_io_ms": round(max(0.0, total_exec_ms - self._exec_model_load_io_ms - _deepcopy_total), 1),
             }
-            return {"images": [], "videos": []}
+            return {"images": [], "videos": [], "_known_good_marked": False}
+
+        # ── PART 11: Mark known-good after successful execution ──
+        # Only real prompts (collect_outputs=True) that succeed get marked.
+        # Warmup-only prompts and failed prompts do not become known-good.
+        _known_good_marked = False
+        try:
+            _known_workflow_hash = self._compute_workflow_struct_hash(workflow)
+            _known_stack = extract_requested_model_stack(workflow)
+            _known_profile = stack_to_profile(_known_stack)
+            if _known_profile:
+                _known_good_marked = _mark_known_good_workflow_profile(_known_workflow_hash, _known_profile)
+                if _known_good_marked:
+                    print(
+                        f"[comfyapp] marked known-good workflow hash={_known_workflow_hash} "
+                        f"profile={json.dumps(_known_profile, separators=(',',':'))}"
+                    )
+        except Exception as _kg_exc:
+            print(f"[comfyapp] failed to mark known-good: {_kg_exc}")
         stage_started = time.time()
         result = self._collect_in_process_outputs(prompt_id, prompt_start_time=prompt_start_time, modal_options=modal_options)
         self._log_profile("inproc_collect", prompt_id=prompt_id[:8], images=len(result.get("images", [])), videos=len(result.get("videos", [])), duration_ms=self._profile_ms(stage_started))
         if trace is not None:
             trace.mark("t8b_outputs_collected")
+        result["_known_good_marked"] = _known_good_marked
         return result
 
     def _collect_in_process_outputs(self, prompt_id: str, prompt_start_time: float | None = None, modal_options: dict | None = None) -> dict:
@@ -3899,6 +6732,7 @@ class _ComfyAPIMixin:
         path only walks ``output`` and ``temp`` so uploaded source images do
         not get returned as generated outputs.
         """
+        _oc_t0 = time.time()
         import base64
         from pathlib import Path
 
@@ -3920,6 +6754,20 @@ class _ComfyAPIMixin:
         _quality = _mo.get("quality", _CONVERTER_DEFAULTS["quality"])
         _wlc = _mo.get("webp_lossless_compression", _CONVERTER_DEFAULTS["webp_lossless_compression"])
         _conversion_meta: list[dict] = []
+        _oc_timing = {
+            "history_fetch_ms": 0.0,
+            "file_scan_ms": 0.0,
+            "read_total_ms": 0.0,
+            "conversion_total_ms": 0.0,
+            "return_packaging_ms": 0.0,
+            "files_read": 0,
+            "bytes_read": 0,
+            "bytes_returned": 0,
+            "images_found": 0,
+            "videos_found": 0,
+            "files_returned": 0,
+        }
+        print("[timing.output] collection_start")
 
         def _is_rgthree_temp_file(fp: Path) -> bool:
             """Return True if *fp* is an rgthree compare temp file."""
@@ -3943,6 +6791,9 @@ class _ComfyAPIMixin:
             _r_start = time.time()
             raw = fp.read_bytes()
             _r_ms = round((time.time() - _r_start) * 1000, 1)
+            _oc_timing["read_total_ms"] += _r_ms
+            _oc_timing["files_read"] += 1
+            _oc_timing["bytes_read"] += len(raw)
             if _r_ms > 100:
                 print(f"[comfyapp] slow output read: file={fp.name} size={len(raw)} duration_ms={_r_ms}")
 
@@ -3954,6 +6805,7 @@ class _ComfyAPIMixin:
                 and fp.suffix.lower() in (".png", ".jpg", ".jpeg")
             )
             converted = None
+            _conv_start = time.time()
             if do_convert:
                 converted = _convert_image_bytes(
                     raw,
@@ -3977,6 +6829,7 @@ class _ComfyAPIMixin:
                     "fallback": converted.get("fallback", False),
                     "error": converted.get("error"),
                 })
+                _oc_timing["conversion_total_ms"] += converted["conversion_time_ms"]
                 print(
                     f"[comfyapp.convert] fmt={_output_fmt} "
                     f"orig={converted['original_size_bytes']}B "
@@ -3988,12 +6841,19 @@ class _ComfyAPIMixin:
             else:
                 out_bytes = raw
                 out_filename = fp.name
+            _oc_timing["conversion_total_ms"] += round((time.time() - _conv_start) * 1000, 1) - (converted["conversion_time_ms"] if converted else 0)
 
             entry = {"filename": out_filename, "data": base64.b64encode(out_bytes).decode(), "node_id": node_id}
+            _oc_timing["bytes_returned"] += len(entry["data"])
             if animated or fp.suffix.lower() in (".gif", ".mp4", ".webm", ".webp"):
                 videos.append(entry)
+                _oc_timing["videos_found"] += 1
             else:
                 images.append(entry)
+                _oc_timing["images_found"] += 1
+            _oc_timing["files_returned"] += 1
+            # Per-file timing log
+            print(f"[timing.output.file] filename={fp.name} read_ms={_r_ms:.1f} bytes_in={len(raw)} bytes_out={len(entry['data'])}")
             if output_key is not None:
                 per_node_outputs.setdefault(node_id, {}).setdefault(output_key, []).append(entry)
 
@@ -4041,6 +6901,7 @@ class _ComfyAPIMixin:
                 _read_and_store(fp, node_id=node_id, animated=animated, output_key=output_key, allow_rgthree_temp=True)
 
         # ── Source 1: executor.history_result ─────────────────────────
+        _s_hf = time.time()
         outputs: dict = {}
         try:
             history_result = getattr(self._executor, "history_result", None)
@@ -4048,6 +6909,7 @@ class _ComfyAPIMixin:
                 outputs = history_result.get("outputs", {}) or {}
         except Exception as exc:
             print(f"[comfyapp] executor.history_result read failed: {exc}")
+        _oc_timing["history_fetch_ms"] = round((time.time() - _s_hf) * 1000, 1)
         if outputs:
             for node_id, node_out in outputs.items():
                 if not isinstance(node_out, dict):
@@ -4069,11 +6931,13 @@ class _ComfyAPIMixin:
                 print(f"[comfyapp] prompt_queue.history read failed: {exc}")
 
         # ── Source 3: directory scan scoped to the prompt's time window ─
+        _s_fs = time.time()
         # Always run as a supplement — catches files the workflow wrote
         # that the executor didn't return in its history metadata.
         if prompt_start_time is not None:
             for base in (comfy_root / "output", comfy_root / "temp"):
                 _scan_dir_for_files(base, since_ts=prompt_start_time)
+        _oc_timing["file_scan_ms"] = round((time.time() - _s_fs) * 1000, 1)
 
         # ── Source 4: most-recent-files fallback ──────────────────────
         if not seen_filenames and prompt_start_time is None:
@@ -4105,11 +6969,28 @@ class _ComfyAPIMixin:
         print(f"[output_collect] files_returned={_files_returned}")
         print(f"[output_collect] skipped_stale=0")
         print(f"[output_collect] skipped_temp={_skipped_temp}")
+        _oc_total = round((time.time() - _oc_t0) * 1000, 1)
+        _oc_timing["return_packaging_ms"] = round(_oc_total - _oc_timing.get("history_fetch_ms", 0) - _oc_timing.get("file_scan_ms", 0) - _oc_timing.get("read_total_ms", 0) - _oc_timing.get("conversion_total_ms", 0), 1)
+        print(
+            f"[timing.output] output_collection_total_ms={_oc_total} "
+            f"history_fetch_ms={_oc_timing.get('history_fetch_ms', 0)} "
+            f"file_scan_ms={_oc_timing.get('file_scan_ms', 0)} "
+            f"read_total_ms={round(_oc_timing.get('read_total_ms', 0), 1)} "
+            f"conversion_total_ms={round(_oc_timing.get('conversion_total_ms', 0), 1)} "
+            f"return_packaging_ms={_oc_timing.get('return_packaging_ms', 0)} "
+            f"files_read={_oc_timing.get('files_read', 0)} "
+            f"images_found={_oc_timing.get('images_found', 0)} "
+            f"videos_found={_oc_timing.get('videos_found', 0)} "
+            f"files_returned={_oc_timing.get('files_returned', 0)} "
+            f"bytes_read={_oc_timing.get('bytes_read', 0)} "
+            f"bytes_returned={_oc_timing.get('bytes_returned', 0)}"
+        )
         return {
             "images": images,
             "videos": videos,
             "outputs": per_node_outputs,
             "_conversion_meta": _conversion_meta,
+            "_oc_timing": _oc_timing,
         }
 
     def _select_backend(self) -> str:
@@ -4346,6 +7227,59 @@ class _ComfyAPIMixin:
         import comfy.utils
         import execution
         import nodes
+
+        # ── Generic entrypoint traceback collector ──
+        # ComfyUI's load_custom_node catches entrypoint exceptions at
+        # nodes.py line 2277 and logs them via logging.warning without
+        # exc_info=True.  We patch logging.warning to detect this
+        # specific pattern and add the full traceback.
+        # This works for ANY custom node entrypoint failure.
+        import logging as _comfy_logging
+        import traceback as _comfy_tb
+        # Idempotent: only patch once
+        if not getattr(_comfy_logging.Logger, '_comfy_modal_warning_patched', False):
+            _comfy_logging.Logger._comfy_modal_warning_orig = _comfy_logging.Logger.warning
+            _orig_logger_warning = _comfy_logging.Logger.warning
+            def _patched_logger_warning(self, msg, *args, **kwargs):
+                result = _orig_logger_warning(self, msg, *args, **kwargs)
+                msg_str = str(msg) if not isinstance(msg, str) else msg
+                if "Error while calling comfy_entrypoint" in msg_str:
+                    _exc = sys.exc_info()
+                    if _exc[0] is not None:
+                        _tb_text = "".join(_comfy_tb.format_exception(*_exc))
+                        _comfy_tb.print_exc()
+                        # Record structured failure for import health
+                        _exception_type = _exc[0].__name__ if _exc[0] else "?"
+                        _exception_msg = str(_exc[1]) if _exc[1] else "?"
+                        try:
+                            _module_path = msg_str.split("in ")[-1].strip().split(":")[0].strip()
+                        except Exception:
+                            _module_path = "?"
+                        global _CUSTOM_NODE_IMPORT_FAILURES, _CUSTOM_NODE_RETRY_REGISTRY
+                        _CUSTOM_NODE_IMPORT_FAILURES.append({
+                            "phase": "entrypoint",
+                            "custom_node_path": _module_path,
+                            "exception_type": _exception_type,
+                            "exception_message": _exception_msg,
+                            "traceback": _tb_text,
+                            "timestamp": time.time(),
+                        })
+                        # Record for post-GPU-warmup retry (schema failures caused
+                        # by CPU-only snapshot where device lists are empty).
+                        global _CUSTOM_NODE_REGISTRATION_PENDING_RETRY
+                        if _module_path and _module_path != "?":
+                            _CUSTOM_NODE_REGISTRATION_PENDING_RETRY.add(_module_path)
+                            _CUSTOM_NODE_RETRY_REGISTRY.register_failure(
+                                path=_module_path,
+                                exc_type=_exception_type,
+                                exc_msg=_exception_msg,
+                                tb=_tb_text,
+                                retryable_reason="cpu_snapshot_schema" if "CUDA" in _exception_msg or "device" in _exception_msg.lower() else "",
+                            )
+                return result
+            _comfy_logging.Logger.warning = _patched_logger_warning
+            _comfy_logging.Logger._comfy_modal_warning_patched = True
+
         import server as comfy_server
         self._log_profile("inproc_imports", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
@@ -4360,6 +7294,46 @@ class _ComfyAPIMixin:
             self._patch_model_management_profiling(comfy.model_management)
         self._log_profile("inproc_patch", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
+
+        # ── Patch get_input_data for sync-safe cache access ──
+        # Custom-node compatibility wrappers (e.g. comfyui_image_metadata_extension's
+        # OutputCacheCompat) may pass raw HierarchicalCache objects as the execution_list
+        # param and call the async ``cache.get()`` method synchronously, returning an
+        # unawaited coroutine instead of a CacheEntry.  This coroutine then hits
+        # ``AttributeError: 'coroutine' object has no attribute 'outputs'`` inside
+        # ``get_input_data()`` and leaks ``RuntimeWarning: coroutine was never awaited``.
+        #
+        # This patch wraps the cache-access call site so any coroutine is detected,
+        # closed (to suppress the warning), and the sync-safe ``get_local()`` fallback
+        # is tried instead.  The fix is generic — no custom-node names are hardcoded.
+        if not getattr(execution, '_comfy_modal_sync_cache_patched', False):
+            _orig_get_input_data = execution.get_input_data
+            def _patched_get_input_data(inputs, class_def, unique_id, execution_list=None, dynprompt=None, extra_data=None):
+                if extra_data is None:
+                    extra_data = {}
+                if execution_list is not None and hasattr(execution_list, 'get_cache'):
+                    class _SafeExecutionListWrapper:
+                        def __init__(self, wrapped):
+                            self.__wrapped = wrapped
+                        def get_cache(self, from_id, to_id):
+                            result = self.__wrapped.get_cache(from_id, to_id)
+                            if asyncio.iscoroutine(result):
+                                try:
+                                    result.close()
+                                except Exception:
+                                    pass
+                                if hasattr(self.__wrapped, 'get_local'):
+                                    return self.__wrapped.get_local(from_id)
+                                if hasattr(self.__wrapped, '_cache') and hasattr(self.__wrapped._cache, 'get_local'):
+                                    return self.__wrapped._cache.get_local(from_id)
+                                return None
+                            return result
+                        def __getattr__(self, name):
+                            return getattr(self.__wrapped, name)
+                    execution_list = _SafeExecutionListWrapper(execution_list)
+                return _orig_get_input_data(inputs, class_def, unique_id, execution_list, dynprompt, extra_data)
+            execution.get_input_data = _patched_get_input_data
+            execution._comfy_modal_sync_cache_patched = True
 
         # ── DummyServer: minimal PromptServer that doesn't bind a port ──
         event_loop = asyncio.new_event_loop()
@@ -4460,6 +7434,7 @@ class _ComfyAPIMixin:
 
         # Register built-in + custom nodes (async in ComfyUI v0.22+)
         self._event_loop.run_until_complete(nodes.init_extra_nodes())
+        self._collect_custom_node_import_health()
         self._apply_sage_attention_policy()
         self._log_profile("inproc_node_init", duration_ms=self._profile_ms(_stage))
 
@@ -4702,7 +7677,13 @@ class _ComfyAPIMixin:
         self._log_profile("custom_nodes_sync", duration_ms=self._profile_ms(stage_started), state_count=len(self._custom_nodes_state))
 
         stage_started = time.time()
-        install_summary = self._install_custom_node_requirements()
+        try:
+            install_summary = self._install_custom_node_requirements()
+        except RuntimeError as _req_err:
+            # In fail_fast mode, abort startup if requirements are missing.
+            # This prevents a container from booting in a broken state.
+            print(f"[comfyapp] FATAL: {_req_err}")
+            raise
         self._log_profile("requirements_install", duration_ms=self._profile_ms(stage_started), installed=len(install_summary.get("installed", [])), skipped=len(install_summary.get("skipped", [])))
 
         stage_started = time.time()
@@ -5596,6 +8577,8 @@ class _ComfyAPIMixin:
                 self._warmup_cuda()
                 __stages["cuda_warmup_ms"] = self._profile_ms(_s)
                 self._log_profile("restore_warmup", mode="cuda_warmup_gpu_snap", duration_ms=__stages["cuda_warmup_ms"])
+                # Retry custom-node registrations that failed during CPU snapshot
+                self._retry_pending_custom_node_registrations()
                 import comfy.utils
                 comfy.utils.DISABLE_MMAP = True
 
@@ -5630,6 +8613,9 @@ class _ComfyAPIMixin:
                 self._warmup_cuda()
                 __stages["cuda_warmup_ms"] = self._profile_ms(_s)
                 self._log_profile("restore_warmup", mode="cuda_warmup", duration_ms=__stages["cuda_warmup_ms"])
+                # Retry custom-node registrations that failed during CPU snapshot
+                # (e.g. schema generation that needs device availability).
+                self._retry_pending_custom_node_registrations()
                 import comfy.utils
                 comfy.utils.DISABLE_MMAP = True
                 if _resolve_runtime_flag('deep_profile', '0'):
@@ -5688,6 +8674,60 @@ class _ComfyAPIMixin:
                 __stages["warmup_profile_source"] = profile.get("_source", "?") if profile else "none"
                 preload_result = {"count": 0, "file_timing_ms": {}}
                 _pm = _resolve_preload_mode()
+
+                # ── PART 3: Preload guardrails ──
+                # Skip CPU preload for unknown/new workflows unless explicitly
+                # enabled.  This prevents wasting ~125s reading 19GB for
+                # workflows that may fail validation or never execute.
+                _preload_skip_reason = None
+                _profile_source = (profile or {}).get("_source", "none")
+                _workflow_hash = (profile or {}).get("_workflow_hash", "")
+
+                # Guard 1: Known-good workflow profile check
+                # active_next_profile alone does not mean known-good.
+                # Only known_good_workflow_profiles.json can make it eligible.
+                if _preload_skip_reason is None:
+                    if not PRELOAD_UNKNOWN_PROFILES:
+                        if _profile_source == "active_next_profile" and _workflow_hash:
+                            if _is_known_good_workflow_profile(_workflow_hash, profile or {}):
+                                print(
+                                    f"[comfyapp] preload known-good profile "
+                                    f"workflow_hash={_workflow_hash}"
+                                )
+                            else:
+                                _preload_skip_reason = "unknown_profile"
+                                print(
+                                    f"[comfyapp] preload_skipped reason=unknown_profile "
+                                    f"workflow_hash={_workflow_hash or 'missing'} "
+                                    f"profile_source={_profile_source} "
+                                    f"COMFYMODAL_PRELOAD_UNKNOWN_PROFILES=0"
+                                )
+                        else:
+                            _preload_skip_reason = "unknown_profile"
+                            print(
+                                f"[comfyapp] preload_skipped reason=unknown_profile "
+                                f"profile_source={_profile_source} "
+                                f"workflow_hash={_workflow_hash or 'missing'} "
+                                f"COMFYMODAL_PRELOAD_UNKNOWN_PROFILES=0"
+                            )
+
+                # Guard 2: Size guardrails via _filter_preload_paths_by_size
+                if _preload_skip_reason is None and preload_paths:
+                    _filtered_paths, _filter_result = _filter_preload_paths_by_size(preload_paths)
+                    if not _filtered_paths:
+                        _preload_skip_reason = _filter_result.get("reason", "size_filtered")
+                        print(
+                            f"[comfyapp] preload_skipped reason={_preload_skip_reason} "
+                            f"{_filter_result}"
+                        )
+                    else:
+                        preload_paths = _filtered_paths
+
+                if _preload_skip_reason:
+                    preload_paths = []
+                    __stages["preload_skipped"] = 1
+                    __stages["preload_skip_reason"] = _preload_skip_reason
+
                 # ── Z-Image restore warmup skip ──
                 if DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE and profile and profile.get("unet", ""):
                     _wu_unet = profile.get("unet", "").lower()
@@ -5828,7 +8868,9 @@ class _ComfyAPIMixin:
                         import comfy.sd as _csd
                         import os as _os
                         _orig_load_diff = _csd.load_diffusion_model
-                        def _cached_load_diff(unet_path, model_options={}, disable_dynamic=False):
+                        def _cached_load_diff(unet_path, model_options=None, disable_dynamic=False):
+                            if model_options is None:
+                                model_options = {}
                             _real = _os.path.realpath(unet_path) if hasattr(_os.path, 'realpath') else unet_path
                             _opts_str = str(sorted(model_options.items())) if model_options else "default"
                             _key = (_real, _opts_str)
@@ -5870,6 +8912,25 @@ class _ComfyAPIMixin:
                     if "z_image" in _wu_unet or "z-image" in _wu_unet:
                         print(f"[comfyapp] DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=1: skipping direct warmup for {_wu_unet}")
                         _skip_direct_warmup = True
+
+                # ── PART 8: Known-good guard before direct warmup ──
+                if not _skip_direct_warmup and profile and profile.get("mode"):
+                    _wg_workflow_hash = (profile or {}).get("_workflow_hash", "")
+                    _wg_load_unet = _resolve_runtime_flag("DIRECT_WARMUP_LOAD_UNET", "0")
+                    _wg_load_clip = _resolve_runtime_flag("DIRECT_WARMUP_LOAD_CLIP", "0")
+                    if (_wg_load_unet or _wg_load_clip) and not PRELOAD_UNKNOWN_PROFILES:
+                        if _wg_workflow_hash and _is_known_good_workflow_profile(_wg_workflow_hash, profile or {}):
+                            print(
+                                f"[comfyapp] direct warmup known-good profile "
+                                f"workflow_hash={_wg_workflow_hash}"
+                            )
+                        else:
+                            _skip_direct_warmup = True
+                            print(
+                                f"[comfyapp] direct_warmup_skipped reason=not_known_good "
+                                f"workflow_hash={_wg_workflow_hash or 'missing'} "
+                                f"load_unet={_wg_load_unet} load_clip={_wg_load_clip}"
+                            )
                 if profile and profile.get("mode") and not _skip_direct_warmup:
                     _s = time.time()
                     _dw = self._warmup_direct(profile)
@@ -6058,28 +9119,28 @@ class _ComfyAPIMixin:
         # the time the function was dispatched.
         server_trace.mark("t3_modal_entry")
 
-        # ── Refresh custom nodes to pick up post-sync additions ─────
-        # Every prompt reloads the volume metadata and syncs symlinks.
-        # When new nodes are found we also re-register classes
-        # (in-process) or restart the subprocess so ComfyUI sees them.
-        # This is cheap in the common case (no new nodes) and avoids
-        # "Node 'X' not found" errors after a volume sync.
-        _cn_sync_start = time.time()
-        _cn_summary, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
-        _cn_created = _cn_summary.get("created", [])
-        if _cn_created:
-            print(f"[comfyapp] run_prompt synced new custom nodes: {_cn_created}")
-            _cn_reqs = self._install_custom_node_requirements()
-            _in_proc = self._select_backend() == "in_process"
-            if _in_proc and self._event_loop is not None:
-                import nodes as _rp_nodes
-                self._event_loop.run_until_complete(_rp_nodes.init_extra_nodes())
-            elif not _in_proc:
-                self._restart_comfy()
-        __stages = getattr(self, "_last_restore_timing", None)
-        if isinstance(__stages, dict):
-            __stages["run_prompt_cn_sync_ms"] = round((time.time() - _cn_sync_start) * 1000, 1)
-            __stages["run_prompt_cn_created"] = len(_cn_created)
+        # ── Check for scheduler test mode ──
+        _scheduler_config_ns = (modal_options or {}).get("comfymodal_scheduler_test")
+        _is_scheduler_test_ns = isinstance(_scheduler_config_ns, dict) and _scheduler_config_ns.get("enabled")
+        _scheduler_trace_ns = None
+
+        if _is_scheduler_test_ns:
+            self._preflight_already_ran = False
+            self._start_scheduler_test(workflow, _scheduler_config_ns)
+            _scheduler_trace_ns = self._scheduler_wait_and_finalize()
+            self._preflight_already_ran = True
+        else:
+            # ── Shared custom-node sync and dependency policy ──
+            # Replaces the inline custom-node sync + preflight logic with a
+            # single method used by both run_prompt and run_prompt_stream.
+            self._preflight_already_ran = False
+            _cn_sync_start = time.time()
+            _policy = self._handle_custom_node_sync_and_dependency_policy(workflow, stream=False)
+            self._preflight_already_ran = True
+            __stages = getattr(self, "_last_restore_timing", None)
+            if isinstance(__stages, dict):
+                __stages["run_prompt_cn_sync_ms"] = round((time.time() - _cn_sync_start) * 1000, 1)
+                __stages["run_prompt_cn_created"] = _policy.get("sync_created_count", 0)
 
         # ── In-process backend: direct execution, no HTTP ──
         if self._select_backend() == "in_process":
@@ -6170,6 +9231,8 @@ class _ComfyAPIMixin:
             trace_summary = server_trace.summary()
             self._enrich_trace_with_restore_timing(trace_summary)
             result["trace"] = trace_summary
+            if isinstance(_scheduler_trace_ns, dict):
+                result["scheduler_trace"] = dict(_scheduler_trace_ns)
 
             # P3 — end-to-end timing: stitch browser t0 to restore phases
             _rt2 = getattr(self, "_last_restore_timing", None)
@@ -6328,6 +9391,40 @@ class _ComfyAPIMixin:
                     result["_return_payload_info"]["clip_cache_size_before_prompt"] = len(_te_cls._clip_text_cache)
             except Exception:
                 pass
+            _rt_summary_i = _rt2 or {}
+            _warmup_prof_i = _rt_summary_i.get("warmup_profile") or {}
+            _known_good_val_i = result.get("_known_good_marked", False)
+            _cn_created_count_i = _rt_summary_i.get("custom_nodes_created", 0)
+            _prompt_hash_i = ""
+            for _v in (workflow or {}).values():
+                if isinstance(_v, dict) and _v.get("prompt_id"):
+                    _prompt_hash_i = str(_v.get("prompt_id", ""))[:8]
+                    break
+            _plv_i = bool(
+                (modal_options or {}).get("local_preflight_validated")
+                or (modal_options or {}).get("preflight_validated")
+            )
+            _summary_inproc = make_request_pipeline_summary(
+                request_id=_prompt_hash_i,
+                mode="in_process",
+                stream=False,
+                workflow_hash=_warmup_prof_i.get("_workflow_hash", ""),
+                model_stack=_warmup_prof_i.get("_current_workflow_stack", {}),
+                local_preflight_validated=_plv_i,
+                remote_preflight_validated=True,
+                custom_node_sync_skipped=_cn_created_count_i == 0,
+                custom_node_sync_skip_reason="memoized" if _cn_created_count_i == 0 else "",
+                active_profile_result=_rt_summary_i.get("warmup_profile_source", "none"),
+                active_profile_expired=_rt_summary_i.get("preload_skip_reason") == "active_profile_expired",
+                preload_skip_reason=_rt_summary_i.get("preload_skip_reason", ""),
+                dependency_check_ran=True,
+                dependency_manifest_cache_hit=True,
+                execution_started=True,
+                execution_success=result.get("images") is not None,
+                known_good_marked=_known_good_val_i,
+                known_good_mark_result="marked" if _known_good_val_i else "",
+            )
+            print(f"[comfyapp] request_pipeline_summary {_summary_inproc}")
             return result
 
         # ── Subprocess backend: HTTP-based submission ──
@@ -6439,6 +9536,40 @@ class _ComfyAPIMixin:
                 result["_restore_timing"]["eq_samples"] = '; '.join(self._comfy_modal_eq_samples[:5])
                 self._comfy_modal_eq_samples.clear()
             print(f"[comfyapp] eq: hits={result['_restore_timing']['eq_hits']} misses={result['_restore_timing']['eq_misses']} {dict(c)}")
+        _prompt_hash = ""
+        for _v in (workflow or {}).values():
+            if isinstance(_v, dict) and _v.get("prompt_id"):
+                _prompt_hash = str(_v.get("prompt_id", ""))[:8]
+                break
+        _plv = bool(
+            (modal_options or {}).get("local_preflight_validated")
+            or (modal_options or {}).get("preflight_validated")
+        )
+        _rt_summary = result.get("_restore_timing", {})
+        _warmup_prof = _rt_summary.get("warmup_profile") or {}
+        _known_good_val = result.get("_known_good_marked", False)
+        _cn_created_count = _rt_summary.get("custom_nodes_created", 0)
+        _summary = make_request_pipeline_summary(
+            request_id=_prompt_hash,
+            mode="subprocess",
+            stream=False,
+            workflow_hash=_warmup_prof.get("_workflow_hash", ""),
+            model_stack=_warmup_prof.get("_current_workflow_stack", {}),
+            local_preflight_validated=_plv,
+            remote_preflight_validated=True,
+            custom_node_sync_skipped=_cn_created_count == 0,
+            custom_node_sync_skip_reason="memoized" if _cn_created_count == 0 else "",
+            active_profile_result=_rt_summary.get("warmup_profile_source", "none"),
+            active_profile_expired=_rt_summary.get("preload_skip_reason") == "active_profile_expired",
+            preload_skip_reason=_rt_summary.get("preload_skip_reason", ""),
+            dependency_check_ran=True,
+            dependency_manifest_cache_hit=True,
+            execution_started=True,
+            execution_success=result.get("images") is not None,
+            known_good_marked=_known_good_val,
+            known_good_mark_result="marked" if _known_good_val else "",
+        )
+        print(f"[comfyapp] request_pipeline_summary {_summary}")
         return result
 
     @modal.method(is_generator=True)
@@ -6479,18 +9610,60 @@ class _ComfyAPIMixin:
         server_trace.mark("t3_modal_entry")
         print(f"[predispatch] phase=modal_entry t={time.time()}")
 
-        # ── Prompt-time async preload (fire-and-forget) ──
-        _preload_info = {"enabled": False, "workers": 0, "deduped_paths": [], "cache_hit": [], "submitted": [], "duplicate_skipped": 0}
-        if PROMPT_ASYNC_PRELOAD:
-            _preload_info = self._prompt_async_preload(workflow)
-
-        # ── Prompt-time actual loader futures ──
-        _actual_load_info = self._prompt_async_actual_load(workflow)
-
         _prog_q = _qm.Queue()
         self._prog_queue = _prog_q
 
         try:
+            # ── Check for scheduler test mode ──
+            _scheduler_config = (modal_options or {}).get("comfymodal_scheduler_test")
+            _is_scheduler_test = isinstance(_scheduler_config, dict) and _scheduler_config.get("enabled")
+
+            if _is_scheduler_test:
+                print(f"[scheduler_test] config={json.dumps(_scheduler_config, default=str)}")
+                self._preflight_already_ran = False
+
+                try:
+                    self._start_scheduler_test(workflow, _scheduler_config)
+                except RuntimeError as _dep_err:
+                    import traceback as _tb
+                    _tb.print_exc()
+                    yield {"type": "error", "message": str(_dep_err)}
+                    return
+
+                try:
+                    _scheduler_trace = self._scheduler_wait_and_finalize()
+                except RuntimeError as _dep_err:
+                    import traceback as _tb
+                    _tb.print_exc()
+                    yield {"type": "error", "message": str(_dep_err)}
+                    return
+
+                self._preflight_already_ran = True
+                _preload_info = {"enabled": False, "workers": 0, "deduped_paths": [], "cache_hit": [], "submitted": [], "duplicate_skipped": 0}
+                _actual_load_info = {"enabled": False, "submitted": [], "skipped_unet": True, "futures": {}}
+            else:
+                # ── Shared custom-node sync and dependency policy ──
+                # Runs before prompt preload, actual_load, and execution.
+                # Dependency failures yield a clear fatal stream event.
+                self._preflight_already_ran = False
+                try:
+                    self._handle_custom_node_sync_and_dependency_policy(workflow, stream=True)
+                    self._preflight_already_ran = True
+                except RuntimeError as _dep_err:
+                    import traceback as _tb
+                    _tb.print_exc()
+                    yield {"type": "error", "message": str(_dep_err)}
+                    return
+
+                # ── Prompt-time async preload (after dependency policy) ──
+                _preload_info: dict = {"enabled": False, "workers": 0, "deduped_paths": [], "cache_hit": [], "submitted": [], "duplicate_skipped": 0}
+                if PROMPT_ASYNC_PRELOAD:
+                    _preload_info = self._prompt_async_preload(workflow)
+
+                # ── Prompt-time actual loader futures (after dependency policy) ──
+                _actual_load_info: dict = self._prompt_async_actual_load(workflow)
+                _scheduler_trace = None
+
             # ── Ensure backend is initialised before _execute_in_process ──
             # The in-process backend (and its self._event_loop) is created
             # lazily in _start_backend().  When snapshot_mode is "none" or
@@ -6511,26 +9684,6 @@ class _ComfyAPIMixin:
                     yield {"type": "error", "message": f"Failed to start backend: {_init_exc}"}
                     return
                 yield {"type": "status", "message": "Backend ready", "phase": "backend_ready"}
-
-            # ── Mirror run_prompt()'s custom-node sync so post-snapshot
-            #    custom nodes (added by the local user since the snapshot
-            #    was taken) are visible to the executor on the streaming
-            #    path too.  Without this the first prompt after a sync
-            #    fails with "Node 'X' not found" exactly like run_prompt()
-            #    used to.  Only re-registers new classes; symlinks are
-            #    already in place.
-            try:
-                _cn_summary, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
-                _cn_created = (_cn_summary or {}).get("created", [])
-                if _cn_created and _in_proc and self._event_loop is not None:
-                    print(f"[comfyapp] run_prompt_stream synced new custom nodes: {_cn_created}")
-                    self._install_custom_node_requirements()
-                    import nodes as _stream_nodes
-                    self._event_loop.run_until_complete(_stream_nodes.init_extra_nodes())
-            except Exception as _cn_exc:
-                # Custom-node sync is best-effort; don't fail the prompt
-                # just because volume stat or init_extra_nodes raised.
-                print(f"[comfyapp] run_prompt_stream custom-node sync skipped: {_cn_exc}")
 
             # ── Yield human-readable startup phases (no percentages) ─────
             _rt = getattr(self, "_last_restore_timing", None) or {}
@@ -6560,6 +9713,8 @@ class _ComfyAPIMixin:
                     trace_summary = server_trace.summary()
                     self._enrich_trace_with_restore_timing(trace_summary)
                     _r["trace"] = trace_summary
+                    if isinstance(_scheduler_trace, dict):
+                        _r["scheduler_trace"] = dict(_scheduler_trace)
                     _rt2 = getattr(self, "_last_restore_timing", None)
                     _r["_restore_timing"] = dict(_rt2) if _rt2 else {}
                     _stages = trace_summary.get("stages", {})
@@ -6593,6 +9748,37 @@ class _ComfyAPIMixin:
                     print(f"[timing] loader_future_hits={_al_hits}")
                     print(f"[timing] loader_future_waits={_al_waits}")
                     print(f"[timing] duplicate_loads_prevented={_al_dups}")
+                    _plv = bool(
+                        (modal_options or {}).get("local_preflight_validated")
+                        or (modal_options or {}).get("preflight_validated")
+                    )
+                    _rt_summary = _rt2 or {}
+                    _warmup_prof = _rt_summary.get("warmup_profile") or {}
+                    _known_good_val = _r.get("_known_good_marked", False)
+                    _cn_created_count = _rt_summary.get("custom_nodes_created", 0)
+                    _summary = make_request_pipeline_summary(
+                        request_id=prompt_id_hint[:8] if prompt_id_hint else "",
+                        mode="in_process",
+                        stream=True,
+                        workflow_hash=_warmup_prof.get("_workflow_hash", ""),
+                        model_stack=_warmup_prof.get("_current_workflow_stack", {}),
+                        local_preflight_validated=_plv,
+                        remote_preflight_validated=True,
+                        custom_node_sync_skipped=_cn_created_count == 0,
+                        custom_node_sync_skip_reason="memoized" if _cn_created_count == 0 else "",
+                        active_profile_result=_rt_summary.get("warmup_profile_source", "none"),
+                        active_profile_expired=_rt_summary.get("preload_skip_reason") == "active_profile_expired",
+                        preload_skip_reason=_rt_summary.get("preload_skip_reason", ""),
+                        dependency_check_ran=True,
+                        dependency_manifest_cache_hit=True,
+                        execution_started=True,
+                        execution_success=True,
+                        known_good_marked=_known_good_val,
+                        known_good_mark_result="marked" if _known_good_val else "",
+                        prompt_preload_result="started" if _preload_info.get("enabled") else "",
+                        actual_load_result="started" if _actual_load_info.get("enabled") else "",
+                    )
+                    print(f"[comfyapp] request_pipeline_summary {_summary}")
                     _result.append(_r)
                 except Exception as _exc:
                     _error.append(_exc)

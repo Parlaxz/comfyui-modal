@@ -8,7 +8,7 @@ __pycache__/
 .custom_nodes.json
 .deploy_log
 .custom_node_requirements/
-benchmark_logs/
-benchmark_runs/
+.baked_custom_node_deps/
+*benchmark*/
 optimization_logs/
 latest_benchmark_workflow.json
