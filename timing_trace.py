@@ -254,6 +254,19 @@ class Trace:
         if vw is not None:
             out["derived_ms"]["vae_node_wait_ms"] = vw
 
+        # Phase 1: dependency validation timing (preserved from upstream enrichment)
+        for _dep_key in (
+            "dependency_validation_ms", "dependency_total_ms",
+            "dependency_pre_key_check_ms", "dependency_baked_manifest_load_ms",
+            "dependency_source_root_resolve_ms", "dependency_fingerprint_ms",
+            "dependency_cache_key_ms", "dependency_memory_lookup_ms",
+            "dependency_sentinel_lookup_ms", "dependency_full_validation_ms",
+            "dependency_sentinel_write_ms",
+        ):
+            _dep_v = t.get(_dep_key)
+            if _dep_v is not None:
+                out["derived_ms"][_dep_key] = _dep_v
+
         # Trace metadata: timing_quality / missing_timing_fields
         _exec_required = [
             "t3d_prompt_start", "t3e_execution_start",
@@ -386,6 +399,13 @@ class Trace:
             "vae_node_wait_ms",
         ]
         derived_parts = [f"{k}={derived[k]}ms" for k in derived_keys if k in derived and derived[k] is not None]
+        dep_val_ms = derived.get("dependency_validation_ms")
+        if dep_val_ms is not None:
+            _fp_ms = derived.get("dependency_fingerprint_ms")
+            _fp_part = f" fp_ms={_fp_ms}" if _fp_ms is not None else ""
+            derived_parts.insert(0, f"cache_layer={s.get('dependency_validation_cache_layer', '?')}")
+            derived_parts.insert(0, f"dep_result={s.get('dependency_validation_result', '?')}")
+            derived_parts.insert(0, f"dep_val_ms={dep_val_ms}ms{_fp_part}")
         msg = "[comfyui-modal.timing] " + " ".join(parts)
         if delta_parts:
             msg += " | " + " ".join(delta_parts)
