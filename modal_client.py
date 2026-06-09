@@ -22,6 +22,7 @@ _apis = {
     if not is_gpu_hidden(entry["value"])
 }
 _download_fn = modal.Function.from_name("comfyui", "download_model_to_volume")
+_download_stream_fn = modal.Function.from_name("comfyui", "download_model_stream")
 _batch_download_fn = modal.Function.from_name("comfyui", "batch_download_models")
 _sync_custom_nodes_fn = modal.Function.from_name("comfyui", "sync_custom_nodes_to_volume")
 _get_volume_status_fn = modal.Function.from_name("comfyui", "get_volume_status")
@@ -167,6 +168,21 @@ async def download_model(url: str, filename: str, save_path: str = "checkpoints"
     if civitai_token:
         kwargs["civitai_token"] = civitai_token
     return await asyncio.to_thread(lambda: _download_fn.remote(**kwargs))
+
+
+async def download_model_stream(url: str, filename: str, save_path: str = "checkpoints", hf_token: str = "", civitai_token: str = ""):
+    """Async generator yielding progress dicts from a Modal streaming download."""
+    kwargs = dict(url=url, filename=filename, save_path=save_path, hf_token=hf_token)
+    if civitai_token:
+        kwargs["civitai_token"] = civitai_token
+    loop = asyncio.get_running_loop()
+    gen = await loop.run_in_executor(None, lambda: _download_stream_fn.remote_gen(**kwargs))
+    while True:
+        try:
+            item = await loop.run_in_executor(None, next, gen)
+            yield item
+        except StopIteration:
+            break
 
 
 @_modal_error_handler

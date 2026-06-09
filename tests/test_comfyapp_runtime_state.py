@@ -156,6 +156,7 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
             (node_dir / "requirements.txt").write_text("numpy\n./src/sam3\n", encoding="utf-8")
 
             with (
+                patch.object(module, "REQUIREMENTS_REPAIR_MODE", "dev"),
                 patch.object(module, "CUSTOM_NODES_PATH", tmp),
                 patch.object(module, "load_runtime_metadata", return_value={"requirements": {}, "runtime": {}}),
                 patch.object(module, "save_runtime_metadata"),
@@ -187,6 +188,7 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
             )
 
             with (
+                patch.object(module, "REQUIREMENTS_REPAIR_MODE", "dev"),
                 patch.object(module, "CUSTOM_NODES_PATH", tmp),
                 patch.object(module, "RUNTIME_METADATA_PATH", str(meta_path)),
                 patch.object(module, "_requirements_have_importable_packages", return_value=False),
@@ -195,11 +197,11 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
                     timeout_exc,
                 ]),
             ):
-                with self.assertRaises(RuntimeError) as exc:
-                    module._ComfyAPIMixin()._install_custom_node_requirements()
+                result = module._ComfyAPIMixin()._install_custom_node_requirements()
                 saved = module.load_runtime_metadata()
 
-            self.assertIn("timed out after 180s", str(exc.exception))
+            self.assertIn("ComfyUI-CacheDiT", result.get("installed", []))
+            self.assertIn("comfyui-impact-pack", result.get("failed", []))
             self.assertEqual(saved["requirements"], {
                 "ComfyUI-CacheDiT": module.requirements_file_hash(str(first / "requirements.txt")),
             })
@@ -219,13 +221,13 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
                 patch.object(module, "CUSTOM_NODES_PATH", tmp),
                 patch.object(module, "load_runtime_metadata", return_value={"requirements": {}, "runtime": {}}),
                 patch.object(module, "save_runtime_metadata"),
+                patch.object(module, "REQUIREMENTS_REPAIR_MODE", "dev"),
                 patch.object(module, "_requirements_have_importable_packages", return_value=False),
                 patch.object(module.subprocess, "run", side_effect=AssertionError("pip should not run")) as run_mock,
             ):
-                with self.assertRaises(RuntimeError) as exc:
-                    module._ComfyAPIMixin()._install_custom_node_requirements()
+                result = module._ComfyAPIMixin()._install_custom_node_requirements()
 
-            self.assertIn("Missing local requirement path", str(exc.exception))
+            self.assertIn("comfyui_sam3", result.get("failed", []))
             run_mock.assert_not_called()
 
     def test_repair_missing_workflow_nodes_retries_custom_node_init_without_new_sync(self):
@@ -243,15 +245,16 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
             mixin = module._ComfyAPIMixin()
             mixin._event_loop = types.SimpleNamespace(run_until_complete=lambda coro: asyncio.run(coro))
 
-            with patch.object(mixin, "_install_custom_node_requirements", return_value={"installed": ["comfyui-easy-use"], "skipped": []}) as install_mock:
-                summary = mixin._repair_missing_workflow_nodes({
-                    "1": {"class_type": "easy globalSeed", "inputs": {}},
-                })
+            with patch.object(module, "REQUIREMENTS_REPAIR_MODE", "dev"):
+                with patch.object(mixin, "_install_custom_node_requirements", return_value={"installed": ["comfyui-easy-use"], "skipped": []}) as install_mock:
+                    summary = mixin._repair_missing_workflow_nodes({
+                        "1": {"class_type": "easy globalSeed", "inputs": {}},
+                    })
 
-            self.assertTrue(summary["attempted"])
-            self.assertEqual(summary["missing_before"], ["easy globalSeed"])
-            self.assertEqual(summary["missing_after"], [])
-            install_mock.assert_called_once_with(force=True)
+                    self.assertTrue(summary["attempted"])
+                    self.assertEqual(summary["missing_before"], ["easy globalSeed"])
+                    self.assertEqual(summary["missing_after"], [])
+                    install_mock.assert_called_once_with(force=True)
         finally:
             if original_nodes is not None:
                 sys.modules["nodes"] = original_nodes
@@ -278,6 +281,7 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
                 patch.object(module, "CUSTOM_NODES_PATH", tmp),
                 patch.object(module, "load_runtime_metadata", return_value=stale_metadata),
                 patch.object(module, "save_runtime_metadata") as save_mock,
+                patch.object(module, "REQUIREMENTS_REPAIR_MODE", "dev"),
                 patch.object(module.subprocess, "run", side_effect=AssertionError("pip should not run")) as run_mock,
                 patch.object(module, "_requirements_have_importable_packages", return_value=True),
             ):
@@ -309,6 +313,7 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
                 patch.object(module, "CUSTOM_NODES_PATH", tmp),
                 patch.object(module, "load_runtime_metadata", return_value=matching_metadata),
                 patch.object(module, "save_runtime_metadata") as save_mock,
+                patch.object(module, "REQUIREMENTS_REPAIR_MODE", "dev"),
                 patch.object(module, "_requirements_have_importable_packages",
                              side_effect=AssertionError("importability check should not be called")) as importable_mock,
                 patch.object(module.subprocess, "run", side_effect=AssertionError("pip should not run")) as run_mock,
@@ -336,6 +341,7 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
             with (
                 patch.object(module, "CUSTOM_NODES_PATH", tmp),
                 patch.object(module, "RUNTIME_METADATA_PATH", str(meta_path)),
+                patch.object(module, "REQUIREMENTS_REPAIR_MODE", "dev"),
                 patch.object(module, "_requirements_have_importable_packages", return_value=True),
                 patch.object(module.subprocess, "run", side_effect=AssertionError("pip should not run")) as run_mock,
             ):
@@ -415,6 +421,7 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
                 patch.object(module, "CUSTOM_NODES_PATH", tmp),
                 patch.object(module, "load_runtime_metadata", return_value=cached_metadata),
                 patch.object(module, "save_runtime_metadata") as save_mock,
+                patch.object(module, "REQUIREMENTS_REPAIR_MODE", "dev"),
                 patch.object(module, "_requirements_have_importable_packages",
                              side_effect=AssertionError("importability check should not be called")) as importable_mock,
                 patch.object(module.subprocess, "run", side_effect=AssertionError("pip should not run")) as run_mock,
@@ -443,15 +450,16 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
         original_nodes = sys.modules.get("nodes")
         sys.modules["nodes"] = fake_nodes
         try:
-            mixin = module._ComfyAPIMixin()
-            mixin._event_loop = types.SimpleNamespace(run_until_complete=lambda coro: asyncio.run(coro))
+            with patch.object(module, "REQUIREMENTS_REPAIR_MODE", "dev"):
+                mixin = module._ComfyAPIMixin()
+                mixin._event_loop = types.SimpleNamespace(run_until_complete=lambda coro: asyncio.run(coro))
 
-            with patch.object(mixin, "_install_custom_node_requirements", return_value={"installed": ["comfyui-easy-use"], "skipped": []}) as install_mock:
-                mixin._repair_missing_workflow_nodes({
-                    "1": {"class_type": "easy globalSeed", "inputs": {}},
-                })
+                with patch.object(mixin, "_install_custom_node_requirements", return_value={"installed": ["comfyui-easy-use"], "skipped": []}) as install_mock:
+                    mixin._repair_missing_workflow_nodes({
+                        "1": {"class_type": "easy globalSeed", "inputs": {}},
+                    })
 
-            install_mock.assert_called_once_with(force=True)
+                install_mock.assert_called_once_with(force=True)
         finally:
             if original_nodes is not None:
                 sys.modules["nodes"] = original_nodes
@@ -532,6 +540,8 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
         mixin._collect_in_process_outputs = MagicMock(side_effect=fake_collect)
 
         workflow = {"1": {"class_type": "SaveImage", "inputs": {"filename_prefix": "test"}}}
+
+        mixin._preflight_already_ran = True
 
         with patch.dict(sys.modules, {"execution": types.SimpleNamespace(validate_prompt=fake_validate_prompt)}):
             first = mixin._execute_in_process(workflow)
