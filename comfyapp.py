@@ -397,6 +397,23 @@ RUNTIME_CONFIG_DIR = "/root/models/runtime_config"
 RUNTIME_RETURN_MODE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "return_mode.txt")
 RUNTIME_STATE_SNAPSHOT_PATH = os.path.join(RUNTIME_CONFIG_DIR, ".runtime_state_snapshot.json")
 
+# ── Phase 1: Dependency validation cache ─────────────────────────────────
+DEPENDENCY_VALIDATION_CACHE_SCHEMA_VERSION = 1
+DEPLOYMENT_DEPENDENCY_VALIDATION_CACHE_DIR = os.path.join(
+    RUNTIME_CONFIG_DIR, "deployment_dependency_validation_cache"
+)
+
+# Per-container in-memory cache for dependency validation results.
+# Keyed by deterministic cache key, stores the last validation result dict.
+_dependency_validation_memory_cache: dict[str, dict] = {}
+_dependency_validation_memory_cache_key: str = ""
+
+# Ultra-fast pre-key memory cache that avoids expensive fingerprint scan.
+# Checked BEFORE building cache key / fingerprint.
+# Stored as dict with keys: baked_hash, repair_mode, source_root_indicator,
+# volume_state_hash, result
+_dep_validation_pre_key: dict | None = None
+
 # ── PART 4: Baked dependency manifest (inside the image, NOT on volume) ──
 BAKED_CUSTOM_NODE_DEPS_MANIFEST_PATH = "/opt/comfymodal/custom_node_deps_baked.json"
 
@@ -1215,6 +1232,461 @@ def validate_custom_node_dependencies_prepared() -> dict:
         "current_hash": current_hash,
         "changed_nodes": changed,
     }
+
+
+def build_dependency_validation_cache_key(
+    baked_hash: str | None,
+    current_dep_fingerprint_hash: str,
+    source_root_indicator: str,
+    repair_mode: str,
+    python_version: str = "",
+    comfyapp_version: str = "",
+    copy_mode: str = "combined",
+) -> str:
+    """Build a deterministic cache key for dependency validation.
+
+    Includes enough to make stale-cache passes impossible:
+    - baked dependency manifest hash
+    - current dependency fingerprint hash
+    - source root indicator (volume / image_baked)
+    - Python major/minor/micro version
+    - COMFYAPP_VERSION
+    - COMFYMODAL_REQUIREMENTS_REPAIR_MODE
+    - custom-node copy mode
+    - cache/schema version
+
+    Does NOT include timestamps or source files that don't affect deps.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(f"schema_version={DEPENDENCY_VALIDATION_CACHE_SCHEMA_VERSION}\n".encode())
+    hasher.update(f"baked_hash={baked_hash or ''}\n".encode())
+    hasher.update(f"dep_fingerprint={current_dep_fingerprint_hash}\n".encode())
+    hasher.update(f"source_root={source_root_indicator}\n".encode())
+    hasher.update(f"python={python_version or sys.version}\n".encode())
+    hasher.update(f"comfyapp={comfyapp_version or COMFYAPP_VERSION}\n".encode())
+    hasher.update(f"repair_mode={repair_mode}\n".encode())
+    hasher.update(f"copy_mode={copy_mode}\n".encode())
+    return hasher.hexdigest()
+
+
+def _get_custom_node_source_root_indicator() -> str:
+    """Return indicator string: 'volume' if volume has syncable nodes, else 'image_baked'."""
+    _syncable = _iter_syncable_custom_node_dirs(CUSTOM_NODES_PATH) if os.path.isdir(CUSTOM_NODES_PATH) else []
+    if os.path.isdir(CUSTOM_NODES_PATH) and _syncable:
+        return "volume"
+    return "image_baked"
+
+
+def _read_deployment_dependency_validation_sentinel(cache_key: str) -> dict | None:
+    """Read a deployment sentinel for *cache_key*.
+
+    Returns the sentinel dict if valid (schema version matches, key matches),
+    or None if the sentinel is missing, corrupt, or has a mismatched key.
+    """
+    sentinel_path = os.path.join(
+        DEPLOYMENT_DEPENDENCY_VALIDATION_CACHE_DIR, f"{cache_key}.json"
+    )
+    if not os.path.isfile(sentinel_path):
+        return None
+    try:
+        with open(sentinel_path, "r", encoding="utf-8") as f:
+            sentinel = json.load(f)
+        if not isinstance(sentinel, dict):
+            return None
+        if sentinel.get("schema_version") != DEPENDENCY_VALIDATION_CACHE_SCHEMA_VERSION:
+            print(f"[comfyapp] dep_validation_sentinel: schema_version mismatch, ignoring")
+            return None
+        if sentinel.get("cache_key") != cache_key:
+            print(f"[comfyapp] dep_validation_sentinel: key mismatch, ignoring")
+            return None
+        return sentinel
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[comfyapp] dep_validation_sentinel: corrupt ({exc}), ignoring")
+        return None
+
+
+def _write_deployment_dependency_validation_sentinel(
+    cache_key: str,
+    baked_hash: str | None,
+    dep_fingerprint_hash: str,
+    repair_mode: str,
+    source_root_indicator: str,
+    validation_result: dict,
+) -> None:
+    """Atomically write a deployment sentinel after successful validation.
+
+    Only writes when validation succeeded (prepared=True).
+    Uses temp-file + os.replace for atomicity.
+    """
+    if not validation_result.get("prepared"):
+        return
+    os.makedirs(DEPLOYMENT_DEPENDENCY_VALIDATION_CACHE_DIR, exist_ok=True)
+    sentinel = {
+        "schema_version": DEPENDENCY_VALIDATION_CACHE_SCHEMA_VERSION,
+        "cache_key": cache_key,
+        "created_at": time.time(),
+        "baked_hash": baked_hash,
+        "dep_fingerprint_hash": dep_fingerprint_hash,
+        "repair_mode": repair_mode,
+        "source_root": source_root_indicator,
+        "validated_node_count": len(validation_result.get("changed_nodes", [])),
+        "result": "validated",
+        "comfyapp_version": COMFYAPP_VERSION,
+    }
+    sentinel_path = os.path.join(
+        DEPLOYMENT_DEPENDENCY_VALIDATION_CACHE_DIR, f"{cache_key}.json"
+    )
+    tmp_path = f"{sentinel_path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(sentinel, f, indent=2, sort_keys=True)
+        os.replace(tmp_path, sentinel_path)
+        _commit_volume_async(label="dep_validation_sentinel")
+        print(
+            f"[comfyapp] dep_validation_sentinel: written key={cache_key[:16]}... "
+            f"source={source_root_indicator} nodes={sentinel['validated_node_count']}"
+        )
+    except Exception as exc:
+        print(f"[comfyapp] dep_validation_sentinel: write failed ({exc})")
+        # Remove temp file on failure
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _cheap_volume_state_hash() -> str:
+    """Compute a hash of custom-node volume state using only stat calls (no content reads).
+
+    Mirrors ``custom_node_volume_state`` — returns MD5 hex of
+    ``(name, st_mtime_ns, req_mtime_ns)`` tuples for each syncable node.
+    Very fast (~1ms for 22 nodes) compared to content fingerprint (~900ms).
+    """
+    if not os.path.isdir(CUSTOM_NODES_PATH):
+        return ""
+    state = custom_node_volume_state(CUSTOM_NODES_PATH)
+    if not state:
+        return ""
+    return hashlib.md5(str(state).encode()).hexdigest()
+
+
+def _run_dependency_validation_with_cache(
+    baked: dict | None = None,
+    repair_mode: str | None = None,
+) -> dict:
+    """Run dependency validation with caching (pre-key memory + full key memory + sentinel).
+
+    Returns a dict with all standard validation fields PLUS cache/timing metadata:
+
+    Cache flow:
+    0. Ultra-fast pre-key memory check using cheap volume state (avoids fingerprint scan)
+    1. Build cheap dependency fingerprint
+    2. Compute deterministic cache key
+    3. Check per-container full-key memory cache
+    4. Check deployment sentinel on volume
+    5. Only if both miss, run full validation
+    6. On success, write caches + deployment sentinel
+
+    Returns a dict with keys:
+    - All keys from validate_custom_node_dependencies_prepared()
+    - dependency_validation_start_unix_s
+    - dependency_validation_end_unix_s
+    - dependency_validation_ms  (same as total_ms, kept for backward compat)
+    - dependency_validation_total_ms
+    - dependency_pre_key_check_ms
+    - dependency_baked_manifest_load_ms
+    - dependency_source_root_resolve_ms
+    - dependency_fingerprint_ms
+    - dependency_cache_key_ms
+    - dependency_memory_lookup_ms
+    - dependency_sentinel_lookup_ms
+    - dependency_full_validation_ms
+    - dependency_sentinel_write_ms
+    - and all existing dependency_validation_* fields
+    """
+    global _dependency_validation_memory_cache, _dependency_validation_memory_cache_key, _dep_validation_pre_key
+
+    _t_total = time.time()
+    _t_phase = _t_total
+
+    def _elapsed_ms(since: float) -> float:
+        return round((time.time() - since) * 1000, 2)
+
+    def _mark_phase() -> float:
+        nonlocal _t_phase
+        now = time.time()
+        d = round((now - _t_phase) * 1000, 2)
+        _t_phase = now
+        return d
+
+    result: dict = {
+        "dependency_validation_start_unix_s": _t_total,
+        "dependency_validation_cache_layer": "none",
+        "dependency_validation_cache_key": "",
+        "dependency_validation_cache_hit": False,
+        "dependency_validation_baked_hash": None,
+        "dependency_validation_current_hash": None,
+        "dependency_validation_changed_nodes": [],
+        "dependency_validation_repair_mode": repair_mode or "",
+        "dependency_total_ms": 0.0,
+        "dependency_pre_key_check_ms": 0.0,
+        "dependency_baked_manifest_load_ms": 0.0,
+        "dependency_source_root_resolve_ms": 0.0,
+        "dependency_fingerprint_ms": 0.0,
+        "dependency_cache_key_ms": 0.0,
+        "dependency_memory_lookup_ms": 0.0,
+        "dependency_sentinel_lookup_ms": 0.0,
+        "dependency_full_validation_ms": 0.0,
+        "dependency_sentinel_write_ms": 0.0,
+    }
+
+    # ── Step 1: Load baked manifest first (needed for pre-key check) ───
+    if baked is None:
+        baked = load_baked_custom_node_dependency_manifest()
+    _baked_load_ms = _mark_phase()
+    result["dependency_baked_manifest_load_ms"] = _baked_load_ms
+
+    # ── Step 0: Pre-key memory fast path ────────────────────────────────
+    # Uses cheap volume state (stat calls only, no content reads) to avoid
+    # the expensive dependency fingerprint scan (~900ms) on subsequent requests
+    # in the same warm container.
+    _pre_key_vol_hash = _cheap_volume_state_hash()
+    _pre_key_resolve_ms = _mark_phase()
+    result["dependency_source_root_resolve_ms"] = _pre_key_resolve_ms
+
+    if not baked:
+        result["dependency_validation_end_unix_s"] = time.time()
+        total = _elapsed_ms(_t_total)
+        result["dependency_validation_ms"] = total
+        result["dependency_total_ms"] = total
+        result["dependency_validation_result"] = "baked_manifest_missing"
+        result["dependency_validation_reason"] = "baked_manifest_missing"
+        val = {
+            "prepared": False,
+            "reason": "baked_manifest_missing",
+            "baked_hash": None,
+            "current_hash": None,
+            "changed_nodes": [],
+        }
+        result.update(val)
+        return result
+
+    baked_hash = baked.get("overall_dependency_hash", "")
+    if repair_mode is None:
+        repair_mode = REQUIREMENTS_REPAIR_MODE.strip().lower()
+    if repair_mode not in ("off", "fail_fast", "dev"):
+        repair_mode = "fail_fast"
+    source_root_indicator = _get_custom_node_source_root_indicator()
+
+    if _dep_validation_pre_key is not None:
+        _pk = _dep_validation_pre_key
+        _pk_mode = _pk.get("repair_mode")
+        _pk_sri = _pk.get("source_root_indicator")
+        _pk_vsh = _pk.get("volume_state_hash")
+        _pk_bh = _pk.get("baked_hash")
+        _pk_match = (
+            _pk_bh == baked_hash
+            and _pk_mode == repair_mode
+            and _pk_sri == source_root_indicator
+            and _pk_vsh == _pre_key_vol_hash
+        )
+        _pk_result = _pk.get("result")
+        if _pk_match and isinstance(_pk_result, dict) and _pk_result.get("prepared"):
+            _pre_key_ms = _mark_phase()
+            result["dependency_pre_key_check_ms"] = _pre_key_ms
+            result["dependency_total_ms"] = _elapsed_ms(_t_total)
+            result["dependency_validation_ms"] = result["dependency_total_ms"]
+            result["dependency_validation_end_unix_s"] = time.time()
+            result["dependency_validation_result"] = "memory_cache_hit"
+            result["dependency_validation_cache_layer"] = "memory_pre_key"
+            result["dependency_validation_cache_hit"] = True
+            result["dependency_validation_reason"] = "pre_key_memory_hit"
+            for _k, _v in _pk_result.items():
+                if _k not in result:
+                    result[_k] = _v
+            print(
+                f"[comfyapp] dep_validation_cache: pre-key memory hit "
+                f"total_ms={result['dependency_total_ms']} "
+                f"pre_key_check_ms={_pre_key_ms}"
+            )
+            return result
+
+    # ── Step 2: Build cheap dependency fingerprint ──────────────────────
+    source_root = get_runtime_custom_node_source_root_for_dependency_validation()
+
+    # ── Step 2: Build cheap dependency fingerprint ──────────────────────
+    source_root = get_runtime_custom_node_source_root_for_dependency_validation()
+    dep_fp = custom_node_dependency_fingerprint(source_root)
+    dep_fingerprint_hash = dep_fp.get("overall_dependency_hash", "")
+    _fingerprint_ms = _mark_phase()
+    result["dependency_fingerprint_ms"] = _fingerprint_ms
+
+    # ── Step 3: Compute cache key ───────────────────────────────────────
+    cache_key = build_dependency_validation_cache_key(
+        baked_hash=baked_hash,
+        current_dep_fingerprint_hash=dep_fingerprint_hash,
+        source_root_indicator=source_root_indicator,
+        repair_mode=repair_mode,
+    )
+    result["dependency_validation_cache_key"] = cache_key
+    result["dependency_validation_baked_hash"] = baked_hash
+    result["dependency_validation_repair_mode"] = repair_mode
+    _cache_key_ms = _mark_phase()
+    result["dependency_cache_key_ms"] = _cache_key_ms
+
+    # ── Step 4: Check per-container full-key memory cache ───────────────
+    if _dependency_validation_memory_cache_key == cache_key and _dependency_validation_memory_cache:
+        cached = _dependency_validation_memory_cache
+        if cached.get("prepared"):
+            _mem_ms = _mark_phase()
+            result["dependency_memory_lookup_ms"] = _mem_ms
+            result["dependency_validation_end_unix_s"] = time.time()
+            result["dependency_total_ms"] = _elapsed_ms(_t_total)
+            result["dependency_validation_ms"] = result["dependency_total_ms"]
+            result["dependency_validation_result"] = "memory_cache_hit"
+            result["dependency_validation_cache_layer"] = "memory"
+            result["dependency_validation_cache_hit"] = True
+            result["dependency_validation_reason"] = "memory_cache_hit"
+            result.update(cached)
+            print(
+                f"[comfyapp] dep_validation_cache: full-key memory hit "
+                f"total_ms={result['dependency_total_ms']} "
+                f"fingerprint_ms={_fingerprint_ms} "
+                f"mem_lookup_ms={_mem_ms}"
+            )
+            return result
+        # Don't cache failures; fall through
+
+    _mem_lookup_ms = _mark_phase()
+    result["dependency_memory_lookup_ms"] = _mem_lookup_ms
+
+    # ── Step 5: Check deployment sentinel on volume ─────────────────────
+    sentinel = _read_deployment_dependency_validation_sentinel(cache_key)
+    if sentinel is not None:
+        val = {
+            "prepared": True,
+            "reason": "deployment_sentinel_match",
+            "baked_hash": baked_hash,
+            "current_hash": dep_fingerprint_hash,
+            "changed_nodes": [],
+        }
+        result.update(val)
+        _sentinel_ms = _mark_phase()
+        result["dependency_sentinel_lookup_ms"] = _sentinel_ms
+        result["dependency_validation_end_unix_s"] = time.time()
+        result["dependency_total_ms"] = _elapsed_ms(_t_total)
+        result["dependency_validation_ms"] = result["dependency_total_ms"]
+        result["dependency_validation_result"] = "deployment_cache_hit"
+        result["dependency_validation_cache_layer"] = "deployment_sentinel"
+        result["dependency_validation_cache_hit"] = True
+        result["dependency_validation_reason"] = "deployment_sentinel_match"
+        _dependency_validation_memory_cache = dict(val)
+        _dependency_validation_memory_cache_key = cache_key
+        _pkey = {
+            "baked_hash": baked_hash,
+            "repair_mode": repair_mode,
+            "source_root_indicator": source_root_indicator,
+            "volume_state_hash": _pre_key_vol_hash,
+            "result": dict(val),
+        }
+        _dep_validation_pre_key = _pkey
+        print(f"[comfyapp] dep_validation_cache: deployment sentinel hit key={cache_key[:16]}...")
+        return result
+
+    _sentinel_lookup_ms = _mark_phase()
+    result["dependency_sentinel_lookup_ms"] = _sentinel_lookup_ms
+
+    # ── Step 6: Fast-path hash compare ─────────────────────────────────
+    if baked_hash and dep_fingerprint_hash and baked_hash == dep_fingerprint_hash:
+        val = {
+            "prepared": True,
+            "reason": "hash_match_fast_path",
+            "baked_hash": baked_hash,
+            "current_hash": dep_fingerprint_hash,
+            "changed_nodes": [],
+        }
+        result.update(val)
+        _write_deployment_dependency_validation_sentinel(
+            cache_key, baked_hash, dep_fingerprint_hash,
+            repair_mode, source_root_indicator, val,
+        )
+        _sentinel_write_ms = _mark_phase()
+        result["dependency_sentinel_write_ms"] = _sentinel_write_ms
+        result["dependency_validation_end_unix_s"] = time.time()
+        result["dependency_total_ms"] = _elapsed_ms(_t_total)
+        result["dependency_validation_ms"] = result["dependency_total_ms"]
+        result["dependency_validation_result"] = "hash_match_fast_path"
+        result["dependency_validation_cache_layer"] = "baked_hash_fast_path"
+        result["dependency_validation_cache_hit"] = True
+        result["dependency_validation_reason"] = "hash_match_fast_path"
+        _dependency_validation_memory_cache = dict(val)
+        _dependency_validation_memory_cache_key = cache_key
+        _pkey = {
+            "baked_hash": baked_hash,
+            "repair_mode": repair_mode,
+            "source_root_indicator": source_root_indicator,
+            "volume_state_hash": _pre_key_vol_hash,
+            "result": dict(val),
+        }
+        _dep_validation_pre_key = _pkey
+        print(
+            f"[comfyapp] dep_validation_cache: hash fast-path "
+            f"total_ms={result['dependency_total_ms']} "
+            f"fingerprint_ms={_fingerprint_ms} "
+            f"sentinel_write_ms={_sentinel_write_ms}"
+        )
+        return result
+
+    # ── Step 7: Full validation (missed all caches) ────────────────────
+    val = validate_custom_node_dependencies_prepared()
+    result.update(val)
+    result["dependency_validation_current_hash"] = val.get("current_hash", dep_fingerprint_hash)
+    result["dependency_validation_changed_nodes"] = val.get("changed_nodes", [])
+    _full_val_ms = _mark_phase()
+    result["dependency_full_validation_ms"] = _full_val_ms
+
+    if val.get("prepared"):
+        result["dependency_validation_result"] = "validated"
+        result["dependency_validation_cache_layer"] = "none"
+        result["dependency_validation_cache_hit"] = False
+        result["dependency_validation_reason"] = val.get("reason", "validated")
+        _dependency_validation_memory_cache = dict(val)
+        _dependency_validation_memory_cache_key = cache_key
+        _write_deployment_dependency_validation_sentinel(
+            cache_key, baked_hash, dep_fingerprint_hash,
+            repair_mode, source_root_indicator, val,
+        )
+        _sentinel_write2_ms = _mark_phase()
+        result["dependency_sentinel_write_ms"] = result.get("dependency_sentinel_write_ms", 0.0) + _sentinel_write2_ms
+        _pkey = {
+            "baked_hash": baked_hash,
+            "repair_mode": repair_mode,
+            "source_root_indicator": source_root_indicator,
+            "volume_state_hash": _pre_key_vol_hash,
+            "result": dict(val),
+        }
+        _dep_validation_pre_key = _pkey
+    else:
+        result["dependency_validation_result"] = "failed"
+        result["dependency_validation_cache_layer"] = "none"
+        result["dependency_validation_cache_hit"] = False
+        result["dependency_validation_reason"] = val.get("reason", "validation_failed")
+        _dependency_validation_memory_cache_key = ""
+        _dependency_validation_memory_cache = {}
+        _dep_validation_pre_key = None
+
+    result["dependency_validation_end_unix_s"] = time.time()
+    result["dependency_total_ms"] = _elapsed_ms(_t_total)
+    result["dependency_validation_ms"] = result["dependency_total_ms"]
+    print(
+        f"[comfyapp] dep_validation_cache: miss result={result['dependency_validation_result']} "
+        f"total_ms={result['dependency_total_ms']} "
+        f"fingerprint_ms={_fingerprint_ms} "
+        f"full_val_ms={_full_val_ms} "
+        f"key={cache_key[:16]}..."
+    )
+    return result
 
 
 # ── PART 11: Known-good workflow profiles ──
@@ -3611,15 +4083,16 @@ class _ComfyAPIMixin:
 
         dep_prepared = True
         dep_reason = ""
+        dep_check: dict = {}
         installed = []
         skipped = []
         failed = []
 
         # 4. Production modes: never pip install
         if mode in ("off", "fail_fast"):
-            dep_check = validate_custom_node_dependencies_prepared()
+            dep_check = _run_dependency_validation_with_cache(repair_mode=mode)
             dep_prepared = dep_check.get("prepared", False)
-            dep_reason = dep_check.get("reason", "")
+            dep_reason = dep_check.get("dependency_validation_reason", dep_check.get("reason", ""))
             if not dep_prepared:
                 baked_hash = dep_check.get("baked_hash", "?") or "?"
                 current_hash = dep_check.get("current_hash", "?") or "?"
@@ -3635,7 +4108,6 @@ class _ComfyAPIMixin:
                     f"changed_nodes={changed_nodes}"
                 )
                 if stream:
-                    # Streaming path: raise so the stream yields a fatal error
                     raise RuntimeError(error_msg)
                 else:
                     raise RuntimeError(error_msg)
@@ -3654,7 +4126,7 @@ class _ComfyAPIMixin:
         # ── 6. Enforce node classes available before model work ─────
         _missing_node_result = self._enforce_workflow_node_classes_available_before_model_work(workflow)
 
-        return {
+        result = {
             "sync_created_count": len(_cn_created),
             "sync_kept_count": len(summary.get("kept", [])),
             "sync_removed_count": len(summary.get("removed", [])),
@@ -3671,6 +4143,24 @@ class _ComfyAPIMixin:
             "missing_nodes_after_repair": _missing_node_result.get("missing_nodes_after_repair", []),
             "missing_node_blocked_by_mode": _missing_node_result.get("missing_node_blocked_by_mode", False),
         }
+        # Propagate dependency validation cache fields from dep_check
+        _dep_fields_propagated = 0
+        for _dep_field in (
+            "dependency_validation_ms", "dependency_total_ms",
+            "dependency_validation_result", "dependency_validation_cache_layer",
+            "dependency_validation_cache_hit", "dependency_validation_reason",
+            "dependency_validation_baked_hash", "dependency_validation_current_hash",
+            "dependency_validation_changed_nodes",
+            "dependency_pre_key_check_ms", "dependency_baked_manifest_load_ms",
+            "dependency_source_root_resolve_ms", "dependency_fingerprint_ms",
+            "dependency_cache_key_ms", "dependency_memory_lookup_ms",
+            "dependency_sentinel_lookup_ms", "dependency_full_validation_ms",
+            "dependency_sentinel_write_ms",
+        ):
+            if _dep_field in dep_check:
+                result[_dep_field] = dep_check[_dep_field]
+                _dep_fields_propagated += 1
+        return result
 
     # ── PART 7: Preflight before prompt execution ────────────────────────
     def _preflight_before_prompt_execution(self, workflow: dict) -> dict:
@@ -3700,13 +4190,13 @@ class _ComfyAPIMixin:
             print(f"[comfyapp] FAILURE SUMMARY: {summary}")
             raise
 
-        # 2. Dependency validation for production modes
+        # 2. Dependency validation for production modes (cached)
         dep_prepared = True
         dep_reason = ""
         if _repair_mode in ("off", "fail_fast"):
-            dep_check = validate_custom_node_dependencies_prepared()
+            dep_check = _run_dependency_validation_with_cache(repair_mode=_repair_mode)
             dep_prepared = dep_check.get("prepared", False)
-            dep_reason = dep_check.get("reason", "")
+            dep_reason = dep_check.get("dependency_validation_reason", dep_check.get("reason", ""))
             if not dep_prepared:
                 baked_hash = dep_check.get("baked_hash", "?") or "?"
                 current_hash = dep_check.get("current_hash", "?") or "?"
@@ -4925,10 +5415,13 @@ class _ComfyAPIMixin:
 
         def _dep_worker():
             try:
-                dep_check = validate_custom_node_dependencies_prepared()
+                dep_check = _run_dependency_validation_with_cache()
                 dep_result["prepared"] = dep_check.get("prepared", False)
-                dep_result["reason"] = dep_check.get("reason", "")
+                dep_result["reason"] = dep_check.get("dependency_validation_reason", dep_check.get("reason", ""))
                 dep_result["changed_nodes"] = dep_check.get("changed_nodes", [])
+                dep_result["cache_layer"] = dep_check.get("dependency_validation_cache_layer", "none")
+                dep_result["cache_hit"] = dep_check.get("dependency_validation_cache_hit", False)
+                dep_result["validation_ms"] = dep_check.get("dependency_validation_ms", 0)
             except Exception as e:
                 dep_result["error"] = str(e)
             finally:
@@ -5594,21 +6087,22 @@ class _ComfyAPIMixin:
         mode = self._resolve_requirements_repair_mode()
 
         if mode == "off":
-            dep_check = validate_custom_node_dependencies_prepared()
+            dep_check = _run_dependency_validation_with_cache(repair_mode=mode)
             print(
                 f"[comfyapp] requirements repair=off: "
                 f"prepared={dep_check.get('prepared')} "
-                f"reason={dep_check.get('reason', '')}"
+                f"reason={dep_check.get('dependency_validation_reason', dep_check.get('reason', ''))} "
+                f"cache_layer={dep_check.get('dependency_validation_cache_layer', 'none')}"
             )
             return {
                 "installed": [], "skipped": [], "failed": [],
                 "mode": "off",
                 "prepared": dep_check.get("prepared", False),
-                "dependency_reason": dep_check.get("reason", ""),
+                "dependency_reason": dep_check.get("dependency_validation_reason", dep_check.get("reason", "")),
             }
 
         if mode == "fail_fast":
-            dep_check = validate_custom_node_dependencies_prepared()
+            dep_check = _run_dependency_validation_with_cache(repair_mode=mode)
             if not dep_check.get("prepared", False):
                 baked_hash = dep_check.get("baked_hash", "?") or "?"
                 current_hash = dep_check.get("current_hash", "?") or "?"
@@ -5618,7 +6112,7 @@ class _ComfyAPIMixin:
                     "Runtime pip install is disabled in fail_fast mode. "
                     "Rebuild/deploy the Modal image after syncing "
                     "custom-node requirements. "
-                    f"reason={dep_check.get('reason', '')} "
+                    f"reason={dep_check.get('dependency_validation_reason', dep_check.get('reason', ''))} "
                     f"baked_hash={baked_hash} "
                     f"current_hash={current_hash} "
                     f"changed_nodes={changed_nodes}"
@@ -9654,6 +10148,34 @@ class _ComfyAPIMixin:
             if _t3_ns is not None and _prompt_start_ts is not None:
                 trace_summary["derived_ms"]["modal_entry_to_prompt_start_ms"] = round((_prompt_start_ts - _t3_ns) * 1000, 1)
             trace_summary["derived_ms"]["total_input_execution_ms"] = total_ms
+
+            # ── Dependency validation caching fields ──
+            for _dep_policy_field in (
+                "dependency_validation_ms", "dependency_total_ms",
+                "dependency_validation_result", "dependency_validation_cache_layer",
+                "dependency_validation_cache_hit", "dependency_validation_reason",
+                "dependency_validation_baked_hash", "dependency_validation_current_hash",
+                "dependency_validation_changed_nodes",
+                "dependency_pre_key_check_ms", "dependency_baked_manifest_load_ms",
+                "dependency_source_root_resolve_ms", "dependency_fingerprint_ms",
+                "dependency_cache_key_ms", "dependency_memory_lookup_ms",
+                "dependency_sentinel_lookup_ms", "dependency_full_validation_ms",
+                "dependency_sentinel_write_ms",
+            ):
+                _pv = _policy.get(_dep_policy_field)
+                if _pv is not None:
+                    if _dep_policy_field in (
+                        "dependency_validation_ms", "dependency_total_ms",
+                        "dependency_pre_key_check_ms", "dependency_baked_manifest_load_ms",
+                        "dependency_source_root_resolve_ms", "dependency_fingerprint_ms",
+                        "dependency_cache_key_ms", "dependency_memory_lookup_ms",
+                        "dependency_sentinel_lookup_ms", "dependency_full_validation_ms",
+                        "dependency_sentinel_write_ms",
+                    ):
+                        trace_summary.setdefault("derived_ms", {})[_dep_policy_field] = _pv
+                    else:
+                        trace_summary[_dep_policy_field] = _pv
+
             result["trace"] = trace_summary
             if isinstance(_scheduler_trace_ns, dict):
                 result["scheduler_trace"] = dict(_scheduler_trace_ns)
@@ -10084,7 +10606,8 @@ class _ComfyAPIMixin:
                 # Dependency failures yield a clear fatal stream event.
                 self._preflight_already_ran = False
                 try:
-                    self._handle_custom_node_sync_and_dependency_policy(workflow, stream=True)
+                    _policy_stream = self._handle_custom_node_sync_and_dependency_policy(workflow, stream=True)
+                    self._policy_stream = _policy_stream
                     self._preflight_already_ran = True
                 except RuntimeError as _dep_err:
                     import traceback as _tb
@@ -10168,6 +10691,36 @@ class _ComfyAPIMixin:
                     if _t3 is not None and _prompt_start_ts is not None:
                         trace_summary["derived_ms"]["modal_entry_to_prompt_start_ms"] = round((_prompt_start_ts - _t3) * 1000, 1)
                     trace_summary["derived_ms"]["total_input_execution_ms"] = round((_t_exec_end - _t_exec_start) * 1000, 1)
+
+                    # ── Dependency validation caching fields (streaming path) ──
+                    _pstream = getattr(self, "_policy_stream", {})
+                    if isinstance(_pstream, dict):
+                        for _dep_field_s in (
+                            "dependency_validation_ms", "dependency_total_ms",
+                            "dependency_validation_result", "dependency_validation_cache_layer",
+                            "dependency_validation_cache_hit", "dependency_validation_reason",
+                            "dependency_validation_baked_hash", "dependency_validation_current_hash",
+                            "dependency_validation_changed_nodes",
+                            "dependency_pre_key_check_ms", "dependency_baked_manifest_load_ms",
+                            "dependency_source_root_resolve_ms", "dependency_fingerprint_ms",
+                            "dependency_cache_key_ms", "dependency_memory_lookup_ms",
+                            "dependency_sentinel_lookup_ms", "dependency_full_validation_ms",
+                            "dependency_sentinel_write_ms",
+                        ):
+                            _v_s = _pstream.get(_dep_field_s)
+                            if _v_s is not None:
+                                if _dep_field_s in (
+                                    "dependency_validation_ms", "dependency_total_ms",
+                                    "dependency_pre_key_check_ms", "dependency_baked_manifest_load_ms",
+                                    "dependency_source_root_resolve_ms", "dependency_fingerprint_ms",
+                                    "dependency_cache_key_ms", "dependency_memory_lookup_ms",
+                                    "dependency_sentinel_lookup_ms", "dependency_full_validation_ms",
+                                    "dependency_sentinel_write_ms",
+                                ):
+                                    trace_summary.setdefault("derived_ms", {})[_dep_field_s] = _v_s
+                                else:
+                                    trace_summary[_dep_field_s] = _v_s
+
                     _r["trace"] = trace_summary
                     if isinstance(_scheduler_trace, dict):
                         _r["scheduler_trace"] = dict(_scheduler_trace)

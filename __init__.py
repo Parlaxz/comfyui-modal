@@ -1189,8 +1189,31 @@ async def _execute_job(item: tuple, item_id: int):
     _merged_trace = trace.summary()
     # Preserve restore timing from the Modal container's trace
     _remote_full = result.get("trace", {})
-    if isinstance(_remote_full, dict) and "restore" in _remote_full:
-        _merged_trace["restore"] = _remote_full["restore"]
+    if isinstance(_remote_full, dict):
+        if "restore" in _remote_full:
+            _merged_trace["restore"] = _remote_full["restore"]
+        # Preserve dependency validation fields from remote trace
+        for _dep_field in (
+            "dependency_validation_ms", "dependency_total_ms",
+            "dependency_validation_result", "dependency_validation_cache_layer",
+            "dependency_validation_cache_hit", "dependency_validation_reason",
+            "dependency_validation_baked_hash", "dependency_validation_current_hash",
+            "dependency_validation_changed_nodes",
+            "dependency_pre_key_check_ms", "dependency_baked_manifest_load_ms",
+            "dependency_source_root_resolve_ms", "dependency_fingerprint_ms",
+            "dependency_cache_key_ms", "dependency_memory_lookup_ms",
+            "dependency_sentinel_lookup_ms", "dependency_full_validation_ms",
+            "dependency_sentinel_write_ms",
+        ):
+            _dep_v = _remote_full.get(_dep_field)
+            if _dep_v is not None:
+                _merged_trace[_dep_field] = _dep_v
+        # Also preserve from derived_ms
+        _remote_derived = _remote_full.get("derived_ms", {})
+        if isinstance(_remote_derived, dict):
+            for _rdk, _rdv in _remote_derived.items():
+                if _rdk not in _merged_trace.get("derived_ms", {}):
+                    _merged_trace.setdefault("derived_ms", {})[_rdk] = _rdv
     result["trace"] = _merged_trace
     _dbg_path = os.path.join(_NODE_DIR, "_trace_debug.log")
     with open(_dbg_path, "a", encoding="utf-8") as _f:
