@@ -22,6 +22,8 @@ Timestamps are prefixed ``t_`` and stored as epoch seconds (float).
 * ``t0_client_press``  – browser captured the click
 * ``t1_local_recv``    – local ComfyUI ``/comfymodal/prompt`` route entered
 * ``t2_local_dispatch`` – ``_execute_job`` started (just before run_prompt)
+* ``t2b_modal_handle_resolved`` – Modal function handle resolved (from cache or lookup)
+* ``t2c_modal_call_start`` – Modal remote call initiated
 * ``t3_modal_entry``   – Modal ``run_prompt`` method body entered
 * ``t3b_validate_done`` – Comfy workflow validation finished
 * ``t3c_prep_done``    – input images written, in-process prep complete
@@ -34,9 +36,16 @@ Timestamps are prefixed ``t_`` and stored as epoch seconds (float).
 * ``t7b_collect_start`` – ``_collect_in_process_outputs`` began
 * ``t8_image_written`` – final image file written by SaveImage
 * ``t8b_outputs_collected`` – ``_collect_in_process_outputs`` finished
-* ``t9_modal_return`` – Modal ``run_prompt`` returned to the local server
+* ``t9_modal_return`` – Modal ``run_prompt`` returned to the local server (remote timestamp)
+* ``t9b_local_result_received`` – Local server received the Modal stream result
+* ``t9c_local_history_poll_start`` – Local history polling phase began (legacy route)
+* ``t9d_local_history_poll_end`` – Local history polling phase ended
+* ``t9e_local_materialize_start`` – Local output file materialization began
 * ``t10_local_materialized`` – local ComfyUI server finished materializing output
   files and is about to send execution success to the browser
+* ``t10b_local_save_start`` – Local auto-save phase began
+* ``t10c_local_save_end`` – Local auto-save phase ended
+* ``t10d_local_response_sent`` – Execution success response sent to frontend
 * ``t10_browser_recv`` – browser received the response
 
 Modal restore/cold-start cost is the gap ``t3_modal_entry - t2_local_dispatch``
@@ -164,6 +173,14 @@ class Trace:
             ("image_io", "t8_image_written", "t8b_outputs_collected"),
             ("t8b_to_t9", "t8b_outputs_collected", "t9_modal_return"),
             ("t9_to_t10", "t9_modal_return", t10_key),
+            # Phase 2 local timing markers
+            ("t9b_to_t9e", "t9b_local_result_received", "t9e_local_materialize_start"),
+            ("t9e_to_t10", "t9e_local_materialize_start", "t10_local_materialized"),
+            ("t10_to_t10b", "t10_local_materialized", "t10b_local_save_start"),
+            ("t10b_to_t10c", "t10b_local_save_start", "t10c_local_save_end"),
+            ("t10c_to_t10d", "t10c_local_save_end", "t10d_local_response_sent"),
+            ("t9_to_t9b", "t9_modal_return", "t9b_local_result_received"),
+            ("t2b_to_t2c", "t2b_modal_handle_resolved", "t2c_modal_call_start"),
         ]
         for key, a, b in pairs:
             d = self.delta_ms(a, b)
@@ -254,6 +271,25 @@ class Trace:
         if vw is not None:
             out["derived_ms"]["vae_node_wait_ms"] = vw
 
+        # Phase 2: local path timing derived metrics
+        _lp_pairs = [
+            ("local_prepare_ms", "t1_local_recv", "t2_local_prepared"),
+            ("modal_handle_resolve_ms", "t2_local_prepared", "t2b_modal_handle_resolved"),
+            ("modal_call_submit_ms", "t2b_modal_handle_resolved", "t2c_modal_call_start"),
+            ("modal_queue_or_start_gap_ms", "t2c_modal_call_start", "t3_modal_entry"),
+            ("modal_return_to_local_receive_ms", "t9_modal_return", "t9b_local_result_received"),
+            ("local_history_poll_ms", "t9c_local_history_poll_start", "t9d_local_history_poll_end"),
+            ("local_materialize_ms", "t9e_local_materialize_start", "t10_local_materialized"),
+            ("local_save_ms", "t10b_local_save_start", "t10c_local_save_end"),
+            ("local_response_send_ms", "t10_local_materialized", "t10d_local_response_sent"),
+            ("modal_return_to_browser_ms", "t9_modal_return", t10_key),
+            ("client_to_response_sent_ms", "t0_client_press", "t10d_local_response_sent"),
+        ]
+        for _lpk, _lpa, _lpb in _lp_pairs:
+            _lpd = self.delta_ms(_lpa, _lpb)
+            if _lpd is not None:
+                out["derived_ms"][_lpk] = _lpd
+
         # Phase 1: dependency validation timing (preserved from upstream enrichment)
         for _dep_key in (
             "dependency_validation_ms", "dependency_total_ms",
@@ -291,10 +327,14 @@ class Trace:
 
         _optional_fields = [
             "t0_client_press", "t1_local_recv", "t2_local_dispatch",
+            "t2b_modal_handle_resolved", "t2c_modal_call_start",
             "t4_clip_load_start", "t4_clip_load_end",
             "t5_text_encode_start", "t5_text_encode_end",
             "t7_vae_decode_start", "t7_vae_decode_end",
-            "t8_image_written", "t9_modal_return", t10_key,
+            "t8_image_written", "t9_modal_return",
+            "t9b_local_result_received", "t9e_local_materialize_start",
+            t10_key, "t10b_local_save_start", "t10c_local_save_end",
+            "t10d_local_response_sent",
         ]
         _opt_missing = [k for k in _optional_fields if k not in t]
 
@@ -333,6 +373,8 @@ class Trace:
         order = [
             "t1_local_recv",
             "t2_local_dispatch",
+            "t2b_modal_handle_resolved",
+            "t2c_modal_call_start",
             "t3_modal_entry",
             "t3b_validate_done",
             "t3c_prep_done",
@@ -354,7 +396,14 @@ class Trace:
             "t8_image_written",
             "t8b_outputs_collected",
             "t9_modal_return",
+            "t9b_local_result_received",
+            "t9c_local_history_poll_start",
+            "t9d_local_history_poll_end",
+            "t9e_local_materialize_start",
             "t10_local_materialized",
+            "t10b_local_save_start",
+            "t10c_local_save_end",
+            "t10d_local_response_sent",
             "t10_browser_recv",
         ]
         for k in order:
@@ -376,6 +425,13 @@ class Trace:
             "image_io",
             "t8b_to_t9",
             "t9_to_t10",
+            "t9_to_t9b",
+            "t9b_to_t9e",
+            "t9e_to_t10",
+            "t10_to_t10b",
+            "t10b_to_t10c",
+            "t10c_to_t10d",
+            "t2b_to_t2c",
             "graph_overhead",
             "inference_total",
             "modal_to_return",
@@ -397,6 +453,19 @@ class Trace:
             "clip_node_wait_ms",
             "unet_node_wait_ms",
             "vae_node_wait_ms",
+        ]
+        derived_keys += [
+            "local_prepare_ms",
+            "modal_handle_resolve_ms",
+            "modal_call_submit_ms",
+            "modal_queue_or_start_gap_ms",
+            "modal_return_to_local_receive_ms",
+            "local_history_poll_ms",
+            "local_materialize_ms",
+            "local_save_ms",
+            "local_response_send_ms",
+            "modal_return_to_browser_ms",
+            "client_to_response_sent_ms",
         ]
         derived_parts = [f"{k}={derived[k]}ms" for k in derived_keys if k in derived and derived[k] is not None]
         dep_val_ms = derived.get("dependency_validation_ms")

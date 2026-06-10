@@ -367,7 +367,18 @@ PROMPT_PRELOAD_WORKERS = int(os.getenv("PROMPT_PRELOAD_WORKERS", "2"))
 PROMPT_ASYNC_ACTUAL_LOAD = os.getenv("PROMPT_ASYNC_ACTUAL_LOAD", "0") == "1"
 PROMPT_ASYNC_ACTUAL_LOAD_UNET = os.getenv("PROMPT_ASYNC_ACTUAL_LOAD_UNET", "0") == "1"
 DISABLE_CACHEDIT_FOR_Z_IMAGE = os.getenv("DISABLE_CACHEDIT_FOR_Z_IMAGE", "0") == "1"
-DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE = os.getenv("DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE", "0") == "1"
+_DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE = os.getenv("DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE", "0") == "1"
+
+
+def _resolve_disable_restore_warmup_for_z_image() -> bool:
+    """Return effective DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE.
+
+    Priority:
+    1. Runtime flag file (set via set_runtime_flag DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE)
+    2. Module-level env default.
+    """
+    return _resolve_runtime_flag("DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE",
+                                 "1" if _DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE else "0")
 ACTUAL_LOAD_MODE = os.getenv("ACTUAL_LOAD_MODE", "clip_vae_only").strip().lower()
 
 # P1 — Direct warmup granular flags.
@@ -3070,7 +3081,7 @@ MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
 LAST_MODEL_STACK_PATH = "/root/models/.last_model_stack.json"
 ACTIVE_NEXT_PROFILE_PATH = "/root/models/runtime_config/active_next_profile.json"
-ACTIVE_NEXT_PROFILE_TTL_S = 60
+ACTIVE_NEXT_PROFILE_TTL_S = int(os.getenv("COMFYMODAL_ACTIVE_NEXT_PROFILE_TTL_S", "3600"))
 LAST_WARMUP_WORKFLOW_PATH = "/root/models/.last_warmup_workflow.json"
 SAGE_RUNTIME_CACHE_PATH = "/root/models/.sage_runtime_cache.json"
 
@@ -3157,9 +3168,10 @@ _image_base = (
             # Restore latency fix — default production profile (Config D)
             "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
             "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
+            "COMFYMODAL_PRELOAD_MODE": "clip_only",
             "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "0",
-            "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "0",
-            "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "0",
+            "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
+            "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "1",
             "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "1",
             "COMFYMODAL_RUNTIME": "1",
             "PROMPT_ASYNC_PRELOAD": "0",
@@ -3168,7 +3180,7 @@ _image_base = (
             "PROMPT_ASYNC_ACTUAL_LOAD_UNET": "1",
             "ACTUAL_LOAD_MODE": "unet_vae_only",
             "DISABLE_CACHEDIT_FOR_Z_IMAGE": "0",
-            "DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE": "1",
+            "DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE": "0",
             # Production guardrails (PART 3, 4, 7)
             "COMFYMODAL_REQUIREMENTS_REPAIR_MODE": "fail_fast",
             "COMFYMODAL_PRELOAD_UNKNOWN_PROFILES": "0",
@@ -4523,6 +4535,25 @@ class _ComfyAPIMixin:
             diag = active.get("_diagnostic", {})
             diag_status = diag.get("status", "")
             if diag_status == "expired":
+                # Expired profile still has valid model stack info. Use it
+                # as fallback rather than skipping preload entirely.
+                # The expiry guards against stale profiles from abandoned
+                # sessions, but for restore-time preload, stale model info
+                # is still orders of magnitude better than no profile.
+                wp = active.get("warmup_profile") or {}
+                if wp:
+                    profile = dict(wp)
+                    source = "active_next_profile_expired"
+                    profile["_source"] = source
+                    profile["_profile_token"] = active.get("profile_token", "")
+                    profile["_workflow_hash"] = active.get("workflow_hash", "")
+                    profile["_current_workflow_stack"] = dict(active.get("model_stack") or {})
+                    print(
+                        f"[comfyapp] snapshot_preload_profile source={source} (expired fallback) "
+                        f"token={profile.get('_profile_token','')} "
+                        f"workflow_hash={profile.get('_workflow_hash','')}"
+                    )
+                    return profile
                 print(
                     f"[comfyapp] snapshot_preload_profile source=none reason=active_profile_expired "
                     f"token={active.get('profile_token','?')} "
@@ -9395,6 +9426,14 @@ class _ComfyAPIMixin:
 
         __stages["preload_mode"] = _resolve_preload_mode()
         __stages["preload_mode_source"] = "file" if os.path.isfile(PRELOAD_MODE_PATH) else "env_var"
+        __stages["preload_env_raw"] = os.environ.get("COMFYMODAL_PRELOAD_MODE", "not_set")
+        __stages["preload_unknown_profiles"] = 1 if PRELOAD_UNKNOWN_PROFILES else 0
+        __stages["disable_restore_warmup_for_z_image"] = 1 if _resolve_disable_restore_warmup_for_z_image() else 0
+        __stages["disable_restore_warmup_for_z_image_effective"] = __stages["disable_restore_warmup_for_z_image"]
+        __stages["direct_warmup_load_unet_flag"] = 1 if DIRECT_WARMUP_LOAD_UNET else 0
+        __stages["direct_warmup_load_clip_flag"] = 1 if DIRECT_WARMUP_LOAD_CLIP else 0
+        __stages["direct_warmup_clip_encode_flag"] = 1 if DIRECT_WARMUP_CLIP_ENCODE else 0
+        __stages["enable_warmup"] = 1 if ENABLE_WARMUP else 0
 
         # ── CacheDiT override ──
         if DISABLE_CACHEDIT_FOR_Z_IMAGE and is_in_proc:
@@ -9424,17 +9463,54 @@ class _ComfyAPIMixin:
         # with GPU warmup, hiding ~200-600ms of latency.
         _warmup_profile = None
         _warmup_paths: list[str] = []
+        _active_profile_diag: dict = {}
         if ENABLE_WARMUP:
             _s = time.time()
+
+            # ── Active profile diagnostics ──
+            _raw_active = self._load_active_next_profile()
+            _diag = _raw_active.get("_diagnostic", {}) if isinstance(_raw_active, dict) else {}
+            _prof_st = _diag.get("status", "not_loaded")
+            _prof_now = _diag.get("now", 0)
+            _prof_exp = _diag.get("expires_at", 0)
+            _prof_age = _diag.get("age_seconds", None)
+            _prof_tok = _diag.get("profile_token", "")
+            _prof_hash = _diag.get("workflow_hash", "")
+            _active_profile_diag = {
+                "active_profile_lookup_attempted": 1,
+                "active_profile_found": 1 if (_raw_active and _diag.get("status") in ("valid", "expired", "disable_warmup")) else 0,
+                "active_profile_source": _diag.get("status", "none"),
+                "active_profile_path": _diag.get("source_path", ""),
+                "active_profile_age_s": _prof_age if _prof_age is not None else -1,
+                "active_profile_workflow_hash": _prof_hash,
+                "active_profile_token": _prof_tok,
+                "active_profile_expires_at_s": _prof_exp,
+                "active_profile_disable_warmup": 1 if _raw_active.get("disable_warmup") else 0,
+                "active_profile_ttl_s": ACTIVE_NEXT_PROFILE_TTL_S,
+            }
+            __stages.update(_active_profile_diag)
+            # Build current profile and warmup selection
             _warmup_profile = self._snapshot_preload_profile()
             if _warmup_profile:
                 _warmup_paths = self._snapshot_preload_paths(_warmup_profile)
             __stages["early_path_resolve_ms"] = self._profile_ms(_s)
+
+            # ── Warmup profile diagnostics ──
+            _warmup_src = _warmup_profile.get("_source", "none") if _warmup_profile else "none"
+            _warmup_wf_hash = _warmup_profile.get("_workflow_hash", "") if _warmup_profile else ""
+            _warmup_tok = _warmup_profile.get("_profile_token", "") if _warmup_profile else ""
+            _warmup_stack = _warmup_profile.get("_current_workflow_stack", {}) if _warmup_profile else {}
+            __stages["warmup_profile_selected"] = _warmup_src
+            __stages["warmup_profile_source"] = _warmup_src
+            __stages["warmup_profile_token"] = _warmup_tok
+            __stages["warmup_profile_workflow_hash"] = _warmup_wf_hash
+            __stages["warmup_profile_stack"] = json.dumps(_warmup_stack, separators=(",", ":")) if _warmup_stack else ""
+
             print(
                 f"[comfyapp] restore warmup selection current_workflow_stack={_warmup_profile.get('_current_workflow_stack', {}) if _warmup_profile else {}} "
-                f"selected_warmup_profile={_warmup_profile or {}} profile_source={_warmup_profile.get('_source', 'none') if _warmup_profile else 'none'} "
-                f"workflow_hash={_warmup_profile.get('_workflow_hash', '') if _warmup_profile else ''} "
-                f"profile_token={_warmup_profile.get('_profile_token', '') if _warmup_profile else ''}"
+                f"selected_warmup_profile={_warmup_profile or {}} profile_source={_warmup_src} "
+                f"workflow_hash={_warmup_wf_hash} "
+                f"profile_token={_warmup_tok}"
             )
 
         if is_in_proc:
@@ -9591,32 +9667,57 @@ class _ComfyAPIMixin:
                 _workflow_hash = (profile or {}).get("_workflow_hash", "")
 
                 # Guard 1: Known-good workflow profile check
-                # active_next_profile alone does not mean known-good.
-                # Only known_good_workflow_profiles.json can make it eligible.
+                # An active_next_profile with a workflow hash is eligible for
+                # preload regardless of known-good status, because:
+                #   - It was written only after local preflight validation
+                #   - It has preflight_validated=true
+                #   - Its model stack and warmup profile are already resolved
+                # The known-good guard was originally intended to prevent
+                # preloading for completely unknown workflows, but the
+                # active_next_profile already represents a validated intent.
+                # Only workflows without any profile source still need the
+                # known-good check (or PRELOAD_UNKNOWN_PROFILES=1).
+                __stages["preload_eligibility_known_good_check"] = 0
+                __stages["preload_eligibility_active_next"] = 0
+                __stages["preload_eligibility_unknown_profiles"] = 1 if PRELOAD_UNKNOWN_PROFILES else 0
                 if _preload_skip_reason is None:
-                    if not PRELOAD_UNKNOWN_PROFILES:
-                        if _profile_source == "active_next_profile" and _workflow_hash:
-                            if _is_known_good_workflow_profile(_workflow_hash, profile or {}):
-                                print(
-                                    f"[comfyapp] preload known-good profile "
-                                    f"workflow_hash={_workflow_hash}"
-                                )
-                            else:
-                                _preload_skip_reason = "unknown_profile"
-                                print(
-                                    f"[comfyapp] preload_skipped reason=unknown_profile "
-                                    f"workflow_hash={_workflow_hash or 'missing'} "
-                                    f"profile_source={_profile_source} "
-                                    f"COMFYMODAL_PRELOAD_UNKNOWN_PROFILES=0"
-                                )
+                    if _profile_source in ("active_next_profile", "active_next_profile_expired") and _workflow_hash:
+                        __stages["preload_eligibility_active_next"] = 1
+                        # active_next_profile is eligible — skip known-good check
+                        print(
+                            f"[comfyapp] preload eligible via {_profile_source} "
+                            f"workflow_hash={_workflow_hash} profile_token={_prof_tok}"
+                        )
+                    elif PRELOAD_UNKNOWN_PROFILES:
+                        __stages["preload_eligibility_unknown_profiles"] = 2
+                        print(
+                            f"[comfyapp] preload eligible via PRELOAD_UNKNOWN_PROFILES=1 "
+                            f"profile_source={_profile_source}"
+                        )
+                    elif _profile_source == "active_next_profile" and _workflow_hash:
+                        # Should not reach (handled above), but keep as safety net
+                        __stages["preload_eligibility_known_good_check"] = 1
+                        if _is_known_good_workflow_profile(_workflow_hash, profile or {}):
+                            print(
+                                f"[comfyapp] preload known-good profile "
+                                f"workflow_hash={_workflow_hash}"
+                            )
                         else:
                             _preload_skip_reason = "unknown_profile"
                             print(
                                 f"[comfyapp] preload_skipped reason=unknown_profile "
-                                f"profile_source={_profile_source} "
                                 f"workflow_hash={_workflow_hash or 'missing'} "
+                                f"profile_source={_profile_source} "
                                 f"COMFYMODAL_PRELOAD_UNKNOWN_PROFILES=0"
                             )
+                    else:
+                        _preload_skip_reason = "unknown_profile"
+                        print(
+                            f"[comfyapp] preload_skipped reason=unknown_profile "
+                            f"profile_source={_profile_source} "
+                            f"workflow_hash={_workflow_hash or 'missing'} "
+                            f"COMFYMODAL_PRELOAD_UNKNOWN_PROFILES=0"
+                        )
 
                 # Guard 2: Size guardrails via _filter_preload_paths_by_size
                 if _preload_skip_reason is None and preload_paths:
@@ -9634,14 +9735,18 @@ class _ComfyAPIMixin:
                     preload_paths = []
                     __stages["preload_skipped"] = 1
                     __stages["preload_skip_reason"] = _preload_skip_reason
+                else:
+                    __stages["preload_skipped"] = 0
 
                 # ── Z-Image restore warmup skip ──
-                if DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE and profile and profile.get("unet", ""):
+                if _resolve_disable_restore_warmup_for_z_image() and profile and profile.get("unet", ""):
                     _wu_unet = profile.get("unet", "").lower()
                     if "z_image" in _wu_unet or "z-image" in _wu_unet:
                         print(f"[comfyapp] DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=1: skipping restore warmup for {_wu_unet}")
                         preload_paths = []
                         __stages["warmup_preload_skipped"] = 1
+                        __stages["direct_warmup_z_image_guard_skipped"] = 1
+                        __stages["direct_warmup_skip_reason"] = "z_image_guard"
                 _s = time.time()
                 if preload_paths and _pm != "off":
                     if _pm == "async_no_wait":
@@ -9814,28 +9919,32 @@ class _ComfyAPIMixin:
                 # still loading UNET into GPU cache and priming the
                 # CLIPTextEncode text cache.
                 _skip_direct_warmup = False
-                if DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE and profile and profile.get("unet", ""):
+                if _resolve_disable_restore_warmup_for_z_image() and profile and profile.get("unet", ""):
                     _wu_unet = profile.get("unet", "").lower()
                     if "z_image" in _wu_unet or "z-image" in _wu_unet:
                         print(f"[comfyapp] DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=1: skipping direct warmup for {_wu_unet}")
                         _skip_direct_warmup = True
+                        __stages["direct_warmup_z_image_guard_skipped"] = 1
+                        __stages["direct_warmup_skip_reason"] = "z_image_guard"
 
-                # ── PART 8: Known-good guard before direct warmup ──
+                # ── PART 8: Active-next / known-good guard before direct warmup ──
                 if not _skip_direct_warmup and profile and profile.get("mode"):
                     _wg_workflow_hash = (profile or {}).get("_workflow_hash", "")
                     _wg_load_unet = _resolve_runtime_flag("DIRECT_WARMUP_LOAD_UNET", "0")
                     _wg_load_clip = _resolve_runtime_flag("DIRECT_WARMUP_LOAD_CLIP", "0")
-                    if (_wg_load_unet or _wg_load_clip) and not PRELOAD_UNKNOWN_PROFILES:
-                        if _wg_workflow_hash and _is_known_good_workflow_profile(_wg_workflow_hash, profile or {}):
-                            print(
-                                f"[comfyapp] direct warmup known-good profile "
-                                f"workflow_hash={_wg_workflow_hash}"
-                            )
-                        else:
+                    _wg_profile_source = (profile or {}).get("_source", "")
+                    if _wg_load_unet or _wg_load_clip:
+                        _wg_eligible = (
+                            PRELOAD_UNKNOWN_PROFILES
+                            or (_wg_profile_source in ("active_next_profile", "active_next_profile_expired") and _wg_workflow_hash)
+                            or (_wg_workflow_hash and _is_known_good_workflow_profile(_wg_workflow_hash, profile or {}))
+                        )
+                        if not _wg_eligible:
                             _skip_direct_warmup = True
                             print(
-                                f"[comfyapp] direct_warmup_skipped reason=not_known_good "
+                                f"[comfyapp] direct_warmup_skipped reason=not_eligible "
                                 f"workflow_hash={_wg_workflow_hash or 'missing'} "
+                                f"profile_source={_wg_profile_source} "
                                 f"load_unet={_wg_load_unet} load_clip={_wg_load_clip}"
                             )
                 if profile and profile.get("mode") and not _skip_direct_warmup:
