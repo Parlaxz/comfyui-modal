@@ -37,6 +37,12 @@ _runtime_state_fn = modal.Function.from_name("comfyui", "runtime_state_cpu")
 
 _current_gpu = DEFAULT_GPU
 _api_instances = {}
+_handle_cache_hits = 0
+_handle_cache_misses = 0
+
+
+def get_handle_cache_stats() -> dict:
+    return {"hits": _handle_cache_hits, "misses": _handle_cache_misses}
 
 
 def set_gpu(gpu: str):
@@ -56,23 +62,34 @@ def get_available_gpus() -> list[dict[str, str]]:
 
 
 def _api():
+    global _handle_cache_hits, _handle_cache_misses
     if _current_gpu not in _api_instances:
+        _handle_cache_misses += 1
         _api_instances[_current_gpu] = _apis[_current_gpu]()
+    else:
+        _handle_cache_hits += 1
     return _api_instances[_current_gpu]
 
 
 def _api_for_gpu(gpu: str | None = None):
+    global _handle_cache_hits, _handle_cache_misses
     selected_gpu = _current_gpu if gpu is None else normalize_gpu_value(gpu)
     if selected_gpu not in _apis:
         raise ValueError(f"Unsupported GPU: {selected_gpu}")
     if selected_gpu not in _api_instances:
+        _handle_cache_misses += 1
         _api_instances[selected_gpu] = _apis[selected_gpu]()
+    else:
+        _handle_cache_hits += 1
     return _api_instances[selected_gpu]
 
 
 def clear_cache():
     """Clear cached API instance handles so subsequent requests use fresh handles."""
+    global _handle_cache_hits, _handle_cache_misses
     _api_instances.clear()
+    _handle_cache_hits = 0
+    _handle_cache_misses = 0
 
 
 def _modal_error_handler(func):

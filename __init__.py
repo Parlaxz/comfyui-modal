@@ -163,6 +163,14 @@ _last_successful_model_stack: dict = {}
 _latest_benchmark_workflow: dict = {}
 _download_progress: dict = {}
 
+_RESULT_ROUTE = os.environ.get("COMFYMODAL_RESULT_ROUTE", "legacy").strip().lower()
+if _RESULT_ROUTE not in ("legacy", "direct"):
+    print(f"[comfyui-modal] WARNING: invalid COMFYMODAL_RESULT_ROUTE={_RESULT_ROUTE!r}, falling back to 'legacy'")
+    _RESULT_ROUTE = "legacy"
+_COMPLETED_RESULTS: dict[str, dict] = {}
+_COMPLETED_RESULTS_LOCK = threading.Lock()
+
+
 
 def _load_latest_benchmark_workflow() -> dict:
     global _latest_benchmark_workflow
@@ -514,7 +522,31 @@ sys.path.insert(0, _NODE_DIR)
 
 try:
     import modal as _modal_pkg
-    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, download_model_stream, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile
+    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, download_model_stream, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile, get_handle_cache_stats
+
+    # ── Runtime flag helpers (lazy init to avoid import-time failures) ──
+    _runtime_flag_funcs: dict = {}
+
+    def _get_preload_mode_fn():
+        if "set_preload_mode" not in _runtime_flag_funcs:
+            _runtime_flag_funcs["set_preload_mode"] = _modal_pkg.Function.from_name("comfyui", "set_preload_mode")
+        return _runtime_flag_funcs["set_preload_mode"]
+
+    def _get_runtime_flag_fn():
+        if "set_runtime_flag" not in _runtime_flag_funcs:
+            _runtime_flag_funcs["set_runtime_flag"] = _modal_pkg.Function.from_name("comfyui", "set_runtime_flag")
+        return _runtime_flag_funcs["set_runtime_flag"]
+
+    async def _call_set_preload_mode(mode: str) -> str:
+        import asyncio
+        fn = _get_preload_mode_fn()
+        return await asyncio.to_thread(lambda: fn.remote(mode))
+
+    async def _call_set_runtime_flag(name: str, value: str) -> str:
+        import asyncio
+        fn = _get_runtime_flag_fn()
+        return await asyncio.to_thread(lambda: fn.remote(name, value))
+
     _modal_available = True
     _maybe_auto_deploy()
 except ImportError:
@@ -543,6 +575,7 @@ except ImportError:
     def set_active_warmup_profile(*a, **kw): raise RuntimeError("modal not installed")
     def get_default_gpu(): return "rtx-pro-6000"
     def get_available_gpus(): return [{"value": "rtx-pro-6000", "label": "RTX PRO 6000"}]
+    def get_handle_cache_stats(): return {"hits": 0, "misses": 0}
     def set_gpu(gpu): pass
     def get_gpu(): return "rtx-pro-6000"
 
@@ -772,6 +805,9 @@ def _collect_input_images(workflow: dict) -> dict:
     return images
 
 
+_ACTIVE_NEXT_PROFILE_TTL_S = int(os.environ.get("COMFYMODAL_ACTIVE_NEXT_PROFILE_TTL_S", "3600"))
+
+
 def _build_next_warmup_activation(workflow: dict, workflow_hash: str) -> dict:
     stack = extract_warmup_stack(workflow) if isinstance(workflow, dict) else {}
     profile = stack_to_warmup_profile(stack)
@@ -781,7 +817,7 @@ def _build_next_warmup_activation(workflow: dict, workflow_hash: str) -> dict:
         "validation_token": str(uuid.uuid4()),
         "workflow_hash": workflow_hash,
         "created_at": now,
-        "expires_at": now + 60.0,
+        "expires_at": now + _ACTIVE_NEXT_PROFILE_TTL_S,
         "mode": profile.get("mode", "none") if profile else "none",
         "model_stack": stack,
         "warmup_profile": profile,
@@ -863,30 +899,29 @@ async def _execute_job(item: tuple, item_id: int):
         print(f"[predispatch] phase=before_active_next_write t={time.time()}")
         if not os.environ.get("DISABLE_ACTIVE_NEXT_WRITE"):
             activation_payload = _build_next_warmup_activation(workflow, prompt_hash)
-
-            async def _fire_and_forget_warmup():
-                try:
-                    activation_result = await set_active_warmup_profile(activation_payload)
-                    print(
-                        f"[comfyui-modal] Armed active warmup profile token={activation_payload['profile_token']} "
-                        f"workflow_hash={prompt_hash[:12]} disable_warmup={1 if activation_payload['disable_warmup'] else 0} result={activation_result}"
-                    )
-                except Exception as exc:
-                    print(f"[comfyui-modal] Failed to arm active warmup profile for {prompt_hash[:12]}: {exc}")
-
-            asyncio.create_task(_fire_and_forget_warmup())
+            try:
+                activation_result = await set_active_warmup_profile(activation_payload)
+                print(
+                    f"[comfyui-modal] Armed active warmup profile token={activation_payload['profile_token']} "
+                    f"workflow_hash={prompt_hash[:12]} disable_warmup={1 if activation_payload['disable_warmup'] else 0} result={activation_result}"
+                )
+            except Exception as exc:
+                print(f"[comfyui-modal] Failed to arm active warmup profile for {prompt_hash[:12]}: {exc}")
         else:
             print(f"[predispatch] active_next_write SKIPPED (DISABLE_ACTIVE_NEXT_WRITE=1)")
         print(f"[predispatch] phase=after_active_next_write t={time.time()}")
 
         remote_started = time.time()
         trace.mark("t2_local_dispatch")
+        trace.mark("t2b_modal_handle_resolved")
+        trace.mark("t2c_modal_call_start")
         print(f"[predispatch] phase=before_gpu_spawn t={time.time()}")
         # Stream prompt execution with real-time progress from the Modal
         # container.  Progress events (executing, progress, execution_start)
         # are forwarded to the ComfyUI frontend as they arrive.
         _modal_result = None
         _first_msg = True
+        _result_route_mode = extra_data.get("result_route", _RESULT_ROUTE)
         _mo = dict(extra_data.get("modal_options") or {})
         _st = extra_data.get("scheduler_test")
         if isinstance(_st, dict):
@@ -930,6 +965,8 @@ async def _execute_job(item: tuple, item_id: int):
         if _modal_result is None:
             raise RuntimeError("run_prompt_stream ended without result")
         result = _modal_result
+        trace.mark("t9_modal_return")
+        trace.mark("t9b_local_result_received")
         remote_run_ms = round((time.time() - remote_started) * 1000, 1)
         print(
             f"[comfyui-modal.profile] stage=remote_run_prompt prompt_id={prompt_id[:8]} "
@@ -938,6 +975,10 @@ async def _execute_job(item: tuple, item_id: int):
         remote_trace = result.get("trace") if isinstance(result, dict) else {}
         if isinstance(remote_trace, dict):
             trace.update(remote_trace.get("stages", {}))
+
+        _direct_result_used = False
+        _direct_fallback_reason = None
+
         success = True
     except asyncio.CancelledError:
         total_ms = round((time.time() - local_started) * 1000, 1)
@@ -989,6 +1030,7 @@ async def _execute_job(item: tuple, item_id: int):
 
     output_dir = os.path.join(_COMFYUI_ROOT, "output")
     os.makedirs(output_dir, exist_ok=True)
+    trace.mark("t9e_local_materialize_start")
     materialize_started = time.time()
     output_bytes_written = 0
     output_image_count = 0
@@ -1086,6 +1128,7 @@ async def _execute_job(item: tuple, item_id: int):
     )
 
     # ── Auto-save ────────────────────────────────────────────────────
+    trace.mark("t10b_local_save_start")
     _mo = extra_data.get("modal_options") if isinstance(extra_data, dict) else None
     _auto_save_enabled = bool((_mo or {}).get("auto_save_local", False))
     _save_results: list[dict] = []
@@ -1185,6 +1228,7 @@ async def _execute_job(item: tuple, item_id: int):
                 "save_warnings": _save_warnings,
             })
 
+    trace.mark("t10c_local_save_end")
     trace.mark("t10_local_materialized")
     _merged_trace = trace.summary()
     # Preserve restore timing from the Modal container's trace
@@ -1228,6 +1272,7 @@ async def _execute_job(item: tuple, item_id: int):
         _f.flush()
     print(trace.log_line())
 
+    trace.mark("t10d_local_response_sent")
     _send(sid, "executing", {"node": None, "display_node": None, "prompt_id": prompt_id})
     _send(sid, "modal_status", {"prompt_id": prompt_id, "message": None, "phase": "done"})
     _send(sid, "execution_success", {"prompt_id": prompt_id, "trace": result.get("trace")})
@@ -1240,6 +1285,19 @@ async def _execute_job(item: tuple, item_id: int):
         "scheduler_trace": result.get("scheduler_trace"),
     }
     _finish_job(task_key, prompt_id, outputs, success=True, meta=_meta)
+
+    # ── Direct route: store completed result for non-polling retrieval ──
+    if _result_route_mode == "direct" and isinstance(result, dict):
+        with _COMPLETED_RESULTS_LOCK:
+            _COMPLETED_RESULTS[prompt_id] = {
+                "result": result,
+                "trace": result.get("trace", {}),
+                "outputs": outputs,
+                "materialize_ms": materialize_ms,
+                "completed_at": time.time(),
+                "direct_route": True,
+            }
+
     total_ms = round((time.time() - local_started) * 1000, 1)
     print(
         f"[comfyui-modal.profile] stage=local_total prompt_id={prompt_id[:8]} "
@@ -1401,6 +1459,9 @@ if _server:
             _item_counter += 1
             item_id = _item_counter
             selected_gpu = get_gpu()
+            _result_route_mode = body.get("result_route", _RESULT_ROUTE)
+            if _result_route_mode not in ("legacy", "direct"):
+                _result_route_mode = _RESULT_ROUTE
             extra_data = {
                 "client_id": client_id,
                 "create_time": int(time.time() * 1000),
@@ -1412,6 +1473,7 @@ if _server:
                 "trace": {**trace.fields(), "prompt_id": prompt_id},
                 "modal_options": modal_options,
                 "scheduler_test": scheduler_test,
+                "result_route": _result_route_mode,
             }
             item = (_item_counter, prompt_id, workflow, extra_data, list(workflow.keys()), {})
             print(f"[predispatch] prompt_bytes={len(json.dumps(body).encode('utf-8'))}")
@@ -1690,6 +1752,18 @@ if _server:
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=503)
 
+    @_server.routes.get("/comfymodal/result/{prompt_id}")
+    async def modal_get_direct_result(request: web.Request) -> web.Response:
+        prompt_id = request.match_info.get("prompt_id", "")
+        if not prompt_id:
+            return web.json_response({"status": "error", "message": "prompt_id required"}, status=400)
+        with _COMPLETED_RESULTS_LOCK:
+            entry = _COMPLETED_RESULTS.get(prompt_id)
+            if entry is None:
+                return web.json_response({"status": "pending", "message": "result not yet available"}, status=404)
+            payload = dict(entry)
+        return web.json_response({"status": "ok", "prompt_id": prompt_id, **payload})
+
     @_server.routes.get("/comfymodal/benchmark/workflow")
     async def modal_benchmark_workflow_get(request: web.Request) -> web.Response:
         snapshot = _load_latest_benchmark_workflow()
@@ -1940,6 +2014,32 @@ if _server:
         try:
             result = await get_runtime_state()
             return web.json_response(result)
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    # ── Runtime flag helpers (proxy to Modal functions) ──
+    @_server.routes.post("/comfymodal/runtime/set_preload_mode")
+    async def modal_set_preload_mode(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            mode = body.get("mode", "").strip().lower()
+            if not mode:
+                return web.json_response({"status": "error", "message": "mode required"}, status=400)
+            result = await _call_set_preload_mode(mode)
+            return web.json_response({"status": "ok", "result": result})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/runtime/set_flag")
+    async def modal_set_runtime_flag(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            name = body.get("name", "").strip()
+            value = body.get("value", "").strip()
+            if not name:
+                return web.json_response({"status": "error", "message": "name required"}, status=400)
+            result = await _call_set_runtime_flag(name, value)
+            return web.json_response({"status": "ok", "result": result})
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 
