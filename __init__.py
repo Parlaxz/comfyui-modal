@@ -331,27 +331,10 @@ def _build_custom_node_fingerprint(cn_root: str) -> str:
 
 
 def _load_deploy_state() -> dict:
-    try:
-        with open(_DEPLOY_STATE_JSON_FILE, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        if isinstance(payload, dict):
-            return {
-                "comfyapp_version": payload.get("comfyapp_version"),
-                "custom_nodes_fingerprint": payload.get("custom_nodes_fingerprint"),
-            }
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
-
-    legacy_version = None
-    try:
-        with open(_DEPLOY_STATE_FILE, "r", encoding="utf-8") as f:
-            legacy_version = f.read().strip() or None
-    except FileNotFoundError:
-        legacy_version = None
-
+    payload = _read_deploy_state_details()
     return {
-        "comfyapp_version": legacy_version,
-        "custom_nodes_fingerprint": None,
+        "comfyapp_version": payload.get("comfyapp_version"),
+        "custom_nodes_fingerprint": payload.get("custom_nodes_fingerprint"),
     }
 
 
@@ -375,15 +358,148 @@ def _set_deployed_version(version: str):
 def _get_deployed_custom_nodes_fingerprint():
     return _load_deploy_state().get("custom_nodes_fingerprint")
 
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _read_deploy_state_details() -> dict:
+    details = {
+        "path": _DEPLOY_STATE_JSON_FILE,
+        "legacy_path": _DEPLOY_STATE_FILE,
+        "loaded": False,
+        "source": "missing",
+        "parse_error": "",
+        "comfyapp_version": None,
+        "custom_nodes_fingerprint": None,
+    }
+    if os.path.isfile(_DEPLOY_STATE_JSON_FILE):
+        details["source"] = "json"
+        try:
+            with open(_DEPLOY_STATE_JSON_FILE, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                details["loaded"] = True
+                details["comfyapp_version"] = payload.get("comfyapp_version")
+                details["custom_nodes_fingerprint"] = payload.get("custom_nodes_fingerprint")
+                return details
+            details["parse_error"] = "deploy_state_json_not_dict"
+        except (json.JSONDecodeError, OSError) as exc:
+            details["parse_error"] = f"{type(exc).__name__}: {exc}"
+    if os.path.isfile(_DEPLOY_STATE_FILE):
+        details["source"] = "legacy"
+        try:
+            with open(_DEPLOY_STATE_FILE, "r", encoding="utf-8") as f:
+                details["comfyapp_version"] = f.read().strip() or None
+            details["loaded"] = True
+            return details
+        except OSError as exc:
+            details["parse_error"] = f"{type(exc).__name__}: {exc}"
+    return details
+
+
+def _build_custom_node_fingerprint_status() -> dict:
+    cn_root = _custom_nodes_root()
+    status = {
+        "custom_nodes_root": cn_root,
+        "available": False,
+        "fingerprint": None,
+        "error": "",
+    }
+    if not os.path.isdir(cn_root):
+        status["error"] = "custom_nodes_root_missing"
+        return status
+    try:
+        status["fingerprint"] = _build_custom_node_fingerprint(cn_root)
+        status["available"] = True
+    except Exception as exc:
+        status["error"] = f"{type(exc).__name__}: {exc}"
+    return status
+
+
+def _build_generation_invocation_plan(gpu: str | None = None, stream: bool = True) -> dict:
+    deployed = _read_deploy_state_details()
+    fingerprint_status = _build_custom_node_fingerprint_status()
+    current_version = _get_comfyapp_version()
+    deployed_version = deployed.get("comfyapp_version") or ""
+    deployed_fingerprint = deployed.get("custom_nodes_fingerprint")
+    current_fingerprint = fingerprint_status.get("fingerprint")
+    fingerprint_changed = True
+    if fingerprint_status.get("available"):
+        fingerprint_changed = current_fingerprint != deployed_fingerprint
+    method_name = "run_prompt_stream" if stream else "run_prompt"
+    class_name = ""
+    modal_lookup_target = "unknown"
+    invocation_mode = "unknown"
+    try:
+        class_name = get_modal_class_name(gpu)
+        modal_lookup_target = get_modal_lookup_target(gpu, method_name)
+        invocation_mode = "deployed_lookup"
+    except Exception as exc:
+        modal_lookup_target = f"lookup_error:{type(exc).__name__}"
+    version_changed = current_version != deployed_version
+    auto_deploy_enabled = _env_flag("COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY", "0")
+    deployed_lookup_current = bool(
+        deployed.get("loaded")
+        and not version_changed
+        and not fingerprint_changed
+    )
+    return {
+        "invocation_mode": invocation_mode,
+        "app_name": get_modal_app_name(),
+        "class_name": class_name,
+        "method_name": method_name,
+        "deployed_state_path": deployed.get("path", _DEPLOY_STATE_JSON_FILE),
+        "deployed_state_loaded": bool(deployed.get("loaded")),
+        "deployed_state_source": deployed.get("source", "missing"),
+        "deployed_state_parse_error": deployed.get("parse_error", ""),
+        "deployed_state_version": deployed_version,
+        "deployed_state_custom_nodes_fingerprint": deployed_fingerprint or "",
+        "current_comfyapp_version": current_version,
+        "current_custom_nodes_fingerprint": current_fingerprint or "",
+        "custom_nodes_fingerprint_error": fingerprint_status.get("error", ""),
+        "custom_nodes_root": fingerprint_status.get("custom_nodes_root", ""),
+        "version_changed": version_changed,
+        "custom_nodes_fingerprint_changed": fingerprint_changed,
+        "auto_deploy_enabled": auto_deploy_enabled,
+        "auto_deploy_started": False,
+        "modal_lookup_target": modal_lookup_target,
+        "deployed_lookup_current": deployed_lookup_current,
+        "would_deploy": auto_deploy_enabled and (version_changed or fingerprint_changed),
+    }
+
+
+def _log_generation_invocation_plan(prompt_id: str, plan: dict) -> None:
+    print(
+        f"[comfyui-modal.invoke] prompt_id={prompt_id[:8]} "
+        f"invocation_mode={plan.get('invocation_mode', 'unknown')} "
+        f"app_name={plan.get('app_name', '')} "
+        f"class_name={plan.get('class_name', '') or '?'} "
+        f"method_name={plan.get('method_name', '')} "
+        f"deployed_state_path={plan.get('deployed_state_path', '')} "
+        f"deployed_state_loaded={1 if plan.get('deployed_state_loaded') else 0} "
+        f"deployed_state_version={plan.get('deployed_state_version', '') or '<missing>'} "
+        f"current_comfyapp_version={plan.get('current_comfyapp_version', '')} "
+        f"version_changed={1 if plan.get('version_changed') else 0} "
+        f"custom_nodes_fingerprint_changed={1 if plan.get('custom_nodes_fingerprint_changed') else 0} "
+        f"auto_deploy_enabled={1 if plan.get('auto_deploy_enabled') else 0} "
+        f"auto_deploy_started={1 if plan.get('auto_deploy_started') else 0} "
+        f"modal_lookup_target={plan.get('modal_lookup_target', 'unknown')} "
+        f"modal_call_start={time.time():.6f}"
+    )
+    if plan.get("deployed_state_parse_error"):
+        print(f"[comfyui-modal.invoke] deployed_state_parse_error={plan['deployed_state_parse_error']}")
+    if plan.get("custom_nodes_fingerprint_error"):
+        print(f"[comfyui-modal.invoke] custom_nodes_fingerprint_error={plan['custom_nodes_fingerprint_error']}")
+
 def _get_comfyapp_version():
     try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("comfyapp_meta", _COMFYAPP_PATH)
-        assert spec is not None
-        assert spec.loader is not None
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return getattr(mod, "COMFYAPP_VERSION", "unknown")
+        with open(_COMFYAPP_PATH, "r", encoding="utf-8") as f:
+            source = f.read()
+        match = re.search(r'^COMFYAPP_VERSION\s*=\s*["\']([^"\']+)["\']', source, re.MULTILINE)
+        if match:
+            return match.group(1)
+        raise RuntimeError("COMFYAPP_VERSION constant not found")
     except Exception as e:
         print(f"[comfyui-modal] Could not read COMFYAPP_VERSION: {e}")
         return "unknown"
@@ -544,12 +660,12 @@ def _ensure_modal_deploy_current(custom_nodes_fingerprint: str | None = None) ->
 
 
 def _maybe_auto_deploy():
-    # ── PART 7: Gate remote background deploy ──
     if os.environ.get("COMFYMODAL_RUNTIME") == "1":
         return
-    if os.environ.get("COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY", "0") != "1":
+    if not _env_flag("COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY", "0"):
         _deploy_status["state"] = "ready"
         _deploy_status["message"] = "Background deploy disabled by config"
+        _deploy_status["warning"] = False
         return
     if not _find_modal_executable():
         return
@@ -560,6 +676,7 @@ def _maybe_auto_deploy():
     else:
         _deploy_status["state"] = "ready"
         _deploy_status["message"] = "Already deployed and current"
+        _deploy_status["warning"] = False
         print("[comfyui-modal] deploy state already current - skipping deploy")
 
 try:
@@ -575,7 +692,7 @@ sys.path.insert(0, _NODE_DIR)
 
 try:
     import modal as _modal_pkg
-    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, download_model_stream, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile, get_handle_cache_stats
+    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, download_model_stream, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile, get_handle_cache_stats, get_modal_app_name, get_modal_class_name, get_modal_lookup_target
 
     # ── Runtime flag helpers (lazy init to avoid import-time failures) ──
     _runtime_flag_funcs: dict = {}
@@ -631,6 +748,9 @@ except ImportError:
     def get_handle_cache_stats(): return {"hits": 0, "misses": 0}
     def set_gpu(gpu): pass
     def get_gpu(): return "rtx-pro-6000"
+    def get_modal_app_name(): return "comfyui"
+    def get_modal_class_name(gpu=None): return ""
+    def get_modal_lookup_target(gpu=None, method_name="run_prompt"): return "unknown"
 
 _COMFYUI_ROOT = os.path.dirname(os.path.dirname(_NODE_DIR))
 
@@ -991,6 +1111,9 @@ async def _execute_job(item: tuple, item_id: int):
             )
         else:
             input_images = {}
+
+        invocation_plan = _build_generation_invocation_plan(extra_data.get("gpu"), stream=True)
+        _log_generation_invocation_plan(prompt_id, invocation_plan)
 
         # ── Active-next warmup profile (compact, skip if unchanged) ──
         _active_next_write_start = time.time()

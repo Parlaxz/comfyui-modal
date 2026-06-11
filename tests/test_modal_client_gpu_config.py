@@ -94,8 +94,8 @@ class ModalClientGpuConfigTests(unittest.TestCase):
             def __init__(self, gpu):
                 self.gpu = gpu
 
-            def remote(self, workflow, input_images, trace):
-                calls.append((self.gpu, workflow, input_images, trace))
+            def remote(self, workflow, input_images, trace, modal_options):
+                calls.append((self.gpu, workflow, input_images, trace, modal_options))
                 return {"gpu": self.gpu}
 
         class FakeAPI:
@@ -119,6 +119,12 @@ class ModalClientGpuConfigTests(unittest.TestCase):
         self.assertEqual(result, {"gpu": "ComfyAPI_L4"})
         self.assertEqual(calls[0][0], "ComfyAPI_L4")
         self.assertEqual(mod.get_gpu(), "a10g")
+
+    def test_lookup_target_reports_deployed_class_method(self):
+        mod = self.load_module()
+        self.assertEqual(mod.get_modal_app_name(), "comfyui")
+        self.assertEqual(mod.get_modal_class_name("l4"), "ComfyAPI_L4")
+        self.assertEqual(mod.get_modal_lookup_target("l4", "run_prompt_stream"), "comfyui.ComfyAPI_L4.run_prompt_stream")
 
     def test_set_active_warmup_profile_calls_modal_function(self):
         calls = []

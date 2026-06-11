@@ -7,7 +7,7 @@ import types
 import unittest
 import uuid
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, mock_open
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +53,7 @@ def _make_modal_client_stub():
         "get_object_info",
         "health_check",
         "download_model",
+        "download_model_stream",
         "batch_download_models",
         "list_models",
         "delete_model",
@@ -63,6 +64,7 @@ def _make_modal_client_stub():
         "clear_cache",
         "set_active_warmup_profile",
         "set_gpu",
+        "get_handle_cache_stats",
     ):
         setattr(stub, name, _noop)
 
@@ -72,6 +74,9 @@ def _make_modal_client_stub():
     setattr(stub, "get_default_gpu", lambda: "a10g")
     setattr(stub, "get_gpu", lambda: "a10g")
     setattr(stub, "get_available_gpus", lambda: [{"value": "a10g", "label": "A10G"}])
+    setattr(stub, "get_modal_app_name", lambda: "comfyui")
+    setattr(stub, "get_modal_class_name", lambda gpu=None: "ComfyAPI")
+    setattr(stub, "get_modal_lookup_target", lambda gpu=None, method_name="run_prompt": f"comfyui.ComfyAPI.{method_name}")
     return stub
 
 
@@ -235,7 +240,7 @@ class CustomNodeRedeployFlowTests(unittest.TestCase):
 
     def test_start_background_deploy_refuses_second_concurrent_deploy(self):
         module = _load_init_module()
-        module._deploy_status = {"state": "deploying", "message": "Running modal deploy..."}
+        setattr(module, "_deploy_status", {"state": "deploying", "message": "Running modal deploy..."})
 
         result = module._start_background_deploy(custom_nodes_fingerprint="fp", reason="custom_nodes_changed")
 
@@ -251,7 +256,7 @@ class CustomNodeRedeployFlowTests(unittest.TestCase):
             patch.object(module, "_get_comfyapp_version", return_value="2.14.2"),
             patch.object(module, "_save_deploy_state") as save_mock,
             patch.object(module, "clear_cache"),
-            patch("builtins.open", new_callable=unittest.mock.mock_open),
+            patch("builtins.open", new_callable=mock_open),
         ):
             module._run_deploy_background(custom_nodes_fingerprint="fp-123")
 
@@ -325,6 +330,60 @@ class CustomNodeRedeployFlowTests(unittest.TestCase):
             module._maybe_auto_deploy()
 
         ensure_mock.assert_not_called()
+
+    def test_maybe_auto_deploy_runs_when_enabled(self):
+        module = _load_init_module()
+        env = {
+            "COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY": "1",
+        }
+        with (
+            patch.object(module.os, "environ", env),
+            patch.object(module, "_find_modal_executable", return_value="modal"),
+            patch.object(module, "_build_custom_node_fingerprint", return_value="fp"),
+            patch.object(module, "_custom_nodes_root", return_value="custom_nodes"),
+            patch.object(module, "_ensure_modal_deploy_current", return_value={"started": False, "reason": "already_current"}) as ensure_mock,
+        ):
+            module._maybe_auto_deploy()
+
+        ensure_mock.assert_called_once_with("fp")
+
+    def test_build_generation_invocation_plan_marks_stale_state(self):
+        module = _load_init_module()
+        with (
+            patch.object(module, "_get_comfyapp_version", return_value="2.16.0"),
+            patch.object(module, "_read_deploy_state_details", return_value={
+                "path": "state.json",
+                "loaded": True,
+                "source": "json",
+                "parse_error": "",
+                "comfyapp_version": "2.14.3",
+                "custom_nodes_fingerprint": "old",
+            }),
+            patch.object(module, "_build_custom_node_fingerprint_status", return_value={
+                "custom_nodes_root": "custom_nodes",
+                "available": True,
+                "fingerprint": "new",
+                "error": "",
+            }),
+        ):
+            plan = module._build_generation_invocation_plan("a10g", stream=True)
+
+        self.assertEqual(plan["invocation_mode"], "deployed_lookup")
+        self.assertTrue(plan["version_changed"])
+        self.assertTrue(plan["custom_nodes_fingerprint_changed"])
+
+    def test_get_comfyapp_version_parses_constant_without_executing_module(self):
+        module = _load_init_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyapp_path = Path(tmp) / "comfyapp.py"
+            comfyapp_path.write_text(
+                'COMFYAPP_VERSION = "9.9.9"\nraise RuntimeError("should not execute")\n',
+                encoding="utf-8",
+            )
+            with patch.object(module, "_COMFYAPP_PATH", str(comfyapp_path)):
+                version = module._get_comfyapp_version()
+
+        self.assertEqual(version, "9.9.9")
 
 
 if __name__ == "__main__":

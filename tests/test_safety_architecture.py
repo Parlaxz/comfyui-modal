@@ -1211,6 +1211,30 @@ class TestKnownGoodPersistence(unittest.TestCase):
         finally:
             comfyapp.KNOWN_GOOD_WORKFLOW_PROFILES_PATH = orig
 
+    def test_equivalent_profile_key_skips_second_write(self):
+        from comfyapp import _mark_known_good_workflow_profile
+        import comfyapp
+        orig = comfyapp.KNOWN_GOOD_WORKFLOW_PROFILES_PATH
+        comfyapp.KNOWN_GOOD_WORKFLOW_PROFILES_PATH = os.path.join(self._tmpdir, "known_good.json")
+        workflow_a = {
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "u.safetensors"}},
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "c.safetensors", "type": "flux"}},
+            "3": {"class_type": "VAELoader", "inputs": {"vae_name": "v.safetensors"}},
+        }
+        workflow_b = {
+            "10": {"class_type": "UNETLoader", "inputs": {"unet_name": "u.safetensors"}},
+            "11": {"class_type": "CLIPLoader", "inputs": {"clip_name": "c.safetensors", "type": "flux"}},
+            "12": {"class_type": "VAELoader", "inputs": {"vae_name": "v.safetensors"}},
+        }
+        profile = {"mode": "split", "unet": "u.safetensors", "clip1": "c.safetensors", "clip2": "c.safetensors", "vae": "v.safetensors", "clip_type": "flux"}
+        try:
+            first = _mark_known_good_workflow_profile("hash-a", profile, workflow=workflow_a)
+            second = _mark_known_good_workflow_profile("hash-b", profile, workflow=workflow_b)
+            self.assertTrue(first)
+            self.assertFalse(second)
+        finally:
+            comfyapp.KNOWN_GOOD_WORKFLOW_PROFILES_PATH = orig
+
 
 # ── PART 11: Additional preload accounting tests ──
 
