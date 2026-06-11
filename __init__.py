@@ -12,6 +12,7 @@ import subprocess
 import time
 from collections import namedtuple
 from pathlib import Path
+import traceback as _traceback
 
 _NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 if _NODE_DIR not in sys.path:
@@ -43,7 +44,36 @@ from output_converter import (
     DEFAULTS as _CONVERTER_DEFAULTS,
 )
 from output_saver import save_output_image, DEFAULTS as _SAVER_DEFAULTS
-from timing_trace import Trace, coerce_t0_from_browser
+from timing_trace import Trace, TraceV4, coerce_t0_from_browser
+from profiler_trace_v4 import (
+    make_event, mark_event, EventTrace, profile_enabled, get_profile_level,
+    T0_CLIENT_PRESS, T1_LOCAL_BRIDGE_RECEIVED,
+    T1A_LOCAL_PAYLOAD_PARSE_START, T1B_LOCAL_PAYLOAD_PARSE_END,
+    T1C_LOCAL_PREFLIGHT_START, T1D_LOCAL_PREFLIGHT_END,
+    T1E_ACTIVE_PROFILE_WRITE_START, T1F_ACTIVE_PROFILE_WRITE_END,
+    T1G_BODY_READ_START, T1H_BODY_READ_END,
+    T1I_JSON_PARSE_START, T1J_JSON_PARSE_END,
+    T1K_PAYLOAD_NORMALIZE_START, T1L_PAYLOAD_NORMALIZE_END,
+    T1M_TRACE_STRIP_START, T1N_TRACE_STRIP_END,
+    T1O_PROMPT_EXTRACT_START, T1P_PROMPT_EXTRACT_END,
+    T1Q_STACK_EXTRACT_START, T1R_STACK_EXTRACT_END,
+    T2_LOCAL_MODAL_SUBMIT_START, T2A_MODAL_CALL_CONSTRUCTED,
+    T2B_MODAL_CALL_STREAM_OPEN, T2C_FIRST_REMOTE_EVENT_RECEIVED,
+    T2D_LOCAL_PROMPT_ACK_RETURNED,
+    T9_LOCAL_REMOTE_RESULT_RECEIVED,
+    T9A_LOCAL_RESULT_DESERIALIZE_START, T9B_LOCAL_RESULT_DESERIALIZE_END,
+    T9C_LOCAL_BASE64_DECODE_START, T9D_LOCAL_BASE64_DECODE_END,
+    T9E_LOCAL_FILE_WRITE_START, T9F_LOCAL_FILE_WRITE_END,
+    T10_LOCAL_MATERIALIZED,
+    T10A_LOCAL_RESPONSE_TO_COMFY_START, T10B_LOCAL_RESPONSE_TO_COMFY_END,
+    T11_LOCAL_UI_DONE,
+    BEFORE_STACK_EXTRACT, AFTER_STACK_EXTRACT,
+    BEFORE_ACTIVE_NEXT_WRITE, AFTER_ACTIVE_NEXT_WRITE,
+    BEFORE_GPU_SPAWN, FIRST_GPU_RESPONSE,
+    PHASE_LOCAL_PRE, PHASE_LOCAL_BRIDGE, PHASE_LOCAL_MATERIALIZE,
+    derive_spans, derive_non_overlapping_critical_path,
+    estimate_clock_skew, summarize_trace, log_event,
+)
 from comparison import (
     create_profile,
     update_profile,
@@ -169,6 +199,29 @@ if _RESULT_ROUTE not in ("legacy", "direct"):
     _RESULT_ROUTE = "legacy"
 _COMPLETED_RESULTS: dict[str, dict] = {}
 _COMPLETED_RESULTS_LOCK = threading.Lock()
+
+# ── v4 local event trace (per-prompt) ──
+_local_event_trace: EventTrace | None = None
+_local_event_trace_lock = threading.Lock()
+
+
+def _init_local_event_trace() -> EventTrace:
+    global _local_event_trace
+    trace = EventTrace(process="local_bridge", request_seq=0)
+    with _local_event_trace_lock:
+        _local_event_trace = trace
+    return trace
+
+
+def _get_local_event_trace() -> EventTrace | None:
+    with _local_event_trace_lock:
+        return _local_event_trace
+
+
+def _clear_local_event_trace() -> None:
+    with _local_event_trace_lock:
+        global _local_event_trace
+        _local_event_trace = None
 
 
 
@@ -777,6 +830,40 @@ async def _process_queue():
             _queue.task_done()
 
 
+def workflow_needs_local_input_files(workflow: dict) -> bool:
+    """Return True if workflow contains nodes that reference local input files.
+
+    Uses generic ComfyUI patterns — does NOT hardcode any specific node ID,
+    LoadImage variant, model filename, or workflow hash.
+    Checks class_type prefixes and well-known input keys.
+    Skips HTTP/HTTPS URLs and node-link values (lists).
+    """
+    _LOCAL_LOAD_PREFIXES = (
+        "LoadImage", "LoadVideo", "LoadAudio", "LoadMask",
+        "VHS_Load", "VHS_Video", "VHS_Audio",
+    )
+    _LOCAL_LOAD_CLASSES = frozenset({"LoadImageMask"})
+    _LOCAL_INPUT_KEYS = ("image", "mask", "video", "audio", "file", "filename")
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type", "")
+        if not (any(class_type.startswith(prefix) for prefix in _LOCAL_LOAD_PREFIXES)
+                or class_type in _LOCAL_LOAD_CLASSES):
+            continue
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        for key in _LOCAL_INPUT_KEYS:
+            val = inputs.get(key)
+            if not isinstance(val, str) or not val:
+                continue
+            if val.startswith(("http://", "https://")):
+                continue
+            return True
+    return False
+
+
 def _collect_input_images(workflow: dict) -> dict:
     images = {}
     for node in workflow.values():
@@ -785,23 +872,26 @@ def _collect_input_images(workflow: dict) -> dict:
         class_type = node.get("class_type", "")
         if not class_type.startswith("LoadImage"):
             continue
-        filename = node.get("inputs", {}).get("image", "") or node.get("inputs", {}).get("mask", "")
-        if not filename or filename in images:
-            continue
-        if filename.startswith("http://") or filename.startswith("https://"):
-            continue
-        try:
-            candidates = _resolve_local_workflow_image_candidates(filename)
-        except ValueError:
-            print(f"[comfyui-modal] Warning: unsafe input image path skipped: {filename}")
-            continue
-        for filepath in candidates:
-            if os.path.isfile(filepath):
-                with open(filepath, "rb") as f:
-                    images[filename] = base64.b64encode(f.read()).decode()
-                break
-        else:
-            print(f"[comfyui-modal] Warning: input image not found locally: {filename}")
+        for key in ("image", "mask"):
+            filename = node.get("inputs", {}).get(key, "")
+            if not isinstance(filename, str) or not filename:
+                continue
+            if filename in images:
+                continue
+            if filename.startswith(("http://", "https://")):
+                continue
+            try:
+                candidates = _resolve_local_workflow_image_candidates(filename)
+            except ValueError:
+                print(f"[comfyui-modal] Warning: unsafe input image path skipped: {filename}")
+                continue
+            for filepath in candidates:
+                if os.path.isfile(filepath):
+                    with open(filepath, "rb") as f:
+                        images[filename] = base64.b64encode(f.read()).decode()
+                    break
+            else:
+                print(f"[comfyui-modal] Warning: input image not found locally: {filename}")
     return images
 
 
@@ -888,34 +978,48 @@ async def _execute_job(item: tuple, item_id: int):
         print(f"[comfyui-modal] Running prompt {prompt_hash[:12]}… summary={prompt_summary} model_stack={model_stack}")
 
         collect_started = time.time()
-        input_images = _collect_input_images(workflow)
-        input_collect_ms = round((time.time() - collect_started) * 1000, 1)
-        input_collect_bytes = sum(len(base64.b64decode(data)) for data in input_images.values())
-        print(
-            f"[comfyui-modal.profile] stage=input_collect prompt_id={prompt_id[:8]} "
-            f"duration_ms={input_collect_ms} count={len(input_images)} bytes={input_collect_bytes}"
-        )
+        collect_started = time.time()
+        input_collect_ms = 0
+        input_collect_bytes = 0
+        if workflow_needs_local_input_files(workflow):
+            input_images = _collect_input_images(workflow)
+            input_collect_ms = round((time.time() - collect_started) * 1000, 1)
+            input_collect_bytes = sum(len(base64.b64decode(data)) for data in input_images.values())
+            print(
+                f"[comfyui-modal.profile] stage=input_collect prompt_id={prompt_id[:8]} "
+                f"duration_ms={input_collect_ms} count={len(input_images)} bytes={input_collect_bytes}"
+            )
+        else:
+            input_images = {}
 
-        print(f"[predispatch] phase=before_active_next_write t={time.time()}")
+        # ── Active-next warmup profile (compact, skip if unchanged) ──
+        _active_next_write_start = time.time()
+        _active_next_payload_bytes = 0
+        _active_next_status = "skipped"
+        _active_next_changed = False
         if not os.environ.get("DISABLE_ACTIVE_NEXT_WRITE"):
             activation_payload = _build_next_warmup_activation(workflow, prompt_hash)
+            _active_next_payload_bytes = len(json.dumps(activation_payload, separators=(",", ":")))
             try:
                 activation_result = await set_active_warmup_profile(activation_payload)
+                _active_next_status = activation_result.get("status", "written")
+                _active_next_changed = activation_result.get("changed", True)
                 print(
-                    f"[comfyui-modal] Armed active warmup profile token={activation_payload['profile_token']} "
-                    f"workflow_hash={prompt_hash[:12]} disable_warmup={1 if activation_payload['disable_warmup'] else 0} result={activation_result}"
+                    f"[comfyui-modal.profile] stage=active_profile_write prompt_id={prompt_id[:8]} "
+                    f"status={_active_next_status} changed={_active_next_changed} bytes={_active_next_payload_bytes}"
                 )
             except Exception as exc:
-                print(f"[comfyui-modal] Failed to arm active warmup profile for {prompt_hash[:12]}: {exc}")
+                _active_next_status = "error"
+                print(f"[comfyui-modal] active profile write failed: {exc}")
         else:
-            print(f"[predispatch] active_next_write SKIPPED (DISABLE_ACTIVE_NEXT_WRITE=1)")
-        print(f"[predispatch] phase=after_active_next_write t={time.time()}")
+            print(f"[comfyui-modal] active_next_write SKIPPED (DISABLE_ACTIVE_NEXT_WRITE=1)")
 
         remote_started = time.time()
         trace.mark("t2_local_dispatch")
         trace.mark("t2b_modal_handle_resolved")
         trace.mark("t2c_modal_call_start")
-        print(f"[predispatch] phase=before_gpu_spawn t={time.time()}")
+        if os.environ.get("COMFYMODAL_PREDISPATCH_DEBUG"):
+            print(f"[predispatch] phase=before_gpu_spawn t={time.time()}")
         # Stream prompt execution with real-time progress from the Modal
         # container.  Progress events (executing, progress, execution_start)
         # are forwarded to the ComfyUI frontend as they arrive.
@@ -935,7 +1039,8 @@ async def _execute_job(item: tuple, item_id: int):
         ):
             if _first_msg:
                 _first_msg = False
-                print(f"[predispatch] phase=first_gpu_response t={time.time()}")
+                if os.environ.get("COMFYMODAL_PREDISPATCH_DEBUG"):
+                    print(f"[predispatch] phase=first_gpu_response t={time.time()}")
             if not isinstance(_msg, dict):
                 continue
             if _msg["type"] == "progress":
@@ -1259,17 +1364,18 @@ async def _execute_job(item: tuple, item_id: int):
                 if _rdk not in _merged_trace.get("derived_ms", {}):
                     _merged_trace.setdefault("derived_ms", {})[_rdk] = _rdv
     result["trace"] = _merged_trace
-    _dbg_path = os.path.join(_NODE_DIR, "_trace_debug.log")
-    with open(_dbg_path, "a", encoding="utf-8") as _f:
-        _f.write(f"[timing_trace.final] trace_version={_merged_trace.get('trace_version')} "
-                 f"has_derived={'derived_ms' in _merged_trace} "
-                 f"derived_keys={list(_merged_trace.get('derived_ms', {}).keys())} "
-                 f"quality={_merged_trace.get('timing_quality')} "
-                 f"quality_reason={_merged_trace.get('timing_quality_reason')} "
-                 f"missing={_merged_trace.get('missing_timing_fields', [])}\n")
-        _f.write(f"[timing_trace.final] DELTAS keys: {list(_merged_trace.get('deltas_ms', {}).keys())}\n")
-        _f.write(f"[timing_trace.final] STAGES keys: {list(_merged_trace.get('stages', {}).keys())}\n")
-        _f.flush()
+    if os.environ.get("COMFYMODAL_TRACE_DEBUG_LOG"):
+        _dbg_path = os.path.join(_NODE_DIR, "_trace_debug.log")
+        with open(_dbg_path, "a", encoding="utf-8") as _f:
+            _f.write(f"[timing_trace.final] trace_version={_merged_trace.get('trace_version')} "
+                     f"has_derived={'derived_ms' in _merged_trace} "
+                     f"derived_keys={list(_merged_trace.get('derived_ms', {}).keys())} "
+                     f"quality={_merged_trace.get('timing_quality')} "
+                     f"quality_reason={_merged_trace.get('timing_quality_reason')} "
+                     f"missing={_merged_trace.get('missing_timing_fields', [])}\n")
+            _f.write(f"[timing_trace.final] DELTAS keys: {list(_merged_trace.get('deltas_ms', {}).keys())}\n")
+            _f.write(f"[timing_trace.final] STAGES keys: {list(_merged_trace.get('stages', {}).keys())}\n")
+            _f.flush()
     print(trace.log_line())
 
     trace.mark("t10d_local_response_sent")
@@ -1398,70 +1504,266 @@ if _server:
         t.start()
         return web.json_response({"status": "ok"})
 
+    # ── Local pre-dispatch instrumentation infrastructure ───────────────────
+    # Configuration
+    _BODY_READ_TIMEOUT_S = float(os.environ.get("COMFYMODAL_LOCAL_BODY_READ_TIMEOUT_S", "10"))
+    _JSON_PARSE_WARN_MS = 3000
+    _JSON_PARSE_FAIL_S = 15
+    _STACK_EXTRACT_WARN_MS = 5000
+    _STACK_EXTRACT_FAIL_S = 30
+    _ACTIVE_NEXT_WRITE_WARN_MS = 1000
+    _ACTIVE_NEXT_WRITE_CRITICAL_MS = 5000
+    _LOCK_WAIT_WARN_MS = 1000
+    _LOCK_WAIT_CRITICAL_MS = 5000
+    _LOCK_WAIT_DEGRADE_S = 30
+    _ACTIVE_REQUEST_IDS: dict[str, float] = {}
+    _ACTIVE_REQUEST_IDS_LOCK = threading.Lock()
+    _LOCAL_REQUEST_SEQ = 0
+    _LOCAL_REQUEST_SEQ_LOCK = threading.Lock()
+    _PREVIOUS_REQUEST_ID: str | None = None
+    _PREVIOUS_REQUEST_FINISHED_AT: float | None = None
+
+    """
+    /comfymodal/prompt — intended flow:
+    1. receive request body via async read
+    2. parse JSON payload
+    3. validate basic structure (preflight)
+    4. normalize payload, strip stale trace fields
+    5. extract workflow, compute hashes, extract model stack
+    6. acquire _counter_lock, assign item_id, build extra_data
+    7. enqueue item to _queue
+    8. return prompt_id immediately (ACK before Modal dispatch)
+    Remote work runs in _process_queue / _execute_job (background asyncio task).
+    The /comfymodal/result/{prompt_id} route reports pending/running/ok/failed.
+    """
+
+    def _make_local_request_state(request, body: dict, prompt_id: str) -> dict:
+        global _LOCAL_REQUEST_SEQ, _PREVIOUS_REQUEST_ID, _PREVIOUS_REQUEST_FINISHED_AT
+        with _LOCAL_REQUEST_SEQ_LOCK:
+            _LOCAL_REQUEST_SEQ += 1
+            seq = _LOCAL_REQUEST_SEQ
+        with _ACTIVE_REQUEST_IDS_LOCK:
+            active_count = len(_ACTIVE_REQUEST_IDS)
+            active_ids = list(_ACTIVE_REQUEST_IDS.keys())
+            now_t = time.time()
+            _ACTIVE_REQUEST_IDS[prompt_id] = now_t
+        prev_id = _PREVIOUS_REQUEST_ID
+        prev_age = (time.time() - _PREVIOUS_REQUEST_FINISHED_AT) if _PREVIOUS_REQUEST_FINISHED_AT else None
+        thread = threading.current_thread()
+        try:
+            loop = asyncio.get_running_loop()
+            loop_id = id(loop)
+            task_name = asyncio.current_task().get_name() if hasattr(asyncio, 'current_task') and asyncio.current_task() else None
+        except RuntimeError:
+            loop_id = None
+            task_name = None
+        content_length = request.content_length if hasattr(request, 'content_length') else None
+        return {
+            "local_request_id": prompt_id[:12],
+            "prompt_id": prompt_id,
+            "route_seq": seq,
+            "thread_id": thread.ident,
+            "thread_name": thread.name,
+            "process_id": os.getpid(),
+            "event_loop_id": loop_id,
+            "asyncio_task_name": task_name,
+            "start_unix_s": time.time(),
+            "request_content_length": content_length,
+            "result_route": body.get("result_route", _RESULT_ROUTE),
+            "return_mode": body.get("modal_options", {}).get("return_mode", "unknown") if isinstance(body.get("modal_options"), dict) else "unknown",
+            "active_request_count_at_entry": active_count,
+            "active_request_ids": active_ids[-10:],
+            "previous_request_id": prev_id,
+            "previous_request_age_s": round(prev_age, 3) if prev_age is not None else None,
+        }
+
+    def _clear_request_state(prompt_id: str):
+        global _PREVIOUS_REQUEST_ID, _PREVIOUS_REQUEST_FINISHED_AT
+        with _ACTIVE_REQUEST_IDS_LOCK:
+            _ACTIVE_REQUEST_IDS.pop(prompt_id, None)
+            _PREVIOUS_REQUEST_ID = prompt_id
+            _PREVIOUS_REQUEST_FINISHED_AT = time.time()
+
+    async def _timed_async_lock_acquire(lock: asyncio.Lock, lock_name: str, request_id: str, timeout_s: float | None = None) -> dict:
+        wait_start = time.perf_counter()
+        acquired = False
+        timed_out = False
+        try:
+            if timeout_s is not None:
+                try:
+                    await asyncio.wait_for(lock.acquire(), timeout=timeout_s)
+                    acquired = True
+                except asyncio.TimeoutError:
+                    timed_out = True
+            else:
+                await lock.acquire()
+                acquired = True
+        except Exception:
+            acquired = False
+        wait_end = time.perf_counter()
+        wait_ms = round((wait_end - wait_start) * 1000, 3)
+        result = {"lock_name": lock_name, "wait_start": wait_start, "wait_end": wait_end, "wait_ms": wait_ms, "acquired": acquired, "timed_out": timed_out}
+        if wait_ms > _LOCK_WAIT_DEGRADE_S * 1000:
+            with _ACTIVE_REQUEST_IDS_LOCK:
+                active = dict(_ACTIVE_REQUEST_IDS)
+            print(f"[local_lock_wait] CRITICAL request_id={request_id} lock={lock_name} wait_ms={wait_ms} active_requests={len(active)} active_ids={list(active.keys())[-5:]}")
+        elif wait_ms > _LOCK_WAIT_CRITICAL_MS:
+            print(f"[local_lock_wait] CRITICAL request_id={request_id} lock={lock_name} wait_ms={wait_ms}")
+        elif wait_ms > _LOCK_WAIT_WARN_MS:
+            print(f"[local_lock_wait] WARN request_id={request_id} lock={lock_name} wait_ms={wait_ms}")
+        return result
+
+    def _detect_local_predispatch_stall(local_ts: dict, request_id: str, degradation_flags: list) -> dict:
+        t1 = local_ts.get("t1_local_recv")
+        t2 = local_ts.get("t2_local_dispatch")
+        body_read = local_ts.get("body_read_ms", 0) or 0
+        json_parse = local_ts.get("json_parse_ms", 0) or 0
+        preflight = local_ts.get("preflight_ms", 0) or 0
+        stack_extract = local_ts.get("stack_extract_ms", 0) or 0
+        active_next = local_ts.get("active_next_write_ms", 0) or 0
+        lock_wait = local_ts.get("lock_wait_total_ms", 0) or 0
+        phases = {"body_read": body_read, "json_parse": json_parse, "preflight": preflight, "stack_extract": stack_extract, "active_next_write": active_next, "lock_wait_total": lock_wait}
+        dominant = max(phases, key=phases.get) if phases else "unknown"
+        dominant_ms = phases.get(dominant, 0)
+        total = t2 - t1 if (t1 is not None and t2 is not None) else 0
+        total_ms = round(total * 1000, 2) if isinstance(total, float) else local_ts.get("local_recv_to_dispatch_ms", 0)
+        if total_ms > 60000:
+            degradation_flags.append("local_predispatch_stall_severe")
+            print(f"[local_predispatch_stall] SEVERE request_id={request_id} total_ms={total_ms} dominant={dominant}={dominant_ms} body_read={body_read} json_parse={json_parse} stack_extract={stack_extract} active_next={active_next} lock_wait={lock_wait}")
+        elif total_ms > 30000:
+            degradation_flags.append("local_predispatch_stall")
+            print(f"[local_predispatch_stall] CRITICAL request_id={request_id} total_ms={total_ms} dominant={dominant}={dominant_ms} body_read={body_read} json_parse={json_parse} stack_extract={stack_extract} active_next={active_next} lock_wait={lock_wait}")
+        elif total_ms > 5000:
+            print(f"[local_predispatch_stall] request_id={request_id} total_ms={total_ms} dominant={dominant}={dominant_ms} body_read={body_read} json_parse={json_parse} stack_extract={stack_extract} active_next={active_next} lock_wait={lock_wait}")
+        return {"local_recv_to_dispatch_ms": total_ms, "dominant_phase": dominant, "dominant_ms": dominant_ms, "body_read_ms": body_read, "json_parse_ms": json_parse, "stack_extract_ms": stack_extract, "active_next_write_ms": active_next, "lock_wait_total_ms": lock_wait}
+
     @_server.routes.post("/comfymodal/prompt")
     async def modal_prompt(request: web.Request) -> web.Response:
         global _queue_worker_started, _item_counter
 
-        body = await request.json()
+        # ── v4 local event trace ──
+        local_et = _init_local_event_trace()
+        local_et.mark(T0_CLIENT_PRESS, phase=PHASE_LOCAL_PRE)
+        local_et.mark(T1_LOCAL_BRIDGE_RECEIVED, phase=PHASE_LOCAL_BRIDGE)
+        _route_entry_ts = time.time()
+
+        # ── Phase: body read + JSON parse ──
+        local_et.mark(T1G_BODY_READ_START, phase=PHASE_LOCAL_BRIDGE)
+        try:
+            body = await asyncio.wait_for(request.json(), timeout=_BODY_READ_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            print(f"[comfyui-modal] BODY READ TIMEOUT after {_BODY_READ_TIMEOUT_S}s")
+            return web.json_response({"status": "error", "error": "Request body read timed out"}, status=408)
+        local_et.mark(T1H_BODY_READ_END, phase=PHASE_LOCAL_BRIDGE)
+        _body_read_done_ts = time.time()
+
+        local_et.mark(T1I_JSON_PARSE_START, phase=PHASE_LOCAL_BRIDGE)
+        _json_parse_done_ts = time.time()
+        body_read_ms = round((_body_read_done_ts - _route_entry_ts) * 1000, 3)
+        if body_read_ms > _JSON_PARSE_WARN_MS:
+            print(f"[comfyui-modal] WARN slow body read: {body_read_ms}ms content_length={request.content_length if hasattr(request, 'content_length') else '?'}")
+        if body_read_ms > _JSON_PARSE_FAIL_S * 1000:
+            return web.json_response({"status": "error", "error": f"JSON read/parse took {body_read_ms}ms, exceeding limit"}, status=413)
+        body_bytes = len(json.dumps(body).encode('utf-8'))
+        if body_bytes > 10 * 1024 * 1024:
+            print(f"[comfyui-modal] WARN large body: {body_bytes} bytes")
+        local_et.mark(T1J_JSON_PARSE_END, phase=PHASE_LOCAL_BRIDGE)
+
+        # ── Extract payload fields and inject detailed trace stages ──
         workflow = body.get("prompt", body)
         client_id = body.get("client_id", str(uuid.uuid4()))
         prompt_id = str(uuid.uuid4())
-        browser_t0 = coerce_t0_from_browser(body)
-        trace = Trace(prompt_id=prompt_id, t0=browser_t0 or time.time())
+        request_state = _make_local_request_state(request, body, prompt_id)
+        # Prefer request-level trace (body["trace"]["t0_client_press"]) over top-level
+        request_trace = body.get("trace", {})
+        browser_t0 = coerce_t0_from_browser(request_trace) or coerce_t0_from_browser(body)
+        trace = Trace(prompt_id=prompt_id, t0=browser_t0 or _route_entry_ts)
         if browser_t0 is not None:
             trace.mark("t0_client_press", browser_t0)
-        trace.mark("t1_local_recv")
-        print(f"[predispatch] phase=recv t={time.time()}")
+        # Emit request-level benchmark metadata from payload.trace into timing_trace stages
+        # so the benchmark can trace stale t0 sources definitively.
+        for _bmk in ("benchmark_run_index", "benchmark_run_id", "benchmark_session_id"):
+            _bmv = request_trace.get(_bmk)
+            if _bmv is not None:
+                trace.mark(_bmk, _bmv if isinstance(_bmv, (int, float)) else time.time())
+        # Emit detailed local route stages into timing_trace
+        trace.mark("t1a_body_read_start", _route_entry_ts)
+        trace.mark("t1b_body_read_end", _body_read_done_ts)
+        trace.mark("t1c_json_parse_start", _body_read_done_ts)
+        trace.mark("t1d_json_parse_end", _json_parse_done_ts)
+        trace.mark("t1_local_recv", time.time())
+        local_et.mark(T1A_LOCAL_PAYLOAD_PARSE_START, phase=PHASE_LOCAL_BRIDGE)
 
-        # ── PART 1: Preflight validation before any Modal interaction ──
-        # Validate API prompt structure before extracting model stack or
-        # warmup profile.  Invalid prompts fail fast (under 1s locally).
+        # ── Preflight validation ──
+        local_et.mark(T1C_LOCAL_PREFLIGHT_START, phase=PHASE_LOCAL_BRIDGE)
+        _preflight_start_ts = time.perf_counter()
         validation_errors = validate_api_prompt_structure(workflow)
+        _preflight_end_ts = time.perf_counter()
+        preflight_ms = round((_preflight_end_ts - _preflight_start_ts) * 1000, 3)
+        local_et.mark(T1D_LOCAL_PREFLIGHT_END, phase=PHASE_LOCAL_BRIDGE)
         if validation_errors:
             summary = FailureSummary(phase="preflight")
             summary.fatal_error = "; ".join(validation_errors)
             summary.modal_invoked = False
-            summary.recommendation = (
-                "Re-export the workflow as API prompt JSON or remove "
-                "corrupt/UI-only nodes."
-            )
+            summary.recommendation = "Re-export the workflow as API prompt JSON or remove corrupt/UI-only nodes."
             print(f"[comfyui-modal] PREFLIGHT FAILED: {summary}")
-            _send(client_id, "execution_error", {
-                "message": f"Preflight validation failed: {summary.fatal_error}",
-                "prompt_id": prompt_id,
-            })
-            raise web.HTTPBadRequest(
-                text=json.dumps({
-                    "status": "error",
-                    "error": f"Preflight validation failed",
-                    "details": summary.fatal_error,
-                    "recommendation": summary.recommendation,
-                }),
-                content_type="application/json",
-            )
+            _send(client_id, "execution_error", {"message": f"Preflight validation failed: {summary.fatal_error}", "prompt_id": prompt_id})
+            _clear_request_state(prompt_id)
+            raise web.HTTPBadRequest(text=json.dumps({"status": "error", "error": "Preflight validation failed", "details": summary.fatal_error, "recommendation": summary.recommendation}), content_type="application/json")
 
-        # Compute prompt integrity metadata (carried in extra_data, never mutates workflow)
+        local_et.mark(T1B_LOCAL_PAYLOAD_PARSE_END, phase=PHASE_LOCAL_BRIDGE)
+        print(f"[predispatch] phase=recv t={time.time()}")
+
+        # ── Stack extraction (prompt hashing + model stack) ──
         print(f"[predispatch] phase=before_stack_extract t={time.time()}")
+        trace.mark("t1k_stack_extract_start", time.time())
+        local_et.mark(T1Q_STACK_EXTRACT_START, phase=PHASE_LOCAL_BRIDGE)
+        _stack_start_ts = time.perf_counter()
         local_payload_hash = prompt_sha256(body)
         workflow_hash = prompt_sha256(workflow)
         prompt_summary = summarize_prompt_fields(workflow)
         model_stack = extract_model_stack(workflow)
-        print(f"[predispatch] phase=after_stack_extract t={time.time()}")
+        _stack_end_ts = time.perf_counter()
+        stack_extract_ms = round((_stack_end_ts - _stack_start_ts) * 1000, 3)
+        if stack_extract_ms > _STACK_EXTRACT_WARN_MS:
+            print(f"[comfyui-modal] CRITICAL slow stack extraction: {stack_extract_ms}ms")
+        if stack_extract_ms > _STACK_EXTRACT_FAIL_S * 1000:
+            _clear_request_state(prompt_id)
+            return web.json_response({"status": "error", "error": f"Stack extraction took {stack_extract_ms}ms, exceeding {_STACK_EXTRACT_FAIL_S}s limit"}, status=500)
+        _stack_end_ts_wall = time.time()
+        trace.mark("t1l_stack_extract_end", _stack_end_ts_wall)
+        local_et.mark(T1R_STACK_EXTRACT_END, phase=PHASE_LOCAL_BRIDGE)
+        print(f"[predispatch] phase=after_stack_extract t={_stack_end_ts_wall}")
 
-        # Extract modal_options from the body (set by frontend sidebar)
+        # Extract modal_options from body
         modal_options = body.get("modal_options", None)
         if not isinstance(modal_options, dict):
             modal_options = None
-
         scheduler_test = body.get("comfymodal_scheduler_test")
 
-        async with _counter_lock:
+        # ── Lock + enqueue ──
+        local_et.mark(T2_LOCAL_MODAL_SUBMIT_START, phase=PHASE_LOCAL_BRIDGE)
+
+        _lock_trace = await _timed_async_lock_acquire(_counter_lock, "counter_lock", prompt_id)
+        try:
             _item_counter += 1
             item_id = _item_counter
             selected_gpu = get_gpu()
             _result_route_mode = body.get("result_route", _RESULT_ROUTE)
             if _result_route_mode not in ("legacy", "direct"):
                 _result_route_mode = _RESULT_ROUTE
+
+            # Build _client_trace for v4 event passing
+            _client_trace_dict = {
+                "trace_id": local_et.trace_id,
+                "events": [{k: e.get(k) for k in ("name", "phase", "process", "wall_unix_ns", "mono_ns") if k in e} for e in local_et.events],
+                "stages": {
+                    T0_CLIENT_PRESS: local_et.events[0].get("wall_unix_ns") if local_et.events else 0,
+                    T1_LOCAL_BRIDGE_RECEIVED: local_et.events[1].get("wall_unix_ns") if len(local_et.events) > 1 else 0,
+                    T2_LOCAL_MODAL_SUBMIT_START: time.time_ns(),
+                },
+            }
+
             extra_data = {
                 "client_id": client_id,
                 "create_time": int(time.time() * 1000),
@@ -1471,12 +1773,16 @@ if _server:
                 "model_stack": model_stack,
                 "gpu": selected_gpu,
                 "trace": {**trace.fields(), "prompt_id": prompt_id},
+                "_client_trace": _client_trace_dict,
                 "modal_options": modal_options,
                 "scheduler_test": scheduler_test,
                 "result_route": _result_route_mode,
             }
             item = (_item_counter, prompt_id, workflow, extra_data, list(workflow.keys()), {})
-            print(f"[predispatch] prompt_bytes={len(json.dumps(body).encode('utf-8'))}")
+            print(f"[predispatch] prompt_bytes={body_bytes}")
+        finally:
+            if _lock_trace.get("acquired"):
+                _counter_lock.release()
 
         pq = _pq()
         if pq:
@@ -1490,6 +1796,20 @@ if _server:
         if not _queue_worker_started:
             _queue_worker_started = True
             asyncio.create_task(_process_queue())
+
+        _dispatch_ts = time.time()
+        local_recv_to_dispatch_ms = round((_dispatch_ts - _route_entry_ts) * 1000, 3)
+
+        # ── Stall detector ──
+        local_ts = {"t1_local_recv": _route_entry_ts, "t2_local_dispatch": _dispatch_ts,
+                    "body_read_ms": body_read_ms, "json_parse_ms": body_read_ms, "preflight_ms": preflight_ms,
+                    "stack_extract_ms": stack_extract_ms, "active_next_write_ms": 0,
+                    "lock_wait_total_ms": _lock_trace.get("wait_ms", 0), "local_recv_to_dispatch_ms": local_recv_to_dispatch_ms}
+        degradation_flags = []
+        _detect_local_predispatch_stall(local_ts, prompt_id, degradation_flags)
+
+        local_et.mark(T2D_LOCAL_PROMPT_ACK_RETURNED, phase=PHASE_LOCAL_BRIDGE)
+        _clear_request_state(prompt_id)
 
         return web.json_response({
             "prompt_id": prompt_id,

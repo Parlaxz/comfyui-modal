@@ -693,6 +693,10 @@ def _write_runs_csv(run_dir: Path, run1_trace: dict, run2_trace: dict) -> None:
         "direct_warmup_z_image_guard_skipped", "direct_warmup_skip_reason",
         "warmup_preload_ms", "warmup_direct_total_ms",
         "clip_cache_size_at_start", "clip_cache_size_after_warmup",
+        # Phase 3C UNET diagnostics
+        "unet_node_wait_ms", "unet_load_ms",
+        "purge_vram_node_executed", "purge_vram_purge_models", "purge_vram_purge_cache",
+        "workflow_mutated",
     ]
 
     rows = []
@@ -771,6 +775,7 @@ def _write_runs_csv(run_dir: Path, run1_trace: dict, run2_trace: dict) -> None:
             "modal_return_to_browser_ms": _v(derived, "modal_return_to_browser_ms"),
             "client_to_response_sent_ms": _v(derived, "client_to_response_sent_ms"),
             "fresh_container_requested": str(trace.get("fresh_container_requested", "")),
+            "workflow_mutated": str(trace.get("workflow_mutated", "")),
             # Phase 3A preload/warmup diagnostics
             "preload_mode": _v(restore, "preload_mode"),
             "preload_mode_source": _v(restore, "preload_mode_source"),
@@ -801,6 +806,11 @@ def _write_runs_csv(run_dir: Path, run1_trace: dict, run2_trace: dict) -> None:
             "direct_warmup_skip_reason": _v(restore, "direct_warmup_skip_reason"),
             "warmup_preload_ms": _v(restore, "warmup_preload_ms"),
             "warmup_direct_total_ms": _v(restore, "warmup_direct_total_ms"),
+            "unet_load_ms": _v(derived, "unet_load_ms"),
+            "unet_node_wait_ms": _v(restore, "unet_node_wait_ms"),
+            "purge_vram_node_executed": _v(trace, "purge_vram_node_executed"),
+            "purge_vram_purge_models": _v(trace, "purge_vram_purge_models"),
+            "purge_vram_purge_cache": _v(trace, "purge_vram_purge_cache"),
         }
 
         for k, v in row.items():
@@ -1211,6 +1221,7 @@ def _print_banner(args: dict, local_reachable: bool) -> None:
     print(f"  app_name:             {args.get('app_name', '(default)')}")
     print(f"  function_name:        {args.get('function_name', '(default)')}")
     print(f"  fresh_container:      {'YES (best-effort)' if args.get('fresh_container') else 'NO'}")
+    print(f"  disable_purge_vram:   {'YES' if args.get('workflow_test_disable_purge_vram') else 'NO'}")
     print(f"  local_comfyui_reachable: {'YES' if local_reachable else 'NO'}")
     if args.get('deploy') or args.get('force_deploy'):
         print(f"  will_deploy:          YES (reason: {'--force-deploy' if args.get('force_deploy') else '--deploy'})")
@@ -1264,6 +1275,7 @@ def _parse_benchmark_args() -> dict:
         "set_preload_mode": None,
         "set_runtime_flags": [],
         "fresh_container": False,
+        "workflow_test_disable_purge_vram": False,
     }
     argv = list(sys.argv)
     skip_next = False
@@ -1321,6 +1333,8 @@ def _parse_benchmark_args() -> dict:
             skip_next = True
         elif a == "--fresh-container":
             args["fresh_container"] = True
+        elif a == "--workflow-test-disable-purge-vram":
+            args["workflow_test_disable_purge_vram"] = True
 
     # ── Resolve deploy_mode from env + flags ──
     if args["force_deploy"]:
@@ -1369,6 +1383,9 @@ def _run_benchmark_sequence(snapshot: dict, run_dir: Path, log_path: Path, resul
             run1_restore = run1_entry.get("result", {}).get("_restore_timing", {})
             if isinstance(run1_restore, dict) and run1_restore:
                 run1_trace["restore"] = run1_restore
+            _cache_diag = run1_entry.get("result", {}).get("_cache_diagnostics", {})
+            if _cache_diag:
+                run1_trace["_cache_diagnostics"] = _cache_diag
             _write_json(run_dir / f"run1_{result_route}_response.json", {"prompt_id": run1_prompt_id, "direct_result": run1_entry})
         else:
             run1_entry = _poll_history(run1_prompt_id)
@@ -1559,6 +1576,33 @@ def main() -> int:
                 _write_summary(run_dir, "local_unreachable", {}, {}, {"error": msg})
                 return 1
 
+    # ── Workflow mutation for purgeVRAM test ──
+    if _benchmark_args.get("workflow_test_disable_purge_vram"):
+        _workflow = snapshot.get("payload", snapshot)
+        _prompt = _workflow.get("prompt", _workflow)
+        _mutated_nodes = []
+        for _nid, _node in _prompt.items():
+            if isinstance(_node, dict) and _node.get("class_type") == "LayerUtility: PurgeVRAM V2":
+                _inputs = _node.get("inputs", {})
+                if _inputs.get("purge_models") is True or _inputs.get("purge_cache") is True:
+                    _old_purge_models = _inputs.get("purge_models")
+                    _old_purge_cache = _inputs.get("purge_cache")
+                    _inputs["purge_models"] = False
+                    _inputs["purge_cache"] = False
+                    _mutated_nodes.append({
+                        "node_id": _nid,
+                        "class_type": "LayerUtility: PurgeVRAM V2",
+                        "field": "purge_models,purge_cache",
+                        "old_value": {"purge_models": _old_purge_models, "purge_cache": _old_purge_cache},
+                        "new_value": {"purge_models": False, "purge_cache": False},
+                    })
+        if _mutated_nodes:
+            print(f"[benchmark] WARNING: workflow mutated for test — disabled PurgeVRAM V2 on {len(_mutated_nodes)} node(s): {_mutated_nodes}")
+            _append_log(log_path, f"workflow_mutated_disable_purge_vram: {json.dumps(_mutated_nodes)}")
+        else:
+            print("[benchmark] --workflow-test-disable-purge-vram: no PurgeVRAM V2 nodes found in workflow")
+        snapshot["workflow_mutated"] = _mutated_nodes
+
     # ── Run benchmark ──
     try:
         if _benchmark_args.get("matrix_run"):
@@ -1575,18 +1619,24 @@ def main() -> int:
                 _append_log(log_path, f"=== Matrix run complete for route={route} status={st} ===")
                 time.sleep(5)
 
+            _extra = {"benchmark_args": dict(_benchmark_args), "matrix_routes": routes, "all_traces": all_traces}
+            if snapshot.get("workflow_mutated"):
+                _extra["workflow_mutated"] = snapshot["workflow_mutated"]
             overall_status = "ok" if all(s == "ok" for s in all_statuses.values()) else "partial"
             _write_summary(run_dir, overall_status,
                            all_traces.get("legacy_run1", {}) or all_traces.get("direct_run1", {}),
                            all_traces.get("legacy_run2", {}) or all_traces.get("direct_run2", {}),
-                           {"benchmark_args": dict(_benchmark_args), "matrix_routes": routes, "all_traces": all_traces})
+                           _extra)
             return 0 if overall_status == "ok" else 1
         else:
             # ── Single mode: run with configured result route ──
             route = _benchmark_args.get("result_route", "legacy")
             _append_log(log_path, f"=== Starting single run for route={route} ===")
             run1_trace, run2_trace, status = _run_benchmark_sequence(snapshot, run_dir, log_path, route)
-            _write_summary(run_dir, status, run1_trace, run2_trace, {"benchmark_args": dict(_benchmark_args)})
+            _extra = {"benchmark_args": dict(_benchmark_args)}
+            if snapshot.get("workflow_mutated"):
+                _extra["workflow_mutated"] = snapshot["workflow_mutated"]
+            _write_summary(run_dir, status, run1_trace, run2_trace, _extra)
             return 0 if status == "ok" else 1
 
     except TimeoutError as exc:

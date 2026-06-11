@@ -1,0 +1,132 @@
+{
+  "_comment": "Profiling & test configuration for comfyui-modal.",
+  "_doc": "Edit this file. Restart ComfyUI or call set_profile_level() to reload. Env vars override these values.",
+
+  "level": "detailed",
+
+  "profiling": {
+    "_comment": "Maps to COMFYMODAL_PROFILING. Enables verbose exception logging.",
+    "enabled": true
+  },
+
+  "preload": {
+    "_comment": "CPU preload during restore. See COMFYMODAL_PRELOAD_MODE docs.",
+    "_values": ["off", "default", "unet_only", "clip_only", "vae", "sequential", "workers_1", "workers_2", "async_no_wait", "budgeted_1500ms"],
+    "mode": "off",
+    "async_preload": false,
+    "preload_workers": 2
+  },
+
+  "actual_load": {
+    "_comment": "Background model loading during prompt execution.",
+    "enabled": false,
+    "mode": "clip_vae_only",
+    "load_unet": false
+  },
+
+  "direct_warmup": {
+    "_comment": "GPU warmup during restore after preload.",
+    "load_unet": false,
+    "load_clip": false,
+    "clip_encode": false,
+    "require_cpu_cache_hit": true
+  },
+
+  "warmup": {
+    "_comment": "Restore-time model warmup profile.",
+    "profile": "off"
+  },
+
+  "return": {
+    "_comment": "How results are returned from Modal.",
+    "_values": ["full_base64", "first_image_only", "metadata_only", "paths_only"],
+    "mode": "full_base64",
+    "_format_values": ["original", "webp_lossless", "webp_lossy", "jpeg"],
+    "format": "original",
+    "quality": 75,
+    "webp_lossless_compression": "balanced"
+  },
+
+  "execution": {
+    "backend": "in_process",
+    "torch_compile": false
+  },
+
+  "runtime_flags": {
+    "_comment": "Set these at Modal runtime via set_runtime_flag. Changes picked up per-request.",
+    "exec_profile": false,
+    "sampler_profile": false,
+    "guider_profile": false,
+    "deep_profile": false
+  },
+
+  "benchmark": {
+    "_comment": "Defaults for benchmark_modal_e2e.py.",
+    "local_url": "http://127.0.0.1:8188",
+    "default_runs": 3,
+    "sleep_between_runs": 5,
+    "print_cost_warning": true
+  },
+
+  "modes": {
+    "_comment": "Quick presets for common test scenarios. Set 'preset' below to one of these keys for rapid switching.",
+
+    "minimal": {
+      "_desc": "Minimal profiling overhead. Good for baseline measurement.",
+      "level": "summary",
+      "preload.mode": "off",
+      "actual_load.enabled": false,
+      "direct_warmup.load_unet": false,
+      "direct_warmup.load_clip": false
+    },
+
+    "full_profile": {
+      "_desc": "Maximum detail. All profiling on, all breakpoints enabled.",
+      "level": "trace_verbose",
+      "preload.mode": "default",
+      "actual_load.enabled": true,
+      "actual_load.mode": "clip_vae_only",
+      "actual_load.load_unet": true,
+      "direct_warmup.load_unet": true,
+      "direct_warmup.load_clip": true,
+      "direct_warmup.clip_encode": true,
+      "runtime_flags.exec_profile": true,
+      "runtime_flags.sampler_profile": true,
+      "runtime_flags.guider_profile": true,
+      "runtime_flags.deep_profile": true
+    },
+
+    "cold_test": {
+      "_desc": "Simulate cold-start conditions for testing. Preload off, minimal warmup.",
+      "level": "detailed",
+      "preload.mode": "off",
+      "actual_load.enabled": false,
+      "direct_warmup.load_unet": false,
+      "direct_warmup.load_clip": false,
+      "warmup.profile": "off"
+    },
+
+    "payload_test": {
+      "_desc": "Test overhead of different return modes and formats.",
+      "level": "detailed",
+      "return.mode": "full_base64",
+      "return.format": "webp_lossy",
+      "return.quality": 75,
+      "actual_load.enabled": false,
+      "preload.mode": "off"
+    },
+
+    "warm_reuse": {
+      "_desc": "Test warm-container reuse. Preload on for fast restore.",
+      "level": "detailed",
+      "preload.mode": "default",
+      "actual_load.enabled": true,
+      "actual_load.load_unet": true,
+      "direct_warmup.load_unet": true,
+      "direct_warmup.load_clip": true,
+      "direct_warmup.clip_encode": true
+    }
+  },
+
+  "preset": null
+}
