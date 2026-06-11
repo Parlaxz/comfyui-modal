@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -419,7 +420,13 @@ def _resolve_disable_restore_warmup_for_z_image() -> bool:
     """
     return _resolve_runtime_flag("DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE",
                                  "1" if _DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE else "0")
-ACTUAL_LOAD_MODE = os.getenv("ACTUAL_LOAD_MODE", "clip_vae_only").strip().lower()
+ACTUAL_LOAD_MODE = os.getenv(
+    "COMFYMODAL_ACTUAL_LOAD_MODE",
+    os.getenv("ACTUAL_LOAD_MODE", "clip_vae_only"),
+).strip().lower()
+if ACTUAL_LOAD_MODE not in ("off", "clip_vae_only", "unet_only", "unet_vae_only"):
+    print(f"[comfyapp] WARNING: invalid COMFYMODAL_ACTUAL_LOAD_MODE={ACTUAL_LOAD_MODE!r}, falling back to 'clip_vae_only'")
+    ACTUAL_LOAD_MODE = "clip_vae_only"
 
 # P1 — Direct warmup granular flags.
 # DIRECT_WARMUP_LOAD_UNET/LOAD_CLIP gate whether UNET/CLIP are loaded
@@ -440,6 +447,44 @@ DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT = os.getenv("COMFYMODAL_DIRECT_WARMUP_REQUIR
 #   baked_cuda     — skip probing, assume Blackwell baked CUDA path
 #   triton_fallback — skip probing, force Triton fallback
 SAGE_RUNTIME_MODE = os.getenv("COMFYMODAL_SAGE_RUNTIME_MODE", "auto").strip().lower()
+
+# P3 — Restore direct CLIP policy.
+#   auto           — (default) load_and_encode unless CLIP already cached or no CLIP in profile
+#   off            — explicit user override: no CLIP load or encode during restore
+#   load_only      — explicit user override: load CLIP but skip dummy encode
+#   load_and_encode — explicit user override: load CLIP and run dummy encode
+RESTORE_DIRECT_CLIP_POLICY = os.getenv("COMFYMODAL_RESTORE_DIRECT_CLIP_POLICY", "auto").strip().lower()
+if RESTORE_DIRECT_CLIP_POLICY not in ("auto", "off", "load_only", "load_and_encode"):
+    print(f"[comfyapp] WARNING: invalid COMFYMODAL_RESTORE_DIRECT_CLIP_POLICY={RESTORE_DIRECT_CLIP_POLICY!r}, falling back to 'auto'")
+    RESTORE_DIRECT_CLIP_POLICY = "auto"
+
+# P4 — VAE decode warmup.
+#   0 — (default) disabled
+#   1 — opt-in: run a dummy VAE decode during restore to warm the decoder
+VAE_DECODE_WARMUP_ENABLED = os.getenv("COMFYMODAL_VAE_DECODE_WARMUP", "0") == "1"
+
+# P5 — Safetensors read mode.
+#   auto         — explicit opt-in: use read_bytes for large .safetensors CPU loads on model paths
+#   normal       — (default) use original loader behavior
+#   read_bytes   — explicit opt-in: open(path, "rb").read() then safetensors.torch.load(bytes)
+SAFETENSORS_READ_MODE = os.getenv("COMFYMODAL_SAFETENSORS_READ_MODE", "normal").strip().lower()
+if SAFETENSORS_READ_MODE not in ("auto", "normal", "read_bytes"):
+    print(f"[comfyapp] WARNING: invalid COMFYMODAL_SAFETENSORS_READ_MODE={SAFETENSORS_READ_MODE!r}, falling back to 'normal'")
+    SAFETENSORS_READ_MODE = "normal"
+SAFETENSORS_READ_BYTES_MIN_MB = int(os.getenv("COMFYMODAL_SAFETENSORS_READ_BYTES_MIN_MB", "512"))
+SAFETENSORS_STRICT = os.getenv("COMFYMODAL_SAFETENSORS_STRICT", "0") == "1"
+# P6 — FUSE / Modal Volume large-read governor.
+# Disabled by default to preserve the recovered 26-29s shape until paid A/B
+# confirms the concurrency gate is a net win on current Modal volume behavior.
+FUSE_READ_GOVERNOR_ENABLED = os.getenv("COMFYMODAL_FUSE_READ_GOVERNOR", "0").strip().lower() in {"1", "true", "yes", "on"}
+try:
+    FUSE_LARGE_READ_CONCURRENCY = max(1, int(os.getenv("COMFYMODAL_FUSE_LARGE_READ_CONCURRENCY", "1")))
+except (TypeError, ValueError):
+    FUSE_LARGE_READ_CONCURRENCY = 1
+try:
+    FUSE_LARGE_READ_MIN_MB = max(1, int(os.getenv("COMFYMODAL_FUSE_LARGE_READ_MIN_MB", "512")))
+except (TypeError, ValueError):
+    FUSE_LARGE_READ_MIN_MB = 512
 # When 0, skip the Sage CUDA extension smoke test during restore.
 # Use the persistent volume cache if available, or SAGE_RUNTIME_MODE default.
 SAGE_RUNTIME_PROBE_ON_RESTORE = os.getenv("COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE", "1") == "1"
@@ -447,6 +492,20 @@ PRELOAD_MODE_PATH = "/root/models/.preload_mode"
 RUNTIME_CONFIG_DIR = "/root/models/runtime_config"
 RUNTIME_RETURN_MODE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "return_mode.txt")
 RUNTIME_STATE_SNAPSHOT_PATH = os.path.join(RUNTIME_CONFIG_DIR, ".runtime_state_snapshot.json")
+
+
+def _log_remote_identity(event: str, *, cls_name: str = "", method_name: str = "", restore_session_id: str = "", request_seq: int = 0, snapshot_created: int = 0, restored_from_snapshot: int = 0) -> None:
+    print(
+        f"[comfyapp.identity] event={event} COMFYAPP_VERSION={COMFYAPP_VERSION} "
+        f"APP_NAME={APP_NAME} class_name={cls_name or '?'} method_name={method_name or '?'} "
+        f"container_session_id={CONTAINER_SESSION_ID} container_import_unix={CONTAINER_IMPORT_UNIX_S} "
+        f"restore_session_id={restore_session_id or '-'} restore_count={_container_restore_count} "
+        f"request_seq={request_seq} snapshot_created_this_invocation={snapshot_created} "
+        f"restored_from_memory_snapshot={restored_from_snapshot} "
+        f"effective_SAFETENSORS_READ_MODE={SAFETENSORS_READ_MODE} "
+        f"effective_RESTORE_DIRECT_CLIP_POLICY={RESTORE_DIRECT_CLIP_POLICY} "
+        f"effective_PRELOAD_MODE={_resolve_preload_mode()}"
+    )
 
 # ── Phase 1: Dependency validation cache ─────────────────────────────────
 DEPENDENCY_VALIDATION_CACHE_SCHEMA_VERSION = 1
@@ -529,6 +588,121 @@ def _model_cpu_cache_lookup_keys(path: str) -> tuple[str, ...]:
         if candidate and candidate not in candidates:
             candidates.append(candidate)
     return tuple(candidates)
+
+
+def load_safetensors_cpu_with_mode(path, *, device="cpu", read_mode="auto",
+                                    model_role="", loader_name="") -> tuple:
+    """Load a safetensors file with configurable read strategy.
+
+    Returns (state_dict, metadata) matching comfy.utils.load_torch_file.
+    Falls back to original loader on exception unless SAFETENSORS_STRICT=1.
+    """
+    _t_total = time.time()
+    _diag = {
+        "safetensors_read_mode": "normal",
+        "model_role": model_role,
+        "loader_name": loader_name,
+        "file_size_gb": 0.0,
+        "read_bytes_ms": 0.0,
+        "decode_ms": 0.0,
+        "total_load_ms": 0.0,
+        "fallback_reason": "",
+        "peak_extra_ram_estimate_gb": 0.0,
+    }
+    _read_mode = read_mode if read_mode in ("auto", "normal", "read_bytes") else "normal"
+    _file_ext = os.path.splitext(path)[1].lower()
+    _file_size = 0
+    try:
+        _file_size = os.path.getsize(path)
+    except OSError:
+        pass
+    _file_size_gb = round(_file_size / (1024**3), 3)
+    _diag["file_size_gb"] = _file_size_gb
+
+    _use_read_bytes = False
+    if _read_mode == "read_bytes":
+        _use_read_bytes = True
+    elif _read_mode == "auto":
+        _on_model_path = ("/root/models" in path or "/root/comfy/ComfyUI/models" in path)
+        _is_safetensors = _file_ext == ".safetensors"
+        _above_threshold = (_file_size / (1024 * 1024)) >= SAFETENSORS_READ_BYTES_MIN_MB
+        _is_cpu = device == "cpu"
+        if _is_cpu and _is_safetensors and _above_threshold and _on_model_path:
+            _use_read_bytes = True
+
+    if not _use_read_bytes:
+        _diag["total_load_ms"] = round((time.time() - _t_total) * 1000, 1)
+        return None, _diag
+
+    try:
+        _tr = time.time()
+        _raw = open(path, "rb").read()
+        _diag["read_bytes_ms"] = round((time.time() - _tr) * 1000, 1)
+        _diag["peak_extra_ram_estimate_gb"] = round(len(_raw) / (1024**3), 3)
+        _diag["safetensors_read_mode"] = "read_bytes"
+
+        import safetensors.torch as _st
+        _td = time.time()
+        _result = _st.load(_raw)
+        _diag["decode_ms"] = round((time.time() - _td) * 1000, 1)
+        _diag["total_load_ms"] = round((time.time() - _t_total) * 1000, 1)
+
+        _sd = _result.get("__metadata__", {})
+        _tensors = {k: v for k, v in _result.items() if k != "__metadata__"}
+        return ({"state_dict": _tensors, "metadata": _sd}, _diag)
+
+    except Exception as _exc:
+        _diag["fallback_reason"] = f"{_exc}"[:200]
+        _diag["safetensors_read_mode"] = "fallback"
+        _diag["total_load_ms"] = round((time.time() - _t_total) * 1000, 1)
+        if SAFETENSORS_STRICT:
+            raise
+        print(f"[safetensors] read_bytes fallback to normal for {os.path.basename(path)}: {_exc}")
+        return None, _diag
+
+
+_SCOPED_SAFETENSORS_LOCK = threading.Lock()
+_SCOPED_SAFETENSORS_ORIGINAL_LOAD_FILE = None
+_SCOPED_SAFETENSORS_DEPTH = 0
+
+
+@contextlib.contextmanager
+def scoped_safetensors_read_mode(read_mode="auto", model_role="", loader_name=""):
+    """Context manager that temporarily patches safetensors.torch.load_file.
+
+    Only patches during the with-block. Restores original on exit.
+    Thread-safe via _SCOPED_SAFETENSORS_LOCK. Does not nest safely with
+    concurrent scoped patches.
+    """
+    global _SCOPED_SAFETENSORS_ORIGINAL_LOAD_FILE, _SCOPED_SAFETENSORS_DEPTH
+    import safetensors.torch as _st
+
+    with _SCOPED_SAFETENSORS_LOCK:
+        _SCOPED_SAFETENSORS_DEPTH += 1
+        if _SCOPED_SAFETENSORS_ORIGINAL_LOAD_FILE is None:
+            _SCOPED_SAFETENSORS_ORIGINAL_LOAD_FILE = _st.load_file
+
+        def _patched_load_file(filename, device="cpu"):
+            _result, _diag = load_safetensors_cpu_with_mode(
+                filename, device=device, read_mode=read_mode,
+                model_role=model_role, loader_name=loader_name,
+            )
+            if _result is not None:
+                return _result[0]["state_dict"]
+            return _SCOPED_SAFETENSORS_ORIGINAL_LOAD_FILE(filename, device=device)
+
+        _st.load_file = _patched_load_file
+
+    try:
+        yield
+    finally:
+        with _SCOPED_SAFETENSORS_LOCK:
+            if _SCOPED_SAFETENSORS_ORIGINAL_LOAD_FILE is not None:
+                _st.load_file = _SCOPED_SAFETENSORS_ORIGINAL_LOAD_FILE
+            _SCOPED_SAFETENSORS_DEPTH -= 1
+            if _SCOPED_SAFETENSORS_DEPTH <= 0:
+                _SCOPED_SAFETENSORS_ORIGINAL_LOAD_FILE = None
+                _SCOPED_SAFETENSORS_DEPTH = 0
 
 
 def _iter_image_entries(node_out: dict):
@@ -665,6 +839,80 @@ def _resolve_return_mode() -> str:
     if _env in _valid:
         return _env
     return "full_base64"
+
+
+def _resolve_restore_direct_clip_policy(profile: dict | None, has_active_prompt_overlap: bool = False) -> dict:
+    """Resolve the restore direct CLIP policy to a specific decision.
+
+    Returns a dict with:
+      policy, decision, load_clip_effective, clip_encode_effective, skip_reason
+    """
+    _policy = RESTORE_DIRECT_CLIP_POLICY
+    _decision = ""
+    _load_clip = 0
+    _encode = 0
+    _skip_reason = ""
+
+    _clip_name = (profile or {}).get("clip1", "")
+    _has_clip_in_profile = bool(_clip_name)
+
+    if _policy == "off":
+        _decision = "off_explicit"
+        return {
+            "restore_direct_clip_policy": _policy,
+            "restore_direct_clip_policy_decision": _decision,
+            "direct_warmup_load_clip_effective": 0,
+            "direct_warmup_clip_encode_effective": 0,
+            "direct_warmup_clip_skip_reason": "off_explicit",
+        }
+
+    if _policy == "load_only":
+        _decision = "load_only_explicit"
+        return {
+            "restore_direct_clip_policy": _policy,
+            "restore_direct_clip_policy_decision": _decision,
+            "direct_warmup_load_clip_effective": 1 if _has_clip_in_profile else 0,
+            "direct_warmup_clip_encode_effective": 0,
+            "direct_warmup_clip_skip_reason": "load_only_explicit",
+        }
+
+    if _policy == "load_and_encode":
+        _decision = "load_and_encode_explicit"
+        return {
+            "restore_direct_clip_policy": _policy,
+            "restore_direct_clip_policy_decision": _decision,
+            "direct_warmup_load_clip_effective": 1 if _has_clip_in_profile else 0,
+            "direct_warmup_clip_encode_effective": 1 if _has_clip_in_profile else 0,
+            "direct_warmup_clip_skip_reason": "",
+        }
+
+    if _policy == "auto":
+        if not _has_clip_in_profile:
+            _decision = "skipped_no_clip_in_profile"
+            _skip_reason = "no_clip_in_profile"
+        elif has_active_prompt_overlap:
+            _decision = "load_and_encode_default"
+        else:
+            _decision = "load_and_encode_default"
+
+        _load_clip = 1 if _has_clip_in_profile else 0
+        _encode = _load_clip
+
+        return {
+            "restore_direct_clip_policy": _policy,
+            "restore_direct_clip_policy_decision": _decision,
+            "direct_warmup_load_clip_effective": _load_clip,
+            "direct_warmup_clip_encode_effective": _encode,
+            "direct_warmup_clip_skip_reason": _skip_reason,
+        }
+
+    return {
+        "restore_direct_clip_policy": _policy,
+        "restore_direct_clip_policy_decision": "fallback_existing",
+        "direct_warmup_load_clip_effective": 0,
+        "direct_warmup_clip_encode_effective": 0,
+        "direct_warmup_clip_skip_reason": "fallback_existing",
+    }
 
 # ── Custom-node volume helpers ────────────────────────────────────────────
 
@@ -1770,10 +2018,86 @@ _volume_commit_dirty_labels: set[str] = set()
 #   result_available (bool), error (str), completed_at (float)
 _ACTIVE_MODEL_READS: dict[str, dict] = {}
 _ACTIVE_MODEL_READS_LOCK = _threading.RLock()
+_FUSE_LARGE_READS_COND = _threading.Condition(_ACTIVE_MODEL_READS_LOCK)
+_FUSE_LARGE_READS_IN_PROGRESS = 0
+_FUSE_LARGE_READS_ACTIVE: dict[str, dict] = {}
+
+
+def _classify_fuse_read(path: str = "", *, loader_type: str = "", caller_hint: str = "") -> dict:
+    """Classify a model path as a large or small Modal Volume/FUSE read."""
+    hint = (caller_hint or "").strip().lower()
+    if hint in ("large", "small"):
+        is_large = hint == "large"
+        return {
+            "active_read_size_bytes": -1,
+            "active_read_size_mb": -1.0,
+            "active_read_is_large": 1 if is_large else 0,
+            "active_read_classification_source": "caller_hint",
+        }
+
+    size_bytes = -1
+    if path:
+        try:
+            size_bytes = os.path.getsize(path)
+        except OSError:
+            size_bytes = -1
+    if size_bytes >= 0:
+        size_mb = round(size_bytes / (1024 * 1024), 1)
+        return {
+            "active_read_size_bytes": size_bytes,
+            "active_read_size_mb": size_mb,
+            "active_read_is_large": 1 if size_mb >= FUSE_LARGE_READ_MIN_MB else 0,
+            "active_read_classification_source": "file_size",
+        }
+
+    lower_path = (path or "").lower()
+    lower_loader = (loader_type or "").lower()
+    looks_like_model = lower_path.endswith((".safetensors", ".ckpt", ".pt", ".pth", ".bin")) or any(
+        token in lower_loader for token in ("unet", "clip", "checkpoint", "vae")
+    )
+    return {
+        "active_read_size_bytes": -1,
+        "active_read_size_mb": -1.0,
+        "active_read_is_large": 1 if looks_like_model else 0,
+        "active_read_classification_source": "unknown_fallback",
+    }
+
+
+def _active_read_priority(owner: str = "", loader_type: str = "", path: str = "", phase: str = "") -> int:
+    """Higher number means higher priority. Inferred from role, not filename."""
+    blob = " ".join(str(v).lower() for v in (owner, loader_type, path, phase) if v)
+    if any(token in blob for token in ("unet", "checkpoint", "diffusion")):
+        return 100
+    if any(token in blob for token in ("clip", "text_encoder", "text_encoders")):
+        return 80
+    if "vae" in blob:
+        return 40
+    return 10
+
+
+def _running_large_reads_locked() -> list[dict]:
+    return [
+        dict(v)
+        for v in _ACTIVE_MODEL_READS.values()
+        if v.get("status") == "running" and int(v.get("active_read_is_large", 0)) == 1
+    ]
+
+
+def _release_fuse_large_read_slot_locked(canonical_key: str, entry: dict) -> None:
+    global _FUSE_LARGE_READS_IN_PROGRESS
+    if not entry.get("active_read_large_slot_acquired"):
+        return
+    _FUSE_LARGE_READS_IN_PROGRESS = max(0, _FUSE_LARGE_READS_IN_PROGRESS - 1)
+    _FUSE_LARGE_READS_ACTIVE.pop(canonical_key, None)
+    entry["active_read_large_slots_used_at_end"] = _FUSE_LARGE_READS_IN_PROGRESS
+    entry["active_read_concurrent_large_reads_at_end"] = len(_running_large_reads_locked())
+    _FUSE_LARGE_READS_COND.notify_all()
 
 
 def _register_active_model_read(canonical_key: str, owner: str, path: str = "",
-                                 future=None, event=None) -> str:
+                                 future=None, event=None, loader_type: str = "",
+                                 phase: str = "", caller_hint: str = "",
+                                 priority: int | None = None) -> str:
     """Register a model-file read before starting the actual loader call.
 
     If a running entry already exists for *canonical_key*, returns
@@ -1783,26 +2107,113 @@ def _register_active_model_read(canonical_key: str, owner: str, path: str = "",
     The caller **must** later call ``_complete_active_model_read()``
     or ``_fail_active_model_read()``.
     """
+    global _FUSE_LARGE_READS_IN_PROGRESS
+    classification = _classify_fuse_read(path, loader_type=loader_type, caller_hint=caller_hint)
+    active_read_priority = priority if priority is not None else _active_read_priority(owner, loader_type, path, phase)
+    is_large = int(classification.get("active_read_is_large", 0)) == 1
     with _ACTIVE_MODEL_READS_LOCK:
         existing = _ACTIVE_MODEL_READS.get(canonical_key)
-        if existing and existing["status"] == "running":
+        if existing and existing["status"] in ("queued", "running"):
             print(f"[active_read] duplicate_read_prevented key={canonical_key[:80]} "
-                  f"owner_existing={existing['owner']} owner_new={owner}")
+                  f"owner_existing={existing['owner']} owner_new={owner} "
+                  f"active_read_attached_existing_future=1 active_read_duplicate_prevented=1")
             return "duplicate"
         entry = {
             "canonical_key": canonical_key,
             "owner": owner,
             "path": path,
             "start_time": time.time(),
-            "status": "running",
+            "status": "queued" if (FUSE_READ_GOVERNOR_ENABLED and is_large) else "running",
             "future": future,
-            "event": event,
+            "event": event or _threading.Event(),
             "result_available": False,
             "error": "",
             "completed_at": 0.0,
+            "loader_type": loader_type,
+            "phase": phase,
+            "active_read_governor_enabled": 1 if FUSE_READ_GOVERNOR_ENABLED else 0,
+            "active_read_priority": active_read_priority,
+            "active_read_queue_enter_ms": 0.0,
+            "active_read_queue_exit_ms": 0.0,
+            "active_read_queue_wait_ms": 0.0,
+            "active_read_large_slots_used_at_enter": 0,
+            "active_read_large_slots_used_at_start": 0,
+            "active_read_large_slots_used_at_end": 0,
+            "active_read_concurrent_large_reads_at_start": 0,
+            "active_read_concurrent_large_reads_at_end": 0,
+            "active_read_attached_existing_future": 0,
+            "active_read_duplicate_prevented": 0,
+            "active_read_large_slot_acquired": False,
+            **classification,
         }
         _ACTIVE_MODEL_READS[canonical_key] = entry
-    print(f"[active_read] registered owner={owner} key={canonical_key[:80]}")
+    if is_large and FUSE_READ_GOVERNOR_ENABLED:
+        queue_enter = time.time()
+        with _FUSE_LARGE_READS_COND:
+            entry = _ACTIVE_MODEL_READS.get(canonical_key)
+            if entry is None:
+                return "missing"
+            entry["active_read_queue_enter_ms"] = round((queue_enter - entry["start_time"]) * 1000, 1)
+            entry["active_read_large_slots_used_at_enter"] = _FUSE_LARGE_READS_IN_PROGRESS
+            while _FUSE_LARGE_READS_IN_PROGRESS >= FUSE_LARGE_READ_CONCURRENCY:
+                _FUSE_LARGE_READS_COND.wait(timeout=0.05)
+            _FUSE_LARGE_READS_IN_PROGRESS += 1
+            _FUSE_LARGE_READS_ACTIVE[canonical_key] = {
+                "owner": owner,
+                "key": canonical_key,
+                "priority": active_read_priority,
+                "phase": phase,
+            }
+            queue_exit = time.time()
+            entry["status"] = "running"
+            entry["active_read_queue_exit_ms"] = round((queue_exit - entry["start_time"]) * 1000, 1)
+            entry["active_read_queue_wait_ms"] = round((queue_exit - queue_enter) * 1000, 1)
+            entry["active_read_large_slots_used_at_start"] = _FUSE_LARGE_READS_IN_PROGRESS
+            entry["active_read_concurrent_large_reads_at_start"] = len(_running_large_reads_locked())
+            entry["active_read_large_slot_acquired"] = True
+            if _FUSE_LARGE_READS_IN_PROGRESS > FUSE_LARGE_READ_CONCURRENCY:
+                others = [v for k, v in _FUSE_LARGE_READS_ACTIVE.items() if k != canonical_key]
+                other = others[0] if others else {}
+                print(
+                    f"[active_read] active_read_governor_violation=1 "
+                    f"owner_a={other.get('owner','?')} owner_b={owner} "
+                    f"key_a={str(other.get('key',''))[:80]} key_b={canonical_key[:80]} "
+                    f"priority_a={other.get('priority','?')} priority_b={active_read_priority} "
+                    f"phase_a={other.get('phase','?')} phase_b={phase}"
+                )
+    elif is_large:
+        with _ACTIVE_MODEL_READS_LOCK:
+            entry = _ACTIVE_MODEL_READS.get(canonical_key)
+            running_large = _running_large_reads_locked()
+            if entry is not None:
+                entry["active_read_concurrent_large_reads_at_start"] = len(running_large)
+            if len(running_large) > 1:
+                print(f"[active_read] active_read_large_overlap_observed=1 concurrent_large_reads={len(running_large)}")
+    else:
+        with _ACTIVE_MODEL_READS_LOCK:
+            entry = _ACTIVE_MODEL_READS.get(canonical_key)
+            if entry is not None:
+                entry["active_read_concurrent_large_reads_at_start"] = len(_running_large_reads_locked())
+    with _ACTIVE_MODEL_READS_LOCK:
+        entry = _ACTIVE_MODEL_READS.get(canonical_key, {})
+        _log_fields = dict(entry)
+    print(
+        f"[active_read] registered owner={owner} key={canonical_key[:80]} "
+        f"active_read_governor_enabled={_log_fields.get('active_read_governor_enabled', 0)} "
+        f"active_read_priority={_log_fields.get('active_read_priority', 0)} "
+        f"active_read_size_bytes={_log_fields.get('active_read_size_bytes', -1)} "
+        f"active_read_size_mb={_log_fields.get('active_read_size_mb', -1.0)} "
+        f"active_read_is_large={_log_fields.get('active_read_is_large', 0)} "
+        f"active_read_classification_source={_log_fields.get('active_read_classification_source', '?')} "
+        f"active_read_queue_enter_ms={_log_fields.get('active_read_queue_enter_ms', 0.0)} "
+        f"active_read_queue_exit_ms={_log_fields.get('active_read_queue_exit_ms', 0.0)} "
+        f"active_read_queue_wait_ms={_log_fields.get('active_read_queue_wait_ms', 0.0)} "
+        f"active_read_large_slots_used_at_enter={_log_fields.get('active_read_large_slots_used_at_enter', 0)} "
+        f"active_read_large_slots_used_at_start={_log_fields.get('active_read_large_slots_used_at_start', 0)} "
+        f"active_read_concurrent_large_reads_at_start={_log_fields.get('active_read_concurrent_large_reads_at_start', 0)} "
+        f"active_read_attached_existing_future={_log_fields.get('active_read_attached_existing_future', 0)} "
+        f"active_read_duplicate_prevented={_log_fields.get('active_read_duplicate_prevented', 0)}"
+    )
     return "registered"
 
 
@@ -1814,9 +2225,10 @@ def _attach_active_model_read_future(canonical_key: str, future) -> None:
         if entry is None:
             return
         entry["future"] = future
+        entry["active_read_attached_existing_future"] = 1
         if entry.get("event") is None:
             entry["event"] = _threading.Event()
-    print(f"[active_read] attached_future owner={entry['owner']} key={canonical_key[:80]}")
+    print(f"[active_read] attached_future owner={entry['owner']} key={canonical_key[:80]} active_read_attached_existing_future=1")
 
 
 def _complete_active_model_read(canonical_key: str) -> None:
@@ -1825,6 +2237,7 @@ def _complete_active_model_read(canonical_key: str) -> None:
         entry = _ACTIVE_MODEL_READS.get(canonical_key)
         if entry is None:
             return
+        _release_fuse_large_read_slot_locked(canonical_key, entry)
         entry["status"] = "completed"
         entry["result_available"] = True
         entry["completed_at"] = time.time()
@@ -1840,6 +2253,7 @@ def _fail_active_model_read(canonical_key: str, error: str = "") -> None:
         entry = _ACTIVE_MODEL_READS.get(canonical_key)
         if entry is None:
             return
+        _release_fuse_large_read_slot_locked(canonical_key, entry)
         entry["status"] = "failed"
         entry["result_available"] = True
         if error:
@@ -1851,6 +2265,12 @@ def _fail_active_model_read(canonical_key: str, error: str = "") -> None:
     print(f"[active_read] failed owner={entry['owner']} key={canonical_key[:80]} error={error[:120]}")
 
 
+def _count_active_model_reads() -> int:
+    """Return the current number of active model reads (for diagnostics)."""
+    with _ACTIVE_MODEL_READS_LOCK:
+        return len(_ACTIVE_MODEL_READS)
+
+
 def _check_active_model_read(canonical_key: str) -> dict | None:
     """Return a snapshot of the registry entry if still running, else None.
 
@@ -1859,7 +2279,7 @@ def _check_active_model_read(canonical_key: str) -> dict | None:
     """
     with _ACTIVE_MODEL_READS_LOCK:
         entry = _ACTIVE_MODEL_READS.get(canonical_key)
-        if entry and entry["status"] == "running":
+        if entry and entry["status"] in ("queued", "running"):
             return dict(entry)
     return None
 
@@ -1880,7 +2300,7 @@ def _wait_for_active_model_read(canonical_key: str, reason: str = "") -> dict:
         if entry is None:
             return {"waited": False, "wait_ms": 0.0, "status": None,
                     "owner": None, "error": "no_entry"}
-        if entry["status"] != "running":
+        if entry["status"] not in ("queued", "running"):
             return {"waited": False, "wait_ms": 0.0,
                     "status": entry["status"], "owner": entry.get("owner"),
                     "error": entry.get("error", "")}
@@ -1954,7 +2374,7 @@ def _is_graph_loader_joinable(canonical_key: str) -> tuple:
         entry = _ACTIVE_MODEL_READS.get(canonical_key)
         if entry is None:
             return False, "no_active_read"
-        if entry["status"] != "running":
+        if entry["status"] not in ("queued", "running"):
             return False, f"read_not_running:{entry['status']}"
         if entry.get("future") is None and entry.get("event") is None:
             return False, "no_waitable"
@@ -2073,6 +2493,21 @@ def save_known_good_workflow_profiles(profiles: dict) -> None:
         print(f"[comfyapp] failed to save known-good profiles: {exc}")
 
 
+def _build_known_good_profile_key(profile: dict, workflow: dict | None = None) -> str:
+    payload = {
+        k: v for k, v in dict(profile or {}).items()
+        if k not in {"workflow_hash", "profile_key"}
+    }
+    if isinstance(workflow, dict):
+        payload["required_class_types"] = sorted({
+            spec.get("class_type", "")
+            for spec in workflow.values()
+            if isinstance(spec, dict) and isinstance(spec.get("class_type"), str) and spec.get("class_type")
+        })
+    compact = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(compact.encode("utf-8")).hexdigest()[:16]
+
+
 def _is_known_good_workflow_profile(workflow_hash: str, profile: dict) -> bool:
     """Return True if this workflow/profile is known-good (previously succeeded)."""
     profiles = load_known_good_workflow_profiles()
@@ -2094,7 +2529,7 @@ def _is_known_good_workflow_profile(workflow_hash: str, profile: dict) -> bool:
     return False
 
 
-def _mark_known_good_workflow_profile(workflow_hash: str, profile: dict) -> bool:
+def _mark_known_good_workflow_profile(workflow_hash: str, profile: dict, workflow: dict | None = None) -> bool:
     """Mark a workflow/profile as known-good after successful execution.
 
     Returns True if a new or changed entry was persisted and a volume
@@ -2102,15 +2537,25 @@ def _mark_known_good_workflow_profile(workflow_hash: str, profile: dict) -> bool
     and is identical (no commit scheduled).
     """
     profiles = load_known_good_workflow_profiles()
+    profile_key = _build_known_good_profile_key(profile, workflow)
     new_entry = {
         "mode": profile.get("mode", ""),
         "workflow_hash": workflow_hash,
+        "profile_key": profile_key,
         **profile,
     }
     existing = profiles.get(workflow_hash)
     if existing is not None and existing == new_entry:
         print(f"[comfyapp] marked known-good workflow hash={workflow_hash} changed=0 (identical)")
         return False
+    for existing_hash, existing_entry in profiles.items():
+        existing_key = existing_entry.get("profile_key") or _build_known_good_profile_key(existing_entry)
+        if existing_key == profile_key and existing_hash != workflow_hash:
+            print(
+                f"[comfyapp] known_good_profile status=unchanged_profile_key "
+                f"workflow_hash={workflow_hash} existing_hash={existing_hash} profile_key={profile_key}"
+            )
+            return False
     profiles[workflow_hash] = new_entry
     save_known_good_workflow_profiles(profiles)
     print(f"[comfyapp] marked known-good workflow hash={workflow_hash} changed=1")
@@ -3484,6 +3929,7 @@ _image_base = (
             "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
             "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "1",
             "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "1",
+            "COMFYMODAL_SAFETENSORS_READ_MODE": "normal",
             "COMFYMODAL_RUNTIME": "1",
             "PROMPT_ASYNC_PRELOAD": "0",
             "PROMPT_PRELOAD_WORKERS": "2",
@@ -5215,16 +5661,43 @@ class _ComfyAPIMixin:
             if to_load:
                 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
-                def _load_one(path: str, filename: str, cache_key: str) -> tuple[str, str, object, object | None, float, int]:
+                def _load_one(path: str, filename: str, cache_key: str) -> tuple[str, str, object, object | None, float, int, dict]:
                     started = time.time()
-                    _register_active_model_read(cache_key, owner="restore_preload", path=path)
+                    _t_before_register = time.time()
+                    _reg_status = _register_active_model_read(cache_key, owner="restore_preload", path=path, phase="restore")
+                    _active_register_ms = round((time.time() - _t_before_register) * 1000, 1)
+                    _attached_existing = 1 if _reg_status == "duplicate" else 0
+                    if _reg_status == "duplicate":
+                        _wr = _wait_for_active_model_read(cache_key, reason="restore_preload_duplicate")
+                        for _lookup_key in _model_cpu_cache_lookup_keys(path):
+                            if _lookup_key in getattr(self, "_model_cpu_cache", {}):
+                                _cached_state, _cached_meta = self._model_cpu_cache[_lookup_key]
+                                _dup_ms = round((time.time() - started) * 1000, 1)
+                                _dup_diag = {
+                                    "active_read_register_ms": _active_register_ms,
+                                    "loader_ms": _dup_ms,
+                                    "cache_register_ms": 0.0,
+                                    "concurrent_reads_at_start": _count_active_model_reads(),
+                                    "concurrent_reads_at_end": _count_active_model_reads(),
+                                    "effective_safetensors_mode": os.environ.get("COMFYMODAL_SAFETENSORS_READ_MODE", "normal").strip().lower(),
+                                    "file_size_bytes": os.path.getsize(path) if os.path.exists(path) else -1,
+                                    "cpu_cache_hit_before": True,
+                                    "active_read_attached_existing_future": 1,
+                                    "active_read_duplicate_prevented": 1,
+                                }
+                                print(f"[preload_model_read_duplicate_adopted] file={filename} key={cache_key[:80]} wait_ms={_wr.get('wait_ms', 0)}")
+                                return filename, cache_key, _cached_state, _cached_meta, _dup_ms, _dup_diag["file_size_bytes"], _dup_diag
+                        _reg_status = _register_active_model_read(cache_key, owner="restore_preload", path=path, phase="restore")
+                    _concurrent_at_start = _count_active_model_reads()
+                    _eff_safetensors_mode = os.environ.get("COMFYMODAL_SAFETENSORS_READ_MODE", "normal").strip().lower()
                     try:
                         loaded = original_loader(path, return_metadata=True)
                     except Exception as _lo_exc:
                         _fail_active_model_read(cache_key, error=f"{_lo_exc}")
                         print(f"[preload_model_read_failed] file={filename} key={cache_key[:80]} owner=restore_preload error={_lo_exc!r}")
                         raise
-                    d_ms = round((time.time() - started) * 1000, 1)
+                    _loader_done = time.time()
+                    _loader_ms = round((_loader_done - started) * 1000, 1)
                     _read_bytes = 0
                     try:
                         _read_bytes = os.path.getsize(path)
@@ -5237,12 +5710,28 @@ class _ComfyAPIMixin:
                     else:
                         state_dict, metadata = loaded, None
                     # Direct assignment into model_cpu_cache (safe, keyed by canonical path)
+                    _t_before_cache = time.time()
                     _model_cache_local = getattr(self, "_model_cpu_cache", {})
+                    _cpu_cache_hit_detect = cache_key in _model_cache_local
                     _model_cache_local[cache_key] = (state_dict, metadata)
+                    _cache_register_ms = round((time.time() - _t_before_cache) * 1000, 1)
                     _complete_active_model_read(cache_key)
+                    _concurrent_at_end = _count_active_model_reads()
+                    _per_file_diag = {
+                        "active_read_register_ms": _active_register_ms,
+                        "loader_ms": _loader_ms,
+                        "cache_register_ms": _cache_register_ms,
+                        "concurrent_reads_at_start": _concurrent_at_start,
+                        "concurrent_reads_at_end": _concurrent_at_end,
+                        "effective_safetensors_mode": _eff_safetensors_mode,
+                        "file_size_bytes": _read_bytes,
+                        "cpu_cache_hit_before": _cpu_cache_hit_detect,
+                        "active_read_attached_existing_future": _attached_existing,
+                        "active_read_duplicate_prevented": 1 if _attached_existing else 0,
+                    }
                     if isinstance(loaded, tuple) and len(loaded) == 2:
-                        return filename, cache_key, loaded[0], loaded[1], d_ms, _read_bytes
-                    return filename, cache_key, loaded, None, d_ms, _read_bytes
+                        return filename, cache_key, loaded[0], loaded[1], _loader_ms, _read_bytes, _per_file_diag
+                    return filename, cache_key, loaded, None, _loader_ms, _read_bytes, _per_file_diag
 
                 def _check_abort() -> bool:
                     nonlocal _aborted, _abort_reason, _abort_throughput_checked, _last_throughput_check_time, _last_throughput_check_bytes
@@ -5318,7 +5807,7 @@ class _ComfyAPIMixin:
                         filename = _fname
                         cache_key = _cache_key
                         try:
-                            fn, cache_key, state_dict, metadata, d_ms, _read_bytes = future.result()
+                            fn, cache_key, state_dict, metadata, d_ms, _read_bytes, _per_file_diag = future.result()
                             _completed_bytes += _read_bytes
                             _completed_files += 1
                             _session_valid = getattr(self, "_active_cpu_preload_session_id", None) == _preload_session_id
@@ -5331,6 +5820,9 @@ class _ComfyAPIMixin:
                                     except Exception:
                                         pass
                             file_timing_ms[fn] = d_ms
+                            if not hasattr(self, "_per_file_preload_diag"):
+                                self._per_file_preload_diag = {}
+                            self._per_file_preload_diag[fn] = _per_file_diag
                             size_mb = "?"
                             for p, f, _cache_key in to_load:
                                 if f == fn:
@@ -5433,6 +5925,7 @@ class _ComfyAPIMixin:
                 "count": len(cached),
                 "cached": cached,
                 "file_timing_ms": file_timing_ms,
+                "per_file_diag": getattr(self, "_per_file_preload_diag", {}),
                 "budget_exceeded": _budget_exceeded,
                 "aborted": _aborted,
                 "abort_reason": _abort_reason,
@@ -5448,6 +5941,8 @@ class _ComfyAPIMixin:
         finally:
             if getattr(self, "_active_cpu_preload_session_id", None) == _preload_session_id:
                 self._active_cpu_preload_session_id = None
+            if hasattr(self, "_per_file_preload_diag"):
+                self._per_file_preload_diag = {}
 
     def _model_in_cpu_cache(self, path: str) -> bool:
         """Return True if a model file is already in ``_model_cpu_cache``.
@@ -5566,6 +6061,8 @@ class _ComfyAPIMixin:
             if start_s is not None and graph_req_s is not None:
                 head_start_ms = max(0.0, (graph_req_s - start_s) * 1000)
                 rec["head_start_ms"] = round(head_start_ms, 2)
+                if str(rec.get("loader_type", "")).upper() == "UNET":
+                    rec["unet_future_head_start_ms"] = round(head_start_ms, 2)
 
             # graph_wait_ms: prefer explicit wait timestamps, fallback to field
             wait_ms = rec.get("graph_wait_ms", 0.0) or 0.0
@@ -5574,6 +6071,8 @@ class _ComfyAPIMixin:
                 rec["graph_wait_ms"] = round(wait_ms, 2)
 
             rec["remaining_wait_ms"] = round(wait_ms, 2)
+            if str(rec.get("loader_type", "")).upper() == "UNET":
+                rec["unet_future_wait_ms"] = round(wait_ms, 2)
 
             # critical_path_saved_ms:
             #   = actual_load_duration_ms - graph_wait_ms  (when actual_load_future used)
@@ -5603,11 +6102,22 @@ class _ComfyAPIMixin:
             "enabled": False, "submitted": [], "skipped_unet": False, "futures": {},
             "clip_submitted": False, "clip_cache_hit": False, "clip_duration_ms": 0.0,
             "actual_load_mode": ACTUAL_LOAD_MODE,
+            "actual_load_mode_effective": ACTUAL_LOAD_MODE,
+            "actual_load_submit_order": [],
+            "actual_load_clip_skipped_reason": "",
+            "actual_load_vae_skipped_reason": "",
         }
         if not PROMPT_ASYNC_ACTUAL_LOAD:
             print("[actual_load] enabled=0")
             return result
         print("[actual_load] enabled=1")
+        if ACTUAL_LOAD_MODE == "off":
+            result["enabled"] = False
+            result["actual_load_clip_skipped_reason"] = "mode_off"
+            result["actual_load_vae_skipped_reason"] = "mode_off"
+            result["skipped_unet"] = True
+            print("[actual_load] disabled_by_mode mode=off")
+            return result
         # Degraded mode guard: check before ANY worker submit (VAE, UNET, CLIP).
         # If preload stalled or failed, do not start background model reads.
         if getattr(self, "_preload_failed", False):
@@ -5629,10 +6139,28 @@ class _ComfyAPIMixin:
         import os as _al_os, nodes as _al_nodes, folder_paths as _al_fp, threading as _al_thr
         self._init_actual_load_registry()
         resolved_keys = []
-        _mode_clip = ACTUAL_LOAD_MODE not in ("unet_vae_only", "unet_only")
-        _mode_vae = ACTUAL_LOAD_MODE not in ("unet_only",)
-        _mode_unet = ACTUAL_LOAD_MODE not in ("clip_vae_only",)
-        print(f"[actual_load] mode={ACTUAL_LOAD_MODE} will_start_clip={1 if _mode_clip else 0} will_start_vae={1 if _mode_vae else 0} will_start_unet={1 if _mode_unet else 0}")
+        _rt_restore = getattr(self, "_last_restore_timing", None) or {}
+        _restore_direct_clip_effective = (
+            _rt_restore.get("restore_direct_clip_policy") == "auto"
+            and int(_rt_restore.get("direct_warmup_load_clip_effective", 0) or 0) == 1
+            and int(_rt_restore.get("direct_warmup_clip_encode_effective", 0) or 0) == 1
+        )
+        _mode_clip = ACTUAL_LOAD_MODE == "clip_vae_only" and not _restore_direct_clip_effective
+        _mode_vae = ACTUAL_LOAD_MODE in ("clip_vae_only", "unet_vae_only")
+        _mode_unet = ACTUAL_LOAD_MODE in ("unet_only", "unet_vae_only")
+        if _restore_direct_clip_effective:
+            result["actual_load_clip_skipped_reason"] = "restore_direct_clip_effective"
+        elif not _mode_clip:
+            result["actual_load_clip_skipped_reason"] = f"mode_{ACTUAL_LOAD_MODE}"
+        if not _mode_vae:
+            result["actual_load_vae_skipped_reason"] = "mode_unet_only" if ACTUAL_LOAD_MODE == "unet_only" else f"mode_{ACTUAL_LOAD_MODE}"
+        print(
+            f"[actual_load] actual_load_mode_effective={ACTUAL_LOAD_MODE} "
+            f"will_start_clip={1 if _mode_clip else 0} will_start_vae={1 if _mode_vae else 0} "
+            f"will_start_unet={1 if _mode_unet else 0} "
+            f"actual_load_clip_skipped_reason={result.get('actual_load_clip_skipped_reason','')} "
+            f"actual_load_vae_skipped_reason={result.get('actual_load_vae_skipped_reason','')}"
+        )
 
         # ── CLIP (single file) ──
         if _mode_clip:
@@ -5693,6 +6221,7 @@ class _ComfyAPIMixin:
                     _t.start()
                     self._actual_load_futures[key] = _t
                     result["submitted"].append(f"CLIP key={key}")
+                    result["actual_load_submit_order"].append("CLIP")
                     result["clip_submitted"] = True
                     print(f"[actual_load] submit_raw_key=({clip_path}, {clip_type}) submit_canonical_key={key}")
             # ── CLIP (DualCLIP — second file if different) ──
@@ -5753,68 +6282,12 @@ class _ComfyAPIMixin:
                         _t.start()
                         self._actual_load_futures[key] = _t
                         result["submitted"].append(f"DualCLIP key={key}")
+                        result["actual_load_submit_order"].append("DualCLIP")
                         print(f"[actual_load] submit_raw_key=({clip_path}, {clip_type}) submit_canonical_key={key}")
         elif ACTUAL_LOAD_MODE in ("unet_vae_only", "unet_only"):
             print(f"[actual_load] mode_violation_check mode={ACTUAL_LOAD_MODE} started_clip=0 correct=1")
 
-        # ── VAE ──
-        if _mode_vae:
-            for vae_name in stack.get("vae", []):
-                vae_path = _al_fp.get_full_path("vae", vae_name) or vae_name
-                if not vae_path:
-                    continue
-                try:
-                    vae_real = _al_os.path.realpath(vae_path)
-                except Exception:
-                    vae_real = vae_path
-                key = ("VAELoader", vae_real)
-                resolved_keys.append(key)
-                lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
-                with lock:
-                    if key in self._actual_load_futures:
-                        self._actual_load_duplicates_prevented += 1
-                        print(f"[actual_load] duplicate_prevented key={key}")
-                        continue
-                    self._init_vae_cache()
-                    if hasattr(self, "_vae_object_cache") and key in self._vae_object_cache:
-                        print(f"[actual_load] cache_hit key={key}")
-                        continue
-                    _al_start_v = time.time()
-                    self._wall_actual_load_per_model.append({
-                        "loader_type": "VAE", "canonical_key": str(key),
-                        "actual_load_start_unix_s": _al_start_v,
-                        "actual_load_done_unix_s": None,
-                    })
-                    def _load_vae(k=key, vn=vae_name, vp=vae_real, _rec_idx=len(self._wall_actual_load_per_model) - 1):
-                        import threading as _thr_lv
-                        _tid = _thr_lv.current_thread().ident
-                        self._actual_load_owner_thread[k] = _tid
-                        print(f"[actual_load] worker_start loader=VAE key={k} thread_id={_tid}")
-                        t0 = time.time()
-                        try:
-                            _orig_fn = self._original_loaders.get("VAELoader.load_vae")
-                            with _model_load_context(owner="actual_load", loader_type="VAE", actual_key=k, canonical_path=vp, record_id=str(_rec_idx)):
-                                if _orig_fn:
-                                    print(f"[actual_load] using_original_loader loader=VAE key={k}")
-                                    obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["VAELoader"](), vae_name=vn)
-                                else:
-                                    obj = _al_nodes.NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=vn)
-                            self._vae_object_cache[k] = obj[0]
-                            d_ms = round((time.time() - t0) * 1000, 1)
-                            if _rec_idx < len(self._wall_actual_load_per_model):
-                                self._wall_actual_load_per_model[_rec_idx]["actual_load_done_unix_s"] = time.time()
-                            print(f"[actual_load] done loader=VAE key={k} ms={d_ms}")
-                        except Exception as e:
-                            print(f"[actual_load] failed loader=VAE key={k} err={e}")
-                        finally:
-                            self._actual_load_owner_thread.pop(k, None)
-                    _t = _al_thr.Thread(target=_load_vae, daemon=True)
-                    _t.start()
-                    self._actual_load_futures[key] = _t
-                    result["submitted"].append(f"VAE key={key}")
-                    print(f"[actual_load] submitted loader=VAE key={key}")
-
-        # ── UNET ──
+        # ── UNET (submitted before VAE for better head start) ──
         if _mode_unet:
             unet_names = stack.get("unet", []) or stack.get("checkpoint", [])
             for unet_name in unet_names:
@@ -5842,6 +6315,8 @@ class _ComfyAPIMixin:
                         print(f"[actual_load] duplicate_prevented key={key}")
                         continue
                     _al_start_u = time.time()
+                    result["actual_load_unet_submitted_at_ms_from_entry"] = round((_al_start_u - _al_t0) * 1000, 1)
+                    result["actual_load_unet_submitted_at_ms_from_modal_entry"] = result["actual_load_unet_submitted_at_ms_from_entry"]
                     self._wall_actual_load_per_model.append({
                         "loader_type": "UNET", "canonical_key": str(key),
                         "actual_load_start_unix_s": _al_start_u,
@@ -5881,12 +6356,82 @@ class _ComfyAPIMixin:
                     _t.start()
                     self._actual_load_futures[key] = _t
                     result["submitted"].append(f"UNET key={key}")
+                    result["actual_load_submit_order"].append("UNET")
                     print(f"[actual_load] submitted loader=UNET key={key}")
         else:
             result["skipped_unet"] = True
             print(f"[actual_load] skipped_unet mode={ACTUAL_LOAD_MODE}")
+
+        # ── VAE (submitted after UNET, deprioritized) ──
+        if _mode_vae:
+            for vae_name in stack.get("vae", []):
+                vae_path = _al_fp.get_full_path("vae", vae_name) or vae_name
+                if not vae_path:
+                    continue
+                try:
+                    vae_real = _al_os.path.realpath(vae_path)
+                except Exception:
+                    vae_real = vae_path
+                key = ("VAELoader", vae_real)
+                resolved_keys.append(key)
+                _vae_classification = _classify_fuse_read(vae_real, loader_type="VAE")
+                if FUSE_READ_GOVERNOR_ENABLED and int(_vae_classification.get("active_read_is_large", 0)) == 1:
+                    result["actual_load_vae_skipped_reason"] = "large_read_governor_defer"
+                    print(
+                        f"[actual_load] skipped loader=VAE reason=large_read_governor_defer "
+                        f"active_read_size_mb={_vae_classification.get('active_read_size_mb', -1.0)}"
+                    )
+                    continue
+                lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
+                with lock:
+                    if key in self._actual_load_futures:
+                        self._actual_load_duplicates_prevented += 1
+                        print(f"[actual_load] duplicate_prevented key={key}")
+                        continue
+                    self._init_vae_cache()
+                    if hasattr(self, "_vae_object_cache") and key in self._vae_object_cache:
+                        print(f"[actual_load] cache_hit key={key}")
+                        continue
+                    _al_start_v = time.time()
+                    result["actual_load_vae_submitted_at_ms_from_entry"] = round((_al_start_v - _al_t0) * 1000, 1)
+                    result["actual_load_vae_submitted_at_ms_from_modal_entry"] = result["actual_load_vae_submitted_at_ms_from_entry"]
+                    self._wall_actual_load_per_model.append({
+                        "loader_type": "VAE", "canonical_key": str(key),
+                        "actual_load_start_unix_s": _al_start_v,
+                        "actual_load_done_unix_s": None,
+                    })
+                    def _load_vae(k=key, vn=vae_name, vp=vae_real, _rec_idx=len(self._wall_actual_load_per_model) - 1):
+                        import threading as _thr_lv
+                        _tid = _thr_lv.current_thread().ident
+                        self._actual_load_owner_thread[k] = _tid
+                        print(f"[actual_load] worker_start loader=VAE key={k} thread_id={_tid}")
+                        t0 = time.time()
+                        try:
+                            _orig_fn = self._original_loaders.get("VAELoader.load_vae")
+                            with _model_load_context(owner="actual_load", loader_type="VAE", actual_key=k, canonical_path=vp, record_id=str(_rec_idx)):
+                                if _orig_fn:
+                                    print(f"[actual_load] using_original_loader loader=VAE key={k}")
+                                    obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["VAELoader"](), vae_name=vn)
+                                else:
+                                    obj = _al_nodes.NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=vn)
+                            self._vae_object_cache[k] = obj[0]
+                            d_ms = round((time.time() - t0) * 1000, 1)
+                            if _rec_idx < len(self._wall_actual_load_per_model):
+                                self._wall_actual_load_per_model[_rec_idx]["actual_load_done_unix_s"] = time.time()
+                            print(f"[actual_load] done loader=VAE key={k} ms={d_ms}")
+                        except Exception as e:
+                            print(f"[actual_load] failed loader=VAE key={k} err={e}")
+                        finally:
+                            self._actual_load_owner_thread.pop(k, None)
+                    _t = _al_thr.Thread(target=_load_vae, daemon=True)
+                    _t.start()
+                    self._actual_load_futures[key] = _t
+                    result["submitted"].append(f"VAE key={key}")
+                    result["actual_load_submit_order"].append("VAE")
+                    print(f"[actual_load] submitted loader=VAE key={key}")
+
         result["enabled"] = True
-        print(f"[actual_load] resolved_keys={resolved_keys}")
+        print(f"[actual_load] actual_load_submit_order={result.get('actual_load_submit_order', [])} resolved_keys={resolved_keys}")
         return result
 
     def _cold_unet_early_actual_load(self, workflow: dict, modal_options: dict | None = None) -> dict:
@@ -6843,7 +7388,7 @@ class _ComfyAPIMixin:
             ctx_owner = getattr(_MODEL_LOAD_CONTEXT, "owner", "graph_loader")
             ctx_loader_type = getattr(_MODEL_LOAD_CONTEXT, "loader_type", "")
             ctx_actual_key = getattr(_MODEL_LOAD_CONTEXT, "actual_key", None)
-            _register_active_model_read(miss_key, owner=ctx_owner, path=path)
+            _register_active_model_read(miss_key, owner=ctx_owner, path=path, loader_type=ctx_loader_type, phase="prompt")
             if ctx_owner != "graph_loader" and ctx_loader_type:
                 _actual_key_str = str(ctx_actual_key) if ctx_actual_key is not None else ""
                 print(f"[active_read] registered owner={ctx_owner} loader={ctx_loader_type} "
@@ -8434,7 +8979,7 @@ class _ComfyAPIMixin:
             _known_stack = extract_requested_model_stack(workflow)
             _known_profile = stack_to_profile(_known_stack)
             if _known_profile:
-                _known_good_marked = _mark_known_good_workflow_profile(_known_workflow_hash, _known_profile)
+                _known_good_marked = _mark_known_good_workflow_profile(_known_workflow_hash, _known_profile, workflow=workflow)
                 if _known_good_marked:
                     print(
                         f"[comfyapp] marked known-good workflow hash={_known_workflow_hash} "
@@ -8492,6 +9037,7 @@ class _ComfyAPIMixin:
         videos: list[dict] = []
         seen_filenames: set[str] = set()  # de-dupe across sources
         per_node_outputs: dict[str, dict[str, list[dict]]] = {}
+        _output_seq = 0
 
         comfy_root = Path("/root/comfy/ComfyUI")
         dir_for_type = {
@@ -8506,11 +9052,13 @@ class _ComfyAPIMixin:
         _quality = _mo.get("quality", _CONVERTER_DEFAULTS["quality"])
         _wlc = _mo.get("webp_lossless_compression", _CONVERTER_DEFAULTS["webp_lossless_compression"])
         _conversion_meta: list[dict] = []
+        _pending_conversions: list[dict] = []
         _oc_timing = {
             "history_fetch_ms": 0.0,
             "file_scan_ms": 0.0,
             "read_total_ms": 0.0,
             "conversion_total_ms": 0.0,
+            "conversion_worker_sum_ms": 0.0,
             "return_packaging_ms": 0.0,
             "files_read": 0,
             "bytes_read": 0,
@@ -8518,6 +9066,8 @@ class _ComfyAPIMixin:
             "images_found": 0,
             "videos_found": 0,
             "files_returned": 0,
+            "output_conversion_parallel": 0,
+            "output_conversion_workers": 0,
         }
         print("[timing.output] collection_start")
 
@@ -8527,6 +9077,7 @@ class _ComfyAPIMixin:
             return ("_temp_" in name or name.endswith("_temp")) and "rgthree" in name
 
         def _read_and_store(fp: Path, node_id: str, animated: bool, output_key: str | None = None, allow_rgthree_temp: bool = True) -> None:
+            nonlocal _output_seq
             """Read a single file and append to images/videos.
 
             When ``output_key`` is given the entry is also recorded in
@@ -8549,65 +9100,47 @@ class _ComfyAPIMixin:
             if _r_ms > 100:
                 print(f"[comfyapp] slow output read: file={fp.name} size={len(raw)} duration_ms={_r_ms}")
 
-            # ── Apply output format conversion ──────────────────────
+            # ── Apply output format conversion (deferred) ─────────────
+            _seq = _output_seq
+            _output_seq += 1
             is_animated = animated or fp.suffix.lower() in (".gif", ".mp4", ".webm")
             do_convert = (
                 _output_fmt != "original"
                 and not is_animated
                 and fp.suffix.lower() in (".png", ".jpg", ".jpeg")
             )
-            converted = None
             _conv_start = time.time()
             if do_convert:
-                converted = _convert_image_bytes(
-                    raw,
-                    output_format=_output_fmt,
-                    quality=_quality,
-                    webp_lossless_compression=_wlc,
-                )
-                out_bytes = converted["bytes"]
-                out_filename = _change_extension(fp.name, converted["file_ext"])
-                _conversion_meta.append({
-                    "filename": out_filename,
+                _pending_conversions.append({
+                    "fp_name": fp.name,
+                    "raw": raw,
                     "node_id": node_id,
-                    "output_format": converted["output_format"],
-                    "mime_type": converted["mime_type"],
-                    "file_ext": converted["file_ext"],
-                    "original_size_bytes": converted["original_size_bytes"],
-                    "returned_size_bytes": converted["returned_size_bytes"],
-                    "conversion_time_ms": converted["conversion_time_ms"],
-                    "quality": converted.get("quality"),
-                    "webp_lossless_compression": converted.get("webp_lossless_compression"),
-                    "fallback": converted.get("fallback", False),
-                    "error": converted.get("error"),
+                    "output_key": output_key,
+                    "out_bytes": raw,
+                    "out_filename": fp.name,
+                    "converted_meta": None,
+                    "done": False,
+                    "seq": _seq,
                 })
-                _oc_timing["conversion_total_ms"] += converted["conversion_time_ms"]
-                print(
-                    f"[comfyapp.convert] fmt={_output_fmt} "
-                    f"orig={converted['original_size_bytes']}B "
-                    f"out={converted['returned_size_bytes']}B "
-                    f"time={converted['conversion_time_ms']}ms "
-                    f"file={out_filename}"
-                    + (f" fallback_err={converted['error']}" if converted.get("fallback") else "")
-                )
             else:
                 out_bytes = raw
                 out_filename = fp.name
-            _oc_timing["conversion_total_ms"] += round((time.time() - _conv_start) * 1000, 1) - (converted["conversion_time_ms"] if converted else 0)
 
-            entry = {"filename": out_filename, "data": base64.b64encode(out_bytes).decode(), "node_id": node_id}
-            _oc_timing["bytes_returned"] += len(entry["data"])
-            if animated or fp.suffix.lower() in (".gif", ".mp4", ".webm", ".webp"):
-                videos.append(entry)
-                _oc_timing["videos_found"] += 1
+            if not do_convert:
+                entry = {"filename": out_filename, "data": base64.b64encode(out_bytes).decode(), "node_id": node_id, "_seq": _seq}
+                _oc_timing["bytes_returned"] += len(entry["data"])
+                if animated or fp.suffix.lower() in (".gif", ".mp4", ".webm", ".webp"):
+                    videos.append(entry)
+                    _oc_timing["videos_found"] += 1
+                else:
+                    images.append(entry)
+                    _oc_timing["images_found"] += 1
+                _oc_timing["files_returned"] += 1
+                print(f"[timing.output.file] filename={fp.name} read_ms={_r_ms:.1f} bytes_in={len(raw)} bytes_out={len(entry['data'])}")
+                if output_key is not None:
+                    per_node_outputs.setdefault(node_id, {}).setdefault(output_key, []).append(entry)
             else:
-                images.append(entry)
-                _oc_timing["images_found"] += 1
-            _oc_timing["files_returned"] += 1
-            # Per-file timing log
-            print(f"[timing.output.file] filename={fp.name} read_ms={_r_ms:.1f} bytes_in={len(raw)} bytes_out={len(entry['data'])}")
-            if output_key is not None:
-                per_node_outputs.setdefault(node_id, {}).setdefault(output_key, []).append(entry)
+                pass
 
         def _scan_dir_for_files(base: Path, since_ts: float | None, limit: int = 20) -> None:
             """Scan a base directory for image/video files, optionally
@@ -8702,7 +9235,110 @@ class _ComfyAPIMixin:
                 f"(history_result_empty={not bool(outputs)} "
                 f"prompt_start_time={'set' if prompt_start_time else 'none'})"
             )
-        print(f"[comfyapp] collected {len(images)} images, {len(videos)} videos")
+        print(f"[comfyapp] collected {len(images)} images, {len(videos)} videos "
+              f"pending_conversions={len(_pending_conversions)}")
+        if _pending_conversions:
+            _conv_start_time = time.time()
+            _n_workers = min(4, len(_pending_conversions))
+            _oc_timing["output_conversion_parallel"] = 1
+            _oc_timing["output_conversion_workers"] = _n_workers
+            _conv_worked = False
+            try:
+                from concurrent.futures import ThreadPoolExecutor
+
+                def _convert_one(item: dict) -> dict:
+                    conv = _convert_image_bytes(
+                        item["raw"],
+                        output_format=_output_fmt,
+                        quality=_quality,
+                        webp_lossless_compression=_wlc,
+                    )
+                    item["out_bytes"] = conv["bytes"]
+                    item["out_filename"] = _change_extension(item["fp_name"], conv["file_ext"])
+                    item["converted_meta"] = {
+                        "filename": item["out_filename"],
+                        "node_id": item["node_id"],
+                        "output_format": conv["output_format"],
+                        "mime_type": conv["mime_type"],
+                        "file_ext": conv["file_ext"],
+                        "original_size_bytes": conv["original_size_bytes"],
+                        "returned_size_bytes": conv["returned_size_bytes"],
+                        "conversion_time_ms": conv["conversion_time_ms"],
+                        "quality": conv.get("quality"),
+                        "webp_lossless_compression": conv.get("webp_lossless_compression"),
+                        "fallback": conv.get("fallback", False),
+                        "error": conv.get("error"),
+                    }
+                    item["done"] = True
+                    return item
+
+                with ThreadPoolExecutor(max_workers=_n_workers) as _pool:
+                    _conv_futs = {_pool.submit(_convert_one, item): i for i, item in enumerate(_pending_conversions)}
+                    for _fut in _conv_futs:
+                        try:
+                            _fut.result()
+                        except Exception as _cex:
+                            print(f"[comfyapp] parallel conversion worker failed: {_cex}")
+                _conv_worked = True
+                _conv_total = round((time.time() - _conv_start_time) * 1000, 1)
+                print(f"[comfyapp] output_conversion_parallel: workers={_n_workers} total_ms={_conv_total}")
+            except Exception as _pex:
+                print(f"[comfyapp] parallel conversion failed, falling back to sequential: {_pex}")
+
+            if not _conv_worked:
+                _oc_timing["output_conversion_parallel"] = 0
+                _oc_timing["output_conversion_workers"] = 0
+                _conv_start_time = time.time()
+                for item in _pending_conversions:
+                    conv = _convert_image_bytes(
+                        item["raw"],
+                        output_format=_output_fmt,
+                        quality=_quality,
+                        webp_lossless_compression=_wlc,
+                    )
+                    item["out_bytes"] = conv["bytes"]
+                    item["out_filename"] = _change_extension(item["fp_name"], conv["file_ext"])
+                    item["converted_meta"] = {
+                        "filename": item["out_filename"],
+                        "node_id": item["node_id"],
+                        "output_format": conv["output_format"],
+                        "mime_type": conv["mime_type"],
+                        "file_ext": conv["file_ext"],
+                        "original_size_bytes": conv["original_size_bytes"],
+                        "returned_size_bytes": conv["returned_size_bytes"],
+                        "conversion_time_ms": conv["conversion_time_ms"],
+                        "quality": conv.get("quality"),
+                        "webp_lossless_compression": conv.get("webp_lossless_compression"),
+                        "fallback": conv.get("fallback", False),
+                        "error": conv.get("error"),
+                    }
+                    item["done"] = True
+            _oc_timing["conversion_total_ms"] = round((time.time() - _conv_start_time) * 1000, 1)
+
+            for item in _pending_conversions:
+                if item.get("converted_meta"):
+                    _conversion_meta.append(item["converted_meta"])
+                    _oc_timing["conversion_worker_sum_ms"] += item["converted_meta"].get("conversion_time_ms", 0)
+                entry = {
+                    "filename": item["out_filename"],
+                    "data": base64.b64encode(item["out_bytes"]).decode(),
+                    "node_id": item["node_id"],
+                    "_seq": item.get("seq", 0),
+                }
+                _oc_timing["bytes_returned"] += len(entry["data"])
+                images.append(entry)
+                _oc_timing["images_found"] += 1
+                _oc_timing["files_returned"] += 1
+                print(f"[timing.output.file] filename={item['fp_name']} bytes_out={len(entry['data'])}")
+                if item.get("output_key") is not None:
+                    per_node_outputs.setdefault(item["node_id"], {}).setdefault(item["output_key"], []).append(entry)
+        images.sort(key=lambda entry: entry.get("_seq", 0))
+        videos.sort(key=lambda entry: entry.get("_seq", 0))
+        for node_outputs in per_node_outputs.values():
+            for entries in node_outputs.values():
+                entries.sort(key=lambda entry: entry.get("_seq", 0))
+        for entry in images + videos:
+            entry.pop("_seq", None)
         print(f"[comfyapp] sanity: prompt_id={prompt_id[:8]} "
               f"job_id={prompt_id[:8]} "
               f"sampler_started={'yes' if images or outputs else 'no'} "
@@ -8722,13 +9358,15 @@ class _ComfyAPIMixin:
         print(f"[output_collect] skipped_stale=0")
         print(f"[output_collect] skipped_temp={_skipped_temp}")
         _oc_total = round((time.time() - _oc_t0) * 1000, 1)
-        _oc_timing["return_packaging_ms"] = round(_oc_total - _oc_timing.get("history_fetch_ms", 0) - _oc_timing.get("file_scan_ms", 0) - _oc_timing.get("read_total_ms", 0) - _oc_timing.get("conversion_total_ms", 0), 1)
+        _oc_timing["conversion_worker_sum_ms"] = round(_oc_timing.get("conversion_worker_sum_ms", 0), 1)
+        _oc_timing["return_packaging_ms"] = round(max(0.0, _oc_total - _oc_timing.get("history_fetch_ms", 0) - _oc_timing.get("file_scan_ms", 0) - _oc_timing.get("read_total_ms", 0) - _oc_timing.get("conversion_total_ms", 0)), 1)
         print(
             f"[timing.output] output_collection_total_ms={_oc_total} "
             f"history_fetch_ms={_oc_timing.get('history_fetch_ms', 0)} "
             f"file_scan_ms={_oc_timing.get('file_scan_ms', 0)} "
             f"read_total_ms={round(_oc_timing.get('read_total_ms', 0), 1)} "
             f"conversion_total_ms={round(_oc_timing.get('conversion_total_ms', 0), 1)} "
+            f"conversion_worker_sum_ms={round(_oc_timing.get('conversion_worker_sum_ms', 0), 1)} "
             f"return_packaging_ms={_oc_timing.get('return_packaging_ms', 0)} "
             f"files_read={_oc_timing.get('files_read', 0)} "
             f"images_found={_oc_timing.get('images_found', 0)} "
@@ -8736,6 +9374,8 @@ class _ComfyAPIMixin:
             f"files_returned={_oc_timing.get('files_returned', 0)} "
             f"bytes_read={_oc_timing.get('bytes_read', 0)} "
             f"bytes_returned={_oc_timing.get('bytes_returned', 0)}"
+            f" output_conversion_parallel={_oc_timing.get('output_conversion_parallel', 0)}"
+            f" output_conversion_workers={_oc_timing.get('output_conversion_workers', 0)}"
         )
         return {
             "images": images,
@@ -9409,6 +10049,7 @@ class _ComfyAPIMixin:
         t0 = time.time()
         _snap_mode = os.environ.get("COMFYMODAL_SNAPSHOT_MODE", "full").strip().lower()
         print(f"[comfyapp] lifecycle=startup snap=True snapshot_mode={_snap_mode}")
+        _log_remote_identity("startup", cls_name=self.__class__.__name__, method_name="startup", snapshot_created=1, restored_from_snapshot=0)
 
         is_in_proc = (self._select_backend() == "in_process")
 
@@ -9537,7 +10178,7 @@ class _ComfyAPIMixin:
         except Exception as exc:
             print(f"[comfyapp] sage_warmup failed: {exc}")
 
-    def _warmup_direct(self, profile: dict) -> dict:
+    def _warmup_direct(self, profile: dict, clip_policy_overrides: dict | None = None) -> dict:
         """Direct warmup: load models and prime CLIPTextEncode cache without
         ComfyUI executor overhead.
 
@@ -9558,6 +10199,11 @@ class _ComfyAPIMixin:
           disabled or async.
         - ``DIRECT_WARMUP_CLIP_ENCODE`` — enable dummy CLIPTextEncode forward
           pass (default 0).
+
+        When ``clip_policy_overrides`` is provided, its
+        ``direct_warmup_load_clip_effective`` and
+        ``direct_warmup_clip_encode_effective`` fields override the runtime
+        flags for CLIP load/encode.
         """
         _t0 = time.time()
         _phases: dict[str, float] = {}
@@ -9578,6 +10224,13 @@ class _ComfyAPIMixin:
             _rt_load_clip = _resolve_runtime_flag("DIRECT_WARMUP_LOAD_CLIP", "0")
             _rt_clip_encode = _resolve_runtime_flag("DIRECT_WARMUP_CLIP_ENCODE", "0")
             _rt_require_cpu_hit = _resolve_runtime_flag("DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT", "1")
+
+            if clip_policy_overrides:
+                _load_clip_eff = clip_policy_overrides.get("direct_warmup_load_clip_effective", 0)
+                _encode_eff = clip_policy_overrides.get("direct_warmup_clip_encode_effective", 0)
+                _rt_load_clip = bool(_load_clip_eff)
+                _rt_clip_encode = bool(_encode_eff)
+                _rt_require_cpu_hit = bool(_load_clip_eff)
 
             # ── 1. Load UNET via UNETLoader (if enabled) ─────────────
             _phases["direct_warmup_load_unet"] = 1.0 if _rt_load_unet else 0.0
@@ -9695,6 +10348,94 @@ class _ComfyAPIMixin:
             _phases["direct_total_ms"] = round((time.time() - _t0) * 1000, 1)
             print(f"[comfyapp] direct warmup FAILED after {_phases['direct_total_ms']}ms: {exc}\n{traceback.format_exc()}")
             return {"status": "error", "error": str(exc)[:200], **_phases}
+
+    def _warmup_vae_decode(self, profile: dict) -> dict:
+        """Run a dummy VAE decode to warm the decoder.
+
+        Gated by COMFYMODAL_VAE_DECODE_WARMUP=1 (default 0 / disabled).
+        Failing warmup does NOT mark VAE actual_load as failed.
+        After one failure, future attempts in the same session are skipped.
+        """
+        _t0 = time.time()
+        _result = {
+            "vae_decode_warmup_enabled": 0,
+            "vae_decode_warmup_submitted": 0,
+            "vae_decode_warmup_status": "skipped",
+            "vae_decode_warmup_ms": 0.0,
+            "vae_decode_warmup_skip_reason": "",
+        }
+        if not VAE_DECODE_WARMUP_ENABLED:
+            _result["vae_decode_warmup_skip_reason"] = "disabled_by_env"
+            return _result
+        if getattr(self, "_vae_warmup_failed", False):
+            _result["vae_decode_warmup_status"] = "disabled_after_failure"
+            _result["vae_decode_warmup_skip_reason"] = "previous_failure"
+            return _result
+        _result["vae_decode_warmup_enabled"] = 1
+        vae_name = (profile or {}).get("vae", "")
+        if not vae_name:
+            _result["vae_decode_warmup_skip_reason"] = "no_vae_in_profile"
+            return _result
+        _result["vae_decode_warmup_submitted"] = 1
+        try:
+            import folder_paths, nodes
+            vae_path = folder_paths.get_full_path("vae", vae_name) or ""
+            if not vae_path:
+                _result["vae_decode_warmup_skip_reason"] = "vae_path_not_found"
+                return _result
+            cls = nodes.NODE_CLASS_MAPPINGS.get("VAELoader")
+            if cls is None:
+                _result["vae_decode_warmup_skip_reason"] = "VAELoader_not_found"
+                return _result
+            vae_loader = cls()
+            vae_out = vae_loader.load_vae(vae_name=vae_name)
+            if not vae_out or vae_out[0] is None:
+                _result["vae_decode_warmup_status"] = "failed"
+                _result["vae_decode_warmup_skip_reason"] = "vae_load_returned_none"
+                self._vae_warmup_failed = True
+                _result["vae_decode_warmup_ms"] = round((time.time() - _t0) * 1000, 1)
+                print(f"[comfyapp] vae_decode_warmup: FAILED vae load returned None")
+                return _result
+            vae_obj = vae_out[0]
+            import torch
+            latent_channels = 16
+            try:
+                if hasattr(vae_obj, 'first_stage_model') and hasattr(vae_obj.first_stage_model, 'config'):
+                    _cfg = vae_obj.first_stage_model.config
+                    for _attr in ('latent_channels', 'z_channels', 'ch'):
+                        if hasattr(_cfg, _attr):
+                            latent_channels = getattr(_cfg, _attr)
+                            break
+                elif hasattr(vae_obj, 'config'):
+                    _cfg = vae_obj.config
+                    for _attr in ('latent_channels', 'z_channels', 'ch'):
+                        if hasattr(_cfg, _attr):
+                            latent_channels = getattr(_cfg, _attr)
+                            break
+            except Exception:
+                pass
+            dummy_latent = torch.randn(1, latent_channels, 8, 8)
+            if torch.cuda.is_available():
+                dummy_latent = dummy_latent.cuda()
+            dec_cls = nodes.NODE_CLASS_MAPPINGS.get("VAEDecode")
+            if dec_cls is None:
+                _result["vae_decode_warmup_status"] = "failed"
+                _result["vae_decode_warmup_skip_reason"] = "VAEDecode_not_found"
+                self._vae_warmup_failed = True
+                _result["vae_decode_warmup_ms"] = round((time.time() - _t0) * 1000, 1)
+                return _result
+            decoder = dec_cls()
+            decoder.decode(vae=vae_obj, samples=dummy_latent)
+            _result["vae_decode_warmup_status"] = "ok"
+            _result["vae_decode_warmup_ms"] = round((time.time() - _t0) * 1000, 1)
+            print(f"[comfyapp] vae_decode_warmup: OK in {_result['vae_decode_warmup_ms']}ms")
+        except Exception as exc:
+            _result["vae_decode_warmup_status"] = "failed"
+            _result["vae_decode_warmup_skip_reason"] = f"{exc}"[:200]
+            self._vae_warmup_failed = True
+            _result["vae_decode_warmup_ms"] = round((time.time() - _t0) * 1000, 1)
+            print(f"[comfyapp] vae_decode_warmup: FAILED {exc}")
+        return _result
 
     def _clip_cache_key(self, clip_path: str, clip_type: str) -> tuple:
         """Deterministic cache key for a CLIP model load request."""
@@ -10428,6 +11169,84 @@ class _ComfyAPIMixin:
                 _warmup_paths = self._snapshot_preload_paths(_warmup_profile)
             __stages["early_path_resolve_ms"] = self._profile_ms(_s)
 
+            # ── Resolve CLIP policy early ───────────────────────────
+            _clip_policy = _resolve_restore_direct_clip_policy(_warmup_profile)
+            __stages.update(_clip_policy)
+            print(
+                f"[comfyapp] restore_direct_clip_policy={_clip_policy.get('restore_direct_clip_policy','?')} "
+                f"decision={_clip_policy.get('restore_direct_clip_policy_decision','?')} "
+                f"load_clip_effective={_clip_policy.get('direct_warmup_load_clip_effective',0)} "
+                f"clip_encode_effective={_clip_policy.get('direct_warmup_clip_encode_effective',0)}"
+            )
+
+            # ── Early CPU preload submit (overlap with GPU restore) ─
+            # Submit the preload thread BEFORE GPU/CUDA/Sage phases so
+            # model file reads overlap with GPU warmup.  The thread is
+            # joined later (after GPU phases) right before direct CLIP
+            # warmup needs the CPU cache.
+            _preload_future = None
+            _preload_overlap_start = 0.0
+            _preload_submitted_early = 0
+            _preload_duplicate_prevented = 0
+            _pm = _resolve_preload_mode() if _warmup_paths else "off"
+            # ── Run preload eligibility guards early ─────────────────────
+            # These guards determine whether preload should proceed.  We
+            # check them here (before GPU phases) so we can submit the
+            # preload thread and overlap I/O with GPU warmup.
+            _preload_skip_reason_early = None
+            _profile_source_early = (_warmup_profile or {}).get("_source", "none")
+            _workflow_hash_early = (_warmup_profile or {}).get("_workflow_hash", "")
+            _prof_tok_early = _prof_tok  # from active profile diag above
+            # Guard 1: Known-good / active_next_profile eligibility
+            if _preload_skip_reason_early is None:
+                if _profile_source_early in ("active_next_profile", "active_next_profile_expired") and _workflow_hash_early:
+                    pass
+                elif PRELOAD_UNKNOWN_PROFILES:
+                    pass
+                elif _profile_source_early == "active_next_profile" and _workflow_hash_early:
+                    if _is_known_good_workflow_profile(_workflow_hash_early, _warmup_profile or {}):
+                        pass
+                    else:
+                        _preload_skip_reason_early = "unknown_profile"
+                else:
+                    _preload_skip_reason_early = "unknown_profile"
+            # Guard 2: Size guardrails
+            if _preload_skip_reason_early is None and _warmup_paths:
+                _filtered_paths_e, _filter_result_e = _filter_preload_paths_by_size(_warmup_paths)
+                if not _filtered_paths_e:
+                    _preload_skip_reason_early = _filter_result_e.get("reason", "size_filtered")
+                    _warmup_paths = []
+                else:
+                    _warmup_paths = _filtered_paths_e
+            # Guard 3: Z-Image restore warmup skip
+            if _preload_skip_reason_early is None and _resolve_disable_restore_warmup_for_z_image() and _warmup_profile and _warmup_profile.get("unet", ""):
+                _wu_unet_e = _warmup_profile.get("unet", "").lower()
+                if "z_image" in _wu_unet_e or "z-image" in _wu_unet_e:
+                    _preload_skip_reason_early = "z_image_guard"
+                    _warmup_paths = []
+                    print(f"[comfyapp] DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=1: skipping restore warmup (detected early)")
+            # ── Submit preload thread now if eligible ────────────────────
+            if _warmup_paths and _pm != "off" and _preload_future is None:
+                _preload_submitted_early = 1
+                _preload_overlap_start = time.time()
+                __stages["restore_preload_submit_at_ms_from_restore_start"] = round((_preload_overlap_start - restore_start) * 1000, 1)
+                import threading as _rt
+                _preload_future = _rt.Thread(
+                    target=self._preload_models_to_cpu,
+                    args=(_warmup_paths,),
+                    kwargs={"budget_ms": None},
+                    daemon=True,
+                )
+                _preload_future.start()
+                __stages["restore_preload_submitted_early"] = 1
+                print(
+                    f"[comfyapp] restore_preload_early_submitted files={len(_warmup_paths)} "
+                    f"mode={_pm} at_ms_from_restore_start={__stages['restore_preload_submit_at_ms_from_restore_start']}"
+                )
+            elif _preload_skip_reason_early:
+                __stages["preload_skip_reason_early"] = _preload_skip_reason_early
+                print(f"[comfyapp] restore_preload_skipped_early reason={_preload_skip_reason_early}")
+
             # ── Warmup profile diagnostics ──
             _warmup_src = _warmup_profile.get("_source", "none") if _warmup_profile else "none"
             _warmup_wf_hash = _warmup_profile.get("_workflow_hash", "") if _warmup_profile else ""
@@ -10480,6 +11299,7 @@ class _ComfyAPIMixin:
                 # Skip _restore_in_process_gpu_state() but still recalculate
                 # VRAM/RAM in case the restore host differs.
                 _s = time.time()
+                __stages["gpu_state_start_ms_from_restore_start"] = round((_s - restore_start) * 1000, 1)
                 import comfy.model_management
                 import psutil
                 comfy.model_management.total_vram = (
@@ -10488,10 +11308,13 @@ class _ComfyAPIMixin:
                 )
                 comfy.model_management.total_ram = psutil.virtual_memory().total / (1024 * 1024)
                 __stages["gpu_state_ms"] = self._profile_ms(_s)
+                __stages["gpu_state_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
 
                 _s = time.time()
+                __stages["cuda_start_ms_from_restore_start"] = round((_s - restore_start) * 1000, 1)
                 self._warmup_cuda()
                 __stages["cuda_warmup_ms"] = self._profile_ms(_s)
+                __stages["cuda_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                 self._log_profile("restore_warmup", mode="cuda_warmup_gpu_snap", duration_ms=__stages["cuda_warmup_ms"])
                 # Retry custom-node registrations that failed during CPU snapshot
                 self._retry_pending_custom_node_registrations()
@@ -10499,9 +11322,11 @@ class _ComfyAPIMixin:
                 comfy.utils.DISABLE_MMAP = True
 
                 _s = time.time()
+                __stages["sage_start_ms_from_restore_start"] = round((_s - restore_start) * 1000, 1)
                 mode, reason = self._select_sage_runtime_mode()
                 self._apply_sage_attention_policy()
                 __stages["sage_runtime_ms"] = self._profile_ms(_s)
+                __stages["sage_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                 __stages["sage_mode"] = mode
                 __stages["sage_reason"] = reason
                 __stages["sage_env_mode"] = SAGE_RUNTIME_MODE
@@ -10518,28 +11343,35 @@ class _ComfyAPIMixin:
                     # under force_cpu, so no CUDA state was captured.  Reattach
                     # the GPU, warm CUDA, select Sage runtime.
                     _s = time.time()
+                    __stages["gpu_state_start_ms_from_restore_start"] = round((_s - restore_start) * 1000, 1)
                     self._restore_in_process_gpu_state()
                     __stages["gpu_state_ms"] = self._profile_ms(_s)
+                    __stages["gpu_state_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                 else:
                     # Deferred init: backend already started with GPU
                     __stages["gpu_state_ms"] = 0.0
                     __stages["gpu_state_source"] = "deferred"
 
                 _s = time.time()
+                __stages["cuda_start_ms_from_restore_start"] = round((_s - restore_start) * 1000, 1)
                 self._warmup_cuda()
                 __stages["cuda_warmup_ms"] = self._profile_ms(_s)
+                __stages["cuda_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                 self._log_profile("restore_warmup", mode="cuda_warmup", duration_ms=__stages["cuda_warmup_ms"])
                 # Retry custom-node registrations that failed during CPU snapshot
                 # (e.g. schema generation that needs device availability).
                 self._retry_pending_custom_node_registrations()
                 import comfy.utils
                 comfy.utils.DISABLE_MMAP = True
+                _patch_s = time.time()
+                __stages["patch_start_ms_from_restore_start"] = round((_patch_s - restore_start) * 1000, 1)
                 if _resolve_runtime_flag('deep_profile', '0'):
                     self._patch_model_cache_comparison()
                 self._patch_clip_text_encode_cache()
                 self._patch_clip_loader_cache()
                 self._patch_unet_loader_cache()
                 self._patch_vae_loader_cache()
+                __stages["patch_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
 
                 # ── CLIP encode cache debug: clear if requested ──────────
                 _clip_cache_clear = _resolve_runtime_flag('clear_clip_encode_cache', '0')
@@ -10564,9 +11396,11 @@ class _ComfyAPIMixin:
                     pass
 
                 _s = time.time()
+                __stages["sage_start_ms_from_restore_start"] = round((_s - restore_start) * 1000, 1)
                 mode, reason = self._select_sage_runtime_mode()
                 self._apply_sage_attention_policy()
                 __stages["sage_runtime_ms"] = self._profile_ms(_s)
+                __stages["sage_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                 __stages["sage_mode"] = mode
                 __stages["sage_reason"] = reason
                 __stages["sage_env_mode"] = SAGE_RUNTIME_MODE
@@ -10590,98 +11424,81 @@ class _ComfyAPIMixin:
                 __stages["warmup_profile_source"] = profile.get("_source", "?") if profile else "none"
                 preload_result = {"count": 0, "file_timing_ms": {}}
                 _pm = _resolve_preload_mode()
+                _preload_overlap_ms = 0.0
+                _preload_await_ms = 0.0
+                _preload_status = "skipped"
 
                 # ── PART 3: Preload guardrails ──
-                # Skip CPU preload for unknown/new workflows unless explicitly
-                # enabled.  This prevents wasting ~125s reading 19GB for
-                # workflows that may fail validation or never execute.
-                _preload_skip_reason = None
-                _profile_source = (profile or {}).get("_source", "none")
-                _workflow_hash = (profile or {}).get("_workflow_hash", "")
-
-                # Guard 1: Known-good workflow profile check
-                # An active_next_profile with a workflow hash is eligible for
-                # preload regardless of known-good status, because:
-                #   - It was written only after local preflight validation
-                #   - It has preflight_validated=true
-                #   - Its model stack and warmup profile are already resolved
-                # The known-good guard was originally intended to prevent
-                # preloading for completely unknown workflows, but the
-                # active_next_profile already represents a validated intent.
-                # Only workflows without any profile source still need the
-                # known-good check (or PRELOAD_UNKNOWN_PROFILES=1).
-                __stages["preload_eligibility_known_good_check"] = 0
-                __stages["preload_eligibility_active_next"] = 0
-                __stages["preload_eligibility_unknown_profiles"] = 1 if PRELOAD_UNKNOWN_PROFILES else 0
-                if _preload_skip_reason is None:
-                    if _profile_source in ("active_next_profile", "active_next_profile_expired") and _workflow_hash:
-                        __stages["preload_eligibility_active_next"] = 1
-                        # active_next_profile is eligible — skip known-good check
-                        print(
-                            f"[comfyapp] preload eligible via {_profile_source} "
-                            f"workflow_hash={_workflow_hash} profile_token={_prof_tok}"
-                        )
-                    elif PRELOAD_UNKNOWN_PROFILES:
-                        __stages["preload_eligibility_unknown_profiles"] = 2
-                        print(
-                            f"[comfyapp] preload eligible via PRELOAD_UNKNOWN_PROFILES=1 "
-                            f"profile_source={_profile_source}"
-                        )
-                    elif _profile_source == "active_next_profile" and _workflow_hash:
-                        # Should not reach (handled above), but keep as safety net
-                        __stages["preload_eligibility_known_good_check"] = 1
-                        if _is_known_good_workflow_profile(_workflow_hash, profile or {}):
-                            print(
-                                f"[comfyapp] preload known-good profile "
-                                f"workflow_hash={_workflow_hash}"
-                            )
-                        else:
-                            _preload_skip_reason = "unknown_profile"
-                            print(
-                                f"[comfyapp] preload_skipped reason=unknown_profile "
-                                f"workflow_hash={_workflow_hash or 'missing'} "
-                                f"profile_source={_profile_source} "
-                                f"COMFYMODAL_PRELOAD_UNKNOWN_PROFILES=0"
-                            )
-                    else:
-                        _preload_skip_reason = "unknown_profile"
-                        print(
-                            f"[comfyapp] preload_skipped reason=unknown_profile "
-                            f"profile_source={_profile_source} "
-                            f"workflow_hash={_workflow_hash or 'missing'} "
-                            f"COMFYMODAL_PRELOAD_UNKNOWN_PROFILES=0"
-                        )
-
-                # Guard 2: Size guardrails via _filter_preload_paths_by_size
-                if _preload_skip_reason is None and preload_paths:
-                    _filtered_paths, _filter_result = _filter_preload_paths_by_size(preload_paths)
-                    if not _filtered_paths:
-                        _preload_skip_reason = _filter_result.get("reason", "size_filtered")
-                        print(
-                            f"[comfyapp] preload_skipped reason={_preload_skip_reason} "
-                            f"{_filter_result}"
-                        )
-                    else:
-                        preload_paths = _filtered_paths
-
+                # These guards were already checked in the early submit
+                # section above.  If _preload_skip_reason_early was set,
+                # preload was skipped and _preload_future is None.
+                # We re-check here as a safety net in case the profile
+                # resolution differed (should not happen).
+                _preload_skip_reason = _preload_skip_reason_early
+                if _preload_skip_reason is None and not _warmup_paths and _preload_future is None:
+                    _preload_skip_reason = "already_skipped_early"
                 if _preload_skip_reason:
                     preload_paths = []
                     __stages["preload_skipped"] = 1
                     __stages["preload_skip_reason"] = _preload_skip_reason
                 else:
                     __stages["preload_skipped"] = 0
+                    if not preload_paths:
+                        preload_paths = _warmup_paths
+                    __stages["preload_eligibility_early"] = 1
 
-                # ── Z-Image restore warmup skip ──
+                # ── Z-Image restore warmup skip (re-check for safety) ──
                 if _resolve_disable_restore_warmup_for_z_image() and profile and profile.get("unet", ""):
                     _wu_unet = profile.get("unet", "").lower()
                     if "z_image" in _wu_unet or "z-image" in _wu_unet:
-                        print(f"[comfyapp] DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=1: skipping restore warmup for {_wu_unet}")
+                        if _preload_future is None:
+                            print(f"[comfyapp] DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=1: skipping restore warmup for {_wu_unet}")
                         preload_paths = []
                         __stages["warmup_preload_skipped"] = 1
                         __stages["direct_warmup_z_image_guard_skipped"] = 1
                         __stages["direct_warmup_skip_reason"] = "z_image_guard"
+
+                # ── Fallback submit if preload was not submitted early ────
+                if preload_paths and _pm != "off" and _preload_future is None:
+                    _preload_submitted_early = 1
+                    _preload_overlap_start = time.time()
+                    __stages["restore_preload_submit_at_ms_from_restore_start"] = round((_preload_overlap_start - restore_start) * 1000, 1)
+                    import threading as _rt2
+                    _preload_future = _rt2.Thread(
+                        target=self._preload_models_to_cpu,
+                        args=(preload_paths,),
+                        kwargs={"budget_ms": None},
+                        daemon=True,
+                    )
+                    _preload_future.start()
+                    __stages["restore_preload_submitted_early"] = 1
+                    print(
+                        f"[comfyapp] restore_preload_submitted_late files={len(preload_paths)} "
+                        f"mode={_pm} at_ms={__stages['restore_preload_submit_at_ms_from_restore_start']}"
+                    )
+
+                # ── Join preload thread (whether submitted early or late) ─
                 _s = time.time()
-                if preload_paths and _pm != "off":
+                if _preload_future is not None:
+                    _preload_join_at_ms = round((time.time() - restore_start) * 1000, 1)
+                    __stages["restore_preload_join_at_ms_from_restore_start"] = _preload_join_at_ms
+                    _preload_overlap_ms = round((time.time() - _preload_overlap_start) * 1000, 1)
+                    _await_start = time.time()
+                    _preload_future.join()
+                    _preload_await_ms = round((time.time() - _await_start) * 1000, 1)
+                    _preload_status = "ok"
+                    __stages["restore_preload_overlap_ms"] = _preload_overlap_ms
+                    __stages["restore_preload_await_ms"] = _preload_await_ms
+                    __stages["restore_preload_status"] = _preload_status
+                    __stages["restore_preload_duplicate_read_prevented"] = 0
+                    __stages["restore_preload_total_ms"] = round((time.time() - _preload_overlap_start) * 1000, 1)
+                    preload_result = {"count": 0, "file_timing_ms": {}, "early_submitted": True}
+                    print(
+                        f"[comfyapp] restore_preload_joined overlap_ms={_preload_overlap_ms} "
+                        f"await_ms={_preload_await_ms} status={_preload_status} "
+                        f"join_at_ms_from_restore_start={_preload_join_at_ms}"
+                    )
+                elif preload_paths and _pm != "off":
                     if _pm == "async_no_wait":
                         import threading
                         _preload_thread = threading.Thread(
@@ -10920,7 +11737,8 @@ class _ComfyAPIMixin:
                             )
                 if profile and profile.get("mode") and not _skip_direct_warmup:
                     _s = time.time()
-                    _dw = self._warmup_direct(profile)
+                    _dw = self._warmup_direct(profile,
+                        clip_policy_overrides=_clip_policy if _clip_policy.get("restore_direct_clip_policy") == "auto" else None)
                     __stages["warmup_direct_total_ms"] = _dw.get("direct_total_ms", 0.0)
                     for _k in ("direct_unet_load_ms", "direct_clip_load_ms", "direct_clip_encode_ms"):
                         _v = _dw.get(_k)
@@ -10947,6 +11765,18 @@ class _ComfyAPIMixin:
                             _mm._comfy_modal_suppress_cleanup = False
                     except Exception:
                         pass
+
+                # ── VAE decode warmup (background, does not block restore) ──
+                if ENABLE_WARMUP and profile:
+                    import threading as _vwt
+                    _vae_warmup_thread = _vwt.Thread(
+                        target=self._warmup_vae_decode,
+                        args=(profile,),
+                        daemon=True,
+                    )
+                    _vae_warmup_thread.start()
+                    __stages["vae_decode_warmup_enabled"] = 1 if VAE_DECODE_WARMUP_ENABLED else 0
+                    __stages["vae_decode_warmup_submitted"] = 1
         else:
             _s = time.time()
             try:
@@ -11009,8 +11839,20 @@ class _ComfyAPIMixin:
         }
         if warmup_error:
             self._last_restore_timing["warmup_error"] = warmup_error
-        print(f"[comfyapp] restore sanity check done in {time.time() - restore_start:.3f}s "
-              f"perf={self._last_restore_timing}")
+        print(
+            f"[comfyapp] restore sanity check done in {time.time() - restore_start:.3f}s "
+            f"restore_total_ms={self._last_restore_timing.get('restore_total_ms', 0)} "
+            f"restore_preload_status={self._last_restore_timing.get('restore_preload_status', '')} "
+            f"restore_preload_overlap_ms={self._last_restore_timing.get('restore_preload_overlap_ms', 0)}"
+        )
+        _log_remote_identity(
+            "restore",
+            cls_name=self.__class__.__name__,
+            method_name="restore",
+            restore_session_id=self._last_restore_timing.get("restore_session_id", ""),
+            snapshot_created=0,
+            restored_from_snapshot=1,
+        )
 
     @modal.exit()
     def shutdown(self):
@@ -11076,6 +11918,16 @@ class _ComfyAPIMixin:
     ) -> dict:
         global _container_request_count
         _container_request_count += 1
+        _rt_identity = getattr(self, "_last_restore_timing", None) or {}
+        _log_remote_identity(
+            "request",
+            cls_name=self.__class__.__name__,
+            method_name="run_prompt",
+            restore_session_id=_rt_identity.get("restore_session_id", ""),
+            request_seq=_container_request_count,
+            snapshot_created=1 if not _rt_identity else 0,
+            restored_from_snapshot=1 if _rt_identity else 0,
+        )
 
         _v4_events: list[dict] = []
         mark_event(_v4_events, T3_MODAL_ENTRY, process="modal_remote", phase="remote_entry",
@@ -11759,6 +12611,16 @@ class _ComfyAPIMixin:
     ):
         global _container_request_count
         _container_request_count += 1
+        _rt_identity = getattr(self, "_last_restore_timing", None) or {}
+        _log_remote_identity(
+            "request",
+            cls_name=self.__class__.__name__,
+            method_name="run_prompt_stream",
+            restore_session_id=_rt_identity.get("restore_session_id", ""),
+            request_seq=_container_request_count,
+            snapshot_created=1 if not _rt_identity else 0,
+            restored_from_snapshot=1 if _rt_identity else 0,
+        )
 
         _v4_events: list[dict] = []
         mark_event(_v4_events, T3_MODAL_ENTRY, process="modal_remote", phase="remote_entry",

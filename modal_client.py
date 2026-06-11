@@ -1,10 +1,12 @@
 import asyncio
 import functools
+import os
 import modal
 
 from gpu_catalog import (
     DEFAULT_GPU,
     GPU_CATALOG,
+    GPU_BY_VALUE,
     get_available_gpu_options,
     get_default_gpu,
     get_supported_gpus,
@@ -12,33 +14,52 @@ from gpu_catalog import (
     normalize_gpu_value,
 )
 
+APP_NAME = os.environ.get("COMFYMODAL_APP_NAME", "comfyui").strip() or "comfyui"
+
 # Client-side backpressure: only one in-flight prompt execution at a time
 _run_prompt_semaphore = asyncio.Semaphore(1)
 
 # Build API handles only for GPUs that are NOT hidden
 _apis = {
-    entry["value"]: modal.Cls.from_name("comfyui", entry["class_name"])
+    entry["value"]: modal.Cls.from_name(APP_NAME, entry["class_name"])
     for entry in GPU_CATALOG
     if not is_gpu_hidden(entry["value"])
 }
-_download_fn = modal.Function.from_name("comfyui", "download_model_to_volume")
-_download_stream_fn = modal.Function.from_name("comfyui", "download_model_stream")
-_batch_download_fn = modal.Function.from_name("comfyui", "batch_download_models")
-_sync_custom_nodes_fn = modal.Function.from_name("comfyui", "sync_custom_nodes_to_volume")
-_get_volume_status_fn = modal.Function.from_name("comfyui", "get_volume_status")
-_upload_model_fn = modal.Function.from_name("comfyui", "upload_model_to_volume")
-_upload_model_chunk_fn = modal.Function.from_name("comfyui", "upload_model_chunk")
-_set_active_warmup_profile_fn = modal.Function.from_name("comfyui", "set_active_warmup_profile")
 
-_list_models_fn = modal.Function.from_name("comfyui", "list_models_cpu")
-_delete_model_fn = modal.Function.from_name("comfyui", "delete_model_cpu")
-_health_fn = modal.Function.from_name("comfyui", "health_cpu")
-_runtime_state_fn = modal.Function.from_name("comfyui", "runtime_state_cpu")
+_download_fn = modal.Function.from_name(APP_NAME, "download_model_to_volume")
+_download_stream_fn = modal.Function.from_name(APP_NAME, "download_model_stream")
+_batch_download_fn = modal.Function.from_name(APP_NAME, "batch_download_models")
+_sync_custom_nodes_fn = modal.Function.from_name(APP_NAME, "sync_custom_nodes_to_volume")
+_get_volume_status_fn = modal.Function.from_name(APP_NAME, "get_volume_status")
+_upload_model_fn = modal.Function.from_name(APP_NAME, "upload_model_to_volume")
+_upload_model_chunk_fn = modal.Function.from_name(APP_NAME, "upload_model_chunk")
+_set_active_warmup_profile_fn = modal.Function.from_name(APP_NAME, "set_active_warmup_profile")
+
+_list_models_fn = modal.Function.from_name(APP_NAME, "list_models_cpu")
+_delete_model_fn = modal.Function.from_name(APP_NAME, "delete_model_cpu")
+_health_fn = modal.Function.from_name(APP_NAME, "health_cpu")
+_runtime_state_fn = modal.Function.from_name(APP_NAME, "runtime_state_cpu")
 
 _current_gpu = DEFAULT_GPU
 _api_instances = {}
 _handle_cache_hits = 0
 _handle_cache_misses = 0
+
+
+def get_modal_app_name() -> str:
+    return APP_NAME
+
+
+def get_modal_class_name(gpu: str | None = None) -> str:
+    selected_gpu = _current_gpu if gpu is None else normalize_gpu_value(gpu)
+    entry = GPU_BY_VALUE.get(selected_gpu)
+    if entry is None:
+        raise ValueError(f"Unsupported GPU: {selected_gpu}")
+    return entry["class_name"]
+
+
+def get_modal_lookup_target(gpu: str | None = None, method_name: str = "run_prompt") -> str:
+    return f"{APP_NAME}.{get_modal_class_name(gpu)}.{method_name}"
 
 
 def get_handle_cache_stats() -> dict:
