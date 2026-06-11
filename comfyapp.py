@@ -420,6 +420,30 @@ def _resolve_disable_restore_warmup_for_z_image() -> bool:
     """
     return _resolve_runtime_flag("DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE",
                                  "1" if _DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE else "0")
+
+
+def _restore_background_code_enabled() -> bool:
+    """Return whether experimental restore-background code is enabled.
+
+    Priority:
+    1. Runtime flag file (set via set_runtime_flag EXPERIMENTAL_RESTORE_BACKGROUND_CODE)
+    2. Module-level env default (COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE).
+    Default remains off.
+    """
+    return _resolve_runtime_flag("EXPERIMENTAL_RESTORE_BACKGROUND_CODE",
+                                 "1" if EXPERIMENTAL_RESTORE_BACKGROUND_CODE else "0")
+
+
+def _restore_background_unet_enabled() -> bool:
+    """Return whether restore-background UNET submission is enabled.
+
+    Priority:
+    1. Runtime flag file (set via set_runtime_flag RESTORE_BACKGROUND_UNET)
+    2. Module-level env default (COMFYMODAL_RESTORE_BACKGROUND_UNET).
+    Default remains off.
+    """
+    return _resolve_runtime_flag("RESTORE_BACKGROUND_UNET",
+                                 "1" if RESTORE_BACKGROUND_UNET_ENABLED else "0")
 ACTUAL_LOAD_MODE = os.getenv(
     "COMFYMODAL_ACTUAL_LOAD_MODE",
     os.getenv("ACTUAL_LOAD_MODE", "clip_vae_only"),
@@ -463,6 +487,18 @@ if RESTORE_DIRECT_CLIP_POLICY not in ("auto", "off", "load_only", "load_and_enco
 #   1 — opt-in: run a dummy VAE decode during restore to warm the decoder
 VAE_DECODE_WARMUP_ENABLED = os.getenv("COMFYMODAL_VAE_DECODE_WARMUP", "0") == "1"
 
+# P4b — Restore background UNET.
+#   0 — (default) disabled
+#   1 — opt-in: after CLIP preload join, start the exact selected UNET load in
+#        the existing future registry so prompt UNET attach/wait can reuse it.
+RESTORE_BACKGROUND_UNET_ENABLED = os.getenv("COMFYMODAL_RESTORE_BACKGROUND_UNET", "0") == "1"
+
+# P4c — Hard rollback gate for ALL restore-background UNET code paths.
+# When 0 (default), no restore-background code runs — the patch is
+# invisible.  When 1, the gated feature can be enabled via
+# COMFYMODAL_RESTORE_BACKGROUND_UNET=1.
+EXPERIMENTAL_RESTORE_BACKGROUND_CODE = os.getenv("COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE", "0") == "1"
+
 # P5 — Safetensors read mode.
 #   auto         — explicit opt-in: use read_bytes for large .safetensors CPU loads on model paths
 #   normal       — (default) use original loader behavior
@@ -503,8 +539,10 @@ def _log_remote_identity(event: str, *, cls_name: str = "", method_name: str = "
         f"request_seq={request_seq} snapshot_created_this_invocation={snapshot_created} "
         f"restored_from_memory_snapshot={restored_from_snapshot} "
         f"effective_SAFETENSORS_READ_MODE={SAFETENSORS_READ_MODE} "
-        f"effective_RESTORE_DIRECT_CLIP_POLICY={RESTORE_DIRECT_CLIP_POLICY} "
-        f"effective_PRELOAD_MODE={_resolve_preload_mode()}"
+        f"effective_RESTORE_DIRECT_CLIP_POLICY={_resolve_restore_direct_clip_policy_name()} "
+        f"effective_PRELOAD_MODE={_resolve_preload_mode()} "
+        f"effective_EXPERIMENTAL_RESTORE_BACKGROUND_CODE={_restore_background_code_enabled()} "
+        f"effective_RESTORE_BACKGROUND_UNET={_restore_background_unet_enabled()}"
     )
 
 # ── Phase 1: Dependency validation cache ─────────────────────────────────
@@ -766,6 +804,46 @@ def _resolve_runtime_flag(name: str, default: str) -> bool:
     return env == "1"
 
 
+def _resolve_runtime_string(name: str, default: str, allowed: set[str] | tuple[str, ...] | None = None) -> str:
+    """Read a runtime string flag from file or env var.
+
+    Priority:
+    1. File on the model volume at ``runtime_config/{name}.txt``.
+    2. Env var ``COMFYMODAL_{name}``.
+    3. ``default`` string.
+
+    When *allowed* is provided, the value is validated against the set.
+    Returns *default* if an invalid value is encountered.
+    """
+    path = os.path.join(RUNTIME_CONFIG_DIR, f"{name}.txt")
+    try:
+        if os.path.isfile(path):
+            v = open(path).read().strip().lower()
+            if v and (allowed is None or v in allowed):
+                return v
+    except Exception:
+        pass
+    env = os.environ.get(f"COMFYMODAL_{name}", default).strip().lower()
+    if allowed is not None and env not in allowed:
+        return default
+    return env
+
+
+def _resolve_restore_direct_clip_policy_name() -> str:
+    """Return the effective RESTORE_DIRECT_CLIP_POLICY from runtime or module default.
+
+    Priority:
+    1. File ``runtime_config/RESTORE_DIRECT_CLIP_POLICY.txt``.
+    2. Env var ``COMFYMODAL_RESTORE_DIRECT_CLIP_POLICY``.
+    3. Module-level ``RESTORE_DIRECT_CLIP_POLICY``.
+    """
+    return _resolve_runtime_string(
+        "RESTORE_DIRECT_CLIP_POLICY",
+        RESTORE_DIRECT_CLIP_POLICY,
+        allowed={"auto", "off", "load_only", "load_and_encode"},
+    )
+
+
 def _resolve_sage_runtime_env_override() -> str:
     """Return the effective SAGE_RUNTIME_MODE from file, env, or module default.
 
@@ -847,7 +925,7 @@ def _resolve_restore_direct_clip_policy(profile: dict | None, has_active_prompt_
     Returns a dict with:
       policy, decision, load_clip_effective, clip_encode_effective, skip_reason
     """
-    _policy = RESTORE_DIRECT_CLIP_POLICY
+    _policy = _resolve_restore_direct_clip_policy_name()
     _decision = ""
     _load_clip = 0
     _encode = 0
@@ -3103,7 +3181,7 @@ def _verify_model_file(path: str, expected_size: int | None = None, expected_sha
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.16.0"
+COMFYAPP_VERSION = "2.16.3"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
@@ -3217,6 +3295,7 @@ _COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = [
     ".deploy_log",
     ".tmp",
     "*.tmp",
+    ".comfymodal_experiments/",
     ".custom_node_requirements/",
     ".hf_token",
     ".civitai_token",
@@ -3226,6 +3305,11 @@ _COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = [
     "latest_benchmark_workflow.json",
     "modal_logs.txt",
     "_deploy_output.log",
+    "comfymodal_experiment_presets.json",
+    "comfymodal_experiment_state.json",
+    "apply_experiment_preset.py",
+    "run_experiment_stage.py",
+    "BENCHMARK_WORKFLOW.md",
 ]
 _COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = [
     "*/.git/",
@@ -3250,9 +3334,16 @@ _COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = [
     "comfyui-modal/.deployed_version",
     "comfyui-modal/.modal_settings.json",
     "comfyui-modal/.last_custom_node_context_manifest.json",
+    "comfyui-modal/.comfymodal_experiments/",
+    "comfyui-modal/.comfymodal_experiments/*",
     "comfyui-modal/.custom_node_requirements/",
     "comfyui-modal/.baked_custom_node_deps/",
     "comfyui-modal/*.md",
+    "comfyui-modal/comfymodal_experiment_presets.json",
+    "comfyui-modal/comfymodal_experiment_state.json",
+    "comfyui-modal/apply_experiment_preset.py",
+    "comfyui-modal/run_experiment_stage.py",
+    "comfyui-modal/BENCHMARK_WORKFLOW.md",
 ]
 _CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE = shutil.ignore_patterns(
     ".git",
@@ -3687,6 +3778,48 @@ def _diagnose_custom_node_requirements_context(source_root: str, requirements_di
     _save_last_context_manifest(current)
 
 
+def _diagnose_experiment_harness_context() -> None:
+    """Print diagnostic info about experiment harness file placement and ignore coverage.
+
+    Called only during local deploy/build-time, not inside hot restore/request path.
+    """
+    import time as _time
+
+    _modal_dir = _COMFYUI_MODAL_DIR
+    _experiments_dir = os.path.join(_modal_dir, ".comfymodal_experiments")
+    _experiments_exists = os.path.isdir(_experiments_dir)
+
+    _legacy_direct_files = [
+        "comfymodal_experiment_presets.json",
+        "comfymodal_experiment_state.json",
+        "apply_experiment_preset.py",
+        "run_experiment_stage.py",
+        "BENCHMARK_WORKFLOW.md",
+    ]
+    _present = [
+        f for f in _legacy_direct_files
+        if os.path.isfile(os.path.join(_modal_dir, f))
+    ]
+
+    _state_path = os.path.join(_experiments_dir, "comfymodal_experiment_state.json")
+    _state_inside_ignored = (
+        _experiments_exists
+        and os.path.isfile(_state_path)
+        and os.path.commonpath([
+            os.path.abspath(_state_path),
+            os.path.abspath(_experiments_dir),
+        ]) == os.path.abspath(_experiments_dir)
+    )
+
+    print(f"[comfyapp] experiment_harness_diag: modal_dir={_modal_dir}")
+    print(f"[comfyapp] experiment_harness_diag: local_only_dir_exists={'1' if _experiments_exists else '0'} path={_experiments_dir}")
+    print(f"[comfyapp] experiment_harness_diag: direct_legacy_files_present={_present if _present else '[]'}")
+    print(f"[comfyapp] experiment_harness_diag: combined_ignore_has_local_only_dir={'1' if any('comfymodal_experiments' in p for p in _COMBINED_CUSTOM_NODE_IGNORE_PATTERNS) else '0'}")
+    print(f"[comfyapp] experiment_harness_diag: modal_ignore_has_local_only_dir={'1' if any('comfymodal_experiments' in p for p in _COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS) else '0'}")
+    print(f"[comfyapp] experiment_harness_diag: mutable_state_location={_state_path}")
+    print(f"[comfyapp] experiment_harness_diag: state_inside_ignored_dir={'1' if _state_inside_ignored else '0'}")
+
+
 def _safe_dependency_relpath(filepath: str, node_root: str) -> str:
     """Return a POSIX-style relative path from *node_root* to *filepath*.
 
@@ -4059,6 +4192,7 @@ if not _INSIDE_MODAL_CONTAINER:
     _diagnose_custom_node_requirements_context(
         _LOCAL_CUSTOM_NODES, _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR, _baked_manifest_for_diag
     )
+    _diagnose_experiment_harness_context()
 
     _image_base = _image_base.add_local_file(
         _BAKED_MANIFEST_TEMP,
@@ -6036,8 +6170,277 @@ class _ComfyAPIMixin:
             self._actual_load_hits = 0
             self._actual_load_waits = 0
             self._actual_load_duplicates_prevented = 0
+        if _restore_background_code_enabled() and not hasattr(self, "_actual_load_future_meta"):
+            self._actual_load_future_meta: dict[tuple, dict] = {}
         if not hasattr(self, "_wall_actual_load_per_model"):
             self._wall_actual_load_per_model: list[dict] = []
+
+    def _set_actual_load_future_meta(self, key: tuple, **fields) -> dict:
+        if not _restore_background_code_enabled():
+            return {}
+        self._init_actual_load_registry()
+        meta = getattr(self, "_actual_load_future_meta", {}).setdefault(key, {})
+        meta.update(fields)
+        return meta
+
+    def _restore_background_unet_eligibility(self, profile: dict | None, clip_policy: dict | None, preload_result: dict | None = None) -> dict:
+        result = {
+            "eligible": 0,
+            "reason": "",
+            "unet_name": "",
+            "unet_path": "",
+            "unet_key": None,
+            "clip_name": "",
+            "clip_path": "",
+            "clip_policy_name": "",
+            "clip_policy_decision": "",
+            "load_clip_effective": 0,
+            "clip_encode_effective": 0,
+            "existing_future": 0,
+            "object_cache_exists": 0,
+            "active_large_reads_at_submit": 0,
+        }
+        if not _restore_background_unet_enabled():
+            result["reason"] = "disabled_by_env"
+            result["flag_default"] = "0"
+            return result
+        if not isinstance(profile, dict) or profile.get("_source") != "active_next_profile":
+            result["reason"] = "active_next_profile_invalid"
+            return result
+        _allowed_clip_decisions = {
+            "load_and_encode_default",
+            "load_and_encode_explicit",
+            "load_only_explicit",
+        }
+        _policy_name = ""
+        _policy_decision = ""
+        _load_clip_effective = 0
+        _clip_encode_effective = 0
+        if isinstance(clip_policy, dict):
+            _policy_name = clip_policy.get("restore_direct_clip_policy", "")
+            _policy_decision = clip_policy.get("restore_direct_clip_policy_decision", "")
+            _load_clip_effective = int(clip_policy.get("direct_warmup_load_clip_effective", 0) or 0)
+            _clip_encode_effective = int(clip_policy.get("direct_warmup_clip_encode_effective", 0) or 0)
+        result["clip_policy_name"] = _policy_name
+        result["clip_policy_decision"] = _policy_decision
+        result["load_clip_effective"] = _load_clip_effective
+        result["clip_encode_effective"] = _clip_encode_effective
+        if _policy_decision not in _allowed_clip_decisions:
+            result["reason"] = "direct_clip_policy_not_compatible"
+            return result
+        preload_result = preload_result or {}
+        if preload_result.get("aborted") or int(preload_result.get("running_threads_not_killable", 0) or 0) > 0:
+            result["reason"] = "clip_preload_incomplete"
+            return result
+        stack = (profile or {}).get("_current_workflow_stack") or {}
+        unet_names = list((stack.get("unet") or []))
+        exact_unet = (profile or {}).get("unet", "")
+        if len(unet_names) != 1 or not exact_unet or unet_names[0] != exact_unet:
+            result["reason"] = "unet_not_exact_single_resolved"
+            return result
+        clip_name = (profile or {}).get("clip1", "")
+        if not clip_name:
+            result["reason"] = "clip_path_unresolved"
+            return result
+        try:
+            import folder_paths
+        except Exception:
+            result["reason"] = "path_resolver_unavailable"
+            return result
+        unet_path = folder_paths.get_full_path("unet", exact_unet) or ""
+        clip_path = folder_paths.get_full_path("text_encoders", clip_name) or ""
+        result["unet_name"] = exact_unet
+        result["unet_path"] = unet_path
+        result["clip_name"] = clip_name
+        result["clip_path"] = clip_path
+        if not unet_path:
+            result["reason"] = "unet_path_unresolved"
+            return result
+        if not clip_path:
+            result["reason"] = "clip_path_unresolved"
+            return result
+        if not self._model_in_cpu_cache(clip_path):
+            result["reason"] = "clip_cpu_cache_missing"
+            return result
+        self._init_actual_load_registry()
+        self._init_unet_cache()
+        key = self._unet_cache_key(unet_path, "default")
+        result["unet_key"] = key
+        meta = getattr(self, "_actual_load_future_meta", {}).get(key, {})
+        future_exists = key in getattr(self, "_actual_load_futures", {})
+        object_cache_exists = key in getattr(self, "_unet_object_cache", {})
+        result["existing_future"] = 1 if future_exists else 0
+        result["object_cache_exists"] = 1 if object_cache_exists else 0
+        if meta.get("source") == "restore_background_unet" and meta.get("status") == "failed":
+            result["reason"] = "previous_restore_background_failure"
+            return result
+        if future_exists:
+            result["reason"] = "existing_future"
+            return result
+        if object_cache_exists:
+            result["reason"] = "object_cache_exists"
+            return result
+        with _ACTIVE_MODEL_READS_LOCK:
+            running_large_reads = _running_large_reads_locked()
+        result["active_large_reads_at_submit"] = len(running_large_reads)
+        if running_large_reads:
+            result["reason"] = "active_large_read_running"
+            return result
+        if "UNETLoader.load_unet" not in self._original_loaders:
+            result["reason"] = "loader_future_registry_unavailable"
+            return result
+        result["eligible"] = 1
+        result["reason"] = "eligible"
+        return result
+
+    def _maybe_submit_restore_background_unet(self, profile: dict | None, clip_policy: dict | None,
+                                              preload_result: dict | None, restore_start: float,
+                                              restore_stages: dict) -> dict:
+        self._init_actual_load_registry()
+        self._init_unet_cache()
+        restore_stages.setdefault("restore_background_unet_enabled", 1 if _restore_background_unet_enabled() else 0)
+        restore_stages.setdefault("restore_background_unet_submitted", 0)
+        restore_stages.setdefault("restore_background_unet_skip_reason", "")
+        restore_stages.setdefault("restore_background_unet_clip_policy_name", "")
+        restore_stages.setdefault("restore_background_unet_clip_policy_decision", "")
+        restore_stages.setdefault("restore_background_unet_load_clip_effective", 0)
+        restore_stages.setdefault("restore_background_unet_clip_encode_effective", 0)
+        restore_stages.setdefault("restore_background_unet_existing_future", 0)
+        restore_stages.setdefault("restore_background_unet_object_cache_exists", 0)
+        restore_stages.setdefault("restore_background_unet_active_large_reads_at_submit", 0)
+        restore_stages.setdefault("restore_background_unet_duplicate_prevented", 0)
+        restore_stages.setdefault("restore_background_unet_fallback_used", 0)
+        restore_stages.setdefault("restore_background_unet_submit_ms_from_restore_start", 0.0)
+        restore_stages.setdefault("restore_background_unet_total_ms", 0.0)
+        restore_stages.setdefault("restore_background_unet_wait_ms", 0.0)
+        restore_stages.setdefault("restore_background_unet_age_ms_at_modal_entry", 0.0)
+        restore_stages.setdefault("restore_background_unet_age_ms_at_graph_unet", 0.0)
+        restore_stages.setdefault("restore_background_unet_future_status_at_graph_unet", "")
+        restore_stages.setdefault("restore_background_unet_future_source_at_graph_unet", "")
+        eligibility = self._restore_background_unet_eligibility(profile, clip_policy, preload_result)
+        restore_stages["restore_background_unet_skip_reason"] = eligibility.get("reason", "")
+        restore_stages["restore_background_unet_clip_policy_name"] = eligibility.get("clip_policy_name", "")
+        restore_stages["restore_background_unet_clip_policy_decision"] = eligibility.get("clip_policy_decision", "")
+        restore_stages["restore_background_unet_load_clip_effective"] = eligibility.get("load_clip_effective", 0)
+        restore_stages["restore_background_unet_clip_encode_effective"] = eligibility.get("clip_encode_effective", 0)
+        restore_stages["restore_background_unet_existing_future"] = eligibility.get("existing_future", 0)
+        restore_stages["restore_background_unet_object_cache_exists"] = eligibility.get("object_cache_exists", 0)
+        restore_stages["restore_background_unet_active_large_reads_at_submit"] = eligibility.get("active_large_reads_at_submit", 0)
+        print(
+            f"[restore_background_unet] eligible={eligibility.get('eligible', 0)} "
+            f"reason={eligibility.get('reason', '')} "
+            f"clip_policy_name={eligibility.get('clip_policy_name', '')} "
+            f"clip_policy_decision={eligibility.get('clip_policy_decision', '')} "
+            f"load_clip_effective={eligibility.get('load_clip_effective', 0)} "
+            f"clip_encode_effective={eligibility.get('clip_encode_effective', 0)} "
+            f"existing_future={eligibility.get('existing_future', 0)} "
+            f"object_cache_exists={eligibility.get('object_cache_exists', 0)} "
+            f"active_large_reads_at_submit={eligibility.get('active_large_reads_at_submit', 0)}"
+        )
+        if not eligibility.get("eligible"):
+            if eligibility.get("reason") in {"existing_future", "object_cache_exists"}:
+                restore_stages["restore_background_unet_duplicate_prevented"] = 1
+            print(f"[restore_background_unet] skipped reason={eligibility.get('reason', '')}")
+            return eligibility
+
+        import nodes as _al_nodes
+        import threading as _al_thr
+
+        key = eligibility["unet_key"]
+        submit_s = time.time()
+        submit_ms = round((submit_s - restore_start) * 1000, 1)
+        restore_stages["restore_background_unet_submitted"] = 1
+        restore_stages["restore_background_unet_submit_ms_from_restore_start"] = submit_ms
+        restore_stages["restore_background_unet_submit_unix_s"] = submit_s
+        restore_stages["restore_background_unet_age_ms_at_modal_entry"] = 0.0
+        restore_stages["restore_background_unet_age_ms_at_graph_unet"] = 0.0
+        restore_stages["restore_background_unet_total_ms"] = 0.0
+        restore_stages["started_after_clip_preload"] = 1
+        restore_stages["started_before_direct_clip"] = 1
+        restore_stages["started_during_direct_clip"] = 0
+        self._wall_actual_load_per_model.append({
+            "loader_type": "UNET",
+            "canonical_key": str(key),
+            "actual_load_start_unix_s": submit_s,
+            "actual_load_done_unix_s": None,
+            "actual_load_source": "restore_background_unet",
+        })
+        rec_idx = len(self._wall_actual_load_per_model) - 1
+
+        def _load_restore_background_unet(k=key, un=eligibility["unet_name"], un_path=eligibility["unet_path"], _rec_idx=rec_idx):
+            import threading as _thr_lu
+            _tid = _thr_lu.current_thread().ident
+            self._actual_load_owner_thread[k] = _tid
+            _cpu_hits_before = sum(self._cpu_cache_hits.values()) if hasattr(self, "_cpu_cache_hits") else 0
+            _cpu_misses_before = sum(self._cpu_cache_misses.values()) if hasattr(self, "_cpu_cache_misses") else 0
+            self._set_actual_load_future_meta(
+                k,
+                source="restore_background_unet",
+                loader_type="UNET",
+                status="running",
+                submitted_at_unix_s=submit_s,
+                submitted_at_ms_from_restore_start=submit_ms,
+                unet_name=un,
+                unet_path=un_path,
+            )
+            t0 = time.time()
+            try:
+                _orig_fn = self._original_loaders.get("UNETLoader.load_unet")
+                if _orig_fn is None:
+                    raise RuntimeError("UNETLoader original loader unavailable")
+                with _model_load_context(owner="restore_background_unet", loader_type="UNET", actual_key=k, canonical_path=un_path, record_id=str(_rec_idx)):
+                    obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["UNETLoader"](), unet_name=un, weight_dtype="default")
+                if obj and obj[0] is not None:
+                    self._unet_object_cache[k] = obj[0]
+                d_ms = round((time.time() - t0) * 1000, 1)
+                _cpu_hits_after = sum(self._cpu_cache_hits.values()) if hasattr(self, "_cpu_cache_hits") else 0
+                _cpu_misses_after = sum(self._cpu_cache_misses.values()) if hasattr(self, "_cpu_cache_misses") else 0
+                _cpu_cache_hit_actual = _cpu_hits_after > _cpu_hits_before
+                _cpu_cache_volume_read = _cpu_misses_after > _cpu_misses_before
+                if _rec_idx < len(self._wall_actual_load_per_model):
+                    self._wall_actual_load_per_model[_rec_idx]["actual_load_done_unix_s"] = time.time()
+                self._set_actual_load_future_meta(
+                    k,
+                    status="completed",
+                    completed_at_unix_s=time.time(),
+                    duration_ms=d_ms,
+                    cpu_cache_hit=1 if _cpu_cache_hit_actual else 0,
+                    volume_read=1 if _cpu_cache_volume_read else 0,
+                )
+                if isinstance(getattr(self, "_last_restore_timing", None), dict):
+                    self._last_restore_timing["restore_background_unet_total_ms"] = d_ms
+                restore_stages["restore_background_unet_total_ms"] = d_ms
+                print(f"[restore_background_unet] completed ms={d_ms} cpu_cache_hit={1 if _cpu_cache_hit_actual else 0} volume_read={1 if _cpu_cache_volume_read else 0}")
+            except Exception as e:
+                self._set_actual_load_future_meta(
+                    k,
+                    status="failed",
+                    completed_at_unix_s=time.time(),
+                    error=str(e)[:200],
+                )
+                restore_stages["restore_background_unet_failed"] = 1
+                print(f"[restore_background_unet] failed err={e}")
+            finally:
+                self._actual_load_owner_thread.pop(k, None)
+
+        self._set_actual_load_future_meta(
+            key,
+            source="restore_background_unet",
+            loader_type="UNET",
+            status="submitted",
+            submitted_at_unix_s=submit_s,
+            submitted_at_ms_from_restore_start=submit_ms,
+            unet_name=eligibility["unet_name"],
+            unet_path=eligibility["unet_path"],
+        )
+        thread = _al_thr.Thread(target=_load_restore_background_unet, daemon=True)
+        self._actual_load_futures[key] = thread
+        thread.start()
+        print(
+            f"[restore_background_unet] submitted key={key} at_ms_from_restore_start={submit_ms} "
+            f"started_after_clip_preload=1 started_before_direct_clip=1 started_during_direct_clip=0"
+        )
+        return eligibility
 
     def _finalize_actual_load_records(self) -> None:
         """Compute derived fields (critical_path_saved_ms, remaining_wait_ms, etc.)
@@ -6311,9 +6714,25 @@ class _ComfyAPIMixin:
                         print(f"[actual_load] cache_hit key={key}")
                         continue
                     if key in self._actual_load_futures:
-                        self._actual_load_duplicates_prevented += 1
-                        print(f"[actual_load] duplicate_prevented key={key}")
-                        continue
+                        _duplicate_should_fall_through = False
+                        if _restore_background_code_enabled():
+                            _future_meta = getattr(self, "_actual_load_future_meta", {}).get(key, {})
+                            _future_source = _future_meta.get("source", "actual_load")
+                            _future_status = _future_meta.get("status", "unknown")
+                            if _future_source == "restore_background_unet":
+                                if _future_status == "failed":
+                                    self._actual_load_futures.pop(key, None)
+                                    _rt_restore["restore_background_unet_fallback_used"] = 1
+                                    print(f"[actual_load] restore_background_unet_failed key={key} status={_future_status} fallback=prompt_actual_load")
+                                    _duplicate_should_fall_through = True
+                                else:
+                                    self._actual_load_duplicates_prevented += 1
+                                    print(f"[actual_load] reused_existing_future loader=UNET source=restore_background_unet key={key}")
+                                    continue
+                        if not _duplicate_should_fall_through:
+                            self._actual_load_duplicates_prevented += 1
+                            print(f"[actual_load] duplicate_prevented key={key}")
+                            continue
                     _al_start_u = time.time()
                     result["actual_load_unet_submitted_at_ms_from_entry"] = round((_al_start_u - _al_t0) * 1000, 1)
                     result["actual_load_unet_submitted_at_ms_from_modal_entry"] = result["actual_load_unet_submitted_at_ms_from_entry"]
@@ -6330,6 +6749,7 @@ class _ComfyAPIMixin:
                         _cpu_misses_before = sum(self._cpu_cache_misses.values()) if hasattr(self, "_cpu_cache_misses") else 0
                         _al_cpu_cache_size_before = len(getattr(self, "_model_cpu_cache", {}))
                         print(f"[actual_load] worker_start loader=UNET key={k} thread_id={_tid}")
+                        self._set_actual_load_future_meta(k, source="actual_load", loader_type="UNET", status="running")
                         t0 = time.time()
                         try:
                             _orig_fn = self._original_loaders.get("UNETLoader.load_unet")
@@ -6347,14 +6767,33 @@ class _ComfyAPIMixin:
                             _cpu_cache_hit_actual = _cpu_hits_after > _cpu_hits_before
                             if _rec_idx < len(self._wall_actual_load_per_model):
                                 self._wall_actual_load_per_model[_rec_idx]["actual_load_done_unix_s"] = time.time()
+                            self._set_actual_load_future_meta(
+                                k,
+                                source="actual_load",
+                                loader_type="UNET",
+                                status="completed",
+                                completed_at_unix_s=time.time(),
+                                duration_ms=d_ms,
+                                cpu_cache_hit=1 if _cpu_cache_hit_actual else 0,
+                                volume_read=1 if _cpu_cache_volume_read else 0,
+                            )
                             print(f"[actual_load] done loader=UNET key={k} ms={d_ms} cpu_cache_hit={_cpu_cache_hit_actual} volume_read={_cpu_cache_volume_read}")
                         except Exception as e:
+                            self._set_actual_load_future_meta(
+                                k,
+                                source="actual_load",
+                                loader_type="UNET",
+                                status="failed",
+                                completed_at_unix_s=time.time(),
+                                error=str(e)[:200],
+                            )
                             print(f"[actual_load] failed loader=UNET key={k} err={e}")
                         finally:
                             self._actual_load_owner_thread.pop(k, None)
                     _t = _al_thr.Thread(target=_load_unet, daemon=True)
                     _t.start()
                     self._actual_load_futures[key] = _t
+                    self._set_actual_load_future_meta(key, source="actual_load", loader_type="UNET", status="submitted", submitted_at_unix_s=_al_start_u)
                     result["submitted"].append(f"UNET key={key}")
                     result["actual_load_submit_order"].append("UNET")
                     print(f"[actual_load] submitted loader=UNET key={key}")
@@ -10517,7 +10956,25 @@ class _ComfyAPIMixin:
             _cache_size_before = len(_cache)
             _cpu_cache_size_before = len(_cpu_cache)
             _future_exists_before = key in _futures
+            _future_source_before = "actual_load"
+            _future_status_before = ""
             _object_cache_exists_before = key in _cache
+            if _restore_background_code_enabled():
+                _future_meta = dict(getattr(_api, '_actual_load_future_meta', {}).get(key, {}))
+                _future_source_before = _future_meta.get("source", "actual_load") if _future_exists_before else "actual_load"
+                _future_status_before = _future_meta.get("status", "") if _future_exists_before else ""
+                _rt_restore = getattr(_api, "_last_restore_timing", None)
+                if isinstance(_rt_restore, dict):
+                    _rt_restore["restore_background_unet_future_source_at_graph_unet"] = (
+                        _future_source_before if _future_source_before == "restore_background_unet" else ""
+                    )
+                    _rt_restore["restore_background_unet_future_status_at_graph_unet"] = (
+                        _future_status_before if _future_source_before == "restore_background_unet" else ""
+                    )
+                if isinstance(_rt_restore, dict) and _future_meta.get("source") == "restore_background_unet":
+                    _submit_unix = _future_meta.get("submitted_at_unix_s") or _rt_restore.get("restore_background_unet_submit_unix_s")
+                    if _submit_unix:
+                        _rt_restore["restore_background_unet_age_ms_at_graph_unet"] = round((time.time() - _submit_unix) * 1000, 1)
             # Record UNET load source — will be set to exact value below
             _diag = {
                 "unet_requested_name": unet_name,
@@ -10540,7 +10997,9 @@ class _ComfyAPIMixin:
             }
             if _object_cache_exists_before:
                 _api._unet_cache_hits = getattr(_api, '_unet_cache_hits', 0) + 1
-                _diag["unet_loaded_from"] = "object_cache"
+                _diag["unet_loaded_from"] = "restore_background_unet_object_cache" if (
+                    _restore_background_code_enabled() and _future_source_before == "restore_background_unet"
+                ) else "object_cache"
                 _diag["unet_loaded_from_object_cache"] = "1"
                 _diag["unet_loaded_from_future"] = "0"
                 _diag["unet_loaded_from_cpu_cache"] = "0"
@@ -10553,7 +11012,9 @@ class _ComfyAPIMixin:
                 _api._unet_load_diagnostics = _diag
                 return (_cache[key],)
             _diag["unet_object_cache_miss"] = "1"
-            print(f"[unet_loader_cache] canonical_key={key} object_cache_exists={'1' if key in _cache else '0'} future_exists={'1' if _future_exists_before else '0'}")
+            print(f"[unet_loader_cache] canonical_key={key} object_cache_exists={'1' if key in _cache else '0'} future_exists={'1' if _future_exists_before else '0'} future_source={_future_source_before}")
+            if _restore_background_code_enabled() and _future_source_before == "restore_background_unet":
+                print(f"[unet_loader_cache] future_exists=1 future_source=restore_background_unet")
             # Self-future detection
             import threading as _thr_sfu
             _owner_map = getattr(_api, "_actual_load_owner_thread", {})
@@ -10599,7 +11060,9 @@ class _ComfyAPIMixin:
                     if key in _cache:
                         print(f"[loader_future] returned_future_result loader=UNET key={key} wait_ms={_f_wait_ms}")
                         _api._unet_cache_hits = getattr(_api, '_unet_cache_hits', 0) + 1
-                        _diag["unet_loaded_from"] = "actual_load_future"
+                        _diag["unet_loaded_from"] = "restore_background_unet_future" if (
+                            _restore_background_code_enabled() and _future_source_before == "restore_background_unet"
+                        ) else "actual_load_future"
                         _diag["unet_future_hit"] = "1"
                         _diag["unet_future_wait_ms"] = _f_wait_ms
                         _diag["unet_loader_return_ms"] = round((time.time() - _loader_entry_t0) * 1000, 1)
@@ -10612,14 +11075,17 @@ class _ComfyAPIMixin:
                                 _rec["future_hit"] = True
                                 break
                         return (_cache[key],)
+                if _restore_background_code_enabled() and _future_source_before == "restore_background_unet" and isinstance(getattr(_api, "_last_restore_timing", None), dict):
+                    _api._last_restore_timing["restore_background_unet_fallback_used"] = 1
+                    print(f"[loader_future] failed_future_fallback key={key} source=restore_background_unet")
             _api._unet_cache_misses = getattr(_api, '_unet_cache_misses', 0) + 1
             t0 = time.time()
             result = orig_load(self_node, **kwargs)
             d_ms = round((time.time() - t0) * 1000, 1)
-            _diag["unet_loaded_from"] = "original_loader_volume"
+            _diag["unet_loaded_from"] = "actual_load"
             _diag["unet_loaded_from_volume_or_original_loader"] = "1"
             _diag["unet_original_loader_ms"] = d_ms
-            print(f"[unet_loader_cache] normal_load path={unet_name} ms={d_ms}")
+            print(f"[unet_loader_cache] normal_load path={unet_name} source=actual_load ms={d_ms}")
             if result and result[0] is not None:
                 _cache[key] = result[0]
                 _diag["unet_cached_after_load"] = "1"
@@ -10717,6 +11183,15 @@ class _ComfyAPIMixin:
         thread.join()
         wait_ms = round((time.time() - t0) * 1000, 1)
         print(f"[loader_future] waited key={key} wait_ms={wait_ms}")
+        if _restore_background_code_enabled():
+            meta = dict(getattr(self, "_actual_load_future_meta", {}).get(key, {}))
+            if meta.get("source") == "restore_background_unet" and isinstance(getattr(self, "_last_restore_timing", None), dict):
+                self._last_restore_timing["restore_background_unet_wait_ms"] = wait_ms
+            meta_after = dict(getattr(self, "_actual_load_future_meta", {}).get(key, {}))
+            if meta_after.get("source") == "restore_background_unet" and meta_after.get("status") == "failed":
+                if isinstance(getattr(self, "_last_restore_timing", None), dict):
+                    self._last_restore_timing["restore_background_unet_fallback_used"] = 1
+                return False
         self._actual_load_waits = getattr(self, '_actual_load_waits', 0) + 1
         return True
 
@@ -11185,6 +11660,7 @@ class _ComfyAPIMixin:
             # joined later (after GPU phases) right before direct CLIP
             # warmup needs the CPU cache.
             _preload_future = None
+            _preload_result_holder: dict[str, dict] = {}
             _preload_overlap_start = 0.0
             _preload_submitted_early = 0
             _preload_duplicate_prevented = 0
@@ -11231,10 +11707,10 @@ class _ComfyAPIMixin:
                 _preload_overlap_start = time.time()
                 __stages["restore_preload_submit_at_ms_from_restore_start"] = round((_preload_overlap_start - restore_start) * 1000, 1)
                 import threading as _rt
+                def _run_restore_preload_early():
+                    _preload_result_holder["result"] = self._preload_models_to_cpu(_warmup_paths, budget_ms=None)
                 _preload_future = _rt.Thread(
-                    target=self._preload_models_to_cpu,
-                    args=(_warmup_paths,),
-                    kwargs={"budget_ms": None},
+                    target=_run_restore_preload_early,
                     daemon=True,
                 )
                 _preload_future.start()
@@ -11427,6 +11903,23 @@ class _ComfyAPIMixin:
                 _preload_overlap_ms = 0.0
                 _preload_await_ms = 0.0
                 _preload_status = "skipped"
+                __stages.setdefault("restore_background_unet_submit_ms_from_restore_start", 0.0)
+                __stages.setdefault("restore_background_unet_enabled", 1 if _restore_background_unet_enabled() else 0)
+                __stages.setdefault("restore_background_unet_submitted", 0)
+                __stages.setdefault("restore_background_unet_skip_reason", "")
+                __stages.setdefault("restore_background_unet_clip_policy_name", "")
+                __stages.setdefault("restore_background_unet_clip_policy_decision", "")
+                __stages.setdefault("restore_background_unet_load_clip_effective", 0)
+                __stages.setdefault("restore_background_unet_clip_encode_effective", 0)
+                __stages.setdefault("restore_background_unet_existing_future", 0)
+                __stages.setdefault("restore_background_unet_object_cache_exists", 0)
+                __stages.setdefault("restore_background_unet_active_large_reads_at_submit", 0)
+                __stages.setdefault("restore_background_unet_total_ms", 0.0)
+                __stages.setdefault("restore_background_unet_wait_ms", 0.0)
+                __stages.setdefault("restore_background_unet_age_ms_at_modal_entry", 0.0)
+                __stages.setdefault("restore_background_unet_age_ms_at_graph_unet", 0.0)
+                __stages.setdefault("restore_background_unet_future_status_at_graph_unet", "")
+                __stages.setdefault("restore_background_unet_future_source_at_graph_unet", "")
 
                 # ── PART 3: Preload guardrails ──
                 # These guards were already checked in the early submit
@@ -11464,10 +11957,10 @@ class _ComfyAPIMixin:
                     _preload_overlap_start = time.time()
                     __stages["restore_preload_submit_at_ms_from_restore_start"] = round((_preload_overlap_start - restore_start) * 1000, 1)
                     import threading as _rt2
+                    def _run_restore_preload_late():
+                        _preload_result_holder["result"] = self._preload_models_to_cpu(preload_paths, budget_ms=None)
                     _preload_future = _rt2.Thread(
-                        target=self._preload_models_to_cpu,
-                        args=(preload_paths,),
-                        kwargs={"budget_ms": None},
+                        target=_run_restore_preload_late,
                         daemon=True,
                     )
                     _preload_future.start()
@@ -11492,12 +11985,17 @@ class _ComfyAPIMixin:
                     __stages["restore_preload_status"] = _preload_status
                     __stages["restore_preload_duplicate_read_prevented"] = 0
                     __stages["restore_preload_total_ms"] = round((time.time() - _preload_overlap_start) * 1000, 1)
-                    preload_result = {"count": 0, "file_timing_ms": {}, "early_submitted": True}
+                    preload_result = _preload_result_holder.get("result") or {"count": 0, "file_timing_ms": {}, "early_submitted": True}
                     print(
                         f"[comfyapp] restore_preload_joined overlap_ms={_preload_overlap_ms} "
                         f"await_ms={_preload_await_ms} status={_preload_status} "
                         f"join_at_ms_from_restore_start={_preload_join_at_ms}"
                     )
+                    if _restore_background_code_enabled():
+                        _rbg = self._maybe_submit_restore_background_unet(profile, _clip_policy, preload_result, restore_start, __stages)
+                        __stages["restore_background_unet_existing_future"] = _rbg.get("existing_future", 0)
+                        __stages["restore_background_unet_object_cache_exists"] = _rbg.get("object_cache_exists", 0)
+                        __stages["restore_background_unet_active_large_reads_at_submit"] = _rbg.get("active_large_reads_at_submit", 0)
                 elif preload_paths and _pm != "off":
                     if _pm == "async_no_wait":
                         import threading
@@ -11738,7 +12236,7 @@ class _ComfyAPIMixin:
                 if profile and profile.get("mode") and not _skip_direct_warmup:
                     _s = time.time()
                     _dw = self._warmup_direct(profile,
-                        clip_policy_overrides=_clip_policy if _clip_policy.get("restore_direct_clip_policy") == "auto" else None)
+                        clip_policy_overrides=_clip_policy)
                     __stages["warmup_direct_total_ms"] = _dw.get("direct_total_ms", 0.0)
                     for _k in ("direct_unet_load_ms", "direct_clip_load_ms", "direct_clip_encode_ms"):
                         _v = _dw.get(_k)
@@ -11967,6 +12465,12 @@ class _ComfyAPIMixin:
         # snapshot restore + CUDA warmup; on a warm container it is just
         # the time the function was dispatched.
         server_trace.mark("t3_modal_entry")
+        _rt_bg = getattr(self, "_last_restore_timing", None)
+        if isinstance(_rt_bg, dict) and _rt_bg.get("restore_background_unet_submit_unix_s"):
+            _rt_bg["restore_background_unet_age_ms_at_modal_entry"] = round(
+                (server_trace.get("t3_modal_entry") - _rt_bg.get("restore_background_unet_submit_unix_s")) * 1000,
+                1,
+            )
 
         # ── Check for scheduler test mode ──
         _scheduler_config_ns = (modal_options or {}).get("comfymodal_scheduler_test")

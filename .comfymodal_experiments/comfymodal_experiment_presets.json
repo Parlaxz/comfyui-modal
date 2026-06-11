@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "default_preset": "baseline_hard_off",
+  "presets": {
+    "baseline_hard_off": {
+      "description": "Hard-off baseline. Restore-background code disabled. Direct CLIP policy auto.",
+      "runtime_flags": {
+        "EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "0",
+        "RESTORE_BACKGROUND_UNET": "0",
+        "RESTORE_DIRECT_CLIP_POLICY": "auto"
+      },
+      "expected_logs": [
+        "effective_EXPERIMENTAL_RESTORE_BACKGROUND_CODE=False",
+        "effective_RESTORE_BACKGROUND_UNET=False",
+        "effective_RESTORE_DIRECT_CLIP_POLICY=auto",
+        "future_source=actual_load"
+      ]
+    },
+    "restore_background_unet_on": {
+      "description": "Enable restore-background UNET after CLIP preload join. Direct CLIP policy auto.",
+      "runtime_flags": {
+        "EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "1",
+        "RESTORE_BACKGROUND_UNET": "1",
+        "RESTORE_DIRECT_CLIP_POLICY": "auto"
+      },
+      "expected_logs": [
+        "effective_EXPERIMENTAL_RESTORE_BACKGROUND_CODE=True",
+        "effective_RESTORE_BACKGROUND_UNET=True",
+        "effective_RESTORE_DIRECT_CLIP_POLICY=auto",
+        "[restore_background_unet] submitted",
+        "future_source=restore_background_unet",
+        "source=restore_background_unet"
+      ]
+    },
+    "restore_bg_unet_clip_load_only": {
+      "description": "Restore-background UNET on, restore CLIP load_only (no encode during restore).",
+      "runtime_flags": {
+        "EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "1",
+        "RESTORE_BACKGROUND_UNET": "1",
+        "RESTORE_DIRECT_CLIP_POLICY": "load_only"
+      },
+      "expected_logs": [
+        "effective_EXPERIMENTAL_RESTORE_BACKGROUND_CODE=True",
+        "effective_RESTORE_BACKGROUND_UNET=True",
+        "effective_RESTORE_DIRECT_CLIP_POLICY=load_only",
+        "restore_direct_clip_policy=load_only decision=load_only_explicit",
+        "direct_warmup_load_clip_effective=1",
+        "direct_warmup_clip_encode_effective=0",
+        "direct_warmup_clip_encode: 0.0",
+        "direct_clip_encode_ms: 0.0",
+        "[restore_background_unet] eligible=1 reason=eligible",
+        "[restore_background_unet] submitted",
+        "[actual_load] reused_existing_future loader=UNET source=restore_background_unet",
+        "future_source=restore_background_unet",
+        "source=restore_background_unet"
+      ]
+    }
+  }
+}

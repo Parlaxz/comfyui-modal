@@ -455,6 +455,199 @@ class SnapshotPreloadProfileTests(unittest.TestCase):
         self.assertIsNone(inst._snapshot_preload_profile())
 
 
+class RestoreBackgroundUnetEligibilityTests(unittest.TestCase):
+    def _make_instance(self):
+        from comfyapp import _ComfyAPIMixin
+        inst = object.__new__(_ComfyAPIMixin)
+        inst._model_cpu_cache = {}
+        inst._actual_load_futures = {}
+        inst._actual_load_future_meta = {}
+        inst._actual_load_locks = {}
+        inst._actual_load_owner_thread = {}
+        inst._unet_object_cache = {}
+        return inst
+
+    def _profile(self, *, unets=None, clip_name="clip.safetensors", source="active_next_profile"):
+        unets = list(unets or ["unet.safetensors"])
+        return {
+            "_source": source,
+            "_current_workflow_stack": {
+                "unet": unets,
+                "clip": [clip_name],
+                "vae": ["vae.safetensors"],
+                "checkpoint": [],
+                "clip_type": "lumina2",
+            },
+            "unet": unets[0] if unets else "",
+            "clip1": clip_name,
+            "clip2": clip_name,
+            "vae": "vae.safetensors",
+            "clip_type": "lumina2",
+        }
+
+    def _clip_policy(self, *, decision="load_and_encode_default"):
+        return {
+            "restore_direct_clip_policy": "auto",
+            "restore_direct_clip_policy_decision": decision,
+            "direct_warmup_load_clip_effective": 1 if decision == "load_and_encode_default" else 0,
+            "direct_warmup_clip_encode_effective": 1 if decision == "load_and_encode_default" else 0,
+        }
+
+    def _preload_result(self, *, cached=None, aborted=False, failed_files=0, running_threads_not_killable=0):
+        return {
+            "cached": list(["clip.safetensors"] if cached is None else cached),
+            "aborted": aborted,
+            "failed_files": failed_files,
+            "running_threads_not_killable": running_threads_not_killable,
+        }
+
+    def test_restore_background_unet_enabled_uses_runtime_flag_file(self):
+        import comfyapp
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             mock.patch.object(comfyapp, "RUNTIME_CONFIG_DIR", tmpdir), \
+             mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", False), \
+             mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("COMFYMODAL_RESTORE_BACKGROUND_UNET", None)
+            with open(os.path.join(tmpdir, "RESTORE_BACKGROUND_UNET.txt"), "w", encoding="utf-8") as f:
+                f.write("1")
+
+            self.assertTrue(comfyapp._resolve_runtime_flag("RESTORE_BACKGROUND_UNET", "0"))
+            self.assertTrue(comfyapp._restore_background_unet_enabled())
+
+    def test_restore_background_unet_requires_valid_active_next_profile(self):
+        inst = self._make_instance()
+        import comfyapp
+
+        fake_folder_paths = SimpleNamespace(
+            get_full_path=lambda bucket, name: f"/models/{bucket}/{name}" if name else ""
+        )
+        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+             mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
+             mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
+            eligibility = inst._restore_background_unet_eligibility(
+                self._profile(source="env_default"),
+                self._clip_policy(),
+                self._preload_result(),
+            )
+
+        self.assertEqual(eligibility["eligible"], 0)
+        self.assertEqual(eligibility["reason"], "active_next_profile_invalid")
+
+    def test_restore_background_unet_requires_exact_single_resolved_unet(self):
+        inst = self._make_instance()
+        import comfyapp
+
+        fake_folder_paths = SimpleNamespace(
+            get_full_path=lambda bucket, name: f"/models/{bucket}/{name}" if name else ""
+        )
+        clip_path = "/models/text_encoders/clip.safetensors"
+        inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
+        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+             mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
+             mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
+            eligibility = inst._restore_background_unet_eligibility(
+                self._profile(unets=["a.safetensors", "b.safetensors"]),
+                self._clip_policy(),
+                self._preload_result(),
+            )
+
+        self.assertEqual(eligibility["eligible"], 0)
+        self.assertEqual(eligibility["reason"], "unet_not_exact_single_resolved")
+
+    def test_restore_background_unet_requires_clip_cpu_cache_after_preload(self):
+        inst = self._make_instance()
+        import comfyapp
+
+        fake_folder_paths = SimpleNamespace(
+            get_full_path=lambda bucket, name: f"/models/{bucket}/{name}" if name else ""
+        )
+        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+             mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
+             mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
+            eligibility = inst._restore_background_unet_eligibility(
+                self._profile(),
+                self._clip_policy(),
+                self._preload_result(cached=[]),
+            )
+
+        self.assertEqual(eligibility["eligible"], 0)
+        self.assertEqual(eligibility["reason"], "clip_cpu_cache_missing")
+
+    def test_restore_background_unet_skips_when_large_read_is_running(self):
+        inst = self._make_instance()
+        import comfyapp
+
+        fake_folder_paths = SimpleNamespace(
+            get_full_path=lambda bucket, name: f"/models/{bucket}/{name}" if name else ""
+        )
+        clip_path = "/models/text_encoders/clip.safetensors"
+        inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
+        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+             mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[{"canonical_key": "busy", "status": "running", "active_read_is_large": 1}]), \
+             mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
+            eligibility = inst._restore_background_unet_eligibility(
+                self._profile(),
+                self._clip_policy(),
+                self._preload_result(),
+            )
+
+        self.assertEqual(eligibility["eligible"], 0)
+        self.assertEqual(eligibility["reason"], "active_large_read_running")
+
+    def test_restore_background_unet_skips_when_future_already_exists(self):
+        inst = self._make_instance()
+        import comfyapp
+
+        fake_folder_paths = SimpleNamespace(
+            get_full_path=lambda bucket, name: f"/models/{bucket}/{name}" if name else ""
+        )
+        clip_path = "/models/text_encoders/clip.safetensors"
+        unet_path = "/models/unet/unet.safetensors"
+        inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
+        inst._actual_load_futures[inst._unet_cache_key(unet_path, "default")] = object()
+        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+             mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
+             mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
+            eligibility = inst._restore_background_unet_eligibility(
+                self._profile(),
+                self._clip_policy(),
+                self._preload_result(),
+            )
+
+        self.assertEqual(eligibility["eligible"], 0)
+        self.assertEqual(eligibility["reason"], "existing_future")
+
+
+class RestoreBackgroundUnetFutureTests(unittest.TestCase):
+    def _make_instance(self):
+        from comfyapp import _ComfyAPIMixin
+        inst = object.__new__(_ComfyAPIMixin)
+        inst._actual_load_futures = {}
+        inst._actual_load_future_meta = {}
+        inst._actual_load_waits = 0
+        return inst
+
+    def test_failed_restore_background_future_does_not_count_as_consumed(self):
+        inst = self._make_instance()
+        key = ("/models/unet/u.safetensors", "default")
+
+        class DummyThread:
+            def join(self):
+                return None
+
+        inst._actual_load_futures[key] = DummyThread()
+        inst._actual_load_future_meta[key] = {
+            "source": "restore_background_unet",
+            "status": "failed",
+            "loader_type": "UNET",
+            "error": "boom",
+        }
+
+        self.assertFalse(inst._consume_actual_load_future(key))
+        self.assertNotIn(key, inst._actual_load_futures)
+
+
 class AutoWarmupASTTests(unittest.TestCase):
     """Structural tests via AST parsing (no Modal dependency)."""
 
@@ -509,6 +702,20 @@ class AutoWarmupASTTests(unittest.TestCase):
         self.assertIsNotNone(source)
         self.assertIn("restore_warmup", source)
         self.assertIn("cuda_warmup", source)
+
+    def test_restore_background_unet_submission_is_wired_into_restore(self):
+        source = self._get_method_source("restore")
+        self.assertIsNotNone(source)
+        source = source or ""
+        self.assertIn("_maybe_submit_restore_background_unet", source)
+        self.assertIn("restore_background_unet_submit_ms_from_restore_start", source)
+        self.assertIn("restore_background_unet_enabled", source)
+
+    def test_prompt_and_loader_paths_reference_restore_background_unet_future(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn("reused_existing_future loader=UNET source=restore_background_unet", source)
+        self.assertIn("future_source=restore_background_unet", source)
+        self.assertIn("restore_background_unet_fallback_used", source)
 
     def test_startup_wraps_in_process_init_in_force_cpu(self):
         """Startup initialises the in-process backend under
