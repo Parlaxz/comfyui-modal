@@ -1044,6 +1044,7 @@ async def _execute_job(item: tuple, item_id: int):
     trace_payload = extra_data.get("trace", {}) if isinstance(extra_data, dict) else {}
     trace = Trace(prompt_id=prompt_id, t0=coerce_t0_from_browser(trace_payload) or local_started)
     trace.update(trace_payload)
+    trace.mark("client_generate_clicked_or_request_start", trace.get("t0_client_press") or local_started)
 
     task_key = _register_running(item)
 
@@ -1141,6 +1142,8 @@ async def _execute_job(item: tuple, item_id: int):
         trace.mark("t2_local_dispatch")
         trace.mark("t2b_modal_handle_resolved")
         trace.mark("t2c_modal_call_start")
+        trace.mark("client_modal_call_start", trace.get("t2c_modal_call_start") or remote_started)
+        trace.mark("client_modal_submit_done", trace.get("t2c_modal_call_start") or remote_started)
         if os.environ.get("COMFYMODAL_PREDISPATCH_DEBUG"):
             print(f"[predispatch] phase=before_gpu_spawn t={time.time()}")
         # Stream prompt execution with real-time progress from the Modal
@@ -1150,6 +1153,20 @@ async def _execute_job(item: tuple, item_id: int):
         _first_msg = True
         _result_route_mode = extra_data.get("result_route", _RESULT_ROUTE)
         _mo = dict(extra_data.get("modal_options") or {})
+        # Propagate runtime restore_background_unet flag to volume file
+        # so the next container cold start can read it during restore().
+        # Only active when EXPERIMENTAL_RESTORE_BACKGROUND_CODE is on.
+        _rbg_enabled = False
+        if isinstance(_mo.get("runtime"), dict):
+            _rbg_runtime = _mo["runtime"].get("restore_background_unet", {})
+            if isinstance(_rbg_runtime, dict):
+                _rbg_enabled = bool(_rbg_runtime.get("enabled", False))
+        if _modal_available and _rbg_enabled:
+            try:
+                await _call_set_runtime_flag("RESTORE_BACKGROUND_UNET", "1")
+                print(f"[comfyui-modal] restore_background_unet volume flag set to 1 via runtime config")
+            except Exception as _rbg_prop_exc:
+                print(f"[comfyui-modal] restore_background_unet volume flag set failed: {_rbg_prop_exc}")
         _st = extra_data.get("scheduler_test")
         if isinstance(_st, dict):
             _mo["comfymodal_scheduler_test"] = _st
@@ -1162,6 +1179,7 @@ async def _execute_job(item: tuple, item_id: int):
         ):
             if _first_msg:
                 _first_msg = False
+                trace.mark("client_first_remote_log_seen")
                 if os.environ.get("COMFYMODAL_PREDISPATCH_DEBUG"):
                     print(f"[predispatch] phase=first_gpu_response t={time.time()}")
             if not isinstance(_msg, dict):
@@ -1195,6 +1213,7 @@ async def _execute_job(item: tuple, item_id: int):
         result = _modal_result
         trace.mark("t9_modal_return")
         trace.mark("t9b_local_result_received")
+        trace.mark("client_remote_result_received", trace.get("t9b_local_result_received") or time.time())
         remote_run_ms = round((time.time() - remote_started) * 1000, 1)
         print(
             f"[comfyui-modal.profile] stage=remote_run_prompt prompt_id={prompt_id[:8]} "
@@ -1260,6 +1279,9 @@ async def _execute_job(item: tuple, item_id: int):
     os.makedirs(output_dir, exist_ok=True)
     trace.mark("t9e_local_materialize_start")
     materialize_started = time.time()
+    _decode_started = False
+    _write_started = False
+    _notify_started = False
     output_bytes_written = 0
     output_image_count = 0
     output_video_count = 0
@@ -1274,7 +1296,11 @@ async def _execute_job(item: tuple, item_id: int):
             local_entries = []
             is_video_key = output_key == "gifs"
             for entry in entries:
+                if not _decode_started:
+                    trace.mark("client_result_decode_start")
+                    _decode_started = True
                 img_bytes = base64.b64decode(entry["data"])
+                trace.mark("client_result_decode_done")
                 output_bytes_written += len(img_bytes)
                 if is_video_key:
                     output_video_count += 1
@@ -1283,8 +1309,12 @@ async def _execute_job(item: tuple, item_id: int):
                 local_filename = entry["filename"]
                 local_path = _unique_path(output_dir, local_filename)
                 local_filename = os.path.basename(local_path)
+                if not _write_started:
+                    trace.mark("client_file_write_start")
+                    _write_started = True
                 with open(local_path, "wb") as f:
                     f.write(img_bytes)
+                trace.mark("client_file_write_done")
                 local_entry = {"filename": local_filename, "subfolder": "", "type": "output"}
                 local_entries.append(local_entry)
                 handled_fnames.add(entry["filename"])
@@ -1295,6 +1325,9 @@ async def _execute_job(item: tuple, item_id: int):
         if not event_output:
             continue
         outputs[node_id] = event_output
+        if not _notify_started:
+            trace.mark("client_comfy_notify_start")
+            _notify_started = True
         _send(sid, "executed", {
             "node": node_id,
             "display_node": node_id,
@@ -1306,19 +1339,30 @@ async def _execute_job(item: tuple, item_id: int):
     for img in result.get("images", []):
         if img["filename"] in handled_fnames:
             continue
+        if not _decode_started:
+            trace.mark("client_result_decode_start")
+            _decode_started = True
         img_bytes = base64.b64decode(img["data"])
+        trace.mark("client_result_decode_done")
         output_bytes_written += len(img_bytes)
         output_image_count += 1
         local_filename = img["filename"]
         local_path = _unique_path(output_dir, local_filename)
         local_filename = os.path.basename(local_path)
+        if not _write_started:
+            trace.mark("client_file_write_start")
+            _write_started = True
         with open(local_path, "wb") as f:
             f.write(img_bytes)
+        trace.mark("client_file_write_done")
         local_entry = {"filename": local_filename, "subfolder": "", "type": "output"}
         node_id = img["node_id"]
         if node_id not in outputs:
             outputs[node_id] = {"images": []}
         outputs[node_id].setdefault("images", []).append(local_entry)
+        if not _notify_started:
+            trace.mark("client_comfy_notify_start")
+            _notify_started = True
         _send(sid, "executed", {
             "node": node_id,
             "display_node": node_id,
@@ -1328,20 +1372,31 @@ async def _execute_job(item: tuple, item_id: int):
 
     # ── Phase 3: Flat videos ──────────────────────────────────────────
     for vid in result.get("videos", []):
+        if not _decode_started:
+            trace.mark("client_result_decode_start")
+            _decode_started = True
         vid_bytes = base64.b64decode(vid["data"])
+        trace.mark("client_result_decode_done")
         output_bytes_written += len(vid_bytes)
         output_video_count += 1
         local_filename = vid["filename"]
         local_path = _unique_path(output_dir, local_filename)
         local_filename = os.path.basename(local_path)
+        if not _write_started:
+            trace.mark("client_file_write_start")
+            _write_started = True
         with open(local_path, "wb") as f:
             f.write(vid_bytes)
+        trace.mark("client_file_write_done")
         local_entry = {"filename": local_filename, "subfolder": "", "type": "output"}
         node_id = vid["node_id"]
         if node_id not in outputs:
             outputs[node_id] = {"images": [], "animated": (True,)}
         outputs[node_id].setdefault("images", []).append(local_entry)
         outputs[node_id]["animated"] = (True,)
+        if not _notify_started:
+            trace.mark("client_comfy_notify_start")
+            _notify_started = True
         _send(sid, "executed", {
             "node": node_id,
             "display_node": node_id,
@@ -1350,6 +1405,12 @@ async def _execute_job(item: tuple, item_id: int):
         })
 
     materialize_ms = round((time.time() - materialize_started) * 1000, 1)
+    if not _decode_started:
+        trace.mark("client_result_decode_start", materialize_started)
+        trace.mark("client_result_decode_done", materialize_started)
+    if not _write_started:
+        trace.mark("client_file_write_start", materialize_started)
+        trace.mark("client_file_write_done", materialize_started)
     print(
         f"[comfyui-modal.profile] stage=output_materialize prompt_id={prompt_id[:8]} "
         f"duration_ms={materialize_ms} images={output_image_count} videos={output_video_count} bytes={output_bytes_written}"
@@ -1502,6 +1563,9 @@ async def _execute_job(item: tuple, item_id: int):
     print(trace.log_line())
 
     trace.mark("t10d_local_response_sent")
+    if not _notify_started:
+        trace.mark("client_comfy_notify_start")
+    trace.mark("client_comfy_notify_done")
     _send(sid, "executing", {"node": None, "display_node": None, "prompt_id": prompt_id})
     _send(sid, "modal_status", {"prompt_id": prompt_id, "message": None, "phase": "done"})
     _send(sid, "execution_success", {"prompt_id": prompt_id, "trace": result.get("trace")})

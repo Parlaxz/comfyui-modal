@@ -1895,15 +1895,31 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     else:
         errors.append("missing active_read attached-future / duplicate-prevented logs")
 
-    # 74. No restore-background UNET added in this round.
-    _restore_background_unet_terms = ["restore_background_unet", "restore_unet_background", "restore_unet_future"]
-    _restore_bg_hits = [t for t in _restore_background_unet_terms if t in comfyapp_source]
-    if not _restore_bg_hits:
-        print("  [OK] no restore-background UNET implementation added")
+    # 74. restore-background UNET is present but defaults to disabled.
+    _rbg_default = re.search(r'RESTORE_BACKGROUND_UNET_ENABLED\s*=\s*os\.getenv\("COMFYMODAL_RESTORE_BACKGROUND_UNET",\s*"([^"]+)"\)\s*==\s*"1"', comfyapp_source)
+    _rbg_default_val = (_rbg_default.group(1) if _rbg_default else "").strip()
+    if _rbg_default_val == "0":
+        print("  [OK] restore-background UNET defaults to disabled")
     else:
-        errors.append(f"restore-background UNET terms found unexpectedly: {_restore_bg_hits}")
+        errors.append(f"restore-background UNET default changed to {_rbg_default_val!r}, expected '0'")
 
-    # 75. CacheDiT remains untouched by FUSE policy.
+    # 75. restore-background UNET guard + reuse path is structurally present.
+    _rbg_required_terms = [
+        "_maybe_submit_restore_background_unet",
+        "active_next_profile_invalid",
+        "clip_cpu_cache_missing",
+        "active_large_read_running",
+        "reused_existing_future loader=UNET source=restore_background_unet",
+        "future_source=restore_background_unet",
+        "restore_background_unet_fallback_used",
+    ]
+    _rbg_missing = [t for t in _rbg_required_terms if t not in comfyapp_source]
+    if not _rbg_missing:
+        print("  [OK] restore-background UNET guard + future reuse path is present")
+    else:
+        errors.append(f"restore-background UNET missing required terms: {_rbg_missing}")
+
+    # 76. CacheDiT remains untouched by FUSE policy.
     _fuse_policy_src = comfyapp_source[
         comfyapp_source.find("def _classify_fuse_read"):
         comfyapp_source.find("def _register_active_model_read", comfyapp_source.find("def _classify_fuse_read"))
