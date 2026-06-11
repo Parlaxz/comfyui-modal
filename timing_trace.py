@@ -258,6 +258,26 @@ class Trace:
         if modal_entry_to_ps is not None:
             out["derived_ms"]["modal_entry_to_prompt_start_ms"] = modal_entry_to_ps
 
+        # Model wrapper chain: combined wall time for all wrapper/patch nodes
+        # that modify the model after loading (CacheDiT, NoiseInjection,
+        # ModelSampling, ModelPatch).
+        _wrapper_stages = [
+            ("cachedit_ms", "t8_cachedit_start", "t8_cachedit_end"),
+            ("noise_inject_ms", "t8_noise_inject_start", "t8_noise_inject_end"),
+            ("model_sampling_ms", "t4d_model_sampling_start", "t4d_model_sampling_end"),
+            ("model_patch_ms", "t4e_model_patch_start", "t4e_model_patch_end"),
+        ]
+        _wrapper_total = 0.0
+        _wrapper_any = False
+        for _wn, _ws, _we in _wrapper_stages:
+            _wd = self.delta_ms(_ws, _we)
+            if _wd is not None:
+                out["deltas_ms"][_wn] = _wd
+                _wrapper_total += _wd
+                _wrapper_any = True
+        if _wrapper_any:
+            out["derived_ms"]["model_wrapper_chain_ms"] = round(_wrapper_total, 2)
+
         # Node-level wall times (alias with clearer naming).
         # These measure the node's wall-clock window which may include
         # future/cache resolution, not just pure model I/O.
@@ -386,6 +406,10 @@ class Trace:
             "t4b_unet_load_end",
             "t4c_vae_load_start",
             "t4c_vae_load_end",
+            "t4d_model_sampling_start",
+            "t4d_model_sampling_end",
+            "t4e_model_patch_start",
+            "t4e_model_patch_end",
             "t5_text_encode_start",
             "t5_text_encode_end",
             "t6_sampler_start",
@@ -436,6 +460,10 @@ class Trace:
             "inference_total",
             "modal_to_return",
             "modal_to_browser",
+            "cachedit_ms",
+            "noise_inject_ms",
+            "model_sampling_ms",
+            "model_patch_ms",
         ]
         delta_parts = [f"{k}={d[k]}ms" for k in delta_keys if k in d and d[k] is not None]
         derived = s.get("derived_ms", {})
@@ -447,6 +475,10 @@ class Trace:
             "output_collection_total_ms",
             "total_input_execution_ms",
             "modal_to_return_ms",
+            "model_wrapper_chain_ms",
+            "exec_model_load_io_ms",
+            "exec_deepcopy_ms",
+            "load_model_gpu_ms",
         ]
         derived_keys += [
             "modal_entry_to_prompt_start_ms",
@@ -510,3 +542,143 @@ def coerce_t0_from_browser(payload: dict | None) -> float | None:
         epoch_ms_at_perf = raw_now - float(raw)
         return epoch_ms_at_perf / 1000.0
     return None
+
+
+# ── TraceV4 — v4 dual-clock trace extension ────────────────────────────────
+# Adds time.time_ns() / time.perf_counter_ns() dual-clock event support
+# while preserving full backward compatibility with Trace.
+
+_V4_PROFILE_LEVEL: str = os.environ.get("COMFYMODAL_PROFILE_LEVEL", "summary").strip().lower()
+if _V4_PROFILE_LEVEL not in ("off", "summary", "detailed", "trace", "trace_verbose"):
+    _V4_PROFILE_LEVEL = "summary"
+
+
+def get_v4_profile_level() -> str:
+    return _V4_PROFILE_LEVEL
+
+
+def set_v4_profile_level(level: str) -> None:
+    global _V4_PROFILE_LEVEL
+    level = level.strip().lower()
+    if level in ("off", "summary", "detailed", "trace", "trace_verbose"):
+        _V4_PROFILE_LEVEL = level
+
+
+def _v4_profile_enabled(level: str = "summary") -> bool:
+    if _V4_PROFILE_LEVEL == "off":
+        return False
+    order = {"off": 0, "summary": 1, "detailed": 2, "trace": 3, "trace_verbose": 4}
+    return order.get(_V4_PROFILE_LEVEL, 0) >= order.get(level, 1)
+
+
+# ── Canonical v4 event name constants ──────────────────────────────────────
+V4_T0_CLIENT_PRESS = "t0_client_press"
+V4_T1_LOCAL_BRIDGE_RECEIVED = "t1_local_bridge_received"
+V4_T2_LOCAL_MODAL_SUBMIT_START = "t2_local_modal_submit_start"
+V4_T2C_FIRST_REMOTE_EVENT_RECEIVED = "t2c_first_remote_event_received"
+V4_T3_MODAL_ENTRY = "t3_modal_entry"
+V4_T4_PROMPT_START = "t4_prompt_start"
+V4_T5_SAMPLER_START = "t5_sampler_start"
+V4_T6_SAMPLER_END = "t6_sampler_end"
+V4_T6A_VAE_DECODE_START = "t6a_vae_decode_start"
+V4_T6B_VAE_DECODE_END = "t6b_vae_decode_end"
+V4_T7_OUTPUTS_COLLECTION_START = "t7_outputs_collection_start"
+V4_T8_OUTPUTS_COLLECTED = "t8_outputs_collected"
+V4_T8F_REMOTE_RETURN_END = "t8f_remote_return_end"
+V4_T9_LOCAL_REMOTE_RESULT_RECEIVED = "t9_local_remote_result_received"
+V4_T10_LOCAL_MATERIALIZED = "t10_local_materialized"
+V4_T10A_LOCAL_RESPONSE_TO_COMFY_START = "t10a_local_response_to_comfy_start"
+V4_T10B_LOCAL_RESPONSE_TO_COMFY_END = "t10b_local_response_to_comfy_end"
+V4_T11_LOCAL_UI_DONE = "t11_local_ui_done"
+V4_RESTORE_START = "restore_start"
+V4_RESTORE_END = "restore_end"
+
+_LEGACY_TO_V4: dict[str, str] = {
+    "t0_client_press": V4_T0_CLIENT_PRESS,
+    "t1_local_recv": V4_T1_LOCAL_BRIDGE_RECEIVED,
+    "t2_local_dispatch": V4_T2_LOCAL_MODAL_SUBMIT_START,
+    "t3_modal_entry": V4_T3_MODAL_ENTRY,
+    "t3d_prompt_start": V4_T4_PROMPT_START,
+    "t6_sampler_start": V4_T5_SAMPLER_START,
+    "t6_sampler_end": V4_T6_SAMPLER_END,
+    "t7_vae_decode_start": V4_T6A_VAE_DECODE_START,
+    "t7_vae_decode_end": V4_T6B_VAE_DECODE_END,
+    "t7b_collect_start": V4_T7_OUTPUTS_COLLECTION_START,
+    "t8b_outputs_collected": V4_T8_OUTPUTS_COLLECTED,
+    "t9_modal_return": V4_T8F_REMOTE_RETURN_END,
+    "t10_local_materialized": V4_T10_LOCAL_MATERIALIZED,
+    "t_restore_start": V4_RESTORE_START,
+    "t_restore_end": V4_RESTORE_END,
+}
+
+
+def _get_thread_info() -> dict:
+    import threading
+    return {
+        "pid": os.getpid(),
+        "thread_id": threading.get_ident(),
+        "thread_name": threading.current_thread().name,
+    }
+
+
+class TraceV4(Trace):
+    """v4 dual-clock trace extension.
+
+    Adds ``wall_unix_ns`` (time.time_ns) and ``mono_ns`` (time.perf_counter_ns)
+    to every event, along with process/phase/thread metadata.
+    Fully backward-compatible with ``Trace`` — inherits ``mark()``, ``summary()``, etc.
+    """
+
+    def __init__(self, prompt_id: str = "", t0: float | None = None, process: str = "comfy_internal"):
+        super().__init__(prompt_id=prompt_id, t0=t0)
+        self.process = process
+        self._v4_events: list[dict] = []
+
+    def mark_v4(
+        self, name: str, process: str = "", phase: str = "",
+        profile_level: str = "summary", **metadata: Any,
+    ) -> dict:
+        if not _v4_profile_enabled(profile_level):
+            return {"name": name}
+        proc = process or self.process
+        wall_ns = time.time_ns()
+        mono_ns = time.perf_counter_ns()
+        thread = _get_thread_info()
+        event: dict[str, Any] = {
+            "name": name,
+            "process": proc,
+            "phase": phase,
+            "wall_unix_ns": wall_ns,
+            "mono_ns": mono_ns,
+            "pid": thread["pid"],
+            "thread_id": thread["thread_id"],
+            "thread_name": thread["thread_name"],
+        }
+        if metadata:
+            event["metadata"] = metadata
+        self._v4_events.append(event)
+        return event
+
+    def mark(self, name: str, t: float | None = None) -> float:
+        val = super().mark(name, t)
+        v4_name = _LEGACY_TO_V4.get(name, name)
+        self.mark_v4(v4_name, phase="timing_trace_legacy", profile_level="trace")
+        return val
+
+    def span_start_v4(self, name: str, process: str = "", phase: str = "", **metadata: Any) -> dict:
+        return self.mark_v4(f"{name}_start", process=process, phase=phase, **metadata)
+
+    def span_end_v4(self, name: str, process: str = "", phase: str = "", **metadata: Any) -> dict:
+        return self.mark_v4(f"{name}_end", process=process, phase=phase, **metadata)
+
+    def to_event_list(self) -> list[dict]:
+        return list(self._v4_events)
+
+    def v4_summary(self) -> dict[str, Any]:
+        return {
+            "trace_version": "4.0.0",
+            "prompt_id": self.prompt_id,
+            "events": list(self._v4_events),
+            "event_count": len(self._v4_events),
+            "process": self.process,
+        }
