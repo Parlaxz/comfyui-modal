@@ -14388,7 +14388,6 @@ def _register_gpu_classes():
             # SageAttention C extensions (safe) while allowing ComfyUI GPU init.
             # The snapshot captures the CUDA context and compiled kernels.
             **({"experimental_options": {"enable_gpu_snapshot": True}} if ENABLE_GPU_SNAPSHOT else {}),
-            secrets=[modal.Secret.from_name("comfyui-warmup-dev")],
         )(Generated)
         globals()[class_name] = Generated
 
