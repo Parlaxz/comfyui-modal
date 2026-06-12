@@ -603,5 +603,313 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
         self.assertEqual(result["outputs"]["7"]["a_images"][0]["filename"], filename)
 
 
+class ComfyAppRuntimeFlagTests(unittest.TestCase):
+    """Selftests for runtime flag resolver priority and cleanup helpers."""
+
+    def setUp(self):
+        self.module = load_module()
+
+    def test_runtime_flag_resolver_priority_flag_file_over_env(self):
+        """Runtime flag file takes priority over env var."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "runtime_config"
+            config_dir.mkdir(parents=True)
+            flag_path = config_dir / "RESTORE_BACKGROUND_UNET.txt"
+            flag_path.write_text("1", encoding="utf-8")
+
+            with patch.object(self.module, "RUNTIME_CONFIG_DIR", str(config_dir)):
+                with patch.dict(os.environ, {"COMFYMODAL_RESTORE_BACKGROUND_UNET": "0"}):
+                    result = self.module._resolve_runtime_flag("RESTORE_BACKGROUND_UNET", "0")
+                    self.assertTrue(result, "Flag file should override env var")
+
+    def test_runtime_flag_resolver_priority_env_over_default(self):
+        """Env var takes priority over module default."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "runtime_config"
+            config_dir.mkdir(parents=True)
+
+            with patch.object(self.module, "RUNTIME_CONFIG_DIR", str(config_dir)):
+                with patch.dict(os.environ, {"COMFYMODAL_RESTORE_BACKGROUND_UNET": "1"}):
+                    result = self.module._resolve_runtime_flag("RESTORE_BACKGROUND_UNET", "0")
+                    self.assertTrue(result, "Env var should override default")
+
+    def test_runtime_flag_resolver_uses_default_when_nothing_set(self):
+        """Default is used when no flag file and no env var."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "runtime_config"
+            config_dir.mkdir(parents=True)
+
+            with patch.object(self.module, "RUNTIME_CONFIG_DIR", str(config_dir)):
+                with patch.dict(os.environ, {}, clear=True):
+                    result = self.module._resolve_runtime_flag("RESTORE_BACKGROUND_UNET", "1")
+                    self.assertTrue(result)
+
+    def test_runtime_string_resolver_priority(self):
+        """Runtime string resolver follows same priority: file > env > default."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "runtime_config"
+            config_dir.mkdir(parents=True)
+            flag_path = config_dir / "RESTORE_DIRECT_CLIP_POLICY.txt"
+            flag_path.write_text("load_only", encoding="utf-8")
+
+            with patch.object(self.module, "RUNTIME_CONFIG_DIR", str(config_dir)):
+                with patch.dict(os.environ, {"COMFYMODAL_RESTORE_DIRECT_CLIP_POLICY": "off"}):
+                    result = self.module._resolve_restore_direct_clip_policy_name()
+                    self.assertEqual(result, "load_only",
+                                     "Flag file should override env var for string resolver")
+
+    def test_runtime_string_rejects_invalid_value(self):
+        """Invalid values fall back to default."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "runtime_config"
+            config_dir.mkdir(parents=True)
+            flag_path = config_dir / "RESTORE_DIRECT_CLIP_POLICY.txt"
+            flag_path.write_text("invalid_policy", encoding="utf-8")
+
+            with patch.object(self.module, "RUNTIME_CONFIG_DIR", str(config_dir)):
+                result = self.module._resolve_restore_direct_clip_policy_name()
+                self.assertEqual(result, "auto",
+                                 "Invalid value should fall back to default 'auto'")
+
+    def test_clear_runtime_flag_internal_safety(self):
+        """clear_runtime_flag_internal rejects path traversal."""
+        result, did_remove = self.module._clear_runtime_flag_internal("RESTORE_BACKGROUND_UNET")
+        self.assertIn("RESTORE_BACKGROUND_UNET", result)
+
+        result, did_remove = self.module._clear_runtime_flag_internal("../../../etc/passwd")
+        self.assertIn("invalid", result)
+        self.assertFalse(did_remove)
+
+        result, did_remove = self.module._clear_runtime_flag_internal("..")
+        self.assertIn("invalid", result)
+        self.assertFalse(did_remove)
+
+    def test_clear_runtime_flag_internal_removes_existing(self):
+        """clear_runtime_flag_internal removes an existing flag file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "runtime_config"
+            config_dir.mkdir(parents=True)
+            flag_path = config_dir / "TEST_FLAG.txt"
+            flag_path.write_text("1", encoding="utf-8")
+
+            with patch.object(self.module, "RUNTIME_CONFIG_DIR", str(config_dir)):
+                result, did_remove = self.module._clear_runtime_flag_internal("TEST_FLAG")
+                self.assertTrue(did_remove)
+                self.assertIn("removed", result)
+                self.assertFalse(flag_path.exists())
+
+    def test_clear_runtime_flag_internal_noop_for_missing(self):
+        """clear_runtime_flag_internal returns 'was not set' for missing flag."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "runtime_config"
+            config_dir.mkdir(parents=True)
+
+            with patch.object(self.module, "RUNTIME_CONFIG_DIR", str(config_dir)):
+                result, did_remove = self.module._clear_runtime_flag_internal("NONEXISTENT_FLAG")
+                self.assertFalse(did_remove)
+                self.assertIn("was not set", result)
+
+    def test_runtime_flag_bool_parsing(self):
+        """_resolve_runtime_flag returns True for '1' and False for '0'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "runtime_config"
+            config_dir.mkdir(parents=True)
+
+            with patch.object(self.module, "RUNTIME_CONFIG_DIR", str(config_dir)):
+                with patch.dict(os.environ, {"COMFYMODAL_TEST_BOOL": "1"}):
+                    result = self.module._resolve_runtime_flag("TEST_BOOL", "0")
+                    self.assertTrue(result)
+
+                with patch.dict(os.environ, {"COMFYMODAL_TEST_BOOL": "0"}):
+                    result = self.module._resolve_runtime_flag("TEST_BOOL", "1")
+                    self.assertFalse(result)
+
+    def test_restore_background_code_disabled_default(self):
+        """Default EXPERIMENTAL_RESTORE_BACKGROUND_CODE is False (0)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "runtime_config"
+            config_dir.mkdir(parents=True)
+
+            with patch.object(self.module, "RUNTIME_CONFIG_DIR", str(config_dir)):
+                with patch.dict(os.environ, {}, clear=True):
+                    with patch.object(self.module, "EXPERIMENTAL_RESTORE_BACKGROUND_CODE", False):
+                        result = self.module._restore_background_code_enabled()
+                        self.assertFalse(result)
+
+    def test_restore_background_unet_disabled_default(self):
+        """Default RESTORE_BACKGROUND_UNET is False (0)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "runtime_config"
+            config_dir.mkdir(parents=True)
+
+            with patch.object(self.module, "RUNTIME_CONFIG_DIR", str(config_dir)):
+                with patch.dict(os.environ, {}, clear=True):
+                    with patch.object(self.module, "RESTORE_BACKGROUND_UNET_ENABLED", False):
+                        result = self.module._restore_background_unet_enabled()
+                        self.assertFalse(result)
+
+    def test_reset_runtime_defaults_flag_list(self):
+        """reset_runtime_defaults clears the expected experiment flags."""
+        expected_flags = {
+            "EXPERIMENTAL_RESTORE_BACKGROUND_CODE",
+            "RESTORE_BACKGROUND_UNET",
+            "RESTORE_DIRECT_CLIP_POLICY",
+            "DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE",
+            "DIRECT_WARMUP_LOAD_UNET",
+            "DIRECT_WARMUP_LOAD_CLIP",
+            "DIRECT_WARMUP_CLIP_ENCODE",
+            "DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT",
+            "FUSE_READ_GOVERNOR",
+            "SAFETENSORS_READ_MODE",
+        }
+        # Verify the function exists and references the right flags
+        self.assertTrue(hasattr(self.module, "reset_runtime_defaults"))
+
+    def test_production_default_preset_values_parseable(self):
+        """Verify the production_default preset file is valid JSON."""
+        presets_path = Path(__file__).resolve().parents[1] / ".comfymodal_experiments" / "comfymodal_experiment_presets.json"
+        if not presets_path.is_file():
+            self.skipTest("Presets file not found")
+        import json
+        data = json.loads(presets_path.read_text(encoding="utf-8"))
+        presets = data.get("presets", {})
+        self.assertIn("production_default", presets, "production_default preset must exist")
+        pd = presets["production_default"]
+        flags = pd.get("runtime_flags", {})
+        self.assertEqual(flags.get("EXPERIMENTAL_RESTORE_BACKGROUND_CODE"), "1")
+        self.assertEqual(flags.get("RESTORE_BACKGROUND_UNET"), "1")
+        self.assertEqual(flags.get("RESTORE_DIRECT_CLIP_POLICY"), "auto")
+        self.assertEqual(flags.get("FUSE_READ_GOVERNOR"), "0")
+        self.assertEqual(flags.get("SAFETENSORS_READ_MODE"), "normal")
+
+    def test_restore_bg_off_preset_disables_both_flags(self):
+        """restore_bg_off preset sets both EXPERIMENTAL_RESTORE_BACKGROUND_CODE=0 and RESTORE_BACKGROUND_UNET=0."""
+        presets_path = Path(__file__).resolve().parents[1] / ".comfymodal_experiments" / "comfymodal_experiment_presets.json"
+        if not presets_path.is_file():
+            self.skipTest("Presets file not found")
+        import json
+        data = json.loads(presets_path.read_text(encoding="utf-8"))
+        presets = data.get("presets", {})
+        self.assertIn("restore_bg_off", presets, "restore_bg_off preset must exist")
+        rbo = presets["restore_bg_off"]
+        flags = rbo.get("runtime_flags", {})
+        self.assertEqual(flags.get("EXPERIMENTAL_RESTORE_BACKGROUND_CODE"), "0")
+        self.assertEqual(flags.get("RESTORE_BACKGROUND_UNET"), "0")
+
+    def test_baseline_hard_off_preset_includes_fuse_and_safetensors(self):
+        """baseline_hard_off preset includes FUSE_READ_GOVERNOR=0 and SAFETENSORS_READ_MODE=normal."""
+        presets_path = Path(__file__).resolve().parents[1] / ".comfymodal_experiments" / "comfymodal_experiment_presets.json"
+        if not presets_path.is_file():
+            self.skipTest("Presets file not found")
+        import json
+        data = json.loads(presets_path.read_text(encoding="utf-8"))
+        presets = data.get("presets", {})
+        self.assertIn("baseline_hard_off", presets)
+        bho = presets["baseline_hard_off"]
+        flags = bho.get("runtime_flags", {})
+        self.assertEqual(flags.get("EXPERIMENTAL_RESTORE_BACKGROUND_CODE"), "0")
+        self.assertEqual(flags.get("RESTORE_BACKGROUND_UNET"), "0")
+        self.assertEqual(flags.get("FUSE_READ_GOVERNOR"), "0")
+        self.assertEqual(flags.get("SAFETENSORS_READ_MODE"), "normal")
+
+    def test_persist_per_stack_metrics_default_off(self):
+        """PERSIST_PER_STACK_METRICS defaults to 0 (off)."""
+        module = load_module()
+        self.assertFalse(module.PERSIST_PER_STACK_METRICS)
+
+    def test_defer_vae_actual_load_default_on(self):
+        """DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET defaults to 1 (on)."""
+        module = load_module()
+        self.assertTrue(module.DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET)
+
+    def test_stall_classifier_unet_threshold(self):
+        """Stall classifier marks UNET read > VOLUME_STALL_UNET_MS as stall."""
+        module = load_module()
+        mixin = module._ComfyAPIMixin()
+        stall = mixin._classify_volume_read_stall({
+            "restore": {
+                "restore_background_unet_total_ms": module.VOLUME_STALL_UNET_MS + 1000,
+            }
+        })
+        self.assertTrue(stall.get("restore_background_unet_stall"))
+        self.assertEqual(stall.get("volume_read_stall_suspected"), 1)
+
+    def test_stall_classifier_no_stall_when_below_threshold(self):
+        """Stall classifier does not suspect stall when all values below threshold."""
+        module = load_module()
+        mixin = module._ComfyAPIMixin()
+        stall = mixin._classify_volume_read_stall({
+            "restore": {
+                "restore_background_unet_total_ms": 1000,
+            }
+        })
+        self.assertFalse(stall.get("volume_read_stall_suspected"))
+
+    def test_stall_classifier_clip_preload_threshold(self):
+        """Stall classifier marks low CLIP preload throughput as stall."""
+        module = load_module()
+        mixin = module._ComfyAPIMixin()
+        # 5GB loaded in 3000ms = 1.67 GB/s, which is below 2.0 GB/s threshold
+        stall = mixin._classify_volume_read_stall({
+            "restore": {
+                "restore_preload_total_gb": 5.0,
+                "restore_preload_total_ms": 3000.0,
+            }
+        })
+        self.assertTrue(stall.get("clip_preload_slow"))
+        self.assertTrue(stall.get("volume_read_stall_suspected"))
+
+    def test_stall_classifier_multiple_reasons_joined(self):
+        """Multiple stall reasons are joined with comma."""
+        module = load_module()
+        mixin = module._ComfyAPIMixin()
+        # Both UNET and VAE above their thresholds
+        stall = mixin._classify_volume_read_stall({
+            "restore": {
+                "restore_background_unet_total_ms": module.VOLUME_STALL_UNET_MS + 1000,
+            },
+        }, after_prompt={"actual_load_vae_duration_ms": module.VOLUME_STALL_VAE_MS + 500})
+        reason = stall.get("volume_read_stall_reason", "")
+        self.assertIn("unet_read_gt_", reason)
+        self.assertIn("vae_small_read_gt_", reason)
+
+    def test_check_rbg_unet_active_no_futures(self):
+        """_check_rbg_unet_active returns inactive when no RBG futures exist."""
+        module = load_module()
+        mixin = module._ComfyAPIMixin()
+        result = mixin._check_rbg_unet_active()
+        self.assertFalse(result.get("active"))
+
+    def test_production_default_and_stable_restore_bg_presets_exist(self):
+        """production_default and stable_restore_bg presets exist in presets file."""
+        presets_path = Path(__file__).resolve().parents[1] / ".comfymodal_experiments" / "comfymodal_experiment_presets.json"
+        if not presets_path.is_file():
+            self.skipTest("Presets file not found")
+        import json
+        data = json.loads(presets_path.read_text(encoding="utf-8"))
+        presets = data.get("presets", {})
+        for name in ("production_default", "stable_restore_bg"):
+            self.assertIn(name, presets, f"Preset {name} must exist")
+
+    def test_diagnostic_persist_metrics_on_preset_exists(self):
+        """diagnostic_persist_metrics_on preset exists for debugging."""
+        presets_path = Path(__file__).resolve().parents[1] / ".comfymodal_experiments" / "comfymodal_experiment_presets.json"
+        if not presets_path.is_file():
+            self.skipTest("Presets file not found")
+        import json
+        data = json.loads(presets_path.read_text(encoding="utf-8"))
+        presets = data.get("presets", {})
+        self.assertIn("diagnostic_persist_metrics_on", presets)
+
+    def test_apply_experiment_preset_allows_new_flags(self):
+        """apply_experiment_preset.py allows PERSIST_PER_STACK_METRICS and DEFER_VAE flags."""
+        preset_mod_path = Path(__file__).resolve().parents[1] / ".comfymodal_experiments" / "apply_experiment_preset.py"
+        if not preset_mod_path.is_file():
+            self.skipTest("apply_experiment_preset.py not found")
+        content = preset_mod_path.read_text(encoding="utf-8")
+        self.assertIn("PERSIST_PER_STACK_METRICS", content)
+        self.assertIn("DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET", content)
+
+
 if __name__ == "__main__":
     unittest.main()

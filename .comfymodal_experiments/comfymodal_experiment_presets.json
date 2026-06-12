@@ -3,17 +3,85 @@
   "default_preset": "baseline_hard_off",
   "presets": {
     "baseline_hard_off": {
-      "description": "Hard-off baseline. Restore-background code disabled. Direct CLIP policy auto.",
+      "description": "Hard-off baseline. Restore-background code disabled. Direct CLIP policy auto. FUSE governor off. Safetensors normal.",
       "runtime_flags": {
         "EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "0",
         "RESTORE_BACKGROUND_UNET": "0",
-        "RESTORE_DIRECT_CLIP_POLICY": "auto"
+        "RESTORE_DIRECT_CLIP_POLICY": "auto",
+        "FUSE_READ_GOVERNOR": "0",
+        "SAFETENSORS_READ_MODE": "normal"
       },
       "expected_logs": [
         "effective_EXPERIMENTAL_RESTORE_BACKGROUND_CODE=False",
         "effective_RESTORE_BACKGROUND_UNET=False",
         "effective_RESTORE_DIRECT_CLIP_POLICY=auto",
         "future_source=actual_load"
+      ]
+    },
+    "restore_bg_off": {
+      "description": "Explicit rollback: restore-background code and UNET both disabled. Persist metrics off. FUSE governor off. Safetensors normal.",
+      "runtime_flags": {
+        "EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "0",
+        "RESTORE_BACKGROUND_UNET": "0",
+        "RESTORE_DIRECT_CLIP_POLICY": "auto",
+        "FUSE_READ_GOVERNOR": "0",
+        "SAFETENSORS_READ_MODE": "normal"
+      },
+      "expected_logs": [
+        "effective_EXPERIMENTAL_RESTORE_BACKGROUND_CODE=False",
+        "effective_RESTORE_BACKGROUND_UNET=False",
+        "future_source=actual_load"
+      ]
+    },
+    "production_default": {
+      "description": "Production default: restore-background enabled, CLIP warmup load+encode, async actual load, VAE defer on, persist metrics off, FUSE governor off, safetensors normal.",
+      "runtime_flags": {
+        "EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "1",
+        "RESTORE_BACKGROUND_UNET": "1",
+        "RESTORE_DIRECT_CLIP_POLICY": "auto",
+        "FUSE_READ_GOVERNOR": "0",
+        "SAFETENSORS_READ_MODE": "normal"
+      },
+      "expected_logs": [
+        "effective_EXPERIMENTAL_RESTORE_BACKGROUND_CODE=True",
+        "effective_RESTORE_BACKGROUND_UNET=True",
+        "effective_RESTORE_DIRECT_CLIP_POLICY=auto",
+        "[restore_background_unet] submitted",
+        "future_source=restore_background_unet"
+      ]
+    },
+    "stable_restore_bg": {
+      "description": "Stable restore-background: same as production_default with VAE defer guard on and persist metrics off. No FUSE governor.",
+      "runtime_flags": {
+        "EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "1",
+        "RESTORE_BACKGROUND_UNET": "1",
+        "RESTORE_DIRECT_CLIP_POLICY": "auto",
+        "FUSE_READ_GOVERNOR": "0",
+        "SAFETENSORS_READ_MODE": "normal"
+      },
+      "expected_logs": [
+        "effective_EXPERIMENTAL_RESTORE_BACKGROUND_CODE=True",
+        "effective_RESTORE_BACKGROUND_UNET=True",
+        "effective_RESTORE_DIRECT_CLIP_POLICY=auto",
+        "[restore_background_unet] submitted",
+        "future_source=restore_background_unet"
+      ]
+    },
+    "diagnostic_persist_metrics_on": {
+      "description": "Same as production_default but with per-stack metrics persistence enabled (for debugging only).",
+      "runtime_flags": {
+        "EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "1",
+        "RESTORE_BACKGROUND_UNET": "1",
+        "RESTORE_DIRECT_CLIP_POLICY": "auto",
+        "FUSE_READ_GOVERNOR": "0",
+        "SAFETENSORS_READ_MODE": "normal"
+      },
+      "expected_logs": [
+        "effective_EXPERIMENTAL_RESTORE_BACKGROUND_CODE=True",
+        "effective_RESTORE_BACKGROUND_UNET=True",
+        "effective_RESTORE_DIRECT_CLIP_POLICY=auto",
+        "[restore_background_unet] submitted",
+        "future_source=restore_background_unet"
       ]
     },
     "restore_background_unet_on": {

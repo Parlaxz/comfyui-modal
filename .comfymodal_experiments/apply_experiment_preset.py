@@ -24,6 +24,13 @@ _ALLOWED_FLAGS = frozenset({
     "RESTORE_DIRECT_CLIP_POLICY",
     "DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE",
     "FUSE_READ_GOVERNOR",
+    "SAFETENSORS_READ_MODE",
+    "DIRECT_WARMUP_LOAD_UNET",
+    "DIRECT_WARMUP_LOAD_CLIP",
+    "DIRECT_WARMUP_CLIP_ENCODE",
+    "DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT",
+    "PERSIST_PER_STACK_METRICS",
+    "DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET",
 })
 
 # Flags whose values must be "0" or "1".
@@ -32,11 +39,14 @@ _BOOL_FLAGS = frozenset({
     "RESTORE_BACKGROUND_UNET",
     "DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE",
     "FUSE_READ_GOVERNOR",
+    "PERSIST_PER_STACK_METRICS",
+    "DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET",
 })
 
 # Flags with specific string values.
 _STRING_FLAG_ALLOWED_VALUES = {
     "RESTORE_DIRECT_CLIP_POLICY": frozenset({"auto", "off", "load_only", "load_and_encode"}),
+    "SAFETENSORS_READ_MODE": frozenset({"auto", "normal", "read_bytes"}),
 }
 
 
