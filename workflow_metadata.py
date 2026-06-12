@@ -173,3 +173,38 @@ def warmup_profile_matches_stack(profile: dict, requested: dict) -> bool:
             and profile.get("vae", "") in requested.get("vae", [])
         )
     return False
+
+
+_MODEL_REF_MAPPINGS: dict[str, list[tuple[str, str]]] = {
+    "CheckpointLoaderSimple": [("checkpoint", "ckpt_name")],
+    "CheckpointLoader": [("checkpoint", "ckpt_name")],
+    "UNETLoader": [("unet", "unet_name")],
+    "CLIPLoader": [("clip", "clip_name")],
+    "DualCLIPLoader": [("clip", "clip_name1"), ("clip", "clip_name2")],
+    "VAELoader": [("vae", "vae_name")],
+    "LoraLoader": [("lora", "lora_name")],
+    "LoraLoaderModelOnly": [("lora", "lora_name")],
+    "ControlNetLoader": [("controlnet", "control_net_name")],
+}
+
+
+def extract_workflow_model_refs(prompt: dict) -> list[dict[str, str]]:
+    seen = set()
+    refs = []
+    for node in prompt.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        mappings = _MODEL_REF_MAPPINGS.get(node.get("class_type", ""), [])
+        for role, field in mappings:
+            value = inputs.get(field)
+            if not isinstance(value, str) or not value:
+                continue
+            key = (role, value)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append({"role": role, "filename": value})
+    return refs

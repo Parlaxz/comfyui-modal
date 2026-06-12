@@ -95,6 +95,9 @@ from comparison import (
     get_workflow_nodes,
 )
 
+import model_manifest as _model_manifest
+import modal_workspaces as _workspace_store
+
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 WEB_DIRECTORY = "web"
@@ -113,6 +116,11 @@ _DEPLOY_STATE_JSON_FILE = os.path.join(_NODE_DIR, ".deployed_state.json")
 _DEPLOY_LOG_FILE = os.path.join(_NODE_DIR, ".deploy_log")
 _LATEST_BENCHMARK_WORKFLOW_FILE = os.path.join(_NODE_DIR, "latest_benchmark_workflow.json")
 _MODAL_SETTINGS_FILE = os.path.join(_NODE_DIR, ".modal_settings.json")
+_WORKSPACES_FILE = os.path.join(_NODE_DIR, ".modal_workspaces.json")
+_MODEL_MANIFEST_FILE = os.path.join(_NODE_DIR, ".model_manifest.json")
+_SWAP_JOB_POLL_INTERVAL_S = 1.0
+_swap_jobs: dict[str, dict] = {}
+_swap_jobs_lock = threading.Lock()
 
 # ── Output settings (server-side, persisted to .modal_settings.json) ──
 def _default_modal_settings() -> dict:
@@ -544,7 +552,40 @@ def _parse_deploy_error(output):
     return ""
 
 
-def _run_deploy_background(custom_nodes_fingerprint: str | None = None):
+def _workspace_registry() -> dict:
+    return _workspace_store.load_workspace_registry(_WORKSPACES_FILE)
+
+
+def _active_workspace() -> dict | None:
+    return _workspace_store.get_active_workspace(_workspace_registry())
+
+
+def _workspace_or_400(workspace_id: str) -> dict | None:
+    return _workspace_store.get_workspace(_workspace_registry(), workspace_id)
+
+
+def _workspace_manifest() -> dict:
+    return _model_manifest.load_master_manifest(_MODEL_MANIFEST_FILE)
+
+
+def _save_workspace_deploy_state(workspace_id: str, version: str | None, fingerprint: str | None) -> None:
+    registry = _workspace_registry()
+    registry.setdefault("deploy_state_by_workspace", {})[workspace_id] = {
+        "comfyapp_version": version,
+        "custom_nodes_fingerprint": fingerprint,
+    }
+    _workspace_store.save_workspace_registry(_WORKSPACES_FILE, registry)
+
+
+def _load_workspace_deploy_state(workspace_id: str) -> dict:
+    registry = _workspace_registry()
+    deploy_state = registry.get("deploy_state_by_workspace", {}).get(workspace_id)
+    if deploy_state:
+        return deploy_state
+    return _load_deploy_state()
+
+
+def _run_deploy_background(workspace: dict, custom_nodes_fingerprint: str | None = None):
     global _deploy_status
 
     modal_cmd = _find_modal_executable()
@@ -556,13 +597,19 @@ def _run_deploy_background(custom_nodes_fingerprint: str | None = None):
         print(f"[comfyui-modal] {_deploy_status['message']}")
         return
 
-    _deploy_status = {"state": "deploying", "message": "Running modal deploy..."}
+    _deploy_status = {"state": "deploying", "message": f"Deploying {workspace['label']}…"}
     print(f"[comfyui-modal] Deploying comfyapp.py (modal: {modal_cmd})")
 
     try:
         # Stream deploy output to log file in real-time so the inline log
         # viewer shows progress as the build runs, not just the final output.
         combined_lines: list[str] = []
+        env = {
+            **os.environ,
+            "MODAL_TOKEN_ID": workspace["token_id"],
+            "MODAL_TOKEN_SECRET": workspace["token_secret"],
+            "PYTHONIOENCODING": "utf-8",
+        }
         with open(_DEPLOY_LOG_FILE, "w", encoding="utf-8") as log_f:
             process = subprocess.Popen(
                 [modal_cmd, "deploy", _COMFYAPP_PATH],
@@ -571,7 +618,7 @@ def _run_deploy_background(custom_nodes_fingerprint: str | None = None):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                env=env,
             )
             # Kill the process if it exceeds 10 minutes (matches original
             # subprocess.run(timeout=600) behavior).
@@ -593,9 +640,9 @@ def _run_deploy_background(custom_nodes_fingerprint: str | None = None):
 
         if returncode == 0:
             version = _get_comfyapp_version()
-            _save_deploy_state(version, custom_nodes_fingerprint)
-            _deploy_status = {"state": "ready", "message": f"Deployed v{version}"}
-            print(f"[comfyui-modal] Deploy succeeded (v{version})")
+            _save_workspace_deploy_state(workspace["id"], version, custom_nodes_fingerprint)
+            _deploy_status = {"state": "ready", "message": f"Deployed {workspace['label']} v{version}"}
+            print(f"[comfyui-modal] Deploy succeeded ({workspace['label']} v{version})")
             if _modal_available:
                 try:
                     clear_cache()
@@ -603,18 +650,19 @@ def _run_deploy_background(custom_nodes_fingerprint: str | None = None):
                     print(f"[comfyui-modal] clear_cache failed: {e}")
         else:
             combined = combined_output.strip()
-            if "token" in combined.lower() or "auth" in combined.lower() or "credentials" in combined.lower():
-                msg = "Modal token not set. Run: modal setup"
+            error_prefix = _parse_deploy_error(combined)
+            tail_bytes = 2000
+            if len(combined) > tail_bytes:
+                tail = "[...truncated, showing last 2000 chars...]\n" + combined[-tail_bytes:]
             else:
-                error_prefix = _parse_deploy_error(combined)
-                truncated = combined[:2000]
-                msg = f"Deploy failed: {truncated}"
-                if error_prefix:
-                    msg = f"{error_prefix} {msg}"
+                tail = combined
+            msg = f"Deploy failed: {tail}"
+            if error_prefix:
+                msg = f"{error_prefix} {msg}"
             _deploy_status = {
                 "state": "error",
                 "message": msg,
-                "details": combined[:2000],
+                "details": tail,
             }
             print(f"[comfyui-modal] {msg[:500]}")
     except subprocess.TimeoutExpired:
@@ -624,34 +672,36 @@ def _run_deploy_background(custom_nodes_fingerprint: str | None = None):
         _deploy_status = {"state": "error", "message": str(e), "details": str(e)}
         print(f"[comfyui-modal] Deploy error: {e}")
 
-def _start_background_deploy(custom_nodes_fingerprint: str | None, reason: str) -> dict:
+def _start_background_deploy(workspace: dict, custom_nodes_fingerprint: str | None, reason: str) -> dict:
     global _deploy_status
     if _deploy_status.get("state") == "deploying":
         return {"started": False, "reason": "deploy_already_running"}
-    _deploy_status = {"state": "deploying", "message": "Running modal deploy..."}
+    _deploy_status = {"state": "deploying", "message": f"Running modal deploy for {workspace['label']}…"}
     thread = threading.Thread(
         target=_run_deploy_background,
-        kwargs={"custom_nodes_fingerprint": custom_nodes_fingerprint},
+        kwargs={"workspace": workspace, "custom_nodes_fingerprint": custom_nodes_fingerprint},
         daemon=True,
     )
     thread.start()
     return {"started": True, "reason": reason}
 
 
-def _ensure_modal_deploy_current(custom_nodes_fingerprint: str | None = None) -> dict:
+def _ensure_modal_deploy_current(workspace: dict, custom_nodes_fingerprint: str | None = None) -> dict:
     current_version = _get_comfyapp_version()
-    deployed = _load_deploy_state()
+    deployed = _load_workspace_deploy_state(workspace["id"])
     deployed_version = deployed.get("comfyapp_version")
     deployed_fingerprint = deployed.get("custom_nodes_fingerprint")
 
     if current_version != deployed_version:
         return _start_background_deploy(
+            workspace=workspace,
             custom_nodes_fingerprint=custom_nodes_fingerprint,
             reason="version_changed",
         )
 
-    if custom_nodes_fingerprint != deployed_fingerprint:
+    if custom_nodes_fingerprint is not None and custom_nodes_fingerprint != deployed_fingerprint:
         return _start_background_deploy(
+            workspace=workspace,
             custom_nodes_fingerprint=custom_nodes_fingerprint,
             reason="custom_nodes_changed",
         )
@@ -669,8 +719,14 @@ def _maybe_auto_deploy():
         return
     if not _find_modal_executable():
         return
+    workspace = _active_workspace()
+    if workspace is None:
+        _deploy_status["state"] = "error"
+        _deploy_status["message"] = "No active workspace configured. Use the workspace manager."
+        print("[comfyui-modal] No active workspace - skipping auto deploy")
+        return
     fingerprint = _build_custom_node_fingerprint(_custom_nodes_root())
-    decision = _ensure_modal_deploy_current(fingerprint)
+    decision = _ensure_modal_deploy_current(workspace, fingerprint)
     if decision["started"]:
         print(f"[comfyui-modal] background deploy started ({decision['reason']})")
     else:
@@ -692,7 +748,7 @@ sys.path.insert(0, _NODE_DIR)
 
 try:
     import modal as _modal_pkg
-    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, download_model_stream, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile, get_handle_cache_stats, get_modal_app_name, get_modal_class_name, get_modal_lookup_target
+    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, download_model_stream, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile, set_workspace_resolver, get_handle_cache_stats, get_modal_app_name, get_modal_class_name, get_modal_lookup_target
 
     # ── Runtime flag helpers (lazy init to avoid import-time failures) ──
     _runtime_flag_funcs: dict = {}
@@ -718,6 +774,7 @@ try:
         return await asyncio.to_thread(lambda: fn.remote(name, value))
 
     _modal_available = True
+    set_workspace_resolver(_active_workspace)
     _maybe_auto_deploy()
 except ImportError:
     _err_detail = f" (install error: {_pip_install_error})" if _pip_install_error else ""
@@ -869,6 +926,8 @@ def _write_civitai_token(token: str):
         f.write(token.strip())
 
 def _is_modal_token_set() -> bool:
+    if _active_workspace() is not None:
+        return True
     try:
         with open(_MODAL_TOML_PATH, "r") as f:
             content = f.read()
@@ -1618,18 +1677,18 @@ def _build_custom_nodes_archive(cn_root: str) -> bytes:
     return buf.getvalue()
 
 
-async def _sync_custom_nodes_and_maybe_deploy(cn_root: str) -> dict:
+async def _sync_custom_nodes_and_maybe_deploy(cn_root: str, workspace: dict) -> dict:
     fingerprint = _build_custom_node_fingerprint(cn_root)
     archive_data = _build_custom_nodes_archive(cn_root)
-    result = await sync_custom_nodes(archive_data)
+    result = await sync_custom_nodes(archive_data, workspace=workspace)
 
     if result.get("status") != "ok":
         return result
 
-    result["deploy"] = _ensure_modal_deploy_current(fingerprint)
+    result["deploy"] = _ensure_modal_deploy_current(workspace, fingerprint)
 
     try:
-        refresh_result = await resync_runtime("custom_nodes")
+        refresh_result = await resync_runtime("custom_nodes", workspace=workspace)
         result["refresh"] = refresh_result
     except Exception as e:
         result["refresh_error"] = str(e)
@@ -1641,6 +1700,262 @@ async def _sync_custom_nodes_and_maybe_deploy(cn_root: str) -> dict:
         result.setdefault("message", "Custom nodes synced to Modal.")
 
     return result
+
+
+def _manifest_entry_from_install(url: str, folder: str, filename: str) -> dict:
+    source_kind = _model_manifest.infer_source_kind(url)
+    return {
+        "folder": folder,
+        "filename": filename,
+        "url": url,
+        "source_kind": source_kind,
+        "requires_hf_token": source_kind == "huggingface",
+        "requires_civitai_token": source_kind == "civitai",
+    }
+
+
+def _refresh_swap_deploy_log(swap_id: str) -> None:
+    """Read the last 50KB of the deploy log and store in swap job status."""
+    try:
+        log_path = _DEPLOY_LOG_FILE
+        if not os.path.isfile(log_path):
+            return
+        file_size = os.path.getsize(log_path)
+        max_bytes = 51200  # 50KB
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            if file_size > max_bytes:
+                f.seek(file_size - max_bytes)
+                f.readline()  # discard partial first line
+                log = "[...truncated, showing last 50KB...]\n" + f.read()
+            else:
+                log = f.read()
+        with _swap_jobs_lock:
+            if swap_id in _swap_jobs:
+                _swap_jobs[swap_id]["deploy_log_tail"] = log
+    except Exception:
+        pass
+
+
+async def _run_workspace_swap_job(swap_id: str, workspace: dict, plan: dict):
+    try:
+        with _swap_jobs_lock:
+            _swap_jobs[swap_id] = {
+                "status": "running",
+                "phase": "deploying",
+                "workspace_label": workspace["label"],
+                "deploy_message": "Ensuring workspace is deployed...",
+            }
+
+        # Phase 1: Ensure workspace is deployed before downloading
+        deploy_decision = _ensure_modal_deploy_current(workspace, None)
+        if deploy_decision.get("started"):
+            with _swap_jobs_lock:
+                _swap_jobs[swap_id]["deploy_message"] = f"Deploying workspace ({deploy_decision['reason']})..."
+            while _deploy_status.get("state") == "deploying":
+                _refresh_swap_deploy_log(swap_id)
+                await asyncio.sleep(3)
+            _refresh_swap_deploy_log(swap_id)
+            if _deploy_status.get("state") == "error":
+                with _swap_jobs_lock:
+                    _swap_jobs[swap_id] = {
+                        "status": "error", "phase": "deploying",
+                        "deploy_message": _deploy_status.get("message", "Deploy failed"),
+                        "deploy_log_tail": _swap_jobs[swap_id].get("deploy_log_tail", ""),
+                        "workspace_label": workspace["label"],
+                    }
+                return
+
+        # Phase 2: Remove flagged models from remote workspace
+        to_remove = plan.get("to_remove", [])
+        remove_results = []
+        remove_failures = []
+        if to_remove:
+            with _swap_jobs_lock:
+                _swap_jobs[swap_id]["phase"] = "removing_models"
+                _swap_jobs[swap_id]["remove_message"] = f"Removing {len(to_remove)} flagged model(s) from workspace..."
+            for rem in to_remove:
+                try:
+                    rem_result = await delete_model(folder=rem["folder"], filename=rem["filename"], workspace=workspace)
+                    if rem_result.get("status") == "ok":
+                        remove_results.append(rem_result)
+                    else:
+                        remove_failures.append({
+                            "folder": rem["folder"],
+                            "filename": rem["filename"],
+                            "error": rem_result.get("message") or rem_result.get("error") or "remove failed",
+                        })
+                except Exception as e:
+                    remove_failures.append({"folder": rem["folder"], "filename": rem["filename"], "error": str(e)})
+
+        # Phase 3: Download selected models
+        with _swap_jobs_lock:
+            _swap_jobs[swap_id]["phase"] = "downloading_models"
+            _swap_jobs[swap_id]["download_total"] = len(plan.get("to_install", []))
+            _swap_jobs[swap_id]["download_completed"] = 0
+            _swap_jobs[swap_id]["download_skipped"] = 0
+            _swap_jobs[swap_id]["download_current_name"] = ""
+            _swap_jobs[swap_id]["download_pct"] = 0
+            _swap_jobs[swap_id]["download_pct_current"] = 0
+            _swap_jobs[swap_id]["error_count"] = 0
+
+        results = []
+        if plan["to_install"]:
+            total = len(plan["to_install"])
+            for idx, item in enumerate(plan["to_install"], 1):
+                with _swap_jobs_lock:
+                    _swap_jobs[swap_id]["download_current_name"] = item["filename"]
+                    _swap_jobs[swap_id]["download_pct_current"] = 0
+                try:
+                    result = None
+                    async for update in download_model_stream(
+                        url=item["url"],
+                        filename=item["filename"],
+                        save_path=item["save_path"],
+                        hf_token=_read_hf_token(),
+                        civitai_token=_read_civitai_token(),
+                        workspace=workspace,
+                    ):
+                        if update["type"] == "progress":
+                            pct = update.get("pct", 0)
+                            with _swap_jobs_lock:
+                                _swap_jobs[swap_id]["download_pct_current"] = pct
+                                _swap_jobs[swap_id]["download_message"] = (
+                                    f"Downloading {item['filename']} ({idx}/{total}) — {pct}%"
+                                )
+                        elif update["type"] == "complete":
+                            result = update
+                    if result is None:
+                        result = {"status": "error", "error": "stream ended without complete", "filename": item["filename"]}
+                    results.append(result)
+                    with _swap_jobs_lock:
+                        if result.get("skipped"):
+                            _swap_jobs[swap_id]["download_skipped"] += 1
+                        else:
+                            _swap_jobs[swap_id]["download_completed"] += 1
+                except Exception as e:
+                    results.append({"status": "error", "error": str(e), "filename": item["filename"]})
+                    with _swap_jobs_lock:
+                        ec = _swap_jobs[swap_id].get("error_count", 0) + 1
+                        _swap_jobs[swap_id]["error_count"] = ec
+            failures = [r for r in results if r.get("status") not in {"ok", "skipped"}]
+            if failures:
+                with _swap_jobs_lock:
+                    _swap_jobs[swap_id] = {
+                        "status": "error", "phase": "downloading_models",
+                        "failures": failures,
+                        "workspace_label": workspace["label"],
+                        "download_completed": _swap_jobs[swap_id]["download_completed"],
+                        "download_skipped": _swap_jobs[swap_id]["download_skipped"],
+                        "download_message": f"Downloaded {_swap_jobs[swap_id]['download_completed']}, skipped {_swap_jobs[swap_id]['download_skipped']}, failed {_swap_jobs[swap_id].get('error_count', 0)}",
+                    }
+                return
+
+        installed_count = sum(1 for r in results if not r.get("skipped"))
+        skipped_count = sum(1 for r in results if r.get("skipped"))
+
+        # Phase 4: Sync custom nodes (with granular status updates)
+        cn_root = os.path.join(_COMFYUI_ROOT, "custom_nodes")
+        cn_fingerprint = _build_custom_node_fingerprint(cn_root)
+
+        with _swap_jobs_lock:
+            _swap_jobs[swap_id]["phase"] = "syncing_custom_nodes"
+            _swap_jobs[swap_id]["sync_message"] = "Packaging custom nodes..."
+        archive_data = _build_custom_nodes_archive(cn_root)
+
+        with _swap_jobs_lock:
+            _swap_jobs[swap_id]["sync_message"] = "Uploading custom nodes to Modal volume..."
+        cn_result = await sync_custom_nodes(archive_data, workspace=workspace)
+
+        if cn_result.get("status") != "ok":
+            with _swap_jobs_lock:
+                _swap_jobs[swap_id] = {
+                    "status": "error", "phase": "syncing_custom_nodes",
+                    "result": cn_result, "workspace_label": workspace["label"],
+                    "sync_message": cn_result.get("message", "Custom node sync failed"),
+                }
+            return
+
+        with _swap_jobs_lock:
+            _swap_jobs[swap_id]["sync_message"] = "Checking if redeploy is needed..."
+        deploy_decision = _ensure_modal_deploy_current(workspace, cn_fingerprint)
+        cn_result["deploy"] = deploy_decision
+        if deploy_decision.get("started"):
+            with _swap_jobs_lock:
+                _swap_jobs[swap_id]["sync_message"] = f"Redeploying workspace ({deploy_decision['reason']})..."
+            while _deploy_status.get("state") == "deploying":
+                _refresh_swap_deploy_log(swap_id)
+                await asyncio.sleep(3)
+            _refresh_swap_deploy_log(swap_id)
+
+        with _swap_jobs_lock:
+            _swap_jobs[swap_id]["sync_message"] = "Refreshing running container..."
+        try:
+            refresh_result = await resync_runtime("custom_nodes", workspace=workspace)
+            cn_result["refresh"] = refresh_result
+        except Exception as e:
+            cn_result["refresh_error"] = str(e)
+            cn_result.setdefault("message", (
+                "Custom nodes synced to Modal Volume, but the running Modal ComfyUI process "
+                "could not be refreshed automatically. "
+                "Try again after the container sleeps, or redeploy if the node is still missing."
+            ))
+        else:
+            cn_result.setdefault("message", "Custom nodes synced to Modal.")
+        if cn_result.get("status") != "ok":
+            with _swap_jobs_lock:
+                _swap_jobs[swap_id] = {
+                    "status": "error", "phase": "syncing_custom_nodes",
+                    "result": cn_result, "workspace_label": workspace["label"],
+                    "sync_message": cn_result.get("message", "Custom node sync failed"),
+                }
+            return
+
+        _workspace_store.set_active_workspace(_WORKSPACES_FILE, workspace["id"])
+        remove_summary = None
+        if to_remove:
+            remove_summary = f"Removed {len(remove_results)} model(s)"
+            if remove_failures:
+                remove_summary += f", {len(remove_failures)} removal(s) failed"
+        with _swap_jobs_lock:
+            _swap_jobs[swap_id] = {
+                "status": "ok", "phase": "deploying",
+                "workspace_label": workspace["label"],
+                "installed_model_count": installed_count,
+                "skipped_model_count": skipped_count,
+                "failed_model_count": _swap_jobs[swap_id].get("error_count", 0),
+                "removed_count": len(remove_results),
+                "remove_failed_count": len(remove_failures),
+                "remove_failures": remove_failures,
+                "remove_summary": remove_summary,
+                "download_summary": f"Downloaded {installed_count}, skipped {skipped_count}",
+                "custom_node_sync": cn_result,
+                "deploy": cn_result.get("deploy"),
+                "sync_message": cn_result.get("message", "Custom nodes synced."),
+            }
+    except Exception as e:
+        with _swap_jobs_lock:
+            _swap_jobs[swap_id] = {"status": "error", "phase": "failed", "error": str(e), "workspace_label": workspace["label"]}
+
+
+async def _scan_swap_plan(workspace: dict) -> dict:
+    """Build a workspace swap plan: scan manifest issues, get remote models, compute diff."""
+    manifest = _workspace_manifest()
+    issues = _model_manifest.scan_local_models_issues(_COMFYUI_ROOT, manifest)
+    blocking = [item for item in issues if item["kind"] in {"missing_url", "missing_source_kind", "invalid_folder", "duplicate_key"}]
+    try:
+        remote = await get_sync_status(workspace=workspace)
+        remote_models = remote.get("models", [])
+    except Exception:
+        remote_models = []
+    plan = _model_manifest.build_workspace_swap_plan(manifest, remote_models)
+    return {
+        "manifest_issues": issues,
+        "blocking_issues": blocking,
+        "already_present": plan.get("already_present", []),
+        "to_install": plan.get("to_install", []),
+        "unresolved": plan.get("unresolved", []),
+        "to_remove": plan.get("to_remove", []),
+    }
 
 
 if _server:
@@ -1687,8 +2002,23 @@ if _server:
             _write_modal_toml(token_id, token_secret)
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
-        t = threading.Thread(target=_run_deploy_background, daemon=True)
-        t.start()
+        # Update/save workspace in registry for backward compat
+        _workspace_store.upsert_workspace(
+            _WORKSPACES_FILE,
+            "Primary",
+            token_id,
+            token_secret,
+            set_active=True,
+        )
+        # Use active workspace or create a minimal workspace for backward compat
+        workspace = _active_workspace()
+        if workspace is None:
+            label = body.get("label", "").strip() or "default"
+            registry = _workspace_store.upsert_workspace(_WORKSPACES_FILE, label, token_id, token_secret, set_active=True)
+            workspace = _workspace_store.get_active_workspace(registry)
+        if workspace:
+            t = threading.Thread(target=_run_deploy_background, kwargs={"workspace": workspace}, daemon=True)
+            t.start()
         return web.json_response({"status": "ok"})
 
     # ── Local pre-dispatch instrumentation infrastructure ───────────────────
@@ -2029,12 +2359,20 @@ if _server:
                 {"folder": item["save_path"], "filename": item["filename"]}
                 for item in normalized_items
             ])
+            manifest_payload = None
+            for item in normalized_items:
+                manifest_payload = _model_manifest.upsert_manifest_entry(
+                    _MODEL_MANIFEST_FILE,
+                    _manifest_entry_from_install(item["url"], item["save_path"], item["filename"]),
+                )
             return web.json_response({
                 "status": "ok",
                 "results": results,
                 "placeholders": placeholders,
                 "placeholder_errors": placeholder_errors,
                 "message": _batch_placeholder_message(placeholders, placeholder_errors),
+                "manifest_entries_written": len(normalized_items),
+                "manifest_issue_count": len(_model_manifest.scan_manifest_issues(manifest_payload or _workspace_manifest())),
             })
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -2059,6 +2397,13 @@ if _server:
                         placeholder = _create_placeholder(save_path, filename)
                     except Exception as e:
                         placeholder_error = {"folder": save_path, "filename": filename, "error": str(e)}
+                    try:
+                        _model_manifest.upsert_manifest_entry(
+                            _MODEL_MANIFEST_FILE,
+                            _manifest_entry_from_install(url, save_path, filename),
+                        )
+                    except Exception:
+                        pass
                     _download_progress[download_id] = {
                         "state": "complete",
                         "result": {**update, "placeholder": placeholder, "placeholder_error": placeholder_error},
@@ -2137,9 +2482,251 @@ if _server:
     async def modal_deploy_trigger(request: web.Request) -> web.Response:
         if _deploy_status.get("state") == "deploying":
             return web.json_response({"status": "already_deploying"})
-        t = threading.Thread(target=_run_deploy_background, daemon=True)
+        workspace = _active_workspace()
+        if workspace is None:
+            return web.json_response({"status": "error", "message": "No active workspace configured"}, status=400)
+        t = threading.Thread(target=_run_deploy_background, kwargs={"workspace": workspace}, daemon=True)
         t.start()
         return web.json_response({"status": "started"})
+
+    # ── Workspace routes ──────────────────────────────────────────────────
+    @_server.routes.get("/comfymodal/workspaces")
+    async def modal_workspaces_get(request: web.Request) -> web.Response:
+        registry = _workspace_registry()
+        return web.json_response({
+            "status": "ok",
+            "active_workspace_id": registry.get("active_workspace_id"),
+            "workspaces": [_workspace_store.workspace_summary(item) for item in registry.get("workspaces", [])],
+        })
+
+    @_server.routes.post("/comfymodal/workspaces")
+    async def modal_workspaces_post(request: web.Request) -> web.Response:
+        body = await request.json()
+        try:
+            registry = _workspace_store.upsert_workspace(
+                _WORKSPACES_FILE,
+                body.get("label", ""),
+                body.get("token_id", ""),
+                body.get("token_secret", ""),
+                workspace_id=body.get("workspace_id"),
+                notes=body.get("notes", ""),
+                set_active=bool(body.get("set_active", False)),
+            )
+        except ValueError as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=400)
+        return web.json_response({
+            "status": "ok",
+            "active_workspace_id": registry.get("active_workspace_id"),
+            "workspaces": [_workspace_store.workspace_summary(item) for item in registry.get("workspaces", [])],
+        })
+
+    @_server.routes.post("/comfymodal/workspaces/active")
+    async def modal_workspaces_set_active(request: web.Request) -> web.Response:
+        body = await request.json()
+        try:
+            registry = _workspace_store.set_active_workspace(_WORKSPACES_FILE, body.get("workspace_id", ""))
+        except KeyError as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=400)
+        return web.json_response({
+            "status": "ok",
+            "active_workspace_id": registry.get("active_workspace_id"),
+            "workspaces": [_workspace_store.workspace_summary(item) for item in registry.get("workspaces", [])],
+        })
+
+    @_server.routes.post("/comfymodal/workspaces/swap")
+    async def modal_workspace_swap(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            workspace = _workspace_or_400(body.get("workspace_id", ""))
+            if workspace is None:
+                return web.json_response({"status": "error", "message": "unknown workspace"}, status=400)
+            if _deploy_status.get("state") == "deploying":
+                return web.json_response({"status": "busy", "message": "deploy already running"}, status=409)
+            if _ACTIVE_REQUEST_IDS and not body.get("confirm_prompt_interrupt", False):
+                return web.json_response({"status": "confirm_required", "message": "prompt execution is active"}, status=409)
+
+            if body.get("confirm"):
+                scan = await _scan_swap_plan(workspace)
+                if scan["blocking_issues"]:
+                    return web.json_response({
+                        "status": "repair_required",
+                        "issues": scan["blocking_issues"],
+                        "workspace_label": workspace["label"],
+                        "message": "Manifest repair required before swapping workspaces",
+                    })
+                if scan["unresolved"]:
+                    return web.json_response({
+                        "status": "repair_required",
+                        "issues": scan["unresolved"],
+                        "workspace_label": workspace["label"],
+                        "message": "Models missing source URLs — repair manifest first",
+                    })
+
+                selected_keys = body.get("selected_keys")
+                if not isinstance(selected_keys, list):
+                    return web.json_response({"status": "error", "message": "selected_keys is required for confirmed swaps"}, status=400)
+                allowed_keys = {str(key) for key in selected_keys if key}
+
+                filtered_install = [
+                    item for item in scan["to_install"]
+                    if f"{item.get('save_path') or item.get('folder') or ''}/{item.get('filename') or ''}" in allowed_keys
+                ]
+
+                swap_id = str(uuid.uuid4())
+                plan = {
+                    "to_install": filtered_install,
+                    "already_present": scan.get("already_present", []),
+                    "to_remove": scan.get("to_remove", []),
+                }
+                asyncio.create_task(_run_workspace_swap_job(swap_id, workspace, plan))
+                return web.json_response({"status": "started", "swap_id": swap_id, "workspace_label": workspace["label"]})
+
+            scan = await _scan_swap_plan(workspace)
+            if scan["blocking_issues"]:
+                return web.json_response({
+                    "status": "repair_required",
+                    "issues": scan["blocking_issues"],
+                    "workspace_label": workspace["label"],
+                    "message": "Manifest repair required before swapping workspaces",
+                })
+            if scan["unresolved"]:
+                return web.json_response({
+                    "status": "repair_required",
+                    "issues": scan["unresolved"],
+                    "workspace_label": workspace["label"],
+                    "message": "Models missing source URLs — repair manifest first",
+                })
+            return web.json_response({
+                "status": "review_required",
+                "swap_id": None,
+                "workspace_label": workspace["label"],
+                "already_present": [{"folder": m["folder"], "filename": m["filename"]} for m in scan["already_present"]],
+                "to_install": scan["to_install"],
+                "to_remove": scan["to_remove"],
+                "present_count": len(scan["already_present"]),
+                "install_count": len(scan["to_install"]),
+            })
+        except Exception as e:
+            return web.json_response({"status": "error", "message": f"Swap scan failed: {e}"}, status=500)
+
+    @_server.routes.get("/comfymodal/workspaces/swap/{swap_id}")
+    async def modal_workspace_swap_status(request: web.Request) -> web.Response:
+        swap_id = request.match_info.get("swap_id", "")
+        with _swap_jobs_lock:
+            payload = _swap_jobs.get(swap_id)
+        if payload is None:
+            return web.json_response({"status": "not_found", "swap_id": swap_id}, status=404)
+        return web.json_response({"swap_id": swap_id, **payload})
+
+    # ── Manifest routes ───────────────────────────────────────────────────
+    @_server.routes.get("/comfymodal/manifest")
+    async def modal_manifest_get(request: web.Request) -> web.Response:
+        manifest = _workspace_manifest()
+        return web.json_response({"status": "ok", **manifest})
+
+    @_server.routes.post("/comfymodal/manifest/repair/scan")
+    async def modal_manifest_repair_scan(request: web.Request) -> web.Response:
+        manifest = _workspace_manifest()
+        issues = _model_manifest.scan_local_models_issues(_COMFYUI_ROOT, manifest)
+        return web.json_response({"status": "ok", "issues": issues})
+
+    @_server.routes.post("/comfymodal/manifest/repair/apply")
+    async def modal_manifest_repair_apply(request: web.Request) -> web.Response:
+        body = await request.json()
+        repaired = _model_manifest.apply_manifest_repairs(_workspace_manifest(), body.get("updates", []))
+        _model_manifest.save_master_manifest(_MODEL_MANIFEST_FILE, repaired)
+        return web.json_response({
+            "status": "ok",
+            "entries": repaired.get("entries", []),
+            "issues": _model_manifest.scan_local_models_issues(_COMFYUI_ROOT, repaired),
+        })
+
+    @_server.routes.post("/comfymodal/manifest/repair/delete-placeholder")
+    async def modal_manifest_repair_delete_placeholder(request: web.Request) -> web.Response:
+        body = await request.json()
+        folder = body.get("folder", "")
+        filename = body.get("filename", "")
+        if not folder or not filename:
+            return web.json_response({"status": "error", "message": "folder and filename required"}, status=400)
+        removed = _remove_local_placeholder_if_needed(folder, filename)
+        if removed:
+            manifest = _workspace_manifest()
+            manifest["entries"] = [e for e in manifest.get("entries", []) if not (e.get("folder") == folder and e.get("filename") == filename)]
+            _model_manifest.save_master_manifest(_MODEL_MANIFEST_FILE, manifest)
+        return web.json_response({
+            "status": "ok",
+            "removed": bool(removed),
+            "message": "Placeholder deleted." if removed else "No local placeholder was deleted; manifest entry was left unchanged.",
+        })
+
+    @_server.routes.post("/comfymodal/manifest/install")
+    async def modal_manifest_install(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            items = body.get("items", [])
+            workspace_id = body.get("workspace_id", "")
+            if not items:
+                return web.json_response({"status": "error", "message": "No items specified"}, status=400)
+            workspace = _workspace_or_400(workspace_id) if workspace_id else _active_workspace()
+            if workspace is None:
+                return web.json_response({"status": "error", "message": "No workspace specified and no active workspace"}, status=400)
+            manifest = _workspace_manifest()
+            entries_by_key = {(e.get("folder"), e.get("filename")): e for e in manifest.get("entries", [])}
+            results = []
+            for item in items:
+                folder = item.get("folder", "")
+                filename = item.get("filename", "")
+                entry = entries_by_key.get((folder, filename))
+                if entry is None:
+                    results.append({"folder": folder, "filename": filename, "status": "error", "error": "not found in manifest"})
+                    continue
+                url = entry.get("url", "")
+                if not url:
+                    results.append({"folder": folder, "filename": filename, "status": "error", "error": "no URL in manifest entry"})
+                    continue
+                try:
+                    result = await download_model(
+                        url=url,
+                        filename=filename,
+                        save_path=folder,
+                        hf_token=_read_hf_token(),
+                        civitai_token=_read_civitai_token(),
+                        workspace=workspace,
+                    )
+                    results.append({"folder": folder, "filename": filename, **result})
+                except Exception as e:
+                    results.append({"folder": folder, "filename": filename, "status": "error", "error": str(e)})
+            successes = sum(1 for r in results if r.get("status") in ("ok", "skipped"))
+            failures = sum(1 for r in results if r.get("status") == "error")
+            return web.json_response({
+                "status": "ok" if failures == 0 else "partial",
+                "results": results,
+                "success_count": successes,
+                "failure_count": failures,
+            })
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/workflow-manifest/export")
+    async def modal_workflow_manifest_export(request: web.Request) -> web.Response:
+        body = await request.json()
+        exported = _model_manifest.export_workflow_manifest(_workspace_manifest(), body.get("prompt", {}), body.get("workflow_name", ""))
+        if exported["unresolved"]:
+            return web.json_response({"status": "repair_required", **exported}, status=409)
+        return web.json_response({"status": "ok", **exported})
+
+    @_server.routes.post("/comfymodal/workflow-manifest/import")
+    async def modal_workflow_manifest_import(request: web.Request) -> web.Response:
+        body = await request.json()
+        merged = _model_manifest.merge_workflow_manifest(
+            _workspace_manifest(),
+            body,
+            resolutions=body.get("conflict_resolutions", {}),
+        )
+        if merged["conflicts"]:
+            return web.json_response({"status": "conflict", **merged}, status=409)
+        _model_manifest.save_master_manifest(_MODEL_MANIFEST_FILE, {"manifest_version": 1, "entries": merged["entries"]})
+        return web.json_response({"status": "ok", "added": merged["added"], "filled": merged["filled"]})
 
     @_server.routes.get("/comfymodal/config")
     async def modal_get_config(request: web.Request) -> web.Response:
@@ -2493,9 +3080,12 @@ if _server:
         cn_root = os.path.join(_COMFYUI_ROOT, "custom_nodes")
         if not os.path.isdir(cn_root):
             return web.json_response({"status": "error", "message": "custom_nodes directory not found"}, status=400)
+        workspace = _active_workspace()
+        if workspace is None:
+            return web.json_response({"status": "error", "message": "No active workspace configured"}, status=400)
 
         try:
-            result = await _sync_custom_nodes_and_maybe_deploy(cn_root)
+            result = await _sync_custom_nodes_and_maybe_deploy(cn_root, workspace)
             return web.json_response(result, status=200 if result.get("status") == "ok" else 500)
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)

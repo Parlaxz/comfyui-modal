@@ -1,0 +1,43 @@
+{
+  "active_workspace_id": "ws_6cf85caf6e07",
+  "deploy_state_by_workspace": {
+    "ws_386649971898": {
+      "comfyapp_version": "2.16.5",
+      "custom_nodes_fingerprint": null
+    },
+    "ws_6cf85caf6e07": {
+      "comfyapp_version": "2.16.5",
+      "custom_nodes_fingerprint": "1d233bc26efcde1a53f5425bb26d0d055198011839df06f9f4e51dc62492f1b5"
+    }
+  },
+  "version": 1,
+  "workspaces": [
+    {
+      "id": "ws_386649971898",
+      "label": "Testing2 Workspace",
+      "last_deploy_status": "idle",
+      "last_used_at": 1781237384.9751854,
+      "notes": "",
+      "token_id": "ak-QkyMcoMVGXbkqq5hVnoCUx",
+      "token_secret": "as-O7fyin1heuFhvs7xPfrcZy"
+    },
+    {
+      "id": "ws_9768b333a3a2",
+      "label": "Testing 3 Workspace",
+      "last_deploy_status": "idle",
+      "last_used_at": null,
+      "notes": "",
+      "token_id": "ak-vkmEpQfr0srdCp0oVbcUVn",
+      "token_secret": "as-ogGP9E68uZe8dT9sxIFwrs"
+    },
+    {
+      "id": "ws_6cf85caf6e07",
+      "label": "Testing 4 Workspace",
+      "last_deploy_status": "idle",
+      "last_used_at": 1781249389.3898096,
+      "notes": "",
+      "token_id": "ak-lRAwgy22gwFfrbczSrGnNZ",
+      "token_secret": "as-yOqPAwlHRSY6EfGxr7F3V3"
+    }
+  ]
+}

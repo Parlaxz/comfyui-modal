@@ -496,6 +496,10 @@ function stopDeployLogPoll() {
  * @param {string} message - Confirmation prompt text
  * @returns {Promise<boolean>} resolves to true if confirmed, false if cancelled
  */
+function showConfirm(message) {
+  return showConfirmDialog(message);
+}
+
 function showConfirmDialog(message) {
   return new Promise((resolve) => {
     const overlay = document.createElement("div");
@@ -1071,6 +1075,12 @@ function buildAuthPanel(onConnected) {
   pasteInput.style.cssText = inputStyle();
   wrap.appendChild(pasteInput);
 
+  const labelInput = document.createElement("input");
+  labelInput.type = "text";
+  labelInput.placeholder = "Workspace label (for the dropdown)";
+  labelInput.style.cssText = inputStyle();
+  wrap.insertBefore(labelInput, pasteInput);
+
   const tokenSecretInput = document.createElement("input");
   tokenSecretInput.type = "password";
   tokenSecretInput.placeholder = "Token Secret  (as-...)  \u2014 auto-filled if pasted above";
@@ -1098,36 +1108,32 @@ function buildAuthPanel(onConnected) {
   wrap.appendChild(errorEl);
 
   const connectBtn = document.createElement("button");
-  connectBtn.textContent = "Connect & Deploy";
+  connectBtn.textContent = "Save Workspace";
   connectBtn.style.cssText = btnStyle("primary");
   connectBtn.onclick = async () => {
+    const label = labelInput.value.trim() || "Primary Workspace";
     const token_id = pasteInput.value.trim();
     const token_secret = tokenSecretInput.value.trim();
     errorEl.textContent = "";
     if (!token_id || !token_secret) {
-      errorEl.textContent = "Both fields are required.";
+      errorEl.textContent = "Workspace label, token ID, and token secret are required.";
       return;
     }
     connectBtn.disabled = true;
-    connectBtn.textContent = "Connecting...";
+    connectBtn.textContent = "Saving\u2026";
     try {
-      const resp = await api.fetchApi(`${MODAL_PREFIX}/auth/setup`, {
+      const resp = await api.fetchApi(`${MODAL_PREFIX}/workspaces`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token_id, token_secret }),
+        body: JSON.stringify({ label, token_id, token_secret, set_active: true }),
       });
       const data = await resp.json();
-      if (data.status === "ok") {
-        onConnected();
-      } else {
-        errorEl.textContent = data.message || "Connection failed.";
-        connectBtn.disabled = false;
-        connectBtn.textContent = "Connect & Deploy";
-      }
+      if (data.status !== "ok") throw new Error(data.message || "Workspace save failed");
+      onConnected();
     } catch (e) {
       errorEl.textContent = `Error: ${e.message}`;
       connectBtn.disabled = false;
-      connectBtn.textContent = "Connect & Deploy";
+      connectBtn.textContent = "Save Workspace";
     }
   };
   wrap.appendChild(connectBtn);
@@ -1622,6 +1628,977 @@ function buildPanel() {
   sidecarToggle.addEventListener("change", () => { _sidecarValue = sidecarToggle.checked; _persistOutputSettings(); });
 
   scrollContent.appendChild(outputCollapsible.wrapper);
+
+  // === WORKSPACE SECTION (Collapsible) ===
+  let currentSwapId = null;
+  let swapPollTimer = null;
+
+  const workspaceSection = createCollapsibleSection("Workspace", { defaultOpen: true, badge: null });
+  const workspaceContent = workspaceSection.content;
+
+  const workspaceSelect = document.createElement("select");
+  workspaceSelect.style.cssText = inputStyle() + "width:100%; margin-bottom:8px;";
+  workspaceContent.appendChild(workspaceSelect);
+
+  const workspaceStatus = document.createElement("div");
+  workspaceStatus.style.cssText = "font-size:11px; color:#888; min-height:16px; margin-bottom:8px;";
+  workspaceContent.appendChild(workspaceStatus);
+
+  const addWsBtn = document.createElement("button");
+  addWsBtn.textContent = "+ Add Workspace";
+  addWsBtn.style.cssText = btnStyle() + "margin-bottom:6px;";
+  addWsBtn.onclick = () => openAddWorkspaceModal();
+  workspaceContent.appendChild(addWsBtn);
+
+  const swapBtn = document.createElement("button");
+  swapBtn.textContent = "Swap Workspace";
+  swapBtn.style.cssText = btnStyle("primary") + "margin-bottom:6px;";
+  workspaceContent.appendChild(swapBtn);
+
+  const repairBtn = document.createElement("button");
+  repairBtn.textContent = "Manifest Repair";
+  repairBtn.style.cssText = btnStyle() + "margin-bottom:6px;";
+  workspaceContent.appendChild(repairBtn);
+
+  const exportBtn = document.createElement("button");
+  exportBtn.textContent = "Export Workflow Manifest";
+  exportBtn.style.cssText = btnStyle() + "margin-bottom:6px;";
+  workspaceContent.appendChild(exportBtn);
+
+  const importBtn = document.createElement("button");
+  importBtn.textContent = "Import Workflow Manifest";
+  importBtn.style.cssText = btnStyle();
+  workspaceContent.appendChild(importBtn);
+
+  const installBtn = document.createElement("button");
+  installBtn.textContent = "Install from Manifest";
+  installBtn.title = "Download one or more manifest-tracked models to the current active workspace";
+  installBtn.style.cssText = btnStyle("primary") + "margin-top:6px;";
+  workspaceContent.appendChild(installBtn);
+
+  const swapProgress = document.createElement("div");
+  swapProgress.style.cssText = "font-size:11px; color:#aaa; margin-top:8px; min-height:32px;";
+  workspaceContent.appendChild(swapProgress);
+
+  // Persistent deploy log container (scroll-safe: textContent updates don't reset scroll)
+  const deployLogPre = document.createElement("pre");
+  deployLogPre.style.cssText = "display:none;margin:6px 0 0;padding:6px;background:#111;color:#aaa;font-size:10px;line-height:1.4;max-height:200px;overflow-y:auto;border-radius:4px;border:1px solid #333;white-space:pre-wrap;word-break:break-all;";
+  workspaceContent.appendChild(deployLogPre);
+
+  scrollContent.appendChild(workspaceSection.wrapper);
+
+  async function loadWorkspaces() {
+    const resp = await api.fetchApi(`${MODAL_PREFIX}/workspaces`);
+    const data = await resp.json();
+    workspaceSelect.innerHTML = "";
+    (data.workspaces || []).forEach((workspace) => {
+      const opt = document.createElement("option");
+      opt.value = workspace.id;
+      opt.textContent = workspace.label;
+      if (workspace.id === data.active_workspace_id) opt.selected = true;
+      workspaceSelect.appendChild(opt);
+    });
+    workspaceStatus.textContent = data.workspaces?.length
+      ? `Active workspace: ${workspaceSelect.options[workspaceSelect.selectedIndex]?.textContent || "none"}`
+      : "No saved Modal workspaces yet.";
+  }
+
+  async function openAddWorkspaceModal() {
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position:fixed; inset:0; background:rgba(0,0,0,0.65); display:flex; align-items:center; justify-content:center; z-index:10001;";
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+    const modal = document.createElement("div");
+    modal.style.cssText = "width:min(460px, 90vw); background:#171717; border:1px solid #333; border-radius:8px; padding:16px; display:flex; flex-direction:column; gap:10px;";
+
+    const title = document.createElement("div");
+    title.style.cssText = "font-weight:600; font-size:14px; margin-bottom:4px;";
+    title.textContent = "Add Modal Workspace";
+    modal.appendChild(title);
+
+    const labelInput = document.createElement("input");
+    labelInput.type = "text";
+    labelInput.placeholder = "Workspace label (e.g. Studio A)";
+    labelInput.style.cssText = inputStyle();
+    modal.appendChild(labelInput);
+
+    const tokenIdInput = document.createElement("input");
+    tokenIdInput.type = "text";
+    tokenIdInput.placeholder = "Token ID (ak-...)";
+    tokenIdInput.style.cssText = inputStyle();
+    modal.appendChild(tokenIdInput);
+
+    const tokenSecretInput = document.createElement("input");
+    tokenSecretInput.type = "password";
+    tokenSecretInput.placeholder = "Token Secret (as-...)";
+    tokenSecretInput.style.cssText = inputStyle();
+    modal.appendChild(tokenSecretInput);
+
+    const errorEl = document.createElement("div");
+    errorEl.style.cssText = "font-size:11px; color:#e05050; min-height:14px;";
+    modal.appendChild(errorEl);
+
+    const btnRow = document.createElement("div");
+    btnRow.style.cssText = "display:flex; gap:8px; justify-content:flex-end;";
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.style.cssText = btnStyle();
+    cancelBtn.onclick = () => overlay.remove();
+    btnRow.appendChild(cancelBtn);
+
+    const saveBtn = document.createElement("button");
+    saveBtn.textContent = "Save Workspace";
+    saveBtn.style.cssText = btnStyle("primary");
+    saveBtn.onclick = async () => {
+      const label = labelInput.value.trim();
+      const token_id = tokenIdInput.value.trim();
+      const token_secret = tokenSecretInput.value.trim();
+      errorEl.textContent = "";
+      if (!label || !token_id || !token_secret) {
+        errorEl.textContent = "All fields required.";
+        return;
+      }
+      saveBtn.disabled = true;
+      saveBtn.textContent = "Saving\u2026";
+      try {
+        const resp = await api.fetchApi(`${MODAL_PREFIX}/workspaces`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ label, token_id, token_secret, set_active: false }),
+        });
+        const data = await resp.json();
+        if (data.status !== "ok") throw new Error(data.message || "Save failed");
+        overlay.remove();
+        showToast("Workspace saved.", "success");
+        await loadWorkspaces();
+      } catch (e) {
+        errorEl.textContent = "Error: " + e.message;
+      } finally {
+        saveBtn.disabled = false;
+        saveBtn.textContent = "Save Workspace";
+      }
+    };
+    btnRow.appendChild(saveBtn);
+    modal.appendChild(btnRow);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+    setTimeout(() => labelInput.focus(), 100);
+  }
+
+  function setWorkspaceBusy(isBusy) {
+    addWsBtn.disabled = isBusy;
+    swapBtn.disabled = isBusy;
+    repairBtn.disabled = isBusy;
+    installBtn.disabled = isBusy;
+    exportBtn.disabled = isBusy;
+    importBtn.disabled = isBusy;
+    workspaceSelect.disabled = isBusy;
+  }
+
+  async function pollSwapJob() {
+    if (!currentSwapId) return;
+    const resp = await api.fetchApi(`${MODAL_PREFIX}/workspaces/swap/${currentSwapId}`);
+    const data = await resp.json();
+    // Hide deploy log in all phases; only the "deploying" handler shows it
+    deployLogPre.style.display = "none";
+    if (data.status === "running") {
+      const phase = data.phase;
+      let msg = "";
+      if (phase === "downloading_models") {
+        const cur = data.download_current_name || "";
+        const done = data.download_completed || 0;
+        const total = (data.download_total || 0) + (data.download_skipped || 0);
+        const pct = data.download_pct_current || 0;
+        const msg = data.download_message || "";
+        const bar = `<div style="margin-top:4px;width:100%;height:6px;background:#333;border-radius:3px;overflow:hidden;"><div style="width:${pct}%;height:100%;background:#f5a623;border-radius:3px;transition:width 0.5s;"></div></div>`;
+        swapProgress.innerHTML = `<div><span style="color:#f5a623;">${msg || `Preparing downloads… ${done}/${total}`}</span>${bar}</div>`;
+      } else if (phase === "syncing_custom_nodes") {
+        const syncMsg = data.sync_message || "Syncing custom nodes to Modal…";
+        swapProgress.innerHTML = `<span style="color:#f5a623;">${syncMsg}</span>`;
+        if (data.deploy_log_tail) {
+          deployLogPre.textContent = data.deploy_log_tail;
+          deployLogPre.style.display = "block";
+        }
+      } else if (phase === "deploying") {
+        const msg = data.deploy_message || "Deploying workspace…";
+        swapProgress.innerHTML = `<span style="color:#f5a623;">${msg}</span>`;
+        if (data.deploy_log_tail) {
+          deployLogPre.textContent = data.deploy_log_tail;
+          deployLogPre.style.display = "block";
+        } else {
+          deployLogPre.style.display = "none";
+        }
+      } else {
+        swapProgress.innerHTML = `<span style="color:#f5a623;">Phase: ${phase.replace(/_/g, " ")}</span>`;
+      }
+      swapPollTimer = setTimeout(pollSwapJob, 1000);
+      return;
+    }
+    setWorkspaceBusy(false);
+    if (data.status === "ok") {
+      const dl = data.download_summary || `${data.installed_model_count} installed, ${data.skipped_model_count} skipped`;
+      const removalNote = data.remove_summary ? ` ${data.remove_summary}.` : "";
+      swapProgress.innerHTML = `<span style="color:#7ed321;">Done — ${data.workspace_label}: ${dl}.${removalNote} Custom nodes synced. Deploy started.</span>`;
+      showToast("Workspace swap complete", "success");
+      await loadWorkspaces();
+      await loadModels();
+      await loadSyncStatus();
+      startDeployPoll();
+      return;
+    }
+    if (data.status === "repair_required") {
+      swapProgress.innerHTML = `<span style="color:#e07070;">Swap blocked: ${data.message || "manifest repair required"}</span>`;
+      showToast("Manifest repair required before swap can continue", "info");
+      await openManifestRepairModal(data.issues || []);
+      return;
+    }
+    const errMsg = data.download_message || data.deploy_message || data.sync_message || data.error || data.message || "Workspace swap failed";
+    swapProgress.innerHTML = `<span style="color:#e05050;">${errMsg}</span>`;
+    showToast(errMsg, "error");
+  }
+
+  function inferSourceKind(url) {
+    if (/huggingface\.co/i.test(url)) return "huggingface";
+    if (/civitai\.com/i.test(url)) return "civitai";
+    if (/^https?:\/\//i.test(url)) return "direct";
+    return "unknown";
+  }
+
+  async function openManifestRepairModal(prefetchedIssues = null) {
+    const scanResp = prefetchedIssues ? null : await api.fetchApi(`${MODAL_PREFIX}/manifest/repair/scan`, { method: "POST" });
+    const scanData = prefetchedIssues ? { issues: prefetchedIssues } : await scanResp.json();
+    const issues = scanData.issues || [];
+    if (!issues.length) {
+      showToast("No manifest issues found. The manifest is empty until you install models — use the Add Model section above to install and track models.", "info");
+      return;
+    }
+
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position:fixed; inset:0; background:rgba(0,0,0,0.65); display:flex; align-items:center; justify-content:center; z-index:10001;";
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+    const modal = document.createElement("div");
+    modal.style.cssText = "width:min(1100px, 95vw); max-height:80vh; background:#171717; border:1px solid #333; border-radius:8px; display:flex; flex-direction:column; overflow:hidden;";
+
+    const headerRow = document.createElement("div");
+    headerRow.style.cssText = "padding:14px 16px 6px; font-weight:600; font-size:13px;";
+    headerRow.textContent = "Manifest Repair";
+    modal.appendChild(headerRow);
+
+    const tableWrap = document.createElement("div");
+    tableWrap.style.cssText = "flex:1; overflow-y:auto; padding:4px 16px; min-height:100px; max-height:55vh;";
+    const table = document.createElement("table");
+    table.style.cssText = "width:100%; border-collapse:collapse; font-size:12px;";
+    const thead = document.createElement("thead");
+    const hdr = document.createElement("tr");
+    const colDefs = [
+      { label: "Folder", width: "12%" },
+      { label: "Filename", width: "22%" },
+      { label: "URL", width: "30%" },
+      { label: "Source", width: "11%" },
+      { label: "Remove", width: "8%" },
+      { label: "", width: "17%" },
+    ];
+    colDefs.forEach((c) => {
+      const th = document.createElement("th");
+      th.textContent = c.label;
+      th.style.cssText = `text-align:left;position:sticky;top:0;background:#171717;padding:6px 4px 8px;font-weight:600;width:${c.width};white-space:nowrap;`;
+      hdr.appendChild(th);
+    });
+    thead.appendChild(hdr);
+    table.appendChild(thead);
+
+    const body = document.createElement("tbody");
+    const rows = issues.map((issue) => {
+      const tr = document.createElement("tr");
+
+      // Folder
+      const folderTd = document.createElement("td");
+      folderTd.style.cssText = "padding:5px 4px;vertical-align:middle;white-space:nowrap;";
+      folderTd.textContent = issue.folder || "";
+      tr.appendChild(folderTd);
+
+      // Filename
+      const nameTd = document.createElement("td");
+      nameTd.style.cssText = "padding:5px 4px;vertical-align:middle;word-break:break-all;";
+      nameTd.textContent = issue.filename || "";
+      tr.appendChild(nameTd);
+
+      // URL input
+      const urlTd = document.createElement("td");
+      urlTd.style.cssText = "padding:5px 4px;vertical-align:middle;";
+      const urlInput = document.createElement("input");
+      urlInput.type = "text";
+      urlInput.value = issue.url || "";
+      urlInput.placeholder = "https://huggingface.co/...";
+      urlInput.style.cssText = inputStyle() + "width:100%;box-sizing:border-box;";
+      urlInput.addEventListener("input", () => {
+        const detected = inferSourceKind(urlInput.value);
+        if (detected !== "unknown") sourceSelect.value = detected;
+      });
+      urlTd.appendChild(urlInput);
+      tr.appendChild(urlTd);
+
+      // Source select
+      const sourceTd = document.createElement("td");
+      sourceTd.style.cssText = "padding:5px 4px;vertical-align:middle;";
+      const sourceSelect = document.createElement("select");
+      sourceSelect.style.cssText = inputStyle() + "width:100%;box-sizing:border-box;";
+      ["unknown", "huggingface", "civitai", "direct"].forEach((kind) => {
+        const opt = document.createElement("option");
+        opt.value = kind;
+        opt.textContent = kind;
+        if ((issue.source_kind || "unknown") === kind) opt.selected = true;
+        sourceSelect.appendChild(opt);
+      });
+      sourceTd.appendChild(sourceSelect);
+      tr.appendChild(sourceTd);
+
+      // Remove checkbox
+      const removeTd = document.createElement("td");
+      removeTd.style.cssText = "padding:5px 4px;vertical-align:middle;text-align:center;";
+      const removeCb = document.createElement("input");
+      removeCb.type = "checkbox";
+      removeCb.checked = !!issue.remove_on_swap;
+      removeCb.title = "Remove from workspace on next swap";
+      removeCb.style.cssText = "width:14px;height:14px;accent-color:#e07070;";
+      removeTd.appendChild(removeCb);
+      tr.appendChild(removeTd);
+
+      // Delete button
+      const actionTd = document.createElement("td");
+      actionTd.style.cssText = "padding:5px 4px;vertical-align:middle;white-space:nowrap;";
+      const delBtn = document.createElement("button");
+      delBtn.textContent = "Delete";
+      delBtn.style.cssText = "background:#4a1a1a;border:1px solid #6a2a2a;color:#e07070;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:11px;line-height:1.4;";
+      delBtn.onclick = async () => {
+        delBtn.disabled = true;
+        delBtn.textContent = "…";
+        try {
+          const resp = await api.fetchApi(`${MODAL_PREFIX}/manifest/repair/delete-placeholder`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ folder: issue.folder, filename: issue.filename }),
+          });
+          const data = await resp.json();
+          if (!data.removed) {
+            delBtn.disabled = false;
+            delBtn.textContent = "Delete";
+            showToast(data.message || `Couldn't delete ${issue.filename}`, "info");
+            return;
+          }
+          tr.remove();
+          const idx = rows.indexOf(rowItem);
+          if (idx !== -1) rows.splice(idx, 1);
+          showToast(`Deleted ${issue.filename}`, "info");
+        } catch (e) {
+          delBtn.disabled = false;
+          delBtn.textContent = "Delete";
+        }
+      };
+      actionTd.appendChild(delBtn);
+      tr.appendChild(actionTd);
+
+      body.appendChild(tr);
+      const rowItem = { issue, urlInput, sourceSelect, removeCb, delBtn };
+      return rowItem;
+    });
+    table.appendChild(body);
+    tableWrap.appendChild(table);
+    modal.appendChild(tableWrap);
+
+    const footer = document.createElement("div");
+    footer.style.cssText = "display:flex; gap:8px; justify-content:flex-end; padding:10px 16px 14px; flex-shrink:0;";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.style.cssText = btnStyle();
+    cancelBtn.onclick = () => overlay.remove();
+    const skipAllBtn = document.createElement("button");
+    skipAllBtn.textContent = "Skip All";
+    skipAllBtn.style.cssText = btnStyle();
+    skipAllBtn.onclick = async () => {
+      const updates = rows.map(({ issue }) => ({ folder: issue.folder, filename: issue.filename, skip: true }));
+      await api.fetchApi(`${MODAL_PREFIX}/manifest/repair/apply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ updates }),
+      });
+      overlay.remove();
+      showToast("Manifest repair skipped for selected rows.", "info");
+    };
+    const saveAllBtn = document.createElement("button");
+    saveAllBtn.textContent = "Save All Valid";
+    saveAllBtn.style.cssText = btnStyle("primary");
+    saveAllBtn.onclick = async () => {
+      const updates = rows
+        .filter(({ urlInput, removeCb }) => urlInput.value.trim() || removeCb.checked)
+        .map(({ issue, urlInput, sourceSelect, removeCb }) => ({
+          folder: issue.folder,
+          filename: issue.filename,
+          url: urlInput.value.trim(),
+          source_kind: sourceSelect.value,
+          ...(removeCb.checked ? { remove: true } : {}),
+        }));
+      const resp = await api.fetchApi(`${MODAL_PREFIX}/manifest/repair/apply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ updates }),
+      });
+      const data = await resp.json();
+      overlay.remove();
+      showToast(data.issues.length ? "Manifest still has unresolved rows." : "Manifest repair saved.", data.issues.length ? "info" : "success");
+    };
+    footer.appendChild(cancelBtn);
+    footer.appendChild(skipAllBtn);
+    footer.appendChild(saveAllBtn);
+    modal.appendChild(footer);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+  }
+
+  async function openImportConflictModal(conflicts, payload) {
+    const resolutions = {};
+    conflicts.forEach((item) => {
+      resolutions[`${item.folder}/${item.filename}`] = window.confirm(`Use imported URL for ${item.filename}?\nLocal: ${item.local_url}\nImported: ${item.imported_url}`)
+        ? "use_imported"
+        : "keep_local";
+    });
+    const resp = await api.fetchApi(`${MODAL_PREFIX}/workflow-manifest/import`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(Object.assign({}, payload, { conflict_resolutions: resolutions })),
+    });
+    return await resp.json();
+  }
+
+  swapBtn.onclick = async () => {
+    setWorkspaceBusy(true);
+    swapProgress.innerHTML = `<span style="color:#888;">Scanning workspace and manifest…</span>`;
+    try {
+      const scanResp = await api.fetchApi(`${MODAL_PREFIX}/workspaces/swap`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workspace_id: workspaceSelect.value }),
+      });
+      const scanData = await scanResp.json();
+      if (scanData.status === "busy") {
+        setWorkspaceBusy(false);
+        swapProgress.innerHTML = `<span style="color:#888;">${scanData.message || "Deploy already running — try again later."}</span>`;
+        return;
+      }
+      if (scanData.status === "error") {
+        setWorkspaceBusy(false);
+        swapProgress.innerHTML = `<span style="color:#e05050;">${scanData.message || "Workspace swap failed."}</span>`;
+        return;
+      }
+      if (scanData.status === "confirm_required") {
+        const ok = await showConfirm("A prompt is still running. Switch workspaces anyway?");
+        if (!ok) {
+          setWorkspaceBusy(false);
+          swapProgress.innerHTML = `<span style="color:#888;">Swap cancelled.</span>`;
+          return;
+        }
+        const retry = await api.fetchApi(`${MODAL_PREFIX}/workspaces/swap`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workspace_id: workspaceSelect.value, confirm_prompt_interrupt: true }),
+        });
+        const retryData = await retry.json();
+        if (retryData.status === "review_required") {
+          await showSwapReviewDialog({ ...retryData, confirm_prompt_interrupt: true });
+          return;
+        }
+        if (retryData.status === "repair_required") {
+          setWorkspaceBusy(false);
+          swapProgress.innerHTML = `<span style="color:#e07070;">${retryData.message || "Swap blocked: manifest repair required."}</span>`;
+          await openManifestRepairModal(retryData.issues || []);
+          return;
+        }
+        if (retryData.status === "busy" || retryData.status === "error") {
+          setWorkspaceBusy(false);
+          swapProgress.innerHTML = `<span style="color:#e05050;">${retryData.message || "Workspace swap failed."}</span>`;
+          return;
+        }
+        currentSwapId = retryData.swap_id;
+        swapProgress.innerHTML = `<span style="color:#888;">Swap started…</span>`;
+        pollSwapJob();
+        return;
+      }
+      if (scanData.status === "repair_required") {
+        setWorkspaceBusy(false);
+        swapProgress.innerHTML = `<span style="color:#e07070;">${scanData.message || "Swap blocked: manifest repair required."}</span>`;
+        await openManifestRepairModal(scanData.issues || []);
+        return;
+      }
+      if (scanData.status === "review_required") {
+        await showSwapReviewDialog(scanData);
+        return;
+      }
+      // Fallback: started directly (no review phase)
+      currentSwapId = scanData.swap_id;
+      swapProgress.innerHTML = `<span style="color:#f5a623;">Preparing downloads…</span>`;
+      pollSwapJob();
+    } catch (e) {
+      setWorkspaceBusy(false);
+      swapProgress.innerHTML = `<span style="color:#e05050;">Error: ${e.message}</span>`;
+    }
+  };
+
+  async function showSwapReviewDialog(data) {
+    const toInstall = data.to_install || [];
+    const alreadyPresent = data.already_present || [];
+    const toRemove = data.to_remove || [];
+    const installCount = data.install_count || 0;
+    const presentCount = data.present_count || 0;
+
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position:fixed; inset:0; background:rgba(0,0,0,0.65); display:flex; align-items:center; justify-content:center; z-index:10001;";
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) { overlay.remove(); setWorkspaceBusy(false); swapProgress.innerHTML = ""; } });
+
+    const modal = document.createElement("div");
+    modal.style.cssText = "width:min(660px, 95vw); max-height:75vh; background:#171717; border:1px solid #333; border-radius:8px; display:flex; flex-direction:column; overflow:hidden;";
+
+    const header = document.createElement("div");
+    header.style.cssText = "padding:16px 16px 8px; font-weight:600; font-size:13px;";
+    header.innerHTML = `Workspace: <span style="color:#6a9fd8;">${data.workspace_label || "unknown"}</span>`;
+    modal.appendChild(header);
+
+    const body = document.createElement("div");
+    body.style.cssText = "flex:1; overflow-y:auto; padding:4px 16px 8px; font-size:12px; line-height:1.6; color:#ccc;";
+    const addBodyText = (text, style = "") => {
+      const row = document.createElement("div");
+      row.textContent = text;
+      row.style.cssText = style;
+      body.appendChild(row);
+      return row;
+    };
+
+    if (installCount === 0) {
+      addBodyText(
+        "All manifest models are already in the target workspace. Custom nodes will still be synced and a deploy will run.",
+        "color:#aaa;"
+      );
+    } else {
+      addBodyText(
+        "Select models to download to target workspace:",
+        "color:#f5a623;margin-bottom:6px;font-weight:600;"
+      );
+    }
+
+    // Group toInstall by folder type
+    const groupOrder = ["checkpoints", "unet", "diffusion_models", "clip", "text_encoders", "vae", "loras", "controlnet", "style_models", "upscale_models", "other"];
+    function folderGroup(folder) { return groupOrder.includes(folder) ? folder : "other"; }
+    const groups = {};
+    toInstall.forEach((m) => {
+      const g = folderGroup(m.save_path || m.folder || "other");
+      if (!groups[g]) groups[g] = [];
+      groups[g].push(m);
+    });
+    const sortedGroups = Object.keys(groups).sort((a, b) => groupOrder.indexOf(a) - groupOrder.indexOf(b));
+
+    const checkItems = [];
+
+    // Per-group checkboxes
+    const groupCbs = {};
+    sortedGroups.forEach((g) => {
+      const items = groups[g];
+      // Group header row with group select-all
+      const headerRow = document.createElement("div");
+      headerRow.style.cssText = "display:flex;align-items:center;gap:8px;padding:6px 0 2px;margin-top:4px;border-top:1px solid #2a2a2a;";
+      const gCb = document.createElement("input");
+      gCb.type = "checkbox";
+      gCb.checked = true;
+      gCb.style.cssText = "width:14px;height:14px;accent-color:#f5a623;flex-shrink:0;";
+      const gLabel = document.createElement("span");
+      gLabel.style.cssText = "color:#f5a623;font-weight:600;font-size:11px;text-transform:uppercase;";
+      gLabel.textContent = `${g} (${items.length})`;
+      headerRow.appendChild(gCb);
+      headerRow.appendChild(gLabel);
+      body.appendChild(headerRow);
+      groupCbs[g] = gCb;
+
+      // Model rows for this group
+      items.forEach((m) => {
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex;align-items:center;gap:8px;padding:2px 0 2px 22px;";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = true;
+        cb.style.cssText = "width:14px;height:14px;accent-color:#f5a623;flex-shrink:0;";
+        const label = document.createElement("span");
+        label.style.cssText = "color:#ddd;word-break:break-all;";
+        label.textContent = m.filename || "?";
+        row.appendChild(cb);
+        row.appendChild(label);
+        body.appendChild(row);
+        checkItems.push({ cb, item: m, group: g });
+        // When individual checkbox changes, update group cb state
+        cb.addEventListener("change", () => {
+          const allInGroup = checkItems.filter((x) => x.group === g);
+          gCb.checked = allInGroup.every((x) => x.cb.checked);
+          gCb.indeterminate = !gCb.checked && allInGroup.some((x) => x.cb.checked);
+        });
+      });
+
+      // Group cb toggles all in group
+      gCb.addEventListener("change", () => {
+        checkItems.filter((x) => x.group === g).forEach((x) => { x.cb.checked = gCb.checked; });
+        updateProceedBtn();
+      });
+    });
+
+    // Global Select All / Deselect All buttons
+    if (installCount > 0) {
+      const bulkBar = document.createElement("div");
+      bulkBar.style.cssText = "display:flex;gap:6px;margin:6px 0 2px;";
+      const selectAllBtn = document.createElement("button");
+      selectAllBtn.textContent = "Select All";
+      selectAllBtn.style.cssText = "background:#2a5a2a;border:1px solid #3a7a3a;color:#7ed321;padding:2px 10px;border-radius:3px;cursor:pointer;font-size:10px;";
+      selectAllBtn.onclick = () => { setAllCheckboxes(true); updateProceedBtn(); };
+      const deselectAllBtn = document.createElement("button");
+      deselectAllBtn.textContent = "Deselect All";
+      deselectAllBtn.style.cssText = "background:#3a2a2a;border:1px solid #5a3a3a;color:#e07070;padding:2px 10px;border-radius:3px;cursor:pointer;font-size:10px;";
+      deselectAllBtn.onclick = () => { setAllCheckboxes(false); updateProceedBtn(); };
+      bulkBar.appendChild(selectAllBtn);
+      bulkBar.appendChild(deselectAllBtn);
+      body.appendChild(bulkBar);
+
+      function setAllCheckboxes(checked) {
+        checkItems.forEach((x) => { x.cb.checked = checked; });
+        Object.keys(groupCbs).forEach((g) => {
+          const allInGroup = checkItems.filter((x) => x.group === g);
+          groupCbs[g].checked = allInGroup.every((x) => x.cb.checked);
+          groupCbs[g].indeterminate = false;
+        });
+      }
+    }
+
+    // Already present section
+    if (presentCount > 0) {
+      addBodyText(
+        `Already in target workspace (${presentCount}) — will be skipped:`,
+        "color:#7ed321;margin-top:10px;margin-bottom:4px;font-weight:600;"
+      );
+      const alreadySlice = alreadyPresent.slice(0, 15);
+      alreadySlice.forEach((m) => {
+        addBodyText(`${m.folder || "?"}/${m.filename || "?"}`, "color:#888;padding-left:12px;font-size:11px;");
+      });
+      if (alreadyPresent.length > 15) {
+        addBodyText(`… and ${alreadyPresent.length - 15} more`, "color:#666;padding-left:12px;font-size:11px;");
+      }
+    }
+
+    // Remove section
+    if (toRemove.length > 0) {
+      addBodyText(
+        `Marked for removal from target workspace (${toRemove.length}):`,
+        "color:#e07070;margin-top:10px;margin-bottom:4px;font-weight:600;"
+      );
+      const removeSlice = toRemove.slice(0, 10);
+      removeSlice.forEach((m) => {
+        addBodyText(`${m.folder || "?"}/${m.filename || "?"}`, "color:#c88;padding-left:12px;font-size:11px;");
+      });
+      if (toRemove.length > 10) {
+        addBodyText(`… and ${toRemove.length - 10} more`, "color:#966;padding-left:12px;font-size:11px;");
+      }
+    }
+
+    addBodyText("After download: sync custom nodes → deploy", "color:#aaa;margin-top:10px;");
+    modal.appendChild(body);
+
+    const footer = document.createElement("div");
+    footer.style.cssText = "display:flex; gap:8px; justify-content:flex-end; padding:8px 16px 14px; flex-shrink:0;";
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.style.cssText = btnStyle();
+    cancelBtn.onclick = () => { overlay.remove(); setWorkspaceBusy(false); swapProgress.innerHTML = ""; };
+    footer.appendChild(cancelBtn);
+
+    function countChecked() { return checkItems.filter((x) => x.cb.checked).length; }
+
+    function updateProceedBtn() {
+      const n = countChecked();
+      if (installCount === 0) {
+        proceedBtn.textContent = "Sync & Deploy";
+      } else if (n === 0) {
+        proceedBtn.textContent = "Nothing selected — skip all downloads";
+      } else {
+        proceedBtn.textContent = `Download Selected (${n} model${n !== 1 ? "s" : ""})`;
+      }
+      proceedBtn.disabled = false;
+    }
+
+    const proceedBtn = document.createElement("button");
+    proceedBtn.style.cssText = btnStyle("primary");
+    updateProceedBtn();
+
+    proceedBtn.onclick = async () => {
+      const selectedKeys = checkItems
+        .filter((x) => x.cb.checked)
+        .map((x) => `${x.item.save_path || x.item.folder || ""}/${x.item.filename || ""}`);
+      const requestBody = {
+        workspace_id: workspaceSelect.value,
+        confirm: true,
+        selected_keys: selectedKeys,
+        confirm_prompt_interrupt: !!data.confirm_prompt_interrupt,
+      };
+      proceedBtn.disabled = true;
+      proceedBtn.textContent = "Starting…";
+      overlay.remove();
+      swapProgress.innerHTML = `<span style="color:#888;">Starting swap…</span>`;
+      try {
+        const execResp = await api.fetchApi(`${MODAL_PREFIX}/workspaces/swap`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(requestBody),
+        });
+        let execData = await execResp.json();
+        if (execData.status === "confirm_required") {
+          const ok = await showConfirm("A prompt is still running. Switch workspaces anyway?");
+          if (!ok) {
+            setWorkspaceBusy(false);
+            swapProgress.innerHTML = `<span style="color:#888;">Swap cancelled.</span>`;
+            return;
+          }
+          const retryResp = await api.fetchApi(`${MODAL_PREFIX}/workspaces/swap`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ...requestBody, confirm_prompt_interrupt: true }),
+          });
+          execData = await retryResp.json();
+        }
+        if (execData.status === "started") {
+          currentSwapId = execData.swap_id;
+          swapProgress.innerHTML = `<span style="color:#f5a623;">Starting downloads…</span>`;
+          pollSwapJob();
+        } else if (execData.status === "repair_required") {
+          setWorkspaceBusy(false);
+          swapProgress.innerHTML = `<span style="color:#e07070;">${execData.message || "Swap blocked: manifest repair required."}</span>`;
+          await openManifestRepairModal(execData.issues || []);
+        } else {
+          setWorkspaceBusy(false);
+          swapProgress.innerHTML = `<span style="color:#e05050;">${execData.message || "Swap failed to start."}</span>`;
+        }
+      } catch (e) {
+        setWorkspaceBusy(false);
+        swapProgress.innerHTML = `<span style="color:#e05050;">Error: ${e.message}</span>`;
+      }
+    };
+    footer.appendChild(proceedBtn);
+    modal.appendChild(footer);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+  }
+
+  async function showManifestInstallDialog() {
+    const resp = await api.fetchApi(`${MODAL_PREFIX}/manifest`);
+    const data = await resp.json();
+    const entries = data.entries || [];
+    if (!entries.length) {
+      showToast("No manifest entries found. Use Swap Workspace or Add Model to populate the manifest first.", "info");
+      return;
+    }
+    const withUrl = entries.filter((e) => e.url);
+    if (!withUrl.length) {
+      showToast("No manifest entries have download URLs. Use Manifest Repair to add URLs first.", "info");
+      return;
+    }
+
+    const workspaceId = workspaceSelect.value;
+    if (!workspaceId) {
+      showToast("Select a workspace first.", "info");
+      return;
+    }
+
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position:fixed; inset:0; background:rgba(0,0,0,0.65); display:flex; align-items:center; justify-content:center; z-index:10001;";
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+
+    const modal = document.createElement("div");
+    modal.style.cssText = "width:min(660px, 95vw); max-height:75vh; background:#171717; border:1px solid #333; border-radius:8px; display:flex; flex-direction:column; overflow:hidden;";
+
+    const header = document.createElement("div");
+    header.style.cssText = "padding:16px 16px 8px; font-weight:600; font-size:13px;";
+    header.textContent = "Install from Manifest";
+    modal.appendChild(header);
+
+    const body = document.createElement("div");
+    body.style.cssText = "flex:1; overflow-y:auto; padding:4px 16px 8px; font-size:12px; line-height:1.6; color:#ccc;";
+
+    const checkItems = [];
+    const groupOrder = ["checkpoints", "unet", "diffusion_models", "clip", "text_encoders", "vae", "loras", "controlnet", "style_models", "upscale_models", "other"];
+    function folderGroup(folder) { return groupOrder.includes(folder) ? folder : "other"; }
+    const groups = {};
+    withUrl.forEach((e) => {
+      const g = folderGroup(e.folder || "other");
+      if (!groups[g]) groups[g] = [];
+      groups[g].push(e);
+    });
+    const sortedGroups = Object.keys(groups).sort((a, b) => groupOrder.indexOf(a) - groupOrder.indexOf(b));
+
+    const groupCbs = {};
+    sortedGroups.forEach((g) => {
+      const items = groups[g];
+      const hdr = document.createElement("div");
+      hdr.style.cssText = "display:flex;align-items:center;gap:8px;padding:6px 0 2px;margin-top:4px;border-top:1px solid #2a2a2a;";
+      const gCb = document.createElement("input");
+      gCb.type = "checkbox";
+      gCb.checked = true;
+      gCb.style.cssText = "width:14px;height:14px;accent-color:#3a6fcc;flex-shrink:0;";
+      const gLabel = document.createElement("span");
+      gLabel.style.cssText = "color:#6a9fd8;font-weight:600;font-size:11px;text-transform:uppercase;";
+      gLabel.textContent = `${g} (${items.length})`;
+      hdr.appendChild(gCb);
+      hdr.appendChild(gLabel);
+      body.appendChild(hdr);
+      groupCbs[g] = gCb;
+
+      items.forEach((e) => {
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex;align-items:center;gap:8px;padding:2px 0 2px 22px;";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = true;
+        cb.style.cssText = "width:14px;height:14px;accent-color:#3a6fcc;flex-shrink:0;";
+        const label = document.createElement("span");
+        label.style.cssText = "color:#ddd;word-break:break-all;";
+        label.textContent = `${e.folder || "?"}/${e.filename || "?"}`;
+        row.appendChild(cb);
+        row.appendChild(label);
+        body.appendChild(row);
+        checkItems.push({ cb, item: e, group: g });
+
+        cb.addEventListener("change", () => {
+          const all = checkItems.filter((x) => x.group === g);
+          gCb.checked = all.every((x) => x.cb.checked);
+          gCb.indeterminate = !gCb.checked && all.some((x) => x.cb.checked);
+        });
+      });
+
+      gCb.addEventListener("change", () => {
+        checkItems.filter((x) => x.group === g).forEach((x) => { x.cb.checked = gCb.checked; });
+        updateInstallBtn();
+      });
+    });
+
+    // Select/Deselect all
+    const bulkBar = document.createElement("div");
+    bulkBar.style.cssText = "display:flex;gap:6px;margin:6px 0 2px;";
+    const selectAllBtn = document.createElement("button");
+    selectAllBtn.textContent = "Select All";
+    selectAllBtn.style.cssText = "background:#2a5a2a;border:1px solid #3a7a3a;color:#7ed321;padding:2px 10px;border-radius:3px;cursor:pointer;font-size:10px;";
+    selectAllBtn.onclick = () => { checkItems.forEach((x) => { x.cb.checked = true; }); Object.keys(groupCbs).forEach((g) => { groupCbs[g].checked = true; groupCbs[g].indeterminate = false; }); updateInstallBtn(); };
+    const deselectAllBtn = document.createElement("button");
+    deselectAllBtn.textContent = "Deselect All";
+    deselectAllBtn.style.cssText = "background:#3a2a2a;border:1px solid #5a3a3a;color:#e07070;padding:2px 10px;border-radius:3px;cursor:pointer;font-size:10px;";
+    deselectAllBtn.onclick = () => { checkItems.forEach((x) => { x.cb.checked = false; }); Object.keys(groupCbs).forEach((g) => { groupCbs[g].checked = false; groupCbs[g].indeterminate = false; }); updateInstallBtn(); };
+    bulkBar.appendChild(selectAllBtn);
+    bulkBar.appendChild(deselectAllBtn);
+    body.appendChild(bulkBar);
+
+    modal.appendChild(body);
+
+    const footer = document.createElement("div");
+    footer.style.cssText = "display:flex; gap:8px; justify-content:flex-end; padding:8px 16px 14px; flex-shrink:0;";
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.style.cssText = btnStyle();
+    cancelBtn.onclick = () => overlay.remove();
+    footer.appendChild(cancelBtn);
+
+    function updateInstallBtn() {
+      const n = checkItems.filter((x) => x.cb.checked).length;
+      installProceedBtn.textContent = n > 0 ? `Install Selected (${n} model${n !== 1 ? "s" : ""})` : "Nothing selected";
+      installProceedBtn.disabled = n === 0;
+    }
+
+    const installProceedBtn = document.createElement("button");
+    installProceedBtn.style.cssText = btnStyle("primary");
+    updateInstallBtn();
+
+    installProceedBtn.onclick = async () => {
+      const selected = checkItems.filter((x) => x.cb.checked).map((x) => ({ folder: x.item.folder, filename: x.item.filename }));
+      installProceedBtn.disabled = true;
+      installProceedBtn.textContent = "Installing…";
+      overlay.remove();
+      swapProgress.innerHTML = `<span style="color:#888;">Installing from manifest…</span>`;
+      try {
+        const execResp = await api.fetchApi(`${MODAL_PREFIX}/manifest/install`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ items: selected, workspace_id: workspaceId }),
+        });
+        const execData = await execResp.json();
+        if (execData.status === "ok" || execData.status === "partial") {
+          const msg = execData.failure_count
+            ? `${execData.success_count} installed, ${execData.failure_count} failed`
+            : `${execData.success_count} model(s) installed successfully`;
+          swapProgress.innerHTML = `<span style="color:#7ed321;">Done — ${msg}</span>`;
+          showToast(msg, execData.failure_count ? "info" : "success");
+          await loadModels();
+        } else {
+          swapProgress.innerHTML = `<span style="color:#e05050;">${execData.message || "Install failed."}</span>`;
+        }
+      } catch (e) {
+        swapProgress.innerHTML = `<span style="color:#e05050;">Error: ${e.message}</span>`;
+      }
+    };
+    footer.appendChild(installProceedBtn);
+    modal.appendChild(footer);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+  }
+
+  repairBtn.onclick = () => openManifestRepairModal();
+
+  installBtn.onclick = () => showManifestInstallDialog();
+
+  exportBtn.onclick = async () => {
+    const prompt = app.graph?.serialize?.() || {};
+    const resp = await api.fetchApi(`${MODAL_PREFIX}/workflow-manifest/export`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt, workflow_name: app.graph?.extra?.workflow?.name || "" }),
+    });
+    const data = await resp.json();
+    if (data.status === "repair_required") {
+      await openManifestRepairModal(data.unresolved || []);
+      return;
+    }
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "workflow-manifest.json";
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  importBtn.onclick = async () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json,application/json";
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      const payload = JSON.parse(await file.text());
+      const resp = await api.fetchApi(`${MODAL_PREFIX}/workflow-manifest/import`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      if (data.status === "conflict") {
+        const resolved = await openImportConflictModal(data.conflicts, payload);
+        if (resolved.status !== "ok") throw new Error(resolved.message || "Import conflict resolution failed");
+        showToast(`Import complete: ${resolved.added.length} added, ${resolved.filled.length} filled.`, "success");
+        return;
+      }
+      showToast(`Import complete: ${data.added.length} added, ${data.filled.length} filled.`, "success");
+    };
+    input.click();
+  };
 
   // === SYNC SECTION (Collapsible) ===
   const syncCollapsible = createCollapsibleSection("Sync", { defaultOpen: true, badge: "..." });
@@ -2345,7 +3322,7 @@ function buildPanel() {
   };
 
   // === Modal sections toggle ===
-  const modalSectionElements = [gpuSection, syncCollapsible.wrapper, modelsCollapsible.wrapper, addSection];
+  const modalSectionElements = [gpuSection, workspaceSection.wrapper, syncCollapsible.wrapper, modelsCollapsible.wrapper, addSection];
 
   function updateModalSections(enabled) {
     for (const el of modalSectionElements) {
@@ -2370,6 +3347,7 @@ function buildPanel() {
   startDeployPoll();
   loadModels();
   loadSyncStatus();
+  loadWorkspaces();
   checkActiveDownloads();
 
   return panel;

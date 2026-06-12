@@ -3,6 +3,7 @@ import unittest
 from workflow_metadata import (
     extract_model_stack,
     extract_warmup_stack,
+    extract_workflow_model_refs,
     normalize_flux_clip_pair,
     prompt_sha256,
     stack_to_warmup_profile,
@@ -101,3 +102,16 @@ class WorkflowMetadataTests(unittest.TestCase):
         profile = stack_to_warmup_profile(extract_warmup_stack(WORKFLOW_DUAL_CLIP_FLUX))
         requested = extract_warmup_stack(WORKFLOW_DUAL_CLIP_FLUX2)
         self.assertFalse(warmup_profile_matches_stack(profile, requested))
+
+    def test_extract_model_refs_includes_dual_clip_entries(self):
+        refs = extract_workflow_model_refs(WORKFLOW_DUAL_CLIP_FLUX)
+        filenames = {(item["role"], item["filename"]) for item in refs}
+        self.assertIn(("clip", "t5xxl_fp16.safetensors"), filenames)
+        self.assertIn(("clip", "clip_l.safetensors"), filenames)
+
+    def test_extract_model_refs_deduplicates_same_loader_value(self):
+        refs = extract_workflow_model_refs({
+            "1": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip_l.safetensors"}},
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip_l.safetensors"}},
+        })
+        self.assertEqual(refs, [{"role": "clip", "filename": "clip_l.safetensors"}])
