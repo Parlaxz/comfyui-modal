@@ -389,6 +389,9 @@ PROMPT_ASYNC_PRELOAD = os.getenv("PROMPT_ASYNC_PRELOAD", "0") == "1"
 PROMPT_PRELOAD_WORKERS = int(os.getenv("PROMPT_PRELOAD_WORKERS", "2"))
 PROMPT_ASYNC_ACTUAL_LOAD = os.getenv("PROMPT_ASYNC_ACTUAL_LOAD", "0") == "1"
 PROMPT_ASYNC_ACTUAL_LOAD_UNET = os.getenv("PROMPT_ASYNC_ACTUAL_LOAD_UNET", "0") == "1"
+# NOTE: CacheDiT dashboard may report zero steps incorrectly.
+# Do not auto-disable CacheDiT based on dashboard zero-step output.
+# User observed disabling CacheDiT increased generation time.
 DISABLE_CACHEDIT_FOR_Z_IMAGE = os.getenv("DISABLE_CACHEDIT_FOR_Z_IMAGE", "0") == "1"
 _DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE = os.getenv("DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE", "0") == "1"
 
@@ -521,6 +524,24 @@ try:
     FUSE_LARGE_READ_MIN_MB = max(1, int(os.getenv("COMFYMODAL_FUSE_LARGE_READ_MIN_MB", "512")))
 except (TypeError, ValueError):
     FUSE_LARGE_READ_MIN_MB = 512
+
+# ── Telemetry: per-stack metrics persistence (default off) ──────────────
+# When 0 (default), metrics are computed in-memory only with no volume write.
+# When 1, metrics are persisted to the model volume (may perturb cold reads).
+PERSIST_PER_STACK_METRICS = os.getenv("COMFYMODAL_PERSIST_PER_STACK_METRICS", "0") == "1"
+
+# ── VAE actual-load defer during restore-background UNET read ──────────
+# When 1 (default), skip VAE actual-load if a restore_background_unet
+# active read is still queued/running, to avoid adding small reads during
+# a large-volume-read window.
+DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET = os.getenv("COMFYMODAL_DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET", "1") == "1"
+
+# ── Volume read-stall classification thresholds ────────────────────────
+VOLUME_STALL_UNET_MS = int(os.getenv("COMFYMODAL_VOLUME_STALL_UNET_MS", "10000"))
+VOLUME_STALL_VAE_MS = int(os.getenv("COMFYMODAL_VOLUME_STALL_VAE_MS", "2000"))
+VOLUME_STALL_CLIP_PRELOAD_THROUGHPUT_GBPS = float(os.getenv("COMFYMODAL_VOLUME_STALL_CLIP_PRELOAD_THROUGHPUT_GBPS", "2.0"))
+VOLUME_STALL_EXEC_MODEL_IO_MS = int(os.getenv("COMFYMODAL_VOLUME_STALL_EXEC_MODEL_IO_MS", "10000"))
+
 # When 0, skip the Sage CUDA extension smoke test during restore.
 # Use the persistent volume cache if available, or SAGE_RUNTIME_MODE default.
 SAGE_RUNTIME_PROBE_ON_RESTORE = os.getenv("COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE", "1") == "1"
@@ -568,6 +589,8 @@ BAKED_CUSTOM_NODE_DEPS_MANIFEST_PATH = "/opt/comfymodal/custom_node_deps_baked.j
 # ── PART 11: Known-good workflow profiles (for preload eligibility) ──
 KNOWN_GOOD_WORKFLOW_PROFILES_PATH = "/root/models/runtime_config/known_good_workflow_profiles.json"
 CURRENT_CUSTOM_NODE_DEPS_CACHE_PATH = "/root/models/runtime_config/current_custom_node_dependency_manifest_cache.json"
+PER_STACK_METRICS_PATH = "/root/models/runtime_config/per_stack_metrics.json"
+PER_STACK_METRICS_MAX_RECORDS = 20
 
 _WORKFLOW_IMAGE_SUFFIX_DIRS = {
     " [output]": "output",
@@ -597,19 +620,43 @@ def _resolve_input_image_destination(filename: str, comfy_root: str = "/root/com
     return Path(comfy_root) / directory / Path(*_workflow_image_parts(relative_name))
 
 
-def _materialize_input_images(input_images: dict | None, comfy_root: str = "/root/comfy/ComfyUI") -> tuple[int, int]:
+def _materialize_input_images(input_images: dict | None, comfy_root: str = "/root/comfy/ComfyUI") -> tuple[int, int, dict]:
     import base64
+    import hashlib
 
     input_count = 0
     input_bytes = 0
+    input_hashes: set[str] = set()
+    input_duplicate_hash_count = 0
+    input_hash_total_ms = 0.0
+    input_write_total_ms = 0.0
     for filename, b64data in (input_images or {}).items():
         dest = _resolve_input_image_destination(filename, comfy_root=comfy_root)
         dest.parent.mkdir(parents=True, exist_ok=True)
+        _t_hash = time.time()
         raw = base64.b64decode(b64data)
+        _digest = hashlib.sha256(raw).hexdigest()
+        _hash_ms = round((time.time() - _t_hash) * 1000, 1)
+        input_hash_total_ms += _hash_ms
+        if _digest in input_hashes:
+            input_duplicate_hash_count += 1
+        else:
+            input_hashes.add(_digest)
+        _t_write = time.time()
         dest.write_bytes(raw)
+        _write_ms = round((time.time() - _t_write) * 1000, 1)
+        input_write_total_ms += _write_ms
         input_count += 1
         input_bytes += len(raw)
-    return input_count, input_bytes
+    telemetry = {
+        "input_materialize_count": input_count,
+        "input_materialize_total_bytes": input_bytes,
+        "input_materialize_duplicate_hash_count": input_duplicate_hash_count,
+        "input_materialize_unique_hash_count": len(input_hashes),
+        "input_materialize_hash_ms": round(input_hash_total_ms, 1),
+        "input_materialize_write_ms": round(input_write_total_ms, 1),
+    }
+    return input_count, input_bytes, telemetry
 
 
 def _model_cpu_cache_key(path: str) -> str:
@@ -3181,7 +3228,7 @@ def _verify_model_file(path: str, expected_size: int | None = None, expected_sha
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.16.3"
+COMFYAPP_VERSION = "2.16.5"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
@@ -4569,6 +4616,132 @@ def set_runtime_flag(name: str, value: str) -> str:
     vol.commit()
     print(f"[comfyapp] set_runtime_flag: {name}={value}")
     return f"runtime_flag {name}={value}"
+
+
+def _clear_runtime_flag_internal(name: str) -> tuple[str, bool]:
+    """Remove a single runtime flag file.  Returns (result_msg, did_remove)."""
+    safe = os.path.basename(name)
+    if not safe or safe != name or ".." in safe:
+        return (f"invalid flag name: {name!r}", False)
+    path = os.path.join(RUNTIME_CONFIG_DIR, f"{safe}.txt")
+    if os.path.isfile(path):
+        os.remove(path)
+        return (f"removed {safe}", True)
+    return (f"{safe} was not set", False)
+
+
+@app.function(
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def clear_runtime_flag(name: str) -> str:
+    """Remove a single runtime config flag file from the volume."""
+    import os
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    msg, _ = _clear_runtime_flag_internal(name)
+    vol.commit()
+    print(f"[comfyapp] clear_runtime_flag: {name} -> {msg}")
+    return f"clear_runtime_flag {name}: {msg}"
+
+
+@app.function(
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def clear_runtime_flags(names: list[str]) -> list[str]:
+    """Remove multiple runtime config flag files from the volume."""
+    import os
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    results = []
+    any_change = False
+    for name in names:
+        msg, changed = _clear_runtime_flag_internal(name)
+        results.append(msg)
+        if changed:
+            any_change = True
+    if any_change:
+        vol.commit()
+    print(f"[comfyapp] clear_runtime_flags: {names} -> {results}")
+    return results
+
+
+@app.function(
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={MODELS_PATH: vol},
+)
+def reset_runtime_defaults() -> dict:
+    """Clear experiment/runtime flags that can override env defaults.
+
+    Clears the following flags if present:
+      EXPERIMENTAL_RESTORE_BACKGROUND_CODE
+      RESTORE_BACKGROUND_UNET
+      RESTORE_DIRECT_CLIP_POLICY
+      DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE
+      DIRECT_WARMUP_LOAD_UNET
+      DIRECT_WARMUP_LOAD_CLIP
+      DIRECT_WARMUP_CLIP_ENCODE
+      DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT
+      PRELOAD_MODE (via .preload_mode)
+      Any preload/restore-background experiment flags.
+
+    Does NOT delete active_next_profile, known_good profiles, model files,
+    custom node files, or dependency cache files.
+    """
+    import os
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+
+    _experiment_flags = [
+        "EXPERIMENTAL_RESTORE_BACKGROUND_CODE",
+        "RESTORE_BACKGROUND_UNET",
+        "RESTORE_DIRECT_CLIP_POLICY",
+        "DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE",
+        "DIRECT_WARMUP_LOAD_UNET",
+        "DIRECT_WARMUP_LOAD_CLIP",
+        "DIRECT_WARMUP_CLIP_ENCODE",
+        "DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT",
+        "FUSE_READ_GOVERNOR",
+        "SAFETENSORS_READ_MODE",
+    ]
+
+    removed = []
+    absent = []
+    any_change = False
+
+    for name in _experiment_flags:
+        msg, changed = _clear_runtime_flag_internal(name)
+        if changed:
+            removed.append(name)
+            any_change = True
+        else:
+            absent.append(name)
+
+    if any_change:
+        vol.commit()
+
+    result = {
+        "status": "ok",
+        "removed": removed,
+        "absent": absent,
+        "note": "active_next_profile, known_good profiles, model files, "
+                "custom node files, and dependency cache files were NOT touched.",
+    }
+    print(f"[comfyapp] reset_runtime_defaults: removed={removed} absent={absent}")
+    return result
 
 
 @app.function(
@@ -6317,6 +6490,19 @@ class _ComfyAPIMixin:
         restore_stages.setdefault("restore_background_unet_age_ms_at_graph_unet", 0.0)
         restore_stages.setdefault("restore_background_unet_future_status_at_graph_unet", "")
         restore_stages.setdefault("restore_background_unet_future_source_at_graph_unet", "")
+        restore_stages.setdefault("restore_background_unet_enabled_effective", 1 if _restore_background_unet_enabled() else 0)
+        restore_stages.setdefault("restore_background_unet_failure_reason", "")
+        restore_stages.setdefault("restore_background_unet_fallback_expected", 0)
+        restore_stages.setdefault("restore_background_unet_expected_source", "")
+        restore_stages.setdefault("restore_background_unet_actual_source", "")
+        restore_stages.setdefault("restore_background_unet_wait_ms_at_graph_unet", 0.0)
+        restore_stages.setdefault("restore_background_unet_completed_before_graph_unet", 0)
+        restore_stages.setdefault("restore_background_unet_submitted_before_direct_clip", 0)
+        restore_stages.setdefault("restore_background_unet_overlapped_direct_clip_load", 0)
+        restore_stages.setdefault("restore_background_unet_overlapped_direct_clip_encode", 0)
+        restore_stages.setdefault("restore_background_unet_overlap_direct_clip_load_ms", 0.0)
+        restore_stages.setdefault("restore_background_unet_overlap_direct_clip_encode_ms", 0.0)
+        restore_stages.setdefault("restore_background_unet_remaining_wait_at_graph_unet_ms", 0.0)
         eligibility = self._restore_background_unet_eligibility(profile, clip_policy, preload_result)
         restore_stages["restore_background_unet_skip_reason"] = eligibility.get("reason", "")
         restore_stages["restore_background_unet_clip_policy_name"] = eligibility.get("clip_policy_name", "")
@@ -6340,7 +6526,10 @@ class _ComfyAPIMixin:
         if not eligibility.get("eligible"):
             if eligibility.get("reason") in {"existing_future", "object_cache_exists"}:
                 restore_stages["restore_background_unet_duplicate_prevented"] = 1
-            print(f"[restore_background_unet] skipped reason={eligibility.get('reason', '')}")
+            restore_stages["restore_background_unet_expected_source"] = "actual_load"
+            restore_stages["restore_background_unet_actual_source"] = "actual_load"
+            restore_stages["restore_background_unet_fallback_expected"] = 1 if eligibility.get("reason") not in ("disabled_by_env",) else 0
+            print(f"[restore_background_unet] skipped reason={eligibility.get('reason', '')} expected_source=actual_load")
             return eligibility
 
         import nodes as _al_nodes
@@ -6356,8 +6545,13 @@ class _ComfyAPIMixin:
         restore_stages["restore_background_unet_age_ms_at_graph_unet"] = 0.0
         restore_stages["restore_background_unet_total_ms"] = 0.0
         restore_stages["started_after_clip_preload"] = 1
-        restore_stages["started_before_direct_clip"] = 1
-        restore_stages["started_during_direct_clip"] = 0
+        restore_stages["submitted_before_direct_clip"] = 1
+        restore_stages["submitted_after_clip_preload"] = 1
+        restore_stages["started_before_direct_clip"] = 1  # deprecated: kept for compat
+        restore_stages["started_during_direct_clip"] = 0  # deprecated: kept for compat
+        restore_stages["restore_background_unet_submitted_before_direct_clip"] = 1
+        restore_stages["restore_background_unet_expected_source"] = "restore_background_unet"
+        restore_stages["restore_background_unet_fallback_expected"] = 1
         self._wall_actual_load_per_model.append({
             "loader_type": "UNET",
             "canonical_key": str(key),
@@ -6419,7 +6613,11 @@ class _ComfyAPIMixin:
                     error=str(e)[:200],
                 )
                 restore_stages["restore_background_unet_failed"] = 1
-                print(f"[restore_background_unet] failed err={e}")
+                restore_stages["restore_background_unet_failure_reason"] = str(e)[:200]
+                restore_stages["restore_background_unet_fallback_expected"] = 1
+                restore_stages["restore_background_unet_expected_source"] = "restore_background_unet"
+                restore_stages["restore_background_unet_actual_source"] = "actual_load"
+                print(f"[restore_background_unet] failed reason={str(e)[:200]} expected_source=restore_background_unet fallback=actual_load")
             finally:
                 self._actual_load_owner_thread.pop(k, None)
 
@@ -6438,7 +6636,10 @@ class _ComfyAPIMixin:
         thread.start()
         print(
             f"[restore_background_unet] submitted key={key} at_ms_from_restore_start={submit_ms} "
-            f"started_after_clip_preload=1 started_before_direct_clip=1 started_during_direct_clip=0"
+            f"submitted_after_clip_preload=1 submitted_before_direct_clip=1 "
+            f"overlapped_direct_clip_load=1 overlapped_direct_clip_encode=1 "
+            f"expected_source=restore_background_unet "
+            f"(deprecated: started_after_clip_preload=1 started_before_direct_clip=1 started_during_direct_clip=0)"
         )
         return eligibility
 
@@ -6492,6 +6693,224 @@ class _ComfyAPIMixin:
                 elif rec.get("object_cache_hit"):
                     saved_ms = duration_ms
             rec["critical_path_saved_ms"] = round(saved_ms, 2)
+
+    def _check_rbg_unet_active(self) -> dict:
+        """Check whether a restore_background_unet active read is queued/running.
+
+        Returns dict with:
+          active (bool): True if any restore_background_unet future is
+                         queued, submitted, or running.
+          rbg_age_ms (float): Age of the oldest active RBG UNET read in ms.
+          active_large_reads (int): Number of large active reads.
+        """
+        result = {
+            "active": False,
+            "rbg_age_ms": 0.0,
+            "active_large_reads": 0,
+        }
+        try:
+            now = time.time()
+            oldest_age = 0.0
+            futures = getattr(self, "_actual_load_futures", {})
+            meta = getattr(self, "_actual_load_future_meta", {})
+            for key, thread in futures.items():
+                if not thread.is_alive():
+                    continue
+                m = meta.get(key, {})
+                if m.get("source") == "restore_background_unet" and m.get("status") in ("submitted", "queued", "running"):
+                    result["active"] = True
+                    submit_s = m.get("submitted_at_unix_s") or 0
+                    age = round((now - submit_s) * 1000, 1) if submit_s else 0.0
+                    if age > oldest_age:
+                        oldest_age = age
+            result["rbg_age_ms"] = oldest_age
+            with _ACTIVE_MODEL_READS_LOCK:
+                result["active_large_reads"] = len(_running_large_reads_locked())
+        except Exception:
+            pass
+        return result
+
+    def _classify_volume_read_stall(self, trace_summary: dict | None, after_prompt: dict | None = None) -> dict:
+        """Classify whether the current run experienced a Modal Volume/FUSE read stall.
+
+        Uses env/runtime thresholds.  Diagnostic only — does not change behavior.
+        """
+        _result = {
+            "volume_read_stall_suspected": 0,
+            "volume_read_stall_reason": "",
+            "restore_background_unet_stall": 0,
+            "vae_actual_load_stall": 0,
+            "clip_preload_slow": 0,
+            "exec_model_io_stall": 0,
+        }
+        try:
+            _restore = {}
+            _execution = {}
+            if isinstance(trace_summary, dict):
+                _restore = trace_summary.get("restore", {}) or {}
+                _execution = trace_summary.get("execution", {}) or {}
+            after_prompt = after_prompt or {}
+
+            _reasons: list[str] = []
+
+            # UNET stall check
+            _rbg_total = _restore.get("restore_background_unet_total_ms", 0) or 0
+            if _rbg_total > VOLUME_STALL_UNET_MS:
+                _result["restore_background_unet_stall"] = 1
+                _reasons.append(f"unet_read_gt_{VOLUME_STALL_UNET_MS}ms")
+
+            # VAE stall check
+            _vae_ms = _execution.get("vae_load_ms", 0) or after_prompt.get("actual_load_vae_duration_ms", 0)
+            if _vae_ms > VOLUME_STALL_VAE_MS:
+                _result["vae_actual_load_stall"] = 1
+                _reasons.append(f"vae_small_read_gt_{VOLUME_STALL_VAE_MS}ms")
+
+            # CLIP preload throughput check
+            _preload_gb = float(_restore.get("restore_preload_total_gb", 0) or _restore.get("warmup_preload_gb", 0) or 0)
+            _preload_ms = float(_restore.get("restore_preload_total_ms", 0) or _restore.get("warmup_preload_ms", 0) or 0)
+            if _preload_ms > 100 and _preload_gb > 0:
+                _throughput = _preload_gb / max(_preload_ms, 1) * 1000
+                if _throughput < VOLUME_STALL_CLIP_PRELOAD_THROUGHPUT_GBPS:
+                    _result["clip_preload_slow"] = 1
+                    _reasons.append(f"clip_preload_throughput_lt_{VOLUME_STALL_CLIP_PRELOAD_THROUGHPUT_GBPS}gbps")
+
+            # exec_model_load_io_ms stall check
+            _exec_io = _execution.get("exec_model_load_io_ms", 0) or 0
+            if _exec_io > VOLUME_STALL_EXEC_MODEL_IO_MS:
+                _result["exec_model_io_stall"] = 1
+                _reasons.append(f"exec_model_io_gt_{VOLUME_STALL_EXEC_MODEL_IO_MS}ms")
+
+            if _reasons:
+                _result["volume_read_stall_suspected"] = 1
+                _result["volume_read_stall_reason"] = ",".join(_reasons)
+        except Exception:
+            pass
+        return _result
+
+    def _record_per_stack_metrics(self, profile: dict | None, trace_summary: dict | None) -> None:
+        """Compute and optionally persist per-stack rolling metrics.
+
+        Stack key is derived from model filenames + clip type + optional workflow
+        class signature.  Keeps only the last PER_STACK_METRICS_MAX_RECORDS (20)
+        records per stack.  Does NOT auto-disable any feature.
+
+        Persistence to the model volume is off by default
+        (COMFYMODAL_PERSIST_PER_STACK_METRICS=0) because per-request volume
+        commits can perturb cold model read performance.
+
+        When persistence is off, metrics are still computed and logged
+        compactly; the per-container in-memory record is updated.
+        """
+        _diag = {
+            "per_stack_metrics_persist_enabled": 1 if PERSIST_PER_STACK_METRICS else 0,
+            "per_stack_metrics_written": 0,
+            "per_stack_metrics_commit_scheduled": 0,
+            "per_stack_metrics_recorded_in_memory": 0,
+            "per_stack_metrics_skip_reason": "",
+        }
+        try:
+            if not profile or not trace_summary:
+                return
+            # Build stable stack key
+            stack_parts = []
+            for _field in ("unet", "clip1", "vae", "clip_type"):
+                _v = str(profile.get(_field, "")).strip()
+                if _v:
+                    stack_parts.append(_v)
+            _ckpt = str(profile.get("checkpoint", "")).strip()
+            if _ckpt:
+                stack_parts.append(f"ckpt={_ckpt}")
+            _wsig = str(trace_summary.get("workflow_struct_hash", "")).strip()[:12]
+            if _wsig:
+                stack_parts.append(f"wsig={_wsig}")
+            if not stack_parts:
+                return
+            _stack_key = "|".join(stack_parts)
+
+            # Collect metrics from trace_summary
+            _restore = trace_summary.get("restore", {})
+            _execution = trace_summary.get("execution", {})
+            _record = {
+                "timestamp": time.time(),
+                "restore_total_ms": round(_restore.get("restore_total_ms", 0), 1),
+                "pre_sampler_ms": round(_execution.get("pre_sampler_ms", 0), 1),
+                "sampler_ms": round(_execution.get("sampler_ms", 0), 1),
+                "post_sampler_ms": round(_execution.get("post_sampler_ms", 0), 1),
+                "remote_visible_ms": round(trace_summary.get("remote_visible_ms", 0), 1),
+                "known_nonoverlap_ms": round(trace_summary.get("known_nonoverlap_ms", 0), 1),
+                "prompt_clip_encode_ms": round(_execution.get("clip_encode_ms", 0), 1),
+                "unet_node_wait_or_load_ms": round(_execution.get("unet_load_or_wait_ms", 0), 1),
+                "restore_background_unet_submitted": _restore.get("restore_background_unet_submitted", 0),
+                "restore_background_unet_wait_ms_at_graph_unet": round(_restore.get("restore_background_unet_wait_ms", 0), 1),
+                "direct_clip_load_ms": round(_restore.get("warmup_direct_clip_load_ms", 0), 1),
+                "direct_clip_encode_ms": round(_restore.get("warmup_direct_clip_encode_ms", 0), 1),
+            }
+
+            # In-memory per-container rolling record
+            if not hasattr(self, '_per_stack_metrics_memory'):
+                self._per_stack_metrics_memory: dict[str, list[dict]] = {}
+            _mem_records = self._per_stack_metrics_memory.get(_stack_key, []) or []
+            _mem_records.append(_record)
+            if len(_mem_records) > PER_STACK_METRICS_MAX_RECORDS:
+                _mem_records = _mem_records[-PER_STACK_METRICS_MAX_RECORDS:]
+            self._per_stack_metrics_memory[_stack_key] = _mem_records
+            _diag["per_stack_metrics_recorded_in_memory"] = 1
+
+            # Compute medians from memory
+            _medians = {}
+            if len(_mem_records) >= 3:
+                for _field_name in ("restore_total_ms", "pre_sampler_ms",
+                                    "prompt_clip_encode_ms", "unet_node_wait_or_load_ms",
+                                    "remote_visible_ms", "known_nonoverlap_ms"):
+                    _vals = sorted(r.get(_field_name, 0) for r in _mem_records)
+                    if _vals:
+                        _mid = len(_vals) // 2
+                        _medians[f"median_{_field_name}"] = round(
+                            _vals[_mid] if len(_vals) % 2 else (_vals[_mid - 1] + _vals[_mid]) / 2, 1)
+
+            print(f"[comfyapp] per_stack_metrics stack={_stack_key[:60]} "
+                  f"records={len(_mem_records)} medians={_medians or 'insufficient'} "
+                  f"persist_enabled={_diag['per_stack_metrics_persist_enabled']}")
+
+            # Persist to volume only if explicitly enabled
+            if not PERSIST_PER_STACK_METRICS:
+                _diag["per_stack_metrics_skip_reason"] = "persistence_disabled"
+                return
+
+            try:
+                _all_data: dict = {}
+                if os.path.isfile(PER_STACK_METRICS_PATH):
+                    try:
+                        with open(PER_STACK_METRICS_PATH, "r", encoding="utf-8") as _f:
+                            _all_data = json.loads(_f.read() or "{}")
+                    except Exception:
+                        _all_data = {}
+
+                _stack_records = _all_data.get(_stack_key, []) or []
+                _stack_records.append(_record)
+                if len(_stack_records) > PER_STACK_METRICS_MAX_RECORDS:
+                    _stack_records = _stack_records[-PER_STACK_METRICS_MAX_RECORDS:]
+                _all_data[_stack_key] = _stack_records
+                if _medians:
+                    _all_data[f"_{_stack_key}_medians"] = _medians
+
+                os.makedirs(os.path.dirname(PER_STACK_METRICS_PATH), exist_ok=True)
+                _tmp = f"{PER_STACK_METRICS_PATH}.tmp"
+                with open(_tmp, "w", encoding="utf-8") as _f:
+                    json.dump(_all_data, _f, separators=(",", ":"), sort_keys=True)
+                os.replace(_tmp, PER_STACK_METRICS_PATH)
+                _diag["per_stack_metrics_written"] = 1
+
+                # Use async commit to avoid hot-path volume churn
+                try:
+                    _commit_volume_async(label="per_stack_metrics")
+                    _diag["per_stack_metrics_commit_scheduled"] = 1
+                except Exception:
+                    pass
+            except Exception as _persist_exc:
+                print(f"[comfyapp] per_stack_metrics persist failed: {_persist_exc}")
+        except Exception as _exc:
+            print(f"[comfyapp] per_stack_metrics record failed: {_exc}")
 
     @property
     def _original_loaders(self):
@@ -6821,6 +7240,26 @@ class _ComfyAPIMixin:
                         f"active_read_size_mb={_vae_classification.get('active_read_size_mb', -1.0)}"
                     )
                     continue
+
+                # ── Defer VAE actual-load if restore-background UNET is still running ──
+                _defer_check = 0
+                _defer_active_rbg_age_ms = 0.0
+                _defer_active_large_reads = 0
+                if DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET:
+                    _rbg_active = self._check_rbg_unet_active()
+                    if _rbg_active.get("active", False):
+                        result["actual_load_vae_defer_guard_enabled"] = 1
+                        result["actual_load_vae_deferred_for_rbg_unet"] = 1
+                        result["actual_load_vae_skipped_reason"] = "restore_background_unet_running"
+                        _defer_active_rbg_age_ms = _rbg_active.get("rbg_age_ms", 0.0)
+                        _defer_active_large_reads = _rbg_active.get("active_large_reads", 0)
+                        print(
+                            f"[actual_load] skipped loader=VAE reason=restore_background_unet_running "
+                            f"rbg_age_ms={_defer_active_rbg_age_ms:.1f} "
+                            f"active_large_reads={_defer_active_large_reads}"
+                        )
+                        continue
+                    result["actual_load_vae_defer_guard_enabled"] = 1
                 lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
                 with lock:
                     if key in self._actual_load_futures:
@@ -9789,6 +10228,24 @@ class _ComfyAPIMixin:
         )
         _files_returned = len(images) + len(videos)
         _skipped_temp = 0
+
+        # ── Output duplicate detection telemetry ───────────────────────
+        _digest_t0 = time.time()
+        _raw_digests: dict[str, list[str]] = {}
+        for _entry in images + videos:
+            _raw_data = base64.b64decode(_entry.get("data", ""))
+            _digest = hashlib.sha256(_raw_data).hexdigest()
+            _raw_digests.setdefault(_digest, []).append(_entry.get("filename", ""))
+        _raw_duplicate_groups = [fnames for fnames in _raw_digests.values() if len(fnames) > 1]
+        _raw_duplicate_count = sum(len(g) - 1 for g in _raw_duplicate_groups)
+        _raw_unique_count = len(_raw_digests)
+        _output_digest_ms = round((time.time() - _digest_t0) * 1000, 1)
+        _oc_timing["output_raw_duplicate_groups"] = len(_raw_duplicate_groups)
+        _oc_timing["output_raw_duplicate_count"] = _raw_duplicate_count
+        _oc_timing["output_raw_unique_count"] = _raw_unique_count
+        _oc_timing["output_raw_digest_time_ms"] = _output_digest_ms
+        _oc_timing["output_conversion_reuse_possible"] = 1 if _raw_duplicate_count > 0 else 0
+
         print(f"[output_collect] prompt_id={prompt_id[:8]}")
         print(f"[output_collect] job_id={prompt_id[:8]}")
         print(f"[output_collect] job_start={prompt_start_time or 0}")
@@ -9796,6 +10253,8 @@ class _ComfyAPIMixin:
         print(f"[output_collect] files_returned={_files_returned}")
         print(f"[output_collect] skipped_stale=0")
         print(f"[output_collect] skipped_temp={_skipped_temp}")
+        if _raw_duplicate_count > 0:
+            print(f"[output_collect] duplicates={_raw_duplicate_count} unique={_raw_unique_count}")
         _oc_total = round((time.time() - _oc_t0) * 1000, 1)
         _oc_timing["conversion_worker_sum_ms"] = round(_oc_timing.get("conversion_worker_sum_ms", 0), 1)
         _oc_timing["return_packaging_ms"] = round(max(0.0, _oc_total - _oc_timing.get("history_fetch_ms", 0) - _oc_timing.get("file_scan_ms", 0) - _oc_timing.get("read_total_ms", 0) - _oc_timing.get("conversion_total_ms", 0)), 1)
@@ -10646,6 +11105,9 @@ class _ComfyAPIMixin:
         """
         _t0 = time.time()
         _phases: dict[str, float] = {}
+        # Phase unix timestamps for overlap telemetry
+        _phases_unix: dict[str, float] = {}
+        _phases_unix["direct_clip_warmup_start_unix_s"] = _t0
         try:
             import nodes
             import folder_paths
@@ -10709,6 +11171,7 @@ class _ComfyAPIMixin:
 
             # ── 2. Load CLIP via CLIPLoader (if enabled) ─────────────
             _phases["direct_warmup_load_clip"] = 1.0 if _rt_load_clip else 0.0
+            _phases_unix["direct_clip_load_start_unix_s"] = time.time()
             _s = time.time()
             clip_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPLoader")
             clip_out = None
@@ -10724,6 +11187,7 @@ class _ComfyAPIMixin:
                 clip_loader = clip_cls()
                 clip_out = clip_loader.load_clip(clip_name=clip_name, type=clip_type)
                 _phases["direct_clip_load_ms"] = round((time.time() - _s) * 1000, 1)
+                _phases_unix["direct_clip_load_end_unix_s"] = time.time()
                 # Store in CLIP object cache for real prompt reuse
                 if clip_out:
                     self._init_clip_cache()
@@ -10738,11 +11202,13 @@ class _ComfyAPIMixin:
                         print(f"[comfyapp] direct warmup: CLIP cache store failed: {exc}")
             else:
                 _phases["direct_clip_load_ms"] = 0.0
+                _phases_unix["direct_clip_load_end_unix_s"] = _s
 
             # ── 3. Prime CLIPTextEncode cache (if enabled) ───────────
             # Costs ~1000ms for Qwen 8B forward pass but saves ~600ms
             # during inference.  Net savings ~400ms by disabling.
             _phases["direct_warmup_clip_encode"] = 1.0 if _rt_clip_encode else 0.0
+            _phases_unix["direct_clip_encode_start_unix_s"] = time.time()
             _s = time.time()
             if _rt_clip_encode and clip_out and WARMUP_TEXT:
                 enc_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
@@ -10750,6 +11216,8 @@ class _ComfyAPIMixin:
                     encoder = enc_cls()
                     encoder.encode(clip=clip_out[0], text=WARMUP_TEXT)
             _phases["direct_clip_encode_ms"] = round((time.time() - _s) * 1000, 1)
+            _phases_unix["direct_clip_encode_end_unix_s"] = time.time()
+            _phases_unix["direct_clip_warmup_end_unix_s"] = time.time()
             _phases["direct_total_ms"] = round((time.time() - _t0) * 1000, 1)
             _clip_load_requested = _rt_load_clip and bool(clip_name)
             _clip_actually_loaded = bool(clip_out) and _phases.get("direct_clip_cached", 0.0) > 0.0
@@ -10781,12 +11249,12 @@ class _ComfyAPIMixin:
             _phases["warmup_clip_completed"] = 1.0 if _clip_actually_loaded else 0.0
             _phases["warmup_clip_skip_reason"] = _clip_skip_reason
             print(f"[comfyapp] direct warmup status={status} {_phases}")
-            return {"status": status, **_phases}
+            return {"status": status, "_phases_unix": _phases_unix, **_phases}
         except Exception as exc:
             import traceback
             _phases["direct_total_ms"] = round((time.time() - _t0) * 1000, 1)
             print(f"[comfyapp] direct warmup FAILED after {_phases['direct_total_ms']}ms: {exc}\n{traceback.format_exc()}")
-            return {"status": "error", "error": str(exc)[:200], **_phases}
+            return {"status": "error", "error": str(exc)[:200], "_phases_unix": _phases_unix, **_phases}
 
     def _warmup_vae_decode(self, profile: dict) -> dict:
         """Run a dummy VAE decode to warm the decoder.
@@ -11428,25 +11896,95 @@ class _ComfyAPIMixin:
                 return
             _cache: dict[tuple, object] = {}
             _cache_mode = "model_aware"
+            # Hit/miss counters exposed for telemetry
+            _clip_node_cls._clip_textencode_cache_hits = 0
+            _clip_node_cls._clip_textencode_cache_misses = 0
+            _clip_node_cls._clip_textencode_cache_hit_node_ids: set[str] = set()
+            _clip_node_cls._clip_textencode_cache_miss_node_ids: set[str] = set()
+            _clip_node_cls._clip_textencode_cache_mode = _cache_mode
+
             def _cached(self_node, clip, text):
                 # Build model-aware key: includes text, CLIP model identity,
                 # resolved paths, clip_type, and class name for safe reuse.
+                _t_lookup = time.time()
                 _paths = tuple(getattr(clip, '_warmup_model_paths', None) or [])
                 _clip_type = getattr(clip, '_warmup_clip_type', '') or ''
                 _cls_name = type(clip).__name__
+                _node_id = str(getattr(self_node, 'id', '')) or ''
                 _key = (text, _paths, _clip_type, _cls_name, id(clip))
                 # Fast path: exact clip object match
                 if _key in _cache:
-                    return _cache[_key]
+                    _clip_node_cls._clip_textencode_cache_hits += 1
+                    if _node_id:
+                        _clip_node_cls._clip_textencode_cache_hit_node_ids.add(_node_id)
+                    _lookup_ms = round((time.time() - _t_lookup) * 1000, 1)
+                    _out = _cache[_key]
+                    # Attach timing metadata to the output if the first element
+                    # supports arbitrary attribute assignment (not a plain list/int/str)
+                    if isinstance(_out, (list, tuple)) and len(_out) > 0:
+                        _clip_out = _out[0]
+                        if hasattr(type(_clip_out), '__dict__') or hasattr(type(_clip_out), '__slots__'):
+                            try:
+                                if hasattr(_clip_out, '_clip_encode_cache_meta'):
+                                    _meta = _clip_out._clip_encode_cache_meta
+                                else:
+                                    _meta = {}
+                                _meta['clip_encode_cache_hit'] = 1
+                                _meta['clip_encode_cache_lookup_ms'] = _lookup_ms
+                                _meta['clip_encode_compute_ms'] = 0.0
+                                _clip_out._clip_encode_cache_meta = _meta
+                            except Exception:
+                                pass
+                    return _out
                 # Slightly relaxed key: same text + same model files (different obj)
                 _relaxed = (text, _paths, _clip_type, _cls_name)
                 if _relaxed in _cache:
-                    return _cache[_relaxed]
+                    _clip_node_cls._clip_textencode_cache_hits += 1
+                    if _node_id:
+                        _clip_node_cls._clip_textencode_cache_hit_node_ids.add(_node_id)
+                    _lookup_ms = round((time.time() - _t_lookup) * 1000, 1)
+                    _out = _cache[_relaxed]
+                    if isinstance(_out, (list, tuple)) and len(_out) > 0:
+                        _clip_out = _out[0]
+                        if hasattr(type(_clip_out), '__dict__') or hasattr(type(_clip_out), '__slots__'):
+                            try:
+                                if hasattr(_clip_out, '_clip_encode_cache_meta'):
+                                    _meta = _clip_out._clip_encode_cache_meta
+                                else:
+                                    _meta = {}
+                                _meta['clip_encode_cache_hit'] = 1
+                                _meta['clip_encode_cache_lookup_ms'] = _lookup_ms
+                                _meta['clip_encode_compute_ms'] = 0.0
+                                _clip_out._clip_encode_cache_meta = _meta
+                            except Exception:
+                                pass
+                    return _out
                 # Miss: encode and cache
+                _t_compute = time.time()
+                _clip_node_cls._clip_textencode_cache_misses += 1
+                if _node_id:
+                    _clip_node_cls._clip_textencode_cache_miss_node_ids.add(_node_id)
                 result = _orig(self_node, clip, text)
+                _compute_ms = round((time.time() - _t_compute) * 1000, 1)
+                _lookup_ms = round((_t_compute - _t_lookup) * 1000, 1)
                 _cache[_key] = result
                 _cache[_relaxed] = result  # also cache relaxed key for future calls
+                if isinstance(result, (list, tuple)) and len(result) > 0:
+                    _clip_out = result[0]
+                    if hasattr(type(_clip_out), '__dict__') or hasattr(type(_clip_out), '__slots__'):
+                        try:
+                            if hasattr(_clip_out, '_clip_encode_cache_meta'):
+                                _meta = _clip_out._clip_encode_cache_meta
+                            else:
+                                _meta = {}
+                            _meta['clip_encode_cache_hit'] = 0
+                            _meta['clip_encode_cache_lookup_ms'] = _lookup_ms
+                            _meta['clip_encode_compute_ms'] = _compute_ms
+                            _clip_out._clip_encode_cache_meta = _meta
+                        except Exception:
+                            pass
                 return result
+
             _cached._comfy_modal_cached = True
             _cached._cache_mode = _cache_mode
             # Expose cache so background encoding can populate it
@@ -11996,6 +12534,24 @@ class _ComfyAPIMixin:
                         __stages["restore_background_unet_existing_future"] = _rbg.get("existing_future", 0)
                         __stages["restore_background_unet_object_cache_exists"] = _rbg.get("object_cache_exists", 0)
                         __stages["restore_background_unet_active_large_reads_at_submit"] = _rbg.get("active_large_reads_at_submit", 0)
+                        # ── Expected-path logs ──
+                        _rbg_expected = __stages.get("restore_background_unet_expected_source", "")
+                        _rbg_submitted = __stages.get("restore_background_unet_submitted", 0)
+                        _unet_expected = "restore_background_unet_future" if (_rbg_submitted and _rbg_expected == "restore_background_unet") else "actual_load_or_graph_cache"
+                        _clip_expected = "direct_restore_clip_cache" if _clip_policy.get("direct_warmup_clip_encode_effective", 0) else "direct_restore_clip_load"
+                        _vae_expected = "actual_load_or_graph_cache"
+                        __stages["graph_unet_expected_source"] = _unet_expected
+                        __stages["graph_clip_expected_source"] = _clip_expected
+                        __stages["graph_vae_expected_source"] = _vae_expected
+                        __stages["actual_load_unet_expected_source"] = _unet_expected
+                        __stages["actual_load_clip_expected_source"] = _clip_expected
+                        __stages["actual_load_vae_expected_source"] = _vae_expected
+                        # Log expected paths
+                        print(
+                            f"[comfyapp] expected_source unet={_unet_expected} "
+                            f"clip={_clip_expected} vae={_vae_expected} "
+                            f"rbg_expected={_rbg_expected or 'none'} rbg_submitted={_rbg_submitted}"
+                        )
                 elif preload_paths and _pm != "off":
                     if _pm == "async_no_wait":
                         import threading
@@ -12250,6 +12806,55 @@ class _ComfyAPIMixin:
                         _v = _dw.get(_flag)
                         if _v is not None:
                             __stages[_flag] = _v
+
+                    # ── CLIP/UNET overlap telemetry ─────────────────────
+                    _pu = _dw.get("_phases_unix", {})
+                    _rbs_unix = __stages.get("restore_background_unet_submit_unix_s")
+                    _clip_load_start = _pu.get("direct_clip_load_start_unix_s")
+                    _clip_load_end = _pu.get("direct_clip_load_end_unix_s")
+                    _clip_encode_start = _pu.get("direct_clip_encode_start_unix_s")
+                    _clip_encode_end = _pu.get("direct_clip_encode_end_unix_s")
+                    _dw_start = _pu.get("direct_clip_warmup_start_unix_s")
+                    _dw_end = _pu.get("direct_clip_warmup_end_unix_s")
+
+                    # Record CLIP timestamps relative to restore_start
+                    if _dw_start:
+                        __stages["direct_clip_warmup_start_ms_from_restore_start"] = round((_dw_start - restore_start) * 1000, 1)
+                    if _clip_load_start:
+                        __stages["direct_clip_load_start_ms_from_restore_start"] = round((_clip_load_start - restore_start) * 1000, 1)
+                    if _clip_load_end:
+                        __stages["direct_clip_load_end_ms_from_restore_start"] = round((_clip_load_end - restore_start) * 1000, 1)
+                    if _clip_encode_start:
+                        __stages["direct_clip_encode_start_ms_from_restore_start"] = round((_clip_encode_start - restore_start) * 1000, 1)
+                    if _clip_encode_end:
+                        __stages["direct_clip_encode_end_ms_from_restore_start"] = round((_clip_encode_end - restore_start) * 1000, 1)
+                    if _dw_end:
+                        __stages["direct_clip_warmup_end_ms_from_restore_start"] = round((_dw_end - restore_start) * 1000, 1)
+
+                    # ── Overlap computation ─────────────────────────────
+                    if _rbs_unix is not None and isinstance(_rbs_unix, (int, float)) and _rbs_unix > 0:
+                        # Was restore_background_unet submitted before direct CLIP?
+                        if _clip_load_start and _rbs_unix < _clip_load_start:
+                            __stages["restore_background_unet_submitted_before_direct_clip"] = 1
+                        # Did restore_background_unet overlap CLIP load?
+                        if _clip_load_start and _clip_load_end and _rbs_unix < _clip_load_end:
+                            __stages["restore_background_unet_overlapped_direct_clip_load"] = 1
+                            _overlap_start = max(_rbs_unix, _clip_load_start)
+                            _overlap_end = _clip_load_end
+                            __stages["restore_background_unet_overlap_direct_clip_load_ms"] = round((_overlap_end - _overlap_start) * 1000, 1)
+                        # Did restore_background_unet overlap CLIP encode?
+                        if _clip_encode_start and _clip_encode_end and _rbs_unix < _clip_encode_end:
+                            __stages["restore_background_unet_overlapped_direct_clip_encode"] = 1
+                            _overlap_start = max(_rbs_unix, _clip_encode_start)
+                            _overlap_end = _clip_encode_end
+                            __stages["restore_background_unet_overlap_direct_clip_encode_ms"] = round((_overlap_end - _overlap_start) * 1000, 1)
+                        # Remaining wait at graph UNET: how much UNET load time remained after CLIP done
+                        _rbg_total = __stages.get("restore_background_unet_total_ms", 0.0)
+                        if _dw_end and __stages.get("restore_background_unet_overlapped_direct_clip_load"):
+                            _overlap_dw_ms = max(0.0, round((min(_dw_end, _clip_load_end or _dw_end) - max(_rbs_unix, _dw_start)) * 1000, 1))
+                            _remaining = min(_rbg_total, max(0.0, _rbg_total - _overlap_dw_ms))
+                            __stages["restore_background_unet_remaining_wait_at_graph_unet_ms"] = round(_remaining, 1)
+
                     if _dw.get("status") != "ok":
                         warmup_result["error"] = _dw.get("error", "direct warmup failed")
                         warmup_result["status"] = "error"
@@ -12893,6 +13498,22 @@ class _ComfyAPIMixin:
                 known_good_mark_result="marked" if _known_good_val_i else "",
             )
             print(f"[comfyapp] request_pipeline_summary {_summary_inproc}")
+
+            # ── Volume read-stall classification diagnostics ──
+            _stall_diag = self._classify_volume_read_stall(trace_summary)
+            if _stall_diag.get("volume_read_stall_suspected"):
+                print(f"[volume_stall] suspected=1 reason={_stall_diag.get('volume_read_stall_reason', '')} "
+                      f"rbg_unet_stall={_stall_diag.get('restore_background_unet_stall', 0)} "
+                      f"vae_stall={_stall_diag.get('vae_actual_load_stall', 0)} "
+                      f"clip_preload_slow={_stall_diag.get('clip_preload_slow', 0)} "
+                      f"exec_io_stall={_stall_diag.get('exec_model_io_stall', 0)}")
+            else:
+                print(f"[volume_stall] suspected=0")
+            result["_volume_stall"] = _stall_diag
+
+            # ── Per-stack metrics (telemetry only, no auto-disable) ──
+            _profile_for_metrics = _rt_summary_i.get("warmup_profile")
+            self._record_per_stack_metrics(_profile_for_metrics, trace_summary)
             mark_event(_v4_events, T8C_RETURN_PACKAGING_START, process="modal_remote", phase=PHASE_RETURN)
             mark_event(_v4_events, T8D_RETURN_PACKAGING_END, process="modal_remote", phase=PHASE_RETURN)
             mark_event(_v4_events, T8E_REMOTE_RETURN_START, process="modal_remote", phase=PHASE_RETURN)
@@ -12915,12 +13536,19 @@ class _ComfyAPIMixin:
 
         if input_images:
             input_started = time.time()
-            input_count, input_bytes = _materialize_input_images(input_images)
+            input_count, input_bytes, input_telemetry = _materialize_input_images(input_images)
             input_decode_ms = round((time.time() - input_started) * 1000, 1)
             print(
                 f"[comfyapp.profile] stage=input_decode_write duration_ms={input_decode_ms} "
                 f"count={input_count} bytes={input_bytes}"
             )
+            if input_telemetry.get("input_materialize_duplicate_hash_count", 0) > 0:
+                print(
+                    f"[comfyapp] input_materialize duplicates={input_telemetry.get('input_materialize_duplicate_hash_count', 0)} "
+                    f"unique={input_telemetry.get('input_materialize_unique_hash_count', 0)} "
+                    f"hash_ms={input_telemetry.get('input_materialize_hash_ms', 0)} "
+                    f"write_ms={input_telemetry.get('input_materialize_write_ms', 0)}"
+                )
 
         client_id = str(uuid.uuid4())
 
