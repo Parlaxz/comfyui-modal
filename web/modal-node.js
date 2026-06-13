@@ -609,7 +609,42 @@ app.registerExtension({
           parsed.t0_perf_ms = t0.t0_perf_ms;
           parsed.t0_perf_now_ms = t0.t0_perf_now_ms;
           parsed.t0_client_press_ms = t0.t0_client_press_ms;
-          parsed.modal_options = _getOutputOptions();
+          const baseOptions = _getOutputOptions();
+          const productionEnabled = _getProductionEnabled();
+          if (productionEnabled) {
+            const prodOutputNodes = _getProdOutputNodes();
+            if (prodOutputNodes.length === 0) {
+              throw new Error("Simulate Production is enabled but no nodes are marked as Production Output. Right-click an output-capable node and select 'Mark as Production Output', or disable Simulate Production.");
+            }
+            const prodBypassNodes = _getBypassNodes();
+            const outputNodeIds = prodOutputNodes.map(n => String(n.id)).sort();
+            const bypassNodeIds = prodBypassNodes.map(n => String(n.id)).sort();
+            // Validate output_node_ids exist in the serialized prompt keys
+            const serializedKeys = parsed.prompt ? Object.keys(parsed.prompt) : [];
+            const finalOutIds = serializedKeys.length > 0
+              ? outputNodeIds.filter(id => serializedKeys.includes(id))
+              : outputNodeIds;
+            if (serializedKeys.length > 0 && finalOutIds.length === 0 && outputNodeIds.length > 0) {
+              log("Production output node IDs not found in serialized prompt: " + outputNodeIds.join(", ") + ". Available keys: " + serializedKeys.join(", "));
+              throw new Error("Production output nodes not found in serialized prompt. The canvas node IDs do not match the serialized workflow. Try re-saving the workflow or re-marking production outputs.");
+            }
+            if (finalOutIds.length < outputNodeIds.length) {
+              log("Some production output nodes missing from serialized prompt. Using " + finalOutIds.length + " of " + outputNodeIds.length + " IDs.");
+            }
+            baseOptions.production = {
+              enabled: true,
+              schema_version: 1,
+              output_node_ids: finalOutIds,
+              bypass_node_ids: bypassNodeIds,
+              disable_sampler_previews: true,
+              quiet_execution_logs: true,
+              progress_min_interval_ms: 500,
+              strict_output_collection: true,
+              direct_output_sink: true,
+              metadata_mode: "none",
+            };
+          }
+          parsed.modal_options = { ...(parsed.modal_options || {}), ...baseOptions };
           options = {
             ...options,
             body: JSON.stringify(parsed),
@@ -642,5 +677,290 @@ app.registerExtension({
     };
 
     log("fetchApi patched. All /prompt POST requests -> Modal GPU.");
+  },
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PRODUCTION MODE EXTENSION (Phase 2)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function _isOutputCapable(node) {
+  return node && !!node;
+}
+
+function _getProductionEnabled() {
+  return !!(app.graph?.extra?.comfymodal?.production_mode_enabled);
+}
+
+function _getCloudModeEnabled() {
+  return window._comfyModalEnabled !== false;
+}
+
+function _getProdOutputNodes() {
+  const result = [];
+  if (!app.graph) return result;
+  for (const node of app.graph._nodes) {
+    if (node.properties?.comfymodal_production_output) {
+      result.push(node);
+    }
+  }
+  return result;
+}
+
+function _getBypassNodes() {
+  const result = [];
+  if (!app.graph) return result;
+  for (const node of app.graph._nodes) {
+    if (node.properties?.comfymodal_bypass_in_production) {
+      result.push(node);
+    }
+  }
+  return result;
+}
+
+function _showNodeSelector(candidates) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:99999;display:flex;align-items:center;justify-content:center;";
+    const box = document.createElement("div");
+    box.style.cssText = "background:#1e1e2e;border:1px solid #444;border-radius:8px;padding:24px;max-width:500px;width:90%;max-height:80vh;display:flex;flex-direction:column;";
+    const titleEl = document.createElement("div");
+    titleEl.style.cssText = "color:#ddd;font-size:15px;font-weight:600;margin-bottom:12px;";
+    titleEl.textContent = "Select Production Output Nodes";
+    const descEl = document.createElement("div");
+    descEl.style.cssText = "color:#888;font-size:12px;margin-bottom:16px;line-height:1.5;";
+    descEl.textContent = "At least one output-capable node must be marked as a production output. Select the nodes that should produce the final output:";
+    const list = document.createElement("div");
+    list.style.cssText = "flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:4px;margin-bottom:16px;";
+    const selected = new Set();
+    for (const node of candidates) {
+      const row = document.createElement("label");
+      row.style.cssText = "display:flex;align-items:center;gap:8px;padding:6px 8px;background:#2a2a2a;border-radius:4px;cursor:pointer;";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.style.cssText = "width:16px;height:16px;accent-color:#3a6fcc;flex-shrink:0;";
+      cb.addEventListener("change", () => {
+        if (cb.checked) selected.add(node);
+        else selected.delete(node);
+      });
+      const label = document.createElement("span");
+      label.style.cssText = "font-size:12px;color:#ddd;flex:1;";
+      label.textContent = `#${node.id} ${node.title || node.type} (${node.type || "?"})`;
+      row.appendChild(cb);
+      row.appendChild(label);
+      list.appendChild(row);
+    }
+    const btnRow = document.createElement("div");
+    btnRow.style.cssText = "display:flex;gap:8px;justify-content:flex-end;";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.style.cssText = "background:transparent;border:1px solid #555;color:#aaa;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:13px;";
+    const confirmBtn = document.createElement("button");
+    confirmBtn.textContent = "Confirm";
+    confirmBtn.style.cssText = "background:#3a6fcc;border:none;color:#fff;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:13px;";
+    function close(result) { overlay.remove(); document.removeEventListener("keydown", escHandler); resolve(result); }
+    const escHandler = (e) => { if (e.key === "Escape") close([]); };
+    document.addEventListener("keydown", escHandler);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close([]); });
+    cancelBtn.onclick = () => close([]);
+    confirmBtn.onclick = () => {
+      if (selected.size === 0) return;
+      close(Array.from(selected));
+    };
+    btnRow.appendChild(cancelBtn);
+    btnRow.appendChild(confirmBtn);
+    box.appendChild(titleEl);
+    box.appendChild(descEl);
+    box.appendChild(list);
+    box.appendChild(btnRow);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+  });
+}
+
+function _computeProductionSummary() {
+  const graph = app.graph;
+  if (!graph) return null;
+  const outputNodes = _getProdOutputNodes();
+  const bypassNodes = _getBypassNodes();
+  const allNodes = graph._nodes || [];
+  const outputIds = new Set(outputNodes.map(n => String(n.id)));
+  const bypassIds = new Set(bypassNodes.map(n => String(n.id)));
+  const kept = allNodes.filter(n => !bypassIds.has(String(n.id))).length;
+  const removed = 0;
+  const bypassed = bypassNodes.length;
+  return {
+    kept,
+    removed,
+    bypassed,
+    outputs: outputNodes.length,
+    outputIds: Array.from(outputIds).sort(),
+    bypassIds: Array.from(bypassIds).sort(),
+    samplerPreviews: "disabled",
+    directOutputs: outputNodes.length,
+  };
+}
+
+app.registerExtension({
+  name: "comfyui.modal.production",
+
+  async beforeRegisterNodeDef(nodeType, nodeData) {
+
+    // ── Context menu ──
+    const origGetExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
+    nodeType.prototype.getExtraMenuOptions = function(_, options) {
+      if (origGetExtraMenuOptions) {
+        origGetExtraMenuOptions.call(this, _, options);
+      }
+      const isMarked = !!this.properties?.comfymodal_production_output;
+      options.push(null);
+      if (isMarked) {
+          options.push({
+            content: "Unmark Production Output",
+            callback: () => {
+              this.properties.comfymodal_production_output = false;
+              app.graph.setDirtyCanvas(true, true);
+            },
+          });
+        } else {
+          options.push({
+            content: "Mark as Production Output",
+            callback: () => {
+              if (!this.properties) this.properties = {};
+              this.properties.comfymodal_production_output = true;
+              app.graph.setDirtyCanvas(true, true);
+            },
+          });
+        }
+      const isBypassMarked = !!this.properties?.comfymodal_bypass_in_production;
+      options.push(null);
+      if (isBypassMarked) {
+        options.push({
+          content: "Do Not Bypass in Production",
+          callback: () => {
+            this.properties.comfymodal_bypass_in_production = false;
+            app.graph.setDirtyCanvas(true, true);
+          },
+        });
+      } else {
+        options.push({
+          content: "Bypass in Production",
+          callback: () => {
+            if (!this.properties) this.properties = {};
+            this.properties.comfymodal_bypass_in_production = true;
+            app.graph.setDirtyCanvas(true, true);
+          },
+        });
+      }
+    };
+
+    // ── Badges (via nodeCreated + LGraphBadge getter) ──
+  },
+
+  nodeCreated(node) {
+    node.badges.push(() => {
+      const opts = { bgColor: "#333" };
+      let text = "";
+      if (node.properties?.comfymodal_production_output) {
+        text = "PROD OUT";
+        opts.bgColor = "#2e7d32";
+        opts.fgColor = "#fff";
+      } else if (node.properties?.comfymodal_bypass_in_production) {
+        text = "PROD BYPASS";
+        opts.bgColor = "#c47c0a";
+        opts.fgColor = "#fff";
+      }
+      if (!text) return null;
+      return new LGraphBadge({ text, ...opts });
+    });
+  },
+
+  async setup() {
+    // ── First-enable behavior ──
+    function onProductionToggle() {
+      const enabled = _getProductionEnabled();
+      if (!enabled) return;
+      const existing = _getProdOutputNodes();
+      if (existing.length > 0) return;
+      const graph = app.graph;
+      if (!graph) return;
+      const candidates = [];
+      for (const node of graph._nodes) {
+        candidates.push(node);
+      }
+      if (candidates.length === 0) return;
+      _showNodeSelector(candidates).then((selected) => {
+        if (selected.length === 0) {
+          if (app.graph && app.graph.extra) {
+            if (app.graph.extra.comfymodal) {
+              app.graph.extra.comfymodal.production_mode_enabled = false;
+            }
+          }
+          return;
+        }
+        for (const node of selected) {
+          if (!node.properties) node.properties = {};
+          node.properties.comfymodal_production_output = true;
+        }
+        app.graph.setDirtyCanvas(true, true);
+      });
+    }
+
+    let _prodCheckInterval = null;
+    function _startProdCheck() {
+      _stopProdCheck();
+      _prodCheckInterval = setInterval(() => {
+        const enabled = _getProductionEnabled();
+        const existing = _getProdOutputNodes();
+        if (enabled && existing.length === 0) {
+          onProductionToggle();
+        }
+      }, 500);
+    }
+    function _stopProdCheck() {
+      if (_prodCheckInterval) {
+        clearInterval(_prodCheckInterval);
+        _prodCheckInterval = null;
+      }
+    }
+
+    // ── Patch app.graphToPrompt for production bypass serialization ──
+    const _originalGraphToPrompt = app.graphToPrompt.bind(app);
+    app.graphToPrompt = async function(...args) {
+      const productionEnabled = _getProductionEnabled();
+      const cloudMode = _getCloudModeEnabled();
+      if (!productionEnabled || !cloudMode) {
+        return _originalGraphToPrompt(...args);
+      }
+      const bypassNodes = _getBypassNodes();
+      if (bypassNodes.length === 0) {
+        return _originalGraphToPrompt(...args);
+      }
+      const savedModes = new Map();
+      for (const node of bypassNodes) {
+        savedModes.set(node, node.mode);
+        node.mode = 4;
+      }
+      try {
+        const result = await _originalGraphToPrompt(...args);
+        const apiPrompt = result?.output || {};
+        for (const node of bypassNodes) {
+          const nid = String(node.id);
+          if (apiPrompt[nid] !== undefined) {
+            throw new Error(
+              `Production bypass failed for node ${nid} (${node.type || "?"}). ComfyUI could not serialize this node as a native bypass.`
+            );
+          }
+        }
+        return result;
+      } finally {
+        for (const [node, mode] of savedModes) {
+          node.mode = mode;
+        }
+      }
+    };
+
+    // ── Add production data to fetchApi interception ──
+    log("Production mode extension loaded.");
   },
 });

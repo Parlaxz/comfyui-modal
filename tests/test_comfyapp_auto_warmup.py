@@ -644,7 +644,9 @@ class RestoreBackgroundUnetFutureTests(unittest.TestCase):
             "error": "boom",
         }
 
-        self.assertFalse(inst._consume_actual_load_future(key))
+        import comfyapp
+        with mock.patch.object(comfyapp, "_restore_background_code_enabled", return_value=True):
+            self.assertFalse(inst._consume_actual_load_future(key))
         self.assertNotIn(key, inst._actual_load_futures)
 
 

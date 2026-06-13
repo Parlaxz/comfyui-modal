@@ -1627,7 +1627,83 @@ function buildPanel() {
   saveFolderInput.addEventListener("change", () => { _saveFolderValue = saveFolderInput.value; _persistOutputSettings(); });
   sidecarToggle.addEventListener("change", () => { _sidecarValue = sidecarToggle.checked; _persistOutputSettings(); });
 
+  function _updateProductionSummary(el) {
+    try {
+      const graph = app.graph;
+      if (!graph) { el.textContent = "No graph available"; return; }
+      const outputNodes = [];
+      const bypassNodes = [];
+      for (const node of graph._nodes || []) {
+        if (node.properties?.comfymodal_production_output) outputNodes.push(node);
+        if (node.properties?.comfymodal_bypass_in_production) bypassNodes.push(node);
+      }
+      const allNodes = graph._nodes || [];
+      const bypassIds = new Set(bypassNodes.map(n => String(n.id)));
+      const kept = allNodes.filter(n => !bypassIds.has(String(n.id))).length;
+      const nOutputs = outputNodes.length;
+      const nBypass = bypassNodes.length;
+      const nRemoved = 0;
+      if (nOutputs === 0) {
+        el.innerHTML = '<span style="color:#e05050;">No production outputs selected</span>';
+        return;
+      }
+      el.innerHTML =
+        '<div style="font-weight:600;margin-bottom:2px;">Production plan</div>' +
+        'Kept: ' + kept + ' nodes<br>' +
+        'Removed: ' + nRemoved + ' nodes<br>' +
+        'Bypassed: ' + nBypass + ' nodes<br>' +
+        'Outputs: ' + nOutputs + '<br>' +
+        'Sampler previews: disabled<br>' +
+        'Direct outputs: ' + nOutputs;
+    } catch (e) {
+      el.innerHTML = '<span style="color:#e05050;">Plan error: ' + e.message + '</span>';
+    }
+  }
+
   scrollContent.appendChild(outputCollapsible.wrapper);
+
+  // ── Production Mode (always visible, not inside collapsed section) ──
+  const prodDivider = document.createElement("div");
+  prodDivider.style.cssText = "border-top: 1px solid #3a3a3a; margin: 8px 0;";
+  scrollContent.appendChild(prodDivider);
+
+  const prodRow = document.createElement("div");
+  prodRow.style.cssText = "display:flex; align-items:center; gap:8px; margin-bottom:6px;";
+
+  const prodToggle = document.createElement("input");
+  prodToggle.type = "checkbox";
+  prodToggle.id = "cm-prod-toggle";
+  prodToggle.checked = !!(app.graph?.extra?.comfymodal?.production_mode_enabled);
+  prodToggle.style.cssText = "width:16px; height:16px; accent-color:#3a6fcc; flex-shrink:0;";
+
+  const prodLabel = document.createElement("span");
+  prodLabel.style.cssText = "font-size:12px; color:#aaa; font-weight:600;";
+  prodLabel.textContent = "Simulate Production";
+  prodLabel.htmlFor = "cm-prod-toggle";
+
+  prodRow.appendChild(prodToggle);
+  prodRow.appendChild(prodLabel);
+  scrollContent.appendChild(prodRow);
+
+  const prodSummaryEl = document.createElement("div");
+  prodSummaryEl.style.cssText = "font-size:11px; color:#666; line-height:1.5; padding:6px 8px; background:#1a1a2a; border-radius:4px; border:1px solid #2a2a3a; display:" + (prodToggle.checked ? "" : "none") + ";";
+  prodSummaryEl.textContent = "No production plan";
+  scrollContent.appendChild(prodSummaryEl);
+
+  prodToggle.addEventListener("change", () => {
+    if (!app.graph) return;
+    if (!app.graph.extra) app.graph.extra = {};
+    if (!app.graph.extra.comfymodal) app.graph.extra.comfymodal = {};
+    app.graph.extra.comfymodal.production_mode_enabled = prodToggle.checked;
+    if (prodToggle.checked) {
+      prodSummaryEl.style.display = "";
+      prodSummaryEl.textContent = "Compiling plan...";
+      setTimeout(() => { _updateProductionSummary(prodSummaryEl); }, 100);
+    } else {
+      prodSummaryEl.style.display = "none";
+    }
+    app.graph.setDirtyCanvas(true, true);
+  });
 
   // === WORKSPACE SECTION (Collapsible) ===
   let currentSwapId = null;

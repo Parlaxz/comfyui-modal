@@ -74,6 +74,10 @@ from profiler_trace_v4 import (
     derive_spans, derive_non_overlapping_critical_path,
     estimate_clock_skew, summarize_trace, log_event,
 )
+from production_workflow import (
+    normalize_production_options,
+    compile_production_workflow,
+)
 from comparison import (
     create_profile,
     update_profile,
@@ -1098,6 +1102,7 @@ def _build_next_warmup_activation(workflow: dict, workflow_hash: str) -> dict:
 
 async def _execute_job(item: tuple, item_id: int):
     number, prompt_id, workflow, extra_data, _, _ = item
+    execution_workflow = extra_data.get("execution_workflow") or workflow
     sid = extra_data.get("client_id", "")
     local_started = time.time()
     trace_payload = extra_data.get("trace", {}) if isinstance(extra_data, dict) else {}
@@ -1118,7 +1123,7 @@ async def _execute_job(item: tuple, item_id: int):
     try:
         _send(sid, "modal_status", {"prompt_id": prompt_id, "message": "Starting up", "phase": "startup"})
         # Verify workflow integrity immediately before remote call
-        current_hash = prompt_sha256(workflow)
+        current_hash = prompt_sha256(execution_workflow)
         expected_hash = extra_data.get("workflow_hash", "")
         if expected_hash and current_hash != expected_hash:
             raise RuntimeError(
@@ -1126,7 +1131,7 @@ async def _execute_job(item: tuple, item_id: int):
             )
 
         # API prompt structure validation (local defense-in-depth)
-        assert_valid_api_prompt_structure(workflow)
+        assert_valid_api_prompt_structure(execution_workflow)
 
         # ── PART 2: Class-type validation before warmup profile write ──
         # Also validate that referenced node class types exist in the
@@ -1135,7 +1140,7 @@ async def _execute_job(item: tuple, item_id: int):
         try:
             import nodes as _validate_nodes
             _requested_types = set()
-            for _spec in workflow.values():
+            for _spec in execution_workflow.values():
                 if isinstance(_spec, dict):
                     _ct = _spec.get("class_type")
                     if isinstance(_ct, str) and _ct:
@@ -1161,8 +1166,8 @@ async def _execute_job(item: tuple, item_id: int):
         collect_started = time.time()
         input_collect_ms = 0
         input_collect_bytes = 0
-        if workflow_needs_local_input_files(workflow):
-            input_images = _collect_input_images(workflow)
+        if workflow_needs_local_input_files(execution_workflow):
+            input_images = _collect_input_images(execution_workflow)
             input_collect_ms = round((time.time() - collect_started) * 1000, 1)
             input_collect_bytes = sum(len(base64.b64decode(data)) for data in input_images.values())
             print(
@@ -1181,7 +1186,7 @@ async def _execute_job(item: tuple, item_id: int):
         _active_next_status = "skipped"
         _active_next_changed = False
         if not os.environ.get("DISABLE_ACTIVE_NEXT_WRITE"):
-            activation_payload = _build_next_warmup_activation(workflow, prompt_hash)
+            activation_payload = _build_next_warmup_activation(execution_workflow, prompt_hash)
             _active_next_payload_bytes = len(json.dumps(activation_payload, separators=(",", ":")))
             try:
                 activation_result = await set_active_warmup_profile(activation_payload)
@@ -1230,7 +1235,7 @@ async def _execute_job(item: tuple, item_id: int):
         if isinstance(_st, dict):
             _mo["comfymodal_scheduler_test"] = _st
         async for _msg in run_prompt_stream(
-            workflow,
+            execution_workflow,
             input_images,
             trace={**trace.fields(), "prompt_id": prompt_id},
             gpu=extra_data.get("gpu"),
@@ -2231,15 +2236,45 @@ if _server:
         local_et.mark(T1B_LOCAL_PAYLOAD_PARSE_END, phase=PHASE_LOCAL_BRIDGE)
         print(f"[predispatch] phase=recv t={time.time()}")
 
+        # ── Production workflow compilation ──
+        modal_options_raw = body.get("modal_options", None)
+        if not isinstance(modal_options_raw, dict):
+            modal_options_raw = None
+        production_options = normalize_production_options(modal_options_raw)
+        production_report = None
+        execution_workflow = workflow
+        if production_options.get("enabled"):
+            try:
+                production_options["enabled"] = True
+                if "schema_version" not in production_options:
+                    production_options["schema_version"] = 1
+                compiled, production_report = compile_production_workflow(
+                    workflow, production_options, allow_direct_output_rewrite=False
+                )
+                execution_workflow = compiled
+                kept = production_report.get("compiled_node_count", 0)
+                removed = production_report.get("removed_node_count", 0)
+                bypassed = len(production_options.get("bypass_node_ids", []))
+                outputs = len(production_options.get("output_node_ids", []))
+                print(
+                    f"[comfyui-modal] Production plan: kept={kept} removed={removed} "
+                    f"bypassed={bypassed} outputs={outputs}"
+                )
+            except Exception:
+                print(f"[comfyui-modal] Production compile failed, failing closed")
+                raise
+        else:
+            production_report = {"enabled": False}
+
         # ── Stack extraction (prompt hashing + model stack) ──
         print(f"[predispatch] phase=before_stack_extract t={time.time()}")
         trace.mark("t1k_stack_extract_start", time.time())
         local_et.mark(T1Q_STACK_EXTRACT_START, phase=PHASE_LOCAL_BRIDGE)
         _stack_start_ts = time.perf_counter()
         local_payload_hash = prompt_sha256(body)
-        workflow_hash = prompt_sha256(workflow)
-        prompt_summary = summarize_prompt_fields(workflow)
-        model_stack = extract_model_stack(workflow)
+        workflow_hash = prompt_sha256(execution_workflow)
+        prompt_summary = summarize_prompt_fields(execution_workflow)
+        model_stack = extract_model_stack(execution_workflow)
         _stack_end_ts = time.perf_counter()
         stack_extract_ms = round((_stack_end_ts - _stack_start_ts) * 1000, 3)
         if stack_extract_ms > _STACK_EXTRACT_WARN_MS:
@@ -2253,9 +2288,7 @@ if _server:
         print(f"[predispatch] phase=after_stack_extract t={_stack_end_ts_wall}")
 
         # Extract modal_options from body
-        modal_options = body.get("modal_options", None)
-        if not isinstance(modal_options, dict):
-            modal_options = None
+        modal_options = modal_options_raw
         scheduler_test = body.get("comfymodal_scheduler_test")
 
         # ── Lock + enqueue ──
@@ -2294,8 +2327,10 @@ if _server:
                 "modal_options": modal_options,
                 "scheduler_test": scheduler_test,
                 "result_route": _result_route_mode,
+                "execution_workflow": execution_workflow,
+                "production_report": production_report,
             }
-            item = (_item_counter, prompt_id, workflow, extra_data, list(workflow.keys()), {})
+            item = (_item_counter, prompt_id, execution_workflow, extra_data, list(execution_workflow.keys()), {})
             print(f"[predispatch] prompt_bytes={body_bytes}")
         finally:
             if _lock_trace.get("acquired"):

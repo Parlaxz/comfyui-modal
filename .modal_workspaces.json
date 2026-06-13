@@ -6,8 +6,8 @@
       "custom_nodes_fingerprint": null
     },
     "ws_6cf85caf6e07": {
-      "comfyapp_version": "2.16.5",
-      "custom_nodes_fingerprint": "1d233bc26efcde1a53f5425bb26d0d055198011839df06f9f4e51dc62492f1b5"
+      "comfyapp_version": "2.16.11",
+      "custom_nodes_fingerprint": null
     }
   },
   "version": 1,

@@ -24,11 +24,15 @@ class ComfyAppPackagingTests(unittest.TestCase):
 
     def test_all_modal_images_include_gpu_catalog_source(self):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
-        self.assertGreaterEqual(source.count('add_local_python_source("gpu_catalog")'), 6)
+        # gpu_catalog is added via the loop in _add_comfymodal_local_python_sources
+        self.assertIn('"gpu_catalog"', source)
+        self.assertIn('_COMFYMODAL_LOCAL_PYTHON_SOURCES', source)
 
     def test_all_modal_images_include_timing_trace_source(self):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
-        self.assertGreaterEqual(source.count('add_local_python_source("timing_trace")'), 2)
+        # timing_trace is added via the loop in _add_comfymodal_local_python_sources
+        self.assertIn('"timing_trace"', source)
+        self.assertIn('_COMFYMODAL_LOCAL_PYTHON_SOURCES', source)
 
     def test_image_pins_sageattention_220(self):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
