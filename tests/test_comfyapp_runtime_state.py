@@ -641,8 +641,8 @@ class ComfyAppRuntimeFlagTests(unittest.TestCase):
 
             with patch.object(self.module, "RUNTIME_CONFIG_DIR", str(config_dir)):
                 with patch.dict(os.environ, {}, clear=True):
-                    result = self.module._resolve_runtime_flag("RESTORE_BACKGROUND_UNET", "1")
-                    self.assertTrue(result)
+                    result = self.module._resolve_runtime_flag("RESTORE_BACKGROUND_UNET", "0")
+                    self.assertFalse(result)
 
     def test_runtime_string_resolver_priority(self):
         """Runtime string resolver follows same priority: file > env > default."""
@@ -817,10 +817,10 @@ class ComfyAppRuntimeFlagTests(unittest.TestCase):
         module = load_module()
         self.assertFalse(module.PERSIST_PER_STACK_METRICS)
 
-    def test_defer_vae_actual_load_default_on(self):
-        """DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET defaults to 1 (on)."""
+    def test_defer_vae_actual_load_default_off(self):
+        """DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET defaults to 0 (off) since RBG UNET is disabled."""
         module = load_module()
-        self.assertTrue(module.DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET)
+        self.assertFalse(module.DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET)
 
     def test_stall_classifier_unet_threshold(self):
         """Stall classifier marks UNET read > VOLUME_STALL_UNET_MS as stall."""

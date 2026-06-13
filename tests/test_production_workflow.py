@@ -1,0 +1,875 @@
+import unittest
+
+from production_workflow import (
+    normalize_production_options,
+    build_production_topology_hash,
+    compile_production_workflow,
+    analyze_duplicate_work,
+    _reset_cache,
+    _cache_size,
+    COMPILER_SCHEMA_VERSION,
+)
+
+
+def _minimal_production(output_ids=None, bypass_ids=None, **overrides):
+    prod = {
+        "schema_version": COMPILER_SCHEMA_VERSION,
+        "output_node_ids": output_ids or ["9"],
+        "bypass_node_ids": bypass_ids or [],
+        "disable_sampler_previews": True,
+        "quiet_execution_logs": True,
+        "progress_min_interval_ms": 500,
+        "strict_output_collection": True,
+        "direct_output_sink": True,
+        "metadata_mode": "none",
+    }
+    prod.update(overrides)
+    return prod
+
+
+WORKFLOW_SINGLE_OUTPUT = {
+    "3": {"class_type": "KSampler", "inputs": {
+        "seed": 7, "steps": 20, "cfg": 3.5,
+        "sampler_name": "euler", "scheduler": "normal", "denoise": 1,
+        "model": ("4", 0), "positive": ("6", 0), "negative": ("7", 0),
+        "latent_image": ("5", 0),
+    }},
+    "4": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux-model.safetensors"}},
+    "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024}},
+    "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat", "clip": ("8", 0)}},
+    "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ("8", 0)}},
+    "8": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors"}},
+    "9": {"class_type": "VAEDecode", "inputs": {"samples": ("3", 0), "vae": ("10", 0)}},
+    "10": {"class_type": "VAELoader", "inputs": {"vae_name": "vae.safetensors"}},
+    "11": {"class_type": "PreviewImage", "inputs": {"images": ("9", 0)}},
+}
+
+WORKFLOW_MULTI_OUTPUT = {
+    "3": {"class_type": "KSampler", "inputs": {
+        "seed": 7, "steps": 20, "cfg": 3.5,
+        "sampler_name": "euler", "scheduler": "normal", "denoise": 1,
+        "model": ("4", 0), "positive": ("6", 0), "negative": ("7", 0),
+        "latent_image": ("5", 0),
+    }},
+    "4": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux-model.safetensors"}},
+    "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024}},
+    "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat", "clip": ("8", 0)}},
+    "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ("8", 0)}},
+    "8": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors"}},
+    "9": {"class_type": "VAEDecode", "inputs": {"samples": ("3", 0), "vae": ("10", 0)}},
+    "10": {"class_type": "VAELoader", "inputs": {"vae_name": "vae.safetensors"}},
+    "11": {"class_type": "SaveImage", "inputs": {"images": ("9", 0)}},
+    "12": {"class_type": "PreviewImage", "inputs": {"images": ("9", 0)}},
+}
+
+
+class NormalizeProductionOptionsTests(unittest.TestCase):
+    def test_none_returns_disabled(self):
+        result = normalize_production_options(None)
+        self.assertEqual(result, {"enabled": False})
+
+    def test_empty_dict_returns_disabled(self):
+        result = normalize_production_options({})
+        self.assertEqual(result, {"enabled": False})
+
+    def test_no_production_key_returns_disabled(self):
+        result = normalize_production_options({"other": "data"})
+        self.assertEqual(result, {"enabled": False})
+
+    def test_rejects_non_dict(self):
+        with self.assertRaises(TypeError):
+            normalize_production_options({"production": "not-a-dict"})
+
+    def test_rejects_wrong_schema_version(self):
+        with self.assertRaises(ValueError):
+            normalize_production_options({
+                "production": {"schema_version": 99, "output_node_ids": ["9"]}
+            })
+
+    def test_accepts_direct_dict_with_schema_and_outputs(self):
+        result = normalize_production_options({
+            "schema_version": COMPILER_SCHEMA_VERSION,
+            "output_node_ids": ["9"],
+        })
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["output_node_ids"], ["9"])
+
+    def test_returns_disabled_when_explicitly_disabled(self):
+        result = normalize_production_options({
+            "production": {"enabled": False, "schema_version": COMPILER_SCHEMA_VERSION}
+        })
+        self.assertEqual(result, {"enabled": False})
+
+    def test_normalizes_and_deduplicates_ids(self):
+        result = normalize_production_options({
+            "production": {
+                "schema_version": COMPILER_SCHEMA_VERSION,
+                "output_node_ids": [9, "10", 9, "9", "8"],
+            }
+        })
+        self.assertEqual(result["output_node_ids"], ["8", "9", "10"])
+
+    def test_rejects_empty_output_node_ids(self):
+        with self.assertRaises(ValueError):
+            normalize_production_options({
+                "production": {"schema_version": COMPILER_SCHEMA_VERSION, "output_node_ids": []}
+            })
+
+    def test_rejects_overlap(self):
+        with self.assertRaises(ValueError):
+            normalize_production_options({
+                "production": {
+                    "schema_version": COMPILER_SCHEMA_VERSION,
+                    "output_node_ids": ["9", "10"],
+                    "bypass_node_ids": ["9"],
+                }
+            })
+
+    def test_accepts_valid_config(self):
+        result = normalize_production_options({
+            "production": {
+                "schema_version": COMPILER_SCHEMA_VERSION,
+                "output_node_ids": ["9"],
+                "disable_sampler_previews": False,
+            }
+        })
+        self.assertTrue(result["enabled"])
+        self.assertFalse(result["disable_sampler_previews"])
+
+    def test_applies_defaults(self):
+        result = normalize_production_options({
+            "production": {
+                "schema_version": COMPILER_SCHEMA_VERSION,
+                "output_node_ids": ["9"],
+            }
+        })
+        self.assertTrue(result["disable_sampler_previews"])
+        self.assertTrue(result["quiet_execution_logs"])
+        self.assertEqual(result["progress_min_interval_ms"], 500)
+        self.assertTrue(result["strict_output_collection"])
+        self.assertTrue(result["direct_output_sink"])
+        self.assertEqual(result["metadata_mode"], "none")
+
+    def test_bypass_normalization(self):
+        result = normalize_production_options({
+            "production": {
+                "schema_version": COMPILER_SCHEMA_VERSION,
+                "output_node_ids": ["9"],
+                "bypass_node_ids": [8, "8", 10, "10"],
+            }
+        })
+        self.assertEqual(result["bypass_node_ids"], ["8", "10"])
+
+
+class CompileProductionWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        _reset_cache()
+
+    def test_one_selected_output_dead_preview_removed(self):
+        prod = _minimal_production(output_ids=["9"])
+        compiled, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False
+        )
+        self.assertIn("9", compiled)
+        self.assertNotIn("11", compiled)
+        self.assertIn("9", report["kept_node_ids"])
+        self.assertNotIn("11", report["kept_node_ids"])
+        self.assertIn("11", report["removed_node_ids"])
+
+    def test_multiple_selected_outputs_retained(self):
+        prod = _minimal_production(output_ids=["11", "12"])
+        compiled, report = compile_production_workflow(
+            WORKFLOW_MULTI_OUTPUT, prod, allow_direct_output_rewrite=False
+        )
+        self.assertIn("11", compiled)
+        self.assertIn("12", compiled)
+
+    def test_shared_ancestors_retained_once(self):
+        prod = _minimal_production(output_ids=["9"])
+        compiled, _ = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False
+        )
+        self.assertIn("3", compiled)
+        self.assertIn("6", compiled)
+        self.assertIn("7", compiled)
+        self.assertIn("8", compiled)
+        self.assertIn("10", compiled)
+
+    def test_disconnected_model_loader_removed(self):
+        wf = dict(WORKFLOW_SINGLE_OUTPUT)
+        wf["99"] = {"class_type": "UNETLoader", "inputs": {"unet_name": "orphan.safetensors"}}
+        prod = _minimal_production(output_ids=["9"])
+        compiled, report = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=False
+        )
+        self.assertNotIn("99", compiled)
+        self.assertIn("99", report["removed_node_ids"])
+
+    def test_scalar_inputs_preserved(self):
+        prod = _minimal_production(output_ids=["9"])
+        compiled, _ = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False
+        )
+        sampler = compiled["3"]
+        self.assertEqual(sampler["inputs"]["seed"], 7)
+        self.assertEqual(sampler["inputs"]["steps"], 20)
+        self.assertEqual(sampler["inputs"]["cfg"], 3.5)
+
+    def test_connection_detection_ignores_arbitrary_two_item_lists(self):
+        wf = {
+            "1": {"class_type": "Note", "inputs": {"text": "hello world"}},
+            "2": {"class_type": "ListMaker", "inputs": {"pair": ["x", "y"]}},
+        }
+        prod = _minimal_production(output_ids=["1", "2"])
+        compiled, _ = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=False
+        )
+        self.assertIn("2", compiled)
+
+    def test_missing_output_rejected(self):
+        prod = _minimal_production(output_ids=["999"])
+        with self.assertRaises(ValueError):
+            compile_production_workflow(
+                WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False
+            )
+
+    def test_output_also_marked_bypass_rejected(self):
+        prod = _minimal_production(output_ids=["9"], bypass_ids=["9"])
+        with self.assertRaises(ValueError):
+            compile_production_workflow(
+                WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False
+            )
+
+    def test_bypass_id_remaining_rejected(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1}},
+            "2": {"class_type": "SaveImage", "inputs": {"images": ("1", 0)}},
+        }
+        prod = _minimal_production(output_ids=["2"], bypass_ids=["1"])
+        with self.assertRaises(ValueError) as ctx:
+            compile_production_workflow(wf, prod, allow_direct_output_rewrite=False)
+        msg = str(ctx.exception)
+        self.assertIn("Production bypass failed for node", msg)
+        self.assertIn("(KSampler)", msg)
+        self.assertIn("ComfyUI could not serialize this node as a native bypass", msg)
+
+    def test_direct_output_rewrite_save_image(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1, "model": ("2", 0)}},
+            "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "m.safetensors"}},
+            "3": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}},
+            "4": {"class_type": "SaveImage", "inputs": {"images": ("3", 0)}},
+        }
+        prod = _minimal_production(output_ids=["4"])
+        compiled, report = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertEqual(compiled["4"]["class_type"], "ComfyModalProductionOutput")
+        self.assertEqual(compiled["4"]["inputs"]["images"], ("3", 0))
+        self.assertIn("4", report["direct_output_rewritten_node_ids"])
+
+    def test_direct_output_rewrite_preview_image(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1, "model": ("2", 0)}},
+            "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "m.safetensors"}},
+            "3": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}},
+            "4": {"class_type": "PreviewImage", "inputs": {"images": ("3", 0)}},
+        }
+        prod = _minimal_production(output_ids=["4"])
+        compiled, _ = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertEqual(compiled["4"]["class_type"], "ComfyModalProductionOutput")
+
+    def test_direct_output_rewrite_save_image_with_metadata(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1, "model": ("2", 0)}},
+            "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "m.safetensors"}},
+            "3": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}},
+            "4": {"class_type": "SaveImageWithMetaData", "inputs": {"images": ("3", 0)}},
+        }
+        prod = _minimal_production(output_ids=["4"])
+        compiled, _ = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertEqual(compiled["4"]["class_type"], "ComfyModalProductionOutput")
+
+    def test_no_rewrite_when_images_not_valid_connection(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1}},
+            "2": {"class_type": "SaveImage", "inputs": {"images": "literal_filename.png"}},
+        }
+        prod = _minimal_production(output_ids=["2"])
+        compiled, report = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertEqual(compiled["2"]["class_type"], "SaveImage")
+        self.assertEqual(report["direct_output_rewritten_node_ids"], [])
+
+    def test_metadata_mode_full_disables_direct_rewrite(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1, "model": ("2", 0)}},
+            "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "m.safetensors"}},
+            "3": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}},
+            "4": {"class_type": "SaveImage", "inputs": {"images": ("3", 0)}},
+        }
+        prod = _minimal_production(output_ids=["4"], metadata_mode="full")
+        compiled, report = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertEqual(compiled["4"]["class_type"], "SaveImage")
+        self.assertEqual(report["direct_output_rewritten_node_ids"], [])
+
+    def test_unsupported_output_class_unchanged(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1, "model": ("2", 0)}},
+            "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "m.safetensors"}},
+            "3": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}},
+        }
+        prod = _minimal_production(output_ids=["3"])
+        compiled, _ = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertEqual(compiled["3"]["class_type"], "VAEDecode")
+
+    def test_allow_direct_output_rewrite_false_skips_rewrite(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1, "model": ("2", 0)}},
+            "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "m.safetensors"}},
+            "3": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}},
+            "4": {"class_type": "SaveImage", "inputs": {"images": ("3", 0)}},
+        }
+        prod = _minimal_production(output_ids=["4"])
+        compiled, _ = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=False
+        )
+        self.assertEqual(compiled["4"]["class_type"], "SaveImage")
+
+
+class TopologyHashTests(unittest.TestCase):
+    def test_stable_when_only_prompt_text_changes(self):
+        wf1 = {**WORKFLOW_SINGLE_OUTPUT}
+        wf2 = dict(WORKFLOW_SINGLE_OUTPUT)
+        wf2["6"] = dict(wf2["6"])
+        wf2["6"]["inputs"] = dict(wf2["6"]["inputs"], text="a different prompt")
+        prod = _minimal_production(output_ids=["9"])
+        h1 = build_production_topology_hash(wf1, prod, allow_direct_output_rewrite=False)
+        h2 = build_production_topology_hash(wf2, prod, allow_direct_output_rewrite=False)
+        self.assertEqual(h1, h2)
+
+    def test_stable_when_only_seed_changes(self):
+        wf1 = {**WORKFLOW_SINGLE_OUTPUT}
+        wf2 = dict(WORKFLOW_SINGLE_OUTPUT)
+        wf2["3"] = dict(wf2["3"])
+        wf2["3"]["inputs"] = dict(wf2["3"]["inputs"], seed=42)
+        prod = _minimal_production(output_ids=["9"])
+        h1 = build_production_topology_hash(wf1, prod, allow_direct_output_rewrite=False)
+        h2 = build_production_topology_hash(wf2, prod, allow_direct_output_rewrite=False)
+        self.assertEqual(h1, h2)
+
+    def test_changes_when_graph_connection_changes(self):
+        wf1 = {**WORKFLOW_SINGLE_OUTPUT}
+        wf2 = dict(WORKFLOW_SINGLE_OUTPUT)
+        wf2["6"] = dict(wf2["6"])
+        wf2["6"]["inputs"] = dict(wf2["6"]["inputs"], clip=("99", 0))
+        wf2["99"] = {"class_type": "CLIPLoader", "inputs": {"clip_name": "other.safetensors"}}
+        prod = _minimal_production(output_ids=["9"])
+        h1 = build_production_topology_hash(wf1, prod, allow_direct_output_rewrite=False)
+        h2 = build_production_topology_hash(wf2, prod, allow_direct_output_rewrite=False)
+        self.assertNotEqual(h1, h2)
+
+    def test_changes_when_production_outputs_change(self):
+        wf = {**WORKFLOW_MULTI_OUTPUT}
+        prod1 = _minimal_production(output_ids=["11"])
+        prod2 = _minimal_production(output_ids=["12"])
+        h1 = build_production_topology_hash(wf, prod1, allow_direct_output_rewrite=False)
+        h2 = build_production_topology_hash(wf, prod2, allow_direct_output_rewrite=False)
+        self.assertNotEqual(h1, h2)
+
+    def test_changes_when_direct_output_sink_changes(self):
+        wf = {**WORKFLOW_SINGLE_OUTPUT}
+        prod1 = _minimal_production(output_ids=["9"])
+        prod2 = _minimal_production(output_ids=["9"], direct_output_sink=False)
+        h1 = build_production_topology_hash(wf, prod1, allow_direct_output_rewrite=False)
+        h2 = build_production_topology_hash(wf, prod2, allow_direct_output_rewrite=False)
+        self.assertNotEqual(h1, h2)
+
+    def test_changes_when_allow_direct_output_rewrite_differs(self):
+        wf = {**WORKFLOW_SINGLE_OUTPUT}
+        prod = _minimal_production(output_ids=["9"])
+        h1 = build_production_topology_hash(wf, prod, allow_direct_output_rewrite=False)
+        h2 = build_production_topology_hash(wf, prod, allow_direct_output_rewrite=True)
+        self.assertNotEqual(h1, h2)
+
+    def test_unresolved_connection_like_treated_as_literal(self):
+        wf = {
+            "1": {"class_type": "Note", "inputs": {"pair": (99, 0)}},
+        }
+        prod = _minimal_production(output_ids=["1"])
+        h = build_production_topology_hash(wf, prod, allow_direct_output_rewrite=False)
+        self.assertIsInstance(h, str)
+        self.assertEqual(len(h), 64)
+
+
+class AnalyzeDuplicateWorkTests(unittest.TestCase):
+    def test_duplicate_output_groups_detected(self):
+        wf = {
+            "1": {"class_type": "VAEDecode", "inputs": {"samples": ("3", 0)}},
+            "2": {"class_type": "SaveImage", "inputs": {"images": ("1", 0)}},
+            "3": {"class_type": "SaveImage", "inputs": {"images": ("1", 0)}},
+            "4": {"class_type": "PreviewImage", "inputs": {"images": ("1", 0)}},
+        }
+        result = analyze_duplicate_work(wf)
+        self.assertEqual(len(result["duplicate_output_groups"]), 1)
+        group = result["duplicate_output_groups"][0]
+        self.assertEqual(group["source_node_id"], "1")
+        self.assertEqual(set(group["member_node_ids"]), {"2", "3", "4"})
+
+    def test_duplicate_vae_decode_groups_detected(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1, "model": ("5", 0)}},
+            "2": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0), "vae": ("6", 0)}},
+            "3": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0), "vae": ("6", 0)}},
+            "4": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0), "vae": ("7", 0)}},
+            "5": {"class_type": "UNETLoader", "inputs": {"unet_name": "m.safetensors"}},
+            "6": {"class_type": "VAELoader", "inputs": {"vae_name": "a.safetensors"}},
+            "7": {"class_type": "VAELoader", "inputs": {"vae_name": "b.safetensors"}},
+        }
+        result = analyze_duplicate_work(wf)
+        vae_groups = result["duplicate_vae_decode_groups"]
+        self.assertTrue(
+            any(
+                set(g["member_node_ids"]) == {"2", "3"}
+                for g in vae_groups
+            ),
+            f"Expected node 2 and 3 to form a VAE duplicate group, got {vae_groups}",
+        )
+
+    def test_vae_requires_exact_class_type_match(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1}},
+            "2": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0), "vae": ("5", 0)}},
+            "3": {"class_type": "VAEDecodeCustom", "inputs": {"samples": ("1", 0), "vae": ("5", 0)}},
+            "5": {"class_type": "VAELoader", "inputs": {"vae_name": "a.safetensors"}},
+        }
+        result = analyze_duplicate_work(wf)
+        all_members = set()
+        for g in result["duplicate_vae_decode_groups"]:
+            all_members.update(g["member_node_ids"])
+        self.assertNotIn("2", all_members)
+        self.assertNotIn("3", all_members)
+
+    def test_clip_requires_exact_class_type_match(self):
+        wf = {
+            "1": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello", "clip": ("3", 0)}},
+            "2": {"class_type": "CLIPTextEncodeCustom", "inputs": {"text": "hello", "clip": ("3", 0)}},
+            "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "c.safetensors"}},
+        }
+        result = analyze_duplicate_work(wf)
+        all_members = set()
+        for g in result["duplicate_clip_encode_groups"]:
+            all_members.update(g["member_node_ids"])
+        self.assertNotIn("1", all_members)
+        self.assertNotIn("2", all_members)
+
+    def test_duplicate_clip_encode_groups_detected(self):
+        wf = {
+            "1": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello", "clip": ("3", 0)}},
+            "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello", "clip": ("3", 0)}},
+            "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "c.safetensors"}},
+        }
+        result = analyze_duplicate_work(wf)
+        clip_groups = result["duplicate_clip_encode_groups"]
+        self.assertEqual(len(clip_groups), 1)
+        self.assertEqual(set(clip_groups[0]["member_node_ids"]), {"1", "2"})
+
+    def test_vae_remaining_scalar_values_compared_exactly(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1}},
+            "2": {"class_type": "VAEDecode", "inputs": {
+                "samples": ("1", 0), "vae": ("5", 0), "flag": True,
+            }},
+            "3": {"class_type": "VAEDecode", "inputs": {
+                "samples": ("1", 0), "vae": ("5", 0), "flag": False,
+            }},
+            "5": {"class_type": "VAELoader", "inputs": {"vae_name": "a.safetensors"}},
+        }
+        result = analyze_duplicate_work(wf)
+        all_members = set()
+        for g in result["duplicate_vae_decode_groups"]:
+            all_members.update(g["member_node_ids"])
+        self.assertNotIn("2", all_members)
+        self.assertNotIn("3", all_members)
+
+    def test_clip_different_text_not_grouped(self):
+        wf = {
+            "1": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello", "clip": ("3", 0)}},
+            "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "world", "clip": ("3", 0)}},
+            "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "c.safetensors"}},
+        }
+        result = analyze_duplicate_work(wf)
+        self.assertEqual(len(result["duplicate_clip_encode_groups"]), 0)
+
+
+class CacheTests(unittest.TestCase):
+    def setUp(self):
+        _reset_cache()
+
+    def test_cache_hit_on_repeated_compilation(self):
+        wf = {**WORKFLOW_SINGLE_OUTPUT}
+        prod = _minimal_production(output_ids=["9"])
+        _, report1 = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=False
+        )
+        self.assertFalse(report1["cache_hit"])
+        _, report2 = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=False
+        )
+        self.assertTrue(report2["cache_hit"])
+
+    def test_cache_miss_on_different_workflow(self):
+        wf1 = {**WORKFLOW_SINGLE_OUTPUT}
+        wf2 = {**WORKFLOW_MULTI_OUTPUT}
+        prod = _minimal_production(output_ids=["9"])
+        _, report1 = compile_production_workflow(
+            wf1, prod, allow_direct_output_rewrite=False
+        )
+        self.assertFalse(report1["cache_hit"])
+        prod2 = _minimal_production(output_ids=["11"])
+        _, report2 = compile_production_workflow(
+            wf2, prod2, allow_direct_output_rewrite=False
+        )
+        self.assertFalse(report2["cache_hit"])
+
+    def test_lru_never_exceeds_32(self):
+        wf = {**WORKFLOW_SINGLE_OUTPUT}
+        for i in range(40):
+            wf["3"] = dict(wf["3"])
+            wf["3"]["inputs"] = dict(wf["3"]["inputs"], seed=i)
+            prod = _minimal_production(output_ids=["9"])
+            compile_production_workflow(wf, prod, allow_direct_output_rewrite=False)
+        self.assertLessEqual(_cache_size(), 32)
+
+    def test_cache_hit_reconstructs_current_scalar_values(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 10}},
+            "2": {"class_type": "SaveImage", "inputs": {"images": ("1", 0)}},
+        }
+        prod = _minimal_production(output_ids=["2"])
+        compiled_first, _ = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertEqual(compiled_first["1"]["inputs"]["seed"], 10)
+
+        wf["1"]["inputs"]["seed"] = 99
+        compiled_second, report = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertTrue(report["cache_hit"])
+        self.assertEqual(compiled_second["1"]["inputs"]["seed"], 99)
+
+    def test_cache_hit_reconstructs_rewrite_status(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1}},
+            "2": {"class_type": "SaveImage", "inputs": {"images": ("1", 0)}},
+        }
+        prod = _minimal_production(output_ids=["2"])
+        _, report_first = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertFalse(report_first["cache_hit"])
+        self.assertIn("2", report_first["direct_output_rewritten_node_ids"])
+
+        _, report_second = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertTrue(report_second["cache_hit"])
+        self.assertIn("2", report_second["direct_output_rewritten_node_ids"])
+
+    def test_cache_hit_rebuilds_from_current_scalars_when_no_rewrite(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 10, "steps": 20}},
+            "2": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}},
+            "3": {"class_type": "SaveImage", "inputs": {"images": ("2", 0)}},
+        }
+        prod = _minimal_production(output_ids=["3"])
+        _, _ = compile_production_workflow(wf, prod, allow_direct_output_rewrite=False)
+
+        wf["1"]["inputs"]["seed"] = 42
+        wf["1"]["inputs"]["steps"] = 50
+        compiled, report = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=False
+        )
+        self.assertTrue(report["cache_hit"])
+        self.assertEqual(compiled["1"]["inputs"]["seed"], 42)
+        self.assertEqual(compiled["1"]["inputs"]["steps"], 50)
+
+
+class WorkflowIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        _reset_cache()
+
+    def test_report_fields_present(self):
+        prod = _minimal_production(output_ids=["9"])
+        _, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False
+        )
+        self.assertIn("enabled", report)
+        self.assertIn("schema_version", report)
+        self.assertIn("original_node_count", report)
+        self.assertIn("compiled_node_count", report)
+        self.assertIn("removed_node_count", report)
+        self.assertIn("kept_node_ids", report)
+        self.assertIn("removed_node_ids", report)
+        self.assertIn("output_node_ids", report)
+        self.assertIn("bypass_node_ids", report)
+        self.assertIn("direct_output_rewritten_node_ids", report)
+        self.assertIn("topology_hash", report)
+        self.assertIn("cache_hit", report)
+        self.assertIn("duplicate_analysis", report)
+
+    def test_compiled_workflow_preserves_dict_insertion_order(self):
+        prod = _minimal_production(output_ids=["9"])
+        compiled, _ = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False
+        )
+        keys = list(compiled.keys())
+        self.assertEqual(keys, ["3", "4", "5", "6", "7", "8", "9", "10"])
+
+    def test_compiled_workflow_preserves_original_insertion_order(self):
+        wf = {
+            "3": {"class_type": "KSampler", "inputs": {"seed": 1}},
+            "10": {"class_type": "VAELoader", "inputs": {"vae_name": "v.safetensors"}},
+            "2": {"class_type": "EmptyLatentImage", "inputs": {"width": 512}},
+        }
+        prod = _minimal_production(output_ids=["3", "10", "2"])
+        compiled, _ = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=False
+        )
+        self.assertEqual(list(compiled.keys()), ["3", "10", "2"])
+
+
+class RgthreeComparerRewriteTests(unittest.TestCase):
+    """Tests for rgthree Image Comparer rewrite support."""
+
+    def setUp(self):
+        _reset_cache()
+
+    def _make_workflow(self):
+        return {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1, "model": ("2", 0)}},
+            "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "m.safetensors"}},
+            "3": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}},
+            "4": {"class_type": "PreviewImage", "inputs": {"images": ("3", 0)}},
+            "5": {"class_type": "Image Comparer (rgthree)", "inputs": {
+                "image_a": ("3", 0), "image_b": ("3", 0),
+            }},
+        }
+
+    def test_exact_class_recognized(self):
+        """Exact 'Image Comparer (rgthree)' class is recognized for rewrite."""
+        wf = self._make_workflow()
+        prod = _minimal_production(output_ids=["5"])
+        compiled, report = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertIn("5", compiled)
+        self.assertEqual(compiled["5"]["class_type"], "ComfyModalProductionImageComparerOutput")
+        self.assertIn("5", report["rgthree_comparer_rewritten_node_ids"])
+        self.assertEqual(report["rgthree_comparer_rewritten_count"], 1)
+
+    def test_similarly_named_not_recognized(self):
+        """A similarly named class (without rgthree) is not recognized."""
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1}},
+            "2": {"class_type": "Image Comparer", "inputs": {"image_a": ("1", 0)}},
+        }
+        prod = _minimal_production(output_ids=["2"])
+        compiled, report = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertEqual(compiled["2"]["class_type"], "Image Comparer")
+        self.assertEqual(report["rgthree_comparer_rewritten_count"], 0)
+
+    def test_image_a_ancestors_remain(self):
+        """image_a ancestors remain in compiled workflow."""
+        wf = self._make_workflow()
+        prod = _minimal_production(output_ids=["5"])
+        compiled, _ = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertIn("3", compiled)
+        self.assertIn("1", compiled)
+        self.assertIn("2", compiled)
+
+    def test_image_b_ancestors_remain(self):
+        """image_b ancestors remain in compiled workflow."""
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1, "model": ("2", 0)}},
+            "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "m.safetensors"}},
+            "3": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}},
+            "4": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}},
+            "5": {"class_type": "Image Comparer (rgthree)", "inputs": {
+                "image_a": ("3", 0), "image_b": ("4", 0),
+            }},
+        }
+        prod = _minimal_production(output_ids=["5"])
+        compiled, _ = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertIn("3", compiled)
+        self.assertIn("4", compiled)
+
+    def test_rewritten_at_same_node_id(self):
+        """Comparer is replaced at the same node ID."""
+        wf = self._make_workflow()
+        prod = _minimal_production(output_ids=["5"])
+        compiled, _ = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertIn("5", compiled)
+        self.assertEqual(compiled["5"]["class_type"], "ComfyModalProductionImageComparerOutput")
+
+    def test_missing_image_b(self):
+        """Missing image_b is supported."""
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1}},
+            "2": {"class_type": "Image Comparer (rgthree)", "inputs": {
+                "image_a": ("1", 0),
+            }},
+        }
+        prod = _minimal_production(output_ids=["2"])
+        compiled, _ = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertEqual(compiled["2"]["class_type"], "ComfyModalProductionImageComparerOutput")
+        self.assertEqual(compiled["2"]["inputs"]["image_a"], ("1", 0))
+        self.assertNotIn("image_b", compiled["2"]["inputs"])
+
+    def test_identical_connections_set_inputs_are_same(self):
+        """Identical image_a and image_b connections set inputs_are_same=True."""
+        wf = self._make_workflow()
+        prod = _minimal_production(output_ids=["5"])
+        compiled, _ = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertTrue(compiled["5"]["inputs"]["inputs_are_same"])
+
+    def test_different_connections_set_inputs_are_same_false(self):
+        """Different image_a and image_b connections set inputs_are_same=False."""
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1, "model": ("2", 0)}},
+            "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "m.safetensors"}},
+            "3": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}},
+            "4": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}},
+            "5": {"class_type": "Image Comparer (rgthree)", "inputs": {
+                "image_a": ("3", 0), "image_b": ("4", 0),
+            }},
+        }
+        prod = _minimal_production(output_ids=["5"])
+        compiled, _ = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertFalse(compiled["5"]["inputs"]["inputs_are_same"])
+
+    def test_cache_preserves_rgthree_rewrite(self):
+        """Topology cache preserves the rgthree rewrite type."""
+        wf = self._make_workflow()
+        prod = _minimal_production(output_ids=["5"])
+        _, report_first = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertFalse(report_first["cache_hit"])
+        self.assertEqual(report_first["rgthree_comparer_rewritten_count"], 1)
+        _, report_second = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertTrue(report_second["cache_hit"])
+        self.assertEqual(report_second["rgthree_comparer_rewritten_count"], 1)
+        self.assertIn("5", report_second["rgthree_comparer_rewritten_node_ids"])
+
+    def test_cache_hit_reconstruction_uses_current_scalars(self):
+        """Cache-hit reconstruction uses current scalar values."""
+        wf = self._make_workflow()
+        prod = _minimal_production(output_ids=["5"])
+        compiled_first, _ = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertEqual(compiled_first["5"]["inputs"]["inputs_are_same"], True)
+        # Change seed (scalar) to verify cache hit uses current value
+        wf["1"]["inputs"]["seed"] = 99
+        compiled_second, report = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertTrue(report["cache_hit"])
+        self.assertEqual(compiled_second["1"]["inputs"]["seed"], 99)
+
+    def test_report_has_accurate_rewrite_counts(self):
+        """Report has accurate rewrite counts for both direct and rgthree."""
+        wf = self._make_workflow()
+        # Select both a SaveImage and the comparer
+        wf["6"] = {"class_type": "SaveImage", "inputs": {"images": ("3", 0)}}
+        prod = _minimal_production(output_ids=["5", "6"])
+        compiled, report = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertEqual(report["direct_output_rewritten_count"], 1)
+        self.assertEqual(report["rgthree_comparer_rewritten_count"], 1)
+        self.assertIn("5", report["rgthree_comparer_rewritten_node_ids"])
+        self.assertIn("6", report["direct_output_rewritten_node_ids"])
+
+    def test_direct_output_rewritten_count_is_zero_when_none(self):
+        """direct_output_rewritten_count is zero when nothing was rewritten."""
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1}},
+            "2": {"class_type": "Image Comparer (rgthree)", "inputs": {"image_a": ("1", 0)}},
+        }
+        prod = _minimal_production(output_ids=["2"], direct_output_sink=False)
+        compiled, report = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=False
+        )
+        self.assertEqual(report["direct_output_rewritten_count"], 0)
+        self.assertEqual(report["rgthree_comparer_rewritten_count"], 0)
+
+    def test_selected_comparer_may_result_in_zero_dead_nodes(self):
+        """A selected comparer may correctly result in zero removed nodes."""
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1}},
+            "2": {"class_type": "Image Comparer (rgthree)", "inputs": {"image_a": ("1", 0)}},
+        }
+        prod = _minimal_production(output_ids=["2"])
+        compiled, report = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertEqual(report["removed_node_count"], 0)
+        self.assertIn("1", compiled)
+        self.assertIn("2", compiled)
+
+    def test_report_fields_present_for_rgthree(self):
+        """Report includes all rgthree-specific fields."""
+        wf = self._make_workflow()
+        prod = _minimal_production(output_ids=["5"])
+        _, report = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertIn("rgthree_comparer_rewritten_node_ids", report)
+        self.assertIn("rgthree_comparer_rewritten_count", report)
+        self.assertIn("selected_output_classes", report)
+        self.assertIn("direct_output_rewritten_count", report)
+        self.assertIn("direct_output_rewrite_allowed", report)
+        self.assertEqual(report["selected_output_classes"], {"5": "Image Comparer (rgthree)"})
+
+    def test_fallback_no_image_a_connection(self):
+        """When image_a is not a valid connection, the comparer is not rewritten."""
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1}},
+            "2": {"class_type": "Image Comparer (rgthree)", "inputs": {
+                "image_a": "literal_filename.png",
+            }},
+        }
+        prod = _minimal_production(output_ids=["2"])
+        compiled, report = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertEqual(compiled["2"]["class_type"], "Image Comparer (rgthree)")
+        self.assertEqual(report["rgthree_comparer_rewritten_count"], 0)
