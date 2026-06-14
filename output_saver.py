@@ -25,12 +25,21 @@ DEFAULTS = {
 _DEFAULT_SAVE_SUBDIR = os.path.join("output", "modal")
 
 
+def _normalize_save_folder(save_folder: str) -> str:
+    normalized = (save_folder or "").replace("\\", "/").strip()
+    normalized = normalized.lstrip("./").rstrip("/")
+    if normalized.lower().startswith("comfyui/"):
+        normalized = normalized[len("comfyui/"):]
+    return normalized
+
+
 def _resolve_save_folder(save_folder: str, comfyui_root: str) -> str:
     """Resolve the save folder, falling back to ComfyUI/output/modal/."""
     if save_folder and os.path.isabs(save_folder):
         return save_folder
-    if save_folder:
-        candidate = os.path.join(comfyui_root, save_folder)
+    normalized = _normalize_save_folder(save_folder)
+    if normalized:
+        candidate = os.path.join(comfyui_root, *normalized.split("/"))
     else:
         candidate = os.path.join(comfyui_root, _DEFAULT_SAVE_SUBDIR)
     return candidate

@@ -1,0 +1,41 @@
+[  313342ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/api/jobs?status=in_progress,pending&limit=200&offset=0:0
+[  313342ms] [ERROR] [Jobs API] Error fetching jobs: TypeError: Failed to fetch
+    at ComfyApi.fetchApi (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:4:1644)
+    at ComfyApi.patchedFetchApi [as fetchApi] (http://127.0.0.1:8188/extensions/comfyui-modal/modal-node.js:744:14)
+    at fetchJobsRaw (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:2:433885)
+    at fetchQueue (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:2:434747)
+    at ComfyApi.getQueue (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:4:8154)
+    at Proxy.update (http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:153:131034)
+    at Proxy.wrappedAction (http://127.0.0.1:8188/assets/vendor-vue-core-C8W6S-ta.js:2:90609)
+    at ComfyApi.onStatus (http://127.0.0.1:8188/assets/GraphView-BVhtNQg6.js:18:204921)
+    at ComfyApi.dispatchCustomEvent (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:4:2092)
+    at WebSocket.<anonymous> (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:4:3213) @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[  313343ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/api/jobs?status=completed,failed,cancelled&limit=64&offset=0:0
+[  313343ms] [ERROR] [Jobs API] Error fetching jobs: TypeError: Failed to fetch
+    at ComfyApi.fetchApi (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:4:1644)
+    at ComfyApi.patchedFetchApi [as fetchApi] (http://127.0.0.1:8188/extensions/comfyui-modal/modal-node.js:744:14)
+    at fetchJobsRaw (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:2:433885)
+    at fetchHistoryPage (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:2:434530)
+    at fetchHistory (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:2:434440)
+    at ComfyApi.getHistory (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:4:8317)
+    at Proxy.update (http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:153:131047)
+    at Proxy.wrappedAction (http://127.0.0.1:8188/assets/vendor-vue-core-C8W6S-ta.js:2:90609)
+    at ComfyApi.onStatus (http://127.0.0.1:8188/assets/GraphView-BVhtNQg6.js:18:204921)
+    at ComfyApi.dispatchCustomEvent (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:4:2092) @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[  313653ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  316005ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  318343ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  320693ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  323034ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  325386ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  327732ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  330111ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  332486ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  334868ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  337269ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  339761ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  342333ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  345187ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  348023ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  351826ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  356680ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=16fe988fe84947ff87ae032ff9e8d6e0' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3

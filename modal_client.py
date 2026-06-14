@@ -219,27 +219,35 @@ async def run_prompt_stream(
       ``{"type": "error", "message": "..."}`` — fatal error.
     """
     selected = _resolve_workspace(workspace)
+    # Semaphore only serializes remote-generator creation, not iteration.
+    # This prevents a caller that breaks early from blocking the next request.
     async with _run_prompt_semaphore:
-        try:
-            gen = _workspace_api(selected, gpu).run_prompt_stream.remote_gen.aio(
-                workflow, input_images or {}, trace or {}, modal_options or {},
-            )
-            async for msg in gen:
-                yield msg
-        except TimeoutError:
-            raise TimeoutError(
-                "Modal request timed out. The container may be cold-starting (1-3 min)."
-            )
-        except (ConnectionError, OSError) as e:
-            raise ConnectionError(
-                "Modal connection failed. Check your internet connection and Modal token."
+        gen = _workspace_api(selected, gpu).run_prompt_stream.remote_gen.aio(
+            workflow, input_images or {}, trace or {}, modal_options or {},
+        )
+    try:
+        async for msg in gen:
+            yield msg
+    except TimeoutError:
+        raise TimeoutError(
+            "Modal request timed out. The container may be cold-starting (1-3 min)."
+        )
+    except (ConnectionError, OSError) as e:
+        raise ConnectionError(
+            "Modal connection failed. Check your internet connection and Modal token."
+        ) from e
+    except Exception as e:
+        if getattr(type(e), "__module__", "").startswith("modal"):
+            raise RuntimeError(
+                f"Modal error: {e}. Try redeploying with the Deploy button."
             ) from e
-        except Exception as e:
-            if getattr(type(e), "__module__", "").startswith("modal"):
-                raise RuntimeError(
-                    f"Modal error: {e}. Try redeploying with the Deploy button."
-                ) from e
-            raise
+        raise
+    finally:
+        # Ensure the remote generator is closed even if the caller breaks early
+        try:
+            await gen.aclose()
+        except Exception:
+            pass
 
 
 @_modal_error_handler

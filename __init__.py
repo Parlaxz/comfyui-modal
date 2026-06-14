@@ -114,6 +114,379 @@ def _unique_path(directory: str, filename: str) -> str:
     stem, ext = os.path.splitext(filename)
     suffix = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1_000_000) % 1_000_000:06d}"
     return os.path.join(directory, f"{stem}_{suffix}{ext}")
+
+# ── MIME type to extension map for remote result materialization ──
+_MIME_EXT_MAP = {
+    "image/webp": ".webp",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+}
+
+
+def _infer_file_ext(filename: str, mime_type: str | None, file_ext: str | None) -> str:
+    if file_ext:
+        return file_ext if file_ext.startswith(".") else "." + file_ext
+    if mime_type:
+        ext = _MIME_EXT_MAP.get(mime_type.lower())
+        if ext:
+            return ext
+    _, ext = os.path.splitext(filename)
+    if ext:
+        return ext
+    return ".png"
+
+
+def select_primary_output(per_node_outputs: dict, node_id: str) -> dict | None:
+    """Deterministically select the primary/final image entry for a node.
+
+    Selection precedence:
+    1. Entry with comparison_side == "b"
+    2. Entry under b_images output key
+    3. Entry marked primary/final
+    4. Entry under images
+    5. Entry with comparison_side == "a"
+    6. First flat image as last-resort compatibility fallback
+    """
+    node_outputs = per_node_outputs.get(node_id)
+    if not node_outputs or not isinstance(node_outputs, dict):
+        return None
+
+    for entries in node_outputs.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("comparison_side") == "b":
+                return entry
+
+    b_entries = node_outputs.get("b_images")
+    if isinstance(b_entries, list) and b_entries:
+        if isinstance(b_entries[0], dict):
+            return b_entries[0]
+
+    for entries in node_outputs.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("primary"):
+                return entry
+
+    img_entries = node_outputs.get("images")
+    if isinstance(img_entries, list) and img_entries:
+        if isinstance(img_entries[0], dict):
+            return img_entries[0]
+
+    for entries in node_outputs.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("comparison_side") == "a":
+                return entry
+
+    for entries in node_outputs.values():
+        if isinstance(entries, list) and entries:
+            if isinstance(entries[0], dict):
+                return entries[0]
+
+    return None
+
+
+def _stable_output_identity(node_id: str, output_key: str, entry: dict, fallback_index: int = 0) -> tuple[str, str, str, int]:
+    raw_index = entry.get("output_index", fallback_index)
+    try:
+        output_index = int(raw_index)
+    except (TypeError, ValueError):
+        output_index = fallback_index
+    return (
+        str(node_id),
+        str(output_key or entry.get("output_key") or "images"),
+        str(entry.get("filename", "")),
+        output_index,
+    )
+
+
+def _build_native_output_descriptor(local_filename: str) -> dict:
+    return {
+        "filename": local_filename,
+        "subfolder": "",
+        "type": "output",
+    }
+
+
+def _build_materialized_output_entry(remote_entry: dict, *, node_id: str, output_key: str, local_filename: str, local_path: str, decoded_bytes: bytes, fallback_index: int = 0) -> dict:
+    inferred_extension = _infer_file_ext(
+        remote_entry.get("filename", local_filename),
+        remote_entry.get("mime_type"),
+        remote_entry.get("file_ext"),
+    )
+    return {
+        "filename": local_filename,
+        "path": local_path,
+        "subfolder": "",
+        "type": "output",
+        "node_id": str(node_id),
+        "output_key": output_key,
+        "comparison_side": remote_entry.get("comparison_side", ""),
+        "mime_type": remote_entry.get("mime_type", ""),
+        "file_ext": inferred_extension,
+        "width": remote_entry.get("width"),
+        "height": remote_entry.get("height"),
+        "format": remote_entry.get("format", ""),
+        "output_index": remote_entry.get("output_index", fallback_index),
+        "byte_count": len(decoded_bytes),
+    }
+
+
+def _select_primary_result_entry(result: dict) -> dict | None:
+    outputs = result.get("outputs", {}) if isinstance(result, dict) else {}
+    if isinstance(outputs, dict):
+        for node_id in outputs:
+            entry = select_primary_output(outputs, node_id)
+            if not isinstance(entry, dict):
+                continue
+            resolved = dict(entry)
+            resolved.setdefault("node_id", str(node_id))
+            if not resolved.get("output_key"):
+                for output_key, entries in outputs.get(node_id, {}).items():
+                    if isinstance(entries, list) and entry in entries:
+                        resolved["output_key"] = output_key
+                        break
+            resolved.setdefault("output_key", "images")
+            return resolved
+    for index, entry in enumerate(result.get("images", []) if isinstance(result, dict) else []):
+        if not isinstance(entry, dict):
+            continue
+        resolved = dict(entry)
+        resolved.setdefault("node_id", str(entry.get("node_id", "")))
+        resolved.setdefault("output_key", entry.get("output_key") or "images")
+        resolved.setdefault("output_index", entry.get("output_index", index))
+        return resolved
+    return None
+
+
+def _materialize_modal_outputs(
+    result: dict,
+    *,
+    output_dir: str,
+    prompt_id: str,
+    client_id: str,
+    send_event,
+    auto_save_local: bool = False,
+    save_folder: str = "",
+    save_metadata_sidecar: bool = True,
+    workflow_hash: str = "",
+    workflow_name: str = "",
+    seed: str = "0",
+    width: int = 0,
+    height: int = 0,
+    comfyui_root: str = "",
+) -> dict:
+    native_outputs: dict[str, dict] = {}
+    materialized_outputs: dict[str, dict] = {}
+    written_files: list[str] = []
+    save_results: list[dict] = []
+    save_warnings: list[str] = []
+    handled_output_ids: set[tuple[str, str, str, int]] = set()
+    image_count = 0
+    video_count = 0
+    output_bytes_written = 0
+
+    def _store_entry(node_id: str, output_key: str, entry: dict, fallback_index: int = 0) -> None:
+        nonlocal image_count, video_count, output_bytes_written
+        raw_bytes = base64.b64decode(entry["data"])
+        local_filename = entry.get("filename", f"output_{fallback_index}.bin")
+        local_path = _unique_path(output_dir, local_filename)
+        local_filename = os.path.basename(local_path)
+        with open(local_path, "wb") as f:
+            f.write(raw_bytes)
+        written_files.append(local_path)
+        output_bytes_written += len(raw_bytes)
+        is_video = output_key == "gifs" or (entry.get("format", "") in {"gif", "mp4", "webm"})
+        if is_video:
+            video_count += 1
+        else:
+            image_count += 1
+        native_entry = _build_native_output_descriptor(local_filename)
+        internal_entry = _build_materialized_output_entry(
+            entry,
+            node_id=str(node_id),
+            output_key=output_key,
+            local_filename=local_filename,
+            local_path=local_path,
+            decoded_bytes=raw_bytes,
+            fallback_index=fallback_index,
+        )
+        native_outputs.setdefault(str(node_id), {}).setdefault(output_key, []).append(native_entry)
+        materialized_outputs.setdefault(str(node_id), {}).setdefault(output_key, []).append(internal_entry)
+        if is_video:
+            native_outputs[str(node_id)]["animated"] = [True] * len(native_outputs[str(node_id)][output_key])
+            materialized_outputs[str(node_id)]["animated"] = [True] * len(materialized_outputs[str(node_id)][output_key])
+        handled_output_ids.add(_stable_output_identity(str(node_id), output_key, entry, fallback_index))
+        primary_flag = 1 if entry.get("comparison_side") == "b" or output_key == "b_images" else 0
+        print(
+            f"[modal-local.write] node_id={node_id} output_key={output_key} "
+            f"comparison_side={entry.get('comparison_side', '')} path={local_path} bytes={len(raw_bytes)}"
+            f"{' primary=1' if primary_flag else ''}"
+        )
+
+    structured_outputs = result.get("outputs", {}) if isinstance(result, dict) else {}
+    for node_id, node_outputs in structured_outputs.items():
+        if not isinstance(node_outputs, dict):
+            continue
+        for output_key, entries in node_outputs.items():
+            if not isinstance(entries, list):
+                continue
+            for index, entry in enumerate(entries):
+                if isinstance(entry, dict) and "data" in entry:
+                    _store_entry(str(node_id), str(output_key), entry, index)
+
+    flat_node_events: dict[str, dict[str, list]] = {}
+    for index, img in enumerate(result.get("images", []) if isinstance(result, dict) else []):
+        if not isinstance(img, dict) or "data" not in img:
+            continue
+        node_id = str(img.get("node_id", ""))
+        output_key = str(img.get("output_key") or "images")
+        if _stable_output_identity(node_id, output_key, img, index) in handled_output_ids:
+            continue
+        _store_entry(node_id, output_key, img, index)
+        flat_node_events.setdefault(node_id, {}).setdefault(output_key, []).append(
+            native_outputs[node_id][output_key][-1]
+        )
+
+    for index, vid in enumerate(result.get("videos", []) if isinstance(result, dict) else []):
+        if not isinstance(vid, dict) or "data" not in vid:
+            continue
+        node_id = str(vid.get("node_id", ""))
+        output_key = str(vid.get("output_key") or "gifs")
+        if _stable_output_identity(node_id, output_key, vid, index) in handled_output_ids:
+            continue
+        _store_entry(node_id, output_key, vid, index)
+        flat_node_events.setdefault(node_id, {}).setdefault(output_key, []).append(
+            native_outputs[node_id][output_key][-1]
+        )
+        flat_node_events[node_id]["animated"] = [True] * len(flat_node_events[node_id][output_key])
+
+    # ── Ensure standard "images" alias for nodes that have comparer keys ──
+    # rgthree Image Comparer uses a_images / b_images, but Media Assets
+    # and generic ComfyUI consumers discover images through the standard
+    # "images" output key.  When a node has b_images but no images,
+    # alias b_images → images so Media Assets can find the final image.
+    _history_outputs: dict[str, dict] = {}
+    for _nid, _noutputs in native_outputs.items():
+        _history_outputs[_nid] = dict(_noutputs)
+    for _nid, _noutputs in native_outputs.items():
+        if "images" not in _noutputs and "b_images" in _noutputs:
+            _history_outputs[_nid]["images"] = list(_noutputs["b_images"])
+            print(
+                f"[modal-local.history] node_id={_nid} "
+                f"keys={','.join(_history_outputs[_nid].keys())} final_alias=b_images"
+            )
+
+    print(
+        f"[modal-local.client] prompt_id={prompt_id} client_id={client_id} "
+        f"server_available={1 if _server else 0}"
+    )
+    for node_id, event_output in native_outputs.items():
+        send_event("executed", {
+            "node": node_id,
+            "display_node": node_id,
+            "prompt_id": prompt_id,
+            "output": event_output,
+        })
+        print(
+            f"[modal-local.executed-event] node_id={node_id} "
+            f"keys={','.join(event_output.keys())} client_id={client_id}"
+        )
+    for node_id, event_output in flat_node_events.items():
+        if node_id in native_outputs:
+            continue
+        send_event("executed", {
+            "node": node_id,
+            "display_node": node_id,
+            "prompt_id": prompt_id,
+            "output": event_output,
+        })
+        print(
+            f"[modal-local.executed-event] node_id={node_id} "
+            f"keys={','.join(event_output.keys())} client_id={client_id}"
+        )
+
+    primary_output = None
+    primary_entry = _select_primary_result_entry({"outputs": materialized_outputs, "images": []})
+    if isinstance(primary_entry, dict):
+        primary_output = {
+            "node_id": str(primary_entry.get("node_id", "")),
+            "output_key": str(primary_entry.get("output_key", "images")),
+            "comparison_side": primary_entry.get("comparison_side", ""),
+            "filename": primary_entry.get("filename", ""),
+            "path": primary_entry.get("path", ""),
+            "mime_type": primary_entry.get("mime_type", ""),
+            "file_ext": primary_entry.get("file_ext", ""),
+            "output_index": primary_entry.get("output_index", 0),
+            "byte_count": primary_entry.get("byte_count", 0),
+        }
+        print(
+            f"[modal-local.primary] prompt_id={prompt_id} node_id={primary_output['node_id']} "
+            f"output_key={primary_output['output_key']} comparison_side={primary_output['comparison_side']} "
+            f"filename={primary_output['filename']} path={primary_output['path']} bytes={primary_output['byte_count']}"
+        )
+
+    if auto_save_local and primary_output and primary_output.get("path"):
+        try:
+            with open(primary_output["path"], "rb") as f:
+                image_bytes = f.read()
+            save_result = save_output_image(
+                image_bytes,
+                output_format="original",
+                file_ext=primary_output.get("file_ext") or ".png",
+                mime_type=primary_output.get("mime_type") or "image/png",
+                quality=None,
+                webp_lossless_compression=None,
+                original_size_bytes=len(image_bytes),
+                conversion_time_ms=0,
+                save_folder=save_folder,
+                save_metadata_sidecar=save_metadata_sidecar,
+                workflow_hash=workflow_hash,
+                workflow_name=workflow_name,
+                seed=str(seed or "0"),
+                width=width,
+                height=height,
+                index=0,
+                comfyui_root=comfyui_root,
+                extra_meta={
+                    "node_id": primary_output.get("node_id", ""),
+                    "output_key": primary_output.get("output_key", ""),
+                    "comparison_side": primary_output.get("comparison_side", ""),
+                    "source_filename": primary_output.get("filename", ""),
+                },
+            )
+            save_results.append(save_result)
+            print(
+                f"[comfyui-modal.auto_save] selected_only=1 node_id={primary_output.get('node_id', '')} "
+                f"output_key={primary_output.get('output_key', '')} "
+                f"comparison_side={primary_output.get('comparison_side', '')} "
+                f"path={save_result.get('path', '')}"
+            )
+            if save_result.get("error"):
+                save_warnings.append(save_result["error"])
+        except OSError as exc:
+            save_warnings.append(str(exc))
+
+    return {
+        "outputs": native_outputs,
+        "history_outputs": _history_outputs,
+        "materialized_outputs": materialized_outputs,
+        "primary_output": primary_output,
+        "written_files": written_files,
+        "image_count": image_count,
+        "video_count": video_count,
+        "bytes_written": output_bytes_written,
+        "save_results": save_results,
+        "save_warnings": save_warnings,
+    }
+
+
 _COMFYAPP_PATH = os.path.join(_NODE_DIR, "comfyapp.py")
 _DEPLOY_STATE_FILE = os.path.join(_NODE_DIR, ".deployed_version")
 _DEPLOY_STATE_JSON_FILE = os.path.join(_NODE_DIR, ".deployed_state.json")
@@ -347,13 +720,21 @@ def _load_deploy_state() -> dict:
     return {
         "comfyapp_version": payload.get("comfyapp_version"),
         "custom_nodes_fingerprint": payload.get("custom_nodes_fingerprint"),
+        "deployed_at": payload.get("deployed_at"),
+        "deployment_command": payload.get("deployment_command"),
     }
 
 
-def _save_deploy_state(version: str | None, fingerprint: str | None) -> None:
+def _utc_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _save_deploy_state(version: str | None, fingerprint: str | None, deployed_at: str | None = None, deployment_command: str | None = None) -> None:
     payload = {
         "comfyapp_version": version,
         "custom_nodes_fingerprint": fingerprint,
+        "deployed_at": deployed_at,
+        "deployment_command": deployment_command,
     }
     with open(_DEPLOY_STATE_JSON_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
@@ -364,7 +745,13 @@ def _get_deployed_version():
 
 
 def _set_deployed_version(version: str):
-    _save_deploy_state(version, _get_deployed_custom_nodes_fingerprint())
+    existing = _read_deploy_state_details()
+    _save_deploy_state(
+        version,
+        _get_deployed_custom_nodes_fingerprint(),
+        deployed_at=existing.get("deployed_at"),
+        deployment_command=existing.get("deployment_command"),
+    )
 
 
 def _get_deployed_custom_nodes_fingerprint():
@@ -384,6 +771,8 @@ def _read_deploy_state_details() -> dict:
         "parse_error": "",
         "comfyapp_version": None,
         "custom_nodes_fingerprint": None,
+        "deployed_at": None,
+        "deployment_command": None,
     }
     if os.path.isfile(_DEPLOY_STATE_JSON_FILE):
         details["source"] = "json"
@@ -394,6 +783,8 @@ def _read_deploy_state_details() -> dict:
                 details["loaded"] = True
                 details["comfyapp_version"] = payload.get("comfyapp_version")
                 details["custom_nodes_fingerprint"] = payload.get("custom_nodes_fingerprint")
+                details["deployed_at"] = payload.get("deployed_at")
+                details["deployment_command"] = payload.get("deployment_command")
                 return details
             details["parse_error"] = "deploy_state_json_not_dict"
         except (json.JSONDecodeError, OSError) as exc:
@@ -429,10 +820,44 @@ def _build_custom_node_fingerprint_status() -> dict:
     return status
 
 
+# ── Cached deployment-state values (invalidated on explicit deployment or sync) ──
+_cached_deploy_details: dict | None = None
+_cached_fingerprint_status: dict | None = None
+_cached_comfyapp_version: str | None = None
+
+
+def _invalidate_deployment_state_cache() -> None:
+    global _cached_deploy_details, _cached_fingerprint_status, _cached_comfyapp_version
+    _cached_deploy_details = None
+    _cached_fingerprint_status = None
+    _cached_comfyapp_version = None
+
+
+def _get_deploy_details_cached() -> dict:
+    global _cached_deploy_details
+    if _cached_deploy_details is None:
+        _cached_deploy_details = _read_deploy_state_details()
+    return _cached_deploy_details
+
+
+def _get_fingerprint_status_cached() -> dict:
+    global _cached_fingerprint_status
+    if _cached_fingerprint_status is None:
+        _cached_fingerprint_status = _build_custom_node_fingerprint_status()
+    return _cached_fingerprint_status
+
+
+def _get_comfyapp_version_cached() -> str:
+    global _cached_comfyapp_version
+    if _cached_comfyapp_version is None:
+        _cached_comfyapp_version = _get_comfyapp_version()
+    return _cached_comfyapp_version
+
+
 def _build_generation_invocation_plan(gpu: str | None = None, stream: bool = True) -> dict:
-    deployed = _read_deploy_state_details()
-    fingerprint_status = _build_custom_node_fingerprint_status()
-    current_version = _get_comfyapp_version()
+    deployed = _get_deploy_details_cached()
+    fingerprint_status = _get_fingerprint_status_cached()
+    current_version = _get_comfyapp_version_cached()
     deployed_version = deployed.get("comfyapp_version") or ""
     deployed_fingerprint = deployed.get("custom_nodes_fingerprint")
     current_fingerprint = fingerprint_status.get("fingerprint")
@@ -572,11 +997,13 @@ def _workspace_manifest() -> dict:
     return _model_manifest.load_master_manifest(_MODEL_MANIFEST_FILE)
 
 
-def _save_workspace_deploy_state(workspace_id: str, version: str | None, fingerprint: str | None) -> None:
+def _save_workspace_deploy_state(workspace_id: str, version: str | None, fingerprint: str | None, deployed_at: str | None = None, deployment_command: str | None = None) -> None:
     registry = _workspace_registry()
     registry.setdefault("deploy_state_by_workspace", {})[workspace_id] = {
         "comfyapp_version": version,
         "custom_nodes_fingerprint": fingerprint,
+        "deployed_at": deployed_at,
+        "deployment_command": deployment_command,
     }
     _workspace_store.save_workspace_registry(_WORKSPACES_FILE, registry)
 
@@ -587,6 +1014,23 @@ def _load_workspace_deploy_state(workspace_id: str) -> dict:
     if deploy_state:
         return deploy_state
     return _load_deploy_state()
+
+
+def _record_manual_deploy_state(workspace_id: str | None = None, deployment_command: str = "") -> dict:
+    version = _get_comfyapp_version()
+    fingerprint = _build_custom_node_fingerprint_status().get("fingerprint")
+    deployed_at = _utc_now_iso()
+    payload = {
+        "comfyapp_version": version,
+        "custom_nodes_fingerprint": fingerprint,
+        "deployed_at": deployed_at,
+        "deployment_command": deployment_command,
+    }
+    if workspace_id:
+        _save_workspace_deploy_state(workspace_id, version, fingerprint, deployed_at=deployed_at, deployment_command=deployment_command)
+    else:
+        _save_deploy_state(version, fingerprint, deployed_at=deployed_at, deployment_command=deployment_command)
+    return payload
 
 
 def _run_deploy_background(workspace: dict, custom_nodes_fingerprint: str | None = None):
@@ -644,7 +1088,13 @@ def _run_deploy_background(workspace: dict, custom_nodes_fingerprint: str | None
 
         if returncode == 0:
             version = _get_comfyapp_version()
-            _save_workspace_deploy_state(workspace["id"], version, custom_nodes_fingerprint)
+            _save_workspace_deploy_state(
+                workspace["id"],
+                version,
+                custom_nodes_fingerprint,
+                deployed_at=_utc_now_iso(),
+                deployment_command=f'"{modal_cmd}" deploy "{_COMFYAPP_PATH}"',
+            )
             _deploy_status = {"state": "ready", "message": f"Deployed {workspace['label']} v{version}"}
             print(f"[comfyui-modal] Deploy succeeded ({workspace['label']} v{version})")
             if _modal_available:
@@ -1009,6 +1459,13 @@ async def _process_queue():
         item, item_id = await _queue.get()
         try:
             await _execute_job(item, item_id)
+        except asyncio.CancelledError:
+            _queue.task_done()
+            raise
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            print("[comfyui-modal] Queue worker survived job exception, continuing")
         finally:
             _queue.task_done()
 
@@ -1080,6 +1537,34 @@ def _collect_input_images(workflow: dict) -> dict:
 
 _ACTIVE_NEXT_PROFILE_TTL_S = int(os.environ.get("COMFYMODAL_ACTIVE_NEXT_PROFILE_TTL_S", "3600"))
 
+_last_written_stable_profile_key: str | None = None
+
+
+def _compute_stable_warmup_profile_key(warmup_profile: dict, model_stack: dict) -> str:
+    """Return a canonical stable key from only restore-relevant stacks.
+    
+    This excludes UUIDs, timestamps, workflow_hash, output nodes, and
+    Production-mode settings so identical model stacks always produce
+    the same key regardless of workflow display state.
+    """
+    stable = {
+        "mode": warmup_profile.get("mode", ""),
+    }
+    if stable["mode"] == "checkpoint":
+        stable["checkpoint"] = warmup_profile.get("checkpoint", "")
+    elif stable["mode"] == "split":
+        stack = dict(model_stack or {})
+        stable["unet"] = stack.get("unet", "")
+        stable["vae"] = stack.get("vae", "")
+        stable["clip1"] = stack.get("clip1", "")
+        stable["clip2"] = stack.get("clip2", "")
+        stable["clip_type"] = stack.get("clip_type", "")
+    stable["disable_warmup"] = warmup_profile.get("disable_warmup", False)
+    # Sort keys for deterministic JSON
+    return hashlib.sha256(
+        json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
 
 def _build_next_warmup_activation(workflow: dict, workflow_hash: str) -> dict:
     stack = extract_warmup_stack(workflow) if isinstance(workflow, dict) else {}
@@ -1101,6 +1586,7 @@ def _build_next_warmup_activation(workflow: dict, workflow_hash: str) -> dict:
 
 
 async def _execute_job(item: tuple, item_id: int):
+    global _last_written_stable_profile_key
     number, prompt_id, workflow, extra_data, _, _ = item
     execution_workflow = extra_data.get("execution_workflow") or workflow
     sid = extra_data.get("client_id", "")
@@ -1116,6 +1602,7 @@ async def _execute_job(item: tuple, item_id: int):
     _send(sid, "execution_cached", {"nodes": [], "prompt_id": prompt_id})
 
     success = False
+    finalized = False
     outputs = {}
     prompt_hash = extra_data.get("workflow_hash", "")
     prompt_summary = extra_data.get("prompt_summary", {})
@@ -1185,20 +1672,36 @@ async def _execute_job(item: tuple, item_id: int):
         _active_next_payload_bytes = 0
         _active_next_status = "skipped"
         _active_next_changed = False
+        _active_next_remote_call = 0
         if not os.environ.get("DISABLE_ACTIVE_NEXT_WRITE"):
             activation_payload = _build_next_warmup_activation(execution_workflow, prompt_hash)
             _active_next_payload_bytes = len(json.dumps(activation_payload, separators=(",", ":")))
-            try:
-                activation_result = await set_active_warmup_profile(activation_payload)
-                _active_next_status = activation_result.get("status", "written")
-                _active_next_changed = activation_result.get("changed", True)
+            # Compute stable profile key from only restore-relevant fields
+            _warmup_profile = activation_payload.get("warmup_profile", {})
+            _model_stack = activation_payload.get("model_stack", {})
+            _stable_key = _compute_stable_warmup_profile_key(_warmup_profile, _model_stack)
+            if _last_written_stable_profile_key == _stable_key:
+                _active_next_status = "unchanged"
                 print(
                     f"[comfyui-modal.profile] stage=active_profile_write prompt_id={prompt_id[:8]} "
-                    f"status={_active_next_status} changed={_active_next_changed} bytes={_active_next_payload_bytes}"
+                    f"decision=unchanged profile_key={_stable_key[:12]} remote_call=0"
                 )
-            except Exception as exc:
-                _active_next_status = "error"
-                print(f"[comfyui-modal] active profile write failed: {exc}")
+            else:
+                _active_next_remote_call = 1
+                try:
+                    activation_result = await set_active_warmup_profile(activation_payload)
+                    _active_next_status = activation_result.get("status", "written")
+                    _active_next_changed = activation_result.get("changed", True)
+                    if _active_next_status not in ("error",):
+                        _last_written_stable_profile_key = _stable_key
+                    print(
+                        f"[comfyui-modal.profile] stage=active_profile_write prompt_id={prompt_id[:8]} "
+                        f"decision=changed profile_key={_stable_key[:12]} remote_call=1 "
+                        f"status={_active_next_status} changed={_active_next_changed} bytes={_active_next_payload_bytes}"
+                    )
+                except Exception as exc:
+                    _active_next_status = "error"
+                    print(f"[comfyui-modal] active profile write failed: {exc}")
         else:
             print(f"[comfyui-modal] active_next_write SKIPPED (DISABLE_ACTIVE_NEXT_WRITE=1)")
 
@@ -1275,6 +1778,13 @@ async def _execute_job(item: tuple, item_id: int):
         if _modal_result is None:
             raise RuntimeError("run_prompt_stream ended without result")
         result = _modal_result
+        # ── Diagnostics: result received ──
+        _flat_imgs = result.get("images", []) if isinstance(result, dict) else []
+        _outs = result.get("outputs", {}) if isinstance(result, dict) else {}
+        print(
+            f"[modal-local.receive-final] result_type={type(result).__name__} "
+            f"image_count={len(_flat_imgs)} output_nodes={len(_outs)}"
+        )
         trace.mark("t9_modal_return")
         trace.mark("t9b_local_result_received")
         trace.mark("client_remote_result_received", trace.get("t9b_local_result_received") or time.time())
@@ -1339,247 +1849,75 @@ async def _execute_job(item: tuple, item_id: int):
     _last_successful_model_stack.clear()
     _last_successful_model_stack.update(extra_data.get("model_stack", {}))
 
+    # ── Post-materialization block: guarded so _finish_job always runs ──
+
     output_dir = os.path.join(_COMFYUI_ROOT, "output")
     os.makedirs(output_dir, exist_ok=True)
     trace.mark("t9e_local_materialize_start")
     materialize_started = time.time()
-    _decode_started = False
-    _write_started = False
-    _notify_started = False
-    output_bytes_written = 0
-    output_image_count = 0
-    output_video_count = 0
-    handled_fnames: set[str] = set()
-
-    # ── Phase 1: Structured per-node outputs ──────────────────────────
-    # Preserves the original output-key structure (e.g. "a_images", "b_images")
-    # so the frontend receives the exact keys rgthree and other nodes expect.
-    for node_id, node_outputs in result.get("outputs", {}).items():
-        event_output: dict = {}
-        for output_key, entries in node_outputs.items():
-            local_entries = []
-            is_video_key = output_key == "gifs"
-            for entry in entries:
-                if not _decode_started:
-                    trace.mark("client_result_decode_start")
-                    _decode_started = True
-                img_bytes = base64.b64decode(entry["data"])
-                trace.mark("client_result_decode_done")
-                output_bytes_written += len(img_bytes)
-                if is_video_key:
-                    output_video_count += 1
-                else:
-                    output_image_count += 1
-                local_filename = entry["filename"]
-                local_path = _unique_path(output_dir, local_filename)
-                local_filename = os.path.basename(local_path)
-                if not _write_started:
-                    trace.mark("client_file_write_start")
-                    _write_started = True
-                with open(local_path, "wb") as f:
-                    f.write(img_bytes)
-                trace.mark("client_file_write_done")
-                local_entry = {"filename": local_filename, "subfolder": "", "type": "output"}
-                local_entries.append(local_entry)
-                handled_fnames.add(entry["filename"])
-            if local_entries:
-                event_output[output_key] = local_entries
-                if is_video_key:
-                    event_output.setdefault("animated", [True] * len(local_entries))
-        if not event_output:
-            continue
-        outputs[node_id] = event_output
-        if not _notify_started:
-            trace.mark("client_comfy_notify_start")
-            _notify_started = True
-        _send(sid, "executed", {
-            "node": node_id,
-            "display_node": node_id,
-            "prompt_id": prompt_id,
-            "output": event_output,
-        })
-
-    # ── Phase 2: Flat images (backward compat / directory-scan fallback) ─
-    for img in result.get("images", []):
-        if img["filename"] in handled_fnames:
-            continue
-        if not _decode_started:
-            trace.mark("client_result_decode_start")
-            _decode_started = True
-        img_bytes = base64.b64decode(img["data"])
-        trace.mark("client_result_decode_done")
-        output_bytes_written += len(img_bytes)
-        output_image_count += 1
-        local_filename = img["filename"]
-        local_path = _unique_path(output_dir, local_filename)
-        local_filename = os.path.basename(local_path)
-        if not _write_started:
-            trace.mark("client_file_write_start")
-            _write_started = True
-        with open(local_path, "wb") as f:
-            f.write(img_bytes)
-        trace.mark("client_file_write_done")
-        local_entry = {"filename": local_filename, "subfolder": "", "type": "output"}
-        node_id = img["node_id"]
-        if node_id not in outputs:
-            outputs[node_id] = {"images": []}
-        outputs[node_id].setdefault("images", []).append(local_entry)
-        if not _notify_started:
-            trace.mark("client_comfy_notify_start")
-            _notify_started = True
-        _send(sid, "executed", {
-            "node": node_id,
-            "display_node": node_id,
-            "prompt_id": prompt_id,
-            "output": {"images": [local_entry]},
-        })
-
-    # ── Phase 3: Flat videos ──────────────────────────────────────────
-    for vid in result.get("videos", []):
-        if not _decode_started:
-            trace.mark("client_result_decode_start")
-            _decode_started = True
-        vid_bytes = base64.b64decode(vid["data"])
-        trace.mark("client_result_decode_done")
-        output_bytes_written += len(vid_bytes)
-        output_video_count += 1
-        local_filename = vid["filename"]
-        local_path = _unique_path(output_dir, local_filename)
-        local_filename = os.path.basename(local_path)
-        if not _write_started:
-            trace.mark("client_file_write_start")
-            _write_started = True
-        with open(local_path, "wb") as f:
-            f.write(vid_bytes)
-        trace.mark("client_file_write_done")
-        local_entry = {"filename": local_filename, "subfolder": "", "type": "output"}
-        node_id = vid["node_id"]
-        if node_id not in outputs:
-            outputs[node_id] = {"images": [], "animated": (True,)}
-        outputs[node_id].setdefault("images", []).append(local_entry)
-        outputs[node_id]["animated"] = (True,)
-        if not _notify_started:
-            trace.mark("client_comfy_notify_start")
-            _notify_started = True
-        _send(sid, "executed", {
-            "node": node_id,
-            "display_node": node_id,
-            "prompt_id": prompt_id,
-            "output": {"images": [local_entry], "animated": [True]},
-        })
-
+    trace.mark("client_result_decode_start", materialize_started)
+    trace.mark("client_file_write_start", materialize_started)
+    trace.mark("client_comfy_notify_start", materialize_started)
+    _mo = extra_data.get("modal_options") if isinstance(extra_data, dict) else None
+    _settings = _load_modal_settings()
+    delivery = _materialize_modal_outputs(
+        result,
+        output_dir=output_dir,
+        prompt_id=prompt_id,
+        client_id=sid,
+        send_event=lambda event, payload: _send(sid, event, payload),
+        auto_save_local=bool((_mo or {}).get("auto_save_local", False)),
+        save_folder=(_mo or {}).get("save_folder") or _settings.get("save_folder", ""),
+        save_metadata_sidecar=bool((_mo or {}).get("save_metadata_sidecar", _settings.get("save_metadata_sidecar", True))),
+        workflow_hash=prompt_hash,
+        workflow_name="",
+        seed=str(prompt_summary.get("seed", "0")),
+        width=prompt_summary.get("width", 0),
+        height=prompt_summary.get("height", 0),
+        comfyui_root=_COMFYUI_ROOT,
+    )
+    outputs.clear()
+    outputs.update(delivery.get("history_outputs", delivery["outputs"]))
+    output_bytes_written = delivery["bytes_written"]
+    output_image_count = delivery["image_count"]
+    output_video_count = delivery["video_count"]
     materialize_ms = round((time.time() - materialize_started) * 1000, 1)
-    if not _decode_started:
-        trace.mark("client_result_decode_start", materialize_started)
-        trace.mark("client_result_decode_done", materialize_started)
-    if not _write_started:
-        trace.mark("client_file_write_start", materialize_started)
-        trace.mark("client_file_write_done", materialize_started)
+    trace.mark("client_result_decode_done")
+    trace.mark("client_file_write_done")
+    trace.mark("client_comfy_notify_done")
     print(
         f"[comfyui-modal.profile] stage=output_materialize prompt_id={prompt_id[:8]} "
         f"duration_ms={materialize_ms} images={output_image_count} videos={output_video_count} bytes={output_bytes_written}"
     )
+    print(
+        f"[modal-local.materialize-end] prompt_id={prompt_id[:8]} "
+        f"written={output_image_count + output_video_count}"
+    )
+    _local_primary_output = delivery.get("primary_output")
+    if isinstance(result, dict) and _local_primary_output:
+        result["_local_primary_output"] = dict(_local_primary_output)
+        result["primary_output"] = dict(_local_primary_output)
 
-    # ── Auto-save ────────────────────────────────────────────────────
     trace.mark("t10b_local_save_start")
-    _mo = extra_data.get("modal_options") if isinstance(extra_data, dict) else None
-    _auto_save_enabled = bool((_mo or {}).get("auto_save_local", False))
-    _save_results: list[dict] = []
-    _save_warnings: list[str] = []
-    if _auto_save_enabled:
-        _settings = _load_modal_settings()
-        _save_folder = (_mo or {}).get("save_folder") or _settings.get("save_folder", "")
-        _save_sidecar = bool((_mo or {}).get("save_metadata_sidecar", _settings.get("save_metadata_sidecar", True)))
-        _conv_meta_list = result.get("_conversion_meta", []) if isinstance(result, dict) else []
-        _conv_by_nodefile: dict[tuple[str, str], dict] = {}
-        for cm in _conv_meta_list:
-            _conv_by_nodefile[(cm.get("node_id", ""), cm.get("filename", ""))] = cm
-
-        _seed = str(prompt_summary.get("seed", "0"))
-        _w = prompt_summary.get("width", 0)
-        _h = prompt_summary.get("height", 0)
-        _autosave_idx = 0
-        _saved_count = 0
-
-        # Collect all output entries from outputs dict
-        for _node_id, _node_out in outputs.items():
-            if not isinstance(_node_out, dict):
-                continue
-            for _out_key, _entries in _node_out.items():
-                if not isinstance(_entries, list):
-                    continue
-                if _out_key == "animated":
-                    continue
-                for _entry in _entries:
-                    if not isinstance(_entry, dict):
-                        continue
-                    _fname = _entry.get("filename", "")
-                    _fpath = os.path.join(output_dir, _fname)
-                    if not os.path.isfile(_fpath):
-                        continue
-                    try:
-                        _img_bytes = open(_fpath, "rb").read()
-                    except OSError as exc:
-                        _save_warnings.append(f"cannot read {_fpath}: {exc}")
-                        continue
-
-                    # Find matching conversion metadata
-                    _conv_meta = _conv_by_nodefile.get((_node_id, _fname), {})
-                    _fmt = _conv_meta.get("output_format", (_mo or {}).get("output_format", "original"))
-                    _ext = _conv_meta.get("file_ext", os.path.splitext(_fname)[1] or ".png")
-                    _mime = _conv_meta.get("mime_type", "image/png")
-                    _orig_size = _conv_meta.get("original_size_bytes", len(_img_bytes))
-                    _conv_time = _conv_meta.get("conversion_time_ms", 0)
-                    _qp = _conv_meta.get("quality")
-                    _wlc = _conv_meta.get("webp_lossless_compression")
-
-                    _save_result = save_output_image(
-                        _img_bytes,
-                        output_format=_fmt,
-                        file_ext=_ext,
-                        mime_type=_mime,
-                        quality=_qp,
-                        webp_lossless_compression=_wlc,
-                        original_size_bytes=_orig_size,
-                        conversion_time_ms=_conv_time,
-                        save_folder=_save_folder,
-                        save_metadata_sidecar=_save_sidecar,
-                        workflow_hash=prompt_hash,
-                        workflow_name="",
-                        seed=_seed,
-                        width=_w,
-                        height=_h,
-                        index=_autosave_idx,
-                        comfyui_root=_COMFYUI_ROOT,
-                    )
-                    _autosave_idx += 1
-                    _save_results.append(_save_result)
-                    if _save_result.get("saved"):
-                        _saved_count += 1
-                        print(
-                            f"[comfyui-modal.auto_save] saved: {_save_result.get('path', '')} "
-                            f"size={len(_img_bytes)}B"
-                        )
-                    if _save_result.get("error"):
-                        _save_warnings.append(_save_result["error"])
-
-        if _save_warnings:
-            print(f"[comfyui-modal.auto_save] warnings: {'; '.join(_save_warnings)}")
-        if _saved_count:
-            _send(sid, "modal_status", {
-                "prompt_id": prompt_id,
-                "message": f"Auto-saved {_saved_count} file(s)",
-                "phase": "auto_save",
-                "save_results": _save_results,
-                "save_warnings": _save_warnings,
-            })
-        elif _save_warnings:
-            _send(sid, "modal_status", {
-                "prompt_id": prompt_id,
-                "message": f"Auto-save warning: {'; '.join(_save_warnings)}",
-                "phase": "auto_save",
-                "save_warnings": _save_warnings,
-            })
+    _save_results = delivery.get("save_results", [])
+    _save_warnings = delivery.get("save_warnings", [])
+    if _save_warnings:
+        print(f"[comfyui-modal.auto_save] warnings: {'; '.join(_save_warnings)}")
+    if _save_results:
+        _send(sid, "modal_status", {
+            "prompt_id": prompt_id,
+            "message": f"Auto-saved {len(_save_results)} file(s)",
+            "phase": "auto_save",
+            "save_results": _save_results,
+            "save_warnings": _save_warnings,
+        })
+    elif _save_warnings:
+        _send(sid, "modal_status", {
+            "prompt_id": prompt_id,
+            "message": f"Auto-save warning: {'; '.join(_save_warnings)}",
+            "phase": "auto_save",
+            "save_warnings": _save_warnings,
+        })
 
     trace.mark("t10c_local_save_end")
     trace.mark("t10_local_materialized")
@@ -1627,21 +1965,33 @@ async def _execute_job(item: tuple, item_id: int):
     print(trace.log_line())
 
     trace.mark("t10d_local_response_sent")
-    if not _notify_started:
-        trace.mark("client_comfy_notify_start")
+    trace.mark("client_comfy_notify_start")
     trace.mark("client_comfy_notify_done")
-    _send(sid, "executing", {"node": None, "display_node": None, "prompt_id": prompt_id})
-    _send(sid, "modal_status", {"prompt_id": prompt_id, "message": None, "phase": "done"})
-    _send(sid, "execution_success", {"prompt_id": prompt_id, "trace": result.get("trace")})
-    _meta = {
-        "model_stack": model_stack,
-        "prompt_summary": prompt_summary,
-        "trace": result.get("trace"),
-        "workflow_hash": prompt_hash,
-        "restore_timing": result.get("_restore_timing", {}),
-        "scheduler_trace": result.get("scheduler_trace"),
-    }
-    _finish_job(task_key, prompt_id, outputs, success=True, meta=_meta)
+    try:
+        _send(sid, "executing", {"node": None, "display_node": None, "prompt_id": prompt_id})
+        _send(sid, "modal_status", {"prompt_id": prompt_id, "message": None, "phase": "done"})
+        _send(sid, "execution_success", {"prompt_id": prompt_id, "trace": result.get("trace")})
+        _meta = {
+            "model_stack": model_stack,
+            "prompt_summary": prompt_summary,
+            "trace": result.get("trace"),
+            "workflow_hash": prompt_hash,
+            "restore_timing": result.get("_restore_timing", {}),
+            "scheduler_trace": result.get("scheduler_trace"),
+            "primary_output": result.get("primary_output") or result.get("_local_primary_output"),
+        }
+        _finish_job(task_key, prompt_id, outputs, success=True, meta=_meta)
+        finalized = True
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        if not finalized and task_key != 0:
+            try:
+                _finish_job(task_key, prompt_id, outputs, success=False,
+                          meta={"error": "completion notification exception"})
+            except Exception as _fe:
+                print(f"[comfyui-modal] _finish_job failed during error recovery: {_fe}")
+        raise
 
     # ── Direct route: store completed result for non-polling retrieval ──
     if _result_route_mode == "direct" and isinstance(result, dict):
@@ -1650,6 +2000,7 @@ async def _execute_job(item: tuple, item_id: int):
                 "result": result,
                 "trace": result.get("trace", {}),
                 "outputs": outputs,
+                "primary_output": result.get("primary_output") or result.get("_local_primary_output"),
                 "materialize_ms": materialize_ms,
                 "completed_at": time.time(),
                 "direct_route": True,
@@ -2327,10 +2678,11 @@ if _server:
                 "modal_options": modal_options,
                 "scheduler_test": scheduler_test,
                 "result_route": _result_route_mode,
-                "execution_workflow": execution_workflow,
+                "execution_workflow": copy.deepcopy(execution_workflow),
                 "production_report": production_report,
             }
-            item = (_item_counter, prompt_id, execution_workflow, extra_data, list(execution_workflow.keys()), {})
+            _queue_execution_workflow = copy.deepcopy(execution_workflow)
+            item = (_item_counter, prompt_id, _queue_execution_workflow, extra_data, list(_queue_execution_workflow.keys()), {})
             print(f"[predispatch] prompt_bytes={body_bytes}")
         finally:
             if _lock_trace.get("acquired"):
@@ -2491,10 +2843,19 @@ if _server:
     @_server.routes.get("/comfymodal/deploy/status")
     async def modal_deploy_status(request: web.Request) -> web.Response:
         resp = dict(_deploy_status)
+        resp["deploy_state"] = _read_deploy_state_details()
         resp.setdefault("has_log", os.path.isfile(_DEPLOY_LOG_FILE))
         if resp.get("state") != "error":
             resp.setdefault("details", "")
         return web.json_response(resp)
+
+    @_server.routes.post("/comfymodal/deploy/state/record")
+    async def modal_record_deploy_state(request: web.Request) -> web.Response:
+        body = await request.json()
+        workspace_id = body.get("workspace_id")
+        deployment_command = str(body.get("deployment_command", "")).strip()
+        payload = _record_manual_deploy_state(workspace_id=workspace_id, deployment_command=deployment_command)
+        return web.json_response({"status": "ok", **payload})
 
     @_server.routes.get("/comfymodal/deploy/log")
     async def modal_deploy_log(request: web.Request) -> web.Response:
@@ -3286,30 +3647,11 @@ if _server:
             mime_type = "image/png"
             file_ext = ".png"
 
-            outputs = _modal_result.get("outputs", {})
-            for node_id, node_outputs in outputs.items():
-                for out_key, entries in node_outputs.items():
-                    if not isinstance(entries, list):
-                        continue
-                    for entry_item in entries:
-                        if isinstance(entry_item, dict) and "data" in entry_item:
-                            image_data_b64 = entry_item["data"]
-                            mime_type = entry_item.get("mime_type", "image/png")
-                            file_ext = entry_item.get("file_ext", ".png")
-                            break
-                    if image_data_b64:
-                        break
-                if image_data_b64:
-                    break
-
-            if not image_data_b64:
-                # Fall back to flat images list
-                for img in _modal_result.get("images", []):
-                    image_data_b64 = img.get("data")
-                    if image_data_b64:
-                        mime_type = img.get("mime_type", "image/png")
-                        file_ext = img.get("file_ext", ".png")
-                        break
+            primary_entry = _select_primary_result_entry(_modal_result)
+            if primary_entry:
+                image_data_b64 = primary_entry.get("data")
+                mime_type = primary_entry.get("mime_type", "image/png")
+                file_ext = primary_entry.get("file_ext", ".png")
 
             if not image_data_b64:
                 raise RuntimeError("No image data in Modal result")
@@ -3325,6 +3667,15 @@ if _server:
                     "file_ext": file_ext,
                     "wall_time_sec": wall_time_sec,
                     "status": "success",
+                    "primary_output": {
+                        "node_id": str(primary_entry.get("node_id", "")) if primary_entry else "",
+                        "output_key": str(primary_entry.get("output_key", "images")) if primary_entry else "images",
+                        "comparison_side": primary_entry.get("comparison_side", "") if primary_entry else "",
+                        "filename": primary_entry.get("filename", "") if primary_entry else "",
+                        "path": primary_entry.get("path", "") if primary_entry else "",
+                        "mime_type": mime_type,
+                        "file_ext": file_ext,
+                    },
                 },
                 image_bytes=img_bytes,
             )
@@ -3370,6 +3721,10 @@ if _server:
                             "comparison_id": comparison_id,
                             "profile_id": pid,
                             "comparison": True,
+                            "node_id": str(primary_entry.get("node_id", "")) if primary_entry else "",
+                            "output_key": str(primary_entry.get("output_key", "images")) if primary_entry else "images",
+                            "comparison_side": primary_entry.get("comparison_side", "") if primary_entry else "",
+                            "source_filename": primary_entry.get("filename", "") if primary_entry else "",
                         },
                     )
                     if saver_result.get("error"):

@@ -66,10 +66,10 @@ class ModalProductionUiAstTests(unittest.TestCase):
         self.assertIn("comfymodal_production_output", source)
         self.assertIn("comfymodal_bypass_in_production", source)
 
-    def test_node_badges(self):
+    def test_badge_integration_removed(self):
         source = UI_NODE_PATH.read_text(encoding="utf-8")
-        self.assertIn("PROD OUT", source)
-        self.assertIn("PROD BYPASS", source)
+        self.assertNotIn("node.badges.push", source)
+        self.assertNotIn("LGraphBadge", source)
 
     def test_production_payload_keys(self):
         source = UI_NODE_PATH.read_text(encoding="utf-8")
@@ -88,15 +88,23 @@ class ModalProductionUiAstTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertIn(key, source)
 
-    def test_graph_to_prompt_patch(self):
+    def test_graph_to_prompt_patch_removed(self):
         source = UI_NODE_PATH.read_text(encoding="utf-8")
-        self.assertIn("graphToPrompt", source)
-        self.assertIn("app.graphToPrompt =", source)
+        self.assertNotIn("app.graphToPrompt =", source)
+        self.assertNotIn("node.mode =", source)
+
+    def test_output_save_folder_defaults_are_normalized(self):
+        node_source = UI_NODE_PATH.read_text(encoding="utf-8")
+        settings_source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("ComfyUI/output/modal/", node_source)
+        self.assertNotIn("ComfyUI/output/modal/", settings_source)
+        self.assertIn("output/modal", node_source)
+        self.assertIn("output/modal", settings_source)
 
     def test_production_bypass_error_message(self):
         source = UI_NODE_PATH.read_text(encoding="utf-8")
-        self.assertIn("Production bypass failed for node", source)
-        self.assertIn("ComfyUI could not serialize this node as a native bypass", source)
+        self.assertNotIn("Production bypass failed for node", source)
+        self.assertNotIn("ComfyUI could not serialize this node as a native bypass", source)
 
 
 if __name__ == "__main__":

@@ -33,7 +33,8 @@ class ProductionPhase2InitPyAstTests(unittest.TestCase):
     def test_modal_prompt_stores_production_report_in_extra_data(self):
         source = INIT_PATH.read_text(encoding="utf-8")
         self.assertIn("production_report", source)
-        self.assertIn('"execution_workflow": execution_workflow', source)
+        self.assertIn("execution_workflow", source)
+        self.assertIn("copy.deepcopy", source)
 
     def test_execute_job_uses_execution_workflow(self):
         source = INIT_PATH.read_text(encoding="utf-8")

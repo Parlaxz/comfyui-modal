@@ -276,10 +276,10 @@ class ExperimentPresetTests(unittest.TestCase):
 
 
 class VersionBumpTest(unittest.TestCase):
-    """Test that COMFYAPP_VERSION is 2.16.10."""
+    """Test that COMFYAPP_VERSION is 2.16.13."""
 
-    def test_version_is_2_16_10(self):
-        """COMFYAPP_VERSION is 2.16.10 (bumped per policy)."""
+    def test_version_is_2_16_14(self):
+        """COMFYAPP_VERSION is 2.16.14 (bumped per policy)."""
         comfyapp_path = REPO_ROOT / "comfyapp.py"
         if not comfyapp_path.is_file():
             self.skipTest("comfyapp.py not found")
@@ -287,7 +287,7 @@ class VersionBumpTest(unittest.TestCase):
         import re
         match = re.search(r'^COMFYAPP_VERSION\s*=\s*["\']([^"\']+)["\']', source, re.MULTILINE)
         self.assertIsNotNone(match, "COMFYAPP_VERSION not found in comfyapp.py")
-        self.assertEqual(match.group(1), "2.16.11")
+        self.assertEqual(match.group(1), "2.16.17")
 
 
 class ImageBaseEnvTest(unittest.TestCase):
@@ -454,8 +454,8 @@ class DeployFingerprintExistingBehaviorTests(unittest.TestCase):
         source = comfyapp_path.read_text(encoding="utf-8")
         match = re.search(r'^COMFYAPP_VERSION\s*=\s*["\']([^"\']+)["\']', source, re.MULTILINE)
         self.assertIsNotNone(match)
-        self.assertEqual(match.group(1), "2.16.11",
-                         "Version must be 2.16.11 per policy: bump every comfyapp.py change")
+        self.assertEqual(match.group(1), "2.16.17",
+                         "Version must be 2.16.17 per policy: bump every comfyapp.py change")
 
 
 class DeployFingerprintSourceCountTests(unittest.TestCase):
@@ -522,7 +522,7 @@ KNOWN_GOOD_LOADING_CONTROL = {
     "safetensors_read_mode": "normal",
     "fuse_read_governor": False,
     "defer_vae_actual_load_during_rbg_unet": True,
-    "comfyapp_version": "2.16.11",
+    "comfyapp_version": "2.16.13",
 }
 
 
@@ -631,12 +631,12 @@ class RollbackControlDefaultTests(unittest.TestCase):
         self.assertIn('"PROMPT_ASYNC_ACTUAL_LOAD": "1"', source)
         self.assertIn('"PROMPT_ASYNC_ACTUAL_LOAD_UNET": "1"', source)
 
-    def test_version_is_2_16_11(self):
+    def test_version_is_2_16_14(self):
         source = self._read_module_source()
         import re
         match = re.search(r'^COMFYAPP_VERSION\s*=\s*["\']([^"\']+)["\']', source, re.MULTILINE)
         self.assertIsNotNone(match)
-        self.assertEqual(match.group(1), "2.16.11")
+        self.assertEqual(match.group(1), "2.16.17")
 
     def test_known_good_control_config_is_consistent(self):
         """Validate KNOWN_GOOD_LOADING_CONTROL dict against actual source."""

@@ -2,7 +2,7 @@
   "auto_save_local": true,
   "output_format": "webp_lossy",
   "quality": 40,
-  "save_folder": "ComfyUI/output/modal/",
+  "save_folder": "output/modal",
   "save_metadata_sidecar": true,
   "webp_lossless_compression": "balanced"
 }
