@@ -232,35 +232,40 @@ def build_production_topology_hash(
 
 
 def compile_production_workflow(
-    workflow: dict, production: dict, *, allow_direct_output_rewrite: bool, allow_rgthree_comparer_rewrite: bool = True
+    workflow: dict, production: dict, *, allow_direct_output_rewrite: bool, allow_rgthree_comparer_rewrite: bool = True, stable: bool = False
 ) -> tuple[dict, dict]:
     original_count = len(workflow)
     nid_map = _build_normalized_id_map(workflow)
     output_ids = production.get("output_node_ids", [])
     bypass_ids = set(production.get("bypass_node_ids", []))
 
-    for oid in output_ids:
-        if oid not in nid_map:
-            available = sorted(nid_map.keys())[:20]
-            raise ValueError(
-                f"output_node_id {oid!r} not found in workflow. "
-                f"Available node IDs (first 20): {available}"
-            )
-    for oid in output_ids:
-        if oid in bypass_ids:
-            raise ValueError(f"output_node_id {oid!r} is also marked as bypassed")
-    for bid in bypass_ids:
-        if bid in nid_map:
-            original_key = nid_map[bid]
-            node = workflow[original_key]
-            ct = node.get("class_type", "?")
-            raise ValueError(
-                f"Production bypass failed for node {bid} ({ct}). "
-                "ComfyUI could not serialize this node as a native bypass."
-            )
+    if not stable:
+        for oid in output_ids:
+            if oid not in nid_map:
+                available = sorted(nid_map.keys())[:20]
+                raise ValueError(
+                    f"output_node_id {oid!r} not found in workflow. "
+                    f"Available node IDs (first 20): {available}"
+                )
+        for oid in output_ids:
+            if oid in bypass_ids:
+                raise ValueError(f"output_node_id {oid!r} is also marked as bypassed")
+        for bid in bypass_ids:
+            if bid in nid_map:
+                original_key = nid_map[bid]
+                node = workflow[original_key]
+                ct = node.get("class_type", "?")
+                raise ValueError(
+                    f"Production bypass failed for node {bid} ({ct}). "
+                    "ComfyUI could not serialize this node as a native bypass."
+                )
 
-    reachable = _collect_reachable(output_ids, workflow, nid_map)
-    kept_ids = [nid for nid in nid_map if nid in reachable]
+    if stable:
+        reachable = set(nid_map.keys())
+        kept_ids = list(reachable)
+    else:
+        reachable = _collect_reachable(output_ids, workflow, nid_map)
+        kept_ids = [nid for nid in nid_map if nid in reachable]
 
     topology_hash = build_production_topology_hash(
         workflow, production, allow_direct_output_rewrite=allow_direct_output_rewrite

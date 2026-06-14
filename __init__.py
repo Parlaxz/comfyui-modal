@@ -1595,7 +1595,7 @@ def _compute_stable_warmup_profile_key(warmup_profile: dict) -> str:
     ).hexdigest()
 
 
-def _build_next_warmup_activation(workflow: dict, workflow_hash: str) -> dict:
+def _build_next_warmup_activation(workflow: dict, workflow_hash: str, production_options: dict | None = None) -> dict:
     stack = extract_warmup_stack(workflow) if isinstance(workflow, dict) else {}
     profile = stack_to_warmup_profile(stack)
     # Normalize: collapse duplicate CLIP entries
@@ -1605,7 +1605,7 @@ def _build_next_warmup_activation(workflow: dict, workflow_hash: str) -> dict:
             _p["clip2"] = ""
         profile = _p
     now = time.time()
-    return {
+    payload = {
         "profile_token": str(uuid.uuid4()),
         "validation_token": str(uuid.uuid4()),
         "workflow_hash": workflow_hash,
@@ -1618,6 +1618,10 @@ def _build_next_warmup_activation(workflow: dict, workflow_hash: str) -> dict:
         "selected_at": None,
         "preflight_validated": True,
     }
+    if production_options and production_options.get("enabled"):
+        payload["production_enabled"] = True
+        payload["production_profile_version"] = 1
+    return payload
 
 
 async def _execute_job(item: tuple, item_id: int):
@@ -1720,7 +1724,11 @@ async def _execute_job(item: tuple, item_id: int):
         _active_next_changed = False
         _active_next_remote_call = 0
         if not os.environ.get("DISABLE_ACTIVE_NEXT_WRITE"):
-            activation_payload = _build_next_warmup_activation(execution_workflow, prompt_hash)
+            _modal_options_for_prod = extra_data.get("modal_options", {}) or {}
+            _production_options_for_activation = _modal_options_for_prod.get("production", {})
+            if not isinstance(_production_options_for_activation, dict):
+                _production_options_for_activation = {}
+            activation_payload = _build_next_warmup_activation(execution_workflow, prompt_hash, _production_options_for_activation)
             _active_next_payload_bytes = len(json.dumps(activation_payload, separators=(",", ":")))
             # Compute stable profile key from only restore-relevant fields
             _warmup_profile = activation_payload.get("warmup_profile", {})

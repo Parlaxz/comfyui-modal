@@ -226,13 +226,61 @@ _CUSTOM_NODE_IMPORT_FAILURES: list[dict] = []
 _CUSTOM_NODE_REGISTRATION_PENDING_RETRY: set[str] = set()
 
 _PROD_DIRECT_SINK_REGISTRY: dict[str, dict[str, list[dict]]] = {}
+_PROD_DIRECT_SINK_LOCK = threading.RLock() if "threading" in dir(__builtins__) else None
 
-_PROD_DIRECT_SINK_REQUEST: dict | None = None
+_prod_direct_sink_lock_imported = False
 
 
-def _is_authorized_production_direct_sink_request(req: dict | None, prompt_id: str, node_id: str) -> bool:
-    if not isinstance(req, dict):
-        return False
+def _get_prod_lock():
+    global _prod_direct_sink_lock_imported, _PROD_DIRECT_SINK_LOCK
+    if not _prod_direct_sink_lock_imported:
+        import threading as _th
+        _PROD_DIRECT_SINK_LOCK = _th.RLock()
+        _prod_direct_sink_lock_imported = True
+    return _PROD_DIRECT_SINK_LOCK
+
+
+def _register_production_request(prompt_id: str, request_data: dict) -> None:
+    global _PROD_DIRECT_SINK_REQUESTS
+    with _get_prod_lock():
+        _PROD_DIRECT_SINK_REQUESTS[prompt_id] = dict(request_data)
+
+
+def _get_production_request(prompt_id: str) -> dict | None:
+    global _PROD_DIRECT_SINK_REQUESTS
+    with _get_prod_lock():
+        return _PROD_DIRECT_SINK_REQUESTS.get(prompt_id)
+
+
+def _store_production_output(prompt_id: str, node_id: str, entry: dict) -> None:
+    global _PROD_DIRECT_SINK_REGISTRY
+    with _get_prod_lock():
+        registry = _PROD_DIRECT_SINK_REGISTRY
+        if prompt_id not in registry:
+            registry[prompt_id] = {}
+        if node_id not in registry[prompt_id]:
+            registry[prompt_id][node_id] = []
+        registry[prompt_id][node_id].append(entry)
+
+
+def _pop_production_outputs(prompt_id: str) -> dict[str, list[dict]]:
+    global _PROD_DIRECT_SINK_REGISTRY
+    with _get_prod_lock():
+        return _PROD_DIRECT_SINK_REGISTRY.pop(prompt_id, {})
+
+
+def _cleanup_production_request(prompt_id: str) -> None:
+    global _PROD_DIRECT_SINK_REQUESTS, _PROD_DIRECT_SINK_REGISTRY
+    with _get_prod_lock():
+        _PROD_DIRECT_SINK_REQUESTS.pop(prompt_id, None)
+        _PROD_DIRECT_SINK_REGISTRY.pop(prompt_id, None)
+
+
+_PROD_DIRECT_SINK_REQUESTS: dict[str, dict] = {}
+
+
+def _is_authorized_production_direct_sink_request(prompt_id: str, node_id: str) -> bool:
+    req = _get_production_request(prompt_id)
     if not req.get("enabled"):
         return False
     if str(req.get("prompt_id") or "") != str(prompt_id):
@@ -369,7 +417,7 @@ class ComfyModalProductionOutput:
             return ()
 
         # Require an active production request
-        req = _PROD_DIRECT_SINK_REQUEST
+        req = _get_production_request(prompt_id)
         if req is None or not req.get("enabled"):
             print(f"[ComfyModalProductionOutput] WARNING: no active production request for prompt_id={prompt_id}, returning empty")
             return ()
@@ -429,12 +477,8 @@ class ComfyModalProductionOutput:
             })
 
         # Store in registry
-        registry = _PROD_DIRECT_SINK_REGISTRY
-        if prompt_id not in registry:
-            registry[prompt_id] = {}
-        if node_id not in registry[prompt_id]:
-            registry[prompt_id][node_id] = []
-        registry[prompt_id][node_id].extend(result_entries)
+        for _entry in result_entries:
+            _store_production_output(prompt_id, node_id, _entry)
 
         total_encode_ms = round((_time.time() - _t0) * 1000, 1)
         print(f"[ComfyModalProductionOutput] encoded {len(result_entries)} images for "
@@ -493,7 +537,7 @@ class ComfyModalProductionImageComparerOutput:
             return ()
 
         # Require an active production request
-        req = _PROD_DIRECT_SINK_REQUEST
+        req = _get_production_request(prompt_id)
         if req is None or not req.get("enabled"):
             print(f"[ComfyModalProductionImageComparerOutput] WARNING: no active production request, returning empty")
             return ()
@@ -611,12 +655,8 @@ class ComfyModalProductionImageComparerOutput:
             encoded_unique = len(a_entries)  # same bytes reused
 
         # Store in registry
-        registry = _PROD_DIRECT_SINK_REGISTRY
-        if prompt_id not in registry:
-            registry[prompt_id] = {}
-        if node_id not in registry[prompt_id]:
-            registry[prompt_id][node_id] = []
-        registry[prompt_id][node_id].extend(result_entries)
+        for _entry in result_entries:
+            _store_production_output(prompt_id, node_id, _entry)
 
         total_encode_ms = round((_time.time() - _t0) * 1000, 1)
         a_count = len(a_entries)
@@ -1108,6 +1148,22 @@ def _resolve_fastpath_v21621() -> dict:
             _master and _resolve_runtime_flag("FASTPATH_V21621_CLIP_READ_BYTES", "1")
         ),
     }
+
+
+def _resolve_production_stable_path_effective(profile: dict | None = None) -> bool:
+    """Resolve whether the stable production path should execute.
+
+    Requires both the active-next profile to signal production_enabled=True
+    AND the rollback flag COMFYMODAL_PRODUCTION_STABLE_PATH to be '1' (default).
+    """
+    _production_enabled = bool((profile or {}).get("_production_enabled"))
+    if not _production_enabled:
+        return False
+    _flag = _resolve_runtime_flag("PRODUCTION_STABLE_PATH", "1")
+    return bool(_flag)
+
+
+PRODUCTION_STABLE_PATH_FLAG = _resolve_runtime_flag("PRODUCTION_STABLE_PATH", "1")
 
 
 # P6 GÇö FUSE / Modal Volume large-read governor.
@@ -3898,7 +3954,7 @@ def _verify_model_file(path: str, expected_size: int | None = None, expected_sha
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.16.21"
+COMFYAPP_VERSION = "2.16.22"
 CONTROL_BASELINE = "v2.16.5_exact_plus_direct_memory_production"
 
 
@@ -5490,6 +5546,21 @@ def validate_active_warmup_profile_payload(payload: dict) -> None:
             "Refusing to write active_next_profile: warmup_profile "
             "must be a dict or disable_warmup must be True."
         )
+    _prod_enabled = payload.get("production_enabled")
+    if _prod_enabled is not None:
+        if _prod_enabled is not True:
+            raise RuntimeError(
+                "Refusing to write active_next_profile: production_enabled "
+                "must be exactly True when present, "
+                f"got {_prod_enabled!r}"
+            )
+        _prod_ver = payload.get("production_profile_version")
+        if _prod_ver != 1:
+            raise RuntimeError(
+                "Refusing to write active_next_profile: production_profile_version "
+                "must be exactly 1 when present, "
+                f"got {_prod_ver!r}"
+            )
 
 
 def _write_active_warmup_profile_payload(payload: dict) -> dict:
@@ -6561,16 +6632,19 @@ class _ComfyAPIMixin:
                 if wp:
                     profile = dict(wp)
                     source = "active_next_profile_expired"
-                    profile["_source"] = source
-                    profile["_profile_token"] = active.get("profile_token", "")
-                    profile["_workflow_hash"] = active.get("workflow_hash", "")
-                    profile["_current_workflow_stack"] = dict(active.get("model_stack") or {})
-                    print(
-                        f"[comfyapp] snapshot_preload_profile source={source} (expired fallback) "
-                        f"token={profile.get('_profile_token','')} "
-                        f"workflow_hash={profile.get('_workflow_hash','')}"
-                    )
-                    return profile
+                profile["_source"] = source
+                profile["_profile_token"] = active.get("profile_token", "")
+                profile["_workflow_hash"] = active.get("workflow_hash", "")
+                profile["_current_workflow_stack"] = dict(active.get("model_stack") or {})
+                if active.get("production_enabled") is True:
+                    profile["_production_enabled"] = True
+                    profile["_production_profile_version"] = active.get("production_profile_version", 0)
+                print(
+                    f"[comfyapp] snapshot_preload_profile source={source} (expired fallback) "
+                    f"token={profile.get('_profile_token','')} "
+                    f"workflow_hash={profile.get('_workflow_hash','')}"
+                )
+                return profile
                 print(
                     f"[comfyapp] snapshot_preload_profile source=none reason=active_profile_expired "
                     f"token={active.get('profile_token','?')} "
@@ -6589,6 +6663,9 @@ class _ComfyAPIMixin:
                     profile["_profile_token"] = active.get("profile_token", "")
                     profile["_workflow_hash"] = active.get("workflow_hash", "")
                     profile["_current_workflow_stack"] = dict(active.get("model_stack") or {})
+                    if active.get("production_enabled") is True:
+                        profile["_production_enabled"] = True
+                        profile["_production_profile_version"] = active.get("production_profile_version", 0)
                     print(
                         f"[comfyapp] snapshot_preload_profile source={source} profile_token={profile.get('_profile_token','')} workflow_hash={profile.get('_workflow_hash','')} data={profile}"
                     )
@@ -7930,6 +8007,134 @@ class _ComfyAPIMixin:
             f"(deprecated: started_after_clip_preload=1 started_before_direct_clip=1 started_during_direct_clip=0)"
         )
         return eligibility
+
+    def _start_production_restore_unet(
+        self,
+        profile: dict,
+        *,
+        restore_start: float,
+        restore_stages: dict,
+    ) -> dict:
+        """Start the exact selected UNET load in the existing future registry.
+
+        Called only when production stable path is active.  Must run after
+        CLIP preload has completed and before request actual-load.
+        """
+        result: dict = {"decision": "production_disabled", "submitted": False, "key": ""}
+        if not profile:
+            result["reason"] = "no_profile"
+            return result
+
+        unet_path = profile.get("unet", "")
+        if not unet_path:
+            result["decision"] = "no_unet"
+            result["reason"] = "profile_missing_unet"
+            return result
+
+        import os as _os
+        _resolved = _os.path.realpath(unet_path)
+        _weight_dtype = profile.get("weight_dtype", "default")
+        key = (_resolved, _weight_dtype)
+
+        result["key"] = str(key)
+
+        # Check object cache
+        _cache = getattr(self, "_unet_object_cache", None) or {}
+        if key in _cache:
+            result["decision"] = "object_cache_hit"
+            result["reason"] = "object_already_cached"
+            return result
+
+        # Check existing future
+        _futures = getattr(self, "_actual_load_futures", None) or {}
+        if key in _futures:
+            result["decision"] = "future_exists"
+            result["reason"] = "future_already_registered"
+            return result
+
+        # Verify CLIP preload complete
+        _active_reads = getattr(self, "_ACTIVE_MODEL_READS", {})
+        _clip_keys = [k for k in _active_reads if "role=clip" in str(k).lower()]
+        clip_read_active = len(_clip_keys) > 0
+        result["clip_read_active"] = 1 if clip_read_active else 0
+
+        # Submit UNET future via original loader
+        _orig_loaders = getattr(self, "_original_loaders", {})
+        _orig_unet = _orig_loaders.get("UNETLoader.load_unet")
+        if _orig_unet is None:
+            result["decision"] = "failed"
+            result["reason"] = "no_original_unet_loader"
+            return result
+
+        import threading as _threading
+
+        _submit_ms = round((_threading_time.time() - restore_start) * 1000, 1)
+        restore_stages["production_unet_submit_ms"] = _submit_ms
+
+        def _production_unet_worker():
+            import nodes as _prod_nodes
+            _loaded = None
+            try:
+                _cls = _prod_nodes.NODE_CLASS_MAPPINGS.get("UNETLoader")
+                if _cls is None:
+                    raise RuntimeError("UNETLoader not found in NODE_CLASS_MAPPINGS")
+                _node = _cls()
+                _loaded = _orig_unet(_node, unet_path, _weight_dtype)
+                _uc = getattr(self, "_unet_object_cache", {})
+                _uc[key] = _loaded
+                self._unet_object_cache = _uc
+                _meta = getattr(self, "_actual_load_future_meta", {})
+                _meta[key] = {
+                    "source": "restore_background_unet",
+                    "production_stable": True,
+                    "strict_no_fallback": True,
+                    "status": "completed",
+                    "selected_unet": _os.path.basename(unet_path),
+                    "canonical_key": key,
+                    "profile_token": profile.get("_profile_token", ""),
+                    "workflow_hash": profile.get("_workflow_hash", ""),
+                }
+                self._actual_load_future_meta = _meta
+            except Exception as _exc:
+                _meta = getattr(self, "_actual_load_future_meta", {})
+                _meta[key] = {
+                    "source": "restore_background_unet",
+                    "production_stable": True,
+                    "strict_no_fallback": True,
+                    "status": "failed",
+                    "selected_unet": _os.path.basename(unet_path),
+                    "canonical_key": key,
+                    "profile_token": profile.get("_profile_token", ""),
+                    "workflow_hash": profile.get("_workflow_hash", ""),
+                }
+                self._actual_load_future_meta = _meta
+                _errs = getattr(self, "_actual_load_future_errors", {})
+                _errs[key] = _exc
+                self._actual_load_future_errors = _errs
+                print(f"[production.unet] worker_failed key={key} err={_exc}")
+
+        import time as _threading_time
+        _thread = _threading.Thread(target=_production_unet_worker, daemon=True)
+        _futures[key] = _thread
+        self._actual_load_futures = _futures
+        _meta = getattr(self, "_actual_load_future_meta", {})
+        _meta[key] = {
+            "source": "restore_background_unet",
+            "production_stable": True,
+            "strict_no_fallback": True,
+            "status": "submitted",
+            "selected_unet": _os.path.basename(unet_path),
+            "canonical_key": key,
+            "profile_token": profile.get("_profile_token", ""),
+            "workflow_hash": profile.get("_workflow_hash", ""),
+        }
+        self._actual_load_future_meta = _meta
+        _thread.start()
+
+        result["decision"] = "started"
+        result["submitted"] = True
+        result["key"] = str(key)
+        return result
 
     def _finalize_actual_load_records(self) -> None:
         """Compute derived fields (critical_path_saved_ms, remaining_wait_ms, etc.)
@@ -11115,7 +11320,6 @@ class _ComfyAPIMixin:
                 production_report.get("rgthree_comparer_rewritten_node_ids", []) or []
             )
         if _prod_sink_enabled:
-            global _PROD_DIRECT_SINK_REQUEST
             self._active_production_request = {
                 "enabled": True,
                 "prompt_id": prompt_id,
@@ -11125,16 +11329,18 @@ class _ComfyAPIMixin:
                 "metadata_mode": _prod_for_sink.get("metadata_mode", "none"),
                 "authorized_node_ids": _authorized_sink_node_ids,
             }
-            _PROD_DIRECT_SINK_REQUEST = self._active_production_request
+            _register_production_request(prompt_id, self._active_production_request)
 
         # —— Production preview suppression and quiet logs ——
                 # --- Compile production workflow if enabled ---
         _exec_t0 = time.time()
+        source_workflow = workflow
         if _prod_sink_enabled:
             _execution_workflow, _production_report = compile_production_workflow(
                 workflow,
                 _prod_for_sink,
                 allow_direct_output_rewrite=True,
+                stable=bool(_resolve_runtime_flag("PRODUCTION_STABLE_PATH", "1")),
             )
             _compile_ms = round((time.time() - _exec_t0) * 1000, 1)
             _th = _production_report.get('topology_hash', '?')[:12]
@@ -11166,8 +11372,7 @@ class _ComfyAPIMixin:
             )
             if hasattr(self, '_active_production_request'):
                 self._active_production_request['authorized_node_ids'] = _authorized_sink_node_ids
-                import sys as _sys_mod
-                _PROD_DIRECT_SINK_REQUEST = self._active_production_request
+                _register_production_request(prompt_id, self._active_production_request)
             # Use compiled workflow for execution
             workflow = _execution_workflow
         else:
@@ -11227,7 +11432,7 @@ class _ComfyAPIMixin:
             if _prod_throttle_saved is not None:
                 self._production_progress_throttle_ms = _prod_throttle_saved
             if _prod_sink_enabled:
-                _PROD_DIRECT_SINK_REQUEST = None
+                _cleanup_production_request(prompt_id)
                 if hasattr(self, "_active_production_request"):
                     del self._active_production_request
         total_exec_ms = self._profile_ms(stage_started)
@@ -11289,11 +11494,11 @@ class _ComfyAPIMixin:
         # Warmup-only prompts and failed prompts do not become known-good.
         _known_good_marked = False
         try:
-            _known_workflow_hash = self._compute_workflow_struct_hash(workflow)
-            _known_stack = extract_requested_model_stack(workflow)
+            _known_workflow_hash = self._compute_workflow_struct_hash(source_workflow)
+            _known_stack = extract_requested_model_stack(source_workflow)
             _known_profile = stack_to_profile(_known_stack)
             if _known_profile:
-                _known_good_marked = _mark_known_good_workflow_profile(_known_workflow_hash, _known_profile, workflow=workflow)
+                _known_good_marked = _mark_known_good_workflow_profile(_known_workflow_hash, _known_profile, workflow=source_workflow)
                 if _known_good_marked:
                     print(
                         f"[comfyapp] marked known-good workflow hash={_known_workflow_hash} "
@@ -11329,9 +11534,9 @@ class _ComfyAPIMixin:
                 _rt["registry_used"] = False
             result["_production_runtime"] = _rt
             # Check registry for reporting
-            _collect_registry_data = _PROD_DIRECT_SINK_REGISTRY.get(prompt_id, {})
+            _collect_registry_data = _get_production_request(prompt_id) or {}
             _reg_node_count = len(_collect_registry_data)
-            _reg_entry_count = sum(len(v) for v in _collect_registry_data.values())
+            _reg_entry_count = 0
             print(f"[production.runtime] preview_suppressed={_rt.get('sampler_previews_suppressed', False)} "
                   f"quiet_logs={_rt.get('quiet_logs_suppressed', False)} "
                   f"progress_skip={_rt.get('progress_skip_count', 0)} "
@@ -11344,7 +11549,7 @@ class _ComfyAPIMixin:
                   f"registry_entry_count={_reg_entry_count}")
         # —— Clean up production output registry now that collection is done ——
         if _prod_sink_enabled:
-            _PROD_DIRECT_SINK_REGISTRY.pop(prompt_id, None)
+            _pop_production_outputs(prompt_id)
         return result
 
     def _collect_in_process_outputs(self, prompt_id: str, prompt_start_time: float | None = None, modal_options: dict | None = None) -> dict:
@@ -11554,8 +11759,7 @@ class _ComfyAPIMixin:
         _registry_valid_entry_count = 0
         _registry_invalid_entry_count = 0
         try:
-            global _PROD_DIRECT_SINK_REGISTRY
-            _reg_data = _PROD_DIRECT_SINK_REGISTRY.get(prompt_id)
+            _reg_data = _pop_production_outputs(prompt_id)
             if _reg_data:
                 for _rid, _rentries in _reg_data.items():
                     _registry_node_count += 1
@@ -14162,7 +14366,8 @@ class _ComfyAPIMixin:
             __stages.setdefault("gpu_state_end_ns", 0)
             __stages.setdefault("cuda_context_end_ns", 0)
             __stages.setdefault("deferred_retry_end_ns", 0)
-            if _warmup_paths and _pm != "off":
+            _production_stable_path = _resolve_production_stable_path_effective(_warmup_profile)
+            if _warmup_paths and _pm != "off" and not _production_stable_path:
                 _preload_submitted_early = 1
                 _preload_overlap_start = time.time()
                 _submitted_ns = time.perf_counter_ns()
@@ -14251,6 +14456,20 @@ class _ComfyAPIMixin:
                         f"fastpath_load_only=1 effective_load=1 effective_encode=0 "
                         f"decision=fastpath_load_only"
                     )
+            if _production_stable_path:
+                _clip_override = _clip_policy.copy() if _clip_policy else {}
+                _clip_override["direct_warmup_load_clip_effective"] = 1
+                _clip_override["direct_warmup_clip_encode_effective"] = 1
+                _clip_override["restore_direct_clip_policy"] = "load_and_encode"
+                _clip_override["restore_direct_clip_policy_decision"] = "production_stable"
+                _clip_policy = _clip_override
+                _fp_state["fastpath_clip_load_only"] = 0
+                _fp_state["fastpath_clip_read_bytes"] = 0
+                __stages.update(_clip_policy)
+                print(
+                    f"[production.clip] strategy=normal policy=load_and_encode "
+                    f"effective_load=1 effective_encode=1"
+                )
             __stages["warmup_profile_source"] = _warmup_src
             __stages["warmup_profile_token"] = _warmup_tok
             __stages["warmup_profile_workflow_hash"] = _warmup_wf_hash
@@ -14262,6 +14481,17 @@ class _ComfyAPIMixin:
                 f"workflow_hash={_warmup_wf_hash} "
                 f"profile_token={_warmup_tok}"
             )
+            _prod_enabled = _warmup_profile.get("_production_enabled") if _warmup_profile else None
+            if _prod_enabled:
+                print(
+                    f"[production.profile] enabled=1 "
+                    f"profile_version={_warmup_profile.get('_production_profile_version', 0)} "
+                    f"profile_token={_warmup_tok} "
+                    f"workflow_hash={_warmup_wf_hash}"
+                )
+            else:
+                print(f"[production.profile] enabled=0")
+            __stages["production_stable_path_effective"] = 1 if _production_stable_path else 0
 
             # GöÇGöÇ Warmup: load models + encode text (for clip cache) GöÇGöÇGöÇGöÇGöÇGöÇ
             if ENABLE_WARMUP:
@@ -14327,9 +14557,12 @@ class _ComfyAPIMixin:
                     _preload_overlap_start = time.time()
                     __stages["restore_preload_submit_at_ms_from_restore_start"] = round((_preload_overlap_start - restore_start) * 1000, 1)
                     _restore_preload_handle = self._start_restore_preload(preload_paths)
+                    if _production_stable_path:
+                        __stages["restore_preload_submitted_production"] = 1
                     __stages["restore_preload_submitted_early"] = 1
+                    _label = "production" if _production_stable_path else "late"
                     print(
-                        f"[comfyapp] restore_preload_submitted_late files={len(preload_paths)} "
+                        f"[comfyapp] restore_preload_submitted_{_label} files={len(preload_paths)} "
                         f"mode={_pm} at_ms={__stages['restore_preload_submit_at_ms_from_restore_start']}"
                     )
 
@@ -14418,6 +14651,17 @@ class _ComfyAPIMixin:
                             f"[comfyapp] expected_source unet={_unet_expected} "
                             f"clip={_clip_expected} vae={_vae_expected} "
                             f"rbg_expected={_rbg_expected or 'none'} rbg_submitted={_rbg_submitted}"
+                        )
+                    if _production_stable_path and profile:
+                        _prod_unet = self._start_production_restore_unet(
+                            profile, restore_start=restore_start, restore_stages=__stages
+                        )
+                        __stages["production_unet_decision"] = _prod_unet.get("decision", "none")
+                        __stages["production_unet_submitted"] = 1 if _prod_unet.get("submitted") else 0
+                        print(
+                            f"[production.unet] decision={_prod_unet.get('decision','none')} "
+                            f"key={_prod_unet.get('key','')} "
+                            f"clip_read_active={_prod_unet.get('clip_read_active',0)}"
                         )
                 elif preload_paths and _pm != "off" and _restore_preload_handle is None:
                     if _pm == "async_no_wait":

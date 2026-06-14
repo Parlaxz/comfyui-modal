@@ -684,9 +684,7 @@ app.registerExtension({
             if (prodOutputNodes.length === 0) {
               throw new Error("Simulate Production is enabled but no nodes are marked as Production Output. Right-click an output-capable node and select 'Mark as Production Output', or disable Simulate Production.");
             }
-            const prodBypassNodes = _getBypassNodes();
             const outputNodeIds = prodOutputNodes.map(n => String(n.id)).sort();
-            const bypassNodeIds = prodBypassNodes.map(n => String(n.id)).sort();
             // Validate output_node_ids exist in the serialized prompt keys
             const serializedKeys = parsed.prompt ? Object.keys(parsed.prompt) : [];
             const finalOutIds = serializedKeys.length > 0
@@ -703,13 +701,13 @@ app.registerExtension({
               enabled: true,
               schema_version: 1,
               output_node_ids: finalOutIds,
-              bypass_node_ids: bypassNodeIds,
               disable_sampler_previews: true,
               quiet_execution_logs: true,
               progress_min_interval_ms: 500,
               strict_output_collection: true,
               direct_output_sink: true,
               metadata_mode: "none",
+              return_comparison_a: false
             };
           }
           parsed.modal_options = { ...(parsed.modal_options || {}), ...baseOptions };

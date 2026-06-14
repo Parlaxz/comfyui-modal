@@ -1547,6 +1547,7 @@ function buildPanel() {
           output_format: _outFmtValue,
           quality: _qualValue,
           webp_lossless_compression: _webpLcValue,
+          // Local-only: not forwarded to remote
           auto_save_local: _autoSaveValue,
           save_folder: _saveFolderValue,
           save_metadata_sidecar: _sidecarValue,
@@ -1805,7 +1806,7 @@ function buildPanel() {
 
   const prodLabel = document.createElement("span");
   prodLabel.style.cssText = "font-size:12px; color:#aaa; font-weight:600;";
-  prodLabel.textContent = "Simulate Production";
+  prodLabel.textContent = "Production Mode";
   prodLabel.htmlFor = "cm-prod-toggle";
 
   prodRow.appendChild(prodToggle);
