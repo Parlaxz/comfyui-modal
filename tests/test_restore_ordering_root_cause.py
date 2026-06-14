@@ -219,71 +219,53 @@ class TestVolumeReloadOptimization(unittest.TestCase):
             "_should_reload_models_volume method must exist")
     
     def test_volume_reload_skipped_when_token_unchanged(self):
-        """When generation token is unchanged and file probe succeeds, skip reload."""
+        """When generation record is unchanged, skip reload."""
         import comfyapp
         
         inst = MagicMock()
-        inst._cheap_volume_state_hash = MagicMock(return_value="stable_token_abc")
+        inst._models_generation_seen = "stable_gen_abc123"
         
-        with patch.dict(os.environ, {'COMFYMODAL_MODELS_GENERATION_TOKEN': 'stable_token_abc'}):
-            with patch('os.path.isfile', return_value=True):
-                with patch('os.path.isdir', return_value=True):
-                    with patch('os.path.exists', return_value=True):
-                        with patch('builtins.open', unittest.mock.mock_open(read_data='stable_token_abc')):
-                            with patch('os.makedirs'):
-                                result = comfyapp._ComfyAPIMixin._should_reload_models_volume(inst)
+        with patch.object(comfyapp, '_current_models_generation_id', return_value="stable_gen_abc123"):
+            result = comfyapp._ComfyAPIMixin._should_reload_models_volume(inst)
         
-        self.assertFalse(result, "Should NOT reload when token is unchanged")
+        self.assertFalse(result, "Should NOT reload when generation is unchanged")
     
     def test_volume_reload_required_when_token_changes(self):
-        """When generation token changes, reload must be required."""
+        """When generation record changes, reload must be required."""
         import comfyapp
         
         inst = MagicMock()
-        inst._cheap_volume_state_hash = MagicMock(return_value="new_token_xyz")
+        inst._models_generation_seen = "old_gen_xyz"
         
-        with patch.dict(os.environ, {'COMFYMODAL_MODELS_GENERATION_TOKEN': 'new_token_xyz'}):
-            with patch('os.path.isfile', return_value=True):
-                with patch('os.path.isdir', return_value=True):
-                    with patch('os.path.exists', return_value=True):
-                        with patch('builtins.open', unittest.mock.mock_open(read_data='old_token_abc')):
-                            with patch('os.makedirs'):
-                                result = comfyapp._ComfyAPIMixin._should_reload_models_volume(inst)
+        with patch.object(comfyapp, '_current_models_generation_id', return_value="new_gen_def456"):
+            result = comfyapp._ComfyAPIMixin._should_reload_models_volume(inst)
         
-        self.assertTrue(result, "Should reload when token changes")
+        self.assertTrue(result, "Should reload when generation changes")
     
     def test_volume_reload_required_when_file_probe_fails(self):
-        """When the probe file doesn't exist, reload must be required."""
+        """When no generation record exists, reload must be required."""
         import comfyapp
         
         inst = MagicMock()
-        inst._cheap_volume_state_hash = MagicMock(return_value="same_token")
+        inst._models_generation_seen = ""
         
-        with patch.dict(os.environ, {'COMFYMODAL_MODELS_GENERATION_TOKEN': 'same_token'}):
-            with patch('os.path.isfile', return_value=True):
-                with patch('os.path.isdir', return_value=True):
-                    with patch('os.path.exists', return_value=False):
-                        with patch('builtins.open', unittest.mock.mock_open(read_data='same_token')):
-                            with patch('os.makedirs'):
-                                result = comfyapp._ComfyAPIMixin._should_reload_models_volume(inst)
+        with patch.object(comfyapp, '_current_models_generation_id', return_value=""):
+            result = comfyapp._ComfyAPIMixin._should_reload_models_volume(inst)
         
-        self.assertTrue(result, "Should reload when file probe fails")
+        self.assertTrue(result, "Should reload when no generation record exists (missing)")
     
     def test_volume_reload_required_on_first_run(self):
-        """On first restore (no stored token), reload must be required."""
+        """On first restore (no seen generation), reload must be required."""
         import comfyapp
         
         inst = MagicMock()
-        inst._cheap_volume_state_hash = MagicMock(return_value="first_token")
+        # Simulate first run: no _models_generation_seen set at all
+        # getattr(self, "_models_generation_seen", "") returns ""
         
-        with patch.dict(os.environ, {'COMFYMODAL_MODELS_GENERATION_TOKEN': 'first_token'}):
-            with patch('os.path.isfile', return_value=False):  # No stored token file
-                with patch('os.path.isdir', return_value=True):
-                    with patch('os.path.exists', return_value=True):
-                        with patch('os.makedirs'):
-                            result = comfyapp._ComfyAPIMixin._should_reload_models_volume(inst)
+        with patch.object(comfyapp, '_current_models_generation_id', return_value="first_gen_111"):
+            result = comfyapp._ComfyAPIMixin._should_reload_models_volume(inst)
         
-        self.assertTrue(result, "Should reload on first restore (no stored token)")
+        self.assertTrue(result, "Should reload on first restore (no seen generation)")
 
 
 class TestPreloadSafetyRegression(unittest.TestCase):

@@ -1460,7 +1460,6 @@ async def _process_queue():
         try:
             await _execute_job(item, item_id)
         except asyncio.CancelledError:
-            _queue.task_done()
             raise
         except Exception:
             import traceback
@@ -1540,35 +1539,71 @@ _ACTIVE_NEXT_PROFILE_TTL_S = int(os.environ.get("COMFYMODAL_ACTIVE_NEXT_PROFILE_
 _last_written_stable_profile_key: str | None = None
 
 
-def _compute_stable_warmup_profile_key(warmup_profile: dict, model_stack: dict) -> str:
+def _normalize_stable_warmup_profile(
+    warmup_profile: dict | None,
+) -> dict:
+    """Return a canonical warmup profile with only restore-relevant fields.
+
+    Rules:
+    - Missing fields become "".
+    - disable_warmup becomes bool.
+    - For mode=="checkpoint": preserve checkpoint, clear model fields.
+    - For mode=="split": preserve model fields, clear checkpoint.
+    - For other modes: preserve only mode and disable_warmup.
+    - When clip2 == clip1, set clip2 = "".
+    - Does not include workflow hash, UUIDs, timestamps, output nodes,
+      seed, prompt, Production settings, or raw stack lists.
+    """
+    if not isinstance(warmup_profile, dict):
+        warmup_profile = {}
+    stable = {
+        "mode": str(warmup_profile.get("mode", "")).strip(),
+        "checkpoint": "",
+        "unet": "",
+        "clip1": "",
+        "clip2": "",
+        "vae": "",
+        "clip_type": "",
+        "disable_warmup": bool(warmup_profile.get("disable_warmup", False)),
+    }
+    _mode = stable["mode"]
+    if _mode == "checkpoint":
+        stable["checkpoint"] = str(warmup_profile.get("checkpoint", "")).strip()
+    elif _mode == "split":
+        stable["unet"] = str(warmup_profile.get("unet", "")).strip()
+        stable["clip1"] = str(warmup_profile.get("clip1", "")).strip()
+        stable["clip2"] = str(warmup_profile.get("clip2", "")).strip()
+        stable["vae"] = str(warmup_profile.get("vae", "")).strip()
+        stable["clip_type"] = str(warmup_profile.get("clip_type", "")).strip()
+    # Collapse duplicate CLIP
+    if stable["clip2"] and stable["clip2"] == stable["clip1"]:
+        stable["clip2"] = ""
+    return stable
+
+
+def _compute_stable_warmup_profile_key(warmup_profile: dict) -> str:
     """Return a canonical stable key from only restore-relevant stacks.
-    
+
     This excludes UUIDs, timestamps, workflow_hash, output nodes, and
     Production-mode settings so identical model stacks always produce
     the same key regardless of workflow display state.
     """
-    stable = {
-        "mode": warmup_profile.get("mode", ""),
-    }
-    if stable["mode"] == "checkpoint":
-        stable["checkpoint"] = warmup_profile.get("checkpoint", "")
-    elif stable["mode"] == "split":
-        stack = dict(model_stack or {})
-        stable["unet"] = stack.get("unet", "")
-        stable["vae"] = stack.get("vae", "")
-        stable["clip1"] = stack.get("clip1", "")
-        stable["clip2"] = stack.get("clip2", "")
-        stable["clip_type"] = stack.get("clip_type", "")
-    stable["disable_warmup"] = warmup_profile.get("disable_warmup", False)
-    # Sort keys for deterministic JSON
+    _stable = _normalize_stable_warmup_profile(warmup_profile)
     return hashlib.sha256(
-        json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()
+        json.dumps(_stable, sort_keys=True, separators=(",", ":"),
+                   ensure_ascii=False).encode("utf-8")
     ).hexdigest()
 
 
 def _build_next_warmup_activation(workflow: dict, workflow_hash: str) -> dict:
     stack = extract_warmup_stack(workflow) if isinstance(workflow, dict) else {}
     profile = stack_to_warmup_profile(stack)
+    # Normalize: collapse duplicate CLIP entries
+    if profile and isinstance(profile, dict):
+        _p = dict(profile)
+        if _p.get("clip2") == _p.get("clip1"):
+            _p["clip2"] = ""
+        profile = _p
     now = time.time()
     return {
         "profile_token": str(uuid.uuid4()),
@@ -1598,8 +1633,19 @@ async def _execute_job(item: tuple, item_id: int):
 
     task_key = _register_running(item)
 
-    _send(sid, "execution_start", {"prompt_id": prompt_id})
-    _send(sid, "execution_cached", {"nodes": [], "prompt_id": prompt_id})
+    # ── v2.16.20: Read acknowledgment event ──
+    ack_ready = extra_data.get("_modal_prompt_ack_ready")
+    execution_start_forwarded = False
+
+    # Send modal_status for Modal-specific status display (may precede ack).
+    _send(sid, "modal_status", {"prompt_id": prompt_id, "message": "Modal execution starting", "phase": "dispatch"})
+
+    # Helper: forward execution_start exactly once
+    def _forward_execution_start_once():
+        nonlocal execution_start_forwarded
+        if not execution_start_forwarded:
+            _send(sid, "execution_start", {"prompt_id": prompt_id})
+            execution_start_forwarded = True
 
     success = False
     finalized = False
@@ -1679,7 +1725,7 @@ async def _execute_job(item: tuple, item_id: int):
             # Compute stable profile key from only restore-relevant fields
             _warmup_profile = activation_payload.get("warmup_profile", {})
             _model_stack = activation_payload.get("model_stack", {})
-            _stable_key = _compute_stable_warmup_profile_key(_warmup_profile, _model_stack)
+            _stable_key = _compute_stable_warmup_profile_key(_warmup_profile)
             if _last_written_stable_profile_key == _stable_key:
                 _active_next_status = "unchanged"
                 print(
@@ -1706,6 +1752,11 @@ async def _execute_job(item: tuple, item_id: int):
             print(f"[comfyui-modal] active_next_write SKIPPED (DISABLE_ACTIVE_NEXT_WRITE=1)")
 
         remote_started = time.time()
+        # ── v2.16.20: Wait for prompt acknowledgment before forwarding events ──
+        if ack_ready is not None:
+            await ack_ready.wait()
+        # Forward execution_start now that ack is done
+        _forward_execution_start_once()
         trace.mark("t2_local_dispatch")
         trace.mark("t2b_modal_handle_resolved")
         trace.mark("t2c_modal_call_start")
@@ -2665,6 +2716,9 @@ if _server:
                 },
             }
 
+            # ── Create prompt acknowledgment event ──
+            ack_ready = asyncio.Event()
+
             extra_data = {
                 "client_id": client_id,
                 "create_time": int(time.time() * 1000),
@@ -2680,6 +2734,7 @@ if _server:
                 "result_route": _result_route_mode,
                 "execution_workflow": copy.deepcopy(execution_workflow),
                 "production_report": production_report,
+                "_modal_prompt_ack_ready": ack_ready,
             }
             _queue_execution_workflow = copy.deepcopy(execution_workflow)
             item = (_item_counter, prompt_id, _queue_execution_workflow, extra_data, list(_queue_execution_workflow.keys()), {})
@@ -2700,6 +2755,9 @@ if _server:
         if not _queue_worker_started:
             _queue_worker_started = True
             asyncio.create_task(_process_queue())
+
+        # ── Signal acknowledgment: prompt is enqueued and response is ready ──
+        asyncio.get_running_loop().call_soon(ack_ready.set)
 
         _dispatch_ts = time.time()
         local_recv_to_dispatch_ms = round((_dispatch_ts - _route_entry_ts) * 1000, 3)

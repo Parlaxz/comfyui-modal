@@ -124,13 +124,7 @@ class Trace:
                     self._t[k] = float(v)
 
     def summary(self) -> dict[str, Any]:
-        try:
-            _dbg_path = os.path.join(os.path.dirname(__file__), "_trace_dbg.log")
-            with open(_dbg_path, "a") as _f:
-                _f.write(f"summary() CALLED trace_version={TRACE_VERSION} "
-                         f"stages={len(self._t)} t3d={'t3d_prompt_start' in self._t}\n")
-        except Exception:
-            pass
+        # NOTE: _trace_dbg.log write removed per Phase 10 — no hot-path debug file I/O.
         """Return a dict with absolute timestamps and key delta pairs.
 
         The deltas are the values most people actually care about:

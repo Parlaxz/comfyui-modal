@@ -287,7 +287,7 @@ class VersionBumpTest(unittest.TestCase):
         import re
         match = re.search(r'^COMFYAPP_VERSION\s*=\s*["\']([^"\']+)["\']', source, re.MULTILINE)
         self.assertIsNotNone(match, "COMFYAPP_VERSION not found in comfyapp.py")
-        self.assertEqual(match.group(1), "2.16.17")
+        self.assertEqual(match.group(1), "2.16.19")
 
 
 class ImageBaseEnvTest(unittest.TestCase):
@@ -454,8 +454,8 @@ class DeployFingerprintExistingBehaviorTests(unittest.TestCase):
         source = comfyapp_path.read_text(encoding="utf-8")
         match = re.search(r'^COMFYAPP_VERSION\s*=\s*["\']([^"\']+)["\']', source, re.MULTILINE)
         self.assertIsNotNone(match)
-        self.assertEqual(match.group(1), "2.16.17",
-                         "Version must be 2.16.17 per policy: bump every comfyapp.py change")
+        self.assertEqual(match.group(1), "2.16.19",
+                         "Version must be 2.16.19 per policy: bump every comfyapp.py change")
 
 
 class DeployFingerprintSourceCountTests(unittest.TestCase):
@@ -636,7 +636,7 @@ class RollbackControlDefaultTests(unittest.TestCase):
         import re
         match = re.search(r'^COMFYAPP_VERSION\s*=\s*["\']([^"\']+)["\']', source, re.MULTILINE)
         self.assertIsNotNone(match)
-        self.assertEqual(match.group(1), "2.16.17")
+        self.assertEqual(match.group(1), "2.16.19")
 
     def test_known_good_control_config_is_consistent(self):
         """Validate KNOWN_GOOD_LOADING_CONTROL dict against actual source."""

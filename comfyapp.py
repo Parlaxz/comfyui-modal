@@ -1082,6 +1082,34 @@ if SAFETENSORS_READ_MODE not in ("auto", "normal", "read_bytes"):
     SAFETENSORS_READ_MODE = "normal"
 SAFETENSORS_READ_BYTES_MIN_MB = int(os.getenv("COMFYMODAL_SAFETENSORS_READ_BYTES_MIN_MB", "512"))
 SAFETENSORS_STRICT = os.getenv("COMFYMODAL_SAFETENSORS_STRICT", "0") == "1"
+
+# ── v2.16.21 combined cold-start fast path ──────────────────────────────
+# Master toggle: when 0, all v2.16.21 features are disabled and v2.16.20
+# behavior is restored without redeployment.
+# Each sub-feature can be independently disabled when the master is 1.
+FASTPATH_V21621 = os.getenv("COMFYMODAL_FASTPATH_V21621", "1") == "1"
+FASTPATH_V21621_BACKGROUND_UNET = os.getenv("COMFYMODAL_FASTPATH_V21621_BACKGROUND_UNET", "1") == "1"
+FASTPATH_V21621_CLIP_LOAD_ONLY = os.getenv("COMFYMODAL_FASTPATH_V21621_CLIP_LOAD_ONLY", "1") == "1"
+FASTPATH_V21621_CLIP_READ_BYTES = os.getenv("COMFYMODAL_FASTPATH_V21621_CLIP_READ_BYTES", "1") == "1"
+
+
+def _resolve_fastpath_v21621() -> dict:
+    """Resolve effective fast-path feature state at runtime."""
+    _master = _resolve_runtime_flag("FASTPATH_V21621", "1")
+    return {
+        "fastpath_v21621_master": _master,
+        "fastpath_background_unet": (
+            _master and _resolve_runtime_flag("FASTPATH_V21621_BACKGROUND_UNET", "1")
+        ),
+        "fastpath_clip_load_only": (
+            _master and _resolve_runtime_flag("FASTPATH_V21621_CLIP_LOAD_ONLY", "1")
+        ),
+        "fastpath_clip_read_bytes": (
+            _master and _resolve_runtime_flag("FASTPATH_V21621_CLIP_READ_BYTES", "1")
+        ),
+    }
+
+
 # P6 GÇö FUSE / Modal Volume large-read governor.
 # Disabled by default to preserve the recovered 26-29s shape until paid A/B
 # confirms the concurrency gate is a net win on current Modal volume behavior.
@@ -1119,6 +1147,74 @@ PRELOAD_MODE_PATH = "/root/models/.preload_mode"
 RUNTIME_CONFIG_DIR = "/root/models/runtime_config"
 RUNTIME_RETURN_MODE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "return_mode.txt")
 RUNTIME_STATE_SNAPSHOT_PATH = os.path.join(RUNTIME_CONFIG_DIR, ".runtime_state_snapshot.json")
+
+# ── Model generation control record ──────────────────────────────────
+# Stored on the custom-nodes Volume (not models Volume) so that
+# custom-node hash never determines whether the models Volume changed.
+MODELS_GENERATION_SCHEMA_VERSION = 1
+MODELS_GENERATION_CONTROL_DIR = "/root/custom_nodes_vol/.comfymodal_control"
+MODELS_GENERATION_CONTROL_PATH = os.path.join(MODELS_GENERATION_CONTROL_DIR, "models_generation.json")
+
+
+def _read_models_generation_record() -> dict | None:
+    """Read the authoritative model-generation record.
+
+    Returns a dict with keys ``generation``, ``updated_at_unix``, ``reason``,
+    and ``schema_version``, or ``None`` when the file is missing or invalid.
+    """
+    try:
+        if not os.path.isfile(MODELS_GENERATION_CONTROL_PATH):
+            return None
+        with open(MODELS_GENERATION_CONTROL_PATH, "r") as _f:
+            _data = json.load(_f)
+    except Exception:
+        return None
+    if not isinstance(_data, dict):
+        if PROFILING_ENABLED or _SILENT_EXCEPTION_DEBUG:
+            print(f"[comfyapp.models_gen] invalid record type: {type(_data).__name__}")
+        return None
+    if _data.get("schema_version") != MODELS_GENERATION_SCHEMA_VERSION:
+        if PROFILING_ENABLED or _SILENT_EXCEPTION_DEBUG:
+            print(f"[comfyapp.models_gen] unsupported schema_version={_data.get('schema_version')}")
+        return None
+    _gen = _data.get("generation")
+    if not _gen or not isinstance(_gen, str):
+        if PROFILING_ENABLED or _SILENT_EXCEPTION_DEBUG:
+            print("[comfyapp.models_gen] missing or invalid generation field")
+        return None
+    return _data
+
+
+def _write_models_generation_record(reason: str) -> dict:
+    """Create a new model-generation record and atomically persist it.
+
+    Must be called with ``custom_nodes_vol`` mounted and committed.
+    Raises on failure.
+    """
+    _record = {
+        "schema_version": MODELS_GENERATION_SCHEMA_VERSION,
+        "generation": uuid.uuid4().hex,
+        "updated_at_unix": time.time(),
+        "reason": reason,
+    }
+    os.makedirs(MODELS_GENERATION_CONTROL_DIR, exist_ok=True)
+    _tmp_path = MODELS_GENERATION_CONTROL_PATH + ".tmp"
+    with open(_tmp_path, "w") as _f:
+        json.dump(_record, _f, separators=(",", ":"))
+        _f.flush()
+        os.fsync(_f.fileno())
+    os.replace(_tmp_path, MODELS_GENERATION_CONTROL_PATH)
+    custom_nodes_vol.commit()
+    print(f"[comfyapp.models_gen] wrote generation={_record['generation'][:12]}... reason={reason}")
+    return _record
+
+
+def _current_models_generation_id() -> str:
+    """Return the current generation id or empty string."""
+    _rec = _read_models_generation_record()
+    if _rec is None:
+        return ""
+    return _rec["generation"]
 
 
 def _log_remote_identity(event: str, *, cls_name: str = "", method_name: str = "", restore_session_id: str = "", request_seq: int = 0, snapshot_created: int = 0, restored_from_snapshot: int = 0, restored_instance_id: str = "") -> None:
@@ -3802,7 +3898,7 @@ def _verify_model_file(path: str, expected_size: int | None = None, expected_sha
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.16.17"
+COMFYAPP_VERSION = "2.16.21"
 CONTROL_BASELINE = "v2.16.5_exact_plus_direct_memory_production"
 
 
@@ -5640,7 +5736,7 @@ def runtime_state_cpu() -> dict:
     }
 
 
-def _filter_preload_paths_by_size(file_paths: list[str]) -> tuple[list[str], dict]:
+def _filter_preload_paths_by_size(file_paths: list) -> tuple[list, dict]:
     """Filter preload candidate paths by size guardrails.
 
     Returns ``(filtered_paths, result_dict)`` where ``result_dict``
@@ -5660,11 +5756,12 @@ def _filter_preload_paths_by_size(file_paths: list[str]) -> tuple[list[str], dic
         "files_skipped": [],
         "skipped_reason": "",
     }
-    kept: list[str] = []
+    kept: list = []
     _total_gb = 0.0
 
     # Phase 1: remove files above PRELOAD_MAX_FILE_GB
-    for _p in file_paths:
+    for _raw in file_paths:
+        _p = _raw["path"] if isinstance(_raw, dict) else _raw
         try:
             _sz_gb = os.path.getsize(_p) / (1024**3)
         except OSError:
@@ -5681,7 +5778,7 @@ def _filter_preload_paths_by_size(file_paths: list[str]) -> tuple[list[str], dic
                 f"max_file_gb={PRELOAD_MAX_FILE_GB}"
             )
             continue
-        kept.append(_p)
+        kept.append(_raw)
         _total_gb += _sz_gb
 
     # Phase 2: if total exceeds max_total_gb, reject everything
@@ -5740,6 +5837,122 @@ class _MemoizedValidationCache:
     def invalidate_all(self) -> None:
         self._data.clear()
         self._fingerprints.clear()
+
+
+# ── v2.16.20 diagnostic helpers ───────────────────────────────────────
+
+def _read_process_rss_mb() -> float:
+    """Return process RSS in MiB via /proc/self/statm, or -1.0 on failure."""
+    try:
+        with open("/proc/self/statm", "r") as _f:
+            _fields = _f.read().split()
+        _pages = int(_fields[1])
+        _page_size = os.sysconf("SC_PAGE_SIZE")
+        return (_pages * _page_size) / (1024 * 1024)
+    except Exception:
+        return -1.0
+
+
+def _read_resource_faults() -> dict:
+    """Return minor/major page faults and max RSS via resource.getrusage."""
+    try:
+        import resource
+        _usage = resource.getrusage(resource.RUSAGE_SELF)
+        return {
+            "minor_faults": int(_usage.ru_minflt),
+            "major_faults": int(_usage.ru_majflt),
+            "max_rss_raw": int(_usage.ru_maxrss),
+        }
+    except Exception:
+        return {"minor_faults": -1, "major_faults": -1, "max_rss_raw": -1}
+
+
+def _walk_tensor_values(value, path: str = "state"):
+    """Recursively walk state dict yielding (path, device_type) for tensors.
+
+    Supports dict, list, tuple containers.  Returns (entries, tensor_count, nested_container_count).
+    """
+    _entries = []
+    _tensor_count = 0
+    _nested_container_count = 0
+    if isinstance(value, dict):
+        _nested_container_count = 1
+        for _k in sorted(value.keys()):
+            _sub_entries, _sub_tc, _sub_nc = _walk_tensor_values(value[_k], f"{path}.{_k}")
+            _entries.extend(_sub_entries)
+            _tensor_count += _sub_tc
+            _nested_container_count += _sub_nc
+    elif isinstance(value, list):
+        _nested_container_count = 1
+        for _i, _v in enumerate(value):
+            _sub_entries, _sub_tc, _sub_nc = _walk_tensor_values(_v, f"{path}[{_i}]")
+            _entries.extend(_sub_entries)
+            _tensor_count += _sub_tc
+            _nested_container_count += _sub_nc
+    elif isinstance(value, tuple):
+        _nested_container_count = 1
+        for _i, _v in enumerate(value):
+            _sub_entries, _sub_tc, _sub_nc = _walk_tensor_values(_v, f"{path}[{_i}]")
+            _entries.extend(_sub_entries)
+            _tensor_count += _sub_tc
+            _nested_container_count += _sub_nc
+    elif hasattr(value, "device"):
+        _device_type = getattr(getattr(value, "device", None), "type", None)
+        _tensor_count = 1
+        _entries.append((path, _device_type))
+    return _entries, _tensor_count, _nested_container_count
+
+
+def _tensor_identity_summary(tensor, *, include_hash: bool = False) -> dict:
+    """Return identity diagnostics for a tensor without altering content."""
+    _summary = {
+        "python_object_id": id(tensor),
+        "shape": tuple(tensor.shape) if hasattr(tensor, "shape") else None,
+        "dtype": str(tensor.dtype) if hasattr(tensor, "dtype") else None,
+        "device": str(tensor.device) if hasattr(tensor, "device") else None,
+    }
+    try:
+        _summary["stride"] = tuple(tensor.stride()) if hasattr(tensor, "stride") else None
+    except Exception:
+        _summary["stride"] = None
+    try:
+        _summary["storage_offset"] = int(tensor.storage_offset()) if hasattr(tensor, "storage_offset") else None
+    except Exception:
+        _summary["storage_offset"] = None
+    try:
+        _summary["data_ptr"] = tensor.data_ptr()
+    except (AttributeError, RuntimeError):
+        _summary["data_ptr"] = None
+    if include_hash:
+        try:
+            import torch
+            _bytes = tensor.contiguous().cpu().numpy().tobytes()
+            _summary["tensor_sha256"] = hashlib.sha256(_bytes).hexdigest()
+        except Exception:
+            _summary["tensor_sha256"] = None
+    return _summary
+
+
+# ── Restore preload handle ─────────────────────────────────────────────
+
+class _RestorePreloadHandle:
+    """Handle for a restore CLIP preload worker thread with exact timing."""
+
+    __slots__ = (
+        "thread", "worker_started_event", "completed_event",
+        "result_holder", "error_holder",
+        "submitted_ns", "worker_started_ns", "completed_ns",
+    )
+
+    def __init__(self):
+        self.thread = None
+        self.worker_started_event = threading.Event()
+        self.completed_event = threading.Event()
+        self.result_holder = {}
+        self.error_holder = {}
+        self.submitted_ns = 0
+        self.worker_started_ns = 0
+        self.completed_ns = 0
 
 
 class _ComfyAPIMixin:
@@ -6267,6 +6480,69 @@ class _ComfyAPIMixin:
         self._validation_cache.set("custom_node_sync", _result, fingerprint=cheap_hash)
         return _result
 
+    def _start_restore_preload(
+        self,
+        preload_paths: list[str],
+    ) -> _RestorePreloadHandle:
+        """Start a restore CLIP preload worker thread with exact timing signals.
+
+        Returns a handle that can be used to wait for worker start and join.
+        """
+        _handle = _RestorePreloadHandle()
+        _handle.worker_started_event = threading.Event()
+        _handle.completed_event = threading.Event()
+        _handle.result_holder = {}
+        _handle.error_holder = {}
+        _handle.submitted_ns = time.perf_counter_ns()
+        _timing_holder: dict = {}
+        _timing_holder["_handle_ref"] = _handle  # allow _load_one to set worker_started_ns before event
+
+        def _run_restore_preload():
+            try:
+                _result = self._preload_models_to_cpu(
+                    preload_paths,
+                    budget_ms=None,
+                    worker_started_event=_handle.worker_started_event,
+                    worker_timing_holder=_timing_holder,
+                )
+                _handle.result_holder["result"] = _result
+            except Exception as _exc:
+                _handle.error_holder["exception"] = _exc
+            finally:
+                _handle.completed_ns = time.perf_counter_ns()
+                if _timing_holder.get("first_worker_started_ns"):
+                    _handle.worker_started_ns = _timing_holder["first_worker_started_ns"]
+                _handle.completed_event.set()
+
+        _handle.thread = threading.Thread(
+            target=_run_restore_preload,
+            daemon=True,
+        )
+        _handle.thread.start()
+        return _handle
+
+    def _join_restore_preload(
+        self,
+        handle: _RestorePreloadHandle,
+    ) -> dict:
+        """Join a restore preload handle and return results.
+
+        Re-raises any exception captured by the preload worker.
+        """
+        _join_start_ns = time.perf_counter_ns()
+        handle.thread.join()
+        _await_ms = round(
+            (time.perf_counter_ns() - _join_start_ns) / 1_000_000, 3,
+        )
+        if handle.error_holder.get("exception"):
+            raise handle.error_holder["exception"]
+        _result = handle.result_holder.get("result", {"count": 0, "file_timing_ms": {}})
+        _result["_preload_handle_await_ms"] = _await_ms
+        _result["_preload_handle_submitted_ns"] = handle.submitted_ns
+        _result["_preload_handle_worker_started_ns"] = handle.worker_started_ns
+        _result["_preload_handle_completed_ns"] = handle.completed_ns
+        return _result
+
     def _snapshot_preload_profile(self) -> dict:
         active = self._load_active_next_profile()
         env_profile = load_warmup_profile()
@@ -6370,7 +6646,7 @@ class _ComfyAPIMixin:
         print(f"  CLIP_TYPE: warmup={_wu_clip_type} workflow={ws_clip_type} match={_wu_clip_type==ws_clip_type}")
         return result
 
-    def _snapshot_preload_paths(self, profile: dict) -> list[str]:
+    def _snapshot_preload_paths(self, profile: dict) -> list:
         """Resolve model file paths for snapshot CPU preload.
 
         Preloads all model files (checkpoint or split) into CPU RAM during
@@ -6446,16 +6722,265 @@ class _ComfyAPIMixin:
                         path_times[fn] = d_ms
                         if path and path not in seen:
                             seen.add(path)
-                            paths.append(path)
+                            paths.append({"path": path, "role": bucket})
                             print(f"[comfyapp] snapshot_preload_paths: resolved bucket={bucket} name={fn} -> {path} in {d_ms}ms")
                         else:
                             print(f"[comfyapp] snapshot_preload_paths: NOT FOUND bucket={bucket} name={fn} in {d_ms}ms")
                     except Exception as exc:
                         print(f"[comfyapp] snapshot_preload_paths: ERROR bucket={bucket} name={filename}: {exc}")
-        print(f"[comfyapp] snapshot_preload_paths: resolved {len(paths)} paths: {[os.path.basename(p) for p in paths]} per-file: {path_times}")
+        print(f"[comfyapp] snapshot_preload_paths: resolved {len(paths)} paths: {[os.path.basename(p['path']) for p in paths]} per-file: {path_times}")
         return paths
 
-    def _preload_models_to_cpu(self, file_paths: list[str], on_file_loaded=None, budget_ms: float | None = None) -> dict:
+    def _load_model_state_explicit_cpu(self, path: str, original_loader) -> tuple[dict, dict | None, dict]:
+        """Load a model state dict with explicit CPU device and full diagnostics.
+
+        Returns (state_dict, metadata_or_None, diagnostics).
+        Diagnostics include RSS, page faults, file probe timing, loader timing,
+        recursive CPU validation, and cache registration timing.
+        """
+        import torch
+        import comfy.model_management as _cmm
+        _file_size = 0
+        try:
+            _file_size = os.path.getsize(path)
+        except Exception:
+            pass
+        # Pre-loader diagnostics
+        _rss_before = _read_process_rss_mb()
+        _faults_before = _read_resource_faults()
+        # File probe: stat + open-read-4096 bytes (diagnostic only)
+        _file_stat_ms = 0.0
+        _stat_start = time.perf_counter_ns()
+        try:
+            os.stat(path)
+            _file_stat_ms = round((time.perf_counter_ns() - _stat_start) / 1_000_000, 3)
+        except Exception:
+            _file_stat_ms = -1.0
+        _file_open_probe_ms = 0.0
+        _probe_start = time.perf_counter_ns()
+        try:
+            with open(path, "rb") as _pf:
+                _probe_bytes = _pf.read(4096)
+                if len(_probe_bytes) < min(4096, _file_size) and _file_size > 4096:
+                    pass  # Expected for large files; only 4096 read
+            _file_open_probe_ms = round((time.perf_counter_ns() - _probe_start) / 1_000_000, 3)
+        except Exception:
+            _file_open_probe_ms = -1.0
+        # Loader call
+        _loader_start = time.perf_counter_ns()
+        _cpu = torch.device("cpu")
+        try:
+            _result = original_loader(
+                path,
+                safe_load=True,
+                device=_cpu,
+                return_metadata=True,
+            )
+        except TypeError:
+            raise RuntimeError(
+                "Explicit CPU preload is unsupported by the current ComfyUI loader signature"
+            )
+        _loader_call_ms = round((time.perf_counter_ns() - _loader_start) / 1_000_000, 3)
+        # Unpack result
+        if isinstance(_result, tuple) and len(_result) >= 2:
+            _sd = _result[0]
+            _meta = _result[1] if len(_result) > 1 else None
+        else:
+            _sd = _result
+            _meta = None
+        # Post-loader RSS and faults
+        _rss_after_loader = _read_process_rss_mb()
+        _faults_after_loader = _read_resource_faults()
+        # Recursive CPU validation
+        _val_start = time.perf_counter_ns()
+        _entries, _tensor_count, _nested_container_count = _walk_tensor_values(_sd)
+        _non_cpu = [(p, d) for p, d in _entries if d != "cpu"]
+        _non_cpu = _non_cpu[:20]
+        _cpu_validation_ms = round((time.perf_counter_ns() - _val_start) / 1_000_000, 3)
+        if _non_cpu:
+            raise RuntimeError(
+                f"Explicit CPU preload returned non-CPU tensors for {path}: "
+                f"{_non_cpu}"
+            )
+        _diag: dict = {
+            "explicit_device": "cpu",
+            "file_size_bytes": _file_size,
+            "file_stat_ms": _file_stat_ms,
+            "file_open_probe_ms": _file_open_probe_ms,
+            "loader_call_ms": _loader_call_ms,
+            "loader_ms": _loader_call_ms,  # compatibility alias
+            "cpu_validation_ms": _cpu_validation_ms,
+            "cache_registration_ms": 0.0,
+            "tensor_count": _tensor_count,
+            "nested_container_count": _nested_container_count,
+            "non_cpu_tensor_count": len(_non_cpu),
+            "rss_before_mb": _rss_before,
+            "rss_after_loader_mb": _rss_after_loader,
+            "rss_after_cache_mb": -1.0,
+            "rss_loader_delta_mb": round(_rss_after_loader - _rss_before, 3) if _rss_before >= 0 and _rss_after_loader >= 0 else -1.0,
+            "rss_cache_delta_mb": -1.0,
+            "minor_faults_before": _faults_before.get("minor_faults", -1),
+            "minor_faults_after_loader": _faults_after_loader.get("minor_faults", -1),
+            "minor_faults_after_cache": -1,
+            "minor_faults_loader_delta": (
+                _faults_after_loader.get("minor_faults", -1) - _faults_before.get("minor_faults", -1)
+                if _faults_before.get("minor_faults", -1) >= 0 and _faults_after_loader.get("minor_faults", -1) >= 0
+                else -1
+            ),
+            "minor_faults_cache_delta": -1,
+            "major_faults_before": _faults_before.get("major_faults", -1),
+            "major_faults_after_loader": _faults_after_loader.get("major_faults", -1),
+            "major_faults_after_cache": -1,
+            "major_faults_loader_delta": (
+                _faults_after_loader.get("major_faults", -1) - _faults_before.get("major_faults", -1)
+                if _faults_before.get("major_faults", -1) >= 0 and _faults_after_loader.get("major_faults", -1) >= 0
+                else -1
+            ),
+            "major_faults_cache_delta": -1,
+            "metadata_present": _meta is not None,
+            "comfy_cpu_state_at_worker_start": str(getattr(_cmm, 'cpu_state', 'unknown')),
+            "torch_cuda_available_at_worker_start": 1 if torch.cuda.is_available() else 0,
+            "torch_cuda_initialized_at_worker_start": 1 if torch.cuda.is_initialized() else 0,
+        }
+        return _sd, _meta, _diag
+
+    def _load_restore_clip_state_read_bytes(
+        self,
+        path: str,
+    ) -> tuple[dict, dict | None, dict]:
+        """Load CLIP safetensors via read_bytes for restore preload only.
+
+        Reads entire file, parses safetensors header for metadata,
+        decodes tensors via safetensors.torch.load, and immediately
+        deletes the raw byte buffer.  Returns the same (state_dict,
+        metadata_or_None, diagnostics) shape as _load_model_state_explicit_cpu.
+        """
+        import json as _json
+        import safetensors.torch as _sft
+        import torch
+        import comfy.model_management as _cmm
+        _file_size = os.path.getsize(path)
+        _diag: dict = {
+            "read_strategy": "read_bytes",
+            "file_size_bytes": _file_size,
+            "read_bytes_ms": 0.0,
+            "decode_ms": 0.0,
+            "temporary_bytes_peak_estimate": _file_size,
+            "metadata_present": False,
+            "file_stat_ms": 0.0,
+            "file_open_probe_ms": 0.0,
+            "loader_call_ms": 0.0,
+            "loader_ms": 0.0,
+            "cpu_validation_ms": 0.0,
+            "cache_registration_ms": 0.0,
+            "tensor_count": 0,
+            "nested_container_count": 0,
+            "non_cpu_tensor_count": 0,
+            "rss_before_mb": _read_process_rss_mb(),
+            "rss_after_loader_mb": -1.0,
+            "rss_after_cache_mb": -1.0,
+            "rss_loader_delta_mb": -1.0,
+            "rss_cache_delta_mb": -1.0,
+            "minor_faults_before": _read_resource_faults().get("minor_faults", -1),
+            "minor_faults_after_loader": -1,
+            "minor_faults_after_cache": -1,
+            "minor_faults_loader_delta": -1,
+            "minor_faults_cache_delta": -1,
+            "major_faults_before": _read_resource_faults().get("major_faults", -1),
+            "major_faults_after_loader": -1,
+            "major_faults_after_cache": -1,
+            "major_faults_loader_delta": -1,
+            "major_faults_cache_delta": -1,
+            "comfy_cpu_state_at_worker_start": str(getattr(_cmm, 'cpu_state', 'unknown')),
+            "torch_cuda_available_at_worker_start": 1 if torch.cuda.is_available() else 0,
+            "torch_cuda_initialized_at_worker_start": 1 if torch.cuda.is_initialized() else 0,
+            "explicit_device": "cpu",
+        }
+        # File probe
+        _stat_start = time.perf_counter_ns()
+        os.stat(path)
+        _diag["file_stat_ms"] = round((time.perf_counter_ns() - _stat_start) / 1_000_000, 3)
+        _probe_start = time.perf_counter_ns()
+        with open(path, "rb") as _pf:
+            _pf.read(4096)
+        _diag["file_open_probe_ms"] = round((time.perf_counter_ns() - _probe_start) / 1_000_000, 3)
+        # Read entire file
+        _read_start = time.perf_counter_ns()
+        with open(path, "rb") as _fh:
+            raw_bytes = _fh.read()
+        _diag["read_bytes_ms"] = round((time.perf_counter_ns() - _read_start) / 1_000_000, 3)
+        # Verify completeness
+        if len(raw_bytes) != _file_size:
+            del raw_bytes
+            raise RuntimeError(
+                "Restore CLIP read_bytes returned an incomplete file read"
+            )
+        # Parse safetensors header
+        if len(raw_bytes) < 8:
+            del raw_bytes
+            raise RuntimeError(
+                "Restore CLIP read_bytes file is too small for safetensors header"
+            )
+        header_length = int.from_bytes(raw_bytes[:8], byteorder="little", signed=False)
+        header_end = 8 + header_length
+        if header_end > len(raw_bytes):
+            del raw_bytes
+            raise RuntimeError(
+                "Restore CLIP read_bytes safetensors header exceeds file size"
+            )
+        header_payload = _json.loads(raw_bytes[8:header_end].decode("utf-8"))
+        metadata = header_payload.get("__metadata__")
+        if metadata is not None and not isinstance(metadata, dict):
+            del raw_bytes
+            raise RuntimeError(
+                "Restore CLIP read_bytes metadata is not a dict"
+            )
+        _diag["metadata_present"] = metadata is not None
+        # Decode tensors
+        _decode_start = time.perf_counter_ns()
+        try:
+            state_dict = _sft.load(raw_bytes)
+        except Exception:
+            del raw_bytes
+            raise
+        _diag["decode_ms"] = round((time.perf_counter_ns() - _decode_start) / 1_000_000, 3)
+        _diag["loader_call_ms"] = _diag["read_bytes_ms"] + _diag["decode_ms"]
+        _diag["loader_ms"] = _diag["loader_call_ms"]
+        _raw_size = len(raw_bytes)
+        del raw_bytes
+        # Validate
+        if not isinstance(state_dict, dict) or not state_dict:
+            raise RuntimeError(
+                "Restore CLIP read_bytes produced an empty or invalid state dict"
+            )
+        _diag["rss_after_loader_mb"] = _read_process_rss_mb()
+        _faults_after = _read_resource_faults()
+        _diag["minor_faults_after_loader"] = _faults_after.get("minor_faults", -1)
+        _diag["major_faults_after_loader"] = _faults_after.get("major_faults", -1)
+        # Recursive CPU validation
+        _val_start = time.perf_counter_ns()
+        _entries, _tensor_count, _nested_container_count = _walk_tensor_values(state_dict)
+        _non_cpu = [(p, d) for p, d in _entries if d != "cpu"]
+        _non_cpu = _non_cpu[:20]
+        _diag["cpu_validation_ms"] = round((time.perf_counter_ns() - _val_start) / 1_000_000, 3)
+        _diag["tensor_count"] = _tensor_count
+        _diag["nested_container_count"] = _nested_container_count
+        _diag["non_cpu_tensor_count"] = len(_non_cpu)
+        if _non_cpu:
+            raise RuntimeError(
+                f"Explicit CPU preload returned non-CPU tensors for {path}: "
+                f"{_non_cpu}"
+            )
+        return state_dict, metadata, _diag
+
+    def _preload_models_to_cpu(
+        self,
+        file_paths: list,
+        on_file_loaded=None,
+        budget_ms: float | None = None,
+        worker_started_event: threading.Event | None = None,
+        worker_timing_holder: dict | None = None,
+    ) -> dict:
         """Preload model state dicts into CPU RAM.
 
         Loaded state dicts are stored in ``_model_cpu_cache``.  The
@@ -6496,9 +7021,19 @@ class _ComfyAPIMixin:
             _total_start = time.time()
             _total_bytes = 0
             _abort_deadline = time.time() + PRELOAD_OUTLIER_ABORT_SECONDS if PRELOAD_OUTLIER_ABORT_SECONDS > 0 else None
-            for p in file_paths:
+            # Normalize items: accept strings or dicts with "path"/"role"
+            _normalized_items = []
+            for _raw in file_paths:
+                if isinstance(_raw, dict):
+                    _normalized_items.append({
+                        "path": _raw.get("path", _raw.get("file", "")),
+                        "role": _raw.get("role", "unknown"),
+                    })
+                else:
+                    _normalized_items.append({"path": str(_raw), "role": "unknown"})
+            for _item in _normalized_items:
                 try:
-                    _total_bytes += os.path.getsize(p)
+                    _total_bytes += os.path.getsize(_item["path"])
                 except OSError:
                     pass
             # Determine worker count from PRELOAD_MODE
@@ -6514,25 +7049,44 @@ class _ComfyAPIMixin:
             print(
                 f"[comfyapp] preload_models_to_cpu: files={len(file_paths)} "
                 f"total_gb={round(_total_bytes / (1024**3), 2)} "
-                f"mode={_pm} workers={_preload_max_workers} starting"
+                f"mode={_pm} configured_workers={_preload_max_workers} starting"
             )
             original_loader = getattr(self, "_original_model_loader", None)
             if original_loader is None:
                 raise RuntimeError("Original ComfyUI model loader unavailable for CPU preload")
 
+            # Pre-validate the explicit CPU helper before any worker starts
+            _explicit_cpu_loader = getattr(
+                self,
+                "_load_model_state_explicit_cpu",
+                None,
+            )
+            if not callable(_explicit_cpu_loader):
+                raise RuntimeError(
+                    "Internal restore preload implementation failure: "
+                    "_load_model_state_explicit_cpu is unavailable"
+                )
+
             # Determine which files need loading (skip already-cached)
             to_load = []
             seen_cache_keys = set()
-            for path in file_paths:
+            for _item in _normalized_items:
+                path = _item["path"]
                 cache_key = _model_cpu_cache_key(path)
                 if cache_key in seen_cache_keys:
                     continue
                 seen_cache_keys.add(cache_key)
                 filename = os.path.basename(path)
                 if not any(key in self._model_cpu_cache for key in _model_cpu_cache_lookup_keys(path)):
-                    to_load.append((path, filename, cache_key))
+                    to_load.append((path, filename, cache_key, _item["role"]))
 
             cached = []
+            # ── Signal worker start when no files need loading ──
+            if not to_load:
+                if worker_timing_holder is not None:
+                    worker_timing_holder["no_worker_needed"] = 1
+                if worker_started_event is not None:
+                    worker_started_event.set()
             file_timing_ms: dict[str, float] = {}
             _aborted = False
             _abort_reason = ""
@@ -6549,8 +7103,20 @@ class _ComfyAPIMixin:
             if to_load:
                 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
-                def _load_one(path: str, filename: str, cache_key: str) -> tuple[str, str, object, object | None, float, int, dict]:
+                def _load_one(path: str, filename: str, cache_key: str, role: str = "unknown") -> tuple[str, str, object, object | None, float, int, dict]:
                     started = time.time()
+                    # ── Signal worker started from actual loader context ──
+                    _worker_started_ns = time.perf_counter_ns()
+                    if worker_timing_holder is not None:
+                        worker_timing_holder.setdefault(
+                            "first_worker_started_ns",
+                            _worker_started_ns,
+                        )
+                        _h_ref = worker_timing_holder.get("_handle_ref")
+                        if _h_ref is not None:
+                            _h_ref.worker_started_ns = _worker_started_ns
+                    if worker_started_event is not None:
+                        worker_started_event.set()
                     _t_before_register = time.time()
                     _reg_status = _register_active_model_read(cache_key, owner="restore_preload", path=path, phase="restore")
                     _active_register_ms = round((time.time() - _t_before_register) * 1000, 1)
@@ -6578,8 +7144,40 @@ class _ComfyAPIMixin:
                         _reg_status = _register_active_model_read(cache_key, owner="restore_preload", path=path, phase="restore")
                     _concurrent_at_start = _count_active_model_reads()
                     _eff_safetensors_mode = os.environ.get("COMFYMODAL_SAFETENSORS_READ_MODE", "normal").strip().lower()
+                    # Resolve read-bytes eligibility
+                    _fp = _resolve_fastpath_v21621()
+                    _use_read_bytes = (
+                        _fp["fastpath_clip_read_bytes"]
+                        and role == "clip"
+                        and path.lower().endswith(".safetensors")
+                    )
+                    if _use_read_bytes:
+                        _read_bytes_loader = getattr(self, "_load_restore_clip_state_read_bytes", None)
+                        if not callable(_read_bytes_loader):
+                            _use_read_bytes = False
                     try:
-                        loaded = original_loader(path, return_metadata=True)
+                        if _use_read_bytes:
+                            loaded = _read_bytes_loader(path)
+                            print(f"[restore.preload.strategy] role=clip strategy=read_bytes file={filename}")
+                        else:
+                            loaded = _explicit_cpu_loader(path, original_loader)
+                            _strat = "read_bytes" if _use_read_bytes else "normal_explicit_cpu"
+                            print(f"[restore.preload.strategy] role={role} strategy={_strat} file={filename}")
+                    except (NameError, AttributeError, AssertionError) as _prog_exc:
+                        _fail_active_model_read(cache_key, error=str(_prog_exc))
+                        raise RuntimeError(
+                            "Internal restore preload implementation failure"
+                        ) from _prog_exc
+                    except RuntimeError as _re_exc:
+                        _re_msg = str(_re_exc)
+                        if (
+                            _re_msg.startswith("Internal restore preload")
+                            or _re_msg.startswith("Explicit CPU preload")
+                        ):
+                            _fail_active_model_read(cache_key, error=_re_msg)
+                            raise
+                        _fail_active_model_read(cache_key, error=f"{_re_exc}")
+                        raise
                     except Exception as _lo_exc:
                         _fail_active_model_read(cache_key, error=f"{_lo_exc}")
                         print(f"[preload_model_read_failed] file={filename} key={cache_key[:80]} owner=restore_preload error={_lo_exc!r}")
@@ -6592,8 +7190,8 @@ class _ComfyAPIMixin:
                     except OSError:
                         pass
                     # Store into CPU cache directly on success regardless of
-                    # session validity GÇö completed reads are never discarded.
-                    if isinstance(loaded, tuple) and len(loaded) == 2:
+                    # session validity — completed reads are never discarded.
+                    if isinstance(loaded, tuple) and len(loaded) >= 2:
                         state_dict, metadata = loaded[0], loaded[1]
                     else:
                         state_dict, metadata = loaded, None
@@ -6603,6 +7201,27 @@ class _ComfyAPIMixin:
                     _cpu_cache_hit_detect = cache_key in _model_cache_local
                     _model_cache_local[cache_key] = (state_dict, metadata)
                     _cache_register_ms = round((time.time() - _t_before_cache) * 1000, 1)
+                    _rss_after_cache = _read_process_rss_mb()
+                    _faults_after_cache = _read_resource_faults()
+                    # Update the explicit-CPU loader diagnostics with after-cache fields
+                    if isinstance(loaded, tuple) and len(loaded) >= 3 and isinstance(loaded[2], dict):
+                        _l_diag = loaded[2]
+                        _l_diag["cache_registration_ms"] = _cache_register_ms
+                        _l_diag["rss_after_cache_mb"] = _rss_after_cache
+                        _l_diag["minor_faults_after_cache"] = _faults_after_cache.get("minor_faults", -1)
+                        _l_diag["major_faults_after_cache"] = _faults_after_cache.get("major_faults", -1)
+                        _rss_before = _l_diag.get("rss_before_mb", -1.0)
+                        _rss_after_loader = _l_diag.get("rss_after_loader_mb", -1.0)
+                        if _rss_after_cache >= 0 and _rss_after_loader >= 0:
+                            _l_diag["rss_cache_delta_mb"] = round(_rss_after_cache - _rss_after_loader, 3)
+                        _mf_before = _l_diag.get("minor_faults_before", -1)
+                        _mf_after_l = _l_diag.get("minor_faults_after_loader", -1)
+                        if _faults_after_cache.get("minor_faults", -1) >= 0 and _mf_after_l >= 0:
+                            _l_diag["minor_faults_cache_delta"] = _faults_after_cache["minor_faults"] - _mf_after_l
+                        _mj_before = _l_diag.get("major_faults_before", -1)
+                        _mj_after_l = _l_diag.get("major_faults_after_loader", -1)
+                        if _faults_after_cache.get("major_faults", -1) >= 0 and _mj_after_l >= 0:
+                            _l_diag["major_faults_cache_delta"] = _faults_after_cache["major_faults"] - _mj_after_l
                     _complete_active_model_read(cache_key)
                     _concurrent_at_end = _count_active_model_reads()
                     _per_file_diag = {
@@ -6617,7 +7236,25 @@ class _ComfyAPIMixin:
                         "active_read_attached_existing_future": _attached_existing,
                         "active_read_duplicate_prevented": 1 if _attached_existing else 0,
                     }
-                    if isinstance(loaded, tuple) and len(loaded) == 2:
+                    # Emit final preload detail log after cache insertion
+                    if isinstance(loaded, tuple) and len(loaded) >= 3 and isinstance(loaded[2], dict):
+                        _l_diag = loaded[2]
+                        print(
+                            f"[restore.preload.detail] file={filename} "
+                            f"stat_ms={_l_diag.get('file_stat_ms', 0)} "
+                            f"probe_ms={_l_diag.get('file_open_probe_ms', 0)} "
+                            f"loader_ms={_l_diag.get('loader_call_ms', 0)} "
+                            f"validation_ms={_l_diag.get('cpu_validation_ms', 0)} "
+                            f"cache_ms={_l_diag.get('cache_registration_ms', 0)} "
+                            f"rss_before_mb={_l_diag.get('rss_before_mb', -1)} "
+                            f"rss_after_loader_mb={_l_diag.get('rss_after_loader_mb', -1)} "
+                            f"rss_after_cache_mb={_l_diag.get('rss_after_cache_mb', -1)} "
+                            f"minor_faults_loader_delta={_l_diag.get('minor_faults_loader_delta', -1)} "
+                            f"major_faults_loader_delta={_l_diag.get('major_faults_loader_delta', -1)} "
+                            f"minor_faults_cache_delta={_l_diag.get('minor_faults_cache_delta', -1)} "
+                            f"major_faults_cache_delta={_l_diag.get('major_faults_cache_delta', -1)}"
+                        )
+                    if isinstance(loaded, tuple) and len(loaded) >= 2:
                         return filename, cache_key, loaded[0], loaded[1], _loader_ms, _read_bytes, _per_file_diag
                     return filename, cache_key, loaded, None, _loader_ms, _read_bytes, _per_file_diag
 
@@ -6669,6 +7306,8 @@ class _ComfyAPIMixin:
                 _pending = list(to_load)
 
                 pool = ThreadPoolExecutor(max_workers=min(len(to_load), _preload_max_workers))
+                _effective_workers = min(len(to_load), _preload_max_workers)
+                print(f"[comfyapp] preload_models_to_cpu: configured_workers={_preload_max_workers} effective_workers={_effective_workers}")
                 try:
                     # Submit initial batch up to max_workers
                     fut_to_item: dict = {}
@@ -6707,9 +7346,9 @@ class _ComfyAPIMixin:
                         )
 
                     while _pending and len(fut_to_item) < _preload_max_workers:
-                        p, f, cache_key = _pending.pop(0)
-                        fut = pool.submit(_load_one, p, f, cache_key)
-                        fut_to_item[fut] = (f, cache_key, p)
+                        p, f, cache_key, role = _pending.pop(0)
+                        fut = pool.submit(_load_one, p, f, cache_key, role)
+                        fut_to_item[fut] = (f, cache_key, p, role)
                         _attach_active_model_read_future(cache_key, fut)
 
                     while fut_to_item and not _aborted:
@@ -6725,7 +7364,7 @@ class _ComfyAPIMixin:
                                 break
                             continue
                         # Remove before processing to ensure exactly-once
-                        _fname, _cache_key, _path = fut_to_item.pop(future)
+                        _fname, _cache_key, _path, _role = fut_to_item.pop(future)
                         filename = _fname
                         cache_key = _cache_key
                         try:
@@ -6737,9 +7376,9 @@ class _ComfyAPIMixin:
 
                         # Submit next pending if not aborted
                         if not _check_abort() and _pending:
-                            p, f, cache_key = _pending.pop(0)
-                            fut = pool.submit(_load_one, p, f, cache_key)
-                            fut_to_item[fut] = (f, cache_key, p)
+                            p, f, cache_key, role = _pending.pop(0)
+                            fut = pool.submit(_load_one, p, f, cache_key, role)
+                            fut_to_item[fut] = (f, cache_key, p, role)
                             _attach_active_model_read_future(cache_key, fut)
 
                     if _aborted:
@@ -11893,6 +12532,22 @@ class _ComfyAPIMixin:
         _, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
         self._log_profile("custom_nodes_sync", duration_ms=self._profile_ms(stage_started), state_count=len(self._custom_nodes_state))
 
+        # ── Initialize model-generation snapshot baseline ─────────────
+        # Capture the current generation before the memory snapshot so
+        # restore can compare without unconditionally reloading models.
+        _gen_rec = _read_models_generation_record()
+        if _gen_rec is None:
+            # Ensure models Volume is available, then create the first record
+            vol.reload()
+            self._ensure_models_symlink()
+            _gen_rec = _write_models_generation_record(
+                "initialize_generation_record"
+            )
+            print(f"[comfyapp.models_gen] snapshot_baseline={_gen_rec['generation'][:12]} reason=initialize_generation_record")
+        else:
+            print(f"[comfyapp.models_gen] snapshot_baseline={_gen_rec['generation'][:12]} reason=existing_record")
+        self._models_generation_seen = _gen_rec["generation"]
+
         stage_started = time.time()
         try:
             install_summary = self._install_custom_node_requirements()
@@ -11943,58 +12598,133 @@ class _ComfyAPIMixin:
         print(f"[comfyapp] startup complete in {duration:.3f}s  "
               f"req_installed={len(install_summary.get('installed', []))}")
 
-    def _warmup_cuda(self):
-        """Revitalise CUDA driver context and force GPU clock ramp-up.
+    def _initialize_cuda_context(self) -> tuple:
+        """Initialize CUDA context: device lookup + first synchronize only.
 
-        Modal's ``enable_gpu_snapshot`` preserves GPU *memory* across
-        restore, but the CUDA driver context can become stale on a new
-        container.  The first kernel launch then pays an ~8s penalty
-        and the GPU may stay in a low-power state that throttles
-        memory-bandwidth-bound ops (VAE decode, text encoding).
-
-        Running a brief warmup here pays the penalty once during
-        restore rather than silently degrading prompt execution.
+        Must not allocate tensors, run GEMMs, or do optional warmup.
         """
         import torch
+        _started_ns = time.perf_counter_ns()
         if not torch.cuda.is_available():
-            print("[comfyapp] CUDA warmup skipped GÇö no GPU")
-            return
-        dev = torch.device(torch.cuda.current_device())
+            return None, {
+                "cuda_available": 0,
+                "cuda_device_index": -1,
+                "cuda_device_name": "",
+                "cuda_context_sync_ms": 0.0,
+                "cuda_context_total_ms": round(
+                    (time.perf_counter_ns() - _started_ns) / 1_000_000, 3,
+                ),
+            }
+        _device_index = torch.cuda.current_device()
+        _device = torch.device(_device_index)
+        _sync_started_ns = time.perf_counter_ns()
+        torch.cuda.synchronize(_device)
+        _sync_end_ns = time.perf_counter_ns()
+        _result = {
+            "cuda_available": 1,
+            "cuda_device_index": int(_device_index),
+            "cuda_device_name": torch.cuda.get_device_name(_device),
+            "cuda_context_sync_ms": round(
+                (_sync_end_ns - _sync_started_ns) / 1_000_000, 3,
+            ),
+            "cuda_context_total_ms": round(
+                (time.perf_counter_ns() - _started_ns) / 1_000_000, 3,
+            ),
+        }
+        print(
+            f"[restore.cuda_context] available=1 device_index={_result['cuda_device_index']} "
+            f"device={_result['cuda_device_name']} sync_ms={_result['cuda_context_sync_ms']} "
+            f"total_ms={_result['cuda_context_total_ms']}"
+        )
+        return _device, _result
+
+    def _run_optional_cuda_warmup(self, device) -> dict:
+        """Run optional GEMM + allocator warmup after CUDA context is initialized.
+
+        Failure is non-fatal and must not invalidate a successful preload.
+        """
+        import torch
+        _preamble = {
+            "optional_cuda_available": 0,
+            "gemm_allocate_ms": 0.0,
+            "gemm_execute_and_sync_ms": 0.0,
+            "allocator_allocate_and_touch_ms": 0.0,
+            "allocator_sync_ms": 0.0,
+            "tensor_cleanup_ms": 0.0,
+            "final_sync_ms": 0.0,
+            "optional_cuda_total_ms": 0.0,
+            "optional_cuda_status": "skipped_no_cuda",
+            "optional_cuda_error": "",
+        }
+        _started_ns = time.perf_counter_ns()
+        if device is None or not torch.cuda.is_available():
+            return _preamble
+        _preamble["optional_cuda_available"] = 1
         a = None
         b = None
-        _warm = None
+        warm = None
+        _cleanup_ms = 0.0
+        _error_str = ""
         try:
-            _t0 = time.time()
-            # Force CUDA context reconnection (first call is slow if stale)
-            torch.cuda.synchronize(dev)
-            _ctx_ms = round((time.time() - _t0) * 1000, 1)
-            _t0 = time.time()
-            # Run a handful of GEMMs to coax GPU Boost out of its low-power state
-            a = torch.randn(2048, 2048, device=dev)
-            b = torch.randn(2048, 2048, device=dev)
+            _t0 = time.perf_counter_ns()
+            a = torch.randn(2048, 2048, device=device)
+            b = torch.randn(2048, 2048, device=device)
+            _preamble["gemm_allocate_ms"] = round(
+                (time.perf_counter_ns() - _t0) / 1_000_000, 3,
+            )
+            _t0 = time.perf_counter_ns()
             for _ in range(5):
                 a = a @ b
-            torch.cuda.synchronize(dev)
-            _gemm_ms = round((time.time() - _t0) * 1000, 1)
-            # Warm the memory allocator with a moderate allocation
-            _t0 = time.time()
-            _warm = torch.empty(256, 1024, 1024, dtype=torch.float16, device=dev)
-            _warm.zero_()
-            torch.cuda.synchronize(dev)
-            _alloc_ms = round((time.time() - _t0) * 1000, 1)
-            _cleanup_ms = 0.0
-            _t0 = time.time()
+            torch.cuda.synchronize(device)
+            _preamble["gemm_execute_and_sync_ms"] = round(
+                (time.perf_counter_ns() - _t0) / 1_000_000, 3,
+            )
+            _t0 = time.perf_counter_ns()
+            warm = torch.empty(256, 1024, 1024, dtype=torch.float16, device=device)
+            warm.zero_()
+            _preamble["allocator_allocate_and_touch_ms"] = round(
+                (time.perf_counter_ns() - _t0) / 1_000_000, 3,
+            )
+            _t0 = time.perf_counter_ns()
+            torch.cuda.synchronize(device)
+            _preamble["allocator_sync_ms"] = round(
+                (time.perf_counter_ns() - _t0) / 1_000_000, 3,
+            )
+            _preamble["optional_cuda_status"] = "ok"
+        except Exception as _exc:
+            _error_str = str(_exc)[:200]
+            _preamble["optional_cuda_status"] = "failed"
+            _preamble["optional_cuda_error"] = _error_str
+            print(f"[restore.cuda_optional] WARNING warmup failed: {_exc}")
         finally:
+            _t0 = time.perf_counter_ns()
             del a
             del b
-            del _warm
-            torch.cuda.synchronize(dev)
-            if _cleanup_ms == 0.0:  # only if we didn't reach the timed cleanup
-                _cleanup_ms = round((time.time() - _t0) * 1000, 1)
-            _cuda_total_ms = _ctx_ms + _gemm_ms + _alloc_ms + _cleanup_ms
-            print(f"[comfyapp] CUDA warmup done device={torch.cuda.get_device_name(dev)} "
-                  f"ctx_sync={_ctx_ms}ms gemm={_gemm_ms}ms alloc={_alloc_ms}ms "
-                  f"cleanup={_cleanup_ms}ms total={_cuda_total_ms}ms")
+            del warm
+            torch.cuda.synchronize(device)
+            _cleanup_ms = round(
+                (time.perf_counter_ns() - _t0) / 1_000_000, 3,
+            )
+            _preamble["tensor_cleanup_ms"] = _cleanup_ms
+            _t_sync = time.perf_counter_ns()
+            torch.cuda.synchronize(device)
+            _preamble["final_sync_ms"] = round(
+                (time.perf_counter_ns() - _t_sync) / 1_000_000, 3,
+            )
+            _preamble["optional_cuda_total_ms"] = round(
+                (time.perf_counter_ns() - _started_ns) / 1_000_000, 3,
+            )
+            print(
+                f"[restore.cuda_optional] status={_preamble['optional_cuda_status']} "
+                f"gemm_allocate_ms={_preamble['gemm_allocate_ms']} "
+                f"gemm_execute_and_sync_ms={_preamble['gemm_execute_and_sync_ms']} "
+                f"allocator_allocate_and_touch_ms={_preamble['allocator_allocate_and_touch_ms']} "
+                f"allocator_sync_ms={_preamble['allocator_sync_ms']} "
+                f"cleanup_ms={_preamble['tensor_cleanup_ms']} "
+                f"final_sync_ms={_preamble['final_sync_ms']} "
+                f"total_ms={_preamble['optional_cuda_total_ms']}"
+            )
+        return _preamble
 
     def _warmup_sage_attention_cuda(self):
         """Run one SageAttention CUDA forward pass to pre-load kernels."""
@@ -12970,55 +13700,19 @@ class _ComfyAPIMixin:
     def _should_reload_models_volume(self) -> bool:
         """Determine whether the models Volume needs a reload.
 
-        The models Volume is reloaded only when:
-        1. No previous generation token exists (first restore)
-        2. The stored generation token changed (new model deployment)
-        3. A selected model file probe fails (file missing or unreadable)
-
-        Control-metadata changes alone (active profile, preload mode)
-        do NOT force a models Volume reload because those files are
-        small and read through FUSE with negligible latency.
+        Uses the authoritative model-generation record stored on the
+        custom-nodes Volume.  Does NOT fall back to custom-node state hashes.
         """
-        _token_path = os.path.join(RUNTIME_CONFIG_DIR, ".models_volume_generation_token")
-        _current_token = os.environ.get("COMFYMODAL_MODELS_GENERATION_TOKEN", "")
-        if not _current_token:
-            try:
-                _current_token = _cheap_volume_state_hash()
-            except Exception:
-                _current_token = ""
-
-        _stored_token = ""
-        try:
-            if os.path.isfile(_token_path):
-                with open(_token_path, "r") as _f:
-                    _stored_token = _f.read().strip()
-        except Exception:
-            pass
-
-        if not _stored_token or _stored_token != _current_token:
-            return True
-
-        # Token matches; probe one known model file
-        _probe_path = os.path.join(MODELS_PATH, ".model_manifest.json")
-        if not os.path.isfile(_probe_path):
-            _probe_path = os.path.join(MODELS_PATH, "unet")
-            if not os.path.isdir(_probe_path):
-                _probe_path = MODELS_PATH
-        try:
-            if not os.path.exists(_probe_path):
-                return True
-        except Exception:
-            return True
-
-        # Store token for next check
-        try:
-            os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
-            with open(_token_path, "w") as _f:
-                _f.write(_current_token)
-        except Exception:
-            pass
-
-        return False
+        _current_gen = _current_models_generation_id()
+        _seen_gen = getattr(self, "_models_generation_seen", "")
+        if not _current_gen:
+            __stages = {}
+            if hasattr(self, 'restore'):  # only within restore context
+                pass
+            return True  # no record → reload required
+        if _current_gen != _seen_gen:
+            return True  # generation changed
+        return False  # unchanged
 
     @modal.enter(snap=False)
     def restore(self):
@@ -13051,10 +13745,12 @@ class _ComfyAPIMixin:
             # Use env var for experiment flexibility, else module default
             pass
 
-        restore_start = time.time()
+        restore_start_wall_s = time.time()
+        restore_start_ns = time.perf_counter_ns()
+        restore_start = restore_start_wall_s  # wall-clock alias for legacy __stages
         global _container_restore_count
         _container_restore_count += 1
-        print(f"[comfyapp] lifecycle=restore snap=False restore_start_unix={restore_start} container_session={CONTAINER_SESSION_ID} restore_count={_container_restore_count}")
+        print(f"[comfyapp] lifecycle=restore snap=False restore_start_unix={restore_start_wall_s} container_session={CONTAINER_SESSION_ID} restore_count={_container_restore_count}")
         __stages: dict[str, float] = {}
         __stages["container_session_id"] = CONTAINER_SESSION_ID
         __stages["snapshot_import_session_id"] = CONTAINER_SESSION_ID
@@ -13071,52 +13767,66 @@ class _ComfyAPIMixin:
         self._ensure_models_symlink()
         __stages["ensure_models_ms"] = self._profile_ms(_s)
 
-        # GöÇGöÇ Wait for FUSE volume mounts to become accessible GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
-        # After snapshot restore, the Modal FUSE daemon re-establishes its
-        # backend connection asynchronously.  If we access the volume mount
-        # point before the daemon is ready, os.path.isdir() returns False
-        # and the volume appears empty.  This retry loop ensures both models
-        # and custom nodes volumes are usable before we proceed.
-        _s_vol_mount = time.time()
+        # ── Phase 1: Refresh custom-nodes Volume ──────────────────────
+        # Custom-nodes Volume must be reloaded first because the
+        # model-generation control record is stored there.
         _wait_seconds = [0.2, 0.5, 1.0, 2.0, 3.0]
-        _models_reload_needed = self._should_reload_models_volume()
-        __stages["models_volume_reload_needed"] = 1 if _models_reload_needed else 0
-        for vol_idx, (vol_obj, mount_path, label) in enumerate([
-            (vol, MODELS_PATH, "models"),
-            (custom_nodes_vol, CUSTOM_NODES_PATH, "custom_nodes"),
-        ]):
-            # Skip models Volume reload when generation token is unchanged
-            # and the mount is already accessible
-            if label == "models" and not _models_reload_needed and os.path.isdir(mount_path):
-                print(f"[comfyapp] volume_mount_skip_reload label={label} reason=generation_token_unchanged")
-                continue
+        _s_vol_mount = time.time()
+        _s_cn_vol = time.time()
+        _cn_mount_ready = False
+        for _attempt in range(len(_wait_seconds)):
+            custom_nodes_vol.reload()
+            if os.path.isdir(CUSTOM_NODES_PATH):
+                _cn_mount_ready = True
+                break
+            if _attempt < len(_wait_seconds) - 1:
+                time.sleep(_wait_seconds[_attempt])
+        if not _cn_mount_ready:
+            print(f"[comfyapp] custom_nodes_volume_mount_failed path={CUSTOM_NODES_PATH}")
+        __stages["custom_nodes_volume_reload_ms"] = self._profile_ms(_s_cn_vol)
 
+        # ── Phase 2: Read model-generation record ────────────────────
+        _s_gen_read = time.time()
+        _models_gen = _read_models_generation_record()
+        _current_gen_id = _models_gen["generation"] if _models_gen else ""
+        _seen_gen = getattr(self, "_models_generation_seen", "")
+        __stages["models_generation_read_ms"] = self._profile_ms(_s_gen_read)
+
+        # ── Phase 3: Determine if models Volume reload is needed ─────
+        _models_reload_needed = True
+        _models_reload_reason = "generation_missing"
+        if _current_gen_id:
+            if _current_gen_id != _seen_gen:
+                _models_reload_reason = "generation_changed"
+            elif not os.path.isdir(MODELS_PATH):
+                _models_reload_reason = "mount_missing"
+            else:
+                _models_reload_needed = False
+                _models_reload_reason = "unchanged"
+        __stages["models_volume_reload_needed"] = 1 if _models_reload_needed else 0
+        __stages["models_volume_reload_reason"] = _models_reload_reason
+
+        # ── Phase 4: Conditionally reload models Volume ──────────────
+        _s_models_vol = time.time()
+        if _models_reload_needed:
+            _models_mount_ready = False
             for _attempt in range(len(_wait_seconds)):
-                vol_obj.reload()
-                if os.path.isdir(mount_path):
-                    if _attempt > 0:
-                        print(f"[comfyapp] volume_mount_ready label={label} attempt={_attempt + 1}")
-                    if label == "models" and _models_reload_needed:
-                        try:
-                            _new_token = os.environ.get("COMFYMODAL_MODELS_GENERATION_TOKEN", "")
-                            if not _new_token:
-                                try:
-                                    _new_token = _cheap_volume_state_hash()
-                                except Exception:
-                                    _new_token = str(time.time())
-                            _token_path = os.path.join(RUNTIME_CONFIG_DIR, ".models_volume_generation_token")
-                            os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
-                            with open(_token_path, "w") as _f:
-                                _f.write(_new_token)
-                        except Exception:
-                            pass
+                vol.reload()
+                if os.path.isdir(MODELS_PATH):
+                    _models_mount_ready = True
                     break
                 if _attempt < len(_wait_seconds) - 1:
-                    _delay = _wait_seconds[_attempt]
-                    print(f"[comfyapp] volume_mount_wait label={label} attempt={_attempt + 1} delay_s={_delay}")
-                    time.sleep(_delay)
-            else:
-                print(f"[comfyapp] volume_mount_failed label={label} mount_path={mount_path}")
+                    print(f"[comfyapp] volume_mount_wait label=models attempt={_attempt + 1} delay_s={_wait_seconds[_attempt]}")
+                    time.sleep(_wait_seconds[_attempt])
+            if not _models_mount_ready:
+                print(f"[comfyapp] models_volume_mount_failed path={MODELS_PATH}")
+            # Update seen generation after successful reload
+            self._models_generation_seen = _current_gen_id
+        else:
+            print(f"[comfyapp] volume_mount_skip_reload label=models reason={_models_reload_reason}")
+        __stages["models_volume_reload_ms"] = self._profile_ms(_s_models_vol)
+
+        # Legacy aggregate for backward-compatible dashboards
         __stages["volume_mount_wait_ms"] = self._profile_ms(_s_vol_mount)
         __stages["models_volume_reload_skipped"] = 0 if _models_reload_needed else 1
 
@@ -13213,6 +13923,7 @@ class _ComfyAPIMixin:
                 f"clip_encode_effective={_clip_policy.get('direct_warmup_clip_encode_effective',0)}"
             )
 
+        _cu_device = None
         if is_in_proc:
             # If backend was skipped during snap=True (snapshot_mode=none/minimal),
             # initialize it now with full GPU access (no force_cpu).
@@ -13260,18 +13971,26 @@ class _ComfyAPIMixin:
                 comfy.model_management.total_ram = psutil.virtual_memory().total / (1024 * 1024)
                 __stages["gpu_state_ms"] = self._profile_ms(_s)
                 __stages["gpu_state_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
+                __stages["gpu_state_end_ns"] = time.perf_counter_ns()
 
                 _s = time.time()
                 __stages["cuda_start_ms_from_restore_start"] = round((_s - restore_start) * 1000, 1)
-                self._warmup_cuda()
+                _cu_device, _cu_diag = self._initialize_cuda_context()
                 __stages["cuda_warmup_ms"] = self._profile_ms(_s)
                 __stages["cuda_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
+                __stages["cuda_context_end_ns"] = time.perf_counter_ns()
+                if _cu_diag:
+                    __stages["cuda_context_sync_ms"] = _cu_diag.get("cuda_context_sync_ms", 0)
+                    __stages["cuda_context_total_ms"] = _cu_diag.get("cuda_context_total_ms", 0)
                 print(f"[restore.order] event=cuda_context_ready "
                       f"cuda_warmup_ms={__stages.get('cuda_warmup_ms', 0)} "
                       f"at_ms_from_restore_start={__stages['cuda_end_ms_from_restore_start']}")
                 self._log_profile("restore_warmup", mode="cuda_warmup_gpu_snap", duration_ms=__stages["cuda_warmup_ms"])
                 # Defer custom-node retry to request time (Bug A)
                 _pending_cn = len(_CUSTOM_NODE_REGISTRATION_PENDING_RETRY) if _CUSTOM_NODE_REGISTRATION_PENDING_RETRY else 0
+                __stages["deferred_retry_ms"] = 0.0
+                __stages["deferred_retry_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
+                __stages["deferred_retry_end_ns"] = time.perf_counter_ns()
                 if _pending_cn:
                     print(f"[comfyapp] deferred_custom_node_retry pending={_pending_cn}")
                 import comfy.utils
@@ -13306,22 +14025,31 @@ class _ComfyAPIMixin:
                     self._restore_in_process_gpu_state()
                     __stages["gpu_state_ms"] = self._profile_ms(_s)
                     __stages["gpu_state_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
+                    __stages["gpu_state_end_ns"] = time.perf_counter_ns()
                 else:
                     # Deferred init: backend already started with GPU
                     __stages["gpu_state_ms"] = 0.0
                     __stages["gpu_state_source"] = "deferred"
+                    __stages["gpu_state_end_ns"] = time.perf_counter_ns()
 
                 _s = time.time()
                 __stages["cuda_start_ms_from_restore_start"] = round((_s - restore_start) * 1000, 1)
-                self._warmup_cuda()
+                _cu_device, _cu_diag = self._initialize_cuda_context()
                 __stages["cuda_warmup_ms"] = self._profile_ms(_s)
                 __stages["cuda_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
+                __stages["cuda_context_end_ns"] = time.perf_counter_ns()
+                if _cu_diag:
+                    __stages["cuda_context_sync_ms"] = _cu_diag.get("cuda_context_sync_ms", 0)
+                    __stages["cuda_context_total_ms"] = _cu_diag.get("cuda_context_total_ms", 0)
                 print(f"[restore.order] event=cuda_context_ready "
                       f"cuda_warmup_ms={__stages.get('cuda_warmup_ms', 0)} "
                       f"at_ms_from_restore_start={__stages['cuda_end_ms_from_restore_start']}")
                 self._log_profile("restore_warmup", mode="cuda_warmup", duration_ms=__stages["cuda_warmup_ms"])
                 # Defer custom-node retry to request time (Bug A)
                 _pending_cn = len(_CUSTOM_NODE_REGISTRATION_PENDING_RETRY) if _CUSTOM_NODE_REGISTRATION_PENDING_RETRY else 0
+                __stages["deferred_retry_ms"] = 0.0
+                __stages["deferred_retry_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
+                __stages["deferred_retry_end_ns"] = time.perf_counter_ns()
                 if _pending_cn:
                     print(f"[comfyapp] deferred_custom_node_retry pending={_pending_cn}")
                 import comfy.utils
@@ -13387,8 +14115,7 @@ class _ComfyAPIMixin:
             # contention on the large CLIP file read.
             # The thread is joined later right before direct CLIP
             # warmup needs the CPU cache.
-            _preload_future = None
-            _preload_result_holder: dict[str, dict] = {}
+            _restore_preload_handle = None
             _preload_overlap_start = 0.0
             _preload_submitted_early = 0
             _preload_duplicate_prevented = 0
@@ -13428,33 +14155,70 @@ class _ComfyAPIMixin:
                     _preload_skip_reason_early = "z_image_guard"
                     _warmup_paths = []
                     print(f"[comfyapp] DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=1: skipping restore warmup (detected early)")
-            # Submit preload thread now if eligible
-            if _warmup_paths and _pm != "off" and _preload_future is None:
+            # Submit preload thread now if eligible (v2.16.20: use handle with worker-start signal)
+            _restore_preload_handle: _RestorePreloadHandle | None = None
+            _preload_worker_started_ns = 0
+            _preload_completed_ns = 0
+            __stages.setdefault("gpu_state_end_ns", 0)
+            __stages.setdefault("cuda_context_end_ns", 0)
+            __stages.setdefault("deferred_retry_end_ns", 0)
+            if _warmup_paths and _pm != "off":
                 _preload_submitted_early = 1
                 _preload_overlap_start = time.time()
+                _submitted_ns = time.perf_counter_ns()
                 __stages["restore_preload_submit_at_ms_from_restore_start"] = round((_preload_overlap_start - restore_start) * 1000, 1)
-                import threading as _rt
-                def _run_restore_preload_early():
-                    import comfy.model_management
-                    _cpu_state = getattr(comfy.model_management, 'cpu_state', None)
-                    _ts = time.time()
-                    if _cpu_state is not None:
-                        print(f"[restore.order] event=clip_preload_worker_start thread_id=preload "
-                              f"cpu_state={_cpu_state} "
-                              f"gpu_state_finalized=1 "
-                              f"at_ms_from_restore_start={round((_ts - restore_start) * 1000, 1)}")
-                    _preload_result_holder["result"] = self._preload_models_to_cpu(_warmup_paths, budget_ms=None)
-                _preload_future = _rt.Thread(
-                    target=_run_restore_preload_early,
-                    daemon=True,
-                )
-                _preload_future.start()
+                # ── Safety assertions: GPU, CUDA, and deferred retry must be done ──
+                _gpu_end_ns = __stages.get("gpu_state_end_ns", 0)
+                _cuda_end_ns = __stages.get("cuda_context_end_ns", 0)
+                _dretry_end_ns = __stages.get("deferred_retry_end_ns", 0)
+                if _gpu_end_ns <= 0:
+                    raise RuntimeError(
+                        "Restore ordering violation: GPU state not finalized before preload"
+                    )
+                if _cuda_end_ns <= 0:
+                    raise RuntimeError(
+                        "Restore ordering violation: CUDA context not initialized before preload"
+                    )
+                if _dretry_end_ns <= 0:
+                    raise RuntimeError(
+                        "Restore ordering violation: deferred custom-node retry not completed before preload"
+                    )
+                _restore_preload_handle = self._start_restore_preload(_warmup_paths)
                 __stages["restore_preload_submitted_early"] = 1
                 print(
                     f"[restore.order] event=clip_preload_submit files={len(_warmup_paths)} "
                     f"mode={_pm} gpu_state_finalized=1 cuda_context_ready=1 "
                     f"at_ms_from_restore_start={__stages['restore_preload_submit_at_ms_from_restore_start']}"
                 )
+                # ── Wait for actual preload worker start (timeout 5s) ──
+                _started = _restore_preload_handle.worker_started_event.wait(timeout=5.0)
+                if not _started:
+                    if _restore_preload_handle.completed_event.is_set() and not _restore_preload_handle.error_holder.get("exception"):
+                        # Cache-hit: no worker needed, preload already completed
+                        pass
+                    else:
+                        raise RuntimeError(
+                            "Restore preload worker did not start within 5 seconds"
+                        )
+                if _restore_preload_handle.worker_started_ns:
+                    _preload_worker_started_ns = _restore_preload_handle.worker_started_ns
+                    __stages["restore_preload_worker_start_at_ms_from_restore_start"] = round(
+                        (_preload_worker_started_ns - _submitted_ns) / 1_000_000, 1,
+                    )
+                # ── Verify ordering: worker cannot have started before GPU/CUDA/deferred-retry ──
+                if _preload_worker_started_ns > 0:
+                    if _preload_worker_started_ns < _gpu_end_ns:
+                        raise RuntimeError(
+                            "Restore ordering violation: preload overlapped GPU-state restoration"
+                        )
+                    if _preload_worker_started_ns < _cuda_end_ns:
+                        raise RuntimeError(
+                            "Restore ordering violation: preload overlapped first CUDA-context initialization"
+                        )
+                    if _preload_worker_started_ns < _dretry_end_ns:
+                        raise RuntimeError(
+                            "Restore ordering violation: preload overlapped deferred custom-node retry"
+                        )
             elif _preload_skip_reason_early:
                 __stages["preload_skip_reason_early"] = _preload_skip_reason_early
                 print(f"[comfyapp] restore_preload_skipped_early reason={_preload_skip_reason_early}")
@@ -13465,6 +14229,28 @@ class _ComfyAPIMixin:
             _warmup_tok = _warmup_profile.get("_profile_token", "") if _warmup_profile else ""
             _warmup_stack = _warmup_profile.get("_current_workflow_stack", {}) if _warmup_profile else {}
             __stages["warmup_profile_selected"] = _warmup_src
+            # ── v2.16.21 fastpath resolution ───────────────────────────
+            _fp_state = _resolve_fastpath_v21621()
+            __stages.update(_fp_state)
+            print(
+                f"[fastpath.v21621] master={_fp_state['fastpath_v21621_master']} "
+                f"background_unet={_fp_state['fastpath_background_unet']} "
+                f"clip_load_only={_fp_state['fastpath_clip_load_only']} "
+                f"clip_read_bytes={_fp_state['fastpath_clip_read_bytes']}"
+            )
+            # Override CLIP encode for load-only fast path
+            if _fp_state["fastpath_clip_load_only"]:
+                _clip_override = _clip_policy.copy() if _clip_policy else {}
+                _cfg_policy = _clip_override.get("restore_direct_clip_policy", "auto")
+                if _cfg_policy == "auto":
+                    _clip_override["direct_warmup_clip_encode_effective"] = 0
+                    _clip_override["restore_direct_clip_policy_decision"] = "fastpath_load_only"
+                    _clip_policy = _clip_override
+                    print(
+                        f"[fastpath.v21621.clip_policy] configured_policy=auto "
+                        f"fastpath_load_only=1 effective_load=1 effective_encode=0 "
+                        f"decision=fastpath_load_only"
+                    )
             __stages["warmup_profile_source"] = _warmup_src
             __stages["warmup_profile_token"] = _warmup_tok
             __stages["warmup_profile_workflow_hash"] = _warmup_wf_hash
@@ -13508,11 +14294,11 @@ class _ComfyAPIMixin:
                 # GöÇGöÇ PART 3: Preload guardrails GöÇGöÇ
                 # These guards were already checked in the early submit
                 # section above.  If _preload_skip_reason_early was set,
-                # preload was skipped and _preload_future is None.
+                # preload was skipped and _restore_preload_handle is None.
                 # We re-check here as a safety net in case the profile
                 # resolution differed (should not happen).
                 _preload_skip_reason = _preload_skip_reason_early
-                if _preload_skip_reason is None and not _warmup_paths and _preload_future is None:
+                if _preload_skip_reason is None and not _warmup_paths and _restore_preload_handle is None:
                     _preload_skip_reason = "already_skipped_early"
                 if _preload_skip_reason:
                     preload_paths = []
@@ -13528,7 +14314,7 @@ class _ComfyAPIMixin:
                 if _resolve_disable_restore_warmup_for_z_image() and profile and profile.get("unet", ""):
                     _wu_unet = profile.get("unet", "").lower()
                     if "z_image" in _wu_unet or "z-image" in _wu_unet:
-                        if _preload_future is None:
+                        if _restore_preload_handle is None:
                             print(f"[comfyapp] DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=1: skipping restore warmup for {_wu_unet}")
                         preload_paths = []
                         __stages["warmup_preload_skipped"] = 1
@@ -13536,45 +14322,79 @@ class _ComfyAPIMixin:
                         __stages["direct_warmup_skip_reason"] = "z_image_guard"
 
                 # GöÇGöÇ Fallback submit if preload was not submitted early GöÇGöÇGöÇGöÇ
-                if preload_paths and _pm != "off" and _preload_future is None:
+                if preload_paths and _pm != "off" and _restore_preload_handle is None:
                     _preload_submitted_early = 1
                     _preload_overlap_start = time.time()
                     __stages["restore_preload_submit_at_ms_from_restore_start"] = round((_preload_overlap_start - restore_start) * 1000, 1)
-                    import threading as _rt2
-                    def _run_restore_preload_late():
-                        _preload_result_holder["result"] = self._preload_models_to_cpu(preload_paths, budget_ms=None)
-                    _preload_future = _rt2.Thread(
-                        target=_run_restore_preload_late,
-                        daemon=True,
-                    )
-                    _preload_future.start()
+                    _restore_preload_handle = self._start_restore_preload(preload_paths)
                     __stages["restore_preload_submitted_early"] = 1
                     print(
                         f"[comfyapp] restore_preload_submitted_late files={len(preload_paths)} "
                         f"mode={_pm} at_ms={__stages['restore_preload_submit_at_ms_from_restore_start']}"
                     )
 
+                # ── v2.16.20: Optional overlap region ──────────────────────
+                # Run optional CUDA warmup while preload worker reads model files.
+                _optional_overlap_start_ns = time.perf_counter_ns()
+                __stages["optional_overlap_start_ms_from_restore_start"] = round(
+                    (_optional_overlap_start_ns - restore_start_ns) / 1_000_000, 1,
+                )
+                if _cu_device is not None:
+                    _optional_cuda_result = self._run_optional_cuda_warmup(_cu_device)
+                    __stages["optional_cuda_total_ms"] = _optional_cuda_result.get("optional_cuda_total_ms", 0)
+                    __stages["optional_cuda_status"] = _optional_cuda_result.get("optional_cuda_status", "skipped")
+                _optional_overlap_end_ns = time.perf_counter_ns()
+                __stages["optional_overlap_end_ms_from_restore_start"] = round(
+                    (_optional_overlap_end_ns - restore_start_ns) / 1_000_000, 1,
+                )
+                _restore_optional_work_total_ms = round(
+                    (_optional_overlap_end_ns - _optional_overlap_start_ns) / 1_000_000, 3,
+                )
+                __stages["restore_optional_work_total_ms"] = _restore_optional_work_total_ms
+
                 # GöÇGöÇ Join preload thread (whether submitted early or late) GöÇ
                 _s = time.time()
-                if _preload_future is not None:
+                if _restore_preload_handle is not None:
                     _preload_join_at_ms = round((time.time() - restore_start) * 1000, 1)
                     __stages["restore_preload_join_at_ms_from_restore_start"] = _preload_join_at_ms
-                    _preload_overlap_ms = round((time.time() - _preload_overlap_start) * 1000, 1)
-                    _await_start = time.time()
-                    _preload_future.join()
-                    _preload_await_ms = round((time.time() - _await_start) * 1000, 1)
-                    _preload_status = "ok"
+                    _await_start = time.perf_counter_ns()
+                    preload_result = self._join_restore_preload(_restore_preload_handle)
+                    _preload_await_ms = round(
+                        (time.perf_counter_ns() - _await_start) / 1_000_000, 3,
+                    )
+                    # ── v2.16.20: Correct overlap calculation ────────────
+                    _preload_completed_ns = _restore_preload_handle.completed_ns
+                    __stages["restore_preload_complete_at_ms_from_restore_start"] = round(
+                        (_preload_completed_ns - restore_start_ns) / 1_000_000, 1,
+                    )
+                    _preload_total_ms = 0.0
+                    if _preload_worker_started_ns > 0 and _preload_completed_ns > _preload_worker_started_ns:
+                        _preload_total_ms = round(
+                            (_preload_completed_ns - _preload_worker_started_ns) / 1_000_000, 3,
+                        )
+                    _overlap_start_ns = max(
+                        _preload_worker_started_ns or _optional_overlap_start_ns,
+                        _optional_overlap_start_ns,
+                    )
+                    _overlap_end_ns = min(
+                        _preload_completed_ns or _optional_overlap_end_ns,
+                        _optional_overlap_end_ns,
+                    )
+                    _preload_overlap_ms = round(
+                        max(0.0, (_overlap_end_ns - _overlap_start_ns) / 1_000_000), 3,
+                    )
+                    _preload_status = preload_result.get("status", "ok")
                     __stages["restore_preload_overlap_ms"] = _preload_overlap_ms
                     __stages["restore_preload_await_ms"] = _preload_await_ms
                     __stages["restore_preload_duplicate_read_prevented"] = 0
-                    __stages["restore_preload_total_ms"] = round((time.time() - _preload_overlap_start) * 1000, 1)
-                    preload_result = _preload_result_holder.get("result") or {"count": 0, "file_timing_ms": {}, "early_submitted": True}
-                    _preload_status = preload_result.get("status", _preload_status)
+                    __stages["restore_preload_total_ms"] = _preload_total_ms
                     __stages["restore_preload_status"] = _preload_status
                     print(
-                        f"[comfyapp] restore_preload_joined overlap_ms={_preload_overlap_ms} "
-                        f"await_ms={_preload_await_ms} status={_preload_status} "
-                        f"join_at_ms_from_restore_start={_preload_join_at_ms}"
+                        f"[restore.preload_timing] submit_at_ms={__stages.get('restore_preload_submit_at_ms_from_restore_start', 0)} "
+                        f"worker_start_at_ms={__stages.get('restore_preload_worker_start_at_ms_from_restore_start', 0)} "
+                        f"complete_at_ms={__stages.get('restore_preload_complete_at_ms_from_restore_start', 0)} "
+                        f"total_ms={_preload_total_ms} overlap_ms={_preload_overlap_ms} "
+                        f"await_ms={_preload_await_ms} optional_work_ms={_restore_optional_work_total_ms}"
                     )
                     if _restore_background_code_enabled():
                         _rbg = self._maybe_submit_restore_background_unet(profile, _clip_policy, preload_result, restore_start, __stages)
@@ -13599,7 +14419,7 @@ class _ComfyAPIMixin:
                             f"clip={_clip_expected} vae={_vae_expected} "
                             f"rbg_expected={_rbg_expected or 'none'} rbg_submitted={_rbg_submitted}"
                         )
-                elif preload_paths and _pm != "off":
+                elif preload_paths and _pm != "off" and _restore_preload_handle is None:
                     if _pm == "async_no_wait":
                         import threading
                         _preload_thread = threading.Thread(
@@ -13793,7 +14613,17 @@ class _ComfyAPIMixin:
                     except Exception as _mp_exc:
                         print(f"[comfyapp] modelpatcher_cache install FAILED: {_mp_exc}")
 
-                # GöÇGöÇ Direct warmup (no ComfyUI executor) GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+                # ── v2.16.21: Restore-background UNET ─────────────────
+                if _fp_state.get("fastpath_background_unet") and _restore_preload_handle is not None and _preload_status == "ok":
+                    _rbg_decision = self._maybe_submit_restore_background_unet(
+                        profile, _clip_policy, preload_result, restore_start, __stages
+                    )
+                    __stages["restore_background_unet_decision"] = _rbg_decision.get("decision", "disabled_master")
+                    print(
+                        f"[fastpath.v21621.bg_unet] decision={__stages['restore_background_unet_decision']}"
+                    )
+
+                # GöÇö Direct warmup (no ComfyUI executor)
                 # Calls UNETLoader, CLIPLoader, and CLIPTextEncode node
                 # functions directly instead of _execute_in_process().
                 # This saves ~800ms of executor dispatch overhead while
