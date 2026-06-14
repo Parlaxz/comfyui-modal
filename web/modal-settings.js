@@ -1256,6 +1256,108 @@ function buildPanel() {
   };
   stickyTop.appendChild(redeployBtn);
 
+  // -- Redeploy + Restart combo button --
+  const redeployRestartBtn = document.createElement("button");
+  redeployRestartBtn.textContent = "Redeploy and Restart";
+  redeployRestartBtn.title = "Redeploy to Modal, restart ComfyUI, and refresh";
+  redeployRestartBtn.style.cssText = btnStyle("primary") + "background: #5a3fcc; border-color: #6a4fe0;";
+  redeployRestartBtn.onclick = async () => {
+    redeployBtn.disabled = true;
+    redeployRestartBtn.disabled = true;
+    redeployRestartBtn.textContent = "Deploying...";
+
+    const updateStatus = (msg) => {
+      redeployRestartBtn.textContent = msg;
+    };
+
+    // Step 1: Deploy
+    setDeployBanner("deploying", "");
+    try {
+      const deployResp = await api.fetchApi(`${MODAL_PREFIX}/deploy`, { method: "POST" });
+      if (!deployResp.ok) throw new Error("Deploy request failed: " + deployResp.status);
+    } catch (e) {
+      setDeployBanner("error", e.message);
+      redeployBtn.disabled = false;
+      redeployRestartBtn.disabled = false;
+      redeployRestartBtn.textContent = "Redeploy and Restart";
+      return;
+    }
+
+    // Step 2: Poll until deploy is ready
+    updateStatus("Waiting for deploy...");
+    let deployReady = false;
+    const pollStart = Date.now();
+    const POLL_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max
+    while (!deployReady && (Date.now() - pollStart) < POLL_TIMEOUT_MS) {
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        const statusResp = await api.fetchApi(`${MODAL_PREFIX}/deploy/status`);
+        if (statusResp.ok) {
+          const data = await statusResp.json();
+          if (data.state === "ready") {
+            deployReady = true;
+          } else if (data.state === "error") {
+            throw new Error(data.message || "Deploy failed");
+          }
+          // "deploying" → keep polling
+        }
+      } catch (e) {
+        if (e.message && !e.message.includes("fetch")) throw e;
+        // Network errors during polling are ok — keep trying
+      }
+    }
+    if (!deployReady) {
+      redeployRestartBtn.textContent = "Deploy timed out";
+      redeployBtn.disabled = false;
+      redeployRestartBtn.disabled = false;
+      setTimeout(() => { redeployRestartBtn.textContent = "Redeploy and Restart"; }, 3000);
+      return;
+    }
+
+    // Step 3: Restart ComfyUI
+    updateStatus("Restarting ComfyUI...");
+    try {
+      await api.fetchApi("/api/manager/restart", { method: "POST" });
+    } catch {
+      // Restart endpoint may close connection before responding — expected
+    }
+
+    // Step 4: Wait for server to go down, then come back up, then reload
+    updateStatus("Waiting for restart...");
+    const RESTART_TIMEOUT_MS = 90 * 1000;
+    const restartStart = Date.now();
+
+    // Phase A: wait for server to actually die (connection refused / timeout)
+    let serverDied = false;
+    while (!serverDied && (Date.now() - restartStart) < RESTART_TIMEOUT_MS) {
+      await new Promise(r => setTimeout(r, 1500));
+      try {
+        const resp = await fetch("/api/object_info", { signal: AbortSignal.timeout(3000) });
+        if (!resp.ok) serverDied = true;
+      } catch {
+        serverDied = true; // connection refused = server is down
+      }
+    }
+
+    // Phase B: wait for server to come back up
+    updateStatus("Server restarting...");
+    let serverUp = false;
+    while (!serverUp && (Date.now() - restartStart) < RESTART_TIMEOUT_MS) {
+      await new Promise(r => setTimeout(r, 2000));
+      try {
+        const resp = await fetch("/api/object_info", { signal: AbortSignal.timeout(3000) });
+        if (resp.ok) serverUp = true;
+      } catch {}
+    }
+
+    // Flag for post-reload success banner
+    try { sessionStorage.setItem("_comfymodal_redeploy_restart_done", "1"); } catch {}
+
+    updateStatus("Reloading...");
+    location.reload();
+  };
+  stickyTop.appendChild(redeployRestartBtn);
+
   // Inline deploy log viewer (hidden by default, shown during deploy)
   const logViewer = createDeployLogInline();
   stickyTop.appendChild(logViewer);
@@ -3433,6 +3535,7 @@ function buildPanel() {
     gpuSelect.disabled = !enabled;
     checkBtn.disabled = !enabled;
     redeployBtn.disabled = !enabled;
+    if (typeof redeployRestartBtn !== "undefined") redeployRestartBtn.disabled = !enabled;
   }
 
   updateModalSections(isCloudMode);
@@ -3659,6 +3762,16 @@ app.registerExtension({
   name: "comfyui.modal.settings",
 
   async setup() {
+    // Post-redeploy+restart success banner
+    try {
+      if (sessionStorage.getItem("_comfymodal_redeploy_restart_done") === "1") {
+        sessionStorage.removeItem("_comfymodal_redeploy_restart_done");
+        setTimeout(() => {
+          showToast("\u2705 Redeploy + Restart complete — ComfyUI is fresh.", "success");
+        }, 800);
+      }
+    } catch {}
+
     // Apply saved GPU config on page load (before sidebar is opened)
     syncGpuConfig();
     syncOutputOptions();
