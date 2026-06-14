@@ -10,15 +10,75 @@ const STORAGE_KEY_OUTPUT_WEBP_LC = "comfymodal_webp_lossless_compression";
 const STORAGE_KEY_OUTPUT_AUTOSAVE = "comfymodal_auto_save_local";
 const STORAGE_KEY_OUTPUT_SAVEFOLDER = "comfymodal_save_folder";
 const STORAGE_KEY_OUTPUT_SIDECAR = "comfymodal_save_metadata_sidecar";
+const DEFAULT_OUTPUT_SAVEFOLDER = "output/modal";
 
 let _originalFetchApi = null;
+const _modalNodeRuntime = {
+  installed: false,
+  listenerRemovers: [],
+  fetchApiPatch: null,
+};
 
 function log(...args) {
   console.log("[comfyui-modal]", ...args);
 }
 
+function _normalizeOutputSaveFolder(savedFolder) {
+  const normalized = String(savedFolder || "")
+    .replace(/\\/g, "/")
+    .replace(/^\.?\//, "")
+    .replace(/\/+$/, "");
+  if (!normalized) {
+    return DEFAULT_OUTPUT_SAVEFOLDER;
+  }
+  if (normalized.toLowerCase() === "comfyui/output/modal") {
+    return DEFAULT_OUTPUT_SAVEFOLDER;
+  }
+  return normalized;
+}
+
+function _readOutputSaveFolder() {
+  const savedFolder = localStorage.getItem(STORAGE_KEY_OUTPUT_SAVEFOLDER);
+  const normalized = _normalizeOutputSaveFolder(savedFolder);
+  if (savedFolder !== normalized) {
+    localStorage.setItem(STORAGE_KEY_OUTPUT_SAVEFOLDER, normalized);
+  }
+  return normalized;
+}
+
+function _trackApiListener(eventName, handler) {
+  if (typeof api?.addEventListener !== "function") {
+    return;
+  }
+  api.addEventListener(eventName, handler);
+  _modalNodeRuntime.listenerRemovers.push(() => {
+    if (typeof api.removeEventListener === "function") {
+      api.removeEventListener(eventName, handler);
+    }
+  });
+}
+
+function _disposeModalNodeRuntime() {
+  while (_modalNodeRuntime.listenerRemovers.length) {
+    const dispose = _modalNodeRuntime.listenerRemovers.pop();
+    try {
+      dispose();
+    } catch {}
+  }
+  if (_originalFetchApi && api?.fetchApi === _modalNodeRuntime.fetchApiPatch) {
+    api.fetchApi = _originalFetchApi;
+  }
+  _modalNodeRuntime.fetchApiPatch = null;
+  _modalNodeRuntime.installed = false;
+}
+
 function _getOutputOptions() {
   if (window._comfyModalOutputOptions && typeof window._comfyModalOutputOptions === "object") {
+    if (window._comfyModalOutputOptions.save_folder !== undefined) {
+      window._comfyModalOutputOptions.save_folder = _normalizeOutputSaveFolder(
+        window._comfyModalOutputOptions.save_folder
+      );
+    }
     return window._comfyModalOutputOptions;
   }
   return {
@@ -26,7 +86,7 @@ function _getOutputOptions() {
     quality: parseInt(localStorage.getItem(STORAGE_KEY_OUTPUT_QUALITY), 10) || 75,
     webp_lossless_compression: localStorage.getItem(STORAGE_KEY_OUTPUT_WEBP_LC) || "balanced",
     auto_save_local: localStorage.getItem(STORAGE_KEY_OUTPUT_AUTOSAVE) === "true",
-    save_folder: localStorage.getItem(STORAGE_KEY_OUTPUT_SAVEFOLDER) || "ComfyUI/output/modal/",
+    save_folder: _readOutputSaveFolder(),
     save_metadata_sidecar: localStorage.getItem(STORAGE_KEY_OUTPUT_SIDECAR) !== "false",
   };
 }
@@ -460,12 +520,13 @@ app.registerExtension({
 
   async setup() {
     log("Extension loaded. Setting up progress bar & patching fetchApi...");
+    _disposeModalNodeRuntime();
 
     // ── Progress Bar ────────────────────────────────────────────────────
     _pbCreate();
 
     if (typeof api.addEventListener === "function") {
-      api.addEventListener("execution_start", () => {
+      const onExecutionStart = () => {
         // The Modal container streams execution_start through its progress
         // queue too, so this can fire twice.  Guard against re-entry.
         if (_execState.executing) return;
@@ -473,9 +534,10 @@ app.registerExtension({
         _execState.executing = true;
         _execState.startTime = Date.now();
         _startTimer();
-      });
+      };
+      _trackApiListener("execution_start", onExecutionStart);
 
-      api.addEventListener("executing", (e) => {
+      const onExecuting = (e) => {
         // ComfyUI frontend API passes nodeId directly as e.detail, NOT
         // wrapped in {node: ...}.  Accept both shapes for compatibility.
         const detail = e?.detail;
@@ -506,9 +568,10 @@ app.registerExtension({
         // Reset step counter — the new node hasn't started its steps yet
         _execState.step = 0;
         _execState.maxStep = 0;
-      });
+      };
+      _trackApiListener("executing", onExecuting);
 
-      api.addEventListener("progress", (e) => {
+      const onProgress = (e) => {
         const d = e?.detail || {};
         // ComfyUI sends this field as `value`, not `step`. Accept both.
         if (d.step != null || d.value != null) {
@@ -528,16 +591,18 @@ app.registerExtension({
             hasSteps ? `${_execState.step}/${_execState.maxStep}` : ""
           );
         }
-      });
+      };
+      _trackApiListener("progress", onProgress);
 
-      api.addEventListener("execution_cached", (e) => {
+      const onExecutionCached = (e) => {
         const nodes = e?.detail?.nodes;
         if (Array.isArray(nodes)) {
           for (const n of nodes) _execState.nodesSeen.add(n);
         }
-      });
+      };
+      _trackApiListener("execution_cached", onExecutionCached);
 
-      api.addEventListener("execution_success", (event) => {
+      const onExecutionSuccess = (event) => {
         _execState.executing = false;
         _stopTimer();
         const total = _execState.totalMs || (_execState.startTime ? Date.now() - _execState.startTime : 0);
@@ -555,9 +620,10 @@ app.registerExtension({
         const t10ClientMs = Date.now();
         const suffix = ` client_event_recv_ms=${t10ClientMs}`;
         _logTrace(trace, suffix);
-      });
+      };
+      _trackApiListener("execution_success", onExecutionSuccess);
 
-      api.addEventListener("execution_error", (e) => {
+      const onExecutionError = (e) => {
         _execState.executing = false;
         _stopTimer();
         const total = _execState.totalMs || (_execState.startTime ? Date.now() - _execState.startTime : 0);
@@ -565,15 +631,17 @@ app.registerExtension({
         _pbShowError(msg, total);
         _resetExecState();
         setTimeout(() => _pbShowIdle(), 4000);
-      });
+      };
+      _trackApiListener("execution_error", onExecutionError);
 
-      api.addEventListener("modal_status", (e) => {
+      const onModalStatus = (e) => {
         const d = e?.detail || {};
         if (!d.prompt_id) return;
         if (d.phase === "startup" || d.phase === "warmup") {
           _pbShowStartup(d.message || "Starting up...");
         }
-      });
+      };
+      _trackApiListener("modal_status", onModalStatus);
     } else {
       log("WARNING: api.addEventListener not available, progress bar disabled");
     }
@@ -581,7 +649,7 @@ app.registerExtension({
     // ── End Progress Bar ────────────────────────────────────────────────
 
     _originalFetchApi = api.fetchApi.bind(api);
-    api.fetchApi = async function (route, options = {}) {
+    const patchedFetchApi = async function (route, options = {}) {
       const isPromptPost =
         options.method === "POST" &&
         (route === "/prompt" || route === "prompt");
@@ -675,6 +743,9 @@ app.registerExtension({
 
       return _originalFetchApi(route, options);
     };
+    api.fetchApi = patchedFetchApi;
+    _modalNodeRuntime.fetchApiPatch = patchedFetchApi;
+    _modalNodeRuntime.installed = true;
 
     log("fetchApi patched. All /prompt POST requests -> Modal GPU.");
   },
@@ -854,113 +925,9 @@ app.registerExtension({
       }
     };
 
-    // ── Badges (via nodeCreated + LGraphBadge getter) ──
-  },
-
-  nodeCreated(node) {
-    node.badges.push(() => {
-      const opts = { bgColor: "#333" };
-      let text = "";
-      if (node.properties?.comfymodal_production_output) {
-        text = "PROD OUT";
-        opts.bgColor = "#2e7d32";
-        opts.fgColor = "#fff";
-      } else if (node.properties?.comfymodal_bypass_in_production) {
-        text = "PROD BYPASS";
-        opts.bgColor = "#c47c0a";
-        opts.fgColor = "#fff";
-      }
-      if (!text) return null;
-      return new LGraphBadge({ text, ...opts });
-    });
   },
 
   async setup() {
-    // ── First-enable behavior ──
-    function onProductionToggle() {
-      const enabled = _getProductionEnabled();
-      if (!enabled) return;
-      const existing = _getProdOutputNodes();
-      if (existing.length > 0) return;
-      const graph = app.graph;
-      if (!graph) return;
-      const candidates = [];
-      for (const node of graph._nodes) {
-        candidates.push(node);
-      }
-      if (candidates.length === 0) return;
-      _showNodeSelector(candidates).then((selected) => {
-        if (selected.length === 0) {
-          if (app.graph && app.graph.extra) {
-            if (app.graph.extra.comfymodal) {
-              app.graph.extra.comfymodal.production_mode_enabled = false;
-            }
-          }
-          return;
-        }
-        for (const node of selected) {
-          if (!node.properties) node.properties = {};
-          node.properties.comfymodal_production_output = true;
-        }
-        app.graph.setDirtyCanvas(true, true);
-      });
-    }
-
-    let _prodCheckInterval = null;
-    function _startProdCheck() {
-      _stopProdCheck();
-      _prodCheckInterval = setInterval(() => {
-        const enabled = _getProductionEnabled();
-        const existing = _getProdOutputNodes();
-        if (enabled && existing.length === 0) {
-          onProductionToggle();
-        }
-      }, 500);
-    }
-    function _stopProdCheck() {
-      if (_prodCheckInterval) {
-        clearInterval(_prodCheckInterval);
-        _prodCheckInterval = null;
-      }
-    }
-
-    // ── Patch app.graphToPrompt for production bypass serialization ──
-    const _originalGraphToPrompt = app.graphToPrompt.bind(app);
-    app.graphToPrompt = async function(...args) {
-      const productionEnabled = _getProductionEnabled();
-      const cloudMode = _getCloudModeEnabled();
-      if (!productionEnabled || !cloudMode) {
-        return _originalGraphToPrompt(...args);
-      }
-      const bypassNodes = _getBypassNodes();
-      if (bypassNodes.length === 0) {
-        return _originalGraphToPrompt(...args);
-      }
-      const savedModes = new Map();
-      for (const node of bypassNodes) {
-        savedModes.set(node, node.mode);
-        node.mode = 4;
-      }
-      try {
-        const result = await _originalGraphToPrompt(...args);
-        const apiPrompt = result?.output || {};
-        for (const node of bypassNodes) {
-          const nid = String(node.id);
-          if (apiPrompt[nid] !== undefined) {
-            throw new Error(
-              `Production bypass failed for node ${nid} (${node.type || "?"}). ComfyUI could not serialize this node as a native bypass.`
-            );
-          }
-        }
-        return result;
-      } finally {
-        for (const [node, mode] of savedModes) {
-          node.mode = mode;
-        }
-      }
-    };
-
-    // ── Add production data to fetchApi interception ──
     log("Production mode extension loaded.");
   },
 });

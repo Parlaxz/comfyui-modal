@@ -39,6 +39,7 @@ const STORAGE_KEY_OUTPUT_WEBP_LC = "comfymodal_webp_lossless_compression";
 const STORAGE_KEY_OUTPUT_AUTOSAVE = "comfymodal_auto_save_local";
 const STORAGE_KEY_OUTPUT_SAVEFOLDER = "comfymodal_save_folder";
 const STORAGE_KEY_OUTPUT_SIDECAR = "comfymodal_save_metadata_sidecar";
+const DEFAULT_OUTPUT_SAVEFOLDER = "output/modal";
 
 const STATUS = {
   UNKNOWN:    "unknown",
@@ -131,19 +132,39 @@ async function syncGpuConfig() {
   return { config, selectedGpu, options };
 }
 
+function normalizeOutputSaveFolder(savedFolder) {
+  const normalized = String(savedFolder || "")
+    .replace(/\\/g, "/")
+    .replace(/^\.?\//, "")
+    .replace(/\/+$/, "");
+  if (!normalized) {
+    return DEFAULT_OUTPUT_SAVEFOLDER;
+  }
+  if (normalized.toLowerCase() === "comfyui/output/modal") {
+    return DEFAULT_OUTPUT_SAVEFOLDER;
+  }
+  return normalized;
+}
+
 async function syncOutputOptions() {
   let config = {
     output_format: "original",
     quality: 75,
     webp_lossless_compression: "balanced",
     auto_save_local: false,
-    save_folder: "ComfyUI/output/modal/",
+    save_folder: DEFAULT_OUTPUT_SAVEFOLDER,
     save_metadata_sidecar: true,
   };
   try {
     const response = await api.fetchApi(`${MODAL_PREFIX}/config`);
     config = { ...config, ...(await response.json()) };
   } catch {}
+
+  const savedFolder = localStorage.getItem(STORAGE_KEY_OUTPUT_SAVEFOLDER);
+  const migratedSavedFolder = normalizeOutputSaveFolder(savedFolder);
+  if (savedFolder !== migratedSavedFolder) {
+    localStorage.setItem(STORAGE_KEY_OUTPUT_SAVEFOLDER, migratedSavedFolder);
+  }
 
   const outputOptions = {
     output_format: localStorage.getItem(STORAGE_KEY_OUTPUT_FORMAT) || config.output_format || "original",
@@ -152,7 +173,7 @@ async function syncOutputOptions() {
     auto_save_local: localStorage.getItem(STORAGE_KEY_OUTPUT_AUTOSAVE) === "true"
       ? true
       : (config.auto_save_local === true),
-    save_folder: localStorage.getItem(STORAGE_KEY_OUTPUT_SAVEFOLDER) || config.save_folder || "ComfyUI/output/modal/",
+    save_folder: migratedSavedFolder || normalizeOutputSaveFolder(config.save_folder),
     save_metadata_sidecar: localStorage.getItem(STORAGE_KEY_OUTPUT_SIDECAR) === "false"
       ? false
       : (config.save_metadata_sidecar !== false),
@@ -1397,7 +1418,7 @@ function buildPanel() {
   let _qualValue = parseInt(localStorage.getItem(_STORAGE_QUALITY), 10) || 75;
   let _webpLcValue = localStorage.getItem(_STORAGE_WEBP_LC) || "balanced";
   let _autoSaveValue = localStorage.getItem(_STORAGE_AUTOSAVE) === "true";
-  let _saveFolderValue = localStorage.getItem(_STORAGE_SAVEFOLDER) || "ComfyUI/output/modal/";
+  let _saveFolderValue = normalizeOutputSaveFolder(localStorage.getItem(_STORAGE_SAVEFOLDER));
   let _sidecarValue = localStorage.getItem(_STORAGE_SIDECAR) !== "false";
 
   function _persistOutputSettings() {
@@ -1446,7 +1467,7 @@ function buildPanel() {
       if (cfg.auto_save_local !== undefined && !localStorage.getItem(_STORAGE_AUTOSAVE))
         _autoSaveValue = Boolean(cfg.auto_save_local);
       if (cfg.save_folder && !localStorage.getItem(_STORAGE_SAVEFOLDER))
-        _saveFolderValue = cfg.save_folder;
+        _saveFolderValue = normalizeOutputSaveFolder(cfg.save_folder);
       if (cfg.save_metadata_sidecar !== undefined && !localStorage.getItem(_STORAGE_SIDECAR))
         _sidecarValue = cfg.save_metadata_sidecar !== false;
       _persistOutputSettings();
@@ -1584,7 +1605,7 @@ function buildPanel() {
   saveFolderInput.type = "text";
   saveFolderInput.value = _saveFolderValue;
   saveFolderInput.style.cssText = inputStyle();
-  saveFolderInput.placeholder = "ComfyUI/output/modal/";
+  saveFolderInput.placeholder = DEFAULT_OUTPUT_SAVEFOLDER;
 
   saveFolderRow.appendChild(saveFolderLabel);
   saveFolderRow.appendChild(saveFolderInput);
@@ -1612,7 +1633,7 @@ function buildPanel() {
   openFolderBtn.textContent = "Open output folder";
   openFolderBtn.style.cssText = btnStyle() + "width:100%;";
   openFolderBtn.onclick = () => {
-    const folder = saveFolderInput.value.trim() || "ComfyUI/output/modal/";
+    const folder = normalizeOutputSaveFolder(saveFolderInput.value.trim() || DEFAULT_OUTPUT_SAVEFOLDER);
     try {
       api.fetchApi(`${MODAL_PREFIX}/open-folder`, {
         method: "POST",
@@ -1624,7 +1645,11 @@ function buildPanel() {
   outContent.appendChild(openFolderBtn);
 
   autoSaveToggle.addEventListener("change", () => { _autoSaveValue = autoSaveToggle.checked; _persistOutputSettings(); });
-  saveFolderInput.addEventListener("change", () => { _saveFolderValue = saveFolderInput.value; _persistOutputSettings(); });
+  saveFolderInput.addEventListener("change", () => {
+    _saveFolderValue = normalizeOutputSaveFolder(saveFolderInput.value);
+    saveFolderInput.value = _saveFolderValue;
+    _persistOutputSettings();
+  });
   sidecarToggle.addEventListener("change", () => { _sidecarValue = sidecarToggle.checked; _persistOutputSettings(); });
 
   function _updateProductionSummary(el) {
