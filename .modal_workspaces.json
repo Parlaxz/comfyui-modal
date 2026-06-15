@@ -6,9 +6,9 @@
       "custom_nodes_fingerprint": null
     },
     "ws_6cf85caf6e07": {
-      "comfyapp_version": "2.16.21",
+      "comfyapp_version": "2.16.23",
       "custom_nodes_fingerprint": null,
-      "deployed_at": "2026-06-14T19:11:15Z",
+      "deployed_at": "2026-06-15T05:03:02Z",
       "deployment_command": "\"C:\\Users\\parla\\AppData\\Roaming\\Python\\Python311\\Scripts\\modal.EXE\" deploy \"C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\comfyapp.py\""
     }
   },

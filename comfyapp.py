@@ -1,4 +1,4 @@
-import contextlib
+﻿import contextlib
 import hashlib
 import json
 import os
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import modal
 
-# GöÇGöÇ Container session identity (set once per container startup) GöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ Container session identity (set once per container startup) GÃ¶Ã‡GÃ¶Ã‡
 CONTAINER_SESSION_ID = uuid.uuid4().hex[:16]
 CONTAINER_IMPORT_UNIX_S = time.time()
 _container_restore_count: int = 0
@@ -47,7 +47,7 @@ from production_workflow import (
 )
 
 
-# GöÇGöÇ Inline output-converter constants & helpers (self-contained for Modal) GöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ Inline output-converter constants & helpers (self-contained for Modal) GÃ¶Ã‡GÃ¶Ã‡
 _OUTPUT_FORMATS = ("original", "webp_lossless", "webp_lossy", "jpeg")
 _WEBP_LOSSLESS_COMPRESSION = ("fast", "balanced", "max")
 _WEBP_LOSSLESS_METHOD = {"fast": 0, "balanced": 4, "max": 6}
@@ -188,7 +188,7 @@ def _convert_image_bytes(
         print(f"[comfyapp.convert] FALLBACK to PNG: fmt={output_format} err={meta['error']}")
     return meta
 
-# GöÇGöÇ PART 12: Silent exception logging helper GöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ PART 12: Silent exception logging helper GÃ¶Ã‡GÃ¶Ã‡
 _SILENT_EXCEPTION_DEBUG = os.getenv("COMFYMODAL_SILENT_EXCEPTION_DEBUG", "0") == "1"
 
 
@@ -270,9 +270,15 @@ def _pop_production_outputs(prompt_id: str) -> dict[str, list[dict]]:
 
 
 def _cleanup_production_request(prompt_id: str) -> None:
-    global _PROD_DIRECT_SINK_REQUESTS, _PROD_DIRECT_SINK_REGISTRY
+    """Remove only the request authorization entry. Output registry is cleaned by collector."""
+    global _PROD_DIRECT_SINK_REQUESTS
     with _get_prod_lock():
         _PROD_DIRECT_SINK_REQUESTS.pop(prompt_id, None)
+
+
+def _cleanup_production_registry(prompt_id: str) -> None:
+    global _PROD_DIRECT_SINK_REGISTRY
+    with _get_prod_lock():
         _PROD_DIRECT_SINK_REGISTRY.pop(prompt_id, None)
 
 
@@ -289,7 +295,7 @@ def _is_authorized_production_direct_sink_request(prompt_id: str, node_id: str) 
     return str(node_id) in authorized_node_ids
 
 
-# ── Shared production-output encoding helpers ──────────────────────────
+# â”€â”€ Shared production-output encoding helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Module-level so both ComfyModalProductionOutput and
 # ComfyModalProductionImageComparerOutput can use them.
 
@@ -422,7 +428,7 @@ class ComfyModalProductionOutput:
             print(f"[ComfyModalProductionOutput] WARNING: no active production request for prompt_id={prompt_id}, returning empty")
             return ()
 
-        # ── Authorisation: the current prompt must match the authorised request ──
+        # â”€â”€ Authorisation: the current prompt must match the authorised request â”€â”€
         req_prompt_id = req.get("prompt_id")
         if str(req_prompt_id) != str(prompt_id):
             print(
@@ -432,7 +438,7 @@ class ComfyModalProductionOutput:
             )
             return ()
 
-        # ── Authorisation: this specific node must have been rewritten by the
+        # â”€â”€ Authorisation: this specific node must have been rewritten by the
         #    compiler (i.e. listed in output_node_ids at production setup time).
         #    Prevents manual/user-supplied invocation of ComfyModalProductionOutput.
         authorized_ids = req.get("authorized_node_ids", [])
@@ -485,7 +491,7 @@ class ComfyModalProductionOutput:
               f"prompt_id={prompt_id_short} node_id={nodestr} "
               f"format={output_format} encode_ms={total_encode_ms}")
 
-        # Return safe success shape — empty tuple (no UI payload into execution
+        # Return safe success shape â€” empty tuple (no UI payload into execution
         # history).  All encoded data is already stored in the in-memory registry.
         return ()
 
@@ -516,11 +522,10 @@ class ComfyModalProductionImageComparerOutput:
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
-                "inputs_are_same": ("BOOLEAN", {"default": False}),
             },
         }
 
-    def encode_compare(self, image_a, image_b=None, unique_id=None, inputs_are_same=False):
+    def encode_compare(self, image_a, image_b=None, unique_id=None):
         import time as _time
 
         from comfy_execution.utils import get_executing_context
@@ -542,26 +547,19 @@ class ComfyModalProductionImageComparerOutput:
             print(f"[ComfyModalProductionImageComparerOutput] WARNING: no active production request, returning empty")
             return ()
 
-        # ── Authorisation ──
         req_prompt_id = req.get("prompt_id")
         if str(req_prompt_id) != str(prompt_id):
-            print(
-                f"[ComfyModalProductionImageComparerOutput] WARNING: prompt_id mismatch "
-                f"(request={str(req_prompt_id)[:8]!r}, executing={str(prompt_id)[:8]!r}), "
-                f"returning empty"
-            )
+            print(f"[ComfyModalProductionImageComparerOutput] WARNING: prompt_id mismatch, returning empty")
             return ()
 
         authorized_ids = req.get("authorized_node_ids", [])
         if str(node_id) not in [str(a) for a in authorized_ids]:
-            print(
-                f"[ComfyModalProductionImageComparerOutput] WARNING: node_id={node_id} not in "
-                f"authorized_ids={authorized_ids}, returning empty"
-            )
+            print(f"[ComfyModalProductionImageComparerOutput] WARNING: node_id={node_id} not authorized, returning empty")
             return ()
 
         _t0 = _time.time()
         output_format, quality, webp_lossless_compression = _collect_production_request_params(req)
+        return_a = bool(req.get("return_comparison_a", False))
 
         try:
             from PIL import Image as _PILImage
@@ -571,240 +569,98 @@ class ComfyModalProductionImageComparerOutput:
 
         prompt_id_short = str(prompt_id)[:8]
         nodestr = str(node_id)
-        inputs_are_same = bool(inputs_are_same)
 
-        # ── Encode image_a ──
-        images_a_t = _clamp_image_tensor(image_a)
-        _a_diag = f"shape={tuple(images_a_t.shape)} dtype={images_a_t.dtype} min={images_a_t.min().item()} max={images_a_t.max().item()} mean={images_a_t.float().mean().item():.1f}"
-        print(f"[production.rgthree.encode] side=a {_a_diag}")
-        if images_a_t.shape[0] == 0:
-            raise RuntimeError(
-                f"[ComfyModalProductionImageComparerOutput] empty image_a batch for "
-                f"prompt_id={prompt_id_short} node_id={nodestr}"
-            )
-
-        a_entries, ext, mime_type, W, H = _encode_image_tensor_batch(
-            images_a_t, output_format, quality, webp_lossless_compression
-        )
-
-        # ── Encode image_b ──
         has_image_b = image_b is not None
-        b_encoded_tensors = None
-        if has_image_b:
-            images_b_t = _clamp_image_tensor(image_b)
-            _b_diag = f"shape={tuple(images_b_t.shape)} dtype={images_b_t.dtype} min={images_b_t.min().item()} max={images_b_t.max().item()} mean={images_b_t.float().mean().item():.1f}"
-            print(f"[production.rgthree.encode] side=b {_b_diag}")
-            if inputs_are_same:
-                # Reuse encoded a_entries for b_entries (no re-encode)
-                b_encoded_tensors = a_entries
-            else:
-                b_encoded_tensors, _, _, _, _ = _encode_image_tensor_batch(
-                    images_b_t, output_format, quality, webp_lossless_compression
-                )
-        else:
-            B = images_a_t.shape[0]
-            if B >= 2:
-                # First image → a, second image → b
-                images_b_t_partial = images_a_t[1:2]  # second batch entry
-                b_encoded_tensors, _, _, _, _ = _encode_image_tensor_batch(
-                    images_b_t_partial, output_format, quality, webp_lossless_compression
-                )
-                # Rebuild a_entries to only include the first entry
-                a_entries, _, _, _, _ = _encode_image_tensor_batch(
-                    images_a_t[0:1], output_format, quality, webp_lossless_compression
-                )
-            # B == 1: no b side
 
+        # ── Encode: B-only by default ──
         result_entries = []
-        for batch_idx, (raw_bytes, _, _) in enumerate(a_entries):
-            filename = f"production_{prompt_id_short}_{nodestr}_a_{batch_idx}{ext}"
-            result_entries.append({
-                "filename": filename,
-                "bytes": raw_bytes,
-                "mime_type": mime_type,
-                "width": W,
-                "height": H,
-                "output_index": batch_idx,
-                "node_id": node_id,
-                "output_key": "a_images",
-                "comparison_side": "a",
-                "format": output_format,
-            })
-
+        a_count = 0
         b_count = 0
-        if b_encoded_tensors is not None:
+        encoded_unique = 0
+
+        if has_image_b and not return_a:
+            # B-only mode: skip A, encode B only
+            images_b_t = _clamp_image_tensor(image_b)
+            _b_diag = f"shape={tuple(images_b_t.shape)} dtype={images_b_t.dtype}"
+            print(f"[production.rgthree.encode] side=b (B-only) {_b_diag}")
+            b_encoded_tensors, ext, mime_type, W, H = _encode_image_tensor_batch(
+                images_b_t, output_format, quality, webp_lossless_compression
+            )
             for batch_idx, (raw_bytes, _, _) in enumerate(b_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_b_{batch_idx}{ext}"
                 result_entries.append({
-                    "filename": filename,
-                    "bytes": raw_bytes,
-                    "mime_type": mime_type,
-                    "width": W,
-                    "height": H,
-                    "output_index": batch_idx,
-                    "node_id": node_id,
-                    "output_key": "b_images",
-                    "comparison_side": "b",
-                    "format": output_format,
+                    "filename": filename, "bytes": raw_bytes, "mime_type": mime_type,
+                    "width": W, "height": H, "output_index": batch_idx,
+                    "node_id": node_id, "output_key": "b_images",
+                    "comparison_side": "b", "format": output_format,
                 })
                 b_count += 1
+            encoded_unique = b_count
+        elif has_image_b:
+            # return_comparison_a=True: encode A and B independently
+            images_a_t = _clamp_image_tensor(image_a)
+            _a_diag = f"shape={tuple(images_a_t.shape)} dtype={images_a_t.dtype}"
+            print(f"[production.rgthree.encode] side=a (return-A mode) {_a_diag}")
+            a_encoded_tensors, ext, mime_type, W, H = _encode_image_tensor_batch(
+                images_a_t, output_format, quality, webp_lossless_compression
+            )
+            for batch_idx, (raw_bytes, _, _) in enumerate(a_encoded_tensors):
+                filename = f"production_{prompt_id_short}_{nodestr}_a_{batch_idx}{ext}"
+                result_entries.append({
+                    "filename": filename, "bytes": raw_bytes, "mime_type": mime_type,
+                    "width": W, "height": H, "output_index": batch_idx,
+                    "node_id": node_id, "output_key": "a_images",
+                    "comparison_side": "a", "format": output_format,
+                })
+                a_count += 1
 
-        # Count unique encodings
-        encoded_unique = len(a_entries) + (b_count if not inputs_are_same else 0)
-        if inputs_are_same:
-            encoded_unique = len(a_entries)  # same bytes reused
+            images_b_t = _clamp_image_tensor(image_b)
+            _b_diag = f"shape={tuple(images_b_t.shape)} dtype={images_b_t.dtype}"
+            print(f"[production.rgthree.encode] side=b (return-A mode) {_b_diag}")
+            b_encoded_tensors, _, _, _, _ = _encode_image_tensor_batch(
+                images_b_t, output_format, quality, webp_lossless_compression
+            )
+            for batch_idx, (raw_bytes, _, _) in enumerate(b_encoded_tensors):
+                filename = f"production_{prompt_id_short}_{nodestr}_b_{batch_idx}{ext}"
+                result_entries.append({
+                    "filename": filename, "bytes": raw_bytes, "mime_type": mime_type,
+                    "width": W, "height": H, "output_index": batch_idx,
+                    "node_id": node_id, "output_key": "b_images",
+                    "comparison_side": "b", "format": output_format,
+                })
+                b_count += 1
+            encoded_unique = a_count + b_count
+        else:
+            # No image_b: fall back to A only
+            images_a_t = _clamp_image_tensor(image_a)
+            _a_diag = f"shape={tuple(images_a_t.shape)} dtype={images_a_t.dtype}"
+            print(f"[production.rgthree.encode] side=a (no-B fallback) {_a_diag}")
+            a_encoded_tensors, ext, mime_type, W, H = _encode_image_tensor_batch(
+                images_a_t, output_format, quality, webp_lossless_compression
+            )
+            for batch_idx, (raw_bytes, _, _) in enumerate(a_encoded_tensors):
+                filename = f"production_{prompt_id_short}_{nodestr}_a_{batch_idx}{ext}"
+                result_entries.append({
+                    "filename": filename, "bytes": raw_bytes, "mime_type": mime_type,
+                    "width": W, "height": H, "output_index": batch_idx,
+                    "node_id": node_id, "output_key": "b_images",
+                    "comparison_side": "b", "format": output_format,
+                })
+                b_count += 1
+            a_count = b_count
+            encoded_unique = b_count
 
         # Store in registry
         for _entry in result_entries:
             _store_production_output(prompt_id, node_id, _entry)
 
         total_encode_ms = round((_time.time() - _t0) * 1000, 1)
-        a_count = len(a_entries)
         print(f"[production.rgthree] node_id={nodestr} a_count={a_count} "
-              f"b_count={b_count} inputs_same={1 if inputs_are_same else 0} "
-              f"encoded_unique={encoded_unique} logical_outputs={a_count + b_count} "
-              f"temp_files_written=0 encode_ms={total_encode_ms}")
+              f"b_count={b_count} encoded_unique={encoded_unique} logical_outputs={len(result_entries)} "
+              f"return_a={1 if return_a else 0} temp_files_written=0 encode_ms={total_encode_ms}")
 
         return ()
 
-
-def _change_extension(filename: str, new_ext: str) -> str:
-    """Replace the file extension of *filename* with *new_ext*."""
-    import os as _os
-    stem, _ = _os.path.splitext(filename)
-    return stem + new_ext
-
-
-def _convert_image_bytes(
-    input_bytes: bytes,
-    output_format: str = "original",
-    quality: int = 75,
-    webp_lossless_compression: str = "balanced",
-) -> dict:
-    """Convert raw PNG bytes to target format.  Returns metadata dict."""
-    import io as _io
-    import time as _time
-
-    _t0 = _time.time()
-    meta = {
-        "bytes": input_bytes,
-        "mime_type": "image/png",
-        "file_ext": ".png",
-        "output_format": output_format,
-        "original_size_bytes": len(input_bytes),
-        "returned_size_bytes": len(input_bytes),
-        "conversion_time_ms": 0,
-        "quality": None,
-        "webp_lossless_compression": None,
-        "fallback": False,
-        "error": None,
-    }
-
-    if output_format not in _OUTPUT_FORMATS:
-        meta["error"] = f"unknown output_format: {output_format!r}"
-        meta["output_format"] = "original"
-        output_format = "original"
-    if not isinstance(quality, (int, float)):
-        quality = 75
-    quality = max(0, min(100, int(quality)))
-    if webp_lossless_compression not in _WEBP_LOSSLESS_COMPRESSION:
-        webp_lossless_compression = "balanced"
-
-    fmt_ext = _FORMAT_META.get(output_format, _FORMAT_META["original"])
-    meta["mime_type"] = fmt_ext["mime"]
-    meta["file_ext"] = fmt_ext["ext"]
-
-    if output_format == "original":
-        meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
-        return meta
-
-    try:
-        from PIL import Image as _PillowImage
-    except ImportError:
-        meta["error"] = "Pillow not available; returning original PNG"
-        meta["fallback"] = True
-        meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
-        return meta
-
-    try:
-        img = _PillowImage.open(_io.BytesIO(input_bytes))
-    except Exception as exc:
-        meta["error"] = f"failed to open image: {exc}"
-        meta["fallback"] = True
-        meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
-        return meta
-
-    out_buf = _io.BytesIO()
-    try:
-        if output_format == "webp_lossless":
-            meta["quality"] = None
-            meta["webp_lossless_compression"] = webp_lossless_compression
-            method = _WEBP_LOSSLESS_METHOD.get(webp_lossless_compression, 4)
-            img.save(out_buf, format="WEBP", lossless=True, method=method)
-        elif output_format == "webp_lossy":
-            meta["quality"] = quality
-            meta["webp_lossless_compression"] = None
-            img.save(out_buf, format="WEBP", lossless=False, quality=quality, method=_WEBP_LOSSY_METHOD)
-        elif output_format == "jpeg":
-            meta["quality"] = quality
-            meta["webp_lossless_compression"] = None
-            # Composite alpha onto white background
-            if img.mode in ("RGBA", "LA", "PA"):
-                if img.mode == "RGBA":
-                    bg = _PillowImage.new("RGB", img.size, (255, 255, 255))
-                    bg.paste(img, mask=img.split()[3])
-                    img = bg
-                elif img.mode == "LA":
-                    bg = _PillowImage.new("L", img.size, 255)
-                    bg.paste(img, mask=img.split()[1])
-                    img = bg.convert("RGB")
-                elif img.mode == "PA":
-                    img = img.convert("RGBA")
-                    bg = _PillowImage.new("RGB", img.size, (255, 255, 255))
-                    bg.paste(img, mask=img.split()[3])
-                    img = bg
-            elif img.mode == "P":
-                if "transparency" in img.info:
-                    img = img.convert("RGBA")
-                    bg = _PillowImage.new("RGB", img.size, (255, 255, 255))
-                    bg.paste(img, mask=img.split()[3])
-                    img = bg
-                else:
-                    img = img.convert("RGB")
-            elif img.mode != "RGB":
-                img = img.convert("RGB")
-            img.save(out_buf, format="JPEG", quality=quality)
-
-        out_buf.seek(0)
-        meta["bytes"] = out_buf.read()
-        meta["returned_size_bytes"] = len(meta["bytes"])
-    except Exception as exc:
-        meta["error"] = f"conversion failed: {exc}"
-        meta["fallback"] = True
-        meta["bytes"] = input_bytes
-        meta["returned_size_bytes"] = len(input_bytes)
-        meta["file_ext"] = ".png"
-        meta["mime_type"] = "image/png"
-
-    meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
-    if meta.get("fallback"):
-        print(f"[comfyapp.convert] FALLBACK to PNG: fmt={output_format} err={meta['error']}")
-    return meta
-
-# ── PART 12: Silent exception logging helper ──
-_SILENT_EXCEPTION_DEBUG = os.getenv("COMFYMODAL_SILENT_EXCEPTION_DEBUG", "0") == "1"
-
-
-def _log_silent_exception(context: str, exc: Exception, detail: str = "") -> None:
-    """Log an exception that would otherwise be silently swallowed.
-
-    Only emits logs when PROFILING_ENABLED or _SILENT_EXCEPTION_DEBUG is set,
-    to avoid log spam in the hot path.  Use this for expected optional failures
-    where the ``pass`` is intentional but the detail is useful for debugging.
-    """
-    if PROFILING_ENABLED or _SILENT_EXCEPTION_DEBUG:
-        detail_str = f" {detail}" if detail else ""
-        print(f"[comfyapp.silent] context={context} error={exc}{detail_str}")
 
 
 PROFILING_ENABLED = os.getenv("COMFYMODAL_PROFILING", "0") == "1"
@@ -829,7 +685,7 @@ _CUSTOM_NODE_IMPORT_FAILURES: list[dict] = []
 _CUSTOM_NODE_REGISTRATION_PENDING_RETRY: set[str] = set()
 
 
-# GöÇGöÇ PART 2: Custom-node retry registry GöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ PART 2: Custom-node retry registry GÃ¶Ã‡GÃ¶Ã‡
 class CustomNodeRetryEntry:
     __slots__ = (
         "path", "first_seen_at", "retry_count", "last_retry_at",
@@ -938,7 +794,7 @@ class CustomNodeRetryRegistry:
 
 _CUSTOM_NODE_RETRY_REGISTRY = CustomNodeRetryRegistry()
 
-# GöÇGöÇ PART 3: Preload guardrails GöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ PART 3: Preload guardrails GÃ¶Ã‡GÃ¶Ã‡
 # Controls whether unknown (never-seen-before) workflow profiles get
 # expensive CPU preload.  Set to 1 to always preload regardless.
 PRELOAD_UNKNOWN_PROFILES = os.getenv("COMFYMODAL_PRELOAD_UNKNOWN_PROFILES", "0") == "1"
@@ -953,7 +809,7 @@ PRELOAD_MIN_THROUGHPUT_GBPS = float(os.getenv("COMFYMODAL_PRELOAD_MIN_THROUGHPUT
 # After this many seconds of preload, evaluate throughput and abort if below threshold.
 PRELOAD_OUTLIER_ABORT_SECONDS = float(os.getenv("COMFYMODAL_PRELOAD_OUTLIER_ABORT_SECONDS", "10"))
 
-# GöÇGöÇ PART 4: Custom-node requirements repair mode GöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ PART 4: Custom-node requirements repair mode GÃ¶Ã‡GÃ¶Ã‡
 #   off        - Never install requirements during prompt execution.
 #   fail_fast  - If requirements hash is missing/stale, fail with
 #                actionable error before model preload.
@@ -967,7 +823,7 @@ _FAIL_FAST_REQ_MSG = (
     "or set COMFYMODAL_REQUIREMENTS_REPAIR_MODE=dev for runtime install."
 )
 
-# GöÇGöÇ PART 7: Remote background deploy gating GöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ PART 7: Remote background deploy gating GÃ¶Ã‡GÃ¶Ã‡
 ENABLE_REMOTE_BACKGROUND_DEPLOY = os.getenv("COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY", "0") == "1"
 WARMUP_PROFILE = os.getenv("COMFYMODAL_WARMUP_PROFILE", "off")
 WARMUP_CHECKPOINT = os.getenv("COMFYMODAL_WARMUP_CHECKPOINT", "").strip()
@@ -979,21 +835,21 @@ WARMUP_CLIP_TYPE = os.getenv("COMFYMODAL_WARMUP_CLIP_TYPE", "flux").strip() or "
 WARMUP_TEXT = os.getenv("COMFYMODAL_WARMUP_TEXT", "warmup")
 
 # Comma-separated custom-node names to ignore in baked vs. volume node-set mismatch validation.
-# Default empty GÇö all node set mismatches are reported.
+# Default empty GÃ‡Ã¶ all node set mismatches are reported.
 _CUSTOM_NODE_SET_MISMATCH_IGNORE_ENV = os.getenv("COMFYMODAL_CUSTOM_NODE_SET_MISMATCH_IGNORE", "")
 
 # Preload mode controls which model files are loaded to CPU during restore
 # and how loading behaves:
-#   workers_2      GÇö (default fallback) UNET + CLIP concurrent, 2 workers
-#   default        GÇö UNET + CLIP concurrent, 4 workers
-#   sequential     GÇö UNET first then CLIP, 1 worker
-#   workers_1      GÇö UNET + CLIP concurrent, 1 worker
-#   unet_only      GÇö UNET only
-#   clip_only      GÇö CLIP only
-#   vae            GÇö UNET + CLIP + VAE concurrent, 4 workers
-#   off            GÇö skip CPU preload entirely
-#   async_no_wait  GÇö fire preload in background thread, don't block restore
-#   budgeted_1500ms GÇö preload with 1500ms time budget, stop when exceeded
+#   workers_2      GÃ‡Ã¶ (default fallback) UNET + CLIP concurrent, 2 workers
+#   default        GÃ‡Ã¶ UNET + CLIP concurrent, 4 workers
+#   sequential     GÃ‡Ã¶ UNET first then CLIP, 1 worker
+#   workers_1      GÃ‡Ã¶ UNET + CLIP concurrent, 1 worker
+#   unet_only      GÃ‡Ã¶ UNET only
+#   clip_only      GÃ‡Ã¶ CLIP only
+#   vae            GÃ‡Ã¶ UNET + CLIP + VAE concurrent, 4 workers
+#   off            GÃ‡Ã¶ skip CPU preload entirely
+#   async_no_wait  GÃ‡Ã¶ fire preload in background thread, don't block restore
+#   budgeted_1500ms GÃ‡Ã¶ preload with 1500ms time budget, stop when exceeded
 PRELOAD_MODE = os.getenv("COMFYMODAL_PRELOAD_MODE", "off").strip().lower()
 PROMPT_ASYNC_PRELOAD = os.getenv("PROMPT_ASYNC_PRELOAD", "0") == "1"
 PROMPT_PRELOAD_WORKERS = int(os.getenv("PROMPT_PRELOAD_WORKERS", "2"))
@@ -1005,7 +861,7 @@ PROMPT_ASYNC_ACTUAL_LOAD_UNET = os.getenv("PROMPT_ASYNC_ACTUAL_LOAD_UNET", "0") 
 DISABLE_CACHEDIT_FOR_Z_IMAGE = os.getenv("DISABLE_CACHEDIT_FOR_Z_IMAGE", "0") == "1"
 _DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE = os.getenv("DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE", "0") == "1"
 
-# GöÇGöÇ Cold UNET early load (opt-in, default 0) GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ Cold UNET early load (opt-in, default 0) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 # NOTE: Cold UNET early load performs speculative independent model file reads
 # that are NOT joined by the graph loader. This causes duplicate physical I/O
 # on cold start and makes performance worse. Disabled by default.
@@ -1065,7 +921,7 @@ if ACTUAL_LOAD_MODE not in ("off", "clip_vae_only", "unet_only", "unet_vae_only"
     print(f"[comfyapp] WARNING: invalid COMFYMODAL_ACTUAL_LOAD_MODE={ACTUAL_LOAD_MODE!r}, falling back to 'clip_vae_only'")
     ACTUAL_LOAD_MODE = "clip_vae_only"
 
-# P1 GÇö Direct warmup granular flags.
+# P1 GÃ‡Ã¶ Direct warmup granular flags.
 # DIRECT_WARMUP_LOAD_UNET/LOAD_CLIP gate whether UNET/CLIP are loaded
 # during direct warmup at all.  Default both to 0 so that synchronous
 # model reads during restore (16+ GB) are opt-in rather than the default.
@@ -1079,43 +935,43 @@ DIRECT_WARMUP_CLIP_ENCODE = os.getenv("COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE", "0
 # CPU preload is disabled or async.
 DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT = os.getenv("COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT", "1") == "1"
 
-# P2 GÇö Sage runtime policy.
-#   auto           GÇö (default) probe and select automatically
-#   baked_cuda     GÇö skip probing, assume Blackwell baked CUDA path
-#   triton_fallback GÇö skip probing, force Triton fallback
+# P2 GÃ‡Ã¶ Sage runtime policy.
+#   auto           GÃ‡Ã¶ (default) probe and select automatically
+#   baked_cuda     GÃ‡Ã¶ skip probing, assume Blackwell baked CUDA path
+#   triton_fallback GÃ‡Ã¶ skip probing, force Triton fallback
 SAGE_RUNTIME_MODE = os.getenv("COMFYMODAL_SAGE_RUNTIME_MODE", "auto").strip().lower()
 
-# P3 GÇö Restore direct CLIP policy.
-#   auto           GÇö (default) load_and_encode unless CLIP already cached or no CLIP in profile
-#   off            GÇö explicit user override: no CLIP load or encode during restore
-#   load_only      GÇö explicit user override: load CLIP but skip dummy encode
-#   load_and_encode GÇö explicit user override: load CLIP and run dummy encode
+# P3 GÃ‡Ã¶ Restore direct CLIP policy.
+#   auto           GÃ‡Ã¶ (default) load_and_encode unless CLIP already cached or no CLIP in profile
+#   off            GÃ‡Ã¶ explicit user override: no CLIP load or encode during restore
+#   load_only      GÃ‡Ã¶ explicit user override: load CLIP but skip dummy encode
+#   load_and_encode GÃ‡Ã¶ explicit user override: load CLIP and run dummy encode
 RESTORE_DIRECT_CLIP_POLICY = os.getenv("COMFYMODAL_RESTORE_DIRECT_CLIP_POLICY", "auto").strip().lower()
 if RESTORE_DIRECT_CLIP_POLICY not in ("auto", "off", "load_only", "load_and_encode"):
     print(f"[comfyapp] WARNING: invalid COMFYMODAL_RESTORE_DIRECT_CLIP_POLICY={RESTORE_DIRECT_CLIP_POLICY!r}, falling back to 'auto'")
     RESTORE_DIRECT_CLIP_POLICY = "auto"
 
-# P4 GÇö VAE decode warmup.
-#   0 GÇö (default) disabled
-#   1 GÇö opt-in: run a dummy VAE decode during restore to warm the decoder
+# P4 GÃ‡Ã¶ VAE decode warmup.
+#   0 GÃ‡Ã¶ (default) disabled
+#   1 GÃ‡Ã¶ opt-in: run a dummy VAE decode during restore to warm the decoder
 VAE_DECODE_WARMUP_ENABLED = os.getenv("COMFYMODAL_VAE_DECODE_WARMUP", "0") == "1"
 
-# P4b GÇö Restore background UNET.
-#   0 GÇö (default) disabled
-#   1 GÇö opt-in: after CLIP preload join, start the exact selected UNET load in
+# P4b GÃ‡Ã¶ Restore background UNET.
+#   0 GÃ‡Ã¶ (default) disabled
+#   1 GÃ‡Ã¶ opt-in: after CLIP preload join, start the exact selected UNET load in
 #        the existing future registry so prompt UNET attach/wait can reuse it.
 RESTORE_BACKGROUND_UNET_ENABLED = os.getenv("COMFYMODAL_RESTORE_BACKGROUND_UNET", "0") == "1"
 
-# P4c GÇö Hard rollback gate for ALL restore-background UNET code paths.
-# When 0 (default), no restore-background code runs GÇö the patch is
+# P4c GÃ‡Ã¶ Hard rollback gate for ALL restore-background UNET code paths.
+# When 0 (default), no restore-background code runs GÃ‡Ã¶ the patch is
 # invisible.  When 1, the gated feature can be enabled via
 # COMFYMODAL_RESTORE_BACKGROUND_UNET=1.
 EXPERIMENTAL_RESTORE_BACKGROUND_CODE = os.getenv("COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE", "0") == "1"
 
-# P5 GÇö Safetensors read mode.
-#   auto         GÇö explicit opt-in: use read_bytes for large .safetensors CPU loads on model paths
-#   normal       GÇö (default) use original loader behavior
-#   read_bytes   GÇö explicit opt-in: open(path, "rb").read() then safetensors.torch.load(bytes)
+# P5 GÃ‡Ã¶ Safetensors read mode.
+#   auto         GÃ‡Ã¶ explicit opt-in: use read_bytes for large .safetensors CPU loads on model paths
+#   normal       GÃ‡Ã¶ (default) use original loader behavior
+#   read_bytes   GÃ‡Ã¶ explicit opt-in: open(path, "rb").read() then safetensors.torch.load(bytes)
 SAFETENSORS_READ_MODE = os.getenv("COMFYMODAL_SAFETENSORS_READ_MODE", "normal").strip().lower()
 if SAFETENSORS_READ_MODE not in ("auto", "normal", "read_bytes"):
     print(f"[comfyapp] WARNING: invalid COMFYMODAL_SAFETENSORS_READ_MODE={SAFETENSORS_READ_MODE!r}, falling back to 'normal'")
@@ -1123,7 +979,7 @@ if SAFETENSORS_READ_MODE not in ("auto", "normal", "read_bytes"):
 SAFETENSORS_READ_BYTES_MIN_MB = int(os.getenv("COMFYMODAL_SAFETENSORS_READ_BYTES_MIN_MB", "512"))
 SAFETENSORS_STRICT = os.getenv("COMFYMODAL_SAFETENSORS_STRICT", "0") == "1"
 
-# ── v2.16.21 combined cold-start fast path ──────────────────────────────
+# â”€â”€ v2.16.21 combined cold-start fast path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Master toggle: when 0, all v2.16.21 features are disabled and v2.16.20
 # behavior is restored without redeployment.
 # Each sub-feature can be independently disabled when the master is 1.
@@ -1163,10 +1019,7 @@ def _resolve_production_stable_path_effective(profile: dict | None = None) -> bo
     return bool(_flag)
 
 
-PRODUCTION_STABLE_PATH_FLAG = _resolve_runtime_flag("PRODUCTION_STABLE_PATH", "1")
-
-
-# P6 GÇö FUSE / Modal Volume large-read governor.
+# P6 GÃ‡Ã¶ FUSE / Modal Volume large-read governor.
 # Disabled by default to preserve the recovered 26-29s shape until paid A/B
 # confirms the concurrency gate is a net win on current Modal volume behavior.
 FUSE_READ_GOVERNOR_ENABLED = os.getenv("COMFYMODAL_FUSE_READ_GOVERNOR", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -1179,18 +1032,18 @@ try:
 except (TypeError, ValueError):
     FUSE_LARGE_READ_MIN_MB = 512
 
-# GöÇGöÇ Telemetry: per-stack metrics persistence (default off) GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ Telemetry: per-stack metrics persistence (default off) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 # When 0 (default), metrics are computed in-memory only with no volume write.
 # When 1, metrics are persisted to the model volume (may perturb cold reads).
 PERSIST_PER_STACK_METRICS = os.getenv("COMFYMODAL_PERSIST_PER_STACK_METRICS", "0") == "1"
 
-# GöÇGöÇ VAE actual-load defer during restore-background UNET read GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ VAE actual-load defer during restore-background UNET read GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 # When 1 (default), skip VAE actual-load if a restore_background_unet
 # active read is still queued/running, to avoid adding small reads during
 # a large-volume-read window.
 DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET = os.getenv("COMFYMODAL_DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET", "1") == "1"
 
-# GöÇGöÇ Volume read-stall classification thresholds GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ Volume read-stall classification thresholds GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 VOLUME_STALL_UNET_MS = int(os.getenv("COMFYMODAL_VOLUME_STALL_UNET_MS", "10000"))
 VOLUME_STALL_VAE_MS = int(os.getenv("COMFYMODAL_VOLUME_STALL_VAE_MS", "2000"))
 VOLUME_STALL_CLIP_PRELOAD_THROUGHPUT_GBPS = float(os.getenv("COMFYMODAL_VOLUME_STALL_CLIP_PRELOAD_THROUGHPUT_GBPS", "2.0"))
@@ -1204,7 +1057,7 @@ RUNTIME_CONFIG_DIR = "/root/models/runtime_config"
 RUNTIME_RETURN_MODE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "return_mode.txt")
 RUNTIME_STATE_SNAPSHOT_PATH = os.path.join(RUNTIME_CONFIG_DIR, ".runtime_state_snapshot.json")
 
-# ── Model generation control record ──────────────────────────────────
+# â”€â”€ Model generation control record â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Stored on the custom-nodes Volume (not models Volume) so that
 # custom-node hash never determines whether the models Volume changed.
 MODELS_GENERATION_SCHEMA_VERSION = 1
@@ -1290,7 +1143,7 @@ def _log_remote_identity(event: str, *, cls_name: str = "", method_name: str = "
         f"CONTROL_BASELINE={CONTROL_BASELINE} "
     )
 
-# GöÇGöÇ Phase 1: Dependency validation cache GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ Phase 1: Dependency validation cache GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 DEPENDENCY_VALIDATION_CACHE_SCHEMA_VERSION = 1
 DEPLOYMENT_DEPENDENCY_VALIDATION_CACHE_DIR = os.path.join(
     RUNTIME_CONFIG_DIR, "deployment_dependency_validation_cache"
@@ -1307,10 +1160,10 @@ _dependency_validation_memory_cache_key: str = ""
 # volume_state_hash, result
 _dep_validation_pre_key: dict | None = None
 
-# GöÇGöÇ PART 4: Baked dependency manifest (inside the image, NOT on volume) GöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ PART 4: Baked dependency manifest (inside the image, NOT on volume) GÃ¶Ã‡GÃ¶Ã‡
 BAKED_CUSTOM_NODE_DEPS_MANIFEST_PATH = "/opt/comfymodal/custom_node_deps_baked.json"
 
-# GöÇGöÇ PART 11: Known-good workflow profiles (for preload eligibility) GöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ PART 11: Known-good workflow profiles (for preload eligibility) GÃ¶Ã‡GÃ¶Ã‡
 KNOWN_GOOD_WORKFLOW_PROFILES_PATH = "/root/models/runtime_config/known_good_workflow_profiles.json"
 CURRENT_CUSTOM_NODE_DEPS_CACHE_PATH = "/root/models/runtime_config/current_custom_node_dependency_manifest_cache.json"
 PER_STACK_METRICS_PATH = "/root/models/runtime_config/per_stack_metrics.json"
@@ -1763,7 +1616,7 @@ def _resolve_restore_direct_clip_policy(profile: dict | None, has_active_prompt_
         "direct_warmup_clip_skip_reason": "fallback_existing",
     }
 
-# GöÇGöÇ Custom-node volume helpers GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ Custom-node volume helpers GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 
 def _safe_listdir(path: str) -> list[str]:
     if not os.path.isdir(path):
@@ -2180,7 +2033,7 @@ def build_custom_node_dependency_manifest(source_root: str) -> dict:
     """Build a deterministic dependency manifest for all custom nodes under
     *source_root*.
 
-    Scans dependency-relevant files only GÇö not entire source trees.
+    Scans dependency-relevant files only GÃ‡Ã¶ not entire source trees.
     """
     import sys as _sys
     nodes_manifest: dict[str, dict] = {}
@@ -2225,7 +2078,7 @@ def load_baked_custom_node_dependency_manifest() -> dict:
     """Read the baked dependency manifest from inside the image.
 
     Returns an empty dict if the manifest does not exist (image was not
-    built with the manifest GÇö compatibility fallback).
+    built with the manifest GÃ‡Ã¶ compatibility fallback).
     """
     if not os.path.isfile(BAKED_CUSTOM_NODE_DEPS_MANIFEST_PATH):
         return {}
@@ -2507,7 +2360,7 @@ def _write_deployment_dependency_validation_sentinel(
 def _cheap_volume_state_hash() -> str:
     """Compute a hash of custom-node volume state using only stat calls (no content reads).
 
-    Mirrors ``custom_node_volume_state`` GÇö returns MD5 hex of
+    Mirrors ``custom_node_volume_state`` GÃ‡Ã¶ returns MD5 hex of
     ``(name, st_mtime_ns, req_mtime_ns)`` tuples for each syncable node.
     Very fast (~1ms for 22 nodes) compared to content fingerprint (~900ms).
     """
@@ -2589,13 +2442,13 @@ def _run_dependency_validation_with_cache(
         "dependency_sentinel_write_ms": 0.0,
     }
 
-    # GöÇGöÇ Step 1: Load baked manifest first (needed for pre-key check) GöÇGöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ Step 1: Load baked manifest first (needed for pre-key check) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
     if baked is None:
         baked = load_baked_custom_node_dependency_manifest()
     _baked_load_ms = _mark_phase()
     result["dependency_baked_manifest_load_ms"] = _baked_load_ms
 
-    # GöÇGöÇ Step 0: Pre-key memory fast path GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ Step 0: Pre-key memory fast path GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
     # Uses cheap volume state (stat calls only, no content reads) to avoid
     # the expensive dependency fingerprint scan (~900ms) on subsequent requests
     # in the same warm container.
@@ -2660,14 +2513,14 @@ def _run_dependency_validation_with_cache(
             )
             return result
 
-    # GöÇGöÇ Step 2: Build cheap dependency fingerprint GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ Step 2: Build cheap dependency fingerprint GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
     source_root = get_runtime_custom_node_source_root_for_dependency_validation()
     dep_fp = custom_node_dependency_fingerprint(source_root)
     dep_fingerprint_hash = dep_fp.get("overall_dependency_hash", "")
     _fingerprint_ms = _mark_phase()
     result["dependency_fingerprint_ms"] = _fingerprint_ms
 
-    # GöÇGöÇ Step 3: Compute cache key GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ Step 3: Compute cache key GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
     cache_key = build_dependency_validation_cache_key(
         baked_hash=baked_hash,
         current_dep_fingerprint_hash=dep_fingerprint_hash,
@@ -2680,7 +2533,7 @@ def _run_dependency_validation_with_cache(
     _cache_key_ms = _mark_phase()
     result["dependency_cache_key_ms"] = _cache_key_ms
 
-    # GöÇGöÇ Step 4: Check per-container full-key memory cache GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ Step 4: Check per-container full-key memory cache GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
     if _dependency_validation_memory_cache_key == cache_key and _dependency_validation_memory_cache:
         cached = _dependency_validation_memory_cache
         if cached.get("prepared"):
@@ -2706,7 +2559,7 @@ def _run_dependency_validation_with_cache(
     _mem_lookup_ms = _mark_phase()
     result["dependency_memory_lookup_ms"] = _mem_lookup_ms
 
-    # GöÇGöÇ Step 5: Check deployment sentinel on volume GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ Step 5: Check deployment sentinel on volume GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
     sentinel = _read_deployment_dependency_validation_sentinel(cache_key)
     if sentinel is not None:
         val = {
@@ -2742,7 +2595,7 @@ def _run_dependency_validation_with_cache(
     _sentinel_lookup_ms = _mark_phase()
     result["dependency_sentinel_lookup_ms"] = _sentinel_lookup_ms
 
-    # GöÇGöÇ Step 6: Fast-path hash compare GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ Step 6: Fast-path hash compare GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
     if baked_hash and dep_fingerprint_hash and baked_hash == dep_fingerprint_hash:
         val = {
             "prepared": True,
@@ -2783,7 +2636,7 @@ def _run_dependency_validation_with_cache(
         )
         return result
 
-    # GöÇGöÇ Step 7: Full validation (missed all caches) GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ Step 7: Full validation (missed all caches) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
     val = validate_custom_node_dependencies_prepared()
     result.update(val)
     result["dependency_validation_current_hash"] = val.get("current_hash", dep_fingerprint_hash)
@@ -2834,7 +2687,7 @@ def _run_dependency_validation_with_cache(
     return result
 
 
-# GöÇGöÇ PART 11: Known-good workflow profiles GöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ PART 11: Known-good workflow profiles GÃ¶Ã‡GÃ¶Ã‡
 def load_known_good_workflow_profiles() -> dict:
     """Load known-good workflow profiles from the volume."""
     try:
@@ -2853,7 +2706,7 @@ _volume_commit_lock = _threading.Lock()
 _volume_commit_inflight_labels: set[str] = set()
 _volume_commit_dirty_labels: set[str] = set()
 
-# GöÇGöÇ Active model-read registry (module-global) GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ Active model-read registry (module-global) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 # Tracks every in-flight model-file read so any consumer (cached_load,
 # restore preload worker, actual_load worker, etc.) can avoid starting
 # a duplicate volume read for the same canonical model path.
@@ -3219,7 +3072,7 @@ def _is_graph_loader_joinable(canonical_key: str) -> tuple:
     """Check if a speculative load can safely join the graph loader's read.
 
     Returns (is_joinable: bool, reason: str).
-    The key must match exactly GÇö same loader function, same role, same path.
+    The key must match exactly GÃ‡Ã¶ same loader function, same role, same path.
     """
     with _ACTIVE_MODEL_READS_LOCK:
         entry = _ACTIVE_MODEL_READS.get(canonical_key)
@@ -3232,7 +3085,7 @@ def _is_graph_loader_joinable(canonical_key: str) -> tuple:
         return True, "joinable"
 
 
-# GöÇGöÇ Thread-local model-load context GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ Thread-local model-load context GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 # Used by cached_load() to distinguish actual_load workers from graph_loader
 # when registering an active model read.  Thread-local because actual_load
 # workers run in background threads and must not share state with the main
@@ -3289,7 +3142,7 @@ def _model_load_context(owner: str = "graph_loader", loader_type: str = "",
 def _commit_volume_async(label: str = "") -> None:
     """Schedule an asynchronous ``vol.commit()`` in a daemon thread.
 
-    Uses a loopGÇæbased worker per label so no followGÇæup depth cap can
+    Uses a loopGÃ‡Ã¦based worker per label so no followGÃ‡Ã¦up depth cap can
     drop a dirty write:
 
     * If no commit is running for *label*, start one.
@@ -3448,7 +3301,7 @@ def build_current_custom_node_dependency_manifest_cached() -> dict:
     When the dependency fingerprint is unchanged since the last call, the
     previously-built manifest is returned.  The cache is invalidated only
     when dependency-relevant file content changes (requirements.txt,
-    pyproject.toml, setup.py, etc.) GÇö ordinary .py source changes do not
+    pyproject.toml, setup.py, etc.) GÃ‡Ã¶ ordinary .py source changes do not
     invalidate it.
     """
     source_root = get_runtime_custom_node_source_root_for_dependency_validation()
@@ -3540,7 +3393,7 @@ def _iter_top_level_requirement_names(req_path: str) -> list[str]:
 
 
 def _canonicalize_dist_name(name: str) -> str:
-    """Normalize a distribution name per PEP 503 (lowercase, ``[-_.]+`` GåÆ ``-``)."""
+    """Normalize a distribution name per PEP 503 (lowercase, ``[-_.]+`` GÃ¥Ã† ``-``)."""
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
@@ -3550,8 +3403,8 @@ def _requirements_have_importable_packages(req_path: str) -> bool:
 
     Uses distribution metadata (``importlib.metadata.distributions()``)
     rather than import-module guesses so that packages whose distribution
-    name differs from their module name (e.g. ``Pillow`` GåÆ ``PIL``,
-    ``opencv-python-headless`` GåÆ ``cv2``) are correctly recognised.
+    name differs from their module name (e.g. ``Pillow`` GÃ¥Ã† ``PIL``,
+    ``opencv-python-headless`` GÃ¥Ã† ``cv2``) are correctly recognised.
 
     Returns ``True`` when the file is empty or contains only local paths /
     VCS sources / pip flags (no top-level packages to verify). Returns
@@ -3902,10 +3755,10 @@ def stack_to_profile(stack: dict) -> dict:
     return {}
 
 
-# GöÇGöÇ PART 8: Runtime model-download policy GöÇGöÇ
-#   off       GÇö Never download model files during request execution.
-#   explicit  GÇö Only download via explicit preinstall/precache functions.
-#   dev       GÇö Allow runtime model downloads (current default for dev).
+# GÃ¶Ã‡GÃ¶Ã‡ PART 8: Runtime model-download policy GÃ¶Ã‡GÃ¶Ã‡
+#   off       GÃ‡Ã¶ Never download model files during request execution.
+#   explicit  GÃ‡Ã¶ Only download via explicit preinstall/precache functions.
+#   dev       GÃ‡Ã¶ Allow runtime model downloads (current default for dev).
 COMFYMODAL_ALLOW_RUNTIME_MODEL_DOWNLOADS = os.getenv("COMFYMODAL_ALLOW_RUNTIME_MODEL_DOWNLOADS", "0") == "1"
 COMFYMODAL_MODEL_DOWNLOAD_MODE = os.getenv("COMFYMODAL_MODEL_DOWNLOAD_MODE", "dev").strip().lower()
 
@@ -3954,7 +3807,7 @@ def _verify_model_file(path: str, expected_size: int | None = None, expected_sha
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.16.22"
+COMFYAPP_VERSION = "2.16.23"
 CONTROL_BASELINE = "v2.16.5_exact_plus_direct_memory_production"
 
 
@@ -4035,7 +3888,7 @@ def _assert_valid_local_custom_nodes_root(path: str) -> None:
         )
 
 
-# GöÇGöÇ Remote runtime detection GöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ Remote runtime detection GÃ¶Ã‡GÃ¶Ã‡
 # When running inside a Modal container (either GPU or helper), Modal sets
 # MODAL_IMAGE_ID.  Use this to skip local-only build-time setup.
 _INSIDE_MODAL_CONTAINER = bool(os.environ.get("MODAL_IMAGE_ID")) or os.path.isdir("/pkg/modal")
@@ -4045,7 +3898,7 @@ _COMFYUI_MODAL_DIR = os.path.dirname(os.path.abspath(__file__))
 if not _INSIDE_MODAL_CONTAINER:
     _LOCAL_CUSTOM_NODES = _resolve_local_custom_nodes_root()
 else:
-    # Remote runtime GÇö skip local source resolution.  The custom nodes will
+    # Remote runtime GÃ‡Ã¶ skip local source resolution.  The custom nodes will
     # be synced from the Modal volume at restore() time.
     _LOCAL_CUSTOM_NODES = "/root/comfy/ComfyUI/custom_nodes"
 
@@ -4130,7 +3983,7 @@ _CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE = shutil.ignore_patterns(
     ".venv",
     "venv",
     ".last_context_manifest.json",
-    # Image/media/docs GÇö not needed for pip install
+    # Image/media/docs GÃ‡Ã¶ not needed for pip install
     "*.jpg",
     "*.jpeg",
     "*.png",
@@ -4159,7 +4012,7 @@ def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
     Filters:
     - must be a regular directory (not a symlink, not a file)
     - must not start with ``.``
-    - must not be in the exclude set (``.git``, ``__pycache__``, GÇª)
+    - must not be in the exclude set (``.git``, ``__pycache__``, GÃ‡Âª)
     - broken symlinks are excluded (``os.path.isdir`` returns ``False``)
     """
     if not os.path.isdir(cn_root):
@@ -4829,7 +4682,7 @@ _image_base = (
             "COMFYMODAL_ENABLE_TORCH_COMPILE": "0",
             "COMFYMODAL_ENABLE_GPU_SNAPSHOT": "0",
             "COMFYMODAL_WARMUP_TEXT": "warmup",
-            # Restore latency fix GÇö default production profile (Config D)
+            # Restore latency fix GÃ‡Ã¶ default production profile (Config D)
             "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
             "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
             "COMFYMODAL_PRELOAD_MODE": "clip_only",
@@ -4892,7 +4745,7 @@ if not _INSIDE_MODAL_CONTAINER:
         'echo "CUSTOM_NODE_PREREQ_INSTALL_END ts_ms=$_end_ts total_nodes=$_total_req installed=$_total_installed skipped_no_req=$_total_skipped"'
     )
 
-# GöÇGöÇ PART 3b: Custom-node source copy (combined or per-node) GöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ PART 3b: Custom-node source copy (combined or per-node) GÃ¶Ã‡GÃ¶Ã‡
 # Only runs during local deploy/image build.  Skipped inside remote Modal containers.
 if not _INSIDE_MODAL_CONTAINER:
     _syncable_node_names = _iter_syncable_custom_node_dirs(_LOCAL_CUSTOM_NODES)
@@ -4919,7 +4772,7 @@ if not _INSIDE_MODAL_CONTAINER:
         _cn_copy_layer_count = len(_syncable_node_names)
         print(f"[comfyapp] custom_node_copy_mode=per_node nodes={len(_syncable_node_names)} layers={_cn_copy_layer_count}")
 
-    # GöÇGöÇ PART 4: Generate baked dependency manifest and copy into image GöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ PART 4: Generate baked dependency manifest and copy into image GÃ¶Ã‡GÃ¶Ã‡
     _BAKED_MANIFEST_DIR = os.path.join(_COMFYUI_MODAL_DIR, ".baked_custom_node_deps")
     os.makedirs(_BAKED_MANIFEST_DIR, exist_ok=True)
     _BAKED_MANIFEST_TEMP = os.path.join(_BAKED_MANIFEST_DIR, "custom_node_deps_baked.json")
@@ -4957,7 +4810,7 @@ if not _INSIDE_MODAL_CONTAINER:
         with open(_BAKED_MANIFEST_TEMP, "w", encoding="utf-8") as _f:
             json.dump({"schema_version": 1, "nodes": {}, "overall_dependency_hash": ""}, _f)
 
-    # GöÇGöÇ Dependency build-context diagnostics GöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ Dependency build-context diagnostics GÃ¶Ã‡GÃ¶Ã‡
     _baked_manifest_for_diag = locals().get("_baked_manifest", {})
     if not _baked_manifest_for_diag:
         try:
@@ -5158,16 +5011,16 @@ def _validate_safe_tar_member(member, staging_dir: str) -> None:
     parts = [p for p in normalized.split("/") if p not in ("", ".")]
     if not parts:
         raise ValueError(
-            f"Tar member {member.name!r} is empty or targets archive root GÇö not allowed"
+            f"Tar member {member.name!r} is empty or targets archive root GÃ‡Ã¶ not allowed"
         )
     if name.startswith("/") or normalized.startswith("/") or any(part == ".." for part in parts):
         raise ValueError(f"Tar member '{member.name}' contains unsafe path")
     if member.issym() or member.islnk():
         raise ValueError(
-            f"Tar member '{member.name}' is a symlink/hardlink GÇö not allowed"
+            f"Tar member '{member.name}' is a symlink/hardlink GÃ‡Ã¶ not allowed"
         )
     if member.isdev() or member.ischr() or member.isblk() or member.isfifo():
-        raise ValueError(f"Tar member '{member.name}' is a special file type GÇö not allowed")
+        raise ValueError(f"Tar member '{member.name}' is a special file type GÃ‡Ã¶ not allowed")
     if not (member.isfile() or member.isdir()):
         raise ValueError(f"Tar member '{member.name}' is an unsupported file type")
     staging_real = os.path.realpath(staging_dir)
@@ -5220,7 +5073,7 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
         _safe_remove_path(staging_dir)
         raise
 
-    # GöÇGöÇ Old content removal (only after new archive is in staging) GöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ Old content removal (only after new archive is in staging) GÃ¶Ã‡GÃ¶Ã‡
     _staging_name = os.path.basename(staging_dir)
     for item in os.listdir(CUSTOM_NODES_PATH):
         if item == _staging_name:
@@ -5668,7 +5521,7 @@ def upload_model_chunk(chunk_data: bytes, folder: str, filename: str, offset: in
     return {"status": "partial", "offset": offset + len(chunk_data)}
 
 
-# GöÇGöÇ CPU-only standalone functions GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# GÃ¶Ã‡GÃ¶Ã‡ CPU-only standalone functions GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 # These used to be GPU-bound @modal.method() on the ComfyAPI class, wasting
 # expensive GPU containers for trivial filesystem/health ops.
 # Names end with ``_cpu`` to avoid collision with the existing
@@ -5684,7 +5537,7 @@ def upload_model_chunk(chunk_data: bytes, folder: str, filename: str, offset: in
     timeout=10,
 )
 def health_cpu():
-    """Minimal health probe.  CPU-only GÇö no GPU cost."""
+    """Minimal health probe.  CPU-only GÃ‡Ã¶ no GPU cost."""
     return {"status": "ok"}
 
 
@@ -5698,7 +5551,7 @@ def health_cpu():
     volumes={MODELS_PATH: vol},
 )
 def list_models_cpu() -> dict:
-    """List all models on the volume.  CPU-only GÇö no GPU cost."""
+    """List all models on the volume.  CPU-only GÃ‡Ã¶ no GPU cost."""
     import os
 
     vol.reload()
@@ -5743,7 +5596,7 @@ def list_models_cpu() -> dict:
     volumes={MODELS_PATH: vol},
 )
 def delete_model_cpu(folder: str, filename: str) -> dict:
-    """Delete a model file from the volume.  CPU-only GÇö no GPU cost."""
+    """Delete a model file from the volume.  CPU-only GÃ‡Ã¶ no GPU cost."""
     import os
 
     safe_folder = os.path.basename(folder)
@@ -5767,7 +5620,7 @@ def delete_model_cpu(folder: str, filename: str) -> dict:
 )
 def runtime_state_cpu() -> dict:
     """Check if the remote runtime state is stale relative to the volumes.
-    CPU-only GÇö no GPU cost."""
+    CPU-only GÃ‡Ã¶ no GPU cost."""
     import json
 
     vol.reload()
@@ -5817,7 +5670,7 @@ def _filter_preload_paths_by_size(file_paths: list) -> tuple[list, dict]:
     1. Remove individual files above ``PRELOAD_MAX_FILE_GB``.
     2. Compute total size of remaining candidates.
     3. If total exceeds ``PRELOAD_MAX_TOTAL_GB``, return empty list
-       with ``reason=max_total_gb_exceeded`` GÇö no partial preload.
+       with ``reason=max_total_gb_exceeded`` GÃ‡Ã¶ no partial preload.
     4. Otherwise return the filtered list.
     """
     result: dict = {
@@ -5910,7 +5763,7 @@ class _MemoizedValidationCache:
         self._fingerprints.clear()
 
 
-# ── v2.16.20 diagnostic helpers ───────────────────────────────────────
+# â”€â”€ v2.16.20 diagnostic helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _read_process_rss_mb() -> float:
     """Return process RSS in MiB via /proc/self/statm, or -1.0 on failure."""
@@ -6004,7 +5857,7 @@ def _tensor_identity_summary(tensor, *, include_hash: bool = False) -> dict:
     return _summary
 
 
-# ── Restore preload handle ─────────────────────────────────────────────
+# â”€â”€ Restore preload handle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class _RestorePreloadHandle:
     """Handle for a restore CLIP preload worker thread with exact timing."""
@@ -6032,7 +5885,7 @@ class _ComfyAPIMixin:
     # Cached localhost HTTP client for ComfyUI API calls.
     _http_client_obj = None
 
-    # GöÇGöÇ Active model-read registry (delegates to module-global) GöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ Active model-read registry (delegates to module-global) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
     def _register_active_read(self, canonical_key: str, owner: str, thread_or_future=None, path: str = ""):
         _register_active_model_read(canonical_key, owner, path=path, future=thread_or_future)
 
@@ -6057,7 +5910,7 @@ class _ComfyAPIMixin:
         payload = " ".join(f"{k}={v}" for k, v in fields.items())
         print(f"[comfyapp.profile] stage={stage} {payload}".rstrip())
 
-    # GöÇGöÇ PART 7: Shared custom-node sync and dependency policy GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ PART 7: Shared custom-node sync and dependency policy GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
     def _handle_custom_node_sync_and_dependency_policy(self, workflow: dict, stream: bool = False) -> dict:
         """Validate prompt, sync custom nodes, and enforce dependency policy.
 
@@ -6121,7 +5974,7 @@ class _ComfyAPIMixin:
                 import nodes as _pol_nodes
                 self._event_loop.run_until_complete(_pol_nodes.init_extra_nodes())
 
-        # GöÇGöÇ 6. Enforce node classes available before model work GöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ 6. Enforce node classes available before model work GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         _missing_node_result = self._enforce_workflow_node_classes_available_before_model_work(workflow)
 
         result = {
@@ -6160,7 +6013,7 @@ class _ComfyAPIMixin:
                 _dep_fields_propagated += 1
         return result
 
-    # GöÇGöÇ PART 7: Preflight before prompt execution GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ PART 7: Preflight before prompt execution GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
     def _preflight_before_prompt_execution(self, workflow: dict) -> dict:
         """Run preflight checks before any prompt execution.
 
@@ -6245,7 +6098,7 @@ class _ComfyAPIMixin:
         return self._http_client_obj
 
     def _ensure_models_symlink(self):
-        """Ensure /root/comfy/ComfyUI/models symlink GåÆ MODELS_PATH exists."""
+        """Ensure /root/comfy/ComfyUI/models symlink GÃ¥Ã† MODELS_PATH exists."""
         _t0 = time.time()
         comfy_models = "/root/comfy/ComfyUI/models"
         if not os.path.islink(comfy_models):
@@ -6513,7 +6366,7 @@ class _ComfyAPIMixin:
                 )
                 return _sanitized
 
-        # Step 2: Volume state changed GÇö compute full content fingerprint
+        # Step 2: Volume state changed GÃ‡Ã¶ compute full content fingerprint
         current_fp = custom_node_source_fingerprint(CUSTOM_NODES_PATH)
         current_fp_hash = hashlib.md5(json.dumps(current_fp, sort_keys=True).encode()).hexdigest()
         last_fp = getattr(self, "_last_custom_node_source_fingerprint", None)
@@ -6538,7 +6391,7 @@ class _ComfyAPIMixin:
             self._validation_cache.set("custom_node_sync", _result, fingerprint=cheap_hash)
             return _result
 
-        # Step 3: Content actually changed GÇö run the real sync
+        # Step 3: Content actually changed GÃ‡Ã¶ run the real sync
         summary = sync_custom_nodes_into_comfy(CUSTOM_NODES_PATH, comfy_custom_nodes, include_state=True)
         state = summary.pop("state", cheap_state)
         node_count_fp = len(current_fp.get("nodes", []))
@@ -6554,6 +6407,9 @@ class _ComfyAPIMixin:
     def _start_restore_preload(
         self,
         preload_paths: list[str],
+        *,
+        read_strategy: str = "auto",
+        abort_policy: str = "existing",
     ) -> _RestorePreloadHandle:
         """Start a restore CLIP preload worker thread with exact timing signals.
 
@@ -6575,6 +6431,8 @@ class _ComfyAPIMixin:
                     budget_ms=None,
                     worker_started_event=_handle.worker_started_event,
                     worker_timing_holder=_timing_holder,
+                    read_strategy=read_strategy,
+                    abort_policy=abort_policy,
                 )
                 _handle.result_holder["result"] = _result
             except Exception as _exc:
@@ -6636,9 +6494,7 @@ class _ComfyAPIMixin:
                 profile["_profile_token"] = active.get("profile_token", "")
                 profile["_workflow_hash"] = active.get("workflow_hash", "")
                 profile["_current_workflow_stack"] = dict(active.get("model_stack") or {})
-                if active.get("production_enabled") is True:
-                    profile["_production_enabled"] = True
-                    profile["_production_profile_version"] = active.get("production_profile_version", 0)
+                # Expired profiles must never enable production mode
                 print(
                     f"[comfyapp] snapshot_preload_profile source={source} (expired fallback) "
                     f"token={profile.get('_profile_token','')} "
@@ -6777,7 +6633,7 @@ class _ComfyAPIMixin:
                 _seen_filenames.add(f)
                 _active_deduped.append((b, f))
         if len(_active_deduped) < len(active):
-            print(f"[comfyapp] snapshot_preload_paths: deduped {len(active)}GåÆ{len(_active_deduped)} "
+            print(f"[comfyapp] snapshot_preload_paths: deduped {len(active)}GÃ¥Ã†{len(_active_deduped)} "
                   f"duplicates={set(f for _, f in active) - set(f for _, f in _active_deduped)}")
         active = _active_deduped
 
@@ -7057,6 +6913,9 @@ class _ComfyAPIMixin:
         budget_ms: float | None = None,
         worker_started_event: threading.Event | None = None,
         worker_timing_holder: dict | None = None,
+        *,
+        read_strategy: str = "auto",
+        abort_policy: str = "existing",
     ) -> dict:
         """Preload model state dicts into CPU RAM.
 
@@ -7097,7 +6956,9 @@ class _ComfyAPIMixin:
         try:
             _total_start = time.time()
             _total_bytes = 0
-            _abort_deadline = time.time() + PRELOAD_OUTLIER_ABORT_SECONDS if PRELOAD_OUTLIER_ABORT_SECONDS > 0 else None
+            _abort_deadline = None
+            if abort_policy != "wait_same_future" and PRELOAD_OUTLIER_ABORT_SECONDS > 0:
+                _abort_deadline = time.time() + PRELOAD_OUTLIER_ABORT_SECONDS
             # Normalize items: accept strings or dicts with "path"/"role"
             _normalized_items = []
             for _raw in file_paths:
@@ -7158,7 +7019,7 @@ class _ComfyAPIMixin:
                     to_load.append((path, filename, cache_key, _item["role"]))
 
             cached = []
-            # ── Signal worker start when no files need loading ──
+            # â”€â”€ Signal worker start when no files need loading â”€â”€
             if not to_load:
                 if worker_timing_holder is not None:
                     worker_timing_holder["no_worker_needed"] = 1
@@ -7182,7 +7043,7 @@ class _ComfyAPIMixin:
 
                 def _load_one(path: str, filename: str, cache_key: str, role: str = "unknown") -> tuple[str, str, object, object | None, float, int, dict]:
                     started = time.time()
-                    # ── Signal worker started from actual loader context ──
+                    # â”€â”€ Signal worker started from actual loader context â”€â”€
                     _worker_started_ns = time.perf_counter_ns()
                     if worker_timing_holder is not None:
                         worker_timing_holder.setdefault(
@@ -7222,12 +7083,14 @@ class _ComfyAPIMixin:
                     _concurrent_at_start = _count_active_model_reads()
                     _eff_safetensors_mode = os.environ.get("COMFYMODAL_SAFETENSORS_READ_MODE", "normal").strip().lower()
                     # Resolve read-bytes eligibility
-                    _fp = _resolve_fastpath_v21621()
-                    _use_read_bytes = (
-                        _fp["fastpath_clip_read_bytes"]
-                        and role == "clip"
-                        and path.lower().endswith(".safetensors")
-                    )
+                    _use_read_bytes = False
+                    if read_strategy != "normal":
+                        _fp = _resolve_fastpath_v21621()
+                        _use_read_bytes = (
+                            _fp["fastpath_clip_read_bytes"]
+                            and role == "clip"
+                            and path.lower().endswith(".safetensors")
+                        )
                     if _use_read_bytes:
                         _read_bytes_loader = getattr(self, "_load_restore_clip_state_read_bytes", None)
                         if not callable(_read_bytes_loader):
@@ -7267,7 +7130,7 @@ class _ComfyAPIMixin:
                     except OSError:
                         pass
                     # Store into CPU cache directly on success regardless of
-                    # session validity — completed reads are never discarded.
+                    # session validity â€” completed reads are never discarded.
                     if isinstance(loaded, tuple) and len(loaded) >= 2:
                         state_dict, metadata = loaded[0], loaded[1]
                     else:
@@ -7344,7 +7207,7 @@ class _ComfyAPIMixin:
                         _abort_reason = "budget_exceeded"
                         _exceeded_by = round((time.time() - _budget_deadline) * 1000, 1)
                         print(f"[comfyapp] preload_models_to_cpu: budget exceeded by {_exceeded_by}ms, "
-                              f"loaded {len(cached)}/{len(to_load)} files so far GÇö stopping")
+                              f"loaded {len(cached)}/{len(to_load)} files so far GÃ‡Ã¶ stopping")
                         return True
                     if _abort_deadline is not None and time.time() >= _abort_deadline:
                         if not _abort_throughput_checked and _completed_bytes == 0:
@@ -7408,7 +7271,7 @@ class _ComfyAPIMixin:
                             self._per_file_preload_diag = {}
                         self._per_file_preload_diag[fn] = _per_file_diag
                         size_mb = "?"
-                        for p, f, _cache_key in to_load:
+                        for p, f, _cache_key, _role in to_load:
                             if f == fn:
                                 try:
                                     size_mb = round(os.path.getsize(p) / (1024 * 1024), 1)
@@ -7506,7 +7369,7 @@ class _ComfyAPIMixin:
                     else:
                         pool.shutdown(wait=True)
             else:
-                # All files already cached GÇö just report them
+                # All files already cached GÃ‡Ã¶ just report them
                 for path in file_paths:
                     filename = os.path.basename(path)
                     cached.append(filename)
@@ -8032,11 +7895,20 @@ class _ComfyAPIMixin:
             return result
 
         import os as _os
-        _resolved = _os.path.realpath(unet_path)
+        import folder_paths as _fp
+        _unet_name = _os.path.basename(unet_path)
+        _resolved = _fp.get_full_path("diffusion_models", _unet_name)
+        if not _resolved or not _os.path.isfile(_resolved):
+            result["decision"] = "failed"
+            result["reason"] = f"unet_not_found via folder_paths: {_unet_name}"
+            return result
         _weight_dtype = profile.get("weight_dtype", "default")
-        key = (_resolved, _weight_dtype)
+        key = self._unet_cache_key(_resolved, _weight_dtype)
 
         result["key"] = str(key)
+
+        # Ensure actual-load registries are initialized
+        self._init_actual_load_registry()
 
         # Check object cache
         _cache = getattr(self, "_unet_object_cache", None) or {}
@@ -8046,14 +7918,15 @@ class _ComfyAPIMixin:
             return result
 
         # Check existing future
-        _futures = getattr(self, "_actual_load_futures", None) or {}
+        _futures = self._actual_load_futures
         if key in _futures:
             result["decision"] = "future_exists"
             result["reason"] = "future_already_registered"
             return result
 
-        # Verify CLIP preload complete
-        _active_reads = getattr(self, "_ACTIVE_MODEL_READS", {})
+        # Verify CLIP preload complete (module-global _ACTIVE_MODEL_READS)
+        import comfyapp as _ca_module
+        _active_reads = getattr(_ca_module, '_ACTIVE_MODEL_READS', {})
         _clip_keys = [k for k in _active_reads if "role=clip" in str(k).lower()]
         clip_read_active = len(_clip_keys) > 0
         result["clip_read_active"] = 1 if clip_read_active else 0
@@ -8067,21 +7940,31 @@ class _ComfyAPIMixin:
             return result
 
         import threading as _threading
+        import time as _threading_time
 
         _submit_ms = round((_threading_time.time() - restore_start) * 1000, 1)
         restore_stages["production_unet_submit_ms"] = _submit_ms
 
         def _production_unet_worker():
             import nodes as _prod_nodes
-            _loaded = None
             try:
                 _cls = _prod_nodes.NODE_CLASS_MAPPINGS.get("UNETLoader")
                 if _cls is None:
                     raise RuntimeError("UNETLoader not found in NODE_CLASS_MAPPINGS")
                 _node = _cls()
-                _loaded = _orig_unet(_node, unet_path, _weight_dtype)
+                with _model_load_context(
+                    owner="restore_background_unet",
+                    loader_type="UNET",
+                    actual_key=key,
+                    canonical_path=_resolved,
+                ):
+                    _loaded = _orig_unet(_node, _unet_name, _weight_dtype)
+                # UNETLoader.load_unet returns (model,) — extract the model
+                if not isinstance(_loaded, tuple) or not _loaded or _loaded[0] is None:
+                    raise RuntimeError("Production restore UNET loader returned an invalid result")
+                _unet_object = _loaded[0]
                 _uc = getattr(self, "_unet_object_cache", {})
-                _uc[key] = _loaded
+                _uc[key] = _unet_object
                 self._unet_object_cache = _uc
                 _meta = getattr(self, "_actual_load_future_meta", {})
                 _meta[key] = {
@@ -8089,8 +7972,9 @@ class _ComfyAPIMixin:
                     "production_stable": True,
                     "strict_no_fallback": True,
                     "status": "completed",
-                    "selected_unet": _os.path.basename(unet_path),
+                    "selected_unet": _unet_name,
                     "canonical_key": key,
+                    "resolved_path": _resolved,
                     "profile_token": profile.get("_profile_token", ""),
                     "workflow_hash": profile.get("_workflow_hash", ""),
                 }
@@ -8102,8 +7986,9 @@ class _ComfyAPIMixin:
                     "production_stable": True,
                     "strict_no_fallback": True,
                     "status": "failed",
-                    "selected_unet": _os.path.basename(unet_path),
+                    "selected_unet": _unet_name,
                     "canonical_key": key,
+                    "resolved_path": _resolved,
                     "profile_token": profile.get("_profile_token", ""),
                     "workflow_hash": profile.get("_workflow_hash", ""),
                 }
@@ -8113,17 +7998,15 @@ class _ComfyAPIMixin:
                 self._actual_load_future_errors = _errs
                 print(f"[production.unet] worker_failed key={key} err={_exc}")
 
-        import time as _threading_time
         _thread = _threading.Thread(target=_production_unet_worker, daemon=True)
         _futures[key] = _thread
-        self._actual_load_futures = _futures
         _meta = getattr(self, "_actual_load_future_meta", {})
         _meta[key] = {
             "source": "restore_background_unet",
             "production_stable": True,
             "strict_no_fallback": True,
             "status": "submitted",
-            "selected_unet": _os.path.basename(unet_path),
+            "selected_unet": _unet_name,
             "canonical_key": key,
             "profile_token": profile.get("_profile_token", ""),
             "workflow_hash": profile.get("_workflow_hash", ""),
@@ -8226,7 +8109,7 @@ class _ComfyAPIMixin:
     def _classify_volume_read_stall(self, trace_summary: dict | None, after_prompt: dict | None = None) -> dict:
         """Classify whether the current run experienced a Modal Volume/FUSE read stall.
 
-        Uses env/runtime thresholds.  Diagnostic only GÇö does not change behavior.
+        Uses env/runtime thresholds.  Diagnostic only GÃ‡Ã¶ does not change behavior.
         """
         _result = {
             "volume_read_stall_suspected": 0,
@@ -8480,7 +8363,7 @@ class _ComfyAPIMixin:
             f"actual_load_vae_skipped_reason={result.get('actual_load_vae_skipped_reason','')}"
         )
 
-        # GöÇGöÇ CLIP (single file) GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ CLIP (single file) GÃ¶Ã‡GÃ¶Ã‡
         if _mode_clip:
             for clip_name in stack.get("clip", []):
                 clip_type = stack.get("clip_type", "stable_diffusion")
@@ -8542,7 +8425,7 @@ class _ComfyAPIMixin:
                     result["actual_load_submit_order"].append("CLIP")
                     result["clip_submitted"] = True
                     print(f"[actual_load] submit_raw_key=({clip_path}, {clip_type}) submit_canonical_key={key}")
-            # GöÇGöÇ CLIP (DualCLIP GÇö second file if different) GöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ CLIP (DualCLIP GÃ‡Ã¶ second file if different) GÃ¶Ã‡GÃ¶Ã‡
             clips = stack.get("clip", [])
             if len(clips) >= 2:
                 clip_type = stack.get("clip_type", "stable_diffusion")
@@ -8605,7 +8488,7 @@ class _ComfyAPIMixin:
         elif ACTUAL_LOAD_MODE in ("unet_vae_only", "unet_only"):
             print(f"[actual_load] mode_violation_check mode={ACTUAL_LOAD_MODE} started_clip=0 correct=1")
 
-        # GöÇGöÇ UNET (submitted before VAE for better head start) GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ UNET (submitted before VAE for better head start) GÃ¶Ã‡GÃ¶Ã‡
         if _mode_unet:
             unet_names = stack.get("unet", []) or stack.get("checkpoint", [])
             for unet_name in unet_names:
@@ -8716,7 +8599,7 @@ class _ComfyAPIMixin:
             result["skipped_unet"] = True
             print(f"[actual_load] skipped_unet mode={ACTUAL_LOAD_MODE}")
 
-        # GöÇGöÇ VAE (submitted after UNET, deprioritized) GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ VAE (submitted after UNET, deprioritized) GÃ¶Ã‡GÃ¶Ã‡
         if _mode_vae:
             for vae_name in stack.get("vae", []):
                 vae_path = _al_fp.get_full_path("vae", vae_name) or vae_name
@@ -8737,13 +8620,19 @@ class _ComfyAPIMixin:
                     )
                     continue
 
-                # GöÇGöÇ Defer VAE actual-load if restore-background UNET is still running GöÇGöÇ
+                # GÃ¶Ã‡GÃ¶Ã‡ Defer VAE actual-load if restore-background UNET is still running GÃ¶Ã‡GÃ¶Ã‡
+                # Exception: don't defer when the running UNET is production_stable
                 _defer_check = 0
                 _defer_active_rbg_age_ms = 0.0
                 _defer_active_large_reads = 0
                 if DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET:
                     _rbg_active = self._check_rbg_unet_active()
-                    if _rbg_active.get("active", False):
+                    _production_rbg = any(
+                        getattr(self, "_actual_load_future_meta", {}).get(k, {}).get("production_stable")
+                        for k in getattr(self, "_actual_load_futures", {})
+                        if getattr(self, "_actual_load_futures", {}).get(k) and getattr(self, "_actual_load_futures", {})[k].is_alive()
+                    )
+                    if _rbg_active.get("active", False) and not _production_rbg:
                         result["actual_load_vae_defer_guard_enabled"] = 1
                         result["actual_load_vae_deferred_for_rbg_unet"] = 1
                         result["actual_load_vae_skipped_reason"] = "restore_background_unet_running"
@@ -9082,14 +8971,14 @@ class _ComfyAPIMixin:
         The caller (run_prompt_stream) waits via ``_scheduler_wait_and_finalize``.
 
         Modes:
-          baseline_current           GÇö no override, existing pipeline
-          early_unet_vae             GÇö UNET+VAE at request start, no CLIP
-          clip_first                 GÇö CLIP at start_clip_ms, UNET at start_unet_ms, GÇª
-          unet_first                 GÇö UNET at start_unet_ms, CLIP at start_clip_ms, GÇª
-          clip_serial_then_unet      GÇö CLIP first, then UNET+VAE+encode after CLIP done
-          parallel_matrix            GÇö all loads start at configured delays
-          clip_load_then_unet_and_encode GÇö CLIP first, then UNET+VAE+encode
-          unet_load_then_clip        GÇö UNET first, then CLIP+encode
+          baseline_current           GÃ‡Ã¶ no override, existing pipeline
+          early_unet_vae             GÃ‡Ã¶ UNET+VAE at request start, no CLIP
+          clip_first                 GÃ‡Ã¶ CLIP at start_clip_ms, UNET at start_unet_ms, GÃ‡Âª
+          unet_first                 GÃ‡Ã¶ UNET at start_unet_ms, CLIP at start_clip_ms, GÃ‡Âª
+          clip_serial_then_unet      GÃ‡Ã¶ CLIP first, then UNET+VAE+encode after CLIP done
+          parallel_matrix            GÃ‡Ã¶ all loads start at configured delays
+          clip_load_then_unet_and_encode GÃ‡Ã¶ CLIP first, then UNET+VAE+encode
+          unet_load_then_clip        GÃ‡Ã¶ UNET first, then CLIP+encode
         """
         import threading
         import os as _st_os
@@ -9108,20 +8997,20 @@ class _ComfyAPIMixin:
 
         if mode == "baseline_current":
             trace["enabled"] = False
-            trace["notes"] = "baseline GÇö no scheduler override"
+            trace["notes"] = "baseline GÃ‡Ã¶ no scheduler override"
             return trace
 
-        # GöÇGöÇ 1. Validate prompt structure (cheap) GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ 1. Validate prompt structure (cheap) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         assert_valid_api_prompt_structure(workflow)
 
-        # GöÇGöÇ 2. Sync custom nodes (needed for node classes) GöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ 2. Sync custom nodes (needed for node classes) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         _cn_sync_start = time.time()
         _cn_summary, _cn_state = self._sync_custom_nodes_from_volume()
         _cn_sync_ms = round((time.time() - _cn_sync_start) * 1000, 1)
         trace["custom_nodes_sync_ms"] = _cn_sync_ms
         trace["custom_nodes_created"] = len(_cn_summary.get("created", []))
 
-        # GöÇGöÇ 3. Start dependency validation in background GöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ 3. Start dependency validation in background GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         dep_result = {"prepared": None, "reason": "", "error": None, "changed_nodes": []}
         dep_done = threading.Event()
         dep_start_ms = round((time.time() - t_start) * 1000, 1)
@@ -9144,18 +9033,18 @@ class _ComfyAPIMixin:
         dep_thread = threading.Thread(target=_dep_worker, daemon=True)
         dep_thread.start()
 
-        # GöÇGöÇ 4. Extract model stack GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ 4. Extract model stack GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         stack = extract_requested_model_stack(workflow)
         clip_type = stack.get("clip_type", "stable_diffusion")
         trace["model_stack"] = {k: v for k, v in stack.items() if v}
 
-        # GöÇGöÇ 5. Init caches/registry GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ 5. Init caches/registry GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         self._init_actual_load_registry()
         self._init_clip_cache()
         self._init_unet_cache()
         self._init_vae_cache()
 
-        # GöÇGöÇ 6. Start model loads based on mode GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ 6. Start model loads based on mode GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         prefetch = scheduler_config.get("prefetch_clip_encode", False)
         start_clip_ms = scheduler_config.get("start_clip_ms")
         start_unet_ms = scheduler_config.get("start_unet_ms")
@@ -9183,7 +9072,7 @@ class _ComfyAPIMixin:
         # Counter for real graph hits (patched in _patch_scheduler_clip_encode_prefetch)
         self._scheduler_prefetch_real_hit = 0
 
-        # GöÇGöÇ Shared loader helpers GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Shared loader helpers GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         _loaded_models: list[dict] = []
 
         def _record_load(label, basename, filepath, size_gb, t0, t1, sched_ms=0, error=None):
@@ -9447,7 +9336,7 @@ class _ComfyAPIMixin:
         if prefetch:
             self._patch_scheduler_clip_encode_prefetch(_scheduler_prefetch_cache)
 
-        # GöÇGöÇ Launch loads per mode GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Launch loads per mode GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         if mode == "early_unet_vae":
             for un in unet_names:
                 d = start_unet_ms if start_unet_ms is not None else 0
@@ -9541,7 +9430,7 @@ class _ComfyAPIMixin:
                 clip_encode_thread = threading.Thread(target=_prefetch_after_clip_unet_first, daemon=True)
                 clip_encode_thread.start()
 
-        # GöÇGöÇ 7. Store threads for caller to wait on GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ 7. Store threads for caller to wait on GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         self._scheduler_dep_thread = dep_thread
         self._scheduler_dep_done = dep_done
         self._scheduler_dep_result = dep_result
@@ -9637,7 +9526,7 @@ class _ComfyAPIMixin:
             trace["clip_encode_prefetch_real_hit"] = real_hit
             trace["clip_encode_prefetch_hit"] = real_hit
 
-        # GöÇGöÇ Compute sampler gate GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Compute sampler gate GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         gate_candidates = []
         dep_gate = trace.get("dependency_gate_done_ms")
         if isinstance(dep_gate, (int, float)):
@@ -9665,7 +9554,7 @@ class _ComfyAPIMixin:
         trace["sampler_gate_ready_without_vae_ms"] = sampler_gate_without_vae
         trace["sampler_gate_ready_with_vae_ms"] = max(gate_candidates) if gate_candidates else 0
 
-        # GöÇGöÇ Notes GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Notes GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         notes_parts = []
         if trace.get("clip_encode_prefetch_hit", 0) > 0:
             notes_parts.append(f"clip_encode_prefetch_hit={trace['clip_encode_prefetch_hit']}")
@@ -9718,7 +9607,7 @@ class _ComfyAPIMixin:
             miss_key = _model_cpu_cache_key(path)
             self._cpu_cache_misses[miss_key] = self._cpu_cache_misses.get(miss_key, 0) + 1
 
-            # GöÇGöÇ Check active read registry (any owner, any path) GöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Check active read registry (any owner, any path) GÃ¶Ã‡GÃ¶Ã‡
             # Avoids duplicate volume reads for the same canonical path
             # regardless of PROMPT_ASYNC_PRELOAD.  Uses module-global
             # registry so background threads (preload workers, actual_load)
@@ -9753,10 +9642,10 @@ class _ComfyAPIMixin:
                     _st = _wr.get("status", "?")
                     if _st == "failed":
                         print(f"[loader_active_read] active_read_failed key={miss_key[:80]} "
-                              f"owner={_owner} error={_wr.get('error', '?')} GÇö falling_back_once=1")
+                              f"owner={_owner} error={_wr.get('error', '?')} GÃ‡Ã¶ falling_back_once=1")
                     else:
                         print(f"[loader_active_read] completed_without_cache BUG key={miss_key[:80]} "
-                              f"owner={_owner} status={_st} GÇö falling_back_once=1")
+                              f"owner={_owner} status={_st} GÃ‡Ã¶ falling_back_once=1")
 
             started = time.time()
             ctx_owner = getattr(_MODEL_LOAD_CONTEXT, "owner", "graph_loader")
@@ -9823,10 +9712,10 @@ class _ComfyAPIMixin:
 
         Respects ``COMFYMODAL_REQUIREMENTS_REPAIR_MODE``:
 
-        * ``off`` GÇö Never pip install.  Validate baked manifest.  Return.
-        * ``fail_fast`` GÇö Never pip install.  Validate baked manifest.
+        * ``off`` GÃ‡Ã¶ Never pip install.  Validate baked manifest.  Return.
+        * ``fail_fast`` GÃ‡Ã¶ Never pip install.  Validate baked manifest.
           Raise RuntimeError if not prepared.
-        * ``dev`` GÇö Runtime pip install allowed.  ``force=True`` works only
+        * ``dev`` GÃ‡Ã¶ Runtime pip install allowed.  ``force=True`` works only
           in dev mode.
 
         CRITICAL: ``force=True`` must NOT override ``off`` or ``fail_fast``.
@@ -9875,7 +9764,7 @@ class _ComfyAPIMixin:
                 "mode": "fail_fast", "prepared": True,
             }
 
-        # GöÇGöÇ dev mode: runtime pip install allowed GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ dev mode: runtime pip install allowed GÃ¶Ã‡GÃ¶Ã‡
         if force:
             print(
                 "[comfyapp] WARNING: requirements repair mode=dev: "
@@ -9995,7 +9884,7 @@ class _ComfyAPIMixin:
             save_runtime_metadata(metadata)
 
         if failures:
-            print(f"[comfyapp] custom node requirements had {len(failures)} failure(s) GÇö continuing "
+            print(f"[comfyapp] custom node requirements had {len(failures)} failure(s) GÃ‡Ã¶ continuing "
                   f"(affects: {[f['node'] for f in failures]})")
 
         _total_ms = round((time.time() - _t0) * 1000, 1)
@@ -10008,7 +9897,7 @@ class _ComfyAPIMixin:
 
         return {"installed": installed, "skipped": skipped, "failed": [f["node"] for f in failures]}
 
-    # GöÇGöÇ sageattention runtime policy helpers GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ sageattention runtime policy helpers GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 
     def _preferred_sage_backend(self):
         import sageattention
@@ -10051,11 +9940,11 @@ class _ComfyAPIMixin:
             return False, [f"cuda-smoke-test-failed:{type(exc).__name__}"]
 
     def _select_sage_runtime_mode(self) -> tuple[str, str]:
-        # Sticky GÇö already selected earlier in this restore
+        # Sticky GÃ‡Ã¶ already selected earlier in this restore
         if getattr(self, "_sage_runtime_mode", None) is not None:
             return self._sage_runtime_mode, getattr(self, "_sage_runtime_reason", "sticky")
 
-        # P2 GÇö runtime-configurable env override (file GåÆ env GåÆ module)
+        # P2 GÃ‡Ã¶ runtime-configurable env override (file GÃ¥Ã† env GÃ¥Ã† module)
         _rt_sage_mode = _resolve_sage_runtime_env_override()
         _rt_sage_probe = _resolve_sage_probe_on_restore()
         if _rt_sage_mode in ("baked_cuda", "triton_fallback"):
@@ -10065,7 +9954,7 @@ class _ComfyAPIMixin:
                   f"(SAGE_RUNTIME_MODE={_rt_sage_mode})")
             return self._sage_runtime_mode, self._sage_runtime_reason
 
-        # P2 GÇö skip probe on restore: prefer cached value, else env default
+        # P2 GÃ‡Ã¶ skip probe on restore: prefer cached value, else env default
         if not _rt_sage_probe:
             cached = self._load_sage_runtime_cache()
             if cached:
@@ -10074,7 +9963,7 @@ class _ComfyAPIMixin:
                 self._sage_runtime_mode = cached["mode"]
                 self._sage_runtime_reason = cached["reason"]
                 return self._sage_runtime_mode, self._sage_runtime_reason
-            # No cache available GÇö fall back to baked_cuda (safe on Blackwell,
+            # No cache available GÃ‡Ã¶ fall back to baked_cuda (safe on Blackwell,
             # and Triton fallback works even if baked CUDA import fails later)
             import torch
             gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unknown"
@@ -10186,7 +10075,7 @@ class _ComfyAPIMixin:
               f"duration={_dur}ms")
         return False
 
-    # GöÇGöÇ Backend scaffold (warmup + execution backend selection) GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+    # GÃ¶Ã‡GÃ¶Ã‡ Backend scaffold (warmup + execution backend selection) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 
     def _begin_prompt_profile(self, workflow: dict, prompt_id: str, outputs_to_execute) -> None:
         node_map: dict[str, str] = {}
@@ -10611,7 +10500,7 @@ class _ComfyAPIMixin:
 
         # torch.compile is disabled on this branch.  It triggers
         # "invalid argument to getCurrentStream" CUDA errors during Dynamo
-        # tracing in the post-restore CUDA context GÇö a known interaction
+        # tracing in the post-restore CUDA context GÃ‡Ã¶ a known interaction
         # between torch.compile and Modal's memory snapshot infrastructure.
         # SageAttention's pre-compiled CUDA/Blackwell kernels already provide
         # optimal performance; torch.compile adds overhead without benefit.
@@ -10722,7 +10611,7 @@ class _ComfyAPIMixin:
                 f"{_diag}"
             )
 
-        # GöÇGöÇ dev mode: attempt runtime repair GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ dev mode: attempt runtime repair GÃ¶Ã‡GÃ¶Ã‡
         req_summary = self._install_custom_node_requirements(force=True)
         import nodes as _repair_nodes
         if self._event_loop is not None:
@@ -10914,7 +10803,7 @@ class _ComfyAPIMixin:
                 "skipped": [],
             }
 
-        # GöÇGöÇ dev mode: attempt runtime repair GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ dev mode: attempt runtime repair GÃ¶Ã‡GÃ¶Ã‡
         import nodes as _repair_nodes
         req_summary = self._install_custom_node_requirements(force=True)
         self._event_loop.run_until_complete(_repair_nodes.init_extra_nodes())
@@ -10933,8 +10822,8 @@ class _ComfyAPIMixin:
         """Execute a ComfyUI workflow directly in-process.
 
         Args:
-            workflow: ComfyUI workflow (dict of node-id → node-spec).
-            input_images: Optional mapping of filename → base64-encoded data.
+            workflow: ComfyUI workflow (dict of node-id â†’ node-spec).
+            input_images: Optional mapping of filename â†’ base64-encoded data.
             collect_outputs: When False, skip output collection (warmup mode).
             trace: Optional Trace to populate with timing markers.
             modal_options: Optional output-format / conversion options dict.
@@ -10958,7 +10847,7 @@ class _ComfyAPIMixin:
         prompt_id = str(uuid.uuid4())
         prompt_start_time: float | None = None
 
-        # GöÇGöÇ PART 7: Preflight before any model operations GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ PART 7: Preflight before any model operations GÃ¶Ã‡GÃ¶Ã‡
         # Must run before: missing-node repair, async preload, actual load,
         # CPU preload, direct warmup, ComfyUI validate_prompt.
         # When called from run_prompt/run_prompt_stream, the preflight already
@@ -10967,7 +10856,7 @@ class _ComfyAPIMixin:
         if not getattr(self, "_preflight_already_ran", False):
             self._preflight_before_prompt_execution(workflow)
 
-        # GöÇGöÇ Write input images to ComfyUI's input directory GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Write input images to ComfyUI's input directory GÃ¶Ã‡GÃ¶Ã‡
         stage_started = time.time()
         if input_images:
             _materialize_input_images(input_images)
@@ -10980,7 +10869,7 @@ class _ComfyAPIMixin:
         if trace is not None:
             trace.mark("t3d_prompt_start", t=prompt_start_time)
 
-        # ── Deferred custom-node retry (moved from restore to request time) ──
+        # â”€â”€ Deferred custom-node retry (moved from restore to request time) â”€â”€
         _pending_cn = list(getattr(self, '_CUSTOM_NODE_REGISTRATION_PENDING_RETRY', None) or [])
         if _pending_cn:
             _cnr_start = time.time()
@@ -11011,7 +10900,7 @@ class _ComfyAPIMixin:
                 f"Modal image if dependencies changed."
             )
 
-        # GöÇGöÇ Fixed-workflow fast path: skip validation if hash matches GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Fixed-workflow fast path: skip validation if hash matches GÃ¶Ã‡GÃ¶Ã‡
         _wf_hash = self._compute_workflow_struct_hash(workflow)
 
         # Production-aware cache key
@@ -11074,7 +10963,7 @@ class _ComfyAPIMixin:
 
         self._begin_prompt_profile(workflow, prompt_id, outputs_to_execute)
 
-        # GöÇGöÇ Reset execution-level accumulators GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Reset execution-level accumulators GÃ¶Ã‡GÃ¶Ã‡
         self._exec_model_load_io_ms = 0.0
         self._exec_deepcopy_ms = 0.0
         self._load_model_gpu_total_ms = 0.0
@@ -11083,7 +10972,7 @@ class _ComfyAPIMixin:
             trace.mark("t3c_prep_done")
         _exec_stage = time.time()
 
-        # GöÇGöÇ Instrument executor for overhead breakdown GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Instrument executor for overhead breakdown GÃ¶Ã‡GÃ¶Ã‡
         import execution as _exec_mod
         _perf_data = {}
         _exec_profiling = _resolve_runtime_flag('exec_profile', '0')
@@ -11120,7 +11009,7 @@ class _ComfyAPIMixin:
             _exec_mod._comfy_modal_exec_patched = True
             _exec_mod._comfy_modal_exec_prof = _exec_prof_data
 
-        # GöÇGöÇ Instrument sampler for per-step breakdown GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Instrument sampler for per-step breakdown GÃ¶Ã‡GÃ¶Ã‡
         _sampler_profiling = _resolve_runtime_flag('sampler_profile', '0')
         if _sampler_profiling:
             import comfy.samplers as _samplers_mod
@@ -11156,7 +11045,7 @@ class _ComfyAPIMixin:
                 _samplers_mod._comfy_modal_sampler_prof_patched = True
                 _samplers_mod._comfy_modal_sampler_prof = _sampler_prof_data
 
-        # GöÇGöÇ Instrument guider for overhead breakdown GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Instrument guider for overhead breakdown GÃ¶Ã‡GÃ¶Ã‡
         _guider_profiling = _resolve_runtime_flag('guider_profile', '0')
         if _guider_profiling:
             import comfy.samplers as _gs_mod
@@ -11183,7 +11072,7 @@ class _ComfyAPIMixin:
                 _gs_mod._comfy_modal_guider_prof_patched = True
                 _gs_mod._comfy_modal_guider_prof = _guider_prof_data
 
-        # GöÇGöÇ Deep sampler wrapper profiling GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Deep sampler wrapper profiling GÃ¶Ã‡GÃ¶Ã‡
         _deep_profiling = _resolve_runtime_flag('deep_profile', '0')
         if _deep_profiling:
             import comfy.sampler_helpers as _dsh_mod
@@ -11204,7 +11093,7 @@ class _ComfyAPIMixin:
             _dp_wrap(_dsh_mod, 'get_additional_models', 'ps_get_additional_models')
             _dp_wrap(_dsh_mod, 'get_additional_models_from_model_options', 'ps_get_additional_models_opts')
             _dp_wrap(_dsh_mod, 'estimate_memory', 'ps_estimate_memory')
-            # GöÇGöÇ Comprehensive load_models_gpu profiler + fastpath diagnostics GöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Comprehensive load_models_gpu profiler + fastpath diagnostics GÃ¶Ã‡GÃ¶Ã‡
             _fp_dryrun = _resolve_runtime_flag('lmg_fastpath_dryrun', '0')
             _fp_enabled = _resolve_runtime_flag('lmg_fastpath', '0')
             _orig_lmg = _dmm_mod.load_models_gpu
@@ -11250,7 +11139,7 @@ class _ComfyAPIMixin:
                 _would_fastpath = _matched_idx is not None and len(models) == 1
                 _fp_reject = "none" if _would_fastpath else ("no_identity_match" if _matched_idx is None else "multiple_models")
                 _vram_ok = getattr(_dmm_mod, 'vram_state', None) == _dmm_mod.VRAMState.HIGH_VRAM
-                # GöÇGöÇ Guarded fast path execution GöÇGöÇ
+                # GÃ¶Ã‡GÃ¶Ã‡ Guarded fast path execution GÃ¶Ã‡GÃ¶Ã‡
                 if _fp_enabled and _would_fastpath and _vram_ok:
                     _t0 = time.perf_counter()
                     _lm = _lm_models[_matched_idx]
@@ -11289,7 +11178,7 @@ class _ComfyAPIMixin:
                         _lmg_calls.append(_call_data)
                         _deep_prof["lmg"] = list(_lmg_calls)
             _dmm_mod.load_models_gpu = _profiled_lmg
-            # GöÇGöÇ Warmup registration logging GöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Warmup registration logging GÃ¶Ã‡GÃ¶Ã‡
             _warmup_lm = list(getattr(_dmm_mod, 'current_loaded_models', []))
             _deep_prof["warmup"] = {
                 "registered_count": len(_warmup_lm),
@@ -11300,15 +11189,15 @@ class _ComfyAPIMixin:
                     "patcher_id": id(lm) if hasattr(lm, 'model') else 0,
                 } for lm in _warmup_lm],
             }
-            # KSAMPLER.sample setup proved ~0.35ms GÇö no further breakdown needed
+            # KSAMPLER.sample setup proved ~0.35ms GÃ‡Ã¶ no further breakdown needed
             import comfy as _comfy_mod
             _comfy_mod._comfy_modal_deep_prof = _deep_prof
 
-        # GöÇGöÇ Execute GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Execute GÃ¶Ã‡GÃ¶Ã‡
         # PromptExecutor.reset() only clears ComfyUI's per-prompt execution
         # caches/UI state. It does not unload the warm model/runtime state we
         # want to preserve across prompts.
-        # —— Set active production request state for direct-memory sink ——
+        # â€”â€” Set active production request state for direct-memory sink â€”â€”
         _prod_for_sink = normalize_production_options(modal_options)
         _prod_sink_enabled = _prod_for_sink.get("enabled", False)
         _authorized_sink_node_ids = []
@@ -11331,7 +11220,7 @@ class _ComfyAPIMixin:
             }
             _register_production_request(prompt_id, self._active_production_request)
 
-        # —— Production preview suppression and quiet logs ——
+        # â€”â€” Production preview suppression and quiet logs â€”â€”
                 # --- Compile production workflow if enabled ---
         _exec_t0 = time.time()
         source_workflow = workflow
@@ -11448,7 +11337,7 @@ class _ComfyAPIMixin:
         # Commit t4..t7 stage windows from the node events to the trace.
         if trace is not None:
             self._commit_stage_windows_to_trace(trace)
-        # t8 GÇö final image was written by SaveImage.  The actual file
+        # t8 GÃ‡Ã¶ final image was written by SaveImage.  The actual file
         # mtime is a more truthful marker than "executor returned" so we
         # query the youngest png/jpg in the output directory that
         # appeared during this prompt's window.
@@ -11489,7 +11378,7 @@ class _ComfyAPIMixin:
             }
             return {"images": [], "videos": [], "_known_good_marked": False}
 
-        # GöÇGöÇ PART 11: Mark known-good after successful execution GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ PART 11: Mark known-good after successful execution GÃ¶Ã‡GÃ¶Ã‡
         # Only real prompts (collect_outputs=True) that succeed get marked.
         # Warmup-only prompts and failed prompts do not become known-good.
         _known_good_marked = False
@@ -11509,13 +11398,14 @@ class _ComfyAPIMixin:
         stage_started = time.time()
         if trace is not None:
             trace.mark("t7b_collect_start", t=stage_started)
-        result = self._collect_in_process_outputs(prompt_id, prompt_start_time=prompt_start_time, modal_options=modal_options)
+        result = self._collect_in_process_outputs(prompt_id, prompt_start_time=prompt_start_time, modal_options=modal_options,
+                                                   stable_production=_prod_sink_enabled and bool(_resolve_runtime_flag("PRODUCTION_STABLE_PATH", "1")))
         self._log_profile("inproc_collect", prompt_id=prompt_id[:8], images=len(result.get("images", [])), videos=len(result.get("videos", [])), duration_ms=self._profile_ms(stage_started))
         if trace is not None:
             trace.mark("t8b_outputs_collected")
         result["_known_good_marked"] = _known_good_marked
 
-        # —— Production runtime telemetry ——
+        # â€”â€” Production runtime telemetry â€”â€”
         if _prod_sink_enabled:
             _rt = {}
             if _prod_for_sink.get("disable_sampler_previews", True):
@@ -11533,10 +11423,11 @@ class _ComfyAPIMixin:
                 _rt["compile_cache_hit"] = production_report.get("cache_hit", False)
                 _rt["registry_used"] = False
             result["_production_runtime"] = _rt
-            # Check registry for reporting
-            _collect_registry_data = _get_production_request(prompt_id) or {}
-            _reg_node_count = len(_collect_registry_data)
-            _reg_entry_count = 0
+            # Use collector's returned metadata for accurate registry telemetry
+            _registry_used = bool(result.get("_registry_used"))
+            _registry_entries = int(result.get("_registry_entries", 0))
+            _rt["registry_used"] = _registry_used
+            _rt["registry_entry_count"] = _registry_entries
             print(f"[production.runtime] preview_suppressed={_rt.get('sampler_previews_suppressed', False)} "
                   f"quiet_logs={_rt.get('quiet_logs_suppressed', False)} "
                   f"progress_skip={_rt.get('progress_skip_count', 0)} "
@@ -11544,29 +11435,27 @@ class _ComfyAPIMixin:
                   f"outputs={_rt.get('production_output_count', 0)} "
                   f"direct_output={_rt.get('direct_output_count', 0)} "
                   f"cache_hit={_rt.get('compile_cache_hit', False)} "
-                  f"registry_used={_reg_node_count > 0} "
-                  f"registry_node_count={_reg_node_count} "
-                  f"registry_entry_count={_reg_entry_count}")
-        # —— Clean up production output registry now that collection is done ——
-        if _prod_sink_enabled:
-            _pop_production_outputs(prompt_id)
+                  f"registry_used={_registry_used} "
+                  f"registry_node_count={0} "
+                  f"registry_entry_count={_registry_entries}")
+        # Collector consumed the registry — no second pop
         return result
 
-    def _collect_in_process_outputs(self, prompt_id: str, prompt_start_time: float | None = None, modal_options: dict | None = None) -> dict:
+    def _collect_in_process_outputs(self, prompt_id: str, prompt_start_time: float | None = None, modal_options: dict | None = None, *, stable_production: bool = False) -> dict:
         """Read generated outputs after an in-process execution.
 
         Tries four sources, in priority order, returning the union:
 
-        1. ``self._executor.history_result`` GÇö set by ``PromptExecutor.execute()``
+        1. ``self._executor.history_result`` GÃ‡Ã¶ set by ``PromptExecutor.execute()``
            when the last execution populated it.
-        2. ``self._dummy_server.prompt_queue.history[prompt_id]`` GÇö populated
+        2. ``self._dummy_server.prompt_queue.history[prompt_id]`` GÃ‡Ã¶ populated
            by the PromptQueue (typically empty for direct executor calls).
-        3. **Directory scan scoped to the prompt's execution window** GÇö
+        3. **Directory scan scoped to the prompt's execution window** GÃ‡Ã¶
            finds any image/video file written to ComfyUI's ``output``,
            ``temp``, or ``input`` directory *after* ``prompt_start_time``.
            This catches every file the workflow actually wrote regardless
            of whether history metadata is structured as expected.
-        4. **Directory scan of the most-recent 20 files** GÇö last-resort
+        4. **Directory scan of the most-recent 20 files** GÃ‡Ã¶ last-resort
            fallback when no ``prompt_start_time`` is available (e.g. older
            callers).
 
@@ -11601,7 +11490,7 @@ class _ComfyAPIMixin:
             "input": comfy_root / "input",
         }
 
-        # GöÇGöÇ Conversion state GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Conversion state GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         _mo = modal_options or {}
         _output_fmt = _mo.get("output_format", _CONVERTER_DEFAULTS["output_format"])
         _quality = _mo.get("quality", _CONVERTER_DEFAULTS["quality"])
@@ -11655,7 +11544,7 @@ class _ComfyAPIMixin:
             if _r_ms > 100:
                 print(f"[comfyapp] slow output read: file={fp.name} size={len(raw)} duration_ms={_r_ms}")
 
-            # GöÇGöÇ Apply output format conversion (deferred) GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Apply output format conversion (deferred) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             _seq = _output_seq
             _output_seq += 1
             is_animated = animated or fp.suffix.lower() in (".gif", ".mp4", ".webm")
@@ -11751,8 +11640,8 @@ class _ComfyAPIMixin:
                 animated = bool(node_out.get("animated", False)) or output_key == "gifs"
                 _read_and_store(fp, node_id=node_id, animated=animated, output_key=output_key, allow_rgthree_temp=True)
 
-        # GöÇGöÇ 
-        # —— Source 0: production direct-memory sink registry ——
+        # GÃ¶Ã‡GÃ¶Ã‡ 
+        # â€”â€” Source 0: production direct-memory sink registry â€”â€”
         _registry_used = False
         _registry_node_count = 0
         _registry_entry_count = 0
@@ -11817,6 +11706,16 @@ class _ComfyAPIMixin:
         _oc_timing["registry_entry_count"] = _registry_entry_count
         _oc_timing["registry_valid_entry_count"] = _registry_valid_entry_count
         _oc_timing["registry_invalid_entry_count"] = _registry_invalid_entry_count
+        # â”€â”€ Stable production: return immediately from registry, no history/filesystem â”€â”€
+        if stable_production:
+            if not _registry_used:
+                raise RuntimeError(
+                    "Production direct-output registry was empty for an authorized production request"
+                )
+            return {"images": images, "videos": videos, "outputs": per_node_outputs,
+                    "_registry_used": True, "_registry_entries": _registry_valid_entry_count,
+                    "_history_fetch_ms": 0, "_file_scan_ms": 0, "_read_total_ms": 0,
+                    "_conversion_total_ms": 0, "_files_read": 0, "_temp_files_written": 0}
         # --- Source 1: executor.history_result ---
         _s_hf = time.time()
         outputs: dict = {}
@@ -11833,7 +11732,7 @@ class _ComfyAPIMixin:
                     continue
                 _process_history_source(node_out, node_id)
 
-        # GöÇGöÇ Source 2: dummy_server.prompt_queue.history[prompt_id] GöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Source 2: dummy_server.prompt_queue.history[prompt_id] GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         if not seen_filenames:
             try:
                 history = self._dummy_server.prompt_queue.history
@@ -11847,16 +11746,16 @@ class _ComfyAPIMixin:
             except Exception as exc:
                 print(f"[comfyapp] prompt_queue.history read failed: {exc}")
 
-        # GöÇGöÇ Source 3: directory scan scoped to the prompt's time window GöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Source 3: directory scan scoped to the prompt's time window GÃ¶Ã‡
         _s_fs = time.time()
-        # Always run as a supplement GÇö catches files the workflow wrote
+        # Always run as a supplement GÃ‡Ã¶ catches files the workflow wrote
         # that the executor didn't return in its history metadata.
         if prompt_start_time is not None:
             for base in (comfy_root / "output", comfy_root / "temp"):
                 _scan_dir_for_files(base, since_ts=prompt_start_time)
         _oc_timing["file_scan_ms"] = round((time.time() - _s_fs) * 1000, 1)
 
-        # GöÇGöÇ Source 4: most-recent-files fallback GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Source 4: most-recent-files fallback GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         if not seen_filenames and prompt_start_time is None:
             print("[comfyapp] output history not found, scanning output directory")
             _scan_dir_for_files(comfy_root / "output", since_ts=None)
@@ -11989,7 +11888,7 @@ class _ComfyAPIMixin:
         _files_returned = len(images) + len(videos)
         _skipped_temp = 0
 
-        # GöÇGöÇ Output duplicate detection telemetry GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Output duplicate detection telemetry GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         _digest_t0 = time.time()
         _raw_digests: dict[str, list[str]] = {}
         for _entry in images + videos:
@@ -12055,8 +11954,8 @@ class _ComfyAPIMixin:
 
         Modal's GPU memory snapshot captures the parent's CUDA driver state
         (context handles, streams, events) along with the Python state.
-        On restore the driver context is fresh GÇö the captured handles are
-        dangling pointers GåÆ SIGSEGV (exit code 139) the first time the
+        On restore the driver context is fresh GÃ‡Ã¶ the captured handles are
+        dangling pointers GÃ¥Ã† SIGSEGV (exit code 139) the first time the
         restored process touches a CUDA tensor.
 
         Workaround: monkey-patch ``torch.cuda.is_available()`` and
@@ -12075,7 +11974,7 @@ class _ComfyAPIMixin:
         the ``*_cuda`` / ``cuda_*`` pattern).  These C extensions'
         ``PyInit_*`` functions call CUDA APIs directly (bypassing the
         ``torch.cuda.is_available()`` patch) and allocate GPU memory
-        during module load GÇö which would land in the snapshot and
+        during module load GÃ‡Ã¶ which would land in the snapshot and
         trigger SIGSEGV on restore.  The block makes any custom node
         that imports sageattention fall back to Triton mode for the
         duration of the snapshot; restore later selects a baked runtime
@@ -12095,9 +11994,9 @@ class _ComfyAPIMixin:
             sys.path.insert(0, comfy_path)
         import comfy.cli_args
 
-        # GöÇGöÇ Monkey-patch torch.cuda query functions GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Monkey-patch torch.cuda query functions GÃ¶Ã‡GÃ¶Ã‡
         # The first access to torch.cuda triggers its __init__.py which calls
-        # _check_driver() GÇö this detects the real GPU and emits a noisy
+        # _check_driver() GÃ‡Ã¶ this detects the real GPU and emits a noisy
         # "compute capability (CC) 12.0 is unsupported" warning.  During
         # snap=True we deliberately hide the GPU; suppress the warning at
         # the import point.
@@ -12114,9 +12013,9 @@ class _ComfyAPIMixin:
         # feature probes don't touch CUDA.
         comfy.cli_args.args.cpu = True
 
-        # GöÇGöÇ Block CUDA C extension imports during snapshot creation GöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Block CUDA C extension imports during snapshot creation GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         # The C extension's PyInit_* runs CUDA driver calls (cudaGetDevice,
-        # cudaMalloc, GÇª) that bypass torch.cuda.is_available and create
+        # cudaMalloc, GÃ‡Âª) that bypass torch.cuda.is_available and create
         # state in the captured snapshot.  Raising ImportError makes
         # sageattention's __init__.py fall back to its Triton path.
         class _BlockCudaModuleImport:
@@ -12175,8 +12074,8 @@ class _ComfyAPIMixin:
         GPU so Modal captures the CUDA context, compiled kernels, and any
         warmup model tensors.  However, SageAttention's ``PyInit_*`` in C
         extension .so files calls CUDA driver APIs directly (cudaGetDevice,
-        cudaMalloc, GÇª) GÇö these create raw CUDA driver handles that become
-        dangling pointers on snapshot restore GåÆ SIGSEGV.
+        cudaMalloc, GÃ‡Âª) GÃ‡Ã¶ these create raw CUDA driver handles that become
+        dangling pointers on snapshot restore GÃ¥Ã† SIGSEGV.
 
         This manager **_only_** blocks C extension imports (via a
         ``sys.meta_path`` finder).  It does **_not_** monkey-patch
@@ -12245,14 +12144,14 @@ class _ComfyAPIMixin:
         to capture the initialized state (imported modules, registered nodes,
         etc.) so subsequent container starts skip Python initialization.
 
-        GPU is available during startup GÇö ``enable_gpu_snapshot=True`` in the
+        GPU is available during startup GÃ‡Ã¶ ``enable_gpu_snapshot=True`` in the
         Modal app ensures GPU memory is preserved in the snapshot.
         """
         t0 = time.time()
         _stage = time.time()
 
-        # GöÇGöÇ Match comfy launch CWD GÇö ComfyUI modules use relative path
-        #    resolution (e.g. ``from utils.install_util import ...``). GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Match comfy launch CWD GÃ‡Ã¶ ComfyUI modules use relative path
+        #    resolution (e.g. ``from utils.install_util import ...``). GÃ¶Ã‡GÃ¶Ã‡
         comfy_path = "/root/comfy/ComfyUI"
         os.chdir(comfy_path)
         if comfy_path not in sys.path:
@@ -12263,11 +12162,11 @@ class _ComfyAPIMixin:
         self._log_profile("inproc_chdir_cwd", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
-        # GöÇGöÇ Import order matters: ComfyUI's utils/ package (directory) is
+        # GÃ¶Ã‡GÃ¶Ã‡ Import order matters: ComfyUI's utils/ package (directory) is
         #    shadowed by comfy/utils.py (module file) when comfy is imported
         #    first.  Replicate main.py's order: folder_paths + utils.* BEFORE
-        #    any import that touches the comfy package.                       GöÇGöÇ
-        import folder_paths  # safe GÇö no comfy deps
+        #    any import that touches the comfy package.                       GÃ¶Ã‡GÃ¶Ã‡
+        import folder_paths  # safe GÃ‡Ã¶ no comfy deps
         import utils.extra_config  # establishes utils as the /utils/ package
         import utils.mime_types  # reinforces utils package before comfy loads
 
@@ -12278,7 +12177,7 @@ class _ComfyAPIMixin:
         import execution
         import nodes
 
-        # GöÇGöÇ Generic entrypoint traceback collector GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Generic entrypoint traceback collector GÃ¶Ã‡GÃ¶Ã‡
         # ComfyUI's load_custom_node catches entrypoint exceptions at
         # nodes.py line 2277 and logs them via logging.warning without
         # exc_info=True.  We patch logging.warning to detect this
@@ -12345,7 +12244,7 @@ class _ComfyAPIMixin:
         self._log_profile("inproc_patch", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
-        # GöÇGöÇ Patch get_input_data for sync-safe cache access GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Patch get_input_data for sync-safe cache access GÃ¶Ã‡GÃ¶Ã‡
         # Custom-node compatibility wrappers (e.g. comfyui_image_metadata_extension's
         # OutputCacheCompat) may pass raw HierarchicalCache objects as the execution_list
         # param and call the async ``cache.get()`` method synchronously, returning an
@@ -12355,7 +12254,7 @@ class _ComfyAPIMixin:
         #
         # This patch wraps the cache-access call site so any coroutine is detected,
         # closed (to suppress the warning), and the sync-safe ``get_local()`` fallback
-        # is tried instead.  The fix is generic GÇö no custom-node names are hardcoded.
+        # is tried instead.  The fix is generic GÃ‡Ã¶ no custom-node names are hardcoded.
         if not getattr(execution, '_comfy_modal_sync_cache_patched', False):
             _orig_get_input_data = execution.get_input_data
             def _patched_get_input_data(inputs, class_def, unique_id, execution_list=None, dynprompt=None, extra_data=None):
@@ -12385,7 +12284,7 @@ class _ComfyAPIMixin:
             execution.get_input_data = _patched_get_input_data
             execution._comfy_modal_sync_cache_patched = True
 
-        # GöÇGöÇ DummyServer: minimal PromptServer that doesn't bind a port GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ DummyServer: minimal PromptServer that doesn't bind a port GÃ¶Ã‡GÃ¶Ã‡
         event_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(event_loop)
 
@@ -12406,8 +12305,8 @@ class _ComfyAPIMixin:
         self._log_profile("inproc_server_init", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
-        # GöÇGöÇ PromptExecutor for direct workflow execution (must provide
-        #    cache_args dict; v0.22+ unconditionally indexes into it) GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ PromptExecutor for direct workflow execution (must provide
+        #    cache_args dict; v0.22+ unconditionally indexes into it) GÃ¶Ã‡GÃ¶Ã‡
         total_ram_gb = _get_system_ram_gb()
         # Cap at 24 GB: ComfyUI's model cache only needs to hold
         # state_dicts for the active workflow (max ~17 GB for
@@ -12426,7 +12325,7 @@ class _ComfyAPIMixin:
         self._log_profile("inproc_executor_init", ram_gb=total_ram_gb, cache_gb=cache_ram_gb, duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
-        # GöÇGöÇ Wire up send_sync for execution-progress logging GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Wire up send_sync for execution-progress logging GÃ¶Ã‡GÃ¶Ã‡
         def _on_sync(event, data, sid):
             # Forward only JSON-style execution events to progress streaming.
             # ComfyUI also emits binary preview-image events via send_sync;
@@ -12460,7 +12359,7 @@ class _ComfyAPIMixin:
                     self._log_profile("inproc_exec_progress", event="execution_error", node=str(data.get("node",""))[:40])
         dummy._send_sync_callback = _on_sync
 
-        # GöÇGöÇ Install progress hook (mirrors main.py:hijack_progress) GöÇGöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Install progress hook (mirrors main.py:hijack_progress) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         # Without this, sampler step progress is never emitted in in-process
         # mode, so the frontend never receives "progress" events.
         from comfy_execution.utils import get_executing_context
@@ -12487,11 +12386,11 @@ class _ComfyAPIMixin:
         self._collect_custom_node_import_health()
         self._apply_sage_attention_policy()
 
-        # ── Register ComfyModalProductionOutput (remote-only, not exposed in frontend) ──
+        # â”€â”€ Register ComfyModalProductionOutput (remote-only, not exposed in frontend) â”€â”€
         nodes.NODE_CLASS_MAPPINGS["ComfyModalProductionOutput"] = ComfyModalProductionOutput
         nodes.NODE_CLASS_MAPPINGS["ComfyModalProductionImageComparerOutput"] = ComfyModalProductionImageComparerOutput
 
-        # ── Ensure production output registry exists ──
+        # â”€â”€ Ensure production output registry exists â”€â”€
         if not hasattr(self, '_production_output_registry'):
             self._production_output_registry = {}
 
@@ -12539,7 +12438,7 @@ class _ComfyAPIMixin:
     def _build_warmup_workflow(self, profile: dict) -> dict:
         """Build a warmup workflow from the pinned warmup profile.
 
-        Returns only model-loading nodes (UNETLoader, CLIPLoader) GÇö no
+        Returns only model-loading nodes (UNETLoader, CLIPLoader) GÃ‡Ã¶ no
         inference nodes.  Loading the models into ComfyUI's GPU cache is
         the critical part; running a warmup inference step adds ~500ms
         with no measurable benefit for the first real prompt.
@@ -12569,7 +12468,7 @@ class _ComfyAPIMixin:
         Uses the active execution backend (in-process or subprocess/HTTP).
         During startup (snap=True) with in-process CUDA is hidden, so this
         method is intentionally skipped by ``startup()`` when
-        ``is_in_proc=True`` GÇö it only runs on the ``restore()`` path where
+        ``is_in_proc=True`` GÃ‡Ã¶ it only runs on the ``restore()`` path where
         the GPU is available.
         """
         _t0 = time.time()
@@ -12653,7 +12552,7 @@ class _ComfyAPIMixin:
         For the subprocess backend, submits a model-loading workflow so the
         GPU model cache is populated before the snapshot is taken.  These
         model tensors are then captured in the GPU memory snapshot and are
-        immediately available after restore GÇö no volume re-read needed.
+        immediately available after restore GÃ‡Ã¶ no volume re-read needed.
         """
         if not ENABLE_WARMUP:
             return {"enabled": False, "profile": WARMUP_PROFILE}
@@ -12736,7 +12635,7 @@ class _ComfyAPIMixin:
         _, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
         self._log_profile("custom_nodes_sync", duration_ms=self._profile_ms(stage_started), state_count=len(self._custom_nodes_state))
 
-        # ── Initialize model-generation snapshot baseline ─────────────
+        # â”€â”€ Initialize model-generation snapshot baseline â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Capture the current generation before the memory snapshot so
         # restore can compare without unconditionally reloading models.
         _gen_rec = _read_models_generation_record()
@@ -12790,7 +12689,7 @@ class _ComfyAPIMixin:
             stage_started = time.time()
             self._start_backend()
             self._log_profile("backend_start", backend=self._select_backend(), duration_ms=self._profile_ms(stage_started))
-            # Skip the GPU warmup preload during snap=True GÇö loading ~9GB
+            # Skip the GPU warmup preload during snap=True GÃ‡Ã¶ loading ~9GB
             # of Flux/Qwen weights into the subprocess's GPU memory would
             # be captured in the snapshot, costing ~30+ seconds of GPU
             # memory transfer on every restore.  The first prompt after
@@ -12936,7 +12835,7 @@ class _ComfyAPIMixin:
             _t0 = time.time()
             backend_name, backend, backend_kwargs = self._preferred_sage_backend()
             if backend is None:
-                print("[comfyapp] sage_warmup skipped GÇö no backend")
+                print("[comfyapp] sage_warmup skipped GÃ‡Ã¶ no backend")
                 return
             import torch
             q = torch.randn(1, 16, 8, 64, device="cuda", dtype=torch.float16)
@@ -12962,14 +12861,14 @@ class _ComfyAPIMixin:
         ``load_models_gpu()`` which the node functions call internally.
 
         Model loading is further gated by:
-        - ``DIRECT_WARMUP_LOAD_UNET`` / ``DIRECT_WARMUP_LOAD_CLIP`` GÇö enable
+        - ``DIRECT_WARMUP_LOAD_UNET`` / ``DIRECT_WARMUP_LOAD_CLIP`` GÃ‡Ã¶ enable
           UNET / CLIP loading in direct warmup (both default 0).
-        - ``DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT`` GÇö when 1 (default), only
+        - ``DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT`` GÃ‡Ã¶ when 1 (default), only
           load a model if it is already present in the CPU cache (populated
           by ``_preload_models_to_cpu``).  This prevents direct warmup from
           becoming a blocking 16.85 GB volume read when CPU preload is
           disabled or async.
-        - ``DIRECT_WARMUP_CLIP_ENCODE`` GÇö enable dummy CLIPTextEncode forward
+        - ``DIRECT_WARMUP_CLIP_ENCODE`` GÃ‡Ã¶ enable dummy CLIPTextEncode forward
           pass (default 0).
 
         When ``clip_policy_overrides`` is provided, its
@@ -12990,11 +12889,11 @@ class _ComfyAPIMixin:
             clip_name = profile.get("clip1", "")
             clip_type = profile.get("clip_type", "flux")
 
-            # GöÇGöÇ Resolve model paths for CPU cache checks GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Resolve model paths for CPU cache checks GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             _unet_full_path = folder_paths.get_full_path("unet", unet_name) or "" if unet_name else ""
             _clip_full_path = folder_paths.get_full_path("text_encoders", clip_name) or "" if clip_name else ""
 
-            # Resolve runtime-configurable flags (file GåÆ env GåÆ module default)
+            # Resolve runtime-configurable flags (file GÃ¥Ã† env GÃ¥Ã† module default)
             _rt_load_unet = _resolve_runtime_flag("DIRECT_WARMUP_LOAD_UNET", "0")
             _rt_load_clip = _resolve_runtime_flag("DIRECT_WARMUP_LOAD_CLIP", "0")
             _rt_clip_encode = _resolve_runtime_flag("DIRECT_WARMUP_CLIP_ENCODE", "0")
@@ -13007,7 +12906,7 @@ class _ComfyAPIMixin:
                 _rt_clip_encode = bool(_encode_eff)
                 _rt_require_cpu_hit = bool(_load_clip_eff)
 
-            # GöÇGöÇ 1. Load UNET via UNETLoader (if enabled) GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ 1. Load UNET via UNETLoader (if enabled) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             _phases["direct_warmup_load_unet"] = 1.0 if _rt_load_unet else 0.0
             _phases["direct_warmup_require_cpu_cache_hit"] = 1.0 if _rt_require_cpu_hit else 0.0
             _s = time.time()
@@ -13043,7 +12942,7 @@ class _ComfyAPIMixin:
             else:
                 _phases["direct_unet_load_ms"] = 0.0
 
-            # GöÇGöÇ 2. Load CLIP via CLIPLoader (if enabled) GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ 2. Load CLIP via CLIPLoader (if enabled) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             _phases["direct_warmup_load_clip"] = 1.0 if _rt_load_clip else 0.0
             _phases_unix["direct_clip_load_start_unix_s"] = time.time()
             _s = time.time()
@@ -13078,7 +12977,7 @@ class _ComfyAPIMixin:
                 _phases["direct_clip_load_ms"] = 0.0
                 _phases_unix["direct_clip_load_end_unix_s"] = _s
 
-            # GöÇGöÇ 3. Prime CLIPTextEncode cache (if enabled) GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ 3. Prime CLIPTextEncode cache (if enabled) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             # Costs ~1000ms for Qwen 8B forward pass but saves ~600ms
             # during inference.  Net savings ~400ms by disabling.
             _phases["direct_warmup_clip_encode"] = 1.0 if _rt_clip_encode else 0.0
@@ -13317,7 +13216,7 @@ class _ComfyAPIMixin:
                     _submit_unix = _future_meta.get("submitted_at_unix_s") or _rt_restore.get("restore_background_unet_submit_unix_s")
                     if _submit_unix:
                         _rt_restore["restore_background_unet_age_ms_at_graph_unet"] = round((time.time() - _submit_unix) * 1000, 1)
-            # Record UNET load source GÇö will be set to exact value below
+            # Record UNET load source GÃ‡Ã¶ will be set to exact value below
             _diag = {
                 "unet_requested_name": unet_name,
                 "unet_requested_path": path,
@@ -13375,7 +13274,7 @@ class _ComfyAPIMixin:
             # (the CPU cache deepcopy will be fast)
             if _cpu_cache_hit:
                 _diag["unet_loaded_from_cpu_cache"] = "1"
-                print(f"[unet_loader_cache] cpu_cache_hit path={unet_name} GÇö normal load will use CPU cache")
+                print(f"[unet_loader_cache] cpu_cache_hit path={unet_name} GÃ‡Ã¶ normal load will use CPU cache")
             # Check in-flight preloads
             _inflight = getattr(_api, "_in_flight_preloads", {})
             if PROMPT_ASYNC_PRELOAD and path in _inflight:
@@ -13525,8 +13424,26 @@ class _ComfyAPIMixin:
         thread.join()
         wait_ms = round((time.time() - t0) * 1000, 1)
         print(f"[loader_future] waited key={key} wait_ms={wait_ms}")
+        meta = dict(getattr(self, "_actual_load_future_meta", {}).get(key, {}))
+        # ── Strict no-fallback: always enforced, independent of experimental flag ──
+        if meta.get("strict_no_fallback"):
+            _errors = getattr(self, "_actual_load_future_errors", {})
+            _err = _errors.get(key)
+            if _err is not None or meta.get("status") == "failed":
+                exc_to_raise = _err if _err is not None else RuntimeError(
+                    f"Strict production model future failed for key={key}"
+                )
+                raise RuntimeError(
+                    f"Strict production model future failed for {key}"
+                ) from exc_to_raise
+            _cache = getattr(self, "_unet_object_cache", {})
+            if key not in _cache:
+                raise RuntimeError(
+                    f"Strict production UNET future completed without publishing its object: {key}"
+                )
+            self._actual_load_waits = getattr(self, '_actual_load_waits', 0) + 1
+            return True
         if _restore_background_code_enabled():
-            meta = dict(getattr(self, "_actual_load_future_meta", {}).get(key, {}))
             if meta.get("source") == "restore_background_unet" and isinstance(getattr(self, "_last_restore_timing", None), dict):
                 self._last_restore_timing["restore_background_unet_wait_ms"] = wait_ms
             meta_after = dict(getattr(self, "_actual_load_future_meta", {}).get(key, {}))
@@ -13545,7 +13462,7 @@ class _ComfyAPIMixin:
         ``self._clip_object_cache`` keyed by (resolved_path, clip_type).
         When the real prompt's CLIPLoader/DualCLIPLoader asks for the
         same file, the patch returns the cached object instead of
-        constructing a new one GÇö eliminating the ~400-600ms clip_load.
+        constructing a new one GÃ‡Ã¶ eliminating the ~400-600ms clip_load.
         """
         self._init_clip_cache()
         _api = self  # capture ComfyAPI instance for closure access
@@ -13608,7 +13525,7 @@ class _ComfyAPIMixin:
                         print(f"[clip_loader_cache] key={_k} object_cache_exists={'1' if _k in _cache else '0'} future_exists={'1' if _k in _futures else '0'}")
 
                     if not missing:
-                        # All keys in cache GåÆ HIT
+                        # All keys in cache GÃ¥Ã† HIT
                         _api._clip_cache_hits = getattr(_api, '_clip_cache_hits', 0) + 1
                         if _name == "DualCLIPLoader":
                             return (_cache[unique_keys[0]], _cache[unique_keys[-1]])
@@ -13654,7 +13571,7 @@ class _ComfyAPIMixin:
     def _patch_model_cache_comparison(self):
         """Patch LoadedModel.__eq__ to match by class+size+device.
 
-        Gated behind ``deep_profile`` GÇö no measurable production win for the
+        Gated behind ``deep_profile`` GÃ‡Ã¶ no measurable production win for the
         current Flux2 workflow (0 hits out of 3 calls; class names differ
         between warmup and prompt wrappers).  Retained as a diagnostic tool.
 
@@ -13756,7 +13673,7 @@ class _ComfyAPIMixin:
 
         Called during ``restore()`` before the warmup workflow, which then
         pre-populates the cache by encoding the warmup text.  The real
-        prompt's CLIPTextEncode hits the cache GåÆ 0ms clip_encode.
+        prompt's CLIPTextEncode hits the cache GÃ¥Ã† 0ms clip_encode.
         """
         try:
             import nodes
@@ -13913,14 +13830,14 @@ class _ComfyAPIMixin:
             __stages = {}
             if hasattr(self, 'restore'):  # only within restore context
                 pass
-            return True  # no record → reload required
+            return True  # no record â†’ reload required
         if _current_gen != _seen_gen:
             return True  # generation changed
         return False  # unchanged
 
     @modal.enter(snap=False)
     def restore(self):
-        # ── Post-snapshot restored-instance identity ──
+        # â”€â”€ Post-snapshot restored-instance identity â”€â”€
         self._restored_instance_id = uuid.uuid4().hex[:16]
         self._restored_instance_start_unix = time.time()
 
@@ -13929,7 +13846,7 @@ class _ComfyAPIMixin:
         ``startup()`` initialises the in-process ComfyUI backend under
         ``_force_cpu_during_snapshot()`` so the snapshot already contains
         the fully loaded Python state (modules, registered nodes,
-        PromptExecutor, DummyServer) with **zero CUDA driver handles** GÇö
+        PromptExecutor, DummyServer) with **zero CUDA driver handles** GÃ‡Ã¶
         no SIGSEGV on restore.
 
         On restore we just need to:
@@ -13971,7 +13888,7 @@ class _ComfyAPIMixin:
         self._ensure_models_symlink()
         __stages["ensure_models_ms"] = self._profile_ms(_s)
 
-        # ── Phase 1: Refresh custom-nodes Volume ──────────────────────
+        # â”€â”€ Phase 1: Refresh custom-nodes Volume â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Custom-nodes Volume must be reloaded first because the
         # model-generation control record is stored there.
         _wait_seconds = [0.2, 0.5, 1.0, 2.0, 3.0]
@@ -13989,14 +13906,14 @@ class _ComfyAPIMixin:
             print(f"[comfyapp] custom_nodes_volume_mount_failed path={CUSTOM_NODES_PATH}")
         __stages["custom_nodes_volume_reload_ms"] = self._profile_ms(_s_cn_vol)
 
-        # ── Phase 2: Read model-generation record ────────────────────
+        # â”€â”€ Phase 2: Read model-generation record â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _s_gen_read = time.time()
         _models_gen = _read_models_generation_record()
         _current_gen_id = _models_gen["generation"] if _models_gen else ""
         _seen_gen = getattr(self, "_models_generation_seen", "")
         __stages["models_generation_read_ms"] = self._profile_ms(_s_gen_read)
 
-        # ── Phase 3: Determine if models Volume reload is needed ─────
+        # â”€â”€ Phase 3: Determine if models Volume reload is needed â”€â”€â”€â”€â”€
         _models_reload_needed = True
         _models_reload_reason = "generation_missing"
         if _current_gen_id:
@@ -14010,7 +13927,7 @@ class _ComfyAPIMixin:
         __stages["models_volume_reload_needed"] = 1 if _models_reload_needed else 0
         __stages["models_volume_reload_reason"] = _models_reload_reason
 
-        # ── Phase 4: Conditionally reload models Volume ──────────────
+        # â”€â”€ Phase 4: Conditionally reload models Volume â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _s_models_vol = time.time()
         if _models_reload_needed:
             _models_mount_ready = False
@@ -14057,7 +13974,7 @@ class _ComfyAPIMixin:
         __stages["direct_warmup_clip_encode_flag"] = 1 if DIRECT_WARMUP_CLIP_ENCODE else 0
         __stages["enable_warmup"] = 1 if ENABLE_WARMUP else 0
 
-        # GöÇGöÇ CacheDiT override GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ CacheDiT override GÃ¶Ã‡GÃ¶Ã‡
         if DISABLE_CACHEDIT_FOR_Z_IMAGE and is_in_proc:
             try:
                 import nodes as _cd_nodes
@@ -14078,7 +13995,7 @@ class _ComfyAPIMixin:
         else:
             __stages["disable_cachedit"] = 0
 
-        # GöÇGöÇ Pre-resolve warmup profile + model paths GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Pre-resolve warmup profile + model paths GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         # FUSE stat calls for model file location are I/O-bound and
         # independent of GPU state.  Resolving them early (before the
         # GPU/Sage warmup section below) lets these stat calls overlap
@@ -14089,7 +14006,7 @@ class _ComfyAPIMixin:
         if ENABLE_WARMUP:
             _s = time.time()
 
-            # GöÇGöÇ Active profile diagnostics GöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Active profile diagnostics GÃ¶Ã‡GÃ¶Ã‡
             _raw_active = self._load_active_next_profile()
             _diag = _raw_active.get("_diagnostic", {}) if isinstance(_raw_active, dict) else {}
             _prof_st = _diag.get("status", "not_loaded")
@@ -14117,7 +14034,7 @@ class _ComfyAPIMixin:
                 _warmup_paths = self._snapshot_preload_paths(_warmup_profile)
             __stages["early_path_resolve_ms"] = self._profile_ms(_s)
 
-            # GöÇGöÇ Resolve CLIP policy early GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Resolve CLIP policy early GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             _clip_policy = _resolve_restore_direct_clip_policy(_warmup_profile)
             __stages.update(_clip_policy)
             print(
@@ -14157,7 +14074,7 @@ class _ComfyAPIMixin:
                 __stages["custom_nodes_reinit_ms"] = self._profile_ms(_s_cn)
 
             if ENABLE_GPU_SNAPSHOT and _backend_inited and not _backend_deferred:
-                # GPU snapshot restored GÇö ComfyUI already initialised with GPU
+                # GPU snapshot restored GÃ‡Ã¶ ComfyUI already initialised with GPU
                 # (CUDA context, HIGH_VRAM mode, executor, etc. are captured).
                 # Skip _restore_in_process_gpu_state() but still recalculate
                 # VRAM/RAM in case the restore host differs.
@@ -14218,7 +14135,7 @@ class _ComfyAPIMixin:
                 )
             else:
                 if not _backend_deferred:
-                    # CPU-only snapshot GÇö the in-process backend was initialised
+                    # CPU-only snapshot GÃ‡Ã¶ the in-process backend was initialised
                     # under force_cpu, so no CUDA state was captured.  Reattach
                     # the GPU, warm CUDA, select Sage runtime.
                     _s = time.time()
@@ -14268,7 +14185,7 @@ class _ComfyAPIMixin:
                 self._patch_vae_loader_cache()
                 __stages["patch_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
 
-                # GöÇGöÇ CLIP encode cache debug: clear if requested GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+                # GÃ¶Ã‡GÃ¶Ã‡ CLIP encode cache debug: clear if requested GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
                 _clip_cache_clear = _resolve_runtime_flag('clear_clip_encode_cache', '0')
                 __stages["clip_cache_clear_requested"] = 1 if _clip_cache_clear else 0
                 if _clip_cache_clear:
@@ -14315,7 +14232,7 @@ class _ComfyAPIMixin:
         if ENABLE_WARMUP:
             # CPU preload submit (GPU/CUDA context already finalized)
             # The GPU state and first CUDA context are complete before
-            # preload starts.  This prevents FUSE/Volume ↔ CUDA resource
+            # preload starts.  This prevents FUSE/Volume â†” CUDA resource
             # contention on the large CLIP file read.
             # The thread is joined later right before direct CLIP
             # warmup needs the CPU cache.
@@ -14372,7 +14289,7 @@ class _ComfyAPIMixin:
                 _preload_overlap_start = time.time()
                 _submitted_ns = time.perf_counter_ns()
                 __stages["restore_preload_submit_at_ms_from_restore_start"] = round((_preload_overlap_start - restore_start) * 1000, 1)
-                # ── Safety assertions: GPU, CUDA, and deferred retry must be done ──
+                # â”€â”€ Safety assertions: GPU, CUDA, and deferred retry must be done â”€â”€
                 _gpu_end_ns = __stages.get("gpu_state_end_ns", 0)
                 _cuda_end_ns = __stages.get("cuda_context_end_ns", 0)
                 _dretry_end_ns = __stages.get("deferred_retry_end_ns", 0)
@@ -14395,7 +14312,7 @@ class _ComfyAPIMixin:
                     f"mode={_pm} gpu_state_finalized=1 cuda_context_ready=1 "
                     f"at_ms_from_restore_start={__stages['restore_preload_submit_at_ms_from_restore_start']}"
                 )
-                # ── Wait for actual preload worker start (timeout 5s) ──
+                # â”€â”€ Wait for actual preload worker start (timeout 5s) â”€â”€
                 _started = _restore_preload_handle.worker_started_event.wait(timeout=5.0)
                 if not _started:
                     if _restore_preload_handle.completed_event.is_set() and not _restore_preload_handle.error_holder.get("exception"):
@@ -14410,7 +14327,7 @@ class _ComfyAPIMixin:
                     __stages["restore_preload_worker_start_at_ms_from_restore_start"] = round(
                         (_preload_worker_started_ns - _submitted_ns) / 1_000_000, 1,
                     )
-                # ── Verify ordering: worker cannot have started before GPU/CUDA/deferred-retry ──
+                # â”€â”€ Verify ordering: worker cannot have started before GPU/CUDA/deferred-retry â”€â”€
                 if _preload_worker_started_ns > 0:
                     if _preload_worker_started_ns < _gpu_end_ns:
                         raise RuntimeError(
@@ -14434,7 +14351,7 @@ class _ComfyAPIMixin:
             _warmup_tok = _warmup_profile.get("_profile_token", "") if _warmup_profile else ""
             _warmup_stack = _warmup_profile.get("_current_workflow_stack", {}) if _warmup_profile else {}
             __stages["warmup_profile_selected"] = _warmup_src
-            # ── v2.16.21 fastpath resolution ───────────────────────────
+            # â”€â”€ v2.16.21 fastpath resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             _fp_state = _resolve_fastpath_v21621()
             __stages.update(_fp_state)
             print(
@@ -14493,7 +14410,7 @@ class _ComfyAPIMixin:
                 print(f"[production.profile] enabled=0")
             __stages["production_stable_path_effective"] = 1 if _production_stable_path else 0
 
-            # GöÇGöÇ Warmup: load models + encode text (for clip cache) GöÇGöÇGöÇGöÇGöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Warmup: load models + encode text (for clip cache) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             if ENABLE_WARMUP:
                 profile = _warmup_profile
                 preload_paths = _warmup_paths
@@ -14521,7 +14438,7 @@ class _ComfyAPIMixin:
                 __stages.setdefault("restore_background_unet_future_status_at_graph_unet", "")
                 __stages.setdefault("restore_background_unet_future_source_at_graph_unet", "")
 
-                # GöÇGöÇ PART 3: Preload guardrails GöÇGöÇ
+                # GÃ¶Ã‡GÃ¶Ã‡ PART 3: Preload guardrails GÃ¶Ã‡GÃ¶Ã‡
                 # These guards were already checked in the early submit
                 # section above.  If _preload_skip_reason_early was set,
                 # preload was skipped and _restore_preload_handle is None.
@@ -14540,7 +14457,7 @@ class _ComfyAPIMixin:
                         preload_paths = _warmup_paths
                     __stages["preload_eligibility_early"] = 1
 
-                # GöÇGöÇ Z-Image restore warmup skip (re-check for safety) GöÇGöÇ
+                # GÃ¶Ã‡GÃ¶Ã‡ Z-Image restore warmup skip (re-check for safety) GÃ¶Ã‡GÃ¶Ã‡
                 if _resolve_disable_restore_warmup_for_z_image() and profile and profile.get("unet", ""):
                     _wu_unet = profile.get("unet", "").lower()
                     if "z_image" in _wu_unet or "z-image" in _wu_unet:
@@ -14551,14 +14468,33 @@ class _ComfyAPIMixin:
                         __stages["direct_warmup_z_image_guard_skipped"] = 1
                         __stages["direct_warmup_skip_reason"] = "z_image_guard"
 
-                # GöÇGöÇ Fallback submit if preload was not submitted early GöÇGöÇGöÇGöÇ
+                # â”€â”€ Production: run optional CUDA before CLIP preload â”€â”€
+                if _production_stable_path and _cu_device is not None:
+                    _s_opt = time.perf_counter_ns()
+                    _optional_cuda_result = self._run_optional_cuda_warmup(_cu_device)
+                    __stages["optional_cuda_total_ms"] = _optional_cuda_result.get("optional_cuda_total_ms", 0)
+                    __stages["optional_cuda_status"] = _optional_cuda_result.get("optional_cuda_status", "skipped")
+                    _restore_optional_work_total_ms = round(
+                        (time.perf_counter_ns() - _s_opt) / 1_000_000, 3,
+                    )
+                    __stages["restore_optional_work_total_ms"] = _restore_optional_work_total_ms
+                    print(f"[restore.order] event=production_optional_cuda_before_clip "
+                          f"optional_cuda_ms={__stages['optional_cuda_total_ms']}")
+
+                # GÃ¶Ã‡GÃ¶Ã‡ Fallback submit if preload was not submitted early GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
                 if preload_paths and _pm != "off" and _restore_preload_handle is None:
                     _preload_submitted_early = 1
                     _preload_overlap_start = time.time()
                     __stages["restore_preload_submit_at_ms_from_restore_start"] = round((_preload_overlap_start - restore_start) * 1000, 1)
-                    _restore_preload_handle = self._start_restore_preload(preload_paths)
                     if _production_stable_path:
+                        _restore_preload_handle = self._start_restore_preload(
+                            preload_paths,
+                            read_strategy="normal",
+                            abort_policy="wait_same_future",
+                        )
                         __stages["restore_preload_submitted_production"] = 1
+                    else:
+                        _restore_preload_handle = self._start_restore_preload(preload_paths)
                     __stages["restore_preload_submitted_early"] = 1
                     _label = "production" if _production_stable_path else "late"
                     print(
@@ -14566,26 +14502,27 @@ class _ComfyAPIMixin:
                         f"mode={_pm} at_ms={__stages['restore_preload_submit_at_ms_from_restore_start']}"
                     )
 
-                # ── v2.16.20: Optional overlap region ──────────────────────
-                # Run optional CUDA warmup while preload worker reads model files.
-                _optional_overlap_start_ns = time.perf_counter_ns()
-                __stages["optional_overlap_start_ms_from_restore_start"] = round(
-                    (_optional_overlap_start_ns - restore_start_ns) / 1_000_000, 1,
-                )
-                if _cu_device is not None:
-                    _optional_cuda_result = self._run_optional_cuda_warmup(_cu_device)
-                    __stages["optional_cuda_total_ms"] = _optional_cuda_result.get("optional_cuda_total_ms", 0)
-                    __stages["optional_cuda_status"] = _optional_cuda_result.get("optional_cuda_status", "skipped")
-                _optional_overlap_end_ns = time.perf_counter_ns()
-                __stages["optional_overlap_end_ms_from_restore_start"] = round(
-                    (_optional_overlap_end_ns - restore_start_ns) / 1_000_000, 1,
-                )
-                _restore_optional_work_total_ms = round(
-                    (_optional_overlap_end_ns - _optional_overlap_start_ns) / 1_000_000, 3,
-                )
-                __stages["restore_optional_work_total_ms"] = _restore_optional_work_total_ms
+                # â”€â”€ v2.16.20: Optional overlap region (non-production only) â”€â”€
+                if not _production_stable_path:
+                    # Run optional CUDA warmup while preload worker reads model files.
+                    _optional_overlap_start_ns = time.perf_counter_ns()
+                    __stages["optional_overlap_start_ms_from_restore_start"] = round(
+                        (_optional_overlap_start_ns - restore_start_ns) / 1_000_000, 1,
+                    )
+                    if _cu_device is not None:
+                        _optional_cuda_result = self._run_optional_cuda_warmup(_cu_device)
+                        __stages["optional_cuda_total_ms"] = _optional_cuda_result.get("optional_cuda_total_ms", 0)
+                        __stages["optional_cuda_status"] = _optional_cuda_result.get("optional_cuda_status", "skipped")
+                    _optional_overlap_end_ns = time.perf_counter_ns()
+                    __stages["optional_overlap_end_ms_from_restore_start"] = round(
+                        (_optional_overlap_end_ns - restore_start_ns) / 1_000_000, 1,
+                    )
+                    _restore_optional_work_total_ms = round(
+                        (_optional_overlap_end_ns - _optional_overlap_start_ns) / 1_000_000, 3,
+                    )
+                    __stages["restore_optional_work_total_ms"] = _restore_optional_work_total_ms
 
-                # GöÇGöÇ Join preload thread (whether submitted early or late) GöÇ
+                # GÃ¶Ã‡GÃ¶Ã‡ Join preload thread (whether submitted early or late) GÃ¶Ã‡
                 _s = time.time()
                 if _restore_preload_handle is not None:
                     _preload_join_at_ms = round((time.time() - restore_start) * 1000, 1)
@@ -14595,7 +14532,14 @@ class _ComfyAPIMixin:
                     _preload_await_ms = round(
                         (time.perf_counter_ns() - _await_start) / 1_000_000, 3,
                     )
-                    # ── v2.16.20: Correct overlap calculation ────────────
+                    # â”€â”€ v2.16.20: Correct overlap calculation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                    # Production already ran its own optional CUDA before CLIP preload,
+                    # so no overlap occurred.
+                    if _production_stable_path:
+                        _optional_overlap_start_ns = time.perf_counter_ns()
+                        _optional_overlap_end_ns = _optional_overlap_start_ns
+                        if not _cu_device:
+                            _restore_optional_work_total_ms = 0.0
                     _preload_completed_ns = _restore_preload_handle.completed_ns
                     __stages["restore_preload_complete_at_ms_from_restore_start"] = round(
                         (_preload_completed_ns - restore_start_ns) / 1_000_000, 1,
@@ -14634,7 +14578,7 @@ class _ComfyAPIMixin:
                         __stages["restore_background_unet_existing_future"] = _rbg.get("existing_future", 0)
                         __stages["restore_background_unet_object_cache_exists"] = _rbg.get("object_cache_exists", 0)
                         __stages["restore_background_unet_active_large_reads_at_submit"] = _rbg.get("active_large_reads_at_submit", 0)
-                        # GöÇGöÇ Expected-path logs GöÇGöÇ
+                        # GÃ¶Ã‡GÃ¶Ã‡ Expected-path logs GÃ¶Ã‡GÃ¶Ã‡
                         _rbg_expected = __stages.get("restore_background_unet_expected_source", "")
                         _rbg_submitted = __stages.get("restore_background_unet_submitted", 0)
                         _unet_expected = "restore_background_unet_future" if (_rbg_submitted and _rbg_expected == "restore_background_unet") else "actual_load_or_graph_cache"
@@ -14676,7 +14620,7 @@ class _ComfyAPIMixin:
                         preload_result = {"count": 0, "file_timing_ms": {}, "async": True}
                         print(f"[comfyapp] preload async_no_wait: thread started for {len(preload_paths)} files, not blocking restore")
                     elif _pm.startswith("budgeted_"):
-                        # Extract budget from suffix: budgeted_1500ms GåÆ 1500, budgeted_2000ms GåÆ 2000
+                        # Extract budget from suffix: budgeted_1500ms GÃ¥Ã† 1500, budgeted_2000ms GÃ¥Ã† 2000
                         try:
                             _budget = float(_pm.replace("budgeted_", "").replace("ms", ""))
                         except (ValueError, TypeError):
@@ -14697,7 +14641,7 @@ class _ComfyAPIMixin:
                     cached=preload_result.get("count", 0),
                     duration_ms=__stages["warmup_preload_ms"],
                 )
-                # GöÇGöÇ Degraded mode & preload failure diagnostics GöÇGöÇ
+                # GÃ¶Ã‡GÃ¶Ã‡ Degraded mode & preload failure diagnostics GÃ¶Ã‡GÃ¶Ã‡
                 _pre_status = preload_result.get("status", "ok")
                 _pre_aborted = preload_result.get("aborted", False)
                 _pre_running_not_killable = preload_result.get("running_threads_not_killable", 0)
@@ -14729,7 +14673,7 @@ class _ComfyAPIMixin:
                 __stages["volume_stall_degraded_mode"] = "1" if getattr(self, "_volume_stall_degraded_mode", False) else "0"
                 warmup_result = {"mode": profile.get("mode", "none") if profile else "none", "status": _pre_status, "preload_count": preload_result.get("count", 0)}
 
-                # GöÇGöÇ ModelPatcher lineage trace (creation / clone / flow) GöÇ
+                # GÃ¶Ã‡GÃ¶Ã‡ ModelPatcher lineage trace (creation / clone / flow) GÃ¶Ã‡
                 # Logs every ModelPatcher.__init__ and .clone() with caller
                 # context to find where identity diverges from warmup.
                 _mp_trace = _resolve_runtime_flag('modelpatcher_trace', '0')
@@ -14816,7 +14760,7 @@ class _ComfyAPIMixin:
                     except Exception as _mptn_exc:
                         print(f"[comfyapp] modelpatcher_trace node patch FAILED: {_mptn_exc}")
 
-                # GöÇGöÇ Canonical ModelPatcher cache (warmupGåÆprompt reuse) GöÇGöÇ
+                # GÃ¶Ã‡GÃ¶Ã‡ Canonical ModelPatcher cache (warmupGÃ¥Ã†prompt reuse) GÃ¶Ã‡GÃ¶Ã‡
                 _mp_cache = _resolve_runtime_flag('modelpatcher_cache', '0')
                 _mp_cache_dryrun = _resolve_runtime_flag('modelpatcher_cache_dryrun', '0')
                 _mp_cache_store = {}
@@ -14836,12 +14780,12 @@ class _ComfyAPIMixin:
                                 print(f"[comfyapp] modelpatcher_cache: key={_key} hit={_hit} dryrun={_mp_cache_dryrun} active={_mp_cache}")
                             if _mp_cache and _hit:
                                 _cached = _mp_cache_store[_key]
-                                print(f"[comfyapp] modelpatcher_cache HIT GÇö returning cached ModelPatcher id={id(_cached)}")
+                                print(f"[comfyapp] modelpatcher_cache HIT GÃ‡Ã¶ returning cached ModelPatcher id={id(_cached)}")
                                 return _cached
                             _result = _orig_load_diff(unet_path, model_options=model_options, disable_dynamic=disable_dynamic)
                             if not _hit:
                                 _mp_cache_store[_key] = _result
-                                print(f"[comfyapp] modelpatcher_cache STORE GÇö key={_key} patcher_id={id(_result)} model_id={id(_result.model) if hasattr(_result,'model') else 0}")
+                                print(f"[comfyapp] modelpatcher_cache STORE GÃ‡Ã¶ key={_key} patcher_id={id(_result)} model_id={id(_result.model) if hasattr(_result,'model') else 0}")
                             # Tag with stable key for identity matching
                             try:
                                 _result._comfy_modal_stable_key = {
@@ -14857,7 +14801,7 @@ class _ComfyAPIMixin:
                     except Exception as _mp_exc:
                         print(f"[comfyapp] modelpatcher_cache install FAILED: {_mp_exc}")
 
-                # ── v2.16.21: Restore-background UNET ─────────────────
+                # â”€â”€ v2.16.21: Restore-background UNET â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 if _fp_state.get("fastpath_background_unet") and _restore_preload_handle is not None and _preload_status == "ok":
                     _rbg_decision = self._maybe_submit_restore_background_unet(
                         profile, _clip_policy, preload_result, restore_start, __stages
@@ -14867,7 +14811,7 @@ class _ComfyAPIMixin:
                         f"[fastpath.v21621.bg_unet] decision={__stages['restore_background_unet_decision']}"
                     )
 
-                # GöÇö Direct warmup (no ComfyUI executor)
+                # GoÌˆCÌ§oÌˆ Direct warmup (no ComfyUI executor)
                 # Calls UNETLoader, CLIPLoader, and CLIPTextEncode node
                 # functions directly instead of _execute_in_process().
                 # This saves ~800ms of executor dispatch overhead while
@@ -14882,7 +14826,7 @@ class _ComfyAPIMixin:
                         __stages["direct_warmup_z_image_guard_skipped"] = 1
                         __stages["direct_warmup_skip_reason"] = "z_image_guard"
 
-                # GöÇGöÇ PART 8: Active-next / known-good guard before direct warmup GöÇGöÇ
+                # GÃ¶Ã‡GÃ¶Ã‡ PART 8: Active-next / known-good guard before direct warmup GÃ¶Ã‡GÃ¶Ã‡
                 if not _skip_direct_warmup and profile and profile.get("mode"):
                     _wg_workflow_hash = (profile or {}).get("_workflow_hash", "")
                     _wg_load_unet = _resolve_runtime_flag("DIRECT_WARMUP_LOAD_UNET", "0")
@@ -14920,7 +14864,7 @@ class _ComfyAPIMixin:
                         if _v is not None:
                             __stages[_flag] = _v
 
-                    # GöÇGöÇ CLIP/UNET overlap telemetry GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+                    # GÃ¶Ã‡GÃ¶Ã‡ CLIP/UNET overlap telemetry GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
                     _pu = _dw.get("_phases_unix", {})
                     _rbs_unix = __stages.get("restore_background_unet_submit_unix_s")
                     _clip_load_start = _pu.get("direct_clip_load_start_unix_s")
@@ -14944,7 +14888,7 @@ class _ComfyAPIMixin:
                     if _dw_end:
                         __stages["direct_clip_warmup_end_ms_from_restore_start"] = round((_dw_end - restore_start) * 1000, 1)
 
-                    # GöÇGöÇ Overlap computation GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+                    # GÃ¶Ã‡GÃ¶Ã‡ Overlap computation GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
                     if _rbs_unix is not None and isinstance(_rbs_unix, (int, float)) and _rbs_unix > 0:
                         # Was restore_background_unet submitted before direct CLIP?
                         if _clip_load_start and _rbs_unix < _clip_load_start:
@@ -14971,7 +14915,7 @@ class _ComfyAPIMixin:
                     if _dw.get("status") != "ok":
                         warmup_result["error"] = _dw.get("error", "direct warmup failed")
                         warmup_result["status"] = "error"
-                        print(f"[comfyapp] direct warmup FAILED GÇö executor bypass disabled")
+                        print(f"[comfyapp] direct warmup FAILED GÃ‡Ã¶ executor bypass disabled")
                         # No executor fallback: direct warmup is the only path.
                         # If it fails, models load during inference (acceptable).
                     # Remove cleanup suppression (not needed without executor)
@@ -14982,7 +14926,7 @@ class _ComfyAPIMixin:
                     except Exception:
                         pass
 
-                # GöÇGöÇ VAE decode warmup (background, does not block restore) GöÇGöÇ
+                # GÃ¶Ã‡GÃ¶Ã‡ VAE decode warmup (background, does not block restore) GÃ¶Ã‡GÃ¶Ã‡
                 if ENABLE_WARMUP and profile:
                     import threading as _vwt
                     _vae_warmup_thread = _vwt.Thread(
@@ -15192,7 +15136,7 @@ class _ComfyAPIMixin:
                 1,
             )
 
-        # GöÇGöÇ Check for scheduler test mode GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Check for scheduler test mode GÃ¶Ã‡GÃ¶Ã‡
         _scheduler_config_ns = (modal_options or {}).get("comfymodal_scheduler_test")
         _is_scheduler_test_ns = isinstance(_scheduler_config_ns, dict) and _scheduler_config_ns.get("enabled")
         _scheduler_trace_ns = None
@@ -15203,7 +15147,7 @@ class _ComfyAPIMixin:
             _scheduler_trace_ns = self._scheduler_wait_and_finalize()
             self._preflight_already_ran = True
         else:
-            # GöÇGöÇ Shared custom-node sync and dependency policy GöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Shared custom-node sync and dependency policy GÃ¶Ã‡GÃ¶Ã‡
             # Replaces the inline custom-node sync + preflight logic with a
             # single method used by both run_prompt and run_prompt_stream.
             self._preflight_already_ran = False
@@ -15215,14 +15159,14 @@ class _ComfyAPIMixin:
                 __stages["run_prompt_cn_sync_ms"] = round((time.time() - _cn_sync_start) * 1000, 1)
                 __stages["run_prompt_cn_created"] = _policy.get("sync_created_count", 0)
 
-        # GöÇGöÇ In-process backend: direct execution, no HTTP GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ In-process backend: direct execution, no HTTP GÃ¶Ã‡GÃ¶Ã‡
         if self._select_backend() == "in_process":
             total_started = time.time()
             _last_graph_validate_ms = getattr(self, "_last_graph_validate_ms", None)
             result = self._execute_in_process(workflow, input_images, trace=server_trace, modal_options=modal_options)
             _graph_validate_ms = getattr(self, "_last_graph_validate_ms", None)
 
-            # GöÇGöÇ Model residency log GöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Model residency log GÃ¶Ã‡GÃ¶Ã‡
             try:
                 import comfy.model_management as _rmm
                 _loaded = getattr(_rmm, "current_loaded_models", [])
@@ -15267,7 +15211,7 @@ class _ComfyAPIMixin:
             total_ms = round((time.time() - total_started) * 1000, 1)
             server_trace.mark("t9_modal_return")
 
-            # GöÇGöÇ Timing (non-streaming path) GöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Timing (non-streaming path) GÃ¶Ã‡GÃ¶Ã‡
             _rt3 = getattr(self, "_last_restore_timing", None) or {}
             _stages_ns = server_trace._t
             _t3_ns = _stages_ns.get("t3_modal_entry", total_started)
@@ -15328,7 +15272,7 @@ class _ComfyAPIMixin:
             trace_summary["derived_ms"]["exec_deepcopy_ms"] = getattr(self, "_exec_deepcopy_ms", 0.0)
             trace_summary["derived_ms"]["load_model_gpu_ms"] = getattr(self, "_load_model_gpu_total_ms", 0.0)
 
-            # GöÇGöÇ Dependency validation caching fields GöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Dependency validation caching fields GÃ¶Ã‡GÃ¶Ã‡
             for _dep_policy_field in (
                 "dependency_validation_ms", "dependency_total_ms",
                 "dependency_validation_result", "dependency_validation_cache_layer",
@@ -15367,7 +15311,7 @@ class _ComfyAPIMixin:
             if isinstance(_scheduler_trace_ns, dict):
                 result["scheduler_trace"] = dict(_scheduler_trace_ns)
 
-            # GöÇGöÇ Wall-clock trace v3 GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Wall-clock trace v3 GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             self._finalize_actual_load_records()
             _rt_wct = getattr(self, "_last_restore_timing", None) or {}
             _wct_stages = server_trace._t
@@ -15418,7 +15362,7 @@ class _ComfyAPIMixin:
             result["_wall_clock_summary"] = make_wall_clock_summary(_wall_clock_trace)
             print(make_summary_log_line(_wall_clock_trace))
 
-            # P3 GÇö end-to-end timing: stitch browser t0 to restore phases
+            # P3 GÃ‡Ã¶ end-to-end timing: stitch browser t0 to restore phases
             _rt2 = getattr(self, "_last_restore_timing", None)
             if isinstance(_rt2, dict):
                 _t0 = trace_summary.get("t0") or 0.0
@@ -15568,7 +15512,7 @@ class _ComfyAPIMixin:
                 "t8b_unknown_ms": _t8b_unknown_ms,
             }
 
-            # GöÇGöÇ Return mode filtering (after full payload logging) GöÇGöÇGöÇGöÇGöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Return mode filtering (after full payload logging) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             _return_mode = _resolve_return_mode()
             result = _apply_return_mode(result, _return_mode, _payload_image_count, _payload_video_count)
             # Cache size before real prompt
@@ -15614,7 +15558,7 @@ class _ComfyAPIMixin:
             )
             print(f"[comfyapp] request_pipeline_summary {_summary_inproc}")
 
-            # GöÇGöÇ Volume read-stall classification diagnostics GöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Volume read-stall classification diagnostics GÃ¶Ã‡GÃ¶Ã‡
             _stall_diag = self._classify_volume_read_stall(trace_summary)
             if _stall_diag.get("volume_read_stall_suspected"):
                 print(f"[volume_stall] suspected=1 reason={_stall_diag.get('volume_read_stall_reason', '')} "
@@ -15626,7 +15570,7 @@ class _ComfyAPIMixin:
                 print(f"[volume_stall] suspected=0")
             result["_volume_stall"] = _stall_diag
 
-            # GöÇGöÇ Per-stack metrics (telemetry only, no auto-disable) GöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Per-stack metrics (telemetry only, no auto-disable) GÃ¶Ã‡GÃ¶Ã‡
             _profile_for_metrics = _rt_summary_i.get("warmup_profile")
             self._record_per_stack_metrics(_profile_for_metrics, trace_summary)
             mark_event(_v4_events, T8C_RETURN_PACKAGING_START, process="modal_remote", phase=PHASE_RETURN)
@@ -15640,7 +15584,7 @@ class _ComfyAPIMixin:
                       f"req_seq={_container_request_count}")
             return result
 
-        # GöÇGöÇ Subprocess backend: HTTP-based submission GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Subprocess backend: HTTP-based submission GÃ¶Ã‡GÃ¶Ã‡
         import base64
         import httpx
         from pathlib import Path
@@ -15759,7 +15703,7 @@ class _ComfyAPIMixin:
         trace_summary["derived_ms"]["total_input_execution_ms"] = total_ms
         result["trace"] = trace_summary
 
-        # GöÇGöÇ Wall-clock trace v3 (subprocess path) GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Wall-clock trace v3 (subprocess path) GÃ¶Ã‡GÃ¶Ã‡
         self._finalize_actual_load_records()
         _rt_sub = getattr(self, "_last_restore_timing", None) or {}
         _wct_stages_sub = server_trace._t if hasattr(server_trace, '_t') else {}
@@ -15878,11 +15822,11 @@ class _ComfyAPIMixin:
         """Execute workflow with streaming progress events.
 
         Yields dicts with these types:
-          ``{"type": "status", "message": "..."}`` GÇö phase status (restore, startup).
-          ``{"type": "progress", "event": "...", "data": {...}}`` GÇö ComfyUI execution
+          ``{"type": "status", "message": "..."}`` GÃ‡Ã¶ phase status (restore, startup).
+          ``{"type": "progress", "event": "...", "data": {...}}`` GÃ‡Ã¶ ComfyUI execution
           events (execution_start, executing, progress, execution_error).
-          ``{"type": "result", "data": {...}}`` GÇö final result dict.
-          ``{"type": "error", "message": "..."}`` GÇö fatal error.
+          ``{"type": "result", "data": {...}}`` GÃ‡Ã¶ final result dict.
+          ``{"type": "error", "message": "..."}`` GÃ‡Ã¶ fatal error.
 
         The caller iterates via ``.remote_gen()`` and forwards progress events
         to the ComfyUI frontend in real-time.
@@ -15908,7 +15852,7 @@ class _ComfyAPIMixin:
         _prog_q = _qm.Queue()
         self._prog_queue = _prog_q
 
-        # GöÇGöÇ Cold UNET early load (opt-in, before dependency policy) GöÇGöÇ
+        # GÃ¶Ã‡GÃ¶Ã‡ Cold UNET early load (opt-in, before dependency policy) GÃ¶Ã‡GÃ¶Ã‡
         # Start UNET actual_load as early as possible so it overlaps with
         # dependency validation, prompt validation, Comfy graph setup,
         # and CLIP encode.  Honours request-level runtime options from
@@ -15916,7 +15860,7 @@ class _ComfyAPIMixin:
         _cold_unet_info: dict = self._cold_unet_early_actual_load(workflow, modal_options=modal_options)
 
         try:
-            # GöÇGöÇ Check for scheduler test mode GöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Check for scheduler test mode GÃ¶Ã‡GÃ¶Ã‡
             _scheduler_config = (modal_options or {}).get("comfymodal_scheduler_test")
             _is_scheduler_test = isinstance(_scheduler_config, dict) and _scheduler_config.get("enabled")
 
@@ -15944,7 +15888,7 @@ class _ComfyAPIMixin:
                 _preload_info = {"enabled": False, "workers": 0, "deduped_paths": [], "cache_hit": [], "submitted": [], "duplicate_skipped": 0}
                 _actual_load_info = {"enabled": False, "submitted": [], "skipped_unet": True, "futures": {}}
             else:
-                # GöÇGöÇ Shared custom-node sync and dependency policy GöÇGöÇ
+                # GÃ¶Ã‡GÃ¶Ã‡ Shared custom-node sync and dependency policy GÃ¶Ã‡GÃ¶Ã‡
                 # Runs before prompt preload, actual_load, and execution.
                 # Dependency failures yield a clear fatal stream event.
                 self._preflight_already_ran = False
@@ -15958,18 +15902,18 @@ class _ComfyAPIMixin:
                     yield {"type": "error", "message": str(_dep_err)}
                     return
 
-                # GöÇGöÇ Prompt-time async preload (after dependency policy) GöÇGöÇ
+                # GÃ¶Ã‡GÃ¶Ã‡ Prompt-time async preload (after dependency policy) GÃ¶Ã‡GÃ¶Ã‡
                 _preload_info: dict = {"enabled": False, "workers": 0, "deduped_paths": [], "cache_hit": [], "submitted": [], "duplicate_skipped": 0}
                 if PROMPT_ASYNC_PRELOAD:
                     _preload_info = self._prompt_async_preload(workflow)
 
-                # GöÇGöÇ Prompt-time actual loader futures (after dependency policy) GöÇGöÇ
+                # GÃ¶Ã‡GÃ¶Ã‡ Prompt-time actual loader futures (after dependency policy) GÃ¶Ã‡GÃ¶Ã‡
                 _actual_load_info: dict = self._prompt_async_actual_load(workflow)
                 _scheduler_trace = None
                 # Finalize cold UNET early load (compute overlap/graph_wait metrics)
                 self._finalize_cold_unet_early_load(_cold_unet_info)
 
-            # GöÇGöÇ Ensure backend is initialised before _execute_in_process GöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Ensure backend is initialised before _execute_in_process GÃ¶Ã‡GÃ¶Ã‡
             # The in-process backend (and its self._event_loop) is created
             # lazily in _start_backend().  When snapshot_mode is "none" or
             # "minimal" startup() defers init to restore(), but a streaming
@@ -15990,7 +15934,7 @@ class _ComfyAPIMixin:
                     return
                 yield {"type": "status", "message": "Backend ready", "phase": "backend_ready"}
 
-            # GöÇGöÇ Yield human-readable startup phases (no percentages) GöÇGöÇGöÇGöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Yield human-readable startup phases (no percentages) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             _rt = getattr(self, "_last_restore_timing", None) or {}
             if _rt.get("restore_total_ms"):
                 yield {"type": "status", "message": "Restoring container", "phase": "restore"}
@@ -16002,7 +15946,7 @@ class _ComfyAPIMixin:
                 yield {"type": "status", "message": "Warming models", "phase": "warmup"}
             yield {"type": "status", "message": "Starting execution", "phase": "execution"}
 
-            # GöÇGöÇ Run execution in a background thread GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Run execution in a background thread GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             # _execute_in_process is synchronous and blocking.  Running it
             # in a daemon thread lets the main generator yield progress
             # events from the _on_sync callback as they fire.
@@ -16013,7 +15957,7 @@ class _ComfyAPIMixin:
                 try:
                     _t_exec_start = time.time()
                     _r = self._execute_in_process(workflow, input_images or {}, trace=server_trace, modal_options=modal_options)
-                    # GöÇGöÇ Cache diagnostics for streaming path GöÇGöÇ
+                    # GÃ¶Ã‡GÃ¶Ã‡ Cache diagnostics for streaming path GÃ¶Ã‡GÃ¶Ã‡
                     try:
                         _r["_cache_diagnostics"] = {
                             "cpu_hits": dict(getattr(self, "_cpu_cache_hits", {})),
@@ -16049,7 +15993,7 @@ class _ComfyAPIMixin:
                         trace_summary["derived_ms"]["modal_entry_to_prompt_start_ms"] = round((_prompt_start_ts - _t3) * 1000, 1)
                     trace_summary["derived_ms"]["total_input_execution_ms"] = round((_t_exec_end - _t_exec_start) * 1000, 1)
 
-                    # GöÇGöÇ Dependency validation caching fields (streaming path) GöÇGöÇ
+                    # GÃ¶Ã‡GÃ¶Ã‡ Dependency validation caching fields (streaming path) GÃ¶Ã‡GÃ¶Ã‡
                     _pstream = getattr(self, "_policy_stream", {})
                     if isinstance(_pstream, dict):
                         for _dep_field_s in (
@@ -16127,7 +16071,7 @@ class _ComfyAPIMixin:
                     if isinstance(_scheduler_trace, dict):
                         _r["scheduler_trace"] = dict(_scheduler_trace)
 
-                    # GöÇGöÇ Wall-clock trace v3 (streaming path) GöÇGöÇ
+                    # GÃ¶Ã‡GÃ¶Ã‡ Wall-clock trace v3 (streaming path) GÃ¶Ã‡GÃ¶Ã‡
                     self._finalize_actual_load_records()
                     _rt_st = _rt2 or {}
                     _wct_stages_st = server_trace._t if hasattr(server_trace, '_t') else {}
@@ -16243,7 +16187,7 @@ class _ComfyAPIMixin:
             _t = threading.Thread(target=_exec, daemon=True)
             _t.start()
 
-            # GöÇGöÇ Drain progress events until execution finishes GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+            # GÃ¶Ã‡GÃ¶Ã‡ Drain progress events until execution finishes GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             while _t.is_alive():
                 try:
                     _ev, _data = _prog_q.get(timeout=0.2)
