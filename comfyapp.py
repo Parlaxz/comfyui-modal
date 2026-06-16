@@ -1315,7 +1315,182 @@ def _log_remote_identity(event: str, *, cls_name: str = "", method_name: str = "
         f"CONTROL_BASELINE={CONTROL_BASELINE} "
     )
 
-# GÃ¶Ã‡GÃ¶Ã‡ Phase 1: Dependency validation cache GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
+
+_PLATFORM_DIAG_CACHE: dict | None = None
+
+
+def _collect_platform_diagnostics(class_name: str = "") -> dict:
+    global _PLATFORM_DIAG_CACHE
+    if os.environ.get("COMFYMODAL_DISABLE_PLATFORM_DIAG", "0") == "1":
+        return {"region": "", "cloud_provider": "", "task_id": "",
+                "function_id": "", "environment": "",
+                "class_name": class_name or "", "gpu_value": ""}
+    if _PLATFORM_DIAG_CACHE is not None:
+        out = dict(_PLATFORM_DIAG_CACHE)
+        out["class_name"] = class_name or out.get("class_name", "")
+        return out
+    out = {"region": os.environ.get("MODAL_REGION", ""),
+           "cloud_provider": os.environ.get("MODAL_CLOUD_PROVIDER", "")
+               or os.environ.get("MODAL_CLOUD", ""),
+           "task_id": os.environ.get("MODAL_TASK_ID", ""),
+           "function_id": os.environ.get("MODAL_FUNCTION_ID", ""),
+           "environment": os.environ.get("MODAL_ENVIRONMENT", ""),
+           "class_name": class_name or "", "gpu_value": ""}
+    try:
+        import gpu_catalog as _gc
+        out["gpu_value"] = _gc.DEFAULT_GPU
+    except Exception:
+        pass
+    _PLATFORM_DIAG_CACHE = out
+    return out
+
+
+_WATERFALL_GLYPH = {"ok": "OK", "miss": "--", "na": "  "}
+
+
+def _log_cold_start_waterfall(s, label=""):
+    if os.environ.get("COMFYMODAL_DISABLE_WATERFALL", "0") == "1":
+        return
+    if not isinstance(s, dict):
+        return
+    stages = s.get("stages") or {}
+    deltas = s.get("deltas_ms") or {}
+    restore = s.get("restore") or {}
+    derived = s.get("derived_ms") or {}
+    pid = str(s.get("prompt_id", "") or "")[:12]
+    t0 = stages.get("t0_client_press") or s.get("t0")
+    t2 = stages.get("t2_local_dispatch") or stages.get("t2d_modal_submit")
+    t3 = stages.get("t3_modal_entry")
+    t3b = stages.get("t3b_validate_done")
+    t3c = stages.get("t3c_prep_done")
+    t9 = stages.get("t9_modal_return")
+    t10 = stages.get("t10_local_materialized")
+    t8b_st = stages.get("t8b_outputs_collected")
+    rs = restore.get("restore_start_unix_s")
+    re = restore.get("restore_end_unix_s")
+    rt = restore.get("restore_total_ms")
+    submit2entry_ms = deltas.get("t2_to_t3")
+    # Check whether restore_total_ms is included in submit-to-entry
+    # (flag set by the app when restore completes before t3 is emitted)
+    restore_incl_in_submit2entry = bool(restore.get("restore_incl_in_submit2entry", False))
+    items = []
+    missing_stages = []
+
+    def _d(a, b):
+        return None if a is None or b is None else max(0.0, (float(b) - float(a)) * 1000.0)
+
+    def _fmt(v):
+        return "    -" if v is None else f"{float(v):>7.1f}"
+
+    def _gl(v):
+        return "ok" if v is not None and float(v) > 0 else ("na" if v is None else "miss")
+
+    # ── Phase 1: Client press → Modal entry (local + platform allocation) ──
+    if t0 is not None:
+        items.append(("local", "client_press_to_modal_entry", "mixed", _d(t0, t3)))
+    else:
+        missing_stages.append("t0_client_press")
+    for dk, dl in (("t0_to_t1", "  browser_to_local_bridge"),
+                   ("t1_to_t2", "  local_parse_and_hash")):
+        v = deltas.get(dk)
+        if v is not None:
+            items.append(("local_sub", dl, "mixed", v))
+    # submit_to_remote_entry_ms: use actual Modal submit timestamp
+    if t2 is not None and t3 is not None:
+        submit2entry_raw = _d(t2, t3)
+        if restore_incl_in_submit2entry and rt is not None and submit2entry_raw is not None:
+            pre_restore_platform_ms = max(0.0, submit2entry_raw - rt)
+            items.append(("local_sub", "  submit_to_remote_entry", "platform", submit2entry_raw))
+            items.append(("local_sub", "  pre_restore_platform_only", "platform", pre_restore_platform_ms))
+        elif submit2entry_raw is not None:
+            items.append(("local_sub", "  submit_to_remote_entry", "platform", submit2entry_raw))
+    elif deltas.get("t2_to_t3") is not None:
+        items.append(("local_sub", "  submit_to_remote_entry", "platform", deltas["t2_to_t3"]))
+
+    # ── Phase 2: Application restore (post-hydration) ──
+    items.append(("snap", "platform_snapshot_hydration_gap", "platform", None))
+    if rt is not None:
+        items.append(("app_r", "app_restore_total", "app", rt))
+    for k, lbl in (("ensure_models_ms", "  ensure_models"),
+                   ("volume_mount_wait_ms", "  vol_mount_wait"),
+                   ("custom_nodes_sync_ms", "  cn_sync"),
+                   ("cuda_warmup_ms", "  cuda_warmup"),
+                   ("gpu_state_ms", "  gpu_state"),
+                   ("sage_runtime_ms", "  sage_select")):
+        v = restore.get(k)
+        if v is not None:
+            items.append(("snap_sub", lbl, "app", v))
+    wp = restore.get("warmup_preload_ms")
+    if wp is not None and wp > 0:
+        items.append(("snap_sub", "  warmup_preload", "app", wp))
+
+    # ── Phase 3: Remote execution (Modal entry → Modal return) ──
+    if t3 is not None and t9 is not None:
+        items.append(("exec", "modal_entry_to_modal_return", "app", _d(t3, t9)))
+    else:
+        if t3 is None:
+            missing_stages.append("t3_modal_entry")
+        if t9 is None:
+            missing_stages.append("t9_modal_return")
+    for dk, dl, stage in (("t3_to_t3b", "  request_validate", "t3b_validate_done"),
+                          ("t3b_to_t3c", "  request_prep", "t3c_prep_done")):
+        v = deltas.get(dk)
+        if v is not None:
+            items.append(("exec_sub", dl, "app", v))
+        elif stages.get(stage) is None:
+            missing_stages.append(stage)
+    for dk, dl in (("clip_load", "  clip_load"),
+                   ("clip_encode", "  clip_text_encode"),
+                   ("sampler", "  sampler"),
+                   ("vae_decode", "  vae_decode")):
+        v = deltas.get(dk)
+        if v is not None:
+            items.append(("exec_sub", "  " + dl, "app", v))
+    if t9 is not None and t8b_st is not None:
+        items.append(("exec_sub", "  outputs_collect", "app", _d(t8b_st, t9)))
+    elif deltas.get("t8b_to_t9") is not None:
+        items.append(("exec_sub", "  outputs_collect", "app", deltas["t8b_to_t9"]))
+    elif stages.get("t8b_outputs_collected") is None:
+        missing_stages.append("t8b_outputs_collected")
+
+    # ── Phase 4: Return to local materialization ──
+    if t9 is not None and t10 is not None:
+        items.append(("local", "return_to_materialized", "app", _d(t9, t10)))
+    elif deltas.get("t9_to_t10") is not None:
+        items.append(("local", "return_to_materialized", "app", deltas["t9_to_t10"]))
+    elif t10 is None:
+        missing_stages.append("t10_local_materialized")
+
+    # ── Top-line wall ──
+    if deltas.get("modal_to_browser") is not None:
+        items.append(("total", "full_wall_ms", "app", deltas["modal_to_browser"]))
+    elif t0 is not None and t10 is not None:
+        items.append(("total", "full_wall_ms", "app", _d(t0, t10)))
+
+    if not items:
+        return
+
+    # Quality classification
+    timing_quality = "complete"
+    if missing_stages:
+        timing_quality = "partial"
+    if deltas.get("t9_to_t10") is not None and deltas.get("t9_to_t10") < 0:
+        timing_quality = "invalid_order"
+
+    print(f"[waterfall] prompt={pid} quality={timing_quality}" +
+          (f" label={label}" if label else "") +
+          (f" missing={missing_stages}" if missing_stages else ""), flush=True)
+    print("[waterfall] ---    PHASE                            ms      SOURCE", flush=True)
+    for code, name, source, value in items:
+        g = _WATERFALL_GLYPH.get(_gl(value), "??")
+        print(f"[waterfall] {g}    {name:<32} {_fmt(value)}  {source}", flush=True)
+
+    # SUM: only non-overlapping top-level spans.
+    crit = sum(float(v) for c,_,_,v in items
+               if v is not None and "_sub" not in c
+               and c not in ("total",))
+    if crit > 0:
+        print(f"[waterfall] SUM    critical_path_non_overlapping  {_fmt(crit)}  --", flush=True)
 DEPENDENCY_VALIDATION_CACHE_SCHEMA_VERSION = 1
 DEPLOYMENT_DEPENDENCY_VALIDATION_CACHE_DIR = os.path.join(
     RUNTIME_CONFIG_DIR, "deployment_dependency_validation_cache"
@@ -11857,7 +12032,8 @@ class _ComfyAPIMixin:
         stage_started = time.time()
         if input_images:
             _materialize_input_images(input_images)
-        self._log_profile("inproc_input_prepare", prompt_id=prompt_id[:8], count=len(input_images or {}), duration_ms=self._profile_ms(stage_started))
+        _input_image_ms = self._profile_ms(stage_started)
+        self._log_profile("inproc_input_prepare", prompt_id=prompt_id[:8], count=len(input_images or {}), duration_ms=_input_image_ms)
 
         # Start the execution window after source-image uploads land on
         # disk so the fallback output scan does not echo them back as
@@ -11876,6 +12052,7 @@ class _ComfyAPIMixin:
 
         repair_started = time.time()
         repair_summary = self._repair_missing_workflow_nodes(workflow)
+        _missing_node_repair_ms = self._profile_ms(repair_started)
         self._log_profile(
             "inproc_missing_node_repair",
             prompt_id=prompt_id[:8],
@@ -11885,7 +12062,7 @@ class _ComfyAPIMixin:
             installed=len(repair_summary.get("installed", [])),
             skipped=len(repair_summary.get("skipped", [])),
             blocked=1 if repair_summary.get("blocked_by_mode") else 0,
-            duration_ms=self._profile_ms(repair_started),
+            duration_ms=_missing_node_repair_ms,
         )
         if repair_summary.get("blocked_by_mode") and repair_summary.get("missing_before"):
             _mode = self._resolve_requirements_repair_mode()
@@ -11898,9 +12075,12 @@ class _ComfyAPIMixin:
             )
 
         # GÃ¶Ã‡GÃ¶Ã‡ Fixed-workflow fast path: skip validation if hash matches GÃ¶Ã‡GÃ¶Ã‡
+        _hash_start_ns = time.perf_counter_ns()
         _wf_hash = self._compute_workflow_struct_hash(workflow)
+        _workflow_hash_ns = time.perf_counter_ns() - _hash_start_ns
 
         # Production-aware cache key
+        _prod_start_ns = time.perf_counter_ns()
         _production_cache = normalize_production_options(modal_options)
         _production_enabled = _production_cache.get("enabled", False)
         if _production_enabled:
@@ -11910,6 +12090,7 @@ class _ComfyAPIMixin:
             _wf_cache_key = f"wf_exec:production:v1:{_topology_hash}:{_wf_hash}"
         else:
             _wf_cache_key = f"wf_exec:{_wf_hash}"
+        _production_compile_ns = time.perf_counter_ns() - _prod_start_ns
 
         _wf_cache = getattr(self, "_workflow_exec_cache", {})
         # Bound the cache to 32 entries
@@ -11949,6 +12130,34 @@ class _ComfyAPIMixin:
         self._last_graph_validate_ms = self._profile_ms(stage_started)
         if trace is not None:
             trace.mark("t3b_validate_done")
+        # Per audit round 7: store granular preflight timings and
+        # print a sorted breakdown to identify the ~1s preflight gap.
+        self._preflight_input_image_ms = _input_image_ms
+        self._preflight_missing_node_repair_ms = _missing_node_repair_ms
+        self._preflight_workflow_hash_ms = round(_workflow_hash_ns / 1_000_000, 3)
+        self._preflight_production_compile_ms = round(_production_compile_ns / 1_000_000, 3)
+        # Sorted breakdown (largest first)
+        _pf_spans = {
+            "input_image": _input_image_ms,
+            "missing_node_repair": _missing_node_repair_ms,
+            "workflow_hash": self._preflight_workflow_hash_ms,
+            "production_compile": self._preflight_production_compile_ms,
+            "graph_validate": self._last_graph_validate_ms,
+        }
+        _pf_sorted = sorted(
+            [(k, v) for k, v in _pf_spans.items() if v > 0],
+            key=lambda x: -x[1],
+        )
+        if _pf_sorted:
+            _pf_total = sum(v for _, v in _pf_sorted)
+            _pf_largest = _pf_sorted[0]
+            _pf_spans_str = " ".join(f"{k}={v}ms" for k, v in _pf_sorted)
+            print(
+                f"[preflight.breakdown] total_ms={round(_pf_total, 3)} "
+                f"largest={_pf_largest[0]} largest_ms={round(_pf_largest[1], 3)} "
+                f"spans={{{_pf_spans_str}}}",
+                flush=True,
+            )
         if not valid:
             parts = [error.get("message", str(error)) if isinstance(error, dict) else str(error)]
             if node_errors:
@@ -16710,9 +16919,15 @@ class _ComfyAPIMixin:
         )
 
         _v4_events: list[dict] = []
+        _pd_run = _collect_platform_diagnostics(self.__class__.__name__)
         mark_event(_v4_events, T3_MODAL_ENTRY, process="modal_remote", phase="remote_entry",
                    container_session_id=CONTAINER_SESSION_ID,
-                   request_seq=_container_request_count)
+                   request_seq=_container_request_count,
+                   platform_region=_pd_run.get("region", ""),
+                   platform_cloud_provider=_pd_run.get("cloud_provider", ""),
+                   platform_task_id=_pd_run.get("task_id", ""),
+                   selected_class_name=_pd_run.get("class_name", ""),
+                   selected_gpu_value=_pd_run.get("gpu_value", ""))
 
         """Submit a workflow for execution.
 
@@ -16926,6 +17141,7 @@ class _ComfyAPIMixin:
             trace_summary["request_sequence_id"] = _container_request_count
             print(f"[container_id] session={CONTAINER_SESSION_ID} import_unix={CONTAINER_IMPORT_UNIX_S} restore_count={_container_restore_count} request_seq={_container_request_count} restore_session={trace_summary['restore_session_id']}")
             result["trace"] = trace_summary
+            _log_cold_start_waterfall(trace_summary, label="run_prompt")
             if isinstance(_scheduler_trace_ns, dict):
                 result["scheduler_trace"] = dict(_scheduler_trace_ns)
 
@@ -17581,6 +17797,7 @@ class _ComfyAPIMixin:
             trace_summary["derived_ms"]["modal_entry_to_prompt_start_ms"] = round((_prompt_start_ts_sp - _t3_entry_sp) * 1000, 1)
         trace_summary["derived_ms"]["total_input_execution_ms"] = total_ms
         result["trace"] = trace_summary
+        _log_cold_start_waterfall(trace_summary, label="run_prompt_stream")
 
         # GÃ¶Ã‡GÃ¶Ã‡ Wall-clock trace v3 (subprocess path) GÃ¶Ã‡GÃ¶Ã‡
         self._finalize_actual_load_records()
@@ -17945,8 +18162,28 @@ class _ComfyAPIMixin:
                     trace_summary["container_import_unix_s"] = CONTAINER_IMPORT_UNIX_S
                     trace_summary["restore_count"] = _container_restore_count
                     trace_summary["request_sequence_id"] = _container_request_count
+                    # Per audit round 7: platform diagnostics on the
+                    # in-process streaming path.
+                    try:
+                        _pd_stream = _collect_platform_diagnostics(self.__class__.__name__)
+                        for _pk_s, _pv_s in _pd_stream.items():
+                            if _pv_s and _pk_s not in trace_summary:
+                                trace_summary[_pk_s] = _pv_s
+                    except Exception:
+                        pass
+                    # Preflight sub-op timing from _execute_in_process
+                    for _pf_s, _pa_s in (("input_image_handle_ms", "_preflight_input_image_ms"),
+                                         ("missing_node_repair_ms", "_preflight_missing_node_repair_ms"),
+                                         ("workflow_hash_ms", "_preflight_workflow_hash_ms"),
+                                         ("production_compile_ms", "_preflight_production_compile_ms")):
+                        _pv_s = getattr(self, _pa_s, None)
+                        if _pv_s is not None and _pv_s > 0:
+                            trace_summary.setdefault("derived_ms", {})[_pf_s] = _pv_s
                     print(f"[container_id] session={CONTAINER_SESSION_ID} import_unix={CONTAINER_IMPORT_UNIX_S} restore_count={_container_restore_count} request_seq={_container_request_count} restore_session={trace_summary['restore_session_id']}")
                     _r["trace"] = trace_summary
+                    # Per audit round 7: waterfall on the in-process
+                    # streaming path — the actual production route.
+                    _log_cold_start_waterfall(trace_summary, label="run_prompt_stream_in_process")
                     if isinstance(_scheduler_trace, dict):
                         _r["scheduler_trace"] = dict(_scheduler_trace)
 
@@ -18060,6 +18297,16 @@ class _ComfyAPIMixin:
                     _error.append(_exc)
                     import traceback as _tb
                     _tb.print_exc()
+                    # Per audit round 7: partial waterfall on failure
+                    # path — emit what trace data we have.
+                    try:
+                        _fail_summary = server_trace.summary()
+                        self._enrich_trace_with_restore_timing(_fail_summary)
+                        _fail_summary["timing_quality"] = "partial"
+                        _fail_summary["missing_timing_fields"] = ["execution_did_not_complete"]
+                        _log_cold_start_waterfall(_fail_summary, label="run_prompt_stream_in_process_failure")
+                    except Exception:
+                        pass
                 finally:
                     _prog_q.put(("__done__", None))
 

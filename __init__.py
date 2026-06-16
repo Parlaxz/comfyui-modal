@@ -1600,17 +1600,21 @@ def _collect_input_images(workflow: dict) -> dict:
 
 _ACTIVE_NEXT_PROFILE_TTL_S = int(os.environ.get("COMFYMODAL_ACTIVE_NEXT_PROFILE_TTL_S", "3600"))
 
-_last_written_stable_profile_key: str | None = None
-# Per audit round 7: track when the last successful write happened
-# so we can refresh the remote profile BEFORE its TTL expires.
-# Without this, the same model stack + prompt indefinitely
-# skips remote writes, the remote profile eventually expires,
-# and exact-prefill / persistent-cache silently stop working
-# until the prompt changes.
-_last_written_stable_profile_at: float = 0.0
+# Per audit round 7: workspace-scoped dedup identity so
+# Workspace A's profile write does not suppress Workspace B's.
+# Keyed by (workspace_id, stable_model_key) => timestamp.
+_last_written_stable_profile: dict[tuple[str, str], float] = {}
 # Half-life refresh window: write at least every TTL/2, with a
 # 30s floor so a small TTL still has a sane minimum.
 _ACTIVE_NEXT_REFRESH_MIN_S = 30.0
+
+
+def _ws_id_for_active_next(workspace: dict | None) -> str:
+    if isinstance(workspace, dict):
+        _wid = workspace.get("id") or workspace.get("workspace_id") or ""
+        if _wid:
+            return str(_wid)
+    return "__default__"
 
 
 def _normalize_stable_warmup_profile(
@@ -1699,16 +1703,11 @@ def _build_next_warmup_activation(workflow: dict, workflow_hash: str, production
 
 
 async def _execute_job(item: tuple, item_id: int):
-    # Per audit round 7 (post-fix verification): BOTH stable
-    # profile globals must be declared here.  If only
-    # ``_last_written_stable_profile_key`` is declared and the
-    # function later assigns to ``_last_written_stable_profile_at``,
-    # Python's compiler treats the second name as a local for the
-    # ENTIRE function — the read at line ~1880 then raises
-    # ``UnboundLocalError`` on the first request.  This was the
-    # exact runtime crash observed after the audit fix.
-    global _last_written_stable_profile_key
-    global _last_written_stable_profile_at
+    # Per audit round 7: the dedup dict is module-global;
+    # mutations must be marked global so the
+    # ``_last_written_stable_profile[key] = ts`` assignment
+    # rebinds the dict in-place rather than creating a local.
+    global _last_written_stable_profile
     number, prompt_id, workflow, extra_data, _, _ = item
     execution_workflow = extra_data.get("execution_workflow") or workflow
     sid = extra_data.get("client_id", "")
@@ -1874,31 +1873,50 @@ async def _execute_job(item: tuple, item_id: int):
             # profile would eventually expire, and exact-prefill
             # and persistent-cache would stop working until the
             # prompt changed.
-            _refresh_after_s = max(
-                _ACTIVE_NEXT_REFRESH_MIN_S,
-                float(_ACTIVE_NEXT_PROFILE_TTL_S) * 0.5,
+            # Per audit round 7: fix small-TTL handling.  Ensure
+            # refresh always occurs before the remote TTL expires.
+            _effective_ttl_s = max(2.0, float(_ACTIVE_NEXT_PROFILE_TTL_S))
+            _refresh_after_s = min(
+                _effective_ttl_s * 0.5,
+                _effective_ttl_s - 1.0,
             )
+            _refresh_after_s = max(1.0, _refresh_after_s)
+            # Per audit round 7: dedup state is keyed by
+            # (workspace_id, stable_key) so Workspace A's write
+            # never suppresses Workspace B's.
+            _ws_id = _ws_id_for_active_next(_request_workspace)
+            _dedup_key = (_ws_id, _stable_key)
+            # Prune stale entries older than 2x TTL so the dict
+            # does not grow unbounded across many different prompts.
+            if len(_last_written_stable_profile) > 100:
+                _cutoff = time.time() - _effective_ttl_s * 2
+                _last_written_stable_profile = {
+                    k: v for k, v in _last_written_stable_profile.items()
+                    if v >= _cutoff
+                }
+            _last_write_ts = _last_written_stable_profile.get(_dedup_key, 0.0)
             _can_skip_active_next = (
-                _last_written_stable_profile_key == _stable_key
-                and (time.time() - _last_written_stable_profile_at)
-                    < _refresh_after_s
+                _last_write_ts > 0.0
+                and (time.time() - _last_write_ts) < _refresh_after_s
             )
             if _can_skip_active_next:
                 _active_next_status = "unchanged"
                 print(
                     f"[comfyui-modal.profile] stage=active_profile_write prompt_id={prompt_id[:8]} "
-                    f"decision=unchanged profile_key={_stable_key[:12]} remote_call=0 "
+                    f"decision=unchanged workspace_id={_ws_id[:12]} profile_key={_stable_key[:12]} remote_call=0 "
                     f"reason=key_match_within_refresh_window"
                 )
             else:
                 _active_next_remote_call = 1
                 try:
-                    activation_result = await set_active_warmup_profile(activation_payload)
+                    activation_result = await set_active_warmup_profile(
+                        activation_payload,
+                        workspace=_request_workspace or None,
+                    )
                     _active_next_status = activation_result.get("status", "written")
                     _active_next_changed = activation_result.get("changed", True)
                     if _active_next_status not in ("error",):
-                        _last_written_stable_profile_key = _stable_key
-                        _last_written_stable_profile_at = time.time()
+                        _last_written_stable_profile[_dedup_key] = time.time()
                     print(
                         f"[comfyui-modal.profile] stage=active_profile_write prompt_id={prompt_id[:8]} "
                         f"decision=changed profile_key={_stable_key[:12]} remote_call=1 "
@@ -1953,6 +1971,7 @@ async def _execute_job(item: tuple, item_id: int):
             trace={**trace.fields(), "prompt_id": prompt_id},
             gpu=extra_data.get("gpu"),
             modal_options=_mo if _mo else None,
+            workspace=_request_workspace or None,
         ):
             if _first_msg:
                 _first_msg = False
@@ -3949,6 +3968,7 @@ if _server:
         auto_save_local: bool,
         save_folder: str,
         save_metadata_sidecar: bool,
+        workspace: dict | None = None,
     ) -> dict:
         import time as _time_module
         import base64 as _b64
@@ -4028,6 +4048,7 @@ if _server:
                 trace=extra_data.get("trace", {}),
                 gpu=extra_data.get("gpu"),
                 modal_options=extra_data.get("modal_options"),
+                workspace=workspace,
             ):
                 if not isinstance(_msg, dict):
                     continue
@@ -4301,6 +4322,11 @@ if _server:
             except (TypeError, ValueError):
                 seed = 0
 
+        # Per audit round 7: capture workspace once for all profile
+        # executions so detached background tasks do not resolve
+        # whichever workspace happens to be active later.
+        _comparison_workspace = _active_workspace() or {}
+
         try:
             manifest = run_comparison(
                 comfyui_root=_COMFYUI_ROOT,
@@ -4343,6 +4369,7 @@ if _server:
                             entry, body, manifest, output_format, quality,
                             webp_lossless_compression, auto_save_local,
                             save_folder, save_metadata_sidecar,
+                            workspace=_comparison_workspace,
                         )
 
                 tasks = [_run_one(e) for e in resolved if e.get("status") == "ready"]
@@ -4367,6 +4394,7 @@ if _server:
                             entry, body, manifest, output_format, quality,
                             webp_lossless_compression, auto_save_local,
                             save_folder, save_metadata_sidecar,
+                            workspace=_comparison_workspace,
                         )
                         if result:
                             results.append(result)
