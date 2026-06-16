@@ -4,6 +4,7 @@ No Modal, Torch, ComfyUI server, filesystem, or GPU dependencies.
 """
 
 import hashlib
+import threading
 from collections import OrderedDict
 
 # ---------------------------------------------------------------------------
@@ -66,24 +67,29 @@ class _LRUDict:
     def __init__(self, maxsize):
         self._maxsize = maxsize
         self._data = OrderedDict()
+        self._lock = threading.Lock()
 
     def get(self, key):
-        if key in self._data:
-            self._data.move_to_end(key)
-            return self._data[key]
-        return None
+        with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+                return self._data[key]
+            return None
 
     def put(self, key, value):
-        self._data[key] = value
-        self._data.move_to_end(key)
-        if len(self._data) > self._maxsize:
-            self._data.popitem(last=False)
+        with self._lock:
+            self._data[key] = value
+            self._data.move_to_end(key)
+            if len(self._data) > self._maxsize:
+                self._data.popitem(last=False)
 
     def __len__(self):
-        return len(self._data)
+        with self._lock:
+            return len(self._data)
 
     def clear(self):
-        self._data.clear()
+        with self._lock:
+            self._data.clear()
 
 
 _topology_plan_cache = _LRUDict(_CACHE_MAXSIZE)
@@ -239,17 +245,18 @@ def compile_production_workflow(
     output_ids = production.get("output_node_ids", [])
     bypass_ids = set(production.get("bypass_node_ids", []))
 
+    for oid in output_ids:
+        if oid not in nid_map:
+            available = sorted(nid_map.keys())[:20]
+            raise ValueError(
+                f"output_node_id {oid!r} not found in workflow. "
+                f"Available node IDs (first 20): {available}"
+            )
+    for oid in output_ids:
+        if oid in bypass_ids:
+            raise ValueError(f"output_node_id {oid!r} is also marked as bypassed")
+
     if not stable:
-        for oid in output_ids:
-            if oid not in nid_map:
-                available = sorted(nid_map.keys())[:20]
-                raise ValueError(
-                    f"output_node_id {oid!r} not found in workflow. "
-                    f"Available node IDs (first 20): {available}"
-                )
-        for oid in output_ids:
-            if oid in bypass_ids:
-                raise ValueError(f"output_node_id {oid!r} is also marked as bypassed")
         for bid in bypass_ids:
             if bid in nid_map:
                 original_key = nid_map[bid]
@@ -271,7 +278,12 @@ def compile_production_workflow(
         workflow, production, allow_direct_output_rewrite=allow_direct_output_rewrite
     )
 
-    cache_key = topology_hash
+    cache_key = (
+        topology_hash,
+        bool(stable),
+        str(production.get("metadata_mode", "none")),
+        bool(allow_rgthree_comparer_rewrite),
+    )
     cached = _topology_plan_cache.get(cache_key)
 
     if cached is not None:
@@ -293,7 +305,7 @@ def compile_production_workflow(
             if oid in compiled:
                 _try_rewrite_rgthree_comparer(oid, compiled, nid_map, rgthree_rewritten_ids)
         removed_ids = [nid for nid in nid_map if nid not in cached_kept_set]
-        duplicate_analysis = analyze_duplicate_work(workflow)
+        duplicate_analysis = {}
         _selected_output_classes = {}
         for oid in output_ids:
             if oid in nid_map:
@@ -336,7 +348,7 @@ def compile_production_workflow(
                 _try_rewrite_output(oid, compiled, nid_map, rewritten_ids)
 
     rgthree_rewritten_ids = []
-    if allow_direct_output_rewrite and production.get("direct_output_sink", True):
+    if allow_direct_output_rewrite and allow_rgthree_comparer_rewrite and production.get("direct_output_sink", True):
         metadata_mode = production.get("metadata_mode", "none")
         if metadata_mode != "full":
             for oid in output_ids:
@@ -510,6 +522,11 @@ def _build_normalized_id_map(workflow):
     for raw_id in workflow:
         nid = str(raw_id).strip()
         if nid:
+            if nid in nid_map:
+                raise ValueError(
+                    f"Normalized node-ID collision: key {raw_id!r} and "
+                    f"{nid_map[nid]!r} both resolve to {nid!r}"
+                )
             nid_map[nid] = raw_id
     return nid_map
 
@@ -583,11 +600,8 @@ def _try_rewrite_rgthree_comparer(oid, compiled, nid_map, rewritten_ids):
     image_b_val = inputs.get("image_b")
     image_b_conn = _extract_connection(image_b_val, nid_map) if image_b_val is not None else None
     new_inputs = {"image_a": image_a_val}
-    inputs_are_same = False
     if image_b_conn is not None:
         new_inputs["image_b"] = image_b_val
-        inputs_are_same = (image_a_conn[0] == image_b_conn[0] and image_a_conn[1] == image_b_conn[1])
-    new_inputs["inputs_are_same"] = inputs_are_same
     compiled[oid] = {
         "class_type": "ComfyModalProductionImageComparerOutput",
         "inputs": new_inputs,

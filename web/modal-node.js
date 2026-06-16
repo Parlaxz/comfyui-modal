@@ -677,7 +677,8 @@ app.registerExtension({
           parsed.t0_perf_ms = t0.t0_perf_ms;
           parsed.t0_perf_now_ms = t0.t0_perf_now_ms;
           parsed.t0_client_press_ms = t0.t0_client_press_ms;
-          const baseOptions = _getOutputOptions();
+          const baseOptions = { ..._getOutputOptions() };
+          delete baseOptions.production;  // ensure clean start
           const productionEnabled = _getProductionEnabled();
           if (productionEnabled) {
             const prodOutputNodes = _getProdOutputNodes();
@@ -695,7 +696,11 @@ app.registerExtension({
               throw new Error("Production output nodes not found in serialized prompt. The canvas node IDs do not match the serialized workflow. Try re-saving the workflow or re-marking production outputs.");
             }
             if (finalOutIds.length < outputNodeIds.length) {
-              log("Some production output nodes missing from serialized prompt. Using " + finalOutIds.length + " of " + outputNodeIds.length + " IDs.");
+              const missing = outputNodeIds.filter(id => !serializedKeys.includes(id));
+              throw new Error(
+                "Production output nodes not found in serialized prompt: " + missing.join(", ") +
+                ". Node IDs in canvas do not match serialized workflow. Re-save workflow or re-mark production outputs."
+              );
             }
             baseOptions.production = {
               enabled: true,
@@ -753,8 +758,15 @@ app.registerExtension({
 // PRODUCTION MODE EXTENSION (Phase 2)
 // ═══════════════════════════════════════════════════════════════════════════
 
+const _OUTPUT_CAPABLE_CLASSES = new Set([
+    "SaveImage", "PreviewImage", "SaveImageWithMetaData",
+    "VHS_VideoCombine", "SaveAnimatedWEBP", "SaveAnimatedPNG",
+    "Image Comparer (rgthree)",
+]);
+
 function _isOutputCapable(node) {
-  return node && !!node;
+    if (!node || !node.type) return false;
+    return _OUTPUT_CAPABLE_CLASSES.has(node.type);
 }
 
 function _getProductionEnabled() {

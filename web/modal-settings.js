@@ -500,12 +500,16 @@ async function updateDeployLogInline() {
 function startDeployLogPoll() {
   stopDeployLogPoll();
   updateDeployLogInline();
-  _deployLogTimer = setInterval(updateDeployLogInline, 2000);
+  _deployLogTimer = setTimeout(function pollLoop() {
+    updateDeployLogInline().finally(() => {
+      _deployLogTimer = setTimeout(pollLoop, 2000);
+    });
+  }, 2000);
 }
 
 function stopDeployLogPoll() {
   if (_deployLogTimer) {
-    clearInterval(_deployLogTimer);
+    clearTimeout(_deployLogTimer);
     _deployLogTimer = null;
   }
 }
@@ -597,7 +601,13 @@ async function pollDeployStatus() {
       _deployWarning = data.warning ? data.message : "";
       updateStatusBanner();
     }
-  } catch {}
+  } catch {
+    // Transient error — re-arm so polling doesn't stop permanently
+  }
+  // Always re-arm if still in a non-terminal state
+  if (_deployState === "deploying" || _deployState === "starting" || _deployState === "unknown") {
+    _deployPollTimer = setTimeout(pollDeployStatus, 3000);
+  }
 }
 
 function startDeployPoll() {
@@ -1073,14 +1083,14 @@ function buildAuthPanel(onConnected) {
 
   const desc = document.createElement("div");
   desc.style.cssText = "font-size:12px; color:#aaa; line-height:1.6;";
-  desc.innerHTML = `Connect your <a href="https://modal.com" target="_blank" style="color:#6a9fd8;">Modal</a> account to run generations on cloud GPUs.`;
+  desc.innerHTML = `Connect your <a href="https://modal.com" target="_blank" rel="noopener noreferrer" style="color:#6a9fd8;">Modal</a> account to run generations on cloud GPUs.`;
   wrap.appendChild(desc);
 
   const steps = document.createElement("ol");
   steps.style.cssText = "font-size:12px; color:#aaa; line-height:1.8; padding-left:18px; margin:0;";
   steps.innerHTML = `
-    <li>Create a free account at <a href="https://modal.com" target="_blank" style="color:#6a9fd8;">modal.com</a></li>
-    <li>Go to <a href="https://modal.com/settings/tokens" target="_blank" style="color:#6a9fd8;">Settings \u2192 Tokens</a></li>
+    <li>Create a free account at <a href="https://modal.com" target="_blank" rel="noopener noreferrer" style="color:#6a9fd8;">modal.com</a></li>
+    <li>Go to <a href="https://modal.com/settings/tokens" target="_blank" rel="noopener noreferrer" style="color:#6a9fd8;">Settings \u2192 Tokens</a></li>
     <li>Create a new token and paste below</li>
   `;
   wrap.appendChild(steps);
@@ -1772,19 +1782,35 @@ function buildPanel() {
       const nBypass = bypassNodes.length;
       const nRemoved = 0;
       if (nOutputs === 0) {
-        el.innerHTML = '<span style="color:#e05050;">No production outputs selected</span>';
+        el.textContent = "";
+        const errSpan = document.createElement("span");
+        errSpan.style.color = "#e05050";
+        errSpan.textContent = "No production outputs selected";
+        el.appendChild(errSpan);
         return;
       }
-      el.innerHTML =
-        '<div style="font-weight:600;margin-bottom:2px;">Production plan</div>' +
-        'Kept: ' + kept + ' nodes<br>' +
-        'Removed: ' + nRemoved + ' nodes<br>' +
-        'Bypassed: ' + nBypass + ' nodes<br>' +
-        'Outputs: ' + nOutputs + '<br>' +
-        'Sampler previews: disabled<br>' +
-        'Direct outputs: ' + nOutputs;
+      el.textContent = "";
+      const titleDiv = document.createElement("div");
+      titleDiv.style.cssText = "font-weight:600;margin-bottom:2px;";
+      titleDiv.textContent = "Production plan";
+      el.appendChild(titleDiv);
+      el.appendChild(document.createTextNode("Kept: " + kept + " nodes"));
+      el.appendChild(document.createElement("br"));
+      el.appendChild(document.createTextNode("Removed: " + nRemoved + " nodes"));
+      el.appendChild(document.createElement("br"));
+      el.appendChild(document.createTextNode("Bypassed: " + nBypass + " nodes"));
+      el.appendChild(document.createElement("br"));
+      el.appendChild(document.createTextNode("Outputs: " + nOutputs));
+      el.appendChild(document.createElement("br"));
+      el.appendChild(document.createTextNode("Sampler previews: disabled"));
+      el.appendChild(document.createElement("br"));
+      el.appendChild(document.createTextNode("Direct outputs: " + nOutputs));
     } catch (e) {
-      el.innerHTML = '<span style="color:#e05050;">Plan error: ' + e.message + '</span>';
+      el.textContent = "";
+      const errSpan = document.createElement("span");
+      errSpan.style.color = "#e05050";
+      errSpan.textContent = "Plan error: " + e.message;
+      el.appendChild(errSpan);
     }
   }
 
@@ -1883,6 +1909,15 @@ function buildPanel() {
   const swapProgress = document.createElement("div");
   swapProgress.style.cssText = "font-size:11px; color:#aaa; margin-top:8px; min-height:32px;";
   workspaceContent.appendChild(swapProgress);
+
+  // Helper: set swapProgress text with color via DOM (avoid innerHTML with dynamic data)
+  function _setSwapProgress(text, color) {
+    swapProgress.textContent = "";
+    const span = document.createElement("span");
+    span.style.color = color;
+    span.textContent = text;
+    swapProgress.appendChild(span);
+  }
 
   // Persistent deploy log container (scroll-safe: textContent updates don't reset scroll)
   const deployLogPre = document.createElement("pre");
@@ -2014,18 +2049,28 @@ function buildPanel() {
         const total = (data.download_total || 0) + (data.download_skipped || 0);
         const pct = data.download_pct_current || 0;
         const msg = data.download_message || "";
-        const bar = `<div style="margin-top:4px;width:100%;height:6px;background:#333;border-radius:3px;overflow:hidden;"><div style="width:${pct}%;height:100%;background:#f5a623;border-radius:3px;transition:width 0.5s;"></div></div>`;
-        swapProgress.innerHTML = `<div><span style="color:#f5a623;">${msg || `Preparing downloads… ${done}/${total}`}</span>${bar}</div>`;
+        const displayMsg = msg || `Preparing downloads… ${done}/${total}`;
+        swapProgress.textContent = "";
+        const textSpan = document.createElement("span");
+        textSpan.style.color = "#f5a623";
+        textSpan.textContent = displayMsg;
+        swapProgress.appendChild(textSpan);
+        const barOuter = document.createElement("div");
+        barOuter.style.cssText = "margin-top:4px;width:100%;height:6px;background:#333;border-radius:3px;overflow:hidden;";
+        const barInner = document.createElement("div");
+        barInner.style.cssText = `width:${pct}%;height:100%;background:#f5a623;border-radius:3px;transition:width 0.5s;`;
+        barOuter.appendChild(barInner);
+        swapProgress.appendChild(barOuter);
       } else if (phase === "syncing_custom_nodes") {
         const syncMsg = data.sync_message || "Syncing custom nodes to Modal…";
-        swapProgress.innerHTML = `<span style="color:#f5a623;">${syncMsg}</span>`;
+        _setSwapProgress(syncMsg, "#f5a623");
         if (data.deploy_log_tail) {
           deployLogPre.textContent = data.deploy_log_tail;
           deployLogPre.style.display = "block";
         }
       } else if (phase === "deploying") {
         const msg = data.deploy_message || "Deploying workspace…";
-        swapProgress.innerHTML = `<span style="color:#f5a623;">${msg}</span>`;
+        _setSwapProgress(msg, "#f5a623");
         if (data.deploy_log_tail) {
           deployLogPre.textContent = data.deploy_log_tail;
           deployLogPre.style.display = "block";
@@ -2033,7 +2078,7 @@ function buildPanel() {
           deployLogPre.style.display = "none";
         }
       } else {
-        swapProgress.innerHTML = `<span style="color:#f5a623;">Phase: ${phase.replace(/_/g, " ")}</span>`;
+        _setSwapProgress(`Phase: ${phase.replace(/_/g, " ")}`, "#f5a623");
       }
       swapPollTimer = setTimeout(pollSwapJob, 1000);
       return;
@@ -2042,7 +2087,7 @@ function buildPanel() {
     if (data.status === "ok") {
       const dl = data.download_summary || `${data.installed_model_count} installed, ${data.skipped_model_count} skipped`;
       const removalNote = data.remove_summary ? ` ${data.remove_summary}.` : "";
-      swapProgress.innerHTML = `<span style="color:#7ed321;">Done — ${data.workspace_label}: ${dl}.${removalNote} Custom nodes synced. Deploy started.</span>`;
+      _setSwapProgress(`Done — ${data.workspace_label}: ${dl}.${removalNote} Custom nodes synced. Deploy started.`, "#7ed321");
       showToast("Workspace swap complete", "success");
       await loadWorkspaces();
       await loadModels();
@@ -2051,13 +2096,13 @@ function buildPanel() {
       return;
     }
     if (data.status === "repair_required") {
-      swapProgress.innerHTML = `<span style="color:#e07070;">Swap blocked: ${data.message || "manifest repair required"}</span>`;
+      _setSwapProgress(`Swap blocked: ${data.message || "manifest repair required"}`, "#e07070");
       showToast("Manifest repair required before swap can continue", "info");
       await openManifestRepairModal(data.issues || []);
       return;
     }
     const errMsg = data.download_message || data.deploy_message || data.sync_message || data.error || data.message || "Workspace swap failed";
-    swapProgress.innerHTML = `<span style="color:#e05050;">${errMsg}</span>`;
+    _setSwapProgress(errMsg, "#e05050");
     showToast(errMsg, "error");
   }
 
@@ -2276,7 +2321,7 @@ function buildPanel() {
 
   swapBtn.onclick = async () => {
     setWorkspaceBusy(true);
-    swapProgress.innerHTML = `<span style="color:#888;">Scanning workspace and manifest…</span>`;
+    _setSwapProgress("Scanning workspace and manifest…", "#888");
     try {
       const scanResp = await api.fetchApi(`${MODAL_PREFIX}/workspaces/swap`, {
         method: "POST",
@@ -2286,19 +2331,19 @@ function buildPanel() {
       const scanData = await scanResp.json();
       if (scanData.status === "busy") {
         setWorkspaceBusy(false);
-        swapProgress.innerHTML = `<span style="color:#888;">${scanData.message || "Deploy already running — try again later."}</span>`;
+        _setSwapProgress(scanData.message || "Deploy already running — try again later.", "#888");
         return;
       }
       if (scanData.status === "error") {
         setWorkspaceBusy(false);
-        swapProgress.innerHTML = `<span style="color:#e05050;">${scanData.message || "Workspace swap failed."}</span>`;
+        _setSwapProgress(scanData.message || "Workspace swap failed.", "#e05050");
         return;
       }
       if (scanData.status === "confirm_required") {
         const ok = await showConfirm("A prompt is still running. Switch workspaces anyway?");
         if (!ok) {
           setWorkspaceBusy(false);
-          swapProgress.innerHTML = `<span style="color:#888;">Swap cancelled.</span>`;
+          _setSwapProgress("Swap cancelled.", "#888");
           return;
         }
         const retry = await api.fetchApi(`${MODAL_PREFIX}/workspaces/swap`, {
@@ -2313,23 +2358,23 @@ function buildPanel() {
         }
         if (retryData.status === "repair_required") {
           setWorkspaceBusy(false);
-          swapProgress.innerHTML = `<span style="color:#e07070;">${retryData.message || "Swap blocked: manifest repair required."}</span>`;
+          _setSwapProgress(retryData.message || "Swap blocked: manifest repair required.", "#e07070");
           await openManifestRepairModal(retryData.issues || []);
           return;
         }
         if (retryData.status === "busy" || retryData.status === "error") {
           setWorkspaceBusy(false);
-          swapProgress.innerHTML = `<span style="color:#e05050;">${retryData.message || "Workspace swap failed."}</span>`;
+          _setSwapProgress(retryData.message || "Workspace swap failed.", "#e05050");
           return;
         }
         currentSwapId = retryData.swap_id;
-        swapProgress.innerHTML = `<span style="color:#888;">Swap started…</span>`;
+        _setSwapProgress("Swap started…", "#888");
         pollSwapJob();
         return;
       }
       if (scanData.status === "repair_required") {
         setWorkspaceBusy(false);
-        swapProgress.innerHTML = `<span style="color:#e07070;">${scanData.message || "Swap blocked: manifest repair required."}</span>`;
+        _setSwapProgress(scanData.message || "Swap blocked: manifest repair required.", "#e07070");
         await openManifestRepairModal(scanData.issues || []);
         return;
       }
@@ -2339,11 +2384,11 @@ function buildPanel() {
       }
       // Fallback: started directly (no review phase)
       currentSwapId = scanData.swap_id;
-      swapProgress.innerHTML = `<span style="color:#f5a623;">Preparing downloads…</span>`;
+      _setSwapProgress("Preparing downloads…", "#f5a623");
       pollSwapJob();
     } catch (e) {
       setWorkspaceBusy(false);
-      swapProgress.innerHTML = `<span style="color:#e05050;">Error: ${e.message}</span>`;
+      _setSwapProgress(`Error: ${e.message}`, "#e05050");
     }
   };
 
@@ -2363,7 +2408,11 @@ function buildPanel() {
 
     const header = document.createElement("div");
     header.style.cssText = "padding:16px 16px 8px; font-weight:600; font-size:13px;";
-    header.innerHTML = `Workspace: <span style="color:#6a9fd8;">${data.workspace_label || "unknown"}</span>`;
+    header.textContent = "Workspace: ";
+    const wsSpan = document.createElement("span");
+    wsSpan.style.color = "#6a9fd8";
+    wsSpan.textContent = data.workspace_label || "unknown";
+    header.appendChild(wsSpan);
     modal.appendChild(header);
 
     const body = document.createElement("div");
@@ -2549,7 +2598,7 @@ function buildPanel() {
       proceedBtn.disabled = true;
       proceedBtn.textContent = "Starting…";
       overlay.remove();
-      swapProgress.innerHTML = `<span style="color:#888;">Starting swap…</span>`;
+      _setSwapProgress("Starting swap…", "#888");
       try {
         const execResp = await api.fetchApi(`${MODAL_PREFIX}/workspaces/swap`, {
           method: "POST",
@@ -2561,7 +2610,7 @@ function buildPanel() {
           const ok = await showConfirm("A prompt is still running. Switch workspaces anyway?");
           if (!ok) {
             setWorkspaceBusy(false);
-            swapProgress.innerHTML = `<span style="color:#888;">Swap cancelled.</span>`;
+            _setSwapProgress("Swap cancelled.", "#888");
             return;
           }
           const retryResp = await api.fetchApi(`${MODAL_PREFIX}/workspaces/swap`, {
@@ -2573,19 +2622,19 @@ function buildPanel() {
         }
         if (execData.status === "started") {
           currentSwapId = execData.swap_id;
-          swapProgress.innerHTML = `<span style="color:#f5a623;">Starting downloads…</span>`;
+          _setSwapProgress("Starting downloads…", "#f5a623");
           pollSwapJob();
         } else if (execData.status === "repair_required") {
           setWorkspaceBusy(false);
-          swapProgress.innerHTML = `<span style="color:#e07070;">${execData.message || "Swap blocked: manifest repair required."}</span>`;
+          _setSwapProgress(execData.message || "Swap blocked: manifest repair required.", "#e07070");
           await openManifestRepairModal(execData.issues || []);
         } else {
           setWorkspaceBusy(false);
-          swapProgress.innerHTML = `<span style="color:#e05050;">${execData.message || "Swap failed to start."}</span>`;
+          _setSwapProgress(execData.message || "Swap failed to start.", "#e05050");
         }
       } catch (e) {
         setWorkspaceBusy(false);
-        swapProgress.innerHTML = `<span style="color:#e05050;">Error: ${e.message}</span>`;
+        _setSwapProgress(`Error: ${e.message}`, "#e05050");
       }
     };
     footer.appendChild(proceedBtn);
@@ -2726,7 +2775,7 @@ function buildPanel() {
       installProceedBtn.disabled = true;
       installProceedBtn.textContent = "Installing…";
       overlay.remove();
-      swapProgress.innerHTML = `<span style="color:#888;">Installing from manifest…</span>`;
+      _setSwapProgress("Installing from manifest…", "#888");
       try {
         const execResp = await api.fetchApi(`${MODAL_PREFIX}/manifest/install`, {
           method: "POST",
@@ -2738,14 +2787,14 @@ function buildPanel() {
           const msg = execData.failure_count
             ? `${execData.success_count} installed, ${execData.failure_count} failed`
             : `${execData.success_count} model(s) installed successfully`;
-          swapProgress.innerHTML = `<span style="color:#7ed321;">Done — ${msg}</span>`;
+          _setSwapProgress(`Done — ${msg}`, "#7ed321");
           showToast(msg, execData.failure_count ? "info" : "success");
           await loadModels();
         } else {
-          swapProgress.innerHTML = `<span style="color:#e05050;">${execData.message || "Install failed."}</span>`;
+          _setSwapProgress(execData.message || "Install failed.", "#e05050");
         }
       } catch (e) {
-        swapProgress.innerHTML = `<span style="color:#e05050;">Error: ${e.message}</span>`;
+        _setSwapProgress(`Error: ${e.message}`, "#e05050");
       }
     };
     footer.appendChild(installProceedBtn);
@@ -3004,16 +3053,44 @@ function buildPanel() {
       const pendingCN = (cn.pending || []).length;
       const totalLocalCN = (cn.local || []).length;
 
-      syncStatusEl.innerHTML = `
-        <div style="margin-bottom:4px;">
-          <strong>Models:</strong> ${syncedModels} synced / ${totalLocalModels} local
-          ${pendingModels > 0 ? `<span style="color:#f5a623;"> (${pendingModels} pending upload)</span>` : '<span style="color:#7ed321;"> \u2713</span>'}
-        </div>
-        <div>
-          <strong>Custom Nodes:</strong> ${syncedCN} synced / ${totalLocalCN} local
-          ${pendingCN > 0 ? `<span style="color:#f5a623;"> (${pendingCN} pending upload)</span>` : '<span style="color:#7ed321;"> \u2713</span>'}
-        </div>
-      `;
+      syncStatusEl.textContent = "";
+
+      const modelsDiv = document.createElement("div");
+      modelsDiv.style.marginBottom = "4px";
+      const modelsStrong = document.createElement("strong");
+      modelsStrong.textContent = "Models: ";
+      modelsDiv.appendChild(modelsStrong);
+      modelsDiv.appendChild(document.createTextNode(`${syncedModels} synced / ${totalLocalModels} local `));
+      if (pendingModels > 0) {
+        const pendingSpan = document.createElement("span");
+        pendingSpan.style.color = "#f5a623";
+        pendingSpan.textContent = ` (${pendingModels} pending upload)`;
+        modelsDiv.appendChild(pendingSpan);
+      } else {
+        const okSpan = document.createElement("span");
+        okSpan.style.color = "#7ed321";
+        okSpan.textContent = " \u2713";
+        modelsDiv.appendChild(okSpan);
+      }
+      syncStatusEl.appendChild(modelsDiv);
+
+      const cnDiv = document.createElement("div");
+      const cnStrong = document.createElement("strong");
+      cnStrong.textContent = "Custom Nodes: ";
+      cnDiv.appendChild(cnStrong);
+      cnDiv.appendChild(document.createTextNode(`${syncedCN} synced / ${totalLocalCN} local `));
+      if (pendingCN > 0) {
+        const pendingSpan = document.createElement("span");
+        pendingSpan.style.color = "#f5a623";
+        pendingSpan.textContent = ` (${pendingCN} pending upload)`;
+        cnDiv.appendChild(pendingSpan);
+      } else {
+        const okSpan = document.createElement("span");
+        okSpan.style.color = "#7ed321";
+        okSpan.textContent = " \u2713";
+        cnDiv.appendChild(okSpan);
+      }
+      syncStatusEl.appendChild(cnDiv);
       syncCollapsible.updateBadge(pendingModels + pendingCN > 0 ? `${pendingModels + pendingCN}` : "\u2713");
       syncCollapsible.refreshHeight();
     } catch (e) {
@@ -3336,7 +3413,7 @@ function buildPanel() {
 
   const hfDesc = document.createElement("div");
   hfDesc.style.cssText = "font-size:11px; color:#888; line-height:1.5; margin-bottom:6px;";
-  hfDesc.innerHTML = `Required only for gated/private models on HuggingFace (e.g., Flux, SDXL Turbo). Get your token at <a href="https://huggingface.co/settings/tokens" target="_blank" style="color:#6a9fd8;">huggingface.co/settings/tokens</a>`;
+  hfDesc.innerHTML = `Required only for gated/private models on HuggingFace (e.g., Flux, SDXL Turbo). Get your token at <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener noreferrer" style="color:#6a9fd8;">huggingface.co/settings/tokens</a>`;
   settingsContent.appendChild(hfDesc);
 
   const hfRow = document.createElement("div");
@@ -3418,7 +3495,7 @@ function buildPanel() {
 
   const civitaiDesc = document.createElement("div");
   civitaiDesc.style.cssText = "font-size:11px; color:#888; line-height:1.5; margin-bottom:6px;";
-  civitaiDesc.innerHTML = `Required for gated/private/purchased models on Civitai. Get your key at <a href="https://civitai.com/user/account" target="_blank" style="color:#6a9fd8;">civitai.com/user/account</a>`;
+  civitaiDesc.innerHTML = `Required for gated/private/purchased models on Civitai. Get your key at <a href="https://civitai.com/user/account" target="_blank" rel="noopener noreferrer" style="color:#6a9fd8;">civitai.com/user/account</a>`;
   settingsContent.appendChild(civitaiDesc);
 
   const civitaiRow = document.createElement("div");
@@ -3763,6 +3840,17 @@ app.registerExtension({
   name: "comfyui.modal.settings",
 
   async setup() {
+    // Idempotent setup: clean up any lingering timers from previous mounts
+    stopDeployLogPoll();
+    if (_deployPollTimer) {
+      clearTimeout(_deployPollTimer);
+      _deployPollTimer = null;
+    }
+    if (_deploySuccessTimer) {
+      clearTimeout(_deploySuccessTimer);
+      _deploySuccessTimer = null;
+    }
+
     // Post-redeploy+restart success banner
     try {
       if (sessionStorage.getItem("_comfymodal_redeploy_restart_done") === "1") {

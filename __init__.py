@@ -108,12 +108,22 @@ WEB_DIRECTORY = "web"
 
 
 def _unique_path(directory: str, filename: str) -> str:
-    path = os.path.join(directory, filename)
-    if not os.path.exists(path):
-        return path
-    stem, ext = os.path.splitext(filename)
-    suffix = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1_000_000) % 1_000_000:06d}"
-    return os.path.join(directory, f"{stem}_{suffix}{ext}")
+    if not filename or not isinstance(filename, str):
+        raise ValueError(f"invalid filename: {filename!r}")
+    if "\x00" in filename:
+        raise ValueError("filename contains null byte")
+    safe_name = Path(filename).name
+    if safe_name != filename or ".." in filename or "/" in filename or "\\" in filename:
+        raise ValueError(f"unsafe remote output filename: {filename!r}")
+    root = Path(directory).resolve()
+    dest = (root / safe_name).resolve()
+    if dest.parent != root:
+        raise ValueError(f"output path escaped root: {filename!r}")
+    if not dest.exists():
+        return str(dest)
+    stem, ext = os.path.splitext(safe_name)
+    suffix = f"{uuid.uuid4().hex[:12]}"
+    return str(root / f"{stem}_{suffix}{ext}")
 
 # ── MIME type to extension map for remote result materialization ──
 _MIME_EXT_MAP = {
@@ -552,23 +562,21 @@ def _ensure_modal():
         return
     except ImportError:
         pass
+    if os.environ.get("COMFYMODAL_ALLOW_RUNTIME_PIP_INSTALL") != "1":
+        _pip_install_error = "modal package not installed. Run: pip install modal"
+        print("[comfyui-modal] ERROR: 'modal' package not found. Run: pip install modal")
+        print("[comfyui-modal] Set COMFYMODAL_ALLOW_RUNTIME_PIP_INSTALL=1 to auto-install (not recommended for production)")
+        return
     print("[comfyui-modal] 'modal' package not found — installing...")
     try:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "modal"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        subprocess.run([sys.executable, "-m", "pip", "install", "modal"], check=True, capture_output=True, text=True)
         print("[comfyui-modal] 'modal' installed successfully.")
     except subprocess.CalledProcessError as e:
         _pip_install_error = e.stderr or str(e)
         print(f"[comfyui-modal] ERROR: Failed to install 'modal' package: {e.stderr}")
-        print("[comfyui-modal] Please install manually: pip install modal")
     except Exception as e:
         _pip_install_error = str(e)
         print(f"[comfyui-modal] ERROR: Unexpected error installing 'modal': {e}")
-        print("[comfyui-modal] Please install manually: pip install modal")
 
 _ensure_modal()
 
@@ -584,6 +592,9 @@ if _RESULT_ROUTE not in ("legacy", "direct"):
     _RESULT_ROUTE = "legacy"
 _COMPLETED_RESULTS: dict[str, dict] = {}
 _COMPLETED_RESULTS_LOCK = threading.Lock()
+_COMPLETED_RESULTS_MAXSIZE = 100
+_COMPLETED_RESULTS_MAX_BYTES = 500 * 1024 * 1024  # 500 MB cap
+_COMPLETED_RESULTS_TTL_S = 600  # 10 minutes
 
 # ── v4 local event trace (per-prompt) ──
 _local_event_trace: EventTrace | None = None
@@ -1365,8 +1376,19 @@ def _read_hf_token() -> str:
         return ""
 
 def _write_hf_token(token: str):
-    with open(_HF_TOKEN_PATH, "w") as f:
-        f.write(token.strip())
+    import tempfile as _tf
+    token = token.strip()
+    parent = os.path.dirname(_HF_TOKEN_PATH)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, tmp = _tf.mkstemp(dir=parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(token)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _HF_TOKEN_PATH)
+    except Exception:
+        os.unlink(tmp)
+        raise
 
 def _read_civitai_token() -> str:
     try:
@@ -1376,8 +1398,19 @@ def _read_civitai_token() -> str:
         return ""
 
 def _write_civitai_token(token: str):
-    with open(_CIVITAI_TOKEN_PATH, "w") as f:
-        f.write(token.strip())
+    import tempfile as _tf
+    token = token.strip()
+    parent = os.path.dirname(_CIVITAI_TOKEN_PATH)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, tmp = _tf.mkstemp(dir=parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(token)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _CIVITAI_TOKEN_PATH)
+    except Exception:
+        os.unlink(tmp)
+        raise
 
 def _is_modal_token_set() -> bool:
     if _active_workspace() is not None:
@@ -1390,16 +1423,44 @@ def _is_modal_token_set() -> bool:
         return False
 
 def _write_modal_toml(token_id: str, token_secret: str):
+    import tempfile
+    if not re.match(r'^ak-[a-zA-Z0-9_\-]+$', token_id):
+        raise ValueError(f"Invalid Modal token ID format: {token_id[:8]}...")
+    if not re.match(r'^as-[a-zA-Z0-9_\-]+$', token_secret):
+        raise ValueError(f"Invalid Modal token secret format: {token_secret[:8]}...")
     content = f'[default]\ntoken_id = "{token_id}"\ntoken_secret = "{token_secret}"\n'
-    os.makedirs(os.path.dirname(_MODAL_TOML_PATH), exist_ok=True)
-    with open(_MODAL_TOML_PATH, "w") as f:
-        f.write(content)
+    parent = os.path.dirname(_MODAL_TOML_PATH)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _MODAL_TOML_PATH)
+    except Exception:
+        os.unlink(tmp)
+        raise
 
 
 _queue: asyncio.Queue = asyncio.Queue()
 _queue_worker_started = False
+_queue_worker_task: asyncio.Task | None = None
 _item_counter = 0
 _counter_lock = asyncio.Lock()
+
+
+def _queue_worker_done(task):
+    global _queue_worker_task, _queue_worker_started
+    _queue_worker_task = None
+    _queue_worker_started = False
+    try:
+        exc = task.exception()
+        if exc:
+            print(f"[comfyui-modal] Queue worker died: {exc}")
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
 
 
 def _send(sid: str, event: str, data: dict):
@@ -1455,6 +1516,7 @@ def _finish_job(item_id: int, prompt_id: str, outputs: dict, success: bool, meta
 
 
 async def _process_queue():
+    global _queue_worker_started, _queue_worker_task
     while True:
         item, item_id = await _queue.get()
         try:
@@ -1467,6 +1529,8 @@ async def _process_queue():
             print("[comfyui-modal] Queue worker survived job exception, continuing")
         finally:
             _queue.task_done()
+    _queue_worker_started = False
+    _queue_worker_task = None
 
 
 def workflow_needs_local_input_files(workflow: dict) -> bool:
@@ -1537,6 +1601,16 @@ def _collect_input_images(workflow: dict) -> dict:
 _ACTIVE_NEXT_PROFILE_TTL_S = int(os.environ.get("COMFYMODAL_ACTIVE_NEXT_PROFILE_TTL_S", "3600"))
 
 _last_written_stable_profile_key: str | None = None
+# Per audit round 7: track when the last successful write happened
+# so we can refresh the remote profile BEFORE its TTL expires.
+# Without this, the same model stack + prompt indefinitely
+# skips remote writes, the remote profile eventually expires,
+# and exact-prefill / persistent-cache silently stop working
+# until the prompt changes.
+_last_written_stable_profile_at: float = 0.0
+# Half-life refresh window: write at least every TTL/2, with a
+# 30s floor so a small TTL still has a sane minimum.
+_ACTIVE_NEXT_REFRESH_MIN_S = 30.0
 
 
 def _normalize_stable_warmup_profile(
@@ -1625,7 +1699,16 @@ def _build_next_warmup_activation(workflow: dict, workflow_hash: str, production
 
 
 async def _execute_job(item: tuple, item_id: int):
+    # Per audit round 7 (post-fix verification): BOTH stable
+    # profile globals must be declared here.  If only
+    # ``_last_written_stable_profile_key`` is declared and the
+    # function later assigns to ``_last_written_stable_profile_at``,
+    # Python's compiler treats the second name as a local for the
+    # ENTIRE function — the read at line ~1880 then raises
+    # ``UnboundLocalError`` on the first request.  This was the
+    # exact runtime crash observed after the audit fix.
     global _last_written_stable_profile_key
+    global _last_written_stable_profile_at
     number, prompt_id, workflow, extra_data, _, _ = item
     execution_workflow = extra_data.get("execution_workflow") or workflow
     sid = extra_data.get("client_id", "")
@@ -1634,6 +1717,15 @@ async def _execute_job(item: tuple, item_id: int):
     trace = Trace(prompt_id=prompt_id, t0=coerce_t0_from_browser(trace_payload) or local_started)
     trace.update(trace_payload)
     trace.mark("client_generate_clicked_or_request_start", trace.get("t0_client_press") or local_started)
+
+    # Per audit round 7: the request workspace was captured at
+    # dispatch time.  Use the same workspace throughout the
+    # request and into the detached persistence thread so the
+    # post-delivery write does not silently target whichever
+    # workspace happens to be active when the worker fires.
+    _request_workspace = extra_data.get("_request_workspace") if isinstance(extra_data, dict) else None
+    if not _request_workspace:
+        _request_workspace = _active_workspace() or {}
 
     task_key = _register_running(item)
 
@@ -1734,11 +1826,69 @@ async def _execute_job(item: tuple, item_id: int):
             _warmup_profile = activation_payload.get("warmup_profile", {})
             _model_stack = activation_payload.get("model_stack", {})
             _stable_key = _compute_stable_warmup_profile_key(_warmup_profile)
-            if _last_written_stable_profile_key == _stable_key:
+            # P2: fold the safe prompt-bundle hash into the dedup key
+            # whenever EITHER exact-prompt prefill OR persistent-clip
+            # cache is enabled.  Both features depend on the bundle
+            # being attached to the activation payload.  If only
+            # COMFYMODAL_PERSISTENT_CLIP_CACHE=1 is set and we did
+            # not extract the bundle here, the restore lookup and
+            # the candidate builder would silently find nothing.
+            _prompt_bundle_hash = ""
+            _exact_or_persistent = (
+                os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "0") == "1"
+                or os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1"
+            )
+            if _exact_or_persistent:
+                try:
+                    from optimizations import extract_safe_prompt_bundle
+                    _bundle_res = extract_safe_prompt_bundle(execution_workflow)
+                    if _bundle_res.get("eligible") and _bundle_res.get("bundle"):
+                        _prompt_bundle_hash = str(
+                            _bundle_res["bundle"].get("bundle_hash", "")
+                        )
+                        activation_payload["prompt_bundle"] = _bundle_res["bundle"]
+                        print(
+                            f"[comfyui-modal.profile] stage=safe_prompt_bundle "
+                            f"prompt_id={prompt_id[:8]} eligible=1 "
+                            f"encodes={len(_bundle_res['bundle'].get('encodes', []))} "
+                            f"bundle_hash={_prompt_bundle_hash[:12]} "
+                            f"reason=exact_or_persistent"
+                        )
+                    else:
+                        print(
+                            f"[comfyui-modal.profile] stage=safe_prompt_bundle "
+                            f"prompt_id={prompt_id[:8]} eligible=0 "
+                            f"reason={_bundle_res.get('reason','?')}"
+                        )
+                except Exception as _bundle_exc:
+                    print(f"[comfyui-modal] safe_prompt_bundle extraction failed: {_bundle_exc}")
+            if _prompt_bundle_hash:
+                _stable_key = hashlib.sha256(
+                    (_stable_key + ":" + _prompt_bundle_hash).encode("utf-8")
+                ).hexdigest()
+            # Per audit round 7: skip the remote write only when
+            # the stable key matches AND the last write is still
+            # comfortably within the remote TTL.  Without the
+            # timestamp check, the local bridge would silently
+            # skip writes after the first request, the remote
+            # profile would eventually expire, and exact-prefill
+            # and persistent-cache would stop working until the
+            # prompt changed.
+            _refresh_after_s = max(
+                _ACTIVE_NEXT_REFRESH_MIN_S,
+                float(_ACTIVE_NEXT_PROFILE_TTL_S) * 0.5,
+            )
+            _can_skip_active_next = (
+                _last_written_stable_profile_key == _stable_key
+                and (time.time() - _last_written_stable_profile_at)
+                    < _refresh_after_s
+            )
+            if _can_skip_active_next:
                 _active_next_status = "unchanged"
                 print(
                     f"[comfyui-modal.profile] stage=active_profile_write prompt_id={prompt_id[:8]} "
-                    f"decision=unchanged profile_key={_stable_key[:12]} remote_call=0"
+                    f"decision=unchanged profile_key={_stable_key[:12]} remote_call=0 "
+                    f"reason=key_match_within_refresh_window"
                 )
             else:
                 _active_next_remote_call = 1
@@ -1748,6 +1898,7 @@ async def _execute_job(item: tuple, item_id: int):
                     _active_next_changed = activation_result.get("changed", True)
                     if _active_next_status not in ("error",):
                         _last_written_stable_profile_key = _stable_key
+                        _last_written_stable_profile_at = time.time()
                     print(
                         f"[comfyui-modal.profile] stage=active_profile_write prompt_id={prompt_id[:8]} "
                         f"decision=changed profile_key={_stable_key[:12]} remote_call=1 "
@@ -1860,6 +2011,7 @@ async def _execute_job(item: tuple, item_id: int):
         _direct_fallback_reason = None
 
         success = True
+        finalized = False
     except asyncio.CancelledError:
         total_ms = round((time.time() - local_started) * 1000, 1)
         print(
@@ -1868,6 +2020,15 @@ async def _execute_job(item: tuple, item_id: int):
         )
         _send(sid, "execution_error", {"message": "cancelled", "prompt_id": prompt_id})
         _finish_job(task_key, prompt_id, outputs, success=False, meta={"error": "cancelled"})
+        if _RESULT_ROUTE == "direct":
+            with _COMPLETED_RESULTS_LOCK:
+                _COMPLETED_RESULTS[prompt_id] = {
+                    "status": "error",
+                    "error": "cancelled",
+                    "completed_at": time.time(),
+                    "direct_route": True,
+                }
+        _clear_request_state(prompt_id)
         raise
     except Exception as e:
         import traceback
@@ -1901,132 +2062,140 @@ async def _execute_job(item: tuple, item_id: int):
             "prompt_summary": prompt_summary,
             "workflow_hash": prompt_hash,
         })
+        if _RESULT_ROUTE == "direct":
+            with _COMPLETED_RESULTS_LOCK:
+                _COMPLETED_RESULTS[prompt_id] = {
+                    "status": "error",
+                    "error": str(e),
+                    "completed_at": time.time(),
+                    "direct_route": True,
+                }
+        _clear_request_state(prompt_id)
         return
 
-    # Update last successful model stack after successful remote result
-    global _last_successful_model_stack
-    _last_successful_model_stack.clear()
-    _last_successful_model_stack.update(extra_data.get("model_stack", {}))
-
     # ── Post-materialization block: guarded so _finish_job always runs ──
-
-    output_dir = os.path.join(_COMFYUI_ROOT, "output")
-    os.makedirs(output_dir, exist_ok=True)
-    trace.mark("t9e_local_materialize_start")
-    materialize_started = time.time()
-    trace.mark("client_result_decode_start", materialize_started)
-    trace.mark("client_file_write_start", materialize_started)
-    trace.mark("client_comfy_notify_start", materialize_started)
-    _mo = extra_data.get("modal_options") if isinstance(extra_data, dict) else None
-    _settings = _load_modal_settings()
-    delivery = _materialize_modal_outputs(
-        result,
-        output_dir=output_dir,
-        prompt_id=prompt_id,
-        client_id=sid,
-        send_event=lambda event, payload: _send(sid, event, payload),
-        auto_save_local=bool((_mo or {}).get("auto_save_local", False)),
-        save_folder=(_mo or {}).get("save_folder") or _settings.get("save_folder", ""),
-        save_metadata_sidecar=bool((_mo or {}).get("save_metadata_sidecar", _settings.get("save_metadata_sidecar", True))),
-        workflow_hash=prompt_hash,
-        workflow_name="",
-        seed=str(prompt_summary.get("seed", "0")),
-        width=prompt_summary.get("width", 0),
-        height=prompt_summary.get("height", 0),
-        comfyui_root=_COMFYUI_ROOT,
-    )
-    outputs.clear()
-    outputs.update(delivery.get("history_outputs", delivery["outputs"]))
-    output_bytes_written = delivery["bytes_written"]
-    output_image_count = delivery["image_count"]
-    output_video_count = delivery["video_count"]
-    materialize_ms = round((time.time() - materialize_started) * 1000, 1)
-    trace.mark("client_result_decode_done")
-    trace.mark("client_file_write_done")
-    trace.mark("client_comfy_notify_done")
-    print(
-        f"[comfyui-modal.profile] stage=output_materialize prompt_id={prompt_id[:8]} "
-        f"duration_ms={materialize_ms} images={output_image_count} videos={output_video_count} bytes={output_bytes_written}"
-    )
-    print(
-        f"[modal-local.materialize-end] prompt_id={prompt_id[:8]} "
-        f"written={output_image_count + output_video_count}"
-    )
-    _local_primary_output = delivery.get("primary_output")
-    if isinstance(result, dict) and _local_primary_output:
-        result["_local_primary_output"] = dict(_local_primary_output)
-        result["primary_output"] = dict(_local_primary_output)
-
-    trace.mark("t10b_local_save_start")
-    _save_results = delivery.get("save_results", [])
-    _save_warnings = delivery.get("save_warnings", [])
-    if _save_warnings:
-        print(f"[comfyui-modal.auto_save] warnings: {'; '.join(_save_warnings)}")
-    if _save_results:
-        _send(sid, "modal_status", {
-            "prompt_id": prompt_id,
-            "message": f"Auto-saved {len(_save_results)} file(s)",
-            "phase": "auto_save",
-            "save_results": _save_results,
-            "save_warnings": _save_warnings,
-        })
-    elif _save_warnings:
-        _send(sid, "modal_status", {
-            "prompt_id": prompt_id,
-            "message": f"Auto-save warning: {'; '.join(_save_warnings)}",
-            "phase": "auto_save",
-            "save_warnings": _save_warnings,
-        })
-
-    trace.mark("t10c_local_save_end")
-    trace.mark("t10_local_materialized")
-    _merged_trace = trace.summary()
-    # Preserve restore timing from the Modal container's trace
-    _remote_full = result.get("trace", {})
-    if isinstance(_remote_full, dict):
-        if "restore" in _remote_full:
-            _merged_trace["restore"] = _remote_full["restore"]
-        # Preserve dependency validation fields from remote trace
-        for _dep_field in (
-            "dependency_validation_ms", "dependency_total_ms",
-            "dependency_validation_result", "dependency_validation_cache_layer",
-            "dependency_validation_cache_hit", "dependency_validation_reason",
-            "dependency_validation_baked_hash", "dependency_validation_current_hash",
-            "dependency_validation_changed_nodes",
-            "dependency_pre_key_check_ms", "dependency_baked_manifest_load_ms",
-            "dependency_source_root_resolve_ms", "dependency_fingerprint_ms",
-            "dependency_cache_key_ms", "dependency_memory_lookup_ms",
-            "dependency_sentinel_lookup_ms", "dependency_full_validation_ms",
-            "dependency_sentinel_write_ms",
-        ):
-            _dep_v = _remote_full.get(_dep_field)
-            if _dep_v is not None:
-                _merged_trace[_dep_field] = _dep_v
-        # Also preserve from derived_ms
-        _remote_derived = _remote_full.get("derived_ms", {})
-        if isinstance(_remote_derived, dict):
-            for _rdk, _rdv in _remote_derived.items():
-                if _rdk not in _merged_trace.get("derived_ms", {}):
-                    _merged_trace.setdefault("derived_ms", {})[_rdk] = _rdv
-    result["trace"] = _merged_trace
-    if os.environ.get("COMFYMODAL_TRACE_DEBUG_LOG"):
-        _dbg_path = os.path.join(_NODE_DIR, "_trace_debug.log")
-        with open(_dbg_path, "a", encoding="utf-8") as _f:
-            _f.write(f"[timing_trace.final] trace_version={_merged_trace.get('trace_version')} "
-                     f"has_derived={'derived_ms' in _merged_trace} "
-                     f"derived_keys={list(_merged_trace.get('derived_ms', {}).keys())} "
-                     f"quality={_merged_trace.get('timing_quality')} "
-                     f"quality_reason={_merged_trace.get('timing_quality_reason')} "
-                     f"missing={_merged_trace.get('missing_timing_fields', [])}\n")
-            _f.write(f"[timing_trace.final] DELTAS keys: {list(_merged_trace.get('deltas_ms', {}).keys())}\n")
-            _f.write(f"[timing_trace.final] STAGES keys: {list(_merged_trace.get('stages', {}).keys())}\n")
-            _f.flush()
-    print(trace.log_line())
-
-    trace.mark("t10d_local_response_sent")
-    trace.mark("client_comfy_notify_start")
-    trace.mark("client_comfy_notify_done")
     try:
+        # Update last successful model stack after successful remote result
+        global _last_successful_model_stack
+        _last_successful_model_stack.clear()
+        _last_successful_model_stack.update(extra_data.get("model_stack", {}))
+
+        output_dir = os.path.join(_COMFYUI_ROOT, "output")
+        os.makedirs(output_dir, exist_ok=True)
+        trace.mark("t9e_local_materialize_start")
+        materialize_started = time.time()
+        trace.mark("client_result_decode_start", materialize_started)
+        trace.mark("client_file_write_start", materialize_started)
+        trace.mark("client_comfy_notify_start", materialize_started)
+        _mo = extra_data.get("modal_options") if isinstance(extra_data, dict) else None
+        _settings = _load_modal_settings()
+        delivery = _materialize_modal_outputs(
+            result,
+            output_dir=output_dir,
+            prompt_id=prompt_id,
+            client_id=sid,
+            send_event=lambda event, payload: _send(sid, event, payload),
+            auto_save_local=bool((_mo or {}).get("auto_save_local", False)),
+            save_folder=(_mo or {}).get("save_folder") or _settings.get("save_folder", ""),
+            save_metadata_sidecar=bool((_mo or {}).get("save_metadata_sidecar", _settings.get("save_metadata_sidecar", True))),
+            workflow_hash=prompt_hash,
+            workflow_name="",
+            seed=str(prompt_summary.get("seed", "0")),
+            width=prompt_summary.get("width", 0),
+            height=prompt_summary.get("height", 0),
+            comfyui_root=_COMFYUI_ROOT,
+        )
+        outputs.clear()
+        outputs.update(delivery.get("history_outputs", delivery["outputs"]))
+        output_bytes_written = delivery["bytes_written"]
+        output_image_count = delivery["image_count"]
+        output_video_count = delivery["video_count"]
+        materialize_ms = round((time.time() - materialize_started) * 1000, 1)
+        trace.mark("client_result_decode_done")
+        trace.mark("client_file_write_done")
+        trace.mark("client_comfy_notify_done")
+        print(
+            f"[comfyui-modal.profile] stage=output_materialize prompt_id={prompt_id[:8]} "
+            f"duration_ms={materialize_ms} images={output_image_count} videos={output_video_count} bytes={output_bytes_written}"
+        )
+        print(
+            f"[modal-local.materialize-end] prompt_id={prompt_id[:8]} "
+            f"written={output_image_count + output_video_count}"
+        )
+        _local_primary_output = delivery.get("primary_output")
+        if isinstance(result, dict) and _local_primary_output:
+            result["_local_primary_output"] = dict(_local_primary_output)
+            result["primary_output"] = dict(_local_primary_output)
+
+        trace.mark("t10b_local_save_start")
+        _save_results = delivery.get("save_results", [])
+        _save_warnings = delivery.get("save_warnings", [])
+        if _save_warnings:
+            print(f"[comfyui-modal.auto_save] warnings: {'; '.join(_save_warnings)}")
+        if _save_results:
+            _send(sid, "modal_status", {
+                "prompt_id": prompt_id,
+                "message": f"Auto-saved {len(_save_results)} file(s)",
+                "phase": "auto_save",
+                "save_results": _save_results,
+                "save_warnings": _save_warnings,
+            })
+        elif _save_warnings:
+            _send(sid, "modal_status", {
+                "prompt_id": prompt_id,
+                "message": f"Auto-save warning: {'; '.join(_save_warnings)}",
+                "phase": "auto_save",
+                "save_warnings": _save_warnings,
+            })
+
+        trace.mark("t10c_local_save_end")
+        trace.mark("t10_local_materialized")
+        _merged_trace = trace.summary()
+        # Preserve restore timing from the Modal container's trace
+        _remote_full = result.get("trace", {})
+        if isinstance(_remote_full, dict):
+            if "restore" in _remote_full:
+                _merged_trace["restore"] = _remote_full["restore"]
+            # Preserve dependency validation fields from remote trace
+            for _dep_field in (
+                "dependency_validation_ms", "dependency_total_ms",
+                "dependency_validation_result", "dependency_validation_cache_layer",
+                "dependency_validation_cache_hit", "dependency_validation_reason",
+                "dependency_validation_baked_hash", "dependency_validation_current_hash",
+                "dependency_validation_changed_nodes",
+                "dependency_pre_key_check_ms", "dependency_baked_manifest_load_ms",
+                "dependency_source_root_resolve_ms", "dependency_fingerprint_ms",
+                "dependency_cache_key_ms", "dependency_memory_lookup_ms",
+                "dependency_sentinel_lookup_ms", "dependency_full_validation_ms",
+                "dependency_sentinel_write_ms",
+            ):
+                _dep_v = _remote_full.get(_dep_field)
+                if _dep_v is not None:
+                    _merged_trace[_dep_field] = _dep_v
+            # Also preserve from derived_ms
+            _remote_derived = _remote_full.get("derived_ms", {})
+            if isinstance(_remote_derived, dict):
+                for _rdk, _rdv in _remote_derived.items():
+                    if _rdk not in _merged_trace.get("derived_ms", {}):
+                        _merged_trace.setdefault("derived_ms", {})[_rdk] = _rdv
+        result["trace"] = _merged_trace
+        if os.environ.get("COMFYMODAL_TRACE_DEBUG_LOG"):
+            _dbg_path = os.path.join(_NODE_DIR, "_trace_debug.log")
+            with open(_dbg_path, "a", encoding="utf-8") as _f:
+                _f.write(f"[timing_trace.final] trace_version={_merged_trace.get('trace_version')} "
+                         f"has_derived={'derived_ms' in _merged_trace} "
+                         f"derived_keys={list(_merged_trace.get('derived_ms', {}).keys())} "
+                         f"quality={_merged_trace.get('timing_quality')} "
+                         f"quality_reason={_merged_trace.get('timing_quality_reason')} "
+                         f"missing={_merged_trace.get('missing_timing_fields', [])}\n")
+                _f.write(f"[timing_trace.final] DELTAS keys: {list(_merged_trace.get('deltas_ms', {}).keys())}\n")
+                _f.write(f"[timing_trace.final] STAGES keys: {list(_merged_trace.get('stages', {}).keys())}\n")
+                _f.flush()
+        print(trace.log_line())
+
+        trace.mark("t10d_local_response_sent")
+        trace.mark("client_comfy_notify_start")
+        trace.mark("client_comfy_notify_done")
         _send(sid, "executing", {"node": None, "display_node": None, "prompt_id": prompt_id})
         _send(sid, "modal_status", {"prompt_id": prompt_id, "message": None, "phase": "done"})
         _send(sid, "execution_success", {"prompt_id": prompt_id, "trace": result.get("trace")})
@@ -2040,36 +2209,145 @@ async def _execute_job(item: tuple, item_id: int):
             "primary_output": result.get("primary_output") or result.get("_local_primary_output"),
         }
         _finish_job(task_key, prompt_id, outputs, success=True, meta=_meta)
+
+        # ── P2: post-delivery prompt-cache persistence ──
+        # Only fires after successful materialization + UI success +
+        # _finish_job. Bounded, exception-safe, never delays the user-
+        # visible completion path.  The payload is collected and
+        # dispatched to a small background task that calls the CPU-only
+        # Modal function.  Failure of persistence never fails the
+        # prompt.
+        try:
+            if os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1":
+                _clip_candidate = result.get("_clip_cache_candidate") if isinstance(result, dict) else None
+                _clip_fingerprint = result.get("_clip_cache_fingerprint") if isinstance(result, dict) else None
+                if _clip_candidate and _clip_fingerprint:
+                    from optimizations import candidate_payload_bytes, PERSISTENT_CLIP_CACHE_MAX_CANDIDATE_MB, _POST_DELIVERY_SINGLETON
+                    _payload_bytes = candidate_payload_bytes(_clip_candidate)
+                    if _payload_bytes <= PERSISTENT_CLIP_CACHE_MAX_CANDIDATE_MB * 1024 * 1024:
+                        # Use the process-wide dispatcher singleton so
+                        # cross-request concurrency and dedup are real.
+                        _dispatcher = _POST_DELIVERY_SINGLETON
+                        _bundle_hash = (
+                            _clip_candidate.get("bundle", {}).get("bundle_hash", "")
+                        )
+                        # Per audit round 7: the dedup identity
+                        # must include the workspace, the
+                        # bundle hash, and the clip fingerprint
+                        # key (which itself encodes model
+                        # generation).  bundle_hash alone is
+                        # insufficient because the same bundle
+                        # under a new model generation must NOT
+                        # be deduplicated against the previous
+                        # generation's successful write.
+                        _workspace_id = ""
+                        if isinstance(_request_workspace, dict):
+                            _workspace_id = str(
+                                _request_workspace.get("id", "")
+                                or _request_workspace.get("workspace_id", "")
+                                or ""
+                            )
+                        _fp_key = ""
+                        if isinstance(_clip_fingerprint, dict):
+                            _fp_key = str(
+                                _clip_fingerprint.get("fingerprint_key", "")
+                                or ""
+                            )
+                        _persist_task_id = ":".join(
+                            x for x in (_workspace_id, _bundle_hash, _fp_key) if x
+                        )
+                        if _bundle_hash and _dispatcher is not None:
+                            def _persist_call():
+                                # Local import keeps the cold path
+                                # clean. The actual call uses
+                                # modal_client; import lazily to avoid
+                                # touching modal at module import time.
+                                try:
+                                    from modal_client import persist_clip_cache_payload
+                                    # Per audit round 7: pass the
+                                    # captured workspace so the
+                                    # persistence RPC targets the
+                                    # SAME workspace as the request,
+                                    # not whichever workspace is
+                                    # active when the detached
+                                    # background thread fires.
+                                    if _request_workspace:
+                                        return persist_clip_cache_payload(
+                                            _clip_candidate,
+                                            workspace=_request_workspace,
+                                            timeout_s=30.0,
+                                        )
+                                    return persist_clip_cache_payload(
+                                        _clip_candidate, timeout_s=30.0
+                                    )
+                                except Exception as _persist_exc:
+                                    print(
+                                        f"[comfyui-modal.post_delivery] persist failed: {_persist_exc!r}"
+                                    )
+                                    return {"status": "error", "error": str(_persist_exc)}
+                            _dispatcher.submit(
+                                task_id=_persist_task_id or _bundle_hash,
+                                fn=_persist_call,
+                                timeout_s=30.0,
+                            )
+                            print(
+                                f"[comfyui-modal.post_delivery] scheduled prompt_id={prompt_id[:8]} "
+                                f"workspace_id={_workspace_id[:12] or '-'} "
+                                f"bundle_hash={_bundle_hash[:12]} "
+                                f"fingerprint_key={_fp_key[:12] or '-'} "
+                                f"bytes={_payload_bytes}"
+                            )
+                    else:
+                        print(
+                            f"[comfyui-modal.post_delivery] skipped_over_limit "
+                            f"prompt_id={prompt_id[:8]} bytes={_payload_bytes} "
+                            f"limit_mb={PERSISTENT_CLIP_CACHE_MAX_CANDIDATE_MB}"
+                        )
+        except Exception as _post_persist_exc:
+            # Never fail the request due to persistence.
+            print(f"[comfyui-modal.post_delivery] dispatcher error: {_post_persist_exc!r}")
+
+        # ── Direct route: store completed result for non-polling retrieval ──
+        if _result_route_mode == "direct" and isinstance(result, dict):
+            with _COMPLETED_RESULTS_LOCK:
+                # Evict oldest if at capacity
+                while len(_COMPLETED_RESULTS) >= _COMPLETED_RESULTS_MAXSIZE:
+                    oldest = min(_COMPLETED_RESULTS.keys(), key=lambda k: _COMPLETED_RESULTS[k].get("completed_at", 0))
+                    del _COMPLETED_RESULTS[oldest]
+                _COMPLETED_RESULTS[prompt_id] = {
+                    "result": result,
+                    "trace": result.get("trace", {}),
+                    "outputs": outputs,
+                    "primary_output": result.get("primary_output") or result.get("_local_primary_output"),
+                    "materialize_ms": materialize_ms,
+                    "completed_at": time.time(),
+                    "direct_route": True,
+                }
+
         finalized = True
-    except Exception:
+
+        total_ms = round((time.time() - local_started) * 1000, 1)
+        print(
+            f"[comfyui-modal.profile] stage=local_total prompt_id={prompt_id[:8]} "
+            f"duration_ms={total_ms} images={output_image_count} videos={output_video_count} bytes={output_bytes_written}"
+        )
+    except Exception as _post_err:
         import traceback
         traceback.print_exc()
+        print(f"[comfyui-modal] Post-result processing failed: {_post_err}")
+        _send(sid, "execution_error", {"message": str(_post_err), "prompt_id": prompt_id})
+    finally:
         if not finalized and task_key != 0:
             try:
                 _finish_job(task_key, prompt_id, outputs, success=False,
-                          meta={"error": "completion notification exception"})
+                            meta={"error": "post-result processing exception",
+                                  "details": str(_post_err) if '_post_err' in dir() else ""})
             except Exception as _fe:
                 print(f"[comfyui-modal] _finish_job failed during error recovery: {_fe}")
-        raise
-
-    # ── Direct route: store completed result for non-polling retrieval ──
-    if _result_route_mode == "direct" and isinstance(result, dict):
-        with _COMPLETED_RESULTS_LOCK:
-            _COMPLETED_RESULTS[prompt_id] = {
-                "result": result,
-                "trace": result.get("trace", {}),
-                "outputs": outputs,
-                "primary_output": result.get("primary_output") or result.get("_local_primary_output"),
-                "materialize_ms": materialize_ms,
-                "completed_at": time.time(),
-                "direct_route": True,
-            }
-
-    total_ms = round((time.time() - local_started) * 1000, 1)
-    print(
-        f"[comfyui-modal.profile] stage=local_total prompt_id={prompt_id[:8]} "
-        f"duration_ms={total_ms} images={output_image_count} videos={output_video_count} bytes={output_bytes_written}"
-    )
+        try:
+            _clear_request_state(prompt_id)
+        except Exception:
+            pass
 
 
 def _build_custom_nodes_archive(cn_root: str) -> bytes:
@@ -2360,8 +2638,17 @@ async def _scan_swap_plan(workspace: dict) -> dict:
     try:
         remote = await get_sync_status(workspace=workspace)
         remote_models = remote.get("models", [])
-    except Exception:
-        remote_models = []
+    except Exception as e:
+        return {
+            "manifest_issues": issues,
+            "blocking_issues": blocking + [{"kind": "remote_unavailable", "detail": str(e)}],
+            "already_present": [],
+            "to_install": [],
+            "unresolved": [],
+            "to_remove": [],
+            "remote_status": "unavailable",
+            "remote_error": str(e),
+        }
     plan = _model_manifest.build_workspace_swap_plan(manifest, remote_models)
     return {
         "manifest_issues": issues,
@@ -2370,6 +2657,7 @@ async def _scan_swap_plan(workspace: dict) -> dict:
         "to_install": plan.get("to_install", []),
         "unresolved": plan.get("unresolved", []),
         "to_remove": plan.get("to_remove", []),
+        "remote_status": "available",
     }
 
 
@@ -2571,7 +2859,7 @@ if _server:
 
     @_server.routes.post("/comfymodal/prompt")
     async def modal_prompt(request: web.Request) -> web.Response:
-        global _queue_worker_started, _item_counter
+        global _queue_worker_started, _queue_worker_task, _item_counter
 
         # ── v4 local event trace ──
         local_et = _init_local_event_trace()
@@ -2581,6 +2869,9 @@ if _server:
 
         # ── Phase: body read + JSON parse ──
         local_et.mark(T1G_BODY_READ_START, phase=PHASE_LOCAL_BRIDGE)
+        content_length = request.content_length
+        if content_length is not None and content_length > 50 * 1024 * 1024:  # 50 MB max
+            return web.json_response({"status": "error", "error": "Request body too large"}, status=413)
         try:
             body = await asyncio.wait_for(request.json(), timeout=_BODY_READ_TIMEOUT_S)
         except asyncio.TimeoutError:
@@ -2593,10 +2884,10 @@ if _server:
         _json_parse_done_ts = time.time()
         body_read_ms = round((_body_read_done_ts - _route_entry_ts) * 1000, 3)
         if body_read_ms > _JSON_PARSE_WARN_MS:
-            print(f"[comfyui-modal] WARN slow body read: {body_read_ms}ms content_length={request.content_length if hasattr(request, 'content_length') else '?'}")
+            print(f"[comfyui-modal] WARN slow body read: {body_read_ms}ms content_length={content_length or '?'}")
         if body_read_ms > _JSON_PARSE_FAIL_S * 1000:
             return web.json_response({"status": "error", "error": f"JSON read/parse took {body_read_ms}ms, exceeding limit"}, status=413)
-        body_bytes = len(json.dumps(body).encode('utf-8'))
+        body_bytes = content_length if content_length else len(json.dumps(body).encode('utf-8'))
         if body_bytes > 10 * 1024 * 1024:
             print(f"[comfyui-modal] WARN large body: {body_bytes} bytes")
         local_et.mark(T1J_JSON_PARSE_END, phase=PHASE_LOCAL_BRIDGE)
@@ -2605,7 +2896,17 @@ if _server:
         workflow = body.get("prompt", body)
         client_id = body.get("client_id", str(uuid.uuid4()))
         prompt_id = str(uuid.uuid4())
-        request_state = _make_local_request_state(request, body, prompt_id)
+        _make_local_request_state(request, body, prompt_id)  # side effects only: registers active request, increments seq
+        # Per audit round 7: capture the request workspace once at
+        # dispatch so the detached background persistence thread
+        # does not resolve whichever workspace happens to be
+        # active when it actually executes.  A user could switch
+        # workspaces between image completion and background
+        # thread execution; we must not let that write workspace
+        # A's payload into workspace B's prompt-cache Volume.
+        _request_workspace = _active_workspace()
+        if _request_workspace is None:
+            _request_workspace = {}
         # Prefer request-level trace (body["trace"]["t0_client_press"]) over top-level
         request_trace = body.get("trace", {})
         browser_t0 = coerce_t0_from_browser(request_trace) or coerce_t0_from_browser(body)
@@ -2705,6 +3006,8 @@ if _server:
         local_et.mark(T2_LOCAL_MODAL_SUBMIT_START, phase=PHASE_LOCAL_BRIDGE)
 
         _lock_trace = await _timed_async_lock_acquire(_counter_lock, "counter_lock", prompt_id)
+        if not _lock_trace.get("acquired"):
+            raise web.HTTPTooManyRequests(text=json.dumps({"status": "error", "error": "server busy, try again"}))
         try:
             _item_counter += 1
             item_id = _item_counter
@@ -2727,6 +3030,7 @@ if _server:
             # ── Create prompt acknowledgment event ──
             ack_ready = asyncio.Event()
 
+            _queue_execution_workflow = copy.deepcopy(execution_workflow)
             extra_data = {
                 "client_id": client_id,
                 "create_time": int(time.time() * 1000),
@@ -2740,11 +3044,16 @@ if _server:
                 "modal_options": modal_options,
                 "scheduler_test": scheduler_test,
                 "result_route": _result_route_mode,
-                "execution_workflow": copy.deepcopy(execution_workflow),
+                "execution_workflow": _queue_execution_workflow,
                 "production_report": production_report,
                 "_modal_prompt_ack_ready": ack_ready,
+                # Carry the request workspace into the queue
+                # worker so the detached persistence thread
+                # can target the same workspace without
+                # re-resolving the active one (which may
+                # have changed in the interim).
+                "_request_workspace": _request_workspace,
             }
-            _queue_execution_workflow = copy.deepcopy(execution_workflow)
             item = (_item_counter, prompt_id, _queue_execution_workflow, extra_data, list(_queue_execution_workflow.keys()), {})
             print(f"[predispatch] prompt_bytes={body_bytes}")
         finally:
@@ -2760,9 +3069,10 @@ if _server:
 
         await _queue.put((item, item_id))
 
-        if not _queue_worker_started:
+        if _queue_worker_task is None or _queue_worker_task.done():
+            _queue_worker_task = asyncio.create_task(_process_queue())
+            _queue_worker_task.add_done_callback(_queue_worker_done)
             _queue_worker_started = True
-            asyncio.create_task(_process_queue())
 
         # ── Signal acknowledgment: prompt is enqueued and response is ready ──
         asyncio.get_running_loop().call_soon(ack_ready.set)
@@ -2779,11 +3089,10 @@ if _server:
         _detect_local_predispatch_stall(local_ts, prompt_id, degradation_flags)
 
         local_et.mark(T2D_LOCAL_PROMPT_ACK_RETURNED, phase=PHASE_LOCAL_BRIDGE)
-        _clear_request_state(prompt_id)
 
         return web.json_response({
             "prompt_id": prompt_id,
-            "number": _item_counter,
+            "number": item_id,
             "node_errors": {},
         })
 
@@ -3263,16 +3572,32 @@ if _server:
         folder = (body.get("path") or body.get("folder") or "").strip()
         if not folder:
             return web.json_response({"status": "error", "message": "no path provided"}, status=400)
-        # Resolve relative paths against ComfyUI root
+
+        _ALLOWED_ROOTS = [
+            os.path.join(_COMFYUI_ROOT, "output"),
+            os.path.join(_COMFYUI_ROOT, "input"),
+        ]
         if not os.path.isabs(folder):
             folder = os.path.join(_COMFYUI_ROOT, folder)
-        folder = os.path.normpath(folder)
+        folder = os.path.normpath(os.path.realpath(folder))
+
+        allowed = False
+        for root in _ALLOWED_ROOTS:
+            try:
+                if os.path.commonpath([os.path.normpath(os.path.realpath(root)), folder]) == os.path.normpath(os.path.realpath(root)):
+                    allowed = True
+                    break
+            except ValueError:
+                pass
+        if not allowed:
+            return web.json_response({"status": "error", "message": "path not in allowed roots"}, status=403)
+
         if not os.path.isdir(folder):
-            os.makedirs(folder, exist_ok=True)
+            return web.json_response({"status": "error", "message": "directory does not exist"}, status=404)
         try:
             _sys_name = platform.system()
             if _sys_name == "Windows":
-                _sp.Popen(["explorer", folder], shell=True)
+                _sp.Popen(["explorer", folder])  # Remove shell=True
             elif _sys_name == "Darwin":
                 _sp.Popen(["open", folder])
             else:
@@ -3314,9 +3639,18 @@ if _server:
         if not prompt_id:
             return web.json_response({"status": "error", "message": "prompt_id required"}, status=400)
         with _COMPLETED_RESULTS_LOCK:
+            # TTL eviction
+            now_t = time.time()
+            expired = [k for k, v in _COMPLETED_RESULTS.items()
+                       if now_t - v.get("completed_at", 0) > _COMPLETED_RESULTS_TTL_S]
+            for k in expired:
+                del _COMPLETED_RESULTS[k]
             entry = _COMPLETED_RESULTS.get(prompt_id)
             if entry is None:
                 return web.json_response({"status": "pending", "message": "result not yet available"}, status=404)
+            if entry.get("status") == "error":
+                payload = dict(entry)
+                return web.json_response({"status": "error", "prompt_id": prompt_id, **payload})
             payload = dict(entry)
         return web.json_response({"status": "ok", "prompt_id": prompt_id, **payload})
 

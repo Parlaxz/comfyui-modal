@@ -499,7 +499,11 @@ async function refreshProfileList() {
       listEl.appendChild(card);
     }
   } catch (e) {
-    listEl.innerHTML = '<div style="color: #e05050; font-size: 12px;">Error loading profiles: ' + e.message + "</div>";
+    listEl.textContent = "";
+    const errDiv = document.createElement("div");
+    errDiv.style.cssText = "color: #e05050; font-size: 12px;";
+    errDiv.textContent = "Error loading profiles: " + e.message;
+    listEl.appendChild(errDiv);
   }
 }
 
@@ -724,7 +728,11 @@ async function openMappingAssistant(profileId, panelEl, sectionEl) {
     panelEl.appendChild(closeMappingBtn);
 
   } catch (e) {
-    panelEl.innerHTML = '<div style="color: #e05050; font-size: 12px;">Error: ' + e.message + "</div>";
+    panelEl.textContent = "";
+    const errDiv = document.createElement("div");
+    errDiv.style.cssText = "color: #e05050; font-size: 12px;";
+    errDiv.textContent = "Error: " + e.message;
+    panelEl.appendChild(errDiv);
   }
 }
 
@@ -1107,7 +1115,11 @@ function buildRunnerTab() {
         profileCheckboxList.appendChild(card);
       }
     } catch (e) {
-      profileCheckboxList.innerHTML = '<div style="color: #e05050; font-size: 12px;">Error: ' + e.message + "</div>";
+      profileCheckboxList.textContent = "";
+      const errDiv = document.createElement("div");
+      errDiv.style.cssText = "color: #e05050; font-size: 12px;";
+      errDiv.textContent = "Error: " + e.message;
+      profileCheckboxList.appendChild(errDiv);
     }
   }
 
@@ -1242,9 +1254,13 @@ function buildGallery(container, comparisonData) {
   // Summary
   const summary = document.createElement("div");
   summary.style.cssText = "font-size: 11px; color: #888; line-height: 1.5; background: #1e1e2e; border-radius: 6px; padding: 8px;";
-  summary.innerHTML = "Seed: " + comparisonData.seed + " | Resolution: " + (comparisonData.width || "?") + "\u00D7" + (comparisonData.height || "?");
+  summary.textContent = "Seed: " + comparisonData.seed + " | Resolution: " + (comparisonData.width || "?") + "\u00D7" + (comparisonData.height || "?");
   if (comparisonData.comparison_id) {
-    summary.innerHTML += '<br><span style="font-size: 10px; color: #666;">ID: ' + comparisonData.comparison_id + "</span>";
+    summary.appendChild(document.createElement("br"));
+    const idSpan = document.createElement("span");
+    idSpan.style.cssText = "font-size: 10px; color: #666;";
+    idSpan.textContent = "ID: " + comparisonData.comparison_id;
+    summary.appendChild(idSpan);
   }
   scrollContent.appendChild(summary);
 
@@ -1346,7 +1362,16 @@ function buildGallery(container, comparisonData) {
     for (const err of errors) {
       const errCard = document.createElement("div");
       errCard.style.cssText = "background: #2a1a1a; border: 1px solid #3d1010; border-radius: 4px; padding: 6px; font-size: 11px;";
-      errCard.innerHTML = '<strong style="color: #e05050;">' + (err.profile_name || err.profile_id || "Unknown") + ':</strong> <span style="color: #aaa;">' + (err.error || "Unknown error") + "</span>";
+      errCard.textContent = "";
+      const nameStrong = document.createElement("strong");
+      nameStrong.style.color = "#e05050";
+      nameStrong.textContent = (err.profile_name || err.profile_id || "Unknown") + ": ";
+      errCard.appendChild(nameStrong);
+      errCard.appendChild(document.createTextNode(" "));
+      const errMsgSpan = document.createElement("span");
+      errMsgSpan.style.color = "#aaa";
+      errMsgSpan.textContent = err.error || "Unknown error";
+      errCard.appendChild(errMsgSpan);
       scrollContent.appendChild(errCard);
     }
   }
@@ -1395,12 +1420,16 @@ async function _resolveProfileNode(profileId, classType, title) {
   }
 }
 
+let _originalGetNodeMenuOptions = null;
+
 function _initContextMenu() {
   if (!app?.canvas?.getNodeMenuOptions) return;
+  // Guard: do not double-wrap
+  if (_originalGetNodeMenuOptions) return;
 
-  var orig = app.canvas.getNodeMenuOptions.bind(app.canvas);
+  _originalGetNodeMenuOptions = app.canvas.getNodeMenuOptions.bind(app.canvas);
   app.canvas.getNodeMenuOptions = function (node) {
-    var options = orig(node);
+    var options = _originalGetNodeMenuOptions(node);
 
     var slotLabels = {
       prompt: "Prompt",
@@ -1550,7 +1579,11 @@ app.registerExtension({
             el.appendChild(buildProfilesTab());
           } catch (e) {
             console.error("[comfyui-modal] Comparison Profiles tab render error:", e);
-            el.innerHTML = '<div style="color:#e05050;padding:20px;font-size:13px;">Error loading Comparison Profiles: ' + e.message + '</div>';
+            el.textContent = "";
+            const errDiv = document.createElement("div");
+            errDiv.style.cssText = "color:#e05050;padding:20px;font-size:13px;";
+            errDiv.textContent = "Error loading Comparison Profiles: " + e.message;
+            el.appendChild(errDiv);
           }
         },
       });
@@ -1569,7 +1602,11 @@ app.registerExtension({
             el.appendChild(buildRunnerTab());
           } catch (e) {
             console.error("[comfyui-modal] Comparison Runner tab render error:", e);
-            el.innerHTML = '<div style="color:#e05050;padding:20px;font-size:13px;">Error loading Comparison Runner: ' + e.message + '</div>';
+            el.textContent = "";
+            const errDiv = document.createElement("div");
+            errDiv.style.cssText = "color:#e05050;padding:20px;font-size:13px;";
+            errDiv.textContent = "Error loading Comparison Runner: " + e.message;
+            el.appendChild(errDiv);
           }
         },
       });

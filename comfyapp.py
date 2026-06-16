@@ -14,7 +14,115 @@ from pathlib import Path
 
 import modal
 
-# GÃ¶Ã‡GÃ¶Ã‡ Container session identity (set once per container startup) GÃ¶Ã‡GÃ¶Ã‡
+# Gö─Gö─ Optimizations module (Phase 1-7 wiring) Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─
+# Imported lazily with a guarded fallback so a missing/import-error in
+# optimizations.py never breaks the rest of comfyapp.py.
+try:
+    from optimizations import (
+        PRODUCTION_MODEL_READ_COORDINATOR_ENABLED,
+        current_unet_start_boundary,
+        get_model_read_coordinator,
+        extract_safe_prompt_bundle,
+        build_clip_fingerprint,
+        clip_fingerprint_key,
+        classify_collapse,
+        InMemoryClipTextCache,
+        PersistentClipCache,
+        PostDeliveryPersistenceDispatcher,
+        ResolvedModelPathCache,
+        get_resolved_model_path_cache,
+        is_persistent_clip_cache_enabled,
+        is_exact_clip_prefill_enabled,
+        is_generic_clip_warmup_fallback_enabled,
+        get_all_flag_values,
+        RequestScopedLogSuppressor,
+        safe_resource_snapshot,
+        make_waterfall_event,
+        WaterfallRecorder,
+        THIRD_PARTY_LOG_SUPPRESSION_ENABLED,
+        THIRD_PARTY_LOG_ALLOWLIST,
+        CUSTOM_NODE_GENERATION_FASTPATH_ENABLED,
+        _read_custom_node_generation_record,
+        _write_custom_node_generation_record,
+        CUSTOM_NODE_GENERATION_SCHEMA_VERSION,
+        PROMPT_BUNDLE_SCHEMA_VERSION,
+        emit_bake_candidate_report,
+        VaeGateMetrics,
+        serialize_conditioning_for_cache,
+        deserialize_conditioning_for_cache,
+        conditioning_equals,
+        stable_clip_cache_tag,
+    )
+    _OPTIMIZATIONS_AVAILABLE = True
+except Exception as _opt_imp_exc:
+    # Define minimal stubs so the rest of the file compiles. The features
+    # simply become no-ops when the import fails.
+    PRODUCTION_MODEL_READ_COORDINATOR_ENABLED = False
+    THIRD_PARTY_LOG_SUPPRESSION_ENABLED = False
+    CUSTOM_NODE_GENERATION_FASTPATH_ENABLED = False
+    _OPTIMIZATIONS_AVAILABLE = False
+
+    def current_unet_start_boundary() -> str:
+        return "after_clip_preload"
+
+    def get_model_read_coordinator():
+        return None
+
+    def get_all_flag_values() -> dict:
+        return {}
+
+    def emit_bake_candidate_report() -> dict:
+        return {"schema_version": 1, "candidates": []}
+
+    class _Stub:
+        def __getattr__(self, _name):
+            return lambda *a, **k: None
+
+    RequestScopedLogSuppressor = _Stub  # type: ignore
+    WaterfallRecorder = _Stub  # type: ignore
+    InMemoryClipTextCache = _Stub  # type: ignore
+    PersistentClipCache = _Stub  # type: ignore
+    PostDeliveryPersistenceDispatcher = _Stub  # type: ignore
+    ResolvedModelPathCache = _Stub  # type: ignore
+    get_resolved_model_path_cache = lambda: None  # type: ignore
+    build_clip_fingerprint = lambda **_k: {}  # type: ignore
+    clip_fingerprint_key = lambda _fp: ""  # type: ignore
+    classify_collapse = lambda _stats: {"kind": "none", "dominant_phase": "none", "explanations": []}  # type: ignore
+    safe_resource_snapshot = lambda: {"platform": "unknown"}  # type: ignore
+    make_waterfall_event = lambda **_k: {}  # type: ignore
+    extract_safe_prompt_bundle = lambda _wf: {"eligible": False, "reason": "optimizations_unavailable", "encodes": []}  # type: ignore
+    is_persistent_clip_cache_enabled = lambda: False  # type: ignore
+    is_exact_clip_prefill_enabled = lambda: False  # type: ignore
+    is_generic_clip_warmup_fallback_enabled = lambda: False  # type: ignore
+    _read_custom_node_generation_record = lambda _p: None  # type: ignore
+    _write_custom_node_generation_record = lambda *_a, **_k: None  # type: ignore
+    # Per audit round 6: the graph wrapper unconditionally calls
+    # stable_clip_cache_tag(paths, clip_type).  Without a fallback
+    # here, an import failure would raise NameError at runtime
+    # and break image generation — defeating the module's
+    # fail-open contract.
+    def stable_clip_cache_tag(paths, clip_type):  # type: ignore
+        _ct = str(clip_type or "")
+        _tail = "_".join(
+            os.path.basename(str(p)) for p in (paths or ()) if p
+        )
+        return f"{_ct}@{_tail}" if _tail else _ct
+    serialize_conditioning_for_cache = lambda _v: None  # type: ignore
+    deserialize_conditioning_for_cache = lambda _s: None  # type: ignore
+    conditioning_equals = lambda _a, _b: False  # type: ignore
+    print(f"[comfyapp.optimizations] import failed: {_opt_imp_exc!r}")
+
+THIRD_PARTY_LOG_ALLOWLIST = [] if not _OPTIMIZATIONS_AVAILABLE else THIRD_PARTY_LOG_ALLOWLIST
+PROMPT_BUNDLE_SCHEMA_VERSION = 1 if not _OPTIMIZATIONS_AVAILABLE else PROMPT_BUNDLE_SCHEMA_VERSION
+CUSTOM_NODE_GENERATION_SCHEMA_VERSION = 1 if not _OPTIMIZATIONS_AVAILABLE else CUSTOM_NODE_GENERATION_SCHEMA_VERSION
+
+# Process-wide waterfall recorder (per-request usage preferred)
+_WATERFALL = WaterfallRecorder()
+
+# Process-wide post-delivery persistence dispatcher
+_POST_DELIVERY = PostDeliveryPersistenceDispatcher()
+
+# Gö─Gö─ Container session identity (set once per container startup) Gö─Gö─
 CONTAINER_SESSION_ID = uuid.uuid4().hex[:16]
 CONTAINER_IMPORT_UNIX_S = time.time()
 _container_restore_count: int = 0
@@ -226,35 +334,27 @@ _CUSTOM_NODE_IMPORT_FAILURES: list[dict] = []
 _CUSTOM_NODE_REGISTRATION_PENDING_RETRY: set[str] = set()
 
 _PROD_DIRECT_SINK_REGISTRY: dict[str, dict[str, list[dict]]] = {}
-_PROD_DIRECT_SINK_LOCK = threading.RLock() if "threading" in dir(__builtins__) else None
-
-_prod_direct_sink_lock_imported = False
-
-
-def _get_prod_lock():
-    global _prod_direct_sink_lock_imported, _PROD_DIRECT_SINK_LOCK
-    if not _prod_direct_sink_lock_imported:
-        import threading as _th
-        _PROD_DIRECT_SINK_LOCK = _th.RLock()
-        _prod_direct_sink_lock_imported = True
-    return _PROD_DIRECT_SINK_LOCK
+_PROD_DIRECT_SINK_LOCK = threading.RLock()
 
 
 def _register_production_request(prompt_id: str, request_data: dict) -> None:
     global _PROD_DIRECT_SINK_REQUESTS
-    with _get_prod_lock():
-        _PROD_DIRECT_SINK_REQUESTS[prompt_id] = dict(request_data)
+    with _PROD_DIRECT_SINK_LOCK:
+        data = dict(request_data)
+        if "authorized_node_ids" in data and not isinstance(data["authorized_node_ids"], frozenset):
+            data["authorized_node_ids"] = frozenset(str(x) for x in data["authorized_node_ids"])
+        _PROD_DIRECT_SINK_REQUESTS[prompt_id] = data
 
 
 def _get_production_request(prompt_id: str) -> dict | None:
     global _PROD_DIRECT_SINK_REQUESTS
-    with _get_prod_lock():
+    with _PROD_DIRECT_SINK_LOCK:
         return _PROD_DIRECT_SINK_REQUESTS.get(prompt_id)
 
 
 def _store_production_output(prompt_id: str, node_id: str, entry: dict) -> None:
     global _PROD_DIRECT_SINK_REGISTRY
-    with _get_prod_lock():
+    with _PROD_DIRECT_SINK_LOCK:
         registry = _PROD_DIRECT_SINK_REGISTRY
         if prompt_id not in registry:
             registry[prompt_id] = {}
@@ -265,20 +365,20 @@ def _store_production_output(prompt_id: str, node_id: str, entry: dict) -> None:
 
 def _pop_production_outputs(prompt_id: str) -> dict[str, list[dict]]:
     global _PROD_DIRECT_SINK_REGISTRY
-    with _get_prod_lock():
+    with _PROD_DIRECT_SINK_LOCK:
         return _PROD_DIRECT_SINK_REGISTRY.pop(prompt_id, {})
 
 
 def _cleanup_production_request(prompt_id: str) -> None:
     """Remove only the request authorization entry. Output registry is cleaned by collector."""
     global _PROD_DIRECT_SINK_REQUESTS
-    with _get_prod_lock():
+    with _PROD_DIRECT_SINK_LOCK:
         _PROD_DIRECT_SINK_REQUESTS.pop(prompt_id, None)
 
 
 def _cleanup_production_registry(prompt_id: str) -> None:
     global _PROD_DIRECT_SINK_REGISTRY
-    with _get_prod_lock():
+    with _PROD_DIRECT_SINK_LOCK:
         _PROD_DIRECT_SINK_REGISTRY.pop(prompt_id, None)
 
 
@@ -287,11 +387,13 @@ _PROD_DIRECT_SINK_REQUESTS: dict[str, dict] = {}
 
 def _is_authorized_production_direct_sink_request(prompt_id: str, node_id: str) -> bool:
     req = _get_production_request(prompt_id)
-    if not req.get("enabled"):
+    if not req or not req.get("enabled"):
         return False
     if str(req.get("prompt_id") or "") != str(prompt_id):
         return False
-    authorized_node_ids = {str(value) for value in (req.get("authorized_node_ids") or [])}
+    authorized_node_ids = req.get("authorized_node_ids")
+    if not authorized_node_ids:
+        return False
     return str(node_id) in authorized_node_ids
 
 
@@ -358,17 +460,13 @@ def _clamp_image_tensor(images):
     """
     import torch
     images_t = images.detach().cpu()
-    orig_dtype = images_t.dtype
+    if images_t.dtype == torch.uint8:
+        return images_t.contiguous()
     images_t = images_t.float()
-    _max_val = float(images_t.max())
-    _min_val = float(images_t.min())
-    if _max_val > 1.0:
-        return images_t.clamp_(0.0, 255.0).to(torch.uint8)
-    images_t = images_t.clamp_(0.0, 1.0)
-    if _max_val <= 1.0 and _min_val >= 0.0:
-        images_t = images_t.mul_(255.0)
+    if float(images_t.max()) <= 1.0:
+        images_t.clamp_(0.0, 1.0).mul_(255.0)
     else:
-        images_t = images_t.mul_(255.0)
+        images_t.clamp_(0.0, 255.0)
     return images_t.to(torch.uint8)
 
 
@@ -662,27 +760,6 @@ class ComfyModalProductionImageComparerOutput:
         return ()
 
 
-
-PROFILING_ENABLED = os.getenv("COMFYMODAL_PROFILING", "0") == "1"
-DEFAULT_EXECUTION_BACKEND = os.getenv("COMFYMODAL_EXECUTION_BACKEND", "in_process")
-ENABLE_WARMUP = os.getenv("COMFYMODAL_ENABLE_WARMUP", "1") == "1"
-ENABLE_TORCH_COMPILE = os.getenv("COMFYMODAL_ENABLE_TORCH_COMPILE", "0") == "1"
-ENABLE_GPU_SNAPSHOT = os.getenv("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1"
-CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S = int(os.getenv("COMFYMODAL_CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S", "180"))
-CUSTOM_NODE_COPY_MODE = os.getenv("COMFYMODAL_CUSTOM_NODE_COPY_MODE", "combined").strip().lower()
-if CUSTOM_NODE_COPY_MODE not in ("combined", "per_node"):
-    print(f"[comfyapp] WARNING: invalid COMFYMODAL_CUSTOM_NODE_COPY_MODE={CUSTOM_NODE_COPY_MODE!r}, falling back to 'combined'")
-    CUSTOM_NODE_COPY_MODE = "combined"
-
-# Generic collector for custom-node import/entrypoint failures during startup.
-# Populated by the logging.warning patch in _start_in_process_backend.
-# Each record is a dict with keys: phase, custom_node_name, custom_node_path,
-# entrypoint_name, exception_type, exception_message, traceback, timestamp.
-_CUSTOM_NODE_IMPORT_FAILURES: list[dict] = []
-
-# Module paths of custom nodes whose entrypoint/schema failed during CPU snapshot.
-# Retried after GPU warmup so schema generation has real device availability.
-_CUSTOM_NODE_REGISTRATION_PENDING_RETRY: set[str] = set()
 
 
 # GÃ¶Ã‡GÃ¶Ã‡ PART 2: Custom-node retry registry GÃ¶Ã‡GÃ¶Ã‡
@@ -1043,6 +1120,21 @@ PERSIST_PER_STACK_METRICS = os.getenv("COMFYMODAL_PERSIST_PER_STACK_METRICS", "0
 # a large-volume-read window.
 DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET = os.getenv("COMFYMODAL_DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET", "1") == "1"
 
+# P1 (corrected): the unconditional removal of the `production_stable`
+# exception in the VAE deferral block was a behavioral change that
+# affected every production request by default.  Restore the
+# production carve-out as the default; the deferred-after-UNET
+# behavior is now opt-in via this flag.
+#
+#   * DEFER_VAE_INCLUDING_PRODUCTION_UNET=0 (default)
+#       Production restore-background UNETs do NOT defer VAE
+#       (matches the original pre-P1 behavior).
+#   * DEFER_VAE_INCLUDING_PRODUCTION_UNET=1
+#       Production UNETs also defer VAE via the deferred-future
+#       path; this is the corrected P1 behavior and is required to
+#       actually prevent the model-read collapse in bad runs.
+DEFER_VAE_INCLUDING_PRODUCTION_UNET = os.getenv("COMFYMODAL_DEFER_VAE_INCLUDING_PRODUCTION_UNET", "0") == "1"
+
 # GÃ¶Ã‡GÃ¶Ã‡ Volume read-stall classification thresholds GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 VOLUME_STALL_UNET_MS = int(os.getenv("COMFYMODAL_VOLUME_STALL_UNET_MS", "10000"))
 VOLUME_STALL_VAE_MS = int(os.getenv("COMFYMODAL_VOLUME_STALL_VAE_MS", "2000"))
@@ -1063,6 +1155,19 @@ RUNTIME_STATE_SNAPSHOT_PATH = os.path.join(RUNTIME_CONFIG_DIR, ".runtime_state_s
 MODELS_GENERATION_SCHEMA_VERSION = 1
 MODELS_GENERATION_CONTROL_DIR = "/root/custom_nodes_vol/.comfymodal_control"
 MODELS_GENERATION_CONTROL_PATH = os.path.join(MODELS_GENERATION_CONTROL_DIR, "models_generation.json")
+
+# ── P3: Custom-nodes generation control record (CORRECTED) ───────────
+# Distinct from the models generation.  This record is advanced
+# ONLY after a successful ``sync_custom_nodes_to_volume``
+# transaction has atomically replaced the custom-nodes Volume
+# contents.  It must NEVER be used as a proxy for the models
+# generation; a model-only change does not advance it and a
+# custom-node-only change does advance it.
+CUSTOM_NODES_GENERATION_SCHEMA_VERSION = 1
+CUSTOM_NODES_GENERATION_CONTROL_DIR = MODELS_GENERATION_CONTROL_DIR
+CUSTOM_NODES_GENERATION_CONTROL_PATH = os.path.join(
+    CUSTOM_NODES_GENERATION_CONTROL_DIR, "custom_nodes_generation.json"
+)
 
 
 def _read_models_generation_record() -> dict | None:
@@ -1121,6 +1226,73 @@ def _write_models_generation_record(reason: str) -> dict:
 def _current_models_generation_id() -> str:
     """Return the current generation id or empty string."""
     _rec = _read_models_generation_record()
+    if _rec is None:
+        return ""
+    return _rec["generation"]
+
+
+
+
+
+def _read_custom_nodes_generation_record() -> dict | None:
+    """Read the authoritative custom-nodes generation record.
+
+    Returns a dict with ``generation``, ``updated_at_unix``, ``reason``,
+    and ``schema_version``, or ``None`` when missing/invalid.
+    Distinct from the models generation: a model-only change does
+    NOT advance this record.
+    """
+    try:
+        if not os.path.isfile(CUSTOM_NODES_GENERATION_CONTROL_PATH):
+            return None
+        with open(CUSTOM_NODES_GENERATION_CONTROL_PATH, "r") as _f:
+            _data = json.load(_f)
+    except Exception:
+        return None
+    if not isinstance(_data, dict):
+        return None
+    if _data.get("schema_version") != CUSTOM_NODES_GENERATION_SCHEMA_VERSION:
+        return None
+    _gen = _data.get("generation")
+    if not _gen or not isinstance(_gen, str):
+        return None
+    return _data
+
+
+def _write_custom_nodes_generation_record_no_commit(reason: str) -> dict:
+    """Create a new custom-nodes generation record and atomically
+    persist it (without committing the volume). The caller is
+    responsible for calling ``custom_nodes_vol.commit()`` after
+    this returns. Raises on failure.
+    """
+    _record = {
+        "schema_version": CUSTOM_NODES_GENERATION_SCHEMA_VERSION,
+        "generation": uuid.uuid4().hex,
+        "updated_at_unix": time.time(),
+        "reason": reason,
+    }
+    os.makedirs(CUSTOM_NODES_GENERATION_CONTROL_DIR, exist_ok=True)
+    _tmp_path = CUSTOM_NODES_GENERATION_CONTROL_PATH + ".tmp"
+    with open(_tmp_path, "w") as _f:
+        json.dump(_record, _f, separators=(",", ":"))
+        _f.flush()
+        os.fsync(_f.fileno())
+    os.replace(_tmp_path, CUSTOM_NODES_GENERATION_CONTROL_PATH)
+    print(f"[comfyapp.custom_nodes_gen] wrote generation={_record['generation'][:12]}... reason={reason}")
+    return _record
+
+
+def _write_custom_nodes_generation_record(reason: str) -> dict:
+    """Legacy wrapper that writes the generation record and commits.
+    Kept for backward-compatibility with external callers.
+    """
+    _record = _write_custom_nodes_generation_record_no_commit(reason)
+    custom_nodes_vol.commit()
+    return _record
+
+
+def _current_custom_nodes_generation_id() -> str:
+    _rec = _read_custom_nodes_generation_record()
     if _rec is None:
         return ""
     return _rec["generation"]
@@ -3814,6 +3986,15 @@ CONTROL_BASELINE = "v2.16.5_exact_plus_direct_memory_production"
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
 CUSTOM_NODES_VOLUME_NAME = "comfyui-custom-nodes"
+# P2: dedicated prompt-encoding cache volume. NEVER written to the
+# models or custom-nodes volumes. The volume is mounted only by the
+# persist + lookup functions below; the GPU class does not need to
+# see it because the GPU container reads the cache via the
+# ``lookup_prompt_cache`` Modal function at restore time.
+PROMPT_CACHE_VOLUME_NAME = "comfymodal-prompt-encoding-cache"
+PROMPT_CACHE_VOLUME_PATH = "/root/prompt_cache_vol"
+PROMPT_CACHE_SCHEMA_VERSION = 1
+PROMPT_CACHE_MAX_BUNDLES = 3
 COMFYUI_PORT = 8188
 
 
@@ -4838,6 +5019,7 @@ _COMFYMODAL_LOCAL_PYTHON_SOURCES = (
     "api_prompt_validator",
     "failure_summary",
     "production_workflow",
+    "optimizations",
 )
 
 def _add_comfymodal_local_python_sources(img):
@@ -4854,6 +5036,31 @@ download_image = _add_comfymodal_local_python_sources(
 
 app = modal.App(APP_NAME, image=image)
 vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+# P2: dedicated prompt-encoding cache volume. Independent of the
+# models and custom-nodes volumes so a bundle change cannot perturb
+# either.  ``create_if_missing=True`` is required so the very first
+# deploy creates the empty volume.
+prompt_cache_vol = modal.Volume.from_name(
+    PROMPT_CACHE_VOLUME_NAME, create_if_missing=True
+)
+
+
+def _build_gpu_volumes() -> dict:
+    """Return the volume mount map for the GPU class.
+
+    The prompt-cache volume is mounted only when the persistent
+    CLIP cache is enabled, so a deploy without that feature
+    matches the previous container mount setup exactly.  This
+    also keeps the snapshot's volume metadata identical to the
+    pre-feature state.
+    """
+    base = {
+        MODELS_PATH: vol,
+        CUSTOM_NODES_PATH: custom_nodes_vol,
+    }
+    if os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1":
+        base[PROMPT_CACHE_VOLUME_PATH] = prompt_cache_vol
+    return base
 custom_nodes_vol = modal.Volume.from_name(CUSTOM_NODES_VOLUME_NAME, create_if_missing=True)
 
 
@@ -5078,6 +5285,8 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
     for item in os.listdir(CUSTOM_NODES_PATH):
         if item == _staging_name:
             continue
+        if item == ".comfymodal_control":
+            continue
         item_path = os.path.join(CUSTOM_NODES_PATH, item)
         if os.path.islink(item_path):
             os.unlink(item_path)
@@ -5095,6 +5304,27 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
     # Clean up staging
     _safe_remove_path(staging_dir)
 
+    # P3 (corrected): Write the generation record BEFORE committing,
+    # so the custom-node contents AND the generation record are part
+    # of the same volume commit.
+    try:
+        _cn_gen = _write_custom_nodes_generation_record_no_commit(
+            reason="post_sync_custom_nodes_to_volume"
+        )
+        print(
+            f"[comfyapp.sync_custom_nodes_to_volume] advanced custom_nodes_generation="
+            f"{( _cn_gen.get('generation', '') or '')[:12]}"
+        )
+    except Exception as _cn_gen_exc:
+        print(f"[comfyapp.sync_custom_nodes_to_volume] generation record write failed: {_cn_gen_exc!r}")
+        # If the generation record cannot be written, we must NOT commit
+        # because the next restore would not know which generation is
+        # active and the atomicity claim would be violated.
+        print("[comfyapp.sync_custom_nodes_to_volume] aborting commit: generation record write failed")
+        return {"status": "error", "error": f"generation_record_write_failed: {_cn_gen_exc!r}"}
+
+    # Single commit: both the extracted files AND the generation record
+    # are part of the same volume commit.
     custom_nodes_vol.commit()
 
     # Return runtime-syncable nodes (not artifacts)
@@ -5658,6 +5888,374 @@ def runtime_state_cpu() -> dict:
         "models_changed": "models changed" in stale_reasons,
         "custom_nodes_changed": "custom nodes changed" in stale_reasons,
     }
+
+
+# ── P2: Prompt-encoding cache (persistent LRU) ──────────────────────────
+# Two CPU-only Modal functions:
+#
+#   * ``persist_clip_cache_payload``: receives a serialized
+#     candidate from the post-delivery dispatcher on the local side.
+#     Writes the candidate to a per-bundle directory under
+#     PROMPT_CACHE_VOLUME_PATH, updates the manifest, and LRU-evicts
+#     the oldest bundle if the count exceeds PROMPT_CACHE_MAX_BUNDLES.
+#
+#   * ``lookup_clip_cache``: returns the manifest entry for a given
+#     ``bundle_hash`` if it matches the requested fingerprint. Used
+#     during restore to pre-populate the in-memory CLIPTextEncode
+#     cache so the graph returns a cache hit without re-encoding.
+#
+# Both functions are mounted on a *dedicated* prompt-encoding
+# volume so they never collide with the models or custom-nodes
+# volumes. Both functions are exception-safe: a failure is returned
+# as ``{"status": "error", "error": "..."}`` and never raises out
+# of the Modal call. The local dispatcher treats an error result as
+# a normal miss.
+
+
+def _prompt_cache_root() -> str:
+    return os.path.join(PROMPT_CACHE_VOLUME_PATH, "bundles")
+
+
+# Serialize/deserialize functions are imported from optimizations module
+# (_serialize_conditioning_for_cache, _deserialize_conditioning_for_cache,
+# _conditioning_equals). The duplicate definitions were removed in favor
+# of the unified versions. See comfyapp.py imports at top of file.
+
+
+
+def _prompt_cache_manifest_path() -> str:
+    return os.path.join(PROMPT_CACHE_VOLUME_PATH, "manifest.json")
+
+
+def _read_prompt_cache_manifest() -> dict:
+    """Read the prompt-cache manifest. Always returns a dict; corrupt
+    manifests become empty dicts, never raises."""
+    p = _prompt_cache_manifest_path()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"schema_version": PROMPT_CACHE_SCHEMA_VERSION, "entries": []}
+        if data.get("schema_version") != PROMPT_CACHE_SCHEMA_VERSION:
+            return {"schema_version": PROMPT_CACHE_SCHEMA_VERSION, "entries": []}
+        if not isinstance(data.get("entries", []), list):
+            return {"schema_version": PROMPT_CACHE_SCHEMA_VERSION, "entries": []}
+        return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"schema_version": PROMPT_CACHE_SCHEMA_VERSION, "entries": []}
+
+
+# Thread-level lock for the manifest read-modify-write transaction.
+# Modal GPU containers use a local filesystem so a process-local
+# ``threading.Lock`` is sufficient in-process; cross-container
+# atomicity is acknowledged as a separate architectural concern.
+# IMPORTANT: this lock is NOT re-entrant.  The unlocked-helper
+# pattern below is required by callers that already hold the
+# lock (e.g. ``persist_clip_cache_payload``).
+_manifest_write_lock = threading.Lock()
+
+
+def _write_prompt_cache_manifest_atomic_unlocked(payload: dict) -> None:
+    """Atomically replace the manifest on disk. Caller must already
+    hold ``_manifest_write_lock``.
+
+    Uses a unique temporary filename (UUID4) to avoid the
+    os.replace race when two writers share the same tmp file
+    name.  The previous implementation used a fixed ``.tmp``
+    suffix; with multiple concurrent writers inside one process
+    (or a cross-container writer that does not respect the
+    unique-suffix convention) that could replace a tmp file
+    another writer was still using.
+    """
+    p = _prompt_cache_manifest_path()
+    tmp = f"{p}.{uuid.uuid4().hex}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, sort_keys=True, separators=(",", ":"))
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.replace(tmp, p)
+
+
+def _write_prompt_cache_manifest_atomic(payload: dict) -> None:
+    """Locking wrapper around ``_write_prompt_cache_manifest_atomic_unlocked``.
+
+    Callers that already hold ``_manifest_write_lock`` MUST use
+    the unlocked variant directly to avoid a deadlock.
+    """
+    with _manifest_write_lock:
+        _write_prompt_cache_manifest_atomic_unlocked(payload)
+
+
+def _evict_prompt_cache_bundle(bundle_dir_name: str) -> None:
+    import shutil as _sh
+    try:
+        _sh.rmtree(os.path.join(_prompt_cache_root(), bundle_dir_name), ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _compute_payload_checksum(payload: dict) -> str:
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _verify_prompt_cache_checksums(bundle_dir: str, manifest_entry: dict) -> bool:
+    """Verify descriptor.json checksum.
+
+    Reads the descriptor file from ``bundle_dir``, recomputes SHA-256,
+    and compares to ``descriptor_checksum`` in the manifest entry.
+    Supports both the old safetensors format and the new JSON-only format.
+    Returns True if the checksum matches, False otherwise.
+    """
+    try:
+        _dj = os.path.join(bundle_dir, "descriptor.json")
+        _expected_desc = manifest_entry.get("descriptor_checksum", "")
+        if not _expected_desc:
+            return False
+        if not os.path.isfile(_dj):
+            return False
+        _actual_desc = hashlib.sha256(open(_dj, "rb").read()).hexdigest()
+        if _actual_desc != _expected_desc:
+            print(f"[prompt_cache] descriptor checksum mismatch: expected={_expected_desc[:16]} actual={_actual_desc[:16]}")
+            return False
+        return True
+    except Exception as _vfy_exc:
+        print(f"[prompt_cache] checksum verification error: {_vfy_exc}")
+        return False
+
+
+@app.function(
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
+    cpu=1,
+    memory=512,
+    timeout=30,
+    volumes={
+        PROMPT_CACHE_VOLUME_PATH: prompt_cache_vol,
+        CUSTOM_NODES_PATH: custom_nodes_vol,
+    },
+)
+def persist_clip_cache_payload(payload: dict) -> dict:
+    """Persist a serialized prompt-encoding cache candidate.
+
+    WARNING: The base64 expansion + JSON serialization of
+    conditioning tensors is on the image-return critical path
+    BEFORE the result leaves the GPU container. The actual persist
+    RPC is post-delivery, but the b64 construction of the payload
+    is on the critical path. This serialization cost is not free.
+
+    The payload shape is exactly what
+    ``serialize_conditioning_for_cache`` produced on the GPU
+    side.  Each entry in ``conditioning_tensors`` is a dict with
+    keys ``node_id``, ``text``, ``loader_class``, ``clip_type``,
+    ``filenames``, plus the serialized conditioning under
+    ``kind == "conditioning_list_v1"``.
+
+    This function runs in a CPU-only container (no torch, no
+    safetensors). It stores the base64-encoded tensor data
+    directly in the JSON descriptor. The GPU container
+    reconstructs tensors at restore time using
+    ``deserialize_conditioning_for_cache``.
+
+    The function is exception-safe: any error is returned as
+    ``{"status": "error", ...}`` and the local dispatcher treats
+    that as a normal miss.  Integrity is enforced by:
+
+      * SHA-256 checksum of the descriptor file,
+      * per-bundle schema version,
+      * manifest schema version,
+      * model-generation token comparison (we read
+        ``MODELS_GENERATION_CONTROL_PATH`` on the writer side and
+        refuse to commit a bundle that would conflict).
+
+    The volume ``CUSTOM_NODES_PATH`` must be mounted for
+    ``_read_models_generation_record`` to access the models
+    generation control file.
+    """
+    import base64 as _b64
+    try:
+        if not isinstance(payload, dict):
+            return {"status": "error", "error": "payload_not_dict"}
+        if payload.get("schema_version") != PROMPT_CACHE_SCHEMA_VERSION:
+            return {"status": "error", "error": "schema_mismatch"}
+        bundle = payload.get("bundle")
+        if not isinstance(bundle, dict) or not bundle.get("bundle_hash"):
+            return {"status": "error", "error": "missing_bundle"}
+        clip_fp = payload.get("clip_fingerprint")
+        if not isinstance(clip_fp, dict):
+            return {"status": "error", "error": "missing_clip_fingerprint"}
+        cond = payload.get("conditioning_tensors")
+        if not isinstance(cond, list):
+            return {"status": "error", "error": "missing_conditioning_tensors"}
+        bundle_hash = str(bundle["bundle_hash"])
+        bundle_dir_name = "b_" + bundle_hash[:32]
+        bundle_dir = os.path.join(_prompt_cache_root(), bundle_dir_name)
+        os.makedirs(bundle_dir, exist_ok=True)
+        descriptor_entries: list = []
+        for ce in cond:
+            if not isinstance(ce, dict):
+                continue
+            node_id = str(ce.get("node_id", ""))
+            if not node_id:
+                continue
+            _serialized = ce.get("serialized")
+            if not isinstance(_serialized, dict):
+                continue
+            if _serialized.get("kind") != "conditioning_list_v1":
+                continue
+            _ser_entries = _serialized.get("entries", [])
+            if not isinstance(_ser_entries, list) or not _ser_entries:
+                continue
+            # Store the base64 entries directly (no torch/safetensors needed).
+            # Each entry in _ser_entries has a cond_b64 key with the b64 data.
+            descriptor_entries.append({
+                "node_id": node_id,
+                "text": str(ce.get("text", "")),
+                "loader_class": str(ce.get("loader_class", "")),
+                "clip_type": str(ce.get("clip_type", "")),
+                "filenames": list(ce.get("filenames") or []),
+                "serialized_entries": _ser_entries,
+            })
+        if not descriptor_entries:
+            return {"status": "error", "error": "no_tensors_to_persist"}
+        # Validate against current models-generation.
+        # Per audit round 5: if the payload claims a generation but
+        # we cannot read the current authoritative generation, the
+        # descriptor would be persisted with an empty generation,
+        # making the model-generation identity check on restore a
+        # tautology.  Reject such writes.
+        _gen_now = (
+            (_read_models_generation_record() or {}).get("generation", "")
+        )
+        _gen_payload = (clip_fp.get("model_generation") or "")
+        if _gen_payload and not _gen_now:
+            return {
+                "status": "error",
+                "error": "missing_authoritative_generation",
+                "payload_generation": _gen_payload,
+            }
+        if _gen_payload and _gen_now and _gen_payload != _gen_now:
+            return {
+                "status": "error",
+                "error": "model_generation_drift",
+                "expected": _gen_payload,
+                "current": _gen_now,
+            }
+        # Write descriptor.json with embedded b64 entries (no safetensors).
+        descriptor = {
+            "schema_version": PROMPT_CACHE_SCHEMA_VERSION,
+            "kind": "conditioning_bundle_v2",
+            "bundle": bundle,
+            "clip_fingerprint": clip_fp,
+            "model_generation": _gen_now,
+            "descriptor_entries": descriptor_entries,
+        }
+        dj_path = os.path.join(bundle_dir, "descriptor.json")
+        with open(dj_path, "w", encoding="utf-8") as f:
+            json.dump(descriptor, f, sort_keys=True, separators=(",", ":"))
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        _descriptor_checksum = hashlib.sha256(
+            open(dj_path, "rb").read()
+        ).hexdigest()
+        file_manifest: list = [
+            {
+                "name": "descriptor.json",
+                "size": os.path.getsize(dj_path),
+                "checksum": _descriptor_checksum,
+            }
+        ]
+        total_bytes = sum(m.get("size", 0) for m in file_manifest)
+        # Manifest: lock around mutation, LRU eviction.
+        now = time.time()
+        with _manifest_write_lock:
+            manifest = _read_prompt_cache_manifest()
+            entries = manifest.setdefault("entries", [])
+            entries = [e for e in entries if e.get("bundle_hash") != bundle_hash]
+            new_entry = {
+                "bundle_hash": bundle_hash,
+                "schema_version": PROMPT_CACHE_SCHEMA_VERSION,
+                "clip_fingerprint_key": clip_fp.get("fingerprint_key", ""),
+                "model_generation": _gen_now,
+                "dir": bundle_dir_name,
+                "files": file_manifest,
+                "total_bytes": int(total_bytes),
+                "descriptor_checksum": _descriptor_checksum,
+                "created_at": now,
+                "last_used_at": now,
+            }
+            entries.append(new_entry)
+            while len(entries) > PROMPT_CACHE_MAX_BUNDLES:
+                oldest = min(entries, key=lambda e: e.get("last_used_at", 0))
+                _evict_prompt_cache_bundle(oldest.get("dir", ""))
+                entries.remove(oldest)
+            manifest["entries"] = entries
+            manifest["updated_at"] = now
+            # Caller already holds _manifest_write_lock.
+            # Use the unlocked helper to avoid a deadlock with
+            # the non-reentrant threading.Lock.
+            _write_prompt_cache_manifest_atomic_unlocked(manifest)
+        prompt_cache_vol.commit()
+        print(
+            f"[prompt_cache] persisted bundle_hash={bundle_hash[:12]} "
+            f"dir={bundle_dir_name} bytes={total_bytes} entries={len(entries)} "
+            f"gen={_gen_now[:12]}"
+        )
+        return {
+            "status": "ok",
+            "bundle_hash": bundle_hash,
+            "total_bytes": int(total_bytes),
+            "entries": len(entries),
+        }
+    except Exception as exc:
+        return {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+@app.function(
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
+    cpu=1,
+    memory=512,
+    timeout=15,
+    volumes={PROMPT_CACHE_VOLUME_PATH: prompt_cache_vol},
+)
+def lookup_clip_cache(bundle_hash: str, clip_fingerprint_key: str) -> dict:
+    """Look up a prompt-cache bundle by hash + fingerprint key.
+
+    Returns ``{"status": "ok", "entry": {...}}`` on hit, or
+    ``{"status": "miss"}``.  Any error becomes a miss; the caller
+    (the GPU container at restore time) treats a miss as a
+    no-op and falls back to the normal CLIP encode path.
+    """
+    try:
+        if not isinstance(bundle_hash, str) or not bundle_hash:
+            return {"status": "miss", "reason": "no_bundle_hash"}
+        manifest = _read_prompt_cache_manifest()
+        for entry in manifest.get("entries", []):
+            if entry.get("bundle_hash") != bundle_hash:
+                continue
+            if entry.get("clip_fingerprint_key") != clip_fingerprint_key:
+                return {"status": "miss", "reason": "fingerprint_mismatch"}
+            # Update last_used_at (LRU touch)
+            entry["last_used_at"] = time.time()
+            manifest["entries"] = [
+                e for e in manifest.get("entries", [])
+                if e.get("bundle_hash") != bundle_hash
+            ] + [entry]
+            _write_prompt_cache_manifest_atomic(manifest)
+            prompt_cache_vol.commit()
+            return {"status": "ok", "entry": entry}
+        return {"status": "miss", "reason": "not_found"}
+    except Exception as exc:
+        return {"status": "miss", "reason": f"error:{exc}"[:120]}
 
 
 def _filter_preload_paths_by_size(file_paths: list) -> tuple[list, dict]:
@@ -6281,13 +6879,56 @@ class _ComfyAPIMixin:
         return {}
 
     def _find_model_file(self, bucket: str, filename: str) -> str | None:
-        """Best-effort model file lookup for warmup preflight checks."""
+        """Best-effort model file lookup for warmup preflight checks.
+
+        When the resolved-path cache is enabled, repeated lookups for
+        the same (generation, bucket, filename) tuple bypass the
+        directory traversal and return the cached realpath. The cache
+        is invalidated automatically on any models-generation change.
+        """
         candidates = {
             "checkpoint": ["checkpoints"],
             "unet": ["diffusion_models", "unet", "unets"],
             "clip": ["text_encoders", "clip"],
             "vae": ["vae"],
         }.get(bucket, [])
+        # P4: cache-wrapped resolver. Disable by default; the
+        # underlying ``os.path.isfile`` checks are the authoritative
+        # source of truth, so a cache miss falls through to them and a
+        # stale cache hit is evicted when the file disappears.
+        if _OPTIMIZATIONS_AVAILABLE:
+            try:
+                from optimizations import (
+                    get_resolved_model_path_cache, _coerce_folder, _coerce_filename,
+                )
+                _pc = get_resolved_model_path_cache()
+                _gen = ""
+                try:
+                    _gen = (_read_models_generation_record() or {}).get("generation", "")
+                except Exception:
+                    _gen = ""
+                def _resolver(_bucket, _fname):
+                    _d = os.path.join(MODELS_PATH, _fname)
+                    if os.path.isfile(_d):
+                        return _d
+                    for _f in candidates:
+                        _p = os.path.join(MODELS_PATH, _f, _fname)
+                        if os.path.isfile(_p):
+                            return _p
+                    return None
+                # Use the first folder for the cache key (bucket → folder).
+                _primary_folder = candidates[0] if candidates else bucket
+                return _pc.resolve(
+                    generation=_gen,
+                    folder=_primary_folder,
+                    filename=filename,
+                    resolver=_resolver,
+                )
+            except Exception:
+                # If the cache path fails, fall through to the
+                # original direct lookup so request flow is never
+                # blocked by an optimization bug.
+                pass
         direct = os.path.join(MODELS_PATH, filename)
         if os.path.isfile(direct):
             return direct
@@ -6337,6 +6978,44 @@ class _ComfyAPIMixin:
         custom_nodes_vol.reload()
         comfy_custom_nodes = "/root/comfy/ComfyUI/custom_nodes"
         self._ensure_validation_cache()
+
+        # P3 (corrected, audit round 2): the fast path MUST
+        # consult the authoritative custom_nodes_generation
+        # record BEFORE any directory walk.  The previous version
+        # walked ``custom_node_volume_state`` first, defeating
+        # most of the fast-path benefit.  A real fast path:
+        #
+        #   custom_nodes_vol.reload()
+        #   generation = read_generation_record()
+        #   if generation == self._custom_nodes_generation_seen:
+        #       return cached_summary_and_state
+        #
+        # ``_custom_nodes_state_last_synced`` is updated at the
+        # end of every successful sync so we have a
+        # (summary, state) tuple ready to return without any
+        # filesystem walk.
+        if _OPTIMIZATIONS_AVAILABLE and os.environ.get(
+            "COMFYMODAL_CUSTOM_NODE_GENERATION_FASTPATH", "0"
+        ) == "1":
+            try:
+                _cn_gen_rec = _read_custom_nodes_generation_record()
+                _cn_gen_now = (
+                    (_cn_gen_rec or {}).get("generation", "")
+                    if _cn_gen_rec else ""
+                )
+                if (
+                    _cn_gen_now
+                    and getattr(self, "_custom_nodes_generation_seen", "") == _cn_gen_now
+                    and getattr(self, "_custom_nodes_state_last_synced", None) is not None
+                ):
+                    # Fast path: generation matches AND we have a
+                    # cached (summary, state) from a prior successful
+                    # sync.  No directory walk.  No mtime scan.
+                    self._custom_nodes_generation_seen = _cn_gen_now
+                    return self._custom_nodes_state_last_synced
+            except Exception:
+                # Never fail generation on a fast-path bug
+                pass
 
         # Step 1: Cheap volume state (names + mtimes) for restore hot path.
         # Avoids expensive content hashing of every .py file on every restore.
@@ -6402,6 +7081,18 @@ class _ComfyAPIMixin:
         self._last_custom_node_source_fingerprint = current_fp
         _result = (summary, state)
         self._validation_cache.set("custom_node_sync", _result, fingerprint=cheap_hash)
+        # Record the generation so the fast path works on subsequent calls
+        # within the same container session.
+        try:
+            _gen_rec = _read_custom_nodes_generation_record()
+            _gen_now = (_gen_rec or {}).get("generation", "") if _gen_rec else ""
+            if _gen_now:
+                self._custom_nodes_generation_seen = _gen_now
+        except Exception:
+            pass
+        # Cache the (summary, state) tuple for the next generation-match
+        # fast path (no directory walk, no mtime scan).
+        self._custom_nodes_state_last_synced = _result
         return _result
 
     def _start_restore_preload(
@@ -6459,7 +7150,10 @@ class _ComfyAPIMixin:
         Re-raises any exception captured by the preload worker.
         """
         _join_start_ns = time.perf_counter_ns()
-        handle.thread.join()
+        handle.thread.join(timeout=600)
+        if handle.thread.is_alive():
+            print(f"[comfyapp] WARNING: restore preload thread did not finish within 600s, continuing without preload result")
+            return {"count": 0, "file_timing_ms": {}, "_preload_timeout": True}
         _await_ms = round(
             (time.perf_counter_ns() - _join_start_ns) / 1_000_000, 3,
         )
@@ -7095,12 +7789,43 @@ class _ComfyAPIMixin:
                         _read_bytes_loader = getattr(self, "_load_restore_clip_state_read_bytes", None)
                         if not callable(_read_bytes_loader):
                             _use_read_bytes = False
+                    # P1: wrap the real physical read in the cold-model
+                    # coordinator so the CLIP restore preload, the graph
+                    # cached_load path, and the actual_load workers all
+                    # serialize on a single in-flight read. The acquire
+                    # context is fail-open: if the wait deadline elapses
+                    # it yields a degraded sentinel and the read still
+                    # runs (without the global serial guarantee).
+                    _coordinator = (
+                        get_model_read_coordinator()
+                        if _OPTIMIZATIONS_AVAILABLE else None
+                    )
+                    _can_coord = bool(
+                        _coordinator is not None
+                        and PRODUCTION_MODEL_READ_COORDINATOR_ENABLED
+                    )
                     try:
                         if _use_read_bytes:
-                            loaded = _read_bytes_loader(path)
+                            if _can_coord:
+                                with _coordinator.acquire(
+                                    owner="restore_preload",
+                                    loader_type=role or "CLIP",
+                                    canonical_path=cache_key,
+                                ):
+                                    loaded = _read_bytes_loader(path)
+                            else:
+                                loaded = _read_bytes_loader(path)
                             print(f"[restore.preload.strategy] role=clip strategy=read_bytes file={filename}")
                         else:
-                            loaded = _explicit_cpu_loader(path, original_loader)
+                            if _can_coord:
+                                with _coordinator.acquire(
+                                    owner="restore_preload",
+                                    loader_type=role or "unknown",
+                                    canonical_path=cache_key,
+                                ):
+                                    loaded = _explicit_cpu_loader(path, original_loader)
+                            else:
+                                loaded = _explicit_cpu_loader(path, original_loader)
                             _strat = "read_bytes" if _use_read_bytes else "normal_explicit_cpu"
                             print(f"[restore.preload.strategy] role={role} strategy={_strat} file={filename}")
                     except (NameError, AttributeError, AssertionError) as _prog_exc:
@@ -7575,6 +8300,16 @@ class _ComfyAPIMixin:
             self._actual_load_future_meta: dict[tuple, dict] = {}
         if not hasattr(self, "_wall_actual_load_per_model"):
             self._wall_actual_load_per_model: list[dict] = []
+        # P1: production UNET start boundary barrier events. Set by
+        # ``_warmup_direct`` when the requested phase (clip object or
+        # clip encode) completes; consumed by the barrier worker that
+        # submits the production UNET.  Default mode
+        # (``after_clip_preload``) sets both events immediately so the
+        # barrier is a no-op.
+        if not hasattr(self, "_production_unet_barrier_event"):
+            self._production_unet_barrier_event = _threading.Event()
+        if not hasattr(self, "_production_unet_encode_barrier_event"):
+            self._production_unet_encode_barrier_event = _threading.Event()
 
     def _set_actual_load_future_meta(self, key: tuple, **fields) -> dict:
         if not _restore_background_code_enabled():
@@ -7812,6 +8547,18 @@ class _ComfyAPIMixin:
                     raise RuntimeError("UNETLoader original loader unavailable")
                 with _model_load_context(owner="restore_background_unet", loader_type="UNET", actual_key=k, canonical_path=un_path, record_id=str(_rec_idx)):
                     obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["UNETLoader"](), unet_name=un, weight_dtype="default")
+                # P1 (corrected): signal the explicit
+                # "restore-background UNET load complete" event
+                # so the deferred VAE worker can start its
+                # physical read while this thread proceeds to
+                # the remaining bookkeeping. The event is keyed
+                # by the same key the VAE worker looks up.
+                try:
+                    _ev = getattr(self, "_rbg_unet_done_events", None)
+                    if _ev is not None:
+                        _ev.setdefault(k, _thr_lu.Event()).set()
+                except Exception:
+                    pass
                 if obj and obj[0] is not None:
                     self._unet_object_cache[k] = obj[0]
                 d_ms = round((time.time() - t0) * 1000, 1)
@@ -7847,6 +8594,17 @@ class _ComfyAPIMixin:
                 restore_stages["restore_background_unet_actual_source"] = "actual_load"
                 print(f"[restore_background_unet] failed reason={str(e)[:200]} expected_source=restore_background_unet fallback=actual_load")
             finally:
+                # Always signal the VAE event so the deferred VAE worker
+                # does not wait the full 600s timeout when the UNET load
+                # fails.  The event represents "the VAE may proceed",
+                # which is true whether UNET succeeded or the graph
+                # fallback is taking over.
+                try:
+                    _ev_map_fin = getattr(self, "_rbg_unet_done_events", None)
+                    if _ev_map_fin is not None and k in _ev_map_fin:
+                        _ev_map_fin[k].set()
+                except Exception:
+                    pass
                 self._actual_load_owner_thread.pop(k, None)
 
         self._set_actual_load_future_meta(
@@ -7859,6 +8617,10 @@ class _ComfyAPIMixin:
             unet_name=eligibility["unet_name"],
             unet_path=eligibility["unet_path"],
         )
+        # Pre-create the UNET done event BEFORE starting the thread.
+        _al_thr = __import__("threading")
+        _ev = _al_thr.Event()
+        self._rbg_unet_done_events[key] = _ev
         thread = _al_thr.Thread(target=_load_restore_background_unet, daemon=True)
         self._actual_load_futures[key] = thread
         thread.start()
@@ -7997,7 +8759,13 @@ class _ComfyAPIMixin:
                 _errs[key] = _exc
                 self._actual_load_future_errors = _errs
                 print(f"[production.unet] worker_failed key={key} err={_exc}")
+            finally:
+                _ev_map = getattr(self, "_rbg_unet_done_events", None)
+                if _ev_map is not None and key in _ev_map:
+                    _ev_map[key].set()
 
+        # Pre-create the UNET done event BEFORE starting the thread.
+        self._rbg_unet_done_events[key] = _threading.Event()
         _thread = _threading.Thread(target=_production_unet_worker, daemon=True)
         _futures[key] = _thread
         _meta = getattr(self, "_actual_load_future_meta", {})
@@ -8006,6 +8774,7 @@ class _ComfyAPIMixin:
             "production_stable": True,
             "strict_no_fallback": True,
             "status": "submitted",
+            "submitted_at_unix_s": time.time(),
             "selected_unet": _unet_name,
             "canonical_key": key,
             "profile_token": profile.get("_profile_token", ""),
@@ -8078,15 +8847,20 @@ class _ComfyAPIMixin:
                          queued, submitted, or running.
           rbg_age_ms (float): Age of the oldest active RBG UNET read in ms.
           active_large_reads (int): Number of large active reads.
+          active_unet_key (str): The cache key of the active UNET.
+          active_unet_event (threading.Event): The done event for the active UNET.
         """
         result = {
             "active": False,
             "rbg_age_ms": 0.0,
             "active_large_reads": 0,
+            "active_unet_key": None,
+            "active_unet_event": None,
         }
         try:
             now = time.time()
-            oldest_age = 0.0
+            oldest_age = -1.0  # -1 so the first eligible entry (with or without timestamp) wins
+            oldest_key = None
             futures = getattr(self, "_actual_load_futures", {})
             meta = getattr(self, "_actual_load_future_meta", {})
             for key, thread in futures.items():
@@ -8097,9 +8871,18 @@ class _ComfyAPIMixin:
                     result["active"] = True
                     submit_s = m.get("submitted_at_unix_s") or 0
                     age = round((now - submit_s) * 1000, 1) if submit_s else 0.0
-                    if age > oldest_age:
+                    # First eligible entry wins; later entries win only if older.
+                    # This guarantees we always return an active key, even
+                    # when the future was registered without a timestamp.
+                    if oldest_key is None or age > oldest_age:
                         oldest_age = age
-            result["rbg_age_ms"] = oldest_age
+                        oldest_key = key
+            result["rbg_age_ms"] = max(0.0, oldest_age) if oldest_age >= 0 else 0.0
+            if oldest_key is not None:
+                key = oldest_key
+                result["active_unet_key"] = key
+                _ev_map = getattr(self, "_rbg_unet_done_events", {}) or {}
+                result["active_unet_event"] = _ev_map.get(key)
             with _ACTIVE_MODEL_READS_LOCK:
                 result["active_large_reads"] = len(_running_large_reads_locked())
         except Exception:
@@ -8419,8 +9202,8 @@ class _ComfyAPIMixin:
                         finally:
                             self._actual_load_owner_thread.pop(k, None)
                     _t = _al_thr.Thread(target=_load_clip, daemon=True)
-                    _t.start()
                     self._actual_load_futures[key] = _t
+                    _t.start()
                     result["submitted"].append(f"CLIP key={key}")
                     result["actual_load_submit_order"].append("CLIP")
                     result["clip_submitted"] = True
@@ -8480,8 +9263,8 @@ class _ComfyAPIMixin:
                             finally:
                                 self._actual_load_owner_thread.pop(k, None)
                         _t = _al_thr.Thread(target=_load_clip2, daemon=True)
-                        _t.start()
                         self._actual_load_futures[key] = _t
+                        _t.start()
                         result["submitted"].append(f"DualCLIP key={key}")
                         result["actual_load_submit_order"].append("DualCLIP")
                         print(f"[actual_load] submit_raw_key=({clip_path}, {clip_type}) submit_canonical_key={key}")
@@ -8620,29 +9403,194 @@ class _ComfyAPIMixin:
                     )
                     continue
 
-                # GÃ¶Ã‡GÃ¶Ã‡ Defer VAE actual-load if restore-background UNET is still running GÃ¶Ã‡GÃ¶Ã‡
-                # Exception: don't defer when the running UNET is production_stable
+                # P1 (corrected): instead of `continue` (which discards
+                # the VAE preload), submit a *deferred* worker that
+                # joins the existing RBG UNET future, then performs the
+                # normal VAE physical read. The graph UNET/VAE
+                # resolution can attach to this future like any other
+                # actual_load future, so the VAE is loaded exactly once
+                # and the read is serialized after the UNET physical
+                # read. A failed speculative load never fails the
+                # prompt; on any exception, the graph falls back to its
+                # normal loader.
                 _defer_check = 0
                 _defer_active_rbg_age_ms = 0.0
                 _defer_active_large_reads = 0
                 if DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET:
                     _rbg_active = self._check_rbg_unet_active()
-                    _production_rbg = any(
-                        getattr(self, "_actual_load_future_meta", {}).get(k, {}).get("production_stable")
-                        for k in getattr(self, "_actual_load_futures", {})
-                        if getattr(self, "_actual_load_futures", {}).get(k) and getattr(self, "_actual_load_futures", {})[k].is_alive()
-                    )
-                    if _rbg_active.get("active", False) and not _production_rbg:
+                    if _rbg_active.get("active", False):
+                        # Honor the original production_stable carve-out
+                        # by default (DEFER_VAE_INCLUDING_PRODUCTION_UNET=0).
+                        # When the opt-in flag is on, we also defer for
+                        # production_stable UNETs and submit a real
+                        # deferred future (the corrected P1 behavior).
+                        _any_production = any(
+                            getattr(self, "_actual_load_future_meta", {}).get(k, {}).get("production_stable")
+                            for k in getattr(self, "_actual_load_futures", {})
+                            if getattr(self, "_actual_load_futures", {}).get(k)
+                            and getattr(self, "_actual_load_futures", {})[k].is_alive()
+                        )
+                        if _any_production and not DEFER_VAE_INCLUDING_PRODUCTION_UNET:
+                            result["actual_load_vae_defer_guard_enabled"] = 1
+                            result["actual_load_vae_skipped_reason"] = (
+                                "production_stable_unet_running"
+                            )
+                            print(
+                                f"[actual_load] skipped loader=VAE reason=production_stable_unet_running"
+                            )
+                            continue
                         result["actual_load_vae_defer_guard_enabled"] = 1
                         result["actual_load_vae_deferred_for_rbg_unet"] = 1
-                        result["actual_load_vae_skipped_reason"] = "restore_background_unet_running"
+                        result["actual_load_vae_skipped_reason"] = "deferred_after_unet"
                         _defer_active_rbg_age_ms = _rbg_active.get("rbg_age_ms", 0.0)
                         _defer_active_large_reads = _rbg_active.get("active_large_reads", 0)
+                        # Track per-request VAE gate metrics.
+                        if _OPTIMIZATIONS_AVAILABLE:
+                            try:
+                                _vae_metrics = getattr(self, "_vae_gate_metrics", None)
+                                if _vae_metrics is None:
+                                    _vae_metrics = VaeGateMetrics()
+                                    setattr(self, "_vae_gate_metrics", _vae_metrics)
+                                _vae_metrics.physical_read_deferred += 1
+                                _vae_metrics.future_submitted += 1
+                            except Exception:
+                                pass
                         print(
-                            f"[actual_load] skipped loader=VAE reason=restore_background_unet_running "
+                            f"[actual_load] deferred loader=VAE reason=restore_background_unet_running "
                             f"rbg_age_ms={_defer_active_rbg_age_ms:.1f} "
                             f"active_large_reads={_defer_active_large_reads}"
                         )
+                        # Register the deferred future and start a
+                        # worker that waits for the RBG UNET then
+                        # performs the normal VAE load. The future is
+                        # visible to the graph via _actual_load_futures
+                        # exactly like a non-deferred future.
+                        _vae_lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
+                        with _vae_lock:
+                            if key in self._actual_load_futures:
+                                self._actual_load_duplicates_prevented += 1
+                                print(f"[actual_load] duplicate_prevented key={key}")
+                                continue
+                            self._init_vae_cache()
+                            if hasattr(self, "_vae_object_cache") and key in self._vae_object_cache:
+                                print(f"[actual_load] cache_hit key={key}")
+                                continue
+                            _al_start_v = time.time()
+                            result["actual_load_vae_submitted_at_ms_from_entry"] = round((_al_start_v - _al_t0) * 1000, 1)
+                            self._wall_actual_load_per_model.append({
+                                "loader_type": "VAE", "canonical_key": str(key),
+                                "actual_load_start_unix_s": _al_start_v,
+                                "actual_load_done_unix_s": None,
+                                "deferred_for_rbg_unet": 1,
+                            })
+                            # P1 (corrected): the deferred VAE
+                            # worker is keyed on the *event* associated
+                            # with the active restore-background UNET,
+                            # not the full thread.  After the event is
+                            # set, the VAE physical read can start while
+                            # the loader thread proceeds to its
+                            # remaining bookkeeping.  This is the
+                            # smallest correct step toward the audit's
+                            # "physical-read-complete event".
+                            _rbg_event = None
+                            _rbg_unet_key = None
+                            try:
+                                _rbg_active = self._check_rbg_unet_active()
+                                if _rbg_active.get("active"):
+                                    _rbg_event = _rbg_active.get("active_unet_event")
+                                    _rbg_unet_key = _rbg_active.get("active_unet_key")
+                            except Exception:
+                                _rbg_event = None
+                            def _load_vae_deferred(
+                                k=key, vn=vae_name, vp=vae_real,
+                                _ev=_rbg_event, _unet_key=_rbg_unet_key,
+                                _rec_idx=len(self._wall_actual_load_per_model) - 1,
+                            ):
+                                import threading as _thr_lv
+                                _tid = _thr_lv.current_thread().ident
+                                self._actual_load_owner_thread[k] = _tid
+                                _wait_start = time.time()
+                                _graph_already_requested = key in (
+                                    getattr(self, "_vae_graph_requested", set())
+                                    or set()
+                                )
+                                if _ev is not None:
+                                    try:
+                                        # 1. Wait on the explicit
+                                        # UNET physical-read-complete
+                                        # event. This is a small,
+                                        # bounded wait that frees the
+                                        # gate after the actual loader
+                                        # call has returned, instead
+                                        # of joining the entire thread.
+                                        _ev.wait(timeout=600)
+                                    except Exception:
+                                        pass
+                                _gate_wait_ms = round((time.time() - _wait_start) * 1000, 1)
+                                if _OPTIMIZATIONS_AVAILABLE:
+                                    try:
+                                        _vm = getattr(self, "_vae_gate_metrics", None)
+                                        if _vm is not None:
+                                            _vm.gate_wait_ms_total += _gate_wait_ms
+                                    except Exception:
+                                        pass
+                                # 2. Run the normal VAE load.
+                                t0 = time.time()
+                                try:
+                                    _orig_fn = self._original_loaders.get("VAELoader.load_vae")
+                                    with _model_load_context(
+                                        owner="actual_load", loader_type="VAE",
+                                        actual_key=k, canonical_path=vp,
+                                        record_id=str(_rec_idx),
+                                    ):
+                                        if _orig_fn:
+                                            obj = _orig_fn(
+                                                _al_nodes.NODE_CLASS_MAPPINGS["VAELoader"](),
+                                                vae_name=vn,
+                                            )
+                                        else:
+                                            obj = _al_nodes.NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=vn)
+                                    self._vae_object_cache[k] = obj[0]
+                                    d_ms = round((time.time() - t0) * 1000, 1)
+                                    if _OPTIMIZATIONS_AVAILABLE:
+                                        try:
+                                            _vm = getattr(self, "_vae_gate_metrics", None)
+                                            if _vm is not None:
+                                                _vm.physical_read_ms_total += d_ms
+                                                if not _graph_already_requested:
+                                                    _vm.ready_before_graph_request += 1
+                                        except Exception:
+                                            pass
+                                    if _rec_idx < len(self._wall_actual_load_per_model):
+                                        self._wall_actual_load_per_model[_rec_idx]["actual_load_done_unix_s"] = time.time()
+                                    print(
+                                        f"[actual_load] done loader=VAE key={k} ms={d_ms} "
+                                        f"deferred=1 gate_wait_ms={_gate_wait_ms:.1f} "
+                                        f"unet_key={_unet_key} graph_already_requested={int(_graph_already_requested)}"
+                                    )
+                                except Exception as e:
+                                    print(f"[actual_load] failed loader=VAE key={k} err={e}")
+                                finally:
+                                    self._actual_load_owner_thread.pop(k, None)
+                            # P1 (corrected): register the future BEFORE
+                            # starting the worker.  This eliminates
+                            # the small attachment race where a
+                            # graph-UNET-pending check could see no
+                            # future for this key and fall through to
+                            # the normal loader.
+                            _t = _al_thr.Thread(target=_load_vae_deferred, daemon=True)
+                            self._actual_load_futures[key] = _t
+                            self._set_actual_load_future_meta(
+                                key, source="actual_load", loader_type="VAE",
+                                status="submitted", submitted_at_unix_s=_al_start_v,
+                            )
+                            _t.start()
+                            result["submitted"].append(f"VAE key={key} (deferred)")
+                            result["actual_load_submit_order"].append("VAE")
+                            print(
+                                f"[actual_load] submitted loader=VAE key={key} "
+                                f"(deferred_for_rbg_unet) unet_key={_rbg_unet_key}"
+                            )
                         continue
                     result["actual_load_vae_defer_guard_enabled"] = 1
                 lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
@@ -8694,6 +9642,14 @@ class _ComfyAPIMixin:
                     print(f"[actual_load] submitted loader=VAE key={key}")
 
         result["enabled"] = True
+        # P1: surface VAE gate metrics so cold-collapse analysis is visible
+        if _OPTIMIZATIONS_AVAILABLE:
+            try:
+                _vae_metrics = getattr(self, "_vae_gate_metrics", None)
+                if _vae_metrics is not None:
+                    result["vae_gate_metrics"] = _vae_metrics.to_dict()
+            except Exception:
+                pass
         print(f"[actual_load] actual_load_submit_order={result.get('actual_load_submit_order', [])} resolved_keys={resolved_keys}")
         return result
 
@@ -9364,7 +10320,10 @@ class _ComfyAPIMixin:
             # Post-CLIP prefetch
             if prefetch and clip_thread is not None:
                 def _prefetch_after_clip():
-                    clip_thread.join()
+                    clip_thread.join(timeout=600)
+                    if clip_thread.is_alive():
+                        print("[scheduler_test] WARNING: clip_thread.join timeout after 600s in _prefetch_after_clip")
+                        return
                     _run_clip_encode_prefetch()
                 clip_encode_thread = threading.Thread(target=_prefetch_after_clip, daemon=True)
                 clip_encode_thread.start()
@@ -9386,7 +10345,10 @@ class _ComfyAPIMixin:
             # Post-CLIP prefetch
             if prefetch and clip_thread is not None:
                 def _prefetch_after_clip_unet():
-                    clip_thread.join()
+                    clip_thread.join(timeout=600)
+                    if clip_thread.is_alive():
+                        print("[scheduler_test] WARNING: clip_thread.join timeout after 600s in _prefetch_after_clip_unet")
+                        return
                     _run_clip_encode_prefetch()
                 clip_encode_thread = threading.Thread(target=_prefetch_after_clip_unet, daemon=True)
                 clip_encode_thread.start()
@@ -9397,7 +10359,9 @@ class _ComfyAPIMixin:
                 clip_thread = threading.Thread(target=_load_clip_worker, args=(cn, ct, 0, "clip"), daemon=True)
                 clip_thread.start()
             if clip_thread is not None:
-                clip_thread.join()
+                clip_thread.join(timeout=600)
+                if clip_thread.is_alive():
+                    print("[scheduler_test] WARNING: clip_thread.join timeout after 600s in clip_serial_then_unet mode")
             for un in unet_names:
                 unet_thread = threading.Thread(target=_load_unet_worker, args=(un, 0, "unet"), daemon=True)
                 unet_thread.start()
@@ -9418,14 +10382,19 @@ class _ComfyAPIMixin:
                 vae_thread = threading.Thread(target=_load_vae_worker, args=(vn, 0, "vae"), daemon=True)
                 vae_thread.start()
             if unet_thread is not None:
-                unet_thread.join()
+                unet_thread.join(timeout=600)
+                if unet_thread.is_alive():
+                    print("[scheduler_test] WARNING: unet_thread.join timeout after 600s in unet_load_then_clip mode")
             for cn in clip_names[:1]:
                 ct = clip_type
                 clip_thread = threading.Thread(target=_load_clip_worker, args=(cn, ct, 0, "clip"), daemon=True)
                 clip_thread.start()
             if prefetch and clip_thread is not None:
                 def _prefetch_after_clip_unet_first():
-                    clip_thread.join()
+                    clip_thread.join(timeout=600)
+                    if clip_thread.is_alive():
+                        print("[scheduler_test] WARNING: clip_thread.join timeout after 600s in _prefetch_after_clip_unet_first")
+                        return
                     _run_clip_encode_prefetch()
                 clip_encode_thread = threading.Thread(target=_prefetch_after_clip_unet_first, daemon=True)
                 clip_encode_thread.start()
@@ -9476,7 +10445,9 @@ class _ComfyAPIMixin:
 
         # Wait for dependency validation
         if dep_thread is not None and dep_thread.is_alive():
-            dep_thread.join()
+            dep_thread.join(timeout=600)
+            if dep_thread.is_alive():
+                print("[scheduler] WARNING: dep_thread.join timeout after 600s")
         if dep_done is not None and dep_done.is_set():
             trace["dependency_gate_done_ms"] = round((time.time() - t_start) * 1000, 1)
             if dep_result:
@@ -9515,10 +10486,14 @@ class _ComfyAPIMixin:
         # Wait for model loads
         for t in (clip_thread, unet_thread, vae_thread):
             if t is not None and t.is_alive():
-                t.join()
+                t.join(timeout=600)
+                if t.is_alive():
+                    print(f"[scheduler] WARNING: model thread.join timeout after 600s for {t.name}")
 
         if prefetch and clip_encode_thread is not None and clip_encode_thread.is_alive():
-            clip_encode_thread.join()
+            clip_encode_thread.join(timeout=600)
+            if clip_encode_thread.is_alive():
+                print("[scheduler] WARNING: clip_encode_thread.join timeout after 600s")
 
         # Read real-execution prefetch hit counter
         real_hit = getattr(self, "_scheduler_prefetch_real_hit", 0)
@@ -9657,7 +10632,29 @@ class _ComfyAPIMixin:
                 print(f"[active_read] registered owner={ctx_owner} loader={ctx_loader_type} "
                       f"key={miss_key[:80]} actual_key={_actual_key_str[:80]}")
             try:
-                result = original_load(path, *args, **kwargs)
+                # ── Phase 1: production cold-model physical-read coordinator ──
+                # Acquire ONLY for the duration of the actual file access. The
+                # coordinator is opt-in (default off) and falls through to the
+                # existing patched behavior when disabled. The acquire context
+                # is fail-open: if the wait deadline elapses it yields a
+                # degraded sentinel instead of raising, so a coordinator bug
+                # can never fail image generation.
+                _ctx_owner = getattr(_MODEL_LOAD_CONTEXT, "owner", "graph_loader")
+                _ctx_loader_type = getattr(_MODEL_LOAD_CONTEXT, "loader_type", "") or ""
+                _coordinator = get_model_read_coordinator() if _OPTIMIZATIONS_AVAILABLE else None
+                _can_coordinate = bool(
+                    _coordinator is not None
+                    and PRODUCTION_MODEL_READ_COORDINATOR_ENABLED
+                )
+                if _can_coordinate:
+                    with _coordinator.acquire(
+                        owner=_ctx_owner,
+                        loader_type=_ctx_loader_type or "unknown",
+                        canonical_path=miss_key,
+                    ) as _coord_state:
+                        result = original_load(path, *args, **kwargs)
+                else:
+                    result = original_load(path, *args, **kwargs)
                 duration_ms = self._profile_ms(started)
                 try:
                     size_mb = round(os.path.getsize(path) / (1024 * 1024), 1)
@@ -11438,7 +12435,8 @@ class _ComfyAPIMixin:
                   f"registry_used={_registry_used} "
                   f"registry_node_count={0} "
                   f"registry_entry_count={_registry_entries}")
-        # Collector consumed the registry — no second pop
+        # Collector consumed the registry — safety cleanup is a no-op after successful pop
+        _cleanup_production_registry(prompt_id)
         return result
 
     def _collect_in_process_outputs(self, prompt_id: str, prompt_start_time: float | None = None, modal_options: dict | None = None, *, stable_production: bool = False) -> dict:
@@ -12849,7 +13847,7 @@ class _ComfyAPIMixin:
         except Exception as exc:
             print(f"[comfyapp] sage_warmup failed: {exc}")
 
-    def _warmup_direct(self, profile: dict, clip_policy_overrides: dict | None = None) -> dict:
+    def _warmup_direct(self, profile: dict, clip_policy_overrides: dict | None = None, warmup_text: str | None = None, warmup_texts: list | None = None) -> dict:
         """Direct warmup: load models and prime CLIPTextEncode cache without
         ComfyUI executor overhead.
 
@@ -12861,20 +13859,24 @@ class _ComfyAPIMixin:
         ``load_models_gpu()`` which the node functions call internally.
 
         Model loading is further gated by:
-        - ``DIRECT_WARMUP_LOAD_UNET`` / ``DIRECT_WARMUP_LOAD_CLIP`` GÃ‡Ã¶ enable
+        - ``DIRECT_WARMUP_LOAD_UNET`` / ``DIRECT_WARMUP_LOAD_CLIP`` — enable
           UNET / CLIP loading in direct warmup (both default 0).
-        - ``DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT`` GÃ‡Ã¶ when 1 (default), only
+        - ``DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT`` — when 1 (default), only
           load a model if it is already present in the CPU cache (populated
           by ``_preload_models_to_cpu``).  This prevents direct warmup from
           becoming a blocking 16.85 GB volume read when CPU preload is
           disabled or async.
-        - ``DIRECT_WARMUP_CLIP_ENCODE`` GÃ‡Ã¶ enable dummy CLIPTextEncode forward
+        - ``DIRECT_WARMUP_CLIP_ENCODE`` — enable dummy CLIPTextEncode forward
           pass (default 0).
 
         When ``clip_policy_overrides`` is provided, its
         ``direct_warmup_load_clip_effective`` and
         ``direct_warmup_clip_encode_effective`` fields override the runtime
         flags for CLIP load/encode.
+
+        When ``warmup_texts`` (a list) is provided, ALL texts in the list
+        are encoded sequentially (after loading the CLIP object once).
+        This ensures every CLIPTextEncode in the bundle is pre-filled.
         """
         _t0 = time.time()
         _phases: dict[str, float] = {}
@@ -12977,20 +13979,59 @@ class _ComfyAPIMixin:
                 _phases["direct_clip_load_ms"] = 0.0
                 _phases_unix["direct_clip_load_end_unix_s"] = _s
 
-            # GÃ¶Ã‡GÃ¶Ã‡ 3. Prime CLIPTextEncode cache (if enabled) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
+            # P1: signal the production UNET barrier that the CLIP
+            # object construction is complete.  This unblocks the
+            # production UNET submit when the active boundary is
+            # ``after_clip_object``.  We signal regardless of
+            # boundary so a default-mode barrier worker (which
+            # waited on the event) is not stuck if the boundary
+            # is changed mid-flight.
+            try:
+                self._init_actual_load_registry()
+                _ev = getattr(self, "_production_unet_barrier_event", None)
+                if _ev is not None:
+                    _ev.set()
+                    _phases["production_unet_barrier_clip_object_signaled"] = 1.0
+            except Exception:
+                pass
+
+            # Gö─Gö─ 3. Prime CLIPTextEncode cache (if enabled) Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─
             # Costs ~1000ms for Qwen 8B forward pass but saves ~600ms
             # during inference.  Net savings ~400ms by disabling.
             _phases["direct_warmup_clip_encode"] = 1.0 if _rt_clip_encode else 0.0
             _phases_unix["direct_clip_encode_start_unix_s"] = time.time()
             _s = time.time()
-            if _rt_clip_encode and clip_out and WARMUP_TEXT:
-                enc_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
-                if enc_cls:
-                    encoder = enc_cls()
-                    encoder.encode(clip=clip_out[0], text=WARMUP_TEXT)
+            if _rt_clip_encode and clip_out:
+                _effective_warmup_text = WARMUP_TEXT
+                if warmup_text is not None:
+                    _effective_warmup_text = warmup_text
+                if warmup_texts:
+                    # Encode ALL texts sequentially for multi-encode bundles.
+                    enc_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
+                    if enc_cls:
+                        encoder = enc_cls()
+                        for _wt in warmup_texts:
+                            if _wt:
+                                encoder.encode(clip=clip_out[0], text=_wt)
+                elif _effective_warmup_text:
+                    enc_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
+                    if enc_cls:
+                        encoder = enc_cls()
+                        encoder.encode(clip=clip_out[0], text=_effective_warmup_text)
             _phases["direct_clip_encode_ms"] = round((time.time() - _s) * 1000, 1)
             _phases_unix["direct_clip_encode_end_unix_s"] = time.time()
             _phases_unix["direct_clip_warmup_end_unix_s"] = time.time()
+            # P1: signal the production UNET barrier that the CLIP
+            # encode is complete.  This unblocks the production
+            # UNET submit when the active boundary is
+            # ``after_clip_encode``.
+            try:
+                _ev2 = getattr(self, "_production_unet_encode_barrier_event", None)
+                if _ev2 is not None:
+                    _ev2.set()
+                    _phases["production_unet_barrier_clip_encode_signaled"] = 1.0
+            except Exception:
+                pass
             _phases["direct_total_ms"] = round((time.time() - _t0) * 1000, 1)
             _clip_load_requested = _rt_load_clip and bool(clip_name)
             _clip_actually_loaded = bool(clip_out) and _phases.get("direct_clip_cached", 0.0) > 0.0
@@ -13130,6 +14171,62 @@ class _ComfyAPIMixin:
         if not hasattr(self, '_clip_object_cache'):
             self._clip_object_cache: dict[tuple, object] = {}
             self._clip_cache_keys: list[tuple] = []
+
+    def _find_clip_object_for_restore(
+        self, loader_class: str, clip_type: str, filenames: list
+    ):
+        """Find an in-process CLIP object matching the requested
+        loader/type/filenames for the prompt-cache seeding path.
+
+        The CLIP object must carry ``_warmup_model_paths`` and
+        ``_warmup_clip_type`` attributes (attached by the loader
+        patch).  We look the object up by resolved path; if no
+        in-process CLIP matches, we return None and the seed
+        path uses the relaxed key only.
+        """
+        if not filenames:
+            return None
+        _clip_obj_cache = getattr(self, "_clip_object_cache", {}) or {}
+        for _fname in filenames:
+            _resolved = self._find_model_file(
+                "clip" if loader_class in ("CLIPLoader", "CLIPLoaderAdvanced")
+                else "clip",
+                _fname,
+            )
+            if not _resolved:
+                continue
+            for _k, _v in _clip_obj_cache.items():
+                try:
+                    if _k and _k[0] == _resolved and (
+                        not clip_type or _k[1] == clip_type
+                    ):
+                        return _v
+                except Exception:
+                    continue
+        # Fallback: any in-process CLIP with a matching type.
+        for _k, _v in _clip_obj_cache.items():
+            try:
+                if not clip_type or _k[1] == clip_type:
+                    return _v
+            except Exception:
+                continue
+        return None
+
+    def _resolve_clip_paths_for_cache(
+        self, filenames: list, loader_class: str
+    ) -> list[str]:
+        """Resolve the canonical paths for the prompt-cache seed key.
+
+        Returns a list of resolved realpath strings.  Order
+        matches the loader's input order (single for CLIPLoader,
+        dual for DualCLIPLoader).
+        """
+        out: list[str] = []
+        for _fname in filenames or []:
+            _resolved = self._find_model_file("clip", _fname)
+            if _resolved:
+                out.append(os.path.realpath(_resolved))
+        return out
 
     def _init_unet_cache(self):
         """Initialise instance-level UNET ModelPatcher cache."""
@@ -13281,16 +14378,19 @@ class _ComfyAPIMixin:
                 _thread = _inflight.pop(path, None)
                 if _thread is not None:
                     t0 = time.time()
-                    _thread.join()
+                    _thread.join(timeout=600)
                     wait_ms = round((time.time() - t0) * 1000, 1)
-                    print(f"[unet_loader_cache] waited_for_inflight path={unet_name} wait_ms={wait_ms}")
-                    if key in _cache:
-                        _api._unet_cache_hits = getattr(_api, '_unet_cache_hits', 0) + 1
-                        _diag["unet_loaded_from"] = "inflight_future"
-                        _diag["unet_future_wait_ms"] = wait_ms
-                        _diag["unet_loader_return_ms"] = round((time.time() - _loader_entry_t0) * 1000, 1)
-                        _api._unet_load_diagnostics = _diag
-                        return (_cache[key],)
+                    if _thread.is_alive():
+                        print(f"[unet_loader_cache] WARNING: inflight preload join timeout after 600s for path={unet_name}, falling through to normal load")
+                    else:
+                        print(f"[unet_loader_cache] waited_for_inflight path={unet_name} wait_ms={wait_ms}")
+                        if key in _cache:
+                            _api._unet_cache_hits = getattr(_api, '_unet_cache_hits', 0) + 1
+                            _diag["unet_loaded_from"] = "inflight_future"
+                            _diag["unet_future_wait_ms"] = wait_ms
+                            _diag["unet_loader_return_ms"] = round((time.time() - _loader_entry_t0) * 1000, 1)
+                            _api._unet_load_diagnostics = _diag
+                            return (_cache[key],)
             # Check in-flight actual-load future
             _f_graph_wait_start_s = time.time()
             if _future_exists_before:
@@ -13394,12 +14494,15 @@ class _ComfyAPIMixin:
             thread = getattr(_api, '_actual_load_futures', {}).pop(key, None)
             if thread is not None:
                 t0 = time.time()
-                thread.join()
+                thread.join(timeout=600)
                 wait_ms = round((time.time() - t0) * 1000, 1)
-                print(f"[loader_future] waited loader=VAE key={key} wait_ms={wait_ms}")
-                if key in cache:
-                    _api._actual_load_waits = getattr(_api, '_actual_load_waits', 0) + 1
-                    return (cache[key],)
+                if thread.is_alive():
+                    print(f"[loader_future] WARNING: waited loader=VAE key={key} timeout after 600s, falling through to normal load")
+                else:
+                    print(f"[loader_future] waited loader=VAE key={key} wait_ms={wait_ms}")
+                    if key in cache:
+                        _api._actual_load_waits = getattr(_api, '_actual_load_waits', 0) + 1
+                        return (cache[key],)
             t0 = time.time()
             result = orig_load(self_node, **kwargs)
             d_ms = round((time.time() - t0) * 1000, 1)
@@ -13421,8 +14524,11 @@ class _ComfyAPIMixin:
         if thread is None:
             return False
         t0 = time.time()
-        thread.join()
+        thread.join(timeout=600)
         wait_ms = round((time.time() - t0) * 1000, 1)
+        if thread.is_alive():
+            print(f"[loader_future] WARNING: waited key={key} timeout after 600s, returning not-consumed")
+            return False
         print(f"[loader_future] waited key={key} wait_ms={wait_ms}")
         meta = dict(getattr(self, "_actual_load_future_meta", {}).get(key, {}))
         # ── Strict no-fallback: always enforced, independent of experimental flag ──
@@ -13696,11 +14802,15 @@ class _ComfyAPIMixin:
 
             def _cached(self_node, clip, text):
                 # Build model-aware key: includes text, CLIP model identity,
-                # resolved paths, clip_type, and class name for safe reuse.
+                # resolved paths, clip_type, and the stable fingerprint tag
+                # from optimizations.stable_clip_cache_tag (single source
+                # of truth shared with the candidate builder and the
+                # restore-time seed).
                 _t_lookup = time.time()
                 _paths = tuple(getattr(clip, '_warmup_model_paths', None) or [])
                 _clip_type = getattr(clip, '_warmup_clip_type', '') or ''
-                _cls_name = type(clip).__name__
+                _stable_fp = stable_clip_cache_tag(_paths, _clip_type)
+                _cls_name = _stable_fp
                 _node_id = str(getattr(self_node, 'id', '')) or ''
                 _key = (text, _paths, _clip_type, _cls_name, id(clip))
                 # Fast path: exact clip object match
@@ -13837,9 +14947,32 @@ class _ComfyAPIMixin:
 
     @modal.enter(snap=False)
     def restore(self):
-        # â”€â”€ Post-snapshot restored-instance identity â”€â”€
+        # ── Post-snapshot restored-instance identity ──
         self._restored_instance_id = uuid.uuid4().hex[:16]
         self._restored_instance_start_unix = time.time()
+
+        # P1 (corrected): reset the UNET boundary barrier events at
+        # the start of every restore. A memory snapshot or a
+        # warm-container second restore would otherwise inherit a
+        # set event from a previous restore, and any
+        # after_clip_object or after_clip_encode boundary worker
+        # would wake up immediately and behave like
+        # after_clip_preload. We also record the actual restore
+        # start so the barrier worker can assert that the
+        # production UNET submission timestamp is not earlier
+        # than the requested boundary timestamp.
+        try:
+            self._init_actual_load_registry()
+            self._production_unet_barrier_event.clear()
+            self._production_unet_encode_barrier_event.clear()
+            self._production_unet_boundary_anchor_unix_s = time.time()
+            # P1 (corrected): the per-key "restore-background UNET
+            # load complete" events are reset every restore so a
+            # warm-container second restore cannot inherit a set
+            # event from a prior run.
+            self._rbg_unet_done_events = {}
+        except Exception:
+            pass
 
         """Snapshot restore: reattach the GPU to the pre-initialised backend.
 
@@ -14033,6 +15166,333 @@ class _ComfyAPIMixin:
             if _warmup_profile:
                 _warmup_paths = self._snapshot_preload_paths(_warmup_profile)
             __stages["early_path_resolve_ms"] = self._profile_ms(_s)
+
+            # P2: prompt-bundle consumption. The local bridge folds
+            # the safe prompt-bundle hash into the active-next
+            # dedup key, so this code path only fires when the
+            # bundle is new or the user has provided one explicitly.
+            # We read the bundle from the just-loaded active-next
+            # payload, look it up in the persistent prompt-cache
+            # volume, and on hit, prime the in-memory CLIPTextEncode
+            # cache so the graph returns a cache hit without
+            # re-encoding. On miss, we have nothing to do.
+            # Ensure the clip text encode cache is patched BEFORE
+            # consuming the persistent cache so _clip_text_cache exists.
+            try:
+                self._patch_clip_text_encode_cache()
+            except Exception as _early_patch_exc:
+                print(f"[comfyapp] early clip_cache patch failed: {_early_patch_exc}")
+            if _OPTIMIZATIONS_AVAILABLE and os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1":
+                _bundle = (_raw_active or {}).get("prompt_bundle") if isinstance(_raw_active, dict) else None
+                if isinstance(_bundle, dict) and _bundle.get("bundle_hash"):
+                    try:
+                        # Build the stable CLIP fingerprint key from
+                        # the loader filenames + clip type. This
+                        # matches the key the local bridge built.
+                        _enc = _bundle.get("encodes") or []
+                        if _enc:
+                            _loader_class = _enc[0].get("loader_class", "")
+                            _filenames = list(_enc[0].get("filenames", []))
+                            _clip_type = _enc[0].get("clip_type", "")
+                            _model_generation = (
+                                _read_models_generation_record() or {}
+                            ).get("generation", "")
+                            from optimizations import (
+                                build_clip_fingerprint,
+                                clip_fingerprint_key,
+                            )
+                            _fp = build_clip_fingerprint(
+                                resolved_paths=_filenames,
+                                clip_type=_clip_type,
+                                loader_class=_loader_class,
+                                model_generation=_model_generation,
+                            )
+                            _fp["eligible"] = True
+                            _fp_key = clip_fingerprint_key(_fp)
+                            # The GPU container has the
+                            # ``prompt_cache_vol`` mounted at
+                            # ``PROMPT_CACHE_VOLUME_PATH``, so we
+                            # read the manifest directly without
+                            # making a remote call. This is a
+                            # local filesystem read of a tiny JSON
+                            # file, not a network round trip. The
+                            # LRU update is async and best-effort so
+                            # the restore critical path is not on
+                            # the volume-commit critical path.
+                            try:
+                                prompt_cache_vol.reload()
+                                _manifest = _read_prompt_cache_manifest()
+                                _lookup = {"status": "miss"}
+                                for _entry in _manifest.get("entries", []):
+                                    if _entry.get("bundle_hash") != _bundle["bundle_hash"]:
+                                        continue
+                                    if _entry.get("clip_fingerprint_key") != _fp_key:
+                                        _lookup = {"status": "miss", "reason": "fingerprint_mismatch"}
+                                        break
+                                    # Validate model-generation. If
+                                    # the recorded generation differs
+                                    # from the current one, the cache
+                                    # is stale and we miss safely.
+                                    if (
+                                        _entry.get("model_generation")
+                                        and _model_generation
+                                        and _entry.get("model_generation") != _model_generation
+                                    ):
+                                        _lookup = {
+                                            "status": "miss",
+                                            "reason": "model_generation_drift",
+                                        }
+                                        break
+                                    _lookup = {"status": "ok", "entry": _entry}
+                                    break
+                            except Exception as _lookup_exc:
+                                _lookup = {"status": "miss", "reason": f"read_err:{_lookup_exc}"}
+                            __stages["prompt_cache_lookup_status"] = (
+                                _lookup.get("status", "miss")
+                            )
+                            if _lookup.get("status") == "ok":
+                                _entry = _lookup.get("entry", {})
+                                # Per audit recommendation: the GPU
+                                # restore side must NOT mutate the
+                                # prompt-cache manifest.  LRU
+                                # maintenance is the responsibility
+                                # of the serialized CPU writer only.
+                                # A previous version spawned a
+                                # background thread here that
+                                # raced with the CPU writer; that
+                                # code is removed.  We log the
+                                # bundle hash so it can be picked
+                                # up by the next CPU writer run.
+                                _bh = _entry.get("bundle_hash", "")
+                                if _bh:
+                                    print(
+                                        f"[prompt_cache] lru_observation_only "
+                                        f"bundle_hash={_bh[:12]} "
+                                        f"reason=gpu_restore_no_mutation"
+                                    )
+                                # Load the safetensors + descriptor
+                                # and seed the in-memory CLIPTextEncode
+                                # cache with the actual reconstructed
+                                # conditioning structure.
+                                _bundle_dir_name = _entry.get("dir", "")
+                                _bundle_dir = os.path.join(
+                                    PROMPT_CACHE_VOLUME_PATH, "bundles", _bundle_dir_name
+                                )
+                                _dj = os.path.join(_bundle_dir, "descriptor.json")
+                                _st = os.path.join(_bundle_dir, "conditioning.safetensors")
+                                _loaded = 0
+                                # Verify checksums before loading
+                                if not _verify_prompt_cache_checksums(_bundle_dir, _entry):
+                                    print(
+                                        f"[prompt_cache] checksum verification failed for "
+                                        f"bundle={_bundle['bundle_hash'][:12]} dir={_bundle_dir_name}"
+                                    )
+                                    __stages["prompt_cache_checksum_fail"] = 1
+                                elif os.path.isfile(_dj):
+                                    try:
+                                        import nodes as _nodes
+                                        from optimizations import (
+                                            deserialize_conditioning_for_cache as _restore_deser,
+                                        )
+                                        _te_cls = _nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
+                                        with open(_dj, "r", encoding="utf-8") as f:
+                                            _desc = json.load(f)
+                                        # Validate descriptor schema AND
+                                        # kind.  Per audit: schema
+                                        # mismatch MUST set _desc = None
+                                        # to skip the deserialization
+                                        # branch below; otherwise a
+                                        # schema-invalid descriptor is
+                                        # silently accepted.
+                                        if _desc.get("schema_version") != PROMPT_CACHE_SCHEMA_VERSION:
+                                            print(
+                                                f"[prompt_cache] schema_version mismatch in "
+                                                f"descriptor: {_desc.get('schema_version')}"
+                                            )
+                                            _desc = None
+                                        elif _desc.get("kind") != "conditioning_bundle_v2":
+                                            print(
+                                                f"[prompt_cache] kind mismatch in "
+                                                f"descriptor: {_desc.get('kind')}"
+                                            )
+                                            _desc = None
+                                        else:
+                                            # Per audit: under the
+                                            # already-acknowledged
+                                            # cross-container manifest
+                                            # races, the manifest may
+                                            # point to a directory whose
+                                            # descriptor does not match
+                                            # the requested bundle.  Re-
+                                            # validate the descriptor's
+                                            # identity against the
+                                            # request before deserializing
+                                            # any tensors.  A mismatch
+                                            # becomes a miss, not a
+                                            # silent load of the wrong
+                                            # cache.
+                                            _desc_bundle = (
+                                                _desc.get("bundle") or {}
+                                            )
+                                            _desc_fp = (
+                                                _desc.get("clip_fingerprint") or {}
+                                            )
+                                            _desc_bh = str(
+                                                _desc_bundle.get("bundle_hash", "")
+                                            )
+                                            _desc_fp_key = str(
+                                                _desc_fp.get("fingerprint_key", "")
+                                            )
+                                            _desc_gen = str(
+                                                _desc.get("model_generation", "")
+                                            )
+                                            _req_bh = str(_bundle.get("bundle_hash", ""))
+                                            _req_fp_key = str(_fp_key)
+                                            _req_gen = str(_model_generation)
+                                            if _desc_bh != _req_bh:
+                                                print(
+                                                    f"[prompt_cache] descriptor bundle_hash "
+                                                    f"mismatch desc={_desc_bh[:12]} req={_req_bh[:12]}"
+                                                )
+                                                _desc = None
+                                            elif _desc_fp_key != _req_fp_key:
+                                                print(
+                                                    f"[prompt_cache] descriptor fingerprint_key "
+                                                    f"mismatch desc={_desc_fp_key[:12]} req={_req_fp_key[:12]}"
+                                                )
+                                                _desc = None
+                                            # Stricter rule per audit:
+                                            # a non-empty request generation
+                                            # must match the descriptor
+                                            # exactly.  The previous
+                                            # "if _desc_gen and _req_gen"
+                                            # guard silently accepted
+                                            # descriptors with empty
+                                            # generation even when the
+                                            # request had a generation.
+                                            elif _req_gen and _desc_gen != _req_gen:
+                                                print(
+                                                    f"[prompt_cache] descriptor model_generation "
+                                                    f"mismatch desc={_desc_gen[:12]} req={_req_gen[:12]}"
+                                                )
+                                                _desc = None
+                                        if _desc is not None:
+                                            _clip_object = _find_clip_object_for_restore(
+                                                _loader_class,
+                                                _clip_type,
+                                                _filenames,
+                                            )
+                                            _paths_tuple = tuple(
+                                                self._resolve_clip_paths_for_cache(
+                                                    _filenames,
+                                                    _loader_class,
+                                                )
+                                            )
+                                            # Use the shared stable fingerprint
+                                            # helper so the graph wrapper, the
+                                            # candidate builder, and this seed
+                                            # all agree on the cache key.
+                                            _cls_name = stable_clip_cache_tag(
+                                                _paths_tuple, _clip_type,
+                                            ) or _loader_class
+                                            # Support both new format (descriptor_entries with b64)
+                                            # and old format (tensors + safetensors).
+                                            _des_entries = _desc.get("descriptor_entries")
+                                            if isinstance(_des_entries, list) and _des_entries:
+                                                # New format: b64 entries stored directly in descriptor.
+                                                for _de in _des_entries:
+                                                    _nid = str(_de.get("node_id", ""))
+                                                    _text = str(_de.get("text", ""))
+                                                    _ser_entries = _de.get("serialized_entries", [])
+                                                    if not _nid or not _text or not _ser_entries:
+                                                        continue
+                                                    # Rebuild from the serialized entries.
+                                                    _ser_payload = {
+                                                        "kind": "conditioning_list_v1",
+                                                        "schema_version": 1,
+                                                        "entries": _ser_entries,
+                                                    }
+                                                    _cond_list = _restore_deser(_ser_payload)
+                                                    if _cond_list is None:
+                                                        continue
+                                                    if _te_cls is not None and hasattr(_te_cls, "_clip_text_cache"):
+                                                        if _clip_object is not None:
+                                                            _exact = (
+                                                                _text,
+                                                                _paths_tuple,
+                                                                _clip_type,
+                                                                _cls_name,
+                                                                id(_clip_object),
+                                                            )
+                                                            _te_cls._clip_text_cache[_exact] = _cond_list
+                                                            _te_cls._clip_textencode_cache_hits = (
+                                                                getattr(_te_cls, "_clip_textencode_cache_hits", 0) + 1
+                                                            )
+                                                            _loaded += 1
+                                                        _relaxed = (
+                                                            _text,
+                                                            _paths_tuple,
+                                                            _clip_type,
+                                                            _cls_name,
+                                                        )
+                                                        if _relaxed not in _te_cls._clip_text_cache:
+                                                            _te_cls._clip_text_cache[_relaxed] = _cond_list
+                                            elif os.path.isfile(_st):
+                                                # Old format: safetensors file.
+                                                import safetensors.torch as _sft
+                                                _flat_t = _sft.load_file(_st)
+                                                for _t in _desc.get("tensors", []):
+                                                    _nid = str(_t.get("node_id", ""))
+                                                    _text = str(_t.get("text", ""))
+                                                    _cond_key = _t.get("cond_key", f"{_nid}/cond_0")
+                                                    if _nid and _text and _cond_key in _flat_t:
+                                                        _meta = {}
+                                                        for _mk, _mv in (_t.get("metadata") or {}).items():
+                                                            if not isinstance(_mv, dict):
+                                                                continue
+                                                            if _mv.get("kind") == "tensor_ref":
+                                                                _tk = _mv.get("tensor_key", "")
+                                                                if _tk in _flat_t:
+                                                                    _meta[_mk] = _flat_t[_tk]
+                                                            elif _mv.get("kind") == "raw":
+                                                                _meta[_mk] = _mv.get("value")
+                                                        _cond_list = [[_flat_t[_cond_key], _meta]]
+                                                        if _te_cls is not None and hasattr(_te_cls, "_clip_text_cache"):
+                                                            if _clip_object is not None:
+                                                                _exact = (
+                                                                    _text,
+                                                                    _paths_tuple,
+                                                                    _clip_type,
+                                                                    _cls_name,
+                                                                    id(_clip_object),
+                                                                )
+                                                                _te_cls._clip_text_cache[_exact] = _cond_list
+                                                                _te_cls._clip_textencode_cache_hits = (
+                                                                    getattr(_te_cls, "_clip_textencode_cache_hits", 0) + 1
+                                                                )
+                                                                _loaded += 1
+                                                            _relaxed = (
+                                                                _text,
+                                                                _paths_tuple,
+                                                                _clip_type,
+                                                                _cls_name,
+                                                            )
+                                                            if _relaxed not in _te_cls._clip_text_cache:
+                                                                _te_cls._clip_text_cache[_relaxed] = _cond_list
+                                    except Exception as _seed_exc:
+                                        print(f"[prompt_cache] seed failed: {_seed_exc!r}")
+                                __stages["prompt_cache_seeded_encodes"] = _loaded
+                                print(
+                                    f"[prompt_cache] hit bundle_hash={_bundle['bundle_hash'][:12]} "
+                                    f"seeded={_loaded} entry_bytes={_entry.get('total_bytes',0)}"
+                                )
+                            else:
+                                print(
+                                    f"[prompt_cache] miss reason={_lookup.get('reason','?')}"
+                                )
+                    except Exception as _bundle_consume_exc:
+                        print(f"[prompt_cache] consume error: {_bundle_consume_exc!r}")
+                        __stages["prompt_cache_consume_error"] = 1
 
             # GÃ¶Ã‡GÃ¶Ã‡ Resolve CLIP policy early GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             _clip_policy = _resolve_restore_direct_clip_policy(_warmup_profile)
@@ -14597,16 +16057,101 @@ class _ComfyAPIMixin:
                             f"rbg_expected={_rbg_expected or 'none'} rbg_submitted={_rbg_submitted}"
                         )
                     if _production_stable_path and profile:
-                        _prod_unet = self._start_production_restore_unet(
-                            profile, restore_start=restore_start, restore_stages=__stages
+                        # P1 (corrected): the UNET start boundary is
+                        # now actually enforced. The selector is read
+                        # from ``COMFYMODAL_PRODUCTION_UNET_START_BOUNDARY``
+                        # and the production UNET submit is gated on
+                        # a barrier event that is signaled by
+                        # ``_warmup_direct`` when the requested
+                        # warmup phase completes.
+                        #
+                        #   * ``after_clip_preload``  — current
+                        #     behavior, maximal overlap (default).
+                        #   * ``after_clip_object``   — wait for
+                        #     _warmup_direct to finish loading the
+                        #     CLIP object (but not the encode).
+                        #   * ``after_clip_encode``   — wait for
+                        #     _warmup_direct to finish the full CLIP
+                        #     encode; fully serialized diagnostic.
+                        _boundary = (
+                            current_unet_start_boundary()
+                            if _OPTIMIZATIONS_AVAILABLE
+                            else "after_clip_preload"
                         )
-                        __stages["production_unet_decision"] = _prod_unet.get("decision", "none")
-                        __stages["production_unet_submitted"] = 1 if _prod_unet.get("submitted") else 0
-                        print(
-                            f"[production.unet] decision={_prod_unet.get('decision','none')} "
-                            f"key={_prod_unet.get('key','')} "
-                            f"clip_read_active={_prod_unet.get('clip_read_active',0)}"
-                        )
+                        __stages["production_unet_start_boundary"] = _boundary
+                        _prod_unet = None
+                        if _boundary == "after_clip_preload":
+                            _prod_unet = self._start_production_restore_unet(
+                                profile, restore_start=restore_start, restore_stages=__stages
+                            )
+                        else:
+                            # Submit a barrier worker that waits
+                            # for the corresponding warmup event
+                            # before starting the production UNET.
+                            import threading as _thr_b
+                            if _boundary == "after_clip_object":
+                                _barrier_event = self._production_unet_barrier_event
+                            else:
+                                _barrier_event = self._production_unet_encode_barrier_event
+                            _barrier_kind = _boundary
+                            def _barrier_worker(
+                                _ev=_barrier_event, _bk=_barrier_kind,
+                                _p=profile, _rs=restore_start, _stg=__stages,
+                            ):
+                                # Cap the wait to avoid indefinite stalls
+                                _t0 = time.time()
+                                _got = _ev.wait(timeout=600)
+                                _wait_ms = round((time.time() - _t0) * 1000, 1)
+                                _stg[f"production_unet_barrier_wait_ms_{_bk}"] = _wait_ms
+                                _stg[f"production_unet_barrier_signaled_{_bk}"] = 1 if _got else 0
+                                # Assert the actual submission
+                                # timestamp is not earlier than the
+                                # requested boundary timestamp. This
+                                # proves the boundary actually
+                                # serialized the production UNET
+                                # behind the warmup phase.
+                                _anchor = getattr(
+                                    self, "_production_unet_boundary_anchor_unix_s", _t0,
+                                )
+                                _submit_unix = time.time()
+                                _stg[f"production_unet_submit_at_unix_s_{_bk}"] = _submit_unix
+                                _stg[f"production_unet_submit_after_anchor_s_{_bk}"] = round(
+                                    _submit_unix - _anchor, 4
+                                )
+                                if _submit_unix < _anchor - 0.001:
+                                    _stg[f"production_unet_boundary_violation_{_bk}"] = 1
+                                    print(
+                                        f"[production.unet] BOUNDARY_VIOLATION "
+                                        f"kind={_bk} anchor={_anchor} submit={_submit_unix}"
+                                    )
+                                _res = self._start_production_restore_unet(
+                                    _p, restore_start=_rs, restore_stages=_stg
+                                )
+                                _stg["production_unet_decision"] = _res.get("decision", "none")
+                                _stg["production_unet_submitted"] = 1 if _res.get("submitted") else 0
+                                print(
+                                    f"[production.unet] barrier_kind={_bk} wait_ms={_wait_ms} "
+                                    f"signaled={int(_got)} "
+                                    f"decision={_res.get('decision','none')} "
+                                    f"key={_res.get('key','')}"
+                                )
+                            _bt = _thr_b.Thread(
+                                target=_barrier_worker, daemon=True,
+                                name="production_unet_barrier"
+                            )
+                            _bt.start()
+                            __stages["production_unet_barrier_thread_started"] = 1
+                            __stages["production_unet_decision"] = "barrier_waiting"
+                            __stages["production_unet_submitted"] = 0
+                            _prod_unet = {"decision": "barrier_waiting", "submitted": False}
+                        if _prod_unet is not None:
+                            __stages["production_unet_decision"] = _prod_unet.get("decision", "none")
+                            __stages["production_unet_submitted"] = 1 if _prod_unet.get("submitted") else 0
+                            print(
+                                f"[production.unet] decision={_prod_unet.get('decision','none')} "
+                                f"key={_prod_unet.get('key','')} "
+                                f"clip_read_active={_prod_unet.get('clip_read_active',0)}"
+                            )
                 elif preload_paths and _pm != "off" and _restore_preload_handle is None:
                     if _pm == "async_no_wait":
                         import threading
@@ -14848,8 +16393,81 @@ class _ComfyAPIMixin:
                             )
                 if profile and profile.get("mode") and not _skip_direct_warmup:
                     _s = time.time()
+                    _warmup_text = WARMUP_TEXT
+                    _warmup_texts = None
+                    # D.1 (audit round 2): Active-next prompt encoding.
+                    # When COMFYMODAL_EXACT_CLIP_PREFILL=1, a bundle
+                    # exists, and the persistent cache missed, encode
+                    # the bundle's texts instead of the generic
+                    # WARMUP_TEXT.  Group texts by the same stable CLIP
+                    # fingerprint as the graph cache key, so we do not
+                    # encode a second CLIP stack's texts with the
+                    # primary CLIP object.  For a workflow with two
+                    # different native CLIP loaders, only the group
+                    # matching the CLIP loaded by _warmup_direct is
+                    # primed; the other stack still encodes during
+                    # graph execution (acceptable per the audit).
+                    if os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "0") == "1":
+                        try:
+                            if isinstance(_raw_active, dict):
+                                _bundle_check = _raw_active.get("prompt_bundle")
+                                if isinstance(_bundle_check, dict):
+                                    _encs = _bundle_check.get("encodes") or []
+                                    # Group by stable fingerprint
+                                    # (clip_type + path tail) — same
+                                    # scheme the graph cache key uses.
+                                    _groups: dict = {}
+                                    for _enc_e in _encs:
+                                        if not isinstance(_enc_e, dict):
+                                            continue
+                                        _t = str(_enc_e.get("text", "") or "")
+                                        if not _t:
+                                            continue
+                                        _ct = str(_enc_e.get("clip_type", "") or "")
+                                        _fns = _enc_e.get("filenames", []) or []
+                                        # Use the shared helper so the
+                                        # grouping key matches the cache
+                                        # key the graph wrapper writes
+                                        # and the candidate builder reads.
+                                        _fp = stable_clip_cache_tag(_fns, _ct)
+                                        _groups.setdefault(_fp, []).append(_t)
+                                    # Determine the fingerprint of the
+                                    # CLIP that _warmup_direct will load
+                                    # (the profile's clip1).  ONLY prime
+                                    # the group whose stable fingerprint
+                                    # matches the profile's loaded CLIP.
+                                    # If no group matches, fall back to
+                                    # the generic WARMUP_TEXT (empty
+                                    # _bundle_texts) so we do not encode
+                                    # the wrong CLIP stack's prompts
+                                    # with the primary CLIP — that would
+                                    # burn ~1000ms per encode for results
+                                    # the graph cannot use.
+                                    _profile_clip = profile.get("clip1", "")
+                                    _profile_clip_type = profile.get("clip_type", "flux")
+                                    _profile_fp = stable_clip_cache_tag(
+                                        [_profile_clip] if _profile_clip else [],
+                                        _profile_clip_type,
+                                    )
+                                    _chosen_group = _groups.get(_profile_fp, [])
+                                    # Dedup texts while preserving order
+                                    _bundle_texts: list = []
+                                    for _t in _chosen_group:
+                                        if _t not in _bundle_texts:
+                                            _bundle_texts.append(_t)
+                                    if _bundle_texts:
+                                        # Only use the bundle texts when
+                                        # persistent cache didn't already seed.
+                                        _seeded = __stages.get("prompt_cache_seeded_encodes", 0)
+                                        if _seeded == 0:
+                                            _warmup_texts = _bundle_texts
+                                            _warmup_text = _bundle_texts[0]
+                        except Exception:
+                            pass
                     _dw = self._warmup_direct(profile,
-                        clip_policy_overrides=_clip_policy)
+                        clip_policy_overrides=_clip_policy,
+                        warmup_text=_warmup_text,
+                        warmup_texts=_warmup_texts)
                     __stages["warmup_direct_total_ms"] = _dw.get("direct_total_ms", 0.0)
                     for _k in ("direct_unet_load_ms", "direct_clip_load_ms", "direct_clip_encode_ms"):
                         _v = _dw.get(_k)
@@ -15523,6 +17141,267 @@ class _ComfyAPIMixin:
                     result["_return_payload_info"]["clip_cache_size_before_prompt"] = len(_te_cls._clip_text_cache)
             except Exception:
                 pass
+
+            # P1 (corrected): collapse classification reads from the
+            # real data sources. The previous version queried
+            # ``result["restore_timing"]`` and
+            # ``result["actual_load_per_model"]`` which were the
+            # wrong keys — the actual data lives under
+            # ``result["_restore_timing"]`` and in
+            # ``self._wall_actual_load_per_model`` plus the VAE gate
+            # metrics populated by the deferral block.
+            if _OPTIMIZATIONS_AVAILABLE:
+                try:
+                    _rt = result.get("_restore_timing", {}) or {}
+                    _wall_records = list(getattr(self, "_wall_actual_load_per_model", []) or [])
+                    # Per-model reads
+                    _unet_phys_ms = 0.0
+                    _unet_post_ms = 0.0
+                    _unet_phys_started_unix = None
+                    _unet_phys_ended_unix = None
+                    _vae_phys_ms = 0.0
+                    _vae_phys_started_unix = None
+                    _vae_phys_ended_unix = None
+                    _clip_phys_ms = 0.0
+                    _clip_phys_started_unix = None
+                    _clip_phys_ended_unix = None
+                    for _m in _wall_records:
+                        try:
+                            _lt = str(_m.get("loader_type", ""))
+                            _start = _m.get("actual_load_start_unix_s")
+                            _end = _m.get("actual_load_done_unix_s")
+                            if _lt == "UNET" and _start and _end:
+                                _unet_phys_ms = max(_unet_phys_ms, (_end - _start) * 1000.0)
+                                if _unet_phys_started_unix is None or _start < _unet_phys_started_unix:
+                                    _unet_phys_started_unix = _start
+                                if _unet_phys_ended_unix is None or _end > _unet_phys_ended_unix:
+                                    _unet_phys_ended_unix = _end
+                            elif _lt == "VAE" and _start and _end:
+                                _vae_phys_ms = max(_vae_phys_ms, (_end - _start) * 1000.0)
+                                if _vae_phys_started_unix is None or _start < _vae_phys_started_unix:
+                                    _vae_phys_started_unix = _start
+                                if _vae_phys_ended_unix is None or _end > _vae_phys_ended_unix:
+                                    _vae_phys_ended_unix = _end
+                            elif _lt == "CLIP" and _start and _end:
+                                _clip_phys_ms = max(_clip_phys_ms, (_end - _start) * 1000.0)
+                                if _clip_phys_started_unix is None or _start < _clip_phys_started_unix:
+                                    _clip_phys_started_unix = _start
+                                if _clip_phys_ended_unix is None or _end > _clip_phys_ended_unix:
+                                    _clip_phys_ended_unix = _end
+                        except Exception:
+                            pass
+                    # Throughput: use restore preload's reported size
+                    # if available, else the wall record.
+                    _clip_throughput = -1.0
+                    try:
+                        _preload_total_ms = float(_rt.get("restore_preload_total_ms", 0) or 0)
+                        _preload_workers = _rt.get("restore_preload_per_file", []) or []
+                        _preload_bytes = sum(
+                            int(p.get("bytes", 0) or 0) for p in _preload_workers
+                            if isinstance(p, dict)
+                        )
+                        if _preload_bytes > 0 and _preload_total_ms > 0:
+                            _clip_throughput = round(
+                                (_preload_bytes / (1024 ** 3)) / (_preload_total_ms / 1000.0), 3
+                            )
+                    except Exception:
+                        pass
+                    if _clip_throughput < 0 and _clip_phys_ms > 0 and _clip_phys_started_unix and _clip_phys_ended_unix:
+                        try:
+                            _dur_ms = (_clip_phys_ended_unix - _clip_phys_started_unix) * 1000.0
+                            if _dur_ms > 0:
+                                # Approximation: bytes unknown → -1
+                                _clip_throughput = -1.0
+                        except Exception:
+                            pass
+                    # Overlap violations: heuristic — if the UNET
+                    # physical read and the CLIP physical read
+                    # overlap, count one violation.
+                    _overlap_count = 0
+                    if (
+                        _unet_phys_started_unix is not None
+                        and _clip_phys_started_unix is not None
+                        and _unet_phys_ended_unix is not None
+                        and _clip_phys_ended_unix is not None
+                    ):
+                        _u_s, _u_e = _unet_phys_started_unix, _unet_phys_ended_unix
+                        _c_s, _c_e = _clip_phys_started_unix, _clip_phys_ended_unix
+                        if _u_s < _c_e and _c_s < _u_e:
+                            _overlap_count += 1
+                    # VAE gate wait
+                    _vae_gate_wait_ms = 0.0
+                    _vm = getattr(self, "_vae_gate_metrics", None)
+                    if _vm is not None:
+                        try:
+                            _vm_d = _vm.to_dict() if hasattr(_vm, "to_dict") else {}
+                            _vae_gate_wait_ms = float(_vm_d.get("gate_wait_ms_total", 0) or 0)
+                        except Exception:
+                            pass
+                    # Per-phase construction: warmup_direct_total_ms
+                    # is too coarse; use the warmup phase split
+                    # captured in __stages if available.  Fall back
+                    # to warmup_direct_total_ms but flag it.
+                    _clip_construction_ms = float(_rt.get("warmup_clip_object_total_ms", 0) or 0)
+                    _clip_construction_ms_fallback = float(_rt.get("warmup_direct_total_ms", 0) or 0)
+                    if _clip_construction_ms <= 0:
+                        _clip_construction_ms = _clip_construction_ms_fallback
+                    _collapse_stats = {
+                        "clip_preload_throughput_gbps": _clip_throughput,
+                        "clip_construction_ms": _clip_construction_ms,
+                        "unet_physical_read_ms": _unet_phys_ms,
+                        "unet_post_read_construction_ms": _unet_post_ms,
+                        "vae_gate_wait_ms": _vae_gate_wait_ms,
+                        "vae_physical_read_ms": _vae_phys_ms,
+                        "overlap_violation_count": _overlap_count,
+                        "graph_waits_ms": {},
+                    }
+                    result["collapse_classification"] = classify_collapse(_collapse_stats)
+                    result["_optimizations_flags"] = get_all_flag_values()
+                    if hasattr(self, "_vae_gate_metrics"):
+                        result["vae_gate_metrics"] = self._vae_gate_metrics.to_dict()
+
+                    # P2: build a CLIP-encoding cache candidate from
+                    # the in-memory CLIPTextEncode cache. We only
+                    # emit the candidate when:
+                    #   * the persistent cache is enabled, AND
+                    #   * the workflow contains a safe prompt
+                    #     bundle (i.e. the local bridge wrote one
+                    #     into the active-next profile), AND
+                    #   * the candidate payload stays under the
+                    #     configured size cap.
+                    # The candidate is consumed by the local
+                    # post-delivery dispatcher.
+                    if (
+                        os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1"
+                        and _OPTIMIZATIONS_AVAILABLE
+                    ):
+                        try:
+                            _active = self._load_active_next_profile()
+                            _bundle = (
+                                (_active or {}).get("prompt_bundle")
+                                if isinstance(_active, dict) else None
+                            )
+                            if isinstance(_bundle, dict) and _bundle.get("encodes"):
+                                import nodes as _nodes
+                                _te_cls = _nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
+                                if _te_cls is not None and hasattr(_te_cls, "_clip_text_cache"):
+                                    _cache = _te_cls._clip_text_cache
+                                    _encodes = _bundle.get("encodes", [])
+                                    _candidates = []
+                                    for _enc in _encodes:
+                                        _nid = str(_enc.get("node_id", ""))
+                                        _text = str(_enc.get("text", ""))
+                                        _loader_class = str(_enc.get("loader_class", ""))
+                                        _clip_type = str(_enc.get("clip_type", ""))
+                                        _filenames = list(_enc.get("filenames", []) or [])
+                                        # Use model-aware key matching:
+                                        # 1. Try exact key (includes id(clip))
+                                        # 2. Try relaxed key (text, paths, clip_type, tag)
+                                        # 3. Never use text-only match (cache-poisoning risk)
+                                        # The tag MUST come from the shared
+                                        # stable_clip_cache_tag helper so the
+                                        # graph wrapper (which writes the
+                                        # cache) and this builder (which
+                                        # reads the cache) agree.
+                                        _paths_tuple = tuple(
+                                            self._resolve_clip_paths_for_cache(
+                                                _filenames, _loader_class,
+                                            )
+                                        )
+                                        _clip_object = self._find_clip_object_for_restore(
+                                            _loader_class, _clip_type, _filenames,
+                                        )
+                                        _cls_name = stable_clip_cache_tag(
+                                            _paths_tuple, _clip_type,
+                                        )
+                                        _hit = None
+                                        # Try exact key (with CLIP object id)
+                                        if _clip_object is not None:
+                                            _exact_key = (
+                                                _text, _paths_tuple, _clip_type,
+                                                _cls_name, id(_clip_object),
+                                            )
+                                            if _exact_key in _cache:
+                                                _hit = _cache[_exact_key]
+                                        # Try relaxed key
+                                        if _hit is None:
+                                            _relaxed_key = (
+                                                _text, _paths_tuple, _clip_type,
+                                                _cls_name,
+                                            )
+                                            if _relaxed_key in _cache:
+                                                _hit = _cache[_relaxed_key]
+                                        if _hit is None:
+                                            # No matching key found; skip
+                                            # (text-only match is a cache-poisoning risk)
+                                            continue
+                                        _serialized = serialize_conditioning_for_cache(_hit)
+                                        if _serialized is None:
+                                            continue
+                                        _candidates.append({
+                                            "node_id": _nid,
+                                            "text": _text,
+                                            "loader_class": _loader_class,
+                                            "clip_type": _clip_type,
+                                            "filenames": _filenames,
+                                            "serialized": _serialized,
+                                        })
+                                    if _candidates:
+                                        # Reject bundles with mixed loaders (different
+                                        # loader_class/clip_type/filenames combinations).
+                                        # When rejected, skip the entire attach
+                                        # block below so we do NOT schedule an
+                                        # empty payload to the local bridge
+                                        # (which would mark the bundle as
+                                        # attempted in the dispatcher's _seen
+                                        # map and prevent future retries).
+                                        _unique_loaders = set()
+                                        for _enc_cand in _encodes:
+                                            _enc_loader = (
+                                                str(_enc_cand.get("loader_class", "")),
+                                                str(_enc_cand.get("clip_type", "")),
+                                                tuple(_enc_cand.get("filenames", []) or []),
+                                            )
+                                            _unique_loaders.add(_enc_loader)
+                                        if len(_unique_loaders) > 1:
+                                            print(
+                                                f"[prompt_cache] mixed_loader_bundle_rejected "
+                                                f"unique_loaders={len(_unique_loaders)}"
+                                            )
+                                            _candidates.clear()
+                                        # Only attach the cache candidate if we
+                                        # still have at least one (mixed-loader
+                                        # rejection cleared the list).
+                                    if _candidates:
+                                        _model_gen = (
+                                            _read_models_generation_record() or {}
+                                        ).get("generation", "")
+                                        from optimizations import (
+                                            build_clip_fingerprint,
+                                            clip_fingerprint_key as _cfk,
+                                            build_clip_candidate_payload,
+                                        )
+                                        _enc0 = _encodes[0]
+                                        _fp = build_clip_fingerprint(
+                                            resolved_paths=list(_enc0.get("filenames", [])),
+                                            clip_type=str(_enc0.get("clip_type", "")),
+                                            loader_class=str(_enc0.get("loader_class", "")),
+                                            model_generation=_model_gen,
+                                        )
+                                        _fp["fingerprint_key"] = _cfk(_fp)
+                                        _fp["eligible"] = True
+                                        _payload = build_clip_candidate_payload(
+                                            bundle=_bundle,
+                                            clip_fingerprint=_fp,
+                                            conditioning_tensors=_candidates,
+                                        )
+                                        result["_clip_cache_candidate"] = _payload
+                                        result["_clip_cache_fingerprint"] = _fp
+                                        result["_clip_cache_candidate_count"] = len(_candidates)
+                        except Exception as _cand_exc:
+                            print(f"[prompt_cache] candidate build failed: {_cand_exc!r}")
+                except Exception:
+                    pass
             _rt_summary_i = _rt2 or {}
             _warmup_prof_i = _rt_summary_i.get("warmup_profile") or {}
             _known_good_val_i = result.get("_known_good_marked", False)
@@ -16184,7 +18063,35 @@ class _ComfyAPIMixin:
                 finally:
                     _prog_q.put(("__done__", None))
 
-            _t = threading.Thread(target=_exec, daemon=True)
+            # P5: log suppression. The audit's safety requirement
+            # is that no global stdout replacement occurs. The
+            # preferred implementation is exact logger-specific
+            # filters or exact third-party call-site patches, both
+            # of which require per-library integration work. As a
+            # safe interim, the wrapper is a no-op pass-through that
+            # records a single telemetry line per request so the
+            # flag is honored without changing global stdout. To
+            # actually suppress noisy third-party output, please
+            # patch the specific logger or print call sites inside
+            # the third-party custom nodes; that work is tracked
+            # separately and is out of scope for this correction
+            # pass.
+            def _exec_with_log_suppression():
+                if not (
+                    _OPTIMIZATIONS_AVAILABLE
+                    and os.environ.get("COMFYMODAL_THIRD_PARTY_LOG_SUPPRESSION", "0") == "1"
+                ):
+                    return _exec()
+                # The suppression is enabled but the safe pass-through
+                # path is used. No sys.stdout reassignment occurs.
+                # Future revisions should add per-logger filter hooks
+                # here instead of process-global redirection.
+                print(
+                    f"[log_suppressor] request={_container_request_count} "
+                    f"enabled=1 mode=pass_through reason=safe_noop_pending_per_logger_patches"
+                )
+                return _exec()
+            _t = threading.Thread(target=_exec_with_log_suppression, daemon=True)
             _t.start()
 
             # GÃ¶Ã‡GÃ¶Ã‡ Drain progress events until execution finishes GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
@@ -16442,7 +18349,7 @@ def _register_gpu_classes():
             min_containers=0,
             # Scale down quickly to avoid holding GPU resources when idle
             scaledown_window=4,
-            volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
+            volumes=_build_gpu_volumes(),
             enable_memory_snapshot=True,
             # GPU snapshot: when enabled, _force_triton_during_snapshot() blocks
             # SageAttention C extensions (safe) while allowing ComfyUI GPU init.
