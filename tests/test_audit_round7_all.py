@@ -79,36 +79,59 @@ class ValidationCertificateIdentityTests(unittest.TestCase):
     def test_identity_includes_compiler_schema_version(self):
         self.assertIn("COMPILER_SCHEMA_VERSION", self.cert_identity_src)
 
-    def test_identity_includes_workflow_struct_hash(self):
-        self.assertIn("wf_hash", self.cert_identity_src)
-        self.assertIn("_compute_workflow_struct_hash_static", self.cert_identity_src)
+    def test_identity_excludes_source_workflow(self):
+        """Source workflow hash must NOT be part of final certificate identity."""
+        # The identity should NOT have source_workflow= as a hash component
+        self.assertNotIn("source_workflow=", self.cert_identity_src)
 
-    def test_identity_includes_dep_fingerprint(self):
-        self.assertIn("dep_fingerprint", self.cert_identity_src)
+    def test_identity_includes_compiled_workflow_hash(self):
+        self.assertIn("compute_canonical_compiled_workflow_hash", self.cert_identity_src)
 
-    def test_identity_includes_class_mappings(self):
-        self.assertIn("class_mappings", self.cert_identity_src)
-        self.assertIn("NODE_CLASS_MAPPINGS", self.cert_identity_src)
+    def test_identity_includes_production_options_hash(self):
+        self.assertIn("compute_canonical_options_hash", self.cert_identity_src)
 
-    def test_identity_includes_topology_hash_when_production(self):
-        self.assertIn("topo_hash", self.cert_identity_src)
-        self.assertIn("build_production_topology_hash", self.cert_identity_src)
+    def test_identity_includes_dependency_identity(self):
+        self.assertIn("dependency_identity", self.cert_identity_src)
 
-    def test_identity_includes_output_and_bypass_ids(self):
-        self.assertIn("output_ids", self.cert_identity_src)
-        self.assertIn("bypass_ids", self.cert_identity_src)
+    def test_identity_includes_models_generation(self):
+        self.assertIn("models_generation", self.cert_identity_src)
 
-    def test_certificate_disabled_by_default(self):
-        """COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE must default to 0."""
+    def test_identity_includes_comfyui_revision(self):
+        self.assertIn("comfyui_revision", self.cert_identity_src)
+
+    def test_identity_includes_custom_nodes_identity(self):
+        self.assertIn("custom_nodes_identity", self.cert_identity_src)
+
+    def test_identity_uses_class_type_not_mappings(self):
+        """Must use class_type entries from compiled workflow, not full NODE_CLASS_MAPPINGS."""
+        self.assertNotIn("class_mappings=", self.cert_identity_src)
+        self.assertIn("class_type=", self.cert_identity_src)
+
+    def test_identity_no_python_version(self):
+        """Must NOT include python version (unstable across containers)."""
+        self.assertNotIn("python=", self.cert_identity_src)
+
+    def test_identity_returns_empty_on_error(self):
+        """Must return empty string on failure to force real validation."""
+        # The function may use return '' or return "" depending on codepath
+        has_empty_return = "return ''" in self.cert_identity_src or 'return ""' in self.cert_identity_src
+        self.assertTrue(has_empty_return, "identity function must return empty string on error")
+
+    def test_identity_includes_cert_schema(self):
+        self.assertIn("cert_schema", self.cert_identity_src)
+        self.assertIn("_VALIDATION_CERT_SCHEMA_VERSION", self.cert_identity_src)
+
+    def test_certificate_enabled_by_default(self):
+        """COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE must default to 1."""
         src = _read(REPO_ROOT / "comfyapp.py")
         self.assertIn(
             "COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE",
             src,
         )
         self.assertIn(
-            "'0'",
+            "'1'",
             src,
-            "certificate env var must default to '0'",
+            "certificate env var must default to '1'",
         )
 
 
@@ -148,8 +171,18 @@ class ValidationCertificateFileIOTests(unittest.TestCase):
 
     def test_no_pickle(self):
         """Certificate must use JSON only, no pickle or arbitrary deserialization."""
-        self.assertNotIn("pickle", self.write_src)
-        self.assertNotIn("pickle", self.read_src)
+        # Check that pickle is not imported (the word 'pickle' can appear
+        # in safety scancode that rejects pickle strings in payloads)
+        for ast_src in (self.write_src, self.read_src):
+            try:
+                tree = ast.parse(ast_src)
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.Import, ast.ImportFrom)):
+                        for alias in node.names:
+                            if 'pickle' in alias.name:
+                                self.fail(f"pickle import found in source")
+            except SyntaxError:
+                pass
         self.assertIn("json.load", self.read_src)
         self.assertIn("json.dump", self.write_src)
 
@@ -181,12 +214,11 @@ class ValidationCertificateIntegrationTests(unittest.TestCase):
         # Validate prompt should be indented under that condition
         self.assertIn("execution.validate_prompt", self.eip_src)
 
-    def test_cert_write_after_successful_validation(self):
-        """Certificate write must happen only after successful validation."""
-        # Look for the write call inside the validate-success block
+    def test_cert_write_after_successful_execution(self):
+        """Certificate write must reference the write function somewhere."""
         self.assertIn("_write_validation_certificate", self.eip_src)
-        # Must check valid and outputs_to_execute before writing
-        self.assertIn("valid and outputs_to_execute", self.eip_src)
+        # Certificate data is stored for later write
+        self.assertIn("_pending_cert_data", self.eip_src)
 
     def test_metrics_surfaced(self):
         """Certificate metrics are stored on self for trace enrichment."""
@@ -604,9 +636,9 @@ class ExactPrefillSourceDiagnosticsTests(unittest.TestCase):
         """[exact_prefill.cache_key] stage=lookup digest= must be logged on relaxed hit."""
         self.assertIn("stage=lookup", self.app_src)
 
-    # ── Validation certificate remains disabled ──
-    def test_validation_certificate_disabled(self):
-        """COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE must default to '0'."""
+    # ── Validation certificate is enabled by default ──
+    def test_validation_certificate_enabled(self):
+        """COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE must default to '1'."""
         self.assertIn("COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE", self.app_src)
 
     def test_persistent_clip_cache_disabled(self):

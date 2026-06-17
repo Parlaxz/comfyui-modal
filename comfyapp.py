@@ -1174,6 +1174,196 @@ DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET = os.getenv("COMFYMODAL_DEFER_VAE_ACTUAL_L
 #       actually prevent the model-read collapse in bad runs.
 DEFER_VAE_INCLUDING_PRODUCTION_UNET = os.getenv("COMFYMODAL_DEFER_VAE_INCLUDING_PRODUCTION_UNET", "0") == "1"
 
+# ---- Narrow UNET->VAE serialization coordinator ----
+# Per-key completion-based UNET/VAE coordinator.
+# Each production UNET load creates a unique Event (in UNSET state) stored
+# under its canonical key and generation token.  The Event transitions from
+# UNSET to SET exactly once when the UNET load completes.  VAE waits on
+# that specific Event (which is unset while UNET is loading), ensuring a
+# correct wait-before-completion semantics.
+_PRODUCTION_UNET_GATE_LOCK = threading.Lock()
+_PRODUCTION_UNET_GATE: dict[str, dict] = {}
+# Each entry: {canonical_key} -> {"event": Event, "generation": str, "join_context": str, "owner": str}
+_PRODUCTION_UNET_VAE_DIAG = os.environ.get("COMFYMODAL_PRODUCTION_UNET_VAE_DIAG", "0") == "1"
+
+
+def _canonical_path_digest(path: str) -> str:
+    """Return a short digest of a canonical path for diagnostics."""
+    if not path:
+        return ""
+    return hashlib.md5(str(path).encode("utf-8")).hexdigest()
+
+
+def _register_production_unet_read(
+    canonical_key: str,
+    join_context: str,
+    generation: str | None = None,
+    owner: str = "production_unet",
+) -> str:
+    """Register a production UNET model read.
+
+    Creates an UNSET Event that will be set when the read completes.
+    Returns the generation token (for matching _unregister).
+    Must be called immediately before the real physical read.
+    Paired with _complete_production_unet_read() in try/finally.
+
+    Uses (canonical_key, generation) as the dict key so multiple
+    generations on the same canonical key do not overwrite each other.
+    """
+    if generation is None:
+        generation = uuid.uuid4().hex[:12]
+    event = threading.Event()  # Initially UNSET (correct: wait() will block)
+    entry = {
+        "event": event,
+        "generation": generation,
+        "join_context": join_context,
+        "owner": owner,
+    }
+    _dict_key = (canonical_key, generation)
+    with _PRODUCTION_UNET_GATE_LOCK:
+        _PRODUCTION_UNET_GATE[_dict_key] = entry
+    if _PRODUCTION_UNET_VAE_DIAG:
+        print(
+            f"[unet_vae_gate] event=unet_registered "
+            f"generation={generation} unet_digest={_canonical_path_digest(canonical_key)[:12]} "
+            f"join_context={join_context}",
+            flush=True,
+        )
+    return generation
+
+
+def _complete_production_unet_read(canonical_key: str, generation: str) -> None:
+    """Signal that a production UNET model read has completed.
+
+    Sets the Event (waking any waiting VAE) and removes the entry.
+    Verifies the generation token to avoid race conditions with
+    a newer load on the same key.
+    """
+    entry = None
+    _dict_key = (canonical_key, generation)
+    with _PRODUCTION_UNET_GATE_LOCK:
+        existing = _PRODUCTION_UNET_GATE.pop(_dict_key, None)
+        if existing is not None and existing.get("generation") == generation:
+            entry = existing
+    if entry is not None:
+        event = entry["event"]
+        event.set()  # Wake waiting VAE
+        if _PRODUCTION_UNET_VAE_DIAG:
+            print(
+                f"[unet_vae_gate] event=unet_completed "
+                f"generation={generation} "
+                f"unet_digest={_canonical_path_digest(canonical_key)[:12]}",
+                flush=True,
+            )
+
+
+def _find_active_unet_gate(canonical_key: str, join_context: str) -> threading.Event | None:
+    """Find a matching active production UNET gate for the given key and context.
+
+    Matching priority:
+    1. Exact (canonical_key, join_context) match among registered entries.
+    2. When join_context is empty (graph VAE path): return the first active
+       UNET entry regardless of context.
+    3. When canonical_key is empty and join_context is set: return the first
+       entry with matching join_context.
+
+    Returns None if no matching active UNET is found.
+    Returns the Event to wait on if a matching UNET is active.
+    """
+    with _PRODUCTION_UNET_GATE_LOCK:
+        # Case 1: Exact canonical_key + join_context match
+        if join_context:
+            for _dk, _ent in list(_PRODUCTION_UNET_GATE.items()):
+                _ck, _gen = _dk
+                if _ck == canonical_key and _ent.get("join_context") == join_context:
+                    return _ent["event"]
+        # Case 2: Empty join_context (graph VAE path) - find any UNET
+        if not join_context and _PRODUCTION_UNET_GATE:
+            # Return the first (oldest) active UNET
+            oldest = next(iter(_PRODUCTION_UNET_GATE.values()))
+            return oldest["event"]
+        # Case 3: Canonical_key is empty but join_context is set
+        if not canonical_key and join_context:
+            for _ent in _PRODUCTION_UNET_GATE.values():
+                if _ent.get("join_context") == join_context:
+                    return _ent["event"]
+        return None
+
+
+def _production_vae_wait_for_unet(
+    canonical_key: str,
+    join_context: str,
+    timeout_s: float = 300.0,
+    vae_canonical_key: str = "",
+) -> bool:
+    """If a matching active production UNET load exists, wait for it.
+
+    Returns True (always proceeds, fail-open on timeout).
+    Waits only on the specific per-load Event that transitions from
+    UNSET (loading) to SET (complete).  If no matching UNET is active,
+    returns immediately.
+    """
+    event = _find_active_unet_gate(canonical_key, join_context)
+    if event is None:
+        # No matching active UNET
+        if _PRODUCTION_UNET_VAE_DIAG:
+            print(
+                f"[unet_vae_gate] event=vae_skip no_active_unet "
+                f"unet_digest={_canonical_path_digest(canonical_key)[:12]} "
+                f"vae_digest={_canonical_path_digest(vae_canonical_key)[:12]}",
+                flush=True,
+            )
+        return True
+
+    # Wait on the specific completion Event (which is UNSET while loading)
+    _wait_start = time.monotonic()
+    if _PRODUCTION_UNET_VAE_DIAG:
+        print(
+            f"[unet_vae_gate] event=vae_wait_start "
+            f"unet_digest={_canonical_path_digest(canonical_key)[:12]} "
+            f"vae_digest={_canonical_path_digest(vae_canonical_key)[:12]}",
+            flush=True,
+        )
+
+    waited = event.wait(timeout=timeout_s)
+    wait_ms = (time.monotonic() - _wait_start) * 1000.0
+
+    if _PRODUCTION_UNET_VAE_DIAG:
+        if waited:
+            print(
+                f"[unet_vae_gate] event=vae_wait_end "
+                f"wait_ms={wait_ms:.1f} timed_out=0",
+                flush=True,
+            )
+        else:
+            print(
+                f"[unet_vae_gate] event=vae_wait_end "
+                f"wait_ms={timeout_s * 1000:.1f} timed_out=1",
+                flush=True,
+            )
+
+    if not waited:
+        print(
+            f"[unet_vae_gate] VAE wait timed out after {timeout_s}s "
+            f"on unet_digest={_canonical_path_digest(canonical_key)[:12]}, "
+            f"fail-open proceeding",
+            flush=True,
+        )
+    return True  # Always proceed (fail-open)
+
+
+def _find_active_unet_canonical_key(match_prefix: str) -> str | None:
+    """Find the canonical key of an active UNET matching the given prefix.
+
+    Used for diagnostics. Returns None if no match.
+    """
+    with _PRODUCTION_UNET_GATE_LOCK:
+        for key in _PRODUCTION_UNET_GATE:
+            if key.startswith(match_prefix):
+                return key
+    return None
+
+
 # GÃ¶Ã‡GÃ¶Ã‡ Volume read-stall classification thresholds GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 VOLUME_STALL_UNET_MS = int(os.getenv("COMFYMODAL_VOLUME_STALL_UNET_MS", "10000"))
 VOLUME_STALL_VAE_MS = int(os.getenv("COMFYMODAL_VOLUME_STALL_VAE_MS", "2000"))
@@ -1419,7 +1609,11 @@ def _log_cold_start_waterfall(s, label=""):
         return None if a is None or b is None else max(0.0, (float(b) - float(a)) * 1000.0)
 
     def _fmt(v):
-        return "    -" if v is None else f"{float(v):>7.1f}"
+        if v is None:
+            return "    -"
+        if v == -1:
+            return "  unkn"
+        return f"{float(v):>7.1f}"
 
     def _gl(v):
         return "ok" if v is not None and float(v) > 0 else ("na" if v is None else "miss")
@@ -1506,6 +1700,46 @@ def _log_cold_start_waterfall(s, label=""):
     elif t0 is not None and t10 is not None:
         items.append(("total", "full_wall_ms", "app", _d(t0, t10)))
 
+    # ── Platform pre-restore gap attribution ──
+    _platform_gap_ms = None
+    if restore_incl_in_submit2entry and rt is not None and submit2entry_raw is not None:
+        _platform_gap_ms = max(0.0, submit2entry_raw - rt)
+
+    # Additional timestamp fields
+    _local_submit_ns = stages.get("t2_local_dispatch_ns") or (stages.get("t2_local_dispatch") * 1e9 if stages.get("t2_local_dispatch") else None)
+    _restore_start_ns = stages.get("restore_start_unix_s")
+    _modal_entry_ns = stages.get("t3_modal_entry")
+    _local_submit_s = stages.get("t2_local_dispatch")
+    _remote_return_s = stages.get("t9_modal_return")
+
+    # Emit submit-to-restore-start and related timestamps
+    if _local_submit_s is not None and _restore_start_ns is not None:
+        _submit_to_restore_ms = max(0.0, (_restore_start_ns - _local_submit_s) * 1000.0)
+        items.append(("platform", "submit_to_restore_start_ms", "platform", _submit_to_restore_ms))
+    if _restore_start_ns is not None and _modal_entry_ns is not None:
+        _restore_end_s = restore.get("restore_end_unix_s")
+        if _restore_end_s is not None:
+            _restore_end_to_entry_ms = max(0.0, (_modal_entry_ns - _restore_end_s) * 1000.0)
+            items.append(("platform", "restore_end_to_modal_entry_ms", "platform", _restore_end_to_entry_ms))
+    if _local_submit_s is not None and _modal_entry_ns is not None:
+        _submit_to_entry_ms = max(0.0, (_modal_entry_ns - _local_submit_s) * 1000.0)
+        items.append(("platform", "submit_to_modal_entry_ms", "platform", _submit_to_entry_ms))
+    if _modal_entry_ns is not None and _remote_return_s is not None:
+        _remote_entry_to_return_ms = max(0.0, (_remote_return_s - _modal_entry_ns) * 1000.0)
+        items.append(("platform", "remote_entry_to_return_ms", "platform", _remote_entry_to_return_ms))
+
+    # Platform pre-restore classification with proper unknown handling
+    if _platform_gap_ms is not None:
+        _platform_outlier = 1 if _platform_gap_ms > _PLATFORM_OUTLIER_THRESHOLD_MS else 0
+        _platform_measurement = "derived"
+        items.append(("platform", "platform_pre_restore_gap", "platform", _platform_gap_ms))
+        items.append(("platform", "platform_pre_restore_outlier", "platform", _platform_outlier))
+    else:
+        _platform_outlier = -1  # sentinel for unknown (waterfall _fmt expects numbers or None)
+        _platform_measurement = "missing_submit_timestamp" if submit2entry_raw is None else "missing_restore"
+        items.append(("platform", "platform_pre_restore_gap", "platform", None))
+    items.append(("platform", "platform_pre_restore_outlier", "platform", _platform_outlier))
+
     if not items:
         return
 
@@ -1546,6 +1780,8 @@ def _log_cold_start_waterfall(s, label=""):
     if crit_total > 0:
         print(f"[waterfall] SUM    known_nonoverlap_total           {_fmt(crit_total)}  --", flush=True)
 DEPENDENCY_VALIDATION_CACHE_SCHEMA_VERSION = 1
+# Platform pre-restore outlier threshold (ms).  Gaps exceeding this are flagged.
+_PLATFORM_OUTLIER_THRESHOLD_MS = int(os.getenv("COMFYMODAL_PLATFORM_OUTLIER_THRESHOLD_MS", "10000"))
 DEPLOYMENT_DEPENDENCY_VALIDATION_CACHE_DIR = os.path.join(
     RUNTIME_CONFIG_DIR, "deployment_dependency_validation_cache"
 )
@@ -1562,11 +1798,61 @@ _dependency_validation_memory_cache_key: str = ""
 _dep_validation_pre_key: dict | None = None
 
 # GÃ¶Ã‡GÃ¶Ã‡ Per-audit round 7: persistent validation certificate GÃ¶Ã‡GÃ¶Ã‡
-# Opt-in certificate that caches a successful execution.validate_prompt()
-# result across container restarts.  Disabled by default.
-# Flag: COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE=1 (default 0)
+# Persistent validation certificate that caches a successful
+# execution.validate_prompt() result across container restarts.
+# Enabled by default after safety fixes.
+# Flag: COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE=1 (default 1)
 _VALIDATION_CERT_DIR = os.path.join(RUNTIME_CONFIG_DIR, "validation_certificates")
-_VALIDATION_CERT_SCHEMA_VERSION = 1
+_VALIDATION_CERT_SCHEMA_VERSION = 2
+
+
+def _resolve_comfyui_revision() -> str:
+    """Resolve a stable ComfyUI source revision for certificate identity.
+
+    Priority:
+      1. Baked revision file at ``/root/comfy_revision.txt`` (deployment build).
+      2. Deterministic SHA-256 hash[:16] of ``execution.__file__`` source.
+      3. Empty string (disables persistence — operator must bake a revision file).
+    """
+    for rev_path in ("/root/comfy_revision.txt",):
+        try:
+            with open(rev_path) as _f:
+                _rev = _f.read().strip()
+                if _rev:
+                    return _rev
+        except OSError:
+            pass
+    try:
+        import execution as _exec_mod
+        import hashlib
+        _src = getattr(_exec_mod, "__file__", None)
+        if _src:
+            try:
+                with open(_src, "rb") as _f:
+                    return hashlib.sha256(_f.read()).hexdigest()[:16]
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return ""
+
+
+def _resolve_application_revision() -> str:
+    """Resolve a stable application revision for certificate identity.
+
+    Uses ``COMFYAPP_VERSION`` augmented with a deterministic source digest
+    of ``comfyapp.py`` when the source file is readable.
+    """
+    import hashlib
+    try:
+        _src_path = __file__
+        if _src_path:
+            with open(_src_path, "rb") as _f:
+                _src_hash = hashlib.sha256(_f.read()).hexdigest()[:16]
+            return f"{COMFYAPP_VERSION}+{_src_hash}"
+    except Exception:
+        pass
+    return COMFYAPP_VERSION
 
 
 def _compute_workflow_struct_hash_static(workflow: dict) -> str:
@@ -1586,62 +1872,321 @@ def _compute_workflow_struct_hash_static(workflow: dict) -> str:
     return hashlib.md5(json.dumps(stripped, sort_keys=True).encode()).hexdigest()[:16]
 
 
-def _build_validation_certificate_identity(workflow, production_options, dep_fingerprint_hash="") -> str:
+# ── Canonical workflow hash functions (validation certificate identity system) ──
+
+
+def compute_canonical_source_workflow_hash(workflow: dict) -> str:
+    """SHA-256 hash of the EXACT source workflow using deterministic JSON encoding.
+
+    Includes every node ID, class_type, input key and value (seed, text, width,
+    height, batch_size, model filenames, links, output-slot indices, arrays,
+    dicts, booleans, nulls, integers, floats, strings).  List ordering is
+    preserved.  Dictionary key ordering is normalized via sort_keys=True.
+
+    Fail-closed: returns empty string on serialization error (never raises).
+    """
+    try:
+        encoded = json.dumps(
+            workflow,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+    except Exception:
+        return ""
+
+
+def compute_canonical_compiled_workflow_hash(compiled_workflow: dict) -> str:
+    """SHA-256 hash of the compiled/compiled execution workflow.
+
+    Same deterministic JSON + SHA-256 rules as
+    compute_canonical_source_workflow_hash.
+    """
+    try:
+        encoded = json.dumps(
+            compiled_workflow,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+    except Exception:
+        return ""
+
+
+def compute_canonical_options_hash(production_options: dict) -> str:
+    """SHA-256 hash of normalized production options dict.
+
+    Same deterministic JSON + SHA-256 rules as
+    compute_canonical_source_workflow_hash.
+    """
+    try:
+        encoded = json.dumps(
+            production_options,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+    except Exception:
+        return ""
+
+
+def _build_validation_certificate_identity(
+    compiled_workflow: dict,
+    production_options: dict,
+    *,
+    dependency_identity: str = "",
+    models_generation: str = "",
+    custom_nodes_identity: str = "",
+    comfyui_revision: str = "",
+    return_components: bool = False,
+):
     """Return a SHA-256 hex digest that identifies the exact validation context.
 
-    Every component that can affect graph validation is included.  The hash
-    is the certificate filename; if any component changes the filename
-    changes, causing a cache miss that falls back to normal validation.
+    The identity includes only components that reflect the compiled/executable
+    graph — source-level inputs (seed, text, etc.) are intentionally excluded
+    so that source-only changes do not invalidate an otherwise identical
+    compiled workflow.
+
+    When a required stable component (dependency_identity, comfyui_revision,
+    or used_classes) is empty / unresolvable, the function logs the reason
+    and returns an empty identity, effectively disabling certificate
+    persistence for this invocation.
+
+    When *return_components* is True, returns ``(hash_str, components_dict)``.
     """
     import hashlib
-    import sys
-    from production_workflow import COMPILER_SCHEMA_VERSION
     h = hashlib.sha256()
-    h.update(f"cert_schema={_VALIDATION_CERT_SCHEMA_VERSION}\n".encode())
-    h.update(f"comfyapp={COMFYAPP_VERSION}\n".encode())
-    h.update(f"schema_version={COMPILER_SCHEMA_VERSION}\n".encode())
-    h.update(f"dep_fingerprint={dep_fingerprint_hash or ''}\n".encode())
-    h.update(f"python={sys.version}\n".encode())
-    # NODE_CLASS_MAPPINGS fingerprint: sorted class names
+
     try:
-        import nodes as _cert_nodes
-        _class_names = sorted(_cert_nodes.NODE_CLASS_MAPPINGS.keys())
-        h.update(f"class_mappings={hashlib.md5('|'.join(_class_names).encode()).hexdigest()}\n".encode())
+        # ── Required-component guard ────────────────────────────────
+        # Disable persistence when a fundamental environment component
+        # is missing so the operator knows what to fix.
+        if not dependency_identity:
+            print(
+                "[cert] identity disabled: dependency_identity is empty — "
+                "no dependency fingerprint available",
+                flush=True,
+            )
+            if return_components:
+                return "", {}
+            return ""
+
+        # Resolve comfyui_revision if not explicitly provided
+        if not comfyui_revision:
+            comfyui_revision = _resolve_comfyui_revision()
+            if not comfyui_revision:
+                print(
+                    "[cert] identity disabled: comfyui_revision is empty — "
+                    "no baked revision file or execution module source found",
+                    flush=True,
+                )
+                if return_components:
+                    return "", {}
+                return ""
+
+        # Warn if custom_nodes_identity is empty (advisory, not blocking)
+        if not custom_nodes_identity:
+            print(
+                "[cert] warning: custom_nodes_identity is empty — "
+                "custom-nodes generation record not found",
+                flush=True,
+            )
+
+        # ── Identity components ─────────────────────────────────────
+        from production_workflow import COMPILER_SCHEMA_VERSION
+
+        # 1. Validation certificate schema version
+        h.update(f"cert_schema={_VALIDATION_CERT_SCHEMA_VERSION}\n".encode())
+
+        # 2. Comfyapp version
+        h.update(f"comfyapp={COMFYAPP_VERSION}\n".encode())
+
+        # 3. Application revision (COMFYAPP_VERSION + source hash)
+        _app_revision = _resolve_application_revision()
+        h.update(f"application_revision={_app_revision}\n".encode())
+
+        # 4. Compiled workflow hash (deterministic JSON)
+        cwf_hash = compute_canonical_compiled_workflow_hash(compiled_workflow)
+        h.update(f"compiled_workflow={cwf_hash}\n".encode())
+
+        # 5. Production options hash (deterministic JSON)
+        opts_hash = compute_canonical_options_hash(production_options)
+        h.update(f"production_options={opts_hash}\n".encode())
+
+        # 6. Compiler schema version
+        h.update(f"compiler={COMPILER_SCHEMA_VERSION}\n".encode())
+
+        # 7. Dependency identity
+        h.update(f"dependency={dependency_identity}\n".encode())
+
+        # 8. Models generation token (optional — empty is valid)
+        _models = models_generation or ""
+        h.update(f"models_generation={_models}\n".encode())
+
+        # 9. Stable ComfyUI source revision
+        h.update(f"comfyui_revision={comfyui_revision}\n".encode())
+
+        # 10. Custom nodes identity (stable ID that changes when custom nodes are synced)
+        _cn_id = custom_nodes_identity or ""
+        h.update(f"custom_nodes_identity={_cn_id}\n".encode())
+
+        # 11. Used class types from the compiled workflow
+        _used_classes_str = ""
+        _used_class_types_list: list[str] = []
+        try:
+            import nodes as _cert_nodes
+            # Extract and deduplicate class_type values present in the compiled workflow
+            _used_class_types_list = sorted(
+                {
+                    spec.get("class_type", "")
+                    for spec in compiled_workflow.values()
+                    if isinstance(spec, dict) and spec.get("class_type")
+                }
+            )
+            for _ct in _used_class_types_list:
+                _cls = _cert_nodes.NODE_CLASS_MAPPINGS.get(_ct)
+                if _cls is not None:
+                    _entry = f"class_type={_ct} module={getattr(_cls, '__module__', '')} qualname={getattr(_cls, '__qualname__', '')}\n"
+                    h.update(_entry.encode())
+                    _used_classes_str += _entry
+                else:
+                    _entry = f"class_type={_ct} module= qualname=\n"
+                    h.update(_entry.encode())
+                    _used_classes_str += _entry
+            if not _used_class_types_list:
+                print(
+                    "[cert] identity disabled: used_classes is empty — "
+                    "no class_type entries found in compiled workflow",
+                    flush=True,
+                )
+                if return_components:
+                    return "", {}
+                return ""
+            _used_classes_hash = hashlib.md5(_used_classes_str.encode()).hexdigest()
+        except Exception:
+            import sys as _sys
+            import traceback as _tb
+            print(
+                f"[comfyapp] FATAL: could not resolve node classes for certificate identity: {_tb.format_exc()}",
+                file=_sys.stderr,
+            )
+            if return_components:
+                return "", {}
+            return ""
+
+        final_hash = h.hexdigest()
+        if return_components:
+            components = {
+                "cert_schema": str(_VALIDATION_CERT_SCHEMA_VERSION),
+                "comfyapp": COMFYAPP_VERSION,
+                "application_revision": _app_revision,
+                "compiled_workflow": cwf_hash,
+                "production_options": opts_hash,
+                "compiler": str(COMPILER_SCHEMA_VERSION),
+                "dependency": dependency_identity,
+                "models_generation": _models,
+                "comfyui_revision": comfyui_revision,
+                "custom_nodes_identity": _cn_id,
+                "used_classes": _used_classes_hash,
+                "used_class_types": _used_class_types_list,
+            }
+            return final_hash, components
+        return final_hash
     except Exception:
-        pass
-    # Workflow structure
-    wf_hash = _compute_workflow_struct_hash_static(workflow)
-    h.update(f"wf_hash={wf_hash}\n".encode())
-    # Production topology
-    if production_options and production_options.get("enabled"):
-        from production_workflow import build_production_topology_hash, normalize_production_options
-        prod_norm = normalize_production_options(production_options)
-        topo_hash = build_production_topology_hash(workflow, prod_norm, allow_direct_output_rewrite=True)
-        h.update(f"topo_hash={topo_hash}\n".encode())
-        h.update(f"output_ids={','.join(sorted(prod_norm.get('output_node_ids', [])))}\n".encode())
-        h.update(f"bypass_ids={','.join(sorted(prod_norm.get('bypass_node_ids', [])))}\n".encode())
-        h.update(f"direct_output_sink={bool(prod_norm.get('direct_output_sink', True))}\n".encode())
-    return h.hexdigest()
+        import sys as _sys
+        import traceback as _tb
+        print(
+            f"[comfyapp] FATAL: could not build validation certificate identity: {_tb.format_exc()}",
+            file=_sys.stderr,
+        )
+        if return_components:
+            return "", {}
+        return ""
 
 
-def _write_validation_certificate(cert_hash, outputs_to_execute, node_errors):
-    """Atomically write a validation certificate.  Never raises."""
+def _write_validation_certificate(cert_hash, outputs_to_execute, node_errors, *, identity_components=None, vol=None, commit=False):
+    """Atomically write a validation certificate.  Never raises.
+
+    When *commit* is True and *vol* is provided, the models volume is
+    committed synchronously after a successful write and retention cleanup.
+    """
     try:
         import json as _cert_json
         import os as _cert_os
+        _cert_write_start = time.time()
         _cert_os.makedirs(_VALIDATION_CERT_DIR, exist_ok=True)
+
+        # Skip write if certificate already exists
+        _cert_path = _cert_os.path.join(_VALIDATION_CERT_DIR, f"{cert_hash}.json")
+        if _cert_os.path.isfile(_cert_path):
+            return {"status": "exists"}
+
+        # Build payload with all identity components
         payload = {
             "schema_version": _VALIDATION_CERT_SCHEMA_VERSION,
+            "identity": cert_hash,
             "created_at": time.time(),
             "comfyapp_version": COMFYAPP_VERSION,
             "outputs_to_execute": outputs_to_execute,
             "node_errors": _CertNodeErrorEncoder.encode(node_errors) if node_errors else {},
         }
+        # Store every identity component for later miss diagnostics
+        if identity_components and isinstance(identity_components, dict):
+            _comp_map = {
+                "exact_source_workflow_hash": "source_workflow",
+                "exact_compiled_workflow_hash": "compiled_workflow",
+                "exact_production_options_hash": "production_options",
+                "compiler_version": "compiler",
+                "comfyui_revision": "comfyui_revision",
+                "application_revision": "application_revision",
+                "dependency_identity": "dependency",
+                "custom_nodes_identity": "custom_nodes_identity",
+                "models_generation": "models_generation",
+                "used_class_fingerprint": "used_classes",
+                "used_class_types": "used_class_types",
+            }
+            for _pkey, _ckey in _comp_map.items():
+                _val = identity_components.get(_ckey)
+                if _val is not None:
+                    payload[_pkey] = _val
+        else:
+            payload["exact_compiled_workflow_hash"] = ""
+            payload["exact_source_workflow_hash"] = ""
+
         tmp = _cert_os.path.join(_VALIDATION_CERT_DIR, f".{cert_hash}.tmp.{os.getpid()}")
         with open(tmp, "w", encoding="utf-8") as _cf:
             _cert_json.dump(payload, _cf, sort_keys=True)
-        _cert_os.replace(tmp, _cert_os.path.join(_VALIDATION_CERT_DIR, f"{cert_hash}.json"))
-        return {"status": "written"}
+        _cert_os.replace(tmp, _cert_path)
+        _cert_write_ms = round((time.time() - _cert_write_start) * 1000, 1)
+
+        if commit and vol is not None:
+            # Retention cleanup BEFORE commit (so commit persists deletions too)
+            _retained = _enforce_certificate_retention()
+            _commit_start = time.time()
+            try:
+                vol.commit()
+                _commit_ms = round((time.time() - _commit_start) * 1000, 1)
+                print(
+                    f"[cert.write] identity={cert_hash[:16]} status=committed "
+                    f"write_ms={_cert_write_ms} commit_ms={_commit_ms}",
+                    flush=True,
+                )
+                return {"status": "committed", "write_ms": _cert_write_ms, "commit_ms": _commit_ms}
+            except Exception as _commit_exc:
+                _commit_ms = round((time.time() - _commit_start) * 1000, 1)
+                print(
+                    f"[cert.write] identity={cert_hash[:16]} status=commit_failed "
+                    f"write_ms={_cert_write_ms} commit_ms={_commit_ms} error={str(_commit_exc)[:80]}",
+                    flush=True,
+                )
+                return {"status": "written", "commit_failed": str(_commit_exc)[:80], "write_ms": _cert_write_ms}
+        return {"status": "written", "write_ms": _cert_write_ms}
     except Exception as _cert_exc:
         return {"status": "error", "error": str(_cert_exc)[:120]}
 
@@ -1660,17 +2205,21 @@ class _CertNodeErrorEncoder:
             errors = []
             for e in info.get("errors") or []:
                 if hasattr(e, "__dict__"):
-                    errors.append({"message": str(e.get("message", "")), "type": str(type(e).__name__)})
+                    errors.append({"message": str(getattr(e, "message", str(e)))[:200], "type": str(type(e).__name__)})
                 else:
                     errors.append({"message": str(e)[:200]})
             out[str(nid)] = {"class_type": str(info.get("class_type", "")), "errors": errors}
         return out
 
 
-def _read_validation_certificate(cert_hash):
+def _read_validation_certificate(cert_hash, compiled_workflow=None, expected_components=None):
     """Read a validation certificate if it exists and is valid.
+
     Returns dict with outputs_to_execute and node_errors, or None.
     Never raises; returns None on any error or mismatch.
+    When *expected_components* is provided, each stored component digest is
+    verified against the expected value and the specific changed component
+    is logged.
     """
     try:
         import json as _cert_json
@@ -1681,19 +2230,150 @@ def _read_validation_certificate(cert_hash):
             payload = _cert_json.load(_cf)
         if not isinstance(payload, dict):
             return None
+
+        # Schema version must match
         if payload.get("schema_version") != _VALIDATION_CERT_SCHEMA_VERSION:
             return None
+
+        # Comfyapp version must match
         if payload.get("comfyapp_version") != COMFYAPP_VERSION:
             return None
-        outputs = payload.get("outputs_to_execute")
-        if not isinstance(outputs, list):
+
+        # Identity must match the requested cert_hash (safety check)
+        payload_identity = payload.get("identity")
+        if payload_identity and payload_identity != cert_hash:
             return None
+
+        # Verify stored component digests against expected values
+        if expected_components and isinstance(expected_components, dict):
+            _comp_key_map = {
+                "compiled_workflow": "exact_compiled_workflow_hash",
+                "production_options": "exact_production_options_hash",
+                "compiler": "compiler_version",
+                "comfyui_revision": "comfyui_revision",
+                "application_revision": "application_revision",
+                "dependency": "dependency_identity",
+                "custom_nodes_identity": "custom_nodes_identity",
+                "models_generation": "models_generation",
+                "used_classes": "used_class_fingerprint",
+            }
+            for _ckey, _pkey in _comp_key_map.items():
+                _expected = expected_components.get(_ckey)
+                _stored = payload.get(_pkey)
+                # Missing or mismatched component -> miss
+                if _stored is None or _stored != _expected:
+                    print(
+                        f"[cert] hit=0 identity={cert_hash[:16]} reason={_ckey}_changed"
+                        f" stored={str(_stored)[:32]!r} expected={str(_expected)[:32]!r}",
+                        flush=True,
+                    )
+                    return None
+
+        # outputs_to_execute must be a non-empty list
+        outputs = payload.get("outputs_to_execute")
+        if not isinstance(outputs, list) or len(outputs) == 0:
+            return None
+
+        # Verify no duplicate malformed output IDs
+        seen_ids = set()
+        for _oid in outputs:
+            if not isinstance(_oid, str) or _oid in seen_ids:
+                return None
+            seen_ids.add(_oid)
+
+        # If compiled_workflow provided, verify every output ID exists
+        # and resolves to a registered executable output node
+        if compiled_workflow is not None and isinstance(compiled_workflow, dict):
+            try:
+                import nodes as _cert_nodes
+            except Exception:
+                _cert_nodes = None
+            for _oid in outputs:
+                if _oid not in compiled_workflow:
+                    return None
+                if _cert_nodes is not None:
+                    _ct = compiled_workflow[_oid].get("class_type", "")
+                    if not _ct or _ct not in _cert_nodes.NODE_CLASS_MAPPINGS:
+                        return None
+                    # Verify the registered class is an actual output node
+                    _cls = _cert_nodes.NODE_CLASS_MAPPINGS.get(_ct)
+                    if _cls is not None and not getattr(_cls, "OUTPUT_NODE", False):
+                        return None
+
+        # node_errors must have expected JSON shape (dict of dicts)
         errors = payload.get("node_errors", {})
         if not isinstance(errors, dict):
             errors = {}
+        else:
+            for _nid, _info in errors.items():
+                if not isinstance(_info, dict):
+                    errors = {}
+                    break
+                if "class_type" not in _info or "errors" not in _info:
+                    errors = {}
+                    break
+                if not isinstance(_info["errors"], list):
+                    errors = {}
+                    break
+
+        # Reject payloads with "pickle" in any key or string value (safety)
+        for _k, _v in payload.items():
+            if isinstance(_k, str) and "pickle" in _k.lower():
+                return None
+            if isinstance(_v, str) and "pickle" in _v.lower():
+                return None
+
         return {"outputs_to_execute": outputs, "node_errors": errors}
     except Exception:
         return None
+
+
+def _log_certificate_identity_digest(identity, identity_components):
+    """Log one bounded diagnostic line with component digests."""
+    compiled = identity_components.get("compiled_workflow", "")[:12]
+    options = identity_components.get("production_options", "")[:12]
+    compiler = identity_components.get("compiler", "?")
+    comfyui = identity_components.get("comfyui_revision", "")[:12]
+    app_rev = identity_components.get("application_revision", "")[:20]
+    cngen = identity_components.get("custom_nodes_identity", "")[:12]
+    dep = identity_components.get("dependency", "")[:12]
+    models = identity_components.get("models_generation", "")[:12]
+    used = identity_components.get("used_classes", "")[:20]
+    final = identity[:16]
+    print(
+        f"[cert.identity] compiled_workflow={compiled} "
+        f"production_options={options} compiler={compiler} "
+        f"comfyui_revision={comfyui} application_revision={app_rev} "
+        f"custom_nodes_identity={cngen} dependency={dep} "
+        f"models_generation={models} used_classes={used} "
+        f"final={final}",
+        flush=True,
+    )
+
+
+def _enforce_certificate_retention(max_certs=128):
+    """Remove oldest certificates beyond max_certs. Never raises."""
+    try:
+        cert_dir = _VALIDATION_CERT_DIR
+        if not os.path.isdir(cert_dir):
+            return
+        certs = sorted(
+            [
+                os.path.join(cert_dir, f)
+                for f in os.listdir(cert_dir)
+                if f.endswith('.json') and not f.startswith('.')
+            ],
+            key=os.path.getmtime,
+        )
+        if len(certs) > max_certs:
+            for old in certs[:-max_certs]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
 
 # GÃ¶Ã‡GÃ¶Ã‡ PART 4: Baked dependency manifest (inside the image, NOT on volume) GÃ¶Ã‡GÃ¶Ã‡
 BAKED_CUSTOM_NODE_DEPS_MANIFEST_PATH = "/opt/comfymodal/custom_node_deps_baked.json"
@@ -9898,6 +10578,8 @@ class _ComfyAPIMixin:
 
     def _prompt_async_actual_load(self, workflow: dict) -> dict:
         _al_t0 = time.time()
+        # Per-invocation sequence identifier for the narrow UNET->VAE coordinator
+        _request_seq = uuid.uuid4().hex[:12]
         result = {
             "enabled": False, "submitted": [], "skipped_unet": False, "futures": {},
             "clip_submitted": False, "clip_cache_hit": False, "clip_duration_ms": 0.0,
@@ -10102,6 +10784,7 @@ class _ComfyAPIMixin:
                 except Exception:
                     unet_real = unet_path
                 key = (unet_real, "default")
+                _prod_unet_canonical_key = str(key)  # Save for VAE closure capture
                 resolved_keys.append(key)
                 lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
                 with lock:
@@ -10141,7 +10824,7 @@ class _ComfyAPIMixin:
                         "actual_load_start_unix_s": _al_start_u,
                         "actual_load_done_unix_s": None,
                     })
-                    def _load_unet(k=key, un=unet_name, un_path=unet_real, _rec_idx=len(self._wall_actual_load_per_model) - 1):
+                    def _load_unet(k=key, un=unet_name, un_path=unet_real, rs=_request_seq, _rec_idx=len(self._wall_actual_load_per_model) - 1):
                         import threading as _thr_lu
                         _tid = _thr_lu.current_thread().ident
                         self._actual_load_owner_thread[k] = _tid
@@ -10153,12 +10836,21 @@ class _ComfyAPIMixin:
                         t0 = time.time()
                         try:
                             _orig_fn = self._original_loaders.get("UNETLoader.load_unet")
-                            with _model_load_context(owner="actual_load", loader_type="UNET", actual_key=k, canonical_path=un_path, record_id=str(_rec_idx)):
-                                if _orig_fn:
-                                    print(f"[actual_load] using_original_loader loader=UNET key={k}")
-                                    obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["UNETLoader"](), unet_name=un, weight_dtype="default")
-                                else:
-                                    obj = _al_nodes.NODE_CLASS_MAPPINGS["UNETLoader"]().load_unet(unet_name=un, weight_dtype="default")
+                            # Signal narrow UNET->VAE coordinator that a production UNET read starts
+                            _unet_generation = _register_production_unet_read(
+                                canonical_key=str(k),
+                                join_context=rs,
+                                owner="production_unet",
+                            )
+                            try:
+                                with _model_load_context(owner="actual_load", loader_type="UNET", actual_key=k, canonical_path=un_path, record_id=str(_rec_idx)):
+                                    if _orig_fn:
+                                        print(f"[actual_load] using_original_loader loader=UNET key={k}")
+                                        obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["UNETLoader"](), unet_name=un, weight_dtype="default")
+                                    else:
+                                        obj = _al_nodes.NODE_CLASS_MAPPINGS["UNETLoader"]().load_unet(unet_name=un, weight_dtype="default")
+                            finally:
+                                _complete_production_unet_read(str(k), _unet_generation)
                             self._unet_object_cache[k] = obj[0]
                             d_ms = round((time.time() - t0) * 1000, 1)
                             _cpu_hits_after = sum(self._cpu_cache_hits.values()) if hasattr(self, "_cpu_cache_hits") else 0
@@ -10323,7 +11015,9 @@ class _ComfyAPIMixin:
                             def _load_vae_deferred(
                                 k=key, vn=vae_name, vp=vae_real,
                                 _ev=_rbg_event, _unet_key=_rbg_unet_key,
+                                rs=_request_seq,
                                 _rec_idx=len(self._wall_actual_load_per_model) - 1,
+                                _prod_unet_key=_prod_unet_canonical_key,
                             ):
                                 import threading as _thr_lv
                                 _tid = _thr_lv.current_thread().ident
@@ -10345,6 +11039,12 @@ class _ComfyAPIMixin:
                                         _ev.wait(timeout=600)
                                     except Exception:
                                         pass
+                                # Also wait for the narrow production UNET->VAE coordinator
+                                _production_vae_wait_for_unet(
+                                    canonical_key=_prod_unet_key,
+                                    join_context=rs,
+                                    vae_canonical_key=str(k),
+                                )
                                 _gate_wait_ms = round((time.time() - _wait_start) * 1000, 1)
                                 if _OPTIMIZATIONS_AVAILABLE:
                                     try:
@@ -10430,11 +11130,17 @@ class _ComfyAPIMixin:
                         "actual_load_start_unix_s": _al_start_v,
                         "actual_load_done_unix_s": None,
                     })
-                    def _load_vae(k=key, vn=vae_name, vp=vae_real, _rec_idx=len(self._wall_actual_load_per_model) - 1):
+                    def _load_vae(k=key, vn=vae_name, vp=vae_real, rs=_request_seq, _rec_idx=len(self._wall_actual_load_per_model) - 1):
                         import threading as _thr_lv
                         _tid = _thr_lv.current_thread().ident
                         self._actual_load_owner_thread[k] = _tid
                         print(f"[actual_load] worker_start loader=VAE key={k} thread_id={_tid}")
+                        # Wait for any in-flight production UNET model read (narrow coordinator)
+                        _production_vae_wait_for_unet(
+                            canonical_key="",
+                            join_context=rs,
+                            vae_canonical_key=vp,
+                        )
                         t0 = time.time()
                         try:
                             _orig_fn = self._original_loaders.get("VAELoader.load_vae")
@@ -11460,6 +12166,15 @@ class _ComfyAPIMixin:
                 # can never fail image generation.
                 _ctx_owner = getattr(_MODEL_LOAD_CONTEXT, "owner", "graph_loader")
                 _ctx_loader_type = getattr(_MODEL_LOAD_CONTEXT, "loader_type", "") or ""
+                # Narrow UNET/VAE gate: if loading a VAE, wait for any active production UNET
+                _vae_loader = isinstance(_ctx_loader_type, str) and "VAE" in _ctx_loader_type.upper()
+                if _vae_loader:
+                    _production_vae_wait_for_unet(
+                        canonical_key="",
+                        join_context="",
+                        timeout_s=300.0,
+                        vae_canonical_key=miss_key,
+                    )
                 _coordinator = get_model_read_coordinator() if _OPTIMIZATIONS_AVAILABLE else None
                 _can_coordinate = bool(
                     _coordinator is not None
@@ -12741,20 +13456,111 @@ class _ComfyAPIMixin:
                 f"Modal image if dependencies changed."
             )
 
-        # GÃ¶Ã‡GÃ¶Ã‡ Fixed-workflow fast path: skip validation if hash matches GÃ¶Ã‡GÃ¶Ã‡
+        # GöÇGöÇ Fixed-workflow fast path: skip validation if hash matches GöÇGöÇ
         _hash_start_ns = time.perf_counter_ns()
         _wf_hash = self._compute_workflow_struct_hash(workflow)
         _workflow_hash_ns = time.perf_counter_ns() - _hash_start_ns
 
-        # Production-aware cache key
+        # GöÇGöÇ Pre-validation production compilation GöÇGöÇ
+        # Compile the production workflow BEFORE validation so that the
+        # compiled graph is what gets validated, cached, and executed.
         _prod_start_ns = time.perf_counter_ns()
         _production_cache = normalize_production_options(modal_options)
         _production_enabled = _production_cache.get("enabled", False)
+        source_workflow = workflow  # save original for known-good marking
+        _compiled_workflow = None
+        _compile_ms = 0
         if _production_enabled:
-            _topology_hash = build_production_topology_hash(
-                workflow, _production_cache, allow_direct_output_rewrite=True
+            if production_report is not None:
+                # Caller pre-compiled; workflow is already the compiled version
+                _compiled_workflow = workflow
+            else:
+                _exec_t0 = time.time()
+                _compiled_workflow, production_report = compile_production_workflow(
+                    workflow,
+                    _production_cache,
+                    allow_direct_output_rewrite=True,
+                    stable=bool(_resolve_runtime_flag("PRODUCTION_STABLE_PATH", "1")),
+                )
+                _compile_ms = round((time.time() - _exec_t0) * 1000, 1)
+                _th = production_report.get('topology_hash', '?')[:12]
+                _cc = production_report.get('compiled_node_count', 0)
+                _rc = production_report.get('removed_node_count', 0)
+                _ch = production_report.get('cache_hit', False)
+                _dow = production_report.get('direct_output_rewrite_allowed', False)
+                _doc = production_report.get('direct_output_rewritten_count', 0)
+                _rcc = production_report.get('rgthree_comparer_rewritten_count', 0)
+                _soc_count = len(production_report.get('selected_output_classes', {}))
+                _soc_str = __import__('json').dumps(production_report.get('selected_output_classes', {}))
+                __import__('builtins').print(
+                    '[production.compile] enabled=1 topology_hash=' + _th +
+                    ' compiled_nodes=' + str(_cc) + ' removed_nodes=' + str(_rc) +
+                    ' cache_hit=' + str(_ch) +
+                    ' compile_ms=' + str(_compile_ms) +
+                    ' direct_output_rewrite_allowed=' + str(1 if _dow else 0) +
+                    ' direct_output_rewritten_count=' + str(_doc) +
+                    ' rgthree_comparer_rewritten_count=' + str(_rcc) +
+                    ' selected_outputs=' + str(_soc_count) +
+                    ' selected_output_classes=' + _soc_str
+                )
+            # Swap to compiled workflow for validation and execution
+            workflow = _compiled_workflow
+        elif production_report is None:
+            # No report provided and production disabled; use empty dict
+            # so downstream isinstance checks work without special-casing None.
+            production_report = {}
+
+        # Production-aware cache key using compiled workflow identity
+        _cert_identity = ""
+        _cert_identity_components = {}
+        if _production_enabled and _compiled_workflow is not None:
+            # Resolve dependency identity from module-level validation cache
+            _dep_id = _dependency_validation_memory_cache.get("current_hash", "") if _dependency_validation_memory_cache else ""
+            if not _dep_id:
+                try:
+                    _dep_fp = custom_node_dependency_fingerprint(
+                        get_runtime_custom_node_source_root_for_dependency_validation()
+                    )
+                    _dep_id = _dep_fp.get("overall_dependency_hash", "")
+                except Exception:
+                    _dep_id = ""
+            _cert_identity, _cert_identity_components = _build_validation_certificate_identity(
+                _compiled_workflow, _production_cache,
+                dependency_identity=_dep_id,
+                models_generation=_current_models_generation_id(),
+                custom_nodes_identity=_current_custom_nodes_generation_id(),
+                return_components=True,
             )
-            _wf_cache_key = f"wf_exec:production:v1:{_topology_hash}:{_wf_hash}"
+            # Guard: if identity is empty (missing required component), disable cache
+            if not _cert_identity:
+                _wf_cache_key = f"wf_exec:v2:identity_unavailable:{_wf_hash}"
+                _cert_eligible = False
+            else:
+                _wf_cache_key = f"wf_exec:v2:{_cert_identity}"
+            # [cert.identity] diagnostic log
+            _log_certificate_identity_digest(_cert_identity, _cert_identity_components)
+            # Source-change vs compiled-change detection
+            _exact_source_hash = compute_canonical_source_workflow_hash(source_workflow)
+            # Store source hash in identity components for payload storage
+            _cert_identity_components["source_workflow"] = _exact_source_hash
+            _cwf_hash = _cert_identity_components.get("compiled_workflow", "")
+            _prev_source = getattr(self, "_last_source_workflow_hash", "")
+            _prev_compiled = getattr(self, "_last_compiled_workflow_hash", "")
+            _source_changed = 1 if (_prev_source and _exact_source_hash != _prev_source) else 0
+            _compiled_changed = 1 if (_prev_compiled and _cwf_hash != _prev_compiled) else 0
+            self._last_source_workflow_hash = _exact_source_hash
+            self._last_compiled_workflow_hash = _cwf_hash
+            print(
+                f"[cert.source] "
+                f"source_hash={_exact_source_hash[:16]} "
+                f"previous_source_hash={_prev_source[:16] if _prev_source else 'none'} "
+                f"source_changed={_source_changed} "
+                f"compiled_hash={_cwf_hash[:16]} "
+                f"previous_compiled_hash={_prev_compiled[:16] if _prev_compiled else 'none'} "
+                f"compiled_changed={_compiled_changed} "
+                f"certificate_reusable={0 if _compiled_changed else 1}",
+                flush=True,
+            )
         else:
             _wf_cache_key = f"wf_exec:{_wf_hash}"
         _production_compile_ns = time.perf_counter_ns() - _prod_start_ns
@@ -12772,6 +13578,7 @@ class _ComfyAPIMixin:
         _cert_lookup_ms = 0.0
         _cert_write_submitted = 0
         _cert_write_result = ""
+        self._pending_cert_data = None
         # Critical-path recorder: validation start boundary
         try:
             self._record_critical_path(
@@ -12822,18 +13629,17 @@ class _ComfyAPIMixin:
             except Exception:
                 pass
         else:
-            # Per audit round 7: persistent validation certificate (opt-in).
+            # Per audit round 7: persistent validation certificate (enabled by default).
             # Check before calling the expensive execution.validate_prompt().
             _cert_eligible = (
                 os.environ.get("COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE", "1") == "1"
                 and _production_enabled
+                and bool(_cert_identity)
+                and bool(_cert_identity_components)
             )
             if _cert_eligible:
                 _cert_lookup_start = time.perf_counter()
-                _cert_identity = _build_validation_certificate_identity(
-                    workflow, _production_cache,
-                    dep_fingerprint_hash=getattr(self, "_last_dep_fingerprint_hash", ""),
-                )
+                # _cert_identity already computed during cache key setup above
                 # Critical-path recorder: validation certificate lookup start
                 try:
                     self._record_critical_path(
@@ -12842,7 +13648,11 @@ class _ComfyAPIMixin:
                     )
                 except Exception:
                     pass
-                _cert_result = _read_validation_certificate(_cert_identity)
+                _cert_result = _read_validation_certificate(
+                    _cert_identity,
+                    compiled_workflow=_compiled_workflow if _production_enabled else None,
+                    expected_components=_cert_identity_components if _cert_eligible else None,
+                )
                 _cert_lookup_ms = (time.perf_counter() - _cert_lookup_start) * 1000
                 if _cert_result is not None:
                     outputs_to_execute = _cert_result["outputs_to_execute"]
@@ -12858,7 +13668,53 @@ class _ComfyAPIMixin:
                     self._log_profile("inproc_validate_cert_hit", prompt_id=prompt_id[:8], hash=_wf_hash, duration_ms=_validate_ms)
                     print(f"[cert] hit=1 identity={_cert_identity[:16]} lookup_ms={round(_cert_lookup_ms, 3)}", flush=True)
                 else:
-                    print(f"[cert] hit=0 identity={_cert_identity[:16]} lookup_ms={round(_cert_lookup_ms, 3)} reason=identity_not_found", flush=True)
+                    # Improved miss diagnostic: compare against stored certificate metadata
+                    _miss_reason = "identity_not_found"
+                    _changed_component = "unknown"
+                    try:
+                        _cert_dir = _VALIDATION_CERT_DIR
+                        if os.path.isdir(_cert_dir) and _cert_identity_components:
+                            _cert_files = sorted(
+                                [f for f in os.listdir(_cert_dir) if f.endswith('.json') and not f.startswith('.')],
+                                key=lambda _cf: os.path.getmtime(os.path.join(_cert_dir, _cf)),
+                                reverse=True,
+                            )
+                            for _cf in _cert_files[:5]:  # check most recent 5
+                                _cf_path = os.path.join(_cert_dir, _cf)
+                                try:
+                                    with open(_cf_path, "r", encoding="utf-8") as _cfh:
+                                        _old_payload = json.load(_cfh)
+                                except Exception:
+                                    continue
+                                if not isinstance(_old_payload, dict):
+                                    continue
+                                _old_cwf = _old_payload.get("compiled_workflow_hash", "")
+                                _new_cwf = _cert_identity_components.get("compiled_workflow", "")
+                                if _old_cwf and _old_cwf == _new_cwf:
+                                    # Same compiled workflow, different identity — compare components
+                                    _diffs = []
+                                    _ck_map = {
+                                        "compiled_workflow": "compiled_workflow_hash",
+                                        "production_options": "production_options_hash",
+                                        "dependency": "dependency_hash",
+                                        "models_generation": "models_generation_hash",
+                                        "custom_nodes_identity": "custom_nodes_identity_hash",
+                                        "comfyui_revision": "comfyui_revision_hash",
+                                        "comfyapp": "comfyapp_version_hash",
+                                    }
+                                    for _ck, _pk in _ck_map.items():
+                                        _old_v = _old_payload.get(_pk, "")
+                                        if not _old_v:
+                                            continue
+                                        _new_v = _cert_identity_components.get(_ck, "")
+                                        if _old_v != _new_v:
+                                            _diffs.append(_ck)
+                                    if _diffs:
+                                        _changed_component = ",".join(_diffs)
+                                    break
+                    except Exception:
+                        pass
+                    print(f"[cert] hit=0 identity={_cert_identity[:16]} lookup_ms={round(_cert_lookup_ms, 3)} reason={_miss_reason} changed={_changed_component}", flush=True)
             else:
                 _cert_miss_reason = "production_disabled" if not _production_enabled else "flag_disabled"
                 print(f"[cert] eligible=0 reason={_cert_miss_reason}", flush=True)
@@ -12902,12 +13758,17 @@ class _ComfyAPIMixin:
                     if not hasattr(self, '_workflow_exec_cache'):
                         self._workflow_exec_cache = {}
                     self._workflow_exec_cache[_wf_cache_key] = (outputs_to_execute, node_errors)
-                    # Write persistent certificate (off the result critical path)
+                    # Defer certificate write to after successful execution
                     if _cert_eligible and valid and outputs_to_execute:
                         try:
+                            self._pending_cert_data = {
+                                "identity": _cert_identity,
+                                "outputs_to_execute": outputs_to_execute,
+                                "node_errors": node_errors,
+                                "identity_components": _cert_identity_components,
+                            }
                             _cert_write_submitted = 1
-                            _wr = _write_validation_certificate(_cert_identity, outputs_to_execute, node_errors)
-                            _cert_write_result = _wr.get("status", "error")
+                            _cert_write_result = "pending"
                         except Exception:
                             _cert_write_result = "error"
                 # Critical-path recorder: validation_complete
@@ -13242,54 +14103,6 @@ class _ComfyAPIMixin:
             }
             _register_production_request(prompt_id, self._active_production_request)
 
-        # â€”â€” Production preview suppression and quiet logs â€”â€”
-                # --- Compile production workflow if enabled ---
-        _exec_t0 = time.time()
-        source_workflow = workflow
-        if _prod_sink_enabled:
-            _execution_workflow, _production_report = compile_production_workflow(
-                workflow,
-                _prod_for_sink,
-                allow_direct_output_rewrite=True,
-                stable=bool(_resolve_runtime_flag("PRODUCTION_STABLE_PATH", "1")),
-            )
-            _compile_ms = round((time.time() - _exec_t0) * 1000, 1)
-            _th = _production_report.get('topology_hash', '?')[:12]
-            _cc = _production_report.get('compiled_node_count', 0)
-            _rc = _production_report.get('removed_node_count', 0)
-            _ch = _production_report.get('cache_hit', False)
-            _dow = _production_report.get('direct_output_rewrite_allowed', False)
-            _doc = _production_report.get('direct_output_rewritten_count', 0)
-            _rcc = _production_report.get('rgthree_comparer_rewritten_count', 0)
-            _soc_count = len(_production_report.get('selected_output_classes', {}))
-            _soc_str = __import__('json').dumps(_production_report.get('selected_output_classes', {}))
-            __import__('builtins').print(
-                '[production.compile] enabled=1 topology_hash=' + _th +
-                ' compiled_nodes=' + str(_cc) + ' removed_nodes=' + str(_rc) +
-                ' cache_hit=' + str(_ch) +
-                ' compile_ms=' + str(_compile_ms) +
-                ' direct_output_rewrite_allowed=' + str(1 if _dow else 0) +
-                ' direct_output_rewritten_count=' + str(_doc) +
-                ' rgthree_comparer_rewritten_count=' + str(_rcc) +
-                ' selected_outputs=' + str(_soc_count) +
-                ' selected_output_classes=' + _soc_str
-            )
-            # Update authorized node IDs from compile report
-            _authorized_sink_node_ids = list(
-                _production_report.get('direct_output_rewritten_node_ids', []) or []
-            )
-            _authorized_sink_node_ids.extend(
-                _production_report.get('rgthree_comparer_rewritten_node_ids', []) or []
-            )
-            if hasattr(self, '_active_production_request'):
-                self._active_production_request['authorized_node_ids'] = _authorized_sink_node_ids
-                _register_production_request(prompt_id, self._active_production_request)
-            # Use compiled workflow for execution
-            workflow = _execution_workflow
-        else:
-            _production_report = {}
-            _compile_ms = 0
-
         _prod_preview_restore = None
         _prod_log_handlers_restore = None
         _prod_throttle_saved = None
@@ -13426,6 +14239,25 @@ class _ComfyAPIMixin:
         if trace is not None:
             trace.mark("t8b_outputs_collected")
         result["_known_good_marked"] = _known_good_marked
+
+        # â€”â€” Write pending validation certificate after successful execution â€”â€”
+        _pending = getattr(self, '_pending_cert_data', None)
+        if _pending is not None:
+            try:
+                _wr = _write_validation_certificate(
+                    _pending["identity"],
+                    _pending["outputs_to_execute"],
+                    _pending["node_errors"],
+                    identity_components=_pending.get("identity_components"),
+                    vol=vol,
+                    commit=True,
+                )
+                self._validation_certificate_write_submitted = 1
+                self._validation_certificate_write_result = _wr.get("status", "error")
+            except Exception:
+                self._validation_certificate_write_result = "error"
+            finally:
+                self._pending_cert_data = None
 
         # â€”â€” Production runtime telemetry â€”â€”
         if _prod_sink_enabled:
