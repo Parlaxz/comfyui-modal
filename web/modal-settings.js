@@ -1332,36 +1332,38 @@ function buildPanel() {
       // Restart endpoint may close connection before responding — expected
     }
 
-    // Step 4: Wait for server to go down, then come back up, then reload
+    // Step 4: Wait for server to come back up, then reload
     updateStatus("Waiting for restart...");
-    const RESTART_TIMEOUT_MS = 90 * 1000;
+    // Generous timeout: ComfyUI can take several minutes to restart on Modal
+    const RESTART_TIMEOUT_MS = 600 * 1000;
     const restartStart = Date.now();
 
-    // Phase A: wait for server to actually die (connection refused / timeout)
-    let serverDied = false;
-    while (!serverDied && (Date.now() - restartStart) < RESTART_TIMEOUT_MS) {
-      await new Promise(r => setTimeout(r, 1500));
-      try {
-        const resp = await fetch("/api/object_info", { signal: AbortSignal.timeout(3000) });
-        if (!resp.ok) serverDied = true;
-      } catch {
-        serverDied = true; // connection refused = server is down
-      }
-    }
-
-    // Phase B: wait for server to come back up
-    updateStatus("Server restarting...");
+    // Brief pause after restart command, then poll for server to be reachable
+    await new Promise(r => setTimeout(r, 3000));
     let serverUp = false;
     while (!serverUp && (Date.now() - restartStart) < RESTART_TIMEOUT_MS) {
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 3000));
       try {
-        const resp = await fetch("/api/object_info", { signal: AbortSignal.timeout(3000) });
+        const resp = await fetch("/api/object_info", { signal: AbortSignal.timeout(5000) });
         if (resp.ok) serverUp = true;
       } catch {}
     }
 
+    if (!serverUp) {
+      updateStatus("Server restart timed out — check logs");
+      redeployRestartBtn.textContent = "Restart timed out";
+      redeployRestartBtn.disabled = false;
+      redeployBtn.disabled = false;
+      setTimeout(() => { redeployRestartBtn.textContent = "Redeploy and Restart"; }, 5000);
+      return;
+    }
+
     // Flag for post-reload success banner
     try { sessionStorage.setItem("_comfymodal_redeploy_restart_done", "1"); } catch {}
+
+    // Wait 10s for the ComfyUI server to stabilize before refreshing
+    updateStatus("Server up — stabilizing 10s before reload...");
+    await new Promise(r => setTimeout(r, 10000));
 
     updateStatus("Reloading...");
     location.reload();

@@ -34,7 +34,7 @@ from collections import OrderedDict, deque
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 
-# ── Flag helpers (all opt-in, conservative defaults) ───────────────────────
+# ── Flag helpers (opt-in by default; EXACT_CLIP_PREFILL defaults to on) ────
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -76,7 +76,7 @@ PRODUCTION_UNET_START_BOUNDARY = _env_str(
     "COMFYMODAL_PRODUCTION_UNET_START_BOUNDARY", "after_clip_preload"
 ).strip().lower()
 PRODUCTION_MODEL_READ_COORDINATOR_DIAG = _env_flag(
-    "COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR_DIAG", "0"
+    "COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR_DIAG", "1"
 )
 
 
@@ -161,6 +161,19 @@ class ProductionModelReadCoordinator:
         with self._lock:
             return self._in_flight is not None
 
+    def _safe_record(self, **kwargs) -> None:
+        """Exception-proofed recording wrapper.
+
+        Catching everything here ensures that a logging failure (e.g.
+        a broken stdout pipe or a slow log sink) can never prevent
+        the coordinator from completing its acquire/release cycle or
+        corrupt the in-flight slot.
+        """
+        try:
+            self._record(**kwargs)
+        except Exception:
+            pass
+
     def _record(
         self,
         *,
@@ -168,28 +181,42 @@ class ProductionModelReadCoordinator:
         owner: str,
         loader_type: str,
         canonical_path: str,
-        queue_enter_ms: float,
-        queue_exit_ms: float,
         wait_ms: float,
         hold_ms: float,
+        degraded: bool = False,
+        contention: bool = False,
+        holder_owner: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
-        rec = {
+        _digest = _canonical_path_digest(canonical_path) if canonical_path else ""
+        rec: Dict[str, Any] = {
             "event": event,
             "owner": owner,
             "loader_type": loader_type,
-            "canonical_path": canonical_path[:200] if canonical_path else "",
-            "queue_enter_ms": round(queue_enter_ms, 3),
-            "queue_exit_ms": round(queue_exit_ms, 3),
+            "canonical_digest": _digest,
             "wait_ms": round(wait_ms, 3),
             "hold_ms": round(hold_ms, 3),
             "ts": time.time(),
+            "ts_monotonic": time.monotonic(),
+            "thread_id": threading.get_ident(),
+            "degraded": int(degraded),
+            "contention": int(contention),
         }
+        if holder_owner is not None:
+            rec["holder_owner"] = holder_owner
+        if extra:
+            for _k, _v in extra.items():
+                if _k not in rec:
+                    rec[_k] = _v
         self.queue_log.append(rec)
         if PRODUCTION_MODEL_READ_COORDINATOR_DIAG:
             print(
                 f"[model_read_coordinator] event={event} owner={owner} "
-                f"loader={loader_type} path={canonical_path[:80]} "
-                f"wait_ms={wait_ms:.1f} hold_ms={hold_ms:.1f}"
+                f"loader={loader_type} path_digest={_digest} "
+                f"wait_ms={wait_ms:.1f} hold_ms={hold_ms:.1f} "
+                f"degraded={int(degraded)} contention={int(contention)} "
+                f"thread_id={rec['thread_id']}"
+                + (f" holder_owner={holder_owner}" if holder_owner else "")
             )
 
     @contextlib.contextmanager
@@ -200,6 +227,7 @@ class ProductionModelReadCoordinator:
         loader_type: str,
         canonical_path: str,
         timeout_s: Optional[float] = None,
+        extra: Optional[Dict[str, Any]] = None,
     ):
         """Acquire the coordinator for one cold model physical read.
 
@@ -213,6 +241,16 @@ class ProductionModelReadCoordinator:
             coordinator were not present; the coordinator never raises out
             of this context manager. This preserves the requirement that a
             speculative optimization can never fail image generation.
+
+        The optional *extra* dict is forwarded to _safe_record() so callers
+        can attach request-scoped metadata (restore_session, request_seq,
+        etc.) without the coordinator knowing their schema.
+
+        **Recording discipline**: event recording happens OUTSIDE the
+        condition lock so logging can never extend the serialized section
+        or corrupt coordinator state.  All recording is wrapped in
+        _safe_record() which catches exceptions, so a broken stdout pipe
+        can never prevent the model read from running.
 
         Spurious wake-up safety: the wait loop uses a deadline computed
         before the first wait, so a normal notification followed by a
@@ -229,54 +267,47 @@ class ProductionModelReadCoordinator:
         if not self.enabled:
             yield {"acquired": False, "reason": "coordinator_disabled", "degraded": False}
             return
+
         _timeout_s = float(timeout_s) if timeout_s is not None else float(_COORDINATOR_WAIT_TIMEOUT_S)
-        deadline = time.time() + _timeout_s
-        # Pre-compute the degraded sentinel OUTSIDE the condition lock
-        # so the yield below can be safe.
+        _deadline_mono = time.monotonic() + _timeout_s
+
         _degraded_sentinel: Optional[Dict[str, Any]] = None
         waited_ms = 0.0
+        _contended = False
+        _holder_before: Optional[str] = None
+
+        # ── Phase 1: coordinate inside the condition lock ─────────────
+        # Only state mutation lives here.  No I/O, no logging.
         with self._cond:
+            if self._in_flight is not None:
+                _holder_before = self._in_flight.get("owner")
             while self._in_flight is not None:
-                remaining = deadline - time.time()
+                _contended = True
+                remaining = _deadline_mono - time.monotonic()
                 if remaining <= 0.0:
-                    # Decide to degrade. Record the failure stat and
-                    # prepare the sentinel. We DO NOT yield while
-                    # holding the cond lock.
                     self._stats.exceptions += 1
-                    self._record(
-                        event="wait_timeout_fail_open",
-                        owner=owner,
-                        loader_type=loader_type,
-                        canonical_path=canonical_path,
-                        queue_enter_ms=0.0,
-                        queue_exit_ms=0.0,
-                        wait_ms=_timeout_s * 1000.0,
-                        hold_ms=0.0,
-                    )
                     _degraded_sentinel = {
                         "acquired": False,
                         "reason": "wait_timeout",
                         "degraded": True,
-                        "wait_ms": _timeout_s * 1000.0,
+                        "wait_ms": round(_timeout_s * 1000.0, 1),
                     }
                     break
-                # Bounded wait. Use a small wake interval so we re-check
-                # the deadline often.
                 _wake = min(remaining, 0.05)
                 self._cond.wait(timeout=_wake)
-                # Loop re-checks _in_flight AND the deadline.
             else:
                 # Loop exited without a `break` — we acquired.
-                t_exit = time.time()
-                waited_ms = (t_exit - (deadline - _timeout_s)) * 1000.0
+                _t_acquire_mono = time.monotonic()
+                if _contended:
+                    waited_ms = (_t_acquire_mono - (_deadline_mono - _timeout_s)) * 1000.0
                 self._in_flight = {
                     "owner": owner,
                     "loader_type": loader_type,
                     "canonical_path": canonical_path,
-                    "acquired_at": t_exit,
+                    "acquired_at": time.time(),
                 }
                 self._stats.acquired += 1
-                if waited_ms > 0.0:
+                if _contended:
                     self._stats.waited += 1
                     self._stats.total_wait_ms += waited_ms
                     if waited_ms > self._stats.peak_wait_ms:
@@ -285,33 +316,48 @@ class ProductionModelReadCoordinator:
                 self._stats.last_owner = owner
                 self._stats.last_loader_type = loader_type
                 self._stats.last_path = canonical_path
-                self._record(
-                    event="acquired",
-                    owner=owner,
-                    loader_type=loader_type,
-                    canonical_path=canonical_path,
-                    queue_enter_ms=0.0,
-                    queue_exit_ms=t_exit * 1000.0,
-                    wait_ms=waited_ms,
-                    hold_ms=0.0,
-                )
-        # The cond lock is RELEASED here regardless of acquired /
-        # degraded outcome. Either the caller proceeds with the
-        # protected physical read, or the caller proceeds with the
-        # degraded sentinel.
+
+        # ── Phase 2: record outside the condition lock ────────────────
         if _degraded_sentinel is not None:
+            self._safe_record(
+                event="wait_timeout_fail_open",
+                owner=owner,
+                loader_type=loader_type,
+                canonical_path=canonical_path,
+                wait_ms=_timeout_s * 1000.0,
+                hold_ms=0.0,
+                degraded=True,
+                contention=_contended,
+                holder_owner=_holder_before,
+                extra=extra,
+            )
             yield _degraded_sentinel
             return
-        t_hold_start = time.time()
+
+        self._safe_record(
+            event="acquired",
+            owner=owner,
+            loader_type=loader_type,
+            canonical_path=canonical_path,
+            wait_ms=waited_ms,
+            hold_ms=0.0,
+            contention=_contended,
+            holder_owner=_holder_before,
+            extra=extra,
+        )
+
+        # ── Phase 3: protected model read ─────────────────────────────
+        t_hold_start = time.monotonic()
         try:
             yield {
                 "acquired": True,
                 "wait_ms": waited_ms,
                 "degraded": False,
-                "holder_owner": self._in_flight.get("owner") if self._in_flight else None,
+                "holder_owner": _holder_before,
+                "contention": _contended,
             }
         finally:
-            hold_ms = (time.time() - t_hold_start) * 1000.0
+            hold_ms = (time.monotonic() - t_hold_start) * 1000.0
             with self._cond:
                 if self._in_flight is not None and self._in_flight.get("owner") == owner:
                     self._in_flight = None
@@ -321,15 +367,15 @@ class ProductionModelReadCoordinator:
                 if hold_ms > self._stats.peak_hold_ms:
                     self._stats.peak_hold_ms = hold_ms
                 self._stats.last_hold_ms = hold_ms
-            self._record(
+            self._safe_record(
                 event="released",
                 owner=owner,
                 loader_type=loader_type,
                 canonical_path=canonical_path,
-                queue_enter_ms=0.0,
-                queue_exit_ms=0.0,
                 wait_ms=0.0,
                 hold_ms=hold_ms,
+                contention=_contended,
+                extra=extra,
             )
 
     def stats(self) -> Dict[str, Any]:
@@ -338,6 +384,44 @@ class ProductionModelReadCoordinator:
     def recent(self, n: int = 16) -> List[Dict[str, Any]]:
         return list(self.queue_log)[-n:]
 
+    def summary(self) -> Dict[str, Any]:
+        """Return aggregated event summary for the current process lifetime.
+
+        Contains only directly observed values — no causal claims.
+        """
+        with self._lock:
+            s = self._stats
+            # Per-owner aggregates from the queue log
+            owner_hold: Dict[str, float] = {}
+            owner_wait: Dict[str, float] = {}
+            owner_count: Dict[str, int] = {}
+            timeout_fail_open = 0
+            for rec in self.queue_log:
+                o = rec.get("owner", "?")
+                if rec.get("event") == "acquired":
+                    owner_count[o] = owner_count.get(o, 0) + 1
+                    owner_wait[o] = owner_wait.get(o, 0.0) + rec.get("wait_ms", 0.0)
+                elif rec.get("event") == "released":
+                    owner_hold[o] = owner_hold.get(o, 0.0) + rec.get("hold_ms", 0.0)
+                elif rec.get("event") == "wait_timeout_fail_open":
+                    timeout_fail_open += 1
+            return {
+                "enabled": int(self.enabled),
+                "acquisitions": s.acquired,
+                "releases": s.released,
+                "waited": s.waited,
+                "total_wait_ms": round(s.total_wait_ms, 1),
+                "total_hold_ms": round(s.total_hold_ms, 1),
+                "peak_wait_ms": round(s.peak_wait_ms, 1),
+                "peak_hold_ms": round(s.peak_hold_ms, 1),
+                "exceptions": s.exceptions,
+                "timeout_fail_open": timeout_fail_open,
+                "timeout_fail_open_total": s.exceptions,
+                "owner_hold_ms": {k: round(v, 1) for k, v in owner_hold.items()},
+                "owner_wait_ms": {k: round(v, 1) for k, v in owner_wait.items()},
+                "owner_acquisitions": dict(owner_count),
+            }
+
 
 # Process-local singleton.
 _model_read_coordinator = ProductionModelReadCoordinator()
@@ -345,6 +429,18 @@ _model_read_coordinator = ProductionModelReadCoordinator()
 
 def get_model_read_coordinator() -> ProductionModelReadCoordinator:
     return _model_read_coordinator
+
+
+def _canonical_path_digest(path: str, length: int = 16) -> str:
+    """Short hex digest of a canonical path for safe logging.
+
+    Returns a fixed-length prefix of the SHA-256 hex digest so
+    log lines never contain full filesystem paths.  Unclear or
+    empty paths return an empty string.
+    """
+    if not path:
+        return ""
+    return hashlib.sha256(path.encode("utf-8")).hexdigest()[:max(8, int(length))]
 
 
 # ── UNET start boundary selector ─────────────────────────────────────────
@@ -628,17 +724,341 @@ def _loader_all_filenames(cls: str, inputs: Dict[str, Any]) -> List[str]:
     return out
 
 
+# ── Static-value resolver framework ───────────────────────────────────
+#
+# Generic, extensible, fail-closed static-value resolution for workflow
+# graph inputs.  Uses a registry of adapters — one per supported node
+# class — so the recursive engine is entirely independent of workflow
+# shape, node IDs, prompt text, or benchmark fixtures.
+#
+# Safety: registry lookup, cycle detection, depth limit, node-count
+# limit, UTF-8 byte size limit on every terminal value, type validation,
+# no eval/exec/imports, no custom-node execution.
+
+from typing import Callable, Dict, List, Any, Optional, Tuple
+
+_RESOLVE_MAX_DEPTH = 10
+_RESOLVE_MAX_NODES = 50
+_RESOLVE_MAX_STRING_BYTES = 100_000
+
+
+class ResolveError(Exception):
+    """Structured failure during static value resolution.
+
+    ``reasons`` is a list of human-readable failure tokens (e.g.
+    ``["cycle_detected", "1"]``, ``["unsupported_class", "BadNode"]``).
+    """
+    def __init__(self, reasons: List[str]) -> None:
+        self.reasons = reasons
+        super().__init__("|".join(reasons))
+
+
+def _checked_string(value: Any) -> Tuple[Optional[str], Optional[List[str]]]:
+    """Validate and size-check a literal string value.
+
+    Returns ``(value, None)`` on success or ``(None, [reason...])`` on failure.
+    Used on EVERY terminal path — PrimitiveStringMultiline output,
+    literal adapter inputs, direct CLIPTextEncode text, intermediate joins.
+    """
+    if not isinstance(value, str):
+        return None, ["not_a_string"]
+    if len(value.encode("utf-8")) > _RESOLVE_MAX_STRING_BYTES:
+        return None, ["resolved_string_too_large"]
+    return value, None
+
+
+class StaticValueAdapter:
+    """Registered adapter for resolving one node class's output to a static literal.
+
+    Subclasses override ``resolve()`` and set ``class_type``.
+    """
+    class_type: str = ""
+    output_type: str = "string"
+    schema_version: int = 1
+    source_package: str = ""
+
+    def resolve(
+        self,
+        workflow: Dict[str, Any],
+        node_id: str,
+        inputs: Dict[str, Any],
+        resolve_input: Callable[..., Any],
+    ) -> Tuple[Any, List[str]]:
+        """Resolve this node's output to a literal value.
+
+        Args:
+            workflow: Full workflow dict (node_id → spec).
+            node_id: This node's ID (for diagnostics).
+            inputs: This node's ``inputs`` dict.
+            resolve_input: ``resolve_input(key, default)`` — resolves a single
+                input of this node.  Returns ``(value, source_chain)`` on
+                success; raises ``ResolveError`` on failure.
+
+        Returns:
+            ``(value, source_chain)`` where *source_chain* is a list of
+            node IDs traversed during resolution (used for diagnostics).
+        """
+        raise NotImplementedError
+
+
+# ── Adapter registry ──────────────────────────────────────────────────
+
+_STATIC_RESOLVER_ADAPTERS: Dict[str, StaticValueAdapter] = {}
+
+
+def register_static_adapter(adapter: StaticValueAdapter) -> None:
+    """Register a static-value adapter for its ``class_type``."""
+    _STATIC_RESOLVER_ADAPTERS[adapter.class_type] = adapter
+
+
+def get_static_adapter(class_type: str) -> Optional[StaticValueAdapter]:
+    return _STATIC_RESOLVER_ADAPTERS.get(class_type)
+
+
+def list_registered_adapters() -> Dict[str, StaticValueAdapter]:
+    return dict(_STATIC_RESOLVER_ADAPTERS)
+
+
+# ── Recursive resolver engine ─────────────────────────────────────────
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class ResolverContext:
+    """Per-request mutable context for the static-value resolver.
+
+    Passed through recursive calls so that counters, visited sets, and
+    failure reasons are request-scoped and never shared across requests.
+    """
+    active_stack: set = field(default_factory=set)
+    visited_nodes: set = field(default_factory=set)
+    source_chain: list = field(default_factory=list)
+    adapter_chain: list = field(default_factory=list)
+    resolved_count: int = 0
+    unsupported_count: int = 0
+    max_depth_seen: int = 0
+    last_failure_reason: str = ""
+
+
+def _parse_connection(
+    value: Any,
+    *,
+    consumer_node_id: str,
+    input_name: str,
+    supported_output_indexes: set = {0},
+) -> tuple:
+    """Validate and parse an API connection value ``[node_id, output_index]``.
+
+    Returns ``(source_id, output_index)`` on success.
+    Raises ``ResolveError`` on any malformed shape, invalid types, or
+    unsupported output index.
+
+    Used for ALL connection parsing — both root CLIPTextEncode inputs
+    (``text``, ``clip``) and adapter input connections — so the two
+    paths never drift apart.
+    """
+    if not isinstance(value, list) or len(value) != 2:
+        raise ResolveError(
+            ["invalid_connection_shape", consumer_node_id, input_name],
+        )
+    source_id, output_index = value
+    if not isinstance(source_id, (str, int)):
+        raise ResolveError(
+            ["invalid_connection_node_id", consumer_node_id, input_name],
+        )
+    if not isinstance(output_index, int):
+        raise ResolveError(
+            ["invalid_output_index", consumer_node_id, input_name],
+        )
+    if output_index not in supported_output_indexes:
+        raise ResolveError(
+            ["unsupported_output_index", consumer_node_id, input_name,
+             str(output_index)],
+        )
+    return str(source_id), output_index
+
+
+def _resolve_static_value(
+    workflow: Dict[str, Any],
+    node_id: str,
+    *,
+    _depth: int = 0,
+    _ctx: Optional[ResolverContext] = None,
+) -> Tuple[Any, List[str], List[Dict[str, Any]]]:
+    """Resolve a workflow node's output to a static literal value.
+
+    Returns ``(value, source_chain, adapter_chain)`` on success.
+    ``source_chain`` lists node IDs traversed (for diagnostics).
+    ``adapter_chain`` lists adapter identities — each is a dict with
+    ``class_type``, ``schema_version``, and ``source_package`` — in
+    traversal order (for determining semantic identity).
+
+    Raises ``ResolveError`` on failure with structured reasons.
+
+    All request-scoped state lives in ``_ctx`` (a ``ResolverContext``),
+    never in module globals.
+    """
+    if _depth > _RESOLVE_MAX_DEPTH:
+        raise ResolveError(["max_depth_exceeded"])
+    if _ctx is None:
+        _ctx = ResolverContext()
+
+    _ctx.max_depth_seen = max(_ctx.max_depth_seen, _depth)
+
+    if node_id in _ctx.active_stack:
+        raise ResolveError(["cycle_detected", node_id])
+    # Check node-count limit BEFORE adding this node
+    if node_id not in _ctx.visited_nodes and len(_ctx.visited_nodes) >= _RESOLVE_MAX_NODES:
+        raise ResolveError(["max_nodes_exceeded"])
+    _ctx.active_stack.add(node_id)
+    _ctx.visited_nodes.add(node_id)
+    _ctx.source_chain.append(node_id)
+
+    try:
+        spec = workflow.get(node_id)
+        if not isinstance(spec, dict):
+            raise ResolveError(["node_not_found", node_id])
+        cls = spec.get("class_type", "")
+        inputs = spec.get("inputs", {}) or {}
+
+        adapter = get_static_adapter(cls)
+        if adapter is None:
+            _ctx.unsupported_count += 1
+            _ctx.last_failure_reason = f"unsupported_class:{cls}"
+            raise ResolveError(["unsupported_class", cls, node_id])
+
+        adapter_id: Dict[str, Any] = {
+            "class_type": adapter.class_type,
+            "schema_version": adapter.schema_version,
+            "source_package": adapter.source_package,
+        }
+        _ctx.adapter_chain.append(adapter_id)
+
+        def resolve_input(key: str, default: Any = _UNSET) -> Any:
+            """Resolve a single input of the current node.
+
+            Called by adapters.  Returns the resolved value directly (on
+            success) or raises ResolveError.  Uses ``_parse_connection``
+            for connection validation so adapter-input and root-input
+            parsing stays identical.
+            """
+            val = inputs.get(key)
+            if val is None:
+                if default is not _UNSET:
+                    return default
+                raise ResolveError(["input_missing", node_id, key])
+            if isinstance(val, str):
+                checked, _err = _checked_string(val)
+                if checked is None:
+                    raise ResolveError(_err or ["literal_size_exceeded", node_id, key])
+                return checked
+            if isinstance(val, list):
+                source_id, _ = _parse_connection(
+                    val, consumer_node_id=node_id, input_name=key,
+                )
+                child_value, _child_src, _child_adapter = _resolve_static_value(
+                    workflow, source_id,
+                    _depth=_depth + 1, _ctx=_ctx,
+                )
+                return child_value
+            raise ResolveError(["invalid_input_type", node_id, key])
+
+        value, adapter_local_chain = adapter.resolve(
+            workflow, node_id, inputs, resolve_input,
+        )
+        _ctx.source_chain.extend(adapter_local_chain[1:])
+        _ctx.resolved_count += 1
+
+        return value, list(_ctx.source_chain), list(_ctx.adapter_chain)
+
+    except ResolveError:
+        raise
+    except Exception as _exc:
+        raise ResolveError(["resolution_internal_error", node_id, str(_exc)[:80]]) from _exc
+    finally:
+        _ctx.active_stack.discard(node_id)
+
+
+_UNSET = object()  # sentinel to distinguish "not provided" from None
+
+
+# ── Built-in adapters ─────────────────────────────────────────────────
+
+class PrimitiveStringMultilineAdapter(StaticValueAdapter):
+    """ComfyUI PrimitiveStringMultiline node.
+
+    The API representation stores the literal value in ``inputs.value``.
+    Some older versions use ``inputs.string``; both are checked.
+    """
+    class_type = "PrimitiveStringMultiline"
+    output_type = "string"
+    schema_version = 1
+    source_package = "ComfyUI core"
+
+    def resolve(self, workflow, node_id, inputs, resolve_input):
+        val = inputs.get("value")
+        if not isinstance(val, str):
+            val = inputs.get("string")
+        checked, _err = _checked_string(val)
+        if checked is None:
+            raise ResolveError(_err or ["PrimitiveStringMultiline_no_string", node_id])
+        return checked, []
+
+
+class JoinStringsAdapter(StaticValueAdapter):
+    """KJNodes JoinStrings — exact binary join.
+
+    Semantics (from KJNodes source):
+        joined_string = string1 + delimiter + string2
+    Defaults:
+        string1 = ""
+        string2 = ""
+        delimiter = " "
+
+    Preserves all whitespace including trailing delimiters.
+    This is NOT a generic N-ary join; only two string slots.
+    """
+    class_type = "JoinStrings"
+    output_type = "string"
+    schema_version = 1
+    source_package = "KJNodes"
+
+    def resolve(self, workflow, node_id, inputs, resolve_input):
+        string1 = resolve_input("string1", "")
+        delimiter = resolve_input("delimiter", " ")
+        string2 = resolve_input("string2", "")
+        result = string1 + delimiter + string2
+        checked, _err = _checked_string(result)
+        if checked is None:
+            raise ResolveError(_err or ["resolved_string_too_large", node_id])
+        return checked, []
+
+
+# Register built-in adapters
+register_static_adapter(PrimitiveStringMultilineAdapter())
+register_static_adapter(JoinStringsAdapter())
+
+
 def extract_safe_prompt_bundle(workflow: Dict[str, Any]) -> Dict[str, Any]:
     """Extract a safe, canonical prompt bundle from a workflow.
 
-    Eligibility rules (any failure → ``eligible=False``):
-      * Native ``CLIPTextEncode`` node.
-      * Literal text input (not a dynamic text connection).
-      * ``clip`` input connected directly to a supported native
-        ``CLIPLoader`` / ``DualCLIPLoader`` / ``CLIPLoaderAdvanced``.
+    The bundle contains per-encode entries that the restore process can
+    pre-encode to seed the in-memory CLIPTextEncode cache, avoiding
+    duplicate graph-time encoding.
+
+    Eligibility (per-encode, not all-or-nothing):
+      * Native ``CLIPTextEncode`` node with a literal or statically
+        resolvable text input.
+      * ``clip`` input connected directly to a supported native CLIP
+        loader (``CLIPLoader`` / ``DualCLIPLoader`` / ``CLIPLoaderAdvanced``).
       * Literal loader model filenames and clip type.
       * No intermediate CLIP LoRA, model patch, custom encoder node,
         textual-inversion transform, or unknown CLIP mutation.
+
+    Unsupported encodes are silently skipped — the bundle is marked
+    eligible as long as at least one safe encode exists.  The graph
+    handles unsupported encodes normally.
 
     Loader input keys are taken from ``_LOADER_MODEL_KEYS``; the
     previous version of this helper used ``ckpt_name`` which is the
@@ -648,9 +1068,9 @@ def extract_safe_prompt_bundle(workflow: Dict[str, Any]) -> Dict[str, Any]:
         return {"eligible": False, "reason": "workflow_not_dict", "encodes": []}
 
     encodes: List[Dict[str, Any]] = []
+    unsupported_reasons: List[str] = []
 
-    # Step 1: collect eligible loader outputs that have literal model
-    # names and clip type. Map: target_node_id -> {cls, filenames, type}.
+    # Step 1: collect eligible CLIP loader outputs.
     loader_outputs: Dict[str, Dict[str, Any]] = {}
     for node_id, spec in workflow.items():
         if not isinstance(spec, dict):
@@ -660,28 +1080,11 @@ def extract_safe_prompt_bundle(workflow: Dict[str, Any]) -> Dict[str, Any]:
             continue
         inputs = spec.get("inputs", {}) or {}
         filenames = _loader_all_filenames(cls, inputs)
-        if not filenames:
-            return {
-                "eligible": False,
-                "reason": "loader_filenames_not_literal",
-                "node_id": str(node_id),
-                "encodes": [],
-            }
-        if len(filenames) != len(_LOADER_MODEL_KEYS.get(cls, [])):
-            return {
-                "eligible": False,
-                "reason": "loader_filenames_incomplete",
-                "node_id": str(node_id),
-                "encodes": [],
-            }
+        if not filenames or len(filenames) != len(_LOADER_MODEL_KEYS.get(cls, [])):
+            continue
         clip_type = inputs.get("type")
         if not isinstance(clip_type, str) or not clip_type.strip():
-            return {
-                "eligible": False,
-                "reason": "loader_clip_type_not_literal",
-                "node_id": str(node_id),
-                "encodes": [],
-            }
+            continue
         loader_outputs[str(node_id)] = {
             "loader_class": cls,
             "filenames": filenames,
@@ -691,8 +1094,8 @@ def extract_safe_prompt_bundle(workflow: Dict[str, Any]) -> Dict[str, Any]:
     if not loader_outputs:
         return {"eligible": False, "reason": "no_native_clip_loader", "encodes": []}
 
-    # Step 2: find native CLIPTextEncode nodes whose text is literal
-    # and whose clip is wired directly to one of the eligible loaders.
+    # Step 2: find CLIPTextEncode nodes, resolve their text per-node.
+    _ctx = ResolverContext()
     for node_id, spec in workflow.items():
         if not isinstance(spec, dict):
             continue
@@ -700,58 +1103,136 @@ def extract_safe_prompt_bundle(workflow: Dict[str, Any]) -> Dict[str, Any]:
             continue
         inputs = spec.get("inputs", {}) or {}
         text = inputs.get("text")
-        if not isinstance(text, str):
-            return {"eligible": False,
-                    "reason": "text_not_literal",
-                    "node_id": str(node_id),
-                    "encodes": []}
         clip_link = inputs.get("clip")
-        if not isinstance(clip_link, list) or len(clip_link) < 1:
-            return {"eligible": False,
-                    "reason": "clip_not_connected",
-                    "node_id": str(node_id),
-                    "encodes": []}
-        loader_node_id = str(clip_link[0])
+
+        # Validate clip connection using the shared _parse_connection
+        if isinstance(clip_link, list):
+            try:
+                _clip_source, _clip_output = _parse_connection(
+                    clip_link, consumer_node_id=node_id, input_name="clip",
+                )
+                loader_node_id = _clip_source
+            except ResolveError as _ce:
+                unsupported_reasons.append(f"clip_invalid:{node_id}:{'|'.join(_ce.reasons)}")
+                continue
+        else:
+            unsupported_reasons.append(f"clip_not_connected:{node_id}")
+            continue
         loader_info = loader_outputs.get(loader_node_id)
         if loader_info is None:
-            return {"eligible": False,
-                    "reason": "clip_not_from_native_loader",
-                    "node_id": str(node_id),
-                    "encodes": []}
-        encodes.append(
-            {
-                "node_id": str(node_id),
-                "text": text,
-                "loader_class": loader_info["loader_class"],
-                "filenames": list(loader_info["filenames"]),
-                "clip_type": loader_info["clip_type"],
-            }
-        )
+            unsupported_reasons.append(f"clip_not_from_native_loader:{node_id}")
+            continue
+
+        # Resolve text — use _parse_connection for connection inputs too
+        if isinstance(text, str):
+            checked, _err = _checked_string(text)
+            if checked is None:
+                unsupported_reasons.append(f"text_oversize:{node_id}")
+                continue
+            resolved_text = checked
+            text_source: List[str] = []
+            adapter_chain: List[Dict[str, Any]] = []
+        elif isinstance(text, list):
+            try:
+                _text_source, _ = _parse_connection(
+                    text, consumer_node_id=node_id, input_name="text",
+                )
+                resolved_text, text_source, adapter_chain = _resolve_static_value(
+                    workflow, _text_source, _ctx=_ctx,
+                )
+            except ResolveError as _re:
+                unsupported_reasons.append(
+                    f"text_not_resolvable:{node_id}:{'|'.join(_re.reasons)}"
+                )
+                continue
+        else:
+            unsupported_reasons.append(f"text_invalid:{node_id}")
+            continue
+
+        if not resolved_text:
+            unsupported_reasons.append(f"text_empty:{node_id}")
+            continue
+
+        encode_entry: Dict[str, Any] = {
+            "node_id": str(node_id),
+            "text": resolved_text,
+            "loader_class": loader_info["loader_class"],
+            "filenames": list(loader_info["filenames"]),
+            "clip_type": loader_info["clip_type"],
+        }
+        if text_source:
+            encode_entry["text_source"] = text_source
+        if adapter_chain:
+            encode_entry["adapter_chain"] = adapter_chain
+        encodes.append(encode_entry)
+        _ctx.resolved_count += 1  # count every successful encode, literal or resolved
 
     if not encodes:
-        return {"eligible": False, "reason": "no_eligible_encode", "encodes": []}
+        _ctx.last_failure_reason = "no_eligible_encode"
+        return {
+            "eligible": False,
+            "reason": "no_eligible_encode",
+            "encodes": [],
+            "detail": ";".join(unsupported_reasons) if unsupported_reasons else "",
+            "resolver_telemetry": {
+                "registered_classes": sorted(_STATIC_RESOLVER_ADAPTERS.keys()),
+                "nodes_visited": len(_ctx.visited_nodes),
+                "resolved_count": _ctx.resolved_count,
+                "unsupported_count": _ctx.unsupported_count,
+                "max_depth_seen": _ctx.max_depth_seen,
+                "last_failure_reason": _ctx.last_failure_reason,
+            },
+        }
 
+    # Bundle hash: SEMANTIC identity only — no node IDs, no workflow
+    # hashes.  Encodes are *sorted* by a canonical tuple so that node
+    # renumbering or dictionary iteration order does not change the
+    # identity.  The adapter identity includes schema_version and
+    # source_package so that registering a corrected adapter produces
+    # a different bundle hash.
+    def _canonical_encode_key(e: Dict[str, Any]) -> Tuple:
+        return (
+            e.get("loader_class", ""),
+            tuple(e.get("filenames", [])),
+            e.get("clip_type", ""),
+            e.get("text", ""),
+            # canonical JSON of the full adapter identity
+            json.dumps(e.get("adapter_chain", []), sort_keys=True),
+        )
+
+    _sorted_for_hash = sorted(
+        [
+            {
+                "text": e["text"],
+                "loader_class": e["loader_class"],
+                "filenames": e["filenames"],
+                "clip_type": e["clip_type"],
+                **({"adapter_chain": e["adapter_chain"]} if e.get("adapter_chain") else {}),
+            }
+            for e in encodes
+        ],
+        key=_canonical_encode_key,
+    )
     bundle: Dict[str, Any] = {
         "schema_version": PROMPT_BUNDLE_SCHEMA_VERSION,
-        "encodes": sorted(encodes, key=lambda e: e["node_id"]),
+        "encodes": encodes,
     }
     bundle["bundle_hash"] = _safe_sha256(
         {
             "schema": PROMPT_BUNDLE_SCHEMA_VERSION,
-            "encodes": [
-                {
-                    "node_id": e["node_id"],
-                    "text": e["text"],
-                    "loader_class": e["loader_class"],
-                    "filenames": e["filenames"],
-                    "clip_type": e["clip_type"],
-                }
-                for e in bundle["encodes"]
-            ],
+            "encodes": _sorted_for_hash,
         }
     )
     return {"eligible": True, "reason": "ok", "encodes": bundle["encodes"],
-            "bundle": bundle}
+            "bundle": bundle,
+            "resolver_telemetry": {
+                "registered_classes": sorted(_STATIC_RESOLVER_ADAPTERS.keys()),
+                "nodes_visited": len(_ctx.visited_nodes),
+                "resolved_count": _ctx.resolved_count,
+                "unsupported_count": _ctx.unsupported_count,
+                "max_depth_seen": _ctx.max_depth_seen,
+                "last_failure_reason": _ctx.last_failure_reason,
+            }}
 
 
 # ── Phase 2: In-memory CLIPTextEncode cache (bounded, fingerprint-aware) ─
@@ -882,7 +1363,7 @@ PERSISTENT_CLIP_CACHE_MAX_CANDIDATE_MB = _env_int(
     "COMFYMODAL_PERSISTENT_CLIP_CACHE_MAX_CANDIDATE_MB", 256
 )
 PERSISTENT_CLIP_CACHE_ENABLED = _env_flag("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0")
-EXACT_CLIP_PREFILL_ENABLED = _env_flag("COMFYMODAL_EXACT_CLIP_PREFILL", "0")
+EXACT_CLIP_PREFILL_ENABLED = _env_flag("COMFYMODAL_EXACT_CLIP_PREFILL", "1")
 GENERIC_CLIP_WARMUP_FALLBACK_ENABLED = _env_flag(
     "COMFYMODAL_GENERIC_CLIP_WARMUP_FALLBACK", "0"
 )
@@ -1900,6 +2381,392 @@ def safe_resource_snapshot() -> Dict[str, Any]:
     return out
 
 
+# ── Critical-path observed-event recorder (diagnostic, opt-in) ──────────
+#
+# This is a small, thread-safe, per-(restore_session, request_seq) event
+# store for the diagnostic-only cold-start pass. It is NOT the production
+# waterfall recorder and it MUST NOT be used to gate behavior.
+#
+# Constraints (per audit contract):
+#   * All three diagnostic flags default to OFF. When all are off, every
+#     record() call short-circuits to a boolean check and never touches
+#     the lock.
+#   * No CUDA events, no torch.cuda.synchronize, no tensor access, no
+#     filesystem I/O on the hot path. The recorder may emit a single
+#     log line on the request summary boundary, but the record() call
+#     itself is silent.
+#   * State is keyed by (restore_session_id, request_seq, canonical_key)
+#     and lives on the ComfyAPI instance — never in a process-global
+#     mutable dict. Concurrent restores / requests cannot mix records.
+#   * Events carry only safe metadata: name, monotonic ns, optional
+#     unix seconds, restore_session_id, request_seq, canonical digest,
+#     thread id, success/failure, and a bounded reason string.
+#   * No raw prompt text, credentials, or full environment contents.
+
+CRITICAL_PATH_DIAG_ENABLED = _env_flag("COMFYMODAL_CRITICAL_PATH_DIAG", "1")
+UNET_PHASE_DIAG_ENABLED = _env_flag("COMFYMODAL_UNET_PHASE_DIAG", "1")
+VALIDATION_PHASE_DIAG_ENABLED = _env_flag("COMFYMODAL_VALIDATION_PHASE_DIAG", "1")
+
+# Startup diagnostic: log actual flag values at module import so
+# deployment/environment discrepancies are obvious from the first line.
+print(
+    f"[critical_path.flags] critical_path={int(CRITICAL_PATH_DIAG_ENABLED)} "
+    f"unet_phase={int(UNET_PHASE_DIAG_ENABLED)} "
+    f"validation_phase={int(VALIDATION_PHASE_DIAG_ENABLED)} "
+    f"coordinator={int(PRODUCTION_MODEL_READ_COORDINATOR_ENABLED)} "
+    f"coordinator_diag={int(PRODUCTION_MODEL_READ_COORDINATOR_DIAG)} "
+    f"source=module_import"
+)
+
+
+def critical_path_diag_active() -> bool:
+    """Single source of truth for whether diagnostic event recording
+    is enabled. Cheap to call from hot paths."""
+    return CRITICAL_PATH_DIAG_ENABLED or UNET_PHASE_DIAG_ENABLED or VALIDATION_PHASE_DIAG_ENABLED
+
+
+def _new_critical_path_recorder() -> "CriticalPathRecorder":
+    return CriticalPathRecorder()
+
+
+class CriticalPathRecorder:
+    """Per-(restore_session, request_seq) observed-event store.
+
+    Records are stored as small dicts. The summary at request end is
+    responsible for emitting any log lines. The recorder itself never
+    prints on the hot path.
+
+    Restore-phase events are preserved when bind() is called at request
+    entry: the existing ``_events`` list becomes ``_restore_events`` and
+    is prepended in snapshot(). This ensures restore-time events
+    (production_unet_submit, exact_prefill_*, etc.) are retained even
+    though the recorder is initialized at the first request boundary.
+    """
+
+    __slots__ = ("_lock", "_events", "_counters", "_restore_events",
+                 "_restore_session_id", "_request_seq", "_timeline_origin_ns",
+                 "_timeline_origin_unix_s", "_last_event_monotonic_ns",
+                 "_restore_frozen")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._events: List[Dict[str, Any]] = []
+        self._counters: Dict[str, int] = {}
+        self._restore_events: List[Dict[str, Any]] = []
+        self._restore_session_id: str = ""
+        self._request_seq: int = 0
+        self._timeline_origin_ns: int = 0
+        self._timeline_origin_unix_s: float = 0.0
+        self._last_event_monotonic_ns: int = 0
+        self._restore_frozen: bool = False
+
+    def start_restore(self, restore_session_id: str) -> None:
+        """Called at the start of a restore phase.
+
+        Clears all previous state, establishes a single timeline origin
+        that persists for all subsequent requests in this container
+        invocation.  ``request_seq`` is set to 0 (restore phase).
+        """
+        with self._lock:
+            self._events.clear()
+            self._restore_events.clear()
+            self._restore_session_id = str(restore_session_id or "")
+            self._request_seq = 0
+            self._timeline_origin_ns = time.perf_counter_ns()
+            self._timeline_origin_unix_s = time.time()
+            self._last_event_monotonic_ns = self._timeline_origin_ns
+            self._counters.clear()
+            self._restore_frozen = False
+
+    def start_request(self, restore_session_id: str, request_seq: int) -> None:
+        """Called at the start of each request.
+
+        Freezes restore-phase events on the first call (``_restore_frozen``
+        goes from ``False`` → ``True``) so they survive across subsequent
+        requests.  On second and later calls the freeze is already in
+        effect and ``_restore_events`` are preserved unchanged.
+
+        The timeline origin is never updated here (unless it was never
+        set, e.g. in tests that skip ``start_restore()``) — all events
+        keep the same ``since_start_ms`` baseline established by
+        ``start_restore()``.
+        """
+        with self._lock:
+            if not self._restore_frozen:
+                # Extend, don't replace — record_restore() may have already
+                # appended worker-thread events to _restore_events.
+                if self._events:
+                    self._restore_events.extend(self._events)
+                self._restore_events.sort(
+                    key=lambda ev: int(ev.get("monotonic_ns") or 0)
+                )
+                self._restore_frozen = True
+            self._restore_session_id = str(restore_session_id or "")
+            self._request_seq = int(request_seq or 0)
+            # Bootstrap the timeline origin if never set (test path or
+            # legacy usage without start_restore).
+            if self._timeline_origin_ns == 0:
+                self._timeline_origin_ns = time.perf_counter_ns()
+                self._timeline_origin_unix_s = time.time()
+            # Do NOT update _timeline_origin_ns on subsequent calls —
+            # keep the restore-start origin so all events share a single
+            # timeline.
+            self._last_event_monotonic_ns = time.perf_counter_ns()
+            self._events.clear()
+            self._counters.clear()
+
+    def bind(self, restore_session_id: str, request_seq: int) -> None:
+        """Legacy alias for ``start_request()``.
+
+        Preserves existing events as ``_restore_events`` on the first
+        call; subsequent calls leave restore events unchanged.
+        """
+        self.start_request(restore_session_id, request_seq)
+
+    def record(
+        self,
+        name: str,
+        *,
+        status: str = "ok",
+        reason: str = "",
+        canonical_digest: str = "",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Append a single observed event.
+
+        Hot-path contract: if all critical-path diagnostic flags are
+        off, this method returns immediately after a boolean check.
+        """
+        if not critical_path_diag_active():
+            return
+        try:
+            _now = time.perf_counter_ns()
+            with self._lock:
+                _since_start_ms = (_now - self._timeline_origin_ns) / 1_000_000.0
+                _since_prev_ms = (_now - self._last_event_monotonic_ns) / 1_000_000.0
+                self._last_event_monotonic_ns = _now
+                _ev: Dict[str, Any] = {
+                    "name": str(name),
+                    "monotonic_ns": _now,
+                    "unix_s": round(time.time(), 6),
+                    "restore_session_id": self._restore_session_id,
+                    "request_seq": self._request_seq,
+                    "thread_id": threading.get_ident(),
+                    "status": str(status),
+                    "reason": (reason or "")[:96],
+                    "canonical_digest": (canonical_digest or "")[:32],
+                    "since_start_ms": round(_since_start_ms, 3),
+                    "since_prev_ms": round(_since_prev_ms, 3),
+                }
+                if extra:
+                    for _k, _v in extra.items():
+                        if _k in _ev:
+                            continue
+                        _ev[_k] = _v
+                self._events.append(_ev)
+                self._counters[name] = self._counters.get(name, 0) + 1
+        except Exception:
+            # Recorder must never raise into hot-path code.
+            pass
+
+    def record_at(
+        self,
+        name: str,
+        *,
+        monotonic_ns: int,
+        unix_s: float,
+        status: str = "ok",
+        reason: str = "",
+        canonical_digest: str = "",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Append an event at a known (monotonic_ns, unix_s) pair.
+
+        Used when the event occurred earlier (e.g. a callback time) and
+        should be timestamped with the recorder's *actual observation
+        time*, not the current ``time.perf_counter_ns()``.
+
+        Hot-path contract: same as ``record()`` — short-circuits to a
+        boolean check when all critical-path flags are off.
+        """
+        if not critical_path_diag_active():
+            return
+        try:
+            with self._lock:
+                _since_start_ms = (monotonic_ns - self._timeline_origin_ns) / 1_000_000.0
+                _since_prev_ms = (monotonic_ns - self._last_event_monotonic_ns) / 1_000_000.0
+                # Don't update _last_event_monotonic_ns for retroactive
+                # events — the timestamp points backward in time and
+                # would make the next real event's since_prev_ms misleading.
+                _ev: Dict[str, Any] = {
+                    "name": str(name),
+                    "monotonic_ns": monotonic_ns,
+                    "unix_s": round(unix_s, 6),
+                    "restore_session_id": self._restore_session_id,
+                    "request_seq": self._request_seq,
+                    "thread_id": threading.get_ident(),
+                    "status": str(status),
+                    "reason": (reason or "")[:96],
+                    "canonical_digest": (canonical_digest or "")[:32],
+                    "since_start_ms": round(_since_start_ms, 3),
+                    "since_prev_ms": round(_since_prev_ms, 3),
+                }
+                if extra:
+                    for _k, _v in extra.items():
+                        if _k in _ev:
+                            continue
+                        _ev[_k] = _v
+                self._events.append(_ev)
+                self._counters[name] = self._counters.get(name, 0) + 1
+        except Exception:
+            pass
+
+    def record_restore(
+        self,
+        name: str,
+        *,
+        status: str = "ok",
+        reason: str = "",
+        canonical_digest: str = "",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Append an event to the persistent _restore_events list.
+
+        Used for late background restore events (e.g. UNET completion)
+        that fire after start_request() has already been called.  These
+        events are appended directly to ``_restore_events`` so they
+        survive subsequent ``start_request()`` calls that clear the
+        ``_events`` list.
+
+        Hot-path contract: same as ``record()``.
+        """
+        if not critical_path_diag_active():
+            return
+        try:
+            _now = time.perf_counter_ns()
+            with self._lock:
+                _since_start_ms = (_now - self._timeline_origin_ns) / 1_000_000.0
+                _since_prev_ms = (_now - self._last_event_monotonic_ns) / 1_000_000.0
+                self._last_event_monotonic_ns = _now
+                _ev: Dict[str, Any] = {
+                    "name": str(name),
+                    "monotonic_ns": _now,
+                    "unix_s": round(time.time(), 6),
+                    "restore_session_id": self._restore_session_id,
+                    "request_seq": 0,  # tagged as restore-phase
+                    "thread_id": threading.get_ident(),
+                    "status": str(status),
+                    "reason": (reason or "")[:96],
+                    "canonical_digest": (canonical_digest or "")[:32],
+                    "since_start_ms": round(_since_start_ms, 3),
+                    "since_prev_ms": round(_since_prev_ms, 3),
+                }
+                if extra:
+                    for _k, _v in extra.items():
+                        if _k in _ev:
+                            continue
+                        _ev[_k] = _v
+                self._restore_events.append(_ev)
+                # Do NOT update _counters — restore events are counted
+                # via the request-level _events only.
+        except Exception:
+            pass
+
+    def snapshot(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self._restore_events) + list(self._events)
+
+    def counters(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._counters)
+
+    def first_event_at(self, name: str) -> Optional[int]:
+        with self._lock:
+            for _ev in self._restore_events:
+                if _ev.get("name") == name:
+                    return int(_ev.get("monotonic_ns") or 0)
+            for _ev in self._events:
+                if _ev.get("name") == name:
+                    return int(_ev.get("monotonic_ns") or 0)
+        return None
+
+    def last_event_at(self, name: str) -> Optional[int]:
+        with self._lock:
+            for _ev in reversed(self._events):
+                if _ev.get("name") == name:
+                    return int(_ev.get("monotonic_ns") or 0)
+            for _ev in reversed(self._restore_events):
+                if _ev.get("name") == name:
+                    return int(_ev.get("monotonic_ns") or 0)
+        return None
+
+    def event_count(self, name: str) -> int:
+        return self._counters.get(name, 0)
+
+    def get_start_monotonic_ns(self) -> int:
+        return self._timeline_origin_ns
+
+    def get_start_unix_s(self) -> float:
+        return self._timeline_origin_unix_s
+
+    def get_timeline_origin_ns(self) -> int:
+        """The single monotonic origin for the restore/request pair."""
+        return self._timeline_origin_ns
+
+    def to_dict(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "restore_session_id": self._restore_session_id,
+                "request_seq": self._request_seq,
+                "start_monotonic_ns": self._timeline_origin_ns,
+                "start_unix_s": self._timeline_origin_unix_s,
+                "restore_events": list(self._restore_events),
+                "events": list(self._events),
+                "counters": dict(self._counters),
+            }
+
+
+# ── Resource delta snapshot (diagnostic, opt-in) ─────────────────────────
+#
+# Returns a small, well-bounded dict of process/thread resource counters
+# at a single boundary. Never raises. On Windows or when the platform
+# doesn't expose the field, returns 0 for that field.
+
+def _diagnostic_resource_snapshot() -> Dict[str, Any]:
+    out: Dict[str, Any] = {"platform": sys.platform}
+    if not CRITICAL_PATH_DIAG_ENABLED:
+        return out
+    # Linux: /proc/self/status + /proc/self/stat
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        out["rss_kb"] = int(line.split()[1])
+                    elif line.startswith("VmSize:"):
+                        out["vmsize_kb"] = int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            pass
+        try:
+            with open("/proc/self/stat", "r", encoding="utf-8", errors="replace") as f:
+                parts = f.read().split()
+            # Field indices per man proc(5): 14 utime, 15 stime, 17 minflt, 18 majflt,
+            # 22 startcode, 23 endcode (comm uses 2..3 parens). We use 11 (utime),
+            # 12 (stime), 9 (minflt), 11 (majflt) — but the safe approach is
+            # to grab by position and tolerate shifts.
+            if len(parts) >= 24:
+                try:
+                    out["user_cpu_ticks"] = int(parts[13])
+                    out["system_cpu_ticks"] = int(parts[14])
+                    out["minor_faults"] = int(parts[9])
+                    out["major_faults"] = int(parts[11])
+                except (ValueError, IndexError):
+                    pass
+        except (OSError, ValueError, IndexError):
+            pass
+    return out
+
+
 # ── Phase 6: Bake-candidate report (read-only) ──────────────────────────
 
 
@@ -1995,4 +2862,13 @@ def get_all_flag_values() -> Dict[str, Any]:
         "THIRD_PARTY_LOG_SUPPRESSION_ENABLED":
             THIRD_PARTY_LOG_SUPPRESSION_ENABLED,
         "PROFILE_RESOURCES_ENABLED": PROFILE_RESOURCES_ENABLED,
+        "CRITICAL_PATH_DIAG_ENABLED": CRITICAL_PATH_DIAG_ENABLED,
+        "UNET_PHASE_DIAG_ENABLED": UNET_PHASE_DIAG_ENABLED,
+        "VALIDATION_PHASE_DIAG_ENABLED": VALIDATION_PHASE_DIAG_ENABLED,
+        # Static value resolver framework
+        "STATIC_RESOLVER_REGISTERED_CLASSES":
+            sorted(_STATIC_RESOLVER_ADAPTERS.keys()),
+        "STATIC_RESOLVER_MAX_DEPTH": _RESOLVE_MAX_DEPTH,
+        "STATIC_RESOLVER_MAX_NODES": _RESOLVE_MAX_NODES,
+        "STATIC_RESOLVER_MAX_STRING_BYTES": _RESOLVE_MAX_STRING_BYTES,
     }

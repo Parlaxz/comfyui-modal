@@ -1834,10 +1834,23 @@ async def _execute_job(item: tuple, item_id: int):
             # the candidate builder would silently find nothing.
             _prompt_bundle_hash = ""
             _exact_or_persistent = (
-                os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "0") == "1"
+                os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "1") == "1"
                 or os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1"
             )
-            if _exact_or_persistent:
+            # Per audit round 7 — exact prefill local diagnostic
+            _local_ep = os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "1") == "1"
+            print(
+                f"[exact_prefill.local] enabled={int(_local_ep)} "
+                f"source=env "
+                f"prompt_id={prompt_id[:8]}"
+            )
+            if not _exact_or_persistent:
+                print(
+                    f"[exact_prefill.bundle] enabled=1 eligible=0 "
+                    f"prompt_id={prompt_id[:8]} "
+                    f"reason=neither_exact_clip_prefill_nor_persistent_clip_cache_enabled"
+                )
+            else:
                 try:
                     from optimizations import extract_safe_prompt_bundle
                     _bundle_res = extract_safe_prompt_bundle(execution_workflow)
@@ -1846,21 +1859,28 @@ async def _execute_job(item: tuple, item_id: int):
                             _bundle_res["bundle"].get("bundle_hash", "")
                         )
                         activation_payload["prompt_bundle"] = _bundle_res["bundle"]
+                        _encode_count = len(_bundle_res['bundle'].get('encodes', []))
+                        _short_hash = _prompt_bundle_hash[:16]
                         print(
-                            f"[comfyui-modal.profile] stage=safe_prompt_bundle "
-                            f"prompt_id={prompt_id[:8]} eligible=1 "
-                            f"encodes={len(_bundle_res['bundle'].get('encodes', []))} "
-                            f"bundle_hash={_prompt_bundle_hash[:12]} "
-                            f"reason=exact_or_persistent"
+                            f"[exact_prefill.bundle] enabled=1 eligible=1 "
+                            f"prompt_id={prompt_id[:8]} "
+                            f"reason=ok "
+                            f"encode_count={_encode_count} "
+                            f"hash={_short_hash}"
                         )
                     else:
+                        _reason = _bundle_res.get('reason', '?')
                         print(
-                            f"[comfyui-modal.profile] stage=safe_prompt_bundle "
-                            f"prompt_id={prompt_id[:8]} eligible=0 "
-                            f"reason={_bundle_res.get('reason','?')}"
+                            f"[exact_prefill.bundle] enabled=1 eligible=0 "
+                            f"prompt_id={prompt_id[:8]} "
+                            f"reason={_reason}"
                         )
                 except Exception as _bundle_exc:
-                    print(f"[comfyui-modal] safe_prompt_bundle extraction failed: {_bundle_exc}")
+                    print(
+                        f"[exact_prefill.bundle] enabled=1 eligible=0 "
+                        f"prompt_id={prompt_id[:8]} "
+                        f"reason=extraction_exception error={_bundle_exc}"
+                    )
             if _prompt_bundle_hash:
                 _stable_key = hashlib.sha256(
                     (_stable_key + ":" + _prompt_bundle_hash).encode("utf-8")
@@ -1922,6 +1942,16 @@ async def _execute_job(item: tuple, item_id: int):
                         f"decision=changed profile_key={_stable_key[:12]} remote_call=1 "
                         f"status={_active_next_status} changed={_active_next_changed} bytes={_active_next_payload_bytes}"
                     )
+                    # Active-next profile write — prompt bundle diagnostic
+                    _bundle_aw = activation_payload.get("prompt_bundle")
+                    if isinstance(_bundle_aw, dict) and _bundle_aw.get("encodes"):
+                        _bw_hash = str(_bundle_aw.get("bundle_hash", ""))[:16]
+                        print(
+                            f"[exact_prefill.active_next_write] bundle_present=1 "
+                            f"bundle_hash={_bw_hash} "
+                            f"encode_count={len(_bundle_aw['encodes'])} "
+                            f"workspace={_ws_id[:12]}"
+                        )
                 except Exception as exc:
                     _active_next_status = "error"
                     print(f"[comfyui-modal] active profile write failed: {exc}")

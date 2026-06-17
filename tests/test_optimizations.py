@@ -521,7 +521,9 @@ class SafePromptBundleTests(unittest.TestCase):
         }
         r = self.mod.extract_safe_prompt_bundle(wf)
         self.assertFalse(r["eligible"])
-        self.assertEqual(r["reason"], "text_not_literal")
+        # With partial eligibility, unsupported encodes are silently skipped;
+        # if no encodes succeed, the reason is "no_eligible_encode".
+        self.assertEqual(r["reason"], "no_eligible_encode")
 
     def test_no_native_loader_rejected(self):
         wf = {
@@ -612,7 +614,9 @@ class SafePromptBundleTests(unittest.TestCase):
         }
         r = self.mod.extract_safe_prompt_bundle(wf)
         self.assertFalse(r["eligible"])
-        self.assertEqual(r["reason"], "loader_filenames_incomplete")
+        # With partial eligibility, incomplete loaders are silently skipped;
+        # if no loaders remain, the reason is "no_native_clip_loader".
+        self.assertEqual(r["reason"], "no_native_clip_loader")
 
 
 class InMemoryClipCacheTests(unittest.TestCase):
@@ -2525,7 +2529,9 @@ class NineBlockerVerificationTests(unittest.TestCase):
 
     def test_exact_prefill_encodes_all_texts(self):
         """Blocker #8: When COMFYMODAL_EXACT_CLIP_PREFILL=1, all encode texts must be used."""
-        idx = self.source.find("COMFYMODAL_EXACT_CLIP_PREFILL")
+        # Search from the restore block (after "D.1" comment), not the .env() occurrence
+        idx = self.source.find("D.1 (audit round 2)")
+        idx = self.source.find("COMFYMODAL_EXACT_CLIP_PREFILL", idx)
         # Look 4000 chars ahead to capture the full block
         end = idx + 4000
         block = self.source[idx:end]
@@ -3301,6 +3307,380 @@ class GlobalDeclarationUnboundLocalTests(unittest.TestCase):
             "_execute_job must declare _last_written_stable_profile_at "
             "(audit round 7 post-fix regression)",
         )
+
+
+# ── Phase 1 extended: coordinator enhanced telemetry and summary ─────────
+
+class ModelReadCoordinatorTelemetryTests(unittest.TestCase):
+    def setUp(self):
+        os.environ["COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR"] = "1"
+        os.environ["COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR_DIAG"] = "0"
+        self.mod = _load_optimizations_with_clean_env()
+
+    def tearDown(self):
+        os.environ.pop("COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR", None)
+        os.environ.pop("COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR_DIAG", None)
+
+    def test_path_digest(self):
+        d = self.mod._canonical_path_digest("")
+        self.assertEqual(d, "")
+
+        d = self.mod._canonical_path_digest("/some/long/path/to/a/model.safetensors")
+        self.assertEqual(len(d), 16)
+        self.assertTrue(all(c in "0123456789abcdef" for c in d))
+
+    def test_digest_is_deterministic(self):
+        d1 = self.mod._canonical_path_digest("/same/path.safetensors")
+        d2 = self.mod._canonical_path_digest("/same/path.safetensors")
+        self.assertEqual(d1, d2)
+
+    def test_digest_differs_for_different_paths(self):
+        d1 = self.mod._canonical_path_digest("/path/a.safetensors")
+        d2 = self.mod._canonical_path_digest("/path/b.safetensors")
+        self.assertNotEqual(d1, d2)
+
+    def test_summary_empty_for_unused_coordinator(self):
+        c = self.mod.ProductionModelReadCoordinator()
+        s = c.summary()
+        self.assertEqual(s["acquisitions"], 0)
+        self.assertEqual(s["releases"], 0)
+        self.assertEqual(s["waited"], 0)
+        self.assertEqual(s["timeout_fail_open"], 0)
+
+    def test_summary_tracks_acquire_release(self):
+        c = self.mod.ProductionModelReadCoordinator()
+        with c.acquire(owner="restore_background_unet", loader_type="UNET",
+                       canonical_path="/u.safetensors"):
+            # sleep long enough to register on any platform
+            _start = time.perf_counter()
+            while (time.perf_counter() - _start) < 0.02:
+                pass
+        s = c.summary()
+        self.assertEqual(s["acquisitions"], 1)
+        self.assertEqual(s["releases"], 1)
+        self.assertGreater(s["total_hold_ms"], 0.0)
+        # Per-owner hold
+        self.assertIn("restore_background_unet", s.get("owner_hold_ms", {}))
+        self.assertGreater(s["owner_hold_ms"]["restore_background_unet"], 0.0)
+
+    def test_summary_tracks_wait(self):
+        c = self.mod.ProductionModelReadCoordinator()
+        order = []
+
+        def first():
+            with c.acquire(owner="a", loader_type="UNET", canonical_path="/u"):
+                order.append("first_in")
+                time.sleep(0.15)
+                order.append("first_out")
+
+        def second():
+            time.sleep(0.02)
+            with c.acquire(owner="b", loader_type="VAE", canonical_path="/v"):
+                order.append("second_in")
+                order.append("second_out")
+
+        t1 = threading.Thread(target=first, daemon=True)
+        t2 = threading.Thread(target=second, daemon=True)
+        t1.start()
+        t2.start()
+        t1.join(timeout=3.0)
+        t2.join(timeout=3.0)
+
+        s = c.summary()
+        self.assertGreaterEqual(s["waited"], 1)
+        self.assertGreater(s["total_wait_ms"], 0.0)
+        self.assertGreater(s["peak_wait_ms"], 0.0)
+
+    def test_summary_timeout_fail_open_counted(self):
+        c = self.mod.ProductionModelReadCoordinator()
+        c._in_flight = {
+            "owner": "orphan", "loader_type": "UNET",
+            "canonical_path": "/o", "acquired_at": time.time(),
+        }
+        os.environ["COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR_WAIT_TIMEOUT_S"] = "1"
+        self.mod = _load_optimizations_with_clean_env()
+        c2 = self.mod.ProductionModelReadCoordinator()
+        c2._in_flight = c._in_flight
+        with c2.acquire(owner="x", loader_type="UNET", canonical_path="/y"):
+            pass
+        os.environ.pop("COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR_WAIT_TIMEOUT_S", None)
+        s = c2.summary()
+        self.assertGreaterEqual(s["timeout_fail_open"], 1)
+
+    def test_disabled_mode_summary(self):
+        os.environ["COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR"] = "0"
+        self.mod = _load_optimizations_with_clean_env()
+        c = self.mod.ProductionModelReadCoordinator()
+        with c.acquire(owner="unet", loader_type="UNET", canonical_path="/u"):
+            pass
+        s = c.summary()
+        self.assertEqual(s["enabled"], 0)
+
+    def test_summary_no_causal_claims_in_keys(self):
+        """Summary keys must contain directly observed values only."""
+        c = self.mod.ProductionModelReadCoordinator()
+        s = c.summary()
+        forbidden = ["prevented_collapse", "saved_ms", "causation",
+                      "contention_caused", "improvement"]
+        for key in str(s):
+            for f in forbidden:
+                self.assertNotIn(f, key.lower())
+
+    def test_record_extra_fields_forwarded(self):
+        c = self.mod.ProductionModelReadCoordinator()
+        with c.acquire(owner="unet", loader_type="UNET", canonical_path="/u",
+                       extra={"restore_session": "sess1", "request_seq": 42}):
+            pass
+        recent = c.recent(5)
+        found = False
+        for rec in recent:
+            if rec.get("owner") == "unet":
+                self.assertEqual(rec.get("restore_session"), "sess1")
+                self.assertEqual(rec.get("request_seq"), 42)
+                found = True
+                break
+        self.assertTrue(found, "extra fields not found in coordinator records")
+
+    def test_diagnostics_cannot_raise(self):
+        """Coordinator diagnostics (_safe_record) must never raise into the caller."""
+        c = self.mod.ProductionModelReadCoordinator()
+        # _safe_record must catch everything and never propagate
+        try:
+            c._safe_record(
+                event="test", owner="x", loader_type="UNET",
+                canonical_path="/p",
+                wait_ms=0.0, hold_ms=0.0, extra={"bad_key": object()},
+            )
+        except Exception:
+            self.fail("_safe_record raised unexpectedly")
+        # Summary must also not raise
+        try:
+            c.summary()
+        except Exception:
+            self.fail("summary raised unexpectedly")
+
+    def test_safe_record_handles_print_exception(self):
+        """_safe_record must tolerate a failing print() even when diagnostics are enabled."""
+        os.environ["COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR_DIAG"] = "1"
+        _mod = _load_optimizations_with_clean_env()
+        c = _mod.ProductionModelReadCoordinator()
+        import builtins
+        _real_print = builtins.print
+        _raise_count = 0
+
+        def _broken_print(*args, **kwargs):
+            nonlocal _raise_count
+            _raise_count += 1
+            raise RuntimeError("Boom(print failed)")
+
+        try:
+            builtins.print = _broken_print
+            # Must not raise, even though print() fails
+            c._safe_record(
+                event="test", owner="x", loader_type="UNET",
+                canonical_path="/p", wait_ms=1.0, hold_ms=2.0,
+            )
+        finally:
+            builtins.print = _real_print
+        # print must have tried (diagnostics branch fires)
+        self.assertGreater(_raise_count, 0,
+                           "print() was not called by _safe_record with diagnostics")
+        # Coordinator must still be usable after broken print
+        with c.acquire(owner="unet", loader_type="UNET", canonical_path="/u"):
+            pass
+        s = c.stats()
+        self.assertEqual(s["acquired"], 1)
+        self.assertEqual(s["released"], 1)
+        os.environ["COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR_DIAG"] = "0"
+
+    def test_uncontended_acquisition_waited_is_zero(self):
+        """An uncontended acquisition must report waited=0 and stats.waited=0."""
+        c = self.mod.ProductionModelReadCoordinator()
+        with c.acquire(owner="unet", loader_type="UNET", canonical_path="/u"):
+            pass
+        s = c.stats()
+        self.assertEqual(s["acquired"], 1)
+        self.assertEqual(s["waited"], 0, "uncontended acquisition must not count as waited")
+        self.assertEqual(s["total_wait_ms"], 0.0, "uncontended must have zero wait ms")
+
+    def test_contended_acquisition_counts_waited(self):
+        """A contended acquisition must count waited correctly."""
+        c = self.mod.ProductionModelReadCoordinator()
+
+        def hold():
+            with c.acquire(owner="a", loader_type="UNET", canonical_path="/u"):
+                time.sleep(0.1)
+
+        def contend():
+            with c.acquire(owner="b", loader_type="VAE", canonical_path="/v"):
+                pass
+
+        t1 = threading.Thread(target=hold, daemon=True)
+        t2 = threading.Thread(target=contend, daemon=True)
+        t1.start()
+        time.sleep(0.02)
+        t2.start()
+        t1.join(timeout=3.0)
+        t2.join(timeout=3.0)
+
+        s = c.stats()
+        self.assertGreaterEqual(s["waited"], 1, "contended acquisition must count waited")
+        self.assertGreater(s["total_wait_ms"], 0.0, "contended must have positive wait ms")
+
+
+# ── Call-path tests: coordinator integration with production UNET and graph VAE ──
+
+class CoordinatorCallPathTests(unittest.TestCase):
+    def setUp(self):
+        os.environ["COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR"] = "1"
+        os.environ["COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR_DIAG"] = "0"
+        self.mod = _load_optimizations_with_clean_env()
+
+    def tearDown(self):
+        os.environ.pop("COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR", None)
+        os.environ.pop("COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR_DIAG", None)
+
+    def test_same_singleton_across_paths(self):
+        """get_model_read_coordinator must return the same singleton."""
+        c1 = self.mod.get_model_read_coordinator()
+        c2 = self.mod.get_model_read_coordinator()
+        self.assertIs(c1, c2)
+
+    def test_sequential_unet_then_vae_no_deadlock(self):
+        """Normal UNET then VAE sequence must not deadlock."""
+        c = self.mod.ProductionModelReadCoordinator()
+        with c.acquire(owner="restore_background_unet", loader_type="UNET",
+                       canonical_path="/u.safetensors"):
+            pass
+        with c.acquire(owner="graph_vae", loader_type="VAE",
+                       canonical_path="/v.safetensors"):
+            pass
+        s = c.stats()
+        self.assertEqual(s["acquired"], 2)
+        self.assertEqual(s["released"], 2)
+
+    def test_unet_then_vae_concurrent_no_deadlock(self):
+        """Two threads: UNET then VAE concurrently."""
+        c = self.mod.ProductionModelReadCoordinator()
+        order = []
+
+        def load_unet():
+            with c.acquire(owner="restore_background_unet", loader_type="UNET",
+                           canonical_path="/u"):
+                order.append("unet_in")
+                time.sleep(0.1)
+                order.append("unet_out")
+
+        def load_vae():
+            time.sleep(0.02)
+            with c.acquire(owner="graph_vae", loader_type="VAE",
+                           canonical_path="/v"):
+                order.append("vae_in")
+                order.append("vae_out")
+
+        t1 = threading.Thread(target=load_unet, daemon=True)
+        t2 = threading.Thread(target=load_vae, daemon=True)
+        t1.start()
+        t2.start()
+        t1.join(timeout=3.0)
+        t2.join(timeout=3.0)
+        self.assertEqual(order, ["unet_in", "unet_out", "vae_in", "vae_out"])
+
+    def test_loader_exception_releases_coordinator(self):
+        """An exception during the protected operation must release."""
+        c = self.mod.ProductionModelReadCoordinator()
+        try:
+            with c.acquire(owner="unet", loader_type="UNET", canonical_path="/u"):
+                raise ValueError("bad load")
+        except ValueError:
+            pass
+        self.assertFalse(c.is_in_flight())
+        # Next loader can acquire
+        with c.acquire(owner="vae", loader_type="VAE", canonical_path="/v"):
+            self.assertTrue(c.is_in_flight())
+
+    def test_disabled_preserves_call_order(self):
+        """Disabled coordinator must yield immediately."""
+        os.environ["COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR"] = "0"
+        self.mod = _load_optimizations_with_clean_env()
+        c = self.mod.ProductionModelReadCoordinator()
+        with c.acquire(owner="unet", loader_type="UNET", canonical_path="/u") as s:
+            self.assertFalse(s["acquired"])
+            self.assertEqual(s["reason"], "coordinator_disabled")
+        # Next load is also immediate
+        with c.acquire(owner="vae", loader_type="VAE", canonical_path="/v") as s:
+            self.assertFalse(s["acquired"])
+
+    def test_coordinator_not_held_during_gpu_transfer(self):
+        """Coordinator must be released before model construction."""
+        c = self.mod.ProductionModelReadCoordinator()
+        # Acquire for file read
+        with c.acquire(owner="unet", loader_type="UNET", canonical_path="/u"):
+            self.assertTrue(c.is_in_flight())
+        # After release, simulate GPU transfer
+        self.assertFalse(c.is_in_flight())
+
+    def test_contention_flag_true_when_waiting(self):
+        """contention flag must be true when the caller had to wait."""
+        c = self.mod.ProductionModelReadCoordinator()
+        contention_result = []
+
+        def first():
+            with c.acquire(owner="a", loader_type="UNET", canonical_path="/u",
+                           extra={}) as s:
+                time.sleep(0.15)
+
+        def second():
+            time.sleep(0.02)
+            with c.acquire(owner="b", loader_type="VAE", canonical_path="/v",
+                           extra={}) as s:
+                contention_result.append(s.get("contention", False))
+
+        t1 = threading.Thread(target=first, daemon=True)
+        t2 = threading.Thread(target=second, daemon=True)
+        t1.start()
+        t2.start()
+        t1.join(timeout=3.0)
+        t2.join(timeout=3.0)
+        self.assertTrue(any(contention_result))
+
+
+# ── Diagnostic flag tests ──
+
+class DiagnosticFlagTests(unittest.TestCase):
+    def test_startup_flags_logged(self):
+        """Verify the startup flag line is printed when module imports."""
+        import io
+        import contextlib
+        os.environ["COMFYMODAL_CRITICAL_PATH_DIAG"] = "1"
+        os.environ["COMFYMODAL_UNET_PHASE_DIAG"] = "1"
+        os.environ["COMFYMODAL_VALIDATION_PHASE_DIAG"] = "1"
+        os.environ["COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR"] = "0"
+        os.environ["COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR_DIAG"] = "1"
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            import importlib
+            import optimizations
+            importlib.reload(optimizations)
+        output = f.getvalue()
+        self.assertIn("[critical_path.flags]", output)
+        self.assertIn("critical_path=1", output)
+        self.assertIn("unet_phase=1", output)
+        self.assertIn("coordinator=0", output)
+        self.assertIn("coordinator_diag=1", output)
+        self.assertIn("source=module_import", output)
+        _clean_diag_env()
+
+    def tearDown(self):
+        _clean_diag_env()
+
+
+def _clean_diag_env():
+    for k in ("COMFYMODAL_CRITICAL_PATH_DIAG", "COMFYMODAL_UNET_PHASE_DIAG",
+              "COMFYMODAL_VALIDATION_PHASE_DIAG",
+              "COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR",
+              "COMFYMODAL_PRODUCTION_MODEL_READ_COORDINATOR_DIAG"):
+        os.environ.pop(k, None)
 
 
 # Module import smoke

@@ -20,6 +20,7 @@ import modal
 try:
     from optimizations import (
         PRODUCTION_MODEL_READ_COORDINATOR_ENABLED,
+        PRODUCTION_MODEL_READ_COORDINATOR_DIAG,
         current_unet_start_boundary,
         get_model_read_coordinator,
         extract_safe_prompt_bundle,
@@ -52,12 +53,20 @@ try:
         deserialize_conditioning_for_cache,
         conditioning_equals,
         stable_clip_cache_tag,
+        CriticalPathRecorder,
+        critical_path_diag_active,
+        CRITICAL_PATH_DIAG_ENABLED,
+        UNET_PHASE_DIAG_ENABLED,
+        VALIDATION_PHASE_DIAG_ENABLED,
+        _diagnostic_resource_snapshot,
+        _new_critical_path_recorder,
     )
     _OPTIMIZATIONS_AVAILABLE = True
 except Exception as _opt_imp_exc:
     # Define minimal stubs so the rest of the file compiles. The features
     # simply become no-ops when the import fails.
     PRODUCTION_MODEL_READ_COORDINATOR_ENABLED = False
+    PRODUCTION_MODEL_READ_COORDINATOR_DIAG = False
     THIRD_PARTY_LOG_SUPPRESSION_ENABLED = False
     CUSTOM_NODE_GENERATION_FASTPATH_ENABLED = False
     _OPTIMIZATIONS_AVAILABLE = False
@@ -107,6 +116,32 @@ except Exception as _opt_imp_exc:
             os.path.basename(str(p)) for p in (paths or ()) if p
         )
         return f"{_ct}@{_tail}" if _tail else _ct
+
+    class CriticalPathRecorder:  # type: ignore
+        def start_restore(self, *_a, **_k): pass
+        def start_request(self, *_a, **_k): pass
+        def bind(self, *_a, **_k): pass
+        def record(self, *_a, **_k): pass
+        def record_at(self, *_a, **_k): pass
+        def record_restore(self, *_a, **_k): pass
+        def snapshot(self): return []
+        def counters(self): return {}
+        def first_event_at(self, _n): return None
+        def last_event_at(self, _n): return None
+        def event_count(self, _n): return 0
+        def get_start_monotonic_ns(self): return 0
+        def get_start_unix_s(self): return 0.0
+        def get_timeline_origin_ns(self): return 0
+        def to_dict(self): return {}
+    def critical_path_diag_active() -> bool:  # type: ignore
+        return False
+    CRITICAL_PATH_DIAG_ENABLED = False
+    UNET_PHASE_DIAG_ENABLED = False
+    VALIDATION_PHASE_DIAG_ENABLED = False
+    def _diagnostic_resource_snapshot():  # type: ignore
+        return {"platform": "unknown"}
+    def _new_critical_path_recorder():  # type: ignore
+        return CriticalPathRecorder()
     serialize_conditioning_for_cache = lambda _v: None  # type: ignore
     deserialize_conditioning_for_cache = lambda _s: None  # type: ignore
     conditioning_equals = lambda _a, _b: False  # type: ignore
@@ -127,6 +162,10 @@ CONTAINER_SESSION_ID = uuid.uuid4().hex[:16]
 CONTAINER_IMPORT_UNIX_S = time.time()
 _container_restore_count: int = 0
 _container_request_count: int = 0
+
+# Exact-prompt CLIP prefill flag diagnostic (remote container startup)
+_remote_ep = os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "1") == "1"
+print(f"[exact_prefill.remote] enabled={int(_remote_ep)} source=env")
 
 from api_prompt_validator import assert_valid_api_prompt_structure
 from gpu_catalog import GPU_CATALOG, get_supported_gpus, is_gpu_hidden
@@ -1485,12 +1524,27 @@ def _log_cold_start_waterfall(s, label=""):
         g = _WATERFALL_GLYPH.get(_gl(value), "??")
         print(f"[waterfall] {g}    {name:<32} {_fmt(value)}  {source}", flush=True)
 
-    # SUM: only non-overlapping top-level spans.
-    crit = sum(float(v) for c,_,_,v in items
-               if v is not None and "_sub" not in c
-               and c not in ("total",))
-    if crit > 0:
-        print(f"[waterfall] SUM    critical_path_non_overlapping  {_fmt(crit)}  --", flush=True)
+    # SUM: non-overlapping critical-path spans computed from raw
+    # timestamps.  The wall trace's submit2entry includes restore;
+    # subtract it when both are available.
+    crit_total = 0.0
+    _client_to_entry = _d(t0, t3) if t0 is not None and t3 is not None else None
+    if _client_to_entry is not None and rt is not None and _client_to_entry > rt:
+        crit_total += _client_to_entry - rt  # pre_restore_platform
+        crit_total += rt                     # app_restore
+    else:
+        if _client_to_entry is not None:
+            crit_total += _client_to_entry
+        if rt is not None:
+            crit_total += rt
+    _modal_to_return = _d(t3, t9) if t3 is not None and t9 is not None else None
+    if _modal_to_return is not None:
+        crit_total += _modal_to_return
+    _ret_to_mat = _d(t9, t10) if t9 is not None and t10 is not None else None
+    if _ret_to_mat is not None:
+        crit_total += _ret_to_mat
+    if crit_total > 0:
+        print(f"[waterfall] SUM    known_nonoverlap_total           {_fmt(crit_total)}  --", flush=True)
 DEPENDENCY_VALIDATION_CACHE_SCHEMA_VERSION = 1
 DEPLOYMENT_DEPENDENCY_VALIDATION_CACHE_DIR = os.path.join(
     RUNTIME_CONFIG_DIR, "deployment_dependency_validation_cache"
@@ -1506,6 +1560,140 @@ _dependency_validation_memory_cache_key: str = ""
 # Stored as dict with keys: baked_hash, repair_mode, source_root_indicator,
 # volume_state_hash, result
 _dep_validation_pre_key: dict | None = None
+
+# GÃ¶Ã‡GÃ¶Ã‡ Per-audit round 7: persistent validation certificate GÃ¶Ã‡GÃ¶Ã‡
+# Opt-in certificate that caches a successful execution.validate_prompt()
+# result across container restarts.  Disabled by default.
+# Flag: COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE=1 (default 0)
+_VALIDATION_CERT_DIR = os.path.join(RUNTIME_CONFIG_DIR, "validation_certificates")
+_VALIDATION_CERT_SCHEMA_VERSION = 1
+
+
+def _compute_workflow_struct_hash_static(workflow: dict) -> str:
+    """Standalone version of _compute_workflow_struct_hash for
+    module-level certificate helpers.  Same logic, no self dependency."""
+    import hashlib
+    import json
+    _mutable_keys = {"seed", "text", "width", "height", "batch_size"}
+    stripped = {}
+    for _nid, _spec in workflow.items():
+        if not isinstance(_spec, dict):
+            continue
+        _inp = dict(_spec.get("inputs", {}))
+        for _k in _mutable_keys:
+            _inp.pop(_k, None)
+        stripped[_nid] = {"class_type": _spec.get("class_type"), "inputs": _inp}
+    return hashlib.md5(json.dumps(stripped, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _build_validation_certificate_identity(workflow, production_options, dep_fingerprint_hash="") -> str:
+    """Return a SHA-256 hex digest that identifies the exact validation context.
+
+    Every component that can affect graph validation is included.  The hash
+    is the certificate filename; if any component changes the filename
+    changes, causing a cache miss that falls back to normal validation.
+    """
+    import hashlib
+    import sys
+    from production_workflow import COMPILER_SCHEMA_VERSION
+    h = hashlib.sha256()
+    h.update(f"cert_schema={_VALIDATION_CERT_SCHEMA_VERSION}\n".encode())
+    h.update(f"comfyapp={COMFYAPP_VERSION}\n".encode())
+    h.update(f"schema_version={COMPILER_SCHEMA_VERSION}\n".encode())
+    h.update(f"dep_fingerprint={dep_fingerprint_hash or ''}\n".encode())
+    h.update(f"python={sys.version}\n".encode())
+    # NODE_CLASS_MAPPINGS fingerprint: sorted class names
+    try:
+        import nodes as _cert_nodes
+        _class_names = sorted(_cert_nodes.NODE_CLASS_MAPPINGS.keys())
+        h.update(f"class_mappings={hashlib.md5('|'.join(_class_names).encode()).hexdigest()}\n".encode())
+    except Exception:
+        pass
+    # Workflow structure
+    wf_hash = _compute_workflow_struct_hash_static(workflow)
+    h.update(f"wf_hash={wf_hash}\n".encode())
+    # Production topology
+    if production_options and production_options.get("enabled"):
+        from production_workflow import build_production_topology_hash, normalize_production_options
+        prod_norm = normalize_production_options(production_options)
+        topo_hash = build_production_topology_hash(workflow, prod_norm, allow_direct_output_rewrite=True)
+        h.update(f"topo_hash={topo_hash}\n".encode())
+        h.update(f"output_ids={','.join(sorted(prod_norm.get('output_node_ids', [])))}\n".encode())
+        h.update(f"bypass_ids={','.join(sorted(prod_norm.get('bypass_node_ids', [])))}\n".encode())
+        h.update(f"direct_output_sink={bool(prod_norm.get('direct_output_sink', True))}\n".encode())
+    return h.hexdigest()
+
+
+def _write_validation_certificate(cert_hash, outputs_to_execute, node_errors):
+    """Atomically write a validation certificate.  Never raises."""
+    try:
+        import json as _cert_json
+        import os as _cert_os
+        _cert_os.makedirs(_VALIDATION_CERT_DIR, exist_ok=True)
+        payload = {
+            "schema_version": _VALIDATION_CERT_SCHEMA_VERSION,
+            "created_at": time.time(),
+            "comfyapp_version": COMFYAPP_VERSION,
+            "outputs_to_execute": outputs_to_execute,
+            "node_errors": _CertNodeErrorEncoder.encode(node_errors) if node_errors else {},
+        }
+        tmp = _cert_os.path.join(_VALIDATION_CERT_DIR, f".{cert_hash}.tmp.{os.getpid()}")
+        with open(tmp, "w", encoding="utf-8") as _cf:
+            _cert_json.dump(payload, _cf, sort_keys=True)
+        _cert_os.replace(tmp, _cert_os.path.join(_VALIDATION_CERT_DIR, f"{cert_hash}.json"))
+        return {"status": "written"}
+    except Exception as _cert_exc:
+        return {"status": "error", "error": str(_cert_exc)[:120]}
+
+
+class _CertNodeErrorEncoder:
+    """Safe, bounded JSON-only encoder for node_errors.  No pickles."""
+
+    @staticmethod
+    def encode(node_errors):
+        if not isinstance(node_errors, dict):
+            return {}
+        out = {}
+        for nid, info in node_errors.items():
+            if not isinstance(info, dict):
+                continue
+            errors = []
+            for e in info.get("errors") or []:
+                if hasattr(e, "__dict__"):
+                    errors.append({"message": str(e.get("message", "")), "type": str(type(e).__name__)})
+                else:
+                    errors.append({"message": str(e)[:200]})
+            out[str(nid)] = {"class_type": str(info.get("class_type", "")), "errors": errors}
+        return out
+
+
+def _read_validation_certificate(cert_hash):
+    """Read a validation certificate if it exists and is valid.
+    Returns dict with outputs_to_execute and node_errors, or None.
+    Never raises; returns None on any error or mismatch.
+    """
+    try:
+        import json as _cert_json
+        path = os.path.join(_VALIDATION_CERT_DIR, f"{cert_hash}.json")
+        if not os.path.isfile(path):
+            return None
+        with open(path, "r", encoding="utf-8") as _cf:
+            payload = _cert_json.load(_cf)
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("schema_version") != _VALIDATION_CERT_SCHEMA_VERSION:
+            return None
+        if payload.get("comfyapp_version") != COMFYAPP_VERSION:
+            return None
+        outputs = payload.get("outputs_to_execute")
+        if not isinstance(outputs, list):
+            return None
+        errors = payload.get("node_errors", {})
+        if not isinstance(errors, dict):
+            errors = {}
+        return {"outputs_to_execute": outputs, "node_errors": errors}
+    except Exception:
+        return None
 
 # GÃ¶Ã‡GÃ¶Ã‡ PART 4: Baked dependency manifest (inside the image, NOT on volume) GÃ¶Ã‡GÃ¶Ã‡
 BAKED_CUSTOM_NODE_DEPS_MANIFEST_PATH = "/opt/comfymodal/custom_node_deps_baked.json"
@@ -5044,7 +5232,8 @@ _image_base = (
             "COMFYMODAL_PRELOAD_MODE": "clip_only",
             "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "0",
             "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
-            "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "1",
+             "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "1",
+            "COMFYMODAL_EXACT_CLIP_PREFILL": "1",
             "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "1",
             "COMFYMODAL_SAFETENSORS_READ_MODE": "normal",
             "COMFYMODAL_RUNTIME": "1",
@@ -6652,6 +6841,26 @@ class _RestorePreloadHandle:
         self.completed_ns = 0
 
 
+class _CriticalPathRecorderTLS(threading.local):
+    """Thread-local stash so module-level closures can record events
+    against the per-instance recorder.  Set by
+    ``_init_critical_path_recorder`` at request entry; cleared by
+    ``_clear_critical_path_recorder`` at request end.  Hot path never
+    touches this when all diagnostic flags are off (it is a single
+    attribute lookup).
+
+    Inherits from ``threading.local`` so each thread has its own
+    ``.recorder`` field, preventing concurrent requests from mixing
+    records.
+    """
+    def __init__(self):
+        super().__init__()
+        self.recorder = None
+
+
+_CR_PATH_RECORDER_TLS = _CriticalPathRecorderTLS()
+
+
 class _ComfyAPIMixin:
     """Shared implementation for all GPU-specific ComfyAPI classes."""
 
@@ -6683,7 +6892,317 @@ class _ComfyAPIMixin:
         payload = " ".join(f"{k}={v}" for k, v in fields.items())
         print(f"[comfyapp.profile] stage={stage} {payload}".rstrip())
 
-    # GÃ¶Ã‡GÃ¶Ã‡ PART 7: Shared custom-node sync and dependency policy GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
+    # ── Critical-path observed-event recorder (per-instance) ─────────
+    #
+    # The recorder lives on the ComfyAPI instance — never in a
+    # process-global dict — so concurrent restores and concurrent
+    # requests cannot mix records.  When all critical-path diagnostic
+    # flags are off, record() short-circuits to a boolean check and
+    # does no work.
+
+    def _init_critical_path_recorder(self, restore_session_id: str, request_seq: int) -> None:
+        rec = getattr(self, "_critical_path_recorder", None)
+        if rec is None:
+            rec = _new_critical_path_recorder()
+            self._critical_path_recorder = rec
+        if request_seq == 0:
+            rec.start_restore(restore_session_id)
+        else:
+            rec.start_request(restore_session_id, request_seq)
+        # Stash the recorder on a thread-local for closures that
+        # cannot easily reach ``self`` (e.g. the patched
+        # CLIPTextEncode.encode wrapper).  Reset only at request
+        # end — we keep it pointing at the same recorder within
+        # a request, even across threads, so concurrent restores
+        # never share state.
+        try:
+            _CR_PATH_RECORDER_TLS.recorder = rec
+        except Exception:
+            pass
+        # Baseline resource snapshot at request entry.  On Linux this
+        # reads /proc/self/status + /proc/self/stat (safe, bounded).
+        # On Windows/other platforms it returns platform name only.
+        if critical_path_diag_active():
+            try:
+                self._resource_snapshot_entry = _diagnostic_resource_snapshot()
+            except Exception:
+                pass
+
+    def _record_critical_path(
+        self,
+        name: str,
+        *,
+        status: str = "ok",
+        reason: str = "",
+        canonical_digest: str = "",
+        extra: dict | None = None,
+    ) -> None:
+        rec = getattr(self, "_critical_path_recorder", None)
+        if rec is None:
+            # Fall back to thread-local (set during request entry).
+            rec = getattr(_CR_PATH_RECORDER_TLS, "recorder", None)
+        if rec is None:
+            return
+        rec.record(
+            name,
+            status=status,
+            reason=reason,
+            canonical_digest=canonical_digest,
+            extra=extra,
+        )
+
+    def _record_critical_path_at(
+        self,
+        name: str,
+        *,
+        monotonic_ns: int,
+        unix_s: float,
+        status: str = "ok",
+        reason: str = "",
+        canonical_digest: str = "",
+        extra: dict | None = None,
+    ) -> None:
+        """Record an event at a known (monotonic_ns, unix_s) pair.
+
+        Used when the event occurred at a specific callback boundary
+        (e.g. sampler first-progress) and the recorder needs the
+        *actual observation time* rather than the current wall clock.
+        """
+        rec = getattr(self, "_critical_path_recorder", None)
+        if rec is None:
+            rec = getattr(_CR_PATH_RECORDER_TLS, "recorder", None)
+        if rec is None:
+            return
+        rec.record_at(
+            name,
+            monotonic_ns=monotonic_ns,
+            unix_s=unix_s,
+            status=status,
+            reason=reason,
+            canonical_digest=canonical_digest,
+            extra=extra,
+        )
+
+    def _record_critical_path_restore(
+        self,
+        name: str,
+        *,
+        status: str = "ok",
+        reason: str = "",
+        canonical_digest: str = "",
+        extra: dict | None = None,
+    ) -> None:
+        """Record a restore-phase event that may fire after start_request().
+
+        Delegates to ``recorder.record_restore()`` so late background
+        restore events (e.g. UNET completion) are appended to the
+        persistent ``_restore_events`` list and survive subsequent
+        request boundaries.
+        """
+        rec = getattr(self, "_critical_path_recorder", None)
+        if rec is None:
+            rec = getattr(_CR_PATH_RECORDER_TLS, "recorder", None)
+        if rec is None:
+            return
+        rec.record_restore(
+            name,
+            status=status,
+            reason=reason,
+            canonical_digest=canonical_digest,
+            extra=extra,
+        )
+
+    def _get_critical_path_recorder(self):
+        return getattr(self, "_critical_path_recorder", None)
+
+    def _clear_critical_path_recorder(self) -> None:
+        # Drop the thread-local pointer so a stale recorder cannot
+        # leak into a subsequent container's worker thread.  Do NOT
+        # clear the per-instance recorder; it lives for the lifetime
+        # of the ComfyAPI instance.
+        try:
+            _CR_PATH_RECORDER_TLS.recorder = None
+        except Exception:
+            pass
+
+    def _emit_critical_path_summary(self) -> None:
+        """Emit a single, compact critical-path summary line at the
+        end of a successful request.  All values are pure
+        observations of the recorder; no causal claim is emitted.
+        Overlap is labeled ``observed_overlap`` to make clear it is
+        not a proof of concurrency.
+        """
+        rec = getattr(self, "_critical_path_recorder", None)
+        if rec is None:
+            return
+        if not critical_path_diag_active():
+            return
+        try:
+            snap = rec.snapshot()
+            if not snap:
+                return
+            # Exit resource snapshot (Linux: /proc/self/status + /proc/self/stat)
+            try:
+                _rs_exit = _diagnostic_resource_snapshot()
+            except Exception:
+                _rs_exit = {}
+            _rs_entry = getattr(self, "_resource_snapshot_entry", {})
+            if _rs_entry and _rs_exit:
+                _rss_delta = {}
+                for _rk in ("rss_kb", "vmsize_kb", "user_cpu_ticks", "system_cpu_ticks", "minor_faults", "major_faults"):
+                    _ev = _rs_entry.get(_rk)
+                    _xv = _rs_exit.get(_rk)
+                    if _ev is not None and _xv is not None:
+                        _rss_delta[f"delta_{_rk}"] = _xv - _ev
+                if _rss_delta:
+                    print(
+                        "[critical_path.resource_deltas] "
+                        + " ".join(f"{k}={v}" for k, v in _rss_delta.items())
+                    )
+
+            _timeline_origin_ns = rec.get_timeline_origin_ns()
+
+            def _ms(_ev):
+                if _ev is None:
+                    return None
+                _mono = _ev.get("monotonic_ns")
+                if _mono is None:
+                    return None
+                return round((_mono - _timeline_origin_ns) / 1_000_000.0, 3)
+
+            def _find_event(_name):
+                for _ev in snap:
+                    if _ev.get("name") == _name:
+                        return _ev
+                return None
+
+            def _diff_ms(_a, _b):
+                if _a is None or _b is None:
+                    return None
+                _an = _a.get("monotonic_ns")
+                _bn = _b.get("monotonic_ns")
+                if _an is None or _bn is None:
+                    return None
+                return round((_bn - _an) / 1_000_000.0, 3)
+
+            _vstart_ev = _find_event("validation_start")
+            _vend_ev = _find_event("validation_complete")
+            _unet_submit_ev = _find_event("production_unet_submit")
+            _unet_done_ev = _find_event("production_unet_done_event_set")
+            _gw_start_ev = _find_event("graph_unet_future_wait_start")
+            _gw_end_ev = _find_event("graph_unet_future_wait_end")
+            _sampler_ev = _find_event("sampler_first_progress")
+            _exact_seed_ev = _find_event("exact_prefill_seed_complete")
+            _clip_ready_ev = (
+                _find_event("graph_clip_lookup_end")
+                or _find_event("graph_fallback_encode_end")
+                or _find_event("exact_prefill_clip_object_ready")
+            )
+            _ep_grouping_end_ev = _find_event("exact_prefill_grouping_end")
+
+            _validation_duration_ms = _diff_ms(_vstart_ev, _vend_ev)
+            _ep_seed_duration_ms = _diff_ms(_ep_grouping_end_ev, _exact_seed_ev)
+            _graph_clip_lookup_duration_ms = _diff_ms(
+                _find_event("graph_clip_lookup_start"),
+                _find_event("graph_clip_lookup_end"),
+            )
+            _unet_future_total_ms = _diff_ms(_unet_submit_ev, _unet_done_ev)
+            _graph_unet_wait_duration_ms = _diff_ms(_gw_start_ev, _gw_end_ev)
+
+            # Observed overlaps: time interval where the two phases
+            # were concurrently active (events ordered in time).
+            def _observed_overlap(_start_a, _end_a, _start_b, _end_b):
+                if not (_start_a and _end_a and _start_b and _end_b):
+                    return None
+                _a1 = _start_a.get("monotonic_ns")
+                _a2 = _end_a.get("monotonic_ns")
+                _b1 = _start_b.get("monotonic_ns")
+                _b2 = _end_b.get("monotonic_ns")
+                if None in (_a1, _a2, _b1, _b2):
+                    return None
+                _start = max(_a1, _b1)
+                _end = min(_a2, _b2)
+                if _end <= _start:
+                    return 0
+                return round((_end - _start) / 1_000_000.0, 3)
+
+            _validation_unet_overlap = _observed_overlap(
+                _vstart_ev, _vend_ev, _unet_submit_ev, _unet_done_ev
+            )
+            _exact_prefill_unet_overlap = _observed_overlap(
+                _ep_grouping_end_ev, _exact_seed_ev, _unet_submit_ev, _unet_done_ev
+            )
+
+            # Tri-state boolean formatter: None=unknown, True=yes, False=no
+            def _format_bool(_value):
+                if _value is None:
+                    return "unknown"
+                return "yes" if _value else "no"
+
+            # Boolean comparison helpers: "did A finish before B completed?"
+            # Returns None if either event is missing.
+            def _finished_before(_ev_a, _ev_b):
+                if _ev_a is None or _ev_b is None:
+                    return None
+                _a_ns = _ev_a.get("monotonic_ns")
+                _b_ns = _ev_b.get("monotonic_ns")
+                if _a_ns is None or _b_ns is None:
+                    return None
+                return _a_ns < _b_ns
+
+            print(
+                f"[critical_path.observed] "
+                f"restore_session={rec._restore_session_id[:12] or '-'} "
+                f"request_seq={rec._request_seq} "
+                f"validation_start_ms={_ms(_vstart_ev) or 'null'} "
+                f"validation_end_ms={_ms(_vend_ev) or 'null'} "
+                f"clip_ready_ms={_ms(_clip_ready_ev) or 'null'} "
+                f"unet_submit_ms={_ms(_unet_submit_ev) or 'null'} "
+                f"unet_future_done_ms={_ms(_unet_done_ev) or 'null'} "
+                f"graph_unet_wait_start_ms={_ms(_gw_start_ev) or 'null'} "
+                f"graph_unet_wait_end_ms={_ms(_gw_end_ev) or 'null'} "
+                f"sampler_first_progress_ms={_ms(_sampler_ev) or 'null'}"
+            )
+            print(
+                f"[critical_path.observed.intervals] "
+                f"validation_duration_ms={_validation_duration_ms if _validation_duration_ms is not None else 'null'} "
+                f"exact_prefill_seed_duration_ms={_ep_seed_duration_ms if _ep_seed_duration_ms is not None else 'null'} "
+                f"graph_clip_lookup_duration_ms={_graph_clip_lookup_duration_ms if _graph_clip_lookup_duration_ms is not None else 'null'} "
+                f"unet_future_total_ms={_unet_future_total_ms if _unet_future_total_ms is not None else 'null'} "
+                f"graph_unet_wait_duration_ms={_graph_unet_wait_duration_ms if _graph_unet_wait_duration_ms is not None else 'null'} "
+                f"validation_unet_observed_overlap_ms={_validation_unet_overlap if _validation_unet_overlap is not None else 'null'} "
+                f"exact_prefill_unet_observed_overlap_ms={_exact_prefill_unet_overlap if _exact_prefill_unet_overlap is not None else 'null'} "
+                f"validation_completed_before_unet_future={_format_bool(_finished_before(_vend_ev, _unet_done_ev))} "
+                f"clip_ready_before_unet_future={_format_bool(_finished_before(_clip_ready_ev, _unet_done_ev))} "
+                f"unet_future_completed_before_sampler_first_progress={_format_bool(_finished_before(_unet_done_ev, _sampler_ev))}"
+            )
+            # ── Coordinator summary (diagnostic only) ──
+            try:
+                _coord = get_model_read_coordinator() if _OPTIMIZATIONS_AVAILABLE else None
+                if _coord is not None and PRODUCTION_MODEL_READ_COORDINATOR_DIAG:
+                    _cs = _coord.summary()
+                    _oh = _cs.get("owner_hold_ms", {})
+                    _ow = _cs.get("owner_wait_ms", {})
+                    print(
+                        f"[model_read_coordinator.summary] "
+                        f"enabled={_cs.get('enabled', 0)} "
+                        f"acquisitions={_cs.get('acquisitions', 0)} "
+                        f"waited={_cs.get('waited', 0)} "
+                        f"total_wait_ms={_cs.get('total_wait_ms', 0.0)} "
+                        f"total_hold_ms={_cs.get('total_hold_ms', 0.0)} "
+                        f"peak_wait_ms={_cs.get('peak_wait_ms', 0.0)} "
+                        f"timeout_fail_open={_cs.get('timeout_fail_open', 0)} "
+                        f"production_unet_hold_ms={_oh.get('restore_background_unet', 0.0)} "
+                        f"graph_vae_wait_ms={_ow.get('graph_vae', 0.0)} "
+                        f"graph_vae_hold_ms={_oh.get('graph_vae', 0.0)}"
+                    )
+            except Exception:
+                pass
+        except Exception:
+            # Summary is best-effort and must never raise.
+            pass
+
+    # Gö─Gö─ PART 7: Shared custom-node sync and dependency policy Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─
     def _handle_custom_node_sync_and_dependency_policy(self, workflow: dict, stream: bool = False) -> dict:
         """Validate prompt, sync custom nodes, and enforce dependency policy.
 
@@ -6973,6 +7492,11 @@ class _ComfyAPIMixin:
     def _load_active_next_profile(self, now: float | None = None) -> dict:
         reason = ""
         try:
+            # Count every call, not just calls with valid bundle encodes
+            # (the review's issue #8: call count must measure every
+            # underlying read attempt).
+            _ar_calls = getattr(self, "_active_next_read_call_count", 0) + 1
+            self._active_next_read_call_count = _ar_calls
             if not os.path.isfile(ACTIVE_NEXT_PROFILE_PATH):
                 reason = "missing_file"
                 return {"_diagnostic": {"status": reason, "source_path": ACTIVE_NEXT_PROFILE_PATH}}
@@ -7013,6 +7537,37 @@ class _ComfyAPIMixin:
                 return payload
             payload_diag["status"] = "valid"
             payload["_diagnostic"] = payload_diag
+            # Active-next profile read — prompt bundle presence diagnostic.
+            # Per-restore dedup: only the first valid bundle observation
+            # for a given (restore_session_id, profile_token, bundle_hash)
+            # emits the diagnostic.  Underlying read count and bundle
+            # observation count are tracked separately and emitted in a
+            # compact summary at restore completion.
+            _bundle_ar = payload.get("prompt_bundle")
+            if isinstance(_bundle_ar, dict) and _bundle_ar.get("encodes"):
+                _bh = str(_bundle_ar.get("bundle_hash", ""))[:16]
+                _tok = str(payload.get("profile_token", "?"))[:12]
+                _rsid = str(payload_diag.get("restore_session_id", "")
+                            or getattr(self, "_current_restore_session_id", "")
+                            or "")
+                _ar_set = getattr(self, "_active_next_read_dedup", None)
+                if _ar_set is None:
+                    _ar_set = set()
+                    self._active_next_read_dedup = _ar_set
+                _ar_obs = getattr(self, "_active_next_bundle_observation_count", 0) + 1
+                self._active_next_bundle_observation_count = _ar_obs
+                _ar_key = (_rsid, _tok, _bh)
+                if _ar_key not in _ar_set:
+                    _ar_set.add(_ar_key)
+                    self._active_next_bundle_diagnostic_emission_count = (
+                        getattr(self, "_active_next_bundle_diagnostic_emission_count", 0) + 1
+                    )
+                    print(
+                        f"[exact_prefill.active_next_read] bundle_present=1 "
+                        f"bundle_hash={_bh} "
+                        f"encode_count={len(_bundle_ar['encodes'])} "
+                        f"token={_tok}"
+                    )
             return payload
         except json.JSONDecodeError as exc:
             reason = "invalid_json"
@@ -8881,24 +9436,90 @@ class _ComfyAPIMixin:
 
         _submit_ms = round((_threading_time.time() - restore_start) * 1000, 1)
         restore_stages["production_unet_submit_ms"] = _submit_ms
+        # Critical-path recorder: production_unet_submit boundary.
+        self._record_critical_path(
+            "production_unet_submit",
+            canonical_digest=str(key)[-32:],
+            extra={"submit_ms": _submit_ms, "key": str(key)},
+        )
+        _submit_unix_ns = time.time()
+        _future_submit_at_ns = time.perf_counter_ns()
+        _production_unet_diag_key = str(key)
 
         def _production_unet_worker():
             import nodes as _prod_nodes
+            _thread_start_ns = time.perf_counter_ns()
             try:
+                self._record_critical_path_restore(
+                    "production_unet_thread_start",
+                    canonical_digest=_production_unet_diag_key,
+                    extra={"thread_start_unix_s": time.time()},
+                )
+            except Exception:
+                pass
+            try:
+                _node_lookup_start_ns = time.perf_counter_ns()
                 _cls = _prod_nodes.NODE_CLASS_MAPPINGS.get("UNETLoader")
                 if _cls is None:
                     raise RuntimeError("UNETLoader not found in NODE_CLASS_MAPPINGS")
                 _node = _cls()
+                _node_lookup_end_ns = time.perf_counter_ns()
+                try:
+                    self._record_critical_path_restore(
+                        "production_unet_node_create",
+                        canonical_digest=_production_unet_diag_key,
+                        extra={
+                            "node_lookup_ms": round((_node_lookup_end_ns - _node_lookup_start_ns) / 1_000_000.0, 3),
+                            "node_lookup_to_create_ms": round((_node_lookup_end_ns - _thread_start_ns) / 1_000_000.0, 3),
+                        },
+                    )
+                except Exception:
+                    pass
+                _orig_loader_enter_ns = time.perf_counter_ns()
+                try:
+                    self._record_critical_path_restore(
+                        "production_unet_original_loader_enter",
+                        canonical_digest=_production_unet_diag_key,
+                        extra={"enter_unix_s": time.time()},
+                    )
+                except Exception:
+                    pass
                 with _model_load_context(
                     owner="restore_background_unet",
                     loader_type="UNET",
                     actual_key=key,
                     canonical_path=_resolved,
                 ):
+                    try:
+                        self._record_critical_path_restore(
+                            "production_unet_model_load_context_enter",
+                            canonical_digest=_production_unet_diag_key,
+                        )
+                    except Exception:
+                        pass
                     _loaded = _orig_unet(_node, _unet_name, _weight_dtype)
+                    try:
+                        self._record_critical_path_restore(
+                            "production_unet_model_load_context_body_end",
+                            canonical_digest=_production_unet_diag_key,
+                        )
+                    except Exception:
+                        pass
+                _orig_loader_exit_ns = time.perf_counter_ns()
+                try:
+                    self._record_critical_path_restore(
+                        "production_unet_original_loader_exit",
+                        canonical_digest=_production_unet_diag_key,
+                        extra={
+                            "original_loader_total_ms": round((_orig_loader_exit_ns - _orig_loader_enter_ns) / 1_000_000.0, 3),
+                        },
+                    )
+                except Exception:
+                    pass
                 # UNETLoader.load_unet returns (model,) — extract the model
                 if not isinstance(_loaded, tuple) or not _loaded or _loaded[0] is None:
                     raise RuntimeError("Production restore UNET loader returned an invalid result")
+                _validate_start_ns = time.perf_counter_ns()
                 _unet_object = _loaded[0]
                 _uc = getattr(self, "_unet_object_cache", {})
                 _uc[key] = _unet_object
@@ -8916,6 +9537,17 @@ class _ComfyAPIMixin:
                     "workflow_hash": profile.get("_workflow_hash", ""),
                 }
                 self._actual_load_future_meta = _meta
+                _validate_end_ns = time.perf_counter_ns()
+                try:
+                    self._record_critical_path_restore(
+                        "production_unet_object_cache_publish",
+                        canonical_digest=_production_unet_diag_key,
+                        extra={
+                            "result_publish_ms": round((_validate_end_ns - _validate_start_ns) / 1_000_000.0, 3),
+                        },
+                    )
+                except Exception:
+                    pass
             except Exception as _exc:
                 _meta = getattr(self, "_actual_load_future_meta", {})
                 _meta[key] = {
@@ -8938,6 +9570,18 @@ class _ComfyAPIMixin:
                 _ev_map = getattr(self, "_rbg_unet_done_events", None)
                 if _ev_map is not None and key in _ev_map:
                     _ev_map[key].set()
+                _done_event_ns = time.perf_counter_ns()
+                try:
+                    self._record_critical_path_restore(
+                        "production_unet_done_event_set",
+                        canonical_digest=_production_unet_diag_key,
+                        extra={
+                            "future_total_ms": round((_done_event_ns - _future_submit_at_ns) / 1_000_000.0, 3),
+                            "thread_start_to_done_event_ms": round((_done_event_ns - _thread_start_ns) / 1_000_000.0, 3),
+                        },
+                    )
+                except Exception:
+                    pass
 
         # Pre-create the UNET done event BEFORE starting the thread.
         self._rbg_unet_done_events[key] = _threading.Event()
@@ -11390,6 +12034,26 @@ class _ComfyAPIMixin:
                         trace._t["t6_sampler_progress_start"] = ps
                     if pe is not None:
                         trace._t["t6_sampler_progress_end"] = pe
+                    # Critical-path recorder: emit sampler_first_progress at
+                    # the actual first-progress callback time (not result-
+                    # packaging time).  Uses record_at() so the event's
+                    # monotonic_ns reflects the real sampler progress, not
+                    # the current wall clock.
+                    _s_ns = fields.get("start_ns")
+                    if _s_ns and _s_ns > 0:
+                        try:
+                            self._record_critical_path_at(
+                                "sampler_first_progress",
+                                monotonic_ns=int(_s_ns),
+                                unix_s=start,
+                                extra={
+                                    "sampler_start_unix_s": start,
+                                    "sampler_end_unix_s": end,
+                                    "sampler_ms": round((end - start) * 1000, 1),
+                                },
+                            )
+                        except Exception:
+                            pass
                 elif stage == "vae_decode":
                     trace._t["t7_vae_decode_start"] = start
                     trace._t["t7_vae_decode_end"] = end
@@ -11424,6 +12088,7 @@ class _ComfyAPIMixin:
         now = time.time()
         if state["first_progress"] is None:
             state["first_progress"] = now
+            state["first_progress_ns"] = time.perf_counter_ns()
         state["last_progress"] = now
         state["progress_events"] += 1
         state["max_step"] = max(state["max_step"], int(data.get("step", 0)))
@@ -11471,6 +12136,8 @@ class _ComfyAPIMixin:
                     windows[stage]["max_steps"] = state.get("max_steps", 0)
                     windows[stage]["duration_ms"] = duration_ms
                     windows[stage]["source"] = "progress"
+                    # Save perf_counter_ns for accurate critical-path recording
+                    windows[stage]["start_ns"] = state.get("first_progress_ns", 0)
                 else:
                     previous_duration = float(windows[stage].get("duration_ms", -1.0))
                     if duration_ms > previous_duration:
@@ -12101,12 +12768,39 @@ class _ComfyAPIMixin:
                 pass
         _cached = _wf_cache.get(_wf_cache_key) if collect_outputs else None
         stage_started = time.time()
+        _cert_hit = False
+        _cert_lookup_ms = 0.0
+        _cert_write_submitted = 0
+        _cert_write_result = ""
+        # Critical-path recorder: validation start boundary
+        try:
+            self._record_critical_path(
+                "validation_start",
+                extra={
+                    "workflow_node_count": len(workflow) if isinstance(workflow, dict) else 0,
+                    "validation_cache_hit": 1 if _cached is not None and collect_outputs else 0,
+                    "collect_outputs": 1 if collect_outputs else 0,
+                },
+            )
+        except Exception:
+            pass
         if _cached is not None and collect_outputs:
             outputs_to_execute, node_errors = _cached
             valid = True
             error = {}
             _validate_ms = self._profile_ms(stage_started)
             self._log_profile("inproc_validate_cached", prompt_id=prompt_id[:8], hash=_wf_hash, duration_ms=_validate_ms)
+            try:
+                self._record_critical_path(
+                    "validation_complete",
+                    extra={
+                        "validation_total_ms": _validate_ms,
+                        "validation_memory_cache_hit": 1,
+                        "real_validation_ran": 0,
+                    },
+                )
+            except Exception:
+                pass
         elif not collect_outputs:
             # Warmup-only mode: skip output validation since warmup workflows
             # may have no output consumers (e.g. UNETLoader + DualCLIPLoader).
@@ -12116,18 +12810,140 @@ class _ComfyAPIMixin:
             valid = True
             node_errors = {}
             error = {}
+            try:
+                self._record_critical_path(
+                    "validation_complete",
+                    extra={
+                        "validation_total_ms": self._profile_ms(stage_started),
+                        "collect_outputs_skip": 1,
+                        "real_validation_ran": 0,
+                    },
+                )
+            except Exception:
+                pass
         else:
-            valid, error, outputs_to_execute, node_errors = self._event_loop.run_until_complete(
-                execution.validate_prompt(prompt_id, workflow, None)
+            # Per audit round 7: persistent validation certificate (opt-in).
+            # Check before calling the expensive execution.validate_prompt().
+            _cert_eligible = (
+                os.environ.get("COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE", "1") == "1"
+                and _production_enabled
             )
-            _validate_ms = self._profile_ms(stage_started)
-            self._log_profile("inproc_validate", prompt_id=prompt_id[:8], valid=1 if valid else 0, outputs=len(outputs_to_execute or []), duration_ms=_validate_ms)
-            # Cache for future requests with same structure
-            if valid and outputs_to_execute:
-                if not hasattr(self, '_workflow_exec_cache'):
-                    self._workflow_exec_cache = {}
-                self._workflow_exec_cache[_wf_cache_key] = (outputs_to_execute, node_errors)
+            if _cert_eligible:
+                _cert_lookup_start = time.perf_counter()
+                _cert_identity = _build_validation_certificate_identity(
+                    workflow, _production_cache,
+                    dep_fingerprint_hash=getattr(self, "_last_dep_fingerprint_hash", ""),
+                )
+                # Critical-path recorder: validation certificate lookup start
+                try:
+                    self._record_critical_path(
+                        "validation_certificate_lookup",
+                        extra={"certificate_eligible": 1},
+                    )
+                except Exception:
+                    pass
+                _cert_result = _read_validation_certificate(_cert_identity)
+                _cert_lookup_ms = (time.perf_counter() - _cert_lookup_start) * 1000
+                if _cert_result is not None:
+                    outputs_to_execute = _cert_result["outputs_to_execute"]
+                    node_errors = _cert_result.get("node_errors", {})
+                    valid = True
+                    error = {}
+                    _cert_hit = True
+                    _validate_ms = self._profile_ms(stage_started)
+                    # Seed the in-memory cache for subsequent requests in this container
+                    if not hasattr(self, '_workflow_exec_cache'):
+                        self._workflow_exec_cache = {}
+                    self._workflow_exec_cache[_wf_cache_key] = (outputs_to_execute, node_errors)
+                    self._log_profile("inproc_validate_cert_hit", prompt_id=prompt_id[:8], hash=_wf_hash, duration_ms=_validate_ms)
+                    print(f"[cert] hit=1 identity={_cert_identity[:16]} lookup_ms={round(_cert_lookup_ms, 3)}", flush=True)
+                else:
+                    print(f"[cert] hit=0 identity={_cert_identity[:16]} lookup_ms={round(_cert_lookup_ms, 3)} reason=identity_not_found", flush=True)
+            else:
+                _cert_miss_reason = "production_disabled" if not _production_enabled else "flag_disabled"
+                print(f"[cert] eligible=0 reason={_cert_miss_reason}", flush=True)
+            if not _cert_hit:
+                # Critical-path recorder: validate_prompt total start
+                try:
+                    self._record_critical_path(
+                        "validate_prompt_total_start",
+                        extra={"workflow_node_count": len(workflow) if isinstance(workflow, dict) else 0},
+                    )
+                except Exception:
+                    pass
+                _run_until_complete_enter_ns = time.perf_counter_ns()
+                try:
+                    self._record_critical_path(
+                        "run_until_complete_enter",
+                        extra={"workflow_node_count": len(workflow) if isinstance(workflow, dict) else 0},
+                    )
+                except Exception:
+                    pass
+                valid, error, outputs_to_execute, node_errors = self._event_loop.run_until_complete(
+                    execution.validate_prompt(prompt_id, workflow, None)
+                )
+                _run_until_complete_exit_ns = time.perf_counter_ns()
+                try:
+                    self._record_critical_path(
+                        "run_until_complete_exit",
+                        extra={
+                            "run_until_complete_ms": round((_run_until_complete_exit_ns - _run_until_complete_enter_ns) / 1_000_000.0, 3),
+                            "valid": 1 if valid else 0,
+                            "node_error_count": len(node_errors or {}),
+                            "output_count": len(outputs_to_execute or []),
+                        },
+                    )
+                except Exception:
+                    pass
+                _validate_ms = self._profile_ms(stage_started)
+                self._log_profile("inproc_validate", prompt_id=prompt_id[:8], valid=1 if valid else 0, outputs=len(outputs_to_execute or []), duration_ms=_validate_ms)
+                # Cache for future requests with same structure
+                if valid and outputs_to_execute:
+                    if not hasattr(self, '_workflow_exec_cache'):
+                        self._workflow_exec_cache = {}
+                    self._workflow_exec_cache[_wf_cache_key] = (outputs_to_execute, node_errors)
+                    # Write persistent certificate (off the result critical path)
+                    if _cert_eligible and valid and outputs_to_execute:
+                        try:
+                            _cert_write_submitted = 1
+                            _wr = _write_validation_certificate(_cert_identity, outputs_to_execute, node_errors)
+                            _cert_write_result = _wr.get("status", "error")
+                        except Exception:
+                            _cert_write_result = "error"
+                # Critical-path recorder: validation_complete
+                try:
+                    _wf_edge_count = 0
+                    _output_node_count = 0
+                    if isinstance(workflow, dict):
+                        for _nid, _node in workflow.items():
+                            if not isinstance(_node, dict):
+                                continue
+                            if _node.get("class_type") in ("SaveImage", "PreviewImage", "VHS_VideoCombine", "Image Comparer (rgthree)"):
+                                _output_node_count += 1
+                            _inp = _node.get("inputs")
+                            if isinstance(_inp, dict):
+                                _wf_edge_count += sum(1 for _v in _inp.values() if isinstance(_v, list))
+                    self._record_critical_path(
+                        "validation_complete",
+                        extra={
+                            "validation_total_ms": _validate_ms,
+                            "validation_memory_cache_hit": 0,
+                            "real_validation_ran": 1,
+                            "validate_prompt_total_ms": _validate_ms,
+                            "node_error_count": len(node_errors or {}),
+                            "workflow_node_count": len(workflow) if isinstance(workflow, dict) else 0,
+                            "workflow_edge_count": _wf_edge_count,
+                            "output_node_count": _output_node_count,
+                            "valid": 1 if valid else 0,
+                        },
+                    )
+                except Exception:
+                    pass
         self._last_graph_validate_ms = self._profile_ms(stage_started)
+        self._validation_certificate_hit = _cert_hit
+        self._validation_certificate_lookup_ms = _cert_lookup_ms
+        self._validation_certificate_write_submitted = _cert_write_submitted
+        self._validation_certificate_write_result = _cert_write_result
         if trace is not None:
             trace.mark("t3b_validate_done")
         # Per audit round 7: store granular preflight timings and
@@ -14216,12 +15032,28 @@ class _ComfyAPIMixin:
                     _effective_warmup_text = warmup_text
                 if warmup_texts:
                     # Encode ALL texts sequentially for multi-encode bundles.
+                    # Track per-text success/failure so the caller can
+                    # distinguish true exact-prefill success from partial
+                    # or complete failure.
                     enc_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
+                    _exact_req = 0
+                    _exact_ok = 0
+                    _exact_fail = 0
+                    _exact_encode_s = time.time()
                     if enc_cls:
                         encoder = enc_cls()
                         for _wt in warmup_texts:
                             if _wt:
-                                encoder.encode(clip=clip_out[0], text=_wt)
+                                _exact_req += 1
+                                try:
+                                    encoder.encode(clip=clip_out[0], text=_wt)
+                                    _exact_ok += 1
+                                except Exception as _wt_exc:
+                                    _exact_fail += 1
+                    _phases["exact_prefill_requested_count"] = _exact_req
+                    _phases["exact_prefill_successful_count"] = _exact_ok
+                    _phases["exact_prefill_failed_count"] = _exact_fail
+                    _phases["exact_prefill_encode_ms"] = round((time.time() - _exact_encode_s) * 1000, 1)
                 elif _effective_warmup_text:
                     enc_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
                     if enc_cls:
@@ -14477,6 +15309,14 @@ class _ComfyAPIMixin:
         def _cached_unet_load(self_node, **kwargs):
             _loader_entry_t0 = time.time()
             unet_name = kwargs.get("unet_name", "")
+            # Critical-path recorder: graph UNET loader entry
+            try:
+                _api._record_critical_path(
+                    "graph_unet_loader_enter",
+                    extra={"unet_name": str(unet_name)[:32]},
+                )
+            except Exception:
+                pass
             weight_dtype = kwargs.get("weight_dtype", "default")
             if not unet_name:
                 return orig_load(self_node, **kwargs)
@@ -14604,9 +15444,34 @@ class _ComfyAPIMixin:
             _f_graph_wait_start_s = time.time()
             if _future_exists_before:
                 _f_wait_t0 = time.time()
+                # Critical-path recorder: graph UNET future wait start
+                try:
+                    _api._record_critical_path(
+                        "graph_unet_future_wait_start",
+                        extra={
+                            "unet_name": str(unet_name)[:32],
+                            "future_source": _future_source_before,
+                            "future_status": _future_status_before,
+                            "graph_wait_start_unix_s": _f_graph_wait_start_s,
+                        },
+                    )
+                except Exception:
+                    pass
                 if _api._consume_actual_load_future(key):
                     _f_wait_s = time.time()
                     _f_wait_ms = round((_f_wait_s - _f_wait_t0) * 1000, 1)
+                    # Critical-path recorder: graph UNET future wait end
+                    try:
+                        _api._record_critical_path(
+                            "graph_unet_future_wait_end",
+                            extra={
+                                "unet_name": str(unet_name)[:32],
+                                "wait_ms": _f_wait_ms,
+                                "wait_end_unix_s": _f_wait_s,
+                            },
+                        )
+                    except Exception:
+                        pass
                     if key in _cache:
                         print(f"[loader_future] returned_future_result loader=UNET key={key} wait_ms={_f_wait_ms}")
                         _api._unet_cache_hits = getattr(_api, '_unet_cache_hits', 0) + 1
@@ -14624,6 +15489,18 @@ class _ComfyAPIMixin:
                                 _rec["cache_source"] = "future"
                                 _rec["future_hit"] = True
                                 break
+                        # Critical-path recorder: graph UNET cache result returned
+                        try:
+                            _api._record_critical_path(
+                                "graph_unet_cache_result_returned",
+                                extra={
+                                    "unet_name": str(unet_name)[:32],
+                                    "loader_return_ms": _diag["unet_loader_return_ms"],
+                                    "future_hit": 1,
+                                },
+                            )
+                        except Exception:
+                            pass
                         return (_cache[key],)
                 if _restore_background_code_enabled() and _future_source_before == "restore_background_unet" and isinstance(getattr(_api, "_last_restore_timing", None), dict):
                     _api._last_restore_timing["restore_background_unet_fallback_used"] = 1
@@ -14698,7 +15575,8 @@ class _ComfyAPIMixin:
             _owner_map = getattr(_api, "_actual_load_owner_thread", {})
             if _owner_map.get(key) == _thr_sfv.current_thread().ident:
                 print(f"[loader_future] self_future_detected key={key} -> using original loader directly")
-                return orig_load(self_node, **kwargs)
+                with _model_load_context(owner="graph_vae", loader_type="VAE", canonical_path=resolved):
+                    return orig_load(self_node, **kwargs)
             # Check in-flight actual load future
             thread = getattr(_api, '_actual_load_futures', {}).pop(key, None)
             if thread is not None:
@@ -14713,7 +15591,8 @@ class _ComfyAPIMixin:
                         _api._actual_load_waits = getattr(_api, '_actual_load_waits', 0) + 1
                         return (cache[key],)
             t0 = time.time()
-            result = orig_load(self_node, **kwargs)
+            with _model_load_context(owner="graph_vae", loader_type="VAE", canonical_path=resolved):
+                result = orig_load(self_node, **kwargs)
             d_ms = round((time.time() - t0) * 1000, 1)
             print(f"[loader_future] fallback_normal_load loader=VAE key={key} ms={d_ms}")
             if result and result[0] is not None:
@@ -14873,7 +15752,10 @@ class _ComfyAPIMixin:
                     if result:
                         for _clip_obj in result:
                             if _clip_obj is not None:
-                                _clip_obj._warmup_model_paths = unique_keys if unique_keys else []
+                                # Extract just path strings, not (path, type) tuples.
+                                # The _cached() wrapper and stable_clip_cache_tag()
+                                # expect a list of bare path strings.
+                                _clip_obj._warmup_model_paths = [k[0] for k in unique_keys] if unique_keys else []
                                 _clip_obj._warmup_clip_type = clip_type
                     return result
 
@@ -15008,6 +15890,14 @@ class _ComfyAPIMixin:
             _clip_node_cls._clip_textencode_cache_hit_node_ids: set[str] = set()
             _clip_node_cls._clip_textencode_cache_miss_node_ids: set[str] = set()
             _clip_node_cls._clip_textencode_cache_mode = _cache_mode
+            _clip_node_cls._clip_textencode_cache_seen_digests: set = set()
+            # Per audit round 8: structured dedup keys for diagnostic
+            # events.  Seed events (stage=seed) and lookup events
+            # (stage=lookup) must be tracked separately so a restore
+            # seed does not suppress a later graph lookup for the same
+            # digest.  See audit round 8 / Part 7.
+            _clip_node_cls._clip_textencode_cache_diag_seen: set = set()
+            _clip_node_cls._exact_prefill_phase: str = ""  # "restore_exact_prefill" or ""
 
             def _cached(self_node, clip, text):
                 # Build model-aware key: includes text, CLIP model identity,
@@ -15021,7 +15911,39 @@ class _ComfyAPIMixin:
                 _stable_fp = stable_clip_cache_tag(_paths, _clip_type)
                 _cls_name = _stable_fp
                 _node_id = str(getattr(self_node, 'id', '')) or ''
+                _phase = getattr(_clip_node_cls, '_exact_prefill_phase', None) or "graph_fallback"
+                # The restore-time phase is a per-request context
+                # flag set by ``_warmup_direct``.  Anything other
+                # than a recognized restore phase is a graph-side
+                # call and should be reported with phase=graph_lookup
+                # so it is tracked independently of the seed.
+                _is_restore_phase = _phase in ("restore_exact_prefill", "generic_warmup")
+                _diag_phase = _phase if _is_restore_phase else "graph_lookup"
                 _key = (text, _paths, _clip_type, _cls_name, id(clip))
+                _relaxed = (text, _paths, _clip_type, _cls_name)
+                _digest_key = f"{text}:{_paths}:{_clip_type}:{_cls_name}"
+                _digest = hashlib.sha256(_digest_key.encode("utf-8")).hexdigest()[:16]
+                # Look up the current request_seq for diagnostic dedup scoping.
+                # This ensures a second request in the same container re-emits
+                # its diagnostics rather than being suppressed by a class-level
+                # dedup set that is never cleared.
+                _diag_rec = getattr(_CR_PATH_RECORDER_TLS, "recorder", None)
+                _diag_request_seq = _diag_rec._request_seq if _diag_rec is not None else 0
+                # Critical-path recorder: record a lookup_start boundary
+                # per call.  Uses ``restore_`` prefix during restore
+                # phase, ``graph_`` prefix during graph phase so the
+                # two are never conflated.
+                _lookup_start_event = "restore_clip_lookup_start" if _is_restore_phase else "graph_clip_lookup_start"
+                try:
+                    _rec = getattr(_CR_PATH_RECORDER_TLS, "recorder", None)
+                    if _rec is not None:
+                        _rec.record(
+                            _lookup_start_event,
+                            canonical_digest=_digest,
+                            extra={"mode": "pending", "phase": _diag_phase, "node_id": _node_id},
+                        )
+                except Exception:
+                    pass
                 # Fast path: exact clip object match
                 if _key in _cache:
                     _clip_node_cls._clip_textencode_cache_hits += 1
@@ -15029,6 +15951,22 @@ class _ComfyAPIMixin:
                         _clip_node_cls._clip_textencode_cache_hit_node_ids.add(_node_id)
                     _lookup_ms = round((time.time() - _t_lookup) * 1000, 1)
                     _out = _cache[_key]
+                    _diag_key = (_diag_request_seq, "lookup", "exact", _diag_phase, _digest)
+                    if _diag_key not in _clip_node_cls._clip_textencode_cache_diag_seen:
+                        _clip_node_cls._clip_textencode_cache_diag_seen.add(_diag_key)
+                        print(f"[exact_prefill.cache_key] stage=lookup mode=exact "
+                              f"digest={_digest} node_id={_node_id} phase={_diag_phase} hit=1")
+                    _lookup_end_event = "restore_clip_lookup_end" if _is_restore_phase else "graph_clip_lookup_end"
+                    try:
+                        _rec = getattr(_CR_PATH_RECORDER_TLS, "recorder", None)
+                        if _rec is not None:
+                            _rec.record(
+                                _lookup_end_event,
+                                canonical_digest=_digest,
+                                extra={"mode": "exact", "phase": _diag_phase, "hit": 1, "lookup_ms": _lookup_ms},
+                            )
+                    except Exception:
+                        pass
                     # Attach timing metadata to the output if the first element
                     # supports arbitrary attribute assignment (not a plain list/int/str)
                     if isinstance(_out, (list, tuple)) and len(_out) > 0:
@@ -15047,13 +15985,28 @@ class _ComfyAPIMixin:
                                 pass
                     return _out
                 # Slightly relaxed key: same text + same model files (different obj)
-                _relaxed = (text, _paths, _clip_type, _cls_name)
                 if _relaxed in _cache:
                     _clip_node_cls._clip_textencode_cache_hits += 1
                     if _node_id:
                         _clip_node_cls._clip_textencode_cache_hit_node_ids.add(_node_id)
                     _lookup_ms = round((time.time() - _t_lookup) * 1000, 1)
                     _out = _cache[_relaxed]
+                    _diag_key = (_diag_request_seq, "lookup", "relaxed", _diag_phase, _digest)
+                    if _diag_key not in _clip_node_cls._clip_textencode_cache_diag_seen:
+                        _clip_node_cls._clip_textencode_cache_diag_seen.add(_diag_key)
+                        print(f"[exact_prefill.cache_key] stage=lookup mode=relaxed "
+                              f"digest={_digest} node_id={_node_id} phase={_diag_phase} hit=1")
+                    _lookup_end_event = "restore_clip_lookup_end" if _is_restore_phase else "graph_clip_lookup_end"
+                    try:
+                        _rec = getattr(_CR_PATH_RECORDER_TLS, "recorder", None)
+                        if _rec is not None:
+                            _rec.record(
+                                _lookup_end_event,
+                                canonical_digest=_digest,
+                                extra={"mode": "relaxed", "phase": _diag_phase, "hit": 1, "lookup_ms": _lookup_ms},
+                            )
+                    except Exception:
+                        pass
                     if isinstance(_out, (list, tuple)) and len(_out) > 0:
                         _clip_out = _out[0]
                         if hasattr(type(_clip_out), '__dict__') or hasattr(type(_clip_out), '__slots__'):
@@ -15074,11 +16027,49 @@ class _ComfyAPIMixin:
                 _clip_node_cls._clip_textencode_cache_misses += 1
                 if _node_id:
                     _clip_node_cls._clip_textencode_cache_miss_node_ids.add(_node_id)
+                _fallback_start_event = "restore_fallback_encode_start" if _is_restore_phase else "graph_fallback_encode_start"
+                try:
+                    _rec = getattr(_CR_PATH_RECORDER_TLS, "recorder", None)
+                    if _rec is not None:
+                        _rec.record(
+                            _fallback_start_event,
+                            canonical_digest=_digest,
+                            extra={"mode": "miss", "phase": _diag_phase, "node_id": _node_id},
+                        )
+                except Exception:
+                    pass
                 result = _orig(self_node, clip, text)
                 _compute_ms = round((time.time() - _t_compute) * 1000, 1)
                 _lookup_ms = round((_t_compute - _t_lookup) * 1000, 1)
                 _cache[_key] = result
                 _cache[_relaxed] = result  # also cache relaxed key for future calls
+                # Cache-key digest: log on miss, with phase context.
+                # Per audit round 8: graph-side misses are reported as
+                # ``graph_miss_encode`` (real encode happened) so they
+                # are tracked independently of any restore-time seed.
+                _miss_diag_phase = "graph_miss_encode" if not _is_restore_phase else _phase
+                _diag_key = (_diag_request_seq, "seed", "encode", _miss_diag_phase, _digest)
+                if _diag_key not in _clip_node_cls._clip_textencode_cache_diag_seen:
+                    _clip_node_cls._clip_textencode_cache_diag_seen.add(_diag_key)
+                    print(f"[exact_prefill.cache_key] stage=seed digest={_digest} "
+                          f"node_id={_node_id} phase={_miss_diag_phase}")
+                _fallback_end_event = "restore_fallback_encode_end" if _is_restore_phase else "graph_fallback_encode_end"
+                _lookup_end_event = "restore_clip_lookup_end" if _is_restore_phase else "graph_clip_lookup_end"
+                try:
+                    _rec = getattr(_CR_PATH_RECORDER_TLS, "recorder", None)
+                    if _rec is not None:
+                        _rec.record(
+                            _fallback_end_event,
+                            canonical_digest=_digest,
+                            extra={"mode": "miss", "phase": _miss_diag_phase, "encode_ms": _compute_ms, "hit": 0},
+                        )
+                        _rec.record(
+                            _lookup_end_event,
+                            canonical_digest=_digest,
+                            extra={"mode": "miss", "phase": _diag_phase, "hit": 0, "lookup_ms": _lookup_ms},
+                        )
+                except Exception:
+                    pass
                 if isinstance(result, (list, tuple)) and len(result) > 0:
                     _clip_out = result[0]
                     if hasattr(type(_clip_out), '__dict__') or hasattr(type(_clip_out), '__slots__'):
@@ -15221,8 +16212,26 @@ class _ComfyAPIMixin:
         __stages["container_import_unix_s"] = CONTAINER_IMPORT_UNIX_S
         __stages["restore_count"] = _container_restore_count
         __stages["restored_instance_id"] = self._restored_instance_id
+        # Bind the new restore identity onto the instance and reset
+        # the per-restore active-next read dedup state so a fresh
+        # restore can emit the diagnostic again.
+        self._current_restore_session_id = __stages["restore_session_id"]
+        self._active_next_read_dedup = set()
+        self._active_next_read_call_count = 0
+        self._active_next_bundle_observation_count = 0
+        self._active_next_bundle_diagnostic_emission_count = 0
         # Clear any stale restore timing from a previous call
         self._last_restore_timing = None
+
+        # Critical-path recorder: initialize at restore start so
+        # restore-phase events (production_unet_submit,
+        # exact_prefill_*, etc.) are captured.  The recorder is bound
+        # with request_seq=0 (restore phase) and later, at request
+        # entry, bind() preserves these events as ``_restore_events``.
+        self._init_critical_path_recorder(
+            __stages.get("restore_session_id") or "",
+            0,  # request_seq=0 signals restore phase
+        )
 
         is_in_proc = (self._select_backend() == "in_process")
 
@@ -16616,15 +17625,33 @@ class _ComfyAPIMixin:
                     # matching the CLIP loaded by _warmup_direct is
                     # primed; the other stack still encodes during
                     # graph execution (acceptable per the audit).
-                    if os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "0") == "1":
+                    #
+                    # Timing and counters: _ep_total_start starts before
+                    # grouping/selection and stops after _warmup_direct
+                    # returns, so exact_prefill_total_ms includes the
+                    # actual encoding.  Encode success/failure counters
+                    # come from _warmup_direct's return dict, not from
+                    # pre-selection estimates.
+                    _ep_total_start = time.time()
+                    _ep_grouping_start = time.time()
+                    _ep_bundle_present = 0
+                    _ep_fingerprint_match = 0
+                    _ep_group_size = 0
+                    _ep_bundle_encode_count = 0
+                    self._record_critical_path(
+                        "exact_prefill_grouping_start",
+                        extra={"profile_clip": str(profile.get("clip1", ""))[:32]},
+                    )
+                    if os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "1") == "1":
+                        __stages["exact_prefill_requested"] = 1
                         try:
                             if isinstance(_raw_active, dict):
                                 _bundle_check = _raw_active.get("prompt_bundle")
                                 if isinstance(_bundle_check, dict):
+                                    _ep_bundle_present = 1
                                     _encs = _bundle_check.get("encodes") or []
+                                    _ep_bundle_encode_count = len(_encs)
                                     # Group by stable fingerprint
-                                    # (clip_type + path tail) — same
-                                    # scheme the graph cache key uses.
                                     _groups: dict = {}
                                     for _enc_e in _encs:
                                         if not isinstance(_enc_e, dict):
@@ -16634,24 +17661,8 @@ class _ComfyAPIMixin:
                                             continue
                                         _ct = str(_enc_e.get("clip_type", "") or "")
                                         _fns = _enc_e.get("filenames", []) or []
-                                        # Use the shared helper so the
-                                        # grouping key matches the cache
-                                        # key the graph wrapper writes
-                                        # and the candidate builder reads.
                                         _fp = stable_clip_cache_tag(_fns, _ct)
                                         _groups.setdefault(_fp, []).append(_t)
-                                    # Determine the fingerprint of the
-                                    # CLIP that _warmup_direct will load
-                                    # (the profile's clip1).  ONLY prime
-                                    # the group whose stable fingerprint
-                                    # matches the profile's loaded CLIP.
-                                    # If no group matches, fall back to
-                                    # the generic WARMUP_TEXT (empty
-                                    # _bundle_texts) so we do not encode
-                                    # the wrong CLIP stack's prompts
-                                    # with the primary CLIP — that would
-                                    # burn ~1000ms per encode for results
-                                    # the graph cannot use.
                                     _profile_clip = profile.get("clip1", "")
                                     _profile_clip_type = profile.get("clip_type", "flux")
                                     _profile_fp = stable_clip_cache_tag(
@@ -16659,24 +17670,106 @@ class _ComfyAPIMixin:
                                         _profile_clip_type,
                                     )
                                     _chosen_group = _groups.get(_profile_fp, [])
+                                    _ep_group_size = len(_chosen_group)
+                                    _ep_fingerprint_match = 1 if _ep_group_size > 0 else 0
                                     # Dedup texts while preserving order
                                     _bundle_texts: list = []
                                     for _t in _chosen_group:
                                         if _t not in _bundle_texts:
                                             _bundle_texts.append(_t)
                                     if _bundle_texts:
-                                        # Only use the bundle texts when
-                                        # persistent cache didn't already seed.
                                         _seeded = __stages.get("prompt_cache_seeded_encodes", 0)
                                         if _seeded == 0:
                                             _warmup_texts = _bundle_texts
                                             _warmup_text = _bundle_texts[0]
-                        except Exception:
-                            pass
+                        except Exception as _ep_exc:
+                            __stages["exact_prefill_error"] = str(_ep_exc)[:120]
+                            print(f"[exact_prefill] restore grouping exception: {_ep_exc}")
+                    else:
+                        __stages["exact_prefill_requested"] = 0
+                    __stages["exact_prefill_bundle_present"] = _ep_bundle_present
+                    __stages["exact_prefill_fingerprint_match"] = _ep_fingerprint_match
+                    __stages["exact_prefill_group_size"] = _ep_group_size
+                    __stages["exact_prefill_encode_count"] = _ep_bundle_encode_count
+                    _ep_grouping_ms = round((time.time() - _ep_grouping_start) * 1000, 3)
+                    __stages["exact_prefill_grouping_ms"] = _ep_grouping_ms
+                    self._record_critical_path(
+                        "exact_prefill_grouping_end",
+                        extra={
+                            "bundle_present": _ep_bundle_present,
+                            "fingerprint_match": _ep_fingerprint_match,
+                            "group_size": _ep_group_size,
+                            "encode_count": _ep_bundle_encode_count,
+                            "grouping_ms": _ep_grouping_ms,
+                        },
+                    )
+                    # Set phase context so _cached() can distinguish
+                    # restore-time seeding from graph-fallback encodes.
+                    try:
+                        import nodes as _ep_nodes
+                        _ep_te_cls = _ep_nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
+                        if _ep_te_cls is not None:
+                            if _warmup_texts:
+                                _ep_te_cls._exact_prefill_phase = "restore_exact_prefill"
+                            else:
+                                _ep_te_cls._exact_prefill_phase = "generic_warmup"
+                    except Exception:
+                        pass
                     _dw = self._warmup_direct(profile,
                         clip_policy_overrides=_clip_policy,
                         warmup_text=_warmup_text,
                         warmup_texts=_warmup_texts)
+                    # Clear phase context
+                    try:
+                        import nodes as _ep_nodes2
+                        _ep_te_cls2 = _ep_nodes2.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
+                        if _ep_te_cls2 is not None:
+                            _ep_te_cls2._exact_prefill_phase = ""
+                    except Exception:
+                        pass
+                    # Read exact-prefill encode counters from _warmup_direct result,
+                    # NOT from pre-selection estimates — these reflect actual
+                    # per-text encode success/failure.
+                    _ep_successful = _dw.get("exact_prefill_successful_count", 0)
+                    _ep_failed = _dw.get("exact_prefill_failed_count", 0)
+                    __stages["exact_prefill_seeded_count"] = _ep_successful
+                    __stages["exact_prefill_requested_count"] = _dw.get("exact_prefill_requested_count", 0)
+                    __stages["exact_prefill_failed_count"] = _ep_failed
+                    __stages["exact_prefill_encode_ms"] = _dw.get("exact_prefill_encode_ms", 0)
+                    __stages["exact_prefill_total_ms"] = round((time.time() - _ep_total_start) * 1000, 1)
+                    # Critical-path recorder: emit seed_complete and a
+                    # structured summary line.  No raw prompt text.
+                    self._record_critical_path(
+                        "exact_prefill_seed_complete",
+                        extra={
+                            "seed_success": int(_ep_successful),
+                            "seed_requested": int(_dw.get("exact_prefill_requested_count", 0)),
+                            "seed_failed": int(_ep_failed),
+                            "seed_encode_ms": float(_dw.get("exact_prefill_encode_ms", 0.0)),
+                            "grouping_ms": float(__stages.get("exact_prefill_grouping_ms", 0.0)),
+                            "total_ms": float(__stages["exact_prefill_total_ms"]),
+                        },
+                    )
+                    print(
+                        f"[critical_path.exact_prefill] "
+                        f"restore_session={(__stages.get('restore_session_id') or '-')[:12]} "
+                        f"request_seq=0 "
+                        f"seed_success={int(_ep_successful)} "
+                        f"seed_requested={int(_dw.get('exact_prefill_requested_count', 0))} "
+                        f"seed_encode_ms={float(_dw.get('exact_prefill_encode_ms', 0.0))} "
+                        f"grouping_ms={float(__stages.get('exact_prefill_grouping_ms', 0.0))} "
+                        f"total_ms={float(__stages['exact_prefill_total_ms'])}"
+                    )
+                    if _ep_successful > 0:
+                        __stages["generic_warmup_encode_skipped"] = 1
+                        __stages["generic_warmup_encode_skip_reason"] = "exact_prefill_seeded"
+                    elif _warmup_texts:
+                        # bundle texts were set but all encodes failed
+                        __stages["generic_warmup_encode_skipped"] = 0
+                        __stages["generic_warmup_encode_skip_reason"] = "exact_prefill_all_failed"
+                    else:
+                        __stages["generic_warmup_encode_skipped"] = 0
+                        __stages["generic_warmup_encode_skip_reason"] = "no_bundle" if not _ep_bundle_present else "no_bundle_texts"
                     __stages["warmup_direct_total_ms"] = _dw.get("direct_total_ms", 0.0)
                     for _k in ("direct_unet_load_ms", "direct_clip_load_ms", "direct_clip_encode_ms"):
                         _v = _dw.get(_k)
@@ -16832,6 +17925,22 @@ class _ComfyAPIMixin:
             f"restore_preload_status={self._last_restore_timing.get('restore_preload_status', '')} "
             f"restore_preload_overlap_ms={self._last_restore_timing.get('restore_preload_overlap_ms', 0)}"
         )
+        # Active-next read summary (per-restore). The first valid
+        # bundle observation emits the [exact_prefill.active_next_read]
+        # diagnostic; subsequent observations of the same
+        # (token, bundle_hash) within the same restore are deduped
+        # but still counted.
+        try:
+            print(
+                f"[active_next.read_summary] "
+                f"calls={getattr(self, '_active_next_read_call_count', 0)} "
+                f"bundle_observations={getattr(self, '_active_next_bundle_observation_count', 0)} "
+                f"diagnostic_emissions={getattr(self, '_active_next_bundle_diagnostic_emission_count', 0)} "
+                f"restore_session={(self._last_restore_timing.get('restore_session_id', '-') or '-')[:12]} "
+                f"profile_token={(self._last_restore_timing.get('warmup_profile_token', '') or '-')[:12]}"
+            )
+        except Exception:
+            pass
         _log_remote_identity(
             "restore",
             cls_name=self.__class__.__name__,
@@ -16916,6 +18025,15 @@ class _ComfyAPIMixin:
             snapshot_created=1 if not _rt_identity else 0,
             restored_from_snapshot=1 if _rt_identity else 0,
             restored_instance_id=_rt_identity.get("restored_instance_id", ""),
+        )
+        # Bind the per-instance critical-path recorder to this request.
+        self._init_critical_path_recorder(
+            _rt_identity.get("restore_session_id", ""),
+            _container_request_count,
+        )
+        self._record_critical_path(
+            "request_modal_entry",
+            extra={"method": "run_prompt"},
         )
 
         _v4_events: list[dict] = []
@@ -17104,6 +18222,20 @@ class _ComfyAPIMixin:
             trace_summary["derived_ms"]["exec_model_load_io_ms"] = getattr(self, "_exec_model_load_io_ms", 0.0)
             trace_summary["derived_ms"]["exec_deepcopy_ms"] = getattr(self, "_exec_deepcopy_ms", 0.0)
             trace_summary["derived_ms"]["load_model_gpu_ms"] = getattr(self, "_load_model_gpu_total_ms", 0.0)
+            # Preflight sub-op timing from _execute_in_process (non-streaming path)
+            for _pf_ns, _pa_ns in (("input_image_handle_ms", "_preflight_input_image_ms"),
+                                    ("missing_node_repair_ms", "_preflight_missing_node_repair_ms"),
+                                    ("workflow_hash_ms", "_preflight_workflow_hash_ms"),
+                                    ("production_compile_ms", "_preflight_production_compile_ms")):
+                _pv_ns = getattr(self, _pa_ns, None)
+                if _pv_ns is not None and _pv_ns > 0:
+                    trace_summary["derived_ms"][_pf_ns] = _pv_ns
+            # Validation certificate metrics (non-streaming path)
+            for _vc_nk in ("validation_certificate_hit", "validation_certificate_lookup_ms",
+                            "validation_certificate_write_submitted", "validation_certificate_write_result"):
+                _vc_nv = getattr(self, f"_{_vc_nk}", None)
+                if _vc_nv is not None:
+                    trace_summary.setdefault("derived_ms", {})[_vc_nk] = _vc_nv
 
             # GÃ¶Ã‡GÃ¶Ã‡ Dependency validation caching fields GÃ¶Ã‡GÃ¶Ã‡
             for _dep_policy_field in (
@@ -17677,6 +18809,9 @@ class _ComfyAPIMixin:
                       f"events={_v4_summary.get('event_count')} "
                       f"container={CONTAINER_SESSION_ID} "
                       f"req_seq={_container_request_count}")
+            # Critical-path summary + TLS cleanup for in-process path
+            self._emit_critical_path_summary()
+            self._clear_critical_path_recorder()
             return result
 
         # GÃ¶Ã‡GÃ¶Ã‡ Subprocess backend: HTTP-based submission GÃ¶Ã‡GÃ¶Ã‡
@@ -17886,6 +19021,13 @@ class _ComfyAPIMixin:
             known_good_mark_result="marked" if _known_good_val else "",
         )
         print(f"[comfyapp] request_pipeline_summary {_summary}")
+        # Critical-path summary at end of request.
+        self._emit_critical_path_summary()
+        # Clear the thread-local recorder pointer so stale recorder state
+        # cannot leak into restore-time worker threads in a subsequent
+        # container invocation.  Also handled on the scheduler-test early
+        # return path above.
+        self._clear_critical_path_recorder()
         return result
 
     @modal.method(is_generator=True)
@@ -17909,11 +19051,39 @@ class _ComfyAPIMixin:
             restored_from_snapshot=1 if _rt_identity else 0,
             restored_instance_id=_rt_identity.get("restored_instance_id", ""),
         )
+        # Bind the per-instance critical-path recorder to this request.
+        self._init_critical_path_recorder(
+            _rt_identity.get("restore_session_id", ""),
+            _container_request_count,
+        )
+        self._record_critical_path(
+            "request_modal_entry",
+            extra={"method": "run_prompt_stream"},
+        )
 
         _v4_events: list[dict] = []
+        _pd_stream_entry = _collect_platform_diagnostics(self.__class__.__name__)
         mark_event(_v4_events, T3_MODAL_ENTRY, process="modal_remote", phase="remote_entry",
                    container_session_id=CONTAINER_SESSION_ID,
-                   request_seq=_container_request_count)
+                   request_seq=_container_request_count,
+                   platform_region=_pd_stream_entry.get("region", ""),
+                   platform_cloud_provider=_pd_stream_entry.get("cloud_provider", ""),
+                   platform_task_id=_pd_stream_entry.get("task_id", ""),
+                   selected_class_name=_pd_stream_entry.get("class_name", ""),
+                   selected_gpu_value=_pd_stream_entry.get("gpu_value", ""))
+        # One compact line per request with available platform metadata
+        print(
+            f"[platform] class={self.__class__.__name__} "
+            f"gpu={_pd_stream_entry.get('gpu_value', '?')} "
+            f"region={_pd_stream_entry.get('region', '?')} "
+            f"cloud={_pd_stream_entry.get('cloud_provider', '?')} "
+            f"task={_pd_stream_entry.get('task_id', '-')[:12]} "
+            f"container={CONTAINER_SESSION_ID} "
+            f"restore_session={_rt_identity.get('restore_session_id', '-')[:12]} "
+            f"instance={_rt_identity.get('restored_instance_id', '-')[:12]} "
+            f"seq={_container_request_count}",
+            flush=True,
+        )
 
         """Execute workflow with streaming progress events.
 
@@ -18179,6 +19349,12 @@ class _ComfyAPIMixin:
                         _pv_s = getattr(self, _pa_s, None)
                         if _pv_s is not None and _pv_s > 0:
                             trace_summary.setdefault("derived_ms", {})[_pf_s] = _pv_s
+                    # Validation certificate metrics
+                    for _vc_k in ("validation_certificate_hit", "validation_certificate_lookup_ms",
+                                   "validation_certificate_write_submitted", "validation_certificate_write_result"):
+                        _vc_v = getattr(self, f"_{_vc_k}", None)
+                        if _vc_v is not None:
+                            trace_summary.setdefault("derived_ms", {})[_vc_k] = _vc_v
                     print(f"[container_id] session={CONTAINER_SESSION_ID} import_unix={CONTAINER_IMPORT_UNIX_S} restore_count={_container_restore_count} request_seq={_container_request_count} restore_session={trace_summary['restore_session_id']}")
                     _r["trace"] = trace_summary
                     # Per audit round 7: waterfall on the in-process
@@ -18324,20 +19500,30 @@ class _ComfyAPIMixin:
             # separately and is out of scope for this correction
             # pass.
             def _exec_with_log_suppression():
-                if not (
-                    _OPTIMIZATIONS_AVAILABLE
-                    and os.environ.get("COMFYMODAL_THIRD_PARTY_LOG_SUPPRESSION", "0") == "1"
-                ):
+                try:
+                    # Propagate the per-instance critical-path recorder
+                    # to this worker thread's TLS so the CLIP encode
+                    # wrapper (module-level, cannot reach ``self``) can
+                    # record critical-path events.
+                    _wrec = getattr(self, "_critical_path_recorder", None)
+                    if _wrec is not None:
+                        _CR_PATH_RECORDER_TLS.recorder = _wrec
+                    if not (
+                        _OPTIMIZATIONS_AVAILABLE
+                        and os.environ.get("COMFYMODAL_THIRD_PARTY_LOG_SUPPRESSION", "0") == "1"
+                    ):
+                        return _exec()
+                    # The suppression is enabled but the safe pass-through
+                    # path is used. No sys.stdout reassignment occurs.
+                    # Future revisions should add per-logger filter hooks
+                    # here instead of process-global redirection.
+                    print(
+                        f"[log_suppressor] request={_container_request_count} "
+                        f"enabled=1 mode=pass_through reason=safe_noop_pending_per_logger_patches"
+                    )
                     return _exec()
-                # The suppression is enabled but the safe pass-through
-                # path is used. No sys.stdout reassignment occurs.
-                # Future revisions should add per-logger filter hooks
-                # here instead of process-global redirection.
-                print(
-                    f"[log_suppressor] request={_container_request_count} "
-                    f"enabled=1 mode=pass_through reason=safe_noop_pending_per_logger_patches"
-                )
-                return _exec()
+                finally:
+                    _CR_PATH_RECORDER_TLS.recorder = None
             _t = threading.Thread(target=_exec_with_log_suppression, daemon=True)
             _t.start()
 
@@ -18361,8 +19547,11 @@ class _ComfyAPIMixin:
                     break
 
             if _error:
+                self._emit_critical_path_summary()
                 yield {"type": "error", "message": str(_error[0])}
                 return
+
+            self._emit_critical_path_summary()
 
             mark_event(_v4_events, T8C_RETURN_PACKAGING_START, process="modal_remote", phase=PHASE_RETURN,
                        request_seq=_container_request_count)
@@ -18384,6 +19573,10 @@ class _ComfyAPIMixin:
 
         finally:
             self._prog_queue = None
+            # Unconditional cleanup: clear the thread-local recorder
+            # pointer so a stale recorder cannot leak into a subsequent
+            # container invocation's worker thread.
+            self._clear_critical_path_recorder()
 
     def _enrich_trace_with_restore_timing(self, trace_summary: dict) -> None:
         """Merge per-phase restore timing into the trace summary (mutates in-place)."""
@@ -18466,6 +19659,10 @@ class _ComfyAPIMixin:
             profile["output_images"] = len(images)
             profile["output_videos"] = len(videos)
             profile["output_bytes"] = total_bytes
+        # Critical-path summary at end of request.
+        self._emit_critical_path_summary()
+        # Clear the thread-local recorder pointer.
+        self._clear_critical_path_recorder()
         return {"images": images, "videos": videos, "outputs": per_node_outputs}
 
     def _record_runtime_state(self):
