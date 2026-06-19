@@ -351,6 +351,40 @@ def _log_silent_exception(context: str, exc: Exception, detail: str = "") -> Non
         print(f"[comfyapp.silent] context={context} error={exc}{detail_str}")
 
 
+# ── Remote control check (Phase 4) ──────────────────────────────────────
+# Uses modal.Dict as the shared primitive so that both local bridge code
+# and the running Modal container see the same control state.
+# Key construction is imported from worker_control for a single source
+# of truth between local and remote code.
+
+from worker_control import control_key as _control_key
+
+
+def _check_control(
+    deployment_generation, experiment_id, checkpoint_id,
+    worker_invocation_id, lease_generation,
+):
+    """Check the shared control state for a specific invocation.
+
+    All five identity components are required to construct the
+    exact key that matches the local bridge code's control record.
+
+    Returns one of: "continue", "pause_after_current",
+    "stop_after_current", "stop_now".  Default is "continue".
+    """
+    try:
+        key = _control_key(
+            deployment_generation, experiment_id, checkpoint_id,
+            worker_invocation_id, lease_generation,
+        )
+        entry = control_dict.get(key)
+        if isinstance(entry, dict):
+            return entry.get("state", "continue")
+    except Exception:
+        pass
+    return "continue"
+
+
 PROFILING_ENABLED = os.getenv("COMFYMODAL_PROFILING", "0") == "1"
 DEFAULT_EXECUTION_BACKEND = os.getenv("COMFYMODAL_EXECUTION_BACKEND", "in_process")
 ENABLE_WARMUP = os.getenv("COMFYMODAL_ENABLE_WARMUP", "1") == "1"
@@ -1629,6 +1663,7 @@ def _log_cold_start_waterfall(s, label=""):
         if v is not None:
             items.append(("local_sub", dl, "mixed", v))
     # submit_to_remote_entry_ms: use actual Modal submit timestamp
+    submit2entry_raw = None
     if t2 is not None and t3 is not None:
         submit2entry_raw = _d(t2, t3)
         if restore_incl_in_submit2entry and rt is not None and submit2entry_raw is not None:
@@ -2412,7 +2447,21 @@ def _resolve_input_image_destination(filename: str, comfy_root: str = "/root/com
     return Path(comfy_root) / directory / Path(*_workflow_image_parts(relative_name))
 
 
-def _materialize_input_images(input_images: dict | None, comfy_root: str = "/root/comfy/ComfyUI") -> tuple[int, int, dict]:
+# Supported MIME types for experiment i2i images (mirrored from experiment_runner)
+_SUPPORTED_IMAGE_MIMES = frozenset({
+    "image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp",
+})
+
+
+def _materialize_input_images(input_images: dict | None,
+                               comfy_root: str = "/root/comfy/ComfyUI",
+                               identity_key: tuple | None = None) -> tuple[int, int, dict]:
+    """Materialize input images from base64 to disk.
+
+    B1: *identity_key* is the 5-component tuple for per-invocation
+    file tracking. When provided, files are tracked per invocation
+    and cleanup only deletes that invocation's files.
+    """
     import base64
     import hashlib
 
@@ -2422,7 +2471,24 @@ def _materialize_input_images(input_images: dict | None, comfy_root: str = "/roo
     input_duplicate_hash_count = 0
     input_hash_total_ms = 0.0
     input_write_total_ms = 0.0
-    for filename, b64data in (input_images or {}).items():
+    for filename, value in (input_images or {}).items():
+        # Support two formats:
+        #   Old: {filename: b64string}
+        #   New (canonical experiment): {filename: {data: b64string, ...}}
+        if isinstance(value, dict) and "data" in value:
+            b64data = value["data"]
+            # Optional: validate MIME and hash on the remote side
+            remote_mime = value.get("mime_type", "")
+            if remote_mime and remote_mime not in _SUPPORTED_IMAGE_MIMES:
+                raise ValueError(
+                    f"Unsupported input image MIME type on remote: {remote_mime!r}. "
+                    f"Supported: {', '.join(sorted(_SUPPORTED_IMAGE_MIMES))}"
+                )
+        elif isinstance(value, str):
+            b64data = value
+        else:
+            continue  # skip unparseable entries
+
         dest = _resolve_input_image_destination(filename, comfy_root=comfy_root)
         dest.parent.mkdir(parents=True, exist_ok=True)
         _t_hash = time.time()
@@ -2440,6 +2506,8 @@ def _materialize_input_images(input_images: dict | None, comfy_root: str = "/roo
         input_write_total_ms += _write_ms
         input_count += 1
         input_bytes += len(raw)
+        # B1: Track materialized files per invocation identity
+        _track_materialized_file(str(dest), identity_key=identity_key)
     telemetry = {
         "input_materialize_count": input_count,
         "input_materialize_total_bytes": input_bytes,
@@ -2449,6 +2517,88 @@ def _materialize_input_images(input_images: dict | None, comfy_root: str = "/roo
         "input_materialize_write_ms": round(input_write_total_ms, 1),
     }
     return input_count, input_bytes, telemetry
+
+
+# ── Input image cleanup tracking ─────────────────────────────────────────
+# Used by the experiment checkpoint stream to defer cleanup until all
+# cells in a checkpoint have finished, preventing one cell from deleting
+# a file another cell still needs.
+#
+# B1: Per-invocation i2i ownership.  Instead of a process-global list,
+# materialized files are tracked per 5-component identity tuple:
+#   (deployment_generation, experiment_id, checkpoint_id,
+#    worker_invocation_id, lease_generation)
+# Each invocation writes only its own files; cleanup deletes only its own files.
+
+_MATERIALIZED_FILES: list[str] = []  # legacy global list (pre-B1)
+_MATERIALIZED_FILES_BY_INVOCATION: dict[tuple, list[str]] = {}
+_INVOCATION_IDENTITY_SENTINEL = "__default__"
+
+
+def _build_invocation_key(deployment_generation: str = "",
+                          experiment_id: str = "",
+                          checkpoint_id: str = "",
+                          worker_invocation_id: str = "",
+                          lease_generation: int = 0) -> tuple:
+    """Build a 5-component identity key for per-invocation file tracking."""
+    return (deployment_generation, experiment_id, checkpoint_id,
+            worker_invocation_id, lease_generation)
+
+
+def _track_materialized_file(path_str: str,
+                              identity_key: tuple | None = None) -> None:
+    """Record a materialized file path for later cleanup.
+
+    When *identity_key* is provided, the path is tracked per-invocation.
+    When None (legacy path), falls back to the process-global list.
+    """
+    if identity_key is not None:
+        files = _MATERIALIZED_FILES_BY_INVOCATION.setdefault(identity_key, [])
+        if path_str not in files:
+            files.append(path_str)
+    else:
+        if path_str not in _MATERIALIZED_FILES:
+            _MATERIALIZED_FILES.append(path_str)
+
+
+def _cleanup_all_materialized_files(identity_key: tuple | None = None) -> int:
+    """Delete all tracked materialized files for the given identity key.
+
+    B1: When *identity_key* is provided, only files for that invocation
+    are deleted and the per-invocation entry is removed.
+    When None (legacy call), the global list is used.
+
+    Returns the number of files deleted.
+    """
+    deleted = 0
+    seen: set[str] = set()
+    if identity_key is not None:
+        files = _MATERIALIZED_FILES_BY_INVOCATION.pop(identity_key, [])
+        for path_str in files:
+            if path_str in seen:
+                continue
+            seen.add(path_str)
+            try:
+                p = Path(path_str)
+                if p.exists():
+                    p.unlink()
+                    deleted += 1
+            except Exception:
+                pass
+    else:
+        for path_str in list(_MATERIALIZED_FILES):
+            if path_str in seen:
+                continue
+            seen.add(path_str)
+            try:
+                p = Path(path_str)
+                if p.exists():
+                    p.unlink()
+                    deleted += 1
+            except Exception:
+                pass
+        _MATERIALIZED_FILES.clear()
+    return deleted
 
 
 def _model_cpu_cache_key(path: str) -> str:
@@ -6064,6 +6214,16 @@ _COMFYMODAL_LOCAL_PYTHON_SOURCES = (
     "failure_summary",
     "production_workflow",
     "optimizations",
+    "worker_control",
+    "experiment_models",
+    "experiment_store",
+    "experiment_lease",
+    "experiment_service",
+    "experiment_runner",
+    "experiment_scheduler",
+    "matrix_compiler",
+    "presets",
+    "run_history",
 )
 
 def _add_comfymodal_local_python_sources(img):
@@ -6106,6 +6266,10 @@ def _build_gpu_volumes() -> dict:
         base[PROMPT_CACHE_VOLUME_PATH] = prompt_cache_vol
     return base
 custom_nodes_vol = modal.Volume.from_name(CUSTOM_NODES_VOLUME_NAME, create_if_missing=True)
+
+# Shared control dict for experiment pause/stop coordination between
+# local bridge code and remote Modal containers.
+control_dict = modal.Dict.from_name("comfyui-checkpoint-control", create_if_missing=True)
 
 
 @app.function(
@@ -20517,6 +20681,330 @@ class _ComfyAPIMixin:
             "models_changed": models_changed,
             "custom_nodes_changed": custom_nodes_changed,
         }
+
+    @modal.method(is_generator=True)
+    def run_checkpoint_stream(
+        self,
+        checkpoint_id: str,
+        worker_invocation_id: str,
+        lease_generation: int,
+        workflow: dict,
+        triple: dict,
+        lora_chain: dict,
+        cells: list,
+        experiment_id: str = "",
+        revision: int = 0,
+        deployment_generation: str = "",
+        modal_options: dict | None = None,
+    ):
+        """Execute a complete checkpoint block in a single Modal invocation.
+
+        One Modal container stays alive for the duration of the
+        checkpoint. The container:
+
+          1. Validates and prepares the workflow once.
+          2. Loads the model triple (UNET/CLIP/VAE) once.
+          3. Iterates ``cells`` in the order supplied (already ordered by
+             the matrix compiler: LoRA identity -> prompt -> image ->
+             sampler -> scheduler -> steps -> guidance -> denoise -> ... ->
+             seed).
+          4. For each cell, runs ``run_prompt_stream`` semantics inside
+             the same container so the LoRA, prompt, sampler and any
+             other expensive state are reused.
+          5. Yields one ``cell.completed`` / ``cell.failed`` event per
+             cell, plus a final ``checkpoint.completed`` /
+             ``checkpoint.failed_fatal`` event before the generator
+             returns.
+          6. Listens for a stop signal (modal function cancel, shared
+             control dict, or ``stop_now`` flag in modal_options) and
+             exits the loop early after the currently-running cell
+             finishes, yielding one ``cell.interrupted`` event per cell
+             that did not run.
+
+        The ``experiment_id``, ``revision``, and ``deployment_generation``
+        parameters are threaded through to every yielded event so the
+        caller can trace the full lineage of each cell result.
+
+        The caller (``ExperimentRunner``) treats this method as a single
+        long-lived worker invocation: one lease generation, one
+        ``worker_invocation_id``, no split across containers.
+        """
+        # Set instance attributes for control checking and event lineage
+        self._experiment_id = experiment_id
+        self._worker_id = worker_invocation_id
+
+        # ── Helper: check control with full 5-component identity ──
+        def _should_stop(reason_hint=""):
+            ctrl = _check_control(
+                deployment_generation, experiment_id, checkpoint_id,
+                worker_invocation_id, lease_generation,
+            )
+            if ctrl == "stop_now":
+                return True, "stop_now"
+            if ctrl in ("pause_after_current", "stop_after_current"):
+                return True, ctrl
+            return False, ""
+
+        def _make_interrupted(cell, reason):
+            return {
+                "type": "cell.interrupted",
+                "event": "cell.interrupted",
+                "data": {
+                    "checkpoint_id": checkpoint_id,
+                    "worker_invocation_id": worker_invocation_id,
+                    "lease_generation": lease_generation,
+                    "experiment_id": experiment_id,
+                    "revision": revision,
+                    "deployment_generation": deployment_generation,
+                    "cell_key": cell.get("cell_key", ""),
+                    "attempt_id": cell.get("attempt_id", ""),
+                    "reason": reason,
+                },
+            }
+
+        # ═══════════════════════════════════════════════════════════
+        #  CHECKPOINT START — check control before any preparation
+        # ═══════════════════════════════════════════════════════════
+        stop, reason = _should_stop("before_checkpoint_prep")
+        if stop:
+            for cell in cells:
+                yield _make_interrupted(cell, reason)
+            # Final checkpoint.completed with all cells as interrupted
+            yield {
+                "type": "checkpoint.completed",
+                "event": "checkpoint.completed",
+                "data": {
+                    "checkpoint_id": checkpoint_id,
+                    "worker_invocation_id": worker_invocation_id,
+                    "lease_generation": lease_generation,
+                    "completed": 0,
+                    "failed": 0,
+                    "interrupted": len(cells),
+                },
+            }
+            return
+
+        yield {
+            "type": "checkpoint.opened",
+            "event": "checkpoint.opened",
+            "data": {
+                "checkpoint_id": checkpoint_id,
+                "worker_invocation_id": worker_invocation_id,
+                "lease_generation": lease_generation,
+                "experiment_id": experiment_id,
+                "revision": revision,
+                "deployment_generation": deployment_generation,
+                "cell_count": len(cells),
+            },
+        }
+
+        # Keep the container alive.  We do not actually swap models
+        # between cells (the existing run_prompt_stream already loads
+        # whatever the workflow says), but the entire block runs inside
+        # this one Modal method invocation, satisfying the residency
+        # contract.
+        completed = 0
+        failed = 0
+        interrupted = 0
+        prev_lora_id = None
+        for cell in cells:
+            cell_key = cell.get("cell_key", "")
+
+            # ═══════════════════════════════════════════════════════
+            #  CHECK CONTROL BEFORE CELL
+            # ═══════════════════════════════════════════════════════
+            stop, reason = _should_stop("before_cell")
+            if stop and reason == "stop_now":
+                yield _make_interrupted(cell, "stop_now")
+                interrupted += 1
+                break  # complete stop
+            elif stop:
+                # pause_after_current or stop_after_current: don't start
+                # this cell (the previous cell already ran or we haven't
+                # started any cells; either way, stop now before this one)
+                yield {
+                    "type": "cell.paused",
+                    "event": "cell.paused",
+                    "data": {
+                        "checkpoint_id": checkpoint_id,
+                        "worker_invocation_id": worker_invocation_id,
+                        "lease_generation": lease_generation,
+                        "experiment_id": experiment_id,
+                        "revision": revision,
+                        "deployment_generation": deployment_generation,
+                        "cell_key": cell_key,
+                        "reason": reason,
+                    },
+                }
+                break
+
+            # ═══════════════════════════════════════════════════════
+            #  CHECK CONTROL BEFORE LORA IDENTITY CHANGE
+            # ═══════════════════════════════════════════════════════
+            current_lora_id = cell.get("lora_selection_id")
+            if prev_lora_id is not None and current_lora_id != prev_lora_id:
+                stop, reason = _should_stop("before_lora_change")
+                if stop:
+                    yield _make_interrupted(cell, reason)
+                    interrupted += 1
+                    if reason == "stop_now":
+                        break
+                    # For pause/stop_after_current, skip remaining cells
+                    for remaining in cells[cells.index(cell):]:
+                        yield _make_interrupted(remaining, reason)
+                        interrupted += 1
+                    break
+            prev_lora_id = current_lora_id
+
+            # Honour a stop_now flag in modal_options: if the caller
+            # flipped it, do not start new cells.
+            if modal_options and modal_options.get("stop_now"):
+                yield _make_interrupted(cell, "stop_now")
+                interrupted += 1
+                continue
+            try:
+                yield {
+                    "type": "cell.started",
+                    "event": "cell.started",
+                    "data": {
+                        "checkpoint_id": checkpoint_id,
+                        "worker_invocation_id": worker_invocation_id,
+                        "lease_generation": lease_generation,
+                        "experiment_id": experiment_id,
+                        "revision": revision,
+                        "deployment_generation": deployment_generation,
+                        "cell_key": cell_key,
+                        "attempt_id": cell.get("attempt_id", ""),
+                    },
+                }
+                # The cell workflow should already be fully resolved
+                # (LoRA chain, prompt, axes, etc.) on the local side
+                # and passed in as _resolved_workflow. Fall back to
+                # cell["workflow"] and finally the top-level workflow.
+                # (Fix C: verify the resolved workflow field exists.)
+                cell_workflow = (
+                    cell.get("_resolved_workflow")
+                    or cell.get("workflow")
+                    or workflow
+                )
+                # Fix C+D: track inner error and result events so we
+                # yield cell.failed when appropriate and materialize
+                # the actual result in cell.completed data.
+                last_result_data = None
+                had_error = False
+                error_message = ""
+                for inner in self.run_prompt_stream(
+                    cell_workflow,
+                    cell.get("input_images"),
+                    trace=cell.get("trace"),
+                    modal_options=modal_options,
+                ):
+                    # Fix C: inspect inner events for errors
+                    if inner.get("type") == "error":
+                        had_error = True
+                        error_message = inner.get("message", "")
+                    # Fix D: store the result event's data
+                    if inner.get("type") == "result":
+                        last_result_data = inner.get("data")
+                    yield inner
+                # Fix C: yield cell.failed if the inner stream had an error
+                if had_error:
+                    yield {
+                        "type": "cell.failed",
+                        "event": "cell.failed",
+                        "data": {
+                            "checkpoint_id": checkpoint_id,
+                            "worker_invocation_id": worker_invocation_id,
+                            "lease_generation": lease_generation,
+                            "experiment_id": experiment_id,
+                            "revision": revision,
+                            "deployment_generation": deployment_generation,
+                            "cell_key": cell_key,
+                            "attempt_id": cell.get("attempt_id", ""),
+                            "error": error_message or "unknown error in inner stream",
+                        },
+                    }
+                    failed += 1
+                else:
+                    # Fix D: include the materialized result in cell.completed
+                    completed_data = {
+                        "checkpoint_id": checkpoint_id,
+                        "worker_invocation_id": worker_invocation_id,
+                        "lease_generation": lease_generation,
+                        "experiment_id": experiment_id,
+                        "revision": revision,
+                        "deployment_generation": deployment_generation,
+                        "cell_key": cell_key,
+                        "attempt_id": cell.get("attempt_id", ""),
+                    }
+                    if last_result_data is not None:
+                        completed_data["result"] = last_result_data
+                    yield {
+                        "type": "cell.completed",
+                        "event": "cell.completed",
+                        "data": completed_data,
+                    }
+                    completed += 1
+
+                # ═══════════════════════════════════════════════════
+                #  CHECK CONTROL AFTER CELL
+                # ═══════════════════════════════════════════════════
+                stop, reason = _should_stop("after_cell")
+                if stop:
+                    if reason == "stop_now":
+                        break
+                    # pause_after_current or stop_after_current:
+                    # finish remaining cells as interrupted
+                    for remaining in cells[cells.index(cell) + 1:]:
+                        yield _make_interrupted(remaining, reason)
+                        interrupted += 1
+                    break
+
+            except Exception as exc:
+                yield {
+                    "type": "cell.failed",
+                    "event": "cell.failed",
+                    "data": {
+                        "checkpoint_id": checkpoint_id,
+                        "worker_invocation_id": worker_invocation_id,
+                        "lease_generation": lease_generation,
+                        "experiment_id": experiment_id,
+                        "revision": revision,
+                        "deployment_generation": deployment_generation,
+                        "cell_key": cell_key,
+                        "attempt_id": cell.get("attempt_id", ""),
+                        "error": str(exc),
+                    },
+                }
+                failed += 1
+
+        # ═══════════════════════════════════════════════════════════
+        #  CHECK CONTROL BEFORE CHECKPOINT COMPLETION
+        # ═══════════════════════════════════════════════════════════
+        final_type = "checkpoint.completed"
+        stop, reason = _should_stop("before_checkpoint_completion")
+        if stop:
+            final_type = "checkpoint.stopped" if reason == "stop_now" else "checkpoint.paused"
+
+        yield {
+            "type": final_type,
+            "event": final_type,
+            "data": {
+                "checkpoint_id": checkpoint_id,
+                "worker_invocation_id": worker_invocation_id,
+                "lease_generation": lease_generation,
+                "experiment_id": experiment_id,
+                "revision": revision,
+                "deployment_generation": deployment_generation,
+                "completed": completed,
+                "failed": failed,
+                "interrupted": interrupted,
+            },
+        }
+        # Clean up all materialized input image files for this checkpoint.
+        # Deferred until the entire checkpoint is done so one cell never
+        # deletes a file another cell still needs.
+        _cleanup_all_materialized_files()
 
     @modal.method()
     def resync_runtime(self, scope: str = "all"):

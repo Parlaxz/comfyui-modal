@@ -1229,6 +1229,23 @@ function buildPanel() {
   title.style.cssText = "font-weight:600; font-size:14px; letter-spacing:0.03em; flex:1;";
   title.textContent = "\u2601 Modal GPU";
 
+  const testingBtn = document.createElement("button");
+  testingBtn.textContent = "Testing Suite";
+  testingBtn.title = "Open the Testing Suite";
+  testingBtn.style.cssText = `
+    background: transparent; border: 1px solid #3a6fcc; color: #6a9fd8;
+    padding: 2px 10px; border-radius: 4px; cursor: pointer;
+    font-size: 11px; flex-shrink: 0; font-weight: 600;
+  `;
+  testingBtn.onclick = () => {
+    if (typeof window.open_testing_modal === "function") {
+      window.open_testing_modal();
+      if (typeof window.__comfyModalTestingMarkSecondaryLauncherRegistered === "function") {
+        window.__comfyModalTestingMarkSecondaryLauncherRegistered();
+      }
+    }
+  };
+
   const gearBtn = document.createElement("button");
   gearBtn.textContent = "\u2699";
   gearBtn.title = "Settings";
@@ -1240,6 +1257,7 @@ function buildPanel() {
   `;
 
   headerRow.appendChild(title);
+  headerRow.appendChild(testingBtn);
   headerRow.appendChild(gearBtn);
   stickyTop.appendChild(headerRow);
 
@@ -3837,6 +3855,82 @@ function inputStyle() {
   `;
 }
 
+// --- Reusable mount/open helpers for Testing Suite integration ---
+
+/**
+ * Mount the full legacy settings panel into the given container element.
+ * This is used by the testing-suite's Settings tab to embed real settings UI.
+ * @param {HTMLElement} containerEl
+ * @returns {HTMLElement} the mounted panel element
+ */
+window.mountSettingsPanel = function mountSettingsPanel(containerEl) {
+  if (!containerEl) throw new Error("mountSettingsPanel: containerEl required");
+  containerEl.innerHTML = "";
+  const panel = buildPanel();
+  containerEl.appendChild(panel);
+  return panel;
+};
+
+/**
+ * Open the legacy settings panel as a full-page overlay (standalone use).
+ * This preserves the legacy behavior while being callable from the testing suite.
+ */
+window.open_comfymodal_settings = function open_comfymodal_settings() {
+  const existing = document.getElementById("comfymodal-settings-overlay");
+  if (existing) {
+    existing.style.display = "flex";
+    return;
+  }
+  const overlay = document.createElement("div");
+  overlay.id = "comfymodal-settings-overlay";
+  overlay.style.cssText = `
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0,0,0,0.7); z-index: 99998;
+    display: flex; align-items: center; justify-content: center;
+  `;
+  const modal = document.createElement("div");
+  modal.style.cssText = `
+    background: #1e1e2e; border: 1px solid #444; border-radius: 8px;
+    width: 90%; max-width: 600px; max-height: 85vh;
+    display: flex; flex-direction: column; overflow: hidden;
+  `;
+  const header = document.createElement("div");
+  header.style.cssText = `
+    display: flex; align-items: center; padding: 12px 16px;
+    border-bottom: 1px solid #333; flex-shrink: 0;
+  `;
+  const title = document.createElement("span");
+  title.style.cssText = "font-weight: 600; font-size: 14px; color: #ddd; flex: 1;";
+  title.textContent = "Settings";
+  const closeBtn = document.createElement("button");
+  closeBtn.textContent = "\u2715";
+  closeBtn.style.cssText = `
+    background: transparent; border: 1px solid #555; color: #aaa;
+    width: 28px; height: 28px; border-radius: 4px; cursor: pointer;
+    font-size: 14px; display: flex; align-items: center; justify-content: center;
+  `;
+  header.appendChild(title);
+  header.appendChild(closeBtn);
+  const body = document.createElement("div");
+  body.style.cssText = "flex: 1; overflow-y: auto; min-height: 0;";
+  modal.appendChild(header);
+  modal.appendChild(body);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  // Mount the panel
+  mountSettingsPanel(body);
+
+  function closeOverlay() {
+    overlay.style.display = "none";
+    document.removeEventListener("keydown", escHandler);
+  }
+  const escHandler = (e) => { if (e.key === "Escape") closeOverlay(); };
+  document.addEventListener("keydown", escHandler);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeOverlay(); });
+  closeBtn.onclick = closeOverlay;
+};
+
 // --- Extension Registration ---
 app.registerExtension({
   name: "comfyui.modal.settings",
@@ -3867,7 +3961,9 @@ app.registerExtension({
     syncGpuConfig();
     syncOutputOptions();
 
-    if (app?.extensionManager?.registerSidebarTab) {
+    // Only register the legacy sidebar tab if the unified Modal GPU tab is NOT active.
+    // When unified UI is enabled, modal-testing.js provides the single primary entry.
+    if (!window.__comfyModalUnifiedUI && app?.extensionManager?.registerSidebarTab) {
       app.extensionManager.registerSidebarTab({
         id: "modal-gpu",
         icon: "pi pi-cloud",

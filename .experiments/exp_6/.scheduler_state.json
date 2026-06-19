@@ -1,0 +1,480 @@
+{
+  "compilation": {
+    "cells": [
+      {
+        "_resolved_clip": "c1",
+        "_resolved_lora_chain": [],
+        "_resolved_negative": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "_resolved_prompt": "a",
+        "_resolved_unet": "u1",
+        "_resolved_vae": "v1",
+        "_resolved_workflow": {
+          "1": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "text": "a"
+            }
+          }
+        },
+        "attempt_id": "a_c6d2e8d8",
+        "axis_values": {
+          "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "guidance": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "lora_clip_strengths": "",
+          "lora_model_strengths": "",
+          "resolution": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "sampler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "scheduler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "seed": 1,
+          "steps": 20
+        },
+        "cell_key": "eefb4707e62745350fa10977e00244e56aa41e9a96a4e86a33d599979b0d70d6",
+        "checkpoint_id": "ck_001",
+        "image_hash": "",
+        "image_id": "",
+        "input_image_hash": "",
+        "loader_target_group_id": "g_default",
+        "lora_selection_id": "L_no",
+        "lora_signature": [],
+        "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "profile_id": "p1",
+        "prompt": "a",
+        "prompt_id": "p_a",
+        "sequence": 1,
+        "triple": {
+          "clip": "c1",
+          "id": "main",
+          "unet": "u1",
+          "vae": "v1"
+        },
+        "triple_id": "main",
+        "workflow_hash": "wh_ck_001"
+      },
+      {
+        "_resolved_clip": "c1",
+        "_resolved_lora_chain": [],
+        "_resolved_negative": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "_resolved_prompt": "a",
+        "_resolved_unet": "u1",
+        "_resolved_vae": "v1",
+        "_resolved_workflow": {
+          "1": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "text": "a"
+            }
+          }
+        },
+        "attempt_id": "a_815e9236",
+        "axis_values": {
+          "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "guidance": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "lora_clip_strengths": "",
+          "lora_model_strengths": "",
+          "resolution": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "sampler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "scheduler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "seed": 2,
+          "steps": 20
+        },
+        "cell_key": "0ef75b685b9544af7b6e00d8bd1f2938cb7e7f303e956de1f1555522d83e180d",
+        "checkpoint_id": "ck_001",
+        "image_hash": "",
+        "image_id": "",
+        "input_image_hash": "",
+        "loader_target_group_id": "g_default",
+        "lora_selection_id": "L_no",
+        "lora_signature": [],
+        "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "profile_id": "p1",
+        "prompt": "a",
+        "prompt_id": "p_a",
+        "sequence": 2,
+        "triple": {
+          "clip": "c1",
+          "id": "main",
+          "unet": "u1",
+          "vae": "v1"
+        },
+        "triple_id": "main",
+        "workflow_hash": "wh_ck_001"
+      },
+      {
+        "_resolved_clip": "c1",
+        "_resolved_lora_chain": [],
+        "_resolved_negative": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "_resolved_prompt": "b",
+        "_resolved_unet": "u1",
+        "_resolved_vae": "v1",
+        "_resolved_workflow": {
+          "1": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "text": "b"
+            }
+          }
+        },
+        "attempt_id": "a_0ef3db01",
+        "axis_values": {
+          "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "guidance": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "lora_clip_strengths": "",
+          "lora_model_strengths": "",
+          "resolution": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "sampler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "scheduler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "seed": 1,
+          "steps": 20
+        },
+        "cell_key": "35856b3da67aecceec264abf9fd3d92d3767c798879ce283f6e506c5ee211e13",
+        "checkpoint_id": "ck_001",
+        "image_hash": "",
+        "image_id": "",
+        "input_image_hash": "",
+        "loader_target_group_id": "g_default",
+        "lora_selection_id": "L_no",
+        "lora_signature": [],
+        "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "profile_id": "p1",
+        "prompt": "b",
+        "prompt_id": "p_b",
+        "sequence": 3,
+        "triple": {
+          "clip": "c1",
+          "id": "main",
+          "unet": "u1",
+          "vae": "v1"
+        },
+        "triple_id": "main",
+        "workflow_hash": "wh_ck_001"
+      },
+      {
+        "_resolved_clip": "c1",
+        "_resolved_lora_chain": [],
+        "_resolved_negative": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "_resolved_prompt": "b",
+        "_resolved_unet": "u1",
+        "_resolved_vae": "v1",
+        "_resolved_workflow": {
+          "1": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "text": "b"
+            }
+          }
+        },
+        "attempt_id": "a_a5e504bd",
+        "axis_values": {
+          "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "guidance": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "lora_clip_strengths": "",
+          "lora_model_strengths": "",
+          "resolution": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "sampler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "scheduler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "seed": 2,
+          "steps": 20
+        },
+        "cell_key": "21b195d612e11c413e39200fec1b7b6a72bb9cf8f3094d568478f353500c2a3c",
+        "checkpoint_id": "ck_001",
+        "image_hash": "",
+        "image_id": "",
+        "input_image_hash": "",
+        "loader_target_group_id": "g_default",
+        "lora_selection_id": "L_no",
+        "lora_signature": [],
+        "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "profile_id": "p1",
+        "prompt": "b",
+        "prompt_id": "p_b",
+        "sequence": 4,
+        "triple": {
+          "clip": "c1",
+          "id": "main",
+          "unet": "u1",
+          "vae": "v1"
+        },
+        "triple_id": "main",
+        "workflow_hash": "wh_ck_001"
+      },
+      {
+        "_resolved_clip": "c1",
+        "_resolved_lora_chain": [],
+        "_resolved_negative": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "_resolved_prompt": "a",
+        "_resolved_unet": "u2",
+        "_resolved_vae": "v1",
+        "_resolved_workflow": {
+          "1": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "text": "a"
+            }
+          }
+        },
+        "attempt_id": "a_c64636d9",
+        "axis_values": {
+          "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "guidance": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "lora_clip_strengths": "",
+          "lora_model_strengths": "",
+          "resolution": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "sampler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "scheduler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "seed": 1,
+          "steps": 20
+        },
+        "cell_key": "cca0e2b2fe45bba2a82c5f22685143776fba96e6b9c00664182197bbbc2a7988",
+        "checkpoint_id": "ck_002",
+        "image_hash": "",
+        "image_id": "",
+        "input_image_hash": "",
+        "loader_target_group_id": "g_default",
+        "lora_selection_id": "L_no",
+        "lora_signature": [],
+        "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "profile_id": "p1",
+        "prompt": "a",
+        "prompt_id": "p_a",
+        "sequence": 5,
+        "triple": {
+          "clip": "c1",
+          "id": "alt",
+          "unet": "u2",
+          "vae": "v1"
+        },
+        "triple_id": "alt",
+        "workflow_hash": "wh_ck_002"
+      },
+      {
+        "_resolved_clip": "c1",
+        "_resolved_lora_chain": [],
+        "_resolved_negative": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "_resolved_prompt": "a",
+        "_resolved_unet": "u2",
+        "_resolved_vae": "v1",
+        "_resolved_workflow": {
+          "1": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "text": "a"
+            }
+          }
+        },
+        "attempt_id": "a_63227ca5",
+        "axis_values": {
+          "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "guidance": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "lora_clip_strengths": "",
+          "lora_model_strengths": "",
+          "resolution": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "sampler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "scheduler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "seed": 2,
+          "steps": 20
+        },
+        "cell_key": "3116f20052301e3c3776ef588cea2bc1120046f1b9550681639ea2f70ad46c8e",
+        "checkpoint_id": "ck_002",
+        "image_hash": "",
+        "image_id": "",
+        "input_image_hash": "",
+        "loader_target_group_id": "g_default",
+        "lora_selection_id": "L_no",
+        "lora_signature": [],
+        "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "profile_id": "p1",
+        "prompt": "a",
+        "prompt_id": "p_a",
+        "sequence": 6,
+        "triple": {
+          "clip": "c1",
+          "id": "alt",
+          "unet": "u2",
+          "vae": "v1"
+        },
+        "triple_id": "alt",
+        "workflow_hash": "wh_ck_002"
+      },
+      {
+        "_resolved_clip": "c1",
+        "_resolved_lora_chain": [],
+        "_resolved_negative": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "_resolved_prompt": "b",
+        "_resolved_unet": "u2",
+        "_resolved_vae": "v1",
+        "_resolved_workflow": {
+          "1": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "text": "b"
+            }
+          }
+        },
+        "attempt_id": "a_b347cbb0",
+        "axis_values": {
+          "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "guidance": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "lora_clip_strengths": "",
+          "lora_model_strengths": "",
+          "resolution": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "sampler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "scheduler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "seed": 1,
+          "steps": 20
+        },
+        "cell_key": "bf0ea4332a27ad3163db5a9909d60701b617617a669c4626c9e4fcc09eac7162",
+        "checkpoint_id": "ck_002",
+        "image_hash": "",
+        "image_id": "",
+        "input_image_hash": "",
+        "loader_target_group_id": "g_default",
+        "lora_selection_id": "L_no",
+        "lora_signature": [],
+        "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "profile_id": "p1",
+        "prompt": "b",
+        "prompt_id": "p_b",
+        "sequence": 7,
+        "triple": {
+          "clip": "c1",
+          "id": "alt",
+          "unet": "u2",
+          "vae": "v1"
+        },
+        "triple_id": "alt",
+        "workflow_hash": "wh_ck_002"
+      },
+      {
+        "_resolved_clip": "c1",
+        "_resolved_lora_chain": [],
+        "_resolved_negative": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "_resolved_prompt": "b",
+        "_resolved_unet": "u2",
+        "_resolved_vae": "v1",
+        "_resolved_workflow": {
+          "1": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "text": "b"
+            }
+          }
+        },
+        "attempt_id": "a_1625b8b4",
+        "axis_values": {
+          "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "guidance": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "lora_clip_strengths": "",
+          "lora_model_strengths": "",
+          "resolution": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "sampler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "scheduler": "__COMFYMODAL_WORKFLOW_OWNED__",
+          "seed": 2,
+          "steps": 20
+        },
+        "cell_key": "21dae6c2e65336d6d17b1d0b59344f0b656cb951b57b0263f5f5543658ab2dbd",
+        "checkpoint_id": "ck_002",
+        "image_hash": "",
+        "image_id": "",
+        "input_image_hash": "",
+        "loader_target_group_id": "g_default",
+        "lora_selection_id": "L_no",
+        "lora_signature": [],
+        "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "profile_id": "p1",
+        "prompt": "b",
+        "prompt_id": "p_b",
+        "sequence": 8,
+        "triple": {
+          "clip": "c1",
+          "id": "alt",
+          "unet": "u2",
+          "vae": "v1"
+        },
+        "triple_id": "alt",
+        "workflow_hash": "wh_ck_002"
+      }
+    ],
+    "checkpoints": [
+      {
+        "cell_count": 4,
+        "id": "ck_001",
+        "loader_target_group_id": "g_default",
+        "loader_target_groups": [],
+        "lora_selection_ids": [
+          "L_no"
+        ],
+        "lora_slots": [],
+        "profile_id": "p1",
+        "slots": {
+          "prompt": {
+            "field": "text",
+            "node_id": "1",
+            "path": [
+              "inputs",
+              "text"
+            ]
+          }
+        },
+        "triple": {
+          "clip": "c1",
+          "id": "main",
+          "unet": "u1",
+          "vae": "v1"
+        },
+        "workflow": {
+          "1": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "text": ""
+            }
+          }
+        },
+        "workflow_hash": "wh_ck_001"
+      },
+      {
+        "cell_count": 4,
+        "id": "ck_002",
+        "loader_target_group_id": "g_default",
+        "loader_target_groups": [],
+        "lora_selection_ids": [
+          "L_no"
+        ],
+        "lora_slots": [],
+        "profile_id": "p1",
+        "slots": {
+          "prompt": {
+            "field": "text",
+            "node_id": "1",
+            "path": [
+              "inputs",
+              "text"
+            ]
+          }
+        },
+        "triple": {
+          "clip": "c1",
+          "id": "alt",
+          "unet": "u2",
+          "vae": "v1"
+        },
+        "workflow": {
+          "1": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "text": ""
+            }
+          }
+        },
+        "workflow_hash": "wh_ck_002"
+      }
+    ],
+    "duplicate_count": 0,
+    "experiment_id": "exp_6",
+    "revision": 1,
+    "warnings": []
+  },
+  "experiment_id": "exp_6",
+  "max_containers": 1,
+  "skipped_checkpoints": [],
+  "status": "completed"
+}

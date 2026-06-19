@@ -12,3 +12,16 @@ __pycache__/
 *benchmark*/
 optimization_logs/
 latest_benchmark_workflow.json
+
+# Playwright test artifacts
+test-results/
+playwright-report/
+playwright/.cache/
+
+# Experiment runtime data
+.experiments/
+.experiment_leases.db
+
+# Preset blobs
+.preset_blobs/
+.presets/

@@ -219,6 +219,7 @@ async def run_prompt_stream(
       ``{"type": "error", "message": "..."}`` — fatal error.
     """
     selected = _resolve_workspace(workspace)
+    gen = None
     # Semaphore only serializes remote-generator creation, not iteration.
     # This prevents a caller that breaks early from blocking the next request.
     async with _run_prompt_semaphore:
@@ -244,10 +245,79 @@ async def run_prompt_stream(
         raise
     finally:
         # Ensure the remote generator is closed even if the caller breaks early
-        try:
-            await gen.aclose()
-        except Exception:
-            pass
+        if gen is not None:
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
+
+
+async def run_checkpoint_stream(
+    checkpoint_id: str,
+    worker_invocation_id: str,
+    lease_generation: int,
+    workflow: dict,
+    triple: dict,
+    lora_chain: dict,
+    cells: list,
+    experiment_id: str = "",
+    revision: int = 0,
+    deployment_generation: str = "",
+    gpu: str | None = None,
+    modal_options: dict | None = None,
+    workspace: dict | None = None,
+):
+    """Execute a complete checkpoint block in a single Modal invocation.
+
+    This is the real long-lived primitive the experiment suite requires:
+    one Modal container stays alive for the duration of the checkpoint
+    and runs every cell belonging to that checkpoint in the order
+    supplied.  A caller breaks out of the generator (via stop_now) to
+    cancel the checkpoint safely: the deployed side yields a
+    ``cell.interrupted`` event for any cell that did not start, then a
+    final ``checkpoint.completed`` summary.
+
+    The ``experiment_id``, ``revision``, and ``deployment_generation``
+    parameters are threaded through to the remote container so every
+    yielded event carries the full lineage identifiers.
+
+    Yields dicts with the same event types as ``run_prompt_stream``,
+    plus a per-cell ``cell.completed`` / ``cell.failed`` /
+    ``cell.interrupted`` event so the local ExperimentRunner can
+    append a journal entry for each one.
+    """
+    selected = _resolve_workspace(workspace)
+    gen = None
+    async with _run_prompt_semaphore:
+        gen = _workspace_api(selected, gpu).run_checkpoint_stream.remote_gen.aio(
+            checkpoint_id, worker_invocation_id, lease_generation,
+            workflow, triple, lora_chain, cells,
+            experiment_id, revision, deployment_generation,
+            modal_options or {},
+        )
+    try:
+        async for msg in gen:
+            yield msg
+    except TimeoutError:
+        raise TimeoutError(
+            "Modal checkpoint run timed out. The container may be cold-starting."
+        )
+    except (ConnectionError, OSError) as e:
+        raise ConnectionError(
+            "Modal connection failed. Check your internet connection and Modal token."
+        ) from e
+    except Exception as e:
+        if getattr(type(e), "__module__", "").startswith("modal"):
+            raise RuntimeError(
+                f"Modal error: {e}. Try redeploying with the Deploy button."
+            ) from e
+        raise
+    finally:
+        if gen is not None:
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
 
 
 @_modal_error_handler
