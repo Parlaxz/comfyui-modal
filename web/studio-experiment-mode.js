@@ -11,7 +11,7 @@
 // master list page. Run Experiment may be disabled with a precise reason.
 
 import { CONTROL_DEFS } from "./studio-feature-registry.js";
-import { getBackends, getCompareBackends } from "./studio-backend.js";
+import { getRuntimePresets } from "./studio-backend.js";
 
 // ── Experiment toggle ────────────────────────────────────────────────────
 
@@ -51,9 +51,9 @@ export function renderCompareBackends(state, actions, context) {
   list.className = "comfymodal-studio-compare-list";
   container.appendChild(list);
 
-  // Fetch backends through the Studio backend abstraction (context passed explicitly)
+  // Fetch presets through the Studio backend abstraction (context passed explicitly)
   const apiBase = (context && context.apiBase) || "/comfymodal";
-  getBackends({ apiBase }).then((backends) => {
+  getRuntimePresets({ apiBase }).then((backends) => {
     while (list.firstChild) list.removeChild(list.firstChild);
 
     if (!backends || backends.length === 0) {

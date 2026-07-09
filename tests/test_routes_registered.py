@@ -8,6 +8,7 @@ client to exercise the route end-to-end.
 import asyncio
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -171,6 +172,16 @@ def _run(coro):
     ``asyncio.run`` returns).
     """
     return asyncio.run(coro)
+
+
+def _load_repo_module(module_name: str, relative_path: str):
+    spec = importlib.util.spec_from_file_location(module_name, REPO_ROOT / relative_path)
+    assert spec is not None
+    assert spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 # ── Tests ────────────────────────────────────────────────────────────────
@@ -641,6 +652,122 @@ class RicherCellNormalizedDimensionsTests(unittest.TestCase):
             self.assertIn("image_id", nd)
             # Check values
             self.assertEqual(nd["profile_id"], "p1")
+
+
+class StudioStoreAndModelTests(unittest.TestCase):
+    """Behavior tests for the extracted Studio store and model modules."""
+
+    def test_json_store_round_trip_and_atomic_replace(self):
+        studio_store = _load_repo_module("studio_store_under_test", "studio_store.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "snapshots.json"
+            store = studio_store.StudioJsonStore(path)
+            store.write_atomic([{"id": "snap_1"}])
+            self.assertEqual(store.read(), [{"id": "snap_1"}])
+            self.assertFalse(path.with_suffix(path.suffix + ".tmp").exists())
+
+    def test_json_store_does_not_treat_corrupt_json_as_empty(self):
+        studio_store = _load_repo_module("studio_store_under_test_corrupt", "studio_store.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "snapshots.json"
+            path.write_text("{not-json}", encoding="utf-8")
+            store = studio_store.StudioJsonStore(path)
+            with self.assertRaises(studio_store.StudioStoreError):
+                store.read()
+
+    def test_snapshot_feature_status_is_conservative_for_multi_feature_records(self):
+        studio_models = _load_repo_module("studio_models_under_test", "studio_models.py")
+        snapshot = studio_models.normalize_snapshot_payload({
+            "name": "Multi feature snapshot",
+            "compatibleFeatures": ["txt2img", "object_remove", "object_replace"],
+            "graphJson": {"nodes": [], "links": []},
+            "apiPromptJson": {"prompt": {}},
+            "nodeBindings": {"prompt": "7.text"},
+            "outputNodeId": "42",
+        })
+        self.assertEqual(snapshot["status"], "needs_bindings")
+        self.assertEqual(snapshot["featureStatus"]["txt2img"]["status"], "runnable")
+        self.assertEqual(snapshot["featureStatus"]["object_remove"]["status"], "needs_bindings")
+        self.assertEqual(snapshot["featureStatus"]["object_replace"]["status"], "needs_bindings")
+
+    def test_preset_missing_snapshot_is_invalid(self):
+        studio_models = _load_repo_module("studio_models_under_test_preset", "studio_models.py")
+        preset = studio_models.normalize_preset_payload(
+            {
+                "label": "Broken preset",
+                "snapshotId": "missing_snapshot",
+                "sourceType": "snapshot",
+            },
+            snapshots_by_id={},
+        )
+        self.assertEqual(preset["status"], "invalid")
+        self.assertEqual(preset["disabledReason"], "Preset references a missing snapshot")
+
+
+class StudioRouteBehaviourTests(unittest.TestCase):
+    """Behavior tests for extracted Studio snapshot/preset routes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.routes_mod = _load_repo_module("studio_routes_under_test", "studio_routes.py")
+
+    def _register(self, tmpdir: str):
+        stub = _StubServer()
+        self.routes_mod.register_studio_routes(stub, node_dir=tmpdir)
+        return type("StudioModule", (), {"_server": stub})
+
+    def test_snapshot_list_hides_archived_by_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / ".studio_snapshots.json"
+            path.write_text(json.dumps([
+                {"id": "snap_live", "name": "Live", "archived": False},
+                {"id": "snap_old", "name": "Old", "archived": True},
+            ]), encoding="utf-8")
+            mod = self._register(tmpdir)
+            fn = _handler_for(mod, "GET", "/comfymodal/studio/snapshots")
+            resp = _run(fn(_MockRequest()))
+            body = json.loads(resp.body)
+            ids = [item["id"] for item in body.get("snapshots", [])]
+            self.assertEqual(ids, ["snap_live"])
+
+    def test_snapshot_list_can_include_archived(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / ".studio_snapshots.json"
+            path.write_text(json.dumps([
+                {"id": "snap_live", "name": "Live", "archived": False},
+                {"id": "snap_old", "name": "Old", "archived": True},
+            ]), encoding="utf-8")
+            mod = self._register(tmpdir)
+            fn = _handler_for(mod, "GET", "/comfymodal/studio/snapshots")
+            resp = _run(fn(_MockRequest(query={"includeArchived": "1"})))
+            body = json.loads(resp.body)
+            ids = [item["id"] for item in body.get("snapshots", [])]
+            self.assertEqual(ids, ["snap_live", "snap_old"])
+
+    def test_snapshot_create_rejects_invalid_feature_with_stable_message(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = self._register(tmpdir)
+            fn = _handler_for(mod, "POST", "/comfymodal/studio/snapshots")
+            resp = _run(fn(_MockRequest(json_body={
+                "name": "Bad snapshot",
+                "compatibleFeatures": ["definitely_fake"],
+            })))
+            self.assertEqual(resp.status, 400)
+            body = json.loads(resp.body)
+            self.assertEqual(body.get("message"), "Invalid compatible feature")
+
+    def test_preset_create_rejects_missing_snapshot_with_stable_message(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = self._register(tmpdir)
+            fn = _handler_for(mod, "POST", "/comfymodal/studio/presets")
+            resp = _run(fn(_MockRequest(json_body={
+                "label": "Missing snapshot preset",
+                "snapshotId": "missing_snapshot",
+                "sourceType": "snapshot",
+            })))
+            self.assertEqual(resp.status, 400)
+            body = json.loads(resp.body)
+            self.assertEqual(body.get("message"), "Preset references a missing snapshot")
 
 
 if __name__ == "__main__":
