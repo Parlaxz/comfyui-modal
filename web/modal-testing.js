@@ -7,8 +7,8 @@ import { ensureStudioStyles } from "./studio-styles.js";
 import { mountStudioShell } from "./studio-shell.js";
 import { mountLegacyTab, stopLegacyController } from "./studio-legacy.js";
 
-// Signal to legacy sidebar modules that the unified Modal Studio tab is active.
-// They should skip registering their own sidebar tabs to avoid duplicates.
+// Backward-compat flag preserved for external scripts/custom nodes that may
+// still read it. Legacy sidebar tabs are now controlled by an explicit opt-in.
 window.__comfyModalUnifiedUI = true;
 
 const MODAL_PREFIX = "/comfymodal";
@@ -462,7 +462,7 @@ app.registerExtension({
           id: "comfymodal-testing-suite",
           icon: "pi pi-cloud",
           title: "Modal GPU",
-          tooltip: "Modal GPU — unified testing suite & settings",
+          tooltip: "Modal Studio — Playground, History, Backend, Settings",
           type: "custom",
           render: async (el) => {
             el.style.height = "100%";
