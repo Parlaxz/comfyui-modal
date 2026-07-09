@@ -219,6 +219,7 @@ async def run_prompt_stream(
       ``{"type": "error", "message": "..."}`` — fatal error.
     """
     selected = _resolve_workspace(workspace)
+    gen = None
     # Semaphore only serializes remote-generator creation, not iteration.
     # This prevents a caller that breaks early from blocking the next request.
     async with _run_prompt_semaphore:
@@ -244,10 +245,79 @@ async def run_prompt_stream(
         raise
     finally:
         # Ensure the remote generator is closed even if the caller breaks early
-        try:
-            await gen.aclose()
-        except Exception:
-            pass
+        if gen is not None:
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
+
+
+async def run_checkpoint_stream(
+    checkpoint_id: str,
+    worker_invocation_id: str,
+    lease_generation: int,
+    workflow: dict,
+    triple: dict,
+    lora_chain: dict,
+    cells: list,
+    experiment_id: str = "",
+    revision: int = 0,
+    deployment_generation: str = "",
+    gpu: str | None = None,
+    modal_options: dict | None = None,
+    workspace: dict | None = None,
+):
+    """Execute a complete checkpoint block in a single Modal invocation.
+
+    This is the real long-lived primitive the experiment suite requires:
+    one Modal container stays alive for the duration of the checkpoint
+    and runs every cell belonging to that checkpoint in the order
+    supplied.  A caller breaks out of the generator (via stop_now) to
+    cancel the checkpoint safely: the deployed side yields a
+    ``cell.interrupted`` event for any cell that did not start, then a
+    final ``checkpoint.completed`` summary.
+
+    The ``experiment_id``, ``revision``, and ``deployment_generation``
+    parameters are threaded through to the remote container so every
+    yielded event carries the full lineage identifiers.
+
+    Yields dicts with the same event types as ``run_prompt_stream``,
+    plus a per-cell ``cell.completed`` / ``cell.failed`` /
+    ``cell.interrupted`` event so the local ExperimentRunner can
+    append a journal entry for each one.
+    """
+    selected = _resolve_workspace(workspace)
+    gen = None
+    async with _run_prompt_semaphore:
+        gen = _workspace_api(selected, gpu).run_checkpoint_stream.remote_gen.aio(
+            checkpoint_id, worker_invocation_id, lease_generation,
+            workflow, triple, lora_chain, cells,
+            experiment_id, revision, deployment_generation,
+            modal_options or {},
+        )
+    try:
+        async for msg in gen:
+            yield msg
+    except TimeoutError:
+        raise TimeoutError(
+            "Modal checkpoint run timed out. The container may be cold-starting."
+        )
+    except (ConnectionError, OSError) as e:
+        raise ConnectionError(
+            "Modal connection failed. Check your internet connection and Modal token."
+        ) from e
+    except Exception as e:
+        if getattr(type(e), "__module__", "").startswith("modal"):
+            raise RuntimeError(
+                f"Modal error: {e}. Try redeploying with the Deploy button."
+            ) from e
+        raise
+    finally:
+        if gen is not None:
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
 
 
 @_modal_error_handler
@@ -411,4 +481,79 @@ async def set_active_warmup_profile(payload: dict, workspace: dict | None = None
     selected = _resolve_workspace(workspace)
     return await asyncio.to_thread(
         lambda: _workspace_function("set_active_warmup_profile", selected).remote(payload),
+    )
+
+
+def persist_clip_cache_payload(
+    payload: dict,
+    workspace: dict | None = None,
+    *,
+    timeout_s: float = 30.0,
+) -> dict:
+    """Synchronous post-delivery persistence of a CLIP-encoding payload.
+
+    Calls a small CPU-only Modal function mounted to a dedicated
+    prompt-encoding cache Volume.  Failures are returned as a dict
+    with ``status="error"``; the caller never raises out of this path.
+
+    The wrapper is intentionally narrow and synchronous because it is
+    invoked from a background worker that has already detached from the
+    user-visible request.  The local caller wraps it in
+    ``PostDeliveryPersistenceDispatcher``.
+
+    ``timeout_s`` is honored: the dispatcher bounds the
+    semaphore acquisition time on the calling side, but the
+    actual ``fn()`` execution is bounded indirectly by the
+    Modal function's ``timeout=30``.  There is no per-task
+    wall-clock timeout on ``fn()`` itself in the dispatcher;
+    if the remote function hangs, the dispatcher will block
+    in the worker until the Modal RPC times out at the
+    function layer.  The local ``_deadline`` is used for
+    diagnostics only.
+    """
+    import time as _t
+    _deadline = _t.time() + max(1.0, float(timeout_s))
+    try:
+        selected = _resolve_workspace(workspace)
+        fn = _workspace_function("persist_clip_cache_payload", selected)
+        # Modal functions do not accept a per-call timeout kwarg for
+        # ``.remote()``; the function's own ``timeout=30`` on the
+        # remote side bounds the call. The dispatcher's per-task
+        # timeout is the second line of defense.
+        return fn.remote(payload)
+    except Exception as exc:  # never raise out
+        try:
+            _err = f"{type(exc).__name__}: {exc}"[:200]
+        except Exception:
+            _err = "persist_clip_cache_payload_unreachable"
+        return {"status": "error", "error": _err, "deadline_unix_s": _deadline}
+
+
+def lookup_clip_cache(
+    bundle_hash: str,
+    clip_fingerprint_key: str,
+    workspace: dict | None = None,
+) -> dict:
+    """Synchronous lookup of a prompt-cache bundle. Returns
+    ``{"status": "ok", "entry": ...}`` on hit or ``{"status": "miss", ...}``.
+    Never raises out; errors become misses."""
+    try:
+        selected = _resolve_workspace(workspace)
+        fn = _workspace_function("lookup_clip_cache", selected)
+        return fn.remote(bundle_hash, clip_fingerprint_key)
+    except Exception as exc:
+        try:
+            return {"status": "miss", "reason": f"{type(exc).__name__}: {exc}"[:120]}
+        except Exception:
+            return {"status": "miss", "reason": "lookup_clip_cache_unreachable"}
+
+
+@_modal_error_handler
+async def persist_clip_cache_payload_async(
+    payload: dict, workspace: dict | None = None
+) -> dict:
+    """Async variant of ``persist_clip_cache_payload`` for tests."""
+    selected = _resolve_workspace(workspace)
+    return await asyncio.to_thread(
+        lambda: _workspace_function("persist_clip_cache_payload", selected).remote(payload),
     )

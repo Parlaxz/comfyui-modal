@@ -12,3 +12,54 @@ __pycache__/
 *benchmark*/
 optimization_logs/
 latest_benchmark_workflow.json
+
+# Playwright test artifacts
+test-results/
+playwright-report/
+playwright/.cache/
+
+# Experiment runtime data
+.experiments/
+.experiment_leases.db*
+
+# Preset blobs
+.preset_blobs/
+.presets/
+
+# Browser session recordings
+.playwright-mcp/
+
+# Workspace config with API secrets
+.modal_workspaces.json
+
+# Audit/backup/patch files
+*.patch
+*.diff
+before_*
+AUDIT_*.md
+
+# Debug screenshots (root-level)
+audit-*.png
+comfyui-home.png
+*-current.png
+*-grid.png
+workflow-cards.png
+workflow-oriented-results.png
+results-page-current.png
+setup-page-current.png
+
+# Debug test output
+compile-*
+modal-body-*.json
+i2i-check.json
+stack-input-values.json
+status-after-*.json
+summary-status-*.json
+setup-body-debug.json
+setup-eval.json
+current-auto-preview.json
+setup-console-errors*.txt
+setup-console-warnings*.txt
+
+# Playwright debug snapshots
+playwright-*.md
