@@ -78,6 +78,7 @@ from production_workflow import (
     normalize_production_options,
     compile_production_workflow,
 )
+import experiment_setup_adapter as _experiment_setup_adapter
 from comparison import (
     create_profile,
     update_profile,
@@ -97,6 +98,7 @@ from comparison import (
     load_comparison_config,
     save_comparison_config,
     get_workflow_nodes,
+    get_profile_workflow,
 )
 
 import model_manifest as _model_manifest
@@ -108,12 +110,22 @@ WEB_DIRECTORY = "web"
 
 
 def _unique_path(directory: str, filename: str) -> str:
-    path = os.path.join(directory, filename)
-    if not os.path.exists(path):
-        return path
-    stem, ext = os.path.splitext(filename)
-    suffix = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1_000_000) % 1_000_000:06d}"
-    return os.path.join(directory, f"{stem}_{suffix}{ext}")
+    if not filename or not isinstance(filename, str):
+        raise ValueError(f"invalid filename: {filename!r}")
+    if "\x00" in filename:
+        raise ValueError("filename contains null byte")
+    safe_name = Path(filename).name
+    if safe_name != filename or ".." in filename or "/" in filename or "\\" in filename:
+        raise ValueError(f"unsafe remote output filename: {filename!r}")
+    root = Path(directory).resolve()
+    dest = (root / safe_name).resolve()
+    if dest.parent != root:
+        raise ValueError(f"output path escaped root: {filename!r}")
+    if not dest.exists():
+        return str(dest)
+    stem, ext = os.path.splitext(safe_name)
+    suffix = f"{uuid.uuid4().hex[:12]}"
+    return str(root / f"{stem}_{suffix}{ext}")
 
 # ── MIME type to extension map for remote result materialization ──
 _MIME_EXT_MAP = {
@@ -487,6 +499,229 @@ def _materialize_modal_outputs(
     }
 
 
+def _make_thumbnail(input_path: str, output_path: str, max_size: int = 256) -> bool:
+    """Generate a WebP thumbnail. Returns True on success."""
+    try:
+        from PIL import Image
+        img = Image.open(input_path)
+        img.thumbnail((max_size, max_size))
+        img.save(output_path, "WEBP", quality=75)
+        return True
+    except Exception:
+        # If PIL not available, just copy the original as thumbnail
+        try:
+            import shutil
+            shutil.copy2(input_path, output_path)
+            return True
+        except Exception:
+            return False
+
+
+def _materialize_experiment_output(
+    result_data: dict,
+    output_dir: str,
+    cell_key: str = "",
+    attempt_id: str = "",
+) -> dict:
+    """Materialize experiment cell outputs and register thumbnails.
+
+    Writes files to output_dir/<attempt_id>/.
+    Generates WebP thumbnails using Pillow if available.
+    Returns dict with:
+        "assets": {asset_id: {"path": ..., "mime_type": ..., "byte_size": ...,
+                              "content_hash": ..., "variant": ...,
+                              "parent_asset_id": ..., "node_id": ...,
+                              "output_key": ..., "output_index": ...,
+                              "comparison_side": ..., "width": ..., "height": ...}}
+        "primary_output": {...}
+        "primary_asset_id": str
+        "primary_thumbnail_asset_id": str
+        "output_count": int
+
+    B4: Thumbnail content_hash is computed from actual thumbnail bytes (SHA-256),
+    NOT copied from the original — so resized WebP has a different hash.
+    """
+    assets: dict[str, dict] = {}
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    seen = 0
+    # Collect all entries indexed by their stable identity for primary selection
+    per_node_outputs: dict[str, dict[str, list[dict]]] = {}
+
+    def _write_and_index(entry: dict, node_id: str, output_key: str, fallback_index: int) -> str:
+        nonlocal seen
+        raw_bytes = base64.b64decode(entry["data"])
+        content_hash = hashlib.sha256(raw_bytes).hexdigest()
+        # Goal 1: globally unique UUID-based asset ID (NOT content-hash-derived)
+        asset_id = str(uuid.uuid4())
+        filename = entry.get("filename", f"output_{seen}.bin")
+        safe_name = Path(filename).name
+        local_path = output_dir_path / safe_name
+        counter = 0
+        while local_path.exists():
+            counter += 1
+            stem = local_path.stem
+            local_path = output_dir_path / f"{stem}_{counter}{local_path.suffix}"
+        local_path.write_bytes(raw_bytes)
+        mime_type = entry.get("mime_type", "image/png")
+        comp_side = entry.get("comparison_side", "")
+        entry_width = entry.get("width", 0) or 0
+        entry_height = entry.get("height", 0) or 0
+        entry_output_index = entry.get("output_index", fallback_index) or 0
+
+        # Goal 2: register original as first-class asset with extended fields
+        assets[asset_id] = {
+            "path": str(local_path),
+            "mime_type": mime_type,
+            "byte_size": len(raw_bytes),
+            "content_hash": content_hash,
+            "variant": "original",
+            "parent_asset_id": "",
+            "node_id": str(node_id),
+            "output_key": str(output_key),
+            "output_index": int(entry_output_index),
+            "comparison_side": str(comp_side),
+            "width": int(entry_width),
+            "height": int(entry_height),
+        }
+
+        # B4: generate WebP thumbnail and register as separate first-class asset
+        thumb_stem = f"{local_path.stem}_thumb"
+        thumb_path = output_dir_path / f"{thumb_stem}.webp"
+        thumb_ok = bool(_make_thumbnail(str(local_path), str(thumb_path)))
+        if thumb_ok and thumb_path.exists():
+            thumb_bytes = thumb_path.read_bytes()
+            # B4: recompute SHA-256 on ACTUAL thumbnail bytes (not original hash)
+            thumb_content_hash = hashlib.sha256(thumb_bytes).hexdigest()
+            thumb_asset_id = str(uuid.uuid4())
+            # Detect actual thumbnail format
+            if thumb_bytes[:4] == b"RIFF" and b"WEBP" in thumb_bytes[:12]:
+                thumb_mime = "image/webp"
+            else:
+                if thumb_bytes[:3] == b"\xff\xd8\xff":
+                    thumb_mime = "image/jpeg"
+                elif thumb_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+                    thumb_mime = "image/png"
+                else:
+                    thumb_mime = "image/webp"
+            assets[thumb_asset_id] = {
+                "path": str(thumb_path),
+                "mime_type": thumb_mime,
+                "byte_size": len(thumb_bytes),
+                "content_hash": thumb_content_hash,  # B4: hash of THUMBNAIL bytes
+                "variant": "thumbnail",
+                "parent_asset_id": asset_id,  # Link back to original
+                "node_id": str(node_id),
+                "output_key": str(output_key),
+                "output_index": int(entry_output_index),
+                "comparison_side": str(comp_side),
+                "width": min(int(entry_width), 256) if int(entry_width) > 0 else 256,
+                "height": min(int(entry_height), 256) if int(entry_height) > 0 else 256,
+            }
+
+        # Index for primary selection (same rules as ordinary result path)
+        materialized_entry = dict(entry)
+        materialized_entry.pop("data", None)  # strip base64
+        materialized_entry["path"] = str(local_path)
+        materialized_entry["byte_count"] = len(raw_bytes)
+        materialized_entry["asset_id"] = asset_id
+        materialized_entry.setdefault("output_key", output_key)
+        materialized_entry.setdefault("node_id", node_id)
+        per_node_outputs.setdefault(node_id, {}).setdefault(output_key, []).append(materialized_entry)
+        seen += 1
+        return asset_id
+
+    # Process structured outputs
+    structured_outputs = result_data.get("outputs", {}) if isinstance(result_data, dict) else {}
+    for node_id, node_outputs in structured_outputs.items():
+        if not isinstance(node_outputs, dict):
+            continue
+        for output_key, entries in node_outputs.items():
+            if not isinstance(entries, list):
+                continue
+            for idx, entry in enumerate(entries):
+                if not isinstance(entry, dict) or "data" not in entry:
+                    continue
+                _write_and_index(entry, str(node_id), str(output_key), idx)
+
+    # Process flat images fallback (no dedup — each gets its own UUID)
+    flat_images = result_data.get("images", []) if isinstance(result_data, dict) else []
+    for idx, img_entry in enumerate(flat_images):
+        if not isinstance(img_entry, dict) or "data" not in img_entry:
+            continue
+        node_id = str(img_entry.get("node_id", ""))
+        output_key = str(img_entry.get("output_key") or "images")
+        _write_and_index(img_entry, node_id, output_key, idx)
+
+    # B5: use deterministic select_primary_output for primary selection
+    primary_asset_id = ""
+    primary_thumbnail_asset_id = ""
+    primary_output = None
+    if per_node_outputs:
+        # B5: iterate ALL nodes, not just the first one
+        best_primary_entry = None
+        for nid in per_node_outputs:
+            candidate = select_primary_output(per_node_outputs, nid)
+            if candidate is not None:
+                best_primary_entry = candidate
+        if best_primary_entry is not None and isinstance(best_primary_entry, dict):
+            found_asset_id = best_primary_entry.get("asset_id", "")
+            if found_asset_id and found_asset_id in assets:
+                primary_asset_id = found_asset_id
+                info = assets[found_asset_id]
+                # Find the thumbnail belonging to this original (by parent_asset_id)
+                thumb_id = next(
+                    (aid for aid, ai in assets.items()
+                     if ai.get("parent_asset_id") == found_asset_id
+                     and ai.get("variant") == "thumbnail"),
+                    ""
+                )
+                primary_thumbnail_asset_id = thumb_id
+                primary_output = {
+                    "asset_id": found_asset_id,
+                    "path": info["path"],
+                    "mime_type": info["mime_type"],
+                    "byte_size": info["byte_size"],
+                    "content_hash": info["content_hash"],
+                    "comparison_side": best_primary_entry.get("comparison_side", ""),
+                    "output_key": best_primary_entry.get("output_key", ""),
+                    "node_id": best_primary_entry.get("node_id", ""),
+                    "output_index": best_primary_entry.get("output_index", 0),
+                    "primary_thumbnail_asset_id": primary_thumbnail_asset_id,
+                }
+            else:
+                # Fallback: pick first original asset
+                orig_ids = sorted(
+                    aid for aid, ai in assets.items() if ai.get("variant") == "original"
+                )
+                if orig_ids:
+                    primary_asset_id = orig_ids[0]
+                    info = assets[primary_asset_id]
+                    thumb_id = next(
+                        (aid for aid, ai in assets.items()
+                         if ai.get("parent_asset_id") == primary_asset_id
+                         and ai.get("variant") == "thumbnail"),
+                        ""
+                    )
+                    primary_thumbnail_asset_id = thumb_id
+                    primary_output = {
+                        "asset_id": primary_asset_id,
+                        "path": info["path"],
+                        "mime_type": info["mime_type"],
+                        "byte_size": info["byte_size"],
+                        "content_hash": info["content_hash"],
+                        "primary_thumbnail_asset_id": primary_thumbnail_asset_id,
+                    }
+
+    return {
+        "assets": assets,
+        "primary_output": primary_output,
+        "primary_asset_id": primary_asset_id,
+        "primary_thumbnail_asset_id": primary_thumbnail_asset_id,
+        "output_count": seen,
+    }
+
+
 _COMFYAPP_PATH = os.path.join(_NODE_DIR, "comfyapp.py")
 _DEPLOY_STATE_FILE = os.path.join(_NODE_DIR, ".deployed_version")
 _DEPLOY_STATE_JSON_FILE = os.path.join(_NODE_DIR, ".deployed_state.json")
@@ -552,23 +787,21 @@ def _ensure_modal():
         return
     except ImportError:
         pass
+    if os.environ.get("COMFYMODAL_ALLOW_RUNTIME_PIP_INSTALL") != "1":
+        _pip_install_error = "modal package not installed. Run: pip install modal"
+        print("[comfyui-modal] ERROR: 'modal' package not found. Run: pip install modal")
+        print("[comfyui-modal] Set COMFYMODAL_ALLOW_RUNTIME_PIP_INSTALL=1 to auto-install (not recommended for production)")
+        return
     print("[comfyui-modal] 'modal' package not found — installing...")
     try:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "modal"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        subprocess.run([sys.executable, "-m", "pip", "install", "modal"], check=True, capture_output=True, text=True)
         print("[comfyui-modal] 'modal' installed successfully.")
     except subprocess.CalledProcessError as e:
         _pip_install_error = e.stderr or str(e)
         print(f"[comfyui-modal] ERROR: Failed to install 'modal' package: {e.stderr}")
-        print("[comfyui-modal] Please install manually: pip install modal")
     except Exception as e:
         _pip_install_error = str(e)
         print(f"[comfyui-modal] ERROR: Unexpected error installing 'modal': {e}")
-        print("[comfyui-modal] Please install manually: pip install modal")
 
 _ensure_modal()
 
@@ -584,6 +817,9 @@ if _RESULT_ROUTE not in ("legacy", "direct"):
     _RESULT_ROUTE = "legacy"
 _COMPLETED_RESULTS: dict[str, dict] = {}
 _COMPLETED_RESULTS_LOCK = threading.Lock()
+_COMPLETED_RESULTS_MAXSIZE = 100
+_COMPLETED_RESULTS_MAX_BYTES = 500 * 1024 * 1024  # 500 MB cap
+_COMPLETED_RESULTS_TTL_S = 600  # 10 minutes
 
 # ── v4 local event trace (per-prompt) ──
 _local_event_trace: EventTrace | None = None
@@ -1095,8 +1331,44 @@ def _run_deploy_background(workspace: dict, custom_nodes_fingerprint: str | None
                 deployed_at=_utc_now_iso(),
                 deployment_command=f'"{modal_cmd}" deploy "{_COMFYAPP_PATH}"',
             )
-            _deploy_status = {"state": "ready", "message": f"Deployed {workspace['label']} v{version}"}
-            print(f"[comfyui-modal] Deploy succeeded ({workspace['label']} v{version})")
+            # Mark this deploy as a new generation that needs warmup.
+            # Launch automatic warmup in a background thread.
+            try:
+                state = WarmupState(_warmup_state_path)
+                state.mark_deploy_started(
+                    version, custom_nodes_fingerprint or "", time.time()
+                )
+                state._data["auto_warmup_pending"] = True
+                state._flush()
+                # Auto-record the deploy in run history.
+                REGISTRY.history().record_run(
+                    kind="deploy",
+                    prompt_id="",
+                    workflow_hash="",
+                    status="deployed",
+                    meta={
+                        "comfyapp_version": version,
+                        "fingerprint": custom_nodes_fingerprint or "",
+                        "workspace_id": workspace.get("id", ""),
+                        "workspace_label": workspace.get("label", ""),
+                    },
+                )
+                # Launch automatic warmup in a background thread
+                if _modal_available:
+                    def _auto_warmup():
+                        try:
+                            _run_auto_warmup(version, custom_nodes_fingerprint or "")
+                        except Exception as exc:
+                            print(f"[comfyui-modal] auto warmup failed: {exc}")
+                    t = threading.Thread(target=_auto_warmup, daemon=True)
+                    t.start()
+            except Exception as exc:
+                print(f"[comfyui-modal] warmup state mark failed: {exc}")
+            _deploy_status = {
+                "state": "deployed_unwarmed",
+                "message": f"Deployed {workspace['label']} v{version}, warming...",
+            }
+            print(f"[comfyui-modal] Deploy succeeded ({workspace['label']} v{version}), warming...")
             if _modal_available:
                 try:
                     clear_cache()
@@ -1188,6 +1460,74 @@ def _maybe_auto_deploy():
         _deploy_status["message"] = "Already deployed and current"
         _deploy_status["warning"] = False
         print("[comfyui-modal] deploy state already current - skipping deploy")
+
+def _run_auto_warmup(version: str, fingerprint: str) -> None:
+    """Run automatic warmup after deploy. Runs in background thread."""
+    global _deploy_status
+    try:
+        state = WarmupState(_warmup_state_path)
+        gen = state.deployment_generation()
+        if not gen:
+            print("[comfyui-modal] auto warmup: no deployment generation, skipping")
+            return
+
+        # Generate a consistent warmup run id for the full lifecycle
+        warmup_run_id = f"auto_{uuid.uuid4().hex[:8]}"
+
+        # Mark warmup as in-progress BEFORE any async work so that
+        # is_warming() is observable and double-warmup is prevented.
+        if state.is_warming():
+            print("[comfyui-modal] auto warmup: already warming, skipping")
+            return
+        state.mark_warmup_started(gen, warmup_run_id=warmup_run_id)
+
+        # Resolve a warmup workflow
+        wf = _load_latest_benchmark_workflow().get("payload", {}).get("prompt", {})
+        if not wf:
+            print("[comfyui-modal] auto warmup: no workflow available, skipping")
+            state.mark_warmup_failed(gen, "no warmup workflow available")
+            return
+
+        import asyncio
+
+        async def _do_warmup():
+            from modal_client import run_prompt_stream
+            had_result = False
+            try:
+                async for ev in run_prompt_stream(
+                    wf,
+                    input_images=None,
+                    modal_options={"comfymodal_warmup": True, "discard": True},
+                ):
+                    if ev.get("type") == "result":
+                        had_result = True
+                        break
+                    if ev.get("type") == "error":
+                        state.mark_warmup_failed(
+                            gen, ev.get("message", "warmup error"),
+                        )
+                        _deploy_status = {
+                            "state": "unwarmed",
+                            "message": f"Warmup failed: {ev.get('message', 'unknown error')}",
+                        }
+                        return
+            except Exception as exc:
+                state.mark_warmup_failed(
+                    gen, str(exc),
+                )
+                return
+            if had_result:
+                try:
+                    state.mark_warmed(gen, warmup_run_id=warmup_run_id)
+                    _deploy_status = {"state": "ready", "message": "Warmup complete"}
+                    print("[comfyui-modal] auto warmup succeeded")
+                except Exception as exc:
+                    print(f"[comfyui-modal] auto warmup mark failed: {exc}")
+
+        asyncio.run(_do_warmup())
+    except Exception as exc:
+        print(f"[comfyui-modal] auto warmup error: {exc}")
+
 
 try:
     from server import PromptServer
@@ -1365,8 +1705,19 @@ def _read_hf_token() -> str:
         return ""
 
 def _write_hf_token(token: str):
-    with open(_HF_TOKEN_PATH, "w") as f:
-        f.write(token.strip())
+    import tempfile as _tf
+    token = token.strip()
+    parent = os.path.dirname(_HF_TOKEN_PATH)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, tmp = _tf.mkstemp(dir=parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(token)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _HF_TOKEN_PATH)
+    except Exception:
+        os.unlink(tmp)
+        raise
 
 def _read_civitai_token() -> str:
     try:
@@ -1376,8 +1727,19 @@ def _read_civitai_token() -> str:
         return ""
 
 def _write_civitai_token(token: str):
-    with open(_CIVITAI_TOKEN_PATH, "w") as f:
-        f.write(token.strip())
+    import tempfile as _tf
+    token = token.strip()
+    parent = os.path.dirname(_CIVITAI_TOKEN_PATH)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, tmp = _tf.mkstemp(dir=parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(token)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _CIVITAI_TOKEN_PATH)
+    except Exception:
+        os.unlink(tmp)
+        raise
 
 def _is_modal_token_set() -> bool:
     if _active_workspace() is not None:
@@ -1390,16 +1752,44 @@ def _is_modal_token_set() -> bool:
         return False
 
 def _write_modal_toml(token_id: str, token_secret: str):
+    import tempfile
+    if not re.match(r'^ak-[a-zA-Z0-9_\-]+$', token_id):
+        raise ValueError(f"Invalid Modal token ID format: {token_id[:8]}...")
+    if not re.match(r'^as-[a-zA-Z0-9_\-]+$', token_secret):
+        raise ValueError(f"Invalid Modal token secret format: {token_secret[:8]}...")
     content = f'[default]\ntoken_id = "{token_id}"\ntoken_secret = "{token_secret}"\n'
-    os.makedirs(os.path.dirname(_MODAL_TOML_PATH), exist_ok=True)
-    with open(_MODAL_TOML_PATH, "w") as f:
-        f.write(content)
+    parent = os.path.dirname(_MODAL_TOML_PATH)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _MODAL_TOML_PATH)
+    except Exception:
+        os.unlink(tmp)
+        raise
 
 
 _queue: asyncio.Queue = asyncio.Queue()
 _queue_worker_started = False
+_queue_worker_task: asyncio.Task | None = None
 _item_counter = 0
 _counter_lock = asyncio.Lock()
+
+
+def _queue_worker_done(task):
+    global _queue_worker_task, _queue_worker_started
+    _queue_worker_task = None
+    _queue_worker_started = False
+    try:
+        exc = task.exception()
+        if exc:
+            print(f"[comfyui-modal] Queue worker died: {exc}")
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
 
 
 def _send(sid: str, event: str, data: dict):
@@ -1452,9 +1842,31 @@ def _finish_job(item_id: int, prompt_id: str, outputs: dict, success: bool, meta
     history_result = {"outputs": outputs, "meta": dict(meta or {})}
     pq.task_done(item_id, history_result, status=status,
                  process_item=lambda prompt: prompt[:5] + prompt[6:])
+    # Auto-record into the run-history store so the testing-suite
+    # /comfymodal/run-history route shows ordinary prompt runs.
+    try:
+        meta_obj = dict(meta or {})
+        primary = meta_obj.get("primary_output") or {}
+        output_path = primary.get("path", "") if isinstance(primary, dict) else ""
+        record = REGISTRY.history().record_run(
+            kind="ordinary",
+            prompt_id=prompt_id,
+            workflow_hash=str(meta_obj.get("workflow_hash", "")),
+            status="success" if success else "error",
+            meta=meta_obj,
+            log_text=str(meta_obj.get("error", "")) if not success else "",
+            timings=meta_obj.get("trace") or {},
+            output_path=output_path,
+        )
+        # Stash the run id back into the meta so the API caller can
+        # find the history entry.
+        meta_obj["run_history_id"] = record.get("run_id", "")
+    except Exception:
+        pass
 
 
 async def _process_queue():
+    global _queue_worker_started, _queue_worker_task
     while True:
         item, item_id = await _queue.get()
         try:
@@ -1467,6 +1879,8 @@ async def _process_queue():
             print("[comfyui-modal] Queue worker survived job exception, continuing")
         finally:
             _queue.task_done()
+    _queue_worker_started = False
+    _queue_worker_task = None
 
 
 def workflow_needs_local_input_files(workflow: dict) -> bool:
@@ -1536,7 +1950,21 @@ def _collect_input_images(workflow: dict) -> dict:
 
 _ACTIVE_NEXT_PROFILE_TTL_S = int(os.environ.get("COMFYMODAL_ACTIVE_NEXT_PROFILE_TTL_S", "3600"))
 
-_last_written_stable_profile_key: str | None = None
+# Per audit round 7: workspace-scoped dedup identity so
+# Workspace A's profile write does not suppress Workspace B's.
+# Keyed by (workspace_id, stable_model_key) => timestamp.
+_last_written_stable_profile: dict[tuple[str, str], float] = {}
+# Half-life refresh window: write at least every TTL/2, with a
+# 30s floor so a small TTL still has a sane minimum.
+_ACTIVE_NEXT_REFRESH_MIN_S = 30.0
+
+
+def _ws_id_for_active_next(workspace: dict | None) -> str:
+    if isinstance(workspace, dict):
+        _wid = workspace.get("id") or workspace.get("workspace_id") or ""
+        if _wid:
+            return str(_wid)
+    return "__default__"
 
 
 def _normalize_stable_warmup_profile(
@@ -1595,7 +2023,7 @@ def _compute_stable_warmup_profile_key(warmup_profile: dict) -> str:
     ).hexdigest()
 
 
-def _build_next_warmup_activation(workflow: dict, workflow_hash: str) -> dict:
+def _build_next_warmup_activation(workflow: dict, workflow_hash: str, production_options: dict | None = None) -> dict:
     stack = extract_warmup_stack(workflow) if isinstance(workflow, dict) else {}
     profile = stack_to_warmup_profile(stack)
     # Normalize: collapse duplicate CLIP entries
@@ -1605,7 +2033,7 @@ def _build_next_warmup_activation(workflow: dict, workflow_hash: str) -> dict:
             _p["clip2"] = ""
         profile = _p
     now = time.time()
-    return {
+    payload = {
         "profile_token": str(uuid.uuid4()),
         "validation_token": str(uuid.uuid4()),
         "workflow_hash": workflow_hash,
@@ -1618,10 +2046,18 @@ def _build_next_warmup_activation(workflow: dict, workflow_hash: str) -> dict:
         "selected_at": None,
         "preflight_validated": True,
     }
+    if production_options and production_options.get("enabled"):
+        payload["production_enabled"] = True
+        payload["production_profile_version"] = 1
+    return payload
 
 
 async def _execute_job(item: tuple, item_id: int):
-    global _last_written_stable_profile_key
+    # Per audit round 7: the dedup dict is module-global;
+    # mutations must be marked global so the
+    # ``_last_written_stable_profile[key] = ts`` assignment
+    # rebinds the dict in-place rather than creating a local.
+    global _last_written_stable_profile
     number, prompt_id, workflow, extra_data, _, _ = item
     execution_workflow = extra_data.get("execution_workflow") or workflow
     sid = extra_data.get("client_id", "")
@@ -1630,6 +2066,15 @@ async def _execute_job(item: tuple, item_id: int):
     trace = Trace(prompt_id=prompt_id, t0=coerce_t0_from_browser(trace_payload) or local_started)
     trace.update(trace_payload)
     trace.mark("client_generate_clicked_or_request_start", trace.get("t0_client_press") or local_started)
+
+    # Per audit round 7: the request workspace was captured at
+    # dispatch time.  Use the same workspace throughout the
+    # request and into the detached persistence thread so the
+    # post-delivery write does not silently target whichever
+    # workspace happens to be active when the worker fires.
+    _request_workspace = extra_data.get("_request_workspace") if isinstance(extra_data, dict) else None
+    if not _request_workspace:
+        _request_workspace = _active_workspace() or {}
 
     task_key = _register_running(item)
 
@@ -1720,31 +2165,143 @@ async def _execute_job(item: tuple, item_id: int):
         _active_next_changed = False
         _active_next_remote_call = 0
         if not os.environ.get("DISABLE_ACTIVE_NEXT_WRITE"):
-            activation_payload = _build_next_warmup_activation(execution_workflow, prompt_hash)
+            _modal_options_for_prod = extra_data.get("modal_options", {}) or {}
+            _production_options_for_activation = _modal_options_for_prod.get("production", {})
+            if not isinstance(_production_options_for_activation, dict):
+                _production_options_for_activation = {}
+            activation_payload = _build_next_warmup_activation(execution_workflow, prompt_hash, _production_options_for_activation)
             _active_next_payload_bytes = len(json.dumps(activation_payload, separators=(",", ":")))
             # Compute stable profile key from only restore-relevant fields
             _warmup_profile = activation_payload.get("warmup_profile", {})
             _model_stack = activation_payload.get("model_stack", {})
             _stable_key = _compute_stable_warmup_profile_key(_warmup_profile)
-            if _last_written_stable_profile_key == _stable_key:
+            # P2: fold the safe prompt-bundle hash into the dedup key
+            # whenever EITHER exact-prompt prefill OR persistent-clip
+            # cache is enabled.  Both features depend on the bundle
+            # being attached to the activation payload.  If only
+            # COMFYMODAL_PERSISTENT_CLIP_CACHE=1 is set and we did
+            # not extract the bundle here, the restore lookup and
+            # the candidate builder would silently find nothing.
+            _prompt_bundle_hash = ""
+            _exact_or_persistent = (
+                os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "1") == "1"
+                or os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1"
+            )
+            # Per audit round 7 — exact prefill local diagnostic
+            _local_ep = os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "1") == "1"
+            print(
+                f"[exact_prefill.local] enabled={int(_local_ep)} "
+                f"source=env "
+                f"prompt_id={prompt_id[:8]}"
+            )
+            if not _exact_or_persistent:
+                print(
+                    f"[exact_prefill.bundle] enabled=1 eligible=0 "
+                    f"prompt_id={prompt_id[:8]} "
+                    f"reason=neither_exact_clip_prefill_nor_persistent_clip_cache_enabled"
+                )
+            else:
+                try:
+                    from optimizations import extract_safe_prompt_bundle
+                    _bundle_res = extract_safe_prompt_bundle(execution_workflow)
+                    if _bundle_res.get("eligible") and _bundle_res.get("bundle"):
+                        _prompt_bundle_hash = str(
+                            _bundle_res["bundle"].get("bundle_hash", "")
+                        )
+                        activation_payload["prompt_bundle"] = _bundle_res["bundle"]
+                        _encode_count = len(_bundle_res['bundle'].get('encodes', []))
+                        _short_hash = _prompt_bundle_hash[:16]
+                        print(
+                            f"[exact_prefill.bundle] enabled=1 eligible=1 "
+                            f"prompt_id={prompt_id[:8]} "
+                            f"reason=ok "
+                            f"encode_count={_encode_count} "
+                            f"hash={_short_hash}"
+                        )
+                    else:
+                        _reason = _bundle_res.get('reason', '?')
+                        print(
+                            f"[exact_prefill.bundle] enabled=1 eligible=0 "
+                            f"prompt_id={prompt_id[:8]} "
+                            f"reason={_reason}"
+                        )
+                except Exception as _bundle_exc:
+                    print(
+                        f"[exact_prefill.bundle] enabled=1 eligible=0 "
+                        f"prompt_id={prompt_id[:8]} "
+                        f"reason=extraction_exception error={_bundle_exc}"
+                    )
+            if _prompt_bundle_hash:
+                _stable_key = hashlib.sha256(
+                    (_stable_key + ":" + _prompt_bundle_hash).encode("utf-8")
+                ).hexdigest()
+            # Per audit round 7: skip the remote write only when
+            # the stable key matches AND the last write is still
+            # comfortably within the remote TTL.  Without the
+            # timestamp check, the local bridge would silently
+            # skip writes after the first request, the remote
+            # profile would eventually expire, and exact-prefill
+            # and persistent-cache would stop working until the
+            # prompt changed.
+            # Per audit round 7: fix small-TTL handling.  Ensure
+            # refresh always occurs before the remote TTL expires.
+            _effective_ttl_s = max(2.0, float(_ACTIVE_NEXT_PROFILE_TTL_S))
+            _refresh_after_s = min(
+                _effective_ttl_s * 0.5,
+                _effective_ttl_s - 1.0,
+            )
+            _refresh_after_s = max(1.0, _refresh_after_s)
+            # Per audit round 7: dedup state is keyed by
+            # (workspace_id, stable_key) so Workspace A's write
+            # never suppresses Workspace B's.
+            _ws_id = _ws_id_for_active_next(_request_workspace)
+            _dedup_key = (_ws_id, _stable_key)
+            # Prune stale entries older than 2x TTL so the dict
+            # does not grow unbounded across many different prompts.
+            if len(_last_written_stable_profile) > 100:
+                _cutoff = time.time() - _effective_ttl_s * 2
+                _last_written_stable_profile = {
+                    k: v for k, v in _last_written_stable_profile.items()
+                    if v >= _cutoff
+                }
+            _last_write_ts = _last_written_stable_profile.get(_dedup_key, 0.0)
+            _can_skip_active_next = (
+                _last_write_ts > 0.0
+                and (time.time() - _last_write_ts) < _refresh_after_s
+            )
+            if _can_skip_active_next:
                 _active_next_status = "unchanged"
                 print(
                     f"[comfyui-modal.profile] stage=active_profile_write prompt_id={prompt_id[:8]} "
-                    f"decision=unchanged profile_key={_stable_key[:12]} remote_call=0"
+                    f"decision=unchanged workspace_id={_ws_id[:12]} profile_key={_stable_key[:12]} remote_call=0 "
+                    f"reason=key_match_within_refresh_window"
                 )
             else:
                 _active_next_remote_call = 1
                 try:
-                    activation_result = await set_active_warmup_profile(activation_payload)
+                    activation_result = await set_active_warmup_profile(
+                        activation_payload,
+                        workspace=_request_workspace or None,
+                    )
                     _active_next_status = activation_result.get("status", "written")
                     _active_next_changed = activation_result.get("changed", True)
                     if _active_next_status not in ("error",):
-                        _last_written_stable_profile_key = _stable_key
+                        _last_written_stable_profile[_dedup_key] = time.time()
                     print(
                         f"[comfyui-modal.profile] stage=active_profile_write prompt_id={prompt_id[:8]} "
                         f"decision=changed profile_key={_stable_key[:12]} remote_call=1 "
                         f"status={_active_next_status} changed={_active_next_changed} bytes={_active_next_payload_bytes}"
                     )
+                    # Active-next profile write — prompt bundle diagnostic
+                    _bundle_aw = activation_payload.get("prompt_bundle")
+                    if isinstance(_bundle_aw, dict) and _bundle_aw.get("encodes"):
+                        _bw_hash = str(_bundle_aw.get("bundle_hash", ""))[:16]
+                        print(
+                            f"[exact_prefill.active_next_write] bundle_present=1 "
+                            f"bundle_hash={_bw_hash} "
+                            f"encode_count={len(_bundle_aw['encodes'])} "
+                            f"workspace={_ws_id[:12]}"
+                        )
                 except Exception as exc:
                     _active_next_status = "error"
                     print(f"[comfyui-modal] active profile write failed: {exc}")
@@ -1794,6 +2351,7 @@ async def _execute_job(item: tuple, item_id: int):
             trace={**trace.fields(), "prompt_id": prompt_id},
             gpu=extra_data.get("gpu"),
             modal_options=_mo if _mo else None,
+            workspace=_request_workspace or None,
         ):
             if _first_msg:
                 _first_msg = False
@@ -1852,6 +2410,7 @@ async def _execute_job(item: tuple, item_id: int):
         _direct_fallback_reason = None
 
         success = True
+        finalized = False
     except asyncio.CancelledError:
         total_ms = round((time.time() - local_started) * 1000, 1)
         print(
@@ -1860,6 +2419,15 @@ async def _execute_job(item: tuple, item_id: int):
         )
         _send(sid, "execution_error", {"message": "cancelled", "prompt_id": prompt_id})
         _finish_job(task_key, prompt_id, outputs, success=False, meta={"error": "cancelled"})
+        if _RESULT_ROUTE == "direct":
+            with _COMPLETED_RESULTS_LOCK:
+                _COMPLETED_RESULTS[prompt_id] = {
+                    "status": "error",
+                    "error": "cancelled",
+                    "completed_at": time.time(),
+                    "direct_route": True,
+                }
+        _clear_request_state(prompt_id)
         raise
     except Exception as e:
         import traceback
@@ -1893,132 +2461,140 @@ async def _execute_job(item: tuple, item_id: int):
             "prompt_summary": prompt_summary,
             "workflow_hash": prompt_hash,
         })
+        if _RESULT_ROUTE == "direct":
+            with _COMPLETED_RESULTS_LOCK:
+                _COMPLETED_RESULTS[prompt_id] = {
+                    "status": "error",
+                    "error": str(e),
+                    "completed_at": time.time(),
+                    "direct_route": True,
+                }
+        _clear_request_state(prompt_id)
         return
 
-    # Update last successful model stack after successful remote result
-    global _last_successful_model_stack
-    _last_successful_model_stack.clear()
-    _last_successful_model_stack.update(extra_data.get("model_stack", {}))
-
     # ── Post-materialization block: guarded so _finish_job always runs ──
-
-    output_dir = os.path.join(_COMFYUI_ROOT, "output")
-    os.makedirs(output_dir, exist_ok=True)
-    trace.mark("t9e_local_materialize_start")
-    materialize_started = time.time()
-    trace.mark("client_result_decode_start", materialize_started)
-    trace.mark("client_file_write_start", materialize_started)
-    trace.mark("client_comfy_notify_start", materialize_started)
-    _mo = extra_data.get("modal_options") if isinstance(extra_data, dict) else None
-    _settings = _load_modal_settings()
-    delivery = _materialize_modal_outputs(
-        result,
-        output_dir=output_dir,
-        prompt_id=prompt_id,
-        client_id=sid,
-        send_event=lambda event, payload: _send(sid, event, payload),
-        auto_save_local=bool((_mo or {}).get("auto_save_local", False)),
-        save_folder=(_mo or {}).get("save_folder") or _settings.get("save_folder", ""),
-        save_metadata_sidecar=bool((_mo or {}).get("save_metadata_sidecar", _settings.get("save_metadata_sidecar", True))),
-        workflow_hash=prompt_hash,
-        workflow_name="",
-        seed=str(prompt_summary.get("seed", "0")),
-        width=prompt_summary.get("width", 0),
-        height=prompt_summary.get("height", 0),
-        comfyui_root=_COMFYUI_ROOT,
-    )
-    outputs.clear()
-    outputs.update(delivery.get("history_outputs", delivery["outputs"]))
-    output_bytes_written = delivery["bytes_written"]
-    output_image_count = delivery["image_count"]
-    output_video_count = delivery["video_count"]
-    materialize_ms = round((time.time() - materialize_started) * 1000, 1)
-    trace.mark("client_result_decode_done")
-    trace.mark("client_file_write_done")
-    trace.mark("client_comfy_notify_done")
-    print(
-        f"[comfyui-modal.profile] stage=output_materialize prompt_id={prompt_id[:8]} "
-        f"duration_ms={materialize_ms} images={output_image_count} videos={output_video_count} bytes={output_bytes_written}"
-    )
-    print(
-        f"[modal-local.materialize-end] prompt_id={prompt_id[:8]} "
-        f"written={output_image_count + output_video_count}"
-    )
-    _local_primary_output = delivery.get("primary_output")
-    if isinstance(result, dict) and _local_primary_output:
-        result["_local_primary_output"] = dict(_local_primary_output)
-        result["primary_output"] = dict(_local_primary_output)
-
-    trace.mark("t10b_local_save_start")
-    _save_results = delivery.get("save_results", [])
-    _save_warnings = delivery.get("save_warnings", [])
-    if _save_warnings:
-        print(f"[comfyui-modal.auto_save] warnings: {'; '.join(_save_warnings)}")
-    if _save_results:
-        _send(sid, "modal_status", {
-            "prompt_id": prompt_id,
-            "message": f"Auto-saved {len(_save_results)} file(s)",
-            "phase": "auto_save",
-            "save_results": _save_results,
-            "save_warnings": _save_warnings,
-        })
-    elif _save_warnings:
-        _send(sid, "modal_status", {
-            "prompt_id": prompt_id,
-            "message": f"Auto-save warning: {'; '.join(_save_warnings)}",
-            "phase": "auto_save",
-            "save_warnings": _save_warnings,
-        })
-
-    trace.mark("t10c_local_save_end")
-    trace.mark("t10_local_materialized")
-    _merged_trace = trace.summary()
-    # Preserve restore timing from the Modal container's trace
-    _remote_full = result.get("trace", {})
-    if isinstance(_remote_full, dict):
-        if "restore" in _remote_full:
-            _merged_trace["restore"] = _remote_full["restore"]
-        # Preserve dependency validation fields from remote trace
-        for _dep_field in (
-            "dependency_validation_ms", "dependency_total_ms",
-            "dependency_validation_result", "dependency_validation_cache_layer",
-            "dependency_validation_cache_hit", "dependency_validation_reason",
-            "dependency_validation_baked_hash", "dependency_validation_current_hash",
-            "dependency_validation_changed_nodes",
-            "dependency_pre_key_check_ms", "dependency_baked_manifest_load_ms",
-            "dependency_source_root_resolve_ms", "dependency_fingerprint_ms",
-            "dependency_cache_key_ms", "dependency_memory_lookup_ms",
-            "dependency_sentinel_lookup_ms", "dependency_full_validation_ms",
-            "dependency_sentinel_write_ms",
-        ):
-            _dep_v = _remote_full.get(_dep_field)
-            if _dep_v is not None:
-                _merged_trace[_dep_field] = _dep_v
-        # Also preserve from derived_ms
-        _remote_derived = _remote_full.get("derived_ms", {})
-        if isinstance(_remote_derived, dict):
-            for _rdk, _rdv in _remote_derived.items():
-                if _rdk not in _merged_trace.get("derived_ms", {}):
-                    _merged_trace.setdefault("derived_ms", {})[_rdk] = _rdv
-    result["trace"] = _merged_trace
-    if os.environ.get("COMFYMODAL_TRACE_DEBUG_LOG"):
-        _dbg_path = os.path.join(_NODE_DIR, "_trace_debug.log")
-        with open(_dbg_path, "a", encoding="utf-8") as _f:
-            _f.write(f"[timing_trace.final] trace_version={_merged_trace.get('trace_version')} "
-                     f"has_derived={'derived_ms' in _merged_trace} "
-                     f"derived_keys={list(_merged_trace.get('derived_ms', {}).keys())} "
-                     f"quality={_merged_trace.get('timing_quality')} "
-                     f"quality_reason={_merged_trace.get('timing_quality_reason')} "
-                     f"missing={_merged_trace.get('missing_timing_fields', [])}\n")
-            _f.write(f"[timing_trace.final] DELTAS keys: {list(_merged_trace.get('deltas_ms', {}).keys())}\n")
-            _f.write(f"[timing_trace.final] STAGES keys: {list(_merged_trace.get('stages', {}).keys())}\n")
-            _f.flush()
-    print(trace.log_line())
-
-    trace.mark("t10d_local_response_sent")
-    trace.mark("client_comfy_notify_start")
-    trace.mark("client_comfy_notify_done")
     try:
+        # Update last successful model stack after successful remote result
+        global _last_successful_model_stack
+        _last_successful_model_stack.clear()
+        _last_successful_model_stack.update(extra_data.get("model_stack", {}))
+
+        output_dir = os.path.join(_COMFYUI_ROOT, "output")
+        os.makedirs(output_dir, exist_ok=True)
+        trace.mark("t9e_local_materialize_start")
+        materialize_started = time.time()
+        trace.mark("client_result_decode_start", materialize_started)
+        trace.mark("client_file_write_start", materialize_started)
+        trace.mark("client_comfy_notify_start", materialize_started)
+        _mo = extra_data.get("modal_options") if isinstance(extra_data, dict) else None
+        _settings = _load_modal_settings()
+        delivery = _materialize_modal_outputs(
+            result,
+            output_dir=output_dir,
+            prompt_id=prompt_id,
+            client_id=sid,
+            send_event=lambda event, payload: _send(sid, event, payload),
+            auto_save_local=bool((_mo or {}).get("auto_save_local", False)),
+            save_folder=(_mo or {}).get("save_folder") or _settings.get("save_folder", ""),
+            save_metadata_sidecar=bool((_mo or {}).get("save_metadata_sidecar", _settings.get("save_metadata_sidecar", True))),
+            workflow_hash=prompt_hash,
+            workflow_name="",
+            seed=str(prompt_summary.get("seed", "0")),
+            width=prompt_summary.get("width", 0),
+            height=prompt_summary.get("height", 0),
+            comfyui_root=_COMFYUI_ROOT,
+        )
+        outputs.clear()
+        outputs.update(delivery.get("history_outputs", delivery["outputs"]))
+        output_bytes_written = delivery["bytes_written"]
+        output_image_count = delivery["image_count"]
+        output_video_count = delivery["video_count"]
+        materialize_ms = round((time.time() - materialize_started) * 1000, 1)
+        trace.mark("client_result_decode_done")
+        trace.mark("client_file_write_done")
+        trace.mark("client_comfy_notify_done")
+        print(
+            f"[comfyui-modal.profile] stage=output_materialize prompt_id={prompt_id[:8]} "
+            f"duration_ms={materialize_ms} images={output_image_count} videos={output_video_count} bytes={output_bytes_written}"
+        )
+        print(
+            f"[modal-local.materialize-end] prompt_id={prompt_id[:8]} "
+            f"written={output_image_count + output_video_count}"
+        )
+        _local_primary_output = delivery.get("primary_output")
+        if isinstance(result, dict) and _local_primary_output:
+            result["_local_primary_output"] = dict(_local_primary_output)
+            result["primary_output"] = dict(_local_primary_output)
+
+        trace.mark("t10b_local_save_start")
+        _save_results = delivery.get("save_results", [])
+        _save_warnings = delivery.get("save_warnings", [])
+        if _save_warnings:
+            print(f"[comfyui-modal.auto_save] warnings: {'; '.join(_save_warnings)}")
+        if _save_results:
+            _send(sid, "modal_status", {
+                "prompt_id": prompt_id,
+                "message": f"Auto-saved {len(_save_results)} file(s)",
+                "phase": "auto_save",
+                "save_results": _save_results,
+                "save_warnings": _save_warnings,
+            })
+        elif _save_warnings:
+            _send(sid, "modal_status", {
+                "prompt_id": prompt_id,
+                "message": f"Auto-save warning: {'; '.join(_save_warnings)}",
+                "phase": "auto_save",
+                "save_warnings": _save_warnings,
+            })
+
+        trace.mark("t10c_local_save_end")
+        trace.mark("t10_local_materialized")
+        _merged_trace = trace.summary()
+        # Preserve restore timing from the Modal container's trace
+        _remote_full = result.get("trace", {})
+        if isinstance(_remote_full, dict):
+            if "restore" in _remote_full:
+                _merged_trace["restore"] = _remote_full["restore"]
+            # Preserve dependency validation fields from remote trace
+            for _dep_field in (
+                "dependency_validation_ms", "dependency_total_ms",
+                "dependency_validation_result", "dependency_validation_cache_layer",
+                "dependency_validation_cache_hit", "dependency_validation_reason",
+                "dependency_validation_baked_hash", "dependency_validation_current_hash",
+                "dependency_validation_changed_nodes",
+                "dependency_pre_key_check_ms", "dependency_baked_manifest_load_ms",
+                "dependency_source_root_resolve_ms", "dependency_fingerprint_ms",
+                "dependency_cache_key_ms", "dependency_memory_lookup_ms",
+                "dependency_sentinel_lookup_ms", "dependency_full_validation_ms",
+                "dependency_sentinel_write_ms",
+            ):
+                _dep_v = _remote_full.get(_dep_field)
+                if _dep_v is not None:
+                    _merged_trace[_dep_field] = _dep_v
+            # Also preserve from derived_ms
+            _remote_derived = _remote_full.get("derived_ms", {})
+            if isinstance(_remote_derived, dict):
+                for _rdk, _rdv in _remote_derived.items():
+                    if _rdk not in _merged_trace.get("derived_ms", {}):
+                        _merged_trace.setdefault("derived_ms", {})[_rdk] = _rdv
+        result["trace"] = _merged_trace
+        if os.environ.get("COMFYMODAL_TRACE_DEBUG_LOG"):
+            _dbg_path = os.path.join(_NODE_DIR, "_trace_debug.log")
+            with open(_dbg_path, "a", encoding="utf-8") as _f:
+                _f.write(f"[timing_trace.final] trace_version={_merged_trace.get('trace_version')} "
+                         f"has_derived={'derived_ms' in _merged_trace} "
+                         f"derived_keys={list(_merged_trace.get('derived_ms', {}).keys())} "
+                         f"quality={_merged_trace.get('timing_quality')} "
+                         f"quality_reason={_merged_trace.get('timing_quality_reason')} "
+                         f"missing={_merged_trace.get('missing_timing_fields', [])}\n")
+                _f.write(f"[timing_trace.final] DELTAS keys: {list(_merged_trace.get('deltas_ms', {}).keys())}\n")
+                _f.write(f"[timing_trace.final] STAGES keys: {list(_merged_trace.get('stages', {}).keys())}\n")
+                _f.flush()
+        print(trace.log_line())
+
+        trace.mark("t10d_local_response_sent")
+        trace.mark("client_comfy_notify_start")
+        trace.mark("client_comfy_notify_done")
         _send(sid, "executing", {"node": None, "display_node": None, "prompt_id": prompt_id})
         _send(sid, "modal_status", {"prompt_id": prompt_id, "message": None, "phase": "done"})
         _send(sid, "execution_success", {"prompt_id": prompt_id, "trace": result.get("trace")})
@@ -2032,36 +2608,145 @@ async def _execute_job(item: tuple, item_id: int):
             "primary_output": result.get("primary_output") or result.get("_local_primary_output"),
         }
         _finish_job(task_key, prompt_id, outputs, success=True, meta=_meta)
+
+        # ── P2: post-delivery prompt-cache persistence ──
+        # Only fires after successful materialization + UI success +
+        # _finish_job. Bounded, exception-safe, never delays the user-
+        # visible completion path.  The payload is collected and
+        # dispatched to a small background task that calls the CPU-only
+        # Modal function.  Failure of persistence never fails the
+        # prompt.
+        try:
+            if os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1":
+                _clip_candidate = result.get("_clip_cache_candidate") if isinstance(result, dict) else None
+                _clip_fingerprint = result.get("_clip_cache_fingerprint") if isinstance(result, dict) else None
+                if _clip_candidate and _clip_fingerprint:
+                    from optimizations import candidate_payload_bytes, PERSISTENT_CLIP_CACHE_MAX_CANDIDATE_MB, _POST_DELIVERY_SINGLETON
+                    _payload_bytes = candidate_payload_bytes(_clip_candidate)
+                    if _payload_bytes <= PERSISTENT_CLIP_CACHE_MAX_CANDIDATE_MB * 1024 * 1024:
+                        # Use the process-wide dispatcher singleton so
+                        # cross-request concurrency and dedup are real.
+                        _dispatcher = _POST_DELIVERY_SINGLETON
+                        _bundle_hash = (
+                            _clip_candidate.get("bundle", {}).get("bundle_hash", "")
+                        )
+                        # Per audit round 7: the dedup identity
+                        # must include the workspace, the
+                        # bundle hash, and the clip fingerprint
+                        # key (which itself encodes model
+                        # generation).  bundle_hash alone is
+                        # insufficient because the same bundle
+                        # under a new model generation must NOT
+                        # be deduplicated against the previous
+                        # generation's successful write.
+                        _workspace_id = ""
+                        if isinstance(_request_workspace, dict):
+                            _workspace_id = str(
+                                _request_workspace.get("id", "")
+                                or _request_workspace.get("workspace_id", "")
+                                or ""
+                            )
+                        _fp_key = ""
+                        if isinstance(_clip_fingerprint, dict):
+                            _fp_key = str(
+                                _clip_fingerprint.get("fingerprint_key", "")
+                                or ""
+                            )
+                        _persist_task_id = ":".join(
+                            x for x in (_workspace_id, _bundle_hash, _fp_key) if x
+                        )
+                        if _bundle_hash and _dispatcher is not None:
+                            def _persist_call():
+                                # Local import keeps the cold path
+                                # clean. The actual call uses
+                                # modal_client; import lazily to avoid
+                                # touching modal at module import time.
+                                try:
+                                    from modal_client import persist_clip_cache_payload
+                                    # Per audit round 7: pass the
+                                    # captured workspace so the
+                                    # persistence RPC targets the
+                                    # SAME workspace as the request,
+                                    # not whichever workspace is
+                                    # active when the detached
+                                    # background thread fires.
+                                    if _request_workspace:
+                                        return persist_clip_cache_payload(
+                                            _clip_candidate,
+                                            workspace=_request_workspace,
+                                            timeout_s=30.0,
+                                        )
+                                    return persist_clip_cache_payload(
+                                        _clip_candidate, timeout_s=30.0
+                                    )
+                                except Exception as _persist_exc:
+                                    print(
+                                        f"[comfyui-modal.post_delivery] persist failed: {_persist_exc!r}"
+                                    )
+                                    return {"status": "error", "error": str(_persist_exc)}
+                            _dispatcher.submit(
+                                task_id=_persist_task_id or _bundle_hash,
+                                fn=_persist_call,
+                                timeout_s=30.0,
+                            )
+                            print(
+                                f"[comfyui-modal.post_delivery] scheduled prompt_id={prompt_id[:8]} "
+                                f"workspace_id={_workspace_id[:12] or '-'} "
+                                f"bundle_hash={_bundle_hash[:12]} "
+                                f"fingerprint_key={_fp_key[:12] or '-'} "
+                                f"bytes={_payload_bytes}"
+                            )
+                    else:
+                        print(
+                            f"[comfyui-modal.post_delivery] skipped_over_limit "
+                            f"prompt_id={prompt_id[:8]} bytes={_payload_bytes} "
+                            f"limit_mb={PERSISTENT_CLIP_CACHE_MAX_CANDIDATE_MB}"
+                        )
+        except Exception as _post_persist_exc:
+            # Never fail the request due to persistence.
+            print(f"[comfyui-modal.post_delivery] dispatcher error: {_post_persist_exc!r}")
+
+        # ── Direct route: store completed result for non-polling retrieval ──
+        if _result_route_mode == "direct" and isinstance(result, dict):
+            with _COMPLETED_RESULTS_LOCK:
+                # Evict oldest if at capacity
+                while len(_COMPLETED_RESULTS) >= _COMPLETED_RESULTS_MAXSIZE:
+                    oldest = min(_COMPLETED_RESULTS.keys(), key=lambda k: _COMPLETED_RESULTS[k].get("completed_at", 0))
+                    del _COMPLETED_RESULTS[oldest]
+                _COMPLETED_RESULTS[prompt_id] = {
+                    "result": result,
+                    "trace": result.get("trace", {}),
+                    "outputs": outputs,
+                    "primary_output": result.get("primary_output") or result.get("_local_primary_output"),
+                    "materialize_ms": materialize_ms,
+                    "completed_at": time.time(),
+                    "direct_route": True,
+                }
+
         finalized = True
-    except Exception:
+
+        total_ms = round((time.time() - local_started) * 1000, 1)
+        print(
+            f"[comfyui-modal.profile] stage=local_total prompt_id={prompt_id[:8]} "
+            f"duration_ms={total_ms} images={output_image_count} videos={output_video_count} bytes={output_bytes_written}"
+        )
+    except Exception as _post_err:
         import traceback
         traceback.print_exc()
+        print(f"[comfyui-modal] Post-result processing failed: {_post_err}")
+        _send(sid, "execution_error", {"message": str(_post_err), "prompt_id": prompt_id})
+    finally:
         if not finalized and task_key != 0:
             try:
                 _finish_job(task_key, prompt_id, outputs, success=False,
-                          meta={"error": "completion notification exception"})
+                            meta={"error": "post-result processing exception",
+                                  "details": str(_post_err) if '_post_err' in dir() else ""})
             except Exception as _fe:
                 print(f"[comfyui-modal] _finish_job failed during error recovery: {_fe}")
-        raise
-
-    # ── Direct route: store completed result for non-polling retrieval ──
-    if _result_route_mode == "direct" and isinstance(result, dict):
-        with _COMPLETED_RESULTS_LOCK:
-            _COMPLETED_RESULTS[prompt_id] = {
-                "result": result,
-                "trace": result.get("trace", {}),
-                "outputs": outputs,
-                "primary_output": result.get("primary_output") or result.get("_local_primary_output"),
-                "materialize_ms": materialize_ms,
-                "completed_at": time.time(),
-                "direct_route": True,
-            }
-
-    total_ms = round((time.time() - local_started) * 1000, 1)
-    print(
-        f"[comfyui-modal.profile] stage=local_total prompt_id={prompt_id[:8]} "
-        f"duration_ms={total_ms} images={output_image_count} videos={output_video_count} bytes={output_bytes_written}"
-    )
+        try:
+            _clear_request_state(prompt_id)
+        except Exception:
+            pass
 
 
 def _build_custom_nodes_archive(cn_root: str) -> bytes:
@@ -2352,8 +3037,17 @@ async def _scan_swap_plan(workspace: dict) -> dict:
     try:
         remote = await get_sync_status(workspace=workspace)
         remote_models = remote.get("models", [])
-    except Exception:
-        remote_models = []
+    except Exception as e:
+        return {
+            "manifest_issues": issues,
+            "blocking_issues": blocking + [{"kind": "remote_unavailable", "detail": str(e)}],
+            "already_present": [],
+            "to_install": [],
+            "unresolved": [],
+            "to_remove": [],
+            "remote_status": "unavailable",
+            "remote_error": str(e),
+        }
     plan = _model_manifest.build_workspace_swap_plan(manifest, remote_models)
     return {
         "manifest_issues": issues,
@@ -2362,6 +3056,7 @@ async def _scan_swap_plan(workspace: dict) -> dict:
         "to_install": plan.get("to_install", []),
         "unresolved": plan.get("unresolved", []),
         "to_remove": plan.get("to_remove", []),
+        "remote_status": "available",
     }
 
 
@@ -2563,7 +3258,7 @@ if _server:
 
     @_server.routes.post("/comfymodal/prompt")
     async def modal_prompt(request: web.Request) -> web.Response:
-        global _queue_worker_started, _item_counter
+        global _queue_worker_started, _queue_worker_task, _item_counter
 
         # ── v4 local event trace ──
         local_et = _init_local_event_trace()
@@ -2573,6 +3268,9 @@ if _server:
 
         # ── Phase: body read + JSON parse ──
         local_et.mark(T1G_BODY_READ_START, phase=PHASE_LOCAL_BRIDGE)
+        content_length = request.content_length
+        if content_length is not None and content_length > 50 * 1024 * 1024:  # 50 MB max
+            return web.json_response({"status": "error", "error": "Request body too large"}, status=413)
         try:
             body = await asyncio.wait_for(request.json(), timeout=_BODY_READ_TIMEOUT_S)
         except asyncio.TimeoutError:
@@ -2585,10 +3283,10 @@ if _server:
         _json_parse_done_ts = time.time()
         body_read_ms = round((_body_read_done_ts - _route_entry_ts) * 1000, 3)
         if body_read_ms > _JSON_PARSE_WARN_MS:
-            print(f"[comfyui-modal] WARN slow body read: {body_read_ms}ms content_length={request.content_length if hasattr(request, 'content_length') else '?'}")
+            print(f"[comfyui-modal] WARN slow body read: {body_read_ms}ms content_length={content_length or '?'}")
         if body_read_ms > _JSON_PARSE_FAIL_S * 1000:
             return web.json_response({"status": "error", "error": f"JSON read/parse took {body_read_ms}ms, exceeding limit"}, status=413)
-        body_bytes = len(json.dumps(body).encode('utf-8'))
+        body_bytes = content_length if content_length else len(json.dumps(body).encode('utf-8'))
         if body_bytes > 10 * 1024 * 1024:
             print(f"[comfyui-modal] WARN large body: {body_bytes} bytes")
         local_et.mark(T1J_JSON_PARSE_END, phase=PHASE_LOCAL_BRIDGE)
@@ -2597,7 +3295,17 @@ if _server:
         workflow = body.get("prompt", body)
         client_id = body.get("client_id", str(uuid.uuid4()))
         prompt_id = str(uuid.uuid4())
-        request_state = _make_local_request_state(request, body, prompt_id)
+        _make_local_request_state(request, body, prompt_id)  # side effects only: registers active request, increments seq
+        # Per audit round 7: capture the request workspace once at
+        # dispatch so the detached background persistence thread
+        # does not resolve whichever workspace happens to be
+        # active when it actually executes.  A user could switch
+        # workspaces between image completion and background
+        # thread execution; we must not let that write workspace
+        # A's payload into workspace B's prompt-cache Volume.
+        _request_workspace = _active_workspace()
+        if _request_workspace is None:
+            _request_workspace = {}
         # Prefer request-level trace (body["trace"]["t0_client_press"]) over top-level
         request_trace = body.get("trace", {})
         browser_t0 = coerce_t0_from_browser(request_trace) or coerce_t0_from_browser(body)
@@ -2697,6 +3405,8 @@ if _server:
         local_et.mark(T2_LOCAL_MODAL_SUBMIT_START, phase=PHASE_LOCAL_BRIDGE)
 
         _lock_trace = await _timed_async_lock_acquire(_counter_lock, "counter_lock", prompt_id)
+        if not _lock_trace.get("acquired"):
+            raise web.HTTPTooManyRequests(text=json.dumps({"status": "error", "error": "server busy, try again"}))
         try:
             _item_counter += 1
             item_id = _item_counter
@@ -2719,6 +3429,7 @@ if _server:
             # ── Create prompt acknowledgment event ──
             ack_ready = asyncio.Event()
 
+            _queue_execution_workflow = copy.deepcopy(execution_workflow)
             extra_data = {
                 "client_id": client_id,
                 "create_time": int(time.time() * 1000),
@@ -2732,11 +3443,16 @@ if _server:
                 "modal_options": modal_options,
                 "scheduler_test": scheduler_test,
                 "result_route": _result_route_mode,
-                "execution_workflow": copy.deepcopy(execution_workflow),
+                "execution_workflow": _queue_execution_workflow,
                 "production_report": production_report,
                 "_modal_prompt_ack_ready": ack_ready,
+                # Carry the request workspace into the queue
+                # worker so the detached persistence thread
+                # can target the same workspace without
+                # re-resolving the active one (which may
+                # have changed in the interim).
+                "_request_workspace": _request_workspace,
             }
-            _queue_execution_workflow = copy.deepcopy(execution_workflow)
             item = (_item_counter, prompt_id, _queue_execution_workflow, extra_data, list(_queue_execution_workflow.keys()), {})
             print(f"[predispatch] prompt_bytes={body_bytes}")
         finally:
@@ -2752,9 +3468,10 @@ if _server:
 
         await _queue.put((item, item_id))
 
-        if not _queue_worker_started:
+        if _queue_worker_task is None or _queue_worker_task.done():
+            _queue_worker_task = asyncio.create_task(_process_queue())
+            _queue_worker_task.add_done_callback(_queue_worker_done)
             _queue_worker_started = True
-            asyncio.create_task(_process_queue())
 
         # ── Signal acknowledgment: prompt is enqueued and response is ready ──
         asyncio.get_running_loop().call_soon(ack_ready.set)
@@ -2771,11 +3488,10 @@ if _server:
         _detect_local_predispatch_stall(local_ts, prompt_id, degradation_flags)
 
         local_et.mark(T2D_LOCAL_PROMPT_ACK_RETURNED, phase=PHASE_LOCAL_BRIDGE)
-        _clear_request_state(prompt_id)
 
         return web.json_response({
             "prompt_id": prompt_id,
-            "number": _item_counter,
+            "number": item_id,
             "node_errors": {},
         })
 
@@ -3255,16 +3971,32 @@ if _server:
         folder = (body.get("path") or body.get("folder") or "").strip()
         if not folder:
             return web.json_response({"status": "error", "message": "no path provided"}, status=400)
-        # Resolve relative paths against ComfyUI root
+
+        _ALLOWED_ROOTS = [
+            os.path.join(_COMFYUI_ROOT, "output"),
+            os.path.join(_COMFYUI_ROOT, "input"),
+        ]
         if not os.path.isabs(folder):
             folder = os.path.join(_COMFYUI_ROOT, folder)
-        folder = os.path.normpath(folder)
+        folder = os.path.normpath(os.path.realpath(folder))
+
+        allowed = False
+        for root in _ALLOWED_ROOTS:
+            try:
+                if os.path.commonpath([os.path.normpath(os.path.realpath(root)), folder]) == os.path.normpath(os.path.realpath(root)):
+                    allowed = True
+                    break
+            except ValueError:
+                pass
+        if not allowed:
+            return web.json_response({"status": "error", "message": "path not in allowed roots"}, status=403)
+
         if not os.path.isdir(folder):
-            os.makedirs(folder, exist_ok=True)
+            return web.json_response({"status": "error", "message": "directory does not exist"}, status=404)
         try:
             _sys_name = platform.system()
             if _sys_name == "Windows":
-                _sp.Popen(["explorer", folder], shell=True)
+                _sp.Popen(["explorer", folder])  # Remove shell=True
             elif _sys_name == "Darwin":
                 _sp.Popen(["open", folder])
             else:
@@ -3306,9 +4038,18 @@ if _server:
         if not prompt_id:
             return web.json_response({"status": "error", "message": "prompt_id required"}, status=400)
         with _COMPLETED_RESULTS_LOCK:
+            # TTL eviction
+            now_t = time.time()
+            expired = [k for k, v in _COMPLETED_RESULTS.items()
+                       if now_t - v.get("completed_at", 0) > _COMPLETED_RESULTS_TTL_S]
+            for k in expired:
+                del _COMPLETED_RESULTS[k]
             entry = _COMPLETED_RESULTS.get(prompt_id)
             if entry is None:
                 return web.json_response({"status": "pending", "message": "result not yet available"}, status=404)
+            if entry.get("status") == "error":
+                payload = dict(entry)
+                return web.json_response({"status": "error", "prompt_id": prompt_id, **payload})
             payload = dict(entry)
         return web.json_response({"status": "ok", "prompt_id": prompt_id, **payload})
 
@@ -3607,6 +4348,7 @@ if _server:
         auto_save_local: bool,
         save_folder: str,
         save_metadata_sidecar: bool,
+        workspace: dict | None = None,
     ) -> dict:
         import time as _time_module
         import base64 as _b64
@@ -3686,6 +4428,7 @@ if _server:
                 trace=extra_data.get("trace", {}),
                 gpu=extra_data.get("gpu"),
                 modal_options=extra_data.get("modal_options"),
+                workspace=workspace,
             ):
                 if not isinstance(_msg, dict):
                     continue
@@ -3959,6 +4702,11 @@ if _server:
             except (TypeError, ValueError):
                 seed = 0
 
+        # Per audit round 7: capture workspace once for all profile
+        # executions so detached background tasks do not resolve
+        # whichever workspace happens to be active later.
+        _comparison_workspace = _active_workspace() or {}
+
         try:
             manifest = run_comparison(
                 comfyui_root=_COMFYUI_ROOT,
@@ -4001,6 +4749,7 @@ if _server:
                             entry, body, manifest, output_format, quality,
                             webp_lossless_compression, auto_save_local,
                             save_folder, save_metadata_sidecar,
+                            workspace=_comparison_workspace,
                         )
 
                 tasks = [_run_one(e) for e in resolved if e.get("status") == "ready"]
@@ -4025,6 +4774,7 @@ if _server:
                             entry, body, manifest, output_format, quality,
                             webp_lossless_compression, auto_save_local,
                             save_folder, save_metadata_sidecar,
+                            workspace=_comparison_workspace,
                         )
                         if result:
                             results.append(result)
@@ -4083,6 +4833,17 @@ if _server:
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 
+    @_server.routes.get("/comfymodal/comparison/profiles/{profile_id}/workflow")
+    async def comparison_workflow_get(request: web.Request) -> web.Response:
+        profile_id = request.match_info.get("profile_id", "")
+        try:
+            payload = get_profile_workflow(_COMFYUI_ROOT, profile_id)
+            if payload is None:
+                return web.json_response({"status": "ok", "workflow_api": {}, "workflow": None})
+            return web.json_response({"status": "ok", **payload})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
     @_server.routes.get("/comfymodal/comparison/config")
     async def comparison_get_config(request: web.Request) -> web.Response:
         try:
@@ -4124,4 +4885,1175 @@ if _server:
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 
-    print("[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*")
+    # ── i2i/t2i testing suite routes ─────────────────────────────────
+    from experiment_service import (
+        REGISTRY, experiments_root, run_history_root, presets_root,
+        blobs_root, leases_db_path, warmup_state_path, experiment_dir,
+    )
+    from matrix_compiler import compile_experiment
+    from deploy_warmup import (
+        WarmupState, deployment_generation, ensure_warmup, gate_experiment,
+        gate_experiment_on_stored_generation, WarmupRequiredError,
+    )
+    from presets import (
+        list_prompt_presets, get_prompt_preset, create_prompt_preset,
+        rename_prompt_preset, delete_prompt_preset, duplicate_prompt_preset,
+        import_prompts_from_text,
+        list_image_presets, get_image_preset, create_image_preset,
+        rename_image_preset, delete_image_preset,
+    )
+    from run_history import redact_log, format_timing
+    from experiment_runner import (
+        CheckpointStreamInvoker, LocalRemoteInvoker,
+    )
+    from experiment_models import CURRENT_SCHEMA_VERSION, validate_definition
+    from experiment_lease import StaleEventError, LeaseActiveError, LeaseError, LeaseOwnershipError, UnknownCheckpointError
+
+    _experiments_root = experiments_root()
+    _leases_db_path = leases_db_path()
+    _warmup_state_path = warmup_state_path()
+
+    # ── Workflow resolution at checkpoint start ──
+    def _resolve_latest_workflow_for_profile(profile_id: str) -> dict:
+        """Return the live workflow JSON for ``profile_id``.
+
+        Resolution order:
+        1. Read ``workflow_api.json`` from the profile directory (the
+           copy saved at profile creation / update time).
+        2. If nothing works, raise ``ValueError``.
+
+        Note: ``workflow_data`` and ``workflow_path`` branches were
+        previously defined in the resolver but never written by any
+        route — they are intentionally removed to keep the contract
+        honest. The only reliable workflow source is the on-disk
+        ``workflow_api.json`` maintained by ``create_profile`` and
+        ``update_profile``.
+        """
+        from comparison import COMPARISON_DIRNAME
+        profiles_root = os.path.join(_COMFYUI_ROOT, "user", "default", "comfy-modal", COMPARISON_DIRNAME)
+        profile_dir = os.path.join(profiles_root, profile_id)
+
+        # Read workflow_api.json (saved at profile creation/update)
+        wf_api_path = os.path.join(profile_dir, "workflow_api.json")
+        if os.path.isfile(wf_api_path):
+            try:
+                with open(wf_api_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        # Nothing worked — raise clear error
+        raise ValueError(
+            f"no workflow found for profile {profile_id!r}: "
+            f"associate a workflow first"
+        )
+
+    def _enrich_checkpoint_from_profile(ck: dict) -> None:
+        """Attach profile metadata (workflow, slots, loader groups, lora slots)
+        to a checkpoint dict so the runner can resolve and inject cell values.
+
+        If the profile cannot be resolved (e.g. missing files in test/dev
+        environments), enrichment is silently skipped so the compiler can
+        still return useful output for normalised-draft compilation.
+        """
+        profile_id = ck.get("profile_id", "")
+        if not profile_id:
+            return
+        try:
+            ck["workflow"] = _resolve_latest_workflow_for_profile(profile_id)
+        except (ValueError, OSError):
+            ck["workflow"] = {}
+        profile = get_profile(_COMFYUI_ROOT, profile_id) or {}
+        ck["slots"] = profile.get("slots", {})
+        ck["loader_target_groups"] = profile.get("loader_target_groups", [])
+        ck["lora_slots"] = profile.get("lora_slots", [])
+
+    @_server.routes.post("/comfymodal/experiments/compile")
+    async def experiment_compile(request: web.Request) -> web.Response:
+        """Compile an experiment spec into a list of checkpoints/cells.
+
+        Accepts either a ``spec`` key (existing compiler-spec format) or a
+        ``normalized_draft`` key (new backend-authoritative format).  When a
+        normalised draft is provided, it is validated and translated to the
+        compiler spec using ``experiment_setup_adapter`` before compilation.
+        """
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "invalid JSON body"}, status=400)
+
+        normalized_draft = payload.get("normalized_draft")
+        if normalized_draft is not None:
+            # New path: normalised draft → validate → compile.
+            if not isinstance(normalized_draft, dict):
+                return web.json_response(
+                    {"status": "error", "message": "normalized_draft must be an object"},
+                    status=400,
+                )
+            validation = _experiment_setup_adapter.validate_normalized_draft(normalized_draft)
+            if not validation.get("valid"):
+                return web.json_response(
+                    {"status": "error", "message": f"draft validation failed: {validation.get('errors', 'unknown')}"},
+                    status=400,
+                )
+            spec = _experiment_setup_adapter.normalized_draft_to_compiler_spec(normalized_draft)
+        else:
+            # Existing path: raw spec.
+            spec = payload.get("spec", {})
+            if not isinstance(spec, dict):
+                return web.json_response({"status": "error", "message": "spec must be an object"}, status=400)
+
+        try:
+            compilation = compile_experiment(spec)
+        except Exception as e:
+            return web.json_response({"status": "error", "message": f"compile failed: {e}"}, status=400)
+        # Tag each checkpoint with its profile metadata.
+        for ck in compilation.get("checkpoints", []):
+            _enrich_checkpoint_from_profile(ck)
+        return web.json_response({"status": "ok", "compilation": compilation})
+
+    @_server.routes.post("/comfymodal/experiments")
+    async def experiment_create(request: web.Request) -> web.Response:
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "invalid JSON body"}, status=400)
+
+        # Accept either a normalised draft (backend-authoritative new path)
+        # or a raw spec (existing path).
+        normalized_draft = payload.get("normalized_draft")
+        if normalized_draft is not None:
+            if not isinstance(normalized_draft, dict):
+                return web.json_response(
+                    {"status": "error", "message": "normalized_draft must be an object"},
+                    status=400,
+                )
+            validation = _experiment_setup_adapter.validate_normalized_draft(normalized_draft)
+            if not validation.get("valid"):
+                return web.json_response(
+                    {"status": "error", "message": f"draft validation failed: {validation.get('errors', 'unknown')}"},
+                    status=400,
+                )
+            spec = _experiment_setup_adapter.normalized_draft_to_compiler_spec(normalized_draft)
+            exp_id = str(normalized_draft.get("experiment_id", ""))
+            if not exp_id:
+                return web.json_response({"status": "error", "message": "normalized_draft.experiment_id required"}, status=400)
+        else:
+            spec = payload.get("spec", {})
+            if not isinstance(spec, dict) or "experiment_id" not in spec:
+                return web.json_response({"status": "error", "message": "spec.experiment_id required"}, status=400)
+            exp_id = str(spec["experiment_id"])
+
+        # Compile to validate spec shape
+        try:
+            compilation = compile_experiment(spec)
+        except Exception as e:
+            return web.json_response({"status": "error", "message": f"compile failed: {e}"}, status=400)
+        # Resolve profile metadata per checkpoint
+        for ck in compilation.get("checkpoints", []):
+            _enrich_checkpoint_from_profile(ck)
+        store = REGISTRY.store(exp_id)
+        now = _utc_now_iso()
+        definition = {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "experiment_id": exp_id,
+            "revision": 1,
+            "name": str(spec.get("name", exp_id)),
+            "notes": str(spec.get("notes", "")),
+            "created_at": now,
+            "updated_at": now,
+        }
+        # Preserve the normalised draft in the definition so it survives
+        # refresh / restart without browser reconstruction.
+        if normalized_draft is not None:
+            definition["normalized_draft"] = normalized_draft
+
+        validate_definition(type("D", (), definition)())  # cheap shape check
+        store.write_definition(definition)
+        event_payload: dict = {
+            "experiment_id": exp_id,
+            "name": definition["name"],
+            "compilation": compilation,
+        }
+        if normalized_draft is not None:
+            event_payload["normalized_draft"] = normalized_draft
+        store.append_event({
+            "type": "experiment.created",
+            "payload": event_payload,
+        })
+        return web.json_response({
+            "status": "ok",
+            "experiment_id": exp_id,
+            "definition": definition,
+            "compilation": compilation,
+        })
+
+    @_server.routes.get("/comfymodal/experiments")
+    async def experiment_list(request: web.Request) -> web.Response:
+        items = []
+        for d in sorted(_experiments_root.iterdir(), reverse=True):
+            if not d.is_dir():
+                continue
+            defn_path = d / "definition.json"
+            if not defn_path.exists():
+                continue
+            try:
+                with open(defn_path, "r", encoding="utf-8") as f:
+                    defn = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            snap_path = d / "snapshot.json"
+            snap = None
+            if snap_path.exists():
+                try:
+                    with open(snap_path, "r", encoding="utf-8") as f:
+                        snap = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    snap = None
+            items.append({
+                "experiment_id": defn.get("experiment_id", d.name),
+                "definition": defn,
+                "snapshot": snap,
+            })
+        return web.json_response({"status": "ok", "experiments": items})
+
+    @_server.routes.get("/comfymodal/experiments/{experiment_id}")
+    async def experiment_detail(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        store = REGISTRY.store(exp_id)
+        defn = store.read_definition()
+        if defn is None:
+            return web.json_response({"status": "error", "message": "unknown experiment"}, status=404)
+        # If we don't have a snapshot, rebuild it.
+        snap = store.read_snapshot() or store.rebuild_snapshot()
+        events = list(store.read_events())
+        return web.json_response({
+            "status": "ok",
+            "definition": defn,
+            "snapshot": snap,
+            "events": events,
+        })
+
+    @_server.routes.get("/comfymodal/experiments/{experiment_id}/events")
+    async def experiment_events(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        after = int(request.query.get("after", "0"))
+        try:
+            store = REGISTRY.store(exp_id)
+        except Exception:
+            return web.json_response({"status": "error", "events": [], "progress": {"cells": {}, "checkpoints": {}}})
+        progress = {}
+        try:
+            progress = REGISTRY.worker_progress(exp_id).snapshot()
+        except Exception:
+            progress = {"cells": {}, "checkpoints": {}}
+        return web.json_response({
+            "status": "ok",
+            "events": store.read_events_after(after),
+            "progress": progress,
+        })
+
+    @_server.routes.post("/comfymodal/experiments/{experiment_id}/start")
+    async def experiment_start(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        try:
+            body = await request.json() if request.body_exists else {}
+        except Exception:
+            body = {}
+        store = REGISTRY.store(exp_id)
+        defn = store.read_definition()
+        if defn is None:
+            return web.json_response({"status": "error", "message": "unknown experiment"}, status=404)
+        spec = body.get("spec", {}) if isinstance(body, dict) else {}
+        max_containers = int((body or {}).get("max_containers", 1))
+
+        # C6: detect stored compilation from clone events when spec is empty
+        compilation = None
+        if not spec:
+            # Look for a stored compilation in the journal
+            for ev in store.read_events():
+                if ev.get("type") == "experiment.cloned":
+                    p = ev.get("payload", {}) or {}
+                    compilation = p.get("compilation", None)
+                    if compilation:
+                        compilation = copy.deepcopy(compilation)
+                        compilation["experiment_id"] = exp_id
+                        break
+                if ev.get("type") == "experiment.created":
+                    p = ev.get("payload", {}) or {}
+                    compilation = p.get("compilation", None)
+                    if compilation:
+                        compilation = copy.deepcopy(compilation)
+                        compilation["experiment_id"] = exp_id
+                        break
+            if compilation is None:
+                # Try loading from scheduler state
+                from experiment_service import experiment_dir as _exp_dir
+                state_file = _exp_dir(exp_id) / ".scheduler_state.json"
+                if state_file.exists():
+                    try:
+                        import json as _json
+                        state = _json.loads(state_file.read_text(encoding="utf-8"))
+                        compilation = state.get("compilation", None)
+                    except Exception:
+                        pass
+            if compilation is None:
+                return web.json_response({"status": "error", "message": "spec required and no stored compilation"}, status=400)
+        else:
+            # Gate the experiment on warmup: if the active deployment is
+            # not warmed, refuse to start scored cells. The client is
+            # expected to call the /comfymodal/deploy-warmup/run route
+            # first.
+            # Use gate_experiment_on_stored_generation — NOT gate_experiment
+            # which regenerates a fresh timestamp and will never match
+            # the generation stored at deploy time.
+            # NOTE: only WarmupRequiredError is caught here. Unexpected
+            # errors (typos, missing imports) propagate to the caller
+            # as a 500 response rather than silently bypassing the gate.
+            try:
+                warmup_state = WarmupState(_warmup_state_path)
+                gate_experiment_on_stored_generation(warmup_state)
+            except WarmupRequiredError as exc:
+                return web.json_response(
+                    {"status": "error", "message": f"warmup required: {exc}"},
+                    status=409,
+                )
+            try:
+                compilation = compile_experiment(spec)
+            except Exception as e:
+                return web.json_response({"status": "error", "message": f"compile failed: {e}"}, status=400)
+            for ck in compilation.get("checkpoints", []):
+                _enrich_checkpoint_from_profile(ck)
+        try:
+            from modal_client import run_checkpoint_stream
+            warmup_state = WarmupState(_warmup_state_path)
+            dep_gen = warmup_state.deployment_generation() or ""
+            invoker = CheckpointStreamInvoker(
+                run_checkpoint_stream,
+                experiment_id=exp_id,
+                stream_event_sink=lambda ev: _on_remote_event(exp_id, ev),
+            )
+        except Exception:
+            invoker = None
+        sched = await REGISTRY.get_or_create_scheduler(
+            exp_id, compilation=compilation, invoker=invoker,
+            max_containers=max_containers,
+        )
+        REGISTRY.save_scheduler_state(exp_id, compilation, max_containers)
+        REGISTRY.start_bridge(exp_id)
+        import asyncio as _asyncio
+        _asyncio.create_task(sched.start())
+        return web.json_response({"status": "ok", "started": True, "experiment_id": exp_id})
+
+    # Phase 7: register the production event handler for recovered schedulers
+    try:
+        from experiment_service import set_remote_event_handler
+        set_remote_event_handler(lambda exp_id, ev: asyncio.create_task(_on_remote_event(exp_id, ev)))
+    except Exception:
+        pass
+
+    def _record_experiment_cell_history(exp_id: str, data: dict, payload: dict, event_type: str) -> None:
+        """Record a cell event into run history with complete resolved metadata.
+
+        B7: Includes deployment_generation, experiment_revision, and output_policy.
+        """
+        try:
+            history_data = {
+                "experiment_id": exp_id,
+                "checkpoint_id": data.get("checkpoint_id", ""),
+                "cell_key": data.get("cell_key", ""),
+                "attempt_id": data.get("attempt_id", ""),
+                "asset_ids": payload.get("asset_ids", []),
+                "primary_asset_id": payload.get("primary_asset_id", ""),
+                "primary_thumbnail_asset_id": payload.get("primary_thumbnail_asset_id", ""),
+                "prompt": data.get("prompt", ""),
+                "negative_prompt": data.get("negative_prompt", ""),
+                "seed": data.get("seed", 0),
+                "steps": data.get("steps", 0),
+                "guidance": data.get("guidance", 0.0),
+                "sampler": data.get("sampler", ""),
+                "scheduler": data.get("scheduler", ""),
+                "denoise": data.get("denoise", 1.0),
+                "width": data.get("width", 0),
+                "height": data.get("height", 0),
+                "unet": data.get("unet", ""),
+                "clip": data.get("clip", ""),
+                "vae": data.get("vae", ""),
+                "lora_chain": data.get("lora_chain", []),
+                "workflow_hash": data.get("workflow_hash", ""),
+                "error": data.get("error", ""),
+                # B7: additional fields
+                "deployment_generation": data.get("deployment_generation", ""),
+                "experiment_revision": data.get("revision", 0),
+                "output_policy": data.get("output_policy", {}),
+            }
+            REGISTRY.history().record_run(
+                kind="experiment_cell",
+                prompt_id=data.get("cell_key", ""),
+                workflow_hash=data.get("workflow_hash", ""),
+                status=event_type.split(".", 1)[1],
+                meta=history_data,
+                log_text=str(data.get("error", "")),
+            )
+        except Exception:
+            pass
+
+    async def _on_remote_event(exp_id: str, ev: dict) -> None:
+        """Forward a single streamed cell event to the journal and to
+        the run-history store.
+
+        This is the SOLE owner of terminal event persistence. The runner
+        does NOT emit cell.completed/failed/interrupted - only this
+        function does, after strict lease validation.
+
+        Also forwards non-terminal progress events to the UI (Phase 9).
+
+        B2: Staged workflow for materialization:
+          1. Validate event identity and lease without consuming terminal ownership
+          2. Write originals to a .tmp/<attempt_id>/ directory
+          3. Write thumbnails in the same tmp
+          4. Compute hashes/asset records
+          5. Begin SQLite transaction
+          6. Register all assets
+          7. Mark attempt terminal accepted
+          8. Persist cell.completed event
+          9. Commit
+          10. Atomically rename tmp to final path
+          11. Record history
+          On any failure after step 6, roll back: delete registered assets,
+          delete tmp files, leave attempt unaccepted, persist cell.failed
+          with category 'output_materialization_failed'.
+        """
+        try:
+            store = REGISTRY.store(exp_id)
+            et = ev.get("type", "")
+            data = ev.get("data", {}) or {}
+
+            # Phase 9: forward non-terminal progress events to the UI
+            if et in {"cell.started", "checkpoint.started", "cell.progress", "sampler.step"}:
+                try:
+                    progress_payload = {
+                        "experiment_id": exp_id,
+                        "checkpoint_id": data.get("checkpoint_id", ""),
+                        "cell_key": data.get("cell_key", ""),
+                        "attempt_id": data.get("attempt_id", ""),
+                        "worker_invocation_id": data.get("worker_invocation_id", ""),
+                        "type": et,
+                        "step": data.get("step"),
+                        "total_steps": data.get("total_steps"),
+                        "pct": data.get("pct"),
+                        "payload": data,
+                    }
+                    _send("", "experiment.worker.progress", progress_payload)
+                    try:
+                        REGISTRY.worker_progress(exp_id).update(
+                            checkpoint_id=data.get("checkpoint_id", ""),
+                            cell_key=data.get("cell_key", ""),
+                            sample=progress_payload,
+                        )
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            # Phase 8: strict lease validation before any terminal persistence
+            if et in {"cell.completed", "cell.failed", "cell.interrupted"}:
+                try:
+                    REGISTRY.leases().validate_and_accept(
+                        exp_id,
+                        checkpoint_id=data.get("checkpoint_id", ""),
+                        lease_generation=int(data.get("lease_generation", 0)),
+                        worker_invocation_id=data.get("worker_invocation_id", ""),
+                        attempt_id=data.get("attempt_id", ""),
+                    )
+                except (LeaseError, Exception) as e:
+                    # Stale/duplicate/unowned event: log and skip persistence
+                    print(f"[comfyui-modal] rejecting event: {e}")
+                    return
+
+            if et in {"cell.completed", "cell.failed", "cell.interrupted"}:
+                payload = {
+                    "checkpoint_id": data.get("checkpoint_id", ""),
+                    "cell_key": data.get("cell_key", ""),
+                    "worker_invocation_id": data.get("worker_invocation_id", ""),
+                    "lease_generation": data.get("lease_generation", 0),
+                    "attempt_id": data.get("attempt_id", ""),
+                    "error": data.get("error", ""),
+                }
+                # Phase 9/10: materialize remote outputs for cell.completed
+                # B2: Staged workflow — do NOT persist cell.completed if
+                # materialization fails.  On failure, persist cell.failed
+                # with category "output_materialization_failed".
+                materialization_ok = True
+                if et == "cell.completed":
+                    result_data = data.get("result", {}) or {}
+                    if result_data:
+                        cell_key = data.get("cell_key", "")
+                        attempt_id = data.get("attempt_id", "")
+                        try:
+                            # B2 step 2+3: write to tmp directory first
+                            output_dir = str(experiment_dir(exp_id) / ".tmp" / attempt_id)
+                            os.makedirs(output_dir, exist_ok=True)
+                            mat = _materialize_experiment_output(
+                                result_data, output_dir, cell_key, attempt_id
+                            )
+                            # B2 step 5+6: begin transaction and register assets
+                            leases = REGISTRY.leases()
+                            for asset_id, info in mat.get("assets", {}).items():
+                                leases.register_asset(
+                                    asset_id=asset_id,
+                                    experiment_id=exp_id,
+                                    cell_key=cell_key,
+                                    attempt_id=attempt_id,
+                                    variant=info.get("variant", "original"),
+                                    path=info["path"],
+                                    mime_type=info.get("mime_type", "image/png"),
+                                    byte_size=info.get("byte_size", 0),
+                                    content_hash=info.get("content_hash", ""),
+                                    parent_asset_id=info.get("parent_asset_id", ""),
+                                    node_id=info.get("node_id", ""),
+                                    output_key=info.get("output_key", ""),
+                                    output_index=info.get("output_index", 0),
+                                    comparison_side=info.get("comparison_side", ""),
+                                    width=info.get("width", 0),
+                                    height=info.get("height", 0),
+                                )
+                            payload["asset_ids"] = list(mat.get("assets", {}).keys())
+                            payload["primary_asset_id"] = mat.get("primary_asset_id", "")
+                            data["asset_ids"] = list(mat.get("assets", {}).keys())
+                            data["primary_asset_id"] = mat.get("primary_asset_id", "")
+                            # B6: completion event carries worker identity and metadata
+                            payload["worker_invocation_id"] = data.get("worker_invocation_id", "")
+                            payload["lease_generation"] = data.get("lease_generation", 0)
+                            payload["original_asset_ids"] = [
+                                aid for aid, info in mat.get("assets", {}).items()
+                                if info.get("variant") == "original"
+                            ]
+                            payload["thumbnail_asset_ids"] = [
+                                aid for aid, info in mat.get("assets", {}).items()
+                                if info.get("variant") == "thumbnail"
+                            ]
+                            payload["output_count"] = mat.get("output_count", 0)
+                            # B6: resolved metadata from stream-enriched data
+                            payload["workflow_hash"] = data.get("workflow_hash", "")
+                            payload["seed"] = data.get("seed", 0)
+                            payload["steps"] = data.get("steps", 0)
+                            payload["guidance"] = data.get("guidance", 0.0)
+                            payload["sampler"] = data.get("sampler", "")
+                            payload["scheduler"] = data.get("scheduler", "")
+                            payload["denoise"] = data.get("denoise", 1.0)
+                            payload["width"] = data.get("width", 0)
+                            payload["height"] = data.get("height", 0)
+                            payload["prompt"] = data.get("prompt", "")
+                            payload["negative_prompt"] = data.get("negative_prompt", "")
+                            payload["unet"] = data.get("unet", "")
+                            payload["clip"] = data.get("clip", "")
+                            payload["vae"] = data.get("vae", "")
+                            payload["lora_chain"] = data.get("lora_chain", [])
+                            payload["deployment_generation"] = data.get("deployment_generation", "")
+                            payload["experiment_revision"] = data.get("revision", 0)
+                            payload["output_policy"] = data.get("output_policy", {})
+                            # B6: no base64 in durable events
+                            data.pop("result", None)
+                            # B2 step 10: rename tmp to final path
+                            final_dir = str(experiment_dir(exp_id) / "outputs" / cell_key / attempt_id)
+                            try:
+                                if os.path.isdir(output_dir):
+                                    os.makedirs(os.path.dirname(final_dir), exist_ok=True)
+                                    os.replace(output_dir, final_dir)
+                            except OSError:
+                                pass  # tmp cleanup is best-effort
+                        except Exception as mat_exc:
+                            print(f"[comfyui-modal] materialization failed for {cell_key}: {mat_exc}")
+                            # B2: on failure, persist cell.failed instead of cell.completed
+                            materialization_ok = False
+                            payload["error"] = f"output_materialization_failed: {mat_exc}"
+                            _record_experiment_cell_history(exp_id, data, payload, "cell.failed")
+                            store.append_event({
+                                "type": "cell.failed",
+                                "payload": payload,
+                            })
+                            return  # exit early — do NOT persist cell.completed
+                if materialization_ok:
+                    store.append_event({
+                        "type": et,
+                        "payload": payload,
+                    })
+                # Auto-record the cell attempt into run history with full metadata.
+                if materialization_ok:
+                    _record_experiment_cell_history(exp_id, data, payload, et)
+            elif et in {"checkpoint.completed", "checkpoint.paused", "checkpoint.stopped"}:
+                store.append_event({
+                    "type": et,
+                    "payload": data,
+                })
+        except Exception:
+            pass
+
+    @_server.routes.post("/comfymodal/experiments/{experiment_id}/pause")
+    async def experiment_pause(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        sched = REGISTRY.get_scheduler(exp_id)
+        if sched is None:
+            sched = await REGISTRY.recover_scheduler(exp_id)
+        if sched is None:
+            return web.json_response({"status": "error", "message": "scheduler not running"}, status=400)
+        await sched.pause()
+        return web.json_response({"status": "ok"})
+
+    @_server.routes.post("/comfymodal/experiments/{experiment_id}/stop-after-current")
+    async def experiment_stop_after_current(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        sched = REGISTRY.get_scheduler(exp_id)
+        if sched is None:
+            sched = await REGISTRY.recover_scheduler(exp_id)
+        if sched is None:
+            return web.json_response({"status": "error", "message": "scheduler not running"}, status=400)
+        await sched.stop_after_current()
+        return web.json_response({"status": "ok"})
+
+    @_server.routes.post("/comfymodal/experiments/{experiment_id}/stop-now")
+    async def experiment_stop_now(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        sched = REGISTRY.get_scheduler(exp_id)
+        if sched is None:
+            sched = await REGISTRY.recover_scheduler(exp_id)
+        if sched is None:
+            return web.json_response({"status": "error", "message": "scheduler not running"}, status=400)
+        await sched.stop_now()
+        return web.json_response({"status": "ok"})
+
+    @_server.routes.post("/comfymodal/experiments/{experiment_id}/resume")
+    async def experiment_resume(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        sched = REGISTRY.get_scheduler(exp_id)
+        if sched is None:
+            sched = await REGISTRY.recover_scheduler(exp_id)
+        if sched is None:
+            return web.json_response({"status": "error", "message": "experiment not running"}, status=400)
+        import asyncio as _asyncio
+        _asyncio.create_task(sched.resume())
+        return web.json_response({"status": "ok", "resumed": True, "current_status": sched.status().get("status", "?")})
+
+    @_server.routes.post("/comfymodal/experiments/{experiment_id}/clone")
+    async def experiment_clone(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        new_id = str((body or {}).get("experiment_id", f"{exp_id}_clone_{int(time.time())}"))
+        store = REGISTRY.store(exp_id)
+        defn = dict(store.read_definition() or {})
+        if not defn:
+            return web.json_response({"status": "error", "message": "unknown experiment"}, status=404)
+
+        # Find compilation from journal
+        events = list(store.read_events())
+        compilation = None
+        for ev in events:
+            if ev.get("type") == "experiment.created":
+                p = ev.get("payload", {}) or {}
+                compilation = p.get("compilation", {})
+                break
+        if compilation:
+            compilation = copy.deepcopy(compilation)
+            compilation["experiment_id"] = new_id
+            compilation["revision"] = 1
+            # Rewrite checkpoint IDs
+            old_to_new_ck: dict = {}
+            for ck in compilation.get("checkpoints", []):
+                old_id = ck.get("id", "")
+                new_ck_id = f"ck_{uuid.uuid4().hex[:8]}"
+                old_to_new_ck[old_id] = new_ck_id
+                ck["id"] = new_ck_id
+            # Rewrite cell keys and checkpoint references
+            for cell in compilation.get("cells", []):
+                old_key = cell.get("cell_key", "")
+                if old_key:
+                    cell["cell_key"] = hashlib.sha256(f"{new_id}:{old_key}".encode()).hexdigest()
+                old_ck = cell.get("checkpoint_id", "")
+                if old_ck in old_to_new_ck:
+                    cell["checkpoint_id"] = old_to_new_ck[old_ck]
+            # Rewrite cells_by_ck checkpoint references
+            cells_by_ck = compilation.get("cells_by_ck", {})
+            if isinstance(cells_by_ck, dict):
+                for ck_id, cell_list in list(cells_by_ck.items()):
+                    if ck_id in old_to_new_ck:
+                        new_ck_id = old_to_new_ck[ck_id]
+                        compilation["cells_by_ck"][new_ck_id] = compilation["cells_by_ck"].pop(ck_id)
+
+        defn["experiment_id"] = new_id
+        defn["revision"] = 1
+        defn["created_at"] = _utc_now_iso()
+        defn["updated_at"] = _utc_now_iso()
+        defn["name"] = (defn.get("name", "") or "") + " (clone)"
+
+        new_store = REGISTRY.store(new_id)
+        new_store.write_definition(defn)
+        new_store.append_event({
+            "type": "experiment.cloned",
+            "payload": {
+                "source_experiment_id": exp_id,
+                "experiment_id": new_id,
+                "compilation": compilation,
+            },
+        })
+        # Enrich checkpoint profiles for the clone so recovered experiments
+        # remain runnable after restart.
+        if compilation:
+            for ck in compilation.get("checkpoints", []):
+                _enrich_checkpoint_from_profile(ck)
+
+        # Persist scheduler state for the clone
+        REGISTRY.save_scheduler_state(
+            new_id, compilation=compilation, status="draft"
+        )
+        return web.json_response({
+            "status": "ok",
+            "experiment_id": new_id,
+            "definition": defn,
+        })
+
+    @_server.routes.post("/comfymodal/experiments/{experiment_id}/run-missing")
+    async def experiment_run_missing(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        sched = REGISTRY.get_scheduler(exp_id)
+        if sched is None:
+            sched = await REGISTRY.recover_scheduler(exp_id)
+        if sched is None:
+            return web.json_response({"status": "error", "message": "scheduler not running"}, status=400)
+        import asyncio as _asyncio
+        _asyncio.create_task(sched.run_missing())
+        return web.json_response({"status": "ok"})
+
+    @_server.routes.post("/comfymodal/experiments/{experiment_id}/checkpoints/{checkpoint_id}/continue")
+    async def experiment_checkpoint_continue(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        ck_id = request.match_info.get("checkpoint_id", "")
+        sched = REGISTRY.get_scheduler(exp_id)
+        if sched is None:
+            sched = await REGISTRY.recover_scheduler(exp_id)
+        if sched is None:
+            return web.json_response({"status": "error", "message": "experiment not running"}, status=400)
+        import asyncio as _asyncio
+        if hasattr(sched, "continue_checkpoint"):
+            _asyncio.create_task(sched.continue_checkpoint(ck_id))
+        else:
+            _asyncio.create_task(sched.continue_here())
+        return web.json_response({"status": "ok", "checkpoint_id": ck_id})
+
+    @_server.routes.post("/comfymodal/experiments/{experiment_id}/checkpoints/{checkpoint_id}/restart")
+    async def experiment_checkpoint_restart(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        ck_id = request.match_info.get("checkpoint_id", "")
+        sched = REGISTRY.get_scheduler(exp_id)
+        if sched is None:
+            sched = await REGISTRY.recover_scheduler(exp_id)
+        if sched is None:
+            return web.json_response({"status": "error", "message": "scheduler not running"}, status=400)
+        import asyncio as _asyncio
+        _asyncio.create_task(sched.restart_block(ck_id))
+        return web.json_response({"status": "ok", "checkpoint_id": ck_id, "restart": "block"})
+
+    @_server.routes.post("/comfymodal/experiments/{experiment_id}/checkpoints/{checkpoint_id}/restart-from")
+    async def experiment_checkpoint_restart_from(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        ck_id = request.match_info.get("checkpoint_id", "")
+        sched = REGISTRY.get_scheduler(exp_id)
+        if sched is None:
+            sched = await REGISTRY.recover_scheduler(exp_id)
+        if sched is None:
+            return web.json_response({"status": "error", "message": "scheduler not running"}, status=400)
+        import asyncio as _asyncio
+        _asyncio.create_task(sched.restart_from(ck_id))
+        return web.json_response({"status": "ok", "checkpoint_id": ck_id, "restart": "from"})
+
+    @_server.routes.post("/comfymodal/experiments/{experiment_id}/checkpoints/{checkpoint_id}/skip")
+    async def experiment_checkpoint_skip(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        ck_id = request.match_info.get("checkpoint_id", "")
+        sched = REGISTRY.get_scheduler(exp_id)
+        if sched is None:
+            sched = await REGISTRY.recover_scheduler(exp_id)
+        if sched is None:
+            return web.json_response({"status": "error", "message": "experiment not running"}, status=400)
+        await sched.skip_block(ck_id)
+        REGISTRY.save_scheduler_state(
+            exp_id,
+            skipped_checkpoints=list(sched._skipped_checkpoints),
+        )
+        return web.json_response({"status": "ok", "checkpoint_id": ck_id, "skipped": True})
+
+    @_server.routes.post("/comfymodal/experiments/{experiment_id}/checkpoints/{checkpoint_id}/unskip")
+    async def experiment_checkpoint_unskip(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        ck_id = request.match_info.get("checkpoint_id", "")
+        sched = REGISTRY.get_scheduler(exp_id)
+        if sched is None:
+            sched = await REGISTRY.recover_scheduler(exp_id)
+        if sched is None:
+            return web.json_response({"status": "error", "message": "experiment not running"}, status=400)
+        await sched.unskip_block(ck_id)
+        REGISTRY.save_scheduler_state(
+            exp_id,
+            skipped_checkpoints=list(sched._skipped_checkpoints),
+        )
+        return web.json_response({"status": "ok", "checkpoint_id": ck_id, "unskipped": True})
+
+    @_server.routes.get("/comfymodal/experiments/{experiment_id}/checkpoints/{checkpoint_id}/logs")
+    async def experiment_checkpoint_logs(request: web.Request) -> web.Response:
+        # Logs are best-effort: we do not have per-container logs at
+        # this stage, so we return the per-experiment journal events
+        # tagged with the checkpoint_id.
+        exp_id = request.match_info.get("experiment_id", "")
+        ck_id = request.match_info.get("checkpoint_id", "")
+        try:
+            store = REGISTRY.store(exp_id)
+        except Exception:
+            return web.json_response({"status": "ok", "logs": []})
+        logs = []
+        for ev in store.read_events():
+            payload = ev.get("payload", {}) or {}
+            if payload.get("checkpoint_id") == ck_id:
+                logs.append(ev)
+        return web.json_response({"status": "ok", "logs": logs, "scope": "best-effort"})
+
+    @_server.routes.get("/comfymodal/experiments/{experiment_id}/cells/{cell_key}")
+    async def experiment_cell_detail(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        cell_key = request.match_info.get("cell_key", "")
+        store = REGISTRY.store(exp_id)
+        attempts = []
+        for ev in store.read_events():
+            payload = ev.get("payload", {}) or {}
+            if payload.get("cell_key") == cell_key:
+                attempts.append(ev)
+        return web.json_response({"status": "ok", "cell_key": cell_key, "attempts": attempts})
+
+    @_server.routes.get("/comfymodal/experiments/{experiment_id}/cells/{cell_key}/attempts")
+    async def experiment_cell_attempts(request: web.Request) -> web.Response:
+        return await experiment_cell_detail(request)
+
+    @_server.routes.post("/comfymodal/experiments/{experiment_id}/cells/{cell_key}/rerun")
+    async def experiment_cell_rerun(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        cell_key = request.match_info.get("cell_key", "")
+        sched = REGISTRY.get_scheduler(exp_id)
+        if sched is None:
+            sched = await REGISTRY.recover_scheduler(exp_id)
+        if sched is None:
+            return web.json_response({"status": "error", "message": "experiment not running"}, status=400)
+        import asyncio as _asyncio
+        _asyncio.create_task(sched.rerun_cell(cell_key))
+        return web.json_response({"status": "ok", "cell_key": cell_key, "rerun": True})
+
+    @_server.routes.post("/comfymodal/experiments/{experiment_id}/rerun-selected")
+    async def experiment_rerun_selected(request: web.Request) -> web.Response:
+        exp_id = request.match_info.get("experiment_id", "")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        cell_keys = (body or {}).get("cell_keys", [])
+        if not cell_keys:
+            return web.json_response({"status": "error", "message": "no cell_keys provided"}, status=400)
+        sched = REGISTRY.get_scheduler(exp_id)
+        if sched is None:
+            sched = await REGISTRY.recover_scheduler(exp_id)
+        if sched is None:
+            return web.json_response({"status": "error", "message": "experiment not running"}, status=400)
+        # Rerun each cell
+        for ck in cell_keys:
+            import asyncio as _asyncio
+            _asyncio.create_task(sched.rerun_cell(ck))
+        return web.json_response({"status": "ok", "cell_keys": cell_keys})
+
+    # ── Prompt presets ────────────────────────────────────────────────
+    @_server.routes.get("/comfymodal/presets/prompts")
+    async def presets_prompts_list(request: web.Request) -> web.Response:
+        return web.json_response({"status": "ok", "presets": list_prompt_presets(root=_NODE_DIR)})
+
+    @_server.routes.post("/comfymodal/presets/prompts")
+    async def presets_prompts_create(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "invalid JSON"}, status=400)
+        name = body.get("name", "")
+        if not name:
+            return web.json_response({"status": "error", "message": "name required"}, status=400)
+        shared_negative = body.get("shared_negative", "")
+        items = body.get("items", [])
+        preset = create_prompt_preset(root=_NODE_DIR, name=name, shared_negative=shared_negative, items=items)
+        return web.json_response({"status": "ok", "preset": preset})
+
+    @_server.routes.get("/comfymodal/presets/prompts/{preset_id}")
+    async def presets_prompts_get(request: web.Request) -> web.Response:
+        preset_id = request.match_info.get("preset_id", "")
+        preset = get_prompt_preset(root=_NODE_DIR, preset_id=preset_id)
+        if preset is None:
+            return web.json_response({"status": "error", "message": "not found"}, status=404)
+        return web.json_response({"status": "ok", "preset": preset})
+
+    @_server.routes.put("/comfymodal/presets/prompts/{preset_id}")
+    async def presets_prompts_update(request: web.Request) -> web.Response:
+        preset_id = request.match_info.get("preset_id", "")
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "invalid JSON"}, status=400)
+        new_name = body.get("name", "")
+        if new_name:
+            preset = rename_prompt_preset(root=_NODE_DIR, preset_id=preset_id, new_name=new_name)
+        else:
+            preset = get_prompt_preset(root=_NODE_DIR, preset_id=preset_id)
+        if preset is None:
+            return web.json_response({"status": "error", "message": "not found"}, status=404)
+        return web.json_response({"status": "ok", "preset": preset})
+
+    @_server.routes.delete("/comfymodal/presets/prompts/{preset_id}")
+    async def presets_prompts_delete(request: web.Request) -> web.Response:
+        preset_id = request.match_info.get("preset_id", "")
+        delete_prompt_preset(root=_NODE_DIR, preset_id=preset_id)
+        return web.json_response({"status": "ok", "deleted": preset_id})
+
+    @_server.routes.post("/comfymodal/presets/prompts/{preset_id}/duplicate")
+    async def presets_prompts_duplicate(request: web.Request) -> web.Response:
+        preset_id = request.match_info.get("preset_id", "")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        new_name = (body or {}).get("name", f"Copy of {preset_id}")
+        preset = duplicate_prompt_preset(root=_NODE_DIR, preset_id=preset_id, new_name=new_name)
+        if preset is None:
+            return web.json_response({"status": "error", "message": "not found"}, status=404)
+        return web.json_response({"status": "ok", "preset": preset})
+
+    @_server.routes.post("/comfymodal/presets/prompts/import")
+    async def presets_prompts_import(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "invalid JSON"}, status=400)
+        text = body.get("text", "")
+        shared_negative = body.get("shared_negative", "")
+        items = import_prompts_from_text(text, shared_negative=shared_negative)
+        return web.json_response({"status": "ok", "imported": items})
+
+    # ── Image presets ─────────────────────────────────────────────────
+    @_server.routes.get("/comfymodal/presets/images")
+    async def presets_images_list(request: web.Request) -> web.Response:
+        return web.json_response({"status": "ok", "presets": list_image_presets(root=_NODE_DIR)})
+
+    @_server.routes.post("/comfymodal/presets/images")
+    async def presets_images_create(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "invalid JSON"}, status=400)
+        name = body.get("name", "")
+        if not name:
+            return web.json_response({"status": "error", "message": "name required"}, status=400)
+        items = body.get("items", [])
+        preset = create_image_preset(root=_NODE_DIR, name=name, items=items)
+        return web.json_response({"status": "ok", "preset": preset})
+
+    @_server.routes.get("/comfymodal/presets/images/{preset_id}")
+    async def presets_images_get(request: web.Request) -> web.Response:
+        preset_id = request.match_info.get("preset_id", "")
+        preset = get_image_preset(root=_NODE_DIR, preset_id=preset_id)
+        if preset is None:
+            return web.json_response({"status": "error", "message": "not found"}, status=404)
+        return web.json_response({"status": "ok", "preset": preset})
+
+    @_server.routes.put("/comfymodal/presets/images/{preset_id}")
+    async def presets_images_update(request: web.Request) -> web.Response:
+        preset_id = request.match_info.get("preset_id", "")
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "invalid JSON"}, status=400)
+        new_name = body.get("name", "")
+        if new_name:
+            preset = rename_image_preset(root=_NODE_DIR, preset_id=preset_id, new_name=new_name)
+        else:
+            preset = get_image_preset(root=_NODE_DIR, preset_id=preset_id)
+        if preset is None:
+            return web.json_response({"status": "error", "message": "not found"}, status=404)
+        return web.json_response({"status": "ok", "preset": preset})
+
+    @_server.routes.delete("/comfymodal/presets/images/{preset_id}")
+    async def presets_images_delete(request: web.Request) -> web.Response:
+        preset_id = request.match_info.get("preset_id", "")
+        delete_image_preset(root=_NODE_DIR, preset_id=preset_id)
+        return web.json_response({"status": "ok", "deleted": preset_id})
+
+    # ── Asset serving (path-traversal-safe) ───────────────────────────
+    _ALLOWED_ASSET_MIME = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".bmp": "image/bmp",
+    }
+
+    @_server.routes.get("/comfymodal/assets/{asset_id}")
+    async def asset_serve(request: web.Request) -> web.Response:
+        asset_id = request.match_info.get("asset_id", "")
+        if not asset_id:
+            return web.json_response({"status": "error", "message": "invalid asset id"}, status=400)
+        # Phase 10: resolve via exact asset registry (LeaseRegistry's assets table)
+        record = REGISTRY.leases().resolve_asset(asset_id)
+        if record is None:
+            return web.json_response({"status": "error", "message": "asset not found"}, status=404)
+        # Path traversal check: the path must be under the node directory
+        node_dir = Path(_NODE_DIR).resolve()
+        asset_path = Path(record["path"])
+        try:
+            asset_path.relative_to(node_dir)
+        except ValueError:
+            return web.json_response({"status": "error", "message": "asset path invalid"}, status=400)
+        if not asset_path.exists():
+            return web.json_response({"status": "error", "message": "asset file missing"}, status=404)
+        try:
+            data = asset_path.read_bytes()
+        except OSError:
+            return web.json_response({"status": "error", "message": "asset unreadable"}, status=500)
+        return web.Response(body=data, content_type=record["mime_type"])
+
+    # ── Run history ───────────────────────────────────────────────────
+    @_server.routes.get("/comfymodal/run-history")
+    async def run_history_list(request: web.Request) -> web.Response:
+        kind = request.query.get("kind", None)
+        limit = int(request.query.get("limit", "200"))
+        items = REGISTRY.history().list_runs(kind=kind, limit=limit)
+        return web.json_response({"status": "ok", "runs": items})
+
+    @_server.routes.get("/comfymodal/run-history/{run_id}")
+    async def run_history_detail(request: web.Request) -> web.Response:
+        run_id = request.match_info.get("run_id", "")
+        meta = REGISTRY.history().get_run(run_id)
+        if meta is None:
+            return web.json_response({"status": "error", "message": "not found"}, status=404)
+        return web.json_response({"status": "ok", "run": meta})
+
+    @_server.routes.get("/comfymodal/run-history/{run_id}/logs")
+    async def run_history_logs(request: web.Request) -> web.Response:
+        run_id = request.match_info.get("run_id", "")
+        logs = REGISTRY.history().get_log(run_id)
+        return web.json_response({
+            "status": "ok",
+            "logs_redacted": redact_log(logs),
+        })
+
+    @_server.routes.get("/comfymodal/run-history/{run_id}/timing")
+    async def run_history_timing(request: web.Request) -> web.Response:
+        run_id = request.match_info.get("run_id", "")
+        timing = REGISTRY.history().get_timing(run_id)
+        return web.json_response({
+            "status": "ok",
+            "timing": timing,
+            "text": format_timing(timing),
+        })
+
+    # ── Warmup ────────────────────────────────────────────────────────
+    @_server.routes.get("/comfymodal/deploy-warmup/status")
+    async def warmup_status(request: web.Request) -> web.Response:
+        state = WarmupState(_warmup_state_path)
+        return web.json_response({
+            "status": "ok",
+            "state": state.snapshot(),
+        })
+
+    @_server.routes.post("/comfymodal/deploy-warmup/run")
+    async def warmup_run(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        state = WarmupState(_warmup_state_path)
+        version = (body or {}).get("version") or "manual"
+        fingerprint = (body or {}).get("fingerprint") or "manual"
+        # Resolve the warmup workflow.  If the body does not supply one,
+        # try the latest saved benchmark workflow as a reasonable default.
+        warmup_workflow = (body or {}).get("workflow", {})
+        if not warmup_workflow:
+            try:
+                wf = _load_latest_benchmark_workflow().get("payload", {}).get("prompt", {})
+                if wf:
+                    warmup_workflow = wf
+            except Exception:
+                pass
+        if not warmup_workflow:
+            return web.json_response(
+                {
+                    "status": "error",
+                    "message": (
+                        "No workflow supplied and no known-safe default available. "
+                        "Submit a workflow or save one first."
+                    ),
+                },
+                status=400,
+            )
+        # Run the warmup workflow remotely and inspect the stream outcome.
+        had_result = False
+        try:
+            from modal_client import run_prompt_stream
+            async for ev in run_prompt_stream(
+                warmup_workflow,
+                input_images=None,
+                modal_options={"comfymodal_warmup": True, "discard": True},
+            ):
+                if ev.get("type") == "result":
+                    had_result = True
+                    break
+                if ev.get("type") == "error":
+                    state = WarmupState(_warmup_state_path)
+                    state.mark_warmup_failed(
+                        state.deployment_generation() or f"manual_{int(time.time())}",
+                        ev.get("message", "warmup error"),
+                    )
+                    return web.json_response({
+                        "status": "error",
+                        "message": f"warmup workflow execution failed: {ev.get('message', 'unknown')}",
+                        "state": state.snapshot(),
+                    }, status=500)
+        except Exception as exc:
+            state = WarmupState(_warmup_state_path)
+            state.mark_warmup_failed(
+                state.deployment_generation() or f"manual_{int(time.time())}",
+                str(exc),
+            )
+            return web.json_response({
+                "status": "error",
+                "message": f"warmup exception: {exc}",
+                "state": state.snapshot(),
+            }, status=500)
+        if not had_result:
+            return web.json_response({
+                "status": "error",
+                "message": "warmup stream ended without result",
+                "state": state.snapshot(),
+            }, status=500)
+        # Stream completed with a result — mark warmed.
+        gen = state.deployment_generation() or deployment_generation(
+            version, fingerprint, time.time()
+        )
+        warmup_run_id = f"warm_{uuid.uuid4().hex[:8]}"
+        state.mark_warmed(gen, warmup_run_id=warmup_run_id)
+        # Clear auto-warmup pending flag if set
+        if state._data.get("auto_warmup_pending"):
+            state._data["auto_warmup_pending"] = False
+            state._flush()
+        return web.json_response({"status": "ok", "state": state.snapshot()})
+
+    @_server.routes.post("/comfymodal/deploy-warmup/invalidate")
+    async def warmup_invalidate(request: web.Request) -> web.Response:
+        state = WarmupState(_warmup_state_path)
+        state.invalidate()
+        return web.json_response({"status": "ok", "state": state.snapshot()})
+
+    print("[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*")

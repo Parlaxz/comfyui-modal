@@ -57,6 +57,10 @@ def _make_modal_stub():
     stub.Secret = MagicMock()
     stub.Secret.from_name.return_value = MagicMock()
 
+    # Dict — used for shared control dict at module level
+    stub.Dict = MagicMock()
+    stub.Dict.from_name.return_value = MagicMock()
+
     # Decorators used on methods / classes
     stub.web_server = lambda *a, **kw: (lambda f: f)
     stub.enter = lambda **kw: (lambda f: f)

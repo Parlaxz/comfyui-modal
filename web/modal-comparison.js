@@ -499,7 +499,11 @@ async function refreshProfileList() {
       listEl.appendChild(card);
     }
   } catch (e) {
-    listEl.innerHTML = '<div style="color: #e05050; font-size: 12px;">Error loading profiles: ' + e.message + "</div>";
+    listEl.textContent = "";
+    const errDiv = document.createElement("div");
+    errDiv.style.cssText = "color: #e05050; font-size: 12px;";
+    errDiv.textContent = "Error loading profiles: " + e.message;
+    listEl.appendChild(errDiv);
   }
 }
 
@@ -724,7 +728,11 @@ async function openMappingAssistant(profileId, panelEl, sectionEl) {
     panelEl.appendChild(closeMappingBtn);
 
   } catch (e) {
-    panelEl.innerHTML = '<div style="color: #e05050; font-size: 12px;">Error: ' + e.message + "</div>";
+    panelEl.textContent = "";
+    const errDiv = document.createElement("div");
+    errDiv.style.cssText = "color: #e05050; font-size: 12px;";
+    errDiv.textContent = "Error: " + e.message;
+    panelEl.appendChild(errDiv);
   }
 }
 
@@ -1107,7 +1115,11 @@ function buildRunnerTab() {
         profileCheckboxList.appendChild(card);
       }
     } catch (e) {
-      profileCheckboxList.innerHTML = '<div style="color: #e05050; font-size: 12px;">Error: ' + e.message + "</div>";
+      profileCheckboxList.textContent = "";
+      const errDiv = document.createElement("div");
+      errDiv.style.cssText = "color: #e05050; font-size: 12px;";
+      errDiv.textContent = "Error: " + e.message;
+      profileCheckboxList.appendChild(errDiv);
     }
   }
 
@@ -1242,9 +1254,13 @@ function buildGallery(container, comparisonData) {
   // Summary
   const summary = document.createElement("div");
   summary.style.cssText = "font-size: 11px; color: #888; line-height: 1.5; background: #1e1e2e; border-radius: 6px; padding: 8px;";
-  summary.innerHTML = "Seed: " + comparisonData.seed + " | Resolution: " + (comparisonData.width || "?") + "\u00D7" + (comparisonData.height || "?");
+  summary.textContent = "Seed: " + comparisonData.seed + " | Resolution: " + (comparisonData.width || "?") + "\u00D7" + (comparisonData.height || "?");
   if (comparisonData.comparison_id) {
-    summary.innerHTML += '<br><span style="font-size: 10px; color: #666;">ID: ' + comparisonData.comparison_id + "</span>";
+    summary.appendChild(document.createElement("br"));
+    const idSpan = document.createElement("span");
+    idSpan.style.cssText = "font-size: 10px; color: #666;";
+    idSpan.textContent = "ID: " + comparisonData.comparison_id;
+    summary.appendChild(idSpan);
   }
   scrollContent.appendChild(summary);
 
@@ -1346,7 +1362,16 @@ function buildGallery(container, comparisonData) {
     for (const err of errors) {
       const errCard = document.createElement("div");
       errCard.style.cssText = "background: #2a1a1a; border: 1px solid #3d1010; border-radius: 4px; padding: 6px; font-size: 11px;";
-      errCard.innerHTML = '<strong style="color: #e05050;">' + (err.profile_name || err.profile_id || "Unknown") + ':</strong> <span style="color: #aaa;">' + (err.error || "Unknown error") + "</span>";
+      errCard.textContent = "";
+      const nameStrong = document.createElement("strong");
+      nameStrong.style.color = "#e05050";
+      nameStrong.textContent = (err.profile_name || err.profile_id || "Unknown") + ": ";
+      errCard.appendChild(nameStrong);
+      errCard.appendChild(document.createTextNode(" "));
+      const errMsgSpan = document.createElement("span");
+      errMsgSpan.style.color = "#aaa";
+      errMsgSpan.textContent = err.error || "Unknown error";
+      errCard.appendChild(errMsgSpan);
       scrollContent.appendChild(errCard);
     }
   }
@@ -1395,12 +1420,16 @@ async function _resolveProfileNode(profileId, classType, title) {
   }
 }
 
+let _originalGetNodeMenuOptions = null;
+
 function _initContextMenu() {
   if (!app?.canvas?.getNodeMenuOptions) return;
+  // Guard: do not double-wrap
+  if (_originalGetNodeMenuOptions) return;
 
-  var orig = app.canvas.getNodeMenuOptions.bind(app.canvas);
+  _originalGetNodeMenuOptions = app.canvas.getNodeMenuOptions.bind(app.canvas);
   app.canvas.getNodeMenuOptions = function (node) {
-    var options = orig(node);
+    var options = _originalGetNodeMenuOptions(node);
 
     var slotLabels = {
       prompt: "Prompt",
@@ -1529,13 +1558,108 @@ function _initContextMenu() {
   };
 }
 
+// ─── Reusable mount helpers for unified UI integration ─────────────────────
+
+/**
+ * Mount the Comparison Profiles tab into the given container element.
+ * Used by testing-dashboard.js quick actions.
+ */
+window.mountComparisonProfiles = function mountComparisonProfiles(containerEl) {
+  if (!containerEl) throw new Error("mountComparisonProfiles: containerEl required");
+  containerEl.innerHTML = "";
+  containerEl.appendChild(buildProfilesTab());
+  return containerEl;
+};
+
+/**
+ * Mount the Comparison Runner tab into the given container element.
+ * Used by testing-dashboard.js quick actions.
+ */
+window.mountComparisonRunner = function mountComparisonRunner(containerEl) {
+  if (!containerEl) throw new Error("mountComparisonRunner: containerEl required");
+  containerEl.innerHTML = "";
+  containerEl.appendChild(buildRunnerTab());
+  return containerEl;
+};
+
+// ─── Open overlay-based comparison helpers ─────────────────────────────────
+
+function _openOverlayPanel(title, builderFn) {
+  const existing = document.getElementById("comfymodal-comparison-overlay");
+  if (existing) {
+    existing.style.display = "flex";
+    return;
+  }
+  const overlay = document.createElement("div");
+  overlay.id = "comfymodal-comparison-overlay";
+  overlay.style.cssText = `
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0,0,0,0.7); z-index: 99998;
+    display: flex; align-items: center; justify-content: center;
+  `;
+  const modal = document.createElement("div");
+  modal.style.cssText = `
+    background: #1e1e2e; border: 1px solid #444; border-radius: 8px;
+    width: 90%; max-width: 700px; max-height: 85vh;
+    display: flex; flex-direction: column; overflow: hidden;
+  `;
+  const header = document.createElement("div");
+  header.style.cssText = `
+    display: flex; align-items: center; padding: 12px 16px;
+    border-bottom: 1px solid #333; flex-shrink: 0;
+  `;
+  const titleEl = document.createElement("span");
+  titleEl.style.cssText = "font-weight: 600; font-size: 14px; color: #ddd; flex: 1;";
+  titleEl.textContent = title;
+  const closeBtn = document.createElement("button");
+  closeBtn.textContent = "\u2715";
+  closeBtn.style.cssText = `
+    background: transparent; border: 1px solid #555; color: #aaa;
+    width: 28px; height: 28px; border-radius: 4px; cursor: pointer;
+    font-size: 14px; display: flex; align-items: center; justify-content: center;
+  `;
+  header.appendChild(titleEl);
+  header.appendChild(closeBtn);
+  const body = document.createElement("div");
+  body.style.cssText = "flex: 1; overflow-y: auto; min-height: 0;";
+  modal.appendChild(header);
+  modal.appendChild(body);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  // Mount content
+  builderFn(body);
+
+  function closeOverlay() {
+    overlay.style.display = "none";
+    document.removeEventListener("keydown", escHandler);
+  }
+  const escHandler = (e) => { if (e.key === "Escape") closeOverlay(); };
+  document.addEventListener("keydown", escHandler);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeOverlay(); });
+  closeBtn.onclick = closeOverlay;
+}
+
+window.openComparisonProfilesOverlay = function openComparisonProfilesOverlay() {
+  _openOverlayPanel("Comparison Profiles", (body) => {
+    window.mountComparisonProfiles(body);
+  });
+};
+
+window.openComparisonRunnerOverlay = function openComparisonRunnerOverlay() {
+  _openOverlayPanel("Comparison Runner", (body) => {
+    window.mountComparisonRunner(body);
+  });
+};
+
 app.registerExtension({
   name: "comfyui.modal.comparison",
 
   async setup() {
     _initContextMenu();
 
-    if (app?.extensionManager?.registerSidebarTab) {
+    // Skip legacy sidebar tabs when unified Modal GPU tab is active.
+    if (!window.__comfyModalUnifiedUI && app?.extensionManager?.registerSidebarTab) {
       // Profiles Tab
       app.extensionManager.registerSidebarTab({
         id: "modal-comparison-profiles",
@@ -1550,7 +1674,11 @@ app.registerExtension({
             el.appendChild(buildProfilesTab());
           } catch (e) {
             console.error("[comfyui-modal] Comparison Profiles tab render error:", e);
-            el.innerHTML = '<div style="color:#e05050;padding:20px;font-size:13px;">Error loading Comparison Profiles: ' + e.message + '</div>';
+            el.textContent = "";
+            const errDiv = document.createElement("div");
+            errDiv.style.cssText = "color:#e05050;padding:20px;font-size:13px;";
+            errDiv.textContent = "Error loading Comparison Profiles: " + e.message;
+            el.appendChild(errDiv);
           }
         },
       });
@@ -1569,7 +1697,11 @@ app.registerExtension({
             el.appendChild(buildRunnerTab());
           } catch (e) {
             console.error("[comfyui-modal] Comparison Runner tab render error:", e);
-            el.innerHTML = '<div style="color:#e05050;padding:20px;font-size:13px;">Error loading Comparison Runner: ' + e.message + '</div>';
+            el.textContent = "";
+            const errDiv = document.createElement("div");
+            errDiv.style.cssText = "color:#e05050;padding:20px;font-size:13px;";
+            errDiv.textContent = "Error loading Comparison Runner: " + e.message;
+            el.appendChild(errDiv);
           }
         },
       });

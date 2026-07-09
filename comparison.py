@@ -26,7 +26,26 @@ SLOT_KEYS = (
     "width",
     "height",
     "input_image",
+    "sampler",
+    "scheduler",
+    "denoise",
+    "unet_loader",
+    "clip_loader",
+    "vae_loader",
+    "lora_loader",
+    "lora_strength_model",
+    "lora_strength_clip",
 )
+
+PROFILE_SCHEMA_VERSION = 2
+
+
+class SubprofileError(ValueError):
+    """Raised when a subprofile id is duplicated or otherwise invalid."""
+
+
+class LoRASlotError(ValueError):
+    """Raised when a LoRA selection is structurally invalid."""
 
 # Node-class → slot heuristics
 _CLASS_HEURISTICS: dict[str, list[tuple[str, str]]] = {
@@ -45,6 +64,32 @@ _CLASS_HEURISTICS: dict[str, list[tuple[str, str]]] = {
     "EmptyLatentImage":      [("width", "width"), ("height", "height")],
     "EmptySD3LatentImage":   [("width", "width"), ("height", "height")],
     "LoadImage":             [("input_image", "image")],
+    # New: sampler/scheduler/denoise axes
+    "KSampler": [
+        ("seed", "seed"), ("steps", "steps"), ("guidance", "cfg"),
+        ("sampler", "sampler"), ("scheduler", "scheduler"), ("denoise", "denoise"),
+    ],
+    "KSamplerAdvanced": [
+        ("seed", "noise_seed"), ("sampler", "sampler"),
+        ("scheduler", "scheduler"), ("denoise", "denoise"),
+    ],
+    "FluxGuidance": [("guidance", "guidance"), ("denoise", "denoise")],
+    # New: loader categories (each can have multiple instances in a workflow)
+    "UNETLoader": [("unet_loader", "unet_name")],
+    "CLIPLoader": [("clip_loader", "clip_name")],
+    "DualCLIPLoader": [("clip_loader", "clip_name1")],
+    "TripleCLIPLoader": [("clip_loader", "clip_name1")],
+    "VAELoader": [("vae_loader", "vae_name")],
+    # New: LoRA slot chain
+    "LoraLoader": [
+        ("lora_loader", "lora_name"),
+        ("lora_strength_model", "strength_model"),
+        ("lora_strength_clip", "strength_clip"),
+    ],
+    "LoraLoaderModelOnly": [
+        ("lora_loader", "lora_name"),
+        ("lora_strength_model", "strength_model"),
+    ],
 }
 
 # Title tag patterns  e.g.  @prompt  @seed  @width  @height  @input_image
@@ -489,13 +534,23 @@ def create_profile(
     profile = {
         "id": profile_id,
         "name": name,
+        "schema_version": PROFILE_SCHEMA_VERSION,
         "workflow_hash": workflow_hash,
         "model_stack": model_stack,
         "slots": adapter.get("slots", {}),
+        "loader_target_groups": [],
+        "lora_slots": [],
+        "subprofiles": [],
         "capabilities": capabilities,
         "created_at": now,
         "updated_at": now,
     }
+
+    # Auto-detect loader target groups from workflow (Phase 2)
+    detected_loaders = _detect_slots_from_class(workflow_api)
+    default_groups = build_loader_target_groups_from_existing(detected_loaders)
+    if default_groups:
+        profile["loader_target_groups"] = default_groups
 
     # Write files
     _write_json(_profile_path(profiles_root, profile_id), profile)
@@ -532,12 +587,45 @@ def update_profile(
         _write_slots(profiles_root, profile_id, slots)
         profile["slots"] = slots
 
-    # Re-read workflow API JSON to recalc capabilities and model stack
-    workflow_api = _load_workflow_api(profiles_root, profile_id)
-    if workflow_api:
-        profile["workflow_hash"] = _workflow_sha256(workflow_api)
-        profile["model_stack"] = _extract_model_stack(workflow_api)
-        profile["capabilities"] = _infer_capabilities({"slots": profile.get("slots", {})}, workflow_api)
+    # Update loader target groups (Phase 2)
+    if "loader_target_groups" in updates:
+        _groups = updates["loader_target_groups"]
+        if not isinstance(_groups, list):
+            raise ValueError("loader_target_groups must be a list")
+        profile["loader_target_groups"] = _groups
+
+    # Update LoRA slots (Phase 2)
+    if "lora_slots" in updates:
+        _lora_slots = updates["lora_slots"]
+        if not isinstance(_lora_slots, list):
+            raise ValueError("lora_slots must be a list")
+        profile["lora_slots"] = _lora_slots
+
+    # Update subprofiles (Phase 2)
+    if "subprofiles" in updates:
+        _subs = updates["subprofiles"]
+        if not isinstance(_subs, list):
+            raise ValueError("subprofiles must be a list")
+        profile["subprofiles"] = _subs
+
+    # Update workflow files if provided
+    if "workflow_api" in updates:
+        if not isinstance(updates["workflow_api"], dict):
+            raise ValueError("workflow_api must be a dict")
+        _write_json(_workflow_api_path(profiles_root, profile_id), updates["workflow_api"])
+        _workflow_api = updates["workflow_api"]
+    else:
+        _workflow_api = _load_workflow_api(profiles_root, profile_id)
+    if "workflow" in updates:
+        if not isinstance(updates["workflow"], dict):
+            raise ValueError("workflow must be a dict")
+        _write_json(_workflow_ui_path(profiles_root, profile_id), updates["workflow"])
+
+    # Recalc metadata from workflow_api (fresh copy if provided, otherwise re-read from disk)
+    if _workflow_api:
+        profile["workflow_hash"] = _workflow_sha256(_workflow_api)
+        profile["model_stack"] = _extract_model_stack(_workflow_api)
+        profile["capabilities"] = _infer_capabilities({"slots": profile.get("slots", {})}, _workflow_api)
 
     _write_json(_profile_path(profiles_root, profile_id), profile)
     return profile
@@ -577,8 +665,31 @@ def duplicate_profile(comfyui_root: str, profile_id: str, new_name: str) -> dict
     return create_profile(comfyui_root, new_name, workflow_api, workflow=workflow_ui, adapter=adapter)
 
 
+def _attach_normalized_view(profile: dict) -> dict:
+    """Attach an in-memory normalised runtime view to a profile dict.
+
+    Uses ``experiment_setup_adapter.build_normalized_runtime_profile``
+    to produce a lightweight view with ``profile_type``, capabilities,
+    synthesised stacks, and LoRA config — without any disk I/O.
+    The original profile dict is returned (modified in place).
+    """
+    try:
+        from experiment_setup_adapter import build_normalized_runtime_profile
+        profile["normalized"] = build_normalized_runtime_profile(profile)
+    except Exception:
+        profile["normalized"] = {
+            "runtime_profile_type": "legacy_default",
+            "capabilities": _infer_capabilities({}, {}),
+            "synthesized_stacks": [],
+            "lora_config": {"entries": [], "slot_count": 0},
+            "dimensions": None,
+        }
+    return profile
+
+
 def list_profiles(comfyui_root: str) -> list[dict]:
-    """List all comparison profiles with their validation status."""
+    """List all comparison profiles with their validation status and
+    a normalised runtime view."""
     profiles_root = _profiles_root(comfyui_root)
     results = []
     if not os.path.isdir(profiles_root):
@@ -590,19 +701,23 @@ def list_profiles(comfyui_root: str) -> list[dict]:
         profile = _load_profile(profiles_root, entry)
         if profile is None:
             continue
+        profile = migrate_profile_to_v2(profile)
         validation = validate_profile(comfyui_root, entry)
         profile["validation"] = validation
+        _attach_normalized_view(profile)
         results.append(profile)
     return results
 
 
 def get_profile(comfyui_root: str, profile_id: str) -> dict | None:
-    """Get a single profile with validation."""
+    """Get a single profile with validation and a normalised runtime view."""
     profiles_root = _profiles_root(comfyui_root)
     profile = _load_profile(profiles_root, profile_id)
     if profile is None:
         return None
+    profile = migrate_profile_to_v2(profile)
     profile["validation"] = validate_profile(comfyui_root, profile_id)
+    _attach_normalized_view(profile)
     return profile
 
 
@@ -788,7 +903,11 @@ def _inject_into_workflow(
     for slot_key, shared_value in shared_inputs.items():
         if slot_key in skip:
             continue
-        if shared_value is None or (isinstance(shared_value, str) and not shared_value.strip()):
+        if shared_value is None:
+            continue
+        # Empty string is meaningful for negative_prompt (clears workflow field).
+        # Skip whitespace-only strings for all other slots.
+        if isinstance(shared_value, str) and not shared_value.strip() and slot_key != "negative_prompt":
             continue
         slot = slots.get(slot_key)
         if not slot or not isinstance(slot, dict):
@@ -854,7 +973,7 @@ def run_comparison(
         shared_inputs["steps"] = steps
     if guidance is not None:
         shared_inputs["guidance"] = guidance
-    if negative_prompt:
+    if negative_prompt is not None:
         shared_inputs["negative_prompt"] = negative_prompt
     if input_image:
         shared_inputs["input_image"] = input_image
@@ -1124,6 +1243,16 @@ def get_workflow_nodes(comfyui_root: str, profile_id: str) -> dict | None:
     return nodes
 
 
+def get_profile_workflow(comfyui_root: str, profile_id: str) -> dict | None:
+    """Return saved workflow payload for a profile."""
+    profiles_root = _profiles_root(comfyui_root)
+    workflow_api = _load_workflow_api(profiles_root, profile_id)
+    if workflow_api is None:
+        return None
+    workflow = _load_workflow_ui(profiles_root, profile_id)
+    return {"workflow_api": workflow_api, "workflow": workflow}
+
+
 def _load_adapter(profiles_root: str, profile_id: str) -> dict | None:
     path = _adapter_path(profiles_root, profile_id)
     if not os.path.isfile(path):
@@ -1179,3 +1308,175 @@ def save_comparison_config(comfyui_root: str, config: dict) -> dict:
     merged.update(config)
     _write_json(path, merged)
     return merged
+
+
+# ── Phase 2: extended mappings ───────────────────────────────────────────
+
+# Mapping summary keys (the profile-card UI consumes this)
+MAPPING_SUMMARY_KEYS = (
+    "prompt", "negative_prompt", "seed", "steps", "guidance",
+    "width", "height", "input_image",
+    "sampler", "scheduler", "denoise",
+    "loader_target_groups", "lora_slots",
+)
+
+
+def compute_mapping_summary(profile: dict) -> dict:
+    """Return a {key: bool} summary of what is mapped on a profile.
+
+    The bool is True iff there is meaningful content for that category.
+    For loader_target_groups and lora_slots, "meaningful" means non-empty.
+    """
+    slots = profile.get("slots", {}) or {}
+    groups = profile.get("loader_target_groups", []) or []
+    lora_slots = profile.get("lora_slots", []) or []
+    out = {}
+    for key in MAPPING_SUMMARY_KEYS:
+        if key == "loader_target_groups":
+            out[key] = bool(groups)
+        elif key == "lora_slots":
+            out[key] = bool(lora_slots)
+        else:
+            slot = slots.get(key) or {}
+            out[key] = bool(slot.get("node_id") or slot.get("field"))
+    return out
+
+
+def build_loader_target_groups_from_existing(slots: dict) -> list:
+    """Construct a single default group from existing per-category slot maps.
+
+    Older profiles store loader mappings as flat ``unet_loader`` / ``clip_loader``
+    / ``vae_loader`` slot lists. This helper promotes them into a single
+    ``g_default`` group so the new loader-target-group code path can consume
+    them without requiring the user to re-map.
+    """
+    def _norm(items):
+        if items is None:
+            return []
+        if isinstance(items, dict):
+            return [items] if items.get("node_id") else []
+        if isinstance(items, list):
+            return [i for i in items if isinstance(i, dict) and i.get("node_id")]
+        return []
+
+    unet = _norm(slots.get("unet_loader"))
+    clip = _norm(slots.get("clip_loader"))
+    vae = _norm(slots.get("vae_loader"))
+    if not unet and not clip and not vae:
+        return []
+    return [{
+        "id": "g_default",
+        "label": "Default",
+        "unet": unet,
+        "clip": clip,
+        "vae": vae,
+    }]
+
+
+def inject_loader_group(workflow: dict, group: dict, triple: dict) -> None:
+    """Inject a resolved triple into all loader fields listed in ``group``.
+
+    Each entry in ``group["unet"|"clip"|"vae"]`` is a ``{node_id, field}`` dict.
+    The corresponding workflow node's ``inputs[field]`` is set to the matching
+    value in ``triple`` ("unet", "clip", "vae"). Multiple loaders of the same
+    category all receive the same value (this is the intended fan-out; the
+    group exists precisely so the user has confirmed they want fan-out).
+    """
+    mapping = [("unet", triple.get("unet", "")),
+               ("clip", triple.get("clip", "")),
+               ("vae", triple.get("vae", ""))]
+    for category, value in mapping:
+        for entry in group.get(category, []) or []:
+            node_id = str(entry.get("node_id", ""))
+            field = entry.get("field", "")
+            if not node_id or not field:
+                continue
+            node = workflow.get(node_id)
+            if not isinstance(node, dict):
+                continue
+            inputs = node.setdefault("inputs", {})
+            if isinstance(inputs, dict):
+                inputs[field] = value
+
+
+# ── Subprofile (alternate triple) management ─────────────────────────────
+
+def add_subprofile(profile: dict, subprofile: dict) -> None:
+    """Add a subprofile triple. Raises SubprofileError on duplicate id."""
+    subs = profile.setdefault("subprofiles", [])
+    sid = subprofile.get("id", "")
+    if not sid:
+        raise SubprofileError("subprofile id must be non-empty")
+    for existing in subs:
+        if existing.get("id") == sid:
+            raise SubprofileError(f"duplicate subprofile id: {sid!r}")
+    subs.append(dict(subprofile))
+
+
+def remove_subprofile(profile: dict, subprofile_id: str) -> None:
+    subs = profile.get("subprofiles", [])
+    profile["subprofiles"] = [s for s in subs if s.get("id") != subprofile_id]
+
+
+# ── LoRA slot validation ─────────────────────────────────────────────────
+
+def validate_lora_selection_against_slots(profile: dict, selection: list) -> list:
+    """Return a list of human-readable warnings for an invalid LoRA selection.
+
+    ``selection`` is a list of ``(filename, [model_strengths], [clip_strengths])``
+    tuples. The selection is valid iff it has at most as many LoRAs as the
+    profile has mapped LoRA slots, and each strength list is a list of floats
+    (an empty strength list is allowed for "No LoRA"; strength 0 is valid).
+    """
+    warnings: list = []
+    slots = profile.get("lora_slots", []) or []
+    slot_count = len(slots)
+    if len(selection) > slot_count:
+        warnings.append(
+            f"LoRA selection has {len(selection)} entries but profile has "
+            f"only {slot_count} mapped LoRA slot(s); selection exceeds capacity"
+        )
+    for idx, (filename, model_strs, clip_strs) in enumerate(selection):
+        if not isinstance(model_strs, list) or not isinstance(clip_strs, list):
+            warnings.append(f"slot {idx}: strengths must be lists, got "
+                            f"model={type(model_strs).__name__} clip={type(clip_strs).__name__}")
+            continue
+        if len(model_strs) == 0 and len(clip_strs) == 0:
+            # explicit "no values" is OK (UI inserts default at execution time)
+            continue
+        for j, v in enumerate(model_strs):
+            try:
+                float(v)
+            except (TypeError, ValueError):
+                warnings.append(f"slot {idx} model_strength[{j}] is not numeric: {v!r}")
+        for j, v in enumerate(clip_strs):
+            try:
+                float(v)
+            except (TypeError, ValueError):
+                warnings.append(f"slot {idx} clip_strength[{j}] is not numeric: {v!r}")
+    return warnings
+
+
+# ── Profile schema migration ─────────────────────────────────────────────
+
+def migrate_profile_to_v2(profile: dict) -> dict:
+    """Promote a v1 (pre-Phase-2) profile to v2 in place.
+
+    v1 had no loader_target_groups, lora_slots, or subprofiles. Existing
+    per-category loader slot lists are promoted into a single default
+    loader_target_group so they keep working without re-mapping.
+
+    A v2 profile is returned unchanged.
+    """
+    version = int(profile.get("schema_version", 1))
+    if version >= 2:
+        return profile
+    if version != 1:
+        raise ValueError(f"unsupported profile schema_version={version}")
+    slots = profile.get("slots", {}) or {}
+    # Build default loader groups from existing flat mappings
+    profile["loader_target_groups"] = build_loader_target_groups_from_existing(slots)
+    profile.setdefault("lora_slots", [])
+    profile.setdefault("subprofiles", [])
+    profile["schema_version"] = 2
+    return profile
