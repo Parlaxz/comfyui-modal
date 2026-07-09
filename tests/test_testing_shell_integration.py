@@ -104,6 +104,48 @@ class ShellRegistrationTests(unittest.TestCase):
             "Expected a named fallback-launcher function in modal-testing.js",
         )
 
+    # -- Sidebar registration title/tooltip ------------------------------------
+    def test_sidebar_tooltip_no_testing_suite(self):
+        """Sidebar registration tooltip must not say 'testing suite' or imply comparison runner."""
+        # The tooltip is the second string argument to tooltip: "..." in registerSidebarTab.
+        # Find the tooltip line and check it specifically.
+        tooltip_match = re.search(r'tooltip:\s*"([^"]+)"', self.m.text)
+        self.assertIsNotNone(tooltip_match, "Could not find tooltip string in sidebar registration")
+        tooltip_text = tooltip_match.group(1)
+        self.assertNotIn(
+            "testing suite",
+            tooltip_text.lower(),
+            "Sidebar registration tooltip must not mention 'testing suite'",
+        )
+
+    def test_sidebar_registration_title_is_modal_studio(self):
+        """Sidebar tab title must be 'Modal Studio' or 'Modal GPU'."""
+        has_valid_title = (
+            '"Modal Studio"' in self.m.text
+            or '"Modal GPU"' in self.m.text
+        )
+        self.assertTrue(
+            has_valid_title,
+            "Sidebar registration title must be 'Modal Studio' or 'Modal GPU'",
+        )
+
+    # -- Sidebar panel content (restored f1d3bb5 behavior) ----------------------
+    def test_sidebar_has_open_testing_suite_button(self):
+        """Sidebar panel must have 'Open Testing Suite' button."""
+        self.assertIn(
+            "Open Testing Suite",
+            self.m.text,
+            "Sidebar panel must show 'Open Testing Suite' button",
+        )
+
+    def test_sidebar_imports_fetch_json(self):
+        """modal-testing.js must import fetchJson for sidebar panel fetch calls."""
+        self.assertIn(
+            "fetchJson",
+            self.m.text,
+            "Expected fetchJson import for sidebar panel API calls",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Diagnostics keys
@@ -1796,6 +1838,93 @@ class RootCauseNoStateContextTests(unittest.TestCase):
             "renderExperimentMode(state, actions, context)",
             text,
             "Expected renderExperimentMode(state, actions, context) signature in playground",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression fix — legacy sidebar tabs must opt in explicitly
+# ---------------------------------------------------------------------------
+
+class LegacyComparisonSidebarGuardTests(unittest.TestCase):
+    """modal-comparison.js must not register legacy sidebar tabs by default.
+    Requires explicit opt-in via window.__comfyModalEnableLegacySidebarTabs."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "modal-comparison.js").read_text(encoding="utf-8")
+
+    def test_comparison_guard_uses_explicit_opt_in(self):
+        """Guard must use __comfyModalEnableLegacySidebarTabs === true, not !__comfyModalUnifiedUI."""
+        self.assertIn(
+            "__comfyModalEnableLegacySidebarTabs",
+            self.text,
+            "Expected __comfyModalEnableLegacySidebarTabs opt-in guard in modal-comparison.js",
+        )
+
+    def test_comparison_guard_no_unifiedui(self):
+        """Guard must NOT use !window.__comfyModalUnifiedUI."""
+        self.assertNotIn(
+            "!window.__comfyModalUnifiedUI",
+            self.text,
+            "Legacy sidebar guard must not rely on __comfyModalUnifiedUI flag",
+        )
+
+    def test_comparison_still_has_render_helpers(self):
+        """Comparison render/mount helpers must remain intact."""
+        self.assertIn("buildProfilesTab", self.text)
+        self.assertIn("buildRunnerTab", self.text)
+
+
+class LegacySettingsSidebarGuardTests(unittest.TestCase):
+    """modal-settings.js must not register legacy modal-gpu sidebar tab by default.
+    Requires explicit opt-in via window.__comfyModalEnableLegacySidebarTabs."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "modal-settings.js").read_text(encoding="utf-8")
+
+    def test_settings_guard_uses_explicit_opt_in(self):
+        """Guard must use __comfyModalEnableLegacySidebarTabs === true, not !__comfyModalUnifiedUI."""
+        self.assertIn(
+            "__comfyModalEnableLegacySidebarTabs",
+            self.text,
+            "Expected __comfyModalEnableLegacySidebarTabs opt-in guard in modal-settings.js",
+        )
+
+    def test_settings_guard_no_unifiedui(self):
+        """Guard must NOT use !window.__comfyModalUnifiedUI."""
+        self.assertNotIn(
+            "!window.__comfyModalUnifiedUI",
+            self.text,
+            "Legacy sidebar guard must not rely on __comfyModalUnifiedUI flag",
+        )
+
+    def test_settings_still_has_legacy_sections(self):
+        """Legacy settings sections must remain intact."""
+        for section in ["auth", "deploy", "gpu", "workspace", "models",
+                        "sync", "output", "tokens", "logs"]:
+            self.assertIn(section, self.text.lower(),
+                          f"Legacy modal-settings.js missing section: {section}")
+
+    def test_settings_still_has_testing_suite_launcher(self):
+        """Secondary Testing Suite launcher must remain in settings."""
+        self.assertIn("Testing Suite", self.text)
+
+
+# ---------------------------------------------------------------------------
+# Unified flag set in modal-testing.js
+# ---------------------------------------------------------------------------
+
+class UnifiedUIFlagTests(unittest.TestCase):
+    """modal-testing.js must still set the __comfyModalUnifiedUI flag."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
+
+    def test_unified_flag_set(self):
+        """modal-testing.js must set __comfyModalUnifiedUI = true."""
+        self.assertIn(
+            "__comfyModalUnifiedUI",
+            self.text,
+            "Expected __comfyModalUnifiedUI flag in modal-testing.js",
         )
 
 

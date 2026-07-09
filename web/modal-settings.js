@@ -3961,9 +3961,10 @@ app.registerExtension({
     syncGpuConfig();
     syncOutputOptions();
 
-    // Only register the legacy sidebar tab if the unified Modal GPU tab is NOT active.
-    // When unified UI is enabled, modal-testing.js provides the single primary entry.
-    if (!window.__comfyModalUnifiedUI && app?.extensionManager?.registerSidebarTab) {
+    // Legacy sidebar tab is hidden by default. Only register when explicitly
+    // opted in via __comfyModalEnableLegacySidebarTabs (set by an admin/user script).
+    // modal-testing.js provides the single primary entry under unified UI.
+    if (window.__comfyModalEnableLegacySidebarTabs === true && app?.extensionManager?.registerSidebarTab) {
       app.extensionManager.registerSidebarTab({
         id: "modal-gpu",
         icon: "pi pi-cloud",

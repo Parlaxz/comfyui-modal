@@ -1658,8 +1658,9 @@ app.registerExtension({
   async setup() {
     _initContextMenu();
 
-    // Skip legacy sidebar tabs when unified Modal GPU tab is active.
-    if (!window.__comfyModalUnifiedUI && app?.extensionManager?.registerSidebarTab) {
+    // Legacy sidebar tabs are hidden by default. Only register when explicitly
+    // opted in via __comfyModalEnableLegacySidebarTabs (set by an admin/user script).
+    if (window.__comfyModalEnableLegacySidebarTabs === true && app?.extensionManager?.registerSidebarTab) {
       // Profiles Tab
       app.extensionManager.registerSidebarTab({
         id: "modal-comparison-profiles",
