@@ -5959,6 +5959,289 @@ if _server:
             "text": format_timing(timing),
         })
 
+    # ── Studio Snapshots & Backend Presets ──────────────────────────
+    # Workflow snapshots and backend preset persistence.
+    # Persisted plugin-local (under _NODE_DIR).
+
+    _STUDIO_SNAPSHOTS_PATH = os.path.join(_NODE_DIR, ".studio_snapshots.json")
+    _STUDIO_PRESETS_PATH = os.path.join(_NODE_DIR, ".studio_presets.json")
+
+    _KNOWN_FEATURE_IDS = {"txt2img", "object_remove", "object_replace"}
+
+    def _normalize_label(s: str) -> str:
+        return (s or "").strip()[:200]
+
+    def _sanitize_description(s: str) -> str:
+        return (s or "").strip()[:2000]
+
+    def _validate_feature_ids(features: list) -> list:
+        """Validate and filter compatibleFeature IDs against known set."""
+        if not isinstance(features, list):
+            return []
+        return [f for f in features if isinstance(f, str) and f in _KNOWN_FEATURE_IDS]
+
+    def _load_studio_snapshots() -> list:
+        try:
+            if os.path.exists(_STUDIO_SNAPSHOTS_PATH):
+                with open(_STUDIO_SNAPSHOTS_PATH, "r") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return []
+
+    def _save_studio_snapshots(snapshots: list) -> None:
+        try:
+            with open(_STUDIO_SNAPSHOTS_PATH, "w") as f:
+                json.dump(snapshots, f, indent=2)
+        except Exception:
+            pass
+
+    def _load_studio_presets() -> list:
+        try:
+            if os.path.exists(_STUDIO_PRESETS_PATH):
+                with open(_STUDIO_PRESETS_PATH, "r") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return []
+
+    def _save_studio_presets(presets: list) -> None:
+        try:
+            with open(_STUDIO_PRESETS_PATH, "w") as f:
+                json.dump(presets, f, indent=2)
+        except Exception:
+            pass
+
+    def _make_snapshot_id() -> str:
+        return f"snap_{uuid.uuid4().hex[:16]}"
+
+    def _make_preset_id() -> str:
+        return f"preset_{uuid.uuid4().hex[:16]}"
+
+    def _now_iso() -> str:
+        import datetime as _dt
+        return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+    # ── Snapshot Routes ───────────────────────────────────────────────
+
+    @_server.routes.get("/comfymodal/studio/snapshots")
+    async def studio_snapshots_list(request: web.Request) -> web.Response:
+        try:
+            snapshots = _load_studio_snapshots()
+            return web.json_response({"status": "ok", "snapshots": snapshots})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/studio/snapshots")
+    async def studio_snapshots_create(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            now = _now_iso()
+            features = _validate_feature_ids(body.get("compatibleFeatures", []))
+            entry = {
+                "id": _make_snapshot_id(),
+                "name": _normalize_label(body.get("name", "Untitled Snapshot")),
+                "description": _sanitize_description(body.get("description", "")),
+                "createdAt": now,
+                "updatedAt": now,
+                "compatibleFeatures": features,
+                "graphJson": body.get("graphJson"),
+                "apiPromptJson": body.get("apiPromptJson"),
+                "nodeBindings": body.get("nodeBindings", {}),
+                "outputNodeId": body.get("outputNodeId", ""),
+                "modelSummary": body.get("modelSummary", ""),
+                "source": _normalize_label(body.get("source", "manual")),
+                "archived": False,
+                "disabledReason": body.get("disabledReason", ""),
+                "status": body.get("status", ""),
+            }
+            snapshots = _load_studio_snapshots()
+            snapshots.append(entry)
+            _save_studio_snapshots(snapshots)
+            return web.json_response({"status": "ok", "snapshot": entry})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.get("/comfymodal/studio/snapshots/{snapshot_id}")
+    async def studio_snapshots_detail(request: web.Request) -> web.Response:
+        sid = request.match_info.get("snapshot_id", "")
+        try:
+            snapshots = _load_studio_snapshots()
+            for s in snapshots:
+                if s.get("id") == sid:
+                    return web.json_response({"status": "ok", "snapshot": s})
+            return web.json_response({"status": "error", "message": "Snapshot not found"}, status=404)
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.patch("/comfymodal/studio/snapshots/{snapshot_id}")
+    async def studio_snapshots_update(request: web.Request) -> web.Response:
+        sid = request.match_info.get("snapshot_id", "")
+        try:
+            body = await request.json()
+            snapshots = _load_studio_snapshots()
+            for s in snapshots:
+                if s.get("id") == sid:
+                    if "name" in body and isinstance(body["name"], str):
+                        s["name"] = _normalize_label(body["name"])
+                    if "description" in body and isinstance(body["description"], str):
+                        s["description"] = _sanitize_description(body["description"])
+                    if "compatibleFeatures" in body:
+                        s["compatibleFeatures"] = _validate_feature_ids(body["compatibleFeatures"])
+                    if "modelSummary" in body and isinstance(body["modelSummary"], str):
+                        s["modelSummary"] = body["modelSummary"].strip()
+                    if "nodeBindings" in body and isinstance(body["nodeBindings"], dict):
+                        s["nodeBindings"] = body["nodeBindings"]
+                    if "outputNodeId" in body and isinstance(body["outputNodeId"], str):
+                        s["outputNodeId"] = body["outputNodeId"]
+                    if "disabledReason" in body and isinstance(body["disabledReason"], str):
+                        s["disabledReason"] = body["disabledReason"].strip()
+                    s["updatedAt"] = _now_iso()
+                    _save_studio_snapshots(snapshots)
+                    return web.json_response({"status": "ok", "snapshot": s})
+            return web.json_response({"status": "error", "message": "Snapshot not found"}, status=404)
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.delete("/comfymodal/studio/snapshots/{snapshot_id}")
+    async def studio_snapshots_archive(request: web.Request) -> web.Response:
+        """Archive = mark archived=True (soft delete to preserve references)."""
+        sid = request.match_info.get("snapshot_id", "")
+        try:
+            snapshots = _load_studio_snapshots()
+            for s in snapshots:
+                if s.get("id") == sid:
+                    s["archived"] = True
+                    s["updatedAt"] = _now_iso()
+                    _save_studio_snapshots(snapshots)
+                    return web.json_response({"status": "ok"})
+            return web.json_response({"status": "error", "message": "Snapshot not found"}, status=404)
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/studio/snapshots/{snapshot_id}/duplicate")
+    async def studio_snapshots_duplicate(request: web.Request) -> web.Response:
+        sid = request.match_info.get("snapshot_id", "")
+        try:
+            snapshots = _load_studio_snapshots()
+            for s in snapshots:
+                if s.get("id") == sid:
+                    dup = copy.deepcopy(s)
+                    dup["id"] = _make_snapshot_id()
+                    dup["name"] = (dup.get("name", "Untitled") or "Untitled") + " (Copy)"
+                    dup["createdAt"] = _now_iso()
+                    dup["updatedAt"] = _now_iso()
+                    dup["archived"] = False
+                    snapshots.append(dup)
+                    _save_studio_snapshots(snapshots)
+                    return web.json_response({"status": "ok", "snapshot": dup})
+            return web.json_response({"status": "error", "message": "Snapshot not found"}, status=404)
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    # ── Backend Preset Routes ──────────────────────────────────────────
+
+    @_server.routes.get("/comfymodal/studio/presets")
+    async def studio_presets_list(request: web.Request) -> web.Response:
+        try:
+            presets = _load_studio_presets()
+            return web.json_response({"status": "ok", "presets": presets})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/studio/presets")
+    async def studio_presets_create(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            now = _now_iso()
+            features = _validate_feature_ids(body.get("compatibleFeatures", []))
+            entry = {
+                "id": _make_preset_id(),
+                "label": _normalize_label(body.get("label", body.get("name", "Untitled Preset"))),
+                "description": _sanitize_description(body.get("description", "")),
+                "snapshotId": body.get("snapshotId", ""),
+                "compatibleFeatures": features,
+                "defaults": body.get("defaults", {}),
+                "sourceType": body.get("sourceType", "manual"),
+                "sourceId": body.get("sourceId", ""),
+                "disabledReason": body.get("disabledReason", ""),
+                "archived": False,
+                "createdAt": now,
+                "updatedAt": now,
+            }
+            presets = _load_studio_presets()
+            presets.append(entry)
+            _save_studio_presets(presets)
+            return web.json_response({"status": "ok", "preset": entry})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.patch("/comfymodal/studio/presets/{preset_id}")
+    async def studio_presets_update(request: web.Request) -> web.Response:
+        pid = request.match_info.get("preset_id", "")
+        try:
+            body = await request.json()
+            presets = _load_studio_presets()
+            for p in presets:
+                if p.get("id") == pid:
+                    if "label" in body and isinstance(body["label"], str):
+                        p["label"] = _normalize_label(body["label"])
+                    if "description" in body and isinstance(body["description"], str):
+                        p["description"] = _sanitize_description(body["description"])
+                    if "snapshotId" in body and isinstance(body["snapshotId"], str):
+                        p["snapshotId"] = body["snapshotId"]
+                    if "compatibleFeatures" in body:
+                        p["compatibleFeatures"] = _validate_feature_ids(body["compatibleFeatures"])
+                    if "defaults" in body and isinstance(body["defaults"], dict):
+                        p["defaults"] = body["defaults"]
+                    if "sourceType" in body and isinstance(body["sourceType"], str):
+                        p["sourceType"] = body["sourceType"]
+                    if "sourceId" in body and isinstance(body["sourceId"], str):
+                        p["sourceId"] = body["sourceId"]
+                    if "disabledReason" in body and isinstance(body["disabledReason"], str):
+                        p["disabledReason"] = body["disabledReason"].strip()
+                    p["updatedAt"] = _now_iso()
+                    _save_studio_presets(presets)
+                    return web.json_response({"status": "ok", "preset": p})
+            return web.json_response({"status": "error", "message": "Preset not found"}, status=404)
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.delete("/comfymodal/studio/presets/{preset_id}")
+    async def studio_presets_archive(request: web.Request) -> web.Response:
+        pid = request.match_info.get("preset_id", "")
+        try:
+            presets = _load_studio_presets()
+            for p in presets:
+                if p.get("id") == pid:
+                    p["archived"] = True
+                    p["updatedAt"] = _now_iso()
+                    _save_studio_presets(presets)
+                    return web.json_response({"status": "ok"})
+            return web.json_response({"status": "error", "message": "Preset not found"}, status=404)
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/studio/presets/{preset_id}/duplicate")
+    async def studio_presets_duplicate(request: web.Request) -> web.Response:
+        pid = request.match_info.get("preset_id", "")
+        try:
+            presets = _load_studio_presets()
+            for p in presets:
+                if p.get("id") == pid:
+                    dup = copy.deepcopy(p)
+                    dup["id"] = _make_preset_id()
+                    dup["label"] = (dup.get("label", "Untitled") or "Untitled") + " (Copy)"
+                    dup["createdAt"] = _now_iso()
+                    dup["updatedAt"] = _now_iso()
+                    dup["archived"] = False
+                    presets.append(dup)
+                    _save_studio_presets(presets)
+                    return web.json_response({"status": "ok", "preset": dup})
+            return web.json_response({"status": "error", "message": "Preset not found"}, status=404)
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
     # ── Studio Backends ─────────────────────────────────────────────
     # Thin metadata layer on top of existing comparison profiles.
     # Reads/writes a single JSON file for Studio-specific backend metadata.
@@ -6028,10 +6311,6 @@ if _server:
                         "disabled_reason",
                         "Manual backend — configure via Settings > Legacy > Profiles",
                     )
-                    if "disabled_reason" not in s:
-                        s["disabled_reason"] = (
-                            "Manual backend — configure via Settings > Legacy > Profiles"
-                        )
                     discovered.append(s)
 
             # Filter by kind if requested
@@ -6050,9 +6329,7 @@ if _server:
         try:
             body = await request.json()
             stored = _load_studio_backends()
-            now = __import__("datetime").datetime.now(
-                tz=__import__("datetime").timezone.utc
-            ).isoformat()
+            now = _now_iso()
             entry = {
                 "id": body.get("id", ""),
                 "name": body.get("name", ""),
