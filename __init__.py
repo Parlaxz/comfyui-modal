@@ -5959,6 +5959,178 @@ if _server:
             "text": format_timing(timing),
         })
 
+    # ── Studio Backends ─────────────────────────────────────────────
+    # Thin metadata layer on top of existing comparison profiles.
+    # Reads/writes a single JSON file for Studio-specific backend metadata.
+
+    _STUDIO_BACKENDS_PATH = os.path.join(_NODE_DIR, ".studio_backends.json")
+
+    def _load_studio_backends():
+        try:
+            if os.path.exists(_STUDIO_BACKENDS_PATH):
+                with open(_STUDIO_BACKENDS_PATH, "r") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return []
+
+    def _save_studio_backends(backends):
+        try:
+            with open(_STUDIO_BACKENDS_PATH, "w") as f:
+                json.dump(backends, f, indent=2)
+        except Exception:
+            pass
+
+    def _discover_legacy_profiles_as_backends():
+        """Discover comparison profiles and return them as backend entries."""
+        from comparison import list_profiles
+        try:
+            profiles = list_profiles(_COMFYUI_ROOT)
+        except Exception:
+            profiles = []
+        results = []
+        for p in profiles:
+            backend = {
+                "id": p.get("id", ""),
+                "name": p.get("name", "Unnamed Profile"),
+                "source_profile_id": p.get("id", ""),
+                "source_type": "comparison_profile",
+                "status": "available",
+                "compatibility": p.get("capabilities", {}).get("mode", "unknown"),
+                "model_stack": p.get("model_stack", []),
+                "schema_version": p.get("schema_version", ""),
+                "created_at": p.get("created_at", ""),
+                "updated_at": p.get("updated_at", ""),
+            }
+            results.append(backend)
+        return results
+
+    @_server.routes.get("/comfymodal/studio/backends")
+    async def studio_backends_list(request: web.Request) -> web.Response:
+        kind = request.query.get("kind", None)
+        try:
+            # Merge legacy profile discovery with stored metadata
+            stored = _load_studio_backends()
+            stored_by_id = {b.get("id"): b for b in stored if b.get("id")}
+
+            discovered = _discover_legacy_profiles_as_backends()
+            # Enrich discovered backends with stored metadata
+            for d in discovered:
+                sid = d.get("id")
+                if sid in stored_by_id:
+                    d["studio_metadata"] = stored_by_id[sid].get("studio_metadata", {})
+
+            # Add stored-only backends (manual entries) marked as disabled
+            for s in stored:
+                sid = s.get("id")
+                if sid and sid not in {d.get("id") for d in discovered}:
+                    s["disabled_reason"] = s.get(
+                        "disabled_reason",
+                        "Manual backend — configure via Settings > Legacy > Profiles",
+                    )
+                    if "disabled_reason" not in s:
+                        s["disabled_reason"] = (
+                            "Manual backend — configure via Settings > Legacy > Profiles"
+                        )
+                    discovered.append(s)
+
+            # Filter by kind if requested
+            if kind == "comparable":
+                discovered = [
+                    b for b in discovered
+                    if b.get("status") == "available" and not b.get("disabled_reason")
+                ]
+
+            return web.json_response({"status": "ok", "backends": discovered})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/studio/backends")
+    async def studio_backends_create(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            stored = _load_studio_backends()
+            now = __import__("datetime").datetime.now(
+                tz=__import__("datetime").timezone.utc
+            ).isoformat()
+            entry = {
+                "id": body.get("id", ""),
+                "name": body.get("name", ""),
+                "studio_metadata": body.get("studio_metadata", {}),
+                "source_profile_id": body.get("source_profile_id", ""),
+                "created_at": now,
+            }
+            if not entry["id"]:
+                entry["id"] = uuid.uuid4().hex[:12]
+            stored.append(entry)
+            _save_studio_backends(stored)
+            return web.json_response({"status": "ok", "backend": entry})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.patch("/comfymodal/studio/backends/{backend_id}")
+    async def studio_backends_update(request: web.Request) -> web.Response:
+        backend_id = request.match_info.get("backend_id", "")
+        try:
+            body = await request.json()
+            stored = _load_studio_backends()
+            for entry in stored:
+                if entry.get("id") == backend_id:
+                    if "name" in body:
+                        entry["name"] = body["name"]
+                    if "studio_metadata" in body:
+                        entry["studio_metadata"] = body["studio_metadata"]
+                    if "disabled_reason" in body:
+                        entry["disabled_reason"] = body["disabled_reason"]
+                    # Also accept flat fields for convenience
+                    flat_fields = ["label", "description", "sourceType", "sourceId",
+                                   "workflowId", "modelLabel", "modelTriple", "compatibleFeatures",
+                                   "disabledReason", "archived"]
+                    for f in flat_fields:
+                        if f in body:
+                            if "studio_metadata" not in entry:
+                                entry["studio_metadata"] = {}
+                            entry["studio_metadata"][f] = body[f]
+                    _save_studio_backends(stored)
+                    return web.json_response({"status": "ok", "backend": entry})
+            return web.json_response({"status": "error", "message": "Backend not found"}, status=404)
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.delete("/comfymodal/studio/backends/{backend_id}")
+    async def studio_backends_delete(request: web.Request) -> web.Response:
+        backend_id = request.match_info.get("backend_id", "")
+        try:
+            stored = _load_studio_backends()
+            filtered = [e for e in stored if e.get("id") != backend_id]
+            if len(filtered) == len(stored):
+                return web.json_response({"status": "error", "message": "Backend not found"}, status=404)
+            _save_studio_backends(filtered)
+            return web.json_response({"status": "ok"})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/studio/backends/{backend_id}/duplicate")
+    async def studio_backends_duplicate(request: web.Request) -> web.Response:
+        backend_id = request.match_info.get("backend_id", "")
+        try:
+            stored = _load_studio_backends()
+            source = None
+            for e in stored:
+                if e.get("id") == backend_id:
+                    source = e
+                    break
+            if source is None:
+                return web.json_response({"status": "error", "message": "Backend not found"}, status=404)
+            dup = copy.deepcopy(source)
+            dup["id"] = uuid.uuid4().hex[:12]
+            dup["name"] = (dup.get("name", "Unnamed") or "Unnamed") + " (Copy)"
+            stored.append(dup)
+            _save_studio_backends(stored)
+            return web.json_response({"status": "ok", "backend": dup})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
     # ── Warmup ────────────────────────────────────────────────────────
     @_server.routes.get("/comfymodal/deploy-warmup/status")
     async def warmup_status(request: web.Request) -> web.Response:

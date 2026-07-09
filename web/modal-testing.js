@@ -22,7 +22,7 @@ const PREFIX = "[comfymodal.testing]";
 const HOST_CLASS = "comfymodal-testing-host";
 
 // Studio shell pages (replaces old 6-tab nav)
-const STUDIO_PAGES = ["Playground", "History", "Settings"];
+const STUDIO_PAGES = ["Playground", "History", "Backend", "Settings"];
 
 console.log(PREFIX, "extension module imported");
 
@@ -193,6 +193,11 @@ export function open_testing_modal(tabName) {
     updateDiag("modalOpen", true);
     if (tabName && _shellCache._studioApi) {
       const page = pageMap[tabName] || "playground";
+      // Set activeLegacyTab for legacy tabs when shell is cached
+      if (page === "settings" && (tabName === "setup" || tabName === "profiles" || tabName === "results")) {
+        const shellState = _shellCache._studioApi.getState();
+        shellState.settings.activeLegacyTab = tabName;
+      }
       _shellCache._studioApi.setPage(page);
     }
     return _shellCache;
@@ -214,13 +219,15 @@ export function open_testing_modal(tabName) {
   shell._escHandler = escHandler;
 
   // Mount the Studio shell (replaces old 6-tab nav)
-  // Build context with apiBase, comfyApi, mountLegacyTab, and draft callbacks
+  // Build context with apiBase, comfyApi, mountLegacyTab, and draft callbacks.
+  // draft/previewState/experimentId use getters so they are read FRESH each
+  // mount instead of freezing state at initial shell mount time.
   const studioContext = {
     apiBase: MODAL_PREFIX,
     comfyApi: comfyApi,
     mountLegacyTab: mountLegacyTab,
-    // Draft state and callbacks for legacy setup tab
-    draft: _draftState.setup ? normalizeDraft(_draftState.setup) : null,
+    // Draft state and callbacks for legacy setup tab (getter = fresh each mount)
+    get draft() { return _draftState.setup ? normalizeDraft(_draftState.setup) : null; },
     onDraftChange: (draft) => {
       _draftState.setup = normalizeDraft(draft);
       _saveDraftToStorage(_draftState.setup);
@@ -230,11 +237,16 @@ export function open_testing_modal(tabName) {
       if (expId) {
         _draftState.lastExperimentId = expId;
         _saveExperimentIdToStorage(expId);
+        // Navigate to Settings > Legacy Results when run starts
+        if (_shellCache && _shellCache._studioApi) {
+          _shellCache._studioApi.setPage("settings");
+          _shellCache._studioApi.getState().settings.activeLegacyTab = "results";
+        }
         open_testing_modal(TAB_RESULTS);
       }
     },
-    previewState: _previewState.setup ? { ..._previewState.setup } : null,
-    experimentId: _draftState.lastExperimentId || _loadExperimentIdFromStorage() || "",
+    get previewState() { return _previewState.setup ? { ..._previewState.setup } : null; },
+    get experimentId() { return _draftState.lastExperimentId || _loadExperimentIdFromStorage() || ""; },
     setPage: (page) => { if (_shellCache && _shellCache._studioApi) _shellCache._studioApi.setPage(page); },
   };
   const studioApi = mountStudioShell(shell.body, studioContext);
@@ -243,6 +255,12 @@ export function open_testing_modal(tabName) {
   // Navigate to initial page if specified
   if (tabName) {
     const page = pageMap[tabName] || "playground";
+    // For legacy tabs mapped to settings, set activeLegacyTab BEFORE setting
+    // the page so the settings renderer shows the legacy view directly
+    if (page === "settings" && (tabName === "setup" || tabName === "profiles" || tabName === "results")) {
+      const shellState = studioApi.getState();
+      shellState.settings.activeLegacyTab = tabName;
+    }
     studioApi.setPage(page);
   }
 

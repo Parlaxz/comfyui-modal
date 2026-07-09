@@ -61,6 +61,12 @@ class _StubRouteTable:
             return fn
         return deco
 
+    def patch(self, path: str) -> Any:
+        def deco(fn):
+            self._handlers.append(("PATCH", path, fn))
+            return fn
+        return deco
+
 
 def _build_init_with_stub(stub_server):
     """Load __init__.py with sys.modules['_server'] = stub_server."""

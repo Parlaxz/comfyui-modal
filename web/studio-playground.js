@@ -11,6 +11,8 @@ import {
   renderExperimentMode,
   enhanceControlWithAxisCheckbox,
 } from "./studio-experiment-mode.js";
+import { getBackends } from "./studio-backend.js";
+
 // ── Element helper ───────────────────────────────────────────────────────
 
 function el(tag, props = {}, children = []) {
@@ -65,14 +67,11 @@ function renderControlPanel(state, context) {
   // Experiment toggle (always at top of control panel)
   panel.appendChild(renderExperimentToggle(state, actions));
 
-  // If experiment mode, render experiment-mode controls
+  // If experiment mode, render experiment-mode controls (context passed explicitly)
   if (isExperiment) {
-    const expBlock = renderExperimentMode(state, actions);
+    const expBlock = renderExperimentMode(state, actions, context);
     panel.appendChild(expBlock);
   }
-
-  // ── Feature Selector ───────────────────────────────────────────────
-  panel.appendChild(renderControlGroup("Feature", renderFeatureSelector(state, actions)));
 
   // ── Backend Selector ───────────────────────────────────────────────
   panel.appendChild(renderControlGroup("Backend", renderBackendSelector(state, actions)));
@@ -87,8 +86,8 @@ function renderControlPanel(state, context) {
     // Skip instruction for txt2img (only relevant for image-edit features)
     if (ctrlId === "instruction" && !currentSpec.isPlaceholder) return;
 
-    // Skip prompt/negative_prompt for placeholder features (use instruction instead)
-    if ((ctrlId === "prompt" || ctrlId === "negative_prompt") && currentSpec.isPlaceholder) return;
+    // Only skip negative_prompt for placeholder features (prompt is still shown for image-edit)
+    if (ctrlId === "negative_prompt" && currentSpec.isPlaceholder) return;
 
     const controlRow = renderControl(def, state, actions);
 
@@ -114,8 +113,8 @@ function renderControlPanel(state, context) {
     controlsContainer.appendChild(placeholderMsg);
   }
 
-  // If current feature is txt2img, add mask controls section
-  if (currentFeatureId === "txt2img") {
+  // Add mask controls section for image-edit/inpaint-like features (txt2img, object_remove, object_replace)
+  if (currentFeatureId === "txt2img" || currentFeatureId === "object_remove" || currentFeatureId === "object_replace") {
     controlsContainer.appendChild(renderMaskControlsSection(state, actions));
   }
 
@@ -165,10 +164,23 @@ function buildActions(state, context) {
         context.setPage("playground");
       }
     },
+    updateExperimentAxisValues(ctrlId, values) {
+      if (!state.playground.experimentAxes) state.playground.experimentAxes = {};
+      if (!state.playground.experimentAxes[ctrlId]) {
+        state.playground.experimentAxes[ctrlId] = { enabled: true, values: [] };
+      }
+      state.playground.experimentAxes[ctrlId].values = values;
+      state.playground.experimentAxes[ctrlId].enabled = true;
+    },
     navigateToLegacySetup() {
       if (context && context.setPage) {
         state.settings.activeLegacyTab = "setup";
         context.setPage("settings");
+      }
+    },
+    navigateToBackendTab() {
+      if (context && context.setPage) {
+        context.setPage("backend");
       }
     },
   };
@@ -186,51 +198,127 @@ function renderControlGroup(labelText, inputEl) {
   return group;
 }
 
-// ── Feature Selector ─────────────────────────────────────────────────────
-
-function renderFeatureSelector(state, actions) {
-  const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
-  const select = el("select", {
-    class: "comfymodal-input comfymodal-studio-select",
-    "data-testid": "feature-selector",
-  });
-
-  FEATURE_SPECS.forEach((spec) => {
-    const option = el("option", { value: spec.id, text: spec.label });
-    if (spec.id === currentFeatureId) option.selected = true;
-    select.appendChild(option);
-  });
-
-  select.addEventListener("change", () => {
-    if (actions.setFeature) actions.setFeature(select.value);
-  });
-
-  return select;
-}
-
 // ── Backend Selector ─────────────────────────────────────────────────────
+//
+// Loads backends from the Studio backend abstraction (getBackends).
+// Filters by feature compatibility when appropriate.
+// In empty state, links to the Backend tab instead of Legacy Setup.
 
 function renderBackendSelector(state, actions) {
   const container = el("div", { class: "comfymodal-studio-backend-selector", "data-testid": "backend-selector" });
 
-  // Show truthful empty state since we don't have a reliable backend inventory
   const select = el("select", {
     class: "comfymodal-input comfymodal-studio-select",
-    disabled: true,
     "data-testid": "backend-select",
   });
-  const emptyOption = el("option", { value: "", text: "No backends available" });
-  select.appendChild(emptyOption);
+  const loadingOpt = el("option", { value: "", text: "Loading backends…", disabled: true, selected: true });
+  select.appendChild(loadingOpt);
+  select.disabled = true;
   container.appendChild(select);
 
-  const emptyMsg = el("p", {
-    class: "comfymodal-studio-empty-state",
-    text: "No backends configured. Go to Settings > Legacy Setup to set up backends.",
-    style: "font-size:var(--font-size-xs);color:var(--color-text-muted);margin-top:4px;",
+  // Async load backends through the Studio abstraction
+  const apiBase = "/comfymodal";
+  getBackends({ apiBase }).then((backends) => {
+    while (select.firstChild) select.removeChild(select.firstChild);
+
+    if (!backends || backends.length === 0) {
+      // Empty state: show disabled select + link to Backend tab
+      const emptyOpt = el("option", { value: "", text: "No backends available", disabled: true, selected: true });
+      select.appendChild(emptyOpt);
+      select.disabled = true;
+
+      // Remove any existing empty message and add fresh one linking to Backend tab
+      const existingMsg = container.querySelector(".comfymodal-studio-backend-empty-msg");
+      if (existingMsg) existingMsg.remove();
+
+      const emptyMsg = el("p", {
+        class: "comfymodal-studio-empty-state comfymodal-studio-backend-empty-msg",
+        style: "font-size:var(--font-size-xs);color:var(--color-text-muted);margin-top:4px;",
+      });
+      emptyMsg.textContent = "No backends configured. ";
+      const link = el("a", {
+        text: "Go to Backend tab",
+        style: "color:var(--color-accent);cursor:pointer;",
+        onclick: (e) => {
+          e.preventDefault();
+          if (actions && actions.navigateToBackendTab) actions.navigateToBackendTab();
+        },
+      });
+      emptyMsg.appendChild(link);
+      emptyMsg.appendChild(document.createTextNode(" to add backends."));
+      container.appendChild(emptyMsg);
+      return;
+    }
+
+    // Populate select with loaded backends
+    select.disabled = false;
+    const placeholderOpt = el("option", { value: "", text: "Select a backend…", disabled: true, selected: true });
+    select.appendChild(placeholderOpt);
+
+    const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
+    backends.forEach((b) => {
+      const compat = b.compatibleFeatures || [];
+      // Show all backends; compatibility is advisory
+      const opt = el("option", { value: b.id || b.label || "", text: b.label || b.id || "Unknown" });
+      if (compat.length > 0 && !compat.includes(currentFeatureId)) {
+        opt.style.opacity = "0.5";
+        opt.title = `Not tested with ${currentFeatureId}`;
+      }
+      select.appendChild(opt);
+    });
+
+    // Set current selection from state
+    const currentId = state.playground && state.playground.selectedBackendId;
+    if (currentId) {
+      select.value = currentId;
+    }
+
+    // Wire change handler to update state
+    select.addEventListener("change", () => {
+      if (actions && actions.setBackend) {
+        actions.setBackend(select.value);
+      }
+    });
+  }).catch(() => {
+    while (select.firstChild) select.removeChild(select.firstChild);
+    const errOpt = el("option", { value: "", text: "Could not load backends", disabled: true, selected: true });
+    select.appendChild(errOpt);
+    select.disabled = true;
   });
-  container.appendChild(emptyMsg);
 
   return container;
+}
+
+// ── Info Hint helper ─────────────────────────────────────────────────────
+//
+// Creates a compact info icon with a hover/focus tooltip to replace bulky
+// visible description paragraphs under headings and section labels.
+
+export function createInfoHint(text, options) {
+  const hint = el("span", {
+    class: "comfymodal-studio-info-hint",
+    "data-testid": "info-hint",
+    tabindex: "0",
+    role: "tooltip",
+    "aria-label": text,
+  });
+  hint.textContent = "\u24d8";  // ⓘ circled info icon
+
+  const tooltip = el("span", {
+    class: "comfymodal-studio-tooltip",
+    text: text,
+  });
+  if (options && options.maxWidth) {
+    tooltip.style.maxWidth = options.maxWidth;
+  }
+  hint.appendChild(tooltip);
+
+  hint.addEventListener("mouseenter", () => { tooltip.style.display = "block"; });
+  hint.addEventListener("mouseleave", () => { tooltip.style.display = ""; });
+  hint.addEventListener("focus", () => { tooltip.style.display = "block"; });
+  hint.addEventListener("blur", () => { tooltip.style.display = ""; });
+
+  return hint;
 }
 
 // ── Render a single control ──────────────────────────────────────────────
@@ -250,12 +338,7 @@ function renderControl(def, state, actions) {
   group.appendChild(label);
 
   if (def.helpText) {
-    const help = el("span", {
-      class: "comfymodal-studio-control-help",
-      text: def.helpText,
-      style: "font-size:var(--font-size-xs);color:var(--color-text-muted);display:block;",
-    });
-    group.appendChild(help);
+    group.appendChild(createInfoHint(def.helpText));
   }
 
   let input;
