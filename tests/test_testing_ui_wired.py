@@ -340,10 +340,10 @@ class ProgressiveClarityShellUiWiredTests(_JsTestBase):
     """Shell fixed sizing and header cleanup."""
 
     def test_shell_fixed_modal_dimensions(self):
-        """testing-styles.js must have fixed width/height for modal."""
-        text = self._read("testing-styles.js")
-        self.assertIn("width: 1200px", text)
-        self.assertIn("height: 780px", text)
+        """studio-styles.js must have larger viewport-relative modal dimensions."""
+        text = self._read("studio-styles.js")
+        self.assertIn("1760px", text)
+        self.assertIn("1040px", text)
 
     def test_shell_no_cloud_subtitle(self):
         """modal-testing.js must not contain cloud subtitle."""
@@ -711,6 +711,114 @@ class LegacyCleanupWiredTests(_JsTestBase):
         """modal-testing.js must reference stopLegacyController in close flow."""
         text = self._read("modal-testing.js")
         self.assertIn("stopLegacyController", text)
+
+
+# ---------------------------------------------------------------------------
+# Slice 1 — Backend tab, history safety, fresh legacy options
+# ---------------------------------------------------------------------------
+
+class StudioBackendWiredTests(_JsTestBase):
+    """Backend page wired tests."""
+
+    def test_studio_backend_module_exists(self):
+        """web/studio-backend.js must exist."""
+        self.assertTrue(
+            (WEB / "studio-backend.js").exists(),
+            "studio-backend.js missing",
+        )
+
+    def test_studio_backend_exports_render_backend(self):
+        """studio-backend.js must export renderBackend."""
+        text = self._read("studio-backend.js")
+        self.assertIn("export function renderBackend", text)
+
+    def test_studio_backend_exports_backend_helpers(self):
+        """studio-backend.js must export getBackends or fetchBackends."""
+        text = self._read("studio-backend.js")
+        self.assertTrue(
+            "export function getBackends" in text
+            or "export async function getBackends" in text
+            or "export function fetchBackends" in text,
+            "Expected backend-fetching export in studio-backend.js",
+        )
+
+    def test_studio_backend_exports_compare_helper(self):
+        """studio-backend.js must export getCompareBackends."""
+        text = self._read("studio-backend.js")
+        self.assertTrue(
+            "getCompareBackends" in text
+            or "export function fetchCompareBackends" in text
+            or "compareBackends" in text,
+            "Expected compare-backends export or reference in studio-backend.js",
+        )
+
+    def test_shell_pages_include_backend(self):
+        """studio-shell.js must reference backend page."""
+        text = self._read("studio-shell.js")
+        self.assertIn("backend", text)
+
+    def test_nav_order_correct(self):
+        """PAGES order must be playground, history, backend, settings."""
+        text = self._read("studio-shell.js")
+        pages_start = text.find("PAGES = {")
+        pages_block = text[pages_start:pages_start + 600]
+        self.assertGreater(
+            pages_block.find("history"),
+            pages_block.find("playground"),
+        )
+        self.assertGreater(
+            pages_block.find("backend"),
+            pages_block.find("history"),
+        )
+        self.assertGreater(
+            pages_block.find("settings"),
+            pages_block.find("backend"),
+        )
+
+    def test_modal_testing_routes_setup_to_settings_legacy(self):
+        """modal-testing.js must map setup legacy tab to settings."""
+        text = self._read("modal-testing.js")
+        self.assertIn("setup", text)
+        # Must set activeLegacyTab for legacy tab routing
+        self.assertIn("activeLegacyTab", text)
+
+    def test_modal_testing_uses_getters_for_legacy_state(self):
+        """modal-testing.js must use getters for draft/previewState/experimentId."""
+        text = self._read("modal-testing.js")
+        has_getter_pattern = (
+            "get draft" in text
+            or "get previewState" in text
+            or "get experimentId" in text
+            or "_readLatest" in text
+        )
+        self.assertTrue(
+            has_getter_pattern,
+            "Expected getter pattern for legacy state in modal-testing.js",
+        )
+
+    def test_history_no_inner_html_for_run_data(self):
+        """studio-history.js must not use innerHTML template literals for run data."""
+        text = self._read("studio-history.js")
+        has_template_innerhtml = 'innerHTML = `' in text or 'innerHTML += `' in text
+        self.assertFalse(
+            has_template_innerhtml,
+            "studio-history.js must not use innerHTML with template literals for run data",
+        )
+
+    def test_history_has_retry_button(self):
+        """studio-history.js must have retry on error."""
+        text = self._read("studio-history.js")
+        self.assertIn("retry", text.lower())
+
+    def test_history_groups_by_experiment_id(self):
+        """studio-history.js must reference experiment_id for grouping."""
+        text = self._read("studio-history.js")
+        self.assertIn("experiment_id", text)
+
+    def test_shell_no_nested_studio_body(self):
+        """studio-shell.js must not use comfymodal-studio-body class on page container."""
+        text = self._read("studio-shell.js")
+        self.assertNotIn("comfymodal-studio-body", text)
 
 
 if __name__ == "__main__":

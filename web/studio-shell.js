@@ -1,18 +1,24 @@
 // Modal Studio — Shell
 //
 // Owns Studio app state and page switching. Renders the top nav with
-// Playground, History, and Settings. Mounts the active page into rootEl.
-// Receives only stable context from modal-testing.js and augments it
-// with shell actions (setPage, setSettingsLegacyTab, mountLegacyTab).
+// Playground, History, Backend, and Settings. Mounts the active page
+// into rootEl. Receives only stable context from modal-testing.js and
+// augments it with shell actions (setPage, setSettingsLegacyTab,
+// mountLegacyTab).
+//
+// Avoids nested containers: the shell's page
+// container uses a distinct class (comfymodal-studio-pagecontainer).
 
 import { renderPlayground } from "./studio-playground.js";
 import { renderHistory } from "./studio-history.js";
+import { renderBackend } from "./studio-backend.js";
 import { renderSettings } from "./studio-settings.js";
 import { stopLegacyController } from "./studio-legacy.js";
 
 const PAGES = {
   playground: { label: "Playground", render: renderPlayground },
   history:    { label: "History",    render: renderHistory },
+  backend:    { label: "Backend",    render: renderBackend },
   settings:   { label: "Settings",   render: renderSettings },
 };
 
@@ -61,8 +67,9 @@ export function mountStudioShell(rootEl, context = {}) {
   // Build top nav
   const nav = el("div", { class: "comfymodal-studio-topnav" });
 
-  // Build page container
-  const pageContainer = el("div", { class: "comfymodal-studio-body", "data-testid": "studio-page" });
+  // Build page container — use a distinct class to avoid
+  // class-name collision with page-level containers
+  const pageContainer = el("div", { class: "comfymodal-studio-pagecontainer", "data-testid": "studio-page" });
 
   function renderActivePage() {
     // Clear page container

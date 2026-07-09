@@ -20,7 +20,7 @@ export const FEATURE_SPECS = [
     futureTools: ["SAM click selection", "Text object selection", "Brush refine"],
     isPlaceholder: true,
     placeholderReason: "Image-edit tools are not implemented in this release. Use Settings > Legacy Setup for the full experiment suite.",
-    controls: ["instruction"],
+    controls: ["prompt", "instruction", "steps", "guidance", "denoise", "seed", "lora", "lora_strength", "mask_blur", "mask_expand"],
   },
   {
     id: "object_replace",
@@ -30,7 +30,7 @@ export const FEATURE_SPECS = [
     futureTools: ["SAM click selection", "Text object selection", "Reference image"],
     isPlaceholder: true,
     placeholderReason: "Image-edit tools are not implemented in this release. Use Settings > Legacy Setup for the full experiment suite.",
-    controls: ["instruction"],
+    controls: ["prompt", "instruction", "steps", "guidance", "denoise", "seed", "lora", "lora_strength", "mask_blur", "mask_expand"],
   },
 ];
 
@@ -43,7 +43,7 @@ export const CONTROL_DEFS = {
     placeholder: "Describe what you want to generate\u2026",
     experimentEligible: true,
     helpText: "The main prompt describing the desired output.",
-    applicableFeatures: ["txt2img"],
+    applicableFeatures: ["txt2img", "object_remove", "object_replace"],
   },
   negative_prompt: {
     id: "negative_prompt",
@@ -61,7 +61,7 @@ export const CONTROL_DEFS = {
     type: "textarea",
     defaultValue: "",
     placeholder: "Describe the edit you want to perform\u2026",
-    experimentEligible: false,
+    experimentEligible: true,
     helpText: "Natural language instruction for the image edit.",
     applicableFeatures: ["object_remove", "object_replace"],
   },
@@ -75,7 +75,7 @@ export const CONTROL_DEFS = {
     step: 1,
     experimentEligible: true,
     helpText: "Number of sampling steps. Higher values may improve quality at the cost of speed.",
-    applicableFeatures: ["txt2img"],
+    applicableFeatures: ["txt2img", "object_remove", "object_replace"],
   },
   guidance: {
     id: "guidance",
@@ -87,7 +87,7 @@ export const CONTROL_DEFS = {
     step: 0.5,
     experimentEligible: true,
     helpText: "Classifier-free guidance scale. Higher values follow the prompt more closely.",
-    applicableFeatures: ["txt2img"],
+    applicableFeatures: ["txt2img", "object_remove", "object_replace"],
   },
   denoise: {
     id: "denoise",
@@ -99,7 +99,7 @@ export const CONTROL_DEFS = {
     step: 0.05,
     experimentEligible: true,
     helpText: "Denoising strength. 1.0 = full generation, lower = less change from input.",
-    applicableFeatures: ["txt2img"],
+    applicableFeatures: ["txt2img", "object_remove", "object_replace"],
   },
   seed: {
     id: "seed",
@@ -111,7 +111,7 @@ export const CONTROL_DEFS = {
     step: 1,
     experimentEligible: true,
     helpText: "Random seed for reproducibility. -1 = random.",
-    applicableFeatures: ["txt2img"],
+    applicableFeatures: ["txt2img", "object_remove", "object_replace"],
   },
   lora: {
     id: "lora",
@@ -120,7 +120,7 @@ export const CONTROL_DEFS = {
     defaultValue: "",
     experimentEligible: false,
     helpText: "LoRA model to apply. Configured in Settings > Legacy Setup.",
-    applicableFeatures: ["txt2img"],
+    applicableFeatures: ["txt2img", "object_remove", "object_replace"],
   },
   lora_strength: {
     id: "lora_strength",
@@ -132,7 +132,7 @@ export const CONTROL_DEFS = {
     step: 0.05,
     experimentEligible: true,
     helpText: "Strength of the applied LoRA. 1.0 = default.",
-    applicableFeatures: ["txt2img"],
+    applicableFeatures: ["txt2img", "object_remove", "object_replace"],
   },
   mask_blur: {
     id: "mask_blur",
@@ -144,7 +144,7 @@ export const CONTROL_DEFS = {
     step: 1,
     experimentEligible: true,
     helpText: "Blur radius applied to the inpaint mask edges.",
-    applicableFeatures: ["txt2img"],
+    applicableFeatures: ["txt2img", "object_remove", "object_replace"],
   },
   mask_expand: {
     id: "mask_expand",
@@ -156,6 +156,6 @@ export const CONTROL_DEFS = {
     step: 1,
     experimentEligible: true,
     helpText: "Expand (positive) or contract (negative) the inpaint mask.",
-    applicableFeatures: ["txt2img"],
+    applicableFeatures: ["txt2img", "object_remove", "object_replace"],
   },
 };
