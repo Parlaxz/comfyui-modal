@@ -54,29 +54,34 @@ export function renderFeaturesChipGrid(features, onChange) {
   const grid = el("div", { class: "comfymodal-studio-features-chip-grid" });
   const known = ["txt2img", "object_remove", "object_replace"];
   const labels = { txt2img: "Txt2Img", object_remove: "Object Remove", object_replace: "Object Replace" };
-  const selected = features || [];
+  const selectedSet = new Set(features || []);
+
+  function syncChip(chip) {
+    const isPressed = selectedSet.has(chip.dataset.feature);
+    chip.setAttribute("aria-pressed", isPressed ? "true" : "false");
+    chip.classList.toggle("checked", isPressed);
+  }
+
   known.forEach((fid) => {
-    const isChecked = selected.includes(fid);
     const chip = el("button", {
       type: "button",
-      class: "comfymodal-studio-feature-chip" + (isChecked ? " checked" : ""),
-      "aria-pressed": isChecked ? "true" : "false",
+      class: "comfymodal-studio-feature-chip",
+      "aria-pressed": "false",
       "data-feature": fid,
     }, [
       el("span", { class: "chip-check", text: "\u2713 " }),
       el("span", { text: labels[fid] || fid }),
     ]);
     chip.addEventListener("click", () => {
-      // JS state is source of truth — toggle aria-pressed, not DOM class
-      const wasPressed = chip.getAttribute("aria-pressed") === "true";
-      chip.setAttribute("aria-pressed", wasPressed ? "false" : "true");
-      chip.classList.toggle("checked");
-      const updated = [];
-      grid.querySelectorAll(".comfymodal-studio-feature-chip").forEach((c) => {
-        if (c.getAttribute("aria-pressed") === "true") updated.push(c.dataset.feature);
-      });
-      if (onChange) onChange(updated);
+      if (selectedSet.has(fid)) {
+        selectedSet.delete(fid);
+      } else {
+        selectedSet.add(fid);
+      }
+      syncChip(chip);
+      if (onChange) onChange(Array.from(selectedSet));
     });
+    syncChip(chip);
     grid.appendChild(chip);
   });
   return grid;

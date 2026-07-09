@@ -180,6 +180,16 @@ class CompatibleFeaturesChipGridTests(unittest.TestCase):
         self.assertIn('type: "button"', self.m.text)
         self.assertIn('aria-pressed', self.m.text)
 
+    def test_features_chip_grid_uses_set_for_state(self):
+        """Chip grid must use a Set in closure, not an array, for state tracking."""
+        self.assertIn("new Set(", self.m.text)
+        self.assertIn("selectedSet", self.m.text)
+        self.assertIn("syncChip", self.m.text)
+
+    def test_features_chip_grid_does_not_query_dom_for_state(self):
+        """Click handler must not query DOM to reconstruct selected features."""
+        self.assertNotIn("grid.querySelectorAll", self.m.text)
+
 
 class BackendModuleSplitTests(unittest.TestCase):
     """Backend page logic should be split into focused modules."""
@@ -221,6 +231,26 @@ class PresetOnlySelectorTests(unittest.TestCase):
         text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
         self.assertIn("getRuntimePresets", text)
         self.assertNotIn("getBackends(", text)
+
+
+class BackendSelectorApiBaseTests(unittest.TestCase):
+    """Backend selector must derive apiBase from context, not hardcode it."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_backend_selector_receives_context(self):
+        """renderControlPanel must pass context to renderBackendSelector."""
+        self.assertIn("renderBackendSelector(state, actions, context)", self.text)
+
+    def test_backend_selector_signature_accepts_context(self):
+        """renderBackendSelector must accept a context parameter."""
+        self.assertIn("function renderBackendSelector(state, actions, context) {", self.text)
+
+    def test_backend_selector_derives_api_base_from_context(self):
+        """renderBackendSelector must use context.apiBase with fallback."""
+        self.assertIn("context.apiBase", self.text)
+        self.assertNotIn('const apiBase = "/comfymodal"', self.text)
 
 
 # ---------------------------------------------------------------------------

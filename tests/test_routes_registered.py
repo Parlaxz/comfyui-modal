@@ -675,6 +675,71 @@ class StudioStoreAndModelTests(unittest.TestCase):
             with self.assertRaises(studio_store.StudioStoreError):
                 store.read()
 
+    def test_json_store_update_mutator_atomic(self):
+        """update() performs read-modify-write under one lock."""
+        studio_store = _load_repo_module("studio_store_update_test", "studio_store.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "data.json"
+            store = studio_store.StudioJsonStore(path)
+            store.write_atomic([{"id": "a"}, {"id": "b"}])
+
+            def _remover(data):
+                data[:] = [d for d in data if d["id"] != "a"]
+
+            result = store.update(_remover)
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0]["id"], "b")
+            # Verify persisted
+            self.assertEqual(store.read(), [{"id": "b"}])
+
+    def test_json_store_update_mutator_writes_atomically(self):
+        """update() cleans up .tmp files."""
+        studio_store = _load_repo_module("studio_store_atomic_test", "studio_store.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "data.json"
+            store = studio_store.StudioJsonStore(path)
+            store.write_atomic([{"id": "x"}])
+
+            def _noop(d):
+                pass
+
+            store.update(_noop)
+            self.assertFalse(path.with_suffix(path.suffix + ".tmp").exists())
+
+    def test_strict_validate_feature_ids_rejects_mixed_list(self):
+        """Strict validation rejects mixed valid+unknown features."""
+        studio_models = _load_repo_module("studio_models_mixed", "studio_models.py")
+        with self.assertRaises(ValueError):
+            studio_models._validate_feature_ids_strict(["txt2img", "bad_feature"])
+
+    def test_strict_validate_feature_ids_rejects_all_unknown(self):
+        """Strict validation rejects entirely unknown feature list."""
+        studio_models = _load_repo_module("studio_models_unknown", "studio_models.py")
+        with self.assertRaises(ValueError):
+            studio_models._validate_feature_ids_strict(["nope", "also_nope"])
+
+    def test_strict_validate_feature_ids_accepts_known_only(self):
+        """Strict validation accepts a list of only known features."""
+        studio_models = _load_repo_module("studio_models_known", "studio_models.py")
+        result = studio_models._validate_feature_ids_strict(["txt2img", "object_remove"])
+        self.assertEqual(result, ["txt2img", "object_remove"])
+
+    def test_snapshot_disabled_reason_derived_server_side(self):
+        """Client-provided disabledReason must be ignored on create."""
+        studio_models = _load_repo_module("studio_models_disabled", "studio_models.py")
+        # make_snapshot should ignore client-disabledReason
+        snapshot = studio_models.make_snapshot({
+            "name": "Test",
+            "compatibleFeatures": ["txt2img"],
+            "apiPromptJson": {"prompt": {}},
+            "nodeBindings": {"prompt": "7.text"},
+            "outputNodeId": "42",
+            "disabledReason": "Client says disabled",  # must be ignored
+        })
+        self.assertNotIn("Client says disabled", snapshot.get("disabledReason", ""))
+        # A runnable snapshot should have empty disabledReason
+        self.assertEqual(snapshot["disabledReason"], "")
+
     def test_snapshot_feature_status_is_conservative_for_multi_feature_records(self):
         studio_models = _load_repo_module("studio_models_under_test", "studio_models.py")
         snapshot = studio_models.normalize_snapshot_payload({
@@ -690,6 +755,73 @@ class StudioStoreAndModelTests(unittest.TestCase):
         self.assertEqual(snapshot["featureStatus"]["object_remove"]["status"], "needs_bindings")
         self.assertEqual(snapshot["featureStatus"]["object_replace"]["status"], "needs_bindings")
 
+    def test_tightened_runnability_requires_api_prompt_and_output_for_all(self):
+        """All features require outputNodeId and apiPromptJson, not just txt2img."""
+        studio_models = _load_repo_module("studio_models_tight", "studio_models.py")
+        # txt2img with everything: should be runnable
+        snapshot = studio_models.normalize_snapshot_payload({
+            "compatibleFeatures": ["txt2img"],
+            "apiPromptJson": {"prompt": {}},
+            "nodeBindings": {"prompt": "7.text"},
+            "outputNodeId": "42",
+        })
+        self.assertEqual(snapshot["featureStatus"]["txt2img"]["status"], "runnable")
+
+        # txt2img missing outputNodeId: should be needs_bindings
+        snapshot2 = studio_models.normalize_snapshot_payload({
+            "compatibleFeatures": ["txt2img"],
+            "apiPromptJson": {"prompt": {}},
+            "nodeBindings": {"prompt": "7.text"},
+        })
+        self.assertEqual(snapshot2["featureStatus"]["txt2img"]["status"], "needs_bindings")
+
+        # object_remove missing apiPromptJson: should be needs_api_prompt
+        snapshot3 = studio_models.normalize_snapshot_payload({
+            "compatibleFeatures": ["object_remove"],
+            "apiPromptJson": None,
+            "nodeBindings": {"object_remove_image": "img", "object_remove_mask": "mask"},
+            "outputNodeId": "42",
+        })
+        self.assertEqual(snapshot3["featureStatus"]["object_remove"]["status"], "needs_api_prompt")
+
+        # object_replace missing outputNodeId: should be needs_bindings
+        snapshot4 = studio_models.normalize_snapshot_payload({
+            "compatibleFeatures": ["object_replace"],
+            "apiPromptJson": {"prompt": {}},
+            "nodeBindings": {"object_replace_image": "img", "object_replace_mask": "mask"},
+        })
+        self.assertEqual(snapshot4["featureStatus"]["object_replace"]["status"], "needs_bindings")
+
+    def test_preset_import_only_without_snapshot(self):
+        """Import sourceType without snapshotId yields import_only status."""
+        studio_models = _load_repo_module("studio_models_import", "studio_models.py")
+        preset = studio_models.normalize_preset_payload(
+            {"label": "Import preset", "sourceType": "import", "snapshotId": ""},
+            snapshots_by_id={},
+        )
+        self.assertEqual(preset["status"], "import_only")
+        self.assertIn("import", preset.get("disabledReason", "").lower())
+
+    def test_preset_metadata_only_without_snapshot(self):
+        """Legacy sourceType without snapshotId yields metadata_only status."""
+        studio_models = _load_repo_module("studio_models_legacy", "studio_models.py")
+        preset = studio_models.normalize_preset_payload(
+            {"label": "Legacy preset", "sourceType": "legacy", "snapshotId": ""},
+            snapshots_by_id={},
+        )
+        self.assertEqual(preset["status"], "metadata_only")
+        self.assertIn("legacy", preset.get("disabledReason", "").lower())
+
+    def test_preset_manual_without_snapshot_is_invalid(self):
+        """Manual sourceType without snapshotId is invalid (not import_only)."""
+        studio_models = _load_repo_module("studio_models_manual", "studio_models.py")
+        preset = studio_models.normalize_preset_payload(
+            {"label": "Manual preset", "sourceType": "manual", "snapshotId": ""},
+            snapshots_by_id={},
+        )
+        self.assertEqual(preset["status"], "invalid")
+        self.assertIn("does not reference", preset.get("disabledReason", ""))
+
     def test_preset_missing_snapshot_is_invalid(self):
         studio_models = _load_repo_module("studio_models_under_test_preset", "studio_models.py")
         preset = studio_models.normalize_preset_payload(
@@ -702,6 +834,56 @@ class StudioStoreAndModelTests(unittest.TestCase):
         )
         self.assertEqual(preset["status"], "invalid")
         self.assertEqual(preset["disabledReason"], "Preset references a missing snapshot")
+
+    def test_make_snapshot_rejects_unknown_features(self):
+        """make_snapshot raises ValueError for unknown features."""
+        studio_models = _load_repo_module("studio_models_ms_rej", "studio_models.py")
+        with self.assertRaises(ValueError):
+            studio_models.make_snapshot({
+                "name": "Bad",
+                "compatibleFeatures": ["fake_feature"],
+            })
+
+    def test_make_preset_rejects_unknown_features(self):
+        """make_preset raises ValueError for unknown features."""
+        studio_models = _load_repo_module("studio_models_mp_rej", "studio_models.py")
+        with self.assertRaises(ValueError):
+            studio_models.make_preset(
+                {"label": "Bad", "compatibleFeatures": ["fake"]},
+                snapshots_by_id={},
+            )
+
+    def test_update_snapshot_ignores_client_disabled_reason(self):
+        """update_snapshot ignores client-provided disabledReason."""
+        studio_models = _load_repo_module("studio_models_udr", "studio_models.py")
+        snapshot = {
+            "id": "snap_1",
+            "name": "Test",
+            "compatibleFeatures": ["txt2img"],
+            "nodeBindings": {"prompt": "7.text"},
+            "outputNodeId": "42",
+            "apiPromptJson": {"prompt": {}},
+        }
+        studio_models.update_snapshot(snapshot, {"disabledReason": "Client reason"})
+        self.assertNotEqual(snapshot.get("disabledReason"), "Client reason")
+        self.assertEqual(snapshot["disabledReason"], "")  # runnable → no disabledReason
+
+    def test_update_preset_ignores_client_disabled_reason(self):
+        """update_preset ignores client-provided disabledReason."""
+        studio_models = _load_repo_module("studio_models_updr", "studio_models.py")
+        preset = {
+            "id": "preset_1",
+            "label": "Test",
+            "snapshotId": "snap_ok",
+            "sourceType": "snapshot",
+        }
+        snapshots_by_id = {
+            "snap_ok": {"id": "snap_ok", "status": "runnable", "compatibleFeatures": ["txt2img"]}
+        }
+        studio_models.update_preset(preset, {"disabledReason": "Client reason"}, snapshots_by_id)
+        self.assertNotEqual(preset.get("disabledReason"), "Client reason")
+        # runnable preset with runnable snapshot should have empty disabledReason
+        self.assertEqual(preset["disabledReason"], "")
 
 
 class StudioRouteBehaviourTests(unittest.TestCase):
@@ -744,6 +926,63 @@ class StudioRouteBehaviourTests(unittest.TestCase):
             ids = [item["id"] for item in body.get("snapshots", [])]
             self.assertEqual(ids, ["snap_live", "snap_old"])
 
+    def test_snapshot_list_re_normalizes_status(self):
+        """List response re-normalizes snapshots even if stored status is stale."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Store a snapshot with stale "runnable" status but missing apiPromptJson
+            path = Path(tmpdir) / ".studio_snapshots.json"
+            path.write_text(json.dumps([{
+                "id": "snap_stale",
+                "name": "Stale",
+                "compatibleFeatures": ["txt2img"],
+                "nodeBindings": {"prompt": "7.text"},
+                "outputNodeId": "42",
+                "apiPromptJson": None,
+                "archived": False,
+                "status": "runnable",
+            }]), encoding="utf-8")
+            mod = self._register(tmpdir)
+            fn = _handler_for(mod, "GET", "/comfymodal/studio/snapshots")
+            resp = _run(fn(_MockRequest()))
+            body = json.loads(resp.body)
+            snapshots = body.get("snapshots", [])
+            self.assertEqual(len(snapshots), 1)
+            # With tightened rules, missing apiPromptJson → needs_api_prompt
+            self.assertEqual(snapshots[0]["status"], "needs_api_prompt")
+
+    def test_snapshot_detail_re_normalizes_status(self):
+        """Detail response re-normalizes snapshot status."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / ".studio_snapshots.json"
+            path.write_text(json.dumps([{
+                "id": "snap_detail",
+                "name": "Detail",
+                "compatibleFeatures": ["txt2img"],
+                "nodeBindings": {},
+                "outputNodeId": "",
+                "apiPromptJson": None,
+                "archived": False,
+                "status": "runnable",
+            }]), encoding="utf-8")
+            mod = self._register(tmpdir)
+            fn = _handler_for(mod, "GET", "/comfymodal/studio/snapshots/{snapshot_id}")
+            resp = _run(fn(_MockRequest(match_info={"snapshot_id": "snap_detail"})))
+            body = json.loads(resp.body)
+            self.assertEqual(body.get("snapshot", {}).get("status"), "needs_bindings")
+
+    def test_snapshot_create_rejects_mixed_features_with_stable_message(self):
+        """Create rejects mixed valid+unknown feature IDs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = self._register(tmpdir)
+            fn = _handler_for(mod, "POST", "/comfymodal/studio/snapshots")
+            resp = _run(fn(_MockRequest(json_body={
+                "name": "Mixed snapshot",
+                "compatibleFeatures": ["txt2img", "bad_feature"],
+            })))
+            self.assertEqual(resp.status, 400)
+            body = json.loads(resp.body)
+            self.assertEqual(body.get("message"), "Invalid compatible feature")
+
     def test_snapshot_create_rejects_invalid_feature_with_stable_message(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             mod = self._register(tmpdir)
@@ -755,6 +994,24 @@ class StudioRouteBehaviourTests(unittest.TestCase):
             self.assertEqual(resp.status, 400)
             body = json.loads(resp.body)
             self.assertEqual(body.get("message"), "Invalid compatible feature")
+
+    def test_snapshot_create_ignores_client_disabled_reason(self):
+        """Client-provided disabledReason is ignored on snapshot create."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = self._register(tmpdir)
+            fn = _handler_for(mod, "POST", "/comfymodal/studio/snapshots")
+            resp = _run(fn(_MockRequest(json_body={
+                "name": "Test snapshot",
+                "compatibleFeatures": ["txt2img"],
+                "apiPromptJson": {"prompt": {}},
+                "nodeBindings": {"prompt": "7.text"},
+                "outputNodeId": "42",
+                "disabledReason": "Client says disabled",
+            })))
+            self.assertEqual(resp.status, 200)
+            body = json.loads(resp.body)
+            snapshot = body.get("snapshot", {})
+            self.assertNotEqual(snapshot.get("disabledReason"), "Client says disabled")
 
     def test_preset_create_rejects_missing_snapshot_with_stable_message(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -768,6 +1025,131 @@ class StudioRouteBehaviourTests(unittest.TestCase):
             self.assertEqual(resp.status, 400)
             body = json.loads(resp.body)
             self.assertEqual(body.get("message"), "Preset references a missing snapshot")
+
+    def test_preset_create_allows_import_without_snapshot(self):
+        """Import preset without snapshotId is allowed (import_only)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = self._register(tmpdir)
+            fn = _handler_for(mod, "POST", "/comfymodal/studio/presets")
+            resp = _run(fn(_MockRequest(json_body={
+                "label": "Import preset",
+                "sourceType": "import",
+                "snapshotId": "",
+            })))
+            self.assertEqual(resp.status, 200)
+            body = json.loads(resp.body)
+            preset = body.get("preset", {})
+            self.assertEqual(preset.get("status"), "import_only")
+
+    def test_preset_create_rejects_manual_without_snapshot(self):
+        """Manual preset without snapshotId is rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = self._register(tmpdir)
+            fn = _handler_for(mod, "POST", "/comfymodal/studio/presets")
+            resp = _run(fn(_MockRequest(json_body={
+                "label": "Manual preset",
+                "sourceType": "manual",
+                "snapshotId": "",
+            })))
+            self.assertEqual(resp.status, 400)
+            body = json.loads(resp.body)
+            self.assertIn("does not reference", body.get("message", ""))
+
+    def test_preset_update_rejects_invalid_snapshot_id(self):
+        """Updating snapshotId to a missing snapshot returns 400."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a valid preset first
+            presets_path = Path(tmpdir) / ".studio_presets.json"
+            presets_path.write_text(json.dumps([{
+                "id": "preset_1",
+                "label": "Original",
+                "snapshotId": "",
+                "sourceType": "snapshot",
+                "archived": False,
+                "createdAt": "2024-01-01T00:00:00",
+                "updatedAt": "2024-01-01T00:00:00",
+            }]), encoding="utf-8")
+            snapshots_path = Path(tmpdir) / ".studio_snapshots.json"
+            snapshots_path.write_text(json.dumps([]), encoding="utf-8")
+            mod = self._register(tmpdir)
+            fn = _handler_for(mod, "PATCH", "/comfymodal/studio/presets/{preset_id}")
+            resp = _run(fn(_MockRequest(
+                json_body={"snapshotId": "nonexistent_snap"},
+                match_info={"preset_id": "preset_1"},
+            )))
+            self.assertEqual(resp.status, 400)
+            body = json.loads(resp.body)
+            self.assertEqual(body.get("message"), "Preset references a missing snapshot")
+
+    def test_snapshot_duplicate_re_normalizes_status(self):
+        """Duplicate re-derives status instead of inheriting stale value."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / ".studio_snapshots.json"
+            path.write_text(json.dumps([{
+                "id": "snap_src",
+                "name": "Source",
+                "compatibleFeatures": ["txt2img"],
+                "nodeBindings": {"prompt": "7.text"},
+                "outputNodeId": "42",
+                "apiPromptJson": None,
+                "archived": False,
+                "status": "runnable",  # stale – should be needs_api_prompt
+            }]), encoding="utf-8")
+            mod = self._register(tmpdir)
+            fn = _handler_for(mod, "POST", "/comfymodal/studio/snapshots/{snapshot_id}/duplicate")
+            resp = _run(fn(_MockRequest(match_info={"snapshot_id": "snap_src"})))
+            self.assertEqual(resp.status, 200)
+            body = json.loads(resp.body)
+            dup = body.get("snapshot", {})
+            self.assertEqual(dup.get("status"), "needs_api_prompt")
+            self.assertNotEqual(dup.get("id"), "snap_src")
+            self.assertIn("(Copy)", dup.get("name", ""))
+
+    def test_preset_duplicate_re_normalizes_status(self):
+        """Preset duplicate re-derives status instead of inheriting stale value."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snapshots_path = Path(tmpdir) / ".studio_snapshots.json"
+            snapshots_path.write_text(json.dumps([{
+                "id": "snap_ok",
+                "name": "Good Snapshot",
+                "compatibleFeatures": ["txt2img"],
+                "status": "runnable",
+            }]), encoding="utf-8")
+            presets_path = Path(tmpdir) / ".studio_presets.json"
+            presets_path.write_text(json.dumps([{
+                "id": "preset_src",
+                "label": "Source Preset",
+                "snapshotId": "snap_ok",
+                "sourceType": "snapshot",
+                "archived": False,
+                "createdAt": "2024-01-01T00:00:00",
+                "updatedAt": "2024-01-01T00:00:00",
+                "status": "invalid",  # stale — should be "runnable" after re-derive
+            }]), encoding="utf-8")
+            mod = self._register(tmpdir)
+            fn = _handler_for(mod, "POST", "/comfymodal/studio/presets/{preset_id}/duplicate")
+            resp = _run(fn(_MockRequest(match_info={"preset_id": "preset_src"})))
+            self.assertEqual(resp.status, 200)
+            body = json.loads(resp.body)
+            dup = body.get("preset", {})
+            self.assertEqual(dup.get("status"), "runnable")
+            self.assertNotEqual(dup.get("id"), "preset_src")
+            self.assertIn("(Copy)", dup.get("label", ""))
+
+    def test_storage_error_returns_stable_message(self):
+        """Storage errors return stable messages, not raw exceptions."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Corrupt the snapshots file to trigger a read error
+            path = Path(tmpdir) / ".studio_snapshots.json"
+            path.write_text("not-json", encoding="utf-8")
+            mod = self._register(tmpdir)
+            fn = _handler_for(mod, "GET", "/comfymodal/studio/snapshots")
+            resp = _run(fn(_MockRequest()))
+            self.assertEqual(resp.status, 500)
+            body = json.loads(resp.body)
+            # Must not contain raw exception details like "Corrupt JSON"
+            self.assertNotIn("Corrupt JSON", body.get("message", ""))
+            self.assertIn("read error", body.get("message", "").lower())
 
 
 if __name__ == "__main__":

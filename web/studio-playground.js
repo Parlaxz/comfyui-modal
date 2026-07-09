@@ -74,7 +74,7 @@ function renderControlPanel(state, context) {
   }
 
   // ── Backend Selector ───────────────────────────────────────────────
-  panel.appendChild(renderControlGroup("Backend", renderBackendSelector(state, actions)));
+  panel.appendChild(renderControlGroup("Backend", renderBackendSelector(state, actions, context)));
 
   // ── Controls from feature registry ─────────────────────────────────
   const controlsContainer = el("div", { class: "comfymodal-studio-controls", "data-testid": "controls-container" });
@@ -204,7 +204,7 @@ function renderControlGroup(labelText, inputEl) {
 // Filters by feature compatibility when appropriate.
 // In empty state, links to the Backend tab instead of Legacy Setup.
 
-function renderBackendSelector(state, actions) {
+function renderBackendSelector(state, actions, context) {
   const container = el("div", { class: "comfymodal-studio-backend-selector", "data-testid": "backend-selector" });
 
   const select = el("select", {
@@ -217,7 +217,7 @@ function renderBackendSelector(state, actions) {
   container.appendChild(select);
 
     // Async load presets through the Studio abstraction (runtime selectors only)
-  const apiBase = "/comfymodal";
+  const apiBase = (context && context.apiBase) || "/comfymodal";
   getRuntimePresets({ apiBase }).then((backends) => {
     while (select.firstChild) select.removeChild(select.firstChild);
 

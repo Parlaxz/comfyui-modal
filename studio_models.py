@@ -4,13 +4,21 @@ Exports
 -------
 * ``_KNOWN_FEATURE_IDS`` — set of recognised compatible-feature identifiers.
 * ``_normalize_label`` / ``_sanitize_description`` / ``_validate_feature_ids``
-* ``normalize_snapshot_payload`` — enrich a snapshot dict with ``status`` and
-  ``featureStatus``.
-* ``normalize_preset_payload`` — enrich a preset dict with derived ``status``.
+* ``_validate_feature_ids_strict`` — rejects unknown feature IDs.
+* ``normalize_snapshot_payload`` — enrich a snapshot dict with ``status``,
+  ``featureStatus``, and ``disabledReason``.
+* ``normalize_preset_payload`` — enrich a preset dict with derived ``status``
+  and ``disabledReason``.
+* ``make_snapshot`` — create a fully-normalised snapshot from an API body.
+* ``update_snapshot`` — apply field updates to an existing snapshot.
+* ``make_preset`` — create a fully-normalised preset from an API body.
+* ``update_preset`` — apply field updates to an existing preset.
 """
 
 from __future__ import annotations
 
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 # ── Known feature IDs ────────────────────────────────────────────────────
@@ -36,6 +44,9 @@ _STATUS_PRIORITY: list[str] = [
     "runnable",
 ]
 
+# Source types that require a snapshot link.
+_SOURCE_TYPES_REQUIRING_SNAPSHOT: set[str] = {"manual", "snapshot"}
+
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
@@ -59,6 +70,23 @@ def _validate_feature_ids(features: Any) -> list[str]:
     return [f for f in features if isinstance(f, str) and f in _KNOWN_FEATURE_IDS]
 
 
+def _validate_feature_ids_strict(features: Any) -> list[str]:
+    """Return recognised feature IDs from *features*.
+
+    Raises ``ValueError`` if any entry is unknown or *features* is not a list.
+    """
+    if not isinstance(features, list):
+        raise ValueError("Invalid compatible feature")
+    unknown = [
+        f
+        for f in features
+        if not (isinstance(f, str) and f in _KNOWN_FEATURE_IDS)
+    ]
+    if unknown:
+        raise ValueError("Invalid compatible feature")
+    return features
+
+
 # ── Feature-status derivation ────────────────────────────────────────────
 
 
@@ -70,18 +98,19 @@ def _derive_feature_status(
 ) -> dict[str, str]:
     """Return a ``{"status": …, "reason": …}`` dict for one feature.
 
+    All runnable features require ``outputNodeId`` and ``apiPromptJson``.
+    In addition, ``txt2img`` requires prompt binding, and
+    ``object_remove`` / ``object_replace`` require their image/mask bindings.
+
     Priority (most restrictive wins):
         needs_bindings > needs_api_prompt > runnable
     """
     bindings = node_bindings if isinstance(node_bindings, dict) else {}
     required_keys = _FEATURE_BINDING_KEYS.get(feature_id, [])
 
-    has_bindings = all(
-        bool(bindings.get(k)) for k in required_keys
-    )
-    has_output_node = bool(output_node_id) if feature_id == "txt2img" else True
-
-    has_api_prompt = bool(api_prompt_json) if feature_id == "txt2img" else True
+    has_bindings = all(bool(bindings.get(k)) for k in required_keys)
+    has_output_node = bool(output_node_id)
+    has_api_prompt = bool(api_prompt_json)
 
     if not has_bindings or not has_output_node:
         return {"status": "needs_bindings", "reason": "missing required node bindings"}
@@ -105,8 +134,22 @@ def _aggregate_status(feature_statuses: dict[str, dict[str, str]]) -> str:
 # ── Snapshot normalisation ───────────────────────────────────────────────
 
 
+def _derive_snapshot_disabled_reason(
+    status: str, feature_statuses: dict[str, dict[str, str]]
+) -> str:
+    """Derive a human-readable ``disabledReason`` for a snapshot."""
+    if status == "invalid":
+        return "No compatible features configured"
+    if status == "needs_bindings":
+        return "Missing required node bindings"
+    if status == "needs_api_prompt":
+        return "Missing API prompt configuration"
+    return ""
+
+
 def normalize_snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy of *payload* enriched with ``status`` and ``featureStatus``.
+    """Return a copy of *payload* enriched with ``status``, ``featureStatus``,
+    and ``disabledReason``.
 
     The input dict is expected to contain (at least):
         compatibleFeatures, graphJson, apiPromptJson, nodeBindings, outputNodeId
@@ -114,6 +157,7 @@ def normalize_snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:
     The enrichment adds:
         featureStatus — ``{feature_id: {"status": …, "reason": …}}`` per feature
         status        — aggregate across all features using the priority rules
+        disabledReason — derived from the aggregate status
     """
     result = dict(payload)
     features = _validate_feature_ids(result.get("compatibleFeatures", []))
@@ -121,6 +165,7 @@ def normalize_snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:
         # No recognised features → invalid
         result["featureStatus"] = {}
         result["status"] = "invalid"
+        result["disabledReason"] = "No compatible features configured"
         return result
 
     node_bindings = result.get("nodeBindings", {}) or {}
@@ -135,6 +180,9 @@ def normalize_snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     result["featureStatus"] = feature_statuses
     result["status"] = _aggregate_status(feature_statuses)
+    result["disabledReason"] = _derive_snapshot_disabled_reason(
+        result["status"], feature_statuses
+    )
 
     # Archive overrides everything
     if result.get("archived"):
@@ -146,22 +194,45 @@ def normalize_snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:
 # ── Preset normalisation ─────────────────────────────────────────────────
 
 
+def _derive_preset_disabled_reason(
+    status: str,
+    snapshot_id: str,
+    snapshot_status: str | None,
+) -> str:
+    """Derive a human-readable ``disabledReason`` for a preset."""
+    if status == "invalid":
+        if snapshot_id and snapshot_status is None:
+            return "Preset references a missing snapshot"
+        return "Preset does not reference a snapshot"
+    if status == "import_only":
+        return "Import preset without snapshot linkage"
+    if status == "metadata_only":
+        return "Legacy preset without snapshot linkage"
+    if snapshot_status and snapshot_status != "runnable":
+        return f"Referenced snapshot is {snapshot_status}"
+    return ""
+
+
 def normalize_preset_payload(
     payload: dict[str, Any],
     snapshots_by_id: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    """Return a copy of *payload* with normalised fields and derived ``status``.
+    """Return a copy of *payload* with normalised fields and derived ``status``
+    and ``disabledReason``.
 
     * If ``snapshotId`` is present and the snapshot is missing from
       ``snapshots_by_id``, status becomes ``"invalid"`` and
       ``disabledReason`` is set to ``"Preset references a missing snapshot"``.
     * If the referenced snapshot is found, the preset inherits the snapshot's
       aggregate ``status`` (runnable only when the snapshot is runnable).
+    * If ``snapshotId`` is empty and ``sourceType`` is ``"import"``, status
+      becomes ``"import_only"``. For ``"legacy"`` it becomes ``"metadata_only"``.
+      For other source types, status becomes ``"invalid"``.
     """
     result = dict(payload)
 
     # Required fields
-    result.setdefault("label", payload.get("name", "Untitled Preset"))
+    result.setdefault("label", result.get("name", "Untitled Preset"))
     result.setdefault("description", "")
     result.setdefault("snapshotId", "")
     result.setdefault("compatibleFeatures", [])
@@ -176,25 +247,200 @@ def normalize_preset_payload(
         snapshot = snapshots_by_id.get(snapshot_id)
         if snapshot is None:
             result["status"] = "invalid"
-            result["disabledReason"] = "Preset references a missing snapshot"
+            result["disabledReason"] = _derive_preset_disabled_reason(
+                "invalid", snapshot_id, None
+            )
             return result
         # Inherit snapshot status (preset is runnable only when snapshot is)
         snap_status = snapshot.get("status", "runnable")
         result["status"] = snap_status
-        # If snapshot is not runnable, mark the preset as derived-invalid
-        if snap_status != "runnable":
-            result["disabledReason"] = (
-                result.get("disabledReason")
-                or f"Referenced snapshot is {snap_status}"
-            )
-    else:
-        # No snapshot reference — the preset exists but is unlinked
-        result["status"] = "invalid"
-        result["disabledReason"] = result.get(
-            "disabledReason", "Preset does not reference a snapshot"
+        result["disabledReason"] = _derive_preset_disabled_reason(
+            snap_status, snapshot_id, snap_status
         )
+    else:
+        # No snapshot reference — check source type semantics
+        source_type = result.get("sourceType", "manual")
+        if source_type == "import":
+            result["status"] = "import_only"
+            result["disabledReason"] = _derive_preset_disabled_reason(
+                "import_only", "", None
+            )
+        elif source_type == "legacy":
+            result["status"] = "metadata_only"
+            result["disabledReason"] = _derive_preset_disabled_reason(
+                "metadata_only", "", None
+            )
+        else:
+            result["status"] = "invalid"
+            result["disabledReason"] = _derive_preset_disabled_reason(
+                "invalid", "", None
+            )
 
     if result.get("archived"):
         result["status"] = "archived"
 
     return result
+
+
+# ── Canonical helpers for route use ──────────────────────────────────────
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _make_snapshot_id() -> str:
+    return f"snap_{uuid.uuid4().hex[:16]}"
+
+
+def _make_preset_id() -> str:
+    return f"preset_{uuid.uuid4().hex[:16]}"
+
+
+def make_snapshot(body: dict[str, Any]) -> dict[str, Any]:
+    """Create a fully-normalised snapshot dict from a raw API body.
+
+    Returns a complete snapshot dictionary with generated ``id``,
+    normalised fields, derived ``status``, ``featureStatus``, and
+    ``disabledReason``.  Client-provided ``disabledReason`` is ignored —
+    it is always derived server-side.
+
+    Raises ``ValueError`` if ``compatibleFeatures`` contains unknown IDs.
+    """
+    features = _validate_feature_ids_strict(body.get("compatibleFeatures", []))
+    now = _now_iso()
+    entry: dict[str, Any] = {
+        "id": _make_snapshot_id(),
+        "name": _normalize_label(body.get("name", "Untitled Snapshot")),
+        "description": _sanitize_description(body.get("description", "")),
+        "createdAt": now,
+        "updatedAt": now,
+        "compatibleFeatures": features,
+        "graphJson": body.get("graphJson"),
+        "apiPromptJson": body.get("apiPromptJson"),
+        "nodeBindings": body.get("nodeBindings", {}),
+        "outputNodeId": body.get("outputNodeId", ""),
+        "modelSummary": body.get("modelSummary", ""),
+        "source": _normalize_label(body.get("source", "manual")),
+        "archived": False,
+    }
+    enriched = normalize_snapshot_payload(entry)
+    entry["status"] = enriched["status"]
+    entry["featureStatus"] = enriched["featureStatus"]
+    entry["disabledReason"] = enriched.get("disabledReason", "")
+    return entry
+
+
+def update_snapshot(
+    snapshot: dict[str, Any], body: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply field updates to an existing snapshot and re-derive status.
+
+    Mutates *snapshot* in place and returns it.  Fields not present in
+    *body* are left unchanged.  Client-provided ``disabledReason`` is
+    ignored — it is always derived server-side.
+
+    Raises ``ValueError`` if ``compatibleFeatures`` contains unknown IDs.
+    """
+    if "name" in body and isinstance(body["name"], str):
+        snapshot["name"] = _normalize_label(body["name"])
+    if "description" in body and isinstance(body["description"], str):
+        snapshot["description"] = _sanitize_description(body["description"])
+    if "compatibleFeatures" in body:
+        snapshot["compatibleFeatures"] = _validate_feature_ids_strict(
+            body["compatibleFeatures"]
+        )
+    if "graphJson" in body:
+        snapshot["graphJson"] = body["graphJson"]
+    if "apiPromptJson" in body:
+        snapshot["apiPromptJson"] = body["apiPromptJson"]
+    if "nodeBindings" in body and isinstance(body["nodeBindings"], dict):
+        snapshot["nodeBindings"] = body["nodeBindings"]
+    if "outputNodeId" in body and isinstance(body["outputNodeId"], str):
+        snapshot["outputNodeId"] = body["outputNodeId"]
+    if "modelSummary" in body and isinstance(body["modelSummary"], str):
+        snapshot["modelSummary"] = body["modelSummary"].strip()
+    if "archived" in body:
+        snapshot["archived"] = bool(body["archived"])
+
+    snapshot["updatedAt"] = _now_iso()
+    enriched = normalize_snapshot_payload(snapshot)
+    snapshot["status"] = enriched["status"]
+    snapshot["featureStatus"] = enriched["featureStatus"]
+    snapshot["disabledReason"] = enriched.get("disabledReason", "")
+    return snapshot
+
+
+def make_preset(
+    body: dict[str, Any],
+    snapshots_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Create a fully-normalised preset dict from a raw API body.
+
+    Returns a complete preset dictionary with generated ``id``,
+    normalised fields, and derived ``status`` and ``disabledReason``.
+    Client-provided ``disabledReason`` is ignored — it is always derived
+    server-side.
+
+    Raises ``ValueError`` if ``compatibleFeatures`` contains unknown IDs.
+    """
+    features = _validate_feature_ids_strict(body.get("compatibleFeatures", []))
+    now = _now_iso()
+    entry: dict[str, Any] = {
+        "id": _make_preset_id(),
+        "label": _normalize_label(
+            body.get("label", body.get("name", "Untitled Preset"))
+        ),
+        "description": _sanitize_description(body.get("description", "")),
+        "snapshotId": body.get("snapshotId", ""),
+        "compatibleFeatures": features,
+        "defaults": body.get("defaults", {}),
+        "sourceType": body.get("sourceType", "manual"),
+        "sourceId": body.get("sourceId", ""),
+        "archived": False,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    normalized = normalize_preset_payload(entry, snapshots_by_id)
+    entry["status"] = normalized["status"]
+    entry["disabledReason"] = normalized.get("disabledReason", "")
+    return entry
+
+
+def update_preset(
+    preset: dict[str, Any],
+    body: dict[str, Any],
+    snapshots_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Apply field updates to an existing preset and re-derive status.
+
+    Mutates *preset* in place and returns it.  Fields not present in
+    *body* are left unchanged.  Client-provided ``disabledReason`` is
+    ignored — it is always derived server-side.
+
+    Raises ``ValueError`` if ``compatibleFeatures`` contains unknown IDs.
+    """
+    if "label" in body and isinstance(body["label"], str):
+        preset["label"] = _normalize_label(body["label"])
+    if "description" in body and isinstance(body["description"], str):
+        preset["description"] = _sanitize_description(body["description"])
+    if "snapshotId" in body and isinstance(body["snapshotId"], str):
+        preset["snapshotId"] = body["snapshotId"]
+    if "compatibleFeatures" in body:
+        preset["compatibleFeatures"] = _validate_feature_ids_strict(
+            body["compatibleFeatures"]
+        )
+    if "defaults" in body and isinstance(body["defaults"], dict):
+        preset["defaults"] = body["defaults"]
+    if "sourceType" in body and isinstance(body["sourceType"], str):
+        preset["sourceType"] = body["sourceType"]
+    if "sourceId" in body and isinstance(body["sourceId"], str):
+        preset["sourceId"] = body["sourceId"]
+    if "archived" in body:
+        preset["archived"] = bool(body["archived"])
+
+    preset["updatedAt"] = _now_iso()
+    normalized = normalize_preset_payload(preset, snapshots_by_id)
+    preset["status"] = normalized["status"]
+    preset["disabledReason"] = normalized.get("disabledReason", "")
+    return preset

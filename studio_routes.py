@@ -22,13 +22,17 @@ Route summary (all under ``/comfymodal/studio/``):
         POST  /comfymodal/studio/presets/{preset_id}/duplicate       — duplicate
 
 Error responses always include a stable ``"message"`` key (not a raw exception
-string) and use appropriate HTTP status codes.
+string) and use appropriate HTTP status codes.  Internal exceptions are logged.
+
+All write operations use ``StudioJsonStore.update`` so that read-modify-write is
+atomic under a single lock.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
@@ -38,14 +42,16 @@ from typing import Any, Callable
 from aiohttp import web
 
 from studio_models import (
-    _KNOWN_FEATURE_IDS,
-    _normalize_label,
-    _sanitize_description,
-    _validate_feature_ids,
+    make_preset,
+    make_snapshot,
     normalize_preset_payload,
     normalize_snapshot_payload,
+    update_preset,
+    update_snapshot,
 )
 from studio_store import StudioJsonStore, StudioStoreError
+
+_log = logging.getLogger(__name__)
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -94,13 +100,19 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
         try:
             snapshots = _snapshots_store.read()
             include_archived = request.query.get("includeArchived", "") == "1"
-            if not include_archived:
-                snapshots = [s for s in snapshots if not s.get("archived")]
-            return web.json_response({"status": "ok", "snapshots": snapshots})
-        except StudioStoreError as exc:
-            return _json_error(500, str(exc.args[0]) if exc.args else "Store read error")
-        except OSError as exc:
-            return _json_error(500, f"Storage error: {exc}")
+            enriched = []
+            for s in snapshots:
+                normalized = normalize_snapshot_payload(s)
+                if not include_archived and normalized.get("archived"):
+                    continue
+                enriched.append(normalized)
+            return web.json_response({"status": "ok", "snapshots": enriched})
+        except StudioStoreError:
+            _log.exception("Failed to read snapshots store")
+            return _json_error(500, "Storage read error")
+        except OSError:
+            _log.exception("Failed to read snapshots store")
+            return _json_error(500, "Storage read error")
 
     @server.routes.post("/comfymodal/studio/snapshots")
     async def studio_snapshots_create(request: web.Request) -> web.Response:
@@ -111,45 +123,23 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
         except Exception:
             return _json_error(400, "Request body could not be read")
 
-        now = _now_iso()
-        features = _validate_feature_ids(body.get("compatibleFeatures", []))
-
-        # Reject entirely unknown feature sets with a stable message
-        raw_features = body.get("compatibleFeatures", [])
-        if isinstance(raw_features, list) and raw_features:
-            if not features:
-                return _json_error(400, "Invalid compatible feature")
-
-        entry: dict[str, Any] = {
-            "id": _make_snapshot_id(),
-            "name": _normalize_label(body.get("name", "Untitled Snapshot")),
-            "description": _sanitize_description(body.get("description", "")),
-            "createdAt": now,
-            "updatedAt": now,
-            "compatibleFeatures": features,
-            "graphJson": body.get("graphJson"),
-            "apiPromptJson": body.get("apiPromptJson"),
-            "nodeBindings": body.get("nodeBindings", {}),
-            "outputNodeId": body.get("outputNodeId", ""),
-            "modelSummary": body.get("modelSummary", ""),
-            "source": _normalize_label(body.get("source", "manual")),
-            "archived": False,
-            "disabledReason": body.get("disabledReason", ""),
-        }
-
-        # Derive status and featureStatus via the normalisation function
-        enriched = normalize_snapshot_payload(entry)
-        entry["status"] = enriched.get("status", "runnable")
-        entry["featureStatus"] = enriched.get("featureStatus", {})
+        try:
+            entry = make_snapshot(body)
+        except ValueError as exc:
+            return _json_error(400, str(exc.args[0]) if exc.args else "Invalid compatible feature")
 
         try:
-            snapshots = _snapshots_store.read()
-            snapshots.append(entry)
-            _snapshots_store.write_atomic(snapshots)
-        except StudioStoreError as exc:
-            return _json_error(500, str(exc.args[0]) if exc.args else "Store write error")
-        except OSError as exc:
-            return _json_error(500, f"Storage error: {exc}")
+
+            def _append(mutator_data):
+                mutator_data.append(entry)
+
+            _snapshots_store.update(_append)
+        except StudioStoreError:
+            _log.exception("Failed to write snapshots store")
+            return _json_error(500, "Storage write error")
+        except OSError:
+            _log.exception("Failed to write snapshots store")
+            return _json_error(500, "Storage write error")
 
         return web.json_response({"status": "ok", "snapshot": entry})
 
@@ -158,12 +148,17 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
         sid = request.match_info.get("snapshot_id", "")
         try:
             snapshots = _snapshots_store.read()
-        except (StudioStoreError, OSError) as exc:
-            return _json_error(500, f"Storage error: {exc}")
+        except StudioStoreError:
+            _log.exception("Failed to read snapshots store")
+            return _json_error(500, "Storage read error")
+        except OSError:
+            _log.exception("Failed to read snapshots store")
+            return _json_error(500, "Storage read error")
 
         for s in snapshots:
             if s.get("id") == sid:
-                return web.json_response({"status": "ok", "snapshot": s})
+                normalized = normalize_snapshot_payload(s)
+                return web.json_response({"status": "ok", "snapshot": normalized})
         return _json_error(404, "Snapshot not found")
 
     @server.routes.patch("/comfymodal/studio/snapshots/{snapshot_id}")
@@ -174,89 +169,89 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
         except Exception:
             return _json_error(400, "Invalid JSON body")
 
+        found: list[dict[str, Any]] = []
+
+        def _mutator(data):
+            for s in data:
+                if s.get("id") == sid:
+                    update_snapshot(s, body)
+                    found.append(s)
+                    return
+
         try:
-            snapshots = _snapshots_store.read()
-        except (StudioStoreError, OSError) as exc:
-            return _json_error(500, f"Storage error: {exc}")
+            _snapshots_store.update(_mutator)
+        except ValueError as exc:
+            return _json_error(400, str(exc.args[0]) if exc.args else "Invalid compatible feature")
+        except StudioStoreError:
+            _log.exception("Failed to write snapshots store")
+            return _json_error(500, "Storage write error")
+        except OSError:
+            _log.exception("Failed to write snapshots store")
+            return _json_error(500, "Storage write error")
 
-        for s in snapshots:
-            if s.get("id") == sid:
-                if "name" in body and isinstance(body["name"], str):
-                    s["name"] = _normalize_label(body["name"])
-                if "description" in body and isinstance(body["description"], str):
-                    s["description"] = _sanitize_description(body["description"])
-                if "compatibleFeatures" in body:
-                    s["compatibleFeatures"] = _validate_feature_ids(body["compatibleFeatures"])
-                if "modelSummary" in body and isinstance(body["modelSummary"], str):
-                    s["modelSummary"] = body["modelSummary"].strip()
-                if "nodeBindings" in body and isinstance(body["nodeBindings"], dict):
-                    s["nodeBindings"] = body["nodeBindings"]
-                if "outputNodeId" in body and isinstance(body["outputNodeId"], str):
-                    s["outputNodeId"] = body["outputNodeId"]
-                if "disabledReason" in body and isinstance(body["disabledReason"], str):
-                    s["disabledReason"] = body["disabledReason"].strip()
-                if "archived" in body:
-                    s["archived"] = bool(body["archived"])
-
-                s["updatedAt"] = _now_iso()
-                # Re-derive status after update
-                enriched = normalize_snapshot_payload(s)
-                s["status"] = enriched.get("status", "runnable")
-                s["featureStatus"] = enriched.get("featureStatus", {})
-
-                try:
-                    _snapshots_store.write_atomic(snapshots)
-                except (StudioStoreError, OSError) as exc:
-                    return _json_error(500, f"Storage error: {exc}")
-                return web.json_response({"status": "ok", "snapshot": s})
-
-        return _json_error(404, "Snapshot not found")
+        if not found:
+            return _json_error(404, "Snapshot not found")
+        return web.json_response({"status": "ok", "snapshot": found[0]})
 
     @server.routes.delete("/comfymodal/studio/snapshots/{snapshot_id}")
     async def studio_snapshots_archive(request: web.Request) -> web.Response:
         """Archive (soft-delete) a snapshot by marking ``archived=True``."""
         sid = request.match_info.get("snapshot_id", "")
+        found: list[dict[str, Any]] = []
+
+        def _mutator(data):
+            for s in data:
+                if s.get("id") == sid:
+                    s["archived"] = True
+                    s["updatedAt"] = _now_iso()
+                    found.append(s)
+                    return
+
         try:
-            snapshots = _snapshots_store.read()
-        except (StudioStoreError, OSError) as exc:
-            return _json_error(500, f"Storage error: {exc}")
+            _snapshots_store.update(_mutator)
+        except StudioStoreError:
+            _log.exception("Failed to write snapshots store")
+            return _json_error(500, "Storage write error")
+        except OSError:
+            _log.exception("Failed to write snapshots store")
+            return _json_error(500, "Storage write error")
 
-        for s in snapshots:
-            if s.get("id") == sid:
-                s["archived"] = True
-                s["updatedAt"] = _now_iso()
-                try:
-                    _snapshots_store.write_atomic(snapshots)
-                except (StudioStoreError, OSError) as exc:
-                    return _json_error(500, f"Storage error: {exc}")
-                return web.json_response({"status": "ok"})
-
-        return _json_error(404, "Snapshot not found")
+        if not found:
+            return _json_error(404, "Snapshot not found")
+        return web.json_response({"status": "ok"})
 
     @server.routes.post("/comfymodal/studio/snapshots/{snapshot_id}/duplicate")
     async def studio_snapshots_duplicate(request: web.Request) -> web.Response:
         sid = request.match_info.get("snapshot_id", "")
+        found: list[dict[str, Any]] = []
+
+        def _mutator(data):
+            for s in data:
+                if s.get("id") == sid:
+                    dup = copy.deepcopy(s)
+                    dup["id"] = _make_snapshot_id()
+                    dup["name"] = (dup.get("name", "Untitled") or "Untitled") + " (Copy)"
+                    dup["createdAt"] = _now_iso()
+                    dup["updatedAt"] = _now_iso()
+                    dup["archived"] = False
+                    # Re-normalize so status/featureStatus/disabledReason are fresh
+                    dup = normalize_snapshot_payload(dup)
+                    data.append(dup)
+                    found.append(dup)
+                    return
+
         try:
-            snapshots = _snapshots_store.read()
-        except (StudioStoreError, OSError) as exc:
-            return _json_error(500, f"Storage error: {exc}")
+            _snapshots_store.update(_mutator)
+        except StudioStoreError:
+            _log.exception("Failed to write snapshots store")
+            return _json_error(500, "Storage write error")
+        except OSError:
+            _log.exception("Failed to write snapshots store")
+            return _json_error(500, "Storage write error")
 
-        for s in snapshots:
-            if s.get("id") == sid:
-                dup = copy.deepcopy(s)
-                dup["id"] = _make_snapshot_id()
-                dup["name"] = (dup.get("name", "Untitled") or "Untitled") + " (Copy)"
-                dup["createdAt"] = _now_iso()
-                dup["updatedAt"] = _now_iso()
-                dup["archived"] = False
-                snapshots.append(dup)
-                try:
-                    _snapshots_store.write_atomic(snapshots)
-                except (StudioStoreError, OSError) as exc:
-                    return _json_error(500, f"Storage error: {exc}")
-                return web.json_response({"status": "ok", "snapshot": dup})
-
-        return _json_error(404, "Snapshot not found")
+        if not found:
+            return _json_error(404, "Snapshot not found")
+        return web.json_response({"status": "ok", "snapshot": found[0]})
 
     # ── Presets ─────────────────────────────────────────────────────────
 
@@ -274,10 +269,12 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
                     continue
                 enriched.append(normalized)
             return web.json_response({"status": "ok", "presets": enriched})
-        except StudioStoreError as exc:
-            return _json_error(500, str(exc.args[0]) if exc.args else "Store read error")
-        except OSError as exc:
-            return _json_error(500, f"Storage error: {exc}")
+        except StudioStoreError:
+            _log.exception("Failed to read store")
+            return _json_error(500, "Storage read error")
+        except OSError:
+            _log.exception("Failed to read store")
+            return _json_error(500, "Storage read error")
 
     @server.routes.post("/comfymodal/studio/presets")
     async def studio_presets_create(request: web.Request) -> web.Response:
@@ -286,47 +283,38 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
         except Exception:
             return _json_error(400, "Invalid JSON body")
 
-        now = _now_iso()
-        features = _validate_feature_ids(body.get("compatibleFeatures", []))
-
-        entry: dict[str, Any] = {
-            "id": _make_preset_id(),
-            "label": _normalize_label(body.get("label", body.get("name", "Untitled Preset"))),
-            "description": _sanitize_description(body.get("description", "")),
-            "snapshotId": body.get("snapshotId", ""),
-            "compatibleFeatures": features,
-            "defaults": body.get("defaults", {}),
-            "sourceType": body.get("sourceType", "manual"),
-            "sourceId": body.get("sourceId", ""),
-            "disabledReason": body.get("disabledReason", ""),
-            "archived": False,
-            "createdAt": now,
-            "updatedAt": now,
-        }
-
-        # Check snapshot reference on create
         try:
             snapshots = _snapshots_store.read()
-        except (StudioStoreError, OSError) as exc:
-            return _json_error(500, f"Storage error: {exc}")
+        except StudioStoreError:
+            _log.exception("Failed to read snapshots store")
+            return _json_error(500, "Storage read error")
+        except OSError:
+            _log.exception("Failed to read snapshots store")
+            return _json_error(500, "Storage read error")
 
         snapshots_by_id = _build_snapshots_by_id(snapshots)
-        normalized = normalize_preset_payload(entry, snapshots_by_id)
-        entry["status"] = normalized.get("status", "runnable")
-        entry["disabledReason"] = normalized.get("disabledReason", "")
-
-        # Reject creation for missing snapshots with a stable message
-        if entry.get("status") == "invalid" and entry.get("disabledReason") == "Preset references a missing snapshot":
-            return _json_error(400, "Preset references a missing snapshot")
 
         try:
-            presets = _presets_store.read()
-            presets.append(entry)
-            _presets_store.write_atomic(presets)
-        except StudioStoreError as exc:
-            return _json_error(500, str(exc.args[0]) if exc.args else "Store write error")
-        except OSError as exc:
-            return _json_error(500, f"Storage error: {exc}")
+            entry = make_preset(body, snapshots_by_id)
+        except ValueError as exc:
+            return _json_error(400, str(exc.args[0]) if exc.args else "Invalid compatible feature")
+
+        # Reject invalid presets on create (missing/invalid snapshot linkage)
+        if entry["status"] == "invalid":
+            return _json_error(400, entry.get("disabledReason", "Invalid preset configuration"))
+
+        try:
+
+            def _append(mutator_data):
+                mutator_data.append(entry)
+
+            _presets_store.update(_append)
+        except StudioStoreError:
+            _log.exception("Failed to write presets store")
+            return _json_error(500, "Storage write error")
+        except OSError:
+            _log.exception("Failed to write presets store")
+            return _json_error(500, "Storage write error")
 
         return web.json_response({"status": "ok", "preset": entry})
 
@@ -339,89 +327,108 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
             return _json_error(400, "Invalid JSON body")
 
         try:
-            presets = _presets_store.read()
             snapshots = _snapshots_store.read()
-        except (StudioStoreError, OSError) as exc:
-            return _json_error(500, f"Storage error: {exc}")
+        except StudioStoreError:
+            _log.exception("Failed to read snapshots store")
+            return _json_error(500, "Storage read error")
+        except OSError:
+            _log.exception("Failed to read snapshots store")
+            return _json_error(500, "Storage read error")
 
-        for p in presets:
-            if p.get("id") == pid:
-                if "label" in body and isinstance(body["label"], str):
-                    p["label"] = _normalize_label(body["label"])
-                if "description" in body and isinstance(body["description"], str):
-                    p["description"] = _sanitize_description(body["description"])
-                if "snapshotId" in body and isinstance(body["snapshotId"], str):
-                    p["snapshotId"] = body["snapshotId"]
-                if "compatibleFeatures" in body:
-                    p["compatibleFeatures"] = _validate_feature_ids(body["compatibleFeatures"])
-                if "defaults" in body and isinstance(body["defaults"], dict):
-                    p["defaults"] = body["defaults"]
-                if "sourceType" in body and isinstance(body["sourceType"], str):
-                    p["sourceType"] = body["sourceType"]
-                if "sourceId" in body and isinstance(body["sourceId"], str):
-                    p["sourceId"] = body["sourceId"]
-                if "disabledReason" in body and isinstance(body["disabledReason"], str):
-                    p["disabledReason"] = body["disabledReason"].strip()
-                if "archived" in body:
-                    p["archived"] = bool(body["archived"])
+        snapshots_by_id = _build_snapshots_by_id(snapshots)
+        found: list[dict[str, Any]] = []
 
-                p["updatedAt"] = _now_iso()
-                # Re-derive status
-                snapshots_by_id = _build_snapshots_by_id(snapshots)
-                normalized = normalize_preset_payload(p, snapshots_by_id)
-                p["status"] = normalized.get("status", "runnable")
-                p["disabledReason"] = normalized.get("disabledReason", "")
+        def _mutator(data):
+            for p in data:
+                if p.get("id") == pid:
+                    update_preset(p, body, snapshots_by_id)
+                    # Reject invalid state on update (snapshot linkage broken)
+                    if p["status"] == "invalid":
+                        raise ValueError(p.get("disabledReason", "Invalid preset configuration"))
+                    found.append(p)
+                    return
 
-                try:
-                    _presets_store.write_atomic(presets)
-                except (StudioStoreError, OSError) as exc:
-                    return _json_error(500, f"Storage error: {exc}")
-                return web.json_response({"status": "ok", "preset": p})
+        try:
+            _presets_store.update(_mutator)
+        except ValueError as exc:
+            return _json_error(400, str(exc.args[0]) if exc.args else "Invalid preset configuration")
+        except StudioStoreError:
+            _log.exception("Failed to write presets store")
+            return _json_error(500, "Storage write error")
+        except OSError:
+            _log.exception("Failed to write presets store")
+            return _json_error(500, "Storage write error")
 
-        return _json_error(404, "Preset not found")
+        if not found:
+            return _json_error(404, "Preset not found")
+        return web.json_response({"status": "ok", "preset": found[0]})
 
     @server.routes.delete("/comfymodal/studio/presets/{preset_id}")
     async def studio_presets_archive(request: web.Request) -> web.Response:
         """Archive (soft-delete) a preset by marking ``archived=True``."""
         pid = request.match_info.get("preset_id", "")
+        found: list[dict[str, Any]] = []
+
+        def _mutator(data):
+            for p in data:
+                if p.get("id") == pid:
+                    p["archived"] = True
+                    p["updatedAt"] = _now_iso()
+                    found.append(p)
+                    return
+
         try:
-            presets = _presets_store.read()
-        except (StudioStoreError, OSError) as exc:
-            return _json_error(500, f"Storage error: {exc}")
+            _presets_store.update(_mutator)
+        except StudioStoreError:
+            _log.exception("Failed to write presets store")
+            return _json_error(500, "Storage write error")
+        except OSError:
+            _log.exception("Failed to write presets store")
+            return _json_error(500, "Storage write error")
 
-        for p in presets:
-            if p.get("id") == pid:
-                p["archived"] = True
-                p["updatedAt"] = _now_iso()
-                try:
-                    _presets_store.write_atomic(presets)
-                except (StudioStoreError, OSError) as exc:
-                    return _json_error(500, f"Storage error: {exc}")
-                return web.json_response({"status": "ok"})
-
-        return _json_error(404, "Preset not found")
+        if not found:
+            return _json_error(404, "Preset not found")
+        return web.json_response({"status": "ok"})
 
     @server.routes.post("/comfymodal/studio/presets/{preset_id}/duplicate")
     async def studio_presets_duplicate(request: web.Request) -> web.Response:
         pid = request.match_info.get("preset_id", "")
         try:
-            presets = _presets_store.read()
-        except (StudioStoreError, OSError) as exc:
-            return _json_error(500, f"Storage error: {exc}")
+            snapshots = _snapshots_store.read()
+        except StudioStoreError:
+            _log.exception("Failed to read snapshots store")
+            return _json_error(500, "Storage read error")
+        except OSError:
+            _log.exception("Failed to read snapshots store")
+            return _json_error(500, "Storage read error")
 
-        for p in presets:
-            if p.get("id") == pid:
-                dup = copy.deepcopy(p)
-                dup["id"] = _make_preset_id()
-                dup["label"] = (dup.get("label", "Untitled") or "Untitled") + " (Copy)"
-                dup["createdAt"] = _now_iso()
-                dup["updatedAt"] = _now_iso()
-                dup["archived"] = False
-                presets.append(dup)
-                try:
-                    _presets_store.write_atomic(presets)
-                except (StudioStoreError, OSError) as exc:
-                    return _json_error(500, f"Storage error: {exc}")
-                return web.json_response({"status": "ok", "preset": dup})
+        snapshots_by_id = _build_snapshots_by_id(snapshots)
+        found: list[dict[str, Any]] = []
 
-        return _json_error(404, "Preset not found")
+        def _mutator(data):
+            for p in data:
+                if p.get("id") == pid:
+                    dup = copy.deepcopy(p)
+                    dup["id"] = _make_preset_id()
+                    dup["label"] = (dup.get("label", "Untitled") or "Untitled") + " (Copy)"
+                    dup["createdAt"] = _now_iso()
+                    dup["updatedAt"] = _now_iso()
+                    dup["archived"] = False
+                    # Re-normalize so status/disabledReason are fresh
+                    dup = normalize_preset_payload(dup, snapshots_by_id)
+                    data.append(dup)
+                    found.append(dup)
+                    return
+
+        try:
+            _presets_store.update(_mutator)
+        except StudioStoreError:
+            _log.exception("Failed to write presets store")
+            return _json_error(500, "Storage write error")
+        except OSError:
+            _log.exception("Failed to write presets store")
+            return _json_error(500, "Storage write error")
+
+        if not found:
+            return _json_error(404, "Preset not found")
+        return web.json_response({"status": "ok", "preset": found[0]})
