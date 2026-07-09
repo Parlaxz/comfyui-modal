@@ -52,5 +52,48 @@ class ProfilesTabTests(unittest.TestCase):
         self.assertIn("detect-slots", self.m.text)
 
 
+# ---------------------------------------------------------------------------
+# Deterministic legacy T2I normalization — labels/source, not Inferred T2I
+# ---------------------------------------------------------------------------
+
+class LegacyT2INormalizationTests(unittest.TestCase):
+    """Profile tests for deterministic legacy T2I normalization labels/source,
+    not Inferred T2I."""
+
+    def setUp(self) -> None:
+        self.m = _JsModule(REPO_ROOT / "web" / "testing-profiles.js")
+        if not self.m.path.exists():
+            raise AssertionError("web/testing-profiles.js missing")
+
+    def test_legacy_t2i_label_present(self):
+        """Profiles must reference a 'Legacy T2I' label for normalization."""
+        self.assertIn(
+            "Legacy T2I",
+            self.m.text,
+            "Expected 'Legacy T2I' normalization label in testing-profiles.js",
+        )
+
+    def test_t2i_normalization_source_marker(self):
+        """Profiles must include a t2i_normalization source key."""
+        text = self.m.text
+        has_source = (
+            "t2i_normalization" in text
+            or "t2i-normalization" in text
+            or "legacyT2i" in text
+        )
+        self.assertTrue(
+            has_source,
+            "Expected t2i_normalization source marker (t2i_normalization / legacyT2i) in testing-profiles.js",
+        )
+
+    def test_no_inferred_t2i(self):
+        """Profiles must NOT use 'Inferred T2I' as a label or reference."""
+        self.assertNotIn(
+            "Inferred T2I",
+            self.m.text,
+            "'Inferred T2I' should not appear in testing-profiles.js; use deterministic Legacy T2I labels instead",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,7 @@ import { app } from "../../scripts/app.js";
 import { api as comfyApi } from "../../scripts/api.js";
 import { ensureTestingStyles } from "./testing-styles.js";
 import { fetchJson, bootstrapLoader } from "./testing-api.js";
+import { createDefaultDraft, createPreviewState, normalizeDraft } from "./testing-setup-adapter.js";
 
 // Signal to legacy sidebar modules that the unified Modal GPU tab is active.
 // They should skip registering their own sidebar tabs to avoid duplicates.
@@ -96,8 +97,57 @@ let _currentTab = null;
 let _currentController = null;
 
 // Draft state: persists across modal close/reopen within a session.
-// Keys: "setup" -> experiment spec, "results" -> experimentId, etc.
+// Keys: "setup" -> normalized draft (user intent), "results" -> experimentId, etc.
 const _draftState = {};
+
+// Runtime preview state: kept separate from the persisted draft.
+// Used for preview counts, validation summaries, etc.
+// This is NOT persisted and resets on each tab mount.
+const _previewState = { setup: null };
+
+// ── Browser-refresh persistence via localStorage ──────────────────────────
+
+const DRAFT_STORAGE_KEY = "comfymodal_setup_draft";
+const EXPERIMENT_ID_KEY = "comfymodal_last_experiment_id";
+
+function _debounce(fn, ms) {
+  let timer = null;
+  return function (...args) {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => { timer = null; fn.apply(this, args); }, ms);
+  };
+}
+
+function _setStorageJSON(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch (_) { /* quota or private mode */ }
+}
+
+function _getStorageJSON(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) { return null; }
+}
+
+function _removeStorage(key) {
+  try { localStorage.removeItem(key); } catch (_) { /* noop */ }
+}
+
+const _saveDraftToStorage = _debounce((draft) => {
+  _setStorageJSON(DRAFT_STORAGE_KEY, draft);
+}, 300);
+
+function _loadDraftFromStorage() {
+  return _getStorageJSON(DRAFT_STORAGE_KEY);
+}
+
+function _saveExperimentIdToStorage(id) {
+  _setStorageJSON(EXPERIMENT_ID_KEY, id);
+}
+
+function _loadExperimentIdFromStorage() {
+  return _getStorageJSON(EXPERIMENT_ID_KEY);
+}
 
 function _stopCurrentController() {
   if (_currentController && typeof _currentController.stop === "function") {
@@ -208,21 +258,37 @@ function mountLazyTab(container, tabName) {
       const tabOptions = { apiBase: MODAL_PREFIX };
 
       // Inject draft state for setup
+      // The normalized draft persists across close/reopen/tab switches.
+      // Runtime preview state is held separately in _previewState.
       if (tabName === TAB_SETUP) {
-        tabOptions.draft = _draftState.setup || null;
-        tabOptions.onDraftChange = (draft) => { _draftState.setup = draft; };
+        // Ensure stored draft is normalized; lazily create default if none
+        if (!_draftState.setup) {
+          _draftState.setup = _loadDraftFromStorage() || createDefaultDraft();
+        }
+        tabOptions.draft = normalizeDraft(_draftState.setup);
+        tabOptions.onDraftChange = (draft) => {
+          _draftState.setup = normalizeDraft(draft);
+          _saveDraftToStorage(_draftState.setup);
+          // Recompute preview state on draft change
+          _previewState.setup = createPreviewState(draft);
+        };
         tabOptions.onRun = (expId) => {
           if (expId) {
             _draftState.lastExperimentId = expId;
+            _saveExperimentIdToStorage(expId);
             // Open Results tab after run starts
             open_testing_modal(TAB_RESULTS);
           }
         };
+        // Attach preview state if available (null on first mount)
+        tabOptions.previewState = _previewState.setup
+          ? { ..._previewState.setup }
+          : null;
       }
 
       // Inject experiment context for results
       if (tabName === TAB_RESULTS) {
-        tabOptions.experimentId = _draftState.lastExperimentId || "";
+        tabOptions.experimentId = _draftState.lastExperimentId || _loadExperimentIdFromStorage() || "";
       }
 
       const result = m[mod.fn](container, comfyApi, tabOptions);

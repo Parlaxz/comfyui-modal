@@ -1,0 +1,410 @@
+- generic [ref=e1]:
+  - main [ref=e9]:
+    - generic [ref=e10]:
+      - generic [ref=e13]:
+        - generic [ref=e14]:
+          - generic [ref=e15]: ↹ Resize Feed
+          - generic:
+            - generic "Controls the maximum size of the image feed panel (25vh)":
+              - generic: Feed Size...
+              - slider: "25"
+            - generic "Controls the number of columns in the feed (4 columns). Click label to set custom value.":
+              - generic: Column count...
+              - slider: "4"
+        - generic [ref=e16]:
+          - button "Clear" [ref=e17] [cursor=pointer]
+          - button "❌" [ref=e18] [cursor=pointer]
+      - generic [ref=e19]:
+        - text: .. .. .. ▼ ▼
+        - generic:
+          - generic [ref=e22]:
+            - group [ref=e26]:
+              - button "Unsaved Workflow • Close" [pressed] [ref=e27] [cursor=pointer]:
+                - generic [ref=e29]:
+                  - generic [ref=e30]: Unsaved Workflow
+                  - generic [ref=e31]:
+                    - generic [ref=e32]: •
+                    - button "Close" [ref=e33]:
+                      - generic [ref=e34]: 
+            - button "Create a new blank workflow" [ref=e35] [cursor=pointer]:
+              - generic [ref=e36]: 
+          - generic:
+            - navigation [ref=e38]:
+              - generic [ref=e39]:
+                - generic [ref=e40]:
+                  - img [ref=e44] [cursor=pointer]
+                  - button "Job History" [ref=e46] [cursor=pointer]:
+                    - generic [ref=e50]: Job History
+                  - button "Assets (a)" [ref=e51] [cursor=pointer]:
+                    - generic [ref=e55]: Assets
+                  - button "Node Library (n)" [ref=e56] [cursor=pointer]:
+                    - generic [ref=e60]: Nodes
+                  - button "Model Library (m)" [ref=e61] [cursor=pointer]:
+                    - generic [ref=e65]: Models
+                  - button "Workflows (w)" [ref=e66] [cursor=pointer]:
+                    - generic [ref=e70]: Workflows
+                  - button "Apps" [ref=e71] [cursor=pointer]:
+                    - generic [ref=e75]: Apps
+                  - button "NodesMap" [ref=e76] [cursor=pointer]:
+                    - generic [ref=e77]:
+                      - generic [ref=e79]: 
+                      - generic [ref=e80]: NodesMap
+                  - button "Modal GPU — unified testing suite & settings" [ref=e81] [cursor=pointer]:
+                    - generic [ref=e82]:
+                      - generic [ref=e84]: 
+                      - generic [ref=e85]: Modal GPU
+                  - button "Templates" [ref=e86] [cursor=pointer]:
+                    - generic [ref=e90]: Templates
+                - generic [ref=e91]:
+                  - button "Help Center" [ref=e92] [cursor=pointer]:
+                    - generic [ref=e93]:
+                      - generic [ref=e95]: 
+                      - generic [ref=e96]: Help
+                  - button "Toggle Bottom Panel" [ref=e97] [cursor=pointer]:
+                    - generic [ref=e101]: Console
+                  - button "Keyboard Shortcuts (Ctrl + Shift + k)" [ref=e102] [cursor=pointer]:
+                    - generic [ref=e106]: Shortcuts
+                  - button "Settings (Ctrl + ,)" [ref=e107] [cursor=pointer]:
+                    - generic [ref=e111]: Settings
+            - generic:
+              - complementary "Sidebar" [ref=e216]:
+                - generic [ref=e219]:
+                  - button "Open Testing Suite" [ref=e220] [cursor=pointer]
+                  - generic [ref=e221]:
+                    - generic [ref=e222]: Deploy
+                    - generic [ref=e223]: ready
+                  - generic [ref=e224]:
+                    - generic [ref=e225]: Experiments
+                    - generic [ref=e226]: 17 total
+                  - generic [ref=e227]:
+                    - generic [ref=e228]: Workers
+                    - generic [ref=e229]: —
+              - separator [ref=e230]
+              - generic:
+                - generic:
+                  - generic:
+                    - generic:
+                      - generic:
+                        - generic [ref=e112]:
+                          - button "Enter app mode" [ref=e113] [cursor=pointer]
+                          - button "Workflow actions" [ref=e115] [cursor=pointer]:
+                            - generic [ref=e116]: Graph
+                        - text: 
+                    - generic:
+                      - generic [ref=e118]:
+                        - button "Launch LoRA Manager (Shift+Click opens in new window)" [ref=e120] [cursor=pointer]:
+                          - img
+                        - generic [ref=e122]:
+                          - generic [ref=e123]:
+                            - button "rgthree-comfy" [ref=e124] [cursor=pointer]:
+                              - img [ref=e126]
+                            - button "󰃀" [ref=e133] [cursor=pointer]:
+                              - generic [ref=e135]: 󰃀
+                          - generic [ref=e136]:
+                            - button "ComfyUI Manager" [ref=e137] [cursor=pointer]:
+                              - generic [ref=e138]: 󰐱
+                              - generic [ref=e139]: Manager
+                            - button "Show favorite custom node list" [ref=e140] [cursor=pointer]:
+                              - generic [ref=e141]: 󰓎
+                            - button "Unload Models" [ref=e142] [cursor=pointer]:
+                              - generic [ref=e143]: 󱦢
+                            - button "Free model and node cache" [ref=e144] [cursor=pointer]:
+                              - generic [ref=e145]: 󱦡
+                            - button "Share" [ref=e146] [cursor=pointer]:
+                              - generic [ref=e147]: 󰒖
+                          - button "Show Image Feed 🐍" [disabled] [ref=e149]:
+                            - generic [ref=e150]: 󰋹
+                            - text: Show Image Feed 🐍
+                        - region [ref=e153]:
+                          - generic [ref=e155]:
+                            - generic [ref=e156]: .. .. ..
+                            - generic [ref=e157]:
+                              - generic "Batch Count" [ref=e158]:
+                                - generic [ref=e159]:
+                                  - textbox "Batch Count" [ref=e160]: "1"
+                                  - generic [ref=e161]:
+                                    - button "Increment" [ref=e162] [cursor=pointer]:
+                                      - img
+                                    - button "Decrement" [disabled]:
+                                      - img
+                              - button "Run" [ref=e163] [cursor=pointer]: Run
+                              - button "Run" [ref=e165] [cursor=pointer]:
+                                - img
+                            - button "Cancel current run" [disabled]
+                            - button "0 active View active jobs (right-click to clear queue)" [ref=e166] [cursor=pointer]:
+                              - generic [ref=e167]: 0 active
+                              - generic [ref=e168]: View active jobs (right-click to clear queue)
+                        - button "Toggle properties panel" [ref=e170] [cursor=pointer]
+                      - alert [ref=e172]:
+                        - generic [ref=e173]:
+                          - generic [ref=e174]: 1 ERROR
+                          - button "Close" [ref=e175] [cursor=pointer]
+                        - list [ref=e178]:
+                          - listitem [ref=e179]:
+                            - generic [ref=e181]: 1 required model is missing
+                        - generic [ref=e182]:
+                          - button "Dismiss" [ref=e183] [cursor=pointer]
+                          - button "Show missing models" [ref=e184] [cursor=pointer]
+                - generic:
+                  - generic:
+                    - toolbar "Canvas Toolbar" [ref=e185]:
+                      - button "Canvas Mode" [ref=e186] [cursor=pointer]
+                      - button "Fit View (.)" [ref=e192] [cursor=pointer]
+                      - button "Zoom Controls" [ref=e194] [cursor=pointer]:
+                        - generic [ref=e196]: 62%
+                      - button "Hide Minimap (ALT + SHIFT + M)" [ref=e199] [cursor=pointer]
+                      - button "Hide Links" [ref=e201] [cursor=pointer]
+                    - generic [ref=e204]:
+                      - button "Settings" [ref=e205] [cursor=pointer]
+                      - button "Close" [ref=e207] [cursor=pointer]
+                      - separator [ref=e209]
+                  - text: 
+        - generic:
+          - generic "The text to be encoded." [ref=e212]:
+            - textbox "text" [ref=e213]: browser validation prompt
+          - generic "The text to be encoded." [ref=e214]:
+            - textbox "text" [ref=e215]: browser validation negative
+    - text: 
+  - text: ×
+  - generic [ref=e234]:
+    - generic [ref=e235]:
+      - heading "Modal GPU" [level=2] [ref=e236]
+      - button "✕" [ref=e237] [cursor=pointer]
+    - generic [ref=e238]:
+      - button "Dashboard" [ref=e239] [cursor=pointer]
+      - button "Setup" [ref=e240] [cursor=pointer]
+      - button "Profiles" [ref=e241] [cursor=pointer]
+      - button "Results" [ref=e242] [cursor=pointer]
+      - button "History" [ref=e243] [cursor=pointer]
+      - button "Settings" [ref=e244] [cursor=pointer]
+    - generic [ref=e269]:
+      - generic [ref=e270]:
+        - generic [ref=e272] [cursor=pointer]: Generation Type
+        - generic [ref=e274]:
+          - generic [ref=e275] [cursor=pointer]:
+            - radio "🎨 Text-to-Image Generate images from a text prompt. No input image required." [checked] [ref=e276]
+            - generic [ref=e277]: 🎨
+            - generic [ref=e278]: Text-to-Image
+            - generic [ref=e279]: Generate images from a text prompt. No input image required.
+          - generic [ref=e280] [cursor=pointer]:
+            - radio "🖼 Image-to-Image Generate images from an input image with optional prompt guidance." [ref=e281]
+            - generic [ref=e282]: 🖼
+            - generic [ref=e283]: Image-to-Image
+            - generic [ref=e284]: Generate images from an input image with optional prompt guidance.
+      - generic [ref=e285]:
+        - generic [ref=e287] [cursor=pointer]: What Changes?
+        - generic [ref=e289]:
+          - generic [ref=e291]:
+            - generic [ref=e292]: Description
+            - textbox "Description" [ref=e293]:
+              - /placeholder: Describe what this experiment changes or tests. What hypothesis are you validating?
+          - generic [ref=e294]:
+            - generic [ref=e295]:
+              - generic [ref=e297]: Prompt
+              - generic [ref=e298]:
+                - button "Default" [ref=e299] [cursor=pointer]
+                - button "Testing" [ref=e300] [cursor=pointer]
+                - button "Controlled" [ref=e301] [cursor=pointer]
+            - generic [ref=e302]:
+              - generic [ref=e304]: Negative Prompt
+              - generic [ref=e305]:
+                - button "Default" [ref=e306] [cursor=pointer]
+                - button "Testing" [ref=e307] [cursor=pointer]
+                - button "Controlled" [ref=e308] [cursor=pointer]
+            - generic [ref=e309]:
+              - generic [ref=e311]: Model Stack
+              - generic [ref=e312]:
+                - button "Default" [ref=e313] [cursor=pointer]
+                - button "Testing" [ref=e314] [cursor=pointer]
+                - button "Controlled" [ref=e315] [cursor=pointer]
+            - generic [ref=e316]:
+              - generic [ref=e318]: LoRA Config
+              - generic [ref=e319]:
+                - button "Default" [ref=e320] [cursor=pointer]
+                - button "Testing" [ref=e321] [cursor=pointer]
+                - button "Controlled" [ref=e322] [cursor=pointer]
+            - generic [ref=e323]:
+              - generic [ref=e325]: Seed
+              - generic [ref=e326]:
+                - button "Default" [ref=e327] [cursor=pointer]
+                - button "Testing" [ref=e328] [cursor=pointer]
+                - button "Controlled" [ref=e329] [cursor=pointer]
+            - generic [ref=e330]:
+              - generic [ref=e332]: Sampler
+              - generic [ref=e333]:
+                - button "Default" [ref=e334] [cursor=pointer]
+                - button "Testing" [ref=e335] [cursor=pointer]
+                - button "Controlled" [ref=e336] [cursor=pointer]
+            - generic [ref=e337]:
+              - generic [ref=e339]: Scheduler
+              - generic [ref=e340]:
+                - button "Default" [ref=e341] [cursor=pointer]
+                - button "Testing" [ref=e342] [cursor=pointer]
+                - button "Controlled" [ref=e343] [cursor=pointer]
+            - generic [ref=e344]:
+              - generic [ref=e346]: Steps
+              - generic [ref=e347]:
+                - button "Default" [ref=e348] [cursor=pointer]
+                - button "Testing" [ref=e349] [cursor=pointer]
+                - button "Controlled" [ref=e350] [cursor=pointer]
+            - generic [ref=e351]:
+              - generic [ref=e353]: Guidance (CFG)
+              - generic [ref=e354]:
+                - button "Default" [ref=e355] [cursor=pointer]
+                - button "Testing" [ref=e356] [cursor=pointer]
+                - button "Controlled" [ref=e357] [cursor=pointer]
+            - generic [ref=e358]:
+              - generic [ref=e360]: Denoise
+              - generic [ref=e361]:
+                - button "Default" [ref=e362] [cursor=pointer]
+                - button "Testing" [ref=e363] [cursor=pointer]
+                - button "Controlled" [ref=e364] [cursor=pointer]
+            - generic [ref=e365]:
+              - generic [ref=e367]: Resolution
+              - generic [ref=e368]:
+                - button "Default" [ref=e369] [cursor=pointer]
+                - button "Testing" [ref=e370] [cursor=pointer]
+                - button "Controlled" [ref=e371] [cursor=pointer]
+      - generic [ref=e372]:
+        - generic [ref=e374] [cursor=pointer]: Workflows
+        - generic [ref=e375]:
+          - generic [ref=e376]:
+            - textbox "Profile name (e.g. Flux2 Klein FP8)" [ref=e377]
+            - button "Create from Canvas" [ref=e378] [cursor=pointer]
+          - generic [ref=e380]:
+            - generic [ref=e381]:
+              - checkbox [checked] [ref=e382]
+              - generic [ref=e383]:
+                - generic [ref=e384]: Flux Klein 9B - Uncensored
+                - generic [ref=e385]: (no model triple)
+              - generic [ref=e386]:
+                - button "Validate" [ref=e387] [cursor=pointer]
+                - button "Duplicate" [ref=e388] [cursor=pointer]
+                - button "Delete" [ref=e389] [cursor=pointer]
+            - generic [ref=e390]:
+              - checkbox [checked] [active] [ref=e391]
+              - generic [ref=e392]:
+                - generic [ref=e393]: ZIT - Current Favorite
+                - generic [ref=e394]: (no model triple)
+              - generic [ref=e395]:
+                - button "Validate" [ref=e396] [cursor=pointer]
+                - button "Duplicate" [ref=e397] [cursor=pointer]
+                - button "Delete" [ref=e398] [cursor=pointer]
+          - generic [ref=e400]:
+            - group [ref=e530]:
+              - generic "Stacks & LoRA Configuration" [ref=e531] [cursor=pointer]
+            - group [ref=e532]:
+              - generic "Stacks & LoRA Configuration" [ref=e533] [cursor=pointer]
+      - generic [ref=e402]:
+        - generic [ref=e404] [cursor=pointer]: Test Values
+        - generic [ref=e406]:
+          - group [ref=e407]:
+            - generic "Prompts" [ref=e408] [cursor=pointer]
+            - generic [ref=e409]:
+              - generic [ref=e411]:
+                - generic [ref=e412]: Positive
+                - textbox "Positive" [ref=e413]:
+                  - /placeholder: Positive prompt…
+              - generic [ref=e414]:
+                - combobox [ref=e415]:
+                  - option "Load a preset…" [selected]
+                - button "Save as Preset" [ref=e416] [cursor=pointer]
+          - group [ref=e418]:
+            - generic "Axes" [ref=e419] [cursor=pointer]
+            - generic [ref=e420]:
+              - generic [ref=e422]:
+                - text: Seeds
+                - textbox "Seeds" [ref=e423]:
+                  - /placeholder: 1,2,3,4,5
+                  - text: 1,2,3
+              - generic [ref=e424]:
+                - generic [ref=e425]:
+                  - generic [ref=e426]: Samplers
+                  - generic [ref=e427]: Enable the samplers to sweep
+                - generic [ref=e428]:
+                  - generic [ref=e429] [cursor=pointer]:
+                    - checkbox "euler" [checked] [ref=e430]
+                    - generic [ref=e431]: euler
+                  - generic [ref=e432] [cursor=pointer]:
+                    - checkbox "euler_ancestral" [checked] [ref=e433]
+                    - generic [ref=e434]: euler_ancestral
+                  - generic [ref=e435] [cursor=pointer]:
+                    - checkbox "heun" [ref=e436]
+                    - generic [ref=e437]: heun
+                  - generic [ref=e438] [cursor=pointer]:
+                    - checkbox "heunpp2" [ref=e439]
+                    - generic [ref=e440]: heunpp2
+                  - generic [ref=e441] [cursor=pointer]:
+                    - checkbox "dpm_2" [ref=e442]
+                    - generic [ref=e443]: dpm_2
+                  - generic [ref=e444] [cursor=pointer]:
+                    - checkbox "dpm_2_ancestral" [ref=e445]
+                    - generic [ref=e446]: dpm_2_ancestral
+                  - generic [ref=e447] [cursor=pointer]:
+                    - checkbox "lms" [ref=e448]
+                    - generic [ref=e449]: lms
+                  - generic [ref=e450] [cursor=pointer]:
+                    - checkbox "dpm_fast" [ref=e451]
+                    - generic [ref=e452]: dpm_fast
+                  - generic [ref=e453] [cursor=pointer]:
+                    - checkbox "dpm_adaptive" [ref=e454]
+                    - generic [ref=e455]: dpm_adaptive
+                  - generic [ref=e456] [cursor=pointer]:
+                    - checkbox "dpmpp_2s_ancestral" [ref=e457]
+                    - generic [ref=e458]: dpmpp_2s_ancestral
+                  - generic [ref=e459] [cursor=pointer]:
+                    - checkbox "dpmpp_sde" [ref=e460]
+                    - generic [ref=e461]: dpmpp_sde
+                  - generic [ref=e462] [cursor=pointer]:
+                    - checkbox "dpmpp_sde_gpu" [ref=e463]
+                    - generic [ref=e464]: dpmpp_sde_gpu
+                  - generic [ref=e465] [cursor=pointer]:
+                    - checkbox "dpmpp_2m" [checked] [ref=e466]
+                    - generic [ref=e467]: dpmpp_2m
+                  - generic [ref=e468] [cursor=pointer]:
+                    - checkbox "dpmpp_2m_sde" [ref=e469]
+                    - generic [ref=e470]: dpmpp_2m_sde
+                  - generic [ref=e471] [cursor=pointer]:
+                    - checkbox "dpmpp_2m_sde_gpu" [ref=e472]
+                    - generic [ref=e473]: dpmpp_2m_sde_gpu
+                  - generic [ref=e474] [cursor=pointer]:
+                    - checkbox "dpmpp_3m_sde" [ref=e475]
+                    - generic [ref=e476]: dpmpp_3m_sde
+                  - generic [ref=e477] [cursor=pointer]:
+                    - checkbox "dpmpp_3m_sde_gpu" [ref=e478]
+                    - generic [ref=e479]: dpmpp_3m_sde_gpu
+                  - generic [ref=e480] [cursor=pointer]:
+                    - checkbox "ddpm" [ref=e481]
+                    - generic [ref=e482]: ddpm
+                  - generic [ref=e483] [cursor=pointer]:
+                    - checkbox "lcm" [ref=e484]
+                    - generic [ref=e485]: lcm
+                  - generic [ref=e486] [cursor=pointer]:
+                    - checkbox "ddim" [ref=e487]
+                    - generic [ref=e488]: ddim
+                  - generic [ref=e489] [cursor=pointer]:
+                    - checkbox "uni_pc" [ref=e490]
+                    - generic [ref=e491]: uni_pc
+                  - generic [ref=e492] [cursor=pointer]:
+                    - checkbox "uni_pc_bh2" [ref=e493]
+                    - generic [ref=e494]: uni_pc_bh2
+              - group [ref=e495]:
+                - generic "Advanced axes" [ref=e496] [cursor=pointer]
+          - group [ref=e497]:
+            - generic "Execution" [ref=e498] [cursor=pointer]
+            - option "Single container" [selected]
+            - option "Multi-container"
+      - generic [ref=e499]:
+        - generic [ref=e501] [cursor=pointer]: Review & Run
+        - generic [ref=e503]:
+          - generic [ref=e504]:
+            - generic [ref=e535]:
+              - generic [ref=e536]: "Type: T2I"
+              - generic [ref=e537]: 2 workflow(s)
+              - generic [ref=e538]: 2 stack(s)
+              - generic [ref=e539]: 0 LoRA(s)
+              - generic [ref=e540]: 3 seed(s)
+              - generic [ref=e541]: 5 testing / 0 controlled
+              - generic [ref=e542]: No prompts
+            - generic [ref=e543]: "Workflow \"flux_klein_9b_-_uncensored\", Stack \"s1\": no model configured; Workflow \"zit_-_current_favorite\", Stack \"s1\": no model configured"
+          - button "Compile" [ref=e517] [cursor=pointer]

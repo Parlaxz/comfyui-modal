@@ -363,9 +363,9 @@ class VisualRedesignTokenTests(unittest.TestCase):
         """testing-styles.js must define focus-visible ring styles."""
         self.assertIn("focus-visible", self.text)
 
-    def test_shared_step_rail_class(self):
-        """testing-styles.js must define a step rail class."""
-        self.assertIn("comfymodal-step-rail", self.text)
+    def test_shared_setup_summary_class(self):
+        """testing-styles.js must define sticky setup summary styling."""
+        self.assertIn("testing-setup-sticky-summary", self.text)
 
     def test_shared_progress_bar_classes(self):
         """testing-styles.js must define progress bar classes."""

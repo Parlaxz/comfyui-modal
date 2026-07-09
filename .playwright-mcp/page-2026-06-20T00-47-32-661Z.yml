@@ -1,0 +1,182 @@
+- generic [ref=e1]:
+  - main [ref=e9]:
+    - generic [ref=e10]:
+      - generic [ref=e13]:
+        - generic [ref=e14]:
+          - generic [ref=e15]: ↹ Resize Feed
+          - generic:
+            - generic "Controls the maximum size of the image feed panel (25vh)":
+              - generic: Feed Size...
+              - slider: "25"
+            - generic "Controls the number of columns in the feed (4 columns). Click label to set custom value.":
+              - generic: Column count...
+              - slider: "4"
+        - generic [ref=e16]:
+          - button "Clear" [ref=e17] [cursor=pointer]
+          - button "❌" [ref=e18] [cursor=pointer]
+      - generic [ref=e19]:
+        - text: .. .. .. ▼ ▼
+        - generic:
+          - generic [ref=e22]:
+            - group [ref=e26]:
+              - button "Unsaved Workflow • Close" [pressed] [ref=e27] [cursor=pointer]:
+                - generic [ref=e29]:
+                  - generic [ref=e30]: Unsaved Workflow
+                  - generic [ref=e31]:
+                    - generic [ref=e32]: •
+                    - button "Close" [ref=e33]:
+                      - generic [ref=e34]: 
+            - button "Create a new blank workflow" [ref=e35] [cursor=pointer]:
+              - generic [ref=e36]: 
+          - generic:
+            - navigation [ref=e38]:
+              - generic [ref=e39]:
+                - generic [ref=e40]:
+                  - img [ref=e44] [cursor=pointer]
+                  - button "Job History" [ref=e46] [cursor=pointer]
+                  - button "Assets (a)" [ref=e50] [cursor=pointer]
+                  - button "Node Library (n)" [ref=e54] [cursor=pointer]
+                  - button "Model Library (m)" [ref=e58] [cursor=pointer]
+                  - button "Workflows (w)" [ref=e62] [cursor=pointer]
+                  - button "Apps" [ref=e66] [cursor=pointer]
+                  - button "NodesMap" [ref=e70] [cursor=pointer]:
+                    - generic [ref=e73]: 
+                  - button "Modal GPU — unified testing suite & settings" [ref=e74] [cursor=pointer]:
+                    - generic [ref=e77]: 
+                  - button "Templates" [ref=e78] [cursor=pointer]
+                - generic [ref=e82]:
+                  - button "Help Center" [ref=e83] [cursor=pointer]:
+                    - generic [ref=e86]: 
+                  - button "Toggle Bottom Panel" [ref=e87] [cursor=pointer]
+                  - button "Keyboard Shortcuts (Ctrl + Shift + k)" [ref=e91] [cursor=pointer]
+                  - button "Settings (Ctrl + ,)" [ref=e95] [cursor=pointer]
+            - generic:
+              - complementary "Sidebar" [ref=e203]:
+                - generic [ref=e206]:
+                  - button "Open Testing Suite" [active] [ref=e207] [cursor=pointer]
+                  - generic [ref=e208]:
+                    - generic [ref=e209]: Deploy
+                    - generic [ref=e210]: ready
+                  - generic [ref=e211]:
+                    - generic [ref=e212]: Experiments
+                    - generic [ref=e213]: 20 total
+                  - generic [ref=e214]:
+                    - generic [ref=e215]: Workers
+                    - generic [ref=e216]: —
+              - separator [ref=e217]
+              - generic:
+                - generic:
+                  - generic:
+                    - generic:
+                      - generic:
+                        - generic [ref=e99]:
+                          - button "Enter app mode" [ref=e100] [cursor=pointer]
+                          - button "Workflow actions" [ref=e102] [cursor=pointer]:
+                            - generic [ref=e103]: Graph
+                        - text: 
+                    - generic:
+                      - generic [ref=e105]:
+                        - button "Launch LoRA Manager (Shift+Click opens in new window)" [ref=e107] [cursor=pointer]:
+                          - img
+                        - generic [ref=e109]:
+                          - generic [ref=e110]:
+                            - button "rgthree-comfy" [ref=e111] [cursor=pointer]:
+                              - img [ref=e113]
+                            - button "󰃀" [ref=e120] [cursor=pointer]:
+                              - generic [ref=e122]: 󰃀
+                          - generic [ref=e123]:
+                            - button "ComfyUI Manager" [ref=e124] [cursor=pointer]:
+                              - generic [ref=e125]: 󰐱
+                              - generic [ref=e126]: Manager
+                            - button "Show favorite custom node list" [ref=e127] [cursor=pointer]:
+                              - generic [ref=e128]: 󰓎
+                            - button "Unload Models" [ref=e129] [cursor=pointer]:
+                              - generic [ref=e130]: 󱦢
+                            - button "Free model and node cache" [ref=e131] [cursor=pointer]:
+                              - generic [ref=e132]: 󱦡
+                            - button "Share" [ref=e133] [cursor=pointer]:
+                              - generic [ref=e134]: 󰒖
+                          - button "Show Image Feed 🐍" [disabled] [ref=e136]:
+                            - generic [ref=e137]: 󰋹
+                            - text: Show Image Feed 🐍
+                        - region [ref=e140]:
+                          - generic [ref=e142]:
+                            - generic [ref=e143]: .. .. ..
+                            - generic [ref=e144]:
+                              - generic "Batch Count" [ref=e145]:
+                                - generic [ref=e146]:
+                                  - textbox "Batch Count" [ref=e147]: "1"
+                                  - generic [ref=e148]:
+                                    - button "Increment" [ref=e149] [cursor=pointer]:
+                                      - img
+                                    - button "Decrement" [disabled]:
+                                      - img
+                              - button "Run" [ref=e150] [cursor=pointer]: Run
+                              - button "Run" [ref=e152] [cursor=pointer]:
+                                - img
+                            - button "Cancel current run" [disabled]
+                            - button "0 active View active jobs (right-click to clear queue)" [ref=e153] [cursor=pointer]:
+                              - generic [ref=e154]: 0 active
+                              - generic [ref=e155]: View active jobs (right-click to clear queue)
+                        - button "Toggle properties panel" [ref=e157] [cursor=pointer]
+                      - alert [ref=e159]:
+                        - generic [ref=e160]:
+                          - generic [ref=e161]: 1 ERROR
+                          - button "Close" [ref=e162] [cursor=pointer]
+                        - list [ref=e165]:
+                          - listitem [ref=e166]:
+                            - generic [ref=e168]: 1 required model is missing
+                        - generic [ref=e169]:
+                          - button "Dismiss" [ref=e170] [cursor=pointer]
+                          - button "Show missing models" [ref=e171] [cursor=pointer]
+                - generic:
+                  - generic:
+                    - toolbar "Canvas Toolbar" [ref=e172]:
+                      - button "Canvas Mode" [ref=e173] [cursor=pointer]
+                      - button "Fit View (.)" [ref=e179] [cursor=pointer]
+                      - button "Zoom Controls" [ref=e181] [cursor=pointer]:
+                        - generic [ref=e183]: 62%
+                      - button "Hide Minimap (ALT + SHIFT + M)" [ref=e186] [cursor=pointer]
+                      - button "Hide Links" [ref=e188] [cursor=pointer]
+                    - generic [ref=e191]:
+                      - button "Settings" [ref=e192] [cursor=pointer]
+                      - button "Close" [ref=e194] [cursor=pointer]
+                      - separator [ref=e196]
+                  - text: 
+        - generic:
+          - generic "The text to be encoded." [ref=e199]:
+            - textbox "text" [ref=e200]: browser validation prompt
+          - generic "The text to be encoded." [ref=e201]:
+            - textbox "text" [ref=e202]: browser validation negative
+    - text: 
+  - text: ×
+  - generic [ref=e221]:
+    - generic [ref=e222]:
+      - heading "Modal GPU" [level=2] [ref=e223]
+      - button "✕" [ref=e224] [cursor=pointer]
+    - generic [ref=e225]:
+      - button "Dashboard" [ref=e226] [cursor=pointer]
+      - button "Setup" [ref=e227] [cursor=pointer]
+      - button "Profiles" [ref=e228] [cursor=pointer]
+      - button "Results" [ref=e229] [cursor=pointer]
+      - button "History" [ref=e230] [cursor=pointer]
+      - button "Settings" [ref=e231] [cursor=pointer]
+    - generic [ref=e234]:
+      - generic [ref=e235]:
+        - button "New Experiment" [ref=e236] [cursor=pointer]
+        - button "Open Results" [ref=e238] [cursor=pointer]
+      - generic [ref=e239]:
+        - button "Comparison Profiles" [ref=e240] [cursor=pointer]
+        - button "Quick Comparison" [ref=e241] [cursor=pointer]
+        - button "Settings" [ref=e242] [cursor=pointer]
+      - generic [ref=e243]:
+        - article [ref=e244]:
+          - heading "Experiments" [level=3] [ref=e245]
+          - generic [ref=e246]: 20 total
+        - generic [ref=e247]:
+          - article [ref=e248]:
+            - heading "Workers" [level=3] [ref=e249]
+            - generic [ref=e250]: "Active workers: 0"
+          - article [ref=e251]:
+            - heading "Last Run" [level=3] [ref=e252]
+            - generic [ref=e253]: No recorded runs yet

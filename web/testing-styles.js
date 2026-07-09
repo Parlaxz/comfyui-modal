@@ -463,6 +463,29 @@ const CSS = `
   cursor: not-allowed;
 }
 
+/* ── Mode Badge (normalization / Legacy T2I) ────────────── */
+
+.comfymodal-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--line-height-tight);
+}
+
+.comfymodal-mode-badge.norm {
+  background: var(--color-info-bg);
+  color: var(--color-accent);
+}
+
+.comfymodal-mode-badge.legacy {
+  background: var(--color-warning-bg);
+  color: var(--color-warning);
+}
+
 /* ── Status Badge ────────────────────────────────────────── */
 
 .comfymodal-status-badge {
@@ -1500,6 +1523,174 @@ const CSS = `
   padding: var(--space-sm) 0;
 }
 
+/* ── Setup: tri-state generation type ────────────────────── */
+
+.testing-setup-generation-type {
+  display: flex;
+  gap: var(--space-md);
+}
+
+.testing-setup-tri-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-xs);
+  padding: var(--space-md);
+  background: var(--color-bg-raised);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  flex: 1;
+  transition: border-color var(--duration-fast) var(--ease-standard),
+              background var(--duration-fast) var(--ease-standard);
+}
+
+.testing-setup-tri-state:hover {
+  border-color: var(--color-border-interactive);
+  background: var(--color-bg-hover);
+}
+
+.testing-setup-tri-state.testing-setup-tri-state-active {
+  border-color: var(--color-accent);
+  background: var(--color-accent-muted);
+}
+
+.testing-setup-tri-state input[type="radio"] {
+  accent-color: var(--color-accent);
+}
+
+.testing-setup-tri-state-label {
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.testing-setup-tri-state-desc {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  text-align: center;
+}
+
+/* ── Setup: workflow-local config ────────────────────────── */
+
+.testing-setup-workflow-local-config {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  margin-top: var(--space-sm);
+}
+
+.testing-setup-workflow-local-entry {
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.testing-setup-workflow-local-entry summary {
+  cursor: pointer;
+  padding: var(--space-sm) var(--space-md);
+  background: var(--color-bg-toolbar);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+  user-select: none;
+}
+
+.testing-setup-workflow-local-entry summary:hover {
+  color: var(--color-accent);
+}
+
+.testing-setup-workflow-local-body {
+  padding: var(--space-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.testing-setup-section-subtitle {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-accent);
+  margin: 0;
+  padding: 0;
+}
+
+/* ── Setup: model stack ──────────────────────────────────── */
+
+.testing-setup-model-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+/* ── Setup: section divider ──────────────────────────────── */
+
+.testing-setup-section-divider {
+  height: 1px;
+  background: var(--color-border-default);
+  margin: var(--space-sm) 0;
+}
+
+/* ── Setup: test values ──────────────────────────────────── */
+
+.testing-setup-test-values {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.testing-setup-test-values-group {
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--color-bg-raised);
+}
+
+.testing-setup-test-values-group summary {
+  cursor: pointer;
+  padding: var(--space-sm) var(--space-md);
+  background: var(--color-bg-toolbar);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+  user-select: none;
+}
+
+.testing-setup-test-values-group summary:hover {
+  color: var(--color-accent);
+}
+
+.testing-setup-test-values-group-body {
+  padding: var(--space-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+/* ── Setup: sticky summary ───────────────────────────────── */
+
+.testing-setup-sticky-summary {
+  padding: var(--space-sm) var(--space-md);
+  background: var(--color-bg-raised);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-md);
+  margin-bottom: var(--space-sm);
+}
+
+.testing-setup-sticky-summary-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-md);
+  align-items: center;
+}
+
+.testing-setup-sticky-summary-item {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  font-weight: var(--font-weight-medium);
+}
+
 /* ── Setup: section status messages ────────────────────────── */
 
 .testing-setup-section-status {
@@ -1595,6 +1786,270 @@ const CSS = `
 .testing-setup-finish-zone-prominent {
   border: 2px solid var(--color-accent);
   background: var(--color-bg-raised);
+}
+
+/* ═══════════════════════════════════════════════════════════ */
+/* SETUP: DEEPER WORKFLOW/MODEL-STACK/LORA SEMANTICS           */
+/* ═══════════════════════════════════════════════════════════ */
+
+/* ── Setup: generation type tiles (T2I vs I2I) ──────────── */
+
+.testing-setup-generation-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-lg);
+  background: var(--color-bg-raised);
+  border: 2px solid var(--color-border-default);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  flex: 1;
+  transition: border-color var(--duration-fast) var(--ease-standard),
+              background var(--duration-fast) var(--ease-standard),
+              transform var(--duration-fast) var(--ease-standard);
+  text-align: center;
+}
+
+.testing-setup-generation-tile:hover {
+  border-color: var(--color-border-interactive);
+  background: var(--color-bg-hover);
+  transform: translateY(-1px);
+}
+
+.testing-setup-generation-tile.testing-setup-generation-tile-active {
+  border-color: var(--color-accent);
+  background: var(--color-accent-muted);
+}
+
+.testing-setup-generation-tile input[type="radio"] {
+  accent-color: var(--color-accent);
+  width: 18px;
+  height: 18px;
+}
+
+.testing-setup-generation-tile-icon {
+  font-size: 28px;
+  line-height: 1;
+}
+
+.testing-setup-generation-tile-label {
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.testing-setup-generation-tile-desc {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  line-height: var(--line-height-base);
+}
+
+/* ── Setup: variable grid (What Changes?) ───────────────── */
+
+.testing-setup-what-changes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.testing-setup-variable-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-md);
+}
+
+@media (max-width: 1200px) {
+  .testing-setup-variable-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 700px) {
+  .testing-setup-variable-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.testing-setup-var-tile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  padding: var(--space-md);
+  background: var(--color-bg-raised);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  transition: border-color var(--duration-fast) var(--ease-standard),
+              background var(--duration-fast) var(--ease-standard);
+}
+
+.testing-setup-var-tile:hover {
+  border-color: var(--color-border-interactive);
+}
+
+/* Variable mode colors */
+.testing-setup-var-tile.testing-setup-var-mode-default {
+  border-color: var(--color-border-default);
+}
+
+.testing-setup-var-tile.testing-setup-var-mode-testing {
+  border-color: var(--color-accent);
+  background: linear-gradient(135deg, var(--color-bg-raised) 0%, var(--color-accent-muted) 100%);
+}
+
+.testing-setup-var-tile.testing-setup-var-mode-controlled {
+  border-color: var(--color-warning);
+  background: linear-gradient(135deg, var(--color-bg-raised) 0%, var(--color-warning-bg) 100%);
+}
+
+.testing-setup-var-tile.testing-setup-var-tile-disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.testing-setup-var-tile-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.testing-setup-var-tile-name {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.testing-setup-var-tile-actions {
+  display: flex;
+  gap: 2px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  border: 1px solid var(--color-border-default);
+  background: var(--color-bg-input);
+}
+
+.testing-setup-var-mode-btn {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--color-text-secondary);
+  padding: 4px 8px;
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease-standard),
+              color var(--duration-fast) var(--ease-standard);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+}
+
+.testing-setup-var-mode-btn:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+
+.testing-setup-var-mode-btn.testing-setup-var-mode-btn-active {
+  background: var(--color-accent);
+  color: #fff;
+  font-weight: var(--font-weight-semibold);
+}
+
+.testing-setup-var-mode-btn.testing-setup-var-mode-btn-testing.testing-setup-var-mode-btn-active {
+  background: var(--color-accent);
+}
+
+.testing-setup-var-mode-btn.testing-setup-var-mode-btn-controlled.testing-setup-var-mode-btn-active {
+  background: var(--color-warning);
+  color: #000;
+}
+
+/* ── Setup: stack editor ────────────────────────────────── */
+
+.testing-setup-stack-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.testing-setup-stack-card {
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  padding: var(--space-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.testing-setup-stack-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+
+.testing-setup-stack-id {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-accent);
+}
+
+.testing-setup-stack-card-actions {
+  display: flex;
+  gap: var(--space-xs);
+}
+
+.testing-setup-stack-action-btn {
+  padding: 3px 8px !important;
+  font-size: var(--font-size-xs) !important;
+}
+
+/* ── Setup: LoRA scope row ───────────────────────────────── */
+
+.testing-setup-lora-scope-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  background: var(--color-bg-input);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-sm);
+}
+
+.testing-setup-lora-scope-btn {
+  padding: 3px 10px !important;
+  font-size: var(--font-size-xs) !important;
+  min-width: 140px;
+}
+
+/* ── Setup: per-stack LoRA section ───────────────────────── */
+
+.testing-setup-stack-loras {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  padding-top: var(--space-sm);
+  border-top: 1px solid var(--color-border-default);
+}
+
+.testing-setup-workflow-heading {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+  padding: var(--space-sm) 0;
+}
+
+.testing-setup-wf-lora-section {
+  margin-top: var(--space-sm);
+}
+
+/* ── Setup: inactive test values group ───────────────────── */
+
+.testing-setup-test-values-inactive {
+  opacity: 0.45;
+}
+
+.testing-setup-test-values-inactive summary {
+  color: var(--color-text-muted);
 }
 
 /* ── Results: command routine group ──────────────────────── */

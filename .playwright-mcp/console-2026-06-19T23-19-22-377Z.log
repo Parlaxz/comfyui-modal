@@ -1,0 +1,76 @@
+[      18ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/userdata/user.css:0
+[      29ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/user.css:0
+[     144ms] [WARNING] [ComfyUI] The legacy queue/history menu is deprecated. Core functionality in this menu may break at any time. Issues and feature requests related to the legacy menu will not be addressed. To switch to the new menu: Settings → search "Use new menu" → change from "Disabled" to "Top". @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:161
+[     144ms] [WARNING] [ComfyUI] The legacy queue/history menu is deprecated. Core functionality in this menu may break at any time. Issues and feature requests related to the legacy menu will not be addressed. To switch to the new menu: Settings → search "Use new menu" → change from "Disabled" to "Top". @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:161
+[     251ms] [ERROR] ComfyApp graph accessed before initialization @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:177
+[     292ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/userdata?dir=subgraphs&recurse=true&split=false&full_info=true:0
+[     419ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/userdata/comfy.templates.json:0
+[     726ms] [WARNING] Extension pysssss.SnapToGrid is disabled. @ http://127.0.0.1:8188/assets/useCopyToClipboard-CFKSU8bA.js:0
+[     735ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/extensions/core/clipspace.js:0
+[     737ms] [WARNING] Extension pysssss.FaviconStatus is disabled. @ http://127.0.0.1:8188/assets/useCopyToClipboard-CFKSU8bA.js:0
+[     743ms] [LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-testing.js:20
+[     743ms] [WARNING] [ComfyUI Notice] "scripts/widgets.js" is an internal module, not part of the public API. Future updates may break this import. @ http://127.0.0.1:8188/scripts/widgets.js:1
+[     745ms] [WARNING] [ComfyUI Deprecated] Importing from "scripts/ui.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/scripts/ui.js:1
+[     748ms] [WARNING] [ComfyUI Notice] "scripts/pnginfo.js" is an internal module, not part of the public API. Future updates may break this import. @ http://127.0.0.1:8188/scripts/pnginfo.js:1
+[     752ms] [ERROR] [vite:preloadError] {url: http://127.0.0.1:8188/extensions/ComfyUI-Impact-Pack/impact-sam-editor.js, fileType: js, chunkName: impact-sam-editor, message: Failed to fetch dynamically imported module: http:…tensions/ComfyUI-Impact-Pack/impact-sam-editor.js} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[     756ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/lm/settings:0
+[     756ms] [WARNING] [ComfyUI Deprecated] Importing from "extensions/core/groupNode.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/extensions/core/groupNode.js:1
+[     799ms] [WARNING] [MaskEditor] ComfyApp.open_maskeditor is deprecated. Plugins should migrate to using the command system or direct node context menu integration. @ http://127.0.0.1:8188/assets/core-CNtDlct3.js:2
+[    1834ms] [WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:ImpactSchedulerAdapter:scheduler is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1841ms] [WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:AnyToText|LP:any_value is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1843ms] [WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:Delay|LP:input is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1843ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any1 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1843ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any2 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1843ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any3 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1843ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any4 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1843ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any5 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1843ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any1 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1843ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any2 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1843ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any3 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1843ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any4 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1844ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any5 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1935ms] [WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:ImpactSchedulerAdapter:scheduler is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1940ms] [WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:AnyToText|LP:any_value is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1941ms] [WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:Delay|LP:input is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1941ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any1 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1941ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any2 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1941ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any3 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1941ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any4 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1941ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any5 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1942ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any1 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1942ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any2 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1942ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any3 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1942ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any4 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1942ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any5 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    1956ms] [WARNING] %c[DEPRECATED]%c Monkey-patching getCanvasMenuOptions is deprecated. (Extension: "pysssss.GraphArrange")
+Please use the new context menu API instead.
+
+See: https://docs.comfy.org/custom-nodes/js/context-menu-migration color: orange; font-weight: bold color: inherit @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:2
+[    1956ms] [WARNING] %c[DEPRECATED]%c Monkey-patching getNodeMenuOptions is deprecated. (Extension: "comfyui.modal.comparison")
+Please use the new context menu API instead.
+
+See: https://docs.comfy.org/custom-nodes/js/context-menu-migration color: orange; font-weight: bold color: inherit @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:2
+[    1956ms] [LOG] [comfyui-modal] Extension loaded. Setting up progress bar & patching fetchApi... @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-node.js:22
+[    1956ms] [LOG] [comfyui-modal] fetchApi patched. All /prompt POST requests -> Modal GPU. @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-node.js:22
+[    1956ms] [LOG] [comfyui-modal] Production mode extension loaded. @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-node.js:22
+[    1956ms] [WARNING] %c[DEPRECATED]%c Monkey-patching getCanvasMenuOptions is deprecated. (Extension: "pysssss.NodeFinder")
+Please use the new context menu API instead.
+
+See: https://docs.comfy.org/custom-nodes/js/context-menu-migration color: orange; font-weight: bold color: inherit @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:2
+[    1956ms] [LOG] [comfymodal.testing] extension setup starting @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-testing.js:369
+[    1957ms] [LOG] [comfymodal.testing] api bootstrap status: ready @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-testing.js:381
+[    1957ms] [LOG] [comfymodal.testing] sidebar tab registered @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-testing.js:401
+[    1957ms] [LOG] [comfymodal.testing] modal host mounted @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-testing.js:121
+[    1957ms] [LOG] [comfymodal.testing] extension setup complete @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-testing.js:421
+[    1965ms] [WARNING] %c[DEPRECATED]%c Monkey-patching getCanvasMenuOptions is deprecated. (Extension: "rgthree.QueueNode")
+Please use the new context menu API instead.
+
+See: https://docs.comfy.org/custom-nodes/js/context-menu-migration color: orange; font-weight: bold color: inherit @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:2
+[    1971ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/pysssss/autocomplete:0
+[    1972ms] [WARNING] [ComfyUI Deprecated] Importing from "scripts/ui/components/button.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/scripts/ui/components/button.js:1
+[    1975ms] [WARNING] [ComfyUI Deprecated] Importing from "scripts/ui/components/buttonGroup.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/scripts/ui/components/buttonGroup.js:1
+[    1976ms] [LOG] LoRA Manager: using actionBarButtons API (frontend version >= 1.33.9) @ http://127.0.0.1:8188/extensions/comfyui-lora-manager/top_menu_extension.js:164
+[    1979ms] [LOG] Empty components: policy ignored @ http://127.0.0.1:8188/extensions/comfyui-manager/components-manager.js:769
+[    2071ms] [WARNING] widget.inputEl is deprecated. Use widget.element instead. undefined @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[    2995ms] [LOG] [FL_WF_Agent] Event added. @ http://127.0.0.1:8188/extensions/comfyui_fill-nodes/nodes/wip/fl_wf_agent.js:817
+[    2995ms] [LOG] [FL_JS] Event added. @ http://127.0.0.1:8188/extensions/comfyui_fill-nodes/nodes/utility/fl_js.js:670

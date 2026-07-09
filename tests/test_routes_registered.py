@@ -316,5 +316,326 @@ class ExperimentRouteBehaviourTests(unittest.TestCase):
         self.assertEqual(resp.status, 400)
 
 
+class ExperimentCompileNormalizedDraftTests(unittest.TestCase):
+    """The compile route must accept a normalised draft directly."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stub = _StubServer()
+        cls.init_mod = _build_init_with_stub(cls.stub)
+
+    def test_compile_with_spec_still_works(self):
+        """Existing spec payloads still compile successfully."""
+        fn = _handler_for(self.init_mod, "POST", "/comfymodal/experiments/compile")
+        spec = {
+            "experiment_id": "exp_1",
+            "revision": 1,
+            "workflows": [{
+                "profile_id": "p1",
+                "loader_target_group_id": "g_default",
+                "main_triple": {"id": "main", "unet": "u1", "clip": "c1", "vae": "v1"},
+                "subprofile_triples": [],
+                "selected_triple_ids": ["main"],
+                "lora_slots": [],
+            }],
+            "prompts": {"items": [
+                {"id": "p", "label": "t", "text": "hi", "negative": None, "enabled": True},
+            ]},
+            "images": {"mode": "cartesian", "items": []},
+            "loras": {"selections": []},
+            "axes": {"shared": {"seed": {"mode": "list", "values": [42]}}},
+        }
+        req = _MockRequest(json_body={"spec": spec})
+        resp = _run(fn(req))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        self.assertEqual(body.get("status"), "ok")
+
+    def test_compile_accepts_normalized_draft(self):
+        """Compile route accepts a normalised draft payload."""
+        fn = _handler_for(self.init_mod, "POST", "/comfymodal/experiments/compile")
+        draft = {
+            "experiment_id": "exp_nd",
+            "revision": 1,
+            "profile_type": "t2i",
+            "workflows": [{
+                "profile_id": "p1",
+                "stacks": [{
+                    "stack_id": "s1",
+                    "loader_target_group_id": "g_default",
+                    "main_triple": {"id": "main", "unet": "u1", "clip": "c1", "vae": "v1"},
+                    "selected_triple_ids": ["main"],
+                    "lora_selections": [],
+                }],
+            }],
+            "prompts": {"items": [
+                {"id": "p", "label": "t", "text": "hi", "negative": None, "enabled": True},
+            ]},
+            "axes": {"shared": {"seed": {"mode": "list", "values": [42]}}},
+        }
+        req = _MockRequest(json_body={"normalized_draft": draft})
+        resp = _run(fn(req))
+        body = json.loads(resp.body)
+        print(f"compile normalized draft response: {json.dumps(body, indent=2)[:500]}")
+        self.assertEqual(resp.status, 200, msg=f"body={body}")
+        self.assertEqual(body.get("status"), "ok")
+        self.assertIn("compilation", body)
+
+    def test_compile_normalized_draft_produces_cells(self):
+        """Normalised draft yields cells via the compiler."""
+        fn = _handler_for(self.init_mod, "POST", "/comfymodal/experiments/compile")
+        draft = {
+            "experiment_id": "exp_cells",
+            "revision": 1,
+            "profile_type": "t2i",
+            "workflows": [{
+                "profile_id": "p1",
+                "stacks": [{
+                    "stack_id": "s1",
+                    "loader_target_group_id": "g_default",
+                    "main_triple": {"id": "main", "unet": "u1", "clip": "c1", "vae": "v1"},
+                    "selected_triple_ids": ["main"],
+                    "lora_selections": [
+                        {"id": "L_no", "label": "No LoRA", "loras": [], "enabled": True},
+                    ],
+                }],
+            }],
+            "prompts": {"items": [
+                {"id": "p_a", "label": "a", "text": "a cat", "negative": None, "enabled": True},
+            ]},
+            "axes": {"shared": {"seed": {"mode": "list", "values": [42]}}},
+        }
+        req = _MockRequest(json_body={"normalized_draft": draft})
+        resp = _run(fn(req))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        cells = body.get("compilation", {}).get("cells", [])
+        self.assertGreater(len(cells), 0)
+        for cell in cells:
+            self.assertIn("normalized_dimensions", cell)
+
+    def test_compile_invalid_normalized_draft_rejected(self):
+        """Invalid normalised draft is rejected with 400."""
+        fn = _handler_for(self.init_mod, "POST", "/comfymodal/experiments/compile")
+        draft = {"experiment_id": ""}  # missing required fields
+        req = _MockRequest(json_body={"normalized_draft": draft})
+        resp = _run(fn(req))
+        self.assertEqual(resp.status, 400)
+        body = json.loads(resp.body)
+        self.assertIn("error", body.get("status", "").lower() or body.get("message", "").lower())
+
+
+class ComparisonProfileNormalizedViewTests(unittest.TestCase):
+    """Comparison profile responses should expose a normalised runtime view."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stub = _StubServer()
+        cls.init_mod = _build_init_with_stub(cls.stub)
+
+    def test_profile_list_returns_normalized_key(self):
+        """The profile list endpoint returns a 'normalized' key per profile."""
+        fn = _handler_for(self.init_mod, "GET", "/comfymodal/comparison/profiles")
+        req = _MockRequest()
+        resp = _run(fn(req))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        profiles = body.get("profiles", [])
+        for p in profiles:
+            self.assertIn(
+                "normalized", p,
+                msg=f"Each profile should have a 'normalized' key; got keys={list(p.keys())}",
+            )
+
+
+class ExperimentCreateDetailNormalizedDraftTests(unittest.TestCase):
+    """The experiment create route should persist and return normalized_draft."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stub = _StubServer()
+        cls.init_mod = _build_init_with_stub(cls.stub)
+
+    def setUp(self):
+        # Use a unique experiment_id per test to avoid cross-test collisions
+        # on the filesystem store.
+        self.exp_id = f"test_nd_{id(self)}"
+
+    # ── compile → create → detail round-trip with normalized_draft ─────
+
+    def test_create_with_normalized_draft_returns_ok(self):
+        """POST /experiments with normalized_draft returns 200."""
+        fn = _handler_for(self.init_mod, "POST", "/comfymodal/experiments")
+        draft = {
+            "experiment_id": self.exp_id,
+            "revision": 1,
+            "profile_type": "t2i",
+            "generation_type": "t2i",
+            "workflows": [{
+                "profile_id": "p1",
+                "stacks": [{
+                    "stack_id": "s1",
+                    "loader_target_group_id": "g_default",
+                    "main_triple": {"id": "main", "unet": "u1", "clip": "c1", "vae": "v1"},
+                    "selected_triple_ids": ["main"],
+                    "lora_selections": [
+                        {"id": "L_no", "label": "No LoRA", "loras": [], "enabled": True},
+                    ],
+                }],
+            }],
+            "prompts": {"items": [
+                {"id": "p_a", "label": "a", "text": "hi", "negative": None, "enabled": True},
+            ]},
+            "axes": {"shared": {"seed": {"mode": "list", "values": [42]}}},
+        }
+        req = _MockRequest(json_body={"normalized_draft": draft})
+        resp = _run(fn(req))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        self.assertEqual(body.get("status"), "ok")
+
+    def test_detail_returns_normalized_draft_when_present(self):
+        """GET /experiments/{id} returns normalized_draft when present
+        in the stored experiment."""
+        # Create first.
+        create_fn = _handler_for(self.init_mod, "POST", "/comfymodal/experiments")
+        draft = {
+            "experiment_id": self.exp_id,
+            "revision": 1,
+            "profile_type": "t2i",
+            "generation_type": "t2i",
+            "workflows": [{
+                "profile_id": "p1",
+                "stacks": [{
+                    "stack_id": "s1",
+                    "loader_target_group_id": "g_default",
+                    "main_triple": {"id": "main", "unet": "u1", "clip": "c1", "vae": "v1"},
+                    "selected_triple_ids": ["main"],
+                    "lora_selections": [
+                        {"id": "L_no", "label": "No LoRA", "loras": [], "enabled": True},
+                    ],
+                }],
+            }],
+            "prompts": {"items": [
+                {"id": "p_a", "label": "a", "text": "hi", "negative": None, "enabled": True},
+            ]},
+            "axes": {"shared": {"seed": {"mode": "list", "values": [42]}}},
+        }
+        _run(create_fn(_MockRequest(json_body={"normalized_draft": draft})))
+
+        # Detail.
+        detail_fn = _handler_for(self.init_mod, "GET",
+                                 "/comfymodal/experiments/{experiment_id}")
+        req = _MockRequest(match_info={"experiment_id": self.exp_id})
+        resp = _run(detail_fn(req))
+        self.assertEqual(resp.status, 200, msg=f"body={resp.body}")
+        body = json.loads(resp.body)
+        # Currently normalized_draft may be in definition or in an event.
+        # The route returns definition + events; we check that it is
+        # present somewhere in the response.
+        events = body.get("events", [])
+        found = False
+        for ev in events:
+            payload = ev.get("payload", {})
+            if payload.get("normalized_draft"):
+                found = True
+                break
+        # Also check if preserved directly in an enriched definition or response key.
+        nd_in_response = body.get("normalized_draft") or body.get("definition", {}).get("normalized_draft")
+        self.assertTrue(
+            found or bool(nd_in_response),
+            msg="normalized_draft not found in events or response",
+        )
+
+    def test_detail_missing_normalized_draft_no_error(self):
+        """Detail for an experiment created without normalized_draft
+        must not error."""
+        create_fn = _handler_for(self.init_mod, "POST", "/comfymodal/experiments")
+        spec = {
+            "experiment_id": self.exp_id,
+            "revision": 1,
+            "name": "legacy",
+            "workflows": [{
+                "profile_id": "p1",
+                "loader_target_group_id": "g_default",
+                "main_triple": {"id": "main", "unet": "u1", "clip": "c1", "vae": "v1"},
+                "subprofile_triples": [],
+                "selected_triple_ids": ["main"],
+                "lora_slots": [],
+            }],
+            "prompts": {"items": [
+                {"id": "p", "label": "t", "text": "hi", "negative": None, "enabled": True},
+            ]},
+            "images": {"mode": "cartesian", "items": []},
+            "loras": {"selections": []},
+            "axes": {"shared": {"seed": {"mode": "list", "values": [42]}}},
+        }
+        _run(create_fn(_MockRequest(json_body={"spec": spec})))
+
+        detail_fn = _handler_for(self.init_mod, "GET",
+                                 "/comfymodal/experiments/{experiment_id}")
+        req = _MockRequest(match_info={"experiment_id": self.exp_id})
+        resp = _run(detail_fn(req))
+        self.assertEqual(resp.status, 200)
+
+
+class RicherCellNormalizedDimensionsTests(unittest.TestCase):
+    """Compiled cells must carry rich normalized_dimensions metadata."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stub = _StubServer()
+        cls.init_mod = _build_init_with_stub(cls.stub)
+
+    def _compile_draft(self, draft: dict) -> dict:
+        fn = _handler_for(self.init_mod, "POST", "/comfymodal/experiments/compile")
+        req = _MockRequest(json_body={"normalized_draft": draft})
+        resp = _run(fn(req))
+        body = json.loads(resp.body)
+        return body.get("compilation", {})
+
+    def test_normalized_dimensions_has_rich_metadata(self):
+        """Each cell's normalized_dimensions includes profile, triple, lora,
+        prompt and image identifiers."""
+        draft = {
+            "experiment_id": "exp_richdim",
+            "revision": 1,
+            "profile_type": "t2i",
+            "workflows": [{
+                "profile_id": "p1",
+                "stacks": [{
+                    "stack_id": "s1",
+                    "loader_target_group_id": "g_default",
+                    "main_triple": {"id": "main", "unet": "u1", "clip": "c1", "vae": "v1"},
+                    "selected_triple_ids": ["main"],
+                    "lora_selections": [
+                        {"id": "L_no", "label": "No LoRA", "loras": [], "enabled": True},
+                    ],
+                }],
+            }],
+            "prompts": {"items": [
+                {"id": "p_a", "label": "a", "text": "hi", "negative": None, "enabled": True},
+            ]},
+            "axes": {"shared": {"seed": {"mode": "list", "values": [42]}}},
+        }
+        compil = self._compile_draft(draft)
+        cells = compil.get("cells", [])
+        self.assertGreater(len(cells), 0)
+        for cell in cells:
+            nd = cell.get("normalized_dimensions", {})
+            self.assertIn("width", nd)
+            self.assertIn("height", nd)
+            self.assertIn("profile_id", nd)
+            self.assertIn("loader_target_group_id", nd)
+            self.assertIn("unet", nd)
+            self.assertIn("clip", nd)
+            self.assertIn("vae", nd)
+            self.assertIn("lora_selection_id", nd)
+            self.assertIn("prompt_id", nd)
+            self.assertIn("image_id", nd)
+            # Check values
+            self.assertEqual(nd["profile_id"], "p1")
+
+
 if __name__ == "__main__":
     unittest.main()

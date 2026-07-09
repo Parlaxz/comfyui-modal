@@ -52,6 +52,14 @@ function statusBadge(status) {
   return el("span", { class: `comfymodal-status-badge ${cls}`, text: status || "unknown" });
 }
 
+function normalizationBadge(profile) {
+  const norm = profile && profile.t2i_normalization;
+  if (norm && norm !== "legacy") {
+    return el("span", { class: "comfymodal-mode-badge norm", text: norm });
+  }
+  return el("span", { class: "comfymodal-mode-badge legacy", text: "Legacy T2I" });
+}
+
 function modelStackSummary(modelStack = {}) {
   const parts = [];
   if (modelStack.checkpoint && modelStack.checkpoint.length) parts.push(`CKPT: ${modelStack.checkpoint[0]}`);
@@ -165,7 +173,10 @@ export function profiles_tab_render(rootEl, api, options = {}) {
             text: profile.name || profile.id,
             onclick: () => loadProfile(profile.id),
           }),
-          statusBadge(validation.status || "unknown"),
+          el("div", { class: "testing-profiles-row-badges", style: "display:flex;gap:4px;align-items:center" }, [
+            normalizationBadge(profile),
+            statusBadge(validation.status || "unknown"),
+          ]),
         ]),
         el("div", { class: "testing-profiles-row-summary", text: modelStackSummary(profile.model_stack || {}) }),
         el("div", { class: "testing-profiles-row-actions" }, [
@@ -345,8 +356,9 @@ export function profiles_tab_render(rootEl, api, options = {}) {
     }
 
     const validation = selectedProfile.validation || {};
-    editorPane.appendChild(el("div", { class: "testing-profiles-editor-header" }, [
+    editorPane.appendChild(el("div", { class: "testing-profiles-editor-header", style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap" }, [
       el("div", { class: "testing-profiles-editor-title", text: selectedProfile.name || selectedProfile.id }),
+      normalizationBadge(selectedProfile),
       statusBadge(validation.status || "unknown"),
     ]));
     editorPane.appendChild(el("div", { class: "testing-profiles-editor-summary", text: modelStackSummary(selectedProfile.model_stack || {}) }));

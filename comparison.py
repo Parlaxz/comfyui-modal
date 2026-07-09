@@ -665,8 +665,31 @@ def duplicate_profile(comfyui_root: str, profile_id: str, new_name: str) -> dict
     return create_profile(comfyui_root, new_name, workflow_api, workflow=workflow_ui, adapter=adapter)
 
 
+def _attach_normalized_view(profile: dict) -> dict:
+    """Attach an in-memory normalised runtime view to a profile dict.
+
+    Uses ``experiment_setup_adapter.build_normalized_runtime_profile``
+    to produce a lightweight view with ``profile_type``, capabilities,
+    synthesised stacks, and LoRA config — without any disk I/O.
+    The original profile dict is returned (modified in place).
+    """
+    try:
+        from experiment_setup_adapter import build_normalized_runtime_profile
+        profile["normalized"] = build_normalized_runtime_profile(profile)
+    except Exception:
+        profile["normalized"] = {
+            "runtime_profile_type": "legacy_default",
+            "capabilities": _infer_capabilities({}, {}),
+            "synthesized_stacks": [],
+            "lora_config": {"entries": [], "slot_count": 0},
+            "dimensions": None,
+        }
+    return profile
+
+
 def list_profiles(comfyui_root: str) -> list[dict]:
-    """List all comparison profiles with their validation status."""
+    """List all comparison profiles with their validation status and
+    a normalised runtime view."""
     profiles_root = _profiles_root(comfyui_root)
     results = []
     if not os.path.isdir(profiles_root):
@@ -681,18 +704,20 @@ def list_profiles(comfyui_root: str) -> list[dict]:
         profile = migrate_profile_to_v2(profile)
         validation = validate_profile(comfyui_root, entry)
         profile["validation"] = validation
+        _attach_normalized_view(profile)
         results.append(profile)
     return results
 
 
 def get_profile(comfyui_root: str, profile_id: str) -> dict | None:
-    """Get a single profile with validation."""
+    """Get a single profile with validation and a normalised runtime view."""
     profiles_root = _profiles_root(comfyui_root)
     profile = _load_profile(profiles_root, profile_id)
     if profile is None:
         return None
     profile = migrate_profile_to_v2(profile)
     profile["validation"] = validate_profile(comfyui_root, profile_id)
+    _attach_normalized_view(profile)
     return profile
 
 

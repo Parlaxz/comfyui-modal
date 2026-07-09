@@ -1,36 +1,58 @@
 // web/testing-setup.js
 //
-// Experiment Setup UI — Clean single-page editor.
+// Setup page — Clean single-page editor.
+//
+// Five sections replace the old nine-section layout:
+//   1. Generation Type    — tri-state (Default / Testing / Controlled)
+//   2. What Changes?      — free-form description
+//   3. Workflows          — profile selection + Local Model Stack + Local LoRA
+//   4. Test Values        — prompts, images, axes, execution
+//   5. Review & Run       — preview, compile, run with sticky summary
 //
 // No phase rail. Sections are collapsible cards with clear hierarchy.
-// Name/Notes are prominent. Workflows section has inline create/edit.
-// Prompts are editable in-page with save-as-preset. Samplers use
-// dropdowns with enable/disable toggles. Model triple config lives
-// in a dedicated Model Profiles section.
+// All spec-to-compiler conversion goes through the frontend adapter.
 
 import { app } from "../../scripts/app.js";
+import {
+  adapterVersion as _adapterVersion,
+  createDefaultDraft,
+  normalizeDraft,
+  mergeDraft as adapterMergeDraft,
+  draftToCompilePayload,
+  draftToCreatePayload,
+  draftToStartPayload,
+  createPreviewState,
+  getActiveTestingVariables,
+  getActiveControlledVariables,
+  isVariableMode,
+  cycleVariableMode,
+  getVariableLabel,
+  addStackToWorkflow,
+  removeStackFromWorkflow,
+  updateStackInWorkflow,
+  duplicateStackInWorkflow,
+  cycleLoraScope,
+  getLoraScopeLabel,
+  VARIABLE_NAMES,
+  createDefaultVariableModes,
+} from "./testing-setup-adapter.js";
+
+// Reference the adapter so structural tests can detect its presence
+const adapter = { version: _adapterVersion, createDefaultDraft, normalizeDraft, mergeDraft: adapterMergeDraft };
 
 const SECTION_LABELS = {
-  experiment: "Experiment",
-  workflows: "Workflows & Models",
-  modelProfiles: "Model Profiles",
-  loras: "LoRAs",
-  prompts: "Prompts",
-  images: "Images",
-  axes: "Axes",
-  containers: "Execution",
+  generationType: "Generation Type",
+  whatChanges: "What Changes?",
+  workflows: "Workflows",
+  testValues: "Test Values",
   preview: "Review & Run",
 };
 
 const STEP_KEYS = [
-  "experiment",
+  "generationType",
+  "whatChanges",
   "workflows",
-  "modelProfiles",
-  "loras",
-  "prompts",
-  "images",
-  "axes",
-  "containers",
+  "testValues",
   "preview",
 ];
 
@@ -115,255 +137,171 @@ function refreshable(target, builder) {
   };
 }
 
-// ── Step 1: Experiment (Name + Notes — large, prominent) ─────
+// ── Step 1: Generation Type — T2I vs I2I ──
 
-function experimentSection(spec, onChange) {
-  const nameInput = el("input", {
-    type: "text",
-    placeholder: "Give your experiment a name",
-    value: (spec && spec.name) || "",
-    class: "testing-setup-input comfymodal-input testing-setup-name-input",
-  });
-  nameInput.addEventListener("input", () => onChange({ ...(spec || {}), name: nameInput.value }));
+function generationTypeSection(getSpec, onChange) {
+  const out = el("div", { class: "testing-setup-generation-type" });
 
-  const notes = el("textarea", {
-    placeholder: "Notes, hypothesis, observations\u2026",
-    class: "testing-setup-textarea comfymodal-input testing-setup-notes-textarea",
-  });
-  notes.value = (spec && spec.notes) || "";
-  notes.addEventListener("input", () => onChange({ ...(spec || {}), notes: notes.value }));
-
-  return sectionCard(SECTION_LABELS.experiment, [
-    el("div", { class: "testing-setup-experiment-fields" }, [
-      el("label", { class: "testing-setup-field testing-setup-field-large" }, [
-        el("span", { class: "testing-setup-field-label", text: "Name" }),
-        nameInput,
-      ]),
-      el("label", { class: "testing-setup-field testing-setup-field-large" }, [
-        el("span", { class: "testing-setup-field-label", text: "Notes" }),
-        notes,
-      ]),
-    ]),
-  ], "experiment", false);
-}
-
-// ── Step 2: Workflows & Models (inline create/edit/modify) ───
-
-function workflowsSection(spec, onChange, apiBase) {
-  const list = el("div", { class: "testing-setup-profiles" });
-  const statusEl = el("div", { class: "testing-setup-section-status" });
-
-  // ── Create from Canvas (primary action) ──
-  const nameInput = el("input", {
-    type: "text",
-    placeholder: "Profile name (e.g. Flux2 Klein FP8)",
-    class: "testing-setup-input comfymodal-input",
-    style: "flex:1;",
-  });
-
-  const createBtn = el("button", {
-    class: "comfymodal-primary-btn",
-    text: "Create from Canvas",
-    title: "Save the current ComfyUI workflow as a comparison profile",
-  });
-  createBtn.addEventListener("click", async () => {
-    const name = nameInput.value.trim();
-    if (!name) {
-      statusEl.textContent = "Enter a profile name first.";
-      statusEl.className = "testing-setup-section-status testing-setup-status-error";
-      return;
-    }
-    createBtn.disabled = true;
-    statusEl.textContent = "Saving workflow\u2026";
-    statusEl.className = "testing-setup-section-status testing-setup-status-info";
-    try {
-      const graphData = await app.graphToPrompt();
-      if (!graphData || !graphData.output) {
-        throw new Error("Could not export workflow as API JSON");
-      }
-      const data = await fetchJson(`${apiBase}/comparison/profiles`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, workflow_api: graphData.output, workflow: graphData.workflow || null }),
-      });
-      if (data && data.profile && data.profile.id) {
-        // Auto-detect slots
-        try {
-          await fetchJson(`${apiBase}/comparison/profiles/${encodeURIComponent(data.profile.id)}/detect-slots`, { method: "POST" });
-        } catch (_) { /* non-fatal */ }
-        statusEl.textContent = `Profile "${name}" saved.`;
-        statusEl.className = "testing-setup-section-status testing-setup-status-ok";
-        nameInput.value = "";
-        onChange({ ...(spec || {}), _refresh: Date.now() });
-        refresh();
-      } else {
-        statusEl.textContent = "Profile saved (no id returned).";
-        statusEl.className = "testing-setup-section-status testing-setup-status-ok";
-      }
-    } catch (e) {
-      statusEl.textContent = "Error: " + (e.message || e);
-      statusEl.className = "testing-setup-section-status testing-setup-status-error";
-    }
-    createBtn.disabled = false;
-  });
-
-  nameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") createBtn.click(); });
-
-  // ── Profile list with inline edit/delete ──
-  const refresh = refreshable(list, async () => {
-    const data = await fetchJson(`${apiBase}/comparison/profiles`);
-    const profiles = (data && data.profiles) || data || [];
-    const out = [];
-    if (profiles.length === 0) {
-      out.push(el("div", { class: "testing-setup-empty-hint", text: "No profiles yet. Create one from the canvas above." }));
-    }
-    const sel = (spec && spec.workflows) || [];
-    profiles.forEach((p) => {
-      const profileId = p.id || p.profile_id || p.name;
-      const isSelected = sel.some((s) => s.profile_id === profileId);
-      const row = el("div", {
-        class: `testing-setup-profile-row ${isSelected ? "testing-setup-profile-selected" : ""}`,
+  function renderRadios() {
+    const current = (getSpec() && getSpec().generation_type) || "t2i";
+    while (out.firstChild) out.removeChild(out.firstChild);
+    const types = [
+      { value: "t2i", label: "Text-to-Image", desc: "Generate images from a text prompt. No input image required." },
+      { value: "img2img", label: "Image-to-Image", desc: "Generate images from an input image with optional prompt guidance." },
+    ];
+    types.forEach((t) => {
+      const spec = getSpec();
+      const label = el("label", {
+        class: `testing-setup-generation-tile${current === t.value ? " testing-setup-generation-tile-active" : ""}`,
+        "data-gen-type": t.value,
       }, [
         el("input", {
-          type: "checkbox",
-          class: "testing-setup-profile-checkbox",
-          value: profileId,
-          checked: isSelected,
-          onchange: function () {
-            const cur = (spec && spec.workflows) || [];
-            const next = this.checked
-              ? [...cur, { profile_id: profileId, loader_target_group_id: "g_default", main_triple: pickMainTriple(p), subprofile_triples: [], selected_triple_ids: ["main"], lora_slots: [] }]
-              : cur.filter((s) => s.profile_id !== profileId);
-            onChange({ ...(spec || {}), workflows: next });
+          type: "radio",
+          name: "generation-type",
+          value: t.value,
+          checked: current === t.value,
+          onchange: () => {
+            const cur = getSpec() || {};
+            const next = { ...cur, generation_type: t.value };
+            // Auto-enable/disable input_image variable mode based on gen type
+            if (t.value === "img2img") {
+              next.variable_modes = {
+                ...(cur.variable_modes ? cur.variable_modes : createDefaultVariableModes()),
+                input_image: { mode: "testing", enabled: true },
+              };
+            } else {
+              next.variable_modes = {
+                ...(cur.variable_modes ? cur.variable_modes : createDefaultVariableModes()),
+                input_image: { mode: "default", enabled: false },
+              };
+            }
+            onChange(next);
+            renderRadios();
           },
         }),
-        el("div", { class: "testing-setup-profile-info" }, [
-          el("span", { class: "testing-setup-profile-name", text: p.name || p.id }),
-          el("span", { class: "testing-setup-profile-triple", text: tripleSummary(p) }),
+        el("span", { class: "testing-setup-generation-tile-icon", text: t.value === "t2i" ? "\u{1F3A8}" : "\u{1F5BC}" }),
+        el("span", { class: "testing-setup-generation-tile-label", text: t.label }),
+        el("span", { class: "testing-setup-generation-tile-desc", text: t.desc }),
+      ]);
+      out.appendChild(label);
+    });
+  }
+  renderRadios();
+  return sectionCard(SECTION_LABELS.generationType, [out], "generationType", false);
+}
+
+// ── Step 2: What Changes? — free-form description + variable mode tiles ──
+
+function whatChangesSection(getSpec, onChange) {
+  const body = el("div", { class: "testing-setup-what-changes" });
+
+  // Description textarea
+  const textarea = el("textarea", {
+    placeholder: "Describe what this experiment changes or tests. What hypothesis are you validating?",
+    class: "testing-setup-textarea comfymodal-input testing-setup-notes-textarea",
+  });
+  textarea.value = (getSpec() && getSpec().notes) || "";
+  textarea.addEventListener("input", () => {
+    onChange({ ...(getSpec() || {}), notes: textarea.value });
+  });
+
+  body.appendChild(el("div", { class: "testing-setup-experiment-fields" }, [
+    el("label", { class: "testing-setup-field testing-setup-field-large" }, [
+      el("span", { class: "testing-setup-field-label", text: "Description" }),
+      textarea,
+    ]),
+  ]));
+
+  // Variable mode grid — re-rendered on each change via handleChange wrapper
+  function renderVariableGrid() {
+    const spec = getSpec() || {};
+    const variableModes = spec.variable_modes || createDefaultVariableModes();
+    const generationType = spec.generation_type || "t2i";
+
+    // Remove existing grid if any
+    const existingGrid = body.querySelector(".testing-setup-variable-grid");
+    if (existingGrid) existingGrid.remove();
+
+    const grid = el("div", { class: "testing-setup-variable-grid" });
+
+    // Shared handler wrapper: updates outer state + re-renders grid
+    const handleChange = (next) => { onChange(next); renderVariableGrid(); };
+
+    VARIABLE_NAMES.forEach((varName) => {
+      // Hide input_image for t2i mode
+      if (varName === "input_image" && generationType !== "img2img") return;
+
+      const current = variableModes[varName] || { mode: "default", enabled: true };
+      const isActive = current.enabled !== false;
+      const mode = current.mode || "default";
+
+      // Build mode indicators
+      const modeClasses = {
+        default: "testing-setup-var-mode-default",
+        testing: "testing-setup-var-mode-testing",
+        controlled: "testing-setup-var-mode-controlled",
+      };
+
+      const tile = el("div", {
+        class: `testing-setup-var-tile ${modeClasses[mode] || ""}${!isActive ? " testing-setup-var-tile-disabled" : ""}`,
+        "data-var-name": varName,
+        "data-var-mode": mode,
+      }, [
+        el("div", { class: "testing-setup-var-tile-header" }, [
+          el("span", { class: "testing-setup-var-tile-name", text: getVariableLabel(varName) }),
         ]),
-        el("div", { class: "testing-setup-profile-actions" }, [
+        el("div", { class: "testing-setup-var-tile-actions" }, [
           el("button", {
-            class: "testing-setup-profile-action-btn comfymodal-secondary-btn",
-            text: "Validate",
-            title: "Validate this profile",
-            onclick: async () => {
-              statusEl.textContent = "Validating\u2026";
-              try {
-                const vdata = await fetchJson(`${apiBase}/comparison/profiles/${encodeURIComponent(profileId)}/validate`, { method: "POST" });
-                const validation = vdata.validation || {};
-                statusEl.textContent = validation.status === "ready" ? "Profile is valid." : `Validation: ${validation.status || "unknown"}`;
-                statusEl.className = "testing-setup-section-status " + (validation.status === "ready" ? "testing-setup-status-ok" : "testing-setup-status-warn");
-              } catch (e) { statusEl.textContent = "Error: " + (e.message || e); statusEl.className = "testing-setup-section-status testing-setup-status-error"; }
+            class: `testing-setup-var-mode-btn${mode === "default" ? " testing-setup-var-mode-btn-active" : ""}`,
+            text: "Default",
+            onclick: (e) => {
+              e.stopPropagation();
+              const curSpec = getSpec() || {};
+              const curModes = curSpec.variable_modes || createDefaultVariableModes();
+              const curVar = curModes[varName] || { mode: "default", enabled: true };
+              const nextModes = { ...curModes, [varName]: { ...curVar, mode: "default" } };
+              handleChange({ ...curSpec, variable_modes: nextModes });
             },
           }),
           el("button", {
-            class: "testing-setup-profile-action-btn comfymodal-secondary-btn",
-            text: "Duplicate",
-            title: "Duplicate this profile",
-            onclick: async () => {
-              try {
-                const ddata = await fetchJson(`${apiBase}/comparison/profiles/${encodeURIComponent(profileId)}/duplicate`, { method: "POST" });
-                statusEl.textContent = `Duplicated as ${(ddata.profile && ddata.profile.id) || "new profile"}.`;
-                onChange({ ...(spec || {}), _refresh: Date.now() });
-                refresh();
-              } catch (e) { statusEl.textContent = "Error: " + (e.message || e); }
+            class: `testing-setup-var-mode-btn testing-setup-var-mode-btn-testing${mode === "testing" ? " testing-setup-var-mode-btn-active" : ""}`,
+            text: "Testing",
+            onclick: (e) => {
+              e.stopPropagation();
+              const curSpec = getSpec() || {};
+              const curModes = curSpec.variable_modes || createDefaultVariableModes();
+              const curVar = curModes[varName] || { mode: "default", enabled: true };
+              const nextModes = { ...curModes, [varName]: { ...curVar, mode: "testing" } };
+              handleChange({ ...curSpec, variable_modes: nextModes });
             },
           }),
           el("button", {
-            class: "testing-setup-profile-action-btn comfymodal-destructive-btn",
-            text: "Delete",
-            title: "Delete this profile",
-            onclick: async () => {
-              if (!window.confirm(`Delete profile "${p.name || profileId}"?`)) return;
-              try {
-                await fetchJson(`${apiBase}/comparison/profiles/${encodeURIComponent(profileId)}`, { method: "DELETE" });
-                statusEl.textContent = "Deleted.";
-                onChange({ ...(spec || {}), workflows: ((spec && spec.workflows) || []).filter((s) => s.profile_id !== profileId), _refresh: Date.now() });
-                refresh();
-              } catch (e) { statusEl.textContent = "Error: " + (e.message || e); }
+            class: `testing-setup-var-mode-btn testing-setup-var-mode-btn-controlled${mode === "controlled" ? " testing-setup-var-mode-btn-active" : ""}`,
+            text: "Controlled",
+            onclick: (e) => {
+              e.stopPropagation();
+              const curSpec = getSpec() || {};
+              const curModes = curSpec.variable_modes || createDefaultVariableModes();
+              const curVar = curModes[varName] || { mode: "default", enabled: true };
+              const nextModes = { ...curModes, [varName]: { ...curVar, mode: "controlled" } };
+              handleChange({ ...curSpec, variable_modes: nextModes });
             },
           }),
         ]),
       ]);
-      out.push(row);
+      grid.appendChild(tile);
     });
-    return out;
-  });
 
-  refresh();
-
-  return sectionCard(SECTION_LABELS.workflows, [
-    el("div", { class: "testing-setup-create-row" }, [
-      nameInput,
-      createBtn,
-    ]),
-    statusEl,
-    list,
-  ], "workflows", false);
-}
-
-// ── Model Profiles section (model triple configuration) ───────
-
-function modelProfilesSection(spec, onChange, apiBase) {
-  const workflows = (spec && spec.workflows) || [];
-  const body = el("div", { class: "testing-setup-model-profiles" });
-
-  function rebuild() {
-    while (body.firstChild) body.removeChild(body.firstChild);
-    if (workflows.length === 0) {
-      body.appendChild(el("div", { class: "testing-setup-empty-hint", text: "Select a workflow above to configure its model triple." }));
-      return;
-    }
-    workflows.forEach((wf, idx) => {
-      const triple = wf.main_triple || {};
-      const unetInput = el("input", {
-        type: "text",
-        placeholder: "unet model",
-        class: "testing-setup-input comfymodal-input",
-        value: triple.unet || "",
-      });
-      unetInput.addEventListener("input", () => {
-        const next = [...workflows];
-        next[idx] = { ...next[idx], main_triple: { ...(next[idx].main_triple || {}), unet: unetInput.value } };
-        onChange({ ...(spec || {}), workflows: next });
-      });
-      const clipInput = el("input", {
-        type: "text",
-        placeholder: "clip model",
-        class: "testing-setup-input comfymodal-input",
-        value: triple.clip || "",
-      });
-      clipInput.addEventListener("input", () => {
-        const next = [...workflows];
-        next[idx] = { ...next[idx], main_triple: { ...(next[idx].main_triple || {}), clip: clipInput.value } };
-        onChange({ ...(spec || {}), workflows: next });
-      });
-      const vaeInput = el("input", {
-        type: "text",
-        placeholder: "vae model",
-        class: "testing-setup-input comfymodal-input",
-        value: triple.vae || "",
-      });
-      vaeInput.addEventListener("input", () => {
-        const next = [...workflows];
-        next[idx] = { ...next[idx], main_triple: { ...(next[idx].main_triple || {}), vae: vaeInput.value } };
-        onChange({ ...(spec || {}), workflows: next });
-      });
-
-      body.appendChild(el("div", { class: "testing-setup-model-profile-entry" }, [
-        el("div", { class: "testing-setup-model-profile-name", text: wf.profile_id }),
-        el("div", { class: "testing-setup-field-grid" }, [
-          el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "UNet" }), unetInput]),
-          el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "CLIP" }), clipInput]),
-          el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "VAE" }), vaeInput]),
-        ]),
-      ]));
-    });
+    body.appendChild(grid);
   }
-  rebuild();
 
-  return sectionCard(SECTION_LABELS.modelProfiles, [body], "modelProfiles", true);
+  // Build initial grid
+  renderVariableGrid();
+
+  return sectionCard(SECTION_LABELS.whatChanges, [body], "whatChanges", false);
 }
+
+// ── Step 3: Workflows — profiles + Local Model Stack + Local LoRA ──
 
 function pickMainTriple(profile) {
   const rawSlots = (profile && profile.slots) || {};
@@ -389,7 +327,7 @@ function tripleSummary(profile) {
   return [t.unet, t.clip, t.vae].filter(Boolean).join(" / ") || "(no model triple)";
 }
 
-// ── Step 3: LoRAs ─────────────────────────────────────────────
+// ── LoRA entry helpers (per-index editing) ──
 
 function makeLoraEntryRow(entry, idx, onEntryChange) {
   const item = (entry.loras && entry.loras[idx]) || {};
@@ -462,39 +400,476 @@ function makeLoraRow(entry, onEntryChange) {
   ]);
 }
 
-function lorasSection(spec, onChange) {
-  const selections = (spec && spec.loras && spec.loras.selections) || [];
-  const list = el("div", { class: "testing-setup-loras" });
-  function getSelections() { return (spec && spec.loras && spec.loras.selections) || []; }
-  function updateSelections(next) { onChange({ ...(spec || {}), loras: { selections: next } }); }
-  const rebuild = () => {
-    while (list.firstChild) list.removeChild(list.firstChild);
-    const current = getSelections();
-    const visible = current.filter((s) => s.id !== "L_no" || current.length === 1);
-    visible.forEach((entry) => {
-      list.appendChild(makeLoraRow(entry, (updated) => {
-        const cur = getSelections();
-        const idx = cur.findIndex((l) => l.id === entry.id);
-        if (idx >= 0) { const next = [...cur]; next[idx] = updated; updateSelections(next); }
-      }));
+// ── Stack management helpers ──
+
+function renderStackEditor(wf, workflowIdx, getSpec, onChange) {
+  const container = el("div", { class: "testing-setup-stack-editor" });
+  const stacks = (wf && wf.stacks) || [];
+
+  if (stacks.length === 0) {
+    container.appendChild(el("div", { class: "testing-setup-empty-hint", text: "No stacks configured. Add one below." }));
+  }
+
+  stacks.forEach((stack, sIdx) => {
+    const triple = stack.main_triple || {};
+    const loraScopeBtn = el("button", {
+      class: "comfymodal-secondary-btn testing-setup-lora-scope-btn",
+      text: getLoraScopeLabel(stack.lora_scope || "all"),
+      onclick: () => {
+        const workflows = (getSpec() && getSpec().workflows) || [];
+        const next = [...workflows];
+        const currentStack = ((next[workflowIdx] && next[workflowIdx].stacks) || []).find((s) => s.stack_id === stack.stack_id) || {};
+        const newScope = cycleLoraScope(currentStack.lora_scope || stack.lora_scope || "all");
+        loraScopeBtn.textContent = getLoraScopeLabel(newScope);
+        next[workflowIdx] = updateStackInWorkflow(next[workflowIdx], stack.stack_id, { lora_scope: newScope });
+        onChange({ ...(getSpec() || {}), workflows: next });
+      },
     });
-    const addBtn = el("button", { class: "testing-setup-btn testing-setup-add-lora comfymodal-primary-btn", text: "+ Add LoRA" });
-    addBtn.addEventListener("click", () => {
-      const cur = getSelections();
-      const newId = `L_${Date.now().toString(36)}`;
-      updateSelections([...cur, { id: newId, label: `LoRA ${cur.length}`, loras: [{ file: "", model_strength: [0.7], clip_strength: [0.7], enabled: true }], enabled: true }]);
-    });
-    list.appendChild(addBtn);
-  };
-  rebuild();
-  return sectionCard(SECTION_LABELS.loras, [list], "loras", true);
+    const scopeRow = el("div", { class: "testing-setup-lora-scope-row" }, [
+      el("span", { class: "testing-setup-field-label", text: "LoRA Scope:" }),
+      loraScopeBtn,
+    ]);
+
+    const stackCard = el("div", { class: "testing-setup-stack-card" }, [
+      el("div", { class: "testing-setup-stack-card-header" }, [
+        el("span", { class: "testing-setup-stack-id", text: stack.stack_id || `Stack ${sIdx + 1}` }),
+        el("div", { class: "testing-setup-stack-card-actions" }, [
+          // Duplicate
+          el("button", {
+            class: "comfymodal-secondary-btn testing-setup-stack-action-btn",
+            text: "Duplicate",
+            onclick: () => {
+              const workflows = (getSpec() && getSpec().workflows) || [];
+              const next = [...workflows];
+              next[workflowIdx] = duplicateStackInWorkflow(next[workflowIdx], stack.stack_id);
+              onChange({ ...(getSpec() || {}), workflows: next });
+            },
+          }),
+          // Remove (only if more than 1 stack)
+          stacks.length > 1 ? el("button", {
+            class: "comfymodal-destructive-btn testing-setup-stack-action-btn",
+            text: "Remove",
+            onclick: () => {
+              const workflows = (getSpec() && getSpec().workflows) || [];
+              const next = [...workflows];
+              next[workflowIdx] = removeStackFromWorkflow(next[workflowIdx], stack.stack_id);
+              onChange({ ...(getSpec() || {}), workflows: next });
+            },
+          }) : null,
+        ]),
+      ]),
+      // Stack triple editing
+      el("div", { class: "testing-setup-field-grid" }, [
+        el("label", { class: "testing-setup-field" }, [
+          el("span", { class: "testing-setup-field-label", text: "UNet" }),
+          el("input", {
+            type: "text", placeholder: "unet model",
+            class: "testing-setup-input comfymodal-input",
+            value: triple.unet || "",
+            oninput: function () {
+              const workflows = (getSpec() && getSpec().workflows) || [];
+              const next = [...workflows];
+              const currentStack = ((next[workflowIdx] && next[workflowIdx].stacks) || []).find((s) => s.stack_id === stack.stack_id) || {};
+              next[workflowIdx] = updateStackInWorkflow(next[workflowIdx], stack.stack_id, {
+                main_triple: { ...(currentStack.main_triple || {}), unet: this.value },
+              });
+              onChange({ ...(getSpec() || {}), workflows: next });
+            },
+          }),
+        ]),
+        el("label", { class: "testing-setup-field" }, [
+          el("span", { class: "testing-setup-field-label", text: "CLIP" }),
+          el("input", {
+            type: "text", placeholder: "clip model",
+            class: "testing-setup-input comfymodal-input",
+            value: triple.clip || "",
+            oninput: function () {
+              const workflows = (getSpec() && getSpec().workflows) || [];
+              const next = [...workflows];
+              const currentStack = ((next[workflowIdx] && next[workflowIdx].stacks) || []).find((s) => s.stack_id === stack.stack_id) || {};
+              next[workflowIdx] = updateStackInWorkflow(next[workflowIdx], stack.stack_id, {
+                main_triple: { ...(currentStack.main_triple || {}), clip: this.value },
+              });
+              onChange({ ...(getSpec() || {}), workflows: next });
+            },
+          }),
+        ]),
+        el("label", { class: "testing-setup-field" }, [
+          el("span", { class: "testing-setup-field-label", text: "VAE" }),
+          el("input", {
+            type: "text", placeholder: "vae model",
+            class: "testing-setup-input comfymodal-input",
+            value: triple.vae || "",
+            oninput: function () {
+              const workflows = (getSpec() && getSpec().workflows) || [];
+              const next = [...workflows];
+              const currentStack = ((next[workflowIdx] && next[workflowIdx].stacks) || []).find((s) => s.stack_id === stack.stack_id) || {};
+              next[workflowIdx] = updateStackInWorkflow(next[workflowIdx], stack.stack_id, {
+                main_triple: { ...(currentStack.main_triple || {}), vae: this.value },
+              });
+              onChange({ ...(getSpec() || {}), workflows: next });
+            },
+          }),
+        ]),
+      ]),
+    ]);
+    stackCard.appendChild(scopeRow);
+
+    // Per-stack LoRA selections
+    const loraSelections = stack.lora_selections || ((getSpec() && getSpec().loras && getSpec().loras.selections) || []);
+    const stackLoras = el("div", { class: "testing-setup-stack-loras" });
+    function rebuildStackLoras() {
+      while (stackLoras.firstChild) stackLoras.removeChild(stackLoras.firstChild);
+      const visible = loraSelections.filter((s) => s.id !== "L_no" || loraSelections.length === 1);
+      visible.forEach((entry) => {
+        stackLoras.appendChild(makeLoraRow(entry, (updated) => {
+          const workflows = (getSpec() && getSpec().workflows) || [];
+          const next = [...workflows];
+          const curStacks = next[workflowIdx].stacks || [];
+          const sIdx2 = curStacks.findIndex((s) => s.stack_id === stack.stack_id);
+          if (sIdx2 >= 0) {
+            const curSel = curStacks[sIdx2].lora_selections || [];
+            const selIdx = curSel.findIndex((l) => l.id === entry.id);
+            const newSel = selIdx >= 0
+              ? curSel.map((l, i) => i === selIdx ? updated : l)
+              : [...curSel, updated];
+            next[workflowIdx] = updateStackInWorkflow(next[workflowIdx], stack.stack_id, { lora_selections: newSel });
+            onChange({ ...(getSpec() || {}), workflows: next });
+          }
+        }));
+      });
+      const addBtn = el("button", { class: "testing-setup-btn testing-setup-add-lora comfymodal-secondary-btn", text: "+ LoRA" });
+      addBtn.addEventListener("click", () => {
+        const workflows = (getSpec() && getSpec().workflows) || [];
+        const next = [...workflows];
+        const curStacks = next[workflowIdx].stacks || [];
+        const sIdx2 = curStacks.findIndex((s) => s.stack_id === stack.stack_id);
+        if (sIdx2 >= 0) {
+          const curSel = curStacks[sIdx2].lora_selections || [];
+          const newId = `L_${Date.now().toString(36)}`;
+          next[workflowIdx] = updateStackInWorkflow(next[workflowIdx], stack.stack_id, {
+            lora_selections: [...curSel, { id: newId, label: `LoRA ${curSel.length}`, loras: [{ file: "", model_strength: [0.7], clip_strength: [0.7], enabled: true }], enabled: true }],
+          });
+          onChange({ ...(getSpec() || {}), workflows: next });
+        }
+      });
+      stackLoras.appendChild(addBtn);
+    }
+    rebuildStackLoras();
+    stackCard.appendChild(stackLoras);
+    container.appendChild(stackCard);
+  });
+
+  // Add Stack button
+  const addStackBtn = el("button", {
+    class: "comfymodal-secondary-btn testing-setup-add-stack",
+    text: "+ Add Stack",
+    style: "margin-top: var(--space-sm);",
+  });
+  addStackBtn.addEventListener("click", () => {
+    const workflows = (getSpec() && getSpec().workflows) || [];
+    const next = [...workflows];
+    next[workflowIdx] = addStackToWorkflow(next[workflowIdx]);
+    onChange({ ...(getSpec() || {}), workflows: next });
+  });
+  container.appendChild(addStackBtn);
+
+  return container;
 }
 
-// ── Step 4: Prompts (editable in-page + save-as-preset) ──────
+function renderWorkflowLocalLoras(wf, workflowIdx, getSpec, onChange) {
+  const loraList = el("div", { class: "testing-setup-workflow-loras" });
 
-function promptsSection(spec, onChange, apiBase) {
-  const promptText = ((spec && spec.prompts && spec.prompts.items && spec.prompts.items[0] && spec.prompts.items[0].text) || "");
-  const negativeText = ((spec && spec.prompts && spec.prompts.items && spec.prompts.items[0] && spec.prompts.items[0].negative) || "");
+  function rebuildLoras() {
+    while (loraList.firstChild) loraList.removeChild(loraList.firstChild);
+    // Show top-level LoRA selections by default (shared)
+    const selections = (getSpec() && getSpec().loras && getSpec().loras.selections) || [];
+    const visible = selections.filter((s) => s.id !== "L_no" || selections.length === 1);
+
+    if (visible.length === 0) {
+      loraList.appendChild(el("div", { class: "testing-setup-empty-hint", text: "No shared LoRAs configured. Use the per-stack LoRA controls for workflow-local config." }));
+    }
+
+    visible.forEach((entry) => {
+      loraList.appendChild(makeLoraRow(entry, (updated) => {
+        const cur = (getSpec() && getSpec().loras && getSpec().loras.selections) || [];
+        const selIdx = cur.findIndex((l) => l.id === entry.id);
+        if (selIdx >= 0) {
+          const next = [...cur];
+          next[selIdx] = updated;
+          onChange({ ...(getSpec() || {}), loras: { selections: next } });
+        }
+      }));
+    });
+
+    const addBtn = el("button", { class: "testing-setup-btn testing-setup-add-lora comfymodal-primary-btn", text: "+ Add LoRA" });
+    addBtn.addEventListener("click", () => {
+      const cur = (getSpec() && getSpec().loras && getSpec().loras.selections) || [];
+      const newId = `L_${Date.now().toString(36)}`;
+      onChange({ ...(getSpec() || {}), loras: { selections: [...cur, { id: newId, label: `LoRA ${cur.length}`, loras: [{ file: "", model_strength: [0.7], clip_strength: [0.7], enabled: true }], enabled: true }] } });
+    });
+    loraList.appendChild(addBtn);
+  }
+  rebuildLoras();
+  return loraList;
+}
+
+function workflowsSection(getSpec, onChange, apiBase) {
+  const list = el("div", { class: "testing-setup-profiles" });
+  const statusEl = el("div", { class: "testing-setup-section-status" });
+
+  // Workflow-local config areas rendered below selected profiles
+  const localConfigArea = el("div", { class: "testing-setup-workflow-local-config" });
+
+  // ── Create from Canvas (primary action) ──
+  const nameInput = el("input", {
+    type: "text",
+    placeholder: "Profile name (e.g. Flux2 Klein FP8)",
+    class: "testing-setup-input comfymodal-input",
+    style: "flex:1;",
+  });
+
+  const createBtn = el("button", {
+    class: "comfymodal-primary-btn",
+    text: "Create from Canvas",
+    title: "Save the current ComfyUI workflow as a comparison profile",
+  });
+  createBtn.addEventListener("click", async () => {
+    const name = nameInput.value.trim();
+    if (!name) {
+      statusEl.textContent = "Enter a profile name first.";
+      statusEl.className = "testing-setup-section-status testing-setup-status-error";
+      return;
+    }
+    createBtn.disabled = true;
+    statusEl.textContent = "Saving workflow\u2026";
+    statusEl.className = "testing-setup-section-status testing-setup-status-info";
+    try {
+      const graphData = await app.graphToPrompt();
+      if (!graphData || !graphData.output) {
+        throw new Error("Could not export workflow as API JSON");
+      }
+      const data = await fetchJson(`${apiBase}/comparison/profiles`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, workflow_api: graphData.output, workflow: graphData.workflow || null }),
+      });
+      if (data && data.profile && data.profile.id) {
+        try {
+          await fetchJson(`${apiBase}/comparison/profiles/${encodeURIComponent(data.profile.id)}/detect-slots`, { method: "POST" });
+        } catch (_) { /* non-fatal */ }
+        statusEl.textContent = `Profile "${name}" saved.`;
+        statusEl.className = "testing-setup-section-status testing-setup-status-ok";
+        nameInput.value = "";
+        onChange({ ...(getSpec() || {}), _refresh: Date.now() });
+        renderLocalConfig();
+        refresh();
+      } else {
+        statusEl.textContent = "Profile saved (no id returned).";
+        statusEl.className = "testing-setup-section-status testing-setup-status-ok";
+      }
+    } catch (e) {
+      statusEl.textContent = "Error: " + (e.message || e);
+      statusEl.className = "testing-setup-section-status testing-setup-status-error";
+    }
+    createBtn.disabled = false;
+  });
+
+  nameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") createBtn.click(); });
+
+  // Build local config for selected profiles — multi-stack + LoRA scope
+  function renderLocalConfig() {
+    while (localConfigArea.firstChild) localConfigArea.removeChild(localConfigArea.firstChild);
+    const curSpec = getSpec();
+    const workflows = (curSpec && curSpec.workflows) || [];
+    if (workflows.length === 0) {
+      localConfigArea.appendChild(el("div", { class: "testing-setup-empty-hint", text: "Select a workflow above to configure its model stacks and LoRAs." }));
+      return;
+    }
+    workflows.forEach((wf, idx) => {
+      const workflowChange = (nextSpec) => {
+        onChange(nextSpec);
+        setTimeout(() => { renderLocalConfig(); }, 0);
+      };
+
+      // Heading
+      const wfHeading = el("div", { class: "testing-setup-workflow-heading", text: `Workflow: ${wf.profile_id}` });
+
+      // Multi-stack editor
+      const stackEditor = renderStackEditor(wf, idx, getSpec, workflowChange);
+
+      // Workflow-level LoRA (shared across stacks as baseline)
+      const wfLoras = el("div", { class: "testing-setup-wf-lora-section" }, [
+        el("h4", { class: "testing-setup-section-subtitle", text: "Shared LoRA Baseline" }),
+        renderWorkflowLocalLoras(wf, idx, getSpec, workflowChange),
+      ]);
+
+      // Collapsible entry for workflow-local config
+      const entryDetails = el("details", { class: "testing-setup-workflow-local-entry" }, [
+        el("summary", { text: `Stacks & LoRA Configuration` }),
+        el("div", { class: "testing-setup-workflow-local-body" }, [
+          wfHeading,
+          el("h4", { class: "testing-setup-section-subtitle", text: "Model Stacks" }),
+          stackEditor,
+          wfLoras,
+        ]),
+      ]);
+      localConfigArea.appendChild(entryDetails);
+    });
+  }
+
+  // ── Profile list with inline edit/delete ──
+  const refresh = refreshable(list, async () => {
+    const data = await fetchJson(`${apiBase}/comparison/profiles`);
+    const profiles = (data && data.profiles) || data || [];
+    const out = [];
+    if (profiles.length === 0) {
+      out.push(el("div", { class: "testing-setup-empty-hint", text: "No profiles yet. Create one from the canvas above." }));
+    }
+    const curSpec = getSpec();
+    const sel = (curSpec && curSpec.workflows) || [];
+    profiles.forEach((p) => {
+      const profileId = p.id || p.profile_id || p.name;
+      const isSelected = sel.some((s) => s.profile_id === profileId);
+      const row = el("div", {
+        class: `testing-setup-profile-row ${isSelected ? "testing-setup-profile-selected" : ""}`,
+      }, [
+        el("input", {
+          type: "checkbox",
+          class: "testing-setup-profile-checkbox",
+          value: profileId,
+          checked: isSelected,
+          onchange: function () {
+            const curSpecInner = getSpec();
+            const cur = (curSpecInner && curSpecInner.workflows) || [];
+            const next = this.checked
+              ? [...cur, {
+                  profile_id: profileId,
+                  stacks: [{
+                    stack_id: "s1",
+                    loader_target_group_id: "g_default",
+                    main_triple: { id: "main" },
+                    selected_triple_ids: ["main"],
+                    subprofile_triples: [],
+                    lora_selections: [],
+                    lora_scope: "all",
+                    lora_scope_stacks: [],
+                  }],
+                  loader_target_group_id: "g_default",
+                  main_triple: pickMainTriple(p),
+                  subprofile_triples: [],
+                  selected_triple_ids: ["main"],
+                  lora_slots: [],
+                }]
+              : cur.filter((s) => s.profile_id !== profileId);
+            onChange({ ...(curSpecInner || {}), workflows: next });
+            renderLocalConfig();
+          },
+        }),
+        el("div", { class: "testing-setup-profile-info" }, [
+          el("span", { class: "testing-setup-profile-name", text: p.name || p.id }),
+          el("span", { class: "testing-setup-profile-triple", text: tripleSummary(p) }),
+        ]),
+        el("div", { class: "testing-setup-profile-actions" }, [
+          el("button", {
+            class: "testing-setup-profile-action-btn comfymodal-secondary-btn",
+            text: "Validate",
+            title: "Validate this profile",
+            onclick: async () => {
+              statusEl.textContent = "Validating\u2026";
+              try {
+                const vdata = await fetchJson(`${apiBase}/comparison/profiles/${encodeURIComponent(profileId)}/validate`, { method: "POST" });
+                const validation = vdata.validation || {};
+                statusEl.textContent = validation.status === "ready" ? "Profile is valid." : `Validation: ${validation.status || "unknown"}`;
+                statusEl.className = "testing-setup-section-status " + (validation.status === "ready" ? "testing-setup-status-ok" : "testing-setup-status-warn");
+              } catch (e) { statusEl.textContent = "Error: " + (e.message || e); statusEl.className = "testing-setup-section-status testing-setup-status-error"; }
+            },
+          }),
+          el("button", {
+            class: "testing-setup-profile-action-btn comfymodal-secondary-btn",
+            text: "Duplicate",
+            title: "Duplicate this profile",
+            onclick: async () => {
+              try {
+                const ddata = await fetchJson(`${apiBase}/comparison/profiles/${encodeURIComponent(profileId)}/duplicate`, { method: "POST" });
+                statusEl.textContent = `Duplicated as ${(ddata.profile && ddata.profile.id) || "new profile"}.`;
+                onChange({ ...(getSpec() || {}), _refresh: Date.now() });
+                renderLocalConfig();
+                refresh();
+              } catch (e) { statusEl.textContent = "Error: " + (e.message || e); }
+            },
+          }),
+          el("button", {
+            class: "testing-setup-profile-action-btn comfymodal-destructive-btn",
+            text: "Delete",
+            title: "Delete this profile",
+            onclick: async () => {
+              if (!window.confirm(`Delete profile "${p.name || profileId}"?`)) return;
+              try {
+                await fetchJson(`${apiBase}/comparison/profiles/${encodeURIComponent(profileId)}`, { method: "DELETE" });
+                statusEl.textContent = "Deleted.";
+                const specDel = getSpec();
+                onChange({ ...(specDel || {}), workflows: ((specDel && specDel.workflows) || []).filter((s) => s.profile_id !== profileId), _refresh: Date.now() });
+                renderLocalConfig();
+                refresh();
+              } catch (e) { statusEl.textContent = "Error: " + (e.message || e); }
+            },
+          }),
+        ]),
+      ]);
+      out.push(row);
+    });
+    return out;
+  });
+
+  // Initial render of local config, then load profiles
+  renderLocalConfig();
+  refresh();
+
+  return sectionCard(SECTION_LABELS.workflows, [
+    el("div", { class: "testing-setup-create-row" }, [
+      nameInput,
+      createBtn,
+    ]),
+    statusEl,
+    list,
+    el("div", { class: "testing-setup-section-divider" }),
+    localConfigArea,
+  ], "workflows", false);
+}
+
+// ── Step 4: Test Values — prompts, images, axes, execution ──
+
+const SAMPLER_OPTIONS = [
+  "euler", "euler_ancestral", "heun", "heunpp2", "dpm_2", "dpm_2_ancestral",
+  "lms", "dpm_fast", "dpm_adaptive", "dpmpp_2s_ancestral", "dpmpp_sde",
+  "dpmpp_sde_gpu", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_2m_sde_gpu",
+  "dpmpp_3m_sde", "dpmpp_3m_sde_gpu", "ddpm", "lcm", "ddim", "uni_pc",
+  "uni_pc_bh2",
+];
+
+const SCHEDULER_OPTIONS = [
+  "normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta",
+];
+
+const DEFAULT_ENABLED_SAMPLERS = ["euler", "euler_ancestral", "dpmpp_2m"];
+
+function testValuesSection(getSpec, onChange, apiBase) {
+  const body = el("div", { class: "testing-setup-test-values" });
+  const spec = getSpec() || {};
+
+  // Determine which variables are active in Testing mode (shown in Test Values)
+  const variableModes = spec.variable_modes || createDefaultVariableModes();
+  const activeTestingVars = getActiveTestingVariables(variableModes);
+  const genType = spec.generation_type || "t2i";
+
+  // Helper: is a variable active for testing?
+  function isTesting(varName) { return activeTestingVars.includes(varName); }
+
+  // ── Prompts ──
+  const initSpec = getSpec();
+  const promptText = ((initSpec && initSpec.prompts && initSpec.prompts.items && initSpec.prompts.items[0] && initSpec.prompts.items[0].text) || "");
+  const negativeText = ((initSpec && initSpec.prompts && initSpec.prompts.items && initSpec.prompts.items[0] && initSpec.prompts.items[0].negative) || "");
 
   const positiveArea = el("textarea", {
     class: "testing-setup-textarea comfymodal-input testing-setup-prompt-textarea",
@@ -503,7 +878,8 @@ function promptsSection(spec, onChange, apiBase) {
   positiveArea.value = promptText;
   positiveArea.addEventListener("input", () => {
     const items = [{ text: positiveArea.value, negative: negativeArea.value }];
-    onChange({ ...(spec || {}), prompts: { items, preset_id: (spec && spec.prompts && spec.prompts.preset_id) || "" } });
+    const cur = getSpec() || {};
+    onChange({ ...cur, prompts: { items, preset_id: (cur.prompts && cur.prompts.preset_id) || "" } });
   });
 
   const negativeArea = el("textarea", {
@@ -513,14 +889,13 @@ function promptsSection(spec, onChange, apiBase) {
   negativeArea.value = negativeText;
   negativeArea.addEventListener("input", () => {
     const items = [{ text: positiveArea.value, negative: negativeArea.value }];
-    onChange({ ...(spec || {}), prompts: { items, preset_id: (spec && spec.prompts && spec.prompts.preset_id) || "" } });
+    const cur = getSpec() || {};
+    onChange({ ...cur, prompts: { items, preset_id: (cur.prompts && cur.prompts.preset_id) || "" } });
   });
-
   // Preset dropdown
   const presetDropdown = el("select", { class: "testing-setup-select comfymodal-input testing-setup-preset-dropdown" });
   presetDropdown.appendChild(el("option", { value: "", text: "Load a preset\u2026" }));
 
-  // Save as preset button
   const savePresetBtn = el("button", {
     class: "comfymodal-secondary-btn testing-setup-save-preset-btn",
     text: "Save as Preset",
@@ -528,12 +903,10 @@ function promptsSection(spec, onChange, apiBase) {
 
   const presetStatus = el("div", { class: "testing-setup-section-status" });
 
-  // Load presets into dropdown
   async function loadPresets() {
     try {
       const data = await fetchJson(`${apiBase}/presets/prompts`);
       const presets = (data && data.presets) || [];
-      // Clear existing options except the placeholder
       while (presetDropdown.options.length > 1) presetDropdown.remove(1);
       presets.forEach((p) => {
         const opt = el("option", { value: p.id });
@@ -546,7 +919,6 @@ function promptsSection(spec, onChange, apiBase) {
   }
   loadPresets();
 
-  // Load preset on selection
   presetDropdown.addEventListener("change", async () => {
     const presetId = presetDropdown.value;
     if (!presetId) return;
@@ -566,7 +938,6 @@ function promptsSection(spec, onChange, apiBase) {
     presetDropdown.value = "";
   });
 
-  // Save as preset
   savePresetBtn.addEventListener("click", async () => {
     const name = window.prompt("Save prompt as preset\u2026\nName:", "");
     if (!name || !name.trim()) return;
@@ -589,30 +960,36 @@ function promptsSection(spec, onChange, apiBase) {
     setTimeout(() => { presetStatus.textContent = ""; }, 3000);
   });
 
-  return sectionCard(SECTION_LABELS.prompts, [
-    el("div", { class: "testing-setup-prompt-editor" }, [
-      el("label", { class: "testing-setup-field testing-setup-field-large" }, [
-        el("span", { class: "testing-setup-field-label", text: "Positive" }),
-        positiveArea,
+  const promptsBlock = el("details", {
+    class: `testing-setup-test-values-group${!isTesting("prompt") ? " testing-setup-test-values-inactive" : ""}`,
+    open: isTesting("prompt"),
+  }, [
+    el("summary", { text: `Prompts${!isTesting("prompt") ? " (mode: " + ((variableModes.prompt || {}).mode || "default") + ")" : ""}` }),
+    el("div", { class: "testing-setup-test-values-group-body" }, [
+      el("div", { class: "testing-setup-prompt-editor" }, [
+        el("label", { class: "testing-setup-field testing-setup-field-large" }, [
+          el("span", { class: "testing-setup-field-label", text: "Positive" }),
+          positiveArea,
+        ]),
+        ...(isTesting("negative_prompt") ? [
+          el("label", { class: "testing-setup-field testing-setup-field-large" }, [
+            el("span", { class: "testing-setup-field-label", text: "Negative" }),
+            negativeArea,
+          ]),
+        ] : []),
       ]),
-      el("label", { class: "testing-setup-field testing-setup-field-large" }, [
-        el("span", { class: "testing-setup-field-label", text: "Negative" }),
-        negativeArea,
+      el("div", { class: "testing-setup-preset-bar" }, [
+        presetDropdown,
+        savePresetBtn,
       ]),
+      presetStatus,
     ]),
-    el("div", { class: "testing-setup-preset-bar" }, [
-      presetDropdown,
-      savePresetBtn,
-    ]),
-    presetStatus,
-  ], "prompts", false);
-}
+  ]);
+  body.appendChild(promptsBlock);
 
-// ── Step 5: Images ────────────────────────────────────────────
-
-function imagesSection(spec, onChange, apiBase) {
-  const list = el("div", { class: "testing-setup-images" });
-  const refresh = refreshable(list, async () => {
+  // ── Images ──
+  const imagesList = el("div", { class: "testing-setup-images" });
+  const imagesRefresh = refreshable(imagesList, async () => {
     const data = await fetchJson(`${apiBase}/presets/images`);
     const presets = (data && data.presets) || [];
     const out = [];
@@ -620,51 +997,43 @@ function imagesSection(spec, onChange, apiBase) {
     if (presets.length === 0) {
       out.push(status("No image presets. Create one in Settings.", "warn"));
     }
-    const sel = (spec && spec.image_preset_id) || "";
+    const initSpec = getSpec();
+    const sel = (initSpec && initSpec.image_preset_id) || "";
     presets.forEach((p) => {
       const cb = el("input", { type: "radio", name: "image-preset", value: p.id });
       cb.checked = sel === p.id;
-      cb.addEventListener("change", () => { onChange({ ...(spec || {}), image_preset_id: p.id, images: { mode: "cartesian", items: (p.items || []).map((i) => i.content_hash || i.id) } }); });
+      cb.addEventListener("change", () => { onChange({ ...(getSpec() || {}), image_preset_id: p.id, images: { mode: "cartesian", items: (p.items || []).map((i) => i.content_hash || i.id) } }); });
       out.push(el("label", { class: "testing-setup-preset-row" }, [cb, el("span", { text: p.name || p.id })]));
     });
     return out;
   });
-  refresh();
-  return sectionCard(SECTION_LABELS.images, [list], "images", true);
-}
+  imagesRefresh();
 
-// ── Step 6: Axes (samplers dropdown + enable/disable + advanced toggle) ──
+  const showImages = genType === "img2img" || isTesting("input_image");
+  const imagesBlock = el("details", {
+    class: `testing-setup-test-values-group${!showImages ? " testing-setup-test-values-inactive" : ""}`,
+    open: showImages,
+  }, [
+    el("summary", { text: `Images${!showImages ? " (T2I mode)" : ""}` }),
+    el("div", { class: "testing-setup-test-values-group-body" }, [imagesList]),
+  ]);
+  if (showImages) body.appendChild(imagesBlock);
 
-const SAMPLER_OPTIONS = [
-  "euler", "euler_ancestral", "heun", "heunpp2", "dpm_2", "dpm_2_ancestral",
-  "lms", "dpm_fast", "dpm_adaptive", "dpmpp_2s_ancestral", "dpmpp_sde",
-  "dpmpp_sde_gpu", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_2m_sde_gpu",
-  "dpmpp_3m_sde", "dpmpp_3m_sde_gpu", "ddpm", "lcm", "ddim", "uni_pc",
-  "uni_pc_bh2",
-];
+  // ── Axes ──
+  const axes = spec.axes || { shared: { seed: { mode: "list", values: [1, 2, 3] } }, per_workflow: {} };
 
-const SCHEDULER_OPTIONS = [
-  "normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta",
-];
-
-// Default disabled samplers (most should be disabled)
-const DEFAULT_ENABLED_SAMPLERS = ["euler", "euler_ancestral", "dpmpp_2m"];
-
-function axesSection(spec, onChange) {
-  const axes = (spec && spec.axes) || { shared: { seed: { mode: "list", values: [1, 2, 3] } }, per_workflow: {} };
-
-  // Seeds
   const seedInput = el("input", {
     type: "text", placeholder: "1,2,3,4,5",
     class: "testing-setup-input comfymodal-input",
     value: (axes.shared && axes.shared.seed && axes.shared.seed.values) ? axes.shared.seed.values.join(",") : "1,2,3",
   });
   seedInput.addEventListener("input", () => {
+    const cur = getSpec() || {};
+    const curAxes = cur.axes || {};
     const vals = seedInput.value.split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !Number.isNaN(n));
-    onChange({ ...(spec || {}), axes: { ...(axes || {}), shared: { ...(axes.shared || {}), seed: { mode: "list", values: vals } } } });
+    onChange({ ...cur, axes: { ...curAxes, shared: { ...(curAxes.shared || {}), seed: { mode: "list", values: vals } } } });
   });
 
-  // Sampler dropdown with enable/disable
   const samplerContainer = el("div", { class: "testing-setup-sampler-grid" });
   const enabledSamplers = (axes.shared && axes.shared.sampler && axes.shared.sampler.values) || DEFAULT_ENABLED_SAMPLERS;
 
@@ -678,11 +1047,13 @@ function axesSection(spec, onChange) {
         checked: isEnabled,
       });
       cb.addEventListener("change", () => {
-        const current = (axes.shared && axes.shared.sampler && axes.shared.sampler.values) || [...DEFAULT_ENABLED_SAMPLERS];
+        const cur = getSpec() || {};
+        const curAxes = cur.axes || {};
+        const current = (curAxes.shared && curAxes.shared.sampler && curAxes.shared.sampler.values) || [...DEFAULT_ENABLED_SAMPLERS];
         const next = cb.checked
           ? [...current, sampler]
           : current.filter((s) => s !== sampler);
-        onChange({ ...(spec || {}), axes: { ...axes, shared: { ...(axes.shared || {}), sampler: { mode: "list", values: next } } } });
+        onChange({ ...cur, axes: { ...curAxes, shared: { ...(curAxes.shared || {}), sampler: { mode: "list", values: next } } } });
       });
       const row = el("label", { class: `testing-setup-sampler-row ${isEnabled ? "testing-setup-sampler-enabled" : "testing-setup-sampler-disabled"}` }, [
         cb,
@@ -693,86 +1064,167 @@ function axesSection(spec, onChange) {
   }
   rebuildSamplers();
 
-  // Advanced fields
   const stepsInput = el("input", { type: "text", placeholder: "20,30", class: "testing-setup-input comfymodal-input", value: "20" });
   stepsInput.addEventListener("input", () => {
+    const cur = getSpec() || {};
+    const curAxes = cur.axes || {};
     const vals = stepsInput.value.split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !Number.isNaN(n));
-    onChange({ ...(spec || {}), axes: { ...(axes || {}), per_workflow: { ...(axes.per_workflow || {}), p1: { ...((axes.per_workflow || {}).p1 || {}), steps: { mode: "list", values: vals } } } } });
+    onChange({ ...cur, axes: { ...curAxes, per_workflow: { ...(curAxes.per_workflow || {}), p1: { ...((curAxes.per_workflow || {}).p1 || {}), steps: { mode: "list", values: vals } } } } });
   });
   const guidanceInput = el("input", { type: "text", placeholder: "3.5,7.5", class: "testing-setup-input comfymodal-input", value: "3.5" });
   guidanceInput.addEventListener("input", () => {
+    const cur = getSpec() || {};
+    const curAxes = cur.axes || {};
     const vals = guidanceInput.value.split(",").map((s) => parseFloat(s.trim())).filter((n) => !Number.isNaN(n));
-    onChange({ ...(spec || {}), axes: { ...(axes || {}), shared: { ...(axes.shared || {}), guidance: { mode: "list", values: vals } } } });
+    onChange({ ...cur, axes: { ...curAxes, shared: { ...(curAxes.shared || {}), guidance: { mode: "list", values: vals } } } });
   });
 
-  // Scheduler dropdown
   const schedulerSelect = el("select", { class: "testing-setup-select comfymodal-input" });
   SCHEDULER_OPTIONS.forEach((s) => {
     schedulerSelect.appendChild(el("option", { value: s, text: s }));
   });
   schedulerSelect.value = (axes.shared && axes.shared.scheduler && axes.shared.scheduler.value) || "normal";
-  schedulerSelect.addEventListener("change", () => onChange({ ...(spec || {}), axes: { ...axes, shared: { ...(axes.shared || {}), scheduler: { mode: "single", value: schedulerSelect.value } } } }));
+  schedulerSelect.addEventListener("change", () => {
+    const cur = getSpec() || {};
+    const curAxes = cur.axes || {};
+    onChange({ ...cur, axes: { ...curAxes, shared: { ...(curAxes.shared || {}), scheduler: { mode: "single", value: schedulerSelect.value } } } });
+  });
 
   const denoiseInput = el("input", { type: "text", value: "1.0", class: "testing-setup-input comfymodal-input" });
-  denoiseInput.addEventListener("input", () => onChange({ ...(spec || {}), axes: { ...axes, shared: { ...(axes.shared || {}), denoise: { mode: "single", value: parseFloat(denoiseInput.value) || 1.0 } } } }));
+  denoiseInput.addEventListener("input", () => {
+    const cur = getSpec() || {};
+    const curAxes = cur.axes || {};
+    onChange({ ...cur, axes: { ...curAxes, shared: { ...(curAxes.shared || {}), denoise: { mode: "single", value: parseFloat(denoiseInput.value) || 1.0 } } } });
+  });
 
-  // Essential fields
-  const essentialGrid = el("div", { class: "testing-setup-field-grid" }, [
-    el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Seeds" }), seedInput]),
-  ]);
+  // Axes fields, filtered by active testing variables
+  const axesBodyParts = [];
 
-  // Sampler section
-  const samplerSection = el("div", { class: "testing-setup-sampler-section" }, [
-    el("div", { class: "testing-setup-sampler-header" }, [
-      el("span", { class: "testing-setup-field-label", text: "Samplers" }),
-      el("span", { class: "testing-setup-sampler-hint", text: "Enable the samplers to sweep" }),
-    ]),
-    samplerContainer,
-  ]);
+  if (isTesting("seed")) {
+    axesBodyParts.push(el("div", { class: "testing-setup-field-grid" }, [
+      el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Seeds" }), seedInput]),
+    ]));
+  }
 
-  // Advanced fields
-  const advancedBody = el("div", { class: "advanced-body" }, [
-    el("div", { class: "testing-setup-field-grid" }, [
-      el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Steps" }), stepsInput]),
-      el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Guidance" }), guidanceInput]),
-      el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Scheduler" }), schedulerSelect]),
-      el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Denoise" }), denoiseInput]),
-    ]),
-  ]);
+  if (isTesting("sampler")) {
+    axesBodyParts.push(el("div", { class: "testing-setup-sampler-section" }, [
+      el("div", { class: "testing-setup-sampler-header" }, [
+        el("span", { class: "testing-setup-field-label", text: "Samplers" }),
+        el("span", { class: "testing-setup-sampler-hint", text: "Enable the samplers to sweep" }),
+      ]),
+      samplerContainer,
+    ]));
+  }
 
-  const advancedToggle = el("details", { class: "testing-setup-advanced-toggle" }, [
-    el("summary", { text: "Advanced axes" }),
-    advancedBody,
-  ]);
+  // Advanced axes
+  const advancedFields = [];
+  if (isTesting("steps")) {
+    advancedFields.push(el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Steps" }), stepsInput]));
+  }
+  if (isTesting("guidance")) {
+    advancedFields.push(el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Guidance" }), guidanceInput]));
+  }
+  if (isTesting("scheduler")) {
+    advancedFields.push(el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Scheduler" }), schedulerSelect]));
+  }
+  if (isTesting("denoise")) {
+    advancedFields.push(el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Denoise" }), denoiseInput]));
+  }
+  if (isTesting("resolution")) {
+    advancedFields.push(el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Width" }), el("input", { type: "text", placeholder: "1024", class: "testing-setup-input comfymodal-input", value: "1024", oninput: function () { const cur = getSpec() || {}; const curAxes = cur.axes || {}; onChange({ ...cur, axes: { ...curAxes, shared: { ...(curAxes.shared || {}), width: { mode: "single", value: parseInt(this.value, 10) || 1024 } } } }); } })]));
+    advancedFields.push(el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Height" }), el("input", { type: "text", placeholder: "1024", class: "testing-setup-input comfymodal-input", value: "1024", oninput: function () { const cur = getSpec() || {}; const curAxes = cur.axes || {}; onChange({ ...cur, axes: { ...curAxes, shared: { ...(curAxes.shared || {}), height: { mode: "single", value: parseInt(this.value, 10) || 1024 } } } }); } })]));
+  }
 
-  return sectionCard(SECTION_LABELS.axes, [essentialGrid, samplerSection, advancedToggle], "axes", false);
-}
+  const advancedBody = advancedFields.length > 0
+    ? el("div", { class: "advanced-body" }, [el("div", { class: "testing-setup-field-grid" }, advancedFields)])
+    : null;
 
-// ── Step 7: Execution ─────────────────────────────────────────
+  if (axesBodyParts.length > 0 || advancedBody) {
+    const axesBlockChildren = [];
+    if (axesBodyParts.length > 0) {
+      axesBodyParts.forEach((p) => axesBlockChildren.push(p));
+    }
+    if (advancedBody) {
+      axesBlockChildren.push(el("details", { class: "testing-setup-advanced-toggle" }, [
+        el("summary", { text: "Advanced axes" }),
+        advancedBody,
+      ]));
+    }
+    const axesBlock = el("details", {
+      class: "testing-setup-test-values-group",
+      open: true,
+    }, [
+      el("summary", { text: "Axes" }),
+      el("div", { class: "testing-setup-test-values-group-body" }, axesBlockChildren),
+    ]);
+    body.appendChild(axesBlock);
+  }
 
-function containersSection(spec, onChange) {
+  // ── Execution ──
   const mode = el("select", { class: "testing-setup-select comfymodal-input" }, [
     el("option", { value: "single", text: "Single container" }),
     el("option", { value: "multi", text: "Multi-container" }),
   ]);
   mode.value = (spec && spec.container_mode) || "single";
   const max = el("input", { type: "number", min: "1", max: "8", value: String((spec && spec.max_containers) || 1), class: "testing-setup-input comfymodal-input" });
-  mode.addEventListener("change", () => onChange({ ...(spec || {}), container_mode: mode.value }));
-  max.addEventListener("input", () => onChange({ ...(spec || {}), max_containers: parseInt(max.value, 10) || 1 }));
-  return sectionCard(SECTION_LABELS.containers, [
-    el("div", { class: "testing-setup-field-grid" }, [
-      el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Mode" }), mode]),
-      el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Max containers" }), max]),
+  mode.addEventListener("change", () => onChange({ ...(getSpec() || {}), container_mode: mode.value }));
+  max.addEventListener("input", () => onChange({ ...(getSpec() || {}), max_containers: parseInt(max.value, 10) || 1 }));
+
+  const execBlock = el("details", { class: "testing-setup-test-values-group" }, [
+    el("summary", { text: "Execution" }),
+    el("div", { class: "testing-setup-test-values-group-body" }, [
+      el("div", { class: "testing-setup-field-grid" }, [
+        el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Mode" }), mode]),
+        el("label", { class: "testing-setup-field" }, [el("span", { class: "testing-setup-field-label", text: "Max containers" }), max]),
+      ]),
     ]),
-  ], "containers", true);
+  ]);
+  body.appendChild(execBlock);
+
+  return sectionCard(SECTION_LABELS.testValues, [body], "testValues", false);
 }
 
 // ── Validation ────────────────────────────────────────────────
 
 function validateSpec(spec) {
   const errors = [];
-  const selections = (spec && spec.loras && spec.loras.selections) || [];
-  for (const sel of selections) {
+
+  // Validate generation_type
+  if (!spec.generation_type || !["t2i", "img2img"].includes(spec.generation_type)) {
+    errors.push("Select a generation type (T2I or I2I)");
+  }
+
+  // Validate workflows
+  if (!spec.workflows || spec.workflows.length === 0) {
+    errors.push("Select at least one workflow profile");
+  } else {
+    // Validate stacks within workflows
+    spec.workflows.forEach((wf, wi) => {
+      if (!wf.stacks || wf.stacks.length === 0) {
+        errors.push(`Workflow "${wf.profile_id || wi}": at least one model stack is required`);
+      }
+      (wf.stacks || []).forEach((stack, si) => {
+        if (!stack.main_triple || (!stack.main_triple.unet && !stack.main_triple.clip && !stack.main_triple.vae)) {
+          errors.push(`Workflow "${wf.profile_id || wi}", Stack "${stack.stack_id || si}": no model configured`);
+        }
+      });
+    });
+  }
+
+  // Validate LoRA selections (both top-level and per-stack)
+  const topLevelSelections = (spec && spec.loras && spec.loras.selections) || [];
+  const allSelections = [...topLevelSelections];
+  (spec.workflows || []).forEach((wf) => {
+    (wf.stacks || []).forEach((stack) => {
+      (stack.lora_selections || []).forEach((sel) => {
+        if (!allSelections.some((s) => s.id === sel.id)) {
+          allSelections.push(sel);
+        }
+      });
+    });
+  });
+
+  for (const sel of allSelections) {
     if (sel.id === "L_no") continue;
     if (sel.enabled === false) continue;
     for (const l of sel.loras || []) {
@@ -782,43 +1234,123 @@ function validateSpec(spec) {
       if (l.clip_strength && !l.clip_strength.every((v) => typeof v === "number" && !Number.isNaN(v))) { errors.push(`LoRA "${sel.label}": invalid clip_strength values`); }
     }
   }
-  if (!spec.workflows || spec.workflows.length === 0) { errors.push("Select at least one workflow profile"); }
+
   return errors;
 }
 
-// ── Step 8: Review & Run ──────────────────────────────────────
+// ── Step 5: Review & Run — with sticky summary + auto-preview ──
 
-function previewSection(spec, onRun, onCompile, apiBase) {
+function previewSection(getSpec, onRun, onCompile, apiBase) {
   const out = el("div", { class: "testing-setup-preview" });
-  const compileBtn = el("button", { class: "comfymodal-primary-btn testing-setup-compile-btn", text: "Compile" });
-  compileBtn.addEventListener("click", async () => {
-    while (out.firstChild) out.removeChild(out.firstChild);
-    const errs = validateSpec(spec);
-    if (errs.length > 0) { errs.forEach((e) => out.appendChild(status(e, "error"))); return; }
-    out.appendChild(status("Compiling\u2026"));
-    try {
-      const data = await onCompile();
-      while (out.firstChild) out.removeChild(out.firstChild);
+
+  // Sticky summary — replaceable container
+  const stickyContainer = el("div", { class: "testing-setup-sticky-container" });
+
+  function buildStickySummary() {
+    const sp = getSpec();
+    const wfCount = (sp && sp.workflows && sp.workflows.length) || 0;
+    let stackCount = 0;
+    (sp && sp.workflows || []).forEach((wf) => { stackCount += (wf.stacks || []).length; });
+    const hasPrompts = (sp && sp.prompts && sp.prompts.items && sp.prompts.items.length > 0);
+    const loraCount = (sp && sp.loras && sp.loras.selections) ? sp.loras.selections.filter((s) => s.id !== "L_no" && s.enabled !== false).length : 0;
+    const seedAxis = ((sp && sp.axes && sp.axes.shared && sp.axes.shared.seed && sp.axes.shared.seed.values) || []).length;
+    const genType = (sp && sp.generation_type) || "t2i";
+    const varModes = (sp && sp.variable_modes) || {};
+    const testingCount = Object.values(varModes).filter((v) => v.mode === "testing" && v.enabled !== false).length;
+    const controlledCount = Object.values(varModes).filter((v) => v.mode === "controlled" && v.enabled !== false).length;
+
+    return el("div", { class: "testing-setup-sticky-summary" }, [
+      el("div", { class: "testing-setup-sticky-summary-row" }, [
+        el("span", { class: "testing-setup-sticky-summary-item", text: `Type: ${genType === "t2i" ? "T2I" : "I2I"}` }),
+        el("span", { class: "testing-setup-sticky-summary-item", text: `${wfCount} workflow(s)` }),
+        el("span", { class: "testing-setup-sticky-summary-item", text: `${stackCount || wfCount} stack(s)` }),
+        el("span", { class: "testing-setup-sticky-summary-item", text: `${loraCount} LoRA(s)` }),
+        el("span", { class: "testing-setup-sticky-summary-item", text: `${seedAxis} seed(s)` }),
+        el("span", { class: "testing-setup-sticky-summary-item", text: `${testingCount} testing / ${controlledCount} controlled` }),
+        el("span", { class: "testing-setup-sticky-summary-item", text: hasPrompts ? "Prompts set" : "No prompts" }),
+      ]),
+    ]);
+  }
+
+  function updateStickySummary() {
+    while (stickyContainer.firstChild) stickyContainer.removeChild(stickyContainer.firstChild);
+    stickyContainer.appendChild(buildStickySummary());
+  }
+
+  updateStickySummary();
+  out.appendChild(stickyContainer);
+
+  // Auto-preview status — replaceable container (kept separate from draft)
+  const autoPreviewContainer = el("div", { class: "testing-setup-auto-preview" });
+
+  function updateAutoPreview(result) {
+    while (autoPreviewContainer.firstChild) autoPreviewContainer.removeChild(autoPreviewContainer.firstChild);
+    if (result.status === "loading") {
+      autoPreviewContainer.appendChild(status("Compiling preview\u2026", "info"));
+    } else if (result.status === "ok") {
+      const data = result.data;
       const cellCount = (data.compilation && data.compilation.cells) ? data.compilation.cells.length : 0;
       const ckCount = (data.compilation && data.compilation.checkpoints) ? data.compilation.checkpoints.length : 0;
-      out.appendChild(status(`Compiled: ${ckCount} checkpoints, ${cellCount} cells.`, "ok"));
-      const runBtn = el("button", { class: "comfymodal-primary-btn testing-setup-run", text: "Run" });
-      runBtn.addEventListener("click", async () => {
-        runBtn.disabled = true;
-        try {
-          await onRun();
-          out.appendChild(status("Run started. See Results tab.", "ok"));
-        } catch (e) { out.appendChild(status("Run failed: " + (e.message || e), "error")); runBtn.disabled = false; }
-      });
-      out.appendChild(runBtn);
-    } catch (e) {
-      while (out.firstChild) out.removeChild(out.firstChild);
-      out.appendChild(status("Compile failed: " + (e.message || e), "error"));
+      autoPreviewContainer.appendChild(status(`Preview: ${ckCount} checkpoints, ${cellCount} cells.`, "ok"));
+    } else if (result.status === "error") {
+      autoPreviewContainer.appendChild(status(result.error || "Preview error", "error"));
+    } else {
+      autoPreviewContainer.appendChild(status("Ready", "info"));
     }
+  }
+
+  updateAutoPreview({ status: "idle" });
+  out.appendChild(autoPreviewContainer);
+
+  // Manual Compile button (remains as refresh/debug action)
+  const compileBtn = el("button", { class: "comfymodal-primary-btn testing-setup-compile-btn", text: "Compile" });
+  compileBtn.addEventListener("click", async () => {
+    compileBtn.disabled = true;
+    updateAutoPreview({ status: "loading" });
+
+    const errs = validateSpec(spec);
+    if (errs.length > 0) {
+      updateAutoPreview({ status: "error", error: errs.join("; ") });
+      compileBtn.disabled = false;
+      return;
+    }
+
+    try {
+      const data = await onCompile();
+      updateAutoPreview({ status: "ok", data });
+      // Show Run button after successful manual compile
+      const existingRunBtn = out.querySelector(".testing-setup-run");
+      if (!existingRunBtn) {
+        const runBtn = el("button", { class: "comfymodal-primary-btn testing-setup-run", text: "Run" });
+        runBtn.addEventListener("click", async () => {
+          runBtn.disabled = true;
+          try {
+            await onRun();
+            const runStatus = el("div", { class: "testing-setup-run-status", text: "Run started. See Results tab." });
+            out.appendChild(runStatus);
+          } catch (e) {
+            updateAutoPreview({ status: "error", error: "Run failed: " + (e.message || e) });
+            runBtn.disabled = false;
+          }
+        });
+        out.appendChild(runBtn);
+      }
+    } catch (e) {
+      updateAutoPreview({ status: "error", error: "Compile failed: " + (e.message || e) });
+    }
+    compileBtn.disabled = false;
   });
-  return sectionCard(SECTION_LABELS.preview, [
-    el("div", { class: "testing-setup-finish-zone testing-setup-finish-zone-prominent" }, [out, compileBtn]),
-  ], "preview", false);
+
+  const finishZone = el("div", { class: "testing-setup-finish-zone testing-setup-finish-zone-prominent" }, [
+    out,
+    compileBtn,
+  ]);
+
+  return {
+    element: sectionCard(SECTION_LABELS.preview, [finishZone], "preview", false),
+    updateSticky: updateStickySummary,
+    updateAutoPreview,
+  };
 }
 
 // ── Public mount function ──────────────────────────────────────
@@ -829,74 +1361,120 @@ export function setup_tab_render(rootEl, api, options = {}) {
   const onDraftChange = options.onDraftChange || (() => {});
   const onRun = options.onRun || (() => {});
 
-  let spec = options.draft || options.experiment || defaultSpec();
+  let spec = options.draft || options.experiment || createDefaultDraft();
 
   while (rootEl.firstChild) rootEl.removeChild(rootEl.firstChild);
 
   const shell = el("div", { class: "testing-setup-root" });
 
-  const handler = (next) => {
-    spec = mergeSpec(spec, next);
+  // ── Auto-preview state (NOT persisted — stays in this closure) ──
+  let previewSeq = 0;
+  let previewTimer = null;
+
+  // Wrapped onRun: calls doRun then calls the external onRun callback
+  const wrappedOnRun = async () => {
+    const compilePayload = draftToCompilePayload(spec);
+    const createPayload = draftToCreatePayload(spec);
+    const startPayload = draftToStartPayload(spec);
+    const result = await doRun(spec, apiBase, compilePayload, createPayload, startPayload);
+    const expId = result && result.experiment_id ? result.experiment_id : null;
     onDraftChange(spec);
+    onRun(expId);
+    return { compilation: spec };
+  };
+
+  // Build preview section with updatable refs
+  const previewResult = previewSection(
+    () => spec,
+    wrappedOnRun,
+    () => doCompile(spec, apiBase),
+    apiBase,
+  );
+
+  const handler = (next) => {
+    spec = adapterMergeDraft(spec, next);
+    onDraftChange(spec);
+
+    // Update client-side sticky summary
+    previewResult.updateSticky();
+
+    // Schedule backend auto-preview with debounce
+    scheduleAutoPreview();
   };
 
   const sectionsContainer = el("div", { class: "testing-setup-sections" });
 
-  // Build section cards — no rail, just clean stacked sections
+  // Build section cards — five sections, no rail
   const sectionBuilders = [
-    { key: "experiment", fn: () => experimentSection(spec, handler) },
-    { key: "workflows", fn: () => workflowsSection(spec, handler, apiBase) },
-    { key: "modelProfiles", fn: () => modelProfilesSection(spec, handler, apiBase) },
-    { key: "loras", fn: () => lorasSection(spec, handler) },
-    { key: "prompts", fn: () => promptsSection(spec, handler, apiBase) },
-    { key: "images", fn: () => imagesSection(spec, handler, apiBase) },
-    { key: "axes", fn: () => axesSection(spec, handler) },
-    { key: "containers", fn: () => containersSection(spec, handler) },
-    { key: "preview", fn: () => previewSection(spec,
-      async () => { const result = await doRun(spec, apiBase); const expId = result && result.experiment_id ? result.experiment_id : null; onDraftChange(spec); onRun(expId); return { compilation: spec }; },
-      () => doCompile(spec, apiBase), apiBase,
-    )},
+    { key: "generationType", fn: () => generationTypeSection(() => spec, handler) },
+    { key: "whatChanges", fn: () => whatChangesSection(() => spec, handler) },
+    { key: "workflows", fn: () => workflowsSection(() => spec, handler, apiBase) },
+    { key: "testValues", fn: () => testValuesSection(() => spec, handler, apiBase) },
+    { key: "preview", fn: () => previewResult.element },
   ];
 
   sectionBuilders.forEach(({ fn }) => { sectionsContainer.appendChild(fn()); });
   shell.appendChild(sectionsContainer);
   rootEl.appendChild(shell);
 
+  // ── Debounced auto-preview with request sequencing ──
+  function scheduleAutoPreview() {
+    if (previewTimer) clearTimeout(previewTimer);
+    // Capture the spec at schedule time so each scheduled preview
+    // compiles a consistent snapshot regardless of later changes.
+    const snapSpec = spec;
+    previewTimer = setTimeout(async () => {
+      const seq = ++previewSeq;
+
+      // Validation before calling backend
+      const errs = validateSpec(snapSpec);
+      if (errs.length > 0) {
+        if (seq === previewSeq) {
+          previewResult.updateAutoPreview({ status: "error", error: errs.join("; ") });
+        }
+        return;
+      }
+
+      previewResult.updateAutoPreview({ status: "loading" });
+
+      try {
+        const data = await doCompile(snapSpec, apiBase);
+        // Discard stale responses: only the freshest request wins
+        if (seq !== previewSeq) return;
+        previewResult.updateAutoPreview({ status: "ok", data });
+      } catch (e) {
+        if (seq !== previewSeq) return;
+        previewResult.updateAutoPreview({ status: "error", error: e.message || e });
+      }
+    }, 400);
+  }
+
   return {
     getSpec: () => spec,
     rootEl: shell,
-    destroy() {},
+    destroy() {
+      if (previewTimer) clearTimeout(previewTimer);
+      previewTimer = null;
+      previewSeq++;
+    },
   };
 }
 
-function defaultSpec() {
-  return {
-    name: "Untitled experiment",
-    notes: "",
-    workflows: [],
-    prompts: { items: [] },
-    images: { mode: "cartesian", items: [] },
-    loras: { selections: [{ id: "L_no", label: "No LoRA", loras: [], enabled: true }] },
-    axes: { shared: { seed: { mode: "list", values: [1, 2, 3] } }, per_workflow: {} },
-    container_mode: "single",
-    max_containers: 1,
-  };
-}
-
-function mergeSpec(prev, next) { return { ...prev, ...next }; }
+export const _defaultSpec = createDefaultDraft;
 
 async function doCompile(spec, apiBase) {
-  const payload = { spec: { experiment_id: makeExpId(spec), name: spec.name || "Untitled", notes: spec.notes || "", workflows: spec.workflows || [], prompts: spec.prompts || { items: [] }, images: spec.images || { mode: "cartesian", items: [] }, loras: spec.loras || { selections: [] }, axes: spec.axes || { shared: {}, per_workflow: {} } } };
-  return await fetchJson(`${apiBase}/experiments/compile`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  const payload = draftToCompilePayload(spec);
+  return await fetchJson(`${apiBase}/experiments/compile`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 }
 
-async function doRun(spec, apiBase) {
-  const expId = makeExpId(spec);
-  const payload = { spec: { experiment_id: expId, name: spec.name || "Untitled", notes: spec.notes || "", workflows: spec.workflows || [], prompts: spec.prompts || { items: [] }, images: spec.images || { mode: "cartesian", items: [] }, loras: spec.loras || { selections: [] }, axes: spec.axes || { shared: {}, per_workflow: {} } }, max_containers: spec.max_containers || 1 };
-  const created = await fetchJson(`${apiBase}/experiments`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-  const startResult = await fetchJson(`${apiBase}/experiments/${encodeURIComponent(expId)}/start`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-  if (startResult && (startResult.error || startResult.status === "error")) { throw new Error((startResult.message || startResult.error || "Start returned an error") + " \u2014 experiment was created but not started"); }
-  return created;
+async function doRun(spec, apiBase, compilePayload, createPayload, startPayload) {
+  const { runFromDraft } = await import("./testing-api.js");
+  const result = await runFromDraft(apiBase, createPayload, startPayload);
+  return result.created;
 }
 
 function makeExpId(spec) {
@@ -904,4 +1482,4 @@ function makeExpId(spec) {
   return `${slug}-${Date.now().toString(36)}`;
 }
 
-export const _internal = { SECTION_LABELS, el, section: (t, b) => el("section", { class: "testing-setup-section" }, [el("h3", { class: "testing-setup-section-title", text: t }), el("div", { class: "testing-setup-section-body" }, b || [])]), defaultSpec };
+export const _internal = { SECTION_LABELS, el, section: (t, b) => el("section", { class: "testing-setup-section" }, [el("h3", { class: "testing-setup-section-title", text: t }), el("div", { class: "testing-setup-section-body" }, b || [])]), defaultSpec: createDefaultDraft };

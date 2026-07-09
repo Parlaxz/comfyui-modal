@@ -425,5 +425,80 @@ class ResultsProgressiveClarityTests(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Results grouping adapter: workflow/model-stack/lora dimensions
+# and technical view fallback.
+# ---------------------------------------------------------------------------
+
+class ResultsGroupingAdapterTests(unittest.TestCase):
+    """Results grouping adapter markers for workflow / model stack / lora
+    dimensions and technical view fallback."""
+
+    def setUp(self) -> None:
+        self.m = _JsModule(REPO_ROOT / "web" / "testing-results.js")
+        if not self.m.text:
+            self.skipTest("web/testing-results.js missing")
+
+    def test_grouping_adapter_marker(self):
+        """Results must reference a grouping adapter for dimension-based grouping."""
+        self.assertIn(
+            "testing-results-grouping-adapter",
+            self.m.text,
+            "Expected testing-results-grouping-adapter for dimension-based grouping",
+        )
+
+    def test_workflow_dimension_marker(self):
+        """Grouping adapter must support workflow dimension."""
+        text = self.m.text
+        has_workflow_dim = (
+            "group-by-workflow" in text
+            or "workflow-dim" in text
+            or "workflow_group" in text
+        )
+        self.assertTrue(
+            has_workflow_dim,
+            "Expected workflow grouping dimension (group-by-workflow / workflow_dim) in testing-results.js",
+        )
+
+    def test_model_stack_dimension_marker(self):
+        """Grouping adapter must support model stack dimension."""
+        text = self.m.text
+        has_model_stack_dim = (
+            "group-by-model-stack" in text
+            or "model-stack-dim" in text
+            or "model_stack_group" in text
+        )
+        self.assertTrue(
+            has_model_stack_dim,
+            "Expected model stack grouping dimension (group-by-model-stack / model_stack_dim) in testing-results.js",
+        )
+
+    def test_lora_dimension_marker(self):
+        """Grouping adapter must support LoRA dimension."""
+        text = self.m.text
+        has_lora_dim = (
+            "group-by-lora" in text
+            or "lora-dim" in text
+            or "lora_group" in text
+        )
+        self.assertTrue(
+            has_lora_dim,
+            "Expected LoRA grouping dimension (group-by-lora / lora_dim) in testing-results.js",
+        )
+
+    def test_technical_view_fallback(self):
+        """Results must have a technical view fallback marker."""
+        text = self.m.text
+        has_tech_fallback = (
+            "testing-results-technical" in text
+            or "technical-view" in text
+            or "tech-fallback" in text
+        )
+        self.assertTrue(
+            has_tech_fallback,
+            "Expected technical view fallback (testing-results-technical / technical-view) in testing-results.js",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

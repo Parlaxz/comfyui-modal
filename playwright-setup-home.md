@@ -1,0 +1,28 @@
+- generic [active] [ref=e1]:
+  - main [ref=e9]:
+    - generic [ref=e10]:
+      - generic [ref=e13]:
+        - generic [ref=e14]:
+          - generic [ref=e15]: ↹ Resize Feed
+          - generic:
+            - generic "Controls the maximum size of the image feed panel (25vh)"
+            - generic "Controls the number of columns in the feed (4 columns). Click label to set custom value."
+        - generic [ref=e16]:
+          - button "Clear" [ref=e17] [cursor=pointer]
+          - button "❌" [ref=e18] [cursor=pointer]
+      - generic [ref=e19]:
+        - text: .. .. .. ▼ ▼
+        - generic:
+          - generic [ref=e22]:
+            - group [ref=e26]
+            - button "Create a new blank workflow" [ref=e35] [cursor=pointer]
+          - generic:
+            - navigation [ref=e38]
+            - generic
+        - generic:
+          - generic "The text to be encoded." [ref=e212]:
+            - textbox "text" [ref=e213]: browser validation prompt
+          - generic "The text to be encoded." [ref=e214]:
+            - textbox "text" [ref=e215]: browser validation negative
+    - text: 
+  - text: ×

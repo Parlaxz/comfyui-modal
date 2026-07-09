@@ -78,6 +78,7 @@ from production_workflow import (
     normalize_production_options,
     compile_production_workflow,
 )
+import experiment_setup_adapter as _experiment_setup_adapter
 from comparison import (
     create_profile,
     update_profile,
@@ -4949,11 +4950,19 @@ if _server:
 
     def _enrich_checkpoint_from_profile(ck: dict) -> None:
         """Attach profile metadata (workflow, slots, loader groups, lora slots)
-        to a checkpoint dict so the runner can resolve and inject cell values."""
+        to a checkpoint dict so the runner can resolve and inject cell values.
+
+        If the profile cannot be resolved (e.g. missing files in test/dev
+        environments), enrichment is silently skipped so the compiler can
+        still return useful output for normalised-draft compilation.
+        """
         profile_id = ck.get("profile_id", "")
         if not profile_id:
             return
-        ck["workflow"] = _resolve_latest_workflow_for_profile(profile_id)
+        try:
+            ck["workflow"] = _resolve_latest_workflow_for_profile(profile_id)
+        except (ValueError, OSError):
+            ck["workflow"] = {}
         profile = get_profile(_COMFYUI_ROOT, profile_id) or {}
         ck["slots"] = profile.get("slots", {})
         ck["loader_target_groups"] = profile.get("loader_target_groups", [])
@@ -4962,14 +4971,38 @@ if _server:
     @_server.routes.post("/comfymodal/experiments/compile")
     async def experiment_compile(request: web.Request) -> web.Response:
         """Compile an experiment spec into a list of checkpoints/cells.
-        Returns the canonical compilation and the cell list."""
+
+        Accepts either a ``spec`` key (existing compiler-spec format) or a
+        ``normalized_draft`` key (new backend-authoritative format).  When a
+        normalised draft is provided, it is validated and translated to the
+        compiler spec using ``experiment_setup_adapter`` before compilation.
+        """
         try:
             payload = await request.json()
         except Exception:
             return web.json_response({"status": "error", "message": "invalid JSON body"}, status=400)
-        spec = payload.get("spec", {})
-        if not isinstance(spec, dict):
-            return web.json_response({"status": "error", "message": "spec must be an object"}, status=400)
+
+        normalized_draft = payload.get("normalized_draft")
+        if normalized_draft is not None:
+            # New path: normalised draft → validate → compile.
+            if not isinstance(normalized_draft, dict):
+                return web.json_response(
+                    {"status": "error", "message": "normalized_draft must be an object"},
+                    status=400,
+                )
+            validation = _experiment_setup_adapter.validate_normalized_draft(normalized_draft)
+            if not validation.get("valid"):
+                return web.json_response(
+                    {"status": "error", "message": f"draft validation failed: {validation.get('errors', 'unknown')}"},
+                    status=400,
+                )
+            spec = _experiment_setup_adapter.normalized_draft_to_compiler_spec(normalized_draft)
+        else:
+            # Existing path: raw spec.
+            spec = payload.get("spec", {})
+            if not isinstance(spec, dict):
+                return web.json_response({"status": "error", "message": "spec must be an object"}, status=400)
+
         try:
             compilation = compile_experiment(spec)
         except Exception as e:
@@ -4985,10 +5018,32 @@ if _server:
             payload = await request.json()
         except Exception:
             return web.json_response({"status": "error", "message": "invalid JSON body"}, status=400)
-        spec = payload.get("spec", {})
-        if not isinstance(spec, dict) or "experiment_id" not in spec:
-            return web.json_response({"status": "error", "message": "spec.experiment_id required"}, status=400)
-        exp_id = str(spec["experiment_id"])
+
+        # Accept either a normalised draft (backend-authoritative new path)
+        # or a raw spec (existing path).
+        normalized_draft = payload.get("normalized_draft")
+        if normalized_draft is not None:
+            if not isinstance(normalized_draft, dict):
+                return web.json_response(
+                    {"status": "error", "message": "normalized_draft must be an object"},
+                    status=400,
+                )
+            validation = _experiment_setup_adapter.validate_normalized_draft(normalized_draft)
+            if not validation.get("valid"):
+                return web.json_response(
+                    {"status": "error", "message": f"draft validation failed: {validation.get('errors', 'unknown')}"},
+                    status=400,
+                )
+            spec = _experiment_setup_adapter.normalized_draft_to_compiler_spec(normalized_draft)
+            exp_id = str(normalized_draft.get("experiment_id", ""))
+            if not exp_id:
+                return web.json_response({"status": "error", "message": "normalized_draft.experiment_id required"}, status=400)
+        else:
+            spec = payload.get("spec", {})
+            if not isinstance(spec, dict) or "experiment_id" not in spec:
+                return web.json_response({"status": "error", "message": "spec.experiment_id required"}, status=400)
+            exp_id = str(spec["experiment_id"])
+
         # Compile to validate spec shape
         try:
             compilation = compile_experiment(spec)
@@ -5008,15 +5063,23 @@ if _server:
             "created_at": now,
             "updated_at": now,
         }
+        # Preserve the normalised draft in the definition so it survives
+        # refresh / restart without browser reconstruction.
+        if normalized_draft is not None:
+            definition["normalized_draft"] = normalized_draft
+
         validate_definition(type("D", (), definition)())  # cheap shape check
         store.write_definition(definition)
+        event_payload: dict = {
+            "experiment_id": exp_id,
+            "name": definition["name"],
+            "compilation": compilation,
+        }
+        if normalized_draft is not None:
+            event_payload["normalized_draft"] = normalized_draft
         store.append_event({
             "type": "experiment.created",
-            "payload": {
-                "experiment_id": exp_id,
-                "name": definition["name"],
-                "compilation": compilation,
-            },
+            "payload": event_payload,
         })
         return web.json_response({
             "status": "ok",

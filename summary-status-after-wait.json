@@ -1,0 +1,14 @@
+{
+  "summary": [
+    "Type: T2I",
+    "2 workflow(s)",
+    "2 stack(s)",
+    "0 LoRA(s)",
+    "3 seed(s)",
+    "5 testing / 0 controlled",
+    "No prompts"
+  ],
+  "status": [
+    "Workflow \"flux_klein_9b_-_uncensored\", Stack \"s1\": no model configured"
+  ]
+}

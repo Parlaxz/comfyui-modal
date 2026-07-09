@@ -1,0 +1,26 @@
+[
+  {
+    "placeholder": "unet model",
+    "value": "flux-unet-fp8.safetensors"
+  },
+  {
+    "placeholder": "clip model",
+    "value": "qwen-clip.safetensors"
+  },
+  {
+    "placeholder": "vae model",
+    "value": "flux-vae.safetensors"
+  },
+  {
+    "placeholder": "unet model",
+    "value": "zit-unet-fp8.safetensors"
+  },
+  {
+    "placeholder": "clip model",
+    "value": "zit-clip.safetensors"
+  },
+  {
+    "placeholder": "vae model",
+    "value": "zit-vae.safetensors"
+  }
+]

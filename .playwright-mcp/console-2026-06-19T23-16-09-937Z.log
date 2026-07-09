@@ -1,0 +1,123 @@
+[      24ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/userdata/user.css:0
+[      41ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/user.css:0
+[     251ms] [WARNING] [ComfyUI] The legacy queue/history menu is deprecated. Core functionality in this menu may break at any time. Issues and feature requests related to the legacy menu will not be addressed. To switch to the new menu: Settings → search "Use new menu" → change from "Disabled" to "Top". @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:161
+[     251ms] [WARNING] [ComfyUI] The legacy queue/history menu is deprecated. Core functionality in this menu may break at any time. Issues and feature requests related to the legacy menu will not be addressed. To switch to the new menu: Settings → search "Use new menu" → change from "Disabled" to "Top". @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:161
+[     402ms] [ERROR] ComfyApp graph accessed before initialization @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:177
+[     487ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/userdata?dir=subgraphs&recurse=true&split=false&full_info=true:0
+[     653ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/userdata/comfy.templates.json:0
+[     998ms] [WARNING] Extension pysssss.SnapToGrid is disabled. @ http://127.0.0.1:8188/assets/useCopyToClipboard-CFKSU8bA.js:0
+[    1004ms] [WARNING] [ComfyUI Notice] "scripts/widgets.js" is an internal module, not part of the public API. Future updates may break this import. @ http://127.0.0.1:8188/scripts/widgets.js:1
+[    1005ms] [WARNING] [ComfyUI Deprecated] Importing from "scripts/ui.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/scripts/ui.js:1
+[    1007ms] [LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-testing.js:20
+[    1026ms] [WARNING] Extension pysssss.FaviconStatus is disabled. @ http://127.0.0.1:8188/assets/useCopyToClipboard-CFKSU8bA.js:0
+[    1028ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/extensions/core/clipspace.js:0
+[    1048ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/lm/settings:0
+[    1049ms] [ERROR] [vite:preloadError] {url: http://127.0.0.1:8188/extensions/ComfyUI-Impact-Pack/impact-sam-editor.js, fileType: js, chunkName: impact-sam-editor, message: Failed to fetch dynamically imported module: http:…tensions/ComfyUI-Impact-Pack/impact-sam-editor.js} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[    1050ms] [WARNING] [ComfyUI Notice] "scripts/pnginfo.js" is an internal module, not part of the public API. Future updates may break this import. @ http://127.0.0.1:8188/scripts/pnginfo.js:1
+[    1050ms] [WARNING] [ComfyUI Deprecated] Importing from "extensions/core/groupNode.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/extensions/core/groupNode.js:1
+[    1094ms] [WARNING] [MaskEditor] ComfyApp.open_maskeditor is deprecated. Plugins should migrate to using the command system or direct node context menu integration. @ http://127.0.0.1:8188/assets/core-CNtDlct3.js:2
+[    2310ms] [WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:ImpactSchedulerAdapter:scheduler is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2316ms] [WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:AnyToText|LP:any_value is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2317ms] [WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:Delay|LP:input is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2317ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any1 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2317ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any2 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2317ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any3 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2317ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any4 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2317ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any5 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2317ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any1 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2317ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any2 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2317ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any3 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2317ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any4 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2317ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any5 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2411ms] [WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:ImpactSchedulerAdapter:scheduler is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2417ms] [WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:AnyToText|LP:any_value is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2418ms] [WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:Delay|LP:input is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2418ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any1 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2418ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any2 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2418ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any3 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2418ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any4 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2418ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any5 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2418ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any1 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2418ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any2 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2418ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any3 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2418ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any4 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2418ms] [WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any5 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[    2433ms] [WARNING] %c[DEPRECATED]%c Monkey-patching getCanvasMenuOptions is deprecated. (Extension: "pysssss.GraphArrange")
+Please use the new context menu API instead.
+
+See: https://docs.comfy.org/custom-nodes/js/context-menu-migration color: orange; font-weight: bold color: inherit @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:2
+[    2439ms] [LOG] [comfymodal.testing] extension setup starting @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-testing.js:369
+[    2440ms] [LOG] [comfymodal.testing] api bootstrap status: ready @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-testing.js:381
+[    2440ms] [LOG] [comfymodal.testing] sidebar tab registered @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-testing.js:401
+[    2440ms] [LOG] [comfymodal.testing] modal host mounted @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-testing.js:121
+[    2440ms] [LOG] [comfymodal.testing] extension setup complete @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-testing.js:421
+[    2440ms] [WARNING] %c[DEPRECATED]%c Monkey-patching getCanvasMenuOptions is deprecated. (Extension: "pysssss.NodeFinder")
+Please use the new context menu API instead.
+
+See: https://docs.comfy.org/custom-nodes/js/context-menu-migration color: orange; font-weight: bold color: inherit @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:2
+[    2442ms] [LOG] [comfyui-modal] Extension loaded. Setting up progress bar & patching fetchApi... @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-node.js:22
+[    2443ms] [LOG] [comfyui-modal] fetchApi patched. All /prompt POST requests -> Modal GPU. @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-node.js:22
+[    2443ms] [LOG] [comfyui-modal] Production mode extension loaded. @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-node.js:22
+[    2443ms] [WARNING] %c[DEPRECATED]%c Monkey-patching getNodeMenuOptions is deprecated. (Extension: "comfyui.modal.comparison")
+Please use the new context menu API instead.
+
+See: https://docs.comfy.org/custom-nodes/js/context-menu-migration color: orange; font-weight: bold color: inherit @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:2
+[    2446ms] [WARNING] %c[DEPRECATED]%c Monkey-patching getCanvasMenuOptions is deprecated. (Extension: "rgthree.QueueNode")
+Please use the new context menu API instead.
+
+See: https://docs.comfy.org/custom-nodes/js/context-menu-migration color: orange; font-weight: bold color: inherit @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:2
+[    2451ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/pysssss/autocomplete:0
+[    2453ms] [WARNING] [ComfyUI Deprecated] Importing from "scripts/ui/components/button.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/scripts/ui/components/button.js:1
+[    2457ms] [WARNING] [ComfyUI Deprecated] Importing from "scripts/ui/components/buttonGroup.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/scripts/ui/components/buttonGroup.js:1
+[    2457ms] [LOG] LoRA Manager: using actionBarButtons API (frontend version >= 1.33.9) @ http://127.0.0.1:8188/extensions/comfyui-lora-manager/top_menu_extension.js:164
+[    2462ms] [LOG] Empty components: policy ignored @ http://127.0.0.1:8188/extensions/comfyui-manager/components-manager.js:769
+[    2587ms] [WARNING] widget.inputEl is deprecated. Use widget.element instead. undefined @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[    3475ms] [LOG] [FL_WF_Agent] Event added. @ http://127.0.0.1:8188/extensions/comfyui_fill-nodes/nodes/wip/fl_wf_agent.js:817
+[    3475ms] [LOG] [FL_JS] Event added. @ http://127.0.0.1:8188/extensions/comfyui_fill-nodes/nodes/utility/fl_js.js:670
+[   42353ms] [ERROR] Failed to load resource: the server responded with a status of 400 (Bad Request) @ http://127.0.0.1:8188/comfymodal/experiments/compile:0
+[  136975ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/api/jobs?status=in_progress,pending&limit=200&offset=0:0
+[  136976ms] [ERROR] [Jobs API] Error fetching jobs: TypeError: Failed to fetch
+    at ComfyApi.fetchApi (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:4:1644)
+    at ComfyApi.patchedFetchApi [as fetchApi] (http://127.0.0.1:8188/extensions/comfyui-modal/modal-node.js:747:14)
+    at fetchJobsRaw (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:2:433885)
+    at fetchQueue (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:2:434747)
+    at ComfyApi.getQueue (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:4:8154)
+    at Proxy.update (http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:153:131034)
+    at Proxy.wrappedAction (http://127.0.0.1:8188/assets/vendor-vue-core-C8W6S-ta.js:2:90609)
+    at ComfyApi.onStatus (http://127.0.0.1:8188/assets/GraphView-BVhtNQg6.js:18:204921)
+    at ComfyApi.dispatchCustomEvent (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:4:2092)
+    at WebSocket.<anonymous> (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:4:3213) @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[  136976ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/api/jobs?status=completed,failed,cancelled&limit=64&offset=0:0
+[  136976ms] [ERROR] [Jobs API] Error fetching jobs: TypeError: Failed to fetch
+    at ComfyApi.fetchApi (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:4:1644)
+    at ComfyApi.patchedFetchApi [as fetchApi] (http://127.0.0.1:8188/extensions/comfyui-modal/modal-node.js:747:14)
+    at fetchJobsRaw (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:2:433885)
+    at fetchHistoryPage (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:2:434530)
+    at fetchHistory (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:2:434440)
+    at ComfyApi.getHistory (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:4:8317)
+    at Proxy.update (http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:153:131047)
+    at Proxy.wrappedAction (http://127.0.0.1:8188/assets/vendor-vue-core-C8W6S-ta.js:2:90609)
+    at ComfyApi.onStatus (http://127.0.0.1:8188/assets/GraphView-BVhtNQg6.js:18:204921)
+    at ComfyApi.dispatchCustomEvent (http://127.0.0.1:8188/assets/api-Bo77DmmK.js:4:2092) @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[  137013ms] [INFO] Autofocus processing was blocked because a document already has a focused element. @ http://127.0.0.1:8188/:0
+[  137286ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  139648ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  142003ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  144368ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  146723ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  149090ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  151442ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  153804ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  156139ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  158497ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  160874ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  163244ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  165600ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  167960ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  170336ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  172710ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  175085ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  177463ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  179823ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  182225ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3
+[  184668ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:8188/ws?clientId=7beefe4d279841d4ad2e9a439e4f7c16' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:3

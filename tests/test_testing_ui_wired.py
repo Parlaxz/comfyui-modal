@@ -61,8 +61,8 @@ class TestingSetupTests(_JsTestBase):
         self.assertIn("comparison/profiles", text)
         self.assertIn("presets/prompts", text)
         self.assertIn("presets/images", text)
-        # All 8 spec sections per parent plan §23.
-        for section in ["Experiment", "Workflows", "LoRAs", "Prompts", "Images", "Axes", "Execution", "Review & Run"]:
+        # All 5 spec sections per the five-section restructure.
+        for section in ["Generation Type", "What Changes?", "Workflows", "Test Values", "Review & Run"]:
             self.assertIn(section, text, f"missing section label: {section}")
 
     def test_pick_main_triple_object_slots(self):
@@ -280,12 +280,6 @@ class VisualRedesignTests(_JsTestBase):
 class SetupClarityUiWiredTests(_JsTestBase):
     """Setup navigation and structure clarity hooks."""
 
-    def test_setup_scroll_navigation_helpers(self):
-        """testing-setup.js must have popup-scroll-aware navigation helpers."""
-        text = self._read("testing-setup.js")
-        self.assertIn("findSetupScrollContainer(", text)
-        self.assertIn("scrollSetupSectionIntoView(", text)
-
     def test_setup_finish_zone_marker(self):
         """testing-setup.js must have testing-setup-finish-zone."""
         text = self._read("testing-setup.js")
@@ -378,11 +372,6 @@ class ProgressiveClarityDashboardUiWiredTests(_JsTestBase):
 class ProgressiveClaritySetupUiWiredTests(_JsTestBase):
     """Setup progressive-collapse markers."""
 
-    def test_setup_phase_rail(self):
-        """testing-setup.js must have testing-setup-phase-rail."""
-        text = self._read("testing-setup.js")
-        self.assertIn("testing-setup-phase-rail", text)
-
     def test_setup_collapsible_section(self):
         """testing-setup.js must have testing-setup-section-collapsible and data-collapsed."""
         text = self._read("testing-setup.js")
@@ -393,12 +382,6 @@ class ProgressiveClaritySetupUiWiredTests(_JsTestBase):
         """testing-setup.js must have testing-setup-advanced-toggle."""
         text = self._read("testing-setup.js")
         self.assertIn("testing-setup-advanced-toggle", text)
-
-    def test_setup_profile_menu(self):
-        """testing-setup.js must have testing-setup-profile-menu."""
-        text = self._read("testing-setup.js")
-        self.assertIn("testing-setup-profile-menu", text)
-
 
 class ProgressiveClarityResultsUiWiredTests(_JsTestBase):
     """Results emphasis markers."""

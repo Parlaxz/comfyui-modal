@@ -120,123 +120,157 @@ def compile_experiment(spec: dict) -> dict:
 
     for wf in workflows:
         profile_id = wf.get("profile_id", "")
-        group_id = wf.get("loader_target_group_id", "g_default")
-        main_triple = wf.get("main_triple") or {}
-        if not isinstance(main_triple, dict):
-            raise CompilationError("main_triple must be a dict")
-        subprofiles = [s for s in (wf.get("subprofile_triples") or [])
-                       if isinstance(s, dict) and s.get("enabled", True)]
-        selected_ids = wf.get("selected_triple_ids") or ["main"]
-        triples: list[tuple[str, dict]] = []
-        if "main" in selected_ids:
-            triples.append(("main", {
-                "id": "main",
-                "unet": main_triple.get("unet", ""),
-                "clip": main_triple.get("clip", ""),
-                "vae": main_triple.get("vae", ""),
-            }))
-        for sub in subprofiles:
-            sid = sub.get("id", "")
-            if sid in selected_ids:
-                triples.append((sid, {
-                    "id": sid,
-                    "unet": sub.get("unet", ""),
-                    "clip": sub.get("clip", ""),
-                    "vae": sub.get("vae", ""),
-                }))
-
-        # Per-workflow axes (steps, guidance, denoise, scheduler may also be per-workflow)
         pw_axes = per_workflow_axes.get(profile_id, {}) or {}
 
-        for triple_id, triple in triples:
-            ck_id = f"ck_{len(checkpoints_out) + 1:03d}"
-            ck_cell_count = 0
-            # Build per-checkpoint axis resolution
-            axis_values_per_axis: dict[str, list] = {}
-            for axis_name in _CHEAP_AXIS_ORDER:
-                if axis_name == "lora_model_strengths" or axis_name == "lora_clip_strengths":
-                    # handled inside LoRA loop
+        # ── Resolve per-stack or flat mode ─────────────────────────────
+        raw_stacks = wf.get("stacks")
+        if isinstance(raw_stacks, list) and raw_stacks:
+            # New per-stack path: each stack is an independent checkpoint
+            # unit with its own main_triple, subprofile_triples, and
+            # per-stack lora_selections.
+            stack_configs = []
+            for stack in raw_stacks:
+                if not isinstance(stack, dict):
                     continue
-                if axis_name == "resolution":
-                    # resolution is special: width × height
-                    res = _resolve_resolution(shared_axes, pw_axes)
-                    axis_values_per_axis[axis_name] = res
-                    continue
-                # Shared first, then per-workflow override
-                if axis_name in pw_axes:
-                    axis_values_per_axis[axis_name] = _axis_values(pw_axes[axis_name])
-                elif axis_name in shared_axes:
-                    axis_values_per_axis[axis_name] = _axis_values(shared_axes[axis_name])
-                else:
-                    axis_values_per_axis[axis_name] = [WORKFLOW_OWNED]
+                stack_lora = [l for l in (stack.get("lora_selections") or [])
+                              if isinstance(l, dict) and l.get("enabled", True)]
+                stack_configs.append({
+                    "group_id": stack.get("loader_target_group_id", "g_default"),
+                    "main_triple": stack.get("main_triple") or {},
+                    "subprofiles": [s for s in (stack.get("subprofile_triples") or [])
+                                    if isinstance(s, dict) and s.get("enabled", True)],
+                    "selected_ids": stack.get("selected_triple_ids") or ["main"],
+                    "lora_selections": stack_lora,
+                })
+        else:
+            # Flat (legacy) mode — a single implicit stack from the
+            # workflow-level fields.
+            stack_configs = [{
+                "group_id": wf.get("loader_target_group_id", "g_default"),
+                "main_triple": wf.get("main_triple") or {},
+                "subprofiles": [s for s in (wf.get("subprofile_triples") or [])
+                                if isinstance(s, dict) and s.get("enabled", True)],
+                "selected_ids": wf.get("selected_triple_ids") or ["main"],
+                "lora_selections": lora_selections,
+            }]
 
-            for lora_sel in lora_selections:
-                lora_id = lora_sel.get("id", "")
-                # Build LoRA signature for cell key
-                lora_signature = _lora_signature(lora_sel)
-                lora_strength_combos = _lora_strength_combos(lora_sel)
+        for sc in stack_configs:
+            group_id = sc["group_id"]
+            main_triple = sc["main_triple"]
+            subprofiles = sc["subprofiles"]
+            selected_ids = sc["selected_ids"]
+            stack_lora_selections = sc["lora_selections"]
 
-                # Build prompt/image pairs
-                pairs = _build_prompt_image_pairs(prompts, image_items, image_mode, warnings, shared_negative=shared_negative)
+            if not isinstance(main_triple, dict):
+                raise CompilationError("main_triple must be a dict")
 
-                for prompt_id, image_id, image_hash, prompt_text, negative in pairs:
-                    for combo in lora_strength_combos:
-                        model_str, clip_str = combo
-                        # Walk cheap axes in fixed order
-                        for sampler in axis_values_per_axis["sampler"]:
-                            for scheduler in axis_values_per_axis["scheduler"]:
-                                for steps in axis_values_per_axis["steps"]:
-                                    for guidance in axis_values_per_axis["guidance"]:
-                                        for denoise in axis_values_per_axis["denoise"]:
-                                            for _res_item in axis_values_per_axis["resolution"]:
-                                                if is_workflow_owned(_res_item):
-                                                    width = WORKFLOW_OWNED
-                                                    height = WORKFLOW_OWNED
-                                                else:
-                                                    width, height = _res_item
-                                                for seed in axis_values_per_axis["seed"]:
-                                                    sequence += 1
-                                                    cell = _build_cell(
-                                                        spec=spec,
-                                                        sequence=sequence,
-                                                        ck_id=ck_id,
-                                                        profile_id=profile_id,
-                                                        group_id=group_id,
-                                                        triple_id=triple_id,
-                                                        triple=triple,
-                                                        lora_id=lora_id,
-                                                        lora_signature=lora_signature,
-                                                        model_str=model_str,
-                                                        clip_str=clip_str,
-                                                        prompt_id=prompt_id,
-                                                        prompt_text=prompt_text,
-                                                        negative=negative,
-                                                        image_id=image_id,
-                                                        image_hash=image_hash,
-                                                        sampler=sampler,
-                                                        scheduler=scheduler,
-                                                        steps=steps,
-                                                        guidance=guidance,
-                                                        denoise=denoise,
-                                                        width=width,
-                                                        height=height,
-                                                        seed=seed,
-                                                    )
-                                                    if cell["cell_key"] in seen_keys:
-                                                        duplicate_count += 1
+            triples: list[tuple[str, dict]] = []
+            if "main" in selected_ids:
+                triples.append(("main", {
+                    "id": "main",
+                    "unet": main_triple.get("unet", ""),
+                    "clip": main_triple.get("clip", ""),
+                    "vae": main_triple.get("vae", ""),
+                }))
+            for sub in subprofiles:
+                sid = sub.get("id", "")
+                if sid in selected_ids:
+                    triples.append((sid, {
+                        "id": sid,
+                        "unet": sub.get("unet", ""),
+                        "clip": sub.get("clip", ""),
+                        "vae": sub.get("vae", ""),
+                    }))
+
+            for triple_id, triple in triples:
+                ck_id = f"ck_{len(checkpoints_out) + 1:03d}"
+                ck_cell_count = 0
+                # Build per-checkpoint axis resolution
+                axis_values_per_axis: dict[str, list] = {}
+                for axis_name in _CHEAP_AXIS_ORDER:
+                    if axis_name == "lora_model_strengths" or axis_name == "lora_clip_strengths":
+                        # handled inside LoRA loop
+                        continue
+                    if axis_name == "resolution":
+                        # resolution is special: width × height
+                        res = _resolve_resolution(shared_axes, pw_axes)
+                        axis_values_per_axis[axis_name] = res
+                        continue
+                    # Shared first, then per-workflow override
+                    if axis_name in pw_axes:
+                        axis_values_per_axis[axis_name] = _axis_values(pw_axes[axis_name])
+                    elif axis_name in shared_axes:
+                        axis_values_per_axis[axis_name] = _axis_values(shared_axes[axis_name])
+                    else:
+                        axis_values_per_axis[axis_name] = [WORKFLOW_OWNED]
+
+                for lora_sel in stack_lora_selections:
+                    lora_id = lora_sel.get("id", "")
+                    # Build LoRA signature for cell key
+                    lora_signature = _lora_signature(lora_sel)
+                    lora_strength_combos = _lora_strength_combos(lora_sel)
+
+                    # Build prompt/image pairs
+                    pairs = _build_prompt_image_pairs(prompts, image_items, image_mode, warnings, shared_negative=shared_negative)
+
+                    for prompt_id, image_id, image_hash, prompt_text, negative in pairs:
+                        for combo in lora_strength_combos:
+                            model_str, clip_str = combo
+                            # Walk cheap axes in fixed order
+                            for sampler in axis_values_per_axis["sampler"]:
+                                for scheduler in axis_values_per_axis["scheduler"]:
+                                    for steps in axis_values_per_axis["steps"]:
+                                        for guidance in axis_values_per_axis["guidance"]:
+                                            for denoise in axis_values_per_axis["denoise"]:
+                                                for _res_item in axis_values_per_axis["resolution"]:
+                                                    if is_workflow_owned(_res_item):
+                                                        width = WORKFLOW_OWNED
+                                                        height = WORKFLOW_OWNED
                                                     else:
-                                                        seen_keys[cell["cell_key"]] = sequence
-                                                    cells_out.append(cell)
-                                                    ck_cell_count += 1
+                                                        width, height = _res_item
+                                                    for seed in axis_values_per_axis["seed"]:
+                                                        sequence += 1
+                                                        cell = _build_cell(
+                                                            spec=spec,
+                                                            sequence=sequence,
+                                                            ck_id=ck_id,
+                                                            profile_id=profile_id,
+                                                            group_id=group_id,
+                                                            triple_id=triple_id,
+                                                            triple=triple,
+                                                            lora_id=lora_id,
+                                                            lora_signature=lora_signature,
+                                                            model_str=model_str,
+                                                            clip_str=clip_str,
+                                                            prompt_id=prompt_id,
+                                                            prompt_text=prompt_text,
+                                                            negative=negative,
+                                                            image_id=image_id,
+                                                            image_hash=image_hash,
+                                                            sampler=sampler,
+                                                            scheduler=scheduler,
+                                                            steps=steps,
+                                                            guidance=guidance,
+                                                            denoise=denoise,
+                                                            width=width,
+                                                            height=height,
+                                                            seed=seed,
+                                                        )
+                                                        if cell["cell_key"] in seen_keys:
+                                                            duplicate_count += 1
+                                                        else:
+                                                            seen_keys[cell["cell_key"]] = sequence
+                                                        cells_out.append(cell)
+                                                        ck_cell_count += 1
 
-            checkpoints_out.append({
-                "id": ck_id,
-                "profile_id": profile_id,
-                "loader_target_group_id": group_id,
-                "triple": triple,
-                "lora_selection_ids": [l.get("id", "") for l in lora_selections],
-                "cell_count": ck_cell_count,
-            })
+                checkpoints_out.append({
+                    "id": ck_id,
+                    "profile_id": profile_id,
+                    "loader_target_group_id": group_id,
+                    "triple": triple,
+                    "lora_selection_ids": [l.get("id", "") for l in stack_lora_selections],
+                    "cell_count": ck_cell_count,
+                })
 
     return {
         "experiment_id": exp_id,
@@ -472,6 +506,16 @@ def _build_cell(*, spec, sequence, ck_id, profile_id, group_id, triple_id,
         "height": height_val,
     }
     cell_key = canonical_hash(key_dict)
+    # Compute normalised dimensions (stable metadata for results grouping).
+    if width is not None and not is_workflow_owned(width):
+        nd_width = width_val
+    else:
+        nd_width = None
+    if height is not None and not is_workflow_owned(height):
+        nd_height = height_val
+    else:
+        nd_height = None
+
     return {
         "cell_key": cell_key,
         "sequence": sequence,
@@ -488,6 +532,19 @@ def _build_cell(*, spec, sequence, ck_id, profile_id, group_id, triple_id,
         "prompt_id": prompt_id,
         "image_id": image_id,
         "image_hash": image_hash,
+        "normalized_dimensions": {
+            "width": nd_width,
+            "height": nd_height,
+            "profile_id": profile_id,
+            "loader_target_group_id": group_id,
+            "unet": triple.get("unet", ""),
+            "clip": triple.get("clip", ""),
+            "vae": triple.get("vae", ""),
+            "lora_selection_id": lora_id,
+            "lora_signature": [list(s) for s in effective_signature],
+            "prompt_id": prompt_id,
+            "image_id": image_id,
+        },
         "axis_values": {
             "sampler": sampler if (sampler is not None and not is_workflow_owned(sampler)) else WORKFLOW_OWNED,
             "scheduler": scheduler if (scheduler is not None and not is_workflow_owned(scheduler)) else WORKFLOW_OWNED,

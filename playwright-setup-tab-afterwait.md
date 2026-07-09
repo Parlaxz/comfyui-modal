@@ -1,0 +1,173 @@
+- generic [ref=e1] [box=0,0,1920,897]:
+  - main [ref=e9] [box=0,0,1920,897]:
+    - generic [ref=e10] [box=0,0,1920,897]:
+      - generic [ref=e13] [box=0,855,1920,42]:
+        - generic [ref=e14] [box=5,860,92,32]:
+          - generic [ref=e15] [box=10,868,82,15]: ↹ Resize Feed
+          - generic [box=5,892,300,0]:
+            - generic "Controls the maximum size of the image feed panel (25vh)" [box=5,892,300,0]:
+              - generic [box=10,892,64,0]: Feed Size...
+              - slider [box=81,892,217,0]: "25"
+            - generic "Controls the number of columns in the feed (4 columns). Click label to set custom value." [box=5,892,300,0]:
+              - generic [box=10,892,63,0]: Column count...
+              - slider [box=80,892,218,0]: "4"
+        - generic [ref=e16] [box=1799,860,116,32]:
+          - button "Clear" [ref=e17] [cursor=pointer] [box=1799,860,76,32]
+          - button "❌" [ref=e18] [cursor=pointer] [box=1883,860,32,32]
+      - generic [ref=e19] [box=0,0,1920,850]:
+        - text: .. .. .. ▼ ▼
+        - generic [box=0,0,1920,850]:
+          - generic [ref=e22] [box=0,0,1920,37]:
+            - group [ref=e26] [box=0,0,168,37]:
+              - button "Unsaved Workflow • Close" [pressed] [ref=e27] [cursor=pointer] [box=0,0,168,37]:
+                - generic [ref=e29] [box=1,0,166,37]:
+                  - generic [ref=e30] [box=9,8,126,21]: Unsaved Workflow
+                  - generic [ref=e31] [box=143,8,16,21]:
+                    - generic [ref=e32] [box=143,2,16,32]: •
+                    - button "Close" [ref=e33] [box=143,8,16,20]:
+                      - generic [ref=e34] [box=143,10,16,16]: 
+            - button "Create a new blank workflow" [ref=e35] [cursor=pointer] [box=168,0,37,37]:
+              - generic [ref=e36] [box=179,11,16,16]: 
+          - generic [box=0,38,1920,812]:
+            - navigation [ref=e38] [box=0,38,59,812]:
+              - generic [ref=e39] [box=0,42,58,804]:
+                - generic [ref=e40] [box=0,42,58,562]:
+                  - img [ref=e44] [cursor=pointer] [box=20,62,18,18]
+                  - button "Job History" [ref=e46] [cursor=pointer] [box=1,99,56,56]:
+                    - generic [ref=e50] [box=1,138,55,10]: Job History
+                  - button "Assets (a)" [ref=e51] [cursor=pointer] [box=1,155,56,56]:
+                    - generic [ref=e55] [box=13,194,32,10]: Assets
+                  - button "Node Library (n)" [ref=e56] [cursor=pointer] [box=1,211,56,56]:
+                    - generic [ref=e60] [box=13,250,31,10]: Nodes
+                  - button "Model Library (m)" [ref=e61] [cursor=pointer] [box=1,267,56,56]:
+                    - generic [ref=e65] [box=11,306,35,10]: Models
+                  - button "Workflows (w)" [ref=e66] [cursor=pointer] [box=1,323,56,56]:
+                    - generic [ref=e70] [box=3,362,51,10]: Workflows
+                  - button "Apps" [ref=e71] [cursor=pointer] [box=1,379,56,56]:
+                    - generic [ref=e75] [box=17,418,25,10]: Apps
+                  - button "NodesMap" [ref=e76] [cursor=pointer] [box=1,435,56,56]:
+                    - generic [ref=e77] [box=3,445,52,37]:
+                      - generic [ref=e79] [box=21,445,16,16]: 
+                      - generic [ref=e80] [box=3,472,52,10]: NodesMap
+                  - button "Modal GPU — unified testing suite & settings" [ref=e81] [cursor=pointer] [box=1,491,56,56]:
+                    - generic [ref=e82] [box=2,501,54,37]:
+                      - generic [ref=e84] [box=21,501,16,16]: 
+                      - generic [ref=e85] [box=2,528,54,10]: Modal GPU
+                  - button "Templates" [ref=e86] [cursor=pointer] [box=1,547,56,56]:
+                    - generic [ref=e90] [box=4,586,49,10]: Templates
+                - generic [ref=e91] [box=0,620,58,226]:
+                  - button "Help Center" [ref=e92] [cursor=pointer] [box=1,621,56,56]:
+                    - generic [ref=e93] [box=18,630,22,37]:
+                      - generic [ref=e95] [box=21,630,16,16]: 
+                      - generic [ref=e96] [box=18,657,22,10]: Help
+                  - button "Toggle Bottom Panel" [ref=e97] [cursor=pointer] [box=1,677,56,56]:
+                    - generic [ref=e101] [box=9,715,39,10]: Console
+                  - button "Keyboard Shortcuts (Ctrl + Shift + k)" [ref=e102] [cursor=pointer] [box=1,733,56,56]:
+                    - generic [ref=e106] [box=6,771,46,10]: Shortcuts
+                  - button "Settings (Ctrl + ,)" [ref=e107] [cursor=pointer] [box=1,789,56,56]:
+                    - generic [ref=e111] [box=9,827,39,10]: Settings
+            - generic [box=59,38,1861,812]:
+              - complementary "Sidebar" [ref=e216] [box=59,38,370,812]:
+                - generic [ref=e219] [box=59,38,370,122]:
+                  - button "Open Testing Suite" [ref=e220] [cursor=pointer] [box=71,46,346,28]
+                  - generic [ref=e221] [box=71,82,346,18]:
+                    - generic [ref=e222] [box=71,84,36,14]: Deploy
+                    - generic [ref=e223] [box=388,84,30,14]: ready
+                  - generic [ref=e224] [box=71,108,346,18]:
+                    - generic [ref=e225] [box=71,110,65,14]: Experiments
+                    - generic [ref=e226] [box=381,110,36,14]: 17 total
+                  - generic [ref=e227] [box=71,134,346,18]:
+                    - generic [ref=e228] [box=71,136,43,14]: Workers
+                    - generic [ref=e229] [box=406,136,11,14]: —
+              - separator [ref=e230] [box=429,38,4,812]
+              - generic [box=433,38,1487,812]:
+                - generic [box=437,38,1483,205]:
+                  - generic [box=437,42,1483,197]:
+                    - generic [box=437,42,551,197]:
+                      - generic [box=437,30,551,56]:
+                        - generic [ref=e112] [box=441,46,119,40]:
+                          - button "Enter app mode" [ref=e113] [cursor=pointer] [box=445,50,32,32]
+                          - button "Workflow actions" [ref=e115] [cursor=pointer] [box=481,46,79,40]:
+                            - generic [ref=e116] [box=491,56,41,20]: Graph
+                        - text: 
+                    - generic [box=994,42,922,197]:
+                      - generic [ref=e118] [box=994,42,922,48]:
+                        - button "Launch LoRA Manager (Shift+Click opens in new window)" [ref=e120] [cursor=pointer] [box=1003,52,34,28]:
+                          - img [box=1010,56,20,20]
+                        - generic [ref=e122] [box=1053,48,497,36]:
+                          - generic [ref=e123] [box=1053,48,92,36]:
+                            - button "rgthree-comfy" [ref=e124] [cursor=pointer] [box=1053,48,52,36]:
+                              - img [ref=e126] [box=1065,51,28,28]
+                            - button "󰃀" [ref=e133] [cursor=pointer] [box=1105,48,40,36]:
+                              - generic [ref=e135] [box=1117,55,16,21]: 󰃀
+                          - generic [ref=e136] [box=1153,48,226,36]:
+                            - button "ComfyUI Manager" [ref=e137] [cursor=pointer] [box=1153,48,93,36]:
+                              - generic [ref=e138] [box=1163,59,13,15]: 󰐱
+                              - generic [ref=e139] [box=1183,59,53,15]: Manager
+                            - button "Show favorite custom node list" [ref=e140] [cursor=pointer] [box=1246,48,33,36]:
+                              - generic [ref=e141] [box=1256,59,13,15]: 󰓎
+                            - button "Unload Models" [ref=e142] [cursor=pointer] [box=1279,48,33,36]:
+                              - generic [ref=e143] [box=1289,59,13,15]: 󱦢
+                            - button "Free model and node cache" [ref=e144] [cursor=pointer] [box=1312,48,33,36]:
+                              - generic [ref=e145] [box=1322,59,13,15]: 󱦡
+                            - button "Share" [ref=e146] [cursor=pointer] [box=1346,48,33,36]:
+                              - generic [ref=e147] [box=1356,59,13,15]: 󰒖
+                          - button "Show Image Feed 🐍" [disabled] [ref=e149] [box=1387,48,163,36]:
+                            - generic [ref=e150] [box=1397,60,13,15]: 󰋹
+                            - text: Show Image Feed 🐍
+                        - region [ref=e153] [box=1566,50,301,32]:
+                          - generic [ref=e155] [box=1566,50,301,32]:
+                            - generic [ref=e156] [box=1563,53,12,21]: .. .. ..
+                            - generic [ref=e157] [box=1583,50,159,32]:
+                              - generic "Batch Count" [ref=e158] [box=1583,50,56,32]:
+                                - generic [ref=e159] [box=1583,50,56,32]
+                              - button "Run" [ref=e163] [cursor=pointer] [box=1639,50,79,32]: Run
+                              - button "Run" [ref=e165] [cursor=pointer] [box=1719,50,24,32]:
+                                - img [box=1727,64,8,5]
+                            - button "Cancel current run" [disabled] [box=1751,50,32,32]
+                            - button "0 active View active jobs (right-click to clear queue)" [ref=e166] [cursor=pointer] [box=1791,50,76,32]:
+                              - generic [ref=e167] [box=1803,56,52,20]: 0 active
+                              - generic [ref=e168] [box=1828,66,1,1]: View active jobs (right-click to clear queue)
+                        - button "Toggle properties panel" [ref=e170] [cursor=pointer] [box=1875,50,32,32]
+                      - alert [ref=e172] [box=1596,94,320,145]:
+                        - generic [ref=e173] [box=1597,95,318,48]:
+                          - generic [ref=e174] [box=1613,109,258,20]: 1 ERROR
+                          - button "Close" [ref=e175] [cursor=pointer] [box=1879,109,20,20]
+                        - list [ref=e178] [box=1613,143,286,19]:
+                          - listitem [ref=e179] [box=1613,143,286,19]:
+                            - generic [ref=e181] [box=1625,143,179,19]: 1 required model is missing
+                        - generic [ref=e182] [box=1597,174,318,64]:
+                          - button "Dismiss" [ref=e183] [cursor=pointer] [box=1642,195,64,22]
+                          - button "Show missing models" [ref=e184] [cursor=pointer] [box=1722,186,177,40]
+                - generic [box=437,243,1479,602]:
+                  - generic [box=437,243,1479,602]:
+                    - toolbar "Canvas Toolbar" [ref=e185] [box=1662,796,254,50]:
+                      - button "Canvas Mode" [ref=e186] [cursor=pointer] [box=1671,805,54,32]
+                      - button "Fit View (.)" [ref=e192] [cursor=pointer] [box=1734,805,32,32]
+                      - button "Zoom Controls" [ref=e194] [cursor=pointer] [box=1770,805,60,32]:
+                        - generic [ref=e196] [box=1777,813,27,16]: 62%
+                      - button "Hide Minimap (ALT + SHIFT + M)" [ref=e199] [cursor=pointer] [box=1839,805,32,32]
+                      - button "Hide Links" [ref=e201] [cursor=pointer] [box=1875,805,32,32]
+                    - generic [ref=e204] [box=1663,592,253,200]:
+                      - button "Settings" [ref=e205] [cursor=pointer] [box=1664,593,32,32]
+                      - button "Close" [ref=e207] [cursor=pointer] [box=1883,593,32,32]
+                      - separator [ref=e209] [box=1664,625,253,2]
+                  - text: 
+        - generic [box=0,0,1920,0]:
+          - generic "The text to be encoded." [ref=e212] [box=271,58,250,73]:
+            - textbox "text" [ref=e213] [box=274,58,245,73]: browser validation prompt
+          - generic "The text to be encoded." [ref=e214] [box=295,197,252,84]:
+            - textbox "text" [ref=e215] [box=297,197,247,84]: browser validation negative
+    - text: 
+  - text: ×
+  - generic [ref=e234] [box=360,59,1200,780]:
+    - generic [ref=e235] [box=361,60,1198,53]:
+      - heading "Modal GPU" [level=2] [ref=e236] [box=377,76,1138,20]
+      - button "✕" [ref=e237] [cursor=pointer] [box=1515,72,28,28]
+    - generic [ref=e238] [box=361,113,1198,40]:
+      - button "Dashboard" [ref=e239] [cursor=pointer] [box=373,113,91,39]
+      - button "Setup" [active] [ref=e240] [cursor=pointer] [box=464,113,65,39]
+      - button "Profiles" [ref=e241] [cursor=pointer] [box=529,113,72,39]
+      - button "Results" [ref=e242] [cursor=pointer] [box=601,113,72,39]
+      - button "History" [ref=e243] [cursor=pointer] [box=673,113,69,39]
+      - button "Settings" [ref=e244] [cursor=pointer] [box=742,113,75,39]

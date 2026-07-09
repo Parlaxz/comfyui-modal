@@ -417,7 +417,71 @@ export function results_tab_render(rootEl, api, options = {}) {
     return card;
   }
 
-  function renderGrid(shell, evs, apiBase) {
+  // ── Results Grouping Adapter ──────────────────────────────────
+  //
+  // Groups cells by backend normalized_dimensions metadata when available,
+  // falling back to checkpoint-based (technical) grouping.
+  // Preserves A/B comparison and selection behavior intact.
+
+  const GROUP_BY_WORKFLOW = "group-by-workflow";
+  const GROUP_BY_MODEL_STACK = "group-by-model-stack";
+  const GROUP_BY_LORA = "group-by-lora";
+
+  function resolveGroupingStrategy(snap) {
+    const dims = (snap && snap.normalized_dimensions) || null;
+    if (dims && Array.isArray(dims) && dims.length > 0) {
+      return {
+        type: "dimension",
+        dimensions: dims,
+        adapterClass: "testing-results-grouping-adapter",
+      };
+    }
+    return {
+      type: "technical",
+      dimensions: [],
+      adapterClass: "testing-results-technical",
+    };
+  }
+
+  function getDimValue(attempt, dimKey) {
+    if (!attempt || !attempt.normalized_values) return null;
+    return attempt.normalized_values[dimKey] || null;
+  }
+
+  function groupByDimensions(cellMap, dimensions) {
+    const groups = {};
+    Object.values(cellMap).forEach((entry) => {
+      const attempt = entry.attempt || {};
+      const parts = dimensions.map((d) => getDimValue(attempt, d) || "_unknown");
+      const groupKey = parts.join(" / ");
+      groups[groupKey] = groups[groupKey] || [];
+      groups[groupKey].push(entry);
+    });
+    return groups;
+  }
+
+  function groupByCheckpoint(cellMap) {
+    const groups = {};
+    Object.values(cellMap).forEach((entry) => {
+      const ck = (entry.attempt && entry.attempt.checkpoint_id) || "_unknown";
+      groups[ck] = groups[ck] || [];
+      groups[ck].push(entry);
+    });
+    return groups;
+  }
+
+  function renderGroupLabel(groupKey, strategy) {
+    if (strategy.type === "technical") {
+      return "Checkpoint " + groupKey;
+    }
+    const parts = groupKey.split(" / ");
+    return strategy.dimensions.map((d, i) => {
+      const val = parts[i] || "_";
+      return d + ": " + val;
+    }).join(" | ");
+  }
+
+  function renderGrid(shell, evs, apiBase, snap) {
     const grid = shell.querySelector('[data-testid="grid-body"]');
     if (!grid) return;
     while (grid.firstChild) grid.removeChild(grid.firstChild);
@@ -432,22 +496,27 @@ export function results_tab_render(rootEl, api, options = {}) {
         cellMap[p.cell_key] = { cell: { cell_key: p.cell_key, ...(prev.cell || {}) }, attempt: { ...(prev.attempt || {}), ...p, status: t.split(".")[1] } };
       }
     });
-    const cks = {};
-    Object.values(cellMap).forEach((entry) => {
-      const ck = (entry.attempt && entry.attempt.checkpoint_id) || "_unknown";
-      cks[ck] = cks[ck] || [];
-      cks[ck].push(entry);
-    });
-    Object.keys(cks).forEach((ck) => {
-      const group = el("div", { class: "testing-results-group" }, [
-        el("h4", { style: "font-size:var(--font-size-sm,12px);font-weight:var(--font-weight-medium,500);color:var(--color-text-secondary,#9aa3b2);margin:0 0 var(--space-sm,8px);", text: `Checkpoint ${ck}` }),
+    const strategy = resolveGroupingStrategy(snap);
+    const groups = strategy.type === "dimension"
+      ? groupByDimensions(cellMap, strategy.dimensions)
+      : groupByCheckpoint(cellMap);
+    Object.keys(groups).forEach((groupKey) => {
+      const group = el("div", {
+        class: "testing-results-group " + strategy.adapterClass,
+        "data-group-strategy": strategy.type,
+      }, [
+        el("h4", {
+          class: strategy.type === "technical" ? "technical-view" : "",
+          style: "font-size:var(--font-size-sm,12px);font-weight:var(--font-weight-medium,500);color:var(--color-text-secondary,#9aa3b2);margin:0 0 var(--space-sm,8px);",
+          text: renderGroupLabel(groupKey, strategy),
+        }),
         el("div", { class: "testing-results-row", style: "display:flex;flex-wrap:wrap;gap:var(--space-sm,8px);" }),
       ]);
       const row = group.querySelector(".testing-results-row");
-      cks[ck].forEach((entry, idx) => row.appendChild(renderCellCard(entry.cell || { cell_key: "_" }, entry.attempt, apiBase, idx)));
+      groups[groupKey].forEach((entry, idx) => row.appendChild(renderCellCard(entry.cell || { cell_key: "_" }, entry.attempt, apiBase, idx)));
       grid.appendChild(group);
     });
-    if (Object.keys(cks).length === 0) {
+    if (Object.keys(groups).length === 0) {
       grid.appendChild(el("div", { class: "testing-results-empty-state", text: "No cells yet — start an experiment." }));
     }
   }
@@ -524,7 +593,7 @@ export function results_tab_render(rootEl, api, options = {}) {
         lastEvents = data.events || [];
         updateProgressBar(shell, snapshot, lastEvents);
         if (lastEvents.length) {
-          renderGrid(shell, lastEvents, apiBase);
+          renderGrid(shell, lastEvents, apiBase, snapshot);
         }
       }
     } catch (e) {

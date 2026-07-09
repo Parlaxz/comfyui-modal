@@ -45,6 +45,62 @@ export async function getExperimentHistory(apiBase) {
   } catch { return null; }
 }
 
+// ── Normalized-draft API helpers ────────────────────────────────────────
+//
+// These helpers send normalized drafts to the backend compile/create/start
+// routes. The frontend must NOT construct final compiler-schema fragments;
+// use these helpers to send normalized_draft payloads to the backend.
+
+/**
+ * Preview (compile) a normalized draft without creating an experiment.
+ * POST /experiments/compile with { normalized_draft: draft }.
+ */
+export async function previewDraft(apiBase, draft) {
+  return fetchJson(`${apiBase || "/comfymodal"}/experiments/compile`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(draft),
+  });
+}
+
+/**
+ * Create an experiment from a normalized draft payload
+ * ({ normalized_draft: ..., max_containers: N }).
+ */
+export async function createFromDraft(apiBase, payload) {
+  return fetchJson(`${apiBase || "/comfymodal"}/experiments`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+/**
+ * Create from draft + start the experiment in one flow.
+ * Returns { created, started } so the caller can inspect both responses.
+ */
+export async function runFromDraft(apiBase, createPayload, startPayload) {
+  const created = await createFromDraft(apiBase, createPayload);
+  const expId = created && created.experiment_id;
+  if (!expId) throw new Error("Create did not return an experiment_id");
+
+  const startResult = await fetchJson(
+    `${apiBase || "/comfymodal"}/experiments/${encodeURIComponent(expId)}/start`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(startPayload || {}),
+    }
+  );
+  if (startResult && (startResult.error || startResult.status === "error")) {
+    throw new Error(
+      (startResult.message || startResult.error || "Start returned an error") +
+        " \u2014 experiment was created but not started"
+    );
+  }
+  return { created, started: startResult };
+}
+
 export function bootstrapLoader(container, loadFn) {
   const loadEl = document.createElement("div");
   loadEl.className = "comfymodal-testing-loader";

@@ -16,7 +16,7 @@
             }
           }
         },
-        "attempt_id": "a_f4c83ac3",
+        "attempt_id": "a_e66670fa",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -37,6 +37,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -65,7 +78,7 @@
             }
           }
         },
-        "attempt_id": "a_69bc4112",
+        "attempt_id": "a_273d3261",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -86,6 +99,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -114,7 +140,7 @@
             }
           }
         },
-        "attempt_id": "a_b0c63cf2",
+        "attempt_id": "a_f39872cf",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -135,6 +161,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -163,7 +202,7 @@
             }
           }
         },
-        "attempt_id": "a_46826c00",
+        "attempt_id": "a_d5f57686",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -184,6 +223,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -212,7 +264,7 @@
             }
           }
         },
-        "attempt_id": "a_9d50eab8",
+        "attempt_id": "a_788e0c6a",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -233,6 +285,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",
@@ -261,7 +326,7 @@
             }
           }
         },
-        "attempt_id": "a_58fdb57b",
+        "attempt_id": "a_085e3358",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -282,6 +347,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",
@@ -310,7 +388,7 @@
             }
           }
         },
-        "attempt_id": "a_ee57eeef",
+        "attempt_id": "a_6331e56e",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -331,6 +409,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",
@@ -359,7 +450,7 @@
             }
           }
         },
-        "attempt_id": "a_d4fbac7d",
+        "attempt_id": "a_d34e11e4",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -380,6 +471,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",
@@ -414,7 +518,7 @@
             }
           }
         },
-        "attempt_id": "a_b3187c9c",
+        "attempt_id": "a_2d6872d0",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -445,6 +549,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -479,7 +602,7 @@
             }
           }
         },
-        "attempt_id": "a_64ab0d9c",
+        "attempt_id": "a_366a1bc9",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -510,6 +633,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -544,7 +686,7 @@
             }
           }
         },
-        "attempt_id": "a_cda773f1",
+        "attempt_id": "a_f8003054",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -575,6 +717,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -609,7 +770,7 @@
             }
           }
         },
-        "attempt_id": "a_853e95e6",
+        "attempt_id": "a_c9be40d9",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -640,6 +801,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -674,7 +854,7 @@
             }
           }
         },
-        "attempt_id": "a_b7ccfc2e",
+        "attempt_id": "a_71204a4c",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -705,6 +885,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",
@@ -739,7 +938,7 @@
             }
           }
         },
-        "attempt_id": "a_b512b335",
+        "attempt_id": "a_1f24fa71",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -770,6 +969,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",
@@ -804,7 +1022,7 @@
             }
           }
         },
-        "attempt_id": "a_565b4135",
+        "attempt_id": "a_c44dfb74",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -835,6 +1053,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",
@@ -869,7 +1106,7 @@
             }
           }
         },
-        "attempt_id": "a_3be5c425",
+        "attempt_id": "a_c98c4e55",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -900,6 +1137,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u1",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",
@@ -928,7 +1184,7 @@
             }
           }
         },
-        "attempt_id": "a_35c717bf",
+        "attempt_id": "a_3f34e67e",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -949,6 +1205,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -977,7 +1246,7 @@
             }
           }
         },
-        "attempt_id": "a_45cc975b",
+        "attempt_id": "a_e67bbe3b",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -998,6 +1267,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -1026,7 +1308,7 @@
             }
           }
         },
-        "attempt_id": "a_24084fa7",
+        "attempt_id": "a_a4b12b97",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -1047,6 +1329,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -1075,7 +1370,7 @@
             }
           }
         },
-        "attempt_id": "a_71b42e1c",
+        "attempt_id": "a_97ae6e5d",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -1096,6 +1391,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -1124,7 +1432,7 @@
             }
           }
         },
-        "attempt_id": "a_d9b06b1c",
+        "attempt_id": "a_de7d7faf",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -1145,6 +1453,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",
@@ -1173,7 +1494,7 @@
             }
           }
         },
-        "attempt_id": "a_d7b334a5",
+        "attempt_id": "a_63e784df",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -1194,6 +1515,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",
@@ -1222,7 +1556,7 @@
             }
           }
         },
-        "attempt_id": "a_977820f3",
+        "attempt_id": "a_19e1a98a",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -1243,6 +1577,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",
@@ -1271,7 +1618,7 @@
             }
           }
         },
-        "attempt_id": "a_97c4fd74",
+        "attempt_id": "a_fa7a5116",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -1292,6 +1639,19 @@
         "lora_selection_id": "L_no",
         "lora_signature": [],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_no",
+          "lora_signature": [],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",
@@ -1326,7 +1686,7 @@
             }
           }
         },
-        "attempt_id": "a_d5111c64",
+        "attempt_id": "a_a5611183",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -1357,6 +1717,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -1391,7 +1770,7 @@
             }
           }
         },
-        "attempt_id": "a_441a5299",
+        "attempt_id": "a_0a7cf54d",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -1422,6 +1801,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -1456,7 +1854,7 @@
             }
           }
         },
-        "attempt_id": "a_7751af28",
+        "attempt_id": "a_d88ae345",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -1487,6 +1885,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -1521,7 +1938,7 @@
             }
           }
         },
-        "attempt_id": "a_49b3a05b",
+        "attempt_id": "a_22ed4888",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -1552,6 +1969,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_a",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "a",
         "prompt_id": "p_a",
@@ -1586,7 +2022,7 @@
             }
           }
         },
-        "attempt_id": "a_18ed3c09",
+        "attempt_id": "a_2515bb90",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -1617,6 +2053,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",
@@ -1651,7 +2106,7 @@
             }
           }
         },
-        "attempt_id": "a_de0a6848",
+        "attempt_id": "a_37e754f7",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 3.5,
@@ -1682,6 +2137,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",
@@ -1716,7 +2190,7 @@
             }
           }
         },
-        "attempt_id": "a_a986d64c",
+        "attempt_id": "a_a8da946c",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -1747,6 +2221,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",
@@ -1781,7 +2274,7 @@
             }
           }
         },
-        "attempt_id": "a_69e92fae",
+        "attempt_id": "a_9e6aeb3e",
         "axis_values": {
           "denoise": "__COMFYMODAL_WORKFLOW_OWNED__",
           "guidance": 0.0,
@@ -1812,6 +2305,25 @@
           ]
         ],
         "negative_prompt": "__COMFYMODAL_WORKFLOW_OWNED__",
+        "normalized_dimensions": {
+          "clip": "c1",
+          "height": null,
+          "image_id": "",
+          "loader_target_group_id": "g_default",
+          "lora_selection_id": "L_a",
+          "lora_signature": [
+            [
+              "a.safetensors",
+              0.7,
+              0.7
+            ]
+          ],
+          "profile_id": "p1",
+          "prompt_id": "p_b",
+          "unet": "u2",
+          "vae": "v1",
+          "width": null
+        },
         "profile_id": "p1",
         "prompt": "b",
         "prompt_id": "p_b",

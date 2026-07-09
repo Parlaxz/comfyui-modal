@@ -1,0 +1,307 @@
+- generic [ref=e269] [box=381,-955,1158,3033]:
+  - generic [ref=e270] [box=381,-955,1158,200]:
+    - generic [ref=e272] [cursor=pointer] [box=394,-946,96,15]: Generation Type
+    - generic [ref=e274] [box=394,-910,1132,142]:
+      - generic [ref=e275] [cursor=pointer] [box=394,-910,560,142]:
+        - radio "🎨 Text-to-Image Generate images from a text prompt. No input image required." [checked] [ref=e276] [box=666,-889,18,18]
+        - generic [ref=e277] [box=655,-863,38,28]: 🎨
+        - generic [ref=e278] [box=626,-827,97,17]: Text-to-Image
+        - generic [ref=e279] [box=513,-802,322,16]: Generate images from a text prompt. No input image required.
+      - generic [ref=e280] [cursor=pointer] [box=966,-910,560,142]:
+        - radio "🖼 Image-to-Image Generate images from an input image with optional prompt guidance." [ref=e281] [box=1238,-889,18,18]
+        - generic [ref=e282] [box=1232,-863,28,28]: 🖼
+        - generic [ref=e283] [box=1191,-827,109,17]: Image-to-Image
+        - generic [ref=e284] [box=1066,-802,359,16]: Generate images from an input image with optional prompt guidance.
+  - generic [ref=e285] [box=381,-744,1158,489]:
+    - generic [ref=e287] [cursor=pointer] [box=394,-735,92,15]: What Changes?
+    - generic [ref=e289] [box=394,-699,1132,431]:
+      - generic [ref=e291] [box=394,-699,1132,99]:
+        - generic [ref=e292] [box=394,-699,1132,15]: Description
+        - textbox "Description" [ref=e293] [box=394,-680,1132,80]:
+          - /placeholder: Describe what this experiment changes or tests. What hypothesis are you validating?
+      - generic [ref=e294] [box=394,-588,1132,320]:
+        - generic [ref=e295] [box=394,-588,369,71]:
+          - generic [ref=e297] [box=407,-575,42,15]: Prompt
+          - generic [ref=e298] [box=407,-552,343,22]:
+            - button "Default" [ref=e299] [cursor=pointer] [box=408,-551,112,20]
+            - button "Testing" [ref=e300] [cursor=pointer] [box=522,-551,112,20]
+            - button "Controlled" [ref=e301] [cursor=pointer] [box=637,-551,112,20]
+        - generic [ref=e302] [box=775,-588,369,71]:
+          - generic [ref=e304] [box=788,-575,97,15]: Negative Prompt
+          - generic [ref=e305] [box=788,-552,343,22]:
+            - button "Default" [ref=e306] [cursor=pointer] [box=789,-551,112,20]
+            - button "Testing" [ref=e307] [cursor=pointer] [box=904,-551,112,20]
+            - button "Controlled" [ref=e308] [cursor=pointer] [box=1018,-551,112,20]
+        - generic [ref=e309] [box=1157,-588,369,71]:
+          - generic [ref=e311] [box=1170,-575,72,15]: Model Stack
+          - generic [ref=e312] [box=1170,-552,343,22]:
+            - button "Default" [ref=e313] [cursor=pointer] [box=1171,-551,112,20]
+            - button "Testing" [ref=e314] [cursor=pointer] [box=1285,-551,112,20]
+            - button "Controlled" [ref=e315] [cursor=pointer] [box=1400,-551,112,20]
+        - generic [ref=e316] [box=394,-505,369,71]:
+          - generic [ref=e318] [box=407,-492,73,15]: LoRA Config
+          - generic [ref=e319] [box=407,-469,343,22]:
+            - button "Default" [ref=e320] [cursor=pointer] [box=408,-468,112,20]
+            - button "Testing" [ref=e321] [cursor=pointer] [box=522,-468,112,20]
+            - button "Controlled" [ref=e322] [cursor=pointer] [box=637,-468,112,20]
+        - generic [ref=e323] [box=775,-505,369,71]:
+          - generic [ref=e325] [box=788,-492,29,15]: Seed
+          - generic [ref=e326] [box=788,-469,343,22]:
+            - button "Default" [ref=e327] [cursor=pointer] [box=789,-468,112,20]
+            - button "Testing" [ref=e328] [cursor=pointer] [box=904,-468,112,20]
+            - button "Controlled" [ref=e329] [cursor=pointer] [box=1018,-468,112,20]
+        - generic [ref=e330] [box=1157,-505,369,71]:
+          - generic [ref=e332] [box=1170,-492,48,15]: Sampler
+          - generic [ref=e333] [box=1170,-469,343,22]:
+            - button "Default" [ref=e334] [cursor=pointer] [box=1171,-468,112,20]
+            - button "Testing" [ref=e335] [cursor=pointer] [box=1285,-468,112,20]
+            - button "Controlled" [ref=e336] [cursor=pointer] [box=1400,-468,112,20]
+        - generic [ref=e337] [box=394,-422,369,71]:
+          - generic [ref=e339] [box=407,-409,59,15]: Scheduler
+          - generic [ref=e340] [box=407,-386,343,22]:
+            - button "Default" [ref=e341] [cursor=pointer] [box=408,-385,112,20]
+            - button "Testing" [ref=e342] [cursor=pointer] [box=522,-385,112,20]
+            - button "Controlled" [ref=e343] [cursor=pointer] [box=637,-385,112,20]
+        - generic [ref=e344] [box=775,-422,369,71]:
+          - generic [ref=e346] [box=788,-409,33,15]: Steps
+          - generic [ref=e347] [box=788,-386,343,22]:
+            - button "Default" [ref=e348] [cursor=pointer] [box=789,-385,112,20]
+            - button "Testing" [ref=e349] [cursor=pointer] [box=904,-385,112,20]
+            - button "Controlled" [ref=e350] [cursor=pointer] [box=1018,-385,112,20]
+        - generic [ref=e351] [box=1157,-422,369,71]:
+          - generic [ref=e353] [box=1170,-409,92,15]: Guidance (CFG)
+          - generic [ref=e354] [box=1170,-386,343,22]:
+            - button "Default" [ref=e355] [cursor=pointer] [box=1171,-385,112,20]
+            - button "Testing" [ref=e356] [cursor=pointer] [box=1285,-385,112,20]
+            - button "Controlled" [ref=e357] [cursor=pointer] [box=1400,-385,112,20]
+        - generic [ref=e358] [box=394,-339,369,71]:
+          - generic [ref=e360] [box=407,-326,47,15]: Denoise
+          - generic [ref=e361] [box=407,-303,343,22]:
+            - button "Default" [ref=e362] [cursor=pointer] [box=408,-302,112,20]
+            - button "Testing" [ref=e363] [cursor=pointer] [box=522,-302,112,20]
+            - button "Controlled" [ref=e364] [cursor=pointer] [box=637,-302,112,20]
+        - generic [ref=e365] [box=775,-339,369,71]:
+          - generic [ref=e367] [box=788,-326,61,15]: Resolution
+          - generic [ref=e368] [box=788,-303,343,22]:
+            - button "Default" [ref=e369] [cursor=pointer] [box=789,-302,112,20]
+            - button "Testing" [ref=e370] [cursor=pointer] [box=904,-302,112,20]
+            - button "Controlled" [ref=e371] [cursor=pointer] [box=1018,-302,112,20]
+  - generic [ref=e372] [box=381,-243,1158,1319]:
+    - generic [ref=e374] [cursor=pointer] [box=394,-234,62,15]: Workflows
+    - generic [ref=e375] [box=382,-210,1156,1285]:
+      - generic [ref=e376] [box=394,-198,1132,32]:
+        - textbox "Profile name (e.g. Flux2 Klein FP8)" [ref=e377] [box=394,-197,977,31]
+        - button "Create from Canvas" [ref=e378] [cursor=pointer] [box=1379,-198,147,32]
+      - generic [ref=e380] [box=394,-138,1132,106]:
+        - generic [ref=e381] [box=394,-138,1132,49]:
+          - checkbox [checked] [ref=e382] [box=411,-120,13,13]
+          - generic [ref=e383] [box=435,-129,878,31]:
+            - generic [ref=e384] [box=435,-129,878,15]: Flux Klein 9B - Uncensored
+            - generic [ref=e385] [box=435,-112,878,14]: (no model triple)
+          - generic [ref=e386] [box=1321,-124,192,22]:
+            - button "Validate" [ref=e387] [cursor=pointer] [box=1321,-124,61,22]
+            - button "Duplicate" [ref=e388] [cursor=pointer] [box=1386,-124,68,22]
+            - button "Delete" [ref=e389] [cursor=pointer] [box=1458,-124,55,22]
+        - generic [ref=e390] [box=394,-81,1132,49]:
+          - checkbox [checked] [ref=e391] [box=411,-63,13,13]
+          - generic [ref=e392] [box=435,-72,878,31]:
+            - generic [ref=e393] [box=435,-72,878,15]: ZIT - Current Favorite
+            - generic [ref=e394] [box=435,-55,878,14]: (no model triple)
+          - generic [ref=e395] [box=1321,-67,192,22]:
+            - button "Validate" [ref=e396] [cursor=pointer] [box=1321,-67,61,22]
+            - button "Duplicate" [ref=e397] [cursor=pointer] [box=1386,-67,68,22]
+            - button "Delete" [ref=e398] [cursor=pointer] [box=1458,-67,55,22]
+      - generic [ref=e400] [box=394,-15,1132,1078]:
+        - group [ref=e530] [box=394,-15,1132,533]:
+          - generic "Stacks & LoRA Configuration" [ref=e531] [cursor=pointer] [box=395,-14,1130,31]
+          - generic [ref=e544] [box=395,17,1130,500]:
+            - generic [ref=e545] [box=407,29,1106,31]: "Workflow: flux_klein_9b_-_uncensored"
+            - heading "Model Stacks" [level=4] [ref=e546] [box=407,72,1106,15]
+            - generic [ref=e547] [box=407,99,1106,288]:
+              - generic [ref=e548] [box=407,99,1106,236]:
+                - generic [ref=e549] [box=420,112,1080,20]:
+                  - generic [ref=e550] [box=420,115,12,15]: s1
+                  - button "Duplicate" [ref=e552] [cursor=pointer] [box=1436,112,64,20]
+                - generic [ref=e553] [box=420,144,1080,75]:
+                  - generic [ref=e554] [box=420,144,534,31]:
+                    - text: UNet
+                    - textbox "UNet" [ref=e555] [box=451,144,168,31]:
+                      - /placeholder: unet model
+                      - text: flux-unet-fp8.safetensors
+                  - generic [ref=e556] [box=966,144,534,31]:
+                    - text: CLIP
+                    - textbox "CLIP" [ref=e557] [box=995,144,168,31]:
+                      - /placeholder: clip model
+                      - text: qwen-clip.safetensors
+                  - generic [ref=e558] [box=420,188,534,31]:
+                    - text: VAE
+                    - textbox "VAE" [ref=e559] [box=445,188,168,31]:
+                      - /placeholder: vae model
+                      - text: flux-vae.safetensors
+                - generic [ref=e560] [box=420,231,1080,38]:
+                  - generic [ref=e561] [box=433,242,79,16]: "LoRA Scope:"
+                  - button "All Selected Stacks" [ref=e562] [cursor=pointer] [box=520,240,140,20]
+                - button "+ LoRA" [ref=e564] [cursor=pointer] [box=420,290,1080,32]
+              - button "+ Add Stack" [ref=e565] [cursor=pointer] [box=407,355,1106,32]
+            - generic [ref=e566] [box=407,407,1106,98]:
+              - heading "Shared LoRA Baseline" [level=4] [ref=e567] [box=407,407,1106,15]
+              - generic [ref=e568] [box=407,422,1106,83]:
+                - generic [ref=e569] [box=407,422,1106,51]:
+                  - generic [ref=e570] [box=407,422,1106,19]:
+                    - checkbox [checked] [ref=e571] [box=411,425,13,13]
+                    - text: No LoRA
+                  - button "+ Add LoRA entry" [ref=e573] [cursor=pointer] [box=407,441,128,32]
+                - button "+ Add LoRA" [ref=e574] [cursor=pointer] [box=407,473,103,32]
+        - group [ref=e532] [box=394,530,1132,533]:
+          - generic "Stacks & LoRA Configuration" [ref=e533] [cursor=pointer] [box=395,531,1130,31]
+          - generic [ref=e575] [box=395,562,1130,500]:
+            - generic [ref=e576] [box=407,574,1106,31]: "Workflow: zit_-_current_favorite"
+            - heading "Model Stacks" [level=4] [ref=e577] [box=407,617,1106,15]
+            - generic [ref=e578] [box=407,644,1106,288]:
+              - generic [ref=e579] [box=407,644,1106,236]:
+                - generic [ref=e580] [box=420,657,1080,20]:
+                  - generic [ref=e581] [box=420,660,12,15]: s1
+                  - button "Duplicate" [ref=e583] [cursor=pointer] [box=1436,657,64,20]
+                - generic [ref=e584] [box=420,689,1080,75]:
+                  - generic [ref=e585] [box=420,689,534,31]:
+                    - text: UNet
+                    - textbox "UNet" [ref=e586] [box=451,689,168,31]:
+                      - /placeholder: unet model
+                      - text: zit-unet-fp8.safetensors
+                  - generic [ref=e587] [box=966,689,534,31]:
+                    - text: CLIP
+                    - textbox "CLIP" [ref=e588] [box=995,689,168,31]:
+                      - /placeholder: clip model
+                      - text: zit-clip.safetensors
+                  - generic [ref=e589] [box=420,733,534,31]:
+                    - text: VAE
+                    - textbox "VAE" [active] [ref=e590] [box=445,733,168,31]:
+                      - /placeholder: vae model
+                      - text: zit-vae.safetensors
+                - generic [ref=e591] [box=420,776,1080,38]:
+                  - generic [ref=e592] [box=433,787,79,16]: "LoRA Scope:"
+                  - button "All Selected Stacks" [ref=e593] [cursor=pointer] [box=520,785,140,20]
+                - button "+ LoRA" [ref=e595] [cursor=pointer] [box=420,835,1080,32]
+              - button "+ Add Stack" [ref=e596] [cursor=pointer] [box=407,900,1106,32]
+            - generic [ref=e597] [box=407,952,1106,98]:
+              - heading "Shared LoRA Baseline" [level=4] [ref=e598] [box=407,952,1106,15]
+              - generic [ref=e599] [box=407,967,1106,83]:
+                - generic [ref=e600] [box=407,967,1106,51]:
+                  - generic [ref=e601] [box=407,967,1106,19]:
+                    - checkbox [checked] [ref=e602] [box=411,970,13,13]
+                    - text: No LoRA
+                  - button "+ Add LoRA entry" [ref=e604] [cursor=pointer] [box=407,986,128,32]
+                - button "+ Add LoRA" [ref=e605] [cursor=pointer] [box=407,1018,103,32]
+  - generic [ref=e402] [box=381,1088,1158,783]:
+    - generic [ref=e404] [cursor=pointer] [box=394,1097,67,15]: Test Values
+    - generic [ref=e406] [box=394,1133,1132,725]:
+      - group [ref=e407] [box=394,1133,1132,233]:
+        - generic "Prompts" [ref=e408] [cursor=pointer] [box=395,1134,1130,31]
+        - generic [ref=e409] [box=395,1165,1130,200]:
+          - generic [ref=e411] [box=407,1177,1106,91]:
+            - generic [ref=e412] [box=407,1177,1106,15]: Positive
+            - textbox "Positive" [ref=e413] [box=407,1196,1106,72]:
+              - /placeholder: Positive prompt…
+          - generic [ref=e414] [box=407,1280,1106,41]:
+            - combobox [ref=e415] [box=407,1290,983,30]:
+              - option "Load a preset…" [selected] [box=0,0,0,0]
+            - button "Save as Preset" [ref=e416] [cursor=pointer] [box=1398,1289,115,32]
+      - group [ref=e418] [box=394,1378,1132,435]:
+        - generic "Axes" [ref=e419] [cursor=pointer] [box=395,1379,1130,31]
+        - generic [ref=e420] [box=395,1410,1130,402]:
+          - generic [ref=e422] [box=407,1422,547,31]:
+            - text: Seeds
+            - textbox "Seeds" [ref=e423] [box=445,1422,168,31]:
+              - /placeholder: 1,2,3,4,5
+              - text: 1,2,3
+          - generic [ref=e424] [box=407,1465,1106,276]:
+            - generic [ref=e425] [box=407,1465,1106,16]:
+              - generic [ref=e426] [box=407,1465,57,16]: Samplers
+              - generic [ref=e427] [box=472,1467,156,14]: Enable the samplers to sweep
+            - generic [ref=e428] [box=407,1489,1106,252]:
+              - generic [ref=e429] [cursor=pointer] [box=407,1489,363,28]:
+                - checkbox "euler" [checked] [ref=e430] [box=419,1496,14,14]
+                - generic [ref=e431] [box=442,1496,29,15]: euler
+              - generic [ref=e432] [cursor=pointer] [box=778,1489,363,28]:
+                - checkbox "euler_ancestral" [checked] [ref=e433] [box=790,1496,14,14]
+                - generic [ref=e434] [box=813,1496,86,15]: euler_ancestral
+              - generic [ref=e435] [cursor=pointer] [box=1150,1489,363,28]:
+                - checkbox "heun" [ref=e436] [box=1162,1496,14,14]
+                - generic [ref=e437] [box=1185,1496,28,15]: heun
+              - generic [ref=e438] [cursor=pointer] [box=407,1521,363,28]:
+                - checkbox "heunpp2" [ref=e439] [box=419,1528,14,14]
+                - generic [ref=e440] [box=442,1528,51,15]: heunpp2
+              - generic [ref=e441] [cursor=pointer] [box=778,1521,363,28]:
+                - checkbox "dpm_2" [ref=e442] [box=790,1528,14,14]
+                - generic [ref=e443] [box=813,1528,38,15]: dpm_2
+              - generic [ref=e444] [cursor=pointer] [box=1150,1521,363,28]:
+                - checkbox "dpm_2_ancestral" [ref=e445] [box=1162,1528,14,14]
+                - generic [ref=e446] [box=1185,1528,96,15]: dpm_2_ancestral
+              - generic [ref=e447] [cursor=pointer] [box=407,1553,363,28]:
+                - checkbox "lms" [ref=e448] [box=419,1560,14,14]
+                - generic [ref=e449] [box=442,1560,20,15]: lms
+              - generic [ref=e450] [cursor=pointer] [box=778,1553,363,28]:
+                - checkbox "dpm_fast" [ref=e451] [box=790,1560,14,14]
+                - generic [ref=e452] [box=813,1560,52,15]: dpm_fast
+              - generic [ref=e453] [cursor=pointer] [box=1150,1553,363,28]:
+                - checkbox "dpm_adaptive" [ref=e454] [box=1162,1560,14,14]
+                - generic [ref=e455] [box=1185,1560,79,15]: dpm_adaptive
+              - generic [ref=e456] [cursor=pointer] [box=407,1585,363,28]:
+                - checkbox "dpmpp_2s_ancestral" [ref=e457] [box=419,1592,14,14]
+                - generic [ref=e458] [box=442,1592,117,15]: dpmpp_2s_ancestral
+              - generic [ref=e459] [cursor=pointer] [box=778,1585,363,28]:
+                - checkbox "dpmpp_sde" [ref=e460] [box=790,1592,14,14]
+                - generic [ref=e461] [box=813,1592,66,15]: dpmpp_sde
+              - generic [ref=e462] [cursor=pointer] [box=1150,1585,363,28]:
+                - checkbox "dpmpp_sde_gpu" [ref=e463] [box=1162,1592,14,14]
+                - generic [ref=e464] [box=1185,1592,93,15]: dpmpp_sde_gpu
+              - generic [ref=e465] [cursor=pointer] [box=407,1617,363,28]:
+                - checkbox "dpmpp_2m" [checked] [ref=e466] [box=419,1624,14,14]
+                - generic [ref=e467] [box=442,1624,64,15]: dpmpp_2m
+              - generic [ref=e468] [cursor=pointer] [box=778,1617,363,28]:
+                - checkbox "dpmpp_2m_sde" [ref=e469] [box=790,1624,14,14]
+                - generic [ref=e470] [box=813,1624,90,15]: dpmpp_2m_sde
+              - generic [ref=e471] [cursor=pointer] [box=1150,1617,363,28]:
+                - checkbox "dpmpp_2m_sde_gpu" [ref=e472] [box=1162,1624,14,14]
+                - generic [ref=e473] [box=1185,1624,117,15]: dpmpp_2m_sde_gpu
+              - generic [ref=e474] [cursor=pointer] [box=407,1649,363,28]:
+                - checkbox "dpmpp_3m_sde" [ref=e475] [box=419,1656,14,14]
+                - generic [ref=e476] [box=442,1656,90,15]: dpmpp_3m_sde
+              - generic [ref=e477] [cursor=pointer] [box=778,1649,363,28]:
+                - checkbox "dpmpp_3m_sde_gpu" [ref=e478] [box=790,1656,14,14]
+                - generic [ref=e479] [box=813,1656,117,15]: dpmpp_3m_sde_gpu
+              - generic [ref=e480] [cursor=pointer] [box=1150,1649,363,28]:
+                - checkbox "ddpm" [ref=e481] [box=1162,1656,14,14]
+                - generic [ref=e482] [box=1185,1656,33,15]: ddpm
+              - generic [ref=e483] [cursor=pointer] [box=407,1681,363,28]:
+                - checkbox "lcm" [ref=e484] [box=419,1688,14,14]
+                - generic [ref=e485] [box=442,1688,20,15]: lcm
+              - generic [ref=e486] [cursor=pointer] [box=778,1681,363,28]:
+                - checkbox "ddim" [ref=e487] [box=790,1688,14,14]
+                - generic [ref=e488] [box=813,1688,28,15]: ddim
+              - generic [ref=e489] [cursor=pointer] [box=1150,1681,363,28]:
+                - checkbox "uni_pc" [ref=e490] [box=1162,1688,14,14]
+                - generic [ref=e491] [box=1185,1688,37,15]: uni_pc
+              - generic [ref=e492] [cursor=pointer] [box=407,1713,363,28]:
+                - checkbox "uni_pc_bh2" [ref=e493] [box=419,1720,14,14]
+                - generic [ref=e494] [box=442,1720,65,15]: uni_pc_bh2
+          - group [ref=e495] [box=407,1761,1106,39]:
+            - generic "Advanced axes" [ref=e496] [cursor=pointer] [box=407,1770,1106,30]
+      - group [ref=e497] [box=394,1825,1132,33]:
+        - generic "Execution" [ref=e498] [cursor=pointer] [box=395,1826,1130,31]
+        - option "Single container" [selected] [box=0,0,0,0]
+        - option "Multi-container" [box=0,0,0,0]
+  - generic [ref=e499] [box=381,1883,1158,194]:
+    - generic [ref=e501] [cursor=pointer] [box=394,1892,78,15]: Review & Run
+    - generic [ref=e503] [box=394,1928,1132,136]:
+      - generic [ref=e504] [box=412,1946,1096,56]:
+        - generic [ref=e607] [box=425,1955,1070,14]:
+          - generic [ref=e608] [box=425,1955,49,14]: "Type: T2I"
+          - generic [ref=e609] [box=486,1955,72,14]: 2 workflow(s)
+          - generic [ref=e610] [box=571,1955,52,14]: 2 stack(s)
+          - generic [ref=e611] [box=635,1955,52,14]: 0 LoRA(s)
+          - generic [ref=e612] [box=699,1955,50,14]: 3 seed(s)
+          - generic [ref=e613] [box=760,1955,118,14]: 5 testing / 0 controlled
+          - generic [ref=e614] [box=891,1955,62,14]: No prompts
+        - generic [ref=e615] [box=412,1986,1096,16]: "Workflow \"flux_klein_9b_-_uncensored\", Stack \"s1\": no model configured"
+      - button "Compile" [ref=e517] [cursor=pointer] [box=412,2014,1096,32]
