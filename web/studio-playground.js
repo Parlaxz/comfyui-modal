@@ -11,7 +11,7 @@ import {
   renderExperimentMode,
   enhanceControlWithAxisCheckbox,
 } from "./studio-experiment-mode.js";
-import { getBackends } from "./studio-backend.js";
+import { getRuntimePresets } from "./studio-backend.js";
 
 // ── Element helper ───────────────────────────────────────────────────────
 
@@ -216,9 +216,9 @@ function renderBackendSelector(state, actions) {
   select.disabled = true;
   container.appendChild(select);
 
-  // Async load backends through the Studio abstraction
+    // Async load presets through the Studio abstraction (runtime selectors only)
   const apiBase = "/comfymodal";
-  getBackends({ apiBase }).then((backends) => {
+  getRuntimePresets({ apiBase }).then((backends) => {
     while (select.firstChild) select.removeChild(select.firstChild);
 
     if (!backends || backends.length === 0) {

@@ -74,15 +74,16 @@ class StudioSnapshotsTests(unittest.TestCase):
     """Snapshot data model and list/detail rendering."""
 
     def setUp(self) -> None:
-        self.m = _JsModule(WEB / "studio-backend.js")
+        self.m = _JsModule(WEB / "studio-backend-snapshots.js")
 
     def test_take_snapshot_button_exists(self):
         """Backend page must have a 'Take Snapshot' button."""
         self.assertIn("Take Snapshot", self.m.text)
 
     def test_snapshot_api_calls_present(self):
-        """Backend page must have snapshot CRUD API calls."""
-        self.assertIn("studio/snapshots", self.m.text)
+        """Backend page must have snapshot CRUD API calls in the API module."""
+        text = (WEB / "studio-backend-api.js").read_text(encoding="utf-8")
+        self.assertIn("studio/snapshots", text)
 
     def test_snapshot_list_renderer_exists(self):
         """Backend page must have a snapshot list renderer function."""
@@ -93,12 +94,14 @@ class StudioSnapshotsTests(unittest.TestCase):
         self.assertIn("renderSnapshotDetail", self.m.text)
 
     def test_snapshot_has_take_snapshot_function(self):
-        """Backend page must have a takeSnapshotOfCurrentGraph function."""
-        self.assertIn("takeSnapshotOfCurrentGraph", self.m.text)
+        """Capture logic lives in studio-backend-capture.js."""
+        text = (WEB / "studio-backend-capture.js").read_text(encoding="utf-8")
+        self.assertIn("takeSnapshotOfCurrentGraph", text)
 
     def test_snapshot_has_status_badge(self):
         """Snapshot detail must use status badges for runnable/needs-bindings."""
-        self.assertIn("status-badge", self.m.text)
+        text = (WEB / "studio-ui.js").read_text(encoding="utf-8")
+        self.assertIn("status-badge", text)
 
     def test_snapshot_non_runnable_status(self):
         """Snapshot must show 'Needs bindings' or 'Needs API prompt' status for non-runnable."""
@@ -111,15 +114,16 @@ class StudioPresetsTests(unittest.TestCase):
     """Backend Preset data model and list/detail rendering."""
 
     def setUp(self) -> None:
-        self.m = _JsModule(WEB / "studio-backend.js")
+        self.m = _JsModule(WEB / "studio-backend-presets.js")
 
     def test_preset_has_new_preset_button(self):
         """Presets page must have a 'New Preset' button."""
         self.assertIn("New Preset", self.m.text)
 
     def test_preset_api_calls_present(self):
-        """Backend page must have preset CRUD API calls."""
-        self.assertIn("studio/presets", self.m.text)
+        """Backend page must have preset CRUD API calls in the API module."""
+        text = (WEB / "studio-backend-api.js").read_text(encoding="utf-8")
+        self.assertIn("studio/presets", text)
 
     def test_preset_list_renderer_exists(self):
         """Backend page must have a preset list renderer function."""
@@ -169,6 +173,54 @@ class CompatibleFeaturesChipGridTests(unittest.TestCase):
         """Features chip must use comfymodal-studio-feature-chip class."""
         text = (WEB / "studio-styles.js").read_text(encoding="utf-8")
         self.assertIn("comfymodal-studio-feature-chip", text)
+
+    def test_features_chip_uses_semantic_button(self):
+        """Feature chips must be semantic toggle buttons, not div-based state."""
+        self.assertIn('button", {', self.m.text)
+        self.assertIn('type: "button"', self.m.text)
+        self.assertIn('aria-pressed', self.m.text)
+
+
+class BackendModuleSplitTests(unittest.TestCase):
+    """Backend page logic should be split into focused modules."""
+
+    def test_backend_page_imports_api_module(self):
+        text = (WEB / "studio-backend.js").read_text(encoding="utf-8")
+        self.assertIn("./studio-backend-api.js", text)
+
+    def test_backend_page_imports_capture_module(self):
+        text = (WEB / "studio-backend.js").read_text(encoding="utf-8")
+        self.assertIn("./studio-backend-capture.js", text)
+
+    def test_backend_page_imports_snapshots_module(self):
+        text = (WEB / "studio-backend.js").read_text(encoding="utf-8")
+        self.assertIn("./studio-backend-snapshots.js", text)
+
+    def test_backend_page_imports_presets_module(self):
+        text = (WEB / "studio-backend.js").read_text(encoding="utf-8")
+        self.assertIn("./studio-backend-presets.js", text)
+
+    def test_backend_page_imports_shared_ui_module(self):
+        text = (WEB / "studio-backend.js").read_text(encoding="utf-8")
+        self.assertIn("./studio-ui.js", text)
+
+    def test_backend_page_no_longer_contains_capture_business_logic(self):
+        text = (WEB / "studio-backend.js").read_text(encoding="utf-8")
+        self.assertNotIn("takeSnapshotOfCurrentGraph", text)
+
+
+class PresetOnlySelectorTests(unittest.TestCase):
+    """Playground and Experiment must consume presets-only runtime selectors."""
+
+    def test_playground_uses_preset_runtime_helper(self):
+        text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+        self.assertIn("getRuntimePresets", text)
+        self.assertNotIn("getBackends(", text)
+
+    def test_experiment_uses_preset_runtime_helper(self):
+        text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
+        self.assertIn("getRuntimePresets", text)
+        self.assertNotIn("getBackends(", text)
 
 
 # ---------------------------------------------------------------------------

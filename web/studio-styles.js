@@ -864,6 +864,11 @@ body:has(.comfymodal-studio-modal) {
   flex-wrap: wrap;
   gap: 4px;
 }
+button.comfymodal-studio-feature-chip {
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+}
 .comfymodal-studio-feature-chip {
   display: inline-flex;
   align-items: center;
@@ -883,7 +888,8 @@ body:has(.comfymodal-studio-modal) {
   border-color: #444;
   background: #1a1a1a;
 }
-.comfymodal-studio-feature-chip.checked {
+.comfymodal-studio-feature-chip.checked,
+.comfymodal-studio-feature-chip[aria-pressed="true"] {
   background: #1a0a0a;
   border-color: #dc2626;
   color: #dc2626;
@@ -891,7 +897,8 @@ body:has(.comfymodal-studio-modal) {
 .comfymodal-studio-feature-chip .chip-check {
   display: none;
 }
-.comfymodal-studio-feature-chip.checked .chip-check {
+.comfymodal-studio-feature-chip.checked .chip-check,
+.comfymodal-studio-feature-chip[aria-pressed="true"] .chip-check {
   display: inline;
 }
 
