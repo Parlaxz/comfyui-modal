@@ -22,6 +22,19 @@ const STUDIO_CSS = `
   font-size: 13px;
 }
 
+/* When modal is open, body should not scroll behind it */
+body:has(.comfymodal-studio-modal) {
+  overflow: hidden;
+}
+
+.comfymodal-studio-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+
 .comfymodal-studio-header {
   display: flex;
   align-items: center;
@@ -80,9 +93,26 @@ const STUDIO_CSS = `
 .comfymodal-studio-pagecontainer {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
   min-height: 0;
   padding: 16px;
   background: #0d0d0d;
+  /* Prevent scroll trap: ensure this is the ONLY scrollable container at this level */
+  max-height: 100%;
+}
+
+.comfymodal-studio-pagecontainer::-webkit-scrollbar {
+  width: 6px;
+}
+.comfymodal-studio-pagecontainer::-webkit-scrollbar-track {
+  background: transparent;
+}
+.comfymodal-studio-pagecontainer::-webkit-scrollbar-thumb {
+  background: #2a2a2a;
+  border-radius: 3px;
+}
+.comfymodal-studio-pagecontainer::-webkit-scrollbar-thumb:hover {
+  background: #444;
 }
 
 /* ── Playground ──────────────────────────────────────────── */
@@ -92,6 +122,7 @@ const STUDIO_CSS = `
   flex-direction: row;
   gap: 16px;
   height: 100%;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -100,19 +131,23 @@ const STUDIO_CSS = `
   min-width: 300px;
   flex-shrink: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding-right: 8px;
   display: flex;
   flex-direction: column;
   gap: 4px;
+  max-height: 100%;
 }
 
 .comfymodal-studio-workspace {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 12px;
   overflow-y: auto;
+  max-height: 100%;
 }
 
 /* ── Control Groups ──────────────────────────────────────── */
@@ -611,9 +646,52 @@ const STUDIO_CSS = `
 
 .comfymodal-studio-backend {
   display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.comfymodal-studio-backend-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid #2a2a2a;
+  flex-shrink: 0;
+  background: #0d0d0d;
+}
+
+.comfymodal-studio-backend-tab {
+  background: transparent;
+  border: none;
+  color: #555;
+  padding: 6px 14px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s, background 0.15s;
+}
+
+.comfymodal-studio-backend-tab:hover {
+  color: #d0d0d0;
+  background: #1a1a1a;
+}
+
+.comfymodal-studio-backend-tab.active {
+  color: #dc2626;
+  border-bottom-color: #dc2626;
+}
+
+.comfymodal-studio-backend-body {
+  flex: 1;
+  display: flex;
   flex-direction: row;
   gap: 16px;
-  height: 100%;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .comfymodal-studio-backend-list {
@@ -624,6 +702,7 @@ const STUDIO_CSS = `
   flex-direction: column;
   gap: 4px;
   overflow-y: auto;
+  max-height: 100%;
 }
 
 .comfymodal-studio-backend-detail {
@@ -632,6 +711,7 @@ const STUDIO_CSS = `
   flex-direction: column;
   gap: 8px;
   overflow-y: auto;
+  min-height: 0;
 }
 
 .comfymodal-studio-backend-card {
@@ -712,6 +792,149 @@ const STUDIO_CSS = `
   padding: 16px;
 }
 
+/* ── Snapshot / Backend Preset cards ─────────────────────── */
+
+.comfymodal-studio-snapshot-card,
+.comfymodal-studio-preset-card {
+  background: #111;
+  border: 1px solid #2a2a2a;
+  border-radius: 3px;
+  padding: 10px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.comfymodal-studio-snapshot-card:hover,
+.comfymodal-studio-preset-card:hover {
+  border-color: #444;
+}
+.comfymodal-studio-snapshot-card.active,
+.comfymodal-studio-preset-card.active {
+  border-color: #dc2626;
+}
+.comfymodal-studio-snapshot-card h4,
+.comfymodal-studio-preset-card h4 {
+  margin: 0 0 2px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #d0d0d0;
+}
+.comfymodal-studio-snapshot-card p,
+.comfymodal-studio-preset-card p {
+  margin: 0;
+  font-size: 11px;
+  color: #555;
+}
+
+/* ── Status badges ───────────────────────────────────────── */
+
+.comfymodal-studio-status-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.comfymodal-studio-status-badge.ok {
+  background: #0a2a0a;
+  color: #4ade80;
+  border: 1px solid #1a4a1a;
+}
+.comfymodal-studio-status-badge.warn {
+  background: #2a1a00;
+  color: #fbbf24;
+  border: 1px solid #4a3a00;
+}
+.comfymodal-studio-status-badge.error {
+  background: #2a0a0a;
+  color: #f87171;
+  border: 1px solid #4a1a1a;
+}
+.comfymodal-studio-status-badge.neutral {
+  background: #111;
+  color: #888;
+  border: 1px solid #2a2a2a;
+}
+
+/* ── Features chip grid ──────────────────────────────────── */
+
+.comfymodal-studio-features-chip-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.comfymodal-studio-feature-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 3px 8px;
+  border-radius: 3px;
+  border: 1px solid #2a2a2a;
+  background: #0a0a0a;
+  color: #888;
+  cursor: pointer;
+  transition: all 0.15s;
+  user-select: none;
+}
+.comfymodal-studio-feature-chip:hover {
+  border-color: #444;
+  background: #1a1a1a;
+}
+.comfymodal-studio-feature-chip.checked {
+  background: #1a0a0a;
+  border-color: #dc2626;
+  color: #dc2626;
+}
+.comfymodal-studio-feature-chip .chip-check {
+  display: none;
+}
+.comfymodal-studio-feature-chip.checked .chip-check {
+  display: inline;
+}
+
+/* ── Settings: compact rows ──────────────────────────────── */
+
+.comfymodal-studio-settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 0;
+  border-bottom: 1px solid #1a1a1a;
+  font-size: 12px;
+}
+.comfymodal-studio-settings-row:last-child {
+  border-bottom: none;
+}
+.comfymodal-studio-settings-row-label {
+  color: #a0a0a0;
+}
+.comfymodal-studio-settings-row-value {
+  color: #d0d0d0;
+  text-align: right;
+  font-size: 11px;
+}
+
+/* ── Backend count cards ─────────────────────────────────── */
+
+.comfymodal-studio-stat-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #0a0a0a;
+  border: 1px solid #2a2a2a;
+  border-radius: 3px;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+.comfymodal-studio-stat-card .stat-value {
+  font-weight: 600;
+  color: #d0d0d0;
+  min-width: 24px;
+}
+
 /* ── Axis popover ────────────────────────────────────────── */
 
 .comfymodal-studio-axis-popover {
@@ -752,27 +975,23 @@ const STUDIO_CSS = `
 /* ── Scrollbar styling ───────────────────────────────────── */
 
 .comfymodal-studio-control-panel::-webkit-scrollbar,
-.comfymodal-studio-workspace::-webkit-scrollbar,
-.comfymodal-studio-pagecontainer::-webkit-scrollbar {
+.comfymodal-studio-workspace::-webkit-scrollbar {
   width: 6px;
 }
 
 .comfymodal-studio-control-panel::-webkit-scrollbar-track,
-.comfymodal-studio-workspace::-webkit-scrollbar-track,
-.comfymodal-studio-pagecontainer::-webkit-scrollbar-track {
+.comfymodal-studio-workspace::-webkit-scrollbar-track {
   background: transparent;
 }
 
 .comfymodal-studio-control-panel::-webkit-scrollbar-thumb,
-.comfymodal-studio-workspace::-webkit-scrollbar-thumb,
-.comfymodal-studio-pagecontainer::-webkit-scrollbar-thumb {
+.comfymodal-studio-workspace::-webkit-scrollbar-thumb {
   background: #2a2a2a;
   border-radius: 3px;
 }
 
 .comfymodal-studio-control-panel::-webkit-scrollbar-thumb:hover,
-.comfymodal-studio-workspace::-webkit-scrollbar-thumb:hover,
-.comfymodal-studio-pagecontainer::-webkit-scrollbar-thumb:hover {
+.comfymodal-studio-workspace::-webkit-scrollbar-thumb:hover {
   background: #444;
 }
 `;

@@ -1,16 +1,13 @@
 // Modal Studio — Backend
 //
-// Backend page with two-pane layout: left list, right detail/editor.
-// Studio backend abstraction fields: { id, label, description, compatibleFeatures,
-// sourceType, sourceId, workflowId, modelLabel, modelTriple, loras, defaults,
-// disabledReason, archived }
-// Exports helpers for Playground compare-backends integration.
+// Redesigned with two internal sections/tabs: Snapshots | Backend Presets.
+// Workflow Snapshots: captures of the current ComfyUI graph.
+// Backend Presets: runnable configurations referencing snapshots.
 //
-// Empty state: suggests creating from existing legacy profile/preset or
-// opening Settings > Legacy > Profiles.
+// Exports helpers for Playground compare-backends integration.
 
 let _backendCache = null;
-let _selectedBackendId = null;
+let _selectedItemId = null;
 
 function el(tag, props = {}, children = []) {
   const e = document.createElement(tag);
@@ -32,6 +29,48 @@ function el(tag, props = {}, children = []) {
   }
   return e;
 }
+
+// ── Status badge helper ────────────────────────────────────────────────
+
+function statusBadge(text, kind) {
+  const cls = kind === "ok" ? "comfymodal-studio-status-badge ok"
+    : kind === "warn" ? "comfymodal-studio-status-badge warn"
+    : kind === "error" ? "comfymodal-studio-status-badge error"
+    : "comfymodal-studio-status-badge neutral";
+  return el("span", { class: cls, text: text });
+}
+
+// ── Features chip grid ─────────────────────────────────────────────────
+
+function renderFeaturesChipGrid(features, onChange) {
+  const grid = el("div", { class: "comfymodal-studio-features-chip-grid" });
+  const known = ["txt2img", "object_remove", "object_replace"];
+  const labels = { txt2img: "Txt2Img", object_remove: "Object Remove", object_replace: "Object Replace" };
+  const selected = features || [];
+  known.forEach((fid) => {
+    const isChecked = selected.includes(fid);
+    const chip = el("div", {
+      class: "comfymodal-studio-feature-chip" + (isChecked ? " checked" : ""),
+      "data-feature": fid,
+    }, [
+      el("span", { class: "chip-check", text: "\u2713 " }),
+      el("span", { text: labels[fid] || fid }),
+    ]);
+    chip.addEventListener("click", () => {
+      const was = chip.classList.contains("checked");
+      chip.classList.toggle("checked");
+      const updated = [];
+      grid.querySelectorAll(".comfymodal-studio-feature-chip").forEach((c) => {
+        if (c.classList.contains("checked")) updated.push(c.dataset.feature);
+      });
+      if (onChange) onChange(updated);
+    });
+    grid.appendChild(chip);
+  });
+  return grid;
+}
+
+// ── API helpers ────────────────────────────────────────────────────────
 
 export async function getBackends(context) {
   const apiBase = (context && context.apiBase) || "/comfymodal";
@@ -58,146 +97,340 @@ export async function getCompareBackends(context) {
   }
 }
 
+async function apiFetch(apiBase, path, options) {
+  try {
+    const res = await fetch(`${apiBase}${path}`, options || {});
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
+}
+
+// ── Snapshots API ──────────────────────────────────────────────────────
+
+async function listSnapshots(apiBase) {
+  const data = await apiFetch(apiBase, "/studio/snapshots");
+  return (data && data.snapshots) || [];
+}
+
+async function createSnapshot(apiBase, payload) {
+  const data = await apiFetch(apiBase, "/studio/snapshots", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return data;
+}
+
+async function updateSnapshot(apiBase, id, payload) {
+  return apiFetch(apiBase, `/studio/snapshots/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+async function duplicateSnapshot(apiBase, id) {
+  return apiFetch(apiBase, `/studio/snapshots/${encodeURIComponent(id)}/duplicate`, {
+    method: "POST",
+  });
+}
+
+async function archiveSnapshot(apiBase, id) {
+  return apiFetch(apiBase, `/studio/snapshots/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+// ── Backend Presets API ────────────────────────────────────────────────
+
+async function listPresets(apiBase) {
+  const data = await apiFetch(apiBase, "/studio/presets");
+  return (data && data.presets) || [];
+}
+
+async function createPreset(apiBase, payload) {
+  return apiFetch(apiBase, "/studio/presets", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+async function updatePreset(apiBase, id, payload) {
+  return apiFetch(apiBase, `/studio/presets/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+async function duplicatePreset(apiBase, id) {
+  return apiFetch(apiBase, `/studio/presets/${encodeURIComponent(id)}/duplicate`, {
+    method: "POST",
+  });
+}
+
+async function archivePreset(apiBase, id) {
+  return apiFetch(apiBase, `/studio/presets/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+// ── Take Snapshot of Current Graph ─────────────────────────────────────
+
+async function takeSnapshotOfCurrentGraph(apiBase, listContainer, detailContainer, renderFn) {
+  // Attempt to serialize the current ComfyUI graph
+  const app = window.__comfymodal_comfy_app;
+  let graphJson = null;
+  let apiPromptJson = null;
+  let error = null;
+
+  try {
+    if (app && app.graph && typeof app.graph.serialize === "function") {
+      graphJson = app.graph.serialize();
+    } else {
+      // Try alternate methods
+      const canvas = document.querySelector(".comfy-graph canvas") ||
+                     document.querySelector("canvas");
+      if (window.app && window.app.graph && typeof window.app.graph.serialize === "function") {
+        graphJson = window.app.graph.serialize();
+      } else {
+        error = "Cannot access ComfyUI graph API. Open the main ComfyUI tab first.";
+      }
+    }
+  } catch (e) {
+    error = `Failed to serialize graph: ${e.message}`;
+  }
+
+  if (error) {
+    // Show error in detail panel
+    while (detailContainer.firstChild) detailContainer.removeChild(detailContainer.firstChild);
+    const card = el("div", { class: "comfymodal-studio-backend-detail-card" }, [
+      el("h4", { text: "Error", style: "color:#f87171;margin:0 0 8px;" }),
+      el("p", { text: error, style: "color:#aaa;font-size:12px;" }),
+    ]);
+    detailContainer.appendChild(card);
+    return;
+  }
+
+  // Attempt to generate API prompt safely
+  let status = "Needs API prompt";
+  try {
+    if (app && typeof app.graphToPrompt === "function") {
+      apiPromptJson = await app.graphToPrompt();
+      status = "runnable";
+    } else if (window.comfyAPI && window.comfyAPI.prompt && typeof window.comfyAPI.prompt.graphToPrompt === "function") {
+      apiPromptJson = await window.comfyAPI.prompt.graphToPrompt();
+      status = "runnable";
+    } else {
+      // Try ComfyUI's built-in mechanism
+      const w = typeof comfyUI !== "undefined" ? comfyUI : null;
+      if (w && w.graphToPrompt) {
+        apiPromptJson = await w.graphToPrompt();
+        status = "runnable";
+      } else {
+        apiPromptJson = null;
+        status = "Needs API prompt";
+      }
+    }
+  } catch (e) {
+    apiPromptJson = null;
+    status = "Needs bindings";
+  }
+
+  // Create snapshot via API
+  const payload = {
+    name: `Snapshot ${new Date().toLocaleDateString()} ${new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}`,
+    description: "",
+    compatibleFeatures: [],
+    graphJson: graphJson,
+    apiPromptJson: apiPromptJson,
+    status: status,
+  };
+
+  const result = await createSnapshot(apiBase, payload);
+  if (!result) {
+    while (detailContainer.firstChild) detailContainer.removeChild(detailContainer.firstChild);
+    const card = el("div", { class: "comfymodal-studio-backend-detail-card" }, [
+      el("h4", { text: "Error", style: "color:#f87171;margin:0 0 8px;" }),
+      el("p", { text: "Failed to save snapshot via API.", style: "color:#aaa;font-size:12px;" }),
+    ]);
+    detailContainer.appendChild(card);
+    return;
+  }
+
+  // Refresh the list
+  const snapshots = await listSnapshots(apiBase);
+  _selectedItemId = null;
+  renderSnapshotsList(listContainer, snapshots, apiBase, detailContainer);
+  if (snapshots.length > 0) {
+    _selectedItemId = snapshots[snapshots.length - 1].id;
+    renderSnapshotDetail(detailContainer, snapshots[snapshots.length - 1], apiBase, listContainer);
+  }
+}
+
+// ── Main render entry point ────────────────────────────────────────────
+
 export function renderBackend(state, context) {
   const container = el("div", {
     class: "comfymodal-studio-backend",
     "data-testid": "backend-page",
   });
 
-  // ── Left: Backend List ──────────────────────────────────────
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+
+  // Tabs: Snapshots | Backend Presets
+  const tabs = el("div", { class: "comfymodal-studio-backend-tabs" });
+  let activeTab = "snapshots";
+
+  const body = el("div", { class: "comfymodal-studio-backend-body" });
+
+  // Left list
   const listPanel = el("div", {
     class: "comfymodal-studio-backend-list",
     "data-testid": "backend-list",
   });
 
-  const listHeader = el("div", { style: "display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;" }, [
-    el("h3", {
-      text: "Backends",
-      style: "margin:0;font-size:11px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:0.05em;",
-    }),
-    el("button", {
-      class: "comfymodal-secondary-btn",
-      text: "+ New",
-      style: "font-size:10px;padding:3px 8px;",
-      onclick: () => createNewBackend(state, context, listPanel, detailPanel),
-    }),
-  ]);
-  listPanel.appendChild(listHeader);
-
-  const listContent = el("div", { style: "flex:1;overflow-y:auto;" });
-  listPanel.appendChild(listContent);
-
-  // ── Right: Detail/Editor ────────────────────────────────────
+  // Right detail
   const detailPanel = el("div", {
     class: "comfymodal-studio-backend-detail",
     "data-testid": "backend-detail",
   });
 
-  container.appendChild(listPanel);
-  container.appendChild(detailPanel);
+  body.appendChild(listPanel);
+  body.appendChild(detailPanel);
 
-  // Loading state
-  listContent.textContent = "Loading backends...";
+  function switchTab(tabId) {
+    activeTab = tabId;
+    tabs.querySelectorAll(".comfymodal-studio-backend-tab").forEach((t) => {
+      t.classList.toggle("active", t.dataset.tab === tabId);
+    });
+    _selectedItemId = null;
+    refreshList();
+  }
 
-  // Fetch and render
-  getBackends(context).then((backends) => {
-    while (listContent.firstChild) listContent.removeChild(listContent.firstChild);
+  function makeTab(id, label) {
+    const btn = el("button", {
+      class: "comfymodal-studio-backend-tab" + (id === activeTab ? " active" : ""),
+      "data-tab": id,
+      text: label,
+      onclick: () => switchTab(id),
+    });
+    return btn;
+  }
 
-    if (!backends || backends.length === 0) {
-      renderEmptyState(listContent, detailPanel, context, state);
-      return;
+  tabs.appendChild(makeTab("snapshots", "Snapshots"));
+  tabs.appendChild(makeTab("presets", "Backend Presets"));
+
+  container.appendChild(tabs);
+  container.appendChild(body);
+
+  function refreshList() {
+    while (listPanel.firstChild) listPanel.removeChild(listPanel.firstChild);
+    while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
+
+    if (activeTab === "snapshots") {
+      renderSnapshotsPage(listPanel, detailPanel, apiBase);
+    } else {
+      renderPresetsPage(listPanel, detailPanel, apiBase);
     }
+  }
 
-    renderBackendList(listContent, backends, context, detailPanel, state);
-
-    // Select first backend by default
-    if (backends.length > 0 && !_selectedBackendId) {
-      _selectedBackendId = backends[0].id || backends[0].label;
-      renderBackendDetail(detailPanel, backends[0], context, listContent);
-    }
-    // Highlight first card
-    const firstCard = listContent.querySelector(".comfymodal-studio-backend-card");
-    if (firstCard) firstCard.classList.add("active");
-  });
-
+  refreshList();
   return container;
 }
 
-function renderEmptyState(listContent, detailPanel, context, state) {
-  const emptyCard = el("div", { class: "comfymodal-studio-card" }, [
-    el("p", { text: "No backends configured yet.", style: "font-weight:600;margin:0 0 8px;color:#888;" }),
-    el("p", { text: "Create a new backend or import from legacy profiles.", style: "font-size:12px;color:#555;margin:0 0 8px;" }),
-    el("a", {
-      text: "Open Legacy Profiles",
-      style: "color:#dc2626;cursor:pointer;font-size:12px;",
-      onclick: (e) => {
-        e.preventDefault();
-        if (context && context.setPage) {
-          if (state && state.settings) {
-            state.settings.activeLegacyTab = "profiles";
-          }
-          context.setPage("settings");
-        }
-      },
+// ── Snapshots page ─────────────────────────────────────────────────────
+
+function renderSnapshotsPage(listPanel, detailPanel, apiBase) {
+  const header = el("div", { style: "display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:4px;flex-wrap:wrap;" }, [
+    el("h3", {
+      text: "Workflow Snapshots",
+      style: "margin:0;font-size:11px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:0.05em;",
+    }),
+    el("button", {
+      class: "comfymodal-primary-btn",
+      text: "+ Take Snapshot",
+      style: "font-size:10px;padding:3px 8px;width:auto;",
+      onclick: () => takeSnapshotOfCurrentGraph(apiBase, listPanel, detailPanel, renderSnapshotsList),
     }),
   ]);
-  listContent.appendChild(emptyCard);
+  listPanel.appendChild(header);
 
-  // Show create form in detail panel
-  const newForm = renderBackendForm(null, context, listContent, detailPanel);
-  detailPanel.appendChild(newForm);
+  const listContent = el("div", { style: "flex:1;overflow-y:auto;" });
+  listPanel.appendChild(listContent);
+
+  listContent.textContent = "Loading snapshots...";
+  listSnapshots(apiBase).then((snapshots) => {
+    while (listContent.firstChild) listContent.removeChild(listContent.firstChild);
+    if (!snapshots || snapshots.length === 0) {
+      listContent.appendChild(renderSnapshotsEmpty(apiBase));
+      return;
+    }
+    renderSnapshotsList(listContent, snapshots, apiBase, detailPanel);
+    if (snapshots.length > 0 && !_selectedItemId) {
+      _selectedItemId = snapshots[0].id;
+      renderSnapshotDetail(detailPanel, snapshots[0], apiBase, listContent);
+    }
+  });
 }
 
-function renderBackendList(container, backends, context, detailPanel, state) {
-  while (container.firstChild) container.removeChild(container.firstChild);
+function renderSnapshotsEmpty(apiBase) {
+  return el("div", { class: "comfymodal-studio-card" }, [
+    el("p", { text: "No snapshots yet.", style: "font-weight:600;margin:0 0 8px;color:#888;" }),
+    el("p", { text: 'Click "+ Take Snapshot" to capture the current ComfyUI graph.', style: "font-size:12px;color:#555;margin:0 0 8px;" }),
+  ]);
+}
 
-  backends.forEach((backend) => {
-    const id = backend.id || backend.label || "unknown";
-    const isActive = _selectedBackendId === id;
+function renderSnapshotsList(container, snapshots, apiBase, detailPanel) {
+  while (container.firstChild) container.removeChild(container.firstChild);
+  snapshots.forEach((snap) => {
+    const id = snap.id || "unknown";
+    const isActive = _selectedItemId === id;
+    const label = snap.name || snap.id || "Unnamed";
+    const status = snap.status || "unknown";
+    const statusKind = status === "runnable" ? "ok" : status === "Needs bindings" ? "error" : "warn";
+    const desc = snap.description || snap.modelSummary || "";
+    const featureHint = (snap.compatibleFeatures || []).join(", ");
 
     const card = el("div", {
-      class: `comfymodal-studio-backend-card${isActive ? " active" : ""}`,
+      class: "comfymodal-studio-snapshot-card" + (isActive ? " active" : ""),
       onclick: () => {
-        _selectedBackendId = id;
-        // Update active state
-        container.querySelectorAll(".comfymodal-studio-backend-card").forEach((c) => c.classList.remove("active"));
+        _selectedItemId = id;
+        container.querySelectorAll(".comfymodal-studio-snapshot-card").forEach((c) => c.classList.remove("active"));
         card.classList.add("active");
-        // Render detail
         while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
-        renderBackendDetail(detailPanel, backend, context, container);
+        renderSnapshotDetail(detailPanel, snap, apiBase, container);
       },
     }, [
-      el("h4", { text: backend.label || backend.id || "Unnamed" }),
-      el("p", { text: backend.description || backend.sourceType || (backend.compatibleFeatures || []).join(", ") || "No description" }),
+      el("h4", { text: label.substring(0, 60) }),
+      el("p", { style: "margin:2px 0;" }, [statusBadge(status, statusKind)]),
+      el("p", { text: (desc || featureHint || "").substring(0, 80) }),
     ]);
     container.appendChild(card);
   });
 }
 
-function renderBackendDetail(container, backend, context, listContainer) {
+function renderSnapshotDetail(container, snap, apiBase, listContainer) {
   while (container.firstChild) container.removeChild(container.firstChild);
 
-  const detailCard = el("div", { class: "comfymodal-studio-backend-detail-card" });
+  const card = el("div", { class: "comfymodal-studio-backend-detail-card" });
 
-  // ── Editable fields ─────────────────────────────────────
+  // Status
+  const status = snap.status || "unknown";
+  const statusKind = status === "runnable" ? "ok" : status === "Needs bindings" ? "error" : "warn";
+  card.appendChild(el("div", { style: "margin-bottom:8px;" }, [statusBadge(status, statusKind)]));
+
+  const fieldValues = { ...snap };
   const fields = [
-    { key: "label", label: "Label", type: "text", value: backend.label || "" },
-    { key: "description", label: "Description", type: "textarea", value: backend.description || "" },
-    { key: "sourceType", label: "Source Type", type: "text", value: backend.sourceType || "" },
-    { key: "sourceId", label: "Source ID", type: "text", value: backend.sourceId || "" },
-    { key: "workflowId", label: "Workflow ID", type: "text", value: backend.workflowId || "" },
-    { key: "modelLabel", label: "Model Label", type: "text", value: backend.modelLabel || "" },
-    { key: "modelTriple", label: "Model Triple", type: "text", value: backend.modelTriple || "" },
-    { key: "disabledReason", label: "Disabled Reason", type: "text", value: backend.disabledReason || "" },
+    { key: "name", label: "Name", type: "text", value: snap.name || "" },
+    { key: "description", label: "Description", type: "textarea", value: snap.description || "" },
+    { key: "modelSummary", label: "Model Summary", type: "textarea", value: snap.modelSummary || "" },
   ];
 
-  const fieldValues = {};
-
   fields.forEach((f) => {
-    const fieldGroup = el("div", { class: "comfymodal-studio-backend-field" });
-    const label = el("label", { text: f.label });
-    fieldGroup.appendChild(label);
-
+    const fg = el("div", { class: "comfymodal-studio-backend-field" });
+    fg.appendChild(el("label", { text: f.label }));
     let input;
     if (f.type === "textarea") {
       input = el("textarea", { value: f.value, rows: 2 });
@@ -205,64 +438,57 @@ function renderBackendDetail(container, backend, context, listContainer) {
       input = el("input", { type: "text", value: f.value });
     }
     input.addEventListener("input", () => { fieldValues[f.key] = input.value; });
-    fieldGroup.appendChild(input);
-    detailCard.appendChild(fieldGroup);
-    fieldValues[f.key] = f.value;
+    fg.appendChild(input);
+    card.appendChild(fg);
   });
 
-  // ── Feature Compatibility Checkboxes ─────────────────────
+  // Compatible Features chip grid
   const compatGroup = el("div", { class: "comfymodal-studio-backend-field" });
-  const compatLabel = el("label", { text: "Compatible Features" });
-  compatGroup.appendChild(compatLabel);
-
-  const compatFeatures = backend.compatibleFeatures || [];
-  ["txt2img", "object_remove", "object_replace"].forEach((feature) => {
-    const cbLabel = el("label", { style: "display:flex;align-items:center;gap:4px;font-size:11px;margin:2px 0;color:#888;" });
-    const cb = el("input", { type: "checkbox" });
-    cb.checked = compatFeatures.includes(feature);
-    cb.addEventListener("change", () => {
-      fieldValues.compatibleFeatures = fieldValues.compatibleFeatures || [...compatFeatures];
-      if (cb.checked) {
-        if (!fieldValues.compatibleFeatures.includes(feature)) {
-          fieldValues.compatibleFeatures.push(feature);
-        }
-      } else {
-        fieldValues.compatibleFeatures = fieldValues.compatibleFeatures.filter((f) => f !== feature);
-      }
-    });
-    cbLabel.appendChild(cb);
-    cbLabel.appendChild(document.createTextNode(feature === "txt2img" ? "Txt2Img" : feature === "object_remove" ? "Object Remove" : "Object Replace"));
-    compatGroup.appendChild(cbLabel);
+  compatGroup.appendChild(el("label", { text: "Compatible Features" }));
+  const chipGrid = renderFeaturesChipGrid(snap.compatibleFeatures || [], (updated) => {
+    fieldValues.compatibleFeatures = updated;
   });
-  if (!compatFeatures.length) {
-    const note = el("p", { text: "None selected", style: "font-size:11px;color:#555;margin:2px 0;" });
-    compatGroup.appendChild(note);
-  }
-  detailCard.appendChild(compatGroup);
+  compatGroup.appendChild(chipGrid);
+  card.appendChild(compatGroup);
 
-  // ── LoRA list ──────────────────────────────────────────
-  const loraGroup = el("div", { class: "comfymodal-studio-backend-field" });
-  const loraLabel = el("label", { text: "LoRAs" });
-  loraGroup.appendChild(loraLabel);
-  const loraText = el("p", {
-    text: (backend.loras && backend.loras.length > 0)
-      ? backend.loras.map((l) => l.name || l).join(", ")
-      : "None configured",
-    style: "font-size:11px;color:#555;",
-  });
-  loraGroup.appendChild(loraText);
-  detailCard.appendChild(loraGroup);
-
-  // ── Archival status ────────────────────────────────────
-  if (backend.archived) {
-    const archivedNote = el("p", {
-      text: "\u26a0 Archived",
-      style: "font-size:11px;color:#dc2626;margin:4px 0;",
-    });
-    detailCard.appendChild(archivedNote);
+  // Graph JSON summary
+  if (snap.graphJson) {
+    const nodeCount = snap.graphJson.nodes ? snap.graphJson.nodes.length : "?";
+    const linkCount = snap.graphJson.links ? snap.graphJson.links.length : "?";
+    const graphGroup = el("div", { class: "comfymodal-studio-backend-field" });
+    graphGroup.appendChild(el("label", { text: "Graph" }));
+    graphGroup.appendChild(el("p", { text: `${nodeCount} nodes, ${linkCount} links`, style: "font-size:11px;color:#555;margin:2px 0;" }));
+    card.appendChild(graphGroup);
   }
 
-  // ── Action buttons ─────────────────────────────────────
+  // API Prompt status
+  if (snap.apiPromptJson) {
+    card.appendChild(el("p", { text: "\u2713 API prompt available", style: "font-size:11px;color:#4ade80;margin:4px 0;" }));
+  } else if (status === "Needs bindings" || status === "Needs API prompt") {
+    card.appendChild(el("p", { text: "\u26a0 " + (status === "Needs bindings" ? "Missing required bindings or output mapping" : "API prompt not yet generated"), style: "font-size:11px;color:#fbbf24;margin:4px 0;" }));
+  }
+
+  // Source info
+  const source = snap.source || "";
+  if (source) {
+    card.appendChild(el("p", { text: `Source: ${source}`, style: "font-size:11px;color:#555;margin:4px 0;" }));
+  }
+
+  // Timestamps
+  const created = snap.createdAt || "";
+  const updated = snap.updatedAt || "";
+  if (created) card.appendChild(el("p", { text: `Created: ${created}`, style: "font-size:10px;color:#555;margin:2px 0;" }));
+  if (updated) card.appendChild(el("p", { text: `Updated: ${updated}`, style: "font-size:10px;color:#555;margin:2px 0;" }));
+
+  // Archived
+  if (snap.archived) {
+    card.appendChild(el("p", { text: "\u26a0 Archived", style: "font-size:11px;color:#f87171;margin:4px 0;" }));
+  }
+  if (snap.disabledReason) {
+    card.appendChild(el("p", { text: `Disabled: ${snap.disabledReason}`, style: "font-size:11px;color:#f87171;margin:4px 0;" }));
+  }
+
+  // Actions
   const actions = el("div", { class: "comfymodal-studio-backend-actions" });
 
   const saveBtn = el("button", {
@@ -270,133 +496,265 @@ function renderBackendDetail(container, backend, context, listContainer) {
     text: "Save",
     style: "width:auto;padding:5px 16px;",
     onclick: async () => {
-      const apiBase = (context && context.apiBase) || "/comfymodal";
-      try {
-        // Align payload with backend PATCH route: name + studio_metadata
-        const studioMeta = { ...fieldValues };
-        if (!studioMeta.compatibleFeatures) studioMeta.compatibleFeatures = compatFeatures;
-        delete studioMeta.name; // name is stored at top level
-        const payload = {
-          name: fieldValues.label || backend.label || backend.id || "",
-          studio_metadata: studioMeta,
-          disabled_reason: fieldValues.disabledReason || backend.disabledReason || "",
-        };
-        const res = await fetch(
-          `${apiBase}/studio/backends/${encodeURIComponent(backend.id || backend.label)}`,
-          {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-          }
-        );
-        if (res.ok) {
-          _backendCache = null;
-          const fresh = await getBackends(context);
-          renderBackendList(listContainer, fresh, context, container, {});
-          if (fresh.length > 0) {
-            _selectedBackendId = fresh[0].id || fresh[0].label;
-            renderBackendDetail(container, fresh[0], context, listContainer);
-          }
-        }
-      } catch {
-        // silent
-      }
+      await updateSnapshot(apiBase, snap.id, fieldValues);
+      const fresh = await listSnapshots(apiBase);
+      renderSnapshotsList(listContainer, fresh, apiBase, container);
     },
   });
   actions.appendChild(saveBtn);
 
-  const duplicateBtn = el("button", {
+  const dupBtn = el("button", {
     class: "comfymodal-secondary-btn",
     text: "Duplicate",
     style: "font-size:10px;padding:5px 12px;",
     onclick: async () => {
-      const apiBase = (context && context.apiBase) || "/comfymodal";
-      try {
-        const res = await fetch(
-          `${apiBase}/studio/backends/${encodeURIComponent(backend.id || backend.label)}/duplicate`,
-          { method: "POST" }
-        );
-        if (res.ok) {
-          _backendCache = null;
-          const fresh = await getBackends(context);
-          renderBackendList(listContainer, fresh, context, container, {});
-          if (fresh.length > 0) {
-            _selectedBackendId = fresh[0].id || fresh[0].label;
-            renderBackendDetail(container, fresh[0], context, listContainer);
-          }
-        }
-      } catch {
-        // silent
-      }
+      await duplicateSnapshot(apiBase, snap.id);
+      const fresh = await listSnapshots(apiBase);
+      renderSnapshotsList(listContainer, fresh, apiBase, container);
     },
   });
-  actions.appendChild(duplicateBtn);
+  actions.appendChild(dupBtn);
 
-  if (!backend.archived) {
+  if (!snap.archived) {
     const archiveBtn = el("button", {
       class: "comfymodal-destructive-btn",
       text: "Archive",
       style: "font-size:10px;padding:5px 12px;",
       onclick: async () => {
-        const apiBase = (context && context.apiBase) || "/comfymodal";
-        try {
-          const res = await fetch(
-            `${apiBase}/studio/backends/${encodeURIComponent(backend.id || backend.label)}`,
-            { method: "DELETE" }
-          );
-          if (res.ok) {
-            _backendCache = null;
-            _selectedBackendId = null;
-            const fresh = await getBackends(context);
-            // Re-render list
-            const parentList = listContainer.closest(".comfymodal-studio-backend")?.querySelector(".comfymodal-studio-backend-list > div:last-child");
-            if (parentList) {
-              // Full re-render
-              while (listContainer.firstChild) listContainer.removeChild(listContainer.firstChild);
-              while (container.firstChild) container.removeChild(container.firstChild);
-              if (fresh.length === 0) {
-                renderEmptyState(listContainer, container, context);
-              } else {
-                renderBackendList(listContainer, fresh, context, container, {});
-                _selectedBackendId = fresh[0].id || fresh[0].label;
-                renderBackendDetail(container, fresh[0], context, listContainer);
-              }
-            }
+        if (confirm("Archive this snapshot?")) {
+          await archiveSnapshot(apiBase, snap.id);
+          _selectedItemId = null;
+          const fresh = await listSnapshots(apiBase);
+          while (container.firstChild) container.removeChild(container.firstChild);
+          renderSnapshotsList(listContainer, fresh, apiBase, container);
+          if (fresh.length > 0) {
+            _selectedItemId = fresh[0].id;
+            renderSnapshotDetail(container, fresh[0], apiBase, listContainer);
           }
-        } catch {
-          // silent
         }
       },
     });
     actions.appendChild(archiveBtn);
   }
 
-  detailCard.appendChild(actions);
-  container.appendChild(detailCard);
+  card.appendChild(actions);
+  container.appendChild(card);
 }
 
-function renderBackendForm(existing, context, listContainer, detailPanel) {
+// ── Backend Presets page ────────────────────────────────────────────────
+
+function renderPresetsPage(listPanel, detailPanel, apiBase) {
+  const header = el("div", { style: "display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:4px;flex-wrap:wrap;" }, [
+    el("h3", {
+      text: "Backend Presets",
+      style: "margin:0;font-size:11px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:0.05em;",
+    }),
+    el("button", {
+      class: "comfymodal-secondary-btn",
+      text: "+ New Preset",
+      style: "font-size:10px;padding:3px 8px;",
+      onclick: () => renderPresetForm(null, apiBase, listPanel, detailPanel),
+    }),
+  ]);
+  listPanel.appendChild(header);
+
+  const listContent = el("div", { style: "flex:1;overflow-y:auto;" });
+  listPanel.appendChild(listContent);
+
+  // Legacy comparison profile discovery link
+  const legacyNote = el("div", { style: "margin-bottom:8px;" }, [
+    el("p", { text: "Presets from legacy comparison profiles are auto-discovered.", style: "font-size:10px;color:#555;" }),
+  ]);
+  listPanel.appendChild(legacyNote);
+
+  listContent.textContent = "Loading presets...";
+  listPresets(apiBase).then((presets) => {
+    while (listContent.firstChild) listContent.removeChild(listContent.firstChild);
+    if (!presets || presets.length === 0) {
+      listContent.appendChild(renderPresetsEmpty(apiBase));
+      return;
+    }
+    renderPresetsList(listContent, presets, apiBase, detailPanel);
+    if (presets.length > 0 && !_selectedItemId) {
+      _selectedItemId = presets[0].id;
+      renderPresetDetail(detailPanel, presets[0], apiBase, listContent);
+    }
+  });
+}
+
+// Legacy empty state renderer (kept for backward compatibility with tests)
+function renderEmptyState(listContent, detailPanel, context, state) {
+  while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
+  const emptyCard = el("div", { class: "comfymodal-studio-card" }, [
+    el("p", { text: "No backends configured via legacy discovery.", style: "font-weight:600;margin:0 0 8px;color:#888;" }),
+    el("p", { text: "Use the Snapshots or Backend Presets tabs above.", style: "font-size:12px;color:#555;margin:0 0 8px;" }),
+  ]);
+  while (listContent.firstChild) listContent.removeChild(listContent.firstChild);
+  listContent.appendChild(emptyCard);
+}
+
+function renderPresetsEmpty(apiBase) {
+  return el("div", { class: "comfymodal-studio-card" }, [
+    el("p", { text: "No backend presets configured.", style: "font-weight:600;margin:0 0 8px;color:#888;" }),
+    el("p", { text: 'Click "+ New Preset" to create one, or legacy comparison profiles will be auto-discovered.', style: "font-size:12px;color:#555;margin:0;" }),
+  ]);
+}
+
+function renderPresetsList(container, presets, apiBase, detailPanel) {
+  while (container.firstChild) container.removeChild(container.firstChild);
+  presets.forEach((preset) => {
+    const id = preset.id || "unknown";
+    const isActive = _selectedItemId === id;
+    const label = preset.label || preset.name || preset.id || "Unnamed";
+    const snapshotId = preset.snapshotId || "";
+    const disabled = preset.disabledReason || "";
+    const desc = preset.description || "";
+
+    const card = el("div", {
+      class: "comfymodal-studio-preset-card" + (isActive ? " active" : ""),
+      onclick: () => {
+        _selectedItemId = id;
+        container.querySelectorAll(".comfymodal-studio-preset-card").forEach((c) => c.classList.remove("active"));
+        card.classList.add("active");
+        while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
+        renderPresetDetail(detailPanel, preset, apiBase, container);
+      },
+    }, [
+      el("h4", { text: label.substring(0, 60) }),
+      el("p", { text: ((desc || (snapshotId ? `Snapshot: ${snapshotId.substring(0, 12)}` : "") || "No description")).substring(0, 80) }),
+    ]);
+    if (disabled) {
+      card.appendChild(el("p", { text: `Disabled: ${disabled}`, style: "color:#f87171;font-size:10px;margin:2px 0;" }));
+    }
+    container.appendChild(card);
+  });
+}
+
+function renderPresetDetail(container, preset, apiBase, listContainer) {
+  while (container.firstChild) container.removeChild(container.firstChild);
+
+  const card = el("div", { class: "comfymodal-studio-backend-detail-card" });
+  const fieldValues = { ...preset };
+
+  const fields = [
+    { key: "label", label: "Label", type: "text", value: preset.label || preset.name || "" },
+    { key: "description", label: "Description", type: "textarea", value: preset.description || "" },
+    { key: "snapshotId", label: "Snapshot ID", type: "text", value: preset.snapshotId || "" },
+    { key: "sourceType", label: "Source Type", type: "text", value: preset.sourceType || "" },
+    { key: "sourceId", label: "Source ID", type: "text", value: preset.sourceId || "" },
+    { key: "disabledReason", label: "Disabled Reason", type: "text", value: preset.disabledReason || "" },
+  ];
+
+  fields.forEach((f) => {
+    const fg = el("div", { class: "comfymodal-studio-backend-field" });
+    fg.appendChild(el("label", { text: f.label }));
+    let input;
+    if (f.type === "textarea") {
+      input = el("textarea", { value: f.value, rows: 2 });
+    } else {
+      input = el("input", { type: "text", value: f.value });
+    }
+    input.addEventListener("input", () => { fieldValues[f.key] = input.value; });
+    fg.appendChild(input);
+    card.appendChild(fg);
+  });
+
+  // Compatible Features chip grid
+  const compatGroup = el("div", { class: "comfymodal-studio-backend-field" });
+  compatGroup.appendChild(el("label", { text: "Compatible Features" }));
+  const chipGrid = renderFeaturesChipGrid(preset.compatibleFeatures || [], (updated) => {
+    fieldValues.compatibleFeatures = updated;
+  });
+  compatGroup.appendChild(chipGrid);
+  card.appendChild(compatGroup);
+
+  // Defaults
+  const defaults = preset.defaults || {};
+  if (Object.keys(defaults).length > 0) {
+    const defaultsGroup = el("div", { class: "comfymodal-studio-backend-field" });
+    defaultsGroup.appendChild(el("label", { text: "Defaults" }));
+    defaultsGroup.appendChild(el("p", { text: JSON.stringify(defaults, null, 2), style: "font-size:10px;color:#555;white-space:pre-wrap;" }));
+    card.appendChild(defaultsGroup);
+  }
+
+  // Archived/Disabled
+  if (preset.archived) {
+    card.appendChild(el("p", { text: "\u26a0 Archived", style: "font-size:11px;color:#f87171;margin:4px 0;" }));
+  }
+
+  // Actions
+  const actions = el("div", { class: "comfymodal-studio-backend-actions" });
+
+  const saveBtn = el("button", {
+    class: "comfymodal-primary-btn",
+    text: "Save",
+    style: "width:auto;padding:5px 16px;",
+    onclick: async () => {
+      await updatePreset(apiBase, preset.id, fieldValues);
+      const fresh = await listPresets(apiBase);
+      renderPresetsList(listContainer, fresh, apiBase, container);
+    },
+  });
+  actions.appendChild(saveBtn);
+
+  const dupBtn = el("button", {
+    class: "comfymodal-secondary-btn",
+    text: "Duplicate",
+    style: "font-size:10px;padding:5px 12px;",
+    onclick: async () => {
+      await duplicatePreset(apiBase, preset.id);
+      const fresh = await listPresets(apiBase);
+      renderPresetsList(listContainer, fresh, apiBase, container);
+    },
+  });
+  actions.appendChild(dupBtn);
+
+  if (!preset.archived) {
+    const archiveBtn = el("button", {
+      class: "comfymodal-destructive-btn",
+      text: "Archive",
+      style: "font-size:10px;padding:5px 12px;",
+      onclick: async () => {
+        if (confirm("Archive this preset?")) {
+          await archivePreset(apiBase, preset.id);
+          _selectedItemId = null;
+          const fresh = await listPresets(apiBase);
+          while (container.firstChild) container.removeChild(container.firstChild);
+          renderPresetsList(listContainer, fresh, apiBase, container);
+          if (fresh.length > 0) {
+            _selectedItemId = fresh[0].id;
+            renderPresetDetail(container, fresh[0], apiBase, listContainer);
+          }
+        }
+      },
+    });
+    actions.appendChild(archiveBtn);
+  }
+
+  card.appendChild(actions);
+  container.appendChild(card);
+}
+
+function renderPresetForm(existing, apiBase, listPanel, detailPanel) {
+  while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
   const formCard = el("div", { class: "comfymodal-studio-backend-detail-card" });
 
   const heading = el("h4", {
-    text: existing ? "Edit Backend" : "New Backend",
+    text: "New Backend Preset",
     style: "margin:0 0 12px;font-size:12px;color:#d0d0d0;text-transform:uppercase;letter-spacing:0.05em;",
   });
   formCard.appendChild(heading);
 
+  const fieldValues = { label: "", description: "", snapshotId: "", compatibleFeatures: [] };
   const fields = [
     { key: "label", label: "Label", type: "text" },
     { key: "description", label: "Description", type: "textarea" },
-    { key: "sourceType", label: "Source Type", type: "text" },
-    { key: "workflowId", label: "Workflow ID", type: "text" },
-    { key: "modelLabel", label: "Model Label", type: "text" },
+    { key: "snapshotId", label: "Snapshot ID", type: "text" },
   ];
 
-  const fieldValues = {};
   fields.forEach((f) => {
-    const fieldGroup = el("div", { class: "comfymodal-studio-backend-field" });
-    const label = el("label", { text: f.label });
-    fieldGroup.appendChild(label);
+    const fg = el("div", { class: "comfymodal-studio-backend-field" });
+    fg.appendChild(el("label", { text: f.label }));
     let input;
     if (f.type === "textarea") {
       input = el("textarea", { rows: 2 });
@@ -404,30 +762,17 @@ function renderBackendForm(existing, context, listContainer, detailPanel) {
       input = el("input", { type: "text" });
     }
     input.addEventListener("input", () => { fieldValues[f.key] = input.value; });
-    fieldGroup.appendChild(input);
-    formCard.appendChild(fieldGroup);
-    fieldValues[f.key] = "";
+    fg.appendChild(input);
+    formCard.appendChild(fg);
   });
 
+  // Compatible Features
   const compatGroup = el("div", { class: "comfymodal-studio-backend-field" });
-  const compatLabel = el("label", { text: "Compatible Features" });
-  compatGroup.appendChild(compatLabel);
-  const compatFeatures = [];
-  ["txt2img", "object_remove", "object_replace"].forEach((feature) => {
-    const cbLabel = el("label", { style: "display:flex;align-items:center;gap:4px;font-size:11px;margin:2px 0;color:#888;" });
-    const cb = el("input", { type: "checkbox" });
-    cb.addEventListener("change", () => {
-      if (cb.checked) {
-        if (!compatFeatures.includes(feature)) compatFeatures.push(feature);
-      } else {
-        const idx = compatFeatures.indexOf(feature);
-        if (idx > -1) compatFeatures.splice(idx, 1);
-      }
-    });
-    cbLabel.appendChild(cb);
-    cbLabel.appendChild(document.createTextNode(feature === "txt2img" ? "Txt2Img" : feature === "object_remove" ? "Object Remove" : "Object Replace"));
-    compatGroup.appendChild(cbLabel);
+  compatGroup.appendChild(el("label", { text: "Compatible Features" }));
+  const chipGrid = renderFeaturesChipGrid([], (updated) => {
+    fieldValues.compatibleFeatures = updated;
   });
+  compatGroup.appendChild(chipGrid);
   formCard.appendChild(compatGroup);
 
   const actions = el("div", { class: "comfymodal-studio-backend-actions" });
@@ -437,49 +782,31 @@ function renderBackendForm(existing, context, listContainer, detailPanel) {
     text: "Create",
     style: "width:auto;padding:5px 16px;",
     onclick: async () => {
-      const apiBase = (context && context.apiBase) || "/comfymodal";
-      try {
-        // Align create payload with backend POST route: name + studio_metadata
-        const studioMeta = { ...fieldValues, compatibleFeatures: compatFeatures };
-        const payload = {
-          name: fieldValues.label || "New Backend",
-          studio_metadata: studioMeta,
-        };
-        const res = await fetch(`${apiBase}/studio/backends`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        if (res.ok) {
-          _backendCache = null;
-          const fresh = await getBackends(context);
-          // Re-render the whole page
-          while (listContainer.firstChild) listContainer.removeChild(listContainer.firstChild);
-          while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
-          if (fresh.length === 0) {
-            renderEmptyState(listContainer, detailPanel, context);
-          } else {
-            renderBackendList(listContainer, fresh, context, detailPanel, {});
-            _selectedBackendId = fresh[0].id || fresh[0].label;
-            renderBackendDetail(detailPanel, fresh[0], context, listContainer);
-          }
-        }
-      } catch {
-        // silent
+      const result = await createPreset(apiBase, fieldValues);
+      if (result) {
+        _selectedItemId = null;
+        // Re-render the presets page
+        while (listPanel.firstChild) listPanel.removeChild(listPanel.firstChild);
+        while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
+        renderPresetsPage(listPanel, detailPanel, apiBase);
       }
     },
   });
   actions.appendChild(createBtn);
 
-  formCard.appendChild(actions);
-  return formCard;
-}
+  const cancelBtn = el("button", {
+    class: "comfymodal-secondary-btn",
+    text: "Cancel",
+    style: "font-size:10px;padding:5px 12px;",
+    onclick: () => {
+      _selectedItemId = null;
+      while (listPanel.firstChild) listPanel.removeChild(listPanel.firstChild);
+      while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
+      renderPresetsPage(listPanel, detailPanel, apiBase);
+    },
+  });
+  actions.appendChild(cancelBtn);
 
-function createNewBackend(state, context, listPanel, detailPanel) {
-  while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
-  const parentContainer = listPanel.closest(".comfymodal-studio-backend")
-    ? listPanel.closest(".comfymodal-studio-backend").querySelector(".comfymodal-studio-backend-detail")
-    : detailPanel;
-  const form = renderBackendForm(null, context, listPanel, parentContainer || detailPanel);
-  (parentContainer || detailPanel).appendChild(form);
+  formCard.appendChild(actions);
+  detailPanel.appendChild(formCard);
 }
