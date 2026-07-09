@@ -288,13 +288,14 @@ class VisualRedesignTokenTests(unittest.TestCase):
     def setUp(self) -> None:
         self.text = _JsModule(WEB / "testing-styles.js").text
 
-    def test_canonical_modal_gpu_naming_in_header(self):
-        """modal-testing.js header must display 'Modal GPU'."""
+    def test_canonical_studio_header_naming(self):
+        """modal-testing.js / studio-shell.js header must display 'Modal Studio'."""
         text = _JsModule(WEB / "modal-testing.js").text
         self.assertIn(
-            "Modal GPU",
+            "Modal Studio",
             text,
-            "Expected 'Modal GPU' as the visible header title",
+            "Expected 'Modal Studio' as the Studio shell header title — "
+            "replaces old 'Modal GPU' header",
         )
 
     def test_tokenized_color_tokens_present(self):
@@ -668,6 +669,456 @@ class ProgressiveClarityHistoryTests(unittest.TestCase):
             text,
             "Expected testing-history-row-meta for bottom line of row",
         )
+
+
+# ---------------------------------------------------------------------------
+# Studio Shell Contract Tests (Task 1 — Studio shell redesign)
+# ---------------------------------------------------------------------------
+
+class StudioShellContractTests(unittest.TestCase):
+    """New Studio shell top nav and Studio module surface."""
+
+    def test_main_nav_uses_playground_history_settings_only(self):
+        """modal-testing.js must reference Playground, History, and Settings."""
+        text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
+        self.assertIn("Playground", text)
+        self.assertIn("History", text)
+        self.assertIn("Settings", text)
+
+    def test_old_primary_tabs_not_in_main_nav(self):
+        """Old Dashboard/Setup/Profiles/Results must NOT appear in main nav."""
+        text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
+        self.assertNotIn(
+            'text: "Dashboard"', text,
+            "Dashboard must not be a top-level nav item",
+        )
+        self.assertNotIn(
+            'text: "Setup"', text,
+            "Setup must not be a top-level nav item",
+        )
+        self.assertNotIn(
+            'text: "Profiles"', text,
+            "Profiles must not be a top-level nav item",
+        )
+        self.assertNotIn(
+            'text: "Results"', text,
+            "Results must not be a top-level nav item",
+        )
+
+    def test_studio_modules_exist(self):
+        """All required Studio module files must exist in web/."""
+        for name in [
+            "studio-shell.js",
+            "studio-playground.js",
+            "studio-history.js",
+            "studio-settings.js",
+            "studio-feature-registry.js",
+            "studio-experiment-mode.js",
+            "studio-legacy.js",
+            "studio-styles.js",
+        ]:
+            self.assertTrue(
+                (WEB / name).exists(),
+                f"Required Studio module web/{name} is missing",
+            )
+
+    # ── Feature registry content ────────────────────────────────────────
+
+    def test_feature_registry_has_txt2img(self):
+        """studio-feature-registry.js must define a txt2img feature."""
+        text = (WEB / "studio-feature-registry.js").read_text(encoding="utf-8")
+        self.assertIn("txt2img", text)
+
+    def test_feature_registry_has_object_remove(self):
+        """studio-feature-registry.js must define an object_remove feature."""
+        text = (WEB / "studio-feature-registry.js").read_text(encoding="utf-8")
+        self.assertIn("object_remove", text)
+
+    def test_feature_registry_has_object_replace(self):
+        """studio-feature-registry.js must define an object_replace feature."""
+        text = (WEB / "studio-feature-registry.js").read_text(encoding="utf-8")
+        self.assertIn("object_replace", text)
+
+    # ── No separate Test Axes page/list ─────────────────────────────────
+
+    def test_no_separate_test_axes_list(self):
+        """Studio modules must NOT define a separate 'Test Axes' concept as a page.
+
+        Experiment mode lives inside Playground as a toggle, not as a separate
+        top-level page or master list.
+        """
+        text = (WEB / "studio-shell.js").read_text(encoding="utf-8")
+        self.assertNotIn("Test Axes", text)
+
+
+class StudioLegacyContractTests(unittest.TestCase):
+    """Legacy reachability via Settings and truthful placeholder copy."""
+
+    def test_settings_legacy_mentions_all_old_tabs(self):
+        """studio-settings.js must list all old tabs under Legacy section."""
+        text = (WEB / "studio-settings.js").read_text(encoding="utf-8")
+        for needle in [
+            "Legacy Dashboard",
+            "Legacy Setup",
+            "Legacy Profiles",
+            "Legacy Results",
+            "Legacy History",
+            "Legacy Settings",
+        ]:
+            self.assertIn(
+                needle, text,
+                f"Expected '{needle}' in studio-settings.js Legacy section",
+            )
+
+    def test_playground_uses_honest_future_placeholder_copy(self):
+        """studio-playground.js must use honest future-work copy for image-edit tools."""
+        text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+        self.assertTrue(
+            "future work" in text.lower()
+            or "not implemented yet" in text.lower(),
+            "Expected honest future-work placeholder copy in studio-playground.js",
+        )
+
+    # ── History uses real data ─────────────────────────────────────────
+
+    def test_history_has_run_history_endpoint(self):
+        """studio-history.js must fetch from the run-history API endpoint."""
+        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
+        self.assertIn(
+            "run-history", text,
+            "Expected run-history endpoint reference in studio-history.js",
+        )
+
+    def test_history_shows_truthful_empty_state(self):
+        """studio-history.js must show a truthful empty state, not decorative text."""
+        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
+        self.assertTrue(
+            "No run history" in text or "No history" in text or "No experiments" in text,
+            "Expected truthful empty state text in studio-history.js",
+        )
+
+    # ── Settings sections with data-section attributes ─────────────────
+
+    def test_settings_sections_have_data_section_attributes(self):
+        """studio-settings.js must have data-section attributes on each section."""
+        text = (WEB / "studio-settings.js").read_text(encoding="utf-8")
+        for section in ["studio", "backends", "runtime", "features", "legacy"]:
+            self.assertIn(
+                f'data-section="{section}"', text,
+                f"Expected data-section=\"{section}\" in studio-settings.js",
+            )
+
+    def test_settings_legacy_items_clickable(self):
+        """studio-settings.js must make legacy items clickable to load old screens."""
+        text = (WEB / "studio-settings.js").read_text(encoding="utf-8")
+        self.assertIn(
+            "mountLegacyTab", text,
+            "Expected mountLegacyTab reference in studio-settings.js",
+        )
+
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — Real Playground layout & experiment mode (structural)
+# ---------------------------------------------------------------------------
+
+class PlaygroundLayoutTests(unittest.TestCase):
+    """Playground must have a real control panel and workspace layout."""
+
+    def setUp(self) -> None:
+        self.text = _JsModule(WEB / "studio-playground.js").text
+
+    def test_playground_has_control_panel_class(self):
+        """studio-playground.js must use comfymodal-studio-control-panel."""
+        self.assertIn(
+            "comfymodal-studio-control-panel",
+            self.text,
+            "Expected control panel class in studio-playground.js",
+        )
+
+    def test_playground_has_workspace_class(self):
+        """studio-playground.js must use comfymodal-studio-workspace."""
+        self.assertIn(
+            "comfymodal-studio-workspace",
+            self.text,
+            "Expected workspace class in studio-playground.js",
+        )
+
+    def test_playground_has_feature_selector(self):
+        """studio-playground.js must have a feature selector element."""
+        self.assertIn(
+            "data-testid",
+            self.text,
+            "Expected data-testid attribute usage in studio-playground.js",
+        )
+        self.assertIn(
+            "feature-selector",
+            self.text,
+            "Expected feature-selector testid in studio-playground.js",
+        )
+
+    def test_playground_has_prompt_input(self):
+        """studio-playground.js must have a prompt/instruction input."""
+        self.assertIn(
+            "prompt",
+            self.text,
+            "Expected prompt input in studio-playground.js",
+        )
+
+    def test_playground_has_experiment_import(self):
+        """studio-playground.js must import experiment mode module."""
+        self.assertIn(
+            "./studio-experiment-mode.js",
+            self.text,
+            "Expected import of experiment mode module",
+        )
+
+    def test_playground_has_feature_registry_import(self):
+        """studio-playground.js must import feature registry."""
+        self.assertIn(
+            "./studio-feature-registry.js",
+            self.text,
+            "Expected import of feature registry module",
+        )
+
+    def test_playground_has_mask_controls_section(self):
+        """studio-playground.js must have mask controls section."""
+        self.assertIn(
+            "mask-controls",
+            self.text,
+            "Expected mask controls testid in studio-playground.js",
+        )
+
+    def test_playground_has_feature_tabs(self):
+        """studio-playground.js must have feature tab buttons."""
+        self.assertIn(
+            "feature-tab",
+            self.text,
+            "Expected feature tab test IDs in studio-playground.js",
+        )
+        self.assertIn(
+            "feature-tabs",
+            self.text,
+            "Expected feature tabs element class in studio-playground.js",
+        )
+
+    def test_playground_has_run_button(self):
+        """studio-playground.js must have a Run button."""
+        self.assertIn(
+            "run-btn",
+            self.text,
+            "Expected Run button testid in studio-playground.js",
+        )
+
+    def test_playground_image_edit_tools_honest_placeholder(self):
+        """studio-playground.js must have honest disabled placeholders for image-edit tools."""
+        self.assertTrue(
+            "not implemented" in self.text.lower()
+            or "coming soon" in self.text.lower()
+            or "future work" in self.text.lower()
+            or "placeholder" in self.text.lower(),
+            "Expected honest future-work placeholder for image-edit tools",
+        )
+
+
+class PlaygroundDisabledRunTests(unittest.TestCase):
+    """Disabled Run button must give precise reasons and route to Legacy Setup."""
+
+    def test_disabled_run_mentions_legacy_setup(self):
+        """studio-playground.js must reference Legacy Setup when Run is disabled."""
+        text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+        self.assertIn(
+            "Legacy Setup",
+            text,
+            "Expected Legacy Setup reference in disabled Run reason",
+        )
+
+    def test_disabled_run_gives_reason(self):
+        """studio-playground.js must give a reason when Run is disabled."""
+        text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+        has_reason = (
+            "configure" in text.lower()
+            or "no backends" in text.lower()
+            or "not available" in text.lower()
+            or "setup" in text.lower()
+        )
+        self.assertTrue(
+            has_reason,
+            "Expected a precise reason when Run is disabled in studio-playground.js",
+        )
+
+
+class PlaygroundBackendSelectorTests(unittest.TestCase):
+    """Backend selector must show truthful empty state or real data."""
+
+    def test_backend_selector_present(self):
+        """studio-playground.js must have a backend selector."""
+        text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+        self.assertIn(
+            "backend",
+            text.lower(),
+            "Expected backend selector in studio-playground.js",
+        )
+
+    def test_backend_empty_state_truthful(self):
+        """studio-playground.js must show truthful empty state for backends."""
+        text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+        has_empty_state = (
+            "no backends" in text.lower()
+            or "no presets" in text.lower()
+            or "empty state" in text.lower()
+        )
+        self.assertTrue(
+            has_empty_state,
+            "Expected truthful empty state for backends in studio-playground.js",
+        )
+
+
+class ExperimentModeTests(unittest.TestCase):
+    """Experiment mode is an overlay on Playground, not a separate page."""
+
+    def test_experiment_toggle_exists(self):
+        """studio-experiment-mode.js must export renderExperimentToggle."""
+        text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
+        self.assertIn(
+            "export function renderExperimentToggle",
+            text,
+            "Expected renderExperimentToggle export in studio-experiment-mode.js",
+        )
+
+    def test_experiment_toggle_labels(self):
+        """studio-experiment-mode.js must have Experiment and Exit Experiment labels."""
+        text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
+        self.assertIn("Experiment", text)
+        self.assertIn("Exit Experiment", text)
+
+    def test_compare_backends_block(self):
+        """studio-experiment-mode.js must have a Compare Backends block."""
+        text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
+        self.assertIn(
+            "Compare Backends",
+            text,
+            "Expected Compare Backends block in experiment mode",
+        )
+
+    def test_matrix_summary_block(self):
+        """studio-experiment-mode.js must have a matrix summary block."""
+        text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
+        self.assertIn(
+            "matrix",
+            text.lower(),
+            "Expected matrix summary block in experiment mode",
+        )
+
+    def test_axis_checkboxes_on_controls(self):
+        """Experiment-eligible controls must gain axis checkboxes."""
+        text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
+        self.assertIn(
+            "checkbox",
+            text.lower(),
+            "Expected axis checkbox support in experiment mode",
+        )
+
+    def test_no_separate_test_axes_list(self):
+        """Studio modules must NOT define a separate Test Axes list."""
+        text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "Test Axes",
+            text,
+            "Test Axes must not appear in experiment mode module",
+        )
+
+    def test_experiment_disabled_run_mentions_legacy_setup(self):
+        """studio-experiment-mode.js must reference Legacy Setup when Run Experiment is disabled."""
+        text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
+        self.assertIn(
+            "Legacy Setup",
+            text,
+            "Expected Legacy Setup reference when Run Experiment is disabled",
+        )
+
+    def test_experiment_disabled_gives_reason(self):
+        """studio-experiment-mode.js must give a precise reason when Run Experiment is disabled."""
+        text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
+        has_reason = (
+            "not yet" in text.lower()
+            or "not wired" in text.lower()
+            or "configure" in text.lower()
+            or "experiment" in text.lower()
+        )
+        self.assertTrue(
+            has_reason,
+            "Expected a precise reason when Run Experiment is disabled",
+        )
+
+
+class FeatureRegistryEnhancedTests(unittest.TestCase):
+    """Feature registry must have detailed control definitions."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-feature-registry.js").read_text(encoding="utf-8")
+
+    def test_feature_registry_has_control_definitions(self):
+        """studio-feature-registry.js must define control details beyond IDs."""
+        self.assertIn("experimentEligible", self.text)
+
+    def test_feature_registry_has_control_types(self):
+        """studio-feature-registry.js must specify control types."""
+        self.assertIn("type", self.text)
+
+    def test_feature_registry_has_default_values(self):
+        """studio-feature-registry.js must specify default values for controls."""
+        self.assertIn("defaultValue", self.text)
+
+    def test_feature_registry_controls_include_steps_guidance_denoise_seed(self):
+        """studio-feature-registry.js must define steps, guidance, denoise, seed controls."""
+        for ctrl in ["steps", "guidance", "denoise", "seed"]:
+            self.assertIn(ctrl, self.text, f"Expected control '{ctrl}' in feature registry")
+
+    def test_feature_registry_controls_include_lora(self):
+        """studio-feature-registry.js must define lora and lora_strength controls."""
+        self.assertIn("lora_strength", self.text)
+
+    def test_feature_registry_controls_include_mask(self):
+        """studio-feature-registry.js must define mask_blur and mask_expand controls."""
+        self.assertIn("mask_blur", self.text)
+        self.assertIn("mask_expand", self.text)
+
+
+class LegacyCleanupTriggerTests(unittest.TestCase):
+    """Legacy controller must be stopped when navigating away or closing modal."""
+
+    def test_stop_legacy_controller_exported(self):
+        """studio-legacy.js must export stopLegacyController."""
+        text = (WEB / "studio-legacy.js").read_text(encoding="utf-8")
+        self.assertIn(
+            "export function stopLegacyController",
+            text,
+            "Expected stopLegacyController export in studio-legacy.js",
+        )
+
+    def test_shell_imports_stop_legacy_controller(self):
+        """studio-shell.js must import stopLegacyController from studio-legacy.js."""
+        text = (WEB / "studio-shell.js").read_text(encoding="utf-8")
+        self.assertIn(
+            "stopLegacyController",
+            text,
+            "Expected stopLegacyController reference in studio-shell.js",
+        )
+
+    def test_modal_testing_calls_stop_legacy_on_close(self):
+        """modal-testing.js must call stopLegacyController when closing the modal."""
+        text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
+        self.assertIn(
+            "stopLegacyController",
+            text,
+            "Expected stopLegacyController call in modal-testing.js close flow",
+        )
+
+    def test_shell_clears_legacy_controller_on_page_nav(self):
+        """studio-shell.js must clear activeLegacyTab and call stopLegacyController on nav away."""
+        text = (WEB / "studio-shell.js").read_text(encoding="utf-8")
+        self.assertIn("stopLegacyController", text)
 
 
 if __name__ == "__main__":

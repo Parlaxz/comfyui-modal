@@ -221,11 +221,12 @@ class ModalSettingsTests(_JsTestBase):
 class VisualRedesignTests(_JsTestBase):
     """Structural tests for the Modal GPU visual redesign."""
 
-    def test_canonical_modal_gpu_naming(self):
-        """modal-testing.js must display 'Modal GPU' as the header title."""
+    def test_canonical_studio_header_naming(self):
+        """modal-testing.js / studio-shell.js must display 'Modal Studio' as header."""
         text = self._read("modal-testing.js")
-        self.assertIn("Modal GPU", text,
-                       "Expected 'Modal GPU' visible header title")
+        self.assertIn("Modal Studio", text,
+                       "Expected 'Modal Studio' visible header title — "
+                       "replaces old 'Modal GPU' header")
 
     def test_dashboard_new_experiment_cta(self):
         """testing-dashboard.js must have 'New Experiment' as primary CTA."""
@@ -409,6 +410,307 @@ class ProgressiveClarityHistoryUiWiredTests(_JsTestBase):
         """testing-history.js must have testing-history-row-meta."""
         text = self._read("testing-history.js")
         self.assertIn("testing-history-row-meta", text)
+
+
+# ---------------------------------------------------------------------------
+# Studio Shell Wired Tests (Task 1 — Studio shell redesign API contract)
+# ---------------------------------------------------------------------------
+
+class StudioShellContextTests(_JsTestBase):
+    """Shell context must include actions and comfyApi for pages."""
+
+    def test_modal_testing_passes_comfy_api_in_context(self):
+        """modal-testing.js must pass comfyApi in the shell context."""
+        text = self._read("modal-testing.js")
+        self.assertIn("comfyApi", text,
+                       "Expected comfyApi reference in modal-testing.js context")
+
+    def test_modal_testing_passes_mount_legacy_tab_in_context(self):
+        """modal-testing.js must pass mountLegacyTab in the shell context."""
+        text = self._read("modal-testing.js")
+        self.assertIn("mountLegacyTab", text,
+                       "Expected mountLegacyTab reference in modal-testing.js context")
+
+    def test_studio_shell_has_data_section_handling(self):
+        """modal-testing.js must handle comfymodal.open-section with real section targets."""
+        text = self._read("modal-testing.js")
+        self.assertIn("data-section", text,
+                       "Expected data-section attribute handling in modal-testing.js")
+
+
+class StudioShellWiredTests(_JsTestBase):
+    """Studio shell module export/API contract tests."""
+
+    def test_studio_shell_exports_mount_studio_shell(self):
+        """studio-shell.js must export mountStudioShell function."""
+        text = self._read("studio-shell.js")
+        self.assertIn("export function mountStudioShell", text)
+
+    def test_studio_shell_returns_shell_api(self):
+        """studio-shell.js must return an object with destroy and setPage."""
+        text = self._read("studio-shell.js")
+        self.assertIn("destroy", text)
+        self.assertIn("setPage", text)
+
+    def test_modal_testing_imports_studio_shell(self):
+        """modal-testing.js must import from studio-shell.js."""
+        text = self._read("modal-testing.js")
+        self.assertIn("./studio-shell.js", text)
+
+    def test_modal_testing_imports_studio_styles(self):
+        """modal-testing.js must import from studio-styles.js."""
+        text = self._read("modal-testing.js")
+        self.assertIn("./studio-styles.js", text)
+
+    # ── Feature registry content ────────────────────────────────────────
+
+    def test_feature_registry_has_txt2img(self):
+        """studio-feature-registry.js must define a txt2img feature."""
+        text = self._read("studio-feature-registry.js")
+        self.assertIn("txt2img", text)
+
+    def test_feature_registry_has_object_remove(self):
+        """studio-feature-registry.js must define an object_remove feature."""
+        text = self._read("studio-feature-registry.js")
+        self.assertIn("object_remove", text)
+
+    def test_feature_registry_has_object_replace(self):
+        """studio-feature-registry.js must define an object_replace feature."""
+        text = self._read("studio-feature-registry.js")
+        self.assertIn("object_replace", text)
+
+    def test_feature_registry_exports_FEATURE_SPECS(self):
+        """studio-feature-registry.js must export FEATURE_SPECS array."""
+        text = self._read("studio-feature-registry.js")
+        self.assertIn("export const FEATURE_SPECS", text)
+
+    # ── No separate Test Axes page/list ─────────────────────────────────
+
+    def test_no_separate_test_axes_list_in_modules(self):
+        """New Studio modules must NOT define a separate 'Test Axes' list/page.
+
+        Experiment mode is an overlay on Playground controls, not a separate page.
+        """
+        text = self._read("studio-shell.js")
+        self.assertNotIn("Test Axes", text)
+
+
+class StudioLegacyWiredTests(_JsTestBase):
+    """Legacy wrapper module API contract tests."""
+
+    def test_studio_legacy_exports_mount_legacy_tab(self):
+        """studio-legacy.js must export mountLegacyTab async function."""
+        text = self._read("studio-legacy.js")
+        self.assertIn("export async function mountLegacyTab", text)
+
+    def test_studio_legacy_stops_previous_controller(self):
+        """studio-legacy.js must implement stopLegacyController for cleanup."""
+        text = self._read("studio-legacy.js")
+        self.assertIn("stopLegacyController", text)
+
+    def test_studio_legacy_references_old_tab_modules(self):
+        """studio-legacy.js must reference all old testing-*.js modules."""
+        text = self._read("studio-legacy.js")
+        for needle in [
+            "testing-dashboard.js",
+            "testing-setup.js",
+            "testing-profiles.js",
+            "testing-results.js",
+            "testing-history.js",
+            "testing-settings.js",
+        ]:
+            self.assertIn(
+                needle, text,
+                f"Expected reference to {needle} in studio-legacy.js",
+            )
+
+    def test_studio_legacy_passes_comfy_api_instead_of_null(self):
+        """studio-legacy.js must pass comfyApi instead of null as the api arg."""
+        text = self._read("studio-legacy.js")
+        self.assertNotIn(
+            ", null, options)", text,
+            "studio-legacy.js must not pass null as api arg to legacy render fns",
+        )
+        self.assertIn(
+            "comfyApi", text,
+            "Expected comfyApi reference in studio-legacy.js",
+        )
+
+    def test_studio_legacy_includes_draft_callbacks(self):
+        """studio-legacy.js must pass draft callbacks and context in options."""
+        text = self._read("studio-legacy.js")
+        for key in ["onDraftChange", "onRun", "experimentId", "previewState"]:
+            self.assertIn(
+                key, text,
+                f"Expected {key} in studio-legacy.js options",
+            )
+
+
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — Playground layout, experiment mode & legacy cleanup (wired)
+# ---------------------------------------------------------------------------
+
+class PlaygroundWiredTests(_JsTestBase):
+    """Playground wired export and structural tests."""
+
+    def test_playground_exports_render_playground(self):
+        """studio-playground.js must export renderPlayground function."""
+        text = self._read("studio-playground.js")
+        self.assertIn("export function renderPlayground", text)
+
+    def test_playground_uses_feature_registry(self):
+        """studio-playground.js must import from studio-feature-registry.js."""
+        text = self._read("studio-playground.js")
+        self.assertIn(
+            "./studio-feature-registry.js",
+            text,
+            "Expected import from studio-feature-registry.js",
+        )
+
+    def test_playground_uses_experiment_mode(self):
+        """studio-playground.js must import from studio-experiment-mode.js."""
+        text = self._read("studio-playground.js")
+        self.assertIn(
+            "./studio-experiment-mode.js",
+            text,
+            "Expected import from studio-experiment-mode.js",
+        )
+
+    def test_playground_has_control_panel_and_workspace(self):
+        """Playground must have left control panel and right workspace."""
+        text = self._read("studio-playground.js")
+        self.assertIn("comfymodal-studio-control-panel", text)
+        self.assertIn("comfymodal-studio-workspace", text)
+
+    def test_playground_feature_tabs(self):
+        """Playground must have feature tab buttons referencing all three features."""
+        text = self._read("studio-playground.js")
+        self.assertIn("comfymodal-studio-feature-tab", text)
+        self.assertIn("feature-tab-", text)
+        self.assertIn("FEATURE_SPECS", text)
+
+    def test_playground_disabled_run_reason(self):
+        """Disabled Run must have a data-testid or reason element."""
+        text = self._read("studio-playground.js")
+        self.assertIn("disabled", text.lower())
+
+    def test_playground_has_canvas_region(self):
+        """Playground workspace must have a canvas region."""
+        text = self._read("studio-playground.js")
+        self.assertIn("comfymodal-studio-canvas", text)
+
+    def test_playground_has_filmstrip(self):
+        """Playground workspace must have a filmstrip/recent-runs strip."""
+        text = self._read("studio-playground.js")
+        self.assertIn("comfymodal-studio-filmstrip", text)
+
+    def test_playground_does_not_import_stop_legacy_controller(self):
+        """studio-playground.js must NOT import stopLegacyController — cleanup is
+        handled by the shell (studio-shell.js) and modal close handler (modal-testing.js),
+        not by individual pages."""
+        text = self._read("studio-playground.js")
+        self.assertNotIn("stopLegacyController", text,
+                         "stopLegacyController was dead code in playground; "
+                         "cleanup belongs in studio-shell.js and modal-testing.js")
+
+
+class ExperimentModeWiredTests(_JsTestBase):
+    """Experiment mode wired export and structure."""
+
+    def test_experiment_mode_exports(self):
+        """studio-experiment-mode.js must export renderExperimentMode."""
+        text = self._read("studio-experiment-mode.js")
+        self.assertIn("export function renderExperimentMode", text)
+
+    def test_experiment_mode_imports_feature_registry(self):
+        """studio-experiment-mode.js must import from studio-feature-registry.js."""
+        text = self._read("studio-experiment-mode.js")
+        self.assertIn(
+            "./studio-feature-registry.js",
+            text,
+            "Expected import from studio-feature-registry.js",
+        )
+
+    def test_experiment_compare_backends_block(self):
+        """Experiment mode must have a Compare Backends block."""
+        text = self._read("studio-experiment-mode.js")
+        self.assertIn("Compare Backends", text)
+
+    def test_experiment_matrix_summary(self):
+        """Experiment mode must have a matrix summary section."""
+        text = self._read("studio-experiment-mode.js")
+        self.assertIn("matrix", text.lower())
+
+    def test_experiment_axis_checkbox_eligible_controls(self):
+        """Experiment mode must handle axis checkboxes for eligible controls."""
+        text = self._read("studio-experiment-mode.js")
+        self.assertIn("axis-checkbox", text)
+        self.assertIn("toggleExperimentAxis", text)
+
+    def test_experiment_disabled_run_experiment_reason(self):
+        """Experiment mode must give reason when Run Experiment is disabled."""
+        text = self._read("studio-experiment-mode.js")
+        # Should not be silently disabled
+        self.assertIn("Legacy Setup", text)
+
+    def test_experiment_no_separate_axes_page(self):
+        """Experiment mode must NOT have a separate Test Axes page."""
+        text = self._read("studio-experiment-mode.js")
+        # "Test Axes" capitalized as a page name is forbidden
+        self.assertNotIn('"Test Axes"', text)
+        self.assertNotIn("'Test Axes'", text)
+
+
+class FeatureRegistryDetailWiredTests(_JsTestBase):
+    """Feature registry must have detailed control metadata."""
+
+    def test_registry_exports_CONTROL_DEFS(self):
+        """studio-feature-registry.js must export CONTROL_DEFS map."""
+        text = self._read("studio-feature-registry.js")
+        self.assertIn("export const CONTROL_DEFS", text)
+
+    def test_registry_control_defs_have_types(self):
+        """Each control def must have a type property."""
+        text = self._read("studio-feature-registry.js")
+        self.assertIn("type:", text)
+
+    def test_registry_control_defs_have_default_values(self):
+        """Each control def must have a defaultValue."""
+        text = self._read("studio-feature-registry.js")
+        self.assertIn("defaultValue", text)
+
+    def test_registry_control_defs_have_experiment_eligible(self):
+        """Each control def must have experimentEligible."""
+        text = self._read("studio-feature-registry.js")
+        self.assertIn("experimentEligible", text)
+
+    def test_registry_controls_contain_all_required(self):
+        """Required controls must all be defined."""
+        text = self._read("studio-feature-registry.js")
+        required = ["steps", "guidance", "denoise", "seed", "lora_strength", "mask_blur", "mask_expand"]
+        for ctrl in required:
+            self.assertIn(ctrl, text, f"Missing control definition: {ctrl}")
+
+
+class LegacyCleanupWiredTests(_JsTestBase):
+    """Legacy controller cleanup must be wired through the shell."""
+
+    def test_legacy_exports_stop_controller(self):
+        """studio-legacy.js must export stopLegacyController."""
+        text = self._read("studio-legacy.js")
+        self.assertIn("export function stopLegacyController", text)
+
+    def test_shell_imports_and_calls_stop_legacy(self):
+        """studio-shell.js must import and reference stopLegacyController."""
+        text = self._read("studio-shell.js")
+        self.assertIn("stopLegacyController", text)
+
+    def test_modal_testing_calls_stop_on_close(self):
+        """modal-testing.js must reference stopLegacyController in close flow."""
+        text = self._read("modal-testing.js")
+        self.assertIn("stopLegacyController", text)
 
 
 if __name__ == "__main__":
