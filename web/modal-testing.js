@@ -3,8 +3,11 @@ import { api as comfyApi } from "../../scripts/api.js";
 import { ensureTestingStyles } from "./testing-styles.js";
 import { fetchJson, bootstrapLoader } from "./testing-api.js";
 import { createDefaultDraft, createPreviewState, normalizeDraft } from "./testing-setup-adapter.js";
+import { ensureStudioStyles } from "./studio-styles.js";
+import { mountStudioShell } from "./studio-shell.js";
+import { mountLegacyTab, stopLegacyController } from "./studio-legacy.js";
 
-// Signal to legacy sidebar modules that the unified Modal GPU tab is active.
+// Signal to legacy sidebar modules that the unified Modal Studio tab is active.
 // They should skip registering their own sidebar tabs to avoid duplicates.
 window.__comfyModalUnifiedUI = true;
 
@@ -17,6 +20,9 @@ const TAB_HISTORY = "history";
 const TAB_SETTINGS = "settings";
 const PREFIX = "[comfymodal.testing]";
 const HOST_CLASS = "comfymodal-testing-host";
+
+// Studio shell pages (replaces old 6-tab nav)
+const STUDIO_PAGES = ["Playground", "History", "Settings"];
 
 console.log(PREFIX, "extension module imported");
 
@@ -69,25 +75,16 @@ function el(tag, props = {}, children = []) {
 
 function buildShell() {
   const overlay = el("div", { class: "comfymodal-testing-overlay" });
-  const modal = el("div", { class: "comfymodal-testing-modal" });
-  const header = el("div", { class: "comfymodal-testing-header" }, [
-    el("h2", { text: "Modal GPU" }),
+  const modal = el("div", { class: "comfymodal-studio-modal" });
+  const header = el("div", { class: "comfymodal-studio-header" }, [
+    el("h2", { text: "Modal Studio" }),
     el("button", { class: "comfymodal-testing-close", text: "✕" }),
   ]);
-  const nav = el("div", { class: "comfymodal-testing-nav" }, [
-    el("button", { class: "comfymodal-testing-nav-btn", "data-tab": TAB_DASHBOARD, text: "Dashboard" }),
-    el("button", { class: "comfymodal-testing-nav-btn", "data-tab": TAB_SETUP, text: "Setup" }),
-    el("button", { class: "comfymodal-testing-nav-btn", "data-tab": TAB_PROFILES, text: "Profiles" }),
-    el("button", { class: "comfymodal-testing-nav-btn", "data-tab": TAB_RESULTS, text: "Results" }),
-    el("button", { class: "comfymodal-testing-nav-btn", "data-tab": TAB_HISTORY, text: "History" }),
-    el("button", { class: "comfymodal-testing-nav-btn", "data-tab": TAB_SETTINGS, text: "Settings" }),
-  ]);
-  const body = el("div", { class: "comfymodal-testing-body", "data-testid": "body" });
+  const body = el("div", { class: "comfymodal-studio-body", "data-testid": "body" });
   modal.appendChild(header);
-  modal.appendChild(nav);
   modal.appendChild(body);
   overlay.appendChild(modal);
-  return { overlay, modal, header, nav, body };
+  return { overlay, modal, header, body };
 }
 
 let _hostEl = null;
@@ -170,6 +167,19 @@ function ensureHost() {
 export function open_testing_modal(tabName) {
   ensureHost();
   ensureTestingStyles();
+  ensureStudioStyles();
+
+  // Map old tab names to Studio pages
+  const pageMap = {
+    playground: "playground",
+    dashboard: "settings",
+    setup: "settings",
+    profiles: "settings",
+    results: "settings",
+    history: "history",
+    settings: "settings",
+  };
+
   if (_shellCache && _hostEl.contains(_shellCache.overlay)) {
     _shellCache.overlay.style.display = "flex";
     if (!_shellCache._escHandler) {
@@ -181,7 +191,10 @@ export function open_testing_modal(tabName) {
     }
     _isOpen = true;
     updateDiag("modalOpen", true);
-    if (tabName && tabName !== _currentTab) showTab(_shellCache, tabName);
+    if (tabName && _shellCache._studioApi) {
+      const page = pageMap[tabName] || "playground";
+      _shellCache._studioApi.setPage(page);
+    }
     return _shellCache;
   }
   const shell = buildShell();
@@ -200,19 +213,48 @@ export function open_testing_modal(tabName) {
   document.addEventListener("keydown", escHandler);
   shell._escHandler = escHandler;
 
-  // Nav button click handlers
-  shell.nav.querySelectorAll(".comfymodal-testing-nav-btn").forEach((b) => {
-    b.addEventListener("click", () => showTab(shell, b.dataset.tab));
-  });
+  // Mount the Studio shell (replaces old 6-tab nav)
+  // Build context with apiBase, comfyApi, mountLegacyTab, and draft callbacks
+  const studioContext = {
+    apiBase: MODAL_PREFIX,
+    comfyApi: comfyApi,
+    mountLegacyTab: mountLegacyTab,
+    // Draft state and callbacks for legacy setup tab
+    draft: _draftState.setup ? normalizeDraft(_draftState.setup) : null,
+    onDraftChange: (draft) => {
+      _draftState.setup = normalizeDraft(draft);
+      _saveDraftToStorage(_draftState.setup);
+      _previewState.setup = createPreviewState(draft);
+    },
+    onRun: (expId) => {
+      if (expId) {
+        _draftState.lastExperimentId = expId;
+        _saveExperimentIdToStorage(expId);
+        open_testing_modal(TAB_RESULTS);
+      }
+    },
+    previewState: _previewState.setup ? { ..._previewState.setup } : null,
+    experimentId: _draftState.lastExperimentId || _loadExperimentIdFromStorage() || "",
+    setPage: (page) => { if (_shellCache && _shellCache._studioApi) _shellCache._studioApi.setPage(page); },
+  };
+  const studioApi = mountStudioShell(shell.body, studioContext);
+  shell._studioApi = studioApi;
+
+  // Navigate to initial page if specified
+  if (tabName) {
+    const page = pageMap[tabName] || "playground";
+    studioApi.setPage(page);
+  }
 
   _hostEl.appendChild(shell.overlay);
   _isOpen = true;
   updateDiag("modalOpen", true);
-  showTab(shell, tabName || TAB_DASHBOARD);
   return shell;
 }
 
 function close_testing_modal() {
+  // Stop any active legacy controller (e.g. results polling) when modal closes
+  stopLegacyController();
   if (_shellCache && _hostEl && _hostEl.contains(_shellCache.overlay)) {
     _shellCache.overlay.style.display = "none";
     if (_shellCache._escHandler) {
@@ -301,44 +343,6 @@ function mountLazyTab(container, tabName) {
   loader.attempt();
 }
 
-function mountDashboardTab(container) { mountLazyTab(container, TAB_DASHBOARD); }
-function mountSetupTab(container)    { mountLazyTab(container, TAB_SETUP); }
-function mountResultsTab(container)  { mountLazyTab(container, TAB_RESULTS); }
-function mountHistoryTab(container)  { mountLazyTab(container, TAB_HISTORY); }
-function mountSettingsTab(container) { mountLazyTab(container, TAB_SETTINGS); }
-
-function showTab(shell, tabName) {
-  if (_currentTab && _currentTab !== tabName) {
-    _stopCurrentController();
-  }
-  const body = shell.body;
-  while (body.firstChild) body.removeChild(body.firstChild);
-
-  // Wrap content in a page-level container for fixed-height scrolling
-  const pageClass = {
-    [TAB_DASHBOARD]: "testing-dashboard-page",
-    [TAB_SETUP]: "testing-setup-page",
-    [TAB_PROFILES]: "testing-profiles-page",
-    [TAB_RESULTS]: "testing-results-page",
-    [TAB_HISTORY]: "testing-history-page",
-    [TAB_SETTINGS]: "",
-  }[tabName] || "";
-
-  if (pageClass) {
-    const pageWrapper = el("div", { class: pageClass });
-    body.appendChild(pageWrapper);
-    mountLazyTab(pageWrapper, tabName);
-  } else {
-    mountLazyTab(body, tabName);
-  }
-
-  shell.nav.querySelectorAll(".comfymodal-testing-nav-btn").forEach((b) => {
-    if (b.dataset.tab === tabName) b.classList.add("active");
-    else b.classList.remove("active");
-  });
-  updateDiag("activeTab", tabName);
-}
-
 function buildSidebarPanel() {
   const panel = el("div", { class: "comfymodal-testing-sidebar-panel" }, [
     el("button", { text: "Open Testing Suite", onclick: () => open_testing_modal() }),
@@ -388,7 +392,7 @@ let _fallbackLauncher = null;
 function ensureFallbackLauncher() {
   if (_fallbackLauncher) return;
   _fallbackLauncher = el("div", { class: "comfymodal-testing-fallback" }, [
-    el("button", { text: "Modal GPU", onclick: () => open_testing_modal() }),
+    el("button", { text: "Modal Studio", onclick: () => open_testing_modal() }),
   ]);
   document.body.appendChild(_fallbackLauncher);
   updateDiag("fallbackLauncherVisible", true);
@@ -397,13 +401,17 @@ function ensureFallbackLauncher() {
 function handleOpenSection(ev) {
   const sectionId = ev.detail && ev.detail.section;
   open_testing_modal(TAB_SETTINGS);
+  // After the settings page renders, scroll to the matching section
   setTimeout(() => {
-    const settingsRoot = _shellCache && _shellCache.body;
-    if (settingsRoot) {
-      const navBtn = settingsRoot.querySelector(`[data-section="${sectionId}"]`);
-      if (navBtn) navBtn.click();
+    const body = _shellCache && _shellCache.body;
+    if (!body) return;
+    const sectionEl = body.querySelector(`[data-section="${sectionId}"]`);
+    if (sectionEl) {
+      sectionEl.scrollIntoView({ behavior: "smooth", block: "start" });
+      sectionEl.style.outline = "2px solid var(--color-accent)";
+      setTimeout(() => { sectionEl.style.outline = ""; }, 2000);
     }
-  }, 100);
+  }, 150);
 }
 
 window.__comfyModalTestingMarkSecondaryLauncherRegistered = function __comfyModalTestingMarkSecondaryLauncherRegistered() {
