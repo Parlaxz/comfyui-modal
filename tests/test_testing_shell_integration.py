@@ -7,6 +7,8 @@ plan are implemented, at which point they should pass (green).
 All checks are structural: source-text/regex only, no runtime harness.
 """
 import re
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -1965,6 +1967,60 @@ class UnifiedUIFlagTests(unittest.TestCase):
             self.text,
             "Expected __comfyModalUnifiedUI flag in modal-testing.js",
         )
+
+
+# ---------------------------------------------------------------------------
+# Runtime syntax regression — real node --check execution
+# ---------------------------------------------------------------------------
+
+
+class SyntaxRegressionTests(unittest.TestCase):
+    """Real runtime syntax checks via subprocess: node --check on each JS file.
+
+    These ensure that the files parse cleanly as valid JavaScript regardless
+    of what structural/text assertions say.  A nonzero exit code fails the
+    test and surfaces stderr so the syntax error is immediately visible.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not shutil.which("node"):
+            raise unittest.SkipTest("node is not on PATH — cannot run syntax checks")
+
+    def _node_check(self, filename: str) -> None:
+        path = WEB / filename
+        self.assertTrue(
+            path.exists(),
+            f"Required JS file not found: {path}",
+        )
+        try:
+            proc = subprocess.run(
+                ["node", "--check", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail(
+                f"node --check {filename} timed out after 30s"
+            )
+        if proc.returncode != 0:
+            msg = proc.stderr.strip() or proc.stdout.strip() or "(no output)"
+            self.fail(
+                f"node --check {filename} failed (exit {proc.returncode}):\n{msg}"
+            )
+
+    def test_modal_testing_js_syntax(self):
+        """modal-testing.js must pass node --check (real syntax validation)."""
+        self._node_check("modal-testing.js")
+
+    def test_modal_comparison_js_syntax(self):
+        """modal-comparison.js must pass node --check (real syntax validation)."""
+        self._node_check("modal-comparison.js")
+
+    def test_modal_settings_js_syntax(self):
+        """modal-settings.js must pass node --check (real syntax validation)."""
+        self._node_check("modal-settings.js")
 
 
 if __name__ == "__main__":
