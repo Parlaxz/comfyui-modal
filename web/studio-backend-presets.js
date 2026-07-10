@@ -6,7 +6,10 @@
 
 import { el } from "./studio-ui.js";
 import { listPresets, createPreset, updatePreset, duplicatePreset, archivePreset } from "./studio-backend-api.js";
-import { _STATE, renderFeaturesChipGrid } from "./studio-backend.js";
+import { _STATE, renderFeaturesChipGrid, launchPresetWizardForEdit } from "./studio-backend.js";
+import {
+  getPresetCapabilitySummary,
+} from "./studio-preset-capabilities.js";
 
 // ── Backend Presets page ──────────────────────────────────────────────────
 
@@ -18,8 +21,9 @@ export function renderPresetsPage(listPanel, detailPanel, apiBase) {
     }),
     el("button", {
       class: "comfymodal-secondary-btn",
-      text: "+ New Preset",
+      text: "+ New Preset (Manual)",
       style: "font-size:10px;padding:3px 8px;",
+      title: "Advanced: manual creation without binding wizard",
       onclick: () => renderPresetForm(null, apiBase, listPanel, detailPanel),
     }),
   ]);
@@ -37,7 +41,15 @@ export function renderPresetsPage(listPanel, detailPanel, apiBase) {
   listContent.textContent = "Loading presets...";
   listPresets(apiBase).then((presets) => {
     while (listContent.firstChild) listContent.removeChild(listContent.firstChild);
-    if (!presets || presets.length === 0) {
+    // null or undefined means network/API error (not just empty)
+    if (presets === null || presets === undefined) {
+      listContent.appendChild(el("div", { class: "comfymodal-studio-card" }, [
+        el("p", { text: "Could not load presets from server.", style: "font-weight:600;margin:0 0 4px;color:#f87171;" }),
+        el("p", { text: "Check that the backend server is running and the API is accessible.", style: "font-size:11px;color:#888;margin:0;" }),
+      ]));
+      return;
+    }
+    if (presets.length === 0) {
       listContent.appendChild(renderPresetsEmpty(apiBase));
       return;
     }
@@ -46,13 +58,20 @@ export function renderPresetsPage(listPanel, detailPanel, apiBase) {
       _STATE.selectedItemId = presets[0].id;
       renderPresetDetail(detailPanel, presets[0], apiBase, listContent);
     }
+  }).catch((err) => {
+    while (listContent.firstChild) listContent.removeChild(listContent.firstChild);
+    listContent.appendChild(el("div", { class: "comfymodal-studio-card" }, [
+      el("p", { text: "Error loading presets.", style: "font-weight:600;margin:0 0 4px;color:#f87171;" }),
+      el("p", { text: err.message || "Unknown error", style: "font-size:11px;color:#888;margin:0;" }),
+    ]));
   });
 }
 
 function renderPresetsEmpty(apiBase) {
   return el("div", { class: "comfymodal-studio-card" }, [
     el("p", { text: "No backend presets configured.", style: "font-weight:600;margin:0 0 8px;color:#888;" }),
-    el("p", { text: 'Click "+ New Preset" to create one, or legacy comparison profiles will be auto-discovered.', style: "font-size:12px;color:#555;margin:0;" }),
+    el("p", { text: 'Use "Make Preset" above to create one from the current ComfyUI graph.', style: "font-size:12px;color:#555;margin:0 0 4px;" }),
+    el("p", { text: 'Or click "+ New Preset" for manual creation (advanced).', style: "font-size:11px;color:#666;margin:0;font-style:italic;" }),
   ]);
 }
 
@@ -107,7 +126,7 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
   statusBanner.textContent = isRunnable ? "\u2713 Runnable" : preset.archived ? "\u26a0 Archived" : "\u26a0 Not Runnable";
   card.appendChild(statusBanner);
 
-  // Disabled reason
+  // Disabled reason (read-only, server-derived)
   if (preset.disabledReason && !preset.archived) {
     card.appendChild(el("p", {
       text: `Reason: ${preset.disabledReason}`,
@@ -115,43 +134,75 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
     }));
   }
 
-  // ── Runnable checklist ──────────────────────────────────────────────
-  if (!preset.archived) {
-    const checkGroup = el("div", {
-      style: "margin-bottom:8px;padding:6px;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:3px;",
+  // ── Capability Summary ──────────────────────────────────────────────
+  (preset.compatibleFeatures || []).forEach((fid) => {
+    const summary = getPresetCapabilitySummary(preset, fid);
+    const summaryGroup = el("div", {
+      style: "margin-bottom:6px;padding:6px;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:3px;",
     });
-    checkGroup.appendChild(el("p", {
-      text: "Runnable Checklist",
+    summaryGroup.appendChild(el("p", {
+      text: `${fid} Capability`,
       style: "font-size:10px;font-weight:600;color:#888;margin:0 0 4px;text-transform:uppercase;letter-spacing:0.05em;",
     }));
 
-    const checks = [
-      { label: "Snapshot linked", ok: Boolean(preset.snapshotId) },
-      { label: "Compatible features assigned", ok: (preset.compatibleFeatures || []).length > 0 },
-      { label: "API prompt available", ok: preset.status !== "needs_api_prompt" },
-      { label: "Bindings configured", ok: preset.status !== "needs_bindings" },
-      { label: "Output mapped", ok: preset.status !== "needs_output" },
-    ];
-    checks.forEach((c) => {
+    // Feature status
+    const featStatus = summary.runnable ? "\u2713 Runnable" : `\u26a0 ${summary.disabledReason || "Not runnable"}`;
+    summaryGroup.appendChild(el("p", {
+      text: `Status: ${featStatus}`,
+      style: `font-size:10px;color:${summary.runnable ? "#4ade80" : "#fbbf24"};margin:0 0 4px;`,
+    }));
+
+    // API graph status
+    summaryGroup.appendChild(el("p", {
+      text: `API graph: ${summary.hasApiGraph ? "\u2713 available" : "\u2717 missing"}`,
+      style: `font-size:10px;color:${summary.hasApiGraph ? "#4ade80" : "#f87171"};margin:0 0 2px;`,
+    }));
+
+    // Output mapping status
+    summaryGroup.appendChild(el("p", {
+      text: `Output mapping: ${summary.hasOutputBinding ? "\u2713 mapped" : "\u2717 missing"}`,
+      style: `font-size:10px;color:${summary.hasOutputBinding ? "#4ade80" : "#f87171"};margin:0 0 4px;`,
+    }));
+
+    // Required binding checklist
+    summaryGroup.appendChild(el("p", {
+      text: `Required bindings: ${summary.totalBoundRequired}/${summary.totalRequired} configured`,
+      style: `font-size:10px;color:${summary.allRequiredMet ? "#4ade80" : "#f87171"};margin:0 0 2px;`,
+    }));
+
+    summary.requiredBindings.forEach((d) => {
       const item = el("div", { style: "display:flex;align-items:center;gap:4px;margin:2px 0;" }, [
-        el("span", { text: c.ok ? "\u2713" : "\u2717", style: `font-size:10px;color:${c.ok ? "#4ade80" : "#f87171"};` }),
-        el("span", { text: c.label, style: "font-size:10px;color:#aaa;" }),
+        el("span", { text: d.bound ? "\u2713" : "\u2717", style: `font-size:10px;color:${d.bound ? "#4ade80" : "#f87171"};` }),
+        el("span", { text: d.label, style: "font-size:10px;color:#aaa;" }),
       ]);
-      checkGroup.appendChild(item);
+      summaryGroup.appendChild(item);
     });
 
-    // Binding status listing
-    if (preset.snapshotId) {
-      const bindingStatus = el("p", {
-        text: preset.status === "runnable" ? "All bindings are configured." :
-              `Bindings may need attention (status: ${preset.status || "unknown"}).`,
-        style: "font-size:10px;color:#888;margin:4px 0 0;font-style:italic;",
+    // Optional exposed controls
+    if (summary.totalBoundOptional > 0) {
+      summaryGroup.appendChild(el("p", {
+        text: `Exposed controls: ${summary.totalBoundOptional} optional`,
+        style: "font-size:10px;color:#888;margin:4px 0 2px;",
+      }));
+      summary.optionalBindings.filter((d) => d.bound).forEach((d) => {
+        summaryGroup.appendChild(el("p", {
+          text: `  \u2713 ${d.label}`,
+          style: "font-size:9px;color:#4ade80;margin:1px 0;",
+        }));
       });
-      checkGroup.appendChild(bindingStatus);
     }
 
-    card.appendChild(checkGroup);
-  }
+    // Missing optional controls hint
+    const missingOpt = summary.optionalBindings.filter((d) => !d.bound);
+    if (missingOpt.length > 0) {
+      summaryGroup.appendChild(el("p", {
+        text: `Missing optional: ${missingOpt.length} (hidden in Playground)`,
+        style: "font-size:9px;color:#666;margin:4px 0 0;font-style:italic;",
+      }));
+    }
+
+    card.appendChild(summaryGroup);
+  });
 
   // ── Fields ──────────────────────────────────────────────────────────
   const fields = [
@@ -214,6 +265,21 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
       },
     });
     actions.appendChild(saveBtn);
+
+    // Edit Bindings button — opens wizard in edit mode
+    const editBindingsBtn = el("button", {
+      class: "comfymodal-secondary-btn",
+      text: "Edit Bindings",
+      style: "font-size:10px;padding:5px 12px;",
+      onclick: async () => {
+        // Load the snapshot to pass to the wizard
+        const { listSnapshots } = await import("./studio-backend-api.js");
+        const snapshots = await listSnapshots(apiBase);
+        const snapshot = (snapshots || []).find((s) => s.id === preset.snapshotId) || null;
+        launchPresetWizardForEdit(preset, snapshot, apiBase);
+      },
+    });
+    actions.appendChild(editBindingsBtn);
   }
 
   const dupBtn = el("button", {
@@ -258,8 +324,23 @@ export function renderPresetForm(existing, apiBase, listPanel, detailPanel) {
   while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
   const formCard = el("div", { class: "comfymodal-studio-backend-detail-card" });
 
+  // Advanced banner
+  const advBanner = el("div", {
+    style: "padding:6px 10px;border-radius:3px;margin-bottom:8px;background:#1a1a0a;border:1px solid #888;color:#d0d0d0;font-size:10px;",
+  }, [
+    el("p", {
+      text: "\u26a0 Advanced: Use \u201cMake Preset\u201d for the primary preset creation flow.",
+      style: "margin:0 0 2px;font-weight:600;",
+    }),
+    el("p", {
+      text: "This form creates a raw preset without bindings. You can edit bindings after creation.",
+      style: "margin:0;font-size:9px;color:#888;",
+    }),
+  ]);
+  formCard.appendChild(advBanner);
+
   const heading = el("h4", {
-    text: "New Backend Preset",
+    text: "New Backend Preset (Manual)",
     style: "margin:0 0 12px;font-size:12px;color:#d0d0d0;text-transform:uppercase;letter-spacing:0.05em;",
   });
   formCard.appendChild(heading);

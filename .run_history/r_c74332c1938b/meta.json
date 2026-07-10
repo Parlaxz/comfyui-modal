@@ -1,0 +1,16 @@
+{
+  "run_id": "r_c74332c1938b",
+  "kind": "deploy",
+  "prompt_id": "",
+  "workflow_hash": "",
+  "status": "deployed",
+  "started_at": "2026-07-10T15:32:57Z",
+  "updated_at": "2026-07-10T15:32:57Z",
+  "output_path": "",
+  "extra": {
+    "comfyapp_version": "2.16.23",
+    "fingerprint": "",
+    "workspace_id": "ws_035a4856f7ba",
+    "workspace_label": "Legacy Modal Token"
+  }
+}

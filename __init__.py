@@ -1742,14 +1742,7 @@ def _write_civitai_token(token: str):
         raise
 
 def _is_modal_token_set() -> bool:
-    if _active_workspace() is not None:
-        return True
-    try:
-        with open(_MODAL_TOML_PATH, "r") as f:
-            content = f.read()
-        return "token_id" in content and "token_secret" in content
-    except FileNotFoundError:
-        return False
+    return _active_workspace() is not None
 
 def _write_modal_toml(token_id: str, token_secret: str):
     import tempfile
@@ -3059,6 +3052,9 @@ async def _scan_swap_plan(workspace: dict) -> dict:
         "remote_status": "available",
     }
 
+
+# Migrate legacy ~/.modal.toml into workspace registry on first load
+_workspace_store.migrate_from_legacy_toml(_WORKSPACES_FILE, _MODAL_TOML_PATH)
 
 if _server:
     @_server.routes.get("/comfymodal/auth/status")

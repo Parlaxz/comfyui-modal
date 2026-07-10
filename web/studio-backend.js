@@ -118,6 +118,20 @@ function launchPresetWizard(context) {
   });
 }
 
+// Edit-mode launcher: opens wizard pre-filled with existing preset data
+export function launchPresetWizardForEdit(preset, snapshot, apiBase) {
+  import("./studio-preset-wizard.js").then(({ openPresetWizard }) => {
+    const onDone = () => {
+      // Trigger re-render of the current page after edit
+      const container = document.querySelector(".comfymodal-studio-backend");
+      if (container && container._refreshHandler) {
+        container._refreshHandler();
+      }
+    };
+    openPresetWizard(onDone, apiBase || "/comfymodal", preset, snapshot);
+  });
+}
+
 // ── Main render entry point ──────────────────────────────────────────────
 
 export function renderBackend(state, context) {
@@ -209,5 +223,12 @@ export function renderBackend(state, context) {
   }
 
   refreshList();
+
+  // Store refresh handler so edit wizard can re-render after changes
+  container._refreshHandler = () => {
+    _STATE.selectedItemId = null;
+    refreshList();
+  };
+
   return container;
 }

@@ -75,6 +75,105 @@ class ModalWorkspaceRegistryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 module.upsert_workspace(path, "Bad", "token-id", "secret", set_active=False)
 
+    # ── Legacy ~/.modal.toml migration ────────────────────────────────
+
+    def test_migrate_from_legacy_toml_creates_workspace(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / ".modal_workspaces.json"
+            toml_path = Path(tmp) / ".modal.toml"
+            toml_path.write_text(
+                '[default]\ntoken_id = "ak-legacy-token"\ntoken_secret = "as-legacy-secret"\n',
+                encoding="utf-8",
+            )
+            registry = module.migrate_from_legacy_toml(registry_path, toml_path)
+            self.assertEqual(len(registry["workspaces"]), 1)
+            self.assertEqual(registry["workspaces"][0]["label"], "Legacy Modal Token")
+            self.assertEqual(registry["workspaces"][0]["token_id"], "ak-legacy-token")
+            self.assertEqual(registry["workspaces"][0]["token_secret"], "as-legacy-secret")
+            self.assertIsNotNone(registry["active_workspace_id"])
+
+    def test_migrate_from_legacy_toml_skips_when_registry_not_empty(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / ".modal_workspaces.json"
+            toml_path = Path(tmp) / ".modal.toml"
+            # Pre-populate registry
+            module.upsert_workspace(registry_path, "Existing", "ak-existing", "as-existing", set_active=True)
+            toml_path.write_text(
+                '[default]\ntoken_id = "ak-other"\ntoken_secret = "as-other"\n',
+                encoding="utf-8",
+            )
+            registry = module.migrate_from_legacy_toml(registry_path, toml_path)
+            self.assertEqual(len(registry["workspaces"]), 1)
+            self.assertEqual(registry["workspaces"][0]["label"], "Existing")
+
+    def test_migrate_from_legacy_toml_skips_when_toml_missing(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / ".modal_workspaces.json"
+            toml_path = Path(tmp) / ".modal.toml"  # does not exist
+            registry = module.migrate_from_legacy_toml(registry_path, toml_path)
+            self.assertEqual(len(registry["workspaces"]), 0)
+            self.assertIsNone(registry["active_workspace_id"])
+
+    def test_migrate_from_legacy_toml_skips_when_toml_missing_token_fields(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / ".modal_workspaces.json"
+            toml_path = Path(tmp) / ".modal.toml"
+            toml_path.write_text('[default]\nother_key = "value"\n', encoding="utf-8")
+            registry = module.migrate_from_legacy_toml(registry_path, toml_path)
+            self.assertEqual(len(registry["workspaces"]), 0)
+
+    def test_migrate_from_legacy_toml_skips_invalid_token_prefixes(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / ".modal_workspaces.json"
+            toml_path = Path(tmp) / ".modal.toml"
+            toml_path.write_text(
+                '[default]\ntoken_id = "bad-token"\ntoken_secret = "bad-secret"\n',
+                encoding="utf-8",
+            )
+            registry = module.migrate_from_legacy_toml(registry_path, toml_path)
+            self.assertEqual(len(registry["workspaces"]), 0)
+            self.assertIsNone(registry["active_workspace_id"])
+
+    # ── Sole workspace is active even without active_workspace_id ─────
+
+    def test_get_active_workspace_returns_sole_workspace_when_no_active_id(self):
+        module = load_module()
+        # Build a registry directly with a single workspace and no active_workspace_id
+        registry = {
+            "version": 1,
+            "active_workspace_id": None,
+            "workspaces": [
+                {"id": "ws_solo", "label": "Solo", "token_id": "ak-solo", "token_secret": "as-solo",
+                 "last_used_at": None, "last_deploy_status": "idle", "notes": ""},
+            ],
+            "deploy_state_by_workspace": {},
+        }
+        active = module.get_active_workspace(registry)
+        self.assertIsNotNone(active)
+        self.assertEqual(active["label"], "Solo")
+
+    def test_get_active_workspace_returns_none_when_multiple_no_active_id(self):
+        module = load_module()
+        # Build a registry directly with two workspaces and no active_workspace_id
+        registry = {
+            "version": 1,
+            "active_workspace_id": None,
+            "workspaces": [
+                {"id": "ws_a", "label": "A", "token_id": "ak-a", "token_secret": "as-a",
+                 "last_used_at": None, "last_deploy_status": "idle", "notes": ""},
+                {"id": "ws_b", "label": "B", "token_id": "ak-b", "token_secret": "as-b",
+                 "last_used_at": None, "last_deploy_status": "idle", "notes": ""},
+            ],
+            "deploy_state_by_workspace": {},
+        }
+        active = module.get_active_workspace(registry)
+        self.assertIsNone(active)
+
 
 if __name__ == "__main__":
     unittest.main()
