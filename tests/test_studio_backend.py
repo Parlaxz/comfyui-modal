@@ -554,5 +554,242 @@ class LegacyRoutingTests(unittest.TestCase):
         self.assertIn("mountLegacyTab", text)
 
 
+# ---------------------------------------------------------------------------
+# Preset Wizard structural tests
+# ---------------------------------------------------------------------------
+
+class PresetWizardModuleTests(unittest.TestCase):
+    """Preset wizard module must exist and export required symbols."""
+
+    def test_wizard_module_exists(self):
+        """web/studio-preset-wizard.js must exist."""
+        self.assertTrue(
+            (WEB / "studio-preset-wizard.js").exists(),
+            "studio-preset-wizard.js missing",
+        )
+
+    def test_wizard_exports_open_close(self):
+        """Wizard must export openPresetWizard and closePresetWizard."""
+        text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+        self.assertIn("export function openPresetWizard", text)
+        self.assertIn("export function closePresetWizard", text)
+
+    def test_wizard_has_feature_definitions(self):
+        """Wizard must define features with required bindings."""
+        text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+        self.assertIn("txt2img", text)
+        self.assertIn("object_remove", text)
+        self.assertIn("object_replace", text)
+
+    def test_wizard_bindings_defined(self):
+        """Wizard must define required bindings per feature."""
+        text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+        # txt2img
+        self.assertIn('"prompt"', text)
+        self.assertIn('"output"', text)
+        # object_remove
+        self.assertIn('"source_image"', text)
+        self.assertIn('"mask"', text)
+        self.assertIn('"instruction"', text)
+        # object_replace
+        self.assertIn('"replacement_prompt"', text)
+
+    def test_wizard_calls_capture_and_api(self):
+        """Wizard must import captureCurrentComfyGraph and createSnapshot/createPreset."""
+        text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+        self.assertIn("captureCurrentComfyGraph", text)
+        self.assertIn("createSnapshot", text)
+        self.assertIn("createPreset", text)
+
+    def test_wizard_imports_graph_binding(self):
+        """Wizard must import from studio-graph-binding.js."""
+        text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+        self.assertIn("./studio-graph-binding.js", text)
+        self.assertIn("beginGraphBindingCapture", text)
+
+    def test_wizard_has_steps(self):
+        """Wizard must have feature steps."""
+        text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+        self.assertIn('"features"', text)
+        self.assertIn('"bindings"', text)
+        self.assertIn('"details"', text)
+
+    def test_wizard_no_client_status_in_save_payload(self):
+        """Wizard must NOT send client-owned status or disabledReason in save payloads."""
+        text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+        # The snapshotPayload and presetPayload should not include status or disabledReason
+        # Check snapshot payload keys
+        self.assertNotIn('"status"', text)
+        self.assertNotIn('"disabledReason"', text)
+
+
+class GraphBindingModuleTests(unittest.TestCase):
+    """Graph binding module must exist and export required symbols."""
+
+    def test_graph_binding_module_exists(self):
+        """web/studio-graph-binding.js must exist."""
+        self.assertTrue(
+            (WEB / "studio-graph-binding.js").exists(),
+            "studio-graph-binding.js missing",
+        )
+
+    def test_graph_binding_exports(self):
+        """Module must export key functions."""
+        text = (WEB / "studio-graph-binding.js").read_text(encoding="utf-8")
+        self.assertIn("export function getComfyGraphContext", text)
+        self.assertIn("export function beginGraphBindingCapture", text)
+        self.assertIn("export function cancelGraphBinding", text)
+        self.assertIn("export function extractNodeCandidates", text)
+        self.assertIn("export function isGraphAvailable", text)
+
+    def test_graph_binding_safe_before_init(self):
+        """Module must never access graph before init."""
+        text = (WEB / "studio-graph-binding.js").read_text(encoding="utf-8")
+        # No top-level graph access
+        self.assertNotIn("window.__comfymodal_comfy_app.graph", text)
+        self.assertNotIn("window.app.graph", text)
+
+    def test_graph_binding_esc_cancels_capture(self):
+        """Capture mode must handle Escape to cancel."""
+        text = (WEB / "studio-graph-binding.js").read_text(encoding="utf-8")
+        self.assertIn("Escape", text)
+        self.assertIn("onCancel", text)
+
+    def test_extract_node_candidates(self):
+        """extractNodeCandidates must extract widget/input/output candidates."""
+        text = (WEB / "studio-graph-binding.js").read_text(encoding="utf-8")
+        self.assertIn("extractNodeCandidates", text)
+        self.assertIn("widgets", text)
+        self.assertIn("inputs", text)
+        self.assertIn("outputs", text)
+
+
+class BindingKeyTests(unittest.TestCase):
+    """Binding keys must be consistent between wizard, models, and routes."""
+
+    def test_model_binding_keys_updated(self):
+        """studio_models.py must use the updated binding keys."""
+        text = (REPO_ROOT / "studio_models.py").read_text(encoding="utf-8")
+        # Updated keys (not legacy object_remove_image / object_replace_image)
+        self.assertIn('"source_image"', text)
+        self.assertIn('"mask"', text)
+        self.assertIn('"instruction"', text)
+        self.assertIn('"replacement_prompt"', text)
+        # Legacy keys must NOT be in FEATURE_BINDING_KEYS anymore
+        # (they can still appear in docstrings or comments)
+        binding_keys_section_start = text.find("_FEATURE_BINDING_KEYS")
+        binding_keys_section = text[binding_keys_section_start:binding_keys_section_start + 600]
+        self.assertNotIn("object_remove_image", binding_keys_section)
+        self.assertNotIn("object_replace_image", binding_keys_section)
+        self.assertNotIn("object_remove_mask", binding_keys_section)
+        self.assertNotIn("object_replace_mask", binding_keys_section)
+
+    def test_wizard_binding_keys_match_model(self):
+        """Wizard binding keys must match the model's _FEATURE_BINDING_KEYS."""
+        wizard_text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+        model_text = (REPO_ROOT / "studio_models.py").read_text(encoding="utf-8")
+        # Both use the same binding key identifiers
+        for key in ["prompt", "source_image", "mask", "instruction", "replacement_prompt"]:
+            self.assertIn(key, wizard_text, f"Wizard missing binding key: {key}")
+            self.assertIn(key, model_text, f"Model missing binding key: {key}")
+
+
+class CaptureModuleTests(unittest.TestCase):
+    """Capture module must export captureCurrentComfyGraph."""
+
+    def test_capture_current_comfy_graph_exported(self):
+        """studio-backend-capture.js must export captureCurrentComfyGraph."""
+        text = (WEB / "studio-backend-capture.js").read_text(encoding="utf-8")
+        self.assertIn("captureCurrentComfyGraph", text)
+
+    def test_capture_returns_structured_result(self):
+        """captureCurrentComfyGraph must return structured {ok, graphJson, ...}."""
+        text = (WEB / "studio-backend-capture.js").read_text(encoding="utf-8")
+        self.assertIn("ok", text)
+        self.assertIn("graphJson", text)
+        self.assertIn("warnings", text)
+
+    def test_capture_no_fake_status(self):
+        """captureCurrentComfyGraph must NOT fabricate status or success."""
+        text = (WEB / "studio-backend-capture.js").read_text(encoding="utf-8")
+        # The captureCurrentComfyGraph function must not contain "runnable"
+        # Find just the captureCurrentComfyGraph function body
+        fn_start = text.find("captureCurrentComfyGraph")
+        fn_end = text.find("\nexport async function takeSnapshotOfCurrentGraph")
+        if fn_start >= 0 and fn_end > fn_start:
+            fn_text = text[fn_start:fn_end]
+            self.assertNotIn('"runnable"', fn_text,
+                             "captureCurrentComfyGraph must not fabricate status")
+        # The legacy takeSnapshotOfCurrentGraph still uses "runnable" — that's OK
+
+    def test_wizard_awaits_graph_capture(self):
+        """Wizard save flow must await captureCurrentComfyGraph."""
+        text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+        self.assertIn("await captureCurrentComfyGraph()", text)
+
+
+class PresetWizardStylingTests(unittest.TestCase):
+    """Wizard must have proper CSS class names in styles."""
+
+    def test_wizard_mode_class_in_styles(self):
+        """studio-styles.js must define .comfymodal-studio-wizard-mode."""
+        text = (WEB / "studio-styles.js").read_text(encoding="utf-8")
+        self.assertIn("comfymodal-studio-wizard-mode", text)
+
+    def test_wizard_overlay_class_in_styles(self):
+        """studio-styles.js must define .comfymodal-studio-wizard-overlay."""
+        text = (WEB / "studio-styles.js").read_text(encoding="utf-8")
+        self.assertIn("comfymodal-studio-wizard-overlay", text)
+
+    def test_wizard_panel_class_in_styles(self):
+        """studio-styles.js must define .comfymodal-studio-wizard-panel."""
+        text = (WEB / "studio-styles.js").read_text(encoding="utf-8")
+        self.assertIn("comfymodal-studio-wizard-panel", text)
+
+    def test_wizard_binding_row_class(self):
+        """studio-styles.js must define .comfymodal-studio-wizard-binding-row."""
+        text = (WEB / "studio-styles.js").read_text(encoding="utf-8")
+        self.assertIn("comfymodal-studio-wizard-binding-row", text)
+
+    def test_wizard_feature_list_class(self):
+        """studio-styles.js must define .comfymodal-studio-wizard-feature-list."""
+        text = (WEB / "studio-styles.js").read_text(encoding="utf-8")
+        self.assertIn("comfymodal-studio-wizard-feature-list", text)
+
+    def test_backend_action_bar_class(self):
+        """studio-styles.js must define .comfymodal-studio-backend-action-bar."""
+        text = (WEB / "studio-styles.js").read_text(encoding="utf-8")
+        self.assertIn("comfymodal-studio-backend-action-bar", text)
+
+    def test_wizard_step_classes(self):
+        """studio-styles.js must define wizard step indicator classes."""
+        text = (WEB / "studio-styles.js").read_text(encoding="utf-8")
+        self.assertIn("comfymodal-studio-wizard-step-dot", text)
+        self.assertIn("comfymodal-studio-wizard-step-label", text)
+
+
+class StudioBackendMakePresetTests(unittest.TestCase):
+    """Backend page must have the Make Preset action."""
+
+    def test_backend_has_make_preset(self):
+        """studio-backend.js must reference 'Make Preset'."""
+        text = (WEB / "studio-backend.js").read_text(encoding="utf-8")
+        self.assertIn("Make Preset", text)
+
+    def test_backend_launches_wizard(self):
+        """studio-backend.js must import studio-preset-wizard.js."""
+        text = (WEB / "studio-backend.js").read_text(encoding="utf-8")
+        self.assertIn("./studio-preset-wizard.js", text)
+        self.assertIn("openPresetWizard", text)
+
+    def test_backend_no_large_wizard_logic(self):
+        """studio-backend.js must keep wizard logic glue-only."""
+        text = (WEB / "studio-backend.js").read_text(encoding="utf-8")
+        # It should NOT contain the actual wizard render functions
+        self.assertNotIn("renderFeaturesStep", text)
+        self.assertNotIn("renderBindingsStep", text)
+        self.assertNotIn('"features"', text)  # The state step values belong in the wizard
+
+
 if __name__ == "__main__":
     unittest.main()

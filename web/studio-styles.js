@@ -1001,6 +1001,350 @@ button.comfymodal-studio-feature-chip {
 .comfymodal-studio-workspace::-webkit-scrollbar-thumb:hover {
   background: #444;
 }
+
+/* ── Wizard Mode (side-panel layout) ─────────────────────── */
+
+.comfymodal-testing-overlay.comfymodal-studio-wizard-mode {
+  justify-content: flex-end;
+  align-items: stretch;
+  padding: 8px;
+  background: transparent;
+  pointer-events: none;
+}
+
+.comfymodal-studio-wizard-mode.comfymodal-studio-modal {
+  width: min(460px, calc(100vw - 16px));
+  height: min(96vh, 1040px);
+  max-width: calc(100vw - 16px);
+  margin-left: auto;
+  pointer-events: auto;
+}
+
+.comfymodal-studio-wizard-mode .comfymodal-studio-topnav,
+.comfymodal-studio-wizard-mode .comfymodal-studio-pagecontainer {
+  display: none;
+}
+
+.comfymodal-studio-wizard-mode .comfymodal-studio-body {
+  overflow: hidden;
+}
+
+/* ── Wizard Overlay and Panel ────────────────────────────── */
+
+.comfymodal-studio-wizard-overlay {
+  width: 100%;
+  flex: 1;
+  min-width: 0;
+  border-left: none;
+  background: #0d0d0d;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  height: 100%;
+}
+
+.comfymodal-studio-wizard-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* ── Wizard Header ───────────────────────────────────────── */
+
+.comfymodal-studio-wizard-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid #2a2a2a;
+  flex-shrink: 0;
+}
+
+.comfymodal-studio-wizard-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #e0e0e0;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.comfymodal-studio-wizard-close {
+  background: transparent;
+  border: none;
+  color: #666;
+  font-size: 20px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.comfymodal-studio-wizard-close:hover {
+  color: #f87171;
+}
+
+/* ── Step Indicator ──────────────────────────────────────── */
+
+.comfymodal-studio-wizard-steps {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 16px;
+  background: #0a0a0a;
+  border-bottom: 1px solid #2a2a2a;
+  flex-shrink: 0;
+}
+
+.comfymodal-studio-wizard-step-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #1a1a1a;
+  color: #555;
+  font-size: 10px;
+  font-weight: 600;
+  border: 1px solid #2a2a2a;
+  flex-shrink: 0;
+}
+
+.comfymodal-studio-wizard-step-dot.active {
+  background: #dc2626;
+  color: #fff;
+  border-color: #dc2626;
+}
+
+.comfymodal-studio-wizard-step-dot.done {
+  background: #0a2a0a;
+  color: #4ade80;
+  border-color: #1a4a1a;
+}
+
+.comfymodal-studio-wizard-step-label {
+  font-size: 10px;
+  color: #555;
+  white-space: nowrap;
+}
+
+.comfymodal-studio-wizard-step-label.active {
+  color: #d0d0d0;
+  font-weight: 500;
+}
+
+.comfymodal-studio-wizard-step-line {
+  display: inline-block;
+  width: 16px;
+  height: 1px;
+  background: #2a2a2a;
+}
+
+.comfymodal-studio-wizard-step-line.done {
+  background: #4ade80;
+}
+
+/* ── Wizard Body ─────────────────────────────────────────── */
+
+.comfymodal-studio-wizard-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 16px;
+  min-height: 0;
+}
+
+.comfymodal-studio-wizard-body::-webkit-scrollbar {
+  width: 4px;
+}
+
+.comfymodal-studio-wizard-body::-webkit-scrollbar-thumb {
+  background: #2a2a2a;
+  border-radius: 2px;
+}
+
+.comfymodal-studio-wizard-section-title {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #d0d0d0;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.comfymodal-studio-wizard-description {
+  font-size: 11px;
+  color: #777;
+  margin: 0 0 12px;
+}
+
+/* ── Wizard Footer ───────────────────────────────────────── */
+
+.comfymodal-studio-wizard-footer {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid #2a2a2a;
+  flex-shrink: 0;
+}
+
+.comfymodal-studio-wizard-footer button {
+  flex: 1;
+}
+
+/* ── Feature List ────────────────────────────────────────── */
+
+.comfymodal-studio-wizard-feature-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.comfymodal-studio-wizard-feature-card {
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px;
+  background: #111;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.comfymodal-studio-wizard-feature-card:hover {
+  border-color: #444;
+  background: #1a1a1a;
+}
+
+.comfymodal-studio-wizard-feature-card.selected {
+  border-color: #dc2626;
+  background: #1a0a0a;
+}
+
+.comfymodal-studio-wizard-feature-check {
+  flex-shrink: 0;
+  padding-top: 1px;
+}
+
+.comfymodal-studio-wizard-checkbox {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid #444;
+  border-radius: 3px;
+  font-size: 11px;
+  color: transparent;
+  background: transparent;
+}
+
+.comfymodal-studio-wizard-checkbox.checked {
+  background: #dc2626;
+  border-color: #dc2626;
+  color: #fff;
+}
+
+.comfymodal-studio-wizard-feature-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.comfymodal-studio-wizard-feature-info strong {
+  font-size: 12px;
+  color: #d0d0d0;
+}
+
+/* ── Binding List ────────────────────────────────────────── */
+
+.comfymodal-studio-wizard-binding-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.comfymodal-studio-wizard-binding-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  background: #111;
+  border: 1px solid #2a2a2a;
+  border-radius: 3px;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.comfymodal-studio-wizard-binding-row:hover {
+  border-color: #444;
+}
+
+.comfymodal-studio-wizard-binding-row.bound {
+  border-color: #1a4a1a;
+}
+
+.comfymodal-studio-wizard-binding-row.capturing {
+  border-color: #fbbf24;
+  background: #1a1a00;
+}
+
+.comfymodal-studio-wizard-binding-row.capturing-active {
+  border-color: #dc2626;
+  background: #2a0a0a;
+}
+
+.comfymodal-studio-wizard-binding-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.comfymodal-studio-wizard-binding-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* ── Graph unavailable banner ────────────────────────────── */
+
+.comfymodal-studio-wizard-graph-unavailable {
+  background: #2a0a0a;
+  border: 1px solid #4a1a1a;
+  border-radius: 3px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+}
+
+/* ── Wizard Spinner ──────────────────────────────────────── */
+
+.comfymodal-studio-wizard-spinner {
+  display: inline-block;
+  width: 24px;
+  height: 24px;
+  border: 2px solid #2a2a2a;
+  border-top-color: #dc2626;
+  border-radius: 50%;
+  animation: comfymodal-spin 0.8s linear infinite;
+  margin-top: 12px;
+}
+
+@keyframes comfymodal-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Details form ────────────────────────────────────────── */
+
+.comfymodal-studio-wizard-details-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* ── Backend Action Bar ──────────────────────────────────── */
+
+.comfymodal-studio-backend-action-bar {
+  padding: 8px 0 0;
+}
 `;
 
 let _injected = false;

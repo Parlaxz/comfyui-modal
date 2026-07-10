@@ -89,6 +89,21 @@ export function renderFeaturesChipGrid(features, onChange) {
 
 // ── Main render entry point ──────────────────────────────────────────────
 
+// ── Wizard launcher ──────────────────────────────────────────────────────
+
+function launchPresetWizard(context) {
+  import("./studio-preset-wizard.js").then(({ openPresetWizard }) => {
+    const apiBase = (context && context.apiBase) || "/comfymodal";
+    openPresetWizard(() => {
+      if (context && typeof context.setPage === "function") {
+        context.setPage("backend");
+      }
+    }, apiBase);
+  });
+}
+
+// ── Main render entry point ──────────────────────────────────────────────
+
 export function renderBackend(state, context) {
   const container = el("div", {
     class: "comfymodal-studio-backend",
@@ -96,6 +111,29 @@ export function renderBackend(state, context) {
   });
 
   const apiBase = (context && context.apiBase) || "/comfymodal";
+
+  // ── Make Preset button (primary action) ───────────────────────────────
+  const actionBar = el("div", {
+    class: "comfymodal-studio-backend-action-bar",
+    style: "display:flex;align-items:center;gap:8px;margin-bottom:4px;",
+  });
+
+  const makePresetBtn = el("button", {
+    class: "comfymodal-primary-btn",
+    text: "Make Preset",
+    style: "width:auto;padding:6px 16px;font-size:12px;",
+    title: "Bind the current ComfyUI graph into a Studio preset",
+    onclick: () => launchPresetWizard(context),
+  });
+  actionBar.appendChild(makePresetBtn);
+
+  const actionBarHint = el("span", {
+    style: "font-size:10px;color:#888;",
+    text: "Bind the current ComfyUI graph into a Studio preset",
+  });
+  actionBar.appendChild(actionBarHint);
+
+  container.appendChild(actionBar);
 
   // Tabs: Snapshots | Backend Presets
   const tabs = el("div", { class: "comfymodal-studio-backend-tabs" });

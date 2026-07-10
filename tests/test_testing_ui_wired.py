@@ -752,6 +752,15 @@ class StudioBackendWiredTests(_JsTestBase):
             "Expected compare-backends export or reference in studio-backend.js",
         )
 
+    def test_backend_presets_exports_render_preset_form(self):
+        """studio-backend-presets.js must export renderPresetForm for glue import."""
+        text = self._read("studio-backend-presets.js")
+        self.assertIn(
+            "export function renderPresetForm",
+            text,
+            "Expected studio-backend-presets.js to export renderPresetForm for studio-backend.js",
+        )
+
     def test_shell_pages_include_backend(self):
         """studio-shell.js must reference backend page."""
         text = self._read("studio-shell.js")

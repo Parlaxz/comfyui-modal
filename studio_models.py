@@ -29,9 +29,15 @@ _KNOWN_FEATURE_IDS: set[str] = {"txt2img", "object_remove", "object_replace"}
 # Each entry lists node-bindings keys that MUST be present and truthy.
 _FEATURE_BINDING_KEYS: dict[str, list[str]] = {
     "txt2img": ["prompt"],
-    "object_remove": ["object_remove_image", "object_remove_mask"],
-    "object_replace": ["object_replace_image", "object_replace_mask"],
+    "object_remove": ["source_image", "mask", "instruction"],
+    "object_replace": ["source_image", "mask", "replacement_prompt"],
 }
+
+# Structured binding keys — each binding value is expected to be a dict
+# with a "kind" field ("node", "widget", "input", "output") rather than
+# a legacy scalar string.  The presence check below treats a truthy dict
+# with a valid "kind" the same as truthy.
+_WIZARD_BINDING_KINDS: set[str] = {"node", "widget", "input", "output"}
 
 # Status sort-order (lower index = more restrictive / higher priority).
 _STATUS_PRIORITY: list[str] = [
@@ -108,7 +114,17 @@ def _derive_feature_status(
     bindings = node_bindings if isinstance(node_bindings, dict) else {}
     required_keys = _FEATURE_BINDING_KEYS.get(feature_id, [])
 
-    has_bindings = all(bool(bindings.get(k)) for k in required_keys)
+    def _binding_truthy(val: object) -> bool:
+        """Check truthiness of a binding value.
+
+        Supports both legacy scalar strings and wizard-style structured
+        binding dicts (``{"kind": "node", ...}``).
+        """
+        if isinstance(val, dict):
+            return bool(val.get("kind")) and bool(val.get("nodeId"))
+        return bool(val)
+
+    has_bindings = all(_binding_truthy(bindings.get(k)) for k in required_keys)
     has_output_node = bool(output_node_id)
     has_api_prompt = bool(api_prompt_json)
 

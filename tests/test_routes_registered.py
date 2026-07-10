@@ -779,7 +779,11 @@ class StudioStoreAndModelTests(unittest.TestCase):
         snapshot3 = studio_models.normalize_snapshot_payload({
             "compatibleFeatures": ["object_remove"],
             "apiPromptJson": None,
-            "nodeBindings": {"object_remove_image": "img", "object_remove_mask": "mask"},
+            "nodeBindings": {
+                "source_image": {"kind": "node", "nodeId": "7"},
+                "mask": {"kind": "node", "nodeId": "8"},
+                "instruction": {"kind": "widget", "nodeId": "9", "widgetName": "text"},
+            },
             "outputNodeId": "42",
         })
         self.assertEqual(snapshot3["featureStatus"]["object_remove"]["status"], "needs_api_prompt")
@@ -788,7 +792,11 @@ class StudioStoreAndModelTests(unittest.TestCase):
         snapshot4 = studio_models.normalize_snapshot_payload({
             "compatibleFeatures": ["object_replace"],
             "apiPromptJson": {"prompt": {}},
-            "nodeBindings": {"object_replace_image": "img", "object_replace_mask": "mask"},
+            "nodeBindings": {
+                "source_image": {"kind": "node", "nodeId": "7"},
+                "mask": {"kind": "node", "nodeId": "8"},
+                "replacement_prompt": {"kind": "widget", "nodeId": "9", "widgetName": "text"},
+            },
         })
         self.assertEqual(snapshot4["featureStatus"]["object_replace"]["status"], "needs_bindings")
 
