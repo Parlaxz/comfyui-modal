@@ -495,6 +495,171 @@ class StudioShellWiredTests(_JsTestBase):
         self.assertNotIn("Test Axes", text)
 
 
+# ---------------------------------------------------------------------------
+# Studio Preset Execution Wired Tests
+# ---------------------------------------------------------------------------
+
+class StudioPresetExecutionUiWiredTests(_JsTestBase):
+    """Frontend wiring tests for Studio preset execution."""
+
+    def test_studio_backend_api_exports_run_studio_preset(self):
+        """studio-backend-api.js must export runStudioPreset helper."""
+        text = self._read("studio-backend-api.js")
+        self.assertIn("export async function runStudioPreset", text)
+
+    def test_studio_backend_api_exports_run_studio_experiment(self):
+        """studio-backend-api.js must export runStudioExperiment helper."""
+        text = self._read("studio-backend-api.js")
+        self.assertIn("export async function runStudioExperiment", text)
+
+    def test_studio_backend_api_exports_get_studio_run_status(self):
+        """studio-backend-api.js must export getStudioRunStatus helper."""
+        text = self._read("studio-backend-api.js")
+        self.assertIn("export async function getStudioRunStatus", text)
+
+    def test_playground_imports_run_studio_preset(self):
+        """studio-playground.js must import runStudioPreset from api module."""
+        text = self._read("studio-playground.js")
+        self.assertIn("runStudioPreset", text)
+        self.assertIn("./studio-backend-api.js", text)
+
+    def test_playground_imports_experiment_run_helpers(self):
+        """studio-playground.js must import experiment run helpers."""
+        text = self._read("studio-playground.js")
+        self.assertIn("canRunExperiment", text)
+        self.assertIn("executeExperimentRun", text)
+
+    def test_playground_run_button_uses_run_studio_preset(self):
+        """The Run button handler must call runStudioPreset."""
+        text = self._read("studio-playground.js")
+        self.assertIn("runStudioPreset(", text)
+
+    def test_playground_run_button_disabled_no_preset_message(self):
+        """Disabled Run reason must show 'Select or create a Backend Preset.'"""
+        text = self._read("studio-playground.js")
+        self.assertIn("Select or create a Backend Preset.", text)
+
+    def test_playground_run_button_shows_server_derived_reason(self):
+        """Disabled Run must display server-derived disabledReason from preset."""
+        text = self._read("studio-playground.js")
+        self.assertIn("disabledReason", text)
+        self.assertIn("This preset is archived.", text)
+
+    def test_playground_run_state_running_shown(self):
+        """Run button must show 'Running...' state during submission."""
+        text = self._read("studio-playground.js")
+        self.assertIn("Running\\u2026", text)
+
+    def test_playground_run_state_submitted_view_history(self):
+        """Submitted run state must show 'View in History' link."""
+        text = self._read("studio-playground.js")
+        self.assertIn("View in History", text)
+
+    def test_playground_run_state_error_dismiss(self):
+        """Error run state must have Dismiss button."""
+        text = self._read("studio-playground.js")
+        self.assertIn("Run Failed", text)
+
+    def test_experiment_mode_imports_run_studio_experiment(self):
+        """studio-experiment-mode.js must import runStudioExperiment."""
+        text = self._read("studio-experiment-mode.js")
+        self.assertIn("runStudioExperiment", text)
+        self.assertIn("./studio-backend-api.js", text)
+
+    def test_experiment_mode_uses_run_studio_experiment(self):
+        """executeExperimentRun must call runStudioExperiment."""
+        text = self._read("studio-experiment-mode.js")
+        self.assertIn("runStudioExperiment(", text)
+
+    def test_experiment_mode_can_run_function(self):
+        """Experiment mode must export canRunExperiment and getExperimentDisabledReason."""
+        text = self._read("studio-experiment-mode.js")
+        self.assertIn("export function canRunExperiment", text)
+        self.assertIn("export function getExperimentDisabledReason", text)
+        self.assertIn("export async function executeExperimentRun", text)
+
+    def test_experiment_compare_presets_uses_only_compare_ids(self):
+        """executeExperimentRun must iterate compare preset IDs only."""
+        text = self._read("studio-experiment-mode.js")
+        self.assertIn("compareBackendIds", text)
+
+    def test_experiment_compare_presets_disabled_reason_shown(self):
+        """Disabled/non-runnable presets must show reason in compare list."""
+        text = self._read("studio-experiment-mode.js")
+        self.assertIn("Not runnable", text)
+        self.assertIn("Not compatible with", text)
+        self.assertIn("Archived", text)
+
+    def test_experiment_disabled_presets_not_submitted(self):
+        """Disabled presets must be disabled in the compare list."""
+        text = self._read("studio-experiment-mode.js")
+        self.assertIn("cb.disabled = true", text)
+
+    def test_history_displays_studio_metadata(self):
+        """studio-history.js must display studio metadata fields."""
+        text = self._read("studio-history.js")
+        self.assertIn("studio_meta", text)
+        self.assertIn("studio_feature_id", text)
+        self.assertIn("studio_preset_id", text)
+
+    def test_history_shows_total_cells_and_counts(self):
+        """History grouped experiments must show total cells and completed/failed counts."""
+        text = self._read("studio-history.js")
+        self.assertIn("total_cells", text)
+        self.assertIn("completed", text)
+        self.assertIn("failed", text)
+
+    def test_history_shows_output_thumb_hint(self):
+        """History run rows must show an output thumbnail hint when output available."""
+        text = self._read("studio-history.js")
+        self.assertIn("asset_id", text)
+
+    def test_backend_detail_checklist_and_status_banner(self):
+        """Preset detail must show status banner and runnable checklist."""
+        text = self._read("studio-backend-presets.js")
+        self.assertIn("Runnable Checklist", text)
+        self.assertIn("Snapshot linked", text)
+        self.assertIn("Compatible features assigned", text)
+        self.assertIn("API prompt available", text)
+
+    def test_backend_detail_uses_status_banner(self):
+        """Preset detail must have status-banner style."""
+        text = self._read("studio-backend-presets.js")
+        self.assertIn("status-banner", text)
+        self.assertIn("Not Runnable", text)
+
+    def test_graph_binding_cleanup_guard(self):
+        """graph-binding cleanup must have reentrancy guard and hint removal."""
+        text = self._read("studio-graph-binding.js")
+        self.assertIn("_cleanupCalled", text)
+        self.assertIn("_removeCaptureHints", text)
+
+    def test_graph_binding_cancel_cleanup_hints(self):
+        """cancelGraphBinding must call _removeCaptureHints."""
+        text = self._read("studio-graph-binding.js")
+        self.assertIn("_removeCaptureHints", text)
+
+    def test_preset_wizard_cancels_binding_on_navigate(self):
+        """Wizard must cancel active binding capture when navigating steps."""
+        text = self._read("studio-preset-wizard.js")
+        self.assertIn("cancelGraphBinding", text)
+        self.assertIn("navigateStep", text)
+
+    def test_no_legacy_sidebar_reintroduction(self):
+        """Playground must not import stopLegacyController or sidebar classes."""
+        text = self._read("studio-playground.js")
+        self.assertNotIn("stopLegacyController", text)
+        self.assertNotIn("comfymodal-sidebar", text)
+        self.assertNotIn("comfymodal-studio-legacy", text)
+
+    def test_experiment_mode_no_legacy_sidebar(self):
+        """Experiment mode should not reference legacy sidebar patterns directly."""
+        text = self._read("studio-experiment-mode.js")
+        self.assertNotIn("comfymodal-sidebar", text)
+        self.assertNotIn("stopLegacyController", text)
+        self.assertNotIn("comfymodal-studio-legacy", text)
+
+
 class StudioLegacyWiredTests(_JsTestBase):
     """Legacy wrapper module API contract tests."""
 

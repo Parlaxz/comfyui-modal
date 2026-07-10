@@ -59,7 +59,8 @@ export function renderHistory(state, context) {
         const ungrouped = [];
 
         runList.forEach((run) => {
-          const expId = run.experiment_id || run.experimentId || null;
+          const extra = getRunExtra(run);
+          const expId = run.experiment_id || run.experimentId || extra.experiment_id || null;
           if (expId) {
             if (!grouped[expId]) grouped[expId] = [];
             grouped[expId].push(run);
@@ -80,15 +81,55 @@ export function renderHistory(state, context) {
           groupHeader.style.alignItems = "center";
           groupHeader.style.marginBottom = "var(--space-sm)";
 
+          // Check for studio experiment metadata
+          const firstRun = groupRuns[0] || {};
+          const firstExtra = getRunExtra(firstRun);
+          const studioMeta = firstRun.studio_meta || firstExtra.studio_meta || (firstRun.metadata && firstRun.metadata.studio_meta) || {};
+
           const groupTitle = document.createElement("strong");
-          groupTitle.textContent = `Experiment: ${expId}`;
+          if (studioMeta.studio_feature_id || studioMeta.studio_preset_id) {
+            const featureLabel = studioMeta.studio_feature_id || "studio";
+            const presetLabel = studioMeta.studio_preset_id ? studioMeta.studio_preset_id.substring(0, 12) : "";
+            groupTitle.textContent = `Studio ${featureLabel}${presetLabel ? " \u2014 " + presetLabel : ""}`;
+          } else {
+            groupTitle.textContent = `Experiment: ${expId}`;
+          }
           groupHeader.appendChild(groupTitle);
 
-          const groupCount = document.createElement("span");
-          groupCount.style.fontSize = "var(--font-size-xs)";
-          groupCount.style.color = "var(--color-text-muted)";
-          groupCount.textContent = `${groupRuns.length} run(s)`;
-          groupHeader.appendChild(groupCount);
+          // Stats row
+          const statsRow = document.createElement("div");
+          statsRow.style.display = "flex";
+          statsRow.style.gap = "8px";
+          statsRow.style.fontSize = "var(--font-size-xs)";
+          statsRow.style.color = "var(--color-text-muted)";
+
+          const totalCells = firstRun.total_cells || firstExtra.total_cells || groupRuns.length;
+          const completedCount = groupRuns.filter((r) => {
+            const s = r.status || r.state || "";
+            return s === "completed" || s === "success" || s === "done";
+          }).length;
+          const failedCount = groupRuns.filter((r) => {
+            const s = r.status || r.state || "";
+            return s === "failed" || s === "error";
+          }).length;
+
+          statsRow.appendChild(document.createTextNode(`${groupRuns.length} run(s)`));
+          if (totalCells > 0) {
+            statsRow.appendChild(document.createTextNode(`\u00b7 ${totalCells} total cells`));
+          }
+          if (completedCount > 0) {
+            const completedSpan = document.createElement("span");
+            completedSpan.style.color = "var(--color-success, #4ade80)";
+            completedSpan.textContent = `\u00b7 ${completedCount} completed`;
+            statsRow.appendChild(completedSpan);
+          }
+          if (failedCount > 0) {
+            const failedSpan = document.createElement("span");
+            failedSpan.style.color = "var(--color-danger, #f87171)";
+            failedSpan.textContent = `\u00b7 ${failedCount} failed`;
+            statsRow.appendChild(failedSpan);
+          }
+          groupHeader.appendChild(statsRow);
 
           groupCard.appendChild(groupHeader);
 
@@ -133,14 +174,22 @@ export function renderHistory(state, context) {
   return container;
 }
 
+function getRunExtra(run) {
+  return (run && run.extra) || {};
+}
+
 function renderRunRow(card, run) {
-  const rid = run.id || run.run_id || run.experiment_id || "unknown";
+  const extra = getRunExtra(run);
+  const rid = run.id || run.run_id || run.experiment_id || extra.experiment_id || "unknown";
   const status = run.status || run.state || "unknown";
   const promptText = (
-    run.prompt || (run.params && run.params.prompt) || rid
+    extra.prompt || run.prompt || (run.params && run.params.prompt) || rid
   ).substring(0, 120);
-  const time = run.created_at || run.timestamp || run.created || "";
+  const time = run.created_at || run.started_at || run.timestamp || run.created || "";
   const dur = run.duration || "";
+
+  // Studio metadata
+  const studioMeta = run.studio_meta || extra.studio_meta || (run.metadata && run.metadata.studio_meta) || {};
 
   const row = document.createElement("div");
   row.className = "testing-history-row";
@@ -153,6 +202,19 @@ function renderRunRow(card, run) {
   statusSpan.className = "testing-history-status";
   statusSpan.textContent = status;
   row.appendChild(statusSpan);
+
+  // Studio feature badge (if available)
+  if (studioMeta.studio_feature_id) {
+    const featureBadge = document.createElement("span");
+    featureBadge.className = "comfymodal-studio-history-feature";
+    featureBadge.textContent = studioMeta.studio_feature_id;
+    featureBadge.style.fontSize = "var(--font-size-xs)";
+    featureBadge.style.color = "var(--color-accent)";
+    featureBadge.style.border = "1px solid var(--color-accent)";
+    featureBadge.style.borderRadius = "3px";
+    featureBadge.style.padding = "0 4px";
+    row.appendChild(featureBadge);
+  }
 
   // Prompt/description
   const promptSpan = document.createElement("span");
@@ -174,6 +236,15 @@ function renderRunRow(card, run) {
     durSpan.className = "testing-history-duration";
     durSpan.textContent = dur;
     row.appendChild(durSpan);
+  }
+
+  // Output thumbnail hint
+  if (extra.primary_asset_id || run.asset_id || (run.outputs && run.outputs.length > 0)) {
+    const thumbHint = document.createElement("span");
+    thumbHint.textContent = "\u{1F5BC}";
+    thumbHint.title = "Output available";
+    thumbHint.style.fontSize = "12px";
+    row.appendChild(thumbHint);
   }
 
   card.appendChild(row);

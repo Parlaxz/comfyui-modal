@@ -82,9 +82,20 @@ function _injectCaptureStyles() {
   document.head.appendChild(style);
 }
 
+function _removeCaptureHints() {
+  const hints = document.querySelectorAll(".comfymodal-binding-capture-hint");
+  hints.forEach((h) => { if (h.parentNode) h.parentNode.removeChild(h); });
+}
+
 export function beginGraphBindingCapture({ bindingKey, label, onCapture, onCancel }) {
+  // Guard: if already active, cancel cleanly first
   if (_captureState.active) {
-    cancelGraphBinding();
+    _captureState.active = false;
+    if (_captureState.cleanup) {
+      _captureState.cleanup();
+      _captureState.cleanup = null;
+    }
+    _removeCaptureHints();
   }
 
   const ctx = getComfyGraphContext();
@@ -104,6 +115,8 @@ export function beginGraphBindingCapture({ bindingKey, label, onCapture, onCance
   document.body.classList.add("comfymodal-binding-capture-active");
 
   _captureState.active = true;
+
+  let _cleanupCalled = false;
 
   // Temporary click listener on the LiteGraph canvas
   function handleClick(e) {
@@ -150,10 +163,14 @@ export function beginGraphBindingCapture({ bindingKey, label, onCapture, onCance
   }
 
   function cleanup() {
+    if (_cleanupCalled) return;
+    _cleanupCalled = true;
     document.removeEventListener("click", handleClick, true);
     document.removeEventListener("keydown", handleKeydown);
     document.body.classList.remove("comfymodal-binding-capture-active");
-    if (hintEl.parentNode) hintEl.parentNode.removeChild(hintEl);
+    _removeCaptureHints();
+    _captureState.cleanup = null;
+    _captureState.resolve = null;
   }
 
   _captureState.cleanup = cleanup;
@@ -174,10 +191,12 @@ export function beginGraphBindingCapture({ bindingKey, label, onCapture, onCance
 
 export function cancelGraphBinding() {
   if (_captureState.active && _captureState.cleanup) {
-    _captureState.cleanup();
     _captureState.active = false;
+    _captureState.cleanup();
     _captureState.cleanup = null;
+    _captureState.resolve = null;
   }
+  _removeCaptureHints();
 }
 
 export function getSelectedGraphNodeTarget() {
