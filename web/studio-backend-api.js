@@ -52,6 +52,7 @@ export async function getCompareBackends(context) {
 
 export async function listSnapshots(apiBase) {
   const data = await apiFetch(apiBase, "/studio/snapshots");
+  if (data === null) return null; // network/API error
   return (data && data.snapshots) || [];
 }
 
@@ -87,6 +88,7 @@ export async function archiveSnapshot(apiBase, id) {
 
 export async function listPresets(apiBase) {
   const data = await apiFetch(apiBase, "/studio/presets");
+  if (data === null) return null; // network/API error
   return (data && data.presets) || [];
 }
 

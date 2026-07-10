@@ -7,6 +7,7 @@
 import { el, statusBadge } from "./studio-ui.js";
 import { listSnapshots, updateSnapshot, duplicateSnapshot, archiveSnapshot } from "./studio-backend-api.js";
 import { _STATE, renderFeaturesChipGrid } from "./studio-backend.js";
+import { getPresetCapabilitySummary } from "./studio-preset-capabilities.js";
 
 // ── Snapshots page ────────────────────────────────────────────────────────
 
@@ -17,10 +18,12 @@ export function renderSnapshotsPage(listPanel, detailPanel, apiBase) {
       style: "margin:0;font-size:11px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:0.05em;",
     }),
     el("button", {
-      class: "comfymodal-primary-btn",
-      text: "+ Take Snapshot",
+      class: "comfymodal-secondary-btn",
+      text: "+ Take Snapshot (Advanced)",
       style: "font-size:10px;padding:3px 8px;width:auto;",
+      title: "Advanced: Use Make Preset for the primary creation flow",
       onclick: () => {
+        if (!confirm("This is an advanced action. Snapshots are normally created automatically by 'Make Preset'. Continue?")) return;
         import("./studio-backend-capture.js").then(({ takeSnapshotOfCurrentGraph }) => {
           takeSnapshotOfCurrentGraph(apiBase, listPanel, detailPanel, renderSnapshotsList);
         });
@@ -35,7 +38,15 @@ export function renderSnapshotsPage(listPanel, detailPanel, apiBase) {
   listContent.textContent = "Loading snapshots...";
   listSnapshots(apiBase).then((snapshots) => {
     while (listContent.firstChild) listContent.removeChild(listContent.firstChild);
-    if (!snapshots || snapshots.length === 0) {
+    // null or undefined means network/API error
+    if (snapshots === null || snapshots === undefined) {
+      listContent.appendChild(el("div", { class: "comfymodal-studio-card" }, [
+        el("p", { text: "Could not load snapshots from server.", style: "font-weight:600;margin:0 0 4px;color:#f87171;" }),
+        el("p", { text: "Check that the backend server is running and the API is accessible.", style: "font-size:11px;color:#888;margin:0;" }),
+      ]));
+      return;
+    }
+    if (snapshots.length === 0) {
       listContent.appendChild(renderSnapshotsEmpty(apiBase));
       return;
     }
@@ -44,13 +55,20 @@ export function renderSnapshotsPage(listPanel, detailPanel, apiBase) {
       _STATE.selectedItemId = snapshots[0].id;
       renderSnapshotDetail(detailPanel, snapshots[0], apiBase, listContent);
     }
+  }).catch((err) => {
+    while (listContent.firstChild) listContent.removeChild(listContent.firstChild);
+    listContent.appendChild(el("div", { class: "comfymodal-studio-card" }, [
+      el("p", { text: "Error loading snapshots.", style: "font-weight:600;margin:0 0 4px;color:#f87171;" }),
+      el("p", { text: err.message || "Unknown error", style: "font-size:11px;color:#888;margin:0;" }),
+    ]));
   });
 }
 
 function renderSnapshotsEmpty(apiBase) {
   return el("div", { class: "comfymodal-studio-card" }, [
     el("p", { text: "No snapshots yet.", style: "font-weight:600;margin:0 0 8px;color:#888;" }),
-    el("p", { text: 'Click "+ Take Snapshot" to capture the current ComfyUI graph.', style: "font-size:12px;color:#555;margin:0 0 8px;" }),
+    el("p", { text: 'Use "Make Preset" above to create presets (snapshots are created automatically).', style: "font-size:12px;color:#555;margin:0 0 8px;" }),
+    el("p", { text: 'Or use "+ Take Snapshot (Advanced)" for manual capture.', style: "font-size:11px;color:#666;margin:0;font-style:italic;" }),
   ]);
 }
 
@@ -159,6 +177,71 @@ export function renderSnapshotDetail(container, snap, apiBase, listContainer) {
   if (snap.disabledReason) {
     card.appendChild(el("p", { text: `Disabled: ${snap.disabledReason}`, style: "font-size:11px;color:#f87171;margin:4px 0;" }));
   }
+
+  // ── Capability summary per feature ──────────────────────────────────
+  (snap.compatibleFeatures || []).forEach((fid) => {
+    const summary = getPresetCapabilitySummary(snap, fid);
+    const summaryGroup = el("div", {
+      style: "margin-bottom:6px;padding:6px;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:3px;",
+    });
+    summaryGroup.appendChild(el("p", {
+      text: `${fid} Capability`,
+      style: "font-size:10px;font-weight:600;color:#888;margin:0 0 4px;text-transform:uppercase;letter-spacing:0.05em;",
+    }));
+
+    // Feature status
+    const featStatus = summary.runnable ? "\u2713 Runnable" : `\u26a0 ${summary.disabledReason || "Needs attention"}`;
+    summaryGroup.appendChild(el("p", {
+      text: `Status: ${featStatus}`,
+      style: `font-size:10px;color:${summary.runnable ? "#4ade80" : "#fbbf24"};margin:0 0 4px;`,
+    }));
+
+    // API graph status
+    summaryGroup.appendChild(el("p", {
+      text: `API graph: ${summary.hasApiGraph ? "\u2713 present" : "\u2717 missing"}`,
+      style: `font-size:10px;color:${summary.hasApiGraph ? "#4ade80" : "#f87171"};margin:0 0 2px;`,
+    }));
+
+    // Output mapping status
+    summaryGroup.appendChild(el("p", {
+      text: `Output mapped: ${summary.hasOutputBinding ? "\u2713 yes" : "\u2717 no"}`,
+      style: `font-size:10px;color:${summary.hasOutputBinding ? "#4ade80" : "#f87171"};margin:0 0 2px;`,
+    }));
+
+    // Required bindings
+    const bindCount = snap.nodeBindings ? Object.keys(snap.nodeBindings).length : 0;
+    summaryGroup.appendChild(el("p", {
+      text: `Node bindings: ${bindCount} total`,
+      style: "font-size:10px;color:#888;margin:0 0 2px;",
+    }));
+
+    summaryGroup.appendChild(el("p", {
+      text: `Required bindings: ${summary.totalBoundRequired}/${summary.totalRequired}`,
+      style: `font-size:10px;color:${summary.allRequiredMet ? "#4ade80" : "#f87171"};margin:0 0 2px;`,
+    }));
+
+    summary.requiredBindings.forEach((d) => {
+      const item = el("div", { style: "display:flex;align-items:center;gap:4px;margin:2px 0;" }, [
+        el("span", { text: d.bound ? "\u2713" : "\u2717", style: `font-size:10px;color:${d.bound ? "#4ade80" : "#f87171"};` }),
+        el("span", { text: d.label, style: "font-size:10px;color:#aaa;" }),
+        d.binding ? el("span", {
+          text: `\u2192 ${d.binding.nodeTitle || d.binding.nodeId || ""}`,
+          style: "font-size:9px;color:#666;margin-left:4px;",
+        }) : null,
+      ]);
+      summaryGroup.appendChild(item);
+    });
+
+    // Missing required notice
+    if (!summary.allRequiredMet) {
+      summaryGroup.appendChild(el("p", {
+        text: `Missing required: ${summary.missingRequired.length}`,
+        style: "font-size:9px;color:#f87171;margin:4px 0 0;",
+      }));
+    }
+
+    card.appendChild(summaryGroup);
+  });
 
   // Actions
   const actions = el("div", { class: "comfymodal-studio-backend-actions" });

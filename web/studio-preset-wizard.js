@@ -1,8 +1,10 @@
 // Modal Studio — Preset Wizard
 //
-// Side-panel wizard for creating a Studio preset from the current ComfyUI graph.
-// Steps: features → bindings → details → saving/saved/error.
+// Side-panel wizard for creating or editing a Studio preset from the
+// current ComfyUI graph.
+// Steps: Feature Type → Required Bindings → Exposed Controls → Details
 // Wires into studio-backend.js as the primary "Make Preset" flow.
+// Supports edit mode: pass existingPreset + existingSnapshot to pre-fill.
 
 import { el } from "./studio-ui.js";
 import {
@@ -13,54 +15,37 @@ import {
   getSelectedGraphNodeTarget,
 } from "./studio-graph-binding.js";
 import { captureCurrentComfyGraph } from "./studio-backend-capture.js";
-import { createSnapshot, createPreset } from "./studio-backend-api.js";
+import { createSnapshot, createPreset, updateSnapshot, updatePreset } from "./studio-backend-api.js";
+import {
+  CONTROL_BINDING_DEFS,
+  getRequiredBindingsForFeature,
+  getOptionalBindingsForFeature,
+} from "./studio-preset-capabilities.js";
 
-// ── Feature definitions with required binding specs ─────────────────────
+// ── Feature definitions for wizard steps ────────────────────────────────
+// Aligned with studio-preset-capabilities.js definitions.
 
 const FEATURE_DEFS = {
   txt2img: {
     id: "txt2img",
     label: "Txt2Img",
     description: "Standard text-to-image generation",
-    requiredBindings: [
-      { key: "prompt", label: "Prompt", description: "The text prompt widget/input" },
-      { key: "output", label: "Output Image", description: "The image output node" },
-    ],
-    optionalBindings: [
-      { key: "seed", label: "Seed", description: "Seed control (optional)" },
-      { key: "steps", label: "Steps", description: "Steps control (optional)" },
-    ],
-    outputRequired: true,
+    requiredBindings: getRequiredBindingsForFeature("txt2img"),
+    optionalBindings: getOptionalBindingsForFeature("txt2img"),
   },
   object_remove: {
     id: "object_remove",
     label: "Object Remove",
     description: "Remove an object from an image",
-    requiredBindings: [
-      { key: "source_image", label: "Source Image", description: "Input image node" },
-      { key: "mask", label: "Mask", description: "Mask indicating the object to remove" },
-      { key: "instruction", label: "Instruction", description: "Prompt describing the removal" },
-      { key: "output", label: "Output Image", description: "The image output node" },
-    ],
-    optionalBindings: [
-      { key: "seed", label: "Seed", description: "Seed control (optional)" },
-    ],
-    outputRequired: true,
+    requiredBindings: getRequiredBindingsForFeature("object_remove"),
+    optionalBindings: getOptionalBindingsForFeature("object_remove"),
   },
   object_replace: {
     id: "object_replace",
     label: "Object Replace",
     description: "Replace an object in an image",
-    requiredBindings: [
-      { key: "source_image", label: "Source Image", description: "Input image node" },
-      { key: "mask", label: "Mask", description: "Mask indicating the object to replace" },
-      { key: "replacement_prompt", label: "Replacement Prompt", description: "Prompt describing the replacement" },
-      { key: "output", label: "Output Image", description: "The image output node" },
-    ],
-    optionalBindings: [
-      { key: "seed", label: "Seed", description: "Seed control (optional)" },
-    ],
-    outputRequired: true,
+    requiredBindings: getRequiredBindingsForFeature("object_replace"),
+    optionalBindings: getOptionalBindingsForFeature("object_replace"),
   },
 };
 
@@ -69,8 +54,8 @@ const FEATURE_DEFS = {
 let _wizardState = null;
 let _wizardRoot = null;
 
-function makeInitialState() {
-  return {
+function makeInitialState(existingPreset, existingSnapshot) {
+  const state = {
     step: "features",           // features | bindings | details | saving | saved | error
     selectedFeatures: [],
     bindings: {},               // { [bindingKey]: bindingTarget | null }
@@ -87,15 +72,53 @@ function makeInitialState() {
     snapshotResult: null,
     presetResult: null,
     errorMessage: "",
+    // Edit-mode fields
+    isEdit: false,
+    existingPreset: null,
+    existingSnapshot: null,
+    existingPresetId: null,
+    existingSnapshotId: null,
   };
+
+  // ── Edit mode: pre-fill from existing preset + snapshot ─────────────
+  if (existingPreset) {
+    state.isEdit = true;
+    state.existingPreset = existingPreset;
+    state.existingPresetId = existingPreset.id;
+    state.step = "bindings"; // skip feature selection in edit mode
+    state.selectedFeatures = existingPreset.compatibleFeatures || [];
+    state.details.name = existingPreset.label || existingPreset.name || "";
+    state.details.description = existingPreset.description || "";
+
+    if (existingSnapshot) {
+      state.existingSnapshot = existingSnapshot;
+      state.existingSnapshotId = existingSnapshot.id;
+      state.graphJson = existingSnapshot.graphJson || null;
+      state.apiPromptJson = existingSnapshot.apiPromptJson || null;
+      state.graphCaptured = true;
+    }
+
+    // Pre-fill bindings from either preset's or snapshot's nodeBindings
+    const srcBindings = existingPreset.nodeBindings || (existingSnapshot && existingSnapshot.nodeBindings) || {};
+    Object.entries(srcBindings).forEach(([key, val]) => {
+      if (val && val.nodeId) {
+        state.bindings[key] = { ...val };
+      }
+    });
+
+    // Pre-fill capture warnings
+    state.captureWarnings = (existingSnapshot && existingSnapshot.warnings) || [];
+  }
+
+  return state;
 }
 
 // ── Public API ───────────────────────────────────────────────────────────
 
-export function openPresetWizard(onDone, apiBase) {
+export function openPresetWizard(onDone, apiBase, existingPreset, existingSnapshot) {
   closePresetWizard(); // Clean up any existing wizard first
 
-  _wizardState = makeInitialState();
+  _wizardState = makeInitialState(existingPreset, existingSnapshot);
   _wizardState._onDone = onDone;
   _wizardState._apiBase = apiBase || "/comfymodal";
 
@@ -162,8 +185,9 @@ function renderWizard(panel, state) {
   while (panel.firstChild) panel.removeChild(panel.firstChild);
 
   // Header
+  const headerTitle = state.isEdit ? "Edit Preset" : "Make Preset";
   const header = el("div", { class: "comfymodal-studio-wizard-header" }, [
-    el("h3", { text: "Make Preset", class: "comfymodal-studio-wizard-title" }),
+    el("h3", { text: headerTitle, class: "comfymodal-studio-wizard-title" }),
     el("button", {
       class: "comfymodal-studio-wizard-close",
       text: "\u00d7",
@@ -172,36 +196,38 @@ function renderWizard(panel, state) {
   ]);
   panel.appendChild(header);
 
-  // Step indicator
-  const stepNames = ["Features", "Bindings", "Details"];
-  const stepKeys = ["features", "bindings", "details"];
-  const currentStepIdx = stepKeys.indexOf(state.step);
+  // Step indicator (skip in edit mode — edit starts at bindings)
+  if (!state.isEdit) {
+    const stepNames = ["Feature Type", "Bindings & Controls", "Details"];
+    const stepKeys = ["features", "bindings", "details"];
+    const currentStepIdx = stepKeys.indexOf(state.step);
 
-  const stepIndicator = el("div", { class: "comfymodal-studio-wizard-steps" });
-  stepKeys.forEach((key, idx) => {
-    const isActive = key === state.step;
-    const isDone = stepKeys.indexOf(state.step) > idx || (state.step === "saved" || state.step === "error");
-    const dot = el("span", {
-      class: "comfymodal-studio-wizard-step-dot"
-        + (isActive ? " active" : "")
-        + (isDone ? " done" : ""),
-      text: isDone ? "\u2713" : String(idx + 1),
-    });
-    const label = el("span", {
-      class: "comfymodal-studio-wizard-step-label"
-        + (isActive ? " active" : ""),
-      text: stepNames[idx],
-    });
-    stepIndicator.appendChild(dot);
-    stepIndicator.appendChild(label);
-    if (idx < stepKeys.length - 1) {
-      stepIndicator.appendChild(el("span", {
-        class: "comfymodal-studio-wizard-step-line"
+    const stepIndicator = el("div", { class: "comfymodal-studio-wizard-steps" });
+    stepKeys.forEach((key, idx) => {
+      const isActive = key === state.step;
+      const isDone = stepKeys.indexOf(state.step) > idx || (state.step === "saved" || state.step === "error");
+      const dot = el("span", {
+        class: "comfymodal-studio-wizard-step-dot"
+          + (isActive ? " active" : "")
           + (isDone ? " done" : ""),
-      }));
-    }
-  });
-  panel.appendChild(stepIndicator);
+        text: isDone ? "\u2713" : String(idx + 1),
+      });
+      const label = el("span", {
+        class: "comfymodal-studio-wizard-step-label"
+          + (isActive ? " active" : ""),
+        text: stepNames[idx],
+      });
+      stepIndicator.appendChild(dot);
+      stepIndicator.appendChild(label);
+      if (idx < stepKeys.length - 1) {
+        stepIndicator.appendChild(el("span", {
+          class: "comfymodal-studio-wizard-step-line"
+            + (isDone ? " done" : ""),
+        }));
+      }
+    });
+    panel.appendChild(stepIndicator);
+  }
 
   // Body
   const body = el("div", { class: "comfymodal-studio-wizard-body" });
@@ -209,7 +235,7 @@ function renderWizard(panel, state) {
 
   // Graph availability banner
   const graphContext = getComfyGraphContext();
-  if (!graphContext.ok) {
+  if (!graphContext.ok && !state.graphCaptured) {
     const banner = el("div", { class: "comfymodal-studio-wizard-graph-unavailable" }, [
       el("p", { text: graphContext.reason || "ComfyUI graph is not ready.", style: "color:#f87171;font-size:11px;margin:0;" }),
     ]);
@@ -259,23 +285,31 @@ function renderWizard(panel, state) {
       },
     }));
   } else if (state.step === "bindings") {
-    const allBound = checkAllRequiredBindings(state) && graphContext.ok;
+    const allRequiredBound = checkAllRequiredBindings(state);
+    const graphOk = graphContext.ok || state.graphCaptured;
+
     footer.appendChild(el("button", {
       class: "comfymodal-secondary-btn",
-      text: "Back to Features",
-      onclick: () => navigateStep("features"),
+      text: state.isEdit ? "Cancel" : "Back to Features",
+      onclick: () => {
+        if (state.isEdit) {
+          closePresetWizardAndNotify();
+        } else {
+          navigateStep("features");
+        }
+      },
     }));
     footer.appendChild(el("button", {
       class: "comfymodal-primary-btn",
       text: "Continue to Details",
-      disabled: !allBound,
+      disabled: !(allRequiredBound && graphOk),
       onclick: () => {
-        if (!allBound) return;
+        if (!(allRequiredBound && graphOk)) return;
         navigateStep("details");
       },
     }));
   } else if (state.step === "details") {
-    const canSave = state.details.name.trim().length > 0 && checkAllRequiredBindings(state) && graphContext.ok;
+    const canSave = state.details.name.trim().length > 0 && checkAllRequiredBindings(state) && (getComfyGraphContext().ok || state.graphCaptured);
     footer.appendChild(el("button", {
       class: "comfymodal-secondary-btn",
       text: "Back to Bindings",
@@ -284,11 +318,10 @@ function renderWizard(panel, state) {
     footer.appendChild(el("button", {
       class: "comfymodal-primary-btn",
       "data-role": "save-preset",
-      text: "Save Preset",
+      text: state.isEdit ? "Update Preset" : "Save Preset",
       disabled: !canSave,
       onclick: async () => {
-        // Check state directly — closure variable is stale from render time
-        if (!(state.details.name.trim().length > 0 && checkAllRequiredBindings(state) && getComfyGraphContext().ok)) return;
+        if (!(state.details.name.trim().length > 0 && checkAllRequiredBindings(state) && (getComfyGraphContext().ok || state.graphCaptured))) return;
         await executeSave(state);
         renderWizard(panel, state);
       },
@@ -303,10 +336,14 @@ function renderWizard(panel, state) {
     }));
     footer.appendChild(el("button", {
       class: "comfymodal-secondary-btn",
-      text: "Make Another",
+      text: state.isEdit ? "Edit Again" : "Make Another",
       onclick: () => {
         closePresetWizard();
-        openPresetWizard(state._onDone, state._apiBase);
+        if (state.isEdit) {
+          openPresetWizard(state._onDone, state._apiBase, state.existingPreset, state.existingSnapshot);
+        } else {
+          openPresetWizard(state._onDone, state._apiBase);
+        }
       },
     }));
   } else if (state.step === "error") {
@@ -383,26 +420,84 @@ function renderBindingsStep(body, state) {
   });
   body.appendChild(desc);
 
-  // Collect all bindings for selected features
-  const allBindings = collectRequiredAndOptionalBindings(state.selectedFeatures);
-
-  const bindingList = el("div", { class: "comfymodal-studio-wizard-binding-list" });
-
   const graphContext = getComfyGraphContext();
-  bindingList.appendChild(el("div", { class: "comfymodal-studio-wizard-binding-row" + (graphContext.ok ? " bound" : "") }, [
+  const graphOk = graphContext.ok || state.graphCaptured;
+
+  // ── API Graph row (read-only, captured automatically on save) ──────
+  const apiRow = el("div", { class: "comfymodal-studio-wizard-binding-row" + (graphOk ? " bound" : "") }, [
     el("div", { class: "comfymodal-studio-wizard-binding-info" }, [
       el("strong", { style: "font-size:12px;", text: "API Graph" }),
-      el("p", { style: "font-size:10px;color:#888;margin:2px 0 0;", text: graphContext.ok ? "Captured from the current ComfyUI graph when you save." : (graphContext.reason || "Graph unavailable") }),
+      el("p", { style: "font-size:10px;color:#888;margin:2px 0 0;",
+        text: graphOk
+          ? "Captured automatically from the current ComfyUI graph when you save."
+          : (graphContext.reason || "Graph unavailable"),
+      }),
     ]),
     el("div", { class: "comfymodal-studio-wizard-binding-status" }, [
-      el("span", { text: graphContext.ok ? "Ready to capture on save" : "Unavailable", style: `font-size:10px;color:${graphContext.ok ? "#4ade80" : "#f87171"};` }),
+      el("span", {
+        text: graphOk ? "Auto-captured on save" : "Unavailable",
+        style: `font-size:10px;color:${graphOk ? "#4ade80" : "#f87171"};`,
+      }),
     ]),
-  ]));
+  ]);
+  body.appendChild(apiRow);
 
-  allBindings.forEach((bindingDef) => {
+  // ── Required bindings ─────────────────────────────────────────────
+  const featureId = state.selectedFeatures[0];
+  const requiredDefs = featureId ? getRequiredBindingsForFeature(featureId) : [];
+  const optionalDefs = featureId ? getOptionalBindingsForFeature(featureId) : [];
+
+  const reqHeading = el("h4", {
+    style: "font-size:11px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:0.05em;margin:12px 0 4px;",
+    text: "Required Bindings",
+  });
+  body.appendChild(reqHeading);
+
+  const requiredList = renderBindingRowList(requiredDefs, state, graphContext);
+  body.appendChild(requiredList);
+
+  // ── Optional / Exposed Controls ──────────────────────────────────
+  if (optionalDefs.length > 0) {
+    const optHeading = el("h4", {
+      style: "font-size:11px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:0.05em;margin:16px 0 4px;",
+      text: "Exposed Controls (Optional)",
+    });
+    body.appendChild(optHeading);
+
+    const optDesc = el("p", {
+      style: "font-size:10px;color:#666;margin:0 0 4px;font-style:italic;",
+      text: "Bind optional controls to expose them in the Playground.",
+    });
+    body.appendChild(optDesc);
+
+    const optionalList = renderBindingRowList(optionalDefs, state, graphContext);
+    body.appendChild(optionalList);
+  }
+
+  // ── Binding summary ──────────────────────────────────────────────
+  const requiredKeys = collectRequiredBindings(state.selectedFeatures).map((b) => b.key);
+  const boundCount = requiredKeys.filter((k) => state.bindings[k] && state.bindings[k].nodeId).length;
+  const summary = el("p", {
+    style: "font-size:11px;color:#888;margin-top:8px;",
+    text: `${boundCount} of ${requiredKeys.length} required bindings complete • API graph ${graphOk ? "ready" : "unavailable"}`,
+  });
+  body.appendChild(summary);
+}
+
+// ── Binding row list renderer ────────────────────────────────────────────
+
+function renderBindingRowList(bindingDefs, state, graphContext) {
+  const list = el("div", { class: "comfymodal-studio-wizard-binding-list" });
+  const graphOk = (graphContext && graphContext.ok) || state.graphCaptured;
+
+  bindingDefs.forEach((bindingDef) => {
     const bindingValue = state.bindings[bindingDef.key];
     const isBound = Boolean(bindingValue && bindingValue.nodeId);
     const isCaptureActive = state.bindingCaptureActive === bindingDef.key;
+
+    // Get label from CONTROL_BINDING_DEFS for consistency
+    const defLabel = bindingDef.label || (CONTROL_BINDING_DEFS[bindingDef.key] && CONTROL_BINDING_DEFS[bindingDef.key].label) || bindingDef.key;
+    const defHelp = bindingDef.helpText || (CONTROL_BINDING_DEFS[bindingDef.key] && CONTROL_BINDING_DEFS[bindingDef.key].helpText) || "";
 
     const row = el("div", {
       class: "comfymodal-studio-wizard-binding-row"
@@ -410,8 +505,8 @@ function renderBindingsStep(body, state) {
         + (isCaptureActive ? " capturing" : ""),
     }, [
       el("div", { class: "comfymodal-studio-wizard-binding-info" }, [
-        el("strong", { style: "font-size:12px;", text: bindingDef.label }),
-        el("p", { style: "font-size:10px;color:#888;margin:2px 0 0;", text: bindingDef.description }),
+        el("strong", { style: "font-size:12px;", text: defLabel }),
+        el("p", { style: "font-size:10px;color:#888;margin:2px 0 0;", text: defHelp }),
       ]),
       el("div", { class: "comfymodal-studio-wizard-binding-status" }, [
         isBound ? renderBoundValue(bindingValue, bindingDef) : (
@@ -457,12 +552,11 @@ function renderBindingsStep(body, state) {
           renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
         },
       }));
-    } else if (!isGraphAvailable()) {
+    } else if (!isGraphAvailable() && !state.graphCaptured) {
       row.style.opacity = "0.4";
       row.title = "Graph not available";
     } else {
       row.addEventListener("click", () => {
-        // If we have a selected-node fallback button, show it
         startBindingCapture(state, bindingDef);
       });
       row.style.cursor = "pointer";
@@ -474,19 +568,10 @@ function renderBindingsStep(body, state) {
       row.appendChild(candidateDropdown);
     }
 
-    bindingList.appendChild(row);
+    list.appendChild(row);
   });
 
-  body.appendChild(bindingList);
-
-  // Binding summary
-  const requiredKeys = collectRequiredBindings(state.selectedFeatures).map((b) => b.key);
-  const boundCount = requiredKeys.filter((k) => state.bindings[k] && state.bindings[k].nodeId).length;
-  const summary = el("p", {
-    style: "font-size:11px;color:#888;margin-top:8px;",
-    text: `${boundCount} of ${requiredKeys.length} required bindings complete • API graph ${graphContext.ok ? "ready" : "unavailable"}`,
-  });
-  body.appendChild(summary);
+  return list;
 }
 
 function renderBoundValue(bindingValue, bindingDef) {
@@ -640,19 +725,25 @@ function renderSavingStep(body, state) {
 // ── Step: Saved ─────────────────────────────────────────────────────────
 
 function renderSavedStep(body, state) {
-  const presetStatus = state.presetResult ? (state.presetResult.status || "unknown") : "unknown";
+  const isEdit = state.isEdit;
+  const presetStatus = state.presetResult ? (state.presetResult.status || "unknown") : (state.existingPreset && state.existingPreset.status) || "unknown";
   const isRunnable = presetStatus === "runnable";
   const success = el("div", { style: "text-align:center;padding:16px;" }, [
     el("div", { text: "\u2713", style: `font-size:32px;color:${isRunnable ? "#4ade80" : "#fbbf24"};` }),
-    el("h4", { text: isRunnable ? "Preset Saved" : "Preset Saved With Follow-Up Needed", style: "margin:8px 0;color:#d0d0d0;" }),
-    el("p", { text: `"${state.details.name}" has been created.`, style: "font-size:12px;color:#888;margin:0 0 8px;" }),
+    el("h4", {
+      text: isEdit ? "Preset Updated" : (isRunnable ? "Preset Saved" : "Preset Saved With Follow-Up Needed"),
+      style: "margin:8px 0;color:#d0d0d0;",
+    }),
+    el("p", {
+      text: isEdit ? `"${state.details.name}" has been updated.` : `"${state.details.name}" has been created.`,
+      style: "font-size:12px;color:#888;margin:0 0 8px;",
+    }),
   ]);
 
-  // Show server-returned status truthfully
+  // Show status truthfully
   if (state.snapshotResult) {
-    const snapStatus = state.snapshotResult.status || "unknown";
     success.appendChild(el("p", {
-      text: `Snapshot status: ${snapStatus}`,
+      text: `Snapshot status: ${state.snapshotResult.status || "unknown"}`,
       style: "font-size:11px;color:#888;margin:4px 0;",
     }));
   }
@@ -661,12 +752,13 @@ function renderSavedStep(body, state) {
       text: `Preset status: ${presetStatus}`,
       style: "font-size:11px;color:#888;margin:4px 0;",
     }));
-    if (!isRunnable) {
-      success.appendChild(el("p", {
-        text: state.presetResult.disabledReason || "This preset is saved but not yet runnable.",
-        style: "font-size:11px;color:#fbbf24;margin:4px 0;",
-      }));
-    }
+  }
+  if (!isRunnable && !isEdit) {
+    const reason = (state.presetResult && state.presetResult.disabledReason) || (state.existingPreset && state.existingPreset.disabledReason) || "";
+    success.appendChild(el("p", {
+      text: reason || "This preset is saved but not yet runnable.",
+      style: "font-size:11px;color:#fbbf24;margin:4px 0;",
+    }));
   }
 
   body.appendChild(success);
@@ -693,18 +785,6 @@ async function executeSave(state) {
   const apiBase = state._apiBase;
 
   try {
-    // 1. Capture the current graph
-    const captureResult = await captureCurrentComfyGraph();
-    if (!captureResult.ok) {
-      state.step = "error";
-      state.errorMessage = captureResult.reason || "Failed to capture graph";
-      return;
-    }
-
-    state.graphJson = captureResult.graphJson;
-    state.apiPromptJson = captureResult.apiPromptJson;
-    state.captureWarnings = captureResult.warnings || [];
-
     // Build nodeBindings from wizard state
     const nodeBindings = {};
     Object.entries(state.bindings).forEach(([key, val]) => {
@@ -721,7 +801,45 @@ async function executeSave(state) {
       }
     });
 
-    const outputNodeId = state.bindings.output && state.bindings.output.nodeId ? state.bindings.output.nodeId : "";
+    const outputNodeId = state.bindings.output && state.bindings.output.nodeId ? state.bindings.output.nodeId : null;
+
+    if (state.isEdit && state.existingSnapshotId) {
+      // ── Edit mode: update snapshot bindings ────────────────────────
+      const snapshotUpdate = {
+        compatibleFeatures: state.selectedFeatures,
+        nodeBindings: nodeBindings,
+      };
+      if (outputNodeId) snapshotUpdate.outputNodeId = outputNodeId;
+
+      await updateSnapshot(apiBase, state.existingSnapshotId, snapshotUpdate);
+
+      // ── Update preset metadata ────────────────────────────────────
+      if (state.existingPresetId) {
+        await updatePreset(apiBase, state.existingPresetId, {
+          label: state.details.name,
+          description: state.details.description,
+          compatibleFeatures: state.selectedFeatures,
+          snapshotId: state.existingSnapshotId,
+        });
+      }
+
+      state.step = "saved";
+      return;
+    }
+
+    // ── New preset flow ─────────────────────────────────────────────
+
+    // 1. Capture the current graph
+    const captureResult = await captureCurrentComfyGraph();
+    if (!captureResult.ok) {
+      state.step = "error";
+      state.errorMessage = captureResult.reason || "Failed to capture graph";
+      return;
+    }
+
+    state.graphJson = captureResult.graphJson;
+    state.apiPromptJson = captureResult.apiPromptJson;
+    state.captureWarnings = captureResult.warnings || [];
 
     // 2. Create snapshot
     const snapshotPayload = {

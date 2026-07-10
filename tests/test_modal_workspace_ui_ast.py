@@ -5,6 +5,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 UI_SETTINGS_PATH = REPO_ROOT / "web" / "modal-settings.js"
 UI_NODE_PATH = REPO_ROOT / "web" / "modal-node.js"
+UI_PLAYGROUND_PATH = REPO_ROOT / "web" / "studio-playground.js"
 
 
 class ModalWorkspaceUiAstTests(unittest.TestCase):
@@ -105,6 +106,36 @@ class ModalProductionUiAstTests(unittest.TestCase):
         source = UI_NODE_PATH.read_text(encoding="utf-8")
         self.assertNotIn("Production bypass failed for node", source)
         self.assertNotIn("ComfyUI could not serialize this node as a native bypass", source)
+
+
+class StudioPlaygroundUiAstTests(unittest.TestCase):
+    """Studio playground UI source-level tests for run status polling."""
+
+    def setUp(self):
+        self.source = UI_PLAYGROUND_PATH.read_text(encoding="utf-8")
+
+    def test_imports_getStudioRunStatus(self):
+        self.assertIn("getStudioRunStatus", self.source)
+        # Must import from studio-backend-api (or be defined locally)
+        self.assertIn('from "./studio-backend-api.js"', self.source)
+        self.assertIn("getStudioRunStatus", self.source.split("import")[-1])
+
+    def test_polls_experiment_status_after_submitted(self):
+        self.assertIn("getStudioRunStatus", self.source)
+        self.assertIn("data.snapshot", self.source)
+        self.assertIn("queued", self.source)
+        self.assertIn("running", self.source)
+        self.assertIn("completed", self.source)
+
+    def test_does_not_keep_static_submitted_state(self):
+        # The old behavior kept "Submitted" as a static terminal state.
+        # The new behavior polls experiment status, so the word "Submitted"
+        # should only appear as a transitional state, not as a permanent display.
+        self.assertIn('"submitted"', self.source)
+        # Ensure there is polling logic (setInterval or recursive setTimeout)
+        has_interval = "setInterval" in self.source
+        has_timeout_recursive = "setTimeout" in self.source and "getStudioRunStatus" in self.source
+        self.assertTrue(has_interval or has_timeout_recursive)
 
 
 if __name__ == "__main__":

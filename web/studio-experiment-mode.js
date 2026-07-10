@@ -13,6 +13,7 @@
 import { CONTROL_DEFS } from "./studio-feature-registry.js";
 import { getRuntimePresets } from "./studio-backend.js";
 import { runStudioExperiment } from "./studio-backend-api.js";
+import { getAxisEligibilityForPresets } from "./studio-preset-capabilities.js";
 
 // ── Experiment toggle ────────────────────────────────────────────────────
 
@@ -36,6 +37,18 @@ export function renderExperimentToggle(state, actions) {
   return container;
 }
 
+// ── Axis eligibility helper ──────────────────────────────────────────────
+
+function recalcEligibleAxes(state, loadedPresets) {
+  const compareIds = (state.playground && state.playground.compareBackendIds) || [];
+  if (compareIds.length === 0) return [];
+  const selectedPresets = compareIds
+    .map((id) => (loadedPresets || []).find((p) => (p.id || p.label || "") === id))
+    .filter(Boolean);
+  const featureId = (state.playground && state.playground.featureId) || "txt2img";
+  return getAxisEligibilityForPresets(selectedPresets, featureId);
+}
+
 // ── Compare Backends block ───────────────────────────────────────────────
 
 export function renderCompareBackends(state, actions, context) {
@@ -57,6 +70,17 @@ export function renderCompareBackends(state, actions, context) {
 
   getRuntimePresets({ apiBase }).then((presets) => {
     while (list.firstChild) list.removeChild(list.firstChild);
+
+    // Calculate eligible axes from compared presets
+    const eligible = recalcEligibleAxes(state, presets);
+    state.playground._eligibleAxes = eligible;
+    // Clear ineligible axes
+    const axes = state.playground.experimentAxes || {};
+    Object.keys(axes).forEach((ctrlId) => {
+      if (!eligible.includes(ctrlId)) {
+        delete axes[ctrlId];
+      }
+    });
 
     if (!presets || presets.length === 0) {
       const emptyState = document.createElement("p");
@@ -111,6 +135,16 @@ export function renderCompareBackends(state, actions, context) {
           updated = current.filter((id) => id !== bId);
         }
         state.playground.compareBackendIds = updated;
+        // Recalculate eligible axes and clear ineligible ones
+        const eligible = recalcEligibleAxes(state, presets);
+        state.playground._eligibleAxes = eligible;
+        // Remove axes that are no longer eligible
+        const axes = state.playground.experimentAxes || {};
+        Object.keys(axes).forEach((ctrlId) => {
+          if (!eligible.includes(ctrlId)) {
+            delete axes[ctrlId];
+          }
+        });
         const matrixBody = container.parentNode
           ? container.parentNode.querySelector('[data-testid="matrix-body"]')
           : null;
@@ -292,6 +326,8 @@ export function enhanceControlWithAxisCheckbox(controlEl, controlId, state, acti
 
   const axes = (state.playground && state.playground.experimentAxes) || {};
   const isAxis = !!(axes[controlId] && axes[controlId].enabled);
+  const eligibleAxes = (state.playground && state.playground._eligibleAxes) || [];
+  const isEligible = eligibleAxes.includes(controlId);
 
   const wrapper = document.createElement("label");
   wrapper.className = "comfymodal-studio-axis-checkbox-wrapper";
@@ -299,9 +335,13 @@ export function enhanceControlWithAxisCheckbox(controlEl, controlId, state, acti
 
   const cb = document.createElement("input");
   cb.type = "checkbox";
-  cb.checked = isAxis;
+  cb.checked = isAxis && isEligible;
   cb.setAttribute("data-axis", controlId);
   cb.className = "comfymodal-studio-axis-checkbox";
+  cb.disabled = !isEligible;
+  if (!isEligible) {
+    wrapper.title = "Axis not available: not all selected presets support this control.";
+  }
   cb.addEventListener("change", () => {
     if (actions && actions.toggleExperimentAxis) {
       actions.toggleExperimentAxis(controlId, cb.checked);
@@ -310,8 +350,8 @@ export function enhanceControlWithAxisCheckbox(controlEl, controlId, state, acti
 
   wrapper.appendChild(cb);
 
-  // If axis is active, insert the inline axis editor after the control group
-  if (isAxis) {
+  // If axis is active and eligible, insert the inline axis editor after the control group
+  if (isAxis && isEligible) {
     const editor = renderAxisEditor(controlId, state, actions);
     if (editor) {
       // Schedule insertion after controlEl's parent processes
@@ -554,9 +594,10 @@ export async function executeExperimentRun(state, context) {
     prompts: [{ text: controls.prompt || "", negative: controls.negative_prompt || "" }],
   };
 
-  // Add axes values
+  // Only submit axes that are eligible (supported by all selected presets)
+  const eligibleAxes = (state.playground && state.playground._eligibleAxes) || [];
   Object.entries(axes).forEach(([ctrlId, def]) => {
-    if (def && def.enabled && def.values && def.values.length > 0) {
+    if (def && def.enabled && def.values && def.values.length > 0 && eligibleAxes.includes(ctrlId)) {
       experimentDef.axes[ctrlId] = { enabled: true, values: def.values };
     }
   });

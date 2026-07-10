@@ -1,4 +1,5 @@
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -124,10 +125,55 @@ def set_active_workspace(path: str | Path, workspace_id: str) -> dict:
 
 def get_active_workspace(registry: dict) -> dict | None:
     active_id = registry.get("active_workspace_id")
-    for workspace in registry.get("workspaces", []):
-        if workspace.get("id") == active_id:
-            return workspace
+    if active_id is not None:
+        for workspace in registry.get("workspaces", []):
+            if workspace.get("id") == active_id:
+                return workspace
+    workspaces = registry.get("workspaces", [])
+    if len(workspaces) == 1:
+        return workspaces[0]
     return None
+
+
+def _parse_legacy_toml(path: str | Path) -> dict:
+    """Parse a simple TOML file and extract token_id/token_secret from [default]."""
+    try:
+        content = Path(path).read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return {}
+    token_id = None
+    token_secret = None
+    for m in re.finditer(r'^token_id\s*=\s*"([^"]*)"\s*$', content, re.MULTILINE):
+        token_id = m.group(1)
+    for m in re.finditer(r'^token_secret\s*=\s*"([^"]*)"\s*$', content, re.MULTILINE):
+        token_secret = m.group(1)
+    if not token_id or not token_secret:
+        return {}
+    return {"token_id": token_id, "token_secret": token_secret}
+
+
+def migrate_from_legacy_toml(registry_path: str | Path, toml_path: str | Path) -> dict:
+    """Migrate credentials from ~/.modal.toml into the workspace registry.
+
+    Only migrates when the registry has zero workspaces and the toml file
+    contains a valid token_id / token_secret pair. Returns the registry dict.
+    """
+    registry = load_workspace_registry(registry_path)
+    if registry.get("workspaces"):
+        return registry
+    legacy = _parse_legacy_toml(toml_path)
+    if not legacy:
+        return registry
+    try:
+        return upsert_workspace(
+            registry_path,
+            label="Legacy Modal Token",
+            token_id=legacy["token_id"],
+            token_secret=legacy["token_secret"],
+            set_active=True,
+        )
+    except ValueError:
+        return registry
 
 
 def get_workspace(registry: dict, workspace_id: str) -> dict | None:

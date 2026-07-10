@@ -12,12 +12,17 @@ import {
   enhanceControlWithAxisCheckbox,
 } from "./studio-experiment-mode.js";
 import { getRuntimePresets } from "./studio-backend.js";
-import { runStudioPreset } from "./studio-backend-api.js";
+import { runStudioPreset, getStudioRunStatus } from "./studio-backend-api.js";
 import {
   canRunExperiment,
   getExperimentDisabledReason,
   executeExperimentRun,
 } from "./studio-experiment-mode.js";
+import {
+  getVisibleControlsForPreset,
+  getPresetCapabilitySummary,
+  getUnavailableControlReasons,
+} from "./studio-preset-capabilities.js";
 
 // ── Element helper ───────────────────────────────────────────────────────
 
@@ -47,6 +52,52 @@ function el(tag, props = {}, children = []) {
   return e;
 }
 
+// ── Polling helper for experiment status ──────────────────────────────────
+// Polls getStudioRunStatus and updates runState to reflect queued,
+// running, completed, or error states.
+
+function _startPolling(container, state, context, actions, runState) {
+  const experimentId = runState.experimentId || runState.runId;
+  if (!experimentId) return;
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  let pollTimer = setInterval(async () => {
+    const data = await getStudioRunStatus(apiBase, experimentId);
+    if (!data) return;
+    if (data.status && data.status !== "ok") {
+      clearInterval(pollTimer);
+      const errMsg = (data.message || data.error || "Run failed.").substring(0, 200);
+      if (actions && actions.setRunState) {
+        actions.setRunState({ status: "error", message: errMsg });
+      }
+      return;
+    }
+    const snapshot = data.snapshot || {};
+    const status = snapshot.overall_status || snapshot.status || data.state || "";
+    if (status === "queued") {
+      if (actions && actions.setRunState) {
+        actions.setRunState({ status: "queued", experimentId });
+      }
+    } else if (status === "in_progress" || status === "running") {
+      if (actions && actions.setRunState) {
+        actions.setRunState({ status: "in_progress", experimentId });
+      }
+    } else if (status === "completed" || status === "succeeded") {
+      clearInterval(pollTimer);
+      if (actions && actions.setRunState) {
+        actions.setRunState({ status: "completed", experimentId });
+      }
+    } else if (status === "error" || status === "failed" || status === "completed_with_failures") {
+      clearInterval(pollTimer);
+      const errMsg = (snapshot.error || data.message || data.error || "Run failed.").substring(0, 200);
+      if (actions && actions.setRunState) {
+        actions.setRunState({ status: "error", message: errMsg });
+      }
+    }
+  }, 3000);
+  // Allow the timer to be cleaned up if the container is removed
+  container._pollTimer = pollTimer;
+}
+
 // ── Main Playground renderer ─────────────────────────────────────────────
 
 export function renderPlayground(state, context) {
@@ -61,7 +112,7 @@ export function renderPlayground(state, context) {
   return container;
 }
 
-// ── Left Control Panel ───────────────────────────────────────────────────
+// ── Left Control Panel (preset-driven) ──────────────────────────────────
 
 function renderControlPanel(state, context) {
   const panel = el("div", { class: "comfymodal-studio-control-panel", "data-testid": "control-panel" });
@@ -85,47 +136,122 @@ function renderControlPanel(state, context) {
   // ── Backend Selector ───────────────────────────────────────────────
   panel.appendChild(renderControlGroup("Backend", renderBackendSelector(state, actions, context)));
 
-  // ── Controls from feature registry ─────────────────────────────────
+  // ── Preset-driven Controls ─────────────────────────────────────────
   const controlsContainer = el("div", { class: "comfymodal-studio-controls", "data-testid": "controls-container" });
+  controlsContainer.appendChild(el("p", {
+    text: "Loading preset capabilities...",
+    style: "font-size:11px;color:#888;padding:8px;",
+  }));
 
-  currentSpec.controls.forEach((ctrlId) => {
-    const def = CONTROL_DEFS[ctrlId];
-    if (!def) return;
+  const selectedPresetId = state.playground && state.playground.selectedBackendId;
 
-    // Skip instruction for txt2img (only relevant for image-edit features)
-    if (ctrlId === "instruction" && !currentSpec.isPlaceholder) return;
+  // Async load presets to derive capabilities
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  getRuntimePresets({ apiBase }).then((presets) => {
+    if (!controlsContainer.isConnected) return;
+    while (controlsContainer.firstChild) controlsContainer.removeChild(controlsContainer.firstChild);
 
-    // Only skip negative_prompt for placeholder features (prompt is still shown for image-edit)
-    if (ctrlId === "negative_prompt" && currentSpec.isPlaceholder) return;
+    const preset = (presets || []).find((p) => (p.id || p.label || "") === selectedPresetId);
 
-    const controlRow = renderControl(def, state, actions);
-
-    // In experiment mode, add axis checkbox for eligible controls
-    if (isExperiment && def.experimentEligible) {
-      const checkboxWrapper = enhanceControlWithAxisCheckbox(controlRow, ctrlId, state, actions);
-      if (checkboxWrapper && controlRow.firstChild) {
-        controlRow.insertBefore(checkboxWrapper, controlRow.firstChild);
-      }
+    if (!selectedPresetId || !preset) {
+      // No preset selected — prompt to select one
+      const noPresetMsg = el("div", {
+        class: "comfymodal-studio-card",
+        style: "padding:12px;text-align:center;",
+      }, [
+        el("p", {
+          text: "Select a Backend Preset to see controls.",
+          style: "font-size:11px;color:#888;margin:0 0 8px;",
+        }),
+        el("a", {
+          text: "Go to Backend tab to create presets",
+          style: "font-size:11px;color:var(--color-accent);cursor:pointer;",
+          onclick: (e) => {
+            e.preventDefault();
+            if (actions && actions.navigateToBackendTab) actions.navigateToBackendTab();
+          },
+        }),
+      ]);
+      controlsContainer.appendChild(noPresetMsg);
+      return;
     }
 
-    controlsContainer.appendChild(controlRow);
+    // Feature compatibility check
+    const compat = preset.compatibleFeatures || [];
+    if (!compat.includes(currentFeatureId)) {
+      controlsContainer.appendChild(el("p", {
+        text: `Selected preset does not support "${currentFeatureId}".`,
+        style: "font-size:11px;color:#fbbf24;padding:8px;",
+      }));
+      return;
+    }
+
+    // Derive visible controls from capabilities + bindings
+    const visibleControlIds = getVisibleControlsForPreset(preset, currentFeatureId);
+    const summary = getPresetCapabilitySummary(preset, currentFeatureId);
+    const reasons = getUnavailableControlReasons(preset, currentFeatureId);
+
+    // If feature is a placeholder (object_remove/replace), show honest disabled state
+    if (currentSpec.isPlaceholder) {
+      const placeholderMsg = el("div", { class: "comfymodal-studio-placeholder-notice" }, [
+        el("p", {
+          text: currentSpec.placeholderReason || "This feature is not implemented yet.",
+          style: "color:var(--color-text-muted);font-size:var(--font-size-sm);font-style:italic;",
+        }),
+      ]);
+      controlsContainer.appendChild(placeholderMsg);
+    }
+
+    // Render visible controls
+    visibleControlIds.forEach((ctrlId) => {
+      const def = CONTROL_DEFS[ctrlId];
+      if (!def) return;
+
+      const isBound = summary.requiredBindings.some((r) => r.key === ctrlId && r.bound)
+        || summary.optionalBindings.some((o) => o.key === ctrlId && o.bound);
+
+      // Check if this control is in the preset's nodeBindings
+      const hasBinding = !!(preset.nodeBindings && preset.nodeBindings[ctrlId] && preset.nodeBindings[ctrlId].nodeId);
+
+      const controlRow = renderControl(def, state, actions);
+
+      // Disable the control if it's a required binding not yet bound
+      if (!isBound && !hasBinding) {
+        controlRow.style.opacity = "0.5";
+        const reason = reasons[ctrlId] || "Requires node binding";
+        const reasonEl = el("p", {
+          text: `\u26a0 ${reason}`,
+          style: "font-size:9px;color:#fbbf24;margin:2px 0 0;",
+        });
+        controlRow.appendChild(reasonEl);
+      }
+
+      // In experiment mode, add axis checkbox for eligible controls
+      if (isExperiment && def.experimentEligible) {
+        const checkboxWrapper = enhanceControlWithAxisCheckbox(controlRow, ctrlId, state, actions);
+        if (checkboxWrapper && controlRow.firstChild) {
+          controlRow.insertBefore(checkboxWrapper, controlRow.firstChild);
+        }
+      }
+
+      controlsContainer.appendChild(controlRow);
+    });
+
+    // If no visible controls (shouldn't normally happen), show a message
+    if (visibleControlIds.length === 0 && !currentSpec.isPlaceholder) {
+      controlsContainer.appendChild(el("p", {
+        text: "No controls available for this preset+feature combination.",
+        style: "font-size:11px;color:#888;padding:8px;font-style:italic;",
+      }));
+    }
+  }).catch(() => {
+    if (!controlsContainer.isConnected) return;
+    while (controlsContainer.firstChild) controlsContainer.removeChild(controlsContainer.firstChild);
+    controlsContainer.appendChild(el("p", {
+      text: "Could not load preset data.",
+      style: "font-size:11px;color:#f87171;padding:8px;",
+    }));
   });
-
-  // If current feature is a placeholder, show honest disabled state
-  if (currentSpec.isPlaceholder) {
-    const placeholderMsg = el("div", { class: "comfymodal-studio-placeholder-notice" }, [
-      el("p", {
-        text: currentSpec.placeholderReason || "This feature is not implemented yet.",
-        style: "color:var(--color-text-muted);font-size:var(--font-size-sm);font-style:italic;",
-      }),
-    ]);
-    controlsContainer.appendChild(placeholderMsg);
-  }
-
-  // Add mask controls section for image-edit/inpaint-like features (txt2img, object_remove, object_replace)
-  if (currentFeatureId === "txt2img" || currentFeatureId === "object_remove" || currentFeatureId === "object_replace") {
-    controlsContainer.appendChild(renderMaskControlsSection(state, actions));
-  }
 
   panel.appendChild(controlsContainer);
 
@@ -141,14 +267,17 @@ function buildActions(state, context) {
   return {
     setFeature(featureId) {
       state.playground.featureId = featureId;
+      // Clear stale controls when feature changes
+      state.playground.controls = {};
       if (context && context.setPage) {
-        // Stay on playground, just re-render by triggering parent refresh
         context.setPage("playground");
       }
     },
     setBackend(backendId) {
       state.playground.selectedBackendId = backendId;
-      // Re-render so Run button reflects selection
+      // Clear stale controls when preset changes to avoid sending
+      // controls that the new preset doesn't support
+      state.playground.controls = {};
       if (context && context.setPage) {
         context.setPage("playground");
       }
@@ -244,6 +373,7 @@ function renderBackendSelector(state, actions, context) {
     // Async load presets through the Studio abstraction (runtime selectors only)
   const apiBase = (context && context.apiBase) || "/comfymodal";
   getRuntimePresets({ apiBase }).then((backends) => {
+    if (!select.isConnected) return;
     while (select.firstChild) select.removeChild(select.firstChild);
 
     if (!backends || backends.length === 0) {
@@ -305,6 +435,7 @@ function renderBackendSelector(state, actions, context) {
       }
     });
   }).catch(() => {
+    if (!select.isConnected) return;
     while (select.firstChild) select.removeChild(select.firstChild);
     const errOpt = el("option", { value: "", text: "Could not load backends", disabled: true, selected: true });
     select.appendChild(errOpt);
@@ -412,27 +543,6 @@ function renderControl(def, state, actions) {
   return group;
 }
 
-// ── Mask Controls Section ────────────────────────────────────────────────
-
-function renderMaskControlsSection(state, actions) {
-  const section = el("div", { class: "comfymodal-studio-mask-controls", "data-testid": "mask-controls" });
-
-  const heading = el("h4", {
-    class: "comfymodal-studio-section-heading",
-    text: "Mask",
-    style: "font-size:var(--font-size-sm);margin:var(--space-md) 0 var(--space-xs);color:var(--color-text-secondary);",
-  });
-  section.appendChild(heading);
-
-  const maskBlurDef = CONTROL_DEFS.mask_blur;
-  const maskExpandDef = CONTROL_DEFS.mask_expand;
-
-  if (maskBlurDef) section.appendChild(renderControl(maskBlurDef, state, actions));
-  if (maskExpandDef) section.appendChild(renderControl(maskExpandDef, state, actions));
-
-  return section;
-}
-
 // ── Run Button ───────────────────────────────────────────────────────────
 
 function renderRunButton(state, context, actions, isExperiment) {
@@ -456,27 +566,57 @@ function renderRunButton(state, context, actions, isExperiment) {
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
   const runState = state.playground && state.playground.runState;
 
-  if (runState && (runState.status === "running" || runState.status === "submitted")) {
-    const isRunning = runState.status === "running";
+  if (runState && runState.status === "running") {
     btn.disabled = true;
-    btn.textContent = isRunning ? "Running\u2026" : "Submitted";
-    btn.title = isRunning ? "Run in progress" : "Run submitted successfully";
-    if (isRunning) {
-      reason.appendChild(el("p", {
-        text: "Your run has been submitted\u2026",
-        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-      }));
-    } else {
-      const viewLink = el("a", {
-        text: "View in History",
-        style: "font-size:var(--font-size-sm);color:var(--color-accent);cursor:pointer;",
-        onclick: (e) => {
-          e.preventDefault();
-          if (actions && actions.navigateToHistory) actions.navigateToHistory();
-        },
-      });
-      reason.appendChild(viewLink);
-    }
+    btn.textContent = "Running\u2026";
+    btn.title = "Run in progress";
+    reason.appendChild(el("p", {
+      text: "Your run has been submitted\u2026",
+      style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+    }));
+    return container;
+  }
+
+  if (runState && runState.status === "submitted") {
+    btn.disabled = true;
+    btn.textContent = "Submitted";
+    btn.title = "Run submitted, waiting for status\u2026";
+    reason.appendChild(el("p", {
+      text: "Waiting for server response\u2026",
+      style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+    }));
+    _startPolling(container, state, context, actions, runState);
+    return container;
+  }
+
+  if (runState && (runState.status === "queued" || runState.status === "in_progress")) {
+    btn.disabled = true;
+    btn.textContent = runState.status === "queued" ? "Queued\u2026" : "Running\u2026";
+    btn.title = "Experiment is running";
+    reason.appendChild(el("p", {
+      text: "Run is in progress\u2026",
+      style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+    }));
+    return container;
+  }
+
+  if (runState && runState.status === "completed") {
+    btn.disabled = true;
+    btn.textContent = "Completed";
+    btn.title = "Run completed successfully";
+    reason.appendChild(el("p", {
+      text: "Run completed successfully.",
+      style: "font-size:var(--font-size-sm);color:var(--color-success);margin:4px 0 0;",
+    }));
+    const viewLink = el("a", {
+      text: "View in History",
+      style: "font-size:var(--font-size-sm);color:var(--color-accent);cursor:pointer;",
+      onclick: (e) => {
+        e.preventDefault();
+        if (actions && actions.navigateToHistory) actions.navigateToHistory();
+      },
+    });
+    reason.appendChild(viewLink);
     return container;
   }
 
@@ -502,6 +642,7 @@ function renderRunButton(state, context, actions, isExperiment) {
 
   // Async-load presets to determine runnability
   getRuntimePresets({ apiBase }).then((presets) => {
+    if (!container.isConnected) return;
     while (reason.firstChild) reason.removeChild(reason.firstChild);
 
     if (!presets || presets.length === 0) {
@@ -619,7 +760,16 @@ function renderRunButton(state, context, actions, isExperiment) {
         btn.textContent = "Running\u2026";
         if (actions && actions.setRunState) actions.setRunState({ status: "running" });
 
-        const controls = (state.playground && state.playground.controls) || {};
+        // Only send controls that are bound/supported by the preset
+        const allControls = (state.playground && state.playground.controls) || {};
+        const visibleIds = getVisibleControlsForPreset(preset, currentFeatureId);
+        const controls = {};
+        visibleIds.forEach((id) => {
+          if (id in allControls) {
+            controls[id] = allControls[id];
+          }
+        });
+
         const result = await runStudioPreset(apiBase, {
           presetId: preset.id || selectedId,
           featureId: currentFeatureId,
@@ -644,6 +794,7 @@ function renderRunButton(state, context, actions, isExperiment) {
       };
     }
   }).catch(() => {
+    if (!container.isConnected) return;
     while (reason.firstChild) reason.removeChild(reason.firstChild);
     reason.appendChild(el("p", {
       text: "Could not load presets.",
