@@ -12,6 +12,7 @@
 
 import { CONTROL_DEFS } from "./studio-feature-registry.js";
 import { getRuntimePresets } from "./studio-backend.js";
+import { runStudioExperiment } from "./studio-backend-api.js";
 
 // ── Experiment toggle ────────────────────────────────────────────────────
 
@@ -44,22 +45,22 @@ export function renderCompareBackends(state, actions, context) {
 
   const heading = document.createElement("h4");
   heading.className = "comfymodal-studio-block-heading";
-  heading.textContent = "Compare Backends";
+  heading.textContent = "Compare Presets";
   container.appendChild(heading);
 
   const list = document.createElement("div");
   list.className = "comfymodal-studio-compare-list";
   container.appendChild(list);
 
-  // Fetch presets through the Studio backend abstraction (context passed explicitly)
   const apiBase = (context && context.apiBase) || "/comfymodal";
-  getRuntimePresets({ apiBase }).then((backends) => {
+  const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
+
+  getRuntimePresets({ apiBase }).then((presets) => {
     while (list.firstChild) list.removeChild(list.firstChild);
 
-    if (!backends || backends.length === 0) {
+    if (!presets || presets.length === 0) {
       const emptyState = document.createElement("p");
       emptyState.className = "comfymodal-studio-empty-state";
-      // Link to the Backend tab instead of Legacy Setup
       const link = document.createElement("a");
       link.href = "#";
       link.textContent = "Go to Backend tab";
@@ -71,26 +72,36 @@ export function renderCompareBackends(state, actions, context) {
           actions.navigateToBackendTab();
         }
       });
-      emptyState.textContent = "No backends configured. ";
+      emptyState.textContent = "No presets configured. ";
       emptyState.appendChild(link);
-      emptyState.appendChild(document.createTextNode(" to add backends."));
+      emptyState.appendChild(document.createTextNode(" to create presets."));
       list.appendChild(emptyState);
       return;
     }
 
-    // Read currently selected compare backend IDs from state
     const compareIds = (state.playground && state.playground.compareBackendIds) || [];
 
-    backends.forEach((b) => {
+    presets.forEach((b) => {
       const bId = b.id || b.label || "";
+      const isRunnable = b.status === "runnable" && !b.archived;
+      const featureCompat = (b.compatibleFeatures || []).includes(currentFeatureId);
+      const canSelect = isRunnable && featureCompat;
+      let disabledReason = "";
+      if (b.archived) disabledReason = "Archived";
+      else if (!featureCompat) disabledReason = `Not compatible with "${currentFeatureId}"`;
+      else if (!isRunnable && b.disabledReason) disabledReason = b.disabledReason;
+      else if (!isRunnable) disabledReason = "Not runnable";
+
       const item = document.createElement("div");
       item.className = "comfymodal-studio-compare-item";
+      if (!canSelect) item.style.opacity = "0.45";
+
       const cb = document.createElement("input");
       cb.type = "checkbox";
       cb.className = "comfymodal-studio-compare-checkbox";
       cb.setAttribute("data-backend-id", bId);
-      // Sync checked state from compareBackendIds
-      cb.checked = compareIds.includes(bId);
+      if (!canSelect) cb.disabled = true;
+      cb.checked = canSelect && compareIds.includes(bId);
       cb.addEventListener("change", () => {
         const current = (state.playground && state.playground.compareBackendIds) || [];
         let updated;
@@ -100,7 +111,6 @@ export function renderCompareBackends(state, actions, context) {
           updated = current.filter((id) => id !== bId);
         }
         state.playground.compareBackendIds = updated;
-        // Re-render matrix summary by re-running updateMatrixSummary on the existing body
         const matrixBody = container.parentNode
           ? container.parentNode.querySelector('[data-testid="matrix-body"]')
           : null;
@@ -109,16 +119,27 @@ export function renderCompareBackends(state, actions, context) {
         }
       });
       item.appendChild(cb);
+
       const label = document.createElement("span");
       label.textContent = b.label || b.id || "Unknown";
       label.style.fontSize = "var(--font-size-sm)";
       item.appendChild(label);
+
+      if (disabledReason) {
+        const reasonEl = document.createElement("span");
+        reasonEl.textContent = ` (${disabledReason})`;
+        reasonEl.style.fontSize = "var(--font-size-xs)";
+        reasonEl.style.color = "var(--color-text-muted)";
+        reasonEl.style.marginLeft = "4px";
+        item.appendChild(reasonEl);
+      }
+
       list.appendChild(item);
     });
   }).catch(() => {
     const errorMsg = document.createElement("p");
     errorMsg.className = "comfymodal-studio-empty-state";
-    errorMsg.textContent = "Could not load backends.";
+    errorMsg.textContent = "Could not load presets.";
     list.appendChild(errorMsg);
   });
 
@@ -496,34 +517,73 @@ export function renderAxisEditor(controlId, state, actions) {
   return editor;
 }
 
-// ── Disabled Run Experiment explanation ──────────────────────────────────
+// ── Experiment run logic ─────────────────────────────────────────────────
 
-export function renderRunExperimentDisabledReason(state, actions) {
-  const container = document.createElement("div");
-  container.className = "comfymodal-studio-disabled-reason";
-  container.setAttribute("data-testid", "run-experiment-disabled");
+export function canRunExperiment(state) {
+  const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
+  const compareIds = (state.playground && state.playground.compareBackendIds) || [];
+  // Require at least one compare preset
+  return compareIds.length > 0;
+}
 
-  const msg = document.createElement("p");
-  msg.textContent = "Run Experiment is not yet wired to the backend. ";
-  msg.style.color = "var(--color-text-secondary)";
-  msg.style.fontSize = "var(--font-size-sm)";
+export function getExperimentDisabledReason(state) {
+  const compareIds = (state.playground && state.playground.compareBackendIds) || [];
+  if (compareIds.length === 0) return "Select at least one preset to compare.";
+  const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
+  const experimentsEnabled = currentFeatureId === "txt2img";
+  if (!experimentsEnabled) return "Experiments are only available for txt2img in this release.";
+  return "";
+}
 
-  const link = document.createElement("a");
-  link.href = "#";
-  link.textContent = "Go to Legacy Setup to run experiments.";
-  link.style.color = "var(--color-accent)";
-  link.style.cursor = "pointer";
-  link.addEventListener("click", (e) => {
-    e.preventDefault();
-    if (actions && actions.navigateToLegacySetup) {
-      actions.navigateToLegacySetup();
+export async function executeExperimentRun(state, context) {
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
+  const compareIds = (state.playground && state.playground.compareBackendIds) || [];
+  const axes = (state.playground && state.playground.experimentAxes) || {};
+  const controls = (state.playground && state.playground.controls) || {};
+
+  if (compareIds.length === 0) {
+    return { status: "error", message: "Select at least one preset to compare." };
+  }
+
+  // Build the shared experiment definition (prompts + axes).
+  // Prompts are included ONCE — the backend applies them to all presets.
+  const experimentDef = {
+    name: `Studio Experiment: ${currentFeatureId}`,
+    axes: {},
+    prompts: [{ text: controls.prompt || "", negative: controls.negative_prompt || "" }],
+  };
+
+  // Add axes values
+  Object.entries(axes).forEach(([ctrlId, def]) => {
+    if (def && def.enabled && def.values && def.values.length > 0) {
+      experimentDef.axes[ctrlId] = { enabled: true, values: def.values };
     }
   });
 
-  msg.appendChild(document.createTextNode(" "));
-  msg.appendChild(link);
-  container.appendChild(msg);
-  return container;
+  // Send ONE request with all presetIds — the backend creates a unified
+  // experiment with one checkpoint per preset.
+  const result = await runStudioExperiment(apiBase, {
+    presetIds: compareIds,
+    featureId: currentFeatureId,
+    experiment: experimentDef,
+    metadata: { source: "studio_experiment" },
+  });
+
+  if (result && result.status === "ok") {
+    return {
+      status: "ok",
+      experimentId: result.experimentId || "",
+      count: result.cellCount || 0,
+      cellCount: result.cellCount || 0,
+      message: `Experiment submitted for ${compareIds.length} preset(s) with ${result.cellCount || 0} cell(s).`,
+    };
+  }
+
+  return {
+    status: "error",
+    message: (result && result.message) || "Experiment run failed.",
+  };
 }
 
 // ── Full experiment mode renderer ────────────────────────────────────────
@@ -533,22 +593,11 @@ export function renderExperimentMode(state, actions, context) {
   container.className = "comfymodal-studio-experiment-mode";
   container.setAttribute("data-testid", "experiment-mode");
 
-  // Compare Backends block (context passed explicitly, not via _context on state)
+  // Compare Backends block (context passed explicitly)
   container.appendChild(renderCompareBackends(state, actions, context || {}));
 
   // Matrix Summary block
   container.appendChild(renderMatrixSummary(state, actions));
-
-  // Disabled Run Experiment explanation
-  const runBtn = document.createElement("button");
-  runBtn.className = "comfymodal-primary-btn";
-  runBtn.disabled = true;
-  runBtn.textContent = "Run Experiment";
-  runBtn.setAttribute("data-testid", "run-experiment-btn");
-  runBtn.title = "Run Experiment is not yet wired. Use Legacy Setup.";
-  container.appendChild(runBtn);
-
-  container.appendChild(renderRunExperimentDisabledReason(state, actions));
 
   return container;
 }

@@ -92,13 +92,74 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
   const card = el("div", { class: "comfymodal-studio-backend-detail-card" });
   const fieldValues = { ...preset };
 
+  const canEdit = !preset.archived;
+
+  // ── Status banner ────────────────────────────────────────────────────
+  const isRunnable = preset.status === "runnable" && !preset.archived;
+  const statusBanner = el("div", {
+    class: "comfymodal-studio-status-banner",
+    style: `padding:6px 10px;border-radius:3px;margin-bottom:8px;font-size:11px;${
+      isRunnable ? "background:#0a2a0a;border:1px solid #4ade80;color:#4ade80;" :
+      preset.archived ? "background:#2a0a0a;border:1px solid #f87171;color:#f87171;" :
+      "background:#2a2a0a;border:1px solid #fbbf24;color:#fbbf24;"
+    }`,
+  });
+  statusBanner.textContent = isRunnable ? "\u2713 Runnable" : preset.archived ? "\u26a0 Archived" : "\u26a0 Not Runnable";
+  card.appendChild(statusBanner);
+
+  // Disabled reason
+  if (preset.disabledReason && !preset.archived) {
+    card.appendChild(el("p", {
+      text: `Reason: ${preset.disabledReason}`,
+      style: "font-size:10px;color:#f87171;margin:2px 0 6px;",
+    }));
+  }
+
+  // ── Runnable checklist ──────────────────────────────────────────────
+  if (!preset.archived) {
+    const checkGroup = el("div", {
+      style: "margin-bottom:8px;padding:6px;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:3px;",
+    });
+    checkGroup.appendChild(el("p", {
+      text: "Runnable Checklist",
+      style: "font-size:10px;font-weight:600;color:#888;margin:0 0 4px;text-transform:uppercase;letter-spacing:0.05em;",
+    }));
+
+    const checks = [
+      { label: "Snapshot linked", ok: Boolean(preset.snapshotId) },
+      { label: "Compatible features assigned", ok: (preset.compatibleFeatures || []).length > 0 },
+      { label: "API prompt available", ok: preset.status !== "needs_api_prompt" },
+      { label: "Bindings configured", ok: preset.status !== "needs_bindings" },
+      { label: "Output mapped", ok: preset.status !== "needs_output" },
+    ];
+    checks.forEach((c) => {
+      const item = el("div", { style: "display:flex;align-items:center;gap:4px;margin:2px 0;" }, [
+        el("span", { text: c.ok ? "\u2713" : "\u2717", style: `font-size:10px;color:${c.ok ? "#4ade80" : "#f87171"};` }),
+        el("span", { text: c.label, style: "font-size:10px;color:#aaa;" }),
+      ]);
+      checkGroup.appendChild(item);
+    });
+
+    // Binding status listing
+    if (preset.snapshotId) {
+      const bindingStatus = el("p", {
+        text: preset.status === "runnable" ? "All bindings are configured." :
+              `Bindings may need attention (status: ${preset.status || "unknown"}).`,
+        style: "font-size:10px;color:#888;margin:4px 0 0;font-style:italic;",
+      });
+      checkGroup.appendChild(bindingStatus);
+    }
+
+    card.appendChild(checkGroup);
+  }
+
+  // ── Fields ──────────────────────────────────────────────────────────
   const fields = [
     { key: "label", label: "Label", type: "text", value: preset.label || preset.name || "" },
     { key: "description", label: "Description", type: "textarea", value: preset.description || "" },
     { key: "snapshotId", label: "Snapshot ID", type: "text", value: preset.snapshotId || "" },
     { key: "sourceType", label: "Source Type", type: "text", value: preset.sourceType || "" },
     { key: "sourceId", label: "Source ID", type: "text", value: preset.sourceId || "" },
-    { key: "disabledReason", label: "Disabled Reason", type: "text", value: preset.disabledReason || "" },
   ];
 
   fields.forEach((f) => {
@@ -106,16 +167,16 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
     fg.appendChild(el("label", { text: f.label }));
     let input;
     if (f.type === "textarea") {
-      input = el("textarea", { value: f.value, rows: 2 });
+      input = el("textarea", { value: f.value, rows: 2, disabled: !canEdit });
     } else {
-      input = el("input", { type: "text", value: f.value });
+      input = el("input", { type: "text", value: f.value, disabled: !canEdit });
     }
     input.addEventListener("input", () => { fieldValues[f.key] = input.value; });
     fg.appendChild(input);
     card.appendChild(fg);
   });
 
-  // Compatible Features chip grid
+  // ── Compatible Features chip grid ──────────────────────────────────
   const compatGroup = el("div", { class: "comfymodal-studio-backend-field" });
   compatGroup.appendChild(el("label", { text: "Compatible Features" }));
   const chipGrid = renderFeaturesChipGrid(preset.compatibleFeatures || [], (updated) => {
@@ -124,7 +185,7 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
   compatGroup.appendChild(chipGrid);
   card.appendChild(compatGroup);
 
-  // Defaults
+  // ── Defaults ────────────────────────────────────────────────────────
   const defaults = preset.defaults || {};
   if (Object.keys(defaults).length > 0) {
     const defaultsGroup = el("div", { class: "comfymodal-studio-backend-field" });
@@ -133,25 +194,27 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
     card.appendChild(defaultsGroup);
   }
 
-  // Archived/Disabled
+  // ── Archived notice ────────────────────────────────────────────────
   if (preset.archived) {
     card.appendChild(el("p", { text: "\u26a0 Archived", style: "font-size:11px;color:#f87171;margin:4px 0;" }));
   }
 
-  // Actions
+  // ── Actions ────────────────────────────────────────────────────────
   const actions = el("div", { class: "comfymodal-studio-backend-actions" });
 
-  const saveBtn = el("button", {
-    class: "comfymodal-primary-btn",
-    text: "Save",
-    style: "width:auto;padding:5px 16px;",
-    onclick: async () => {
-      await updatePreset(apiBase, preset.id, fieldValues);
-      const fresh = await listPresets(apiBase);
-      renderPresetsList(listContainer, fresh, apiBase, container);
-    },
-  });
-  actions.appendChild(saveBtn);
+  if (canEdit) {
+    const saveBtn = el("button", {
+      class: "comfymodal-primary-btn",
+      text: "Save",
+      style: "width:auto;padding:5px 16px;",
+      onclick: async () => {
+        await updatePreset(apiBase, preset.id, fieldValues);
+        const fresh = await listPresets(apiBase);
+        renderPresetsList(listContainer, fresh, apiBase, container);
+      },
+    });
+    actions.appendChild(saveBtn);
+  }
 
   const dupBtn = el("button", {
     class: "comfymodal-secondary-btn",
@@ -165,7 +228,7 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
   });
   actions.appendChild(dupBtn);
 
-  if (!preset.archived) {
+  if (canEdit) {
     const archiveBtn = el("button", {
       class: "comfymodal-destructive-btn",
       text: "Archive",

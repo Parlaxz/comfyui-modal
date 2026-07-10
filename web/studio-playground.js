@@ -12,6 +12,12 @@ import {
   enhanceControlWithAxisCheckbox,
 } from "./studio-experiment-mode.js";
 import { getRuntimePresets } from "./studio-backend.js";
+import { runStudioPreset } from "./studio-backend-api.js";
+import {
+  canRunExperiment,
+  getExperimentDisabledReason,
+  executeExperimentRun,
+} from "./studio-experiment-mode.js";
 
 // ── Element helper ───────────────────────────────────────────────────────
 
@@ -188,6 +194,18 @@ function buildActions(state, context) {
     navigateToBackendTab() {
       if (context && context.setPage) {
         context.setPage("backend");
+      }
+    },
+    navigateToHistory() {
+      if (context && context.setPage) {
+        context.setPage("history");
+      }
+    },
+    setRunState(runState) {
+      if (!state.playground) state.playground = {};
+      state.playground.runState = runState;
+      if (context && context.setPage) {
+        context.setPage("playground");
       }
     },
   };
@@ -421,11 +439,12 @@ function renderRunButton(state, context, actions, isExperiment) {
   const container = el("div", { class: "comfymodal-studio-run-section" });
 
   const btnText = isExperiment ? "Run Experiment" : "Run";
+  const testId = isExperiment ? "run-experiment-btn" : "run-btn";
   const btn = el("button", {
     class: "comfymodal-primary-btn",
     disabled: true,
     text: btnText,
-    "data-testid": isExperiment ? "run-experiment-btn" : "run-btn",
+    "data-testid": testId,
     title: "",
   });
 
@@ -433,18 +452,64 @@ function renderRunButton(state, context, actions, isExperiment) {
   container.appendChild(btn);
   container.appendChild(reason);
 
-  // Async-load presets to determine the correct message
   const apiBase = (context && context.apiBase) || "/comfymodal";
-  getRuntimePresets({ apiBase }).then((backends) => {
+  const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
+  const runState = state.playground && state.playground.runState;
+
+  if (runState && (runState.status === "running" || runState.status === "submitted")) {
+    const isRunning = runState.status === "running";
+    btn.disabled = true;
+    btn.textContent = isRunning ? "Running\u2026" : "Submitted";
+    btn.title = isRunning ? "Run in progress" : "Run submitted successfully";
+    if (isRunning) {
+      reason.appendChild(el("p", {
+        text: "Your run has been submitted\u2026",
+        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+      }));
+    } else {
+      const viewLink = el("a", {
+        text: "View in History",
+        style: "font-size:var(--font-size-sm);color:var(--color-accent);cursor:pointer;",
+        onclick: (e) => {
+          e.preventDefault();
+          if (actions && actions.navigateToHistory) actions.navigateToHistory();
+        },
+      });
+      reason.appendChild(viewLink);
+    }
+    return container;
+  }
+
+  if (runState && runState.status === "error") {
+    btn.disabled = true;
+    btn.textContent = "Run Failed";
+    btn.title = "Run failed";
+    reason.appendChild(el("p", {
+      text: runState.message || "Run failed. Try again.",
+      style: "font-size:var(--font-size-sm);color:var(--color-danger);margin:4px 0 0;",
+    }));
+    const retryBtn = el("button", {
+      class: "comfymodal-secondary-btn",
+      text: "Dismiss",
+      style: "font-size:10px;padding:2px 8px;margin-top:4px;",
+      onclick: () => {
+        if (actions && actions.setRunState) actions.setRunState(null);
+      },
+    });
+    reason.appendChild(retryBtn);
+    return container;
+  }
+
+  // Async-load presets to determine runnability
+  getRuntimePresets({ apiBase }).then((presets) => {
     while (reason.firstChild) reason.removeChild(reason.firstChild);
 
-    if (!backends || backends.length === 0) {
-      // No presets at all — link to the Backend tab
+    if (!presets || presets.length === 0) {
       btn.disabled = true;
-      btn.title = "No backends configured";
+      btn.title = "No backend presets configured";
 
       const p1 = el("p", {
-        text: "No backends configured. ",
+        text: "No backend presets configured. ",
         style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
       });
       const link = el("a", {
@@ -455,38 +520,133 @@ function renderRunButton(state, context, actions, isExperiment) {
           actions.navigateToBackendTab();
         },
       });
-      const p2 = el("p", {
-        text: " to add backends.",
-        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-      });
       reason.appendChild(p1);
       reason.appendChild(link);
-      reason.appendChild(p2);
+      reason.appendChild(document.createTextNode(" to create presets."));
       return;
     }
 
-    // Presets exist on the server
+    if (isExperiment) {
+      // ── Experiment mode run button ──────────────────────────────────
+      const canRun = canRunExperiment(state);
+      const expReason = getExperimentDisabledReason(state);
+
+      if (!canRun || expReason) {
+        btn.disabled = true;
+        btn.title = expReason || "Cannot run experiment";
+        reason.appendChild(el("p", {
+          text: expReason || "Select presets to compare.",
+          style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+        }));
+      } else {
+        btn.disabled = false;
+        btn.title = "";
+        btn.onclick = async () => {
+          btn.disabled = true;
+          btn.textContent = "Running\u2026";
+          if (actions && actions.setRunState) actions.setRunState({ status: "running" });
+
+          const result = await executeExperimentRun(state, context);
+
+          if (result && result.status === "ok") {
+            if (actions && actions.setRunState) {
+              actions.setRunState({
+                status: "submitted",
+                experimentId: result.experimentId,
+                message: result.message,
+              });
+            }
+          } else {
+            const errMsg = (result && result.message) || "Experiment run failed.";
+            if (actions && actions.setRunState) {
+              actions.setRunState({ status: "error", message: errMsg });
+            }
+          }
+        };
+      }
+      return;
+    }
+
+    // ── Single run mode ──────────────────────────────────────────────
     const selectedId = state.playground && state.playground.selectedBackendId;
-    if (selectedId) {
-      // Single-run wiring is not yet adapted to the Studio Playground context
+    if (!selectedId) {
       btn.disabled = true;
-      btn.title = "Run not yet wired";
+      btn.title = "Select a backend preset";
       reason.appendChild(el("p", {
-        text: "Run is not yet wired for Studio presets.",
+        text: "Select or create a Backend Preset.",
+        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+      }));
+      return;
+    }
+
+    const preset = presets.find((p) => (p.id || p.label || "") === selectedId);
+    if (!preset) {
+      btn.disabled = true;
+      btn.title = "Selected preset not found";
+      reason.appendChild(el("p", {
+        text: "Selected preset is no longer available.",
+        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+      }));
+      return;
+    }
+
+    const presetRunnable = preset.status === "runnable";
+    const featureCompat = (preset.compatibleFeatures || []).includes(currentFeatureId);
+    let disabledReason = "";
+
+    if (preset.archived) {
+      disabledReason = "This preset is archived.";
+    } else if (!featureCompat) {
+      disabledReason = `This preset does not support "${currentFeatureId}".`;
+    } else if (!presetRunnable && preset.disabledReason) {
+      disabledReason = preset.disabledReason;
+    } else if (!presetRunnable) {
+      disabledReason = "This preset is not runnable.";
+    }
+
+    if (disabledReason) {
+      btn.disabled = true;
+      btn.title = disabledReason;
+      reason.appendChild(el("p", {
+        text: disabledReason,
         style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
       }));
     } else {
-      btn.disabled = true;
-      btn.title = "Select a backend";
-      reason.appendChild(el("p", {
-        text: "Select a backend to run.",
-        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-      }));
+      btn.disabled = false;
+      btn.title = "";
+      btn.onclick = async () => {
+        btn.disabled = true;
+        btn.textContent = "Running\u2026";
+        if (actions && actions.setRunState) actions.setRunState({ status: "running" });
+
+        const controls = (state.playground && state.playground.controls) || {};
+        const result = await runStudioPreset(apiBase, {
+          presetId: preset.id || selectedId,
+          featureId: currentFeatureId,
+          controls: controls,
+          metadata: { source: "studio_playground" },
+        });
+
+        if (result && result.status === "ok") {
+          if (actions && actions.setRunState) {
+            actions.setRunState({
+              status: "submitted",
+              runId: result.runId || result.experimentId,
+              experimentId: result.experimentId,
+            });
+          }
+        } else {
+          const errMsg = (result && result.message) || "Run failed.";
+          if (actions && actions.setRunState) {
+            actions.setRunState({ status: "error", message: errMsg });
+          }
+        }
+      };
     }
   }).catch(() => {
     while (reason.firstChild) reason.removeChild(reason.firstChild);
     reason.appendChild(el("p", {
-      text: "Could not load backends.",
+      text: "Could not load presets.",
       style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
     }));
   });

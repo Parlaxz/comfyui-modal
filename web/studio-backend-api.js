@@ -10,8 +10,14 @@ let _backendCache = null;
 async function apiFetch(apiBase, path, options) {
   try {
     const res = await fetch(`${apiBase}${path}`, options || {});
+    const data = await res.json();
+    // Return error JSON as-is so callers can inspect status/message
+    if (!res.ok && data && typeof data === "object") {
+      data._httpStatus = res.status;
+      return data;
+    }
     if (!res.ok) return null;
-    return await res.json();
+    return data;
   } catch { return null; }
 }
 
@@ -110,4 +116,26 @@ export async function archivePreset(apiBase, id) {
   return apiFetch(apiBase, `/studio/presets/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+// ── Studio Run / Experiment API ──────────────────────────────────────────
+
+export async function runStudioPreset(apiBase, payload) {
+  return apiFetch(apiBase, "/studio/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function runStudioExperiment(apiBase, payload) {
+  return apiFetch(apiBase, "/studio/experiment", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getStudioRunStatus(apiBase, id) {
+  return apiFetch(apiBase, `/experiments/${encodeURIComponent(id)}`);
 }

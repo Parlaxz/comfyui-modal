@@ -32,6 +32,14 @@ playwright/.cache/
 # Workspace config with API secrets
 .modal_workspaces.json
 
+# Studio runtime artifacts (user-local state, not committed)
+.studio_presets.json
+.studio_snapshots.json
+.studio_backends.json
+
+# Temporary files from atomic writes
+*.tmp
+
 # Audit/backup/patch files
 *.patch
 *.diff

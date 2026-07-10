@@ -5286,6 +5286,8 @@ if _server:
                 "deployment_generation": data.get("deployment_generation", ""),
                 "experiment_revision": data.get("revision", 0),
                 "output_policy": data.get("output_policy", {}),
+                "studio_meta": data.get("studio_meta", {}),
+                "total_cells": data.get("total_cells", 0),
             }
             REGISTRY.history().record_run(
                 kind="experiment_cell",
@@ -6152,6 +6154,76 @@ if _server:
             return web.json_response({"status": "ok", "backend": dup})
         except StudioStoreError as exc:
             return web.json_response({"status": "error", "message": str(exc)}, status=500)
+
+    # ── Studio run / experiment routes ─────────────────────────────────
+    @_server.routes.post("/comfymodal/studio/run")
+    async def studio_run(request: web.Request) -> web.Response:
+        """Execute a single Studio preset run.
+
+        Expects JSON body:
+            presetId: str  — the preset to run
+            featureId: str — which feature (e.g. "txt2img")
+            controls: dict — control overrides (prompt, seed, steps, …)
+
+        Returns ``{"status": "ok", runId, experimentId, message}`` or
+        ``{"status": "error", "message"}``.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "Invalid JSON body"}, status=400)
+        preset_id = (body or {}).get("presetId", "").strip()
+        feature_id = (body or {}).get("featureId", "").strip()
+        controls = (body or {}).get("controls", {}) or {}
+        if not preset_id or not feature_id:
+            return web.json_response(
+                {"status": "error", "message": "presetId and featureId are required"}, status=400
+            )
+        try:
+            from studio_run_adapter import handle_studio_run
+            result = handle_studio_run(preset_id, feature_id, controls, _NODE_DIR)
+            status_code = 200 if result.get("status") == "ok" else 400
+            return web.json_response(result, status=status_code)
+        except Exception:
+            _log.exception("Studio run error")
+            return web.json_response({"status": "error", "message": "Internal error processing run"}, status=500)
+
+    @_server.routes.post("/comfymodal/studio/experiment")
+    async def studio_experiment(request: web.Request) -> web.Response:
+        """Execute a Studio experiment (matrix expansion).
+
+        Expects JSON body:
+            presetIds: string[]  — one or more preset IDs to include
+            featureId: str      — which feature
+            experiment: dict    — experiment definition (prompts, axes, …)
+
+        All presets share a single unified experiment with one checkpoint
+        per preset.  Returns ``{"status": "ok", experimentId, cellCount,
+        message}`` or ``{"status": "error", "message"}``.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "Invalid JSON body"}, status=400)
+        preset_ids = (body or {}).get("presetIds", [])
+        if isinstance(preset_ids, str):
+            preset_ids = [preset_ids]
+        preset_ids = [pid.strip() for pid in preset_ids if pid and pid.strip()]
+        feature_id = (body or {}).get("featureId", "").strip()
+        experiment_def = (body or {}).get("experiment", {}) or {}
+        if not preset_ids or not feature_id or not experiment_def:
+            return web.json_response(
+                {"status": "error", "message": "presetIds (non-empty array), featureId, and experiment are required"},
+                status=400,
+            )
+        try:
+            from studio_run_adapter import handle_studio_experiment
+            result = handle_studio_experiment(preset_ids, feature_id, experiment_def, _NODE_DIR)
+            status_code = 200 if result.get("status") == "ok" else 400
+            return web.json_response(result, status=status_code)
+        except Exception:
+            _log.exception("Studio experiment error")
+            return web.json_response({"status": "error", "message": "Internal error processing experiment"}, status=500)
 
     # ── Warmup ────────────────────────────────────────────────────────
     @_server.routes.get("/comfymodal/deploy-warmup/status")

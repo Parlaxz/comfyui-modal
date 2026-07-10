@@ -238,6 +238,14 @@ function renderWizard(panel, state) {
       break;
   }
 
+  // Helper: cancel any active binding capture before navigating steps
+  function navigateStep(nextStep) {
+    cancelGraphBinding();
+    state.bindingCaptureActive = null;
+    state.step = nextStep;
+    renderWizard(panel, state);
+  }
+
   // Footer
   const footer = el("div", { class: "comfymodal-studio-wizard-footer" });
   if (state.step === "features") {
@@ -247,8 +255,7 @@ function renderWizard(panel, state) {
       disabled: state.selectedFeatures.length !== 1,
       onclick: () => {
         if (state.selectedFeatures.length !== 1) return;
-        state.step = "bindings";
-        renderWizard(panel, state);
+        navigateStep("bindings");
       },
     }));
   } else if (state.step === "bindings") {
@@ -256,10 +263,7 @@ function renderWizard(panel, state) {
     footer.appendChild(el("button", {
       class: "comfymodal-secondary-btn",
       text: "Back to Features",
-      onclick: () => {
-        state.step = "features";
-        renderWizard(panel, state);
-      },
+      onclick: () => navigateStep("features"),
     }));
     footer.appendChild(el("button", {
       class: "comfymodal-primary-btn",
@@ -267,8 +271,7 @@ function renderWizard(panel, state) {
       disabled: !allBound,
       onclick: () => {
         if (!allBound) return;
-        state.step = "details";
-        renderWizard(panel, state);
+        navigateStep("details");
       },
     }));
   } else if (state.step === "details") {
@@ -276,10 +279,7 @@ function renderWizard(panel, state) {
     footer.appendChild(el("button", {
       class: "comfymodal-secondary-btn",
       text: "Back to Bindings",
-      onclick: () => {
-        state.step = "bindings";
-        renderWizard(panel, state);
-      },
+      onclick: () => navigateStep("bindings"),
     }));
     footer.appendChild(el("button", {
       class: "comfymodal-primary-btn",
@@ -313,10 +313,7 @@ function renderWizard(panel, state) {
     footer.appendChild(el("button", {
       class: "comfymodal-secondary-btn",
       text: "Back to Details",
-      onclick: () => {
-        state.step = "details";
-        renderWizard(panel, state);
-      },
+      onclick: () => navigateStep("details"),
     }));
     footer.appendChild(el("button", {
       class: "comfymodal-destructive-btn",
@@ -347,6 +344,8 @@ function renderFeaturesStep(body, state) {
       class: "comfymodal-studio-wizard-feature-card"
         + (isSelected ? " selected" : ""),
       onclick: () => {
+        cancelGraphBinding();
+        state.bindingCaptureActive = null;
         state.selectedFeatures = isSelected ? [] : [def.id];
         renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
       },

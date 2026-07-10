@@ -38,9 +38,25 @@ export const _STATE = { selectedItemId: null };
 // getRuntimePresets wraps the presets API so Playground and Experiment can
 // switch to presets-based selection without touching import/discovery paths.
 
+// Module-level cache to avoid refetching presets on every render
+let _runtimePresetsCache = null;
+let _runtimePresetsCacheKey = "";
+
 export async function getRuntimePresets(context) {
   const apiBase = (context && context.apiBase) || "/comfymodal";
-  return await listPresets(apiBase);
+  // Use simple cache: invalidated when apiBase changes
+  if (_runtimePresetsCache && _runtimePresetsCacheKey === apiBase) {
+    return _runtimePresetsCache;
+  }
+  _runtimePresetsCache = await listPresets(apiBase);
+  _runtimePresetsCacheKey = apiBase;
+  return _runtimePresetsCache;
+}
+
+// Allow external invalidation of the runtime presets cache
+export function invalidateRuntimePresetsCache() {
+  _runtimePresetsCache = null;
+  _runtimePresetsCacheKey = "";
 }
 
 // ── Features chip grid (semantic button toggles) ─────────────────────────
