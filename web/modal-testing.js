@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api as comfyApi } from "../../scripts/api.js";
 import { ensureTestingStyles } from "./testing-styles.js";
-import { fetchJson, bootstrapLoader } from "./testing-api.js";
+import { bootstrapLoader } from "./testing-api.js";
 import { createDefaultDraft, createPreviewState, normalizeDraft } from "./testing-setup-adapter.js";
 import { ensureStudioStyles } from "./studio-styles.js";
 import { mountStudioShell } from "./studio-shell.js";
@@ -363,45 +363,11 @@ function mountLazyTab(container, tabName) {
 
 function buildSidebarPanel() {
   const panel = el("div", { class: "comfymodal-testing-sidebar-panel" }, [
-    el("button", { text: "Open Testing Suite", onclick: () => open_testing_modal() }),
-    el("div", { class: "status-row" }, [
-      el("span", { text: "Deploy" }),
-      el("span", { "data-testid": "sidebar-deploy", text: "—" }),
-    ]),
-    el("div", { class: "status-row" }, [
-      el("span", { text: "Experiments" }),
-      el("span", { "data-testid": "sidebar-experiments", text: "—" }),
-    ]),
-    el("div", { class: "status-row" }, [
-      el("span", { text: "Workers" }),
-      el("span", { "data-testid": "sidebar-workers", text: "—" }),
-    ]),
+    el("div", { class: "launcher-title", text: "Modal Studio" }),
+    el("div", { class: "launcher-subtitle", text: "Playground, History, Backend, Settings" }),
+    el("button", { text: "Open Studio", onclick: () => open_testing_modal() }),
+    el("div", { class: "launcher-status", text: "Studio shell ready" }),
   ]);
-
-  (async function refreshSidebar() {
-    try {
-      const [deploy, exps] = await Promise.all([
-        fetchJson(`${MODAL_PREFIX}/deploy/status`).catch(() => null),
-        fetchJson(`${MODAL_PREFIX}/experiments`).catch(() => null),
-      ]);
-      const deployEl = panel.querySelector('[data-testid="sidebar-deploy"]');
-      if (deployEl) deployEl.textContent = (deploy && deploy.state) || "unknown";
-      const expEl = panel.querySelector('[data-testid="sidebar-experiments"]');
-      const expsList = (exps && exps.experiments) || [];
-      const activeExperiments = expsList.filter((e) => {
-        const status = e?.snapshot?.status || e?.status;
-        return status === "running" || status === "started" || status === "paused";
-      });
-      if (expEl) expEl.textContent = activeExperiments.length > 0 ? `${activeExperiments.length} active` : `${expsList.length} total`;
-      const workerEl = panel.querySelector('[data-testid="sidebar-workers"]');
-      const workerCount = activeExperiments.reduce((count, experiment) => {
-        const checkpoints = experiment?.snapshot?.checkpoints || {};
-        return count + Object.values(checkpoints).filter((checkpoint) => checkpoint && checkpoint.status && checkpoint.status !== "completed").length;
-      }, 0);
-      if (workerEl) workerEl.textContent = workerCount ? String(workerCount) : "—";
-    } catch {}
-  })();
-
   return panel;
 }
 
