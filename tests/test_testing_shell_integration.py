@@ -129,21 +129,60 @@ class ShellRegistrationTests(unittest.TestCase):
             "Sidebar registration title must be 'Modal Studio' or 'Modal GPU'",
         )
 
-    # -- Sidebar panel content (restored f1d3bb5 behavior) ----------------------
-    def test_sidebar_has_open_testing_suite_button(self):
-        """Sidebar panel must have 'Open Testing Suite' button."""
+    # -- Sidebar panel content (minimal launcher, no old sidebar rows) ---------
+    def test_sidebar_has_open_studio_button(self):
+        """Sidebar panel must have 'Open Studio' button."""
         self.assertIn(
-            "Open Testing Suite",
+            "Open Studio",
             self.m.text,
-            "Sidebar panel must show 'Open Testing Suite' button",
+            "Sidebar panel must show 'Open Studio' button",
         )
 
-    def test_sidebar_imports_fetch_json(self):
-        """modal-testing.js must import fetchJson for sidebar panel fetch calls."""
-        self.assertIn(
-            "fetchJson",
+    def test_sidebar_no_open_testing_suite(self):
+        """Sidebar panel must NOT contain 'Open Testing Suite' text."""
+        self.assertNotIn(
+            "Open Testing Suite",
             self.m.text,
-            "Expected fetchJson import for sidebar panel API calls",
+            "Sidebar panel must not show 'Open Testing Suite' — replaced by 'Open Studio'",
+        )
+
+    def test_sidebar_no_deploy_experiments_workers_rows(self):
+        """buildSidebarPanel must NOT render Deploy / Experiments / Workers rows."""
+        text = self.m.text
+        start = text.find("function buildSidebarPanel")
+        self.assertNotEqual(start, -1, "Expected buildSidebarPanel function in modal-testing.js")
+        build_region = text[start:start + 1000]
+        self.assertNotIn(
+            "Deploy",
+            build_region,
+            "buildSidebarPanel must not render Deploy status row",
+        )
+        self.assertNotIn(
+            "Experiments",
+            build_region,
+            "buildSidebarPanel must not render Experiments status row",
+        )
+        self.assertNotIn(
+            "Workers",
+            build_region,
+            "buildSidebarPanel must not render Workers status row",
+        )
+
+    def test_sidebar_no_fetch_deploy_status_or_experiments(self):
+        """buildSidebarPanel must NOT fetch /deploy/status or /experiments."""
+        text = self.m.text
+        start = text.find("function buildSidebarPanel")
+        self.assertNotEqual(start, -1, "Expected buildSidebarPanel function in modal-testing.js")
+        build_region = text[start:]
+        self.assertNotIn(
+            "/deploy/status",
+            build_region,
+            "buildSidebarPanel must not call fetchJson for /deploy/status",
+        )
+        self.assertNotIn(
+            "/experiments",
+            build_region,
+            "buildSidebarPanel must not call fetchJson for /experiments",
         )
 
 
