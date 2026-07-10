@@ -27,6 +27,9 @@ function el(tag, props = {}, children = []) {
       e.value = props[k];
     } else if (k === "dataset") {
       Object.assign(e.dataset, props[k]);
+    } else if (k === "disabled" || k === "checked" || k === "hidden" || k === "readonly" || k === "required") {
+      if (props[k]) e.setAttribute(k, "");
+      else e.removeAttribute(k);
     } else {
       e.setAttribute(k, props[k]);
     }
@@ -139,6 +142,10 @@ function buildActions(state, context) {
     },
     setBackend(backendId) {
       state.playground.selectedBackendId = backendId;
+      // Re-render so Run button reflects selection
+      if (context && context.setPage) {
+        context.setPage("playground");
+      }
     },
     setControl(ctrlId, value) {
       if (!state.playground.controls) state.playground.controls = {};
@@ -419,36 +426,71 @@ function renderRunButton(state, context, actions, isExperiment) {
     disabled: true,
     text: btnText,
     "data-testid": isExperiment ? "run-experiment-btn" : "run-btn",
-    title: "Configure backends in Legacy Setup before running.",
+    title: "",
   });
 
-  // Run/Experiment is disabled because the single-run and experiment wiring
-  // is not yet adapted to the Studio Playground context.
-  const reason = el("div", { class: "comfymodal-studio-disabled-reason" }, [
-    el("p", {
-      text: "No backends configured. Go to ",
-      style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-    }),
-    el("a", {
-      text: "Settings > Legacy Setup",
-      style: "font-size:var(--font-size-sm);color:var(--color-accent);cursor:pointer;",
-      onclick: (e) => {
-        e.preventDefault();
-        // Navigate to Settings > Legacy > Setup
-        if (context && context.setPage) {
-          state.settings.activeLegacyTab = "setup";
-          context.setPage("settings");
-        }
-      },
-    }),
-    el("p", {
-      text: " to configure backends and run.",
-      style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-    }),
-  ]);
-
+  const reason = el("div", { class: "comfymodal-studio-disabled-reason" });
   container.appendChild(btn);
   container.appendChild(reason);
+
+  // Async-load presets to determine the correct message
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  getRuntimePresets({ apiBase }).then((backends) => {
+    while (reason.firstChild) reason.removeChild(reason.firstChild);
+
+    if (!backends || backends.length === 0) {
+      // No presets at all — link to the Backend tab
+      btn.disabled = true;
+      btn.title = "No backends configured";
+
+      const p1 = el("p", {
+        text: "No backends configured. ",
+        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+      });
+      const link = el("a", {
+        text: "Go to Backend tab",
+        style: "font-size:var(--font-size-sm);color:var(--color-accent);cursor:pointer;",
+        onclick: (e) => {
+          e.preventDefault();
+          actions.navigateToBackendTab();
+        },
+      });
+      const p2 = el("p", {
+        text: " to add backends.",
+        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+      });
+      reason.appendChild(p1);
+      reason.appendChild(link);
+      reason.appendChild(p2);
+      return;
+    }
+
+    // Presets exist on the server
+    const selectedId = state.playground && state.playground.selectedBackendId;
+    if (selectedId) {
+      // Single-run wiring is not yet adapted to the Studio Playground context
+      btn.disabled = true;
+      btn.title = "Run not yet wired";
+      reason.appendChild(el("p", {
+        text: "Run is not yet wired for Studio presets.",
+        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+      }));
+    } else {
+      btn.disabled = true;
+      btn.title = "Select a backend";
+      reason.appendChild(el("p", {
+        text: "Select a backend to run.",
+        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+      }));
+    }
+  }).catch(() => {
+    while (reason.firstChild) reason.removeChild(reason.firstChild);
+    reason.appendChild(el("p", {
+      text: "Could not load backends.",
+      style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+    }));
+  });
+
   return container;
 }
 

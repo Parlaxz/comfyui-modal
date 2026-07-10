@@ -191,7 +191,7 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
   container.appendChild(card);
 }
 
-function renderPresetForm(existing, apiBase, listPanel, detailPanel) {
+export function renderPresetForm(existing, apiBase, listPanel, detailPanel) {
   while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
   const formCard = el("div", { class: "comfymodal-studio-backend-detail-card" });
 

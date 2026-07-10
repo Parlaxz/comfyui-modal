@@ -5,69 +5,60 @@
 
 import { el } from "./studio-ui.js";
 import { createSnapshot, listSnapshots } from "./studio-backend-api.js";
-import { _STATE, renderFeaturesChipGrid } from "./studio-backend.js";
+import { _STATE } from "./studio-backend.js";
+import { getComfyGraphContext } from "./studio-graph-binding.js";
 
-// ── Take Snapshot of Current Graph ────────────────────────────────────────
+// ── Capture Current Comfy Graph (structured, non-mutating) ──────────────
 
-export async function takeSnapshotOfCurrentGraph(apiBase, listContainer, detailContainer, renderFn) {
-  // Attempt to serialize the current ComfyUI graph
-  const app = window.__comfymodal_comfy_app;
+export async function captureCurrentComfyGraph() {
+  const ctx = getComfyGraphContext();
+  const warnings = [];
+
+  if (!ctx.ok) return { ok: false, reason: ctx.reason, warnings };
+
+  const { app, graph } = ctx;
+
   let graphJson = null;
-  let apiPromptJson = null;
-  let error = null;
-
   try {
-    if (app && app.graph && typeof app.graph.serialize === "function") {
-      graphJson = app.graph.serialize();
+    if (graph && typeof graph.serialize === "function") {
+      graphJson = graph.serialize();
     } else {
-      // Try alternate methods
-      const canvas = document.querySelector(".comfy-graph canvas") ||
-                     document.querySelector("canvas");
-      if (window.app && window.app.graph && typeof window.app.graph.serialize === "function") {
-        graphJson = window.app.graph.serialize();
-      } else {
-        error = "Cannot access ComfyUI graph API. Open the main ComfyUI tab first.";
-      }
+      return { ok: false, reason: "ComfyUI graph is not ready.", warnings };
     }
   } catch (e) {
-    error = `Failed to serialize graph: ${e.message}`;
+    return { ok: false, reason: `Failed to serialize graph: ${e.message}`, warnings };
   }
 
-  if (error) {
-    // Show error in detail panel
+  let apiPromptJson = null;
+  try {
+    if (typeof app.graphToPrompt === "function") {
+      apiPromptJson = await app.graphToPrompt();
+    } else {
+      warnings.push("ComfyUI API prompt generation is unavailable.");
+    }
+  } catch {
+    warnings.push("Could not generate API prompt automatically.");
+  }
+
+  return { ok: true, graphJson, apiPromptJson, warnings };
+}
+
+// ── Take Snapshot of Current Graph (legacy flow) ────────────────────────
+
+export async function takeSnapshotOfCurrentGraph(apiBase, listContainer, detailContainer, renderFn) {
+  const capture = await captureCurrentComfyGraph();
+  if (!capture.ok) {
     while (detailContainer.firstChild) detailContainer.removeChild(detailContainer.firstChild);
     const card = el("div", { class: "comfymodal-studio-backend-detail-card" }, [
       el("h4", { text: "Error", style: "color:#f87171;margin:0 0 8px;" }),
-      el("p", { text: error, style: "color:#aaa;font-size:12px;" }),
+      el("p", { text: capture.reason || "Failed to capture graph", style: "color:#aaa;font-size:12px;" }),
     ]);
     detailContainer.appendChild(card);
     return;
   }
 
-  // Attempt to generate API prompt safely
-  let status = "Needs API prompt";
-  try {
-    if (app && typeof app.graphToPrompt === "function") {
-      apiPromptJson = await app.graphToPrompt();
-      status = "runnable";
-    } else if (window.comfyAPI && window.comfyAPI.prompt && typeof window.comfyAPI.prompt.graphToPrompt === "function") {
-      apiPromptJson = await window.comfyAPI.prompt.graphToPrompt();
-      status = "runnable";
-    } else {
-      // Try ComfyUI's built-in mechanism
-      const w = typeof comfyUI !== "undefined" ? comfyUI : null;
-      if (w && w.graphToPrompt) {
-        apiPromptJson = await w.graphToPrompt();
-        status = "runnable";
-      } else {
-        apiPromptJson = null;
-        status = "Needs API prompt";
-      }
-    }
-  } catch (e) {
-    apiPromptJson = null;
-    status = "Needs bindings";
-  }
+  const graphJson = capture.graphJson;
+  const apiPromptJson = capture.apiPromptJson;
 
   // Create snapshot via API
   const payload = {
@@ -76,7 +67,6 @@ export async function takeSnapshotOfCurrentGraph(apiBase, listContainer, detailC
     compatibleFeatures: [],
     graphJson: graphJson,
     apiPromptJson: apiPromptJson,
-    status: status,
   };
 
   const result = await createSnapshot(apiBase, payload);
