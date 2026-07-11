@@ -38,6 +38,10 @@ playwright/.cache/
 .studio_backends.json
 .deploy_warmup_state.json
 .run_history/
+# Studio output images (generated at runtime, not source)
+output/studio/
+# Experiment runtime directory
+.comfymodal_experiments/
 # Temp JSON runtime files
 *_runtime.json
 .studio_*.tmp

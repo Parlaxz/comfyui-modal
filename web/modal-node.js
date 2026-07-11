@@ -1,5 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { initSharedTracker, getSharedTracker, setNodeLabelResolver } from "./comfymodal-progress.js";
 
 const MODAL_PREFIX = "/comfymodal";
 const BENCHMARK_WORKFLOW_PATH = "/comfymodal/benchmark/workflow";
@@ -525,126 +526,72 @@ app.registerExtension({
     // ── Progress Bar ────────────────────────────────────────────────────
     _pbCreate();
 
-    if (typeof api.addEventListener === "function") {
-      const onExecutionStart = () => {
-        // The Modal container streams execution_start through its progress
-        // queue too, so this can fire twice.  Guard against re-entry.
-        if (_execState.executing) return;
-        _resetExecState();
-        _execState.executing = true;
-        _execState.startTime = Date.now();
-        _startTimer();
-      };
-      _trackApiListener("execution_start", onExecutionStart);
+    // Set up node label resolver so shared progress module can resolve labels
+    setNodeLabelResolver(function (nodeId) {
+      try {
+        const n = app?.graph?.getNodeById(Number(nodeId));
+        if (n) return n.title || n.type;
+      } catch {}
+      return String(nodeId);
+    });
 
-      const onExecuting = (e) => {
-        // ComfyUI frontend API passes nodeId directly as e.detail, NOT
-        // wrapped in {node: ...}.  Accept both shapes for compatibility.
-        const detail = e?.detail;
-        const node = (detail != null && typeof detail === "object") ? detail.node : detail;
-        if (node === null || node === undefined) {
-          return;
-        }
-        // Record previous node's wall-clock duration before switching
-        if (_execState.currentNode != null && _execState.nodeStartTime) {
-          const prevDur = Date.now() - _execState.nodeStartTime;
-          _execState.nodeTimes[String(_execState.currentNode)] = prevDur;
-        }
-        _execState.currentNode = node;
-        _execState.nodeStartTime = Date.now();
-        _execState.nodeMs = 0;
-        // Show node label + node-level progress while we wait for step data
-        const nodeLabel = _getNodeLabel(node);
-        const doneCount = _execState.nodesSeen.size;
-        const total = _execState.totalNodes;
-        const nodePct = total > 0 ? (doneCount / total) * 100 : null;
-        _pbShowProgress(
-          _execState.queue,
-          nodePct,
-          null,
-          nodeLabel,
-          total > 0 ? `${doneCount}/${total}` : ""
-        );
-        // Reset step counter — the new node hasn't started its steps yet
-        _execState.step = 0;
-        _execState.maxStep = 0;
-      };
-      _trackApiListener("executing", onExecuting);
+    // Create shared progress tracker (singleton, safe for both modal-node and playground)
+    const tracker = initSharedTracker(api);
+    // Store reference for _execState interactions
+    _modalNodeRuntime._tracker = tracker;
 
-      const onProgress = (e) => {
-        const d = e?.detail || {};
-        // ComfyUI sends this field as `value`, not `step`. Accept both.
-        if (d.step != null || d.value != null) {
-          _execState.step = d.step ?? d.value;
-          _execState.maxStep = d.max ?? d.max_step ?? d.maxStep ?? _execState.maxStep;
-        }
-        if (d.queue != null) _execState.queue = d.queue;
-        if (_execState.executing) {
-          const hasSteps = _execState.maxStep > 0 && _execState.step != null;
-          const pct = hasSteps ? (_execState.step / _execState.maxStep) * 100 : null;
-          const label = _getNodeLabel(_execState.currentNode);
+    // Subscribe tracker state to progress bar updates
+    tracker.onProgress(function (s) {
+      if (!_pb) return;
+
+      switch (s.stage) {
+        case "idle":
+          _pbShowIdle();
+          break;
+        case "startup":
+          _pbShowStartup(s.message || "Starting up...");
+          break;
+        case "generating":
           _pbShowProgress(
-            _execState.queue,
-            pct,
-            pct,
-            label,
-            hasSteps ? `${_execState.step}/${_execState.maxStep}` : ""
+            s.queuePosition,
+            s.overallPercent,
+            s.samplerMaximum > 0 && s.samplerStep != null
+              ? (s.samplerStep / s.samplerMaximum) * 100
+              : null,
+            s.currentNodeLabel,
+            s.totalNodes > 0 ? `${s.completedNodes}/${s.totalNodes}` : ""
           );
+          break;
+        case "done": {
+          const finalNodeTimes = { ...s.perNodeDurations };
+          _pbShowDone(s.elapsedMs, finalNodeTimes);
+          break;
         }
-      };
-      _trackApiListener("progress", onProgress);
+        case "error":
+          _pbShowError(s.error, s.elapsedMs);
+          break;
+      }
 
-      const onExecutionCached = (e) => {
-        const nodes = e?.detail?.nodes;
-        if (Array.isArray(nodes)) {
-          for (const n of nodes) _execState.nodesSeen.add(n);
-        }
-      };
-      _trackApiListener("execution_cached", onExecutionCached);
+      // Update timing display in the bar
+      if (s.stage === "generating" && s.startTime) {
+        const elapsed = Date.now() - s.startTime;
+        let t = _formatTime(elapsed);
+        _pb.etaEl.textContent = t;
+      }
+    });
 
-      const onExecutionSuccess = (event) => {
-        _execState.executing = false;
-        _stopTimer();
-        const total = _execState.totalMs || (_execState.startTime ? Date.now() - _execState.startTime : 0);
-        const finalNodeTimes = { ..._execState.nodeTimes };
-        // Include current node's time if still running
-        if (_execState.currentNode != null && _execState.nodeStartTime) {
-          finalNodeTimes[String(_execState.currentNode)] = Date.now() - _execState.nodeStartTime;
-        }
-        _pbShowDone(total, finalNodeTimes);
-        _resetExecState();
-
-        const detail = event?.detail || {};
-        const trace = detail.trace;
-        if (!trace) return;
-        const t10ClientMs = Date.now();
-        const suffix = ` client_event_recv_ms=${t10ClientMs}`;
-        _logTrace(trace, suffix);
-      };
-      _trackApiListener("execution_success", onExecutionSuccess);
-
-      const onExecutionError = (e) => {
-        _execState.executing = false;
-        _stopTimer();
-        const total = _execState.totalMs || (_execState.startTime ? Date.now() - _execState.startTime : 0);
-        const msg = e?.detail?.message || "Execution error";
-        _pbShowError(msg, total);
-        _resetExecState();
-        setTimeout(() => _pbShowIdle(), 4000);
-      };
-      _trackApiListener("execution_error", onExecutionError);
-
-      const onModalStatus = (e) => {
-        const d = e?.detail || {};
-        if (!d.prompt_id) return;
-        if (d.phase === "startup" || d.phase === "warmup") {
-          _pbShowStartup(d.message || "Starting up...");
-        }
-      };
-      _trackApiListener("modal_status", onModalStatus);
-    } else {
-      log("WARNING: api.addEventListener not available, progress bar disabled");
-    }
+    // ── Legacy _execState bridge ────────────────────────────────────────
+    // Keep _execState populated for downstream consumers that reference it
+    // (e.g., fetchApi path for totalNodes counting)
+    tracker.onProgress(function (s) {
+      _execState.executing = s.stage === "generating" || s.stage === "startup";
+      _execState.queue = s.queuePosition;
+      _execState.totalNodes = s.totalNodes;
+      _execState.currentNode = s.currentNodeId;
+      _execState.nodeTimes = { ...s.perNodeDurations };
+      _execState.totalMs = s.elapsedMs;
+      _execState.startTime = s.startTime;
+    });
 
     // ── End Progress Bar ────────────────────────────────────────────────
 
@@ -730,6 +677,10 @@ app.registerExtension({
             });
             if (nodeKeys.length > 0) {
               _execState.totalNodes = nodeKeys.length;
+              // Update shared tracker too
+              if (_modalNodeRuntime._tracker && typeof _modalNodeRuntime._tracker.setTotalNodes === "function") {
+                _modalNodeRuntime._tracker.setTotalNodes(nodeKeys.length);
+              }
             }
           }
         }

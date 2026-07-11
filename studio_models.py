@@ -487,3 +487,119 @@ def update_preset(
     preset["status"] = normalized["status"]
     preset["disabledReason"] = normalized.get("disabledReason", "")
     return preset
+
+
+# ── Control validation ────────────────────────────────────────────────────
+
+
+def validate_controls_against_schema(
+    controls: dict[str, Any],
+    schemas: dict[str, dict],
+    feature_id: str,
+    strict_unknown_rejection: bool = False,
+) -> list[dict[str, str]]:
+    """Validate submitted control values against control schemas.
+
+    Parameters
+    ----------
+    controls : dict
+        The submitted control values (control_id → value).
+    schemas : dict
+        Control schemas keyed by control_id, derived from the snapshot graph.
+    feature_id : str
+        Feature identifier for context (currently unused, reserved).
+    strict_unknown_rejection : bool, optional
+        If True, control fields that do not appear in *schemas* are rejected
+        as unknown.  Default False preserves backward compatibility for
+        legacy/extra fields.
+
+    Returns a list of error dicts (``{"field": …, "message": …}``).
+    An empty list means all controls are valid.
+    """
+    errors: list[dict[str, str]] = []
+
+    for field, value in controls.items():
+        schema = schemas.get(field)
+        if schema is None:
+            if strict_unknown_rejection:
+                errors.append({
+                    "field": field,
+                    "message": f"Unknown control field {field!r} not in control schemas",
+                })
+            continue  # unknown field, skip validation unless strict mode
+
+        kind = schema.get("kind", "unknown")
+        resolved = schema.get("schemaResolved", False)
+
+        if not resolved or kind == "unresolved":
+            continue  # can't validate unresolved schemas
+
+        if kind == "enum":
+            options = schema.get("options", [])
+            if value is None:
+                errors.append({
+                    "field": field,
+                    "message": f"Value for {field!r} must not be null. "
+                              f"Must be one of: {', '.join(str(o) for o in options)}",
+                })
+            elif value not in options:
+                errors.append({
+                    "field": field,
+                    "message": f"Invalid value {value!r} for {field!r}. "
+                              f"Must be one of: {', '.join(str(o) for o in options)}",
+                })
+
+        elif kind == "integer":
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool):
+                errors.append({
+                    "field": field,
+                    "message": f"Value for {field!r} must be an integer, got {type(value).__name__}",
+                })
+                continue
+            minimum = schema.get("minimum")
+            maximum = schema.get("maximum")
+            if minimum is not None and value < minimum:
+                errors.append({
+                    "field": field,
+                    "message": f"Value for {field!r} must be >= {minimum}, got {value}",
+                })
+            if maximum is not None and value > maximum:
+                errors.append({
+                    "field": field,
+                    "message": f"Value for {field!r} must be <= {maximum}, got {value}",
+                })
+
+        elif kind == "number":
+            if value is None:
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                errors.append({
+                    "field": field,
+                    "message": f"Value for {field!r} must be a number, got {type(value).__name__}",
+                })
+                continue
+            minimum = schema.get("minimum")
+            maximum = schema.get("maximum")
+            if minimum is not None and value < minimum:
+                errors.append({
+                    "field": field,
+                    "message": f"Value for {field!r} must be >= {minimum}, got {value}",
+                })
+            if maximum is not None and value > maximum:
+                errors.append({
+                    "field": field,
+                    "message": f"Value for {field!r} must be <= {maximum}, got {value}",
+                })
+
+        elif kind == "boolean":
+            if value is not None and not isinstance(value, bool):
+                # Accept 0/1 for backward compatibility
+                if value not in (0, 1):
+                    errors.append({
+                        "field": field,
+                        "message": f"Value for {field!r} must be a boolean, got {type(value).__name__}",
+                    })
+
+    return errors

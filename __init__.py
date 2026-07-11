@@ -5927,8 +5927,40 @@ if _server:
     async def run_history_list(request: web.Request) -> web.Response:
         kind = request.query.get("kind", None)
         limit = int(request.query.get("limit", "200"))
-        items = REGISTRY.history().list_runs(kind=kind, limit=limit)
-        return web.json_response({"status": "ok", "runs": items})
+        offset = int(request.query.get("offset", "0"))
+        sort = request.query.get("sort", "newest")
+        status_filter = request.query.get("status", None)
+        favorite_only = request.query.get("favorite_only", "").lower() in ("1", "true")
+        search = request.query.get("search", None) or None
+        feature = request.query.get("feature", None) or None
+        preset = request.query.get("preset", None) or None
+        date_from = request.query.get("date_from", None) or None
+        date_to = request.query.get("date_to", None) or None
+        has_image_raw = request.query.get("has_image", None)
+        has_image: Optional[bool] = None
+        if has_image_raw is not None:
+            has_image = has_image_raw.lower() in ("1", "true")
+        result = REGISTRY.history().list_runs(
+            kind=kind,
+            limit=limit,
+            offset=offset,
+            sort=sort,
+            status_filter=status_filter,
+            favorite_only=favorite_only,
+            search=search,
+            feature=feature,
+            preset=preset,
+            date_from=date_from,
+            date_to=date_to,
+            has_image=has_image,
+        )
+        return web.json_response({
+            "status": "ok",
+            "runs": result["runs"],
+            "total": result["total"],
+            "limit": result["limit"],
+            "offset": result["offset"],
+        })
 
     @_server.routes.get("/comfymodal/run-history/{run_id}")
     async def run_history_detail(request: web.Request) -> web.Response:
@@ -5955,6 +5987,54 @@ if _server:
             "status": "ok",
             "timing": timing,
             "text": format_timing(timing),
+        })
+
+    @_server.routes.patch("/comfymodal/run-history/{run_id}/annotations")
+    async def run_history_patch_annotations(request: web.Request) -> web.Response:
+        """PATCH annotations (favorite, note) for a run.
+
+        Body (JSON):
+            ``{"favorite": true, "note": "My note"}`` (both optional)
+
+        Only ``favorite`` (bool) and ``note`` (str, max 2000 chars) are
+        allowed. Unknown fields are rejected.
+        """
+        from experiment_service import _validate_annotation_payload
+        run_id = request.match_info.get("run_id", "")
+        if not run_id:
+            return web.json_response({"status": "error", "message": "missing run_id"}, status=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "Invalid JSON body"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"status": "error", "message": "body must be a JSON object"}, status=400)
+        # Validate payload
+        errors = _validate_annotation_payload(body)
+        if errors:
+            return web.json_response({
+                "status": "error",
+                "message": "Annotation validation failed",
+                "errors": errors,
+            }, status=422)
+        # Build full annotations object
+        history = REGISTRY.history()
+        meta = history.get_run(run_id)
+        if meta is None:
+            return web.json_response({"status": "error", "message": "run not found"}, status=404)
+        # Merge with existing annotations
+        current = meta.get("annotations", {}) or {}
+        merged = dict(current)
+        if "favorite" in body:
+            merged["favorite"] = bool(body["favorite"])
+        if "note" in body:
+            merged["note"] = str(body["note"])
+        from datetime import datetime, timezone
+        merged["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        history.update_run(run_id, meta={"annotations": merged})
+        return web.json_response({
+            "status": "ok",
+            "annotations": merged,
         })
 
     # ── Studio Snapshots & Backend Presets ──────────────────────────
@@ -6176,7 +6256,19 @@ if _server:
                 {"status": "error", "message": "presetId and featureId are required"}, status=400
             )
         try:
-            from studio_run_adapter import handle_studio_run
+            from studio_run_adapter import handle_studio_run, derive_control_schemas_from_snapshot, load_preset_and_snapshot
+            from studio_models import validate_controls_against_schema
+            # Validate controls against snapshot-derived schemas
+            _preset, _snapshot_or_err = load_preset_and_snapshot(preset_id, _NODE_DIR)
+            if _preset is not None:
+                schemas = derive_control_schemas_from_snapshot(_snapshot_or_err)
+                validation_errors = validate_controls_against_schema(controls, schemas, feature_id)
+                if validation_errors:
+                    return web.json_response({
+                        "status": "error",
+                        "message": "Control validation failed",
+                        "errors": validation_errors,
+                    }, status=400)
             result = handle_studio_run(preset_id, feature_id, controls, _NODE_DIR)
             status_code = 200 if result.get("status") == "ok" else 400
             return web.json_response(result, status=status_code)
@@ -6213,7 +6305,42 @@ if _server:
                 status=400,
             )
         try:
-            from studio_run_adapter import handle_studio_experiment
+            from studio_run_adapter import handle_studio_experiment, derive_control_schemas_from_snapshot, load_preset_and_snapshot
+            from studio_models import validate_controls_against_schema
+            # Validate experiment controls/axes against snapshot-derived schemas
+            # Use the first preset's snapshot for schema derivation
+            _first_preset, _first_snap = None, None
+            for _pid in preset_ids:
+                _fp, _fs = load_preset_and_snapshot(_pid, _NODE_DIR)
+                if _fp is not None:
+                    _first_preset, _first_snap = _fp, _fs
+                    break
+            if _first_snap is not None:
+                schemas = derive_control_schemas_from_snapshot(_first_snap)
+                exp_errors: list[dict] = []
+                # Validate shared defaults (one shot — flat dict is safe here)
+                _defaults = experiment_def.get("defaults", {}) or {}
+                if _defaults:
+                    exp_errors.extend(validate_controls_against_schema(
+                        _defaults, schemas, feature_id,
+                        strict_unknown_rejection=False,
+                    ))
+                # Validate each axis value INDIVIDUALLY — do NOT flatten into
+                # a single dict because later values would overwrite earlier
+                # ones, silently skipping validation of earlier values.
+                for _axis_id, _axis_def in (experiment_def.get("axes", {}) or {}).items():
+                    if isinstance(_axis_def, dict) and _axis_def.get("values"):
+                        for _v in _axis_def["values"]:
+                            exp_errors.extend(validate_controls_against_schema(
+                                {_axis_id: _v}, schemas, feature_id,
+                                strict_unknown_rejection=False,
+                            ))
+                if exp_errors:
+                    return web.json_response({
+                        "status": "error",
+                        "message": "Experiment control validation failed",
+                        "errors": exp_errors,
+                    }, status=400)
             result = handle_studio_experiment(preset_ids, feature_id, experiment_def, _NODE_DIR)
             status_code = 200 if result.get("status") == "ok" else 400
             return web.json_response(result, status=status_code)
