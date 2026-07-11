@@ -136,12 +136,33 @@ def derive_control_schemas_from_snapshot(snapshot: dict) -> dict[str, dict]:
     ``maximum``, ``step``, ``precision``, ``default``, ``nodeId``,
     ``nodeType``, ``widgetName``, and ``schemaResolved``.
 
+    **Phase 4**: Snapshots created by the browser preset wizard now carry
+    a ``controlSchemas`` dict keyed by control ID.  These were captured
+    from the live LiteGraph widget metadata at binding time.  When present
+    and non-empty, captured schemas are returned as the primary source —
+    the static Python registry is only used as a legacy fallback for old
+    snapshots that lack captured schemas.
+
     For backward compatibility, missing or unresolvable schemas return a
     stub with ``schemaResolved: False`` so the frontend can fall back to
     its static type definitions.
     """
     schemas: dict[str, dict] = {}
     bindings = snapshot.get("nodeBindings", {}) or {}
+
+    # ── Phase 4: prefer captured schemas from browser widget metadata ──
+    captured = snapshot.get("controlSchemas", {}) or {}
+    if captured:
+        # Deep-copy so caller mutations never leak into the stored snapshot.
+        # Also ensure schemaResolved/field are set on the copy, not the stored object.
+        result = copy.deepcopy(captured)
+        for ctrl_id, schema in result.items():
+            if isinstance(schema, dict):
+                schema.setdefault("schemaResolved", True)
+                schema.setdefault("field", ctrl_id)
+        return result
+
+    # ── Legacy fallback: derive from static registry ─────────────────────
     workflow = _get_executable_workflow(snapshot.get("apiPromptJson"))
 
     for ctrl_id, binding in bindings.items():
@@ -1028,6 +1049,8 @@ async def _schedule_and_start(
             pass
 
     timings: dict[str, Any] = {}
+    timing_sources: dict[str, str] = {}
+    generation_ms = 0
     if submission_started_at:
         try:
             sub_dt = datetime.fromisoformat(submission_started_at.replace("Z", "+00:00"))
@@ -1038,10 +1061,13 @@ async def _schedule_and_start(
                 "generation_ms": max(0, generation_ms),
                 "total_ms": max(0, queue_ms + generation_ms),
             }
+            timing_sources["queue_ms"] = "server_observed"
+            timing_sources["generation_ms"] = "server_observed"
+            timing_sources["total_ms"] = "server_observed"
         except Exception:
             pass
 
-    # Preserve any remote-side timing breakdown separately
+    # Remote-side timing breakdown — flatten into top-level AND keep remote_timings for diagnostics
     if isinstance(result, dict):
         remote_breakdown = {}
         for k in list(result.keys()):
@@ -1050,6 +1076,28 @@ async def _schedule_and_start(
                 remote_breakdown[k] = result[k]
         if remote_breakdown:
             timings["remote_timings"] = remote_breakdown
+            # Flatten remote timing fields to the top level for the frontend normalizer
+            for k, v in remote_breakdown.items():
+                if k not in timings:
+                    timings[k] = v
+                    timing_sources[k] = "remote"
+
+    # Canonical wall-clock summary fields
+    if submission_started_at and completed_at:
+        try:
+            sub_dt = datetime.fromisoformat(submission_started_at.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+            end_to_end_ms = int((end_dt - sub_dt).total_seconds() * 1000)
+            timings["scheduler_execution_ms"] = max(0, generation_ms) if "generation_ms" in timings else end_to_end_ms
+            timings["end_to_end_total_ms"] = max(0, end_to_end_ms)
+            timing_sources["scheduler_execution_ms"] = "server_observed"
+            timing_sources["end_to_end_total_ms"] = "server_observed"
+        except Exception:
+            pass
+
+    # Attach timing_sources metadata
+    if timing_sources:
+        timings["timing_sources"] = timing_sources
 
     # ── Inspect experiment journal for the LATEST visible cell.completed ──
     output_paths: list[str] = []

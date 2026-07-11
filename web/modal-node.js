@@ -555,9 +555,7 @@ app.registerExtension({
           _pbShowProgress(
             s.queuePosition,
             s.overallPercent,
-            s.samplerMaximum > 0 && s.samplerStep != null
-              ? (s.samplerStep / s.samplerMaximum) * 100
-              : null,
+            s.samplerPercent,
             s.currentNodeLabel,
             s.totalNodes > 0 ? `${s.completedNodes}/${s.totalNodes}` : ""
           );

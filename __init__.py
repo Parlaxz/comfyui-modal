@@ -5925,12 +5925,16 @@ if _server:
     # ── Run history ───────────────────────────────────────────────────
     @_server.routes.get("/comfymodal/run-history")
     async def run_history_list(request: web.Request) -> web.Response:
-        kind = request.query.get("kind", None)
+        # Accept both 'kind' and 'type' for frontend compatibility
+        kind = request.query.get("kind", None) or request.query.get("type", None)
         limit = int(request.query.get("limit", "200"))
         offset = int(request.query.get("offset", "0"))
         sort = request.query.get("sort", "newest")
         status_filter = request.query.get("status", None)
-        favorite_only = request.query.get("favorite_only", "").lower() in ("1", "true")
+        # Accept both 'favorite_only' and 'favorite' for frontend compatibility
+        fav_only_q = request.query.get("favorite_only", "").lower() in ("1", "true")
+        fav_q = request.query.get("favorite", "").lower() in ("1", "true")
+        favorite_only = fav_only_q or fav_q
         search = request.query.get("search", None) or None
         feature = request.query.get("feature", None) or None
         preset = request.query.get("preset", None) or None

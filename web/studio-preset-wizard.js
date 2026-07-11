@@ -537,6 +537,12 @@ function renderBindingRowList(bindingDefs, state, graphContext) {
           event.stopPropagation();
           const selected = getSelectedGraphNodeTarget();
           if (!selected) return;
+          // Phase 4: extract widgetSchema from the selected candidate
+          const selCandidate = _findSelectedCandidate(
+            selected.candidates,
+            { widgetName: selected.widgetName, inputName: selected.inputName, outputIndex: selected.outputIndex }
+          );
+          const selWidgetSchema = _buildWidgetSchemaFromCandidate(selCandidate);
           state.bindings[bindingDef.key] = {
             kind: selected.widgetName ? "widget" : selected.inputName ? "input" : selected.outputIndex != null ? "output" : "node",
             nodeId: selected.nodeId,
@@ -547,6 +553,7 @@ function renderBindingRowList(bindingDefs, state, graphContext) {
             outputIndex: selected.outputIndex,
             label: selected.nodeTitle || selected.nodeType,
             candidates: selected.candidates || [],
+            widgetSchema: selWidgetSchema,
           };
           cancelGraphBinding();
           state.bindingCaptureActive = null;
@@ -627,6 +634,12 @@ function renderCandidateDropdown(bindingValue, bindingDef, state) {
       if (val.kind === "widget") { bindingValue.widgetName = val.name; bindingValue.inputName = null; bindingValue.outputIndex = null; }
       else if (val.kind === "input") { bindingValue.inputName = val.name; bindingValue.widgetName = null; bindingValue.outputIndex = null; }
       else if (val.kind === "output") { bindingValue.outputIndex = val.index; bindingValue.widgetName = null; bindingValue.inputName = null; }
+      // Phase 4: keep widgetSchema in sync with the selected candidate
+      const updatedCandidate = _findSelectedCandidate(
+        bindingValue.candidates,
+        { widgetName: bindingValue.widgetName, inputName: bindingValue.inputName, outputIndex: bindingValue.outputIndex }
+      );
+      bindingValue.widgetSchema = _buildWidgetSchemaFromCandidate(updatedCandidate);
       renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
     } catch { /* ignore parse errors */ }
   });
@@ -650,6 +663,12 @@ function startBindingCapture(state, bindingDef) {
     bindingKey: bindingDef.key,
     label: bindingDef.label,
     onCapture: (result) => {
+      // Phase 4: extract widgetSchema from the selected candidate
+      const selectedCandidate = _findSelectedCandidate(
+        result.candidates,
+        { widgetName: result.widgetName, inputName: result.inputName, outputIndex: result.outputIndex }
+      );
+      const widgetSchema = _buildWidgetSchemaFromCandidate(selectedCandidate);
       state.bindings[result.bindingKey] = {
         kind: result.widgetName ? "widget" : result.inputName ? "input" : result.outputIndex != null ? "output" : "node",
         nodeId: result.nodeId,
@@ -660,6 +679,7 @@ function startBindingCapture(state, bindingDef) {
         outputIndex: result.outputIndex,
         label: result.nodeTitle || result.nodeType,
         candidates: result.candidates || [],
+        widgetSchema: widgetSchema,
       };
       state.bindingCaptureActive = null;
       renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
@@ -817,10 +837,12 @@ async function executeSave(state) {
     const outputNodeId = state.bindings.output && state.bindings.output.nodeId ? state.bindings.output.nodeId : null;
 
     if (state.isEdit && state.existingSnapshotId) {
-      // ── Edit mode: update snapshot bindings ────────────────────────
+      // ── Edit mode: update snapshot bindings + control schemas ──────
+      const controlSchemas = buildControlSchemas(state);
       const snapshotUpdate = {
         compatibleFeatures: state.selectedFeatures,
         nodeBindings: nodeBindings,
+        controlSchemas: controlSchemas,
       };
       if (outputNodeId) snapshotUpdate.outputNodeId = outputNodeId;
 
@@ -855,6 +877,7 @@ async function executeSave(state) {
     state.captureWarnings = captureResult.warnings || [];
 
     // 2. Create snapshot
+    const controlSchemas = buildControlSchemas(state);
     const snapshotPayload = {
       name: state.details.name + " (snapshot)",
       description: state.details.description,
@@ -864,6 +887,7 @@ async function executeSave(state) {
       nodeBindings: nodeBindings,
       outputNodeId: outputNodeId || "",
       source: "current_graph",
+      controlSchemas: controlSchemas,
     };
 
     const snapshotResult = await createSnapshot(apiBase, snapshotPayload);
@@ -900,6 +924,90 @@ async function executeSave(state) {
     state.step = "error";
     state.errorMessage = err.message || "An unexpected error occurred";
   }
+}
+
+// ── Phase 4: Build widget schema from a single candidate ────────────
+
+function _buildWidgetSchemaFromCandidate(candidate) {
+  /** Extract widget schema metadata from a captured LiteGraph candidate.
+   *
+   *  Returns null for non-widget candidates (input, output, node).
+   *  Fields mirror what extractNodeCandidates captures from LiteGraph widgets.
+   */
+  if (!candidate || candidate.kind !== "widget") return null;
+  return {
+    schemaType: candidate.schemaType || null,
+    enumValues: candidate.enumValues || null,
+    min: candidate.min,
+    max: candidate.max,
+    step: candidate.step,
+    precision: candidate.precision,
+    defaultValue: candidate.defaultValue,
+    multiline: candidate.multiline || false,
+  };
+}
+
+function _findSelectedCandidate(candidates, bindingValue) {
+  /** Find the candidate matching the current widget/input/output selection. */
+  if (!candidates || !bindingValue) return null;
+  if (candidates.length === 1) return candidates[0];
+  return candidates.find((c) => {
+    if (c.kind === "widget") return c.name === bindingValue.widgetName;
+    if (c.kind === "input") return c.name === bindingValue.inputName;
+    if (c.kind === "output") return c.index === bindingValue.outputIndex;
+    return false;
+  }) || null;
+}
+
+// ── Phase 4: Build control schemas from bound widget data ────────────
+
+function buildControlSchemas(state) {
+  /** Build a controlSchemas dict keyed by control (binding) ID.
+   *
+   *  Each entry is a schema dict captured from the live LiteGraph widget
+   *  metadata.  This is persisted with the snapshot and takes priority
+   *  over the Python-side static registry at runtime.
+   *
+   *  Only widget-kind bindings with captured widgetSchema contribute.
+   *  Node/input/output bindings without widget metadata are omitted.
+   */
+  const schemas = {};
+  Object.entries(state.bindings).forEach(([key, val]) => {
+    if (!val || !val.nodeId) return;
+    const ws = val.widgetSchema;
+    if (!ws) return;
+    if (val.kind !== "widget") return;
+
+    const schema = {
+      kind: mapSchemaKind(ws),
+      nodeId: val.nodeId,
+      nodeType: val.nodeType || "",
+      widgetName: val.widgetName || "",
+      default: ws.defaultValue,
+    };
+
+    if (ws.schemaType === "enum" && ws.enumValues) {
+      schema.options = ws.enumValues;
+    }
+    if (ws.min != null) schema.minimum = ws.min;
+    if (ws.max != null) schema.maximum = ws.max;
+    if (ws.step != null) schema.step = ws.step;
+    if (ws.precision != null) schema.precision = ws.precision;
+    if (ws.multiline) schema.multiline = true;
+
+    schemas[key] = schema;
+  });
+  return schemas;
+}
+
+function mapSchemaKind(ws) {
+  if (!ws || !ws.schemaType) return "unresolved";
+  if (ws.schemaType === "enum") return "enum";
+  if (ws.schemaType === "number") return "number";
+  if (ws.schemaType === "integer") return "integer";
+  if (ws.schemaType === "boolean") return "boolean";
+  if (ws.multiline) return "multiline";
+  return ws.schemaType;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

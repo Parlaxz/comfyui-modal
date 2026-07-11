@@ -769,6 +769,26 @@ class RunHistoryService:
 
         return meta_obj
 
+    def _merge_timing_summary(self, run_dir: Path, meta_obj: dict) -> dict:
+        """Merge timing.json data into meta_obj as ``timing_summary``.
+
+        Reads the timing.json file for this run and adds a ``timing_summary``
+        key to *meta_obj* with the full timing data. If no timing file exists,
+        the summary is set to an empty dict.
+
+        Returns *meta_obj* for convenience.
+        """
+        timing_path = run_dir / "timing.json"
+        if timing_path.exists():
+            try:
+                timing_data = json.loads(timing_path.read_text(encoding="utf-8"))
+                meta_obj["timing_summary"] = timing_data
+            except (json.JSONDecodeError, OSError):
+                meta_obj["timing_summary"] = {}
+        else:
+            meta_obj["timing_summary"] = {}
+        return meta_obj
+
     def list_runs(
         self,
         *,
@@ -884,6 +904,8 @@ class RunHistoryService:
             meta_obj["_path"] = str(run_dir)
             # Normalize annotations for old records
             _normalize_annotations(meta_obj)
+            # Merge timing.json into the run object
+            self._merge_timing_summary(run_dir, meta_obj)
             out.append(meta_obj)
 
         total = len(out)
@@ -912,6 +934,22 @@ class RunHistoryService:
                 timing = self.get_timing(run_id)
                 return -(timing.get("scheduler_execution_ms", timing.get("total_ms", 0)) or 0)
             out.sort(key=_slow_sort_key)
+        elif sort == "preset_az":
+            def _az_sort_key(r):
+                extra = r.get("extra", {}) or {}
+                label = extra.get("preset_label", "") or ""
+                # Empty labels sort last, then case-insensitive ascending
+                return (label == "", label.lower())
+            out.sort(key=_az_sort_key)
+        elif sort == "preset_za":
+            def _za_sort_key(r):
+                extra = r.get("extra", {}) or {}
+                label = extra.get("preset_label", "") or ""
+                # Empty labels sort last, then case-insensitive descending.
+                # Use `label != ""` so empty → (False, "") sorts after
+                # non-empty → (True, ...) when reverse=True.
+                return (label != "", label.lower())
+            out.sort(key=_za_sort_key, reverse=True)
         else:
             # Default: newest
             out.sort(key=_sort_key, reverse=True)
@@ -940,6 +978,8 @@ class RunHistoryService:
         meta_obj["_path"] = str(run_dir)
         # Normalize annotations for old records that lack them
         _normalize_annotations(meta_obj)
+        # Merge timing.json data into the run object
+        self._merge_timing_summary(run_dir, meta_obj)
         return meta_obj
 
     def get_log(self, run_id: str) -> str:

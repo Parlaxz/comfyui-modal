@@ -2447,6 +2447,468 @@ class ControlValidationTests(unittest.TestCase):
                          "load_presets_and_snapshots should be removed (dead double-load)")
 
 
+# ---------------------------------------------------------------------------
+# Phase 4: Captured Control Schemas
+# ---------------------------------------------------------------------------
+
+class CapturedControlSchemasTests(unittest.TestCase):
+    """Phase 4: Captured control schemas must take priority over static registry.
+
+    New-style snapshots carry a ``controlSchemas`` dict keyed by control ID,
+    captured from the live LiteGraph widgets at binding time.  Old snapshots
+    lack this key and fall back to the static ``_NODE_WIDGET_SCHEMAS`` table.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_derive_uses_captured_schemas_when_present(self):
+        """When snapshot has controlSchemas, use them as primary source."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"sampler_name": "euler"}},
+            },
+            "nodeBindings": {
+                "sampler": {"kind": "widget", "nodeId": "3", "widgetName": "sampler_name"},
+            },
+            "controlSchemas": {
+                "sampler": {
+                    "kind": "enum",
+                    "options": ["euler", "dpmpp_2m", "custom_sampler"],
+                    "default": "euler",
+                    "nodeId": "3",
+                    "widgetName": "sampler_name",
+                },
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("sampler", {})
+        self.assertEqual(s.get("kind"), "enum")
+        self.assertIn("custom_sampler", s.get("options", []),
+                      "Captured option 'custom_sampler' must be in enum options")
+
+    def test_derive_static_fallback_when_no_captured_schemas(self):
+        """Old snapshots without controlSchemas still fall back to static registry."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"sampler_name": "euler"}},
+            },
+            "nodeBindings": {
+                "sampler": {"kind": "widget", "nodeId": "3", "widgetName": "sampler_name"},
+            },
+            # no controlSchemas key — old-style snapshot
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("sampler", {})
+        self.assertEqual(s.get("kind"), "enum")
+        self.assertTrue(s.get("schemaResolved"))
+        self.assertIn("euler", s.get("options", []))
+        self.assertIn("dpmpp_2m", s.get("options", []))
+
+    def test_captured_custom_widget_enum_preserved(self):
+        """Custom/unknown widget enum values from captured schema, not Python table."""
+        snapshot = {
+            "apiPromptJson": {
+                "99": {"class_type": "CustomSamplerNode", "inputs": {"preset": "fast"}},
+            },
+            "nodeBindings": {
+                "preset": {"kind": "widget", "nodeId": "99", "widgetName": "preset"},
+            },
+            "controlSchemas": {
+                "preset": {
+                    "kind": "enum",
+                    "options": ["fast", "quality", "extreme"],
+                    "default": "fast",
+                    "nodeId": "99",
+                    "widgetName": "preset",
+                },
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("preset", {})
+        self.assertEqual(s.get("kind"), "enum")
+        self.assertEqual(s.get("options"), ["fast", "quality", "extreme"])
+        self.assertTrue(s.get("schemaResolved"))
+
+    def test_captured_integer_schema_with_range(self):
+        """Captured integer schema preserves min/max/step from LiteGraph widget."""
+        snapshot = {
+            "apiPromptJson": {
+                "99": {"class_type": "CustomIntNode", "inputs": {"value": 5}},
+            },
+            "nodeBindings": {
+                "my_int": {"kind": "widget", "nodeId": "99", "widgetName": "value"},
+            },
+            "controlSchemas": {
+                "my_int": {
+                    "kind": "integer",
+                    "default": 5,
+                    "minimum": 1,
+                    "maximum": 100,
+                    "step": 1,
+                    "nodeId": "99",
+                    "widgetName": "value",
+                },
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("my_int", {})
+        self.assertEqual(s.get("kind"), "integer")
+        self.assertEqual(s.get("minimum"), 1)
+        self.assertEqual(s.get("maximum"), 100)
+        self.assertEqual(s.get("step"), 1)
+        self.assertTrue(s.get("schemaResolved"))
+
+    def test_captured_schemas_empty_dict_falls_back(self):
+        """Empty dict controlSchemas falls back to static registry."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"sampler_name": "euler"}},
+            },
+            "nodeBindings": {
+                "sampler": {"kind": "widget", "nodeId": "3", "widgetName": "sampler_name"},
+            },
+            "controlSchemas": {},
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("sampler", {})
+        self.assertEqual(s.get("kind"), "enum")
+        self.assertTrue(s.get("schemaResolved"))
+
+    def test_captured_boolean_schema(self):
+        """Captured boolean schema with no static equivalent works."""
+        snapshot = {
+            "apiPromptJson": {
+                "50": {"class_type": "CustomBoolNode", "inputs": {"flag": True}},
+            },
+            "nodeBindings": {
+                "enable": {"kind": "widget", "nodeId": "50", "widgetName": "flag"},
+            },
+            "controlSchemas": {
+                "enable": {
+                    "kind": "boolean",
+                    "default": True,
+                    "nodeId": "50",
+                    "widgetName": "flag",
+                },
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("enable", {})
+        self.assertEqual(s.get("kind"), "boolean")
+        self.assertEqual(s.get("default"), True)
+        self.assertTrue(s.get("schemaResolved"))
+
+    def test_captured_multiline_schema(self):
+        """Captured multiline string schema."""
+        snapshot = {
+            "apiPromptJson": {
+                "7": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}},
+            },
+            "nodeBindings": {
+                "prompt": {"kind": "widget", "nodeId": "7", "widgetName": "text"},
+            },
+            "controlSchemas": {
+                "prompt": {
+                    "kind": "multiline",
+                    "default": "",
+                    "nodeId": "7",
+                    "widgetName": "text",
+                },
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("prompt", {})
+        self.assertEqual(s.get("kind"), "multiline")
+        self.assertTrue(s.get("schemaResolved"))
+
+    def test_captured_schema_with_aliased_control_id(self):
+        """Control ID aliases (guidance→cfg) work with captured schemas."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"cfg": 7.0}},
+            },
+            "nodeBindings": {
+                "guidance": {"kind": "widget", "nodeId": "3", "widgetName": "cfg"},
+            },
+            "controlSchemas": {
+                "guidance": {
+                    "kind": "number",
+                    "default": 7.0,
+                    "minimum": 0.0,
+                    "maximum": 100.0,
+                    "step": 0.5,
+                    "nodeId": "3",
+                    "widgetName": "cfg",
+                },
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("guidance", {})
+        self.assertEqual(s.get("kind"), "number")
+        self.assertEqual(s.get("minimum"), 0.0)
+        self.assertTrue(s.get("schemaResolved"))
+
+
+class CapturedControlSchemasSnapshotModelTests(unittest.TestCase):
+    """Snapshot model must accept and persist controlSchemas."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_models", "studio_models.py")
+
+    def test_make_snapshot_accepts_control_schemas(self):
+        """make_snapshot accepts controlSchemas in body."""
+        body = {
+            "name": "Test Captured",
+            "compatibleFeatures": ["txt2img"],
+            "graphJson": {"nodes": []},
+            "apiPromptJson": {"3": {"class_type": "KSampler", "inputs": {"seed": 42}}},
+            "nodeBindings": {
+                "sampler": {"kind": "widget", "nodeId": "3", "widgetName": "sampler_name"},
+            },
+            "outputNodeId": "9",
+            "controlSchemas": {
+                "sampler": {
+                    "kind": "enum",
+                    "options": ["euler", "dpmpp_2m"],
+                    "default": "euler",
+                    "nodeId": "3",
+                    "widgetName": "sampler_name",
+                },
+            },
+        }
+        snapshot = self.mod.make_snapshot(body)
+        self.assertIn("controlSchemas", snapshot)
+        self.assertEqual(
+            snapshot["controlSchemas"]["sampler"]["kind"], "enum"
+        )
+        self.assertIn("euler", snapshot["controlSchemas"]["sampler"]["options"])
+
+    def test_make_snapshot_defaults_control_schemas_to_empty(self):
+        """make_snapshot defaults controlSchemas to {} when absent."""
+        body = {
+            "name": "No Schemas",
+            "compatibleFeatures": ["txt2img"],
+            "graphJson": {"nodes": []},
+            "apiPromptJson": {"3": {"class_type": "KSampler", "inputs": {"seed": 42}}},
+            "nodeBindings": {
+                "sampler": {"kind": "widget", "nodeId": "3", "widgetName": "sampler_name"},
+            },
+            "outputNodeId": "9",
+        }
+        snapshot = self.mod.make_snapshot(body)
+        self.assertIn("controlSchemas", snapshot)
+        self.assertEqual(snapshot["controlSchemas"], {})
+
+    def test_update_snapshot_accepts_control_schemas(self):
+        """update_snapshot accepts controlSchemas update."""
+        body = {
+            "name": "Test",
+            "compatibleFeatures": ["txt2img"],
+            "graphJson": {"nodes": []},
+            "apiPromptJson": {"3": {"class_type": "KSampler", "inputs": {"seed": 42}}},
+            "nodeBindings": {},
+            "outputNodeId": "9",
+        }
+        snapshot = self.mod.make_snapshot(body)
+        # Now update with controlSchemas
+        updated = self.mod.update_snapshot(snapshot, {
+            "controlSchemas": {"sampler": {"kind": "enum"}},
+        })
+        self.assertIn("controlSchemas", updated)
+        self.assertEqual(updated["controlSchemas"]["sampler"]["kind"], "enum")
+
+    def test_snapshot_model_field_exists(self):
+        """Snapshot fields must include controlSchemas."""
+        # Check make_snapshot entry template — visible in source
+        import inspect
+        source = inspect.getsource(self.mod.make_snapshot)
+        self.assertIn("controlSchemas", source,
+                      "make_snapshot must reference controlSchemas in entry dict")
+
+    def test_normalize_snapshot_does_not_strip_control_schemas(self):
+        """normalize_snapshot_payload preserves controlSchemas."""
+        payload = {
+            "compatibleFeatures": ["txt2img"],
+            "graphJson": {"nodes": []},
+            "apiPromptJson": {"3": {"class_type": "KSampler", "inputs": {"seed": 42}}},
+            "nodeBindings": {},
+            "outputNodeId": "9",
+            "controlSchemas": {"steps": {"kind": "integer"}},
+        }
+        result = self.mod.normalize_snapshot_payload(payload)
+        self.assertIn("controlSchemas", result)
+        self.assertEqual(result["controlSchemas"]["steps"]["kind"], "integer")
+
+
+class CapturedSchemaPresetEnrichmentTests(unittest.TestCase):
+    """Preset list API enrichment includes captured schemas."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.adapter = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_preset_enrichment_uses_captured_schemas_when_present(self):
+        """Preset enrichment uses captured schemas from snapshot."""
+        snapshot = {
+            "id": "snap_captured",
+            "compatibleFeatures": ["txt2img"],
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"sampler_name": "euler"}},
+            },
+            "nodeBindings": {
+                "sampler": {"kind": "widget", "nodeId": "3", "widgetName": "sampler_name"},
+            },
+            "controlSchemas": {
+                "sampler": {
+                    "kind": "enum",
+                    "options": ["turbo", "lcm"],
+                    "default": "turbo",
+                    "nodeId": "3",
+                    "widgetName": "sampler_name",
+                },
+            },
+            "archived": False,
+        }
+        schemas = self.adapter.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("sampler", {})
+        self.assertEqual(s.get("options"), ["turbo", "lcm"],
+                         "Captured sampler options should not come from static table")
+
+
+class CapturedSchemaValidationIntegrationTests(unittest.TestCase):
+    """End-to-end validation: captured schemas enforce enum/range/boolean checks."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.adapter = _load_module("studio_run_adapter", "studio_run_adapter.py")
+        cls.model = _load_module("studio_models", "studio_models.py")
+
+    def test_captured_enum_validation_rejects_invalid_option(self):
+        """Captured enum schema enforces its custom options, not the static table."""
+        snapshot = {
+            "apiPromptJson": {"3": {"class_type": "KSampler", "inputs": {"sampler_name": "euler"}}},
+            "nodeBindings": {"sampler": {"kind": "widget", "nodeId": "3", "widgetName": "sampler_name"}},
+            "controlSchemas": {
+                "sampler": {
+                    "kind": "enum",
+                    "options": ["turbo", "lcm"],
+                    "default": "turbo",
+                    "nodeId": "3",
+                    "widgetName": "sampler_name",
+                },
+            },
+        }
+        schemas = self.adapter.derive_control_schemas_from_snapshot(snapshot)
+        # "euler" is in the static table but NOT in captured options
+        errors = self.model.validate_controls_against_schema(
+            {"sampler": "euler"}, schemas, "txt2img"
+        )
+        self.assertEqual(len(errors), 1,
+                         "captured enum must reject values not in its own options")
+        self.assertIn("euler", errors[0]["message"])
+        # "turbo" IS in captured options
+        errors2 = self.model.validate_controls_against_schema(
+            {"sampler": "turbo"}, schemas, "txt2img"
+        )
+        self.assertEqual(len(errors2), 0,
+                         "captured enum must accept values in its own options")
+
+    def test_captured_range_validation(self):
+        """Captured integer schema enforces its own min/max range."""
+        snapshot = {
+            "apiPromptJson": {"99": {"class_type": "CustomIntNode", "inputs": {"value": 5}}},
+            "nodeBindings": {"my_int": {"kind": "widget", "nodeId": "99", "widgetName": "value"}},
+            "controlSchemas": {
+                "my_int": {
+                    "kind": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "nodeId": "99",
+                    "widgetName": "value",
+                },
+            },
+        }
+        schemas = self.adapter.derive_control_schemas_from_snapshot(snapshot)
+        errors = self.model.validate_controls_against_schema(
+            {"my_int": 999}, schemas, "txt2img"
+        )
+        self.assertEqual(len(errors), 1,
+                         "captured range must reject out-of-range values")
+
+    def test_captured_boolean_validation_rejects_string(self):
+        """Captured boolean schema rejects non-boolean values."""
+        snapshot = {
+            "apiPromptJson": {"50": {"class_type": "CustomBoolNode", "inputs": {"flag": True}}},
+            "nodeBindings": {"enable": {"kind": "widget", "nodeId": "50", "widgetName": "flag"}},
+            "controlSchemas": {
+                "enable": {
+                    "kind": "boolean",
+                    "default": True,
+                    "nodeId": "50",
+                    "widgetName": "flag",
+                },
+            },
+        }
+        schemas = self.adapter.derive_control_schemas_from_snapshot(snapshot)
+        errors = self.model.validate_controls_against_schema(
+            {"enable": "yes"}, schemas, "txt2img"
+        )
+        self.assertEqual(len(errors), 1, "captured boolean must reject string")
+
+    def test_captured_schema_strict_unknown_rejection(self):
+        """Captured schemas used with strict_unknown_rejection reject unknown fields."""
+        snapshot = {
+            "apiPromptJson": {"3": {"class_type": "KSampler", "inputs": {"seed": 42}}},
+            "nodeBindings": {"seed": {"kind": "widget", "nodeId": "3", "widgetName": "seed"}},
+            "controlSchemas": {
+                "seed": {"kind": "integer", "default": 42, "nodeId": "3", "widgetName": "seed"},
+            },
+        }
+        schemas = self.adapter.derive_control_schemas_from_snapshot(snapshot)
+        errors = self.model.validate_controls_against_schema(
+            {"seed": 42, "bogus_field": "x"}, schemas, "txt2img",
+            strict_unknown_rejection=True,
+        )
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["field"], "bogus_field")
+
+
+class CapturedSchemaDeepCopyTests(unittest.TestCase):
+    """derive_control_schemas_from_snapshot must deep-copy so reads don't mutate stored objects."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_mutating_returned_schemas_does_not_affect_snapshot(self):
+        """In-place mutations of returned schemas must not alter the stored snapshot."""
+        stored_schemas = {
+            "sampler": {
+                "kind": "enum",
+                "options": ["turbo", "lcm"],
+                "default": "turbo",
+            },
+        }
+        snapshot = {
+            "apiPromptJson": {"3": {"class_type": "KSampler", "inputs": {"sampler_name": "turbo"}}},
+            "nodeBindings": {"sampler": {"kind": "widget", "nodeId": "3", "widgetName": "sampler_name"}},
+            "controlSchemas": dict(stored_schemas),
+        }
+        result = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        # Mutate the returned schema in place
+        result["sampler"]["kind"] = "mutated"
+        result["sampler"]["options"].append("injected")
+        # The original snapshot must be unchanged
+        original = snapshot["controlSchemas"]["sampler"]
+        self.assertEqual(original["kind"], "enum",
+                         "Snapshot kind must not be mutated by caller")
+        self.assertNotIn("injected", original.get("options", []),
+                         "Snapshot options must not be mutated by caller")
+
+
 class GitignoreRuntimeDirectoriesTests(unittest.TestCase):
     """.gitignore covers output/studio/ and .comfymodal_experiments/."""
 

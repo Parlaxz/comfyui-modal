@@ -194,7 +194,9 @@ function renderNoteEditor(nr, apiBase) {
       if (result && result.status === "ok") {
         savedNote = textarea.value;
         nr.note = textarea.value;
-        nr.noteUpdatedAt = new Date().toISOString();
+        // Use backend updated_at as primary source, fall back to client time
+        var backendUpdatedAt = result.annotations && result.annotations.updated_at;
+        nr.noteUpdatedAt = backendUpdatedAt || new Date().toISOString();
         isDirty = false;
         statusEl.textContent = "Saved " + nr.noteUpdatedAt.substring(0, 19);
         statusEl.style.color = "#4ade80";
