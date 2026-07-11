@@ -586,10 +586,18 @@ export async function executeExperimentRun(state, context) {
     return { status: "error", message: "Select at least one preset to compare." };
   }
 
-  // Build the shared experiment definition (prompts + axes).
-  // Prompts are included ONCE — the backend applies them to all presets.
+  // Build the shared experiment definition (prompts, defaults, axes).
+  // Prompts and shared defaults are included ONCE — the backend applies
+  // them to all presets uniformly.
+  const sharedDefaults = {};
+  Object.entries(controls).forEach(([key, value]) => {
+    if (key !== "prompt" && key !== "negative_prompt") {
+      sharedDefaults[key] = value;
+    }
+  });
   const experimentDef = {
     name: `Studio Experiment: ${currentFeatureId}`,
+    defaults: sharedDefaults,
     axes: {},
     prompts: [{ text: controls.prompt || "", negative: controls.negative_prompt || "" }],
   };

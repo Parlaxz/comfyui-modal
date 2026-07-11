@@ -178,9 +178,55 @@ def _compile_with_workflow_hash(spec):
     return result
 
 
+class LocalRemoteInvokerOutputSaveTests(unittest.TestCase):
+    def test_save_output_images_reads_outputs_shape(self):
+        mod = load_runner()
+
+        async def _unused_stream(**kwargs):
+            if False:
+                yield kwargs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            invoker = mod.LocalRemoteInvoker(_unused_stream, experiment_id="exp_test", node_dir=tmp)
+            result_data = {
+                "outputs": {
+                    "107": {
+                        "images": [{
+                            "filename": "studio_test.png",
+                            "data": "aGVsbG8=",
+                        }],
+                    },
+                },
+            }
+
+            saved = asyncio.run(invoker._save_output_images(result_data, "cell_1"))
+
+            self.assertEqual(saved, ["studio_test.png"])
+            self.assertTrue((Path(tmp) / "output" / "studio" / "studio_test.png").exists())
+
+
 # ── Tests ────────────────────────────────────────────────────────────────
 
 class WorkerInvocationTests(unittest.TestCase):
+    def test_resolve_and_inject_cell_ignores_empty_negative_without_slot(self):
+        r = load_runner()
+        resolved = r.resolve_and_inject_cell(
+            profile_workflow={"1": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}}},
+            profile_slots={"prompt": {"node_id": "1", "field": "text", "path": ["inputs", "text"]}},
+            loader_target_groups=[],
+            lora_slots=[],
+            cell={
+                "profile_id": "studio_profile",
+                "prompt": "hello",
+                "negative_prompt": "",
+                "triple": {},
+                "axis_values": {},
+                "loader_target_group_id": "g_default",
+                "lora_signature": [],
+            },
+        )
+        self.assertEqual(resolved.workflow["1"]["inputs"]["text"], "hello")
+
     def test_one_worker_per_checkpoint(self):
         r = load_runner()
         with tempfile.TemporaryDirectory() as tmp:

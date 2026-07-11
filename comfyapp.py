@@ -9668,9 +9668,9 @@ class _ComfyAPIMixin:
                     else:
                         pool.shutdown(wait=True)
             else:
-                # All files already cached GÃ‡Ã¶ just report them
-                for path in file_paths:
-                    filename = os.path.basename(path)
+                # All files already cached -- just report them
+                for _item in _normalized_items:
+                    filename = os.path.basename(_item["path"])
                     cached.append(filename)
 
             _total_ms = self._profile_ms(_total_start)
@@ -9684,10 +9684,10 @@ class _ComfyAPIMixin:
                     _slowest_fn = _fn
             if _total_ms > 5000 and _slowest_fn:
                 _slowest_size_gb = 0.0
-                for p in file_paths:
-                    if os.path.basename(p) == _slowest_fn:
+                for _item in _normalized_items:
+                    if os.path.basename(_item["path"]) == _slowest_fn:
                         try:
-                            _slowest_size_gb = os.path.getsize(p) / (1024**3)
+                            _slowest_size_gb = os.path.getsize(_item["path"]) / (1024**3)
                         except OSError:
                             pass
                         break
@@ -17348,7 +17348,7 @@ class _ComfyAPIMixin:
         # GPU/Sage warmup section below) lets these stat calls overlap
         # with GPU warmup, hiding ~200-600ms of latency.
         _warmup_profile = None
-        _warmup_paths: list[str] = []
+        _warmup_paths: list = []
         _active_profile_diag: dict = {}
         if ENABLE_WARMUP:
             _s = time.time()
@@ -20110,6 +20110,8 @@ class _ComfyAPIMixin:
         server_trace.update(trace)
         server_trace.mark("t3_modal_entry")
         print(f"[predispatch] phase=modal_entry t={time.time()}")
+        # ── Early status yield — before cold UNET / dependency policy ──
+        yield {"type": "status", "message": "Prompt received", "phase": "entry"}
 
         _prog_q = _qm.Queue()
         self._prog_queue = _prog_q
@@ -20119,7 +20121,9 @@ class _ComfyAPIMixin:
         # dependency validation, prompt validation, Comfy graph setup,
         # and CLIP encode.  Honours request-level runtime options from
         # modal_options (injected by benchmark preset system).
+        print(f"[predispatch] phase=cold_unet_before t={time.time()}")
         _cold_unet_info: dict = self._cold_unet_early_actual_load(workflow, modal_options=modal_options)
+        print(f"[predispatch] phase=cold_unet_after t={time.time()}")
 
         try:
             # GÃ¶Ã‡GÃ¶Ã‡ Check for scheduler test mode GÃ¶Ã‡GÃ¶Ã‡
@@ -20154,9 +20158,11 @@ class _ComfyAPIMixin:
                 # Runs before prompt preload, actual_load, and execution.
                 # Dependency failures yield a clear fatal stream event.
                 self._preflight_already_ran = False
+                print(f"[predispatch] phase=dependency_policy_before t={time.time()}")
                 try:
                     _policy_stream = self._handle_custom_node_sync_and_dependency_policy(workflow, stream=True)
                     self._policy_stream = _policy_stream
+                    print(f"[predispatch] phase=dependency_policy_after t={time.time()}")
                     self._preflight_already_ran = True
                 except RuntimeError as _dep_err:
                     import traceback as _tb

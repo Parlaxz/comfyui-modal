@@ -1371,5 +1371,100 @@ class StringResolverTests(unittest.TestCase):
         self.assertTrue(r["eligible"], "literal-only workflow should be eligible")
 
 
+
+# ── Part 5: run_prompt_stream hang instrumentation — local (modal_client.py) ──
+
+
+class RunPromptStreamLocalInstrumentationTests(unittest.TestCase):
+    """modal_client.run_prompt_stream must emit clear local logs around
+    generator creation and first message arrival."""
+
+    def setUp(self):
+        src = _read(REPO_ROOT / "modal_client.py")
+        self.src = _func_source(src, "run_prompt_stream")
+        self.assertIsNotNone(self.src, "run_prompt_stream must be found in modal_client.py")
+
+    def test_has_pre_gen_log(self):
+        """must have a log before remote_gen.aio( to mark pre-generation."""
+        pre_idx = self.src.find("pre_gen")
+        aio_idx = self.src.find("remote_gen.aio(")
+        self.assertGreaterEqual(pre_idx, 0, "Must have 'pre_gen' marker in run_prompt_stream")
+        self.assertGreaterEqual(aio_idx, 0, "Must have remote_gen.aio( call")
+        self.assertLess(pre_idx, aio_idx, "'pre_gen' marker must appear before remote_gen.aio(")
+
+    def test_has_post_gen_log(self):
+        """must have a log after remote_gen.aio( to confirm generator created."""
+        aio_idx = self.src.find("remote_gen.aio(")
+        post_idx = self.src.find("post_gen")
+        self.assertGreaterEqual(aio_idx, 0, "Must have remote_gen.aio( call")
+        self.assertGreaterEqual(post_idx, 0, "Must have 'post_gen' marker in run_prompt_stream")
+        self.assertGreater(post_idx, aio_idx, "'post_gen' marker must appear after remote_gen.aio(")
+
+    def test_has_first_msg_log(self):
+        """must have a log when the first streamed message arrives."""
+        self.assertIn("first_msg", self.src,
+                      "Must have 'first_msg' marker in run_prompt_stream iteration loop")
+
+
+# ── Part 6: run_prompt_stream hang instrumentation — remote (comfyapp.py) ──
+
+
+class RunPromptStreamRemoteInstrumentationTests(unittest.TestCase):
+    """comfyapp.run_prompt_stream must yield an early entry status event
+    and log around the two suspected pre-yield blockers."""
+
+    def setUp(self):
+        src = _read(REPO_ROOT / "comfyapp.py")
+        self.src = _func_source(src, "run_prompt_stream")
+        self.assertIsNotNone(self.src, "run_prompt_stream must be found in comfyapp.py")
+
+    def test_has_early_entry_yield(self):
+        """must yield status with phase=entry before _cold_unet_early_actual_load."""
+        entry_idx = self.src.find("'entry'")
+        cold_unet_idx = self.src.find("_cold_unet_early_actual_load")
+        self.assertGreaterEqual(entry_idx, 0,
+                                "Must have 'entry' phase marker in run_prompt_stream")
+        self.assertGreaterEqual(cold_unet_idx, 0,
+                                "Must have _cold_unet_early_actual_load call")
+        self.assertLess(entry_idx, cold_unet_idx,
+                        "'entry' status yield must appear before _cold_unet_early_actual_load")
+
+    def test_has_log_before_cold_unet(self):
+        """must have a log before _cold_unet_early_actual_load to mark entry."""
+        pre_idx = self.src.find("cold_unet_before")
+        cold_unet_idx = self.src.find("_cold_unet_early_actual_load")
+        self.assertGreaterEqual(pre_idx, 0,
+                                "Must have 'cold_unet_before' marker in run_prompt_stream")
+        self.assertLess(pre_idx, cold_unet_idx,
+                        "'cold_unet_before' marker must appear before _cold_unet_early_actual_load")
+
+    def test_has_log_after_cold_unet(self):
+        """must have a log after _cold_unet_early_actual_load to mark completion."""
+        cold_unet_idx = self.src.find("_cold_unet_early_actual_load")
+        post_idx = self.src.find("cold_unet_after")
+        self.assertGreaterEqual(post_idx, 0,
+                                "Must have 'cold_unet_after' marker in run_prompt_stream")
+        self.assertGreater(post_idx, cold_unet_idx,
+                           "'cold_unet_after' marker must appear after _cold_unet_early_actual_load")
+
+    def test_has_log_before_dependency_policy(self):
+        """must have a log before _handle_custom_node_sync_and_dependency_policy."""
+        pre_idx = self.src.find("dependency_policy_before")
+        dep_idx = self.src.find("_handle_custom_node_sync_and_dependency_policy")
+        self.assertGreaterEqual(pre_idx, 0,
+                                "Must have 'dependency_policy_before' marker in run_prompt_stream")
+        self.assertLess(pre_idx, dep_idx,
+                        "'dependency_policy_before' must appear before _handle_custom_node_sync_and_dependency_policy")
+
+    def test_has_log_after_dependency_policy(self):
+        """must have a log after _handle_custom_node_sync_and_dependency_policy."""
+        dep_idx = self.src.find("_handle_custom_node_sync_and_dependency_policy")
+        post_idx = self.src.find("dependency_policy_after")
+        self.assertGreaterEqual(post_idx, 0,
+                                "Must have 'dependency_policy_after' marker in run_prompt_stream")
+        self.assertGreater(post_idx, dep_idx,
+                           "'dependency_policy_after' must appear after _handle_custom_node_sync_and_dependency_policy")
+
+
 if __name__ == "__main__":
     unittest.main()

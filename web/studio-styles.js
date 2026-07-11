@@ -569,14 +569,78 @@ body:has(.comfymodal-studio-modal) {
   background-size: 20px 20px;
 }
 
-/* ── Filmstrip ───────────────────────────────────────────── */
+/* ── Carousel ───────────────────────────────────────────── */
 
-.comfymodal-studio-filmstrip {
+.comfymodal-studio-carousel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 60px;
+}
+
+.comfymodal-studio-carousel-track {
   display: flex;
   gap: 8px;
-  padding: 8px 0;
-  min-height: 40px;
-  align-items: center;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 4px 0;
+  scroll-behavior: smooth;
+  -webkit-overflow-scrolling: touch;
+}
+
+.comfymodal-studio-carousel-track::-webkit-scrollbar {
+  height: 4px;
+}
+
+.comfymodal-studio-carousel-track::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.comfymodal-studio-carousel-track::-webkit-scrollbar-thumb {
+  background: #2a2a2a;
+  border-radius: 2px;
+}
+
+.comfymodal-studio-carousel-item {
+  flex-shrink: 0;
+  width: 80px;
+  height: 80px;
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+  border: 2px solid #2a2a2a;
+  position: relative;
+  transition: border-color 0.15s, transform 0.15s;
+}
+
+.comfymodal-studio-carousel-item:hover {
+  border-color: #dc2626;
+  transform: scale(1.05);
+}
+
+.comfymodal-studio-carousel-item.completed {
+  border-color: #1a4a1a;
+}
+
+.comfymodal-studio-carousel-item.failed {
+  border-color: #4a1a1a;
+}
+
+.comfymodal-studio-carousel-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.comfymodal-studio-carousel-status {
+  position: absolute;
+  bottom: 2px;
+  right: 2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1px solid rgba(0,0,0,0.5);
 }
 
 /* ── History ─────────────────────────────────────────────── */
@@ -585,6 +649,225 @@ body:has(.comfymodal-studio-modal) {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+/* ── History Gallery Grid ──────────────────────────────── */
+
+.comfymodal-studio-history-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.comfymodal-studio-history-card {
+  position: relative;
+  background: #0a0a0a;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color 0.15s, transform 0.15s;
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.comfymodal-studio-history-card:hover {
+  border-color: #dc2626;
+  transform: scale(1.03);
+  z-index: 1;
+}
+
+.comfymodal-studio-history-card.completed {
+  border-color: #1a4a1a;
+}
+
+.comfymodal-studio-history-card.failed {
+  border-color: #4a1a1a;
+}
+
+.comfymodal-studio-history-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.comfymodal-studio-history-fallback {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 8px;
+  color: #555;
+  text-align: center;
+  width: 100%;
+  height: 100%;
+}
+
+.comfymodal-studio-history-fallback-icon {
+  font-size: 24px;
+  opacity: 0.5;
+}
+
+.comfymodal-studio-history-fallback-label {
+  font-size: 10px;
+  color: #666;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.comfymodal-studio-history-card-overlay {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: linear-gradient(transparent, rgba(0,0,0,0.85));
+  padding: 20px 6px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.2s;
+  pointer-events: none;
+}
+
+.comfymodal-studio-history-card:hover .comfymodal-studio-history-card-overlay {
+  opacity: 1;
+}
+
+.comfymodal-studio-history-card-status {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #4ade80;
+}
+
+.comfymodal-studio-history-card.completed .comfymodal-studio-history-card-status {
+  color: #4ade80;
+}
+
+.comfymodal-studio-history-card.failed .comfymodal-studio-history-card-status {
+  color: #f87171;
+}
+
+.comfymodal-studio-history-card-prompt {
+  font-size: 9px;
+  color: #aaa;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.comfymodal-studio-history-card-time {
+  font-size: 8px;
+  color: #666;
+}
+
+/* ── History Preview Overlay / Lightbox ────────────────── */
+
+.comfymodal-studio-history-preview {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.comfymodal-studio-history-preview-backdrop {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.85);
+}
+
+.comfymodal-studio-history-preview-content {
+  position: relative;
+  max-width: 90vw;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.comfymodal-studio-history-preview-close {
+  position: absolute;
+  top: -32px;
+  right: 0;
+  background: transparent;
+  border: none;
+  color: #aaa;
+  font-size: 24px;
+  cursor: pointer;
+  padding: 4px 8px;
+  line-height: 1;
+  z-index: 1;
+}
+
+.comfymodal-studio-history-preview-close:hover {
+  color: #fff;
+}
+
+.comfymodal-studio-history-preview-image {
+  max-width: 100%;
+  max-height: 80vh;
+  border-radius: 4px;
+  object-fit: contain;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.6);
+}
+
+.comfymodal-studio-history-preview-noimage {
+  width: 240px;
+  height: 160px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #111;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  color: #555;
+  font-size: 12px;
+}
+
+.comfymodal-studio-history-preview-info {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+  color: #aaa;
+  max-width: 100%;
+}
+
+.comfymodal-studio-history-preview-status {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+  color: #4ade80;
+}
+
+.comfymodal-studio-history-preview-prompt {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.comfymodal-studio-history-preview-time {
+  color: #666;
+  flex-shrink: 0;
 }
 
 /* ── Settings ────────────────────────────────────────────── */

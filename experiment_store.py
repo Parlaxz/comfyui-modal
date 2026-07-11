@@ -308,6 +308,10 @@ class ExperimentStore:
                 status = "completed"
             elif et == "experiment.failed_fatal":
                 status = "failed_fatal"
+            elif et == "experiment.error":
+                # Treat scheduler/background errors as terminal failure
+                if status not in ("completed", "stopped", "failed_fatal"):
+                    status = "failed_fatal"
 
             if et == "checkpoint.claimed":
                 ck = checkpoint_id

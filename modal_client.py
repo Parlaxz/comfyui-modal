@@ -220,14 +220,20 @@ async def run_prompt_stream(
     """
     selected = _resolve_workspace(workspace)
     gen = None
+    print(f"[modal-client] phase=pre_gen workspace={selected.get('name', '?')} gpu={gpu or 'default'}")
     # Semaphore only serializes remote-generator creation, not iteration.
     # This prevents a caller that breaks early from blocking the next request.
     async with _run_prompt_semaphore:
         gen = _workspace_api(selected, gpu).run_prompt_stream.remote_gen.aio(
             workflow, input_images or {}, trace or {}, modal_options or {},
         )
+    print(f"[modal-client] phase=post_gen gen_created=True")
+    _first_client_msg = True
     try:
         async for msg in gen:
+            if _first_client_msg:
+                _first_client_msg = False
+                print(f"[modal-client] phase=first_msg arrived=True")
             yield msg
     except TimeoutError:
         raise TimeoutError(

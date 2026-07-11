@@ -111,6 +111,7 @@ function launchPresetWizard(context) {
   import("./studio-preset-wizard.js").then(({ openPresetWizard }) => {
     const apiBase = (context && context.apiBase) || "/comfymodal";
     openPresetWizard(() => {
+      invalidateRuntimePresetsCache();
       if (context && typeof context.setPage === "function") {
         context.setPage("backend");
       }
@@ -122,6 +123,7 @@ function launchPresetWizard(context) {
 export function launchPresetWizardForEdit(preset, snapshot, apiBase) {
   import("./studio-preset-wizard.js").then(({ openPresetWizard }) => {
     const onDone = () => {
+      invalidateRuntimePresetsCache();
       // Trigger re-render of the current page after edit
       const container = document.querySelector(".comfymodal-studio-backend");
       if (container && container._refreshHandler) {

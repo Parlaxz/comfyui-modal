@@ -77,8 +77,16 @@ def workspace_summary(workspace: dict) -> dict:
 
 def upsert_workspace(path: str | Path, label: str, token_id: str, token_secret: str, *,
                      workspace_id: str | None = None, notes: str = "", set_active: bool = False) -> dict:
-    safe_label, safe_token_id, safe_token_secret = _validate_workspace(label, token_id, token_secret)
     registry = load_workspace_registry(path)
+    existing_workspace = None
+    for existing in registry["workspaces"]:
+        if workspace_id and existing["id"] == workspace_id:
+            existing_workspace = existing
+            break
+    if existing_workspace is not None:
+        token_id = (token_id or "").strip() or existing_workspace.get("token_id", "")
+        token_secret = (token_secret or "").strip() or existing_workspace.get("token_secret", "")
+    safe_label, safe_token_id, safe_token_secret = _validate_workspace(label, token_id, token_secret)
     workspaces = []
     matched_id = None
     for existing in registry["workspaces"]:

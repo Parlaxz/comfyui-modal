@@ -40,7 +40,10 @@ def _make_runnable_snapshot(snapshot_id: str = "snap_runnable") -> dict:
         "id": snapshot_id,
         "name": "Runnable Txt2Img Snapshot",
         "compatibleFeatures": ["txt2img"],
-        "apiPromptJson": {"3": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 20}}},
+        "apiPromptJson": {
+            "3": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 20}},
+            "9": {"class_type": "SaveImage", "inputs": {"images": []}},
+        },
         "nodeBindings": {
             "prompt": {"kind": "widget", "nodeId": "3", "widgetName": "text"},
             "output": {"kind": "output", "nodeId": "9"},
@@ -333,6 +336,111 @@ class StudioRunAdapterCompilationTests(unittest.TestCase):
             self.assertIn("studio_controls", meta)
             self.assertEqual(meta["studio_controls"].get("seed"), 1)
 
+    def test_single_run_spec_accepts_graph_to_prompt_wrapper_shape(self):
+        """Wrapped graphToPrompt payloads use apiPromptJson.output as the workflow."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            snap["apiPromptJson"] = {
+                "workflow": {"nodes": [], "links": []},
+                "output": copy.deepcopy(snap["apiPromptJson"]),
+            }
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            spec = self.mod.build_single_run_spec(preset, snap, "txt2img", {"seed": 7}, tmp)
+            self.assertNotIn("error", spec)
+            self.assertEqual(spec["checkpoints"][0]["workflow"], snap["apiPromptJson"]["output"])
+
+    def test_single_run_spec_infers_single_value_input_for_node_binding(self):
+        """Legacy node-kind prompt bindings should resolve a single 'value' input."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            snap["apiPromptJson"] = {
+                "1497": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "old prompt"}},
+                "9": {"class_type": "SaveImage", "inputs": {"images": []}},
+            }
+            snap["nodeBindings"] = {
+                "prompt": {"kind": "node", "nodeId": "1497"},
+                "output": {"kind": "output", "nodeId": "9"},
+            }
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            spec = self.mod.build_single_run_spec(
+                preset, snap, "txt2img", {"prompt": "new prompt"}, tmp
+            )
+            self.assertNotIn("error", spec)
+            self.assertEqual(
+                spec["checkpoints"][0]["workflow"]["1497"]["inputs"]["value"],
+                "new prompt",
+            )
+
+    def test_single_run_spec_injects_missing_clip_input_when_unique_loader_exists(self):
+        """Studio prompt workflows may omit CLIPTextEncode.clip but still include one loader."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            snap["apiPromptJson"] = {
+                "62": {
+                    "class_type": "CLIPLoader",
+                    "inputs": {"clip_name": "qwen_3_4b.safetensors", "type": "lumina2", "device": "default"},
+                },
+                "67": {
+                    "class_type": "CLIPTextEncode",
+                    "inputs": {"text": ["1497", 0]},
+                },
+                "1497": {
+                    "class_type": "PrimitiveStringMultiline",
+                    "inputs": {"value": "old prompt"},
+                },
+                "9": {"class_type": "SaveImage", "inputs": {"images": []}},
+            }
+            snap["nodeBindings"] = {
+                "prompt": {"kind": "node", "nodeId": "1497"},
+                "output": {"kind": "output", "nodeId": "9"},
+            }
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            spec = self.mod.build_single_run_spec(
+                preset, snap, "txt2img", {"prompt": "new prompt"}, tmp
+            )
+            self.assertNotIn("error", spec)
+            self.assertEqual(
+                spec["checkpoints"][0]["workflow"]["67"]["inputs"]["clip"],
+                ["62", 0],
+            )
+
+    def test_single_run_spec_injects_missing_vae_input_when_unique_loader_exists(self):
+        """Studio prompt workflows may omit VAEDecode.vae but still include one loader."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            snap["apiPromptJson"] = {
+                "1277": {
+                    "class_type": "VAELoader",
+                    "inputs": {"vae_name": "ae.safetensors"},
+                },
+                "175": {
+                    "class_type": "VAEDecode",
+                    "inputs": {"samples": ["1242", 1]},
+                },
+                "1497": {
+                    "class_type": "PrimitiveStringMultiline",
+                    "inputs": {"value": "old prompt"},
+                },
+                "9": {"class_type": "SaveImage", "inputs": {"images": []}},
+            }
+            snap["nodeBindings"] = {
+                "prompt": {"kind": "node", "nodeId": "1497"},
+                "output": {"kind": "output", "nodeId": "9"},
+            }
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            spec = self.mod.build_single_run_spec(
+                preset, snap, "txt2img", {"prompt": "new prompt"}, tmp
+            )
+            self.assertNotIn("error", spec)
+            self.assertEqual(
+                spec["checkpoints"][0]["workflow"]["175"]["inputs"]["vae"],
+                ["1277", 0],
+            )
+
 
 class StudioRunAdapterExperimentTests(unittest.TestCase):
     """Experiment expansion from Studio presets."""
@@ -388,6 +496,24 @@ class StudioRunAdapterExperimentTests(unittest.TestCase):
                 self.assertIn("slots", ck)
                 # Should be from snapshot, not from legacy profile
                 self.assertEqual(ck["workflow"], snap["apiPromptJson"])
+
+    def test_experiment_accepts_graph_to_prompt_wrapper_shape(self):
+        """Experiment checkpoints also unwrap graphToPrompt payloads."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            snap["apiPromptJson"] = {
+                "workflow": {"nodes": [], "links": []},
+                "output": copy.deepcopy(snap["apiPromptJson"]),
+            }
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            exp_def = {"prompts": [{"id": "p1", "text": "test", "enabled": True}]}
+            spec = self.mod.build_experiment_spec(
+                [(preset, snap)], "txt2img", exp_def, tmp
+            )
+            self.assertNotIn("error", spec)
+            for ck in spec.get("checkpoints", []):
+                self.assertEqual(ck["workflow"], snap["apiPromptJson"]["output"])
 
 
 class StudioRunAdapterHistoryTests(unittest.TestCase):
@@ -590,6 +716,177 @@ class GitignoreRuntimeArtifactTests(unittest.TestCase):
     def test_tmp_suffix_glob_in_gitignore(self):
         text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
         self.assertIn("*.tmp", text)
+
+
+class StudioExtractDefaultsTests(unittest.TestCase):
+    """Tests for extract_defaults_from_snapshot()."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_basic_widget_extraction(self):
+        """Widget-kind bindings extract the correct value from apiPromptJson."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 30}},
+            },
+            "nodeBindings": {
+                "steps": {"kind": "widget", "nodeId": "3", "widgetName": "steps"},
+                "seed": {"kind": "widget", "nodeId": "3", "widgetName": "seed"},
+            },
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        self.assertEqual(defaults, {"steps": 30, "seed": 42})
+
+    def test_input_kind_extraction(self):
+        """Input-kind bindings use inputName instead of widgetName."""
+        snapshot = {
+            "apiPromptJson": {
+                "5": {"class_type": "LoadImage", "inputs": {"image": "photo.png"}},
+            },
+            "nodeBindings": {
+                "source_image": {
+                    "kind": "input", "nodeId": "5", "inputName": "image",
+                },
+            },
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        self.assertEqual(defaults, {"source_image": "photo.png"})
+
+    def test_node_kind_skipped(self):
+        """Node-kind bindings are skipped (no scalar value)."""
+        snapshot = {
+            "apiPromptJson": {
+                "12": {"class_type": "SomeNode", "inputs": {}},
+            },
+            "nodeBindings": {
+                "source_node": {"kind": "node", "nodeId": "12"},
+            },
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        self.assertEqual(defaults, {})
+
+    def test_output_kind_skipped(self):
+        """Output-kind bindings are skipped."""
+        snapshot = {
+            "apiPromptJson": {
+                "9": {"class_type": "SaveImage", "inputs": {}},
+            },
+            "nodeBindings": {
+                "output": {"kind": "output", "nodeId": "9"},
+            },
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        self.assertEqual(defaults, {})
+
+    def test_missing_widget_in_workflow_omitted(self):
+        """Binding references a widget not in apiPromptJson inputs -> key omitted."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"seed": 42}},
+            },
+            "nodeBindings": {
+                "steps": {"kind": "widget", "nodeId": "3", "widgetName": "steps"},
+                "seed": {"kind": "widget", "nodeId": "3", "widgetName": "seed"},
+            },
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        self.assertEqual(defaults, {"seed": 42})
+
+    def test_empty_snapshot_returns_empty(self):
+        """Empty workflow and empty bindings produce {}."""
+        self.assertEqual(
+            self.mod.extract_defaults_from_snapshot({"apiPromptJson": {}, "nodeBindings": {}}),
+            {},
+        )
+        self.assertEqual(
+            self.mod.extract_defaults_from_snapshot({"apiPromptJson": None, "nodeBindings": None}),
+            {},
+        )
+        self.assertEqual(
+            self.mod.extract_defaults_from_snapshot({}),
+            {},
+        )
+
+    def test_mixed_bindings(self):
+        """Mix of widget, input, node, output -- only scalar ones extracted."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 30}},
+                "5": {"class_type": "LoadImage", "inputs": {"image": "cat.png"}},
+            },
+            "nodeBindings": {
+                "steps": {"kind": "widget", "nodeId": "3", "widgetName": "steps"},
+                "seed": {"kind": "widget", "nodeId": "3", "widgetName": "seed"},
+                "source_image": {"kind": "input", "nodeId": "5", "inputName": "image"},
+                "source_node": {"kind": "node", "nodeId": "12"},
+                "output": {"kind": "output", "nodeId": "9"},
+            },
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        self.assertEqual(defaults, {"steps": 30, "seed": 42, "source_image": "cat.png"})
+
+
+class StudioDefaultsAPIEnrichmentTests(unittest.TestCase):
+    """Tests that presets API enrichment populates defaults from snapshots."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_enrichment_preserves_controls_defaults(self):
+        """Snapshot defaults get enriched onto the preset dict."""
+        from studio_models import normalize_snapshot_payload
+        snap = normalize_snapshot_payload({
+            "id": "snap1",
+            "name": "Test",
+            "compatibleFeatures": ["txt2img"],
+            "apiPromptJson": {"3": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 30}}},
+            "nodeBindings": {
+                "prompt": {"kind": "widget", "nodeId": "3", "widgetName": "text"},
+                "steps": {"kind": "widget", "nodeId": "3", "widgetName": "steps"},
+                "seed": {"kind": "widget", "nodeId": "3", "widgetName": "seed"},
+            },
+            "outputNodeId": "9",
+            "graphJson": {"nodes": [], "links": []},
+            "archived": False,
+            "status": "runnable",
+        })
+        defaults = self.mod.extract_defaults_from_snapshot(snap)
+        self.assertIn("steps", defaults)
+        self.assertIn("seed", defaults)
+        self.assertEqual(defaults["steps"], 30)
+        self.assertEqual(defaults["seed"], 42)
+
+    def test_enrichment_accepts_graph_to_prompt_wrapper_shape(self):
+        """Normalization/default extraction accepts wrapped graphToPrompt payloads."""
+        from studio_models import normalize_snapshot_payload
+        snap = normalize_snapshot_payload({
+            "id": "snap_wrapped",
+            "name": "Wrapped",
+            "compatibleFeatures": ["txt2img"],
+            "apiPromptJson": {
+                "workflow": {"nodes": [], "links": []},
+                "output": {
+                    "3": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 30}},
+                    "9": {"class_type": "SaveImage", "inputs": {"images": []}},
+                },
+            },
+            "nodeBindings": {
+                "prompt": {"kind": "widget", "nodeId": "3", "widgetName": "text"},
+                "steps": {"kind": "widget", "nodeId": "3", "widgetName": "steps"},
+                "seed": {"kind": "widget", "nodeId": "3", "widgetName": "seed"},
+            },
+            "outputNodeId": "9",
+            "graphJson": {"nodes": [], "links": []},
+            "archived": False,
+            "status": "runnable",
+        })
+        self.assertEqual(snap["status"], "runnable")
+        defaults = self.mod.extract_defaults_from_snapshot(snap)
+        self.assertEqual(defaults["steps"], 30)
+        self.assertEqual(defaults["seed"], 42)
 
 
 if __name__ == "__main__":
