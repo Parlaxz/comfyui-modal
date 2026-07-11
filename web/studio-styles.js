@@ -1340,6 +1340,103 @@ button.comfymodal-studio-feature-chip {
   line-height: inherit;
 }
 
+/* ── Progress Section ──────────────────────────────────── */
+
+.comfymodal-studio-progress-section {
+  background: #0f0f0f;
+  border: 1px solid #222;
+  border-radius: 3px;
+  padding: 6px 10px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.comfymodal-studio-progress-bar-track {
+  width: 100%;
+  height: 8px;
+  background: #1a1a1a;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.comfymodal-studio-progress-bar-fill {
+  height: 100%;
+  background: #dc2626;
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}
+
+/* ── Favorite Star ─────────────────────────────────────── */
+
+.comfymodal-studio-favorite-star {
+  cursor: pointer;
+  font-size: 16px;
+  user-select: none;
+  transition: transform 0.15s, color 0.15s;
+}
+
+.comfymodal-studio-favorite-star:hover {
+  transform: scale(1.2);
+}
+
+/* ── Note Editor ───────────────────────────────────────── */
+
+.comfymodal-studio-note-editor {
+  margin-top: 4px;
+}
+
+.comfymodal-studio-note-editor textarea {
+  font-family: inherit;
+}
+
+/* ── Timing Summary ────────────────────────────────────── */
+
+.comfymodal-studio-timing-summary {
+  font-size: 10px;
+  color: #888;
+  margin-top: 2px;
+  padding: 2px 0;
+}
+
+/* ── Filter Bar ────────────────────────────────────────── */
+
+.comfymodal-studio-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  background: #0f0f0f;
+  border: 1px solid #222;
+  border-radius: 3px;
+}
+
+.comfymodal-studio-filter-bar input,
+.comfymodal-studio-filter-bar select {
+  font-family: inherit;
+}
+
+/* ── Pagination controls ──────────────────────────────── */
+
+.comfymodal-studio-history .comfymodal-secondary-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── Card-level favorite star positioning ─────────────── */
+
+.comfymodal-studio-history-card {
+  position: relative;
+}
+
+.comfymodal-studio-history-card .comfymodal-studio-favorite-star {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 2;
+}
+
 /* ── Override testing-styles for Nexus look ──────────────── */
 
 .comfymodal-input,

@@ -1526,5 +1526,135 @@ class NormalizerPresetLabelTests(unittest.TestCase):
         self.assertIn("studio_preset_label", self.text)
 
 
+# ---------------------------------------------------------------------------
+# CONTROL_DEFS sampler/scheduler must be type "select" (not "text")
+# ---------------------------------------------------------------------------
+
+class ControlDefsSamplerSchedulerTypeTests(unittest.TestCase):
+    """CONTROL_DEFS sampler and scheduler must have type: "select"."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-feature-registry.js").read_text(encoding="utf-8")
+
+    def _control_defs_section(self):
+        start = self.text.find("export const CONTROL_DEFS")
+        if start < 0:
+            return ""
+        return self.text[start:]
+
+    def test_sampler_type_is_select(self):
+        section = self._control_defs_section()
+        sampler_start = section.find("sampler:")
+        sampler_block = section[sampler_start:sampler_start + 400]
+        self.assertIn('type: "select"', sampler_block,
+                      "sampler CONTROL_DEF must have type: 'select'")
+
+    def test_scheduler_type_is_select(self):
+        section = self._control_defs_section()
+        scheduler_start = section.find("scheduler:")
+        if scheduler_start < 0:
+            scheduler_start = section.find("scheduler ")
+        scheduler_block = section[scheduler_start:scheduler_start + 400]
+        self.assertIn('type: "select"', scheduler_block,
+                      "scheduler CONTROL_DEF must have type: 'select'")
+
+    def test_sampler_has_dynamic_options_flag(self):
+        section = self._control_defs_section()
+        sampler_start = section.find("sampler:")
+        sampler_block = section[sampler_start:sampler_start + 400]
+        self.assertIn("dynamicOptions", sampler_block,
+                      "sampler CONTROL_DEF must have dynamicOptions flag")
+
+    def test_scheduler_has_dynamic_options_flag(self):
+        section = self._control_defs_section()
+        scheduler_start = section.find("scheduler:")
+        if scheduler_start < 0:
+            scheduler_start = section.find("scheduler ")
+        scheduler_block = section[scheduler_start:scheduler_start + 400]
+        self.assertIn("dynamicOptions", scheduler_block,
+                      "scheduler CONTROL_DEF must have dynamicOptions flag")
+
+
+# ---------------------------------------------------------------------------
+# Playground renderControl must handle controlSchemas
+# ---------------------------------------------------------------------------
+
+class PlaygroundControlSchemaRenderingTests(unittest.TestCase):
+    """renderControl must use controlSchemas from preset for schema-driven rendering."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_render_checks_control_schemas(self):
+        """renderControl must read controlSchemas from the preset."""
+        self.assertIn("controlSchemas", self.text)
+
+    def test_render_uses_schema_kind(self):
+        """renderControl must use schema.kind for rendering."""
+        self.assertIn("schemaKind", self.text)
+
+    def test_render_enum_creates_select(self):
+        """Enum schema kind renders as <select> with options."""
+        self.assertIn('"enum"', self.text)
+        self.assertIn('"select"', self.text)
+
+    def test_render_boolean_creates_checkbox(self):
+        """Boolean schema kind renders as checkbox."""
+        self.assertIn('"checkbox"', self.text)
+
+    def test_render_integer_uses_min_max(self):
+        """Integer schema kind renders with min/max/step from schema."""
+        self.assertIn("schema.minimum", self.text)
+        self.assertIn("schema.maximum", self.text)
+        self.assertIn("schema.step", self.text)
+
+    def test_render_multiline_creates_textarea(self):
+        """Multiline schema kind renders as textarea."""
+        self.assertIn('"multiline"', self.text)
+
+    def test_render_falls_back_to_static_type(self):
+        """When no schema, render falls back to static CONTROL_DEFS type."""
+        self.assertIn("def.type === ", self.text)
+
+    def test_render_preserves_falsy_values(self):
+        """Falsy values (0, false) are preserved, not coerced to default."""
+        self.assertIn("!= null", self.text)
+
+
+# ---------------------------------------------------------------------------
+# Experiment mode uses canonical preset ID set
+# ---------------------------------------------------------------------------
+
+class ExperimentCanonicalPresetIdTests(unittest.TestCase):
+    """Experiment mode must use canonical unique preset ID set."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
+
+    def test_get_experiment_preset_ids_exported(self):
+        """getExperimentPresetIds must be exported."""
+        self.assertIn("getExperimentPresetIds", self.text)
+
+    def test_canonical_preset_ids_in_execute(self):
+        """executeExperimentRun must use canonical preset ID set."""
+        self.assertIn("canonicalPresetIds", self.text)
+
+    def test_canonical_preset_ids_includes_base(self):
+        """Canonical set includes base selectedBackendId."""
+        self.assertIn("baseBackendId", self.text)
+
+    def test_canonical_preset_ids_deduplicates(self):
+        """Canonical set deduplicates via new Set."""
+        self.assertIn("new Set(", self.text)
+
+    def test_can_run_experiment_requires_two(self):
+        """canRunExperiment requires >= 2 canonical presets."""
+        self.assertIn("canonicalPresetIds.length >= 2", self.text)
+
+    def test_disabled_reason_requires_two(self):
+        """getExperimentDisabledReason mentions 'at least 2'."""
+        self.assertIn("Select at least 2 presets", self.text)
+
+
 if __name__ == "__main__":
     unittest.main()

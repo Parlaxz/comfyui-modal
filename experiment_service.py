@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -503,11 +504,142 @@ def _atomic_write_text(path: Path, text: str) -> None:
 # ── Run-history service ─────────────────────────────────────────────────
 
 
+# ── Default annotations ──────────────────────────────────────────────
+
+_DEFAULT_ANNOTATIONS: dict = {
+    "schema_version": 1,
+    "favorite": False,
+    "note": "",
+    "updated_at": None,
+}
+
+_ANNOTATION_NOTE_MAX_LENGTH: int = 2000
+_ANNOTATION_ALLOWED_FIELDS: frozenset = frozenset({"favorite", "note"})
+
+
+def _validate_annotation_payload(payload: dict) -> list[str]:
+    """Validate an annotation PATCH payload.
+
+    Returns a list of error messages (empty = valid).
+    Only ``favorite`` (bool) and ``note`` (str, max length) are allowed.
+    """
+    errors: list[str] = []
+
+    if not isinstance(payload, dict):
+        return ["payload must be a dict"]
+
+    # Check for unknown fields
+    for key in payload:
+        if key not in _ANNOTATION_ALLOWED_FIELDS:
+            errors.append(f"Unknown field: {key!r}")
+
+    # Validate favorite if present
+    if "favorite" in payload:
+        fav = payload["favorite"]
+        if not isinstance(fav, bool):
+            errors.append("favorite must be a boolean")
+
+    # Validate note if present
+    if "note" in payload:
+        note = payload["note"]
+        if not isinstance(note, str):
+            errors.append("note must be a string")
+        elif len(note) > _ANNOTATION_NOTE_MAX_LENGTH:
+            errors.append(
+                f"note must not exceed {_ANNOTATION_NOTE_MAX_LENGTH} characters"
+            )
+
+    return errors
+
+
+def _normalize_annotations(meta_obj: dict) -> dict:
+    """Ensure *meta_obj* has an ``annotations`` key with normalized defaults.
+
+    Annotations live at the top level of meta.json (not inside ``extra``)
+    so the PATCH endpoint can modify them without racing with finalization
+    writes that update ``extra``.
+
+    Migration: if annotations exist in ``extra`` but not at top level,
+    promote them to top level and remove from ``extra``.
+    Returns *meta_obj* mutated in place for convenience.
+    """
+    # Migrate from extra.annotations to top-level annotations
+    extra = meta_obj.get("extra")
+    if isinstance(extra, dict) and "annotations" in extra and "annotations" not in meta_obj:
+        meta_obj["annotations"] = extra.pop("annotations")
+
+    if "annotations" not in meta_obj:
+        meta_obj["annotations"] = dict(_DEFAULT_ANNOTATIONS)
+    else:
+        # Ensure all keys exist even if partial
+        ann = meta_obj["annotations"]
+        if not isinstance(ann, dict):
+            meta_obj["annotations"] = dict(_DEFAULT_ANNOTATIONS)
+        else:
+            merged = dict(_DEFAULT_ANNOTATIONS)
+            merged.update(ann)
+            meta_obj["annotations"] = merged
+    return meta_obj
+
+
+# ── Per-run lock manager ─────────────────────────────────────────────
+
+
+class _PerRunLock:
+    """Lightweight per-run-id lock manager for concurrent update safety."""
+
+    def __init__(self) -> None:
+        self._locks: dict[str, threading.Lock] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, run_id: str) -> threading.Lock:
+        with self._lock:
+            if run_id not in self._locks:
+                self._locks[run_id] = threading.Lock()
+            return self._locks[run_id]
+
+
+# ── Run ID validation ────────────────────────────────────────────────
+
+_RUN_ID_PATTERN = re.compile(r"^r_[a-zA-Z0-9_\-]+$")
+
+
+def _validate_run_id(run_id: str) -> bool:
+    """Return True if *run_id* is safe for filesystem use.
+
+    Rejects empty strings, path-traversal chars (``..``, ``/``, ``\\``),
+    null bytes, and any character outside ``[a-zA-Z0-9_-]`` after the
+    ``r_`` prefix.
+    """
+    if not run_id or not isinstance(run_id, str):
+        return False
+    if "\x00" in run_id:
+        return False
+    if ".." in run_id:
+        return False
+    if "/" in run_id or "\\" in run_id:
+        return False
+    return bool(_RUN_ID_PATTERN.match(run_id))
+
+
+# ── Run-history service ─────────────────────────────────────────────────
+
+
 class RunHistoryService:
-    """Persists per-run records to ``.run_history/<run_id>/meta.json``."""
+    """Persists per-run records to ``.run_history/<run_id>/meta.json``.
+
+    Thread-safe per-run locking: each ``run_id`` has its own lock so
+    concurrent updates to different records do not block each other.
+    Timing data is stored in a separate ``timing.json`` file and merged
+    on write so that finalization and annotation writes can coexist.
+    """
 
     def __init__(self, root: Path) -> None:
         self._root = root
+        self._run_locks = _PerRunLock()
+
+    def _lock_for(self, run_id: str) -> threading.Lock:
+        return self._run_locks.acquire(run_id)
 
     def record_run(
         self,
@@ -528,6 +660,15 @@ class RunHistoryService:
         meta_path = run_dir / "meta.json"
         log_path = run_dir / "log.txt"
         timing_path = run_dir / "timing.json"
+        extra = dict(meta or {})
+        # Extract annotations from meta and place at top level
+        caller_annotations = extra.pop("annotations", None) if meta else None
+        if isinstance(caller_annotations, dict):
+            merged_ann = dict(_DEFAULT_ANNOTATIONS)
+            merged_ann.update(caller_annotations)
+            top_annotations = merged_ann
+        else:
+            top_annotations = dict(_DEFAULT_ANNOTATIONS)
         meta_obj = {
             "run_id": run_id,
             "kind": kind,
@@ -537,7 +678,8 @@ class RunHistoryService:
             "started_at": started_at if started_at is not None else _utc_now_iso(),
             "updated_at": _utc_now_iso(),
             "output_path": output_path,
-            "extra": dict(meta or {}),
+            "extra": extra,
+            "annotations": top_annotations,
         }
         _atomic_write_json(meta_path, meta_obj)
         if log_text:
@@ -558,35 +700,127 @@ class RunHistoryService:
         workflow_hash: Optional[str] = None,
         primary_asset_id: Optional[str] = None,
     ) -> dict:
+        # Validate run_id before any filesystem access
+        if not _validate_run_id(run_id):
+            return {"status": "error", "message": "invalid run_id"}
+        # Copy caller-supplied meta dict to avoid mutation
+        meta_copy: Optional[dict] = None
+        if meta is not None:
+            meta_copy = dict(meta)
+        meta = meta_copy
+
         run_dir = self._root / run_id
         meta_path = run_dir / "meta.json"
         if not meta_path.exists():
             return {"status": "error", "message": "unknown run_id"}
-        try:
-            meta_obj = json.loads(meta_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            meta_obj = {}
-        if status is not None:
-            meta_obj["status"] = status
-        if output_path is not None:
-            meta_obj["output_path"] = output_path
-        if workflow_hash is not None:
-            meta_obj["workflow_hash"] = workflow_hash
-        if completed_at is not None:
-            meta_obj["completed_at"] = completed_at
-        if primary_asset_id is not None:
-            meta_obj["primary_asset_id"] = primary_asset_id
-        if meta:
-            meta_obj.setdefault("extra", {}).update(meta)
-        meta_obj["updated_at"] = _utc_now_iso()
-        _atomic_write_json(meta_path, meta_obj)
-        # Write timings atomically if provided
-        if timings is not None:
-            timing_path = run_dir / "timing.json"
-            _atomic_write_json(timing_path, timings)
+
+        # Acquire per-run lock to prevent concurrent read-modify-write races
+        lock = self._lock_for(run_id)
+        with lock:
+            # ── Read and update meta.json ──────────────────────────────
+            try:
+                meta_obj = json.loads(meta_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                meta_obj = {}
+            if status is not None:
+                meta_obj["status"] = status
+            if output_path is not None:
+                meta_obj["output_path"] = output_path
+            if workflow_hash is not None:
+                meta_obj["workflow_hash"] = workflow_hash
+            if completed_at is not None:
+                meta_obj["completed_at"] = completed_at
+            if primary_asset_id is not None:
+                meta_obj["primary_asset_id"] = primary_asset_id
+            if meta is not None:
+                # Extract annotations from meta and store at top-level
+                caller_annotations: Optional[dict] = None
+                if "annotations" in meta:
+                    caller_annotations = meta.pop("annotations")
+                    if not isinstance(caller_annotations, dict):
+                        caller_annotations = None
+                # Merge remaining meta fields into extra
+                if meta:
+                    meta_obj.setdefault("extra", {}).update(meta)
+                # Handle annotations at top level
+                if caller_annotations is not None:
+                    merged = dict(_DEFAULT_ANNOTATIONS)
+                    merged.update(caller_annotations)
+                    meta_obj["annotations"] = merged
+
+            # Ensure top-level annotations always exist after any update
+            meta_obj.setdefault("annotations", dict(_DEFAULT_ANNOTATIONS))
+            meta_obj["updated_at"] = _utc_now_iso()
+            _atomic_write_json(meta_path, meta_obj)
+
+            # ── Merge timings into timing.json (do not replace) ────────
+            if timings is not None:
+                timing_path = run_dir / "timing.json"
+                existing_timing: dict = {}
+                if timing_path.exists():
+                    try:
+                        existing_timing = json.loads(
+                            timing_path.read_text(encoding="utf-8")
+                        )
+                    except json.JSONDecodeError:
+                        existing_timing = {}
+                existing_timing.update(timings)
+                _atomic_write_json(timing_path, existing_timing)
+
         return meta_obj
 
-    def list_runs(self, *, kind: Optional[str] = None, limit: int = 200) -> list[dict]:
+    def list_runs(
+        self,
+        *,
+        kind: Optional[str] = None,
+        limit: int = 200,
+        offset: int = 0,
+        sort: str = "newest",
+        status_filter: Optional[str] = None,
+        favorite_only: bool = False,
+        search: Optional[str] = None,
+        feature: Optional[str] = None,
+        preset: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        has_image: Optional[bool] = None,
+    ) -> dict:
+        """List run history records with pagination, filtering, and sorting.
+
+        Parameters
+        ----------
+        kind : str, optional
+            Filter by record kind (e.g. ``"studio_run"``).
+        limit : int
+            Maximum records to return (default 200).
+        offset : int
+            Number of records to skip (for pagination).
+        sort : str
+            Sort order: ``"newest"`` (default), ``"oldest"``, ``"fastest"``,
+            ``"slowest"``.
+        status_filter : str, optional
+            Filter by record status (e.g. ``"completed"``, ``"error"``).
+        favorite_only : bool
+            If True, only return records with ``annotations.favorite == true``.
+        search : str, optional
+            Case-insensitive search across prompt_id, note (annotations),
+            preset_label, run_id, experiment_id.
+        feature : str, optional
+            Filter by ``studio_feature_id`` in extra.
+        preset : str, optional
+            Filter by ``studio_preset_id`` in extra.
+        date_from : str, optional
+            ISO datetime string; only return runs with ``started_at >= date_from``.
+        date_to : str, optional
+            ISO datetime string; only return runs with ``started_at <= date_to``.
+        has_image : bool, optional
+            If True, only return runs with a non-empty ``output_path``.
+
+        Returns
+        -------
+        dict
+            ``{"runs": [...], "total": int, "limit": int, "offset": int}``
+        """
         out: list[dict] = []
         for run_dir in self._root.iterdir():
             if not run_dir.is_dir():
@@ -600,21 +834,101 @@ class RunHistoryService:
                 continue
             if kind is not None and meta_obj.get("kind") != kind:
                 continue
+            if status_filter is not None and meta_obj.get("status") != status_filter:
+                continue
+            if favorite_only:
+                ann = meta_obj.get("annotations", {}) or {}
+                if not ann.get("favorite"):
+                    continue
+            # ── Search filter ───────────────────────────────────────
+            if search:
+                _search_lower = search.lower()
+                extra = meta_obj.get("extra", {}) or {}
+                ann = meta_obj.get("annotations", {}) or {}
+                # Fields to search
+                _search_fields = [
+                    meta_obj.get("prompt_id", ""),
+                    meta_obj.get("run_id", ""),
+                    extra.get("experiment_id", ""),
+                    extra.get("preset_label", ""),
+                    ann.get("note", ""),
+                ]
+                if not any(_search_lower in (f or "").lower() for f in _search_fields):
+                    continue
+            # ── Feature filter ──────────────────────────────────────
+            if feature is not None:
+                extra = meta_obj.get("extra", {}) or {}
+                if extra.get("studio_feature_id") != feature:
+                    continue
+            # ── Preset filter ───────────────────────────────────────
+            if preset is not None:
+                extra = meta_obj.get("extra", {}) or {}
+                if extra.get("studio_preset_id") != preset:
+                    continue
+            # ── Date range filter ───────────────────────────────────
+            if date_from is not None:
+                sa = meta_obj.get("started_at", "") or ""
+                if sa < date_from:
+                    continue
+            if date_to is not None:
+                sa = meta_obj.get("started_at", "") or ""
+                if sa > date_to:
+                    continue
+            # ── Has image filter ────────────────────────────────────
+            if has_image is True:
+                if not meta_obj.get("output_path"):
+                    continue
+            elif has_image is False:
+                if meta_obj.get("output_path"):
+                    continue
             meta_obj["_path"] = str(run_dir)
+            # Normalize annotations for old records
+            _normalize_annotations(meta_obj)
             out.append(meta_obj)
 
-        # Sort by completed_at DESC, then started_at DESC, then file mtime DESC
+        total = len(out)
+
+        # Sort
         def _sort_key(r: dict) -> tuple:
             ca = r.get("completed_at", "") or ""
             sa = r.get("started_at", "") or ""
-            # Use numeric mtime so '9' < '89' sorts correctly (string would invert this)
             mtime = Path(r.get("_path", "")).stat().st_mtime if r.get("_path") else 0
             return (ca or "", sa or "", mtime)
 
-        out.sort(key=_sort_key, reverse=True)
-        return out[:limit]
+        if sort == "newest":
+            out.sort(key=_sort_key, reverse=True)
+        elif sort == "oldest":
+            out.sort(key=_sort_key)
+        elif sort == "fastest":
+            # Sort by total_ms from timing.json ascending
+            def _fast_sort_key(r):
+                run_id = r.get("run_id", "")
+                timing = self.get_timing(run_id)
+                return timing.get("scheduler_execution_ms", timing.get("total_ms", float("inf"))) or 0
+            out.sort(key=_fast_sort_key)
+        elif sort == "slowest":
+            def _slow_sort_key(r):
+                run_id = r.get("run_id", "")
+                timing = self.get_timing(run_id)
+                return -(timing.get("scheduler_execution_ms", timing.get("total_ms", 0)) or 0)
+            out.sort(key=_slow_sort_key)
+        else:
+            # Default: newest
+            out.sort(key=_sort_key, reverse=True)
+
+        # Apply pagination
+        paginated = out[offset:offset + limit] if offset > 0 else out[:limit]
+
+        return {
+            "runs": paginated,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
 
     def get_run(self, run_id: str) -> Optional[dict]:
+        if not _validate_run_id(run_id):
+            return None
         run_dir = self._root / run_id
         meta_path = run_dir / "meta.json"
         if not meta_path.exists():
@@ -624,9 +938,13 @@ class RunHistoryService:
         except json.JSONDecodeError:
             return None
         meta_obj["_path"] = str(run_dir)
+        # Normalize annotations for old records that lack them
+        _normalize_annotations(meta_obj)
         return meta_obj
 
     def get_log(self, run_id: str) -> str:
+        if not _validate_run_id(run_id):
+            return ""
         run_dir = self._root / run_id
         log_path = run_dir / "log.txt"
         if not log_path.exists():
@@ -634,6 +952,8 @@ class RunHistoryService:
         return log_path.read_text(encoding="utf-8")
 
     def get_timing(self, run_id: str) -> dict:
+        if not _validate_run_id(run_id):
+            return {}
         run_dir = self._root / run_id
         timing_path = run_dir / "timing.json"
         if not timing_path.exists():

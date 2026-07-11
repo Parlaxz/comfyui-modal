@@ -233,12 +233,9 @@ function updateMatrixSummary(body, state) {
   const axes = (state.playground && state.playground.experimentAxes) || {};
   const axisEntries = Object.entries(axes).filter(([, def]) => def && def.enabled);
 
-  // Count backends: base selectedBackendId + compareBackendIds
-  const baseBackend = (state.playground && state.playground.selectedBackendId) || "";
-  const compareIds = (state.playground && state.playground.compareBackendIds) || [];
-  const allBackendIds = baseBackend ? [baseBackend, ...compareIds] : [...compareIds];
-  const uniqueBackendIds = [...new Set(allBackendIds.filter(Boolean))];
-  const backendCount = uniqueBackendIds.length;
+  // Canonical preset ID set: unique([selectedBasePresetId, ...comparePresetIds])
+  const canonicalPresetIds = getExperimentPresetIds(state);
+  const backendCount = canonicalPresetIds.length;
 
   if (axisEntries.length === 0 && backendCount === 0) {
     const empty = document.createElement("p");
@@ -560,15 +557,13 @@ export function renderAxisEditor(controlId, state, actions) {
 // ── Experiment run logic ─────────────────────────────────────────────────
 
 export function canRunExperiment(state) {
-  const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
-  const compareIds = (state.playground && state.playground.compareBackendIds) || [];
-  // Require at least one compare preset
-  return compareIds.length > 0;
+  const canonicalPresetIds = getExperimentPresetIds(state);
+  return canonicalPresetIds.length >= 2;
 }
 
 export function getExperimentDisabledReason(state) {
-  const compareIds = (state.playground && state.playground.compareBackendIds) || [];
-  if (compareIds.length === 0) return "Select at least one preset to compare.";
+  const canonicalPresetIds = getExperimentPresetIds(state);
+  if (canonicalPresetIds.length < 2) return "Select at least 2 presets to compare (choose a base + 1+ compare presets).";
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
   const experimentsEnabled = currentFeatureId === "txt2img";
   if (!experimentsEnabled) return "Experiments are only available for txt2img in this release.";
@@ -578,11 +573,20 @@ export function getExperimentDisabledReason(state) {
 export async function executeExperimentRun(state, context) {
   const apiBase = (context && context.apiBase) || "/comfymodal";
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
+  const baseBackendId = (state.playground && state.playground.selectedBackendId) || "";
   const compareIds = (state.playground && state.playground.compareBackendIds) || [];
   const axes = (state.playground && state.playground.experimentAxes) || {};
   const controls = (state.playground && state.playground.controls) || {};
 
-  if (compareIds.length === 0) {
+  // Canonical preset ID set: unique([selectedBasePresetId, ...comparePresetIds])
+  // This ensures validation, estimation, payload, and labels all use the
+  // same authoritative set.
+  const allPresetIds = baseBackendId
+    ? [baseBackendId].concat(compareIds.filter(function (id) { return id !== baseBackendId; }))
+    : compareIds;
+  const canonicalPresetIds = [...new Set(allPresetIds.filter(Boolean))];
+
+  if (canonicalPresetIds.length === 0) {
     return { status: "error", message: "Select at least one preset to compare." };
   }
 
@@ -613,7 +617,7 @@ export async function executeExperimentRun(state, context) {
   // Send ONE request with all presetIds — the backend creates a unified
   // experiment with one checkpoint per preset.
   const result = await runStudioExperiment(apiBase, {
-    presetIds: compareIds,
+    presetIds: canonicalPresetIds,
     featureId: currentFeatureId,
     experiment: experimentDef,
     metadata: { source: "studio_experiment" },
@@ -625,7 +629,7 @@ export async function executeExperimentRun(state, context) {
       experimentId: result.experimentId || "",
       count: result.cellCount || 0,
       cellCount: result.cellCount || 0,
-      message: `Experiment submitted for ${compareIds.length} preset(s) with ${result.cellCount || 0} cell(s).`,
+      message: `Experiment submitted for ${canonicalPresetIds.length} preset(s) with ${result.cellCount || 0} cell(s).`,
     };
   }
 
@@ -633,6 +637,19 @@ export async function executeExperimentRun(state, context) {
     status: "error",
     message: (result && result.message) || "Experiment run failed.",
   };
+}
+
+/**
+ * Compute the canonical set of preset IDs for experiment validation/display.
+ * Returns a unique array derived from the base preset + compare presets.
+ */
+export function getExperimentPresetIds(state) {
+  const baseBackendId = (state.playground && state.playground.selectedBackendId) || "";
+  const compareIds = (state.playground && state.playground.compareBackendIds) || [];
+  const allIds = baseBackendId
+    ? [baseBackendId].concat(compareIds.filter(function (id) { return id !== baseBackendId; }))
+    : compareIds;
+  return [...new Set(allIds.filter(Boolean))];
 }
 
 // ── Full experiment mode renderer ────────────────────────────────────────

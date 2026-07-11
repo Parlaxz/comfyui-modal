@@ -48,7 +48,9 @@ from studio_models import (
     normalize_snapshot_payload,
     update_preset,
     update_snapshot,
+    validate_controls_against_schema,
 )
+from studio_run_adapter import derive_control_schemas_from_snapshot
 from studio_store import StudioJsonStore, StudioStoreError
 
 _log = logging.getLogger(__name__)
@@ -290,6 +292,8 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
                     normalized["hasApiPromptJson"] = bool(snapshot.get("apiPromptJson"))
                     normalized["hasGraphJson"] = bool(snapshot.get("graphJson"))
                     normalized["snapshotSummary"] = _build_snapshot_summary(snapshot)
+                    # Derive lightweight controlSchemas from the snapshot graph
+                    normalized["controlSchemas"] = derive_control_schemas_from_snapshot(snapshot)
                 else:
                     normalized["nodeBindings"] = {}
                     normalized["outputNodeId"] = ""
@@ -297,6 +301,7 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
                     normalized["hasApiPromptJson"] = False
                     normalized["hasGraphJson"] = False
                     normalized["snapshotSummary"] = {}
+                    normalized["controlSchemas"] = {}
                 enriched.append(normalized)
             return web.json_response({"status": "ok", "presets": enriched})
         except StudioStoreError:

@@ -137,25 +137,25 @@ class StudioRunAdapterLoadTests(unittest.TestCase):
             self.assertEqual(s["id"], "snap_runnable")
 
     def test_load_missing_preset_rejected(self):
-        """Missing preset ID returns None."""
+        """Missing preset ID returns (None, error)."""
         with tempfile.TemporaryDirectory() as tmp:
             _make_studio_store_files(tmp, [], [])
-            result = self.mod.load_preset_and_snapshot("does_not_exist", tmp)
-            self.assertIsNone(result)
-            err = self.mod.get_load_error()
+            preset, err = self.mod.load_preset_and_snapshot("does_not_exist", tmp)
+            self.assertIsNone(preset)
+            self.assertIsNotNone(err)
             self.assertIn("not found", err.lower())
 
     def test_load_missing_snapshot_rejected(self):
-        """Preset referencing missing snapshot returns None."""
+        """Preset referencing missing snapshot returns (None, error)."""
         with tempfile.TemporaryDirectory() as tmp:
             preset = {
                 "id": "preset_bad", "label": "Bad", "snapshotId": "snap_missing",
                 "sourceType": "snapshot", "archived": False,
             }
             _make_studio_store_files(tmp, [], [preset])
-            result = self.mod.load_preset_and_snapshot("preset_bad", tmp)
-            self.assertIsNone(result)
-            err = self.mod.get_load_error()
+            preset, err = self.mod.load_preset_and_snapshot("preset_bad", tmp)
+            self.assertIsNone(preset)
+            self.assertIsNotNone(err)
             self.assertIn("not found", err.lower())
 
     def test_load_archived_preset_rejected(self):
@@ -164,9 +164,9 @@ class StudioRunAdapterLoadTests(unittest.TestCase):
             snap = _make_runnable_snapshot()
             preset = _make_archived_preset()
             _make_studio_store_files(tmp, [snap], [preset])
-            result = self.mod.load_preset_and_snapshot("preset_archived", tmp)
-            self.assertIsNone(result)
-            err = self.mod.get_load_error()
+            preset, err = self.mod.load_preset_and_snapshot("preset_archived", tmp)
+            self.assertIsNone(preset)
+            self.assertIsNotNone(err)
             self.assertIn("archived", err.lower())
 
     def test_load_archived_snapshot_rejected(self):
@@ -175,10 +175,18 @@ class StudioRunAdapterLoadTests(unittest.TestCase):
             snap = _make_archived_snapshot()
             preset = _make_runnable_preset(snapshot_id="snap_archived")
             _make_studio_store_files(tmp, [snap], [preset])
-            result = self.mod.load_preset_and_snapshot("preset_runnable", tmp)
-            self.assertIsNone(result)
-            err = self.mod.get_load_error()
+            preset, err = self.mod.load_preset_and_snapshot("preset_runnable", tmp)
+            self.assertIsNone(preset)
+            self.assertIsNotNone(err)
             self.assertIn("archived", err.lower())
+
+    def test_load_thread_safe_no_global_state(self):
+        """load_preset_and_snapshot no longer uses a global _last_load_error."""
+        mod = self.mod
+        self.assertFalse(hasattr(mod, "_last_load_error"),
+                         "Module must not have global _last_load_error")
+        self.assertFalse(hasattr(mod, "get_load_error"),
+                         "Module must not have get_load_error")
 
 
 class StudioRunAdapterValidationTests(unittest.TestCase):
@@ -1088,10 +1096,10 @@ class RunHistoryServiceExtensionTests(unittest.TestCase):
             )
             svc.update_run(rec_b["run_id"], completed_at="2025-06-01T01:00:00Z")
             # A should come first (later completed_at)
-            runs = svc.list_runs(kind="studio_run")
-            self.assertEqual(len(runs), 2)
-            self.assertEqual(runs[0]["run_id"], rec_a["run_id"])
-            self.assertEqual(runs[1]["run_id"], rec_b["run_id"])
+            result = svc.list_runs(kind="studio_run")
+            self.assertEqual(len(result["runs"]), 2)
+            self.assertEqual(result["runs"][0]["run_id"], rec_a["run_id"])
+            self.assertEqual(result["runs"][1]["run_id"], rec_b["run_id"])
 
     def test_list_runs_falls_back_to_started_at_when_no_completed_at(self):
         """When completed_at is absent, use started_at descending."""
@@ -1103,7 +1111,8 @@ class RunHistoryServiceExtensionTests(unittest.TestCase):
                                     started_at="2025-06-01T03:00:00Z")
             rec_b = svc.record_run(kind="studio_run", prompt_id="exp_b", status="running",
                                     started_at="2025-06-01T01:00:00Z")
-            runs = svc.list_runs(kind="studio_run")
+            result = svc.list_runs(kind="studio_run")
+            runs = result["runs"]
             self.assertEqual(runs[0]["run_id"], rec_a["run_id"])
             self.assertEqual(runs[1]["run_id"], rec_b["run_id"])
 
@@ -1124,8 +1133,8 @@ class RunHistoryServiceExtensionTests(unittest.TestCase):
             # Set mtime: b newer
             old = time.time() - 100
             os.utime(run_dir_a, (old, old))
-            runs = svc.list_runs(kind="studio_run")
-            self.assertEqual(len(runs), 2)
+            result = svc.list_runs(kind="studio_run")
+            self.assertEqual(len(result["runs"]), 2)
 
 
 # ---------------------------------------------------------------------------
@@ -1504,8 +1513,8 @@ class ScheduleAndStartFinalizationTests(unittest.TestCase):
             )
             self.assertEqual(updated.get("status"), "completed")
             self.assertEqual(updated.get("run_id"), run_id)
-            runs = svc.list_runs(kind="studio_run")
-            self.assertEqual(len(runs), 1)
+            result = svc.list_runs(kind="studio_run")
+            self.assertEqual(len(result["runs"]), 1)
 
     def test_failure_finalizes_same_record_as_failed(self):
         """On failure, the submission record is finalized with failed status."""
@@ -1890,7 +1899,8 @@ class ListRunsSortKeyTests(unittest.TestCase):
             # Set mtime: a=epoch+1000, b=epoch+2000 (b newer)
             os.utime(run_a, (1000, 1000))
             os.utime(run_b, (2000, 2000))
-            runs = svc.list_runs(kind="studio_run")
+            result = svc.list_runs(kind="studio_run")
+            runs = result["runs"]
             self.assertEqual(len(runs), 2)
             # b should come first (newer mtime = higher = first in DESC)
             self.assertEqual(runs[0]["run_id"], "r_bbbb")
@@ -1914,7 +1924,8 @@ class ListRunsSortKeyTests(unittest.TestCase):
             # mtime_a=9, mtime_b=89 — string sort would put '9' > '89' (wrong)
             os.utime(run_a, (9, 9))
             os.utime(run_b, (89, 89))
-            runs = svc.list_runs(kind="studio_run")
+            result = svc.list_runs(kind="studio_run")
+            runs = result["runs"]
             self.assertEqual(len(runs), 2)
             # Numeric: 89 > 9, so b first in DESC
             self.assertEqual(runs[0]["run_id"], "r_bbbb")
@@ -2087,6 +2098,365 @@ class ExtractDefaultsSamplerSchedulerTests(unittest.TestCase):
         self.assertIn("seed", defaults)
         self.assertNotIn("sampler", defaults)
         self.assertNotIn("scheduler", defaults)
+
+
+# ---------------------------------------------------------------------------
+# Control Schema derivation tests
+# ---------------------------------------------------------------------------
+
+class ControlSchemaDerivationTests(unittest.TestCase):
+    """Tests for derive_control_schemas_from_snapshot()."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_sampler_binding_produces_enum_schema(self):
+        """sampler binding produces an enum schema with exact graph options."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"seed": 42, "sampler_name": "euler"}},
+            },
+            "nodeBindings": {
+                "sampler": {"kind": "widget", "nodeId": "3", "widgetName": "sampler_name"},
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("sampler", {})
+        self.assertEqual(s.get("kind"), "enum")
+        self.assertTrue(s.get("schemaResolved"))
+        self.assertIn("euler", s.get("options", []))
+        self.assertIn("dpmpp_2m", s.get("options", []))
+
+    def test_scheduler_binding_produces_enum_schema(self):
+        """scheduler binding produces an enum schema with exact graph options."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"seed": 42, "scheduler": "normal"}},
+            },
+            "nodeBindings": {
+                "scheduler": {"kind": "widget", "nodeId": "3", "widgetName": "scheduler"},
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("scheduler", {})
+        self.assertEqual(s.get("kind"), "enum")
+        self.assertTrue(s.get("schemaResolved"))
+        self.assertIn("normal", s.get("options", []))
+        self.assertIn("karras", s.get("options", []))
+
+    def test_steps_binding_produces_integer_schema(self):
+        """steps binding produces an integer schema with numeric constraints."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"steps": 20}},
+            },
+            "nodeBindings": {
+                "steps": {"kind": "widget", "nodeId": "3", "widgetName": "steps"},
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("steps", {})
+        self.assertEqual(s.get("kind"), "integer")
+        self.assertTrue(s.get("schemaResolved"))
+        self.assertIsNotNone(s.get("minimum"))
+        self.assertIsNotNone(s.get("maximum"))
+
+    def test_guidance_alias_maps_to_cfg(self):
+        """guidance control ID is aliased to cfg widget name."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"cfg": 7.0}},
+            },
+            "nodeBindings": {
+                "guidance": {"kind": "widget", "nodeId": "3", "widgetName": "cfg"},
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("guidance", {})
+        self.assertEqual(s.get("kind"), "number")
+        self.assertTrue(s.get("schemaResolved"))
+
+    def test_prompt_produces_multiline_schema(self):
+        """prompt binding on CLIPTextEncode produces multiline schema."""
+        snapshot = {
+            "apiPromptJson": {
+                "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat"}},
+            },
+            "nodeBindings": {
+                "prompt": {"kind": "widget", "nodeId": "7", "widgetName": "text"},
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("prompt", {})
+        self.assertEqual(s.get("kind"), "multiline")
+        self.assertTrue(s.get("schemaResolved"))
+
+    def test_unknown_node_type_falls_back_to_inferred_type(self):
+        """When node type is unknown, schema is inferred from the value."""
+        snapshot = {
+            "apiPromptJson": {
+                "99": {"class_type": "CustomNode", "inputs": {"some_value": 42}},
+            },
+            "nodeBindings": {
+                "custom_ctrl": {"kind": "widget", "nodeId": "99", "widgetName": "some_value"},
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("custom_ctrl", {})
+        # Should infer integer from the value 42
+        self.assertEqual(s.get("kind"), "integer")
+        self.assertTrue(s.get("schemaResolved"))
+
+    def test_missing_snapshot_data_returns_unresolved(self):
+        """When no apiPromptJson, schema returns unresolved."""
+        snapshot = {
+            "apiPromptJson": None,
+            "nodeBindings": {
+                "steps": {"kind": "widget", "nodeId": "3", "widgetName": "steps"},
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("steps", {})
+        self.assertEqual(s.get("kind"), "unresolved")
+        self.assertFalse(s.get("schemaResolved"))
+
+    def test_node_kind_binding_skipped(self):
+        """Node-kind bindings (not widget/input) return unresolved."""
+        snapshot = {
+            "apiPromptJson": {"3": {"class_type": "KSampler", "inputs": {}}},
+            "nodeBindings": {
+                "prompt": {"kind": "node", "nodeId": "3"},
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("prompt", {})
+        self.assertEqual(s.get("kind"), "unresolved")
+        self.assertFalse(s.get("schemaResolved"))
+
+    def test_boolean_control_schema(self):
+        """Boolean widget inferred from bool value."""
+        snapshot = {
+            "apiPromptJson": {
+                "50": {"class_type": "BooleanControl", "inputs": {"value": False}},
+            },
+            "nodeBindings": {
+                "enable": {"kind": "widget", "nodeId": "50", "widgetName": "value"},
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("enable", {})
+        self.assertEqual(s.get("kind"), "boolean")
+        self.assertEqual(s.get("default"), False)
+
+    def test_denoise_preserves_zero(self):
+        """Denoise=0 is preserved as a valid numeric value in the schema."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"denoise": 0.0}},
+            },
+            "nodeBindings": {
+                "denoise": {"kind": "widget", "nodeId": "3", "widgetName": "denoise"},
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("denoise", {})
+        self.assertEqual(s.get("kind"), "number")
+        # Schema default comes from the hardcoded registry (1.0 for KSampler denoise),
+        # NOT the workflow value. The workflow value is extracted via
+        # extract_defaults_from_snapshot. Verify schema has proper range that
+        # includes 0.
+        self.assertIsNotNone(s.get("minimum"))
+        self.assertIsNotNone(s.get("maximum"))
+        self.assertLessEqual(s.get("minimum", 0), 0.0)
+
+
+class ControlValidationTests(unittest.TestCase):
+    """Tests for validate_controls_against_schema()."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_models", "studio_models.py")
+
+    def test_valid_enum_passes(self):
+        """Valid enum value passes validation."""
+        schemas = {"sampler": {"kind": "enum", "options": ["euler", "dpmpp_2m"], "schemaResolved": True}}
+        errors = self.mod.validate_controls_against_schema({"sampler": "euler"}, schemas, "txt2img")
+        self.assertEqual(errors, [])
+
+    def test_invalid_enum_rejected(self):
+        """Invalid enum value returns precise error."""
+        schemas = {"sampler": {"kind": "enum", "options": ["euler", "dpmpp_2m"], "schemaResolved": True}}
+        errors = self.mod.validate_controls_against_schema({"sampler": "nonexistent"}, schemas, "txt2img")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["field"], "sampler")
+        self.assertIn("nonexistent", errors[0]["message"])
+
+    def test_valid_integer_passes(self):
+        """Valid integer value passes."""
+        schemas = {"steps": {"kind": "integer", "minimum": 1, "maximum": 100, "schemaResolved": True}}
+        errors = self.mod.validate_controls_against_schema({"steps": 20}, schemas, "txt2img")
+        self.assertEqual(errors, [])
+
+    def test_invalid_integer_type_rejected(self):
+        """Non-integer value for integer field rejected."""
+        schemas = {"steps": {"kind": "integer", "schemaResolved": True}}
+        errors = self.mod.validate_controls_against_schema({"steps": "twenty"}, schemas, "txt2img")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("integer", errors[0]["message"])
+
+    def test_integer_out_of_range_rejected(self):
+        """Integer out of range rejected."""
+        schemas = {"steps": {"kind": "integer", "minimum": 1, "maximum": 100, "schemaResolved": True}}
+        errors = self.mod.validate_controls_against_schema({"steps": 999}, schemas, "txt2img")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("999", errors[0]["message"])
+
+    def test_valid_number_passes(self):
+        """Valid float value passes."""
+        schemas = {"guidance": {"kind": "number", "minimum": 0.0, "maximum": 30.0, "schemaResolved": True}}
+        errors = self.mod.validate_controls_against_schema({"guidance": 7.5}, schemas, "txt2img")
+        self.assertEqual(errors, [])
+
+    def test_number_out_of_range_rejected(self):
+        """Number out of range rejected."""
+        schemas = {"guidance": {"kind": "number", "minimum": 0.0, "maximum": 30.0, "schemaResolved": True}}
+        errors = self.mod.validate_controls_against_schema({"guidance": 999.0}, schemas, "txt2img")
+        self.assertEqual(len(errors), 1)
+
+    def test_boolean_accepts_0_and_1(self):
+        """Boolean schema accepts 0/1 for backward compatibility."""
+        schemas = {"flag": {"kind": "boolean", "schemaResolved": True}}
+        errors = self.mod.validate_controls_against_schema({"flag": 0}, schemas, "txt2img")
+        self.assertEqual(errors, [])
+
+        errors = self.mod.validate_controls_against_schema({"flag": 1}, schemas, "txt2img")
+        self.assertEqual(errors, [])
+
+    def test_boolean_rejects_string(self):
+        """Boolean schema rejects non-boolean strings."""
+        schemas = {"flag": {"kind": "boolean", "schemaResolved": True}}
+        errors = self.mod.validate_controls_against_schema({"flag": "yes"}, schemas, "txt2img")
+        self.assertEqual(len(errors), 1)
+
+    def test_unresolved_schema_skips_validation(self):
+        """Unresolved schemas do not produce validation errors."""
+        schemas = {"unknown": {"kind": "unresolved", "schemaResolved": False}}
+        errors = self.mod.validate_controls_against_schema({"unknown": "anything"}, schemas, "txt2img")
+        self.assertEqual(errors, [])
+
+    def test_none_value_passes_for_optional_field(self):
+        """None value for optional field passes validation."""
+        schemas = {"steps": {"kind": "integer", "schemaResolved": True}}
+        errors = self.mod.validate_controls_against_schema({"steps": None}, schemas, "txt2img")
+        self.assertEqual(errors, [])
+
+    def test_zero_value_passes_for_integer_field(self):
+        """Zero is a valid integer value."""
+        schemas = {"seed": {"kind": "integer", "schemaResolved": True}}
+        errors = self.mod.validate_controls_against_schema({"seed": 0}, schemas, "txt2img")
+        self.assertEqual(errors, [])
+
+    def test_false_value_passes_for_boolean_field(self):
+        """False is a valid boolean value."""
+        schemas = {"flag": {"kind": "boolean", "schemaResolved": True}}
+        errors = self.mod.validate_controls_against_schema({"flag": False}, schemas, "txt2img")
+        self.assertEqual(errors, [])
+
+    def test_null_enum_value_rejected(self):
+        """None/null value for enum field is rejected."""
+        schemas = {"sampler": {"kind": "enum", "options": ["euler", "dpmpp_2m"], "schemaResolved": True}}
+        errors = self.mod.validate_controls_against_schema({"sampler": None}, schemas, "txt2img")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["field"], "sampler")
+        self.assertIn("must be one of", errors[0]["message"].lower())
+
+    def test_unknown_control_field_rejected(self):
+        """Control field not in any schema is rejected when strictUnknownRejection=True."""
+        schemas = {"steps": {"kind": "integer", "schemaResolved": True}}
+        errors = self.mod.validate_controls_against_schema(
+            {"steps": 20, "nonexistent_field": "value"}, schemas, "txt2img",
+            strict_unknown_rejection=True,
+        )
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["field"], "nonexistent_field")
+        self.assertIn("unknown", errors[0]["message"].lower())
+
+    def test_unknown_control_field_allowed_by_default(self):
+        """Unknown fields pass by default (backward compatibility)."""
+        schemas = {"steps": {"kind": "integer", "schemaResolved": True}}
+        errors = self.mod.validate_controls_against_schema(
+            {"steps": 20, "unknown_field": "value"}, schemas, "txt2img",
+        )
+        self.assertEqual(errors, [])
+
+    def test_experiment_shared_defaults_validated(self):
+        """Shared defaults in experiment definition are validated like run controls."""
+        schemas = {"steps": {"kind": "integer", "minimum": 1, "maximum": 100, "schemaResolved": True}}
+        # Collect all values from experiment_def default + axes for validation
+        experiment_def = {
+            "defaults": {"steps": 999},
+            "axes": {},
+        }
+        all_values = dict(experiment_def.get("defaults", {}))
+        for _axis_id, axis_def in (experiment_def.get("axes", {}) or {}).items():
+            if isinstance(axis_def, dict) and axis_def.get("values"):
+                for v in axis_def["values"]:
+                    all_values[_axis_id] = v
+        errors = self.mod.validate_controls_against_schema(all_values, schemas, "txt2img")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["field"], "steps")
+
+    def test_experiment_axis_values_validated(self):
+        """Each axis value is validated individually — invalid values caught
+        regardless of position in the list (not just when last)."""
+        schemas = {"sampler": {"kind": "enum", "options": ["euler", "dpmpp_2m"], "schemaResolved": True}}
+        # Validate each axis value individually (correct pattern — no overwriting)
+        axis_values = ["nonexistent_sampler", "euler"]
+        errors = []
+        for v in axis_values:
+            single_value = {"sampler": v}
+            errors.extend(
+                self.mod.validate_controls_against_schema(single_value, schemas, "txt2img")
+            )
+        # The invalid value first should produce an error
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["field"], "sampler")
+
+    def test_experiment_axis_values_non_last_invalid_also_caught(self):
+        """Invalid axis value caught even when it is NOT the last in the list."""
+        schemas = {"sampler": {"kind": "enum", "options": ["euler", "dpmpp_2m"], "schemaResolved": True}}
+        # Invalid value FIRST, valid second — this would be missed by the
+        # overwriting pattern (only last value survives into a flat dict).
+        axis_values = ["INVALID", "euler"]
+        errors = []
+        for v in axis_values:
+            single_value = {"sampler": v}
+            errors.extend(
+                self.mod.validate_controls_against_schema(single_value, schemas, "txt2img")
+            )
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["field"], "sampler")
+
+    def test_load_presets_and_snapshots_no_double_read(self):
+        """load_presets_and_snapshots no longer double-reads after validation pass."""
+        mod = self.mod
+        # The function should not exist anymore, replaced by calling
+        # load_preset_and_snapshot in a loop directly
+        self.assertFalse(hasattr(mod, "load_presets_and_snapshots"),
+                         "load_presets_and_snapshots should be removed (dead double-load)")
+
+
+class GitignoreRuntimeDirectoriesTests(unittest.TestCase):
+    """.gitignore covers output/studio/ and .comfymodal_experiments/."""
+
+    def test_output_studio_in_gitignore(self):
+        text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("output/studio/", text)
+
+    def test_comfymodal_experiments_in_gitignore(self):
+        text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn(".comfymodal_experiments/", text)
 
 
 if __name__ == "__main__":

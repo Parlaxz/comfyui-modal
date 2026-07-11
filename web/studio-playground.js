@@ -25,6 +25,8 @@ import {
 } from "./studio-preset-capabilities.js";
 import { resolveRunImageUrl, hasRunImage, normalizeStudioRun } from "./studio-run-normalizer.js";
 import { saveSelection, loadSelection, clearSelection } from "./studio-playground-state.js";
+import { getSharedTracker } from "./comfymodal-progress.js";
+import { updateRunAnnotation } from "./studio-backend-api.js";
 
 // ── Element helper ───────────────────────────────────────────────────────
 
@@ -371,6 +373,63 @@ export async function hydratePlayground(state, context) {
 
 export function renderPlayground(state, context) {
   const container = el("div", { class: "comfymodal-studio-playground" });
+
+  // ── Wire up shared tracker to drive progress state ──────────────────
+  // The tracker is created by modal-node.js and exposed via singleton.
+  // This is the PRIMARY progress source for Studio runs when running
+  // through ComfyUI's normal execution pipeline. Polling remains as
+  // fallback for experiment runs routed through Modal's async scheduler.
+  if (!state.playground._trackerWired) {
+    state.playground._trackerWired = true;
+    const tracker = getSharedTracker();
+    if (tracker) {
+      // Subscribe to tracker state and merge into runState so the
+      // progress section renders event-driven progress.
+      tracker.onProgress(function (s) {
+        var rs = state.playground.runState || {};
+        // Only apply tracker updates when a Studio run is in flight
+        // (status starts with "running", "submitted", or is absent)
+        var isInFlight = !rs.status
+          || rs.status === "running"
+          || rs.status === "submitted"
+          || rs.status === "in_progress"
+          || rs.status === "queued"
+          || rs.status === "waiting";
+        if (!isInFlight) return;
+
+        // Map tracker stage to runState status
+        var mappedStatus = rs.status;
+        if (s.stage === "startup") mappedStatus = "in_progress";
+        else if (s.stage === "generating") mappedStatus = "in_progress";
+        else if (s.stage === "done") mappedStatus = "completed";
+        else if (s.stage === "error") mappedStatus = "error";
+        else if (s.stage === "idle" && rs.status !== "submitted") return;
+
+        if (mappedStatus !== rs.status || s.overallPercent != null || s.completedNodes > 0) {
+          rs.overallPercent = s.overallPercent;
+          rs.completedNodes = s.completedNodes;
+          rs.totalNodes = s.totalNodes;
+          rs.samplerStep = s.samplerStep;
+          rs.samplerMaximum = s.samplerMaximum;
+          rs.elapsedMs = s.elapsedMs;
+          rs.queuePosition = s.queuePosition;
+          rs.currentNodeLabel = s.currentNodeLabel;
+          rs.stage = s.stage;
+          rs.message = s.message;
+          rs.error = s.error;
+
+          if (mappedStatus !== rs.status) {
+            rs.status = mappedStatus;
+          }
+
+          // Trigger re-render on completed/error
+          if (mappedStatus === "completed" || mappedStatus === "error") {
+            if (context && context.setPage) context.setPage("playground");
+          }
+        }
+      });
+    }
+  }
 
   const leftPanel = renderControlPanel(state, context);
   const rightWorkspace = renderWorkspace(state, context);
@@ -850,12 +909,22 @@ export function createInfoHint(text, options) {
 }
 
 // ── Render a single control ──────────────────────────────────────────────
+//
+// Schema-driven rendering: if the preset carries a controlSchemas entry for
+// this control ID, the schema's ``kind`` field (from the backend graph) takes
+// precedence over the static CONTROL_DEFS ``type``.  This ensures sampler/
+// scheduler are rendered as <select> with proper graph-derived options.
 
 function renderControl(def, state, actions, preset) {
   const presetDefaults = (preset && preset.defaults) || {};
   const currentOverrides = (state.playground && state.playground.controls) || {};
   const hydratedValues = (state.playground && state.playground._hydratedControls) || {};
   const value = currentOverrides[def.id] ?? hydratedValues[def.id] ?? presetDefaults[def.id] ?? def.defaultValue;
+
+  // Resolve schema from the backend preset (if available)
+  const schema = (preset && preset.controlSchemas && preset.controlSchemas[def.id]) || null;
+  const schemaKind = (schema && schema.schemaResolved && schema.kind) || null;
+
   const group = el("div", {
     class: "comfymodal-studio-control-group",
     "data-control-id": def.id,
@@ -873,56 +942,159 @@ function renderControl(def, state, actions, preset) {
   }
 
   let input;
-  if (def.type === "textarea") {
-    input = el("textarea", {
-      class: "comfymodal-input comfymodal-studio-textarea",
-      placeholder: def.placeholder || "",
-      value: String(value),
-      "data-testid": `input-${def.id}`,
-    });
-    input.addEventListener("input", () => {
-      if (actions.setControl) actions.setControl(def.id, input.value);
-    });
-  } else if (def.type === "select") {
+
+  // ── Schema-kind dispatch (backend truth) ─────────────────────────────
+  if (schemaKind === "enum") {
+    // Enum: render as <select> with options from the schema
+    const options = schema.options || [];
     input = el("select", {
       class: "comfymodal-input comfymodal-studio-select",
       "data-testid": `input-${def.id}`,
     });
-    const emptyOpt = el("option", { value: "", text: "Default" });
-    input.appendChild(emptyOpt);
-    input.disabled = true;
-    // Disabled: LoRA selection is done in Legacy Setup
-    const note = el("span", {
-      class: "comfymodal-studio-control-note",
-      text: "Configure in Legacy Setup",
-      style: "font-size:var(--font-size-xs);color:var(--color-text-muted);",
+    options.forEach(function (optVal) {
+      const opt = el("option", {
+        value: optVal,
+        text: optVal,
+      });
+      if (String(optVal) === String(value)) opt.selected = true;
+      input.appendChild(opt);
     });
-    group.appendChild(note);
-  } else if (def.type === "text") {
+    input.addEventListener("change", () => {
+      if (actions.setControl) actions.setControl(def.id, input.value);
+    });
+  } else if (schemaKind === "boolean") {
+    // Boolean: render as checkbox
+    input = el("input", {
+      type: "checkbox",
+      class: "comfymodal-input comfymodal-studio-checkbox",
+      "data-testid": `input-${def.id}`,
+    });
+    // Preserve falsy zero/false — only truly missing treated as default
+    const isChecked = value === true || value === 1 || value === "1" || value === "true";
+    input.checked = isChecked;
+    input.addEventListener("change", () => {
+      if (actions.setControl) actions.setControl(def.id, input.checked);
+    });
+  } else if (schemaKind === "integer" || schemaKind === "number") {
+    // Integer / Number: render with schema min/max/step
+    const isInteger = schemaKind === "integer";
+    input = el("input", {
+      type: "number",
+      class: "comfymodal-input comfymodal-studio-number-input",
+      value: value != null ? String(value) : "",
+      min: schema.minimum != null ? String(schema.minimum) : "",
+      max: schema.maximum != null ? String(schema.maximum) : "",
+      step: schema.step != null ? String(schema.step) : (isInteger ? "1" : "any"),
+      "data-testid": `input-${def.id}`,
+    });
+    input.addEventListener("input", () => {
+      var parsed = isInteger ? parseInt(input.value, 10) : parseFloat(input.value);
+      if (actions.setControl) actions.setControl(def.id, isNaN(parsed) ? input.value : parsed);
+    });
+  } else if (schemaKind === "multiline") {
+    input = el("textarea", {
+      class: "comfymodal-input comfymodal-studio-textarea",
+      placeholder: def.placeholder || "",
+      value: value != null ? String(value) : "",
+      "data-testid": `input-${def.id}`,
+    });
+    input.addEventListener("input", () => {
+      if (actions.setControl) actions.setControl(def.id, input.value);
+    });
+  } else if (schemaKind === "string") {
     input = el("input", {
       type: "text",
       class: "comfymodal-input comfymodal-studio-text-input",
-      value: String(value),
+      value: value != null ? String(value) : "",
       placeholder: def.placeholder || "",
       "data-testid": `input-${def.id}`,
     });
     input.addEventListener("input", () => {
       if (actions.setControl) actions.setControl(def.id, input.value);
     });
-  } else {
-    // number type
+  } else if (schemaKind === "image" || schemaKind === "file" || schemaKind === "model") {
+    // Image/file/model controls: render as disabled text input for now
     input = el("input", {
-      type: "number",
-      class: "comfymodal-input comfymodal-studio-number-input",
-      value: String(value),
-      min: def.min != null ? String(def.min) : "",
-      max: def.max != null ? String(def.max) : "",
-      step: def.step != null ? String(def.step) : "any",
+      type: "text",
+      class: "comfymodal-input comfymodal-studio-text-input",
+      value: value != null ? String(value) : "",
+      disabled: true,
       "data-testid": `input-${def.id}`,
     });
-    input.addEventListener("input", () => {
-      if (actions.setControl) actions.setControl(def.id, parseFloat(input.value) || input.value);
-    });
+  }
+
+  // ── Static CONTROL_DEFS type dispatch (fallback) ─────────────────────
+  if (!input) {
+    if (def.type === "textarea") {
+      input = el("textarea", {
+        class: "comfymodal-input comfymodal-studio-textarea",
+        placeholder: def.placeholder || "",
+        value: String(value),
+        "data-testid": `input-${def.id}`,
+      });
+      input.addEventListener("input", () => {
+        if (actions.setControl) actions.setControl(def.id, input.value);
+      });
+    } else if (def.type === "select") {
+      // Check if this is a dynamic-options select (sampler/scheduler)
+      if (def.dynamicOptions && schema && schema.kind === "enum" && schema.options) {
+        input = el("select", {
+          class: "comfymodal-input comfymodal-studio-select",
+          "data-testid": `input-${def.id}`,
+        });
+        schema.options.forEach(function (optVal) {
+          const opt = el("option", {
+            value: optVal,
+            text: optVal,
+          });
+          if (String(optVal) === String(value)) opt.selected = true;
+          input.appendChild(opt);
+        });
+        input.addEventListener("change", () => {
+          if (actions.setControl) actions.setControl(def.id, input.value);
+        });
+      } else {
+        // Static select (LoRA etc.): disabled, configured elsewhere
+        input = el("select", {
+          class: "comfymodal-input comfymodal-studio-select",
+          "data-testid": `input-${def.id}`,
+        });
+        const emptyOpt = el("option", { value: "", text: "Default" });
+        input.appendChild(emptyOpt);
+        input.disabled = true;
+        const note = el("span", {
+          class: "comfymodal-studio-control-note",
+          text: "Configure in Legacy Setup",
+          style: "font-size:var(--font-size-xs);color:var(--color-text-muted);",
+        });
+        group.appendChild(note);
+      }
+    } else if (def.type === "text") {
+      input = el("input", {
+        type: "text",
+        class: "comfymodal-input comfymodal-studio-text-input",
+        value: String(value),
+        placeholder: def.placeholder || "",
+        "data-testid": `input-${def.id}`,
+      });
+      input.addEventListener("input", () => {
+        if (actions.setControl) actions.setControl(def.id, input.value);
+      });
+    } else {
+      // number type
+      input = el("input", {
+        type: "number",
+        class: "comfymodal-input comfymodal-studio-number-input",
+        value: String(value),
+        min: def.min != null ? String(def.min) : "",
+        max: def.max != null ? String(def.max) : "",
+        step: def.step != null ? String(def.step) : "any",
+        "data-testid": `input-${def.id}`,
+      });
+      input.addEventListener("input", () => {
+        if (actions.setControl) actions.setControl(def.id, parseFloat(input.value) || input.value);
+      });
+    }
   }
 
   if (input) group.appendChild(input);
@@ -1258,6 +1430,232 @@ function renderRunButton(state, context, actions, isExperiment) {
   return container;
 }
 
+// ── Progress Section ─────────────────────────────────────────────────────
+//
+// Displays shared progress state: overall bar, current stage/node, sampler
+// step progress, completed/total nodes, elapsed time, queue/startup state,
+// clear failure state, and completed duration.
+
+function renderProgressSection(state, context) {
+  const section = el("div", {
+    class: "comfymodal-studio-metadata-section",
+    "data-testid": "progress-section",
+    style: "display:none;",
+  });
+
+  const runState = state.playground && state.playground.runState;
+  if (!runState || runState.status === "completed" || runState.status === "error") {
+    // Show completed/error state in metadata section instead
+    return section;
+  }
+
+  section.style.display = "block";
+
+  // Overall progress bar
+  const barContainer = el("div", {
+    style: "width:100%;height:8px;background:#1a1a1a;border-radius:4px;overflow:hidden;margin-bottom:6px;",
+  });
+  const barFill = el("div", {
+    style: "width:0%;height:100%;background:#dc2626;border-radius:4px;transition:width 0.3s ease;",
+  });
+  barContainer.appendChild(barFill);
+
+  // Stage / status info
+  const info = el("div", {
+    style: "display:flex;flex-wrap:wrap;gap:4px 12px;font-size:10px;color:#aaa;",
+  });
+
+  const stageEl = el("span", { "data-testid": "progress-stage" });
+  const nodesEl = el("span", { "data-testid": "progress-nodes" });
+  const elapsedEl = el("span", { "data-testid": "progress-elapsed" });
+  const stepEl = el("span", { "data-testid": "progress-step" });
+  const queueEl = el("span", { "data-testid": "progress-queue" });
+
+  info.appendChild(stageEl);
+  info.appendChild(nodesEl);
+  info.appendChild(elapsedEl);
+  info.appendChild(stepEl);
+  info.appendChild(queueEl);
+
+  section.appendChild(barContainer);
+  section.appendChild(info);
+
+  // Determine stage display text
+  var stageLabel = "Starting...";
+  if (runState.status === "queued") stageLabel = "Queued";
+  else if (runState.status === "in_progress") stageLabel = "Generating";
+  else if (runState.status === "running") stageLabel = "Running";
+  else if (runState.status === "submitted") stageLabel = "Submitted";
+  else if (runState.status === "waiting") stageLabel = "Waiting";
+
+  stageEl.textContent = "Stage: " + stageLabel;
+  nodesEl.textContent = "Nodes: " + (runState.completedNodes || 0) + "/" + (runState.totalNodes || 0);
+  stepEl.textContent = "Sampler: " + (runState.samplerStep != null ? runState.samplerStep : "?") + "/" + (runState.samplerMaximum || "?");
+  elapsedEl.textContent = "Elapsed: " + _formatDuration(runState.elapsedMs);
+
+  if (runState.queuePosition > 0) {
+    queueEl.textContent = "Queue: " + runState.queuePosition;
+    queueEl.style.display = "";
+  } else {
+    queueEl.style.display = "none";
+  }
+
+  // Update progress bar width
+  if (runState.overallPercent != null) {
+    barFill.style.width = Math.max(0, Math.min(100, runState.overallPercent)) + "%";
+  } else {
+    // Indeterminate: show a partial bar with animation
+    barFill.style.width = "30%";
+    barFill.style.animation = "cm-pb-pulse 1.6s ease-in-out infinite";
+  }
+
+  return section;
+}
+
+function _formatDuration(ms) {
+  if (ms == null) return "?";
+  if (ms < 1000) return ms.toFixed(0) + "ms";
+  if (ms < 60000) return (ms / 1000).toFixed(1) + "s";
+  var m = Math.floor(ms / 60000);
+  var s = (ms % 60000) / 1000;
+  return m + "m " + s.toFixed(0) + "s";
+}
+
+// ── Favorite Star ────────────────────────────────────────────────────────
+
+function renderFavoriteStar(nr, actions, apiBase) {
+  var star = el("span", {
+    class: "comfymodal-studio-favorite-star",
+    "data-testid": "favorite-star",
+    text: nr.favorite ? "\u2605" : "\u2606",
+    style: "cursor:pointer;font-size:18px;color:" + (nr.favorite ? "#fbbf24" : "#555") + ";user-select:none;",
+    title: nr.favorite ? "Remove from favorites" : "Add to favorites",
+  });
+
+  star.addEventListener("click", function (e) {
+    e.stopPropagation();
+    // Optimistic toggle
+    var wasFav = nr.favorite;
+    var newFav = !wasFav;
+    nr.favorite = newFav;
+    var runId = nr.id || nr.experimentId;
+    star.textContent = newFav ? "\u2605" : "\u2606";
+    star.style.color = newFav ? "#fbbf24" : "#555";
+    star.title = newFav ? "Remove from favorites" : "Add to favorites";
+
+    // Optimistic API call with rollback
+    updateRunAnnotation(apiBase, runId, { favorite: newFav }).then(function (result) {
+      if (!result || result.status !== "ok") {
+        // Rollback on failure
+        nr.favorite = wasFav;
+        star.textContent = wasFav ? "\u2605" : "\u2606";
+        star.style.color = wasFav ? "#fbbf24" : "#555";
+        star.title = wasFav ? "Remove from favorites" : "Add to favorites";
+      }
+    });
+  });
+
+  return star;
+}
+
+// ── Note Editor ──────────────────────────────────────────────────────────
+
+function renderNoteEditor(nr, actions, apiBase) {
+  var container = el("div", {
+    class: "comfymodal-studio-note-editor",
+    "data-testid": "note-editor",
+    style: "margin-top:4px;",
+  });
+
+  var currentNote = nr.note || "";
+  var textarea = el("textarea", {
+    class: "comfymodal-input comfymodal-studio-textarea",
+    "data-testid": "note-textarea",
+    style: "min-height:40px;font-size:11px;resize:vertical;box-sizing:border-box;",
+    text: currentNote,
+  });
+  textarea.value = currentNote;
+
+  var buttonRow = el("div", {
+    style: "display:flex;gap:4px;margin-top:4px;align-items:center;",
+  });
+
+  var saveBtn = el("button", {
+    class: "comfymodal-secondary-btn",
+    "data-testid": "note-save-btn",
+    text: "Save",
+    style: "font-size:10px;",
+  });
+
+  var cancelBtn = el("button", {
+    class: "comfymodal-secondary-btn",
+    "data-testid": "note-cancel-btn",
+    text: "Cancel",
+    style: "font-size:10px;",
+  });
+
+  var statusEl = el("span", {
+    "data-testid": "note-status",
+    style: "font-size:9px;color:#888;margin-left:4px;",
+  });
+
+  buttonRow.appendChild(saveBtn);
+  buttonRow.appendChild(cancelBtn);
+  buttonRow.appendChild(statusEl);
+  container.appendChild(textarea);
+  container.appendChild(buttonRow);
+
+  var runId = nr.id || nr.experimentId;
+  var isDirty = false;
+  var savedNote = currentNote;
+
+  textarea.addEventListener("input", function () {
+    isDirty = textarea.value !== savedNote;
+    if (isDirty) {
+      statusEl.textContent = "Unsaved changes";
+      statusEl.style.color = "#fbbf24";
+    } else {
+      statusEl.textContent = "";
+    }
+  });
+
+  saveBtn.addEventListener("click", function () {
+    if (!isDirty) return;
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Saving...";
+    statusEl.textContent = "Saving...";
+    statusEl.style.color = "#888";
+
+    updateRunAnnotation(apiBase, runId, { note: textarea.value }).then(function (result) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = "Save";
+      if (result && result.status === "ok") {
+        savedNote = textarea.value;
+        nr.note = textarea.value;
+        nr.noteUpdatedAt = new Date().toISOString();
+        isDirty = false;
+        statusEl.textContent = "Saved " + nr.noteUpdatedAt.substring(0, 19);
+        statusEl.style.color = "#4ade80";
+      } else {
+        statusEl.textContent = "Save failed";
+        statusEl.style.color = "#f87171";
+      }
+    });
+  });
+
+  cancelBtn.addEventListener("click", function () {
+    textarea.value = savedNote;
+    isDirty = false;
+    statusEl.textContent = "";
+    if (savedNote) {
+      statusEl.textContent = "Note saved";
+      statusEl.style.color = "#888";
+    }
+  });
+
+  return container;
+}
+
 // ── Right Workspace ──────────────────────────────────────────────────────
 
 function renderWorkspace(state, context) {
@@ -1268,6 +1666,9 @@ function renderWorkspace(state, context) {
 
   // Canvas area
   workspace.appendChild(renderCanvas(state, context));
+
+  // Progress section (shared progress display)
+  workspace.appendChild(renderProgressSection(state, context));
 
   // Metadata section
   workspace.appendChild(renderMetadataSection(state, context));
@@ -1350,6 +1751,9 @@ function renderMetadataSection(state, context) {
     "data-testid": "metadata-section",
   });
 
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  const actions = buildActions(state, context);
+
   const selectedRun = state.playground && state.playground._selectedRun;
   if (!selectedRun) {
     // No run selected — show only when a canvas result exists
@@ -1370,6 +1774,9 @@ function renderMetadataSection(state, context) {
     text: isFailed ? "\u26a0 Failed" : "\u2713 Completed",
     style: "color:" + (isFailed ? "var(--color-danger, #f87171)" : "var(--color-success, #4ade80)"),
   }));
+
+  // Favorite star
+  summary.appendChild(renderFavoriteStar(nr, actions, apiBase));
 
   // Prompt (use nullish check to preserve empty string)
   if (nr.prompt != null) {
@@ -1418,17 +1825,29 @@ function renderMetadataSection(state, context) {
 
   section.appendChild(summary);
 
+  // ── Timing Summary ────────────────────────────────────────────────
+  if (nr.timingSummary) {
+    section.appendChild(el("div", {
+      class: "comfymodal-studio-timing-summary",
+      style: "font-size:10px;color:#888;margin-top:2px;",
+      text: "Timing: " + nr.timingSummary,
+    }));
+  }
+
   // ── Key generation settings ────────────────────────────────────────
   const settingsRow = el("div", { class: "comfymodal-studio-metadata-settings" });
   const genSettings = [];
 
-  const seed = rc.seed || rqc.seed || "";
-  if (seed) genSettings.push({ label: "Seed", value: String(seed) });
-  if (rc.steps) genSettings.push({ label: "Steps", value: String(rc.steps) });
-  if (rc.cfg || rc.guidance) genSettings.push({ label: "CFG", value: String(rc.cfg || rc.guidance) });
+  // Use nullish-safe helpers to preserve 0/false values
+  const seed = rc.seed != null ? rc.seed : (rqc.seed != null ? rqc.seed : "");
+  if (seed !== "") genSettings.push({ label: "Seed", value: String(seed) });
+  if (rc.steps != null) genSettings.push({ label: "Steps", value: String(rc.steps) });
+  if (rc.cfg != null || rc.guidance != null) {
+    genSettings.push({ label: "CFG", value: String(rc.cfg != null ? rc.cfg : rc.guidance) });
+  }
   if (rc.sampler_name || rc.sampler) genSettings.push({ label: "Sampler", value: String(rc.sampler_name || rc.sampler) });
   if (rc.scheduler) genSettings.push({ label: "Scheduler", value: String(rc.scheduler) });
-  if (rc.denoise) genSettings.push({ label: "Denoise", value: String(rc.denoise) });
+  if (rc.denoise != null) genSettings.push({ label: "Denoise", value: String(rc.denoise) });
   if (rc.width && rc.height) genSettings.push({ label: "Size", value: rc.width + "\u00d7" + rc.height });
   if (nr.workflowHash) genSettings.push({ label: "Workflow", value: nr.workflowHash.substring(0, 8) + "\u2026" });
 
@@ -1464,6 +1883,9 @@ function renderMetadataSection(state, context) {
     }));
   }
 
+  // ── Note Editor ───────────────────────────────────────────────────
+  section.appendChild(renderNoteEditor(nr, actions, apiBase));
+
   // ── Collapsible advanced details ───────────────────────────────────
   const advancedToggle = el("button", {
     class: "comfymodal-studio-metadata-advanced-toggle",
@@ -1492,10 +1914,23 @@ function renderMetadataSection(state, context) {
   if (nr.experimentId) advancedItems.push({ label: "Experiment ID", value: nr.experimentId });
   if (nr.snapshotId) advancedItems.push({ label: "Snapshot ID", value: nr.snapshotId });
 
-  // Full timings
-  if (nr.durationMs) advancedItems.push({ label: "Duration (ms)", value: String(nr.durationMs) });
-  if (Object.keys(nr.timings).length > 0) {
-    advancedItems.push({ label: "Timings", value: JSON.stringify(nr.timings) });
+  // Full timings — keep raw JSON accessible in advanced diagnostics
+  if (nr.durationMs != null) advancedItems.push({ label: "Duration (ms)", value: String(nr.durationMs) });
+  if (nr.rawTiming && Object.keys(nr.rawTiming).length > 0) {
+    advancedItems.push({ label: "Raw Timings", value: JSON.stringify(nr.rawTiming) });
+  }
+  if (nr.timingStages && nr.timingStages.length > 0) {
+    nr.timingStages.forEach(function (st) {
+      if (st.durationMs > 0) {
+        advancedItems.push({ label: st.label, value: _formatDuration(st.durationMs) });
+      }
+    });
+  }
+  if (nr.perNodeTimings && nr.perNodeTimings.length > 0) {
+    var nodeSummary = nr.perNodeTimings.slice(0, 10).map(function (nt) {
+      return "#" + nt.nodeId + ": " + _formatDuration(nt.durationMs) + (nt.cached ? " (cached)" : "");
+    }).join(" | ");
+    advancedItems.push({ label: "Per-Node Timings", value: nodeSummary });
   }
 
   // Workflow hash
@@ -1516,7 +1951,7 @@ function renderMetadataSection(state, context) {
   advancedItems.forEach(function (item) {
     advancedPanel.appendChild(el("div", { style: "margin:2px 0;" }, [
       el("strong", { text: item.label + ": ", style: "color:#888;" }),
-      el("span", { text: item.value.substring(0, 200) + (item.value.length > 200 ? "\u2026" : "") }),
+      el("span", { text: (item.value || "").substring(0, 200) + ((item.value || "").length > 200 ? "\u2026" : "") }),
     ]));
   });
 

@@ -60,6 +60,155 @@ _IMAGE_INPUT_FEATURES_UNIMPLEMENTED: set[str] = {"object_remove", "object_replac
 # Stable error message (no raw exceptions leaked to clients).
 _STABLE_INTERNAL_ERROR = "Internal error processing request"
 
+# ── Control Schema Helpers ──────────────────────────────────────────────────
+# Known ComfyUI sampler names (for enum schema derivation).
+_SAMPLER_NAMES: list[str] = [
+    "euler", "euler_ancestral", "heun", "heunpp2",
+    "dpm_2", "dpm_2_ancestral", "lms", "dpm_fast", "dpm_adaptive",
+    "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_3m_sde",
+    "dpmpp_sde", "dpmpp_sde_gpu", "dpmpp_2m_sde_gpu", "dpmpp_3m_sde_gpu",
+    "ddim", "uni_pc", "uni_pc_bh2",
+]
+
+_SCHEDULER_NAMES: list[str] = [
+    "normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform",
+]
+
+# Mapping from ComfyUI node type → widget_name → schema fragment.
+# Used by derive_control_schemas_from_snapshot to produce control schemas.
+_NODE_WIDGET_SCHEMAS: dict[str, dict[str, dict]] = {
+    "KSampler": {
+        "seed": {"kind": "integer", "default": 0, "minimum": 0, "maximum": 2 ** 32 - 1},
+        "steps": {"kind": "integer", "default": 20, "minimum": 1, "maximum": 10000},
+        "cfg": {"kind": "number", "default": 8.0, "minimum": 0.0, "maximum": 100.0, "step": 0.5, "precision": 1},
+        "sampler_name": {"kind": "enum", "options": list(_SAMPLER_NAMES), "default": "euler"},
+        "scheduler": {"kind": "enum", "options": list(_SCHEDULER_NAMES), "default": "normal"},
+        "denoise": {"kind": "number", "default": 1.0, "minimum": 0.0, "maximum": 1.0, "step": 0.01, "precision": 2},
+    },
+    "KSamplerAdvanced": {
+        "seed": {"kind": "integer", "default": 0, "minimum": 0, "maximum": 2 ** 32 - 1},
+        "steps": {"kind": "integer", "default": 20, "minimum": 1, "maximum": 10000},
+        "cfg": {"kind": "number", "default": 8.0, "minimum": 0.0, "maximum": 100.0, "step": 0.5, "precision": 1},
+        "sampler_name": {"kind": "enum", "options": list(_SAMPLER_NAMES), "default": "euler"},
+        "scheduler": {"kind": "enum", "options": list(_SCHEDULER_NAMES), "default": "normal"},
+        "denoise": {"kind": "number", "default": 1.0, "minimum": 0.0, "maximum": 1.0, "step": 0.01, "precision": 2},
+    },
+    "CLIPTextEncode": {
+        "text": {"kind": "multiline", "default": ""},
+    },
+    "CheckpointLoaderSimple": {
+        "ckpt_name": {"kind": "model", "default": ""},
+    },
+    "VAELoader": {
+        "vae_name": {"kind": "model", "default": ""},
+    },
+    "IntNumber": {
+        "value": {"kind": "integer", "default": 0, "minimum": -2 ** 31, "maximum": 2 ** 31 - 1},
+    },
+    "FloatNumber": {
+        "value": {"kind": "number", "default": 0.0},
+    },
+    "PrimitiveString": {
+        "value": {"kind": "string", "default": ""},
+    },
+    "PrimitiveStringMultiline": {
+        "value": {"kind": "multiline", "default": ""},
+    },
+    "BooleanControl": {
+        "value": {"kind": "boolean", "default": False},
+    },
+}
+
+# Control ID → widget-name aliases for common bindings.
+# Key = control ID (binding key), value = widget name in the node.
+_CONTROL_WIDGET_ALIASES: dict[str, str] = {
+    "sampler": "sampler_name",
+    "guidance": "cfg",
+    "negative_prompt": "text",
+}
+
+
+def derive_control_schemas_from_snapshot(snapshot: dict) -> dict[str, dict]:
+    """Derive control schemas from a snapshot's nodeBindings + apiPromptJson.
+
+    Returns a dict keyed by control ID (binding key), each value being a
+    schema dict with fields like ``kind``, ``options``, ``minimum``,
+    ``maximum``, ``step``, ``precision``, ``default``, ``nodeId``,
+    ``nodeType``, ``widgetName``, and ``schemaResolved``.
+
+    For backward compatibility, missing or unresolvable schemas return a
+    stub with ``schemaResolved: False`` so the frontend can fall back to
+    its static type definitions.
+    """
+    schemas: dict[str, dict] = {}
+    bindings = snapshot.get("nodeBindings", {}) or {}
+    workflow = _get_executable_workflow(snapshot.get("apiPromptJson"))
+
+    for ctrl_id, binding in bindings.items():
+        if not isinstance(binding, dict):
+            continue
+        kind = binding.get("kind", "")
+        node_id = str(binding.get("nodeId", ""))
+        node_type = binding.get("nodeType", "") or ""
+        widget_name = binding.get("widgetName") or binding.get("inputName") or ""
+
+        # Skip non-widget bindings (node-kind, output-kind)
+        if kind not in ("widget", "input"):
+            schemas[ctrl_id] = {
+                "field": ctrl_id,
+                "kind": "unresolved",
+                "schemaResolved": False,
+                "nodeId": node_id,
+                "nodeType": node_type,
+            }
+            continue
+
+        # Resolve widget name via aliases
+        resolved_widget = _CONTROL_WIDGET_ALIASES.get(ctrl_id, widget_name)
+
+        # Look up the node type in the workflow
+        node_data = workflow.get(node_id, {}) if isinstance(workflow, dict) else {}
+        actual_type = node_data.get("class_type") or node_type
+
+        schema: dict = {
+            "field": ctrl_id,
+            "nodeId": node_id,
+            "nodeType": actual_type,
+            "widgetName": resolved_widget,
+        }
+
+        # Look up widget schema from our registry
+        widget_schemas = _NODE_WIDGET_SCHEMAS.get(actual_type, {})
+        widget_schema = widget_schemas.get(resolved_widget)
+
+        if widget_schema:
+            schema.update(widget_schema)
+            schema["schemaResolved"] = True
+        else:
+            # Fall back: infer type from the actual value in the workflow
+            actual_value = None
+            if isinstance(node_data, dict):
+                inputs = node_data.get("inputs", {}) or {}
+                actual_value = inputs.get(resolved_widget)
+            if actual_value is not None:
+                if isinstance(actual_value, bool):
+                    schema["kind"] = "boolean"
+                elif isinstance(actual_value, int):
+                    schema["kind"] = "integer"
+                elif isinstance(actual_value, float):
+                    schema["kind"] = "number"
+                else:
+                    schema["kind"] = "string"
+                schema["default"] = actual_value
+                schema["schemaResolved"] = True
+            else:
+                schema["kind"] = "unresolved"
+                schema["schemaResolved"] = False
+
+        schemas[ctrl_id] = schema
+
+    return schemas
+
 
 def _get_executable_workflow(api_prompt_json: Any) -> dict[str, Any]:
     """Return the runnable prompt map from stored apiPromptJson payloads."""
@@ -146,15 +295,13 @@ def _build_index(entries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
 def load_preset_and_snapshot(
     preset_id: str, node_dir: str | os.PathLike,
-):
+) -> tuple[dict | None, str | None]:
     """Load a preset and its referenced snapshot from Studio stores.
 
-    Returns ``(preset, snapshot)`` on success (two-element tuple).
-
-    Returns ``None`` on failure — use :func:`get_load_error` to retrieve
-    the most recent error message.
+    Returns ``(preset_dict, snapshot_dict)`` on success (both dicts).
+    Returns ``(None, error_message)`` on failure — no global state needed.
+    Thread-safe: each call returns its own error inline.
     """
-    global _last_load_error
     node_dir = Path(node_dir)
     presets = _read_store(node_dir / ".studio_presets.json")
     snapshots = _read_store(node_dir / ".studio_snapshots.json")
@@ -164,60 +311,23 @@ def load_preset_and_snapshot(
 
     preset = preset_index.get(preset_id)
     if preset is None:
-        _last_load_error = f"Preset {preset_id!r} not found"
-        return None
+        return None, f"Preset {preset_id!r} not found"
 
     if preset.get("archived"):
-        _last_load_error = f"Preset {preset_id!r} is archived"
-        return None
+        return None, f"Preset {preset_id!r} is archived"
 
     snapshot_id = preset.get("snapshotId", "") or ""
     if not snapshot_id:
-        _last_load_error = f"Preset {preset_id!r} has no snapshot reference"
-        return None
+        return None, f"Preset {preset_id!r} has no snapshot reference"
 
     snapshot = snapshot_index.get(snapshot_id)
     if snapshot is None:
-        _last_load_error = f"Snapshot {snapshot_id!r} referenced by preset {preset_id!r} not found"
-        return None
+        return None, f"Snapshot {snapshot_id!r} referenced by preset {preset_id!r} not found"
 
     if snapshot.get("archived"):
-        _last_load_error = f"Snapshot {snapshot_id!r} referenced by preset {preset_id!r} is archived"
-        return None
+        return None, f"Snapshot {snapshot_id!r} referenced by preset {preset_id!r} is archived"
 
     return preset, snapshot
-
-
-_last_load_error: str = ""
-
-
-def get_load_error() -> str:
-    """Return the most recent error message from :func:`load_preset_and_snapshot`."""
-    global _last_load_error
-    return _last_load_error
-
-
-def load_presets_and_snapshots(
-    preset_ids: list[str], node_dir: str | os.PathLike,
-):
-    """Load multiple presets and their referenced snapshots.
-
-    Returns ``[(preset, snapshot), ...]`` on success (list of tuples).
-
-    Returns ``None`` on failure — use :func:`get_load_error` to retrieve
-    the most recent error message.
-    """
-    for pid in preset_ids:
-        loaded = load_preset_and_snapshot(pid, node_dir)
-        if loaded is None:
-            return None
-    # All loaded — re-read and build full list
-    result = []
-    for pid in preset_ids:
-        loaded = load_preset_and_snapshot(pid, node_dir)
-        if loaded is not None:
-            result.append(loaded)
-    return result
 
 
 def validate_studio_run(
@@ -862,19 +972,36 @@ async def _schedule_and_start(
     try:
         result = await sched.start()
     except Exception as exc:
-        # Finalize the submission record as failed — stable message only
+        # Finalize the submission record as failed — preserve elapsed timings and failure evidence
         run_history_id = compilation.get("run_history_id", "")
         if run_history_id:
             fail_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             try:
+                # Compute known timings even on failure
+                fail_timings: dict[str, Any] = {}
+                fail_meta: dict[str, Any] = {
+                    "error": _STABLE_INTERNAL_ERROR,
+                    "_error_detail": str(exc)[:500],
+                    "failure_stage": "scheduler_execution",
+                }
+                sub_meta = REGISTRY.history().get_run(run_history_id)
+                if sub_meta:
+                    sub_started = sub_meta.get("started_at") or ""
+                    if sub_started:
+                        try:
+                            sub_dt = datetime.fromisoformat(sub_started.replace("Z", "+00:00"))
+                            now_dt = datetime.fromisoformat(fail_ts.replace("Z", "+00:00"))
+                            elapsed_ms = int((now_dt - sub_dt).total_seconds() * 1000)
+                            fail_timings["queue_ms"] = max(0, elapsed_ms)
+                            fail_timings["end_to_end_total_ms"] = max(0, elapsed_ms)
+                        except Exception:
+                            pass
                 REGISTRY.history().update_run(
                     run_history_id,
                     status="error",
                     completed_at=fail_ts,
-                    meta={
-                        "error": _STABLE_INTERNAL_ERROR,
-                        "_error_detail": str(exc)[:500],
-                    },
+                    timings=fail_timings if fail_timings else None,
+                    meta=fail_meta,
                 )
             except Exception:
                 _log.warning("Failed to update run history for %s on failure", exp_id)
@@ -1127,14 +1254,14 @@ def handle_studio_run(
     node_dir = Path(node_dir)
     _log.info("Studio run received: preset_id=%s feature_id=%s", preset_id, feature_id)
 
-    # 1. Load
-    loaded = load_preset_and_snapshot(preset_id, node_dir)
-    if loaded is None:
-        _log.warning("Studio run load failed: %s", get_load_error())
-        return {"status": "error", "message": get_load_error()}
-    preset, snapshot = loaded
+    # 1. Load (returns (preset, snapshot) or (None, error) — thread-safe, no global state)
+    loaded_preset, loaded_snapshot = load_preset_and_snapshot(preset_id, node_dir)
+    if loaded_preset is None:
+        _log.warning("Studio run load failed: %s", loaded_snapshot)
+        return {"status": "error", "message": loaded_snapshot}
     _log.info("Studio run preset/snapshot loaded: preset=%s snapshot=%s",
-              preset.get("id", ""), snapshot.get("id", ""))
+              loaded_preset.get("id", ""), loaded_snapshot.get("id", ""))
+    preset, snapshot = loaded_preset, loaded_snapshot
 
     # 2. Validate
     validation = validate_studio_run(preset, snapshot, feature_id)
@@ -1306,14 +1433,14 @@ def handle_studio_experiment(
         _log.warning("Studio experiment rejected: no preset IDs")
         return {"status": "error", "message": "At least one presetId is required"}
 
-    # 1. Load all presets + snapshots
+    # 1. Load all presets + snapshots (thread-safe, no global state)
     pairs: list[tuple[dict, dict]] = []
     for pid in preset_ids:
-        loaded = load_preset_and_snapshot(pid, node_dir)
-        if loaded is None:
-            _log.warning("Studio experiment load failed for preset %s: %s", pid, get_load_error())
-            return {"status": "error", "message": get_load_error()}
-        pairs.append(loaded)
+        loaded_preset, loaded_snapshot = load_preset_and_snapshot(pid, node_dir)
+        if loaded_preset is None:
+            _log.warning("Studio experiment load failed for preset %s: %s", pid, loaded_snapshot)
+            return {"status": "error", "message": loaded_snapshot}
+        pairs.append((loaded_preset, loaded_snapshot))
     _log.info("Studio experiment loaded %d preset/snapshot pairs", len(pairs))
 
     # 2. Build unified experiment spec (includes validation of all pairs)
