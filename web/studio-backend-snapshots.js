@@ -6,7 +6,7 @@
 
 import { el, statusBadge } from "./studio-ui.js";
 import { listSnapshots, updateSnapshot, duplicateSnapshot, archiveSnapshot } from "./studio-backend-api.js";
-import { _STATE, renderFeaturesChipGrid } from "./studio-backend.js";
+import { _STATE, renderFeaturesChipGrid, invalidateRuntimePresetsCache } from "./studio-backend.js";
 import { getPresetCapabilitySummary } from "./studio-preset-capabilities.js";
 
 // ── Snapshots page ────────────────────────────────────────────────────────
@@ -252,6 +252,7 @@ export function renderSnapshotDetail(container, snap, apiBase, listContainer) {
     style: "width:auto;padding:5px 16px;",
     onclick: async () => {
       await updateSnapshot(apiBase, snap.id, fieldValues);
+      invalidateRuntimePresetsCache();
       const fresh = await listSnapshots(apiBase);
       renderSnapshotsList(listContainer, fresh, apiBase, container);
     },
@@ -264,6 +265,7 @@ export function renderSnapshotDetail(container, snap, apiBase, listContainer) {
     style: "font-size:10px;padding:5px 12px;",
     onclick: async () => {
       await duplicateSnapshot(apiBase, snap.id);
+      invalidateRuntimePresetsCache();
       const fresh = await listSnapshots(apiBase);
       renderSnapshotsList(listContainer, fresh, apiBase, container);
     },
@@ -278,6 +280,7 @@ export function renderSnapshotDetail(container, snap, apiBase, listContainer) {
       onclick: async () => {
         if (confirm("Archive this snapshot?")) {
           await archiveSnapshot(apiBase, snap.id);
+          invalidateRuntimePresetsCache();
           _STATE.selectedItemId = null;
           const fresh = await listSnapshots(apiBase);
           while (container.firstChild) container.removeChild(container.firstChild);

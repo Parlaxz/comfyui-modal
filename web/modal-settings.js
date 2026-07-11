@@ -1900,6 +1900,12 @@ function buildPanel() {
   addWsBtn.onclick = () => openAddWorkspaceModal();
   workspaceContent.appendChild(addWsBtn);
 
+  const editWsBtn = document.createElement("button");
+  editWsBtn.textContent = "Edit Workspace";
+  editWsBtn.style.cssText = btnStyle() + "margin-bottom:6px;";
+  editWsBtn.disabled = true;
+  workspaceContent.appendChild(editWsBtn);
+
   const swapBtn = document.createElement("button");
   swapBtn.textContent = "Swap Workspace";
   swapBtn.style.cssText = btnStyle("primary") + "margin-bottom:6px;";
@@ -1949,14 +1955,19 @@ function buildPanel() {
   async function loadWorkspaces() {
     const resp = await api.fetchApi(`${MODAL_PREFIX}/workspaces`);
     const data = await resp.json();
+    const selectedId = workspaceSelect.value;
     workspaceSelect.innerHTML = "";
     (data.workspaces || []).forEach((workspace) => {
       const opt = document.createElement("option");
       opt.value = workspace.id;
       opt.textContent = workspace.label;
-      if (workspace.id === data.active_workspace_id) opt.selected = true;
+      if (workspace.id === selectedId || (!selectedId && workspace.id === data.active_workspace_id)) opt.selected = true;
       workspaceSelect.appendChild(opt);
     });
+    if (!workspaceSelect.value && workspaceSelect.options.length) {
+      workspaceSelect.selectedIndex = 0;
+    }
+    editWsBtn.disabled = !workspaceSelect.options.length;
     workspaceStatus.textContent = data.workspaces?.length
       ? `Active workspace: ${workspaceSelect.options[workspaceSelect.selectedIndex]?.textContent || "none"}`
       : "No saved Modal workspaces yet.";
@@ -2044,8 +2055,108 @@ function buildPanel() {
     setTimeout(() => labelInput.focus(), 100);
   }
 
+  async function openEditWorkspaceModal() {
+    const selectedOption = workspaceSelect.options[workspaceSelect.selectedIndex];
+    if (!selectedOption) return;
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position:fixed; inset:0; background:rgba(0,0,0,0.65); display:flex; align-items:center; justify-content:center; z-index:10001;";
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+    const modal = document.createElement("div");
+    modal.style.cssText = "width:min(460px, 90vw); background:#171717; border:1px solid #333; border-radius:8px; padding:16px; display:flex; flex-direction:column; gap:10px;";
+
+    const title = document.createElement("div");
+    title.style.cssText = "font-weight:600; font-size:14px; margin-bottom:4px;";
+    title.textContent = "Edit Modal Workspace";
+    modal.appendChild(title);
+
+    const labelInput = document.createElement("input");
+    labelInput.type = "text";
+    labelInput.placeholder = "Workspace label (e.g. Studio A)";
+    labelInput.value = selectedOption.textContent || "";
+    labelInput.style.cssText = inputStyle();
+    modal.appendChild(labelInput);
+
+    const tokenIdInput = document.createElement("input");
+    tokenIdInput.type = "text";
+    tokenIdInput.placeholder = "Token ID (ak-...) — Leave blank to keep current";
+    tokenIdInput.style.cssText = inputStyle();
+    modal.appendChild(tokenIdInput);
+
+    const tokenSecretInput = document.createElement("input");
+    tokenSecretInput.type = "password";
+    tokenSecretInput.placeholder = "Token Secret (as-...) — Leave blank to keep current";
+    tokenSecretInput.style.cssText = inputStyle();
+    modal.appendChild(tokenSecretInput);
+
+    const helpEl = document.createElement("div");
+    helpEl.style.cssText = "font-size:11px; color:#888; min-height:14px;";
+    helpEl.textContent = "Leave blank to keep current credentials.";
+    modal.appendChild(helpEl);
+
+    const errorEl = document.createElement("div");
+    errorEl.style.cssText = "font-size:11px; color:#e05050; min-height:14px;";
+    modal.appendChild(errorEl);
+
+    const btnRow = document.createElement("div");
+    btnRow.style.cssText = "display:flex; gap:8px; justify-content:flex-end;";
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.style.cssText = btnStyle();
+    cancelBtn.onclick = () => overlay.remove();
+    btnRow.appendChild(cancelBtn);
+
+    const saveBtn = document.createElement("button");
+    saveBtn.textContent = "Save Workspace";
+    saveBtn.style.cssText = btnStyle("primary");
+    saveBtn.onclick = async () => {
+      const label = labelInput.value.trim();
+      const token_id = tokenIdInput.value.trim();
+      const token_secret = tokenSecretInput.value.trim();
+      errorEl.textContent = "";
+      if (!label) {
+        errorEl.textContent = "Workspace label required.";
+        return;
+      }
+      saveBtn.disabled = true;
+      saveBtn.textContent = "Saving…";
+      try {
+        const resp = await api.fetchApi(`${MODAL_PREFIX}/workspaces`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workspace_id: selectedOption.value, label, token_id, token_secret, set_active: false }),
+        });
+        const data = await resp.json();
+        if (data.status !== "ok") throw new Error(data.message || "Save failed");
+        overlay.remove();
+        showToast("Workspace updated.", "success");
+        await loadWorkspaces();
+        workspaceSelect.value = selectedOption.value;
+      } catch (e) {
+        errorEl.textContent = "Error: " + e.message;
+      } finally {
+        saveBtn.disabled = false;
+        saveBtn.textContent = "Save Workspace";
+      }
+    };
+    btnRow.appendChild(saveBtn);
+    modal.appendChild(btnRow);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+    setTimeout(() => labelInput.focus(), 100);
+  }
+
+  editWsBtn.onclick = () => openEditWorkspaceModal();
+  workspaceSelect.onchange = () => {
+    editWsBtn.disabled = !workspaceSelect.options.length;
+    workspaceStatus.textContent = workspaceSelect.options.length
+      ? `Active workspace: ${workspaceSelect.options[workspaceSelect.selectedIndex]?.textContent || "none"}`
+      : "No saved Modal workspaces yet.";
+  };
+
   function setWorkspaceBusy(isBusy) {
     addWsBtn.disabled = isBusy;
+    editWsBtn.disabled = isBusy || !workspaceSelect.options.length;
     swapBtn.disabled = isBusy;
     repairBtn.disabled = isBusy;
     installBtn.disabled = isBusy;

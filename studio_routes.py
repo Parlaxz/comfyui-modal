@@ -72,6 +72,17 @@ def _build_snapshots_by_id(snapshots: list[dict[str, Any]]) -> dict[str, dict[st
     return {s.get("id", ""): s for s in snapshots if s.get("id")}
 
 
+def _build_snapshot_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Build a lightweight summary of a snapshot for preset list responses."""
+    return {
+        "name": snapshot.get("name", ""),
+        "status": snapshot.get("status", ""),
+        "compatibleFeatures": snapshot.get("compatibleFeatures", []),
+        "modelSummary": snapshot.get("modelSummary", ""),
+        "source": snapshot.get("source", ""),
+    }
+
+
 def _json_error(status: int, message: str) -> web.Response:
     return web.json_response({"status": "error", "message": message}, status=status)
 
@@ -267,6 +278,25 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
                 normalized = normalize_preset_payload(p, snapshots_by_id)
                 if not include_archived and normalized.get("archived"):
                     continue
+                # Enrich with snapshot-backed fields (no full graphJson/apiPromptJson)
+                sid = normalized.get("snapshotId", "") or ""
+                snapshot = snapshots_by_id.get(sid) if sid else None
+                if snapshot is not None:
+                    from studio_run_adapter import extract_defaults_from_snapshot
+                    normalized["defaults"] = extract_defaults_from_snapshot(snapshot)
+                    normalized["nodeBindings"] = snapshot.get("nodeBindings", {})
+                    normalized["outputNodeId"] = snapshot.get("outputNodeId", "")
+                    normalized["featureStatus"] = snapshot.get("featureStatus", {})
+                    normalized["hasApiPromptJson"] = bool(snapshot.get("apiPromptJson"))
+                    normalized["hasGraphJson"] = bool(snapshot.get("graphJson"))
+                    normalized["snapshotSummary"] = _build_snapshot_summary(snapshot)
+                else:
+                    normalized["nodeBindings"] = {}
+                    normalized["outputNodeId"] = ""
+                    normalized["featureStatus"] = {}
+                    normalized["hasApiPromptJson"] = False
+                    normalized["hasGraphJson"] = False
+                    normalized["snapshotSummary"] = {}
                 enriched.append(normalized)
             return web.json_response({"status": "ok", "presets": enriched})
         except StudioStoreError:
@@ -316,6 +346,13 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
             _log.exception("Failed to write presets store")
             return _json_error(500, "Storage write error")
 
+        # Enrich defaults from snapshot
+        if entry.get("snapshotId"):
+            snapshot = snapshots_by_id.get(entry["snapshotId"])
+            if snapshot:
+                from studio_run_adapter import extract_defaults_from_snapshot
+                entry["defaults"] = extract_defaults_from_snapshot(snapshot)
+
         return web.json_response({"status": "ok", "preset": entry})
 
     @server.routes.patch("/comfymodal/studio/presets/{preset_id}")
@@ -361,7 +398,16 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
 
         if not found:
             return _json_error(404, "Preset not found")
-        return web.json_response({"status": "ok", "preset": found[0]})
+
+        # Enrich defaults from snapshot
+        entry = found[0]
+        if entry.get("snapshotId"):
+            snapshot = snapshots_by_id.get(entry["snapshotId"])
+            if snapshot:
+                from studio_run_adapter import extract_defaults_from_snapshot
+                entry["defaults"] = extract_defaults_from_snapshot(snapshot)
+
+        return web.json_response({"status": "ok", "preset": entry})
 
     @server.routes.delete("/comfymodal/studio/presets/{preset_id}")
     async def studio_presets_archive(request: web.Request) -> web.Response:
@@ -432,3 +478,18 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
         if not found:
             return _json_error(404, "Preset not found")
         return web.json_response({"status": "ok", "preset": found[0]})
+
+    @server.routes.get("/comfymodal/studio/outputs/{filename:.*}")
+    async def studio_outputs_serve(request: web.Request) -> web.Response:
+        """Serve Studio-generated output images."""
+        filename = request.match_info.get("filename", "")
+        if not filename or ".." in filename or "/" in filename:
+            return _json_error(404, "Not found")
+        output_dir = _node_dir / "output" / "studio"
+        filepath = output_dir / filename
+        if not filepath.exists() or not filepath.is_file():
+            return _json_error(404, "File not found")
+        ext = filepath.suffix.lower()
+        mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                "webp": "image/webp", "gif": "image/gif"}.get(ext.lstrip("."), "application/octet-stream")
+        return web.Response(body=filepath.read_bytes(), content_type=mime)

@@ -23,6 +23,7 @@ import {
   getPresetCapabilitySummary,
   getUnavailableControlReasons,
 } from "./studio-preset-capabilities.js";
+import { resolveRunImageUrl, hasRunImage } from "./studio-run-normalizer.js";
 
 // ── Element helper ───────────────────────────────────────────────────────
 
@@ -55,6 +56,10 @@ function el(tag, props = {}, children = []) {
 // ── Polling helper for experiment status ──────────────────────────────────
 // Polls getStudioRunStatus and updates runState to reflect queued,
 // running, completed, or error states.
+//
+// Completion requires real evidence: completed cell count > 0,
+// an explicit experiment.completed event, or cell.completed events.
+// Empty/unknown snapshots with no definition stay in waiting state.
 
 function _startPolling(container, state, context, actions, runState) {
   const experimentId = runState.experimentId || runState.runId;
@@ -63,6 +68,8 @@ function _startPolling(container, state, context, actions, runState) {
   let pollTimer = setInterval(async () => {
     const data = await getStudioRunStatus(apiBase, experimentId);
     if (!data) return;
+
+    // Server-level error response
     if (data.status && data.status !== "ok") {
       clearInterval(pollTimer);
       const errMsg = (data.message || data.error || "Run failed.").substring(0, 200);
@@ -71,26 +78,118 @@ function _startPolling(container, state, context, actions, runState) {
       }
       return;
     }
+
+    // Unknown experiment (no definition yet or invalid id)
+    if (!data.definition && (!data.snapshot || Object.keys(data.snapshot).length === 0)) {
+      // Experiment not yet available — stay in waiting / submitted state
+      if (actions && actions.setRunState) {
+        actions.setRunState({ status: "waiting", experimentId });
+      }
+      return;
+    }
+
     const snapshot = data.snapshot || {};
     const status = snapshot.overall_status || snapshot.status || data.state || "";
+    const counters = snapshot.counters || {};
+    const events = data.events || [];
+
+    // Check for explicit terminal event evidence in the journal
+    const hasTerminalEvent = events.some(function (ev) {
+      return ev.type === "experiment.completed" ||
+             ev.type === "experiment.stopped";
+    });
+
+    // Check for explicit error events in the journal (safety net for
+    // scheduler failures that may not yet be reflected in snapshot status)
+    const errorEvents = events.filter(function (ev) {
+      return ev.type === "experiment.error" || ev.type === "experiment.failed_fatal";
+    });
+    const hasExplicitErrorEvent = errorEvents.length > 0;
+    const lastErrorMsg = hasExplicitErrorEvent
+      ? (errorEvents[errorEvents.length - 1].payload || {}).error || ""
+      : "";
+
+    // Cell-level completion evidence
+    const completedCellCount = counters.completed || 0;
+    const totalCells = snapshot.total_cells || 0;
+    const cellCompletedEvents = events.filter(function (ev) {
+      return ev.type === "cell.completed";
+    }).length;
+    const hasCellCompletionEvidence = completedCellCount > 0 || cellCompletedEvents > 0;
+
     if (status === "queued") {
       if (actions && actions.setRunState) {
         actions.setRunState({ status: "queued", experimentId });
       }
     } else if (status === "in_progress" || status === "running") {
+      const progressState = { status: "in_progress", experimentId };
+      if (completedCellCount > 0 && totalCells > 0) {
+        progressState.cellProgress = completedCellCount + "/" + totalCells;
+      }
       if (actions && actions.setRunState) {
-        actions.setRunState({ status: "in_progress", experimentId });
+        actions.setRunState(progressState);
       }
     } else if (status === "completed" || status === "succeeded") {
-      clearInterval(pollTimer);
-      if (actions && actions.setRunState) {
-        actions.setRunState({ status: "completed", experimentId });
+      // Require real evidence before showing completed UI
+      if (hasCellCompletionEvidence || hasTerminalEvent) {
+        clearInterval(pollTimer);
+        // Extract output evidence from cell.completed events
+        const outputEvents = events.filter(function (ev) {
+          return ev.type === "cell.completed" && ev.payload;
+        });
+        let primaryOutput = null;
+        for (const ev of outputEvents) {
+          const payload = ev.payload || {};
+          if (payload.primary_asset_id) {
+            primaryOutput = apiBase + "/assets/" + encodeURIComponent(payload.primary_asset_id);
+            break;
+          }
+          if (payload.output_paths && payload.output_paths.length > 0) {
+            const outputFilename = payload.output_paths[0];
+            primaryOutput = apiBase + "/studio/outputs/" + encodeURIComponent(outputFilename);
+            break;
+          }
+        }
+        if (actions && actions.setRunState) {
+          actions.setRunState({
+            status: "completed",
+            experimentId: experimentId,
+            completedCells: completedCellCount || cellCompletedEvents,
+            totalCells: totalCells,
+            primaryOutput: primaryOutput,
+            hasHistory: true,
+          });
+        }
       }
-    } else if (status === "error" || status === "failed" || status === "completed_with_failures") {
+      // Without evidence, stay in current state (don't claim completion)
+    } else if (status === "failed_fatal" || status === "error" || status === "failed" || status === "completed_with_failures") {
       clearInterval(pollTimer);
-      const errMsg = (snapshot.error || data.message || data.error || "Run failed.").substring(0, 200);
+      const errMsg = (lastErrorMsg || snapshot.error || data.message || data.error || "Run failed.").substring(0, 200);
       if (actions && actions.setRunState) {
-        actions.setRunState({ status: "error", message: errMsg });
+        actions.setRunState({
+          status: "error",
+          message: errMsg,
+          experimentId: experimentId,
+        });
+      }
+    } else if (status === "draft" || !status) {
+      // Safety net: if there are explicit error events even while status
+      // shows draft/unknown, surface the error terminal state
+      if (hasExplicitErrorEvent) {
+        clearInterval(pollTimer);
+        const errMsg = (lastErrorMsg || "Run failed.").substring(0, 200);
+        if (actions && actions.setRunState) {
+          actions.setRunState({
+            status: "error",
+            message: errMsg,
+            experimentId: experimentId,
+          });
+        }
+      } else {
+        // Still being set up — stay in waiting
+        if (actions && actions.setRunState) {
+          actions.setRunState({ status: "waiting", experimentId });
+        }
       }
     }
   }, 3000);
@@ -153,6 +252,10 @@ function renderControlPanel(state, context) {
 
     const preset = (presets || []).find((p) => (p.id || p.label || "") === selectedPresetId);
 
+    if (preset) {
+      state.playground._currentPreset = preset;
+    }
+
     if (!selectedPresetId || !preset) {
       // No preset selected — prompt to select one
       const noPresetMsg = el("div", {
@@ -213,7 +316,7 @@ function renderControlPanel(state, context) {
       // Check if this control is in the preset's nodeBindings
       const hasBinding = !!(preset.nodeBindings && preset.nodeBindings[ctrlId] && preset.nodeBindings[ctrlId].nodeId);
 
-      const controlRow = renderControl(def, state, actions);
+      const controlRow = renderControl(def, state, actions, preset);
 
       // Disable the control if it's a required binding not yet bound
       if (!isBound && !hasBinding) {
@@ -269,6 +372,8 @@ function buildActions(state, context) {
       state.playground.featureId = featureId;
       // Clear stale controls when feature changes
       state.playground.controls = {};
+      // Clear stale run state so Run button re-enables
+      if (state.playground) state.playground.runState = null;
       if (context && context.setPage) {
         context.setPage("playground");
       }
@@ -278,6 +383,8 @@ function buildActions(state, context) {
       // Clear stale controls when preset changes to avoid sending
       // controls that the new preset doesn't support
       state.playground.controls = {};
+      // Clear stale run state so Run button re-enables
+      if (state.playground) state.playground.runState = null;
       if (context && context.setPage) {
         context.setPage("playground");
       }
@@ -285,6 +392,17 @@ function buildActions(state, context) {
     setControl(ctrlId, value) {
       if (!state.playground.controls) state.playground.controls = {};
       state.playground.controls[ctrlId] = value;
+      // Clear stale terminal run state so Run button re-enables on control
+      // change, but preserve in-flight states to prevent duplicate submits.
+      const currentRunState = state.playground && state.playground.runState;
+      const isTerminalState = currentRunState
+        && (currentRunState.status === "completed" || currentRunState.status === "error");
+      if (isTerminalState) {
+        state.playground.runState = null;
+        if (context && context.setPage) {
+          context.setPage("playground");
+        }
+      }
     },
     setExperimentMode(enabled) {
       state.playground.experimentMode = enabled;
@@ -295,9 +413,11 @@ function buildActions(state, context) {
     toggleExperimentAxis(ctrlId, enabled) {
       if (!state.playground.experimentAxes) state.playground.experimentAxes = {};
       if (enabled) {
+        const presetDefaults = (state.playground._currentPreset && state.playground._currentPreset.defaults) || {};
+        const defaultValue = presetDefaults[ctrlId] ?? (CONTROL_DEFS[ctrlId] ? CONTROL_DEFS[ctrlId].defaultValue : "");
         state.playground.experimentAxes[ctrlId] = {
           enabled: true,
-          values: [CONTROL_DEFS[ctrlId] ? CONTROL_DEFS[ctrlId].defaultValue : ""],
+          values: [defaultValue],
         };
       } else {
         delete state.playground.experimentAxes[ctrlId];
@@ -333,6 +453,11 @@ function buildActions(state, context) {
     setRunState(runState) {
       if (!state.playground) state.playground = {};
       state.playground.runState = runState;
+      // Persist the primary output URL so the canvas shows it even after
+      // runState is cleared for a re-run
+      if (runState && runState.primaryOutput) {
+        state.playground.lastRunOutput = runState.primaryOutput;
+      }
       if (context && context.setPage) {
         context.setPage("playground");
       }
@@ -479,8 +604,10 @@ export function createInfoHint(text, options) {
 
 // ── Render a single control ──────────────────────────────────────────────
 
-function renderControl(def, state, actions) {
-  const value = ((state.playground && state.playground.controls) || {})[def.id] ?? def.defaultValue;
+function renderControl(def, state, actions, preset) {
+  const presetDefaults = (preset && preset.defaults) || {};
+  const currentOverrides = (state.playground && state.playground.controls) || {};
+  const value = currentOverrides[def.id] ?? presetDefaults[def.id] ?? def.defaultValue;
   const group = el("div", {
     class: "comfymodal-studio-control-group",
     "data-control-id": def.id,
@@ -589,54 +716,76 @@ function renderRunButton(state, context, actions, isExperiment) {
     return container;
   }
 
+  if (runState && runState.status === "waiting") {
+    btn.disabled = true;
+    btn.textContent = "Waiting\u2026";
+    btn.title = "Waiting for experiment to be ready on server";
+    reason.appendChild(el("p", {
+      text: "Waiting for server setup\u2026",
+      style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+    }));
+    return container;
+  }
+
   if (runState && (runState.status === "queued" || runState.status === "in_progress")) {
     btn.disabled = true;
     btn.textContent = runState.status === "queued" ? "Queued\u2026" : "Running\u2026";
     btn.title = "Experiment is running";
+    const progressText = runState.cellProgress
+      ? "Cells completed: " + runState.cellProgress
+      : "Run is in progress\u2026";
     reason.appendChild(el("p", {
-      text: "Run is in progress\u2026",
+      text: progressText,
       style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
     }));
     return container;
   }
 
   if (runState && runState.status === "completed") {
-    btn.disabled = true;
-    btn.textContent = "Completed";
-    btn.title = "Run completed successfully";
-    reason.appendChild(el("p", {
-      text: "Run completed successfully.",
+    // Terminal state: enable "Run Again" instead of permanently disabling
+    btn.disabled = false;
+    btn.textContent = "Run Again";
+    btn.title = "Run completed successfully. Click to run again.";
+    const messageEl = el("p", {
       style: "font-size:var(--font-size-sm);color:var(--color-success);margin:4px 0 0;",
-    }));
-    const viewLink = el("a", {
-      text: "View in History",
-      style: "font-size:var(--font-size-sm);color:var(--color-accent);cursor:pointer;",
-      onclick: (e) => {
-        e.preventDefault();
-        if (actions && actions.navigateToHistory) actions.navigateToHistory();
-      },
     });
-    reason.appendChild(viewLink);
+    messageEl.textContent = runState.completedCells
+      ? "Run completed (" + runState.completedCells + " cell(s))."
+      : "Run completed successfully.";
+    reason.appendChild(messageEl);
+    // Only show View in History when meaningful history evidence exists
+    if (runState.hasHistory) {
+      const viewLink = el("a", {
+        text: "View in History",
+        style: "font-size:var(--font-size-sm);color:var(--color-accent);cursor:pointer;margin-left:8px;",
+        onclick: (e) => {
+          e.preventDefault();
+          if (actions && actions.navigateToHistory) actions.navigateToHistory();
+        },
+      });
+      messageEl.appendChild(document.createTextNode(" "));
+      messageEl.appendChild(viewLink);
+    }
+    // Run Again clears stale run state so Run becomes clickable
+    btn.onclick = function () {
+      if (actions && actions.setRunState) actions.setRunState(null);
+    };
     return container;
   }
 
   if (runState && runState.status === "error") {
-    btn.disabled = true;
-    btn.textContent = "Run Failed";
-    btn.title = "Run failed";
+    // Terminal error state: enable "Run Again" instead of just Dismiss
+    btn.disabled = false;
+    btn.textContent = "Run Again";
+    btn.title = "Run failed. Click to try again.";
     reason.appendChild(el("p", {
       text: runState.message || "Run failed. Try again.",
       style: "font-size:var(--font-size-sm);color:var(--color-danger);margin:4px 0 0;",
     }));
-    const retryBtn = el("button", {
-      class: "comfymodal-secondary-btn",
-      text: "Dismiss",
-      style: "font-size:10px;padding:2px 8px;margin-top:4px;",
-      onclick: () => {
-        if (actions && actions.setRunState) actions.setRunState(null);
-      },
-    });
-    reason.appendChild(retryBtn);
+    // Run Again clears stale run state so Run becomes clickable
+    btn.onclick = function () {
+      if (actions && actions.setRunState) actions.setRunState(null);
+    };
     return container;
   }
 
@@ -858,6 +1007,7 @@ function renderCanvas(state, context) {
     "data-testid": "canvas-area",
   });
 
+  const outputUrl = state.playground && state.playground.lastRunOutput;
   if (currentSpec && currentSpec.isPlaceholder) {
     // Honest disabled placeholder for image-edit features
     const placeholderMsg = el("div", { class: "comfymodal-studio-placeholder-notice", style: "text-align:center;padding:40px 20px;" }, [
@@ -865,6 +1015,13 @@ function renderCanvas(state, context) {
       el("p", { text: currentSpec.placeholderReason || "This feature is not available in this release.", style: "font-size:var(--font-size-sm);color:var(--color-text-muted);" }),
     ]);
     canvas.appendChild(placeholderMsg);
+  } else if (outputUrl) {
+    const img = el("img", {
+      src: outputUrl,
+      style: "max-width:100%;max-height:100%;object-fit:contain;border-radius:4px;",
+      "data-testid": "canvas-output",
+    });
+    canvas.appendChild(img);
   } else {
     canvas.appendChild(el("p", {
       text: "Generated output will appear here.",
@@ -875,20 +1032,124 @@ function renderCanvas(state, context) {
   return canvas;
 }
 
-// ── Filmstrip ────────────────────────────────────────────────────────────
+// ── Carousel ────────────────────────────────────────────────────────────
+//
+// Image carousel of thumbnails from recent image-producing runs.
+// Clicking a thumbnail updates the main canvas output.
+// Only image-producing runs are shown.
 
 function renderFilmstrip(state, context) {
-  const filmstrip = el("div", {
-    class: "comfymodal-studio-filmstrip",
+  const carousel = el("div", {
+    class: "comfymodal-studio-carousel",
     "data-testid": "filmstrip",
   });
 
-  const msg = el("p", {
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  carousel.appendChild(el("p", {
     class: "comfymodal-studio-empty-state",
-    text: "Recent runs will appear here once you create experiments. Use Settings > Legacy Setup to run experiments.",
+    text: "Loading recent runs...",
     style: "font-size:var(--font-size-xs);color:var(--color-text-muted);padding:8px;",
-  });
-  filmstrip.appendChild(msg);
+  }));
 
-  return filmstrip;
+  // Build actions for state mutation
+  function getActions() {
+    return {
+      setRunState(runState) {
+        if (!state.playground) state.playground = {};
+        state.playground.runState = runState;
+        if (runState && runState.primaryOutput) {
+          state.playground.lastRunOutput = runState.primaryOutput;
+        }
+        if (context && context.setPage) {
+          context.setPage("playground");
+        }
+      },
+    };
+  }
+
+  // Fetch recent runs from history
+  fetch(apiBase + "/run-history?limit=50").then(function (resp) {
+    if (!resp.ok) return null;
+    return resp.json();
+  }).then(function (data) {
+    if (!carousel.isConnected) return;
+    while (carousel.firstChild) carousel.removeChild(carousel.firstChild);
+
+    const entries = (data && data.runs) || [];
+    // Filter to Studio runs first, then keep only image-producing ones.
+    const studioRuns = entries.filter(function (r) {
+      const extra = (r && r.extra) || {};
+      const studioMeta = extra.studio_meta || extra.studio_metadata || {};
+      return (r.prompt_id && r.prompt_id.indexOf("studio_") === 0) ||
+             r.kind === "experiment_cell" ||
+             !!(extra.studio_feature_id || extra.studio_preset_id || studioMeta.studio_feature_id || studioMeta.studio_preset_id);
+    });
+    const imageRuns = studioRuns.filter(function (r) {
+      return hasRunImage(r);
+    });
+
+    if (imageRuns.length === 0) {
+      carousel.appendChild(el("p", {
+        class: "comfymodal-studio-empty-state",
+        text: "Recent runs will appear here once you use the Playground.",
+        style: "font-size:var(--font-size-xs);color:var(--color-text-muted);padding:8px;",
+      }));
+      return;
+    }
+
+    // Carousel track for horizontal scrolling
+    const track = el("div", { class: "comfymodal-studio-carousel-track" });
+
+    imageRuns.forEach(function (run) {
+      const imageUrl = resolveRunImageUrl(run, apiBase);
+      const extra = (run && run.extra) || {};
+      const label = extra.studio_preset_id || extra.studio_feature_id || "Run";
+
+      const thumb = el("div", {
+        class: "comfymodal-studio-carousel-item"
+          + (run.status === "completed" ? " completed" : "")
+          + (run.status === "error" || run.status === "failed" ? " failed" : ""),
+        title: label + " - " + (run.status || ""),
+        onclick: function () {
+          // Update the canvas with this run's output
+          if (imageUrl && state.playground) {
+            state.playground.lastRunOutput = imageUrl;
+            // Clear current run state so the canvas re-renders with the new output
+            if (context && context.setPage) {
+              context.setPage("playground");
+            }
+          }
+        },
+      });
+
+      if (imageUrl) {
+        thumb.appendChild(el("img", {
+          class: "comfymodal-studio-carousel-thumb",
+          src: imageUrl,
+          alt: label,
+          loading: "lazy",
+        }));
+      }
+
+      // Status dot
+      thumb.appendChild(el("span", {
+        class: "comfymodal-studio-carousel-status",
+        style: "background:" + (run.status === "completed" ? "#4ade80" : run.status === "error" || run.status === "failed" ? "#f87171" : "#fbbf24"),
+      }));
+
+      track.appendChild(thumb);
+    });
+
+    carousel.appendChild(track);
+  }).catch(function () {
+    if (!carousel.isConnected) return;
+    while (carousel.firstChild) carousel.removeChild(carousel.firstChild);
+    carousel.appendChild(el("p", {
+      class: "comfymodal-studio-empty-state",
+      text: "Could not load recent runs.",
+      style: "font-size:var(--font-size-xs);color:var(--color-text-muted);padding:8px;",
+    }));
+  });
+
+  return carousel;
 }

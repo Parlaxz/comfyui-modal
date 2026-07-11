@@ -6,7 +6,7 @@
 
 import { el } from "./studio-ui.js";
 import { listPresets, createPreset, updatePreset, duplicatePreset, archivePreset } from "./studio-backend-api.js";
-import { _STATE, renderFeaturesChipGrid, launchPresetWizardForEdit } from "./studio-backend.js";
+import { _STATE, renderFeaturesChipGrid, launchPresetWizardForEdit, invalidateRuntimePresetsCache } from "./studio-backend.js";
 import {
   getPresetCapabilitySummary,
 } from "./studio-preset-capabilities.js";
@@ -260,6 +260,7 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
       style: "width:auto;padding:5px 16px;",
       onclick: async () => {
         await updatePreset(apiBase, preset.id, fieldValues);
+        invalidateRuntimePresetsCache();
         const fresh = await listPresets(apiBase);
         renderPresetsList(listContainer, fresh, apiBase, container);
       },
@@ -288,6 +289,7 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
     style: "font-size:10px;padding:5px 12px;",
     onclick: async () => {
       await duplicatePreset(apiBase, preset.id);
+      invalidateRuntimePresetsCache();
       const fresh = await listPresets(apiBase);
       renderPresetsList(listContainer, fresh, apiBase, container);
     },
@@ -302,6 +304,7 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
       onclick: async () => {
         if (confirm("Archive this preset?")) {
           await archivePreset(apiBase, preset.id);
+          invalidateRuntimePresetsCache();
           _STATE.selectedItemId = null;
           const fresh = await listPresets(apiBase);
           while (container.firstChild) container.removeChild(container.firstChild);
@@ -384,6 +387,7 @@ export function renderPresetForm(existing, apiBase, listPanel, detailPanel) {
     onclick: async () => {
       const result = await createPreset(apiBase, fieldValues);
       if (result) {
+        invalidateRuntimePresetsCache();
         _STATE.selectedItemId = null;
         // Re-render the presets page
         while (listPanel.firstChild) listPanel.removeChild(listPanel.firstChild);

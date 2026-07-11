@@ -362,11 +362,25 @@ function mountLazyTab(container, tabName) {
 }
 
 function buildSidebarPanel() {
+  const statusEl = el("div", { class: "launcher-status", text: "Studio shell ready" });
   const panel = el("div", { class: "comfymodal-testing-sidebar-panel" }, [
     el("div", { class: "launcher-title", text: "Modal Studio" }),
     el("div", { class: "launcher-subtitle", text: "Playground, History, Backend, Settings" }),
     el("button", { text: "Open Studio", onclick: () => open_testing_modal() }),
-    el("div", { class: "launcher-status", text: "Studio shell ready" }),
+    el("button", {
+      text: "Open Legacy Settings",
+      onclick: () => {
+        if (typeof window.open_comfymodal_settings === "function") {
+          statusEl.style.color = "";
+          statusEl.textContent = "Opening legacy settings…";
+          window.open_comfymodal_settings();
+          return;
+        }
+        statusEl.style.color = "#e05050";
+        statusEl.textContent = "Legacy settings unavailable.";
+      },
+    }),
+    statusEl,
   ]);
   return panel;
 }

@@ -17,6 +17,16 @@ class ModalWorkspaceUiAstTests(unittest.TestCase):
         self.assertIn("Import Workflow Manifest", source)
         self.assertIn("Install from Manifest", source)
 
+    def test_edit_workspace_controls_are_present(self):
+        source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
+        self.assertIn("Edit Workspace", source)
+        self.assertIn("Leave blank to keep current", source)
+
+    def test_sidebar_launcher_can_open_legacy_settings(self):
+        source = (REPO_ROOT / "web" / "modal-testing.js").read_text(encoding="utf-8")
+        self.assertIn("Open Legacy Settings", source)
+        self.assertIn("open_comfymodal_settings", source)
+
     def test_workspace_routes_are_called(self):
         source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
         self.assertIn("MODAL_PREFIX}/workspaces", source)

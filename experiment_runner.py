@@ -307,8 +307,8 @@ def resolve_and_inject_cell(
 
     # Validate negative prompt slot if cell has a negative value
     neg_prompt = cell.get("negative_prompt", "")
-    if not is_workflow_owned(neg_prompt) and neg_prompt is not None:
-        neg_slot = _find_slot_by_category(profile_slots, "negative_prompt")
+    neg_slot = _find_slot_by_category(profile_slots, "negative_prompt")
+    if not is_workflow_owned(neg_prompt) and (neg_prompt not in (None, "") or neg_slot):
         if neg_slot:
             neg_node_id = str(neg_slot.get("node_id", ""))
             if neg_node_id not in wf:
@@ -359,11 +359,11 @@ def resolve_and_inject_cell(
     neg_prompt = cell.get("negative_prompt", "")
     if is_workflow_owned(neg_prompt):
         pass  # Don't touch the workflow's existing negative prompt
-    elif neg_prompt is not None:  # includes explicit empty string
+    elif neg_prompt is not None:
         neg_slot = _find_slot_by_category(profile_slots, "negative_prompt")
         if neg_slot:
             _set_path_value(wf, neg_slot, neg_prompt)
-        else:
+        elif neg_prompt != "":
             raise MissingNegativePromptSlot(
                 f"profile {profile_id!r}: cell has explicit negative prompt but "
                 f"profile has no negative_prompt slot configured",
@@ -746,12 +746,29 @@ class ExperimentRunner:
         completed = counters.get("completed", 0)
         failed = counters.get("failed", 0)
         interrupted = counters.get("interrupted", 0)
-        await self._emit("experiment.stopped" if self._stop_mode else "experiment.completed", {
+        checkpoint_states = snap.get("checkpoints", {}) or {}
+        has_fatal_checkpoint = any(
+            (checkpoint_states.get(ck_id, {}) or {}).get("status") == "failed_fatal"
+            for ck_id in checkpoint_states
+        )
+        terminal_event = "experiment.failed_fatal" if has_fatal_checkpoint else (
+            "experiment.stopped" if self._stop_mode else "experiment.completed"
+        )
+        terminal_payload = {
             "completed": completed,
             "failed": failed,
             "interrupted": interrupted,
             "total_cells": total_cells,
-        })
+}
+        if has_fatal_checkpoint:
+            ck_errors = [
+                ev.get("payload", {}).get("error", "")
+                for ev in self._store.read_events()
+                if ev.get("type") == "checkpoint.failed_fatal"
+                and ev.get("payload", {}).get("error")
+            ]
+            terminal_payload["error"] = (ck_errors[-1] if ck_errors else "checkpoint failed")[:200]
+        await self._emit(terminal_event, terminal_payload)
         return {"completed": completed, "failed": failed, "interrupted": interrupted, "total_cells": total_cells}
 
     async def _run_checkpoint(self, ck: dict, cells: list, sem: asyncio.Semaphore) -> None:
@@ -860,11 +877,17 @@ class ExperimentRunner:
                     prev_prefix = prefix
                     attempt_id = cell.get("attempt_id", f"a_{uuid.uuid4().hex[:8]}")
                     result = await self._invoker.run_cell(worker_invocation_id, cell)
-                    # Fix B: terminal events (cell.completed, cell.failed,
-                    # cell.interrupted) are emitted ONLY by the stream
-                    # event sink (_on_remote_event) when using the
-                    # CheckpointStreamInvoker. We keep only the counters
-                    # for the checkpoint-level summary emit below.
+                    # For LocalRemoteInvoker (Studio single runs), emit
+                    # cell.completed with output_paths so the frontend can
+                    # display results. CheckpointStreamInvoker uses the
+                    # stream event sink (_on_remote_event) instead.
+                    if result.get("output_paths"):
+                        await self._emit("cell.completed", {
+                            "cell_key": cell.get("cell_key", ""),
+                            "checkpoint_id": ck["id"],
+                            "output_paths": result["output_paths"],
+                            "attempt_id": attempt_id,
+                        })
                     if result.get("status") == "completed":
                         ck_completed += 1
                     elif result.get("status") == "interrupted":
@@ -931,18 +954,50 @@ class LocalRemoteInvoker:
     """Production implementation of _RemoteInvoker. Wraps the existing
     modal_client.run_prompt_stream surface."""
 
-    def __init__(self, modal_run_prompt_stream):
+    def __init__(self, modal_run_prompt_stream, experiment_id="", node_dir=""):
         self._run_prompt_stream = modal_run_prompt_stream
+        self._experiment_id = experiment_id
+        self._node_dir = Path(node_dir) if node_dir else Path(os.path.dirname(os.path.abspath(__file__)))
 
     async def open_worker(self, worker_invocation_id, checkpoint_id, profile_id,
                           workflow, triple) -> None:
         return None
 
+    async def _save_output_images(self, result_data: dict, cell_key: str) -> list[str]:
+        """Save output images from a Modal result to disk and return URL paths."""
+        import base64
+        from datetime import datetime
+
+        outputs = (result_data or {}).get("outputs", {})
+        saved_urls = []
+        output_dir = self._node_dir / "output" / "studio"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        for node_id, node_outputs in outputs.items():
+            if not isinstance(node_outputs, dict):
+                continue
+            for _output_key, entries in node_outputs.items():
+                if not isinstance(entries, list):
+                    continue
+                for idx, img in enumerate(entries):
+                    if isinstance(img, dict):
+                        fname = img.get("filename", f"studio_{self._experiment_id}_{cell_key}_{node_id}_{idx}_{ts}.png")
+                        image_data = img.get("data", "")
+                    elif isinstance(img, str):
+                        fname = f"studio_{self._experiment_id}_{cell_key}_{node_id}_{idx}_{ts}.png"
+                        image_data = img
+                    else:
+                        continue
+                    if image_data:
+                        image_bytes = base64.b64decode(image_data)
+                        filepath = output_dir / fname
+                        with open(filepath, "wb") as f:
+                            f.write(image_bytes)
+                        saved_urls.append(fname)
+        return saved_urls
+
     async def run_cell(self, worker_invocation_id, cell) -> dict:
         try:
-            # Extract canonical input_images payload dict.
-            # In the new format, values are dicts with "data" key for base64.
-            # Convert to the simpler {filename: b64data} dict that run_prompt_stream expects.
             raw = cell.get("input_images") or {}
             flat = {}
             for filename, entry in raw.items():
@@ -950,11 +1005,18 @@ class LocalRemoteInvoker:
                     flat[filename] = entry["data"]
                 elif isinstance(entry, str):
                     flat[filename] = entry
-            result = await self._run_prompt_stream(
+            async for msg in self._run_prompt_stream(
                 workflow=cell.get("_resolved_workflow", cell.get("_workflow", {})),
                 input_images=flat if flat else None,
-            )
-            return {"status": "completed", "result": result}
+            ):
+                mtype = msg.get("type", "")
+                if mtype == "result":
+                    data = msg.get("data", {})
+                    saved = await self._save_output_images(data, cell.get("cell_key", "unknown"))
+                    return {"status": "completed", "result": data, "output_paths": saved}
+                if mtype == "error":
+                    return {"status": "failed", "error": msg.get("message", "Remote execution error")}
+            return {"status": "failed", "error": "run_prompt_stream ended without result"}
         except Exception as exc:
             return {"status": "failed", "error": str(exc)}
 

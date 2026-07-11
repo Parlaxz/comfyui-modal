@@ -118,3 +118,63 @@ class ComfyAppPreloadStateMachineTests(unittest.TestCase):
         self.assertTrue(waited["restore_preload_active"])
         self.assertTrue(mixin._model_in_cpu_cache(clip_path))
         self.assertEqual(module._count_active_model_reads(), 0)
+
+    def test_dict_preload_entries_cached_branch_no_crash(self):
+        """Dict entries in file_paths must not crash the all-cached branch at
+        line ~9672 where raw ``file_paths`` is iterated with ``os.path.basename``."""
+        module = load_module()
+        mixin = module._ComfyAPIMixin()
+        mixin._model_cpu_cache = {}
+
+        def loader(_path, return_metadata=True):
+            return ({"ok": True}, {"meta": 1}) if return_metadata else {"ok": True}
+
+        mixin._original_model_loader = loader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "clip.safetensors"
+            path.write_bytes(b"x")
+            # Pre-populate cache so the file is seen as already loaded
+            cache_key = module._model_cpu_cache_key(str(path))
+            mixin._model_cpu_cache[cache_key] = ({"ok": True}, {"meta": 1})
+
+            with patch.object(module, "_resolve_preload_mode", return_value="clip_only"):
+                result = mixin._preload_models_to_cpu([{"path": str(path), "role": "clip"}])
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(result.get("cached", [])), 1)
+
+    def test_dict_preload_entries_outlier_branch_no_crash(self):
+        """Dict entries in file_paths must not crash the outlier detection at
+        line ~9687 where raw ``file_paths`` is iterated with ``os.path.basename``
+        and ``os.path.getsize``.
+
+        We patch ``_load_model_state_explicit_cpu`` and use
+        ``read_strategy="normal"`` so the test does not depend on the
+        ``comfy.model_management`` module (which imports ``comfy_aimdo``
+        and may not be available in the test environment).
+        """
+        module = load_module()
+        mixin = module._ComfyAPIMixin()
+        mixin._model_cpu_cache = {}
+
+        def loader(_path, return_metadata=True):
+            return ({"ok": True}, {"meta": 1}) if return_metadata else {"ok": True}
+
+        mixin._original_model_loader = loader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "clip.safetensors"
+            path.write_bytes(b"x")
+            with (
+                patch.object(module, "_resolve_preload_mode", return_value="clip_only"),
+                patch.object(mixin, "_profile_ms", return_value=6000.0),
+                patch.object(mixin, "_load_model_state_explicit_cpu",
+                             return_value=({"ok": True}, {"meta": 1}, {})),
+            ):
+                result = mixin._preload_models_to_cpu(
+                    [{"path": str(path), "role": "clip"}],
+                    read_strategy="normal",
+                )
+
+        self.assertEqual(result["status"], "ok")

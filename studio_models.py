@@ -93,6 +93,16 @@ def _validate_feature_ids_strict(features: Any) -> list[str]:
     return features
 
 
+def _extract_executable_prompt(api_prompt_json: Any) -> dict[str, Any]:
+    if not isinstance(api_prompt_json, dict):
+        return {}
+    output = api_prompt_json.get("output")
+    workflow = api_prompt_json.get("workflow")
+    if isinstance(output, dict) and isinstance(workflow, dict):
+        return output
+    return api_prompt_json
+
+
 # ── Feature-status derivation ────────────────────────────────────────────
 
 
@@ -132,6 +142,23 @@ def _derive_feature_status(
         return {"status": "needs_bindings", "reason": "missing required node bindings"}
     if not has_api_prompt:
         return {"status": "needs_api_prompt", "reason": "missing API prompt configuration"}
+
+    # Validate that every binding nodeId exists as a key in the executable prompt
+    executable_prompt = _extract_executable_prompt(api_prompt_json)
+    if executable_prompt:
+        for key in required_keys:
+            binding = bindings.get(key, {})
+            if isinstance(binding, dict):
+                node_id = str(binding.get("nodeId", ""))
+                if node_id and node_id not in executable_prompt:
+                    return {
+                        "status": "needs_bindings",
+                        "reason": (
+                            f"binding '{key}' maps to node {node_id} "
+                            f"which does not exist in the workflow"
+                        ),
+                    }
+
     return {"status": "runnable", "reason": ""}
 
 
@@ -186,7 +213,7 @@ def normalize_snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     node_bindings = result.get("nodeBindings", {}) or {}
     output_node_id = result.get("outputNodeId") or ""
-    api_prompt_json = result.get("apiPromptJson") or {}
+    api_prompt_json = _extract_executable_prompt(result.get("apiPromptJson") or {})
 
     feature_statuses: dict[str, dict[str, str]] = {}
     for fid in features:

@@ -61,6 +61,63 @@ _IMAGE_INPUT_FEATURES_UNIMPLEMENTED: set[str] = {"object_remove", "object_replac
 _STABLE_INTERNAL_ERROR = "Internal error processing request"
 
 
+def _get_executable_workflow(api_prompt_json: Any) -> dict[str, Any]:
+    """Return the runnable prompt map from stored apiPromptJson payloads."""
+    if not isinstance(api_prompt_json, dict):
+        return {}
+    output = api_prompt_json.get("output")
+    workflow = api_prompt_json.get("workflow")
+    if isinstance(output, dict) and isinstance(workflow, dict):
+        return output
+    return api_prompt_json
+
+
+def _repair_missing_clip_inputs(workflow: dict[str, Any]) -> None:
+    """Inject a CLIP loader link for CLIPTextEncode when one unique loader exists."""
+    if not isinstance(workflow, dict):
+        return
+    clip_loader_ids = [
+        str(node_id)
+        for node_id, node in workflow.items()
+        if isinstance(node, dict)
+        and node.get("class_type") in ("CLIPLoader", "DualCLIPLoader")
+    ]
+    if len(clip_loader_ids) != 1:
+        return
+    clip_ref = [clip_loader_ids[0], 0]
+    for node in workflow.values():
+        if not isinstance(node, dict) or node.get("class_type") != "CLIPTextEncode":
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        if "clip" not in inputs:
+            inputs["clip"] = list(clip_ref)
+
+
+def _repair_missing_vae_inputs(workflow: dict[str, Any]) -> None:
+    """Inject a VAE loader link for VAEDecode when one unique loader exists."""
+    if not isinstance(workflow, dict):
+        return
+    vae_loader_ids = [
+        str(node_id)
+        for node_id, node in workflow.items()
+        if isinstance(node, dict)
+        and node.get("class_type") == "VAELoader"
+    ]
+    if len(vae_loader_ids) != 1:
+        return
+    vae_ref = [vae_loader_ids[0], 0]
+    for node in workflow.values():
+        if not isinstance(node, dict) or node.get("class_type") != "VAEDecode":
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        if "vae" not in inputs:
+            inputs["vae"] = list(vae_ref)
+
+
 # ── Public helpers ─────────────────────────────────────────────────────────
 
 
@@ -224,6 +281,42 @@ def validate_studio_run(
     return {}
 
 
+# ── Defaults extraction ────────────────────────────────────────────────
+
+
+def extract_defaults_from_snapshot(snapshot: dict) -> dict:
+    """Extract flat {controlId: value} from snapshot nodeBindings + apiPromptJson.
+
+    Walks nodeBindings to find the workflow path for each bound control,
+    reads the widget/input value from the apiPromptJson workflow, and returns
+    a flat dict of {control_id: value}. Handles kind="widget" (uses widgetName)
+    and kind="input" (uses inputName). Skips kind="node"/"output" bindings.
+    Missing keys are handled gracefully via .get() chains.
+    """
+    workflow = _get_executable_workflow(snapshot.get("apiPromptJson"))
+    bindings = snapshot.get("nodeBindings", {}) or {}
+    defaults = {}
+    for ctrl_id, binding in bindings.items():
+        if not isinstance(binding, dict):
+            continue
+        kind = binding.get("kind", "")
+        if kind == "widget":
+            name_key = "widgetName"
+        elif kind == "input":
+            name_key = "inputName"
+        else:
+            continue  # skip "node" and "output" kinds
+        node_id = binding.get("nodeId", "")
+        widget_name = binding.get(name_key, "")
+        if not node_id or not widget_name:
+            continue
+        node = workflow.get(node_id, {})
+        inputs = node.get("inputs", {})
+        if widget_name in inputs:
+            defaults[ctrl_id] = inputs[widget_name]
+    return defaults
+
+
 # ── Binding mapping ────────────────────────────────────────────────────────
 
 
@@ -252,10 +345,15 @@ def _map_binding_to_slot(
             "path": ["inputs", widget_name],
         }
     elif kind == "node":
+        field = (
+            binding_val.get("widgetName")
+            or binding_val.get("inputName")
+            or "value"
+        )
         return {
             "node_id": node_id,
-            "field": binding_key,
-            "path": ["inputs", binding_key],
+            "field": field,
+            "path": ["inputs", field],
         }
     elif kind == "output":
         return {
@@ -391,11 +489,26 @@ def build_single_run_spec(
     exp_id = _make_studio_experiment_id()
 
     # Deep copy so stored data is never mutated
-    workflow = copy.deepcopy(snapshot.get("apiPromptJson", {})) or {}
+    workflow = copy.deepcopy(_get_executable_workflow(snapshot.get("apiPromptJson"))) or {}
+    _repair_missing_clip_inputs(workflow)
+    _repair_missing_vae_inputs(workflow)
     node_bindings = copy.deepcopy(snapshot.get("nodeBindings", {})) or {}
 
     # Map bindings to slots
     slots = map_studio_bindings_to_slots(node_bindings)
+
+    # Validate all mapped slot node IDs exist in the workflow
+    missing = []
+    for sk, sv in slots.items():
+        nid = sv.get("node_id", "")
+        if nid and nid not in workflow:
+            missing.append(f"'{sk}' maps to node {nid}")
+    if missing:
+        return {"error": (
+            f"Snapshot has node bindings that reference nodes not found in "
+            f"the workflow: {', '.join(missing)}. "
+            f"Re-bind these slots in the preset wizard."
+        )}
 
     # Apply control overrides to the deep-copied workflow
     _apply_controls_to_workflow(workflow, slots, controls)
@@ -563,7 +676,11 @@ def build_experiment_spec(
     slots_map: dict[str, dict] = {}
     for idx, (preset, snapshot) in enumerate(preset_snapshot_pairs):
         profile_id = f"studio_{preset.get('id', '')}_{idx}"
-        workflow_map[profile_id] = copy.deepcopy(snapshot.get("apiPromptJson", {})) or {}
+        workflow_map[profile_id] = copy.deepcopy(
+            _get_executable_workflow(snapshot.get("apiPromptJson"))
+        ) or {}
+        _repair_missing_clip_inputs(workflow_map[profile_id])
+        _repair_missing_vae_inputs(workflow_map[profile_id])
         slots_map[profile_id] = map_studio_bindings_to_slots(
             copy.deepcopy(snapshot.get("nodeBindings", {})) or {}
         )
@@ -582,6 +699,21 @@ def build_experiment_spec(
         ck["lora_slots"] = []
         ck["studio_meta"] = studio_meta
 
+        # Validate all mapped slot node IDs exist in this checkpoint's workflow
+        wf = ck["workflow"]
+        ck_slots = ck["slots"]
+        missing = []
+        for sk, sv in ck_slots.items():
+            nid = sv.get("node_id", "")
+            if nid and nid not in wf:
+                missing.append(f"'{sk}' maps to node {nid}")
+        if missing:
+            return {"error": (
+                f"Preset snapshot has node bindings that reference nodes not "
+                f"found in the workflow: {', '.join(missing)}. "
+                f"Re-bind these slots in the preset wizard."
+            )}
+
     for cell in compilation.get("cells", []):
         cell["studio_meta"] = studio_meta
 
@@ -596,19 +728,37 @@ async def _schedule_and_start(
     exp_id: str,
     compilation: dict[str, Any],
     REGISTRY: Any,
+    node_dir: str | os.PathLike = "",
 ) -> dict[str, Any]:
     """Create scheduler and start execution. Returns the run result."""
     from experiment_runner import LocalRemoteInvoker
     from modal_client import run_prompt_stream
 
-    invoker = LocalRemoteInvoker(run_prompt_stream)
+    invoker = LocalRemoteInvoker(
+        run_prompt_stream,
+        experiment_id=exp_id,
+        node_dir=str(node_dir) if node_dir else "",
+    )
     sched = await REGISTRY.get_or_create_scheduler(
         exp_id,
         compilation=compilation,
         invoker=invoker,
         max_containers=1,
     )
-    return await sched.start()
+    result = await sched.start()
+    # Record run history after successful completion
+    if result and result.get("completed", 0) > 0:
+        try:
+            from experiment_service import REGISTRY as _REGISTRY
+            _REGISTRY.history().record_run(
+                kind="studio_run",
+                prompt_id=exp_id,
+                status="completed",
+                meta=compilation.get("studio_meta", {}),
+            )
+        except Exception:
+            _log.warning("Failed to record run history for experiment %s", exp_id)
+    return result
 
 
 def _fire_and_forget(coro, exp_id: str) -> None:
@@ -656,6 +806,23 @@ def _create_experiment(
 # ── Route helpers ──────────────────────────────────────────────────────────
 
 
+def _persist_experiment_error(exp_id: str, error_message: str) -> None:
+    """Persist an error event to the experiment store so polling can see it."""
+    try:
+        from experiment_service import REGISTRY
+        store = REGISTRY.store(exp_id)
+        store.append_event({
+            "type": "experiment.error",
+            "payload": {
+                "experiment_id": exp_id,
+                "error": error_message,
+                "stage": "scheduler",
+            },
+        })
+    except Exception:
+        _log.warning("Failed to persist error event for experiment %s", exp_id)
+
+
 def handle_studio_run(
     preset_id: str,
     feature_id: str,
@@ -673,21 +840,28 @@ def handle_studio_run(
     strings are exposed in the message.
     """
     node_dir = Path(node_dir)
+    _log.info("Studio run received: preset_id=%s feature_id=%s", preset_id, feature_id)
 
     # 1. Load
     loaded = load_preset_and_snapshot(preset_id, node_dir)
     if loaded is None:
+        _log.warning("Studio run load failed: %s", get_load_error())
         return {"status": "error", "message": get_load_error()}
     preset, snapshot = loaded
+    _log.info("Studio run preset/snapshot loaded: preset=%s snapshot=%s",
+              preset.get("id", ""), snapshot.get("id", ""))
 
     # 2. Validate
     validation = validate_studio_run(preset, snapshot, feature_id)
     if validation.get("error"):
+        _log.warning("Studio run validation failed: %s", validation["error"])
         return {"status": "error", "message": validation["error"]}
+    _log.info("Studio run validation passed")
 
     # 3. Build single-run compilation (includes validation)
     compilation = build_single_run_spec(preset, snapshot, feature_id, controls, node_dir)
     if isinstance(compilation, dict) and compilation.get("error"):
+        _log.warning("Studio run compilation failed: %s", compilation["error"])
         return {"status": "error", "message": compilation["error"]}
 
     # 4. Create experiment via REGISTRY and start scheduler
@@ -707,21 +881,38 @@ def handle_studio_run(
             "studio_meta": compilation.get("studio_meta", {}),
         }
         _create_experiment(exp_id, compilation, definition, REGISTRY)
+        _log.info("Studio experiment created: %s", exp_id)
 
         # Start scheduler in background — report truthful submission status
         import asyncio
+
+        async def _start_and_catch(exp_id, compilation, REGISTRY, nd):
+            """Start scheduler and persist error events on failure."""
+            try:
+                _log.info("Scheduler start called for experiment %s", exp_id)
+                result = await _schedule_and_start(exp_id, compilation, REGISTRY, node_dir=nd)
+                _log.info("Scheduler start completed for experiment %s: %s", exp_id, result)
+                return result
+            except Exception as exc:
+                error_msg = str(exc)[:200]
+                _log.error("Scheduler start failed for experiment %s: %s", exp_id, error_msg)
+                _persist_experiment_error(exp_id, error_msg)
+                raise
 
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 _fire_and_forget(
-                    _schedule_and_start(exp_id, compilation, REGISTRY),
+                    _start_and_catch(exp_id, compilation, REGISTRY, node_dir),
                     exp_id,
                 )
             else:
-                asyncio.run(_schedule_and_start(exp_id, compilation, REGISTRY))
+                asyncio.run(_start_and_catch(exp_id, compilation, REGISTRY, node_dir))
         except RuntimeError:
-            asyncio.run(_schedule_and_start(exp_id, compilation, REGISTRY))
+            asyncio.run(_start_and_catch(exp_id, compilation, REGISTRY, node_dir))
+        except Exception:
+            _log.exception("Unexpected error starting scheduler for %s", exp_id)
+            _persist_experiment_error(exp_id, _STABLE_INTERNAL_ERROR)
 
         return {
             "status": "ok",
@@ -749,8 +940,10 @@ def handle_studio_experiment(
     No raw exception strings are exposed.
     """
     node_dir = Path(node_dir)
+    _log.info("Studio experiment received: presets=%s feature=%s", preset_ids, feature_id)
 
     if not preset_ids:
+        _log.warning("Studio experiment rejected: no preset IDs")
         return {"status": "error", "message": "At least one presetId is required"}
 
     # 1. Load all presets + snapshots
@@ -758,13 +951,17 @@ def handle_studio_experiment(
     for pid in preset_ids:
         loaded = load_preset_and_snapshot(pid, node_dir)
         if loaded is None:
+            _log.warning("Studio experiment load failed for preset %s: %s", pid, get_load_error())
             return {"status": "error", "message": get_load_error()}
         pairs.append(loaded)
+    _log.info("Studio experiment loaded %d preset/snapshot pairs", len(pairs))
 
     # 2. Build unified experiment spec (includes validation of all pairs)
     compilation = build_experiment_spec(pairs, feature_id, experiment_def, node_dir)
     if isinstance(compilation, dict) and compilation.get("error"):
+        _log.warning("Studio experiment spec build failed: %s", compilation["error"])
         return {"status": "error", "message": compilation["error"]}
+    _log.info("Studio experiment spec built successfully")
 
     # 3. Create unified experiment via REGISTRY
     try:
@@ -783,21 +980,38 @@ def handle_studio_experiment(
             "studio_meta": compilation.get("studio_meta", {}),
         }
         _create_experiment(exp_id, compilation, definition, REGISTRY)
+        _log.info("Studio experiment created: %s", exp_id)
 
         # Start scheduler
         import asyncio
+
+        async def _start_and_catch(exp_id, compilation, REGISTRY, nd):
+            """Start scheduler and persist error events on failure."""
+            try:
+                _log.info("Scheduler start called for experiment %s", exp_id)
+                result = await _schedule_and_start(exp_id, compilation, REGISTRY, node_dir=nd)
+                _log.info("Scheduler start completed for experiment %s: %s", exp_id, result)
+                return result
+            except Exception as exc:
+                error_msg = str(exc)[:200]
+                _log.error("Scheduler start failed for experiment %s: %s", exp_id, error_msg)
+                _persist_experiment_error(exp_id, error_msg)
+                raise
 
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 _fire_and_forget(
-                    _schedule_and_start(exp_id, compilation, REGISTRY),
+                    _start_and_catch(exp_id, compilation, REGISTRY, node_dir),
                     exp_id,
                 )
             else:
-                asyncio.run(_schedule_and_start(exp_id, compilation, REGISTRY))
+                asyncio.run(_start_and_catch(exp_id, compilation, REGISTRY, node_dir))
         except RuntimeError:
-            asyncio.run(_schedule_and_start(exp_id, compilation, REGISTRY))
+            asyncio.run(_start_and_catch(exp_id, compilation, REGISTRY, node_dir))
+        except Exception:
+            _log.exception("Unexpected error starting scheduler for %s", exp_id)
+            _persist_experiment_error(exp_id, _STABLE_INTERNAL_ERROR)
 
         cell_count = len(compilation.get("cells", []))
 

@@ -36,6 +36,11 @@ playwright/.cache/
 .studio_presets.json
 .studio_snapshots.json
 .studio_backends.json
+.deploy_warmup_state.json
+.run_history/
+# Temp JSON runtime files
+*_runtime.json
+.studio_*.tmp
 
 # Temporary files from atomic writes
 *.tmp

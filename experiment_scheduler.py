@@ -329,6 +329,11 @@ class ExperimentScheduler:
             total_cells=len(self._compilation.get("cells", [])) if self._compilation else 0
         )
         counters = snap.get("counters", {})
+        checkpoint_states = snap.get("checkpoints", {}) or {}
+        has_fatal_checkpoint = any(
+            (checkpoint_states.get(ck_id, {}) or {}).get("status") == STATUS_FAILED_FATAL
+            for ck_id in checkpoint_states
+        )
         completed = counters.get("completed", 0)
         failed = counters.get("failed", 0)
         total = snap.get("total_cells", 0)
@@ -338,6 +343,8 @@ class ExperimentScheduler:
             self._set_status(STATUS_PAUSED)
         elif self._stop_after_current_flag or self._status == STATUS_STOP_NOW_REQUESTED:
             self._set_status(STATUS_STOPPED)
+        elif snap.get("status") == STATUS_FAILED_FATAL or has_fatal_checkpoint:
+            self._set_status(STATUS_FAILED_FATAL)
         elif failed > 0:
             # Some cells currently visible as failed → completed_with_failures
             self._set_status(STATUS_COMPLETED_WITH_FAILURES)

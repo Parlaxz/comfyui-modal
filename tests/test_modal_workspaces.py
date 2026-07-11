@@ -75,6 +75,46 @@ class ModalWorkspaceRegistryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 module.upsert_workspace(path, "Bad", "token-id", "secret", set_active=False)
 
+    def test_update_workspace_preserves_existing_tokens_when_left_blank(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".modal_workspaces.json"
+            initial = module.upsert_workspace(path, "Studio A", "ak-original", "as-original", set_active=True)
+            workspace_id = initial["workspaces"][0]["id"]
+
+            updated = module.upsert_workspace(
+                path,
+                label="Studio A Renamed",
+                token_id="",
+                token_secret="",
+                workspace_id=workspace_id,
+                set_active=False,
+            )
+
+        self.assertEqual(updated["workspaces"][0]["label"], "Studio A Renamed")
+        self.assertEqual(updated["workspaces"][0]["token_id"], "ak-original")
+        self.assertEqual(updated["workspaces"][0]["token_secret"], "as-original")
+
+    def test_update_workspace_by_id_does_not_create_duplicate_entry(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".modal_workspaces.json"
+            initial = module.upsert_workspace(path, "Studio A", "ak-original", "as-original", set_active=True)
+            workspace_id = initial["workspaces"][0]["id"]
+
+            updated = module.upsert_workspace(
+                path,
+                label="Studio A Renamed",
+                token_id="ak-updated",
+                token_secret="as-updated",
+                workspace_id=workspace_id,
+                set_active=False,
+            )
+
+        self.assertEqual(len(updated["workspaces"]), 1)
+        self.assertEqual(updated["workspaces"][0]["id"], workspace_id)
+        self.assertEqual(updated["workspaces"][0]["label"], "Studio A Renamed")
+
     # ── Legacy ~/.modal.toml migration ────────────────────────────────
 
     def test_migrate_from_legacy_toml_creates_workspace(self):

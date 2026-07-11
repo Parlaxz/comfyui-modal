@@ -253,6 +253,41 @@ class BackendSelectorApiBaseTests(unittest.TestCase):
         self.assertNotIn('const apiBase = "/comfymodal"', self.text)
 
 
+class PlaygroundOutputAndHistoryWiringTests(unittest.TestCase):
+    """Successful Studio runs must wire output assets and history visibility."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_completed_state_checks_primary_asset_id(self):
+        """Polling completion path must read primary_asset_id evidence."""
+        self.assertIn("primary_asset_id", self.text)
+
+    def test_completed_state_uses_assets_route(self):
+        """Playground canvas should use the stable /assets route for completed runs."""
+        self.assertIn('"/assets/"', self.text)
+
+    def test_filmstrip_recognizes_nested_studio_meta(self):
+        """Recent runs filter must accept run-history entries with extra.studio_meta."""
+        self.assertIn("extra.studio_meta", self.text)
+
+    def test_filmstrip_fetches_broader_history_window(self):
+        """Filmstrip should not miss studio runs due to a tiny history limit."""
+        self.assertIn('"/run-history?limit=50"', self.text)
+
+
+class HistoryFlatStudioMetaTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-history.js").read_text(encoding="utf-8")
+
+    def test_history_reads_flat_studio_feature_fields(self):
+        self.assertIn("extra.studio_feature_id", self.text)
+        self.assertIn("extra.studio_preset_id", self.text)
+
+    def test_history_accepts_output_path_as_output_evidence(self):
+        self.assertIn("run.output_path", self.text)
+
+
 # ---------------------------------------------------------------------------
 # Snapshot data model shape
 # ---------------------------------------------------------------------------
@@ -789,6 +824,177 @@ class StudioBackendMakePresetTests(unittest.TestCase):
         self.assertNotIn("renderFeaturesStep", text)
         self.assertNotIn("renderBindingsStep", text)
         self.assertNotIn('"features"', text)  # The state step values belong in the wizard
+
+
+# ---------------------------------------------------------------------------
+# Studio Run Normalizer — shared image URL resolution helper
+# ---------------------------------------------------------------------------
+
+class StudioRunNormalizerTests(unittest.TestCase):
+    """studio-run-normalizer.js must exist and export helpers."""
+
+    def test_run_normalizer_module_exists(self):
+        """web/studio-run-normalizer.js must exist."""
+        self.assertTrue(
+            (WEB / "studio-run-normalizer.js").exists(),
+            "studio-run-normalizer.js missing — expected a shared run normalizer helper",
+        )
+
+    def test_run_normalizer_exports_resolveRunImageUrl(self):
+        """studio-run-normalizer.js must export resolveRunImageUrl."""
+        self.assertTrue(
+            _JsModule(WEB / "studio-run-normalizer.js").has_export("resolveRunImageUrl"),
+            "Expected export function resolveRunImageUrl",
+        )
+
+    def test_run_normalizer_exports_hasRunImage(self):
+        """studio-run-normalizer.js must export hasRunImage."""
+        self.assertTrue(
+            _JsModule(WEB / "studio-run-normalizer.js").has_export("hasRunImage"),
+            "Expected export function hasRunImage",
+        )
+
+    def test_run_normalizer_resolves_primary_asset_id(self):
+        """resolveRunImageUrl must prefer extra.primary_asset_id when present."""
+        text = (WEB / "studio-run-normalizer.js").read_text(encoding="utf-8")
+        self.assertIn("primary_asset_id", text)
+
+    def test_run_normalizer_falls_back_to_run_asset_id(self):
+        """resolveRunImageUrl must fall back to run.asset_id when primary_asset_id absent."""
+        text = (WEB / "studio-run-normalizer.js").read_text(encoding="utf-8")
+        self.assertIn("asset_id", text)
+
+    def test_run_normalizer_falls_back_to_output_path(self):
+        """resolveRunImageUrl must fall back to output_path when asset_id absent."""
+        text = (WEB / "studio-run-normalizer.js").read_text(encoding="utf-8")
+        self.assertIn("output_path", text)
+
+    def test_run_normalizer_returns_null_for_no_image(self):
+        """resolveRunImageUrl must return null when no image source exists."""
+        text = (WEB / "studio-run-normalizer.js").read_text(encoding="utf-8")
+        # Should have a null return or null fallback path
+        self.assertIn("null", text)
+
+    def test_run_normalizer_handles_assets_route(self):
+        """resolveRunImageUrl must use /assets/ route for asset-based URLs."""
+        text = (WEB / "studio-run-normalizer.js").read_text(encoding="utf-8")
+        self.assertIn("/assets/", text)
+
+    def test_run_normalizer_handles_outputs_route(self):
+        """resolveRunImageUrl must use /studio/outputs/ route for output_path URLs."""
+        text = (WEB / "studio-run-normalizer.js").read_text(encoding="utf-8")
+        self.assertIn("/studio/outputs/", text)
+
+
+# ---------------------------------------------------------------------------
+# History gallery — image grid with clickable cards and preview overlay
+# ---------------------------------------------------------------------------
+
+class HistoryGalleryTests(unittest.TestCase):
+    """History must show an image grid/gallery with clickable cards and preview overlay."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-history.js").read_text(encoding="utf-8")
+
+    def test_history_uses_gallery_grid_class(self):
+        """history must use a gallery grid container class."""
+        self.assertIn("comfymodal-studio-history-gallery", self.text)
+
+    def test_history_has_preview_overlay(self):
+        """history must have a preview overlay class."""
+        self.assertIn("comfymodal-studio-history-preview", self.text)
+
+    def test_history_overlay_has_close_button(self):
+        """history preview must have a close button."""
+        self.assertIn("close", self.text.lower())
+
+    def test_history_creates_img_in_cards(self):
+        """history cards must create img elements for image runs."""
+        self.assertTrue(
+            '"img"' in self.text or 'el("img"' in self.text,
+            "Expected img creation in history gallery cards",
+        )
+
+    def test_history_card_click_opens_preview(self):
+        """history gallery cards must have click handlers that set preview state."""
+        self.assertTrue(
+            "onclick" in self.text or "click" in self.text.lower(),
+            "Expected onclick or click handler in history gallery",
+        )
+
+    def test_history_shows_non_image_fallback(self):
+        """history must show fallback tile for non-image runs (not broken img)."""
+        self.assertTrue(
+            "fallback" in self.text.lower() or "no image" in self.text.lower(),
+            "Expected fallback tile for non-image runs",
+        )
+
+    def test_history_preserves_experiment_grouping(self):
+        """history gallery must preserve experiment_id grouping."""
+        self.assertIn("experiment_id", self.text)
+
+
+# ---------------------------------------------------------------------------
+# Playground carousel — image thumbnails that update the canvas
+# ---------------------------------------------------------------------------
+
+class PlaygroundCarouselTests(unittest.TestCase):
+    """Playground filmstrip must be an image carousel of thumbnails."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_filmstrip_uses_carousel_class(self):
+        """filmstrip must use a carousel class instead of plain list."""
+        self.assertIn("comfymodal-studio-carousel", self.text)
+
+    def test_carousel_renders_img_thumbnails(self):
+        """carousel must render img elements for image-producing runs."""
+        self.assertTrue(
+            '"img"' in self.text or 'el("img"' in self.text,
+            "Expected img creation in carousel thumbnails",
+        )
+
+    def test_carousel_filters_image_producing_runs(self):
+        """carousel must filter to only image-producing runs."""
+        self.assertTrue(
+            "hasRunImage" in self.text or "resolveRunImageUrl" in self.text,
+            "Expected hasRunImage or resolveRunImageUrl usage in carousel",
+        )
+
+    def test_carousel_click_updates_canvas(self):
+        """clicking a carousel thumbnail must update the main canvas output."""
+        self.assertTrue(
+            "lastRunOutput" in self.text or "setRunState" in self.text,
+            "Expected lastRunOutput or setRunState reference in carousel click handler",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gallery / carousel / lightbox styles
+# ---------------------------------------------------------------------------
+
+class GalleryCarouselStylesTests(unittest.TestCase):
+    """studio-styles.js must define gallery, carousel, and preview overlay styles."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-styles.js").read_text(encoding="utf-8")
+
+    def test_styles_have_history_gallery_class(self):
+        """styles must define .comfymodal-studio-history-gallery."""
+        self.assertIn("comfymodal-studio-history-gallery", self.text)
+
+    def test_styles_have_history_preview_class(self):
+        """styles must define .comfymodal-studio-history-preview."""
+        self.assertIn("comfymodal-studio-history-preview", self.text)
+
+    def test_styles_have_carousel_class(self):
+        """styles must define .comfymodal-studio-carousel."""
+        self.assertIn("comfymodal-studio-carousel", self.text)
+
+    def test_styles_have_preview_overlay_positioning(self):
+        """preview overlay must use fixed/flex positioning."""
+        self.assertIn("position", self.text)
 
 
 if __name__ == "__main__":
