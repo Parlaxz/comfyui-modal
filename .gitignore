@@ -80,3 +80,6 @@ setup-console-warnings*.txt
 
 # Playwright debug snapshots
 playwright-*.md
+
+# Local orchestrator deepwork state
+.slim/deepwork/

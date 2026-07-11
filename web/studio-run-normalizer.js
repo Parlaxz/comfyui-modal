@@ -57,12 +57,21 @@ export function nilOrEmptyTo(value, fallback) {
 
 /**
  * Normalize raw timings into readable stages.
+ *
+ * Reads both the legacy deltas_ms/trace format AND the Phase 2 canonical
+ * flattened timing schema (scheduler_execution_ms, sampling_ms, etc.).
+ * Prefers the canonical schema when available.
+ *
  * @param {object} timings - Raw timings/trace object.
  * @returns {Array<{label:string, durationMs:number, source:string}>}
  */
 export function normalizeTimingStages(timings) {
   if (!timings || typeof timings !== "object") return [];
   const stages = [];
+
+  // Prefer canonical flat timing fields (Phase 2 schema, from timing.json)
+  // over the legacy deltas_ms / trace-compat format.
+  const hasCanonical = timings.scheduler_execution_ms != null;
   const d = timings.deltas_ms || timings;
 
   // Helper to add a stage if its value exists
@@ -73,6 +82,26 @@ export function normalizeTimingStages(timings) {
     }
   }
 
+  // Phase 2 canonical fields (always flat at top level of timing.json)
+  if (hasCanonical) {
+    addStage("Queue", "queue_ms");
+    addStage("Worker Startup", "worker_startup_ms");
+    addStage("Workflow Load", "workflow_load_ms");
+    addStage("Workflow Validation", "workflow_validation_ms");
+    addStage("Model Load", "model_load_ms");
+    addStage("CLIP Load", "clip_load_ms");
+    addStage("Prompt Encoding", "clip_encode_ms");
+    addStage("Sampling", "sampling_ms");
+    addStage("VAE Decode", "vae_decode_ms");
+    addStage("Image Save/Transfer", "image_io_ms");
+    addStage("Output Transfer", "output_transfer_ms");
+    addStage("History Finalization", "history_finalization_ms");
+    addStage("Remote Inference Total", "remote_inference_total_ms");
+    addStage("Scheduler Execution", "scheduler_execution_ms");
+    addStage("End-to-End Total", "end_to_end_total_ms");
+  }
+
+  // Legacy trace fields (present when timings come from profiler_trace_v4)
   addStage("Queue", "t0_to_t1");
   addStage("Worker Startup", "t1_to_t2");
   addStage("Workload Load/Validate", "t3_to_t3b");
@@ -93,6 +122,12 @@ export function normalizeTimingStages(timings) {
   // Graph overhead
   if (d.graph_overhead != null) {
     stages.push({ label: "Graph Overhead", durationMs: d.graph_overhead, source: "graph_overhead" });
+  }
+
+  // Restore total (Modal cold-start restore, from remote_timings)
+  const restoreMs = d.restore_total_ms != null ? d.restore_total_ms : (timings.remote_timings && timings.remote_timings.restore_total_ms);
+  if (restoreMs != null && typeof restoreMs === "number") {
+    stages.push({ label: "Cold Start (restore)", durationMs: restoreMs, source: "restore_total_ms" });
   }
 
   return stages;
@@ -166,12 +201,14 @@ export function _formatDuration(ms) {
 export function normalizeAnnotations(run) {
   if (!run) return { favorite: false, note: "", noteUpdatedAt: "" };
   var extra = (run && run.extra) || {};
-  var annotations = extra.annotations || extra.metadata?.annotations || {};
+  // Prefer top-level run.annotations (backend stores annotations at this level),
+  // then fall back to legacy extra.annotations / extra.metadata.annotations.
+  var annotations = run.annotations || extra.annotations || extra.metadata?.annotations || {};
 
   return {
     favorite: nilTo(annotations.favorite, false),
     note: nilTo(annotations.note, ""),
-    noteUpdatedAt: nilTo(annotations.note_updated_at || annotations.noteUpdatedAt, ""),
+    noteUpdatedAt: nilTo(annotations.updated_at || annotations.note_updated_at || annotations.noteUpdatedAt, ""),
   };
 }
 
@@ -259,8 +296,12 @@ export function normalizeStudioRun(rawRun, apiBase) {
   const startedAt = run.started_at || run.created_at || run.timestamp || run.created || "";
   const completedAt = run.completed_at || "";
 
-  // Timings detail
-  const timings = run.timings || extra.timings || {};
+  // Timings detail: prefer timing_summary (merged from timing.json by backend),
+  // fall back to legacy run.timings / extra.timings.
+  const timingSummaryFromBackend = run.timing_summary || {};
+  const timings = timingSummaryFromBackend.scheduler_execution_ms != null
+    ? timingSummaryFromBackend
+    : (run.timings || extra.timings || {});
 
   // Duration: prefer explicit duration_ms, then timings.total_ms (canonical backend field),
   // then legacy run.duration (seconds → ms), else 0.
@@ -288,7 +329,12 @@ export function normalizeStudioRun(rawRun, apiBase) {
   // ── Timing normalization ────────────────────────────────────────────
   const timingStages = normalizeTimingStages(timings);
   const perNodeTimings = normalizePerNodeTimings(timings);
+
+  // Build timing_sources from both top-level timing_sources annotation
+  // and the canonical fields we know how to read.
+  const backendTimingSources = timings.timing_sources || rawRun.timing_summary?.timing_sources || {};
   const timingSources = {
+    ...backendTimingSources,
     duration_ms: "raw",
     timings: "raw",
     stages: "derived",

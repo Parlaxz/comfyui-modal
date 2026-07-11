@@ -168,9 +168,11 @@ export async function listRunHistory(apiBase, params) {
     if (params.limit != null) query.set("limit", String(params.limit));
     if (params.offset != null) query.set("offset", String(params.offset));
     if (params.search) query.set("search", params.search);
-    if (params.type) query.set("type", params.type);
+    if (params.kind) query.set("kind", params.kind);
+    else if (params.type) query.set("kind", params.type);
     if (params.status) query.set("status", params.status);
-    if (params.favorite) query.set("favorite", "true");
+    if (params.favorite_only) query.set("favorite_only", "true");
+    else if (params.favorite) query.set("favorite_only", "true");
     if (params.preset) query.set("preset", params.preset);
     if (params.feature) query.set("feature", params.feature);
     if (params.date_from) query.set("date_from", params.date_from);
@@ -197,7 +199,7 @@ export async function listRunHistory(apiBase, params) {
  */
 export async function updateRunAnnotation(apiBase, runId, payload) {
   if (!runId) return null;
-  return apiFetch(apiBase, `/run-history/${encodeURIComponent(runId)}/annotation`, {
+  return apiFetch(apiBase, `/run-history/${encodeURIComponent(runId)}/annotations`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),

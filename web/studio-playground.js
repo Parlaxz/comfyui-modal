@@ -25,7 +25,7 @@ import {
 } from "./studio-preset-capabilities.js";
 import { resolveRunImageUrl, hasRunImage, normalizeStudioRun } from "./studio-run-normalizer.js";
 import { saveSelection, loadSelection, clearSelection } from "./studio-playground-state.js";
-import { getSharedTracker } from "./comfymodal-progress.js";
+import { getSharedTracker, createScopedTracker } from "./comfymodal-progress.js";
 import { updateRunAnnotation } from "./studio-backend-api.js";
 
 // ── Element helper ───────────────────────────────────────────────────────
@@ -374,62 +374,18 @@ export async function hydratePlayground(state, context) {
 export function renderPlayground(state, context) {
   const container = el("div", { class: "comfymodal-studio-playground" });
 
-  // ── Wire up shared tracker to drive progress state ──────────────────
-  // The tracker is created by modal-node.js and exposed via singleton.
-  // This is the PRIMARY progress source for Studio runs when running
-  // through ComfyUI's normal execution pipeline. Polling remains as
-  // fallback for experiment runs routed through Modal's async scheduler.
-  if (!state.playground._trackerWired) {
-    state.playground._trackerWired = true;
-    const tracker = getSharedTracker();
-    if (tracker) {
-      // Subscribe to tracker state and merge into runState so the
-      // progress section renders event-driven progress.
-      tracker.onProgress(function (s) {
-        var rs = state.playground.runState || {};
-        // Only apply tracker updates when a Studio run is in flight
-        // (status starts with "running", "submitted", or is absent)
-        var isInFlight = !rs.status
-          || rs.status === "running"
-          || rs.status === "submitted"
-          || rs.status === "in_progress"
-          || rs.status === "queued"
-          || rs.status === "waiting";
-        if (!isInFlight) return;
-
-        // Map tracker stage to runState status
-        var mappedStatus = rs.status;
-        if (s.stage === "startup") mappedStatus = "in_progress";
-        else if (s.stage === "generating") mappedStatus = "in_progress";
-        else if (s.stage === "done") mappedStatus = "completed";
-        else if (s.stage === "error") mappedStatus = "error";
-        else if (s.stage === "idle" && rs.status !== "submitted") return;
-
-        if (mappedStatus !== rs.status || s.overallPercent != null || s.completedNodes > 0) {
-          rs.overallPercent = s.overallPercent;
-          rs.completedNodes = s.completedNodes;
-          rs.totalNodes = s.totalNodes;
-          rs.samplerStep = s.samplerStep;
-          rs.samplerMaximum = s.samplerMaximum;
-          rs.elapsedMs = s.elapsedMs;
-          rs.queuePosition = s.queuePosition;
-          rs.currentNodeLabel = s.currentNodeLabel;
-          rs.stage = s.stage;
-          rs.message = s.message;
-          rs.error = s.error;
-
-          if (mappedStatus !== rs.status) {
-            rs.status = mappedStatus;
-          }
-
-          // Trigger re-render on completed/error
-          if (mappedStatus === "completed" || mappedStatus === "error") {
-            if (context && context.setPage) context.setPage("playground");
-          }
-        }
-      });
-    }
-  }
+  // ── Scoped tracker lifecycle ────────────────────────────────────────
+  // Studio progress is driven by a scoped tracker (per-run), NOT the
+  // global shared tracker. This prevents unrelated ComfyUI executions
+  // from driving the Studio progress UI.
+  //
+  // Scoped trackers are created in doRunSubmit (single runs) and in the
+  // experiment run handlers, then disposed on terminal states.
+  // The _scopedTracker reference in state.playground is managed there.
+  //
+  // getSharedTracker() is still imported for potential secondary uses
+  // (e.g., capturing execState bridge values) but is NOT subscribed to
+  // for progress UI updates.
 
   const leftPanel = renderControlPanel(state, context);
   const rightWorkspace = renderWorkspace(state, context);
@@ -633,6 +589,8 @@ function buildActions(state, context) {
       state.playground._selectedRun = null;
       // Clear stale run state so Run button re-enables
       if (state.playground) state.playground.runState = null;
+      // Dispose scoped tracker — switching features invalidates current run
+      _disposeScopedTracker(state);
       // Persist selection
       saveSelection(state.playground.selectedBackendId, featureId);
       if (context && context.setPage) {
@@ -648,6 +606,8 @@ function buildActions(state, context) {
       state.playground._selectedRun = null;
       // Clear stale run state so Run button re-enables
       if (state.playground) state.playground.runState = null;
+      // Dispose scoped tracker — switching backends invalidates current run
+      _disposeScopedTracker(state);
       // Persist selection
       saveSelection(backendId, state.playground.featureId);
       if (context && context.setPage) {
@@ -719,6 +679,12 @@ function buildActions(state, context) {
       if (!state.playground) state.playground = {};
       const prevRunState = state.playground.runState;
       state.playground.runState = runState;
+
+      // Dispose scoped tracker on terminal states
+      if (runState && (runState.status === "completed" || runState.status === "error")) {
+        _disposeScopedTracker(state);
+      }
+
       if (runState && runState.status === "completed") {
         // Persist primary output URL so canvas shows result
         if (runState.primaryOutput) {
@@ -1109,6 +1075,70 @@ function renderControl(def, state, actions, preset) {
 // Deduplicated from the inline handler in renderRunButton so that
 // completed/error state can re-submit in a single click.
 
+function _disposeScopedTracker(state) {
+  var st = state.playground && state.playground._scopedTracker;
+  if (st && typeof st.dispose === "function") {
+    try { st.dispose(); } catch {}
+  }
+  if (state.playground) state.playground._scopedTracker = null;
+}
+
+function _createAndStartScopedTracker(state, context, runId, experimentId) {
+  // Dispose any existing scoped tracker first
+  _disposeScopedTracker(state);
+
+  var api = (context && context.comfyApi) || (context && context.api);
+  // If no api available, cannot create scoped tracker — polling will handle progress
+  if (!api || typeof api.addEventListener !== "function") return null;
+
+  var tracker = createScopedTracker(api, { runId: runId, experimentId: experimentId, promptId: null });
+  state.playground._scopedTracker = tracker;
+
+  // Subscribe tracker updates to runState
+  tracker.onProgress(function (s) {
+    var rs = state.playground.runState || {};
+    // Scoped tracker only produces updates for OUR run — no isInFlight guard needed
+    if (!rs.status) return;
+
+    // Map tracker stage to runState status
+    var mappedStatus = rs.status;
+    if (s.stage === "startup") mappedStatus = "in_progress";
+    else if (s.stage === "generating") mappedStatus = "in_progress";
+    else if (s.stage === "done") mappedStatus = "completed";
+    else if (s.stage === "error") mappedStatus = "error";
+    else if (s.stage === "idle" && rs.status !== "submitted") return;
+
+    if (mappedStatus !== rs.status || s.overallPercent != null || s.completedNodes > 0) {
+      rs.overallPercent = s.overallPercent;
+      rs.completedNodes = s.completedNodes;
+      rs.totalNodes = s.totalNodes;
+      rs.samplerStep = s.samplerStep;
+      rs.samplerMaximum = s.samplerMaximum;
+      rs.samplerPercent = s.samplerPercent;
+      rs.elapsedMs = s.elapsedMs;
+      rs.queuePosition = s.queuePosition;
+      rs.currentNodeLabel = s.currentNodeLabel;
+      rs.stage = s.stage;
+      rs.message = s.message;
+      rs.error = s.error;
+
+      if (mappedStatus !== rs.status) {
+        rs.status = mappedStatus;
+      }
+
+      // Trigger re-render on terminal states
+      if (mappedStatus === "completed" || mappedStatus === "error") {
+        // Dispose scoped tracker on terminal state
+        _disposeScopedTracker(state);
+        if (context && context.setPage) context.setPage("playground");
+      }
+    }
+  });
+
+  tracker.start();
+  return tracker;
+}
+
 async function doRunSubmit(state, context, actions) {
   const apiBase = (context && context.apiBase) || "/comfymodal";
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
@@ -1134,6 +1164,9 @@ async function doRunSubmit(state, context, actions) {
   });
 
   if (result && result.status === "ok") {
+    // Dispose any previous scoped tracker before creating new one
+    _disposeScopedTracker(state);
+
     if (actions && actions.setRunState) {
       actions.setRunState({
         status: "submitted",
@@ -1141,6 +1174,13 @@ async function doRunSubmit(state, context, actions) {
         experimentId: result.experimentId,
       });
     }
+
+    // Create scoped tracker for this run's execution events
+    _createAndStartScopedTracker(
+      state, context,
+      result.runId || result.experimentId,
+      result.experimentId
+    );
   } else {
     const errMsg = (result && result.message) || "Run failed.";
     if (actions && actions.setRunState) {
@@ -1315,6 +1355,8 @@ function renderRunButton(state, context, actions, isExperiment) {
         btn.onclick = async () => {
           btn.disabled = true;
           btn.textContent = "Running\u2026";
+          // Dispose any scoped tracker before experiment run (experiments use polling)
+          _disposeScopedTracker(state);
           if (actions && actions.setRunState) actions.setRunState({ status: "running" });
 
           const result = await executeExperimentRun(state, context);
@@ -1401,6 +1443,9 @@ function renderRunButton(state, context, actions, isExperiment) {
         });
 
         if (result && result.status === "ok") {
+          // Dispose any previous scoped tracker before creating new one
+          _disposeScopedTracker(state);
+
           if (actions && actions.setRunState) {
             actions.setRunState({
               status: "submitted",
@@ -1408,8 +1453,13 @@ function renderRunButton(state, context, actions, isExperiment) {
               experimentId: result.experimentId,
             });
           }
-          // Refresh recent runs after successful submission will happen
-          // in the polling completion handler via setRunState
+
+          // Create scoped tracker for this run's execution events
+          _createAndStartScopedTracker(
+            state, context,
+            result.runId || result.experimentId,
+            result.experimentId
+          );
         } else {
           const errMsg = (result && result.message) || "Run failed.";
           if (actions && actions.setRunState) {
@@ -1490,7 +1540,8 @@ function renderProgressSection(state, context) {
 
   stageEl.textContent = "Stage: " + stageLabel;
   nodesEl.textContent = "Nodes: " + (runState.completedNodes || 0) + "/" + (runState.totalNodes || 0);
-  stepEl.textContent = "Sampler: " + (runState.samplerStep != null ? runState.samplerStep : "?") + "/" + (runState.samplerMaximum || "?");
+  var samplerPct = runState.samplerPercent != null ? " (" + Math.round(runState.samplerPercent) + "%)" : "";
+  stepEl.textContent = "Sampler: " + (runState.samplerStep != null ? runState.samplerStep : "?") + "/" + (runState.samplerMaximum || "?") + samplerPct;
   elapsedEl.textContent = "Elapsed: " + _formatDuration(runState.elapsedMs);
 
   if (runState.queuePosition > 0) {
@@ -1632,7 +1683,9 @@ function renderNoteEditor(nr, actions, apiBase) {
       if (result && result.status === "ok") {
         savedNote = textarea.value;
         nr.note = textarea.value;
-        nr.noteUpdatedAt = new Date().toISOString();
+        // Use backend updated_at as primary source, fall back to client time
+        var backendUpdatedAt = result.annotations && result.annotations.updated_at;
+        nr.noteUpdatedAt = backendUpdatedAt || new Date().toISOString();
         isDirty = false;
         statusEl.textContent = "Saved " + nr.noteUpdatedAt.substring(0, 19);
         statusEl.style.color = "#4ade80";

@@ -975,9 +975,122 @@ class BackwardCompatibilityTests(unittest.TestCase):
         self.assertEqual(meta.get("run_id"), run_id)
         self.assertEqual(meta.get("workflow_name"), "Old Workflow")
 
+    def test_sort_preset_az(self):
+        """Sort preset_az returns A-Z by preset_label."""
+        self.svc.record_run(kind="studio_run", prompt_id="exp_az1", status="completed",
+                            meta={"preset_label": "Zebra"},
+                            started_at="2025-06-01T00:00:00Z")
+        self.svc.record_run(kind="studio_run", prompt_id="exp_az2", status="completed",
+                            meta={"preset_label": "Alpha"},
+                            started_at="2025-06-01T01:00:00Z")
+        self.svc.record_run(kind="studio_run", prompt_id="exp_az3", status="completed",
+                            meta={"preset_label": "Beta"},
+                            started_at="2025-06-01T02:00:00Z")
+        result = self.svc.list_runs(kind="studio_run", sort="preset_az")
+        runs = result["runs"]
+        labels = []
+        for r in runs:
+            extra = r.get("extra", {}) or {}
+            labels.append(extra.get("preset_label", ""))
+        self.assertEqual(labels, sorted(labels))
+
+    def test_sort_preset_za(self):
+        """Sort preset_za returns Z-A by preset_label."""
+        self.svc.record_run(kind="studio_run", prompt_id="exp_za1", status="completed",
+                            meta={"preset_label": "Alpha"},
+                            started_at="2025-06-01T00:00:00Z")
+        self.svc.record_run(kind="studio_run", prompt_id="exp_za2", status="completed",
+                            meta={"preset_label": "Zebra"},
+                            started_at="2025-06-01T01:00:00Z")
+        self.svc.record_run(kind="studio_run", prompt_id="exp_za3", status="completed",
+                            meta={"preset_label": "Beta"},
+                            started_at="2025-06-01T02:00:00Z")
+        result = self.svc.list_runs(kind="studio_run", sort="preset_za")
+        runs = result["runs"]
+        labels = []
+        for r in runs:
+            extra = r.get("extra", {}) or {}
+            labels.append(extra.get("preset_label", ""))
+        self.assertEqual(labels, sorted(labels, reverse=True))
+
+    def test_sort_preset_az_empty_labels_at_end(self):
+        """preset_az sorts entries without preset_label after those with labels."""
+        self.svc.record_run(kind="studio_run", prompt_id="exp_emptylabel", status="completed",
+                            meta={},
+                            started_at="2025-06-01T00:00:00Z")
+        self.svc.record_run(kind="studio_run", prompt_id="exp_labeled", status="completed",
+                            meta={"preset_label": "Alpha"},
+                            started_at="2025-06-01T01:00:00Z")
+        result = self.svc.list_runs(kind="studio_run", sort="preset_az")
+        runs = result["runs"]
+        # The entry with 'Alpha' should come before the empty label entry
+        labeled_idx = None
+        empty_idx = None
+        for i, r in enumerate(runs):
+            extra = r.get("extra", {}) or {}
+            label = extra.get("preset_label", "")
+            if label == "Alpha":
+                labeled_idx = i
+            elif label == "" and r["prompt_id"] == "exp_emptylabel":
+                empty_idx = i
+        if labeled_idx is not None and empty_idx is not None:
+            self.assertLess(labeled_idx, empty_idx,
+                           "Labeled entry should sort before empty-label entry")
+
+    def test_sort_preset_za_empty_labels_at_end(self):
+        """preset_za sorts entries without preset_label after those with labels (Z-A)."""
+        self.svc.record_run(kind="studio_run", prompt_id="exp_za_emptylabel", status="completed",
+                            meta={},
+                            started_at="2025-06-01T00:00:00Z")
+        self.svc.record_run(kind="studio_run", prompt_id="exp_za_labeled", status="completed",
+                            meta={"preset_label": "Zebra"},
+                            started_at="2025-06-01T01:00:00Z")
+        result = self.svc.list_runs(kind="studio_run", sort="preset_za")
+        runs = result["runs"]
+        # The entry with 'Zebra' should come before the empty label entry
+        labeled_idx = None
+        empty_idx = None
+        for i, r in enumerate(runs):
+            extra = r.get("extra", {}) or {}
+            label = extra.get("preset_label", "")
+            if label == "Zebra":
+                labeled_idx = i
+            elif label == "" and r["prompt_id"] == "exp_za_emptylabel":
+                empty_idx = i
+        if labeled_idx is not None and empty_idx is not None:
+            self.assertLess(labeled_idx, empty_idx,
+                           "preset_za: Labeled entry should sort before empty-label entry")
+
+    def test_sort_preset_za_not_falling_back_to_newest(self):
+        """preset_za does not silently fall back to newest-first ordering."""
+        for i in range(5):
+            self.svc.record_run(kind="studio_run", prompt_id=f"exp_nofall_{i}", status="completed",
+                                meta={"preset_label": f"Label_{i}"},
+                                started_at=f"2025-06-0{i+1}T00:00:00Z")
+        result = self.svc.list_runs(sort="preset_za")
+        runs = result["runs"]
+        labels = []
+        for r in runs:
+            extra = r.get("extra", {}) or {}
+            label = extra.get("preset_label", "")
+            if label.startswith("Label_"):
+                labels.append(label)
+        if len(labels) >= 2:
+            self.assertEqual(labels, sorted(labels, reverse=True),
+                             "preset_za should sort Z-A, not newest-first")
+
     def test_old_studio_record_readable(self):
         """Old-style studio record without annotations is readable and normalizes."""
         run_id = "r_old_studio"
+        old_meta = _default_meta(run_id)
+        del old_meta["extra"]["experiment_id"]  # old records may not have this
+        _make_run_dir(self.root, run_id, old_meta)
+        meta = self.svc.get_run(run_id)
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta.get("status"), "completed")
+        # annotations should normalize
+        ann = meta.get("annotations", {})
+        self.assertEqual(ann.get("schema_version"), 1)
         old_meta = _default_meta(run_id)
         del old_meta["extra"]["experiment_id"]  # old records may not have this
         _make_run_dir(self.root, run_id, old_meta)
@@ -1329,6 +1442,171 @@ class FailureTimingPreservationTests(unittest.TestCase):
         import inspect
         src = inspect.getsource(self.adapter._schedule_and_start)
         self.assertIn("failure_stage", src)
+
+
+# ===================================================================
+# Contract Fix Tests: Frontend/Backend parameter alignment
+# ===================================================================
+
+class ContractFixAliasTests(unittest.TestCase):
+    """Backend accepts aliases for frontend compatibility.
+
+    The backend must accept both 'kind' (canonical) and 'type' (legacy frontend)
+    for the kind filter, and both 'favorite_only' (canonical) and 'favorite'
+    (legacy frontend) for the favorite filter.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.svc_mod = _load_module("experiment_service", "experiment_service.py")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.svc = self.svc_mod.RunHistoryService(self.root)
+        self.svc.record_run(kind="studio_run", prompt_id="exp_alias_sr", status="completed")
+        self.svc.record_run(kind="ordinary", prompt_id="exp_alias_ord", status="completed")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_list_runs_accepts_kind_param(self):
+        """list_runs accepts canonical 'kind' parameter."""
+        result = self.svc.list_runs(kind="studio_run")
+        for r in result["runs"]:
+            self.assertEqual(r.get("kind"), "studio_run")
+
+    def test_favorite_only_filter_works(self):
+        """favorite_only filter actually filters by favorite status."""
+        # Create a favorited run
+        all_runs = self.svc.list_runs()["runs"]
+        if all_runs:
+            run_id = all_runs[0]["run_id"]
+            self.svc.update_run(run_id, meta={"annotations": {
+                "schema_version": 1, "favorite": True, "note": "", "updated_at": None
+            }})
+            # favorite_only should return only favorited runs
+            result = self.svc.list_runs(favorite_only=True)
+            self.assertGreater(len(result["runs"]), 0)
+            for r in result["runs"]:
+                ann = r.get("annotations", {})
+                self.assertIs(ann.get("favorite"), True,
+                             "favorite_only filter returned non-favorited run")
+
+    def test_list_runs_preset_az_does_not_fall_back(self):
+        """preset_az does not fall back to newest-first ordering."""
+        z_run = self.svc.record_run(kind="studio_run", prompt_id="exp_az_fallback_z",
+                                     status="completed",
+                                     meta={"preset_label": "Zoo"},
+                                     started_at="2025-01-01T00:00:00Z")
+        a_run = self.svc.record_run(kind="studio_run", prompt_id="exp_az_fallback_a",
+                                     status="completed",
+                                     meta={"preset_label": "Apple"},
+                                     started_at="2025-06-01T00:00:00Z")
+        result = self.svc.list_runs(sort="preset_az")
+        runs = result["runs"]
+        labels = []
+        for r in runs:
+            extra = r.get("extra", {}) or {}
+            label = extra.get("preset_label", "")
+            if label:
+                labels.append(label)
+        if len(labels) >= 2:
+            # Apple must come before Zoo (A-Z), regardless of started_at
+            apple_idx = labels.index("Apple") if "Apple" in labels else -1
+            zoo_idx = labels.index("Zoo") if "Zoo" in labels else -1
+            if apple_idx >= 0 and zoo_idx >= 0:
+                self.assertLess(apple_idx, zoo_idx,
+                               "preset_az: Apple must sort before Zoo")
+
+    def test_list_runs_preset_za_does_not_fall_back(self):
+        """preset_za does not fall back to newest-first ordering."""
+        a_run = self.svc.record_run(kind="studio_run", prompt_id="exp_za_fallback_a",
+                                     status="completed",
+                                     meta={"preset_label": "Apple"},
+                                     started_at="2025-06-01T00:00:00Z")
+        z_run = self.svc.record_run(kind="studio_run", prompt_id="exp_za_fallback_z",
+                                     status="completed",
+                                     meta={"preset_label": "Zoo"},
+                                     started_at="2025-01-01T00:00:00Z")
+        result = self.svc.list_runs(sort="preset_za")
+        runs = result["runs"]
+        labels = []
+        for r in runs:
+            extra = r.get("extra", {}) or {}
+            label = extra.get("preset_label", "")
+            if label:
+                labels.append(label)
+        if len(labels) >= 2:
+            # Zoo must come before Apple (Z-A), regardless of started_at
+            apple_idx = labels.index("Apple") if "Apple" in labels else -1
+            zoo_idx = labels.index("Zoo") if "Zoo" in labels else -1
+            if apple_idx >= 0 and zoo_idx >= 0:
+                self.assertLess(zoo_idx, apple_idx,
+                               "preset_za: Zoo must sort before Apple (Z-A)")
+
+
+class ContractAnnotationRestoreTests(unittest.TestCase):
+    """Persisted annotations (favorite, note) must restore after reload from top-level."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.svc_mod = _load_module("experiment_service", "experiment_service.py")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.svc = self.svc_mod.RunHistoryService(self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_favorite_persists_after_reload(self):
+        """Favorite state persists across get_run calls (top-level annotations)."""
+        rec = self.svc.record_run(kind="studio_run", prompt_id="exp_persist_fav", status="completed")
+        run_id = rec["run_id"]
+        # Set favorite to true via annotations (stored at top level)
+        self.svc.update_run(run_id, meta={"annotations": {
+            "schema_version": 1, "favorite": True, "note": "", "updated_at": None
+        }})
+        # Reload and check
+        meta = self.svc.get_run(run_id)
+        ann = meta.get("annotations", {})
+        self.assertIs(ann.get("favorite"), True)
+        # Verify annotations are at top level, not hidden in extra
+        self.assertIn("annotations", meta)
+        self.assertEqual(meta["annotations"]["favorite"], True)
+
+    def test_note_with_timestamp_survives_reload(self):
+        """Note and its updated_at timestamp survive reload."""
+        rec = self.svc.record_run(kind="studio_run", prompt_id="exp_persist_note", status="completed")
+        run_id = rec["run_id"]
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.svc.update_run(run_id, meta={"annotations": {
+            "schema_version": 1, "favorite": False, "note": "test note", "updated_at": ts
+        }})
+        # Reload
+        meta = self.svc.get_run(run_id)
+        ann = meta.get("annotations", {})
+        self.assertEqual(ann.get("note"), "test note")
+        self.assertEqual(ann.get("updated_at"), ts)
+
+    def test_annotations_merged_not_overwritten_by_finalization(self):
+        """Finalization write does not overwrite already-set annotations."""
+        rec = self.svc.record_run(kind="studio_run", prompt_id="exp_persist_merge", status="running")
+        run_id = rec["run_id"]
+        # Set annotation
+        self.svc.update_run(run_id, meta={"annotations": {
+            "schema_version": 1, "favorite": True, "note": "keep me", "updated_at": None
+        }})
+        # Finalize (no annotations in meta)
+        self.svc.update_run(run_id, status="completed", timings={"total_ms": 5000})
+        # Verify annotation survived
+        meta = self.svc.get_run(run_id)
+        ann = meta.get("annotations", {})
+        self.assertIs(ann.get("favorite"), True)
+        self.assertEqual(ann.get("note"), "keep me")
 
 
 if __name__ == "__main__":

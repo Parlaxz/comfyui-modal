@@ -274,14 +274,35 @@ export function extractNodeCandidates(node) {
   if (!node) return candidates;
 
   // Widgets (inputs visible on the node)
+  // Phase 4: capture full LiteGraph widget schema metadata so the preset
+  // wizard can persist enum options, range, step, precision, multiline,
+  // boolean state, and default values directly from the live graph.
   if (node.widgets && Array.isArray(node.widgets)) {
     node.widgets.forEach((w) => {
       if (w && w.name) {
+        const opts = w.options || {};
+        let schemaType = w.type || "string";
+        // Map LiteGraph widget types to schema kinds
+        if (schemaType === "combo" || schemaType === "dropdown") schemaType = "enum";
+        else if (schemaType === "number") schemaType = "number";
+        else if (schemaType === "slider") schemaType = "number";
+        else if (schemaType === "toggle") schemaType = "boolean";
+        else if (schemaType === "converted-widget") schemaType = "string";
+
         candidates.push({
           kind: "widget",
           name: w.name,
           type: w.type || "string",
           label: w.label || w.name,
+          // Phase 4: widget schema metadata
+          schemaType: schemaType,
+          enumValues: opts.values || null,
+          min: opts.min ?? null,
+          max: opts.max ?? null,
+          step: opts.step ?? null,
+          precision: opts.precision ?? null,
+          defaultValue: opts.default !== undefined ? opts.default : (w.value ?? null),
+          multiline: !!opts.multiline,
         });
       }
     });

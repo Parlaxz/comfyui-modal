@@ -365,6 +365,7 @@ def make_snapshot(body: dict[str, Any]) -> dict[str, Any]:
         "outputNodeId": body.get("outputNodeId", ""),
         "modelSummary": body.get("modelSummary", ""),
         "source": _normalize_label(body.get("source", "manual")),
+        "controlSchemas": body.get("controlSchemas", {}),
         "archived": False,
     }
     enriched = normalize_snapshot_payload(entry)
@@ -403,6 +404,8 @@ def update_snapshot(
         snapshot["outputNodeId"] = body["outputNodeId"]
     if "modelSummary" in body and isinstance(body["modelSummary"], str):
         snapshot["modelSummary"] = body["modelSummary"].strip()
+    if "controlSchemas" in body and isinstance(body["controlSchemas"], dict):
+        snapshot["controlSchemas"] = body["controlSchemas"]
     if "archived" in body:
         snapshot["archived"] = bool(body["archived"])
 

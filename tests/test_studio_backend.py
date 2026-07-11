@@ -1656,5 +1656,160 @@ class ExperimentCanonicalPresetIdTests(unittest.TestCase):
         self.assertIn("Select at least 2 presets", self.text)
 
 
+# ---------------------------------------------------------------------------
+# Phase 4: Captured control schemas – browser-side
+# ---------------------------------------------------------------------------
+
+class CapturedControlSchemasGraphBindingTests(unittest.TestCase):
+    """extractNodeCandidates must capture full widget schema metadata."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-graph-binding.js").read_text(encoding="utf-8")
+        self.fn_start = self.text.find("function extractNodeCandidates")
+        self.fn_block = self.text[self.fn_start:self.fn_start + 3000]
+
+    def test_captures_schema_type(self):
+        """Widget candidate must include schemaType derived from w.type."""
+        self.assertIn("schemaType", self.fn_block)
+
+    def test_captures_enum_values(self):
+        """Widget candidate must capture w.options?.values as enumValues."""
+        self.assertIn("enumValues", self.fn_block)
+
+    def test_captures_min_max_step_precision(self):
+        """Widget candidate must capture min, max, step, precision."""
+        for field in ["min", "max", "step", "precision"]:
+            self.assertIn(field, self.fn_block,
+                          f"Widget candidate missing field: {field}")
+
+    def test_captures_default_value(self):
+        """Widget candidate must capture default value."""
+        self.assertIn("defaultValue", self.fn_block)
+
+    def test_captures_multiline_flag(self):
+        """Widget candidate must capture multiline flag."""
+        self.assertIn("multiline", self.fn_block)
+
+    def test_captures_boolean_default(self):
+        """Widget candidate must handle boolean type for default."""
+        self.assertIn("boolean", self.fn_block.lower())
+
+    def test_captures_dynamic_values_if_available(self):
+        """Widget candidate must capture w.options?.values for dynamic enums."""
+        self.assertIn("w.options", self.fn_block)
+
+
+class CapturedControlSchemasPresetWizardTests(unittest.TestCase):
+    """Preset wizard must build controlSchemas in snapshot payload."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+
+    def test_wizard_includes_control_schemas_in_snapshot_payload(self):
+        """executeSave must include controlSchemas in snapshotPayload."""
+        self.assertIn("controlSchemas", self.text,
+                      "Preset wizard must reference controlSchemas")
+
+    def test_wizard_has_build_control_schemas_function(self):
+        """Wizard must have a buildControlSchemas helper."""
+        self.assertIn("buildControlSchemas", self.text)
+
+    def test_capture_stores_widget_schema(self):
+        """startBindingCapture onCapture callback must store widgetSchema."""
+        self.assertIn("widgetSchema", self.text)
+
+    def test_snapshot_payload_accepts_control_schemas(self):
+        """executeSave snapshotPayload must pass controlSchemas to API."""
+        self.assertIn('controlSchemas:', self.text)
+
+
+class CapturedControlSchemasSnapshotModelTests(unittest.TestCase):
+    """Snapshot model on backend must persist controlSchemas."""
+
+    def test_make_snapshot_accepts_control_schemas(self):
+        """Backend make_snapshot must accept controlSchemas from body."""
+        text = (REPO_ROOT / "studio_models.py").read_text(encoding="utf-8")
+        self.assertIn("controlSchemas", text)
+
+    def test_make_snapshot_defaults_to_empty_dict(self):
+        """Backend make_snapshot must default controlSchemas to {}."""
+        text = (REPO_ROOT / "studio_models.py").read_text(encoding="utf-8")
+        # One of the entries in make_snapshot should include controlSchemas
+        self.assertIn('"controlSchemas"', text)
+
+    def test_update_snapshot_accepts_control_schemas(self):
+        """Backend update_snapshot must accept controlSchemas update."""
+        text = (REPO_ROOT / "studio_models.py").read_text(encoding="utf-8")
+        self.assertIn("controlSchemas", text)
+
+    def test_derive_control_schemas_checks_captured_first(self):
+        """derive_control_schemas_from_snapshot must check controlSchemas first."""
+        text = (REPO_ROOT / "studio_run_adapter.py").read_text(encoding="utf-8")
+        self.assertIn("controlSchemas", text)
+
+    def test_derive_falls_back_to_static_registry(self):
+        """Old snapshots without controlSchemas must still derive from static table."""
+        text = (REPO_ROOT / "studio_run_adapter.py").read_text(encoding="utf-8")
+        self.assertIn("_NODE_WIDGET_SCHEMAS", text)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 Gap Fixes: Edit mode, candidate dropdown, toggle mapping
+# ---------------------------------------------------------------------------
+
+class Phase4FixEditModeControlSchemasTests(unittest.TestCase):
+    """Edit mode must persist refreshed controlSchemas on snapshot update."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+        # Find the edit-mode section
+        self.edit_start = self.text.find("// ── Edit mode: update snapshot bindings")
+        self.edit_block = self.text[self.edit_start:self.edit_start + 800] if self.edit_start >= 0 else ""
+
+    def test_edit_mode_includes_control_schemas(self):
+        """Edit mode snapshot update must include controlSchemas."""
+        self.assertIn("controlSchemas", self.edit_block,
+                      "Edit mode snapshotUpdate must include controlSchemas")
+
+    def test_edit_mode_calls_build_control_schemas(self):
+        """Edit mode snapshot update must call buildControlSchemas."""
+        self.assertIn("buildControlSchemas", self.edit_block,
+                      "Edit mode must call buildControlSchemas()")
+
+
+class Phase4FixCandidateDropdownWidgetSchemaTests(unittest.TestCase):
+    """Candidate dropdown change handler must keep widgetSchema in sync."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+        # Find the renderCandidateDropdown section
+        self.dropdown_start = self.text.find("function renderCandidateDropdown")
+        self.dropdown_block = self.text[self.dropdown_start:self.dropdown_start + 2500] if self.dropdown_start >= 0 else ""
+
+    def test_dropdown_change_updates_widget_schema(self):
+        """Change handler must rebuild widgetSchema when selection changes."""
+        self.assertIn("widgetSchema", self.dropdown_block,
+                      "Dropdown change handler must update widgetSchema")
+        self.assertIn("_buildWidgetSchemaFromCandidate", self.dropdown_block,
+                      "Dropdown must use _buildWidgetSchemaFromCandidate helper")
+
+
+class Phase4FixToggleBooleanMappingTests(unittest.TestCase):
+    """LiteGraph toggle widgets must map to boolean schema kind."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-graph-binding.js").read_text(encoding="utf-8")
+        # Find the extractNodeCandidates function
+        self.fn_start = self.text.find("function extractNodeCandidates")
+        self.fn_block = self.text[self.fn_start:self.fn_start + 3500] if self.fn_start >= 0 else ""
+
+    def test_toggle_maps_to_boolean(self):
+        """'toggle' widget type must map to schemaType 'boolean'."""
+        self.assertIn('"toggle"', self.fn_block,
+                      "toggle must be handled in schemaType mapping")
+        self.assertIn('"boolean"', self.fn_block,
+                      "schemaType must include boolean mapping")
+
+
 if __name__ == "__main__":
     unittest.main()
