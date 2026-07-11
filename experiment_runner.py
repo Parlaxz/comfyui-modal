@@ -964,15 +964,29 @@ class LocalRemoteInvoker:
         return None
 
     async def _save_output_images(self, result_data: dict, cell_key: str) -> list[str]:
-        """Save output images from a Modal result to disk and return URL paths."""
+        """Save output images from a Modal result to disk and return URL paths.
+
+        Safety guarantees:
+        - Remote filenames are never trusted as-is; basename is sanitised.
+        - Only supported image extensions are accepted.
+        - Path traversal (``../``) is stripped.
+        - Each output gets a unique ``studio_<exp>_<cell>_<node>_<index>_<token>.<ext>``
+          filename so repeated remote names never overwrite.
+        - The original remote name is preserved in a ``_remote_filename``
+          diagnostic key in the result data.
+        """
         import base64
+        import re
+        import secrets
         from datetime import datetime
 
         outputs = (result_data or {}).get("outputs", {})
-        saved_urls = []
+        saved_urls: list[str] = []
         output_dir = self._node_dir / "output" / "studio"
         output_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        supported_exts = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
+        diagnostic_meta: list[dict] = []
+
         for node_id, node_outputs in outputs.items():
             if not isinstance(node_outputs, dict):
                 continue
@@ -981,19 +995,60 @@ class LocalRemoteInvoker:
                     continue
                 for idx, img in enumerate(entries):
                     if isinstance(img, dict):
-                        fname = img.get("filename", f"studio_{self._experiment_id}_{cell_key}_{node_id}_{idx}_{ts}.png")
+                        remote_fname = img.get("filename", "")
                         image_data = img.get("data", "")
                     elif isinstance(img, str):
-                        fname = f"studio_{self._experiment_id}_{cell_key}_{node_id}_{idx}_{ts}.png"
+                        remote_fname = ""
                         image_data = img
                     else:
                         continue
-                    if image_data:
-                        image_bytes = base64.b64decode(image_data)
-                        filepath = output_dir / fname
-                        with open(filepath, "wb") as f:
-                            f.write(image_bytes)
-                        saved_urls.append(fname)
+                    if not image_data:
+                        continue
+
+                    # ── Sanitise remote filename ──────────────────────────
+                    # Use only the basename portion (strip directory components)
+                    safe_basename = Path(remote_fname).name if remote_fname else ""
+                    # Check extension is a supported image type
+                    ext = Path(safe_basename).suffix.lower()
+                    if ext not in supported_exts:
+                        ext = ".png"  # fallback default
+                    # Sanitise the stem: keep only alphanumeric, underscore, hyphen
+                    stem = Path(safe_basename).stem if safe_basename else f"{node_id}_{idx}"
+                    stem = re.sub(r"[^a-zA-Z0-9_-]", "_", stem)[:64]
+
+                    # ── Generate unique local filename ─────────────────────
+                    token = secrets.token_hex(4)
+                    local_fname = (
+                        f"studio_{self._experiment_id}_{cell_key}_"
+                        f"{node_id}_{idx}_{token}{ext}"
+                    )
+                    filepath = output_dir / local_fname
+
+                    # Never overwrite (extremely unlikely with token, but be safe)
+                    counter = 0
+                    while filepath.exists():
+                        counter += 1
+                        local_fname = (
+                            f"studio_{self._experiment_id}_{cell_key}_"
+                            f"{node_id}_{idx}_{token}_{counter}{ext}"
+                        )
+                        filepath = output_dir / local_fname
+
+                    image_bytes = base64.b64decode(image_data)
+                    filepath.write_bytes(image_bytes)
+                    saved_urls.append(local_fname)
+
+                    # Preserve original remote name in diagnostics
+                    if remote_fname:
+                        diagnostic_meta.append({
+                            "local": local_fname,
+                            "remote": remote_fname,
+                        })
+
+        # Attach diagnostic metadata back to result_data for traceability
+        if diagnostic_meta:
+            result_data.setdefault("_image_save_diagnostics", []).extend(diagnostic_meta)
+
         return saved_urls
 
     async def run_cell(self, worker_invocation_id, cell) -> dict:

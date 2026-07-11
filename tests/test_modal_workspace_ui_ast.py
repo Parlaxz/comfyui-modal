@@ -128,7 +128,11 @@ class StudioPlaygroundUiAstTests(unittest.TestCase):
         self.assertIn("getStudioRunStatus", self.source)
         # Must import from studio-backend-api (or be defined locally)
         self.assertIn('from "./studio-backend-api.js"', self.source)
-        self.assertIn("getStudioRunStatus", self.source.split("import")[-1])
+        # Check the static imports explicitly — the dynamic import in hydratePlayground
+        # uses import() not import, so split by static imports only
+        static_import_lines = [line for line in self.source.split("\n") if line.strip().startswith("import ")]
+        has_static_import = any("getStudioRunStatus" in line for line in static_import_lines)
+        self.assertTrue(has_static_import, "Expected getStudioRunStatus in static imports")
 
     def test_polls_experiment_status_after_submitted(self):
         self.assertIn("getStudioRunStatus", self.source)
@@ -146,6 +150,45 @@ class StudioPlaygroundUiAstTests(unittest.TestCase):
         has_interval = "setInterval" in self.source
         has_timeout_recursive = "setTimeout" in self.source and "getStudioRunStatus" in self.source
         self.assertTrue(has_interval or has_timeout_recursive)
+
+
+# ---------------------------------------------------------------------------
+# normalizeStudioRun imported/used by Playground and persisted state
+# ---------------------------------------------------------------------------
+
+class StudioPlaygroundNormalizerAndPersistenceTests(unittest.TestCase):
+    """Playground must import normalizeStudioRun and have persistence state."""
+
+    def setUp(self):
+        self.text = (REPO_ROOT / "web" / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_playground_imports_normalize_studio_run(self):
+        """studio-playground.js must import normalizeStudioRun from normalizer."""
+        self.assertIn("normalizeStudioRun", self.text)
+        self.assertIn("./studio-run-normalizer.js", self.text)
+
+    def test_persistence_key_has_versioned_selection(self):
+        """Persistence key must be versioned and store selection state."""
+        self.assertIn("localStorage", self.text)
+        self.assertIn("selection", self.text)
+
+    def test_selected_preset_and_feature_persisted(self):
+        """Selected preset id and feature id must be persisted to localStorage."""
+        self.assertIn("selectedBackendId", self.text)
+
+    def test_persistence_does_not_store_image_blobs(self):
+        """Persistence must only store lightweight selection state, not image blobs."""
+        self.assertNotIn("imageBlob", self.text.lower() if hasattr(self.text, 'lower') else self.text)
+
+
+class StudioHistoryNormalizerTests(unittest.TestCase):
+    """History must import normalizeStudioRun from shared normalizer."""
+
+    def test_history_imports_normalize_studio_run(self):
+        """studio-history.js must import normalizeStudioRun."""
+        text = (REPO_ROOT / "web" / "studio-history.js").read_text(encoding="utf-8")
+        self.assertIn("normalizeStudioRun", text)
+        self.assertIn("./studio-run-normalizer.js", text)
 
 
 if __name__ == "__main__":

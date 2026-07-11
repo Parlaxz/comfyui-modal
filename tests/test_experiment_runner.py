@@ -201,8 +201,18 @@ class LocalRemoteInvokerOutputSaveTests(unittest.TestCase):
 
             saved = asyncio.run(invoker._save_output_images(result_data, "cell_1"))
 
-            self.assertEqual(saved, ["studio_test.png"])
-            self.assertTrue((Path(tmp) / "output" / "studio" / "studio_test.png").exists())
+            # The filename is now unique (studio_<exp>_<cell>_<node>_<idx>_<token>.png)
+            # not the original remote name
+            self.assertEqual(len(saved), 1)
+            fname = saved[0]
+            self.assertTrue(fname.startswith("studio_exp_test_cell_1_107_0_"),
+                            f"Expected studio_ prefix pattern, got {fname!r}")
+            self.assertTrue(fname.endswith(".png"), f"Expected .png extension, got {fname!r}")
+            # Verify the file exists on disk
+            output_file = Path(tmp) / "output" / "studio" / fname
+            self.assertTrue(output_file.exists())
+            # Content should be "hello" (base64 of "aGVsbG8=")
+            self.assertEqual(output_file.read_bytes(), b"hello")
 
 
 # ── Tests ────────────────────────────────────────────────────────────────

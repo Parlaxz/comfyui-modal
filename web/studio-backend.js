@@ -167,9 +167,9 @@ export function renderBackend(state, context) {
 
   container.appendChild(actionBar);
 
-  // Tabs: Snapshots | Backend Presets
+  // Tabs: Backend Presets | Snapshots (presets is default)
   const tabs = el("div", { class: "comfymodal-studio-backend-tabs" });
-  let activeTab = "snapshots";
+  let activeTab = "presets";
 
   const body = el("div", { class: "comfymodal-studio-backend-body" });
 
@@ -207,8 +207,8 @@ export function renderBackend(state, context) {
     return btn;
   }
 
-  tabs.appendChild(makeTab("snapshots", "Snapshots"));
   tabs.appendChild(makeTab("presets", "Backend Presets"));
+  tabs.appendChild(makeTab("snapshots", "Snapshots"));
 
   container.appendChild(tabs);
   container.appendChild(body);

@@ -430,18 +430,109 @@ def _apply_controls_to_workflow(
 # ── History metadata ───────────────────────────────────────────────────────
 
 
+def _build_resolved_controls(
+    workflow: dict[str, Any],
+    slots: dict[str, Any],
+) -> dict[str, Any]:
+    """Read back actual control values from the workflow after application.
+
+    Iterates ALL bound slots generically — not a hardcoded shortlist — so
+    arbitrary bindings (mask_blur, lora_strength, source_image, expansion,
+    etc.) are captured.  Preserves falsy values (0, 0.0, "", False).
+    Only keys that have a corresponding slot mapping are included.
+
+    For each slot, the function follows the slot's ``path`` into the
+    workflow node and returns the terminal value.
+    """
+    resolved: dict[str, Any] = {}
+    for key, slot in slots.items():
+        if not isinstance(slot, dict):
+            continue
+        nid = slot.get("node_id", "")
+        path = slot.get("path", [])
+        if not nid or not path:
+            continue
+        node = workflow.get(nid, {})
+        target = node
+        for segment in path:
+            if isinstance(target, dict):
+                target = target.get(segment)
+            else:
+                target = None
+                break
+        if target is not None:
+            resolved[key] = target
+    return resolved
+
+
+_CANONICAL_ALIAS_KEYS = frozenset({
+    "prompt", "negative_prompt", "seed", "steps", "guidance", "cfg",
+    "sampler", "scheduler", "denoise", "width", "height",
+})
+
+
+def _flatten_canonical_aliases(
+    resolved_controls: dict[str, Any],
+    event_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Copy key values from *resolved_controls* into flat aliases.
+
+    Also copies any arbitrary keys (lora_name, lora_strength, source_image,
+    mask_blur, expansion, image_identity, etc.) so the frontend normalizer
+    does not need to dig into ``resolved_controls``.
+
+    When the same key appears in *event_payload* (from the remote cell
+    completion event), the event value takes precedence since it represents
+    the actual executed value.
+
+    Falsy values (0, 0.0, "", False) are preserved — only truly missing
+    keys (``None``) are skipped.
+    """
+    aliases: dict[str, Any] = {}
+    seen: set[str] = set()
+
+    # 1. Known canonical keys from resolved_controls
+    for key in _CANONICAL_ALIAS_KEYS:
+        val = resolved_controls.get(key)
+        if val is not None:
+            aliases[key] = val
+            seen.add(key)
+
+    # 2. Arbitrary keys from resolved_controls (LoRA, image, mask, etc.)
+    for key, val in resolved_controls.items():
+        if val is not None and key not in seen:
+            aliases[key] = val
+            seen.add(key)
+
+    # 3. Event payload overrides (actual executed values from remote)
+    if event_payload:
+        for key in _CANONICAL_ALIAS_KEYS:
+            val = event_payload.get(key)
+            if val is not None:
+                aliases[key] = val
+
+    return aliases
+
+
 def _build_studio_history_meta(
     preset_id: str,
     snapshot_id: str,
     feature_id: str,
     controls: dict[str, Any] | None = None,
+    preset_label: str = "",
 ) -> dict[str, Any]:
-    """Build metadata dict for run history, carrying Studio info."""
+    """Build metadata dict for run history, carrying Studio info.
+
+    Includes ``studio_preset_label`` so that finalization and the frontend
+    normalizer can surface the human-readable preset name instead of the
+    raw preset id.
+    """
     return {
         "studio_preset_id": preset_id,
         "studio_snapshot_id": snapshot_id,
         "studio_feature_id": feature_id,
         "studio_controls": dict(controls or {}),
+        "studio_preset_label": preset_label,
     }
 
 
@@ -528,6 +619,7 @@ def build_single_run_spec(
         snapshot_id=snapshot.get("id", ""),
         feature_id=feature_id,
         controls=controls,
+        preset_label=preset.get("label", ""),
     )
 
     compilation: dict[str, Any] = {
@@ -730,7 +822,28 @@ async def _schedule_and_start(
     REGISTRY: Any,
     node_dir: str | os.PathLike = "",
 ) -> dict[str, Any]:
-    """Create scheduler and start execution. Returns the run result."""
+    """Create scheduler and start execution. Returns the run result.
+
+    Finalizes the submission-time history record (created by
+    ``handle_studio_run``) with the actual output paths, timings,
+    resolved controls, and terminal status.
+
+    Timing semantics
+    ----------------
+    ``submitted_at`` — set when ``handle_studio_run`` created the record.
+    ``queue_ms``     — wall-clock from submission to ``sched.start()``.
+    ``generation_ms`` — wall-clock duration of ``sched.start()``.
+    ``total_ms``     — ``queue_ms + generation_ms``.
+    ``remote_timings`` — any timing breakdown from the remote side, kept
+                         separate from the local wall-clock measurements.
+    ``completed_at`` — set after ``sched.start()`` returns or fails.
+    """
+    from datetime import datetime, timezone
+
+    # Capture the pre-start timestamp for queue_ms computation
+    generation_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    generation_start_dt = datetime.fromisoformat(generation_start.replace("Z", "+00:00"))
+
     from experiment_runner import LocalRemoteInvoker
     from modal_client import run_prompt_stream
 
@@ -745,19 +858,191 @@ async def _schedule_and_start(
         invoker=invoker,
         max_containers=1,
     )
-    result = await sched.start()
-    # Record run history after successful completion
-    if result and result.get("completed", 0) > 0:
+
+    try:
+        result = await sched.start()
+    except Exception as exc:
+        # Finalize the submission record as failed — stable message only
+        run_history_id = compilation.get("run_history_id", "")
+        if run_history_id:
+            fail_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            try:
+                REGISTRY.history().update_run(
+                    run_history_id,
+                    status="error",
+                    completed_at=fail_ts,
+                    meta={
+                        "error": _STABLE_INTERNAL_ERROR,
+                        "_error_detail": str(exc)[:500],
+                    },
+                )
+            except Exception:
+                _log.warning("Failed to update run history for %s on failure", exp_id)
+        # Persist the stable error, not raw exception text
         try:
-            from experiment_service import REGISTRY as _REGISTRY
-            _REGISTRY.history().record_run(
+            _persist_experiment_error(exp_id, _STABLE_INTERNAL_ERROR[:200])
+        except Exception:
+            pass
+        raise
+
+    # ── Capture post-execution timestamps ─────────────────────────────────
+    completed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    completed_dt = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+
+    # Compute wall-clock timing relative to the submission record's started_at
+    run_history_id = compilation.get("run_history_id", "")
+    submission_started_at: str | None = None
+    if run_history_id:
+        try:
+            meta = REGISTRY.history().get_run(run_history_id)
+            if meta:
+                submission_started_at = meta.get("started_at") or None
+        except Exception:
+            pass
+
+    timings: dict[str, Any] = {}
+    if submission_started_at:
+        try:
+            sub_dt = datetime.fromisoformat(submission_started_at.replace("Z", "+00:00"))
+            queue_ms = int((generation_start_dt - sub_dt).total_seconds() * 1000)
+            generation_ms = int((completed_dt - generation_start_dt).total_seconds() * 1000)
+            timings = {
+                "queue_ms": max(0, queue_ms),
+                "generation_ms": max(0, generation_ms),
+                "total_ms": max(0, queue_ms + generation_ms),
+            }
+        except Exception:
+            pass
+
+    # Preserve any remote-side timing breakdown separately
+    if isinstance(result, dict):
+        remote_breakdown = {}
+        for k in list(result.keys()):
+            if k.endswith("_ms") or k in ("sampling_ms", "queue_remote_ms",
+                                          "inference_ms", "restore_total_ms"):
+                remote_breakdown[k] = result[k]
+        if remote_breakdown:
+            timings["remote_timings"] = remote_breakdown
+
+    # ── Inspect experiment journal for the LATEST visible cell.completed ──
+    output_paths: list[str] = []
+    primary_asset_id = ""
+    attempt_id = ""
+    cell_key = ""
+    checkpoint_id = ""
+    resolved_meta: dict = {}
+    has_cell_completed = False
+
+    try:
+        store = REGISTRY.store(exp_id)
+        # Iterate all events; only the LAST cell.completed is used
+        for ev in store.read_events():
+            if ev.get("type") == "cell.completed":
+                has_cell_completed = True
+                pl = ev.get("payload", {}) or {}
+                paths = pl.get("output_paths", [])
+                if paths:
+                    output_paths = paths
+                primary_asset_id = pl.get("primary_asset_id", primary_asset_id)
+                attempt_id = pl.get("attempt_id", attempt_id)
+                cell_key = pl.get("cell_key", cell_key)
+                checkpoint_id = pl.get("checkpoint_id", checkpoint_id)
+                resolved_meta["workflow_hash"] = pl.get("workflow_hash", resolved_meta.get("workflow_hash", ""))
+    except Exception:
+        _log.warning("Failed to read journal events for %s", exp_id)
+
+    # Derive resolved_controls from the post-application workflow
+    resolved_controls: dict = {}
+    try:
+        if compilation.get("checkpoints"):
+            ck = compilation["checkpoints"][0]
+            wf = ck.get("workflow", {})
+            slots = ck.get("slots", {})
+            resolved_controls = _build_resolved_controls(wf, slots)
+    except Exception:
+        _log.warning("Failed to derive resolved_controls for %s", exp_id)
+
+    # Determine terminal status
+    terminal_status = "completed"
+    if result:
+        completed = result.get("completed", 0)
+        failed = result.get("failed", 0)
+        if failed > 0 and completed == 0:
+            terminal_status = "failed"
+        elif failed > 0:
+            terminal_status = "completed_with_failures"
+        # If no cell.completed event was seen, execution didn't actually produce output
+        if not has_cell_completed:
+            terminal_status = "failed"
+
+    # Build canonical flattened metadata for the frontend normalizer.
+    # Everything lives at the top level or in extra — NOT hidden inside nested dicts.
+    studio_meta = compilation.get("studio_meta", {}) or {}
+    meta_merge: dict = {}
+    meta_merge["requested_controls"] = dict(studio_meta.get("studio_controls", {}))
+    meta_merge["resolved_controls"] = dict(resolved_controls or {})
+    meta_merge["studio_preset_id"] = studio_meta.get("studio_preset_id", "")
+    meta_merge["studio_snapshot_id"] = studio_meta.get("studio_snapshot_id", "")
+    meta_merge["studio_feature_id"] = studio_meta.get("studio_feature_id", "")
+    meta_merge["experiment_id"] = exp_id
+    meta_merge["attempt_id"] = attempt_id or ""
+    meta_merge["cell_key"] = cell_key or ""
+    meta_merge["checkpoint_id"] = checkpoint_id or ""
+    meta_merge["preset_label"] = studio_meta.get("studio_preset_label", "")
+
+    # Include submitted_at from the submission record's started_at
+    if submission_started_at:
+        meta_merge["submitted_at"] = submission_started_at
+
+    # Flatten canonical aliases from resolved_controls + event payload
+    # so frontend/history see prompt, seed, steps, etc. at top level.
+    canonical_aliases = _flatten_canonical_aliases(
+        resolved_controls or {},
+        resolved_meta if has_cell_completed else None,
+    )
+    for k, v in canonical_aliases.items():
+        if v is not None and k not in meta_merge:
+            meta_merge[k] = v
+
+    if has_cell_completed and output_paths:
+        meta_merge["output_paths"] = list(output_paths)
+    if primary_asset_id:
+        meta_merge["primary_asset_id"] = primary_asset_id
+    if resolved_meta.get("workflow_hash"):
+        meta_merge["workflow_hash"] = resolved_meta["workflow_hash"]
+
+    # Finalize the submission record — only set output_path if truly completed
+    if run_history_id:
+        try:
+            output_path_val = output_paths[0] if (has_cell_completed and output_paths) else ""
+            update_kwargs: dict = {
+                "status": terminal_status,
+                "completed_at": completed_at,
+                "timings": timings,
+                "meta": meta_merge,
+            }
+            if output_path_val:
+                update_kwargs["output_path"] = output_path_val
+            if primary_asset_id and has_cell_completed:
+                update_kwargs["primary_asset_id"] = primary_asset_id
+            if resolved_meta.get("workflow_hash"):
+                update_kwargs["workflow_hash"] = resolved_meta["workflow_hash"]
+            REGISTRY.history().update_run(run_history_id, **update_kwargs)  # type: ignore[arg-type]
+        except Exception:
+            _log.warning("Failed to finalize run history for %s", exp_id)
+    else:
+        # Fallback: no submission record — create one (legacy path)
+        try:
+            REGISTRY.history().record_run(
                 kind="studio_run",
                 prompt_id=exp_id,
-                status="completed",
+                status=terminal_status,
+                started_at=completed_at,
                 meta=compilation.get("studio_meta", {}),
             )
         except Exception:
-            _log.warning("Failed to record run history for experiment %s", exp_id)
+            _log.warning("Failed to record fallback run history for %s", exp_id)
+
     return result
 
 
@@ -864,21 +1149,80 @@ def handle_studio_run(
         _log.warning("Studio run compilation failed: %s", compilation["error"])
         return {"status": "error", "message": compilation["error"]}
 
-    # 4. Create experiment via REGISTRY and start scheduler
+    # 4. Create submission-time history record
     try:
         from experiment_service import REGISTRY
 
         exp_id = compilation["experiment_id"]
         from datetime import datetime, timezone
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Build requested_controls from the controls dict + studio meta
+        requested_controls = dict(controls or {})
+        studio_meta = compilation.get("studio_meta", {})
+
+        # Compute workflow_hash from the built workflow if possible
+        workflow_hash_at_submit = ""
+        try:
+            ck_list = compilation.get("checkpoints", [])
+            if ck_list and isinstance(ck_list[0], dict):
+                wf = ck_list[0].get("workflow", {})
+                if wf:
+                    # Import inline to avoid circular dependency at module level
+                    from experiment_runner import _workflow_sha256
+                    workflow_hash_at_submit = _workflow_sha256(wf)
+        except Exception:
+            pass
+
+        meta_payload: dict = {
+            "requested_controls": requested_controls,
+            "studio_preset_id": studio_meta.get("studio_preset_id", preset_id),
+            "studio_snapshot_id": studio_meta.get("studio_snapshot_id", ""),
+            "studio_feature_id": studio_meta.get("studio_feature_id", feature_id),
+            "experiment_id": exp_id,
+            "preset_label": preset.get("label", preset_id),
+            "submitted_at": now,
+        }
+        if workflow_hash_at_submit:
+            meta_payload["workflow_hash"] = workflow_hash_at_submit
+
+        # Create the submission history record
+        submission_record = REGISTRY.history().record_run(
+            kind="studio_run",
+            prompt_id=exp_id,
+            status="submitted",
+            started_at=now,
+            meta=meta_payload,
+        )
+        run_history_id = submission_record.get("run_id", "")
+        compilation["run_history_id"] = run_history_id
+
+        # Flow run_history_id through all compilation metadata layers
+        for ck in compilation.get("checkpoints", []):
+            ck.setdefault("studio_meta", {})["run_history_id"] = run_history_id
+        for cell in compilation.get("cells", []):
+            cell.setdefault("studio_meta", {})["run_history_id"] = run_history_id
+        compilation.setdefault("studio_meta", {})["run_history_id"] = run_history_id
+
+        _log.info("Studio run history record created: %s (status=submitted)", run_history_id)
+
+        # Update the submission record to "running" right before scheduling
+        REGISTRY.history().update_run(
+            run_history_id,
+            status="running",
+        )
+
+        # 5. Create experiment via REGISTRY and start scheduler
         definition = {
             "experiment_id": exp_id,
             "revision": 1,
             "name": f"Studio Run: {preset.get('label', preset_id)} [{feature_id}]",
             "notes": "",
-            "created_at": now,
-            "updated_at": now,
-            "studio_meta": compilation.get("studio_meta", {}),
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "studio_meta": studio_meta,
+            "run_history_id": run_history_id,
         }
         _create_experiment(exp_id, compilation, definition, REGISTRY)
         _log.info("Studio experiment created: %s", exp_id)
@@ -894,9 +1238,24 @@ def handle_studio_run(
                 _log.info("Scheduler start completed for experiment %s: %s", exp_id, result)
                 return result
             except Exception as exc:
-                error_msg = str(exc)[:200]
-                _log.error("Scheduler start failed for experiment %s: %s", exp_id, error_msg)
-                _persist_experiment_error(exp_id, error_msg)
+                error_detail = str(exc)[:300]
+                fail_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                _log.error("Scheduler start failed for experiment %s: %s", exp_id, error_detail)
+                # Finalize the submission record as failed with stable message
+                if run_history_id:
+                    try:
+                        REGISTRY.history().update_run(
+                            run_history_id,
+                            status="error",
+                            completed_at=fail_ts,
+                            meta={
+                                "error": _STABLE_INTERNAL_ERROR,
+                                "_error_detail": error_detail,
+                            },
+                        )
+                    except Exception:
+                        pass
+                _persist_experiment_error(exp_id, _STABLE_INTERNAL_ERROR[:200])
                 raise
 
         try:
@@ -918,8 +1277,9 @@ def handle_studio_run(
             "status": "ok",
             "runId": exp_id,
             "experimentId": exp_id,
+            "runHistoryId": run_history_id,
             "message": "Studio run submitted; check experiment status for completion",
-            "studio_meta": compilation.get("studio_meta", {}),
+            "studio_meta": studio_meta,
         }
     except Exception:
         _log.exception("Studio run failed for experiment %s", compilation.get("experiment_id", "unknown"))

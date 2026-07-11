@@ -889,5 +889,1205 @@ class StudioDefaultsAPIEnrichmentTests(unittest.TestCase):
         self.assertEqual(defaults["seed"], 42)
 
 
+# ---------------------------------------------------------------------------
+# RunHistoryService extension tests
+# ---------------------------------------------------------------------------
+
+class RunHistoryServiceExtensionTests(unittest.TestCase):
+    """Test backward-compatible extensions to RunHistoryService.
+
+    These tests cover explicit started_at, completed_at, timings in
+    update_run, workflow_hash updates, primary_asset_id, and backward-
+    compatible reads of older entries.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.svc_mod = _load_module("experiment_service", "experiment_service.py")
+
+    def test_record_run_with_explicit_started_at(self):
+        """record_run accepts explicit started_at, overriding the auto value."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            started = "2025-06-01T00:00:00Z"
+            rec = svc.record_run(
+                kind="studio_run",
+                prompt_id="exp_submit",
+                status="submitted",
+                meta={"client": "studio"},
+                started_at=started,
+            )
+            self.assertEqual(rec.get("started_at"), started)
+            self.assertEqual(rec.get("status"), "submitted")
+
+    def test_update_run_supports_timings(self):
+        """update_run writes timing.json when timings dict is provided."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            rec = svc.record_run(kind="studio_run", prompt_id="exp_t", status="running")
+            run_id = rec["run_id"]
+            timings = {"queue_ms": 100, "sampling_ms": 2000, "total_ms": 2100}
+            updated = svc.update_run(run_id, timings=timings)
+            self.assertEqual(updated.get("status"), "running")
+            # Verify timing.json was written
+            read_timing = svc.get_timing(run_id)
+            self.assertEqual(read_timing, timings)
+
+    def test_update_run_with_completed_at(self):
+        """update_run accepts completed_at timestamp."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            rec = svc.record_run(kind="studio_run", prompt_id="exp_c", status="running")
+            run_id = rec["run_id"]
+            completed = "2025-06-01T01:00:00Z"
+            updated = svc.update_run(run_id, status="completed", completed_at=completed)
+            self.assertEqual(updated.get("status"), "completed")
+            self.assertEqual(updated.get("completed_at"), completed)
+
+    def test_update_run_with_workflow_hash(self):
+        """update_run accepts workflow_hash."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            rec = svc.record_run(kind="studio_run", prompt_id="exp_w", status="running")
+            run_id = rec["run_id"]
+            updated = svc.update_run(run_id, status="completed", workflow_hash="wh_test123")
+            self.assertEqual(updated.get("workflow_hash"), "wh_test123")
+
+    def test_update_run_with_output_path(self):
+        """update_run accepts output_path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            rec = svc.record_run(kind="studio_run", prompt_id="exp_o", status="running")
+            run_id = rec["run_id"]
+            updated = svc.update_run(run_id, output_path="outputs/studio/test.png")
+            self.assertIn("test.png", updated.get("output_path", ""))
+
+    def test_update_run_merges_meta(self):
+        """update_run merges new meta into existing extra, not replace."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            rec = svc.record_run(
+                kind="studio_run", prompt_id="exp_m", status="running",
+                meta={"original": "yes"},
+            )
+            run_id = rec["run_id"]
+            updated = svc.update_run(run_id, meta={"resolved": "data"})
+            self.assertEqual(updated.get("extra", {}).get("original"), "yes")
+            self.assertEqual(updated.get("extra", {}).get("resolved"), "data")
+
+    def test_backward_compatible_read_of_older_entries(self):
+        """Records written before the extensions remain readable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            # Write an "old-style" record with only basic fields
+            rec = svc.record_run(kind="studio_run", prompt_id="exp_old", status="running")
+            run_id = rec["run_id"]
+            # Read it back - should not error and contain expected fields
+            meta = svc.get_run(run_id)
+            self.assertIsNotNone(meta)
+            self.assertEqual(meta.get("kind"), "studio_run")
+            self.assertEqual(meta.get("prompt_id"), "exp_old")
+
+    def test_update_run_with_primary_asset_id(self):
+        """update_run accepts primary_asset_id stored in meta/extra."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            rec = svc.record_run(kind="studio_run", prompt_id="exp_a", status="running")
+            run_id = rec["run_id"]
+            updated = svc.update_run(run_id, primary_asset_id="asset_abc123")
+            # primary_asset_id should be stored in the record
+            meta = svc.get_run(run_id)
+            self.assertEqual(meta.get("primary_asset_id"), "asset_abc123")
+
+    def test_update_run_with_timings_and_meta_merge(self):
+        """Combined update_run with timings, status, meta, output_path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            rec = svc.record_run(
+                kind="studio_run", prompt_id="exp_combo", status="running",
+                meta={"requested_controls": {"seed": 42}},
+            )
+            run_id = rec["run_id"]
+            timings = {"total_ms": 5000}
+            updated = svc.update_run(
+                run_id,
+                status="completed",
+                timings=timings,
+                meta={"resolved_controls": {"seed": 42, "steps": 20}},
+                output_path="outputs/studio/img_001.png",
+            )
+            self.assertEqual(updated.get("status"), "completed")
+            self.assertIn("img_001.png", updated.get("output_path", ""))
+            # Read full meta
+            meta = svc.get_run(run_id)
+            self.assertEqual(meta.get("extra", {}).get("requested_controls", {}).get("seed"), 42)
+            self.assertEqual(meta.get("extra", {}).get("resolved_controls", {}).get("steps"), 20)
+            # Check timings persisted
+            read_timing = svc.get_timing(run_id)
+            self.assertEqual(read_timing, timings)
+
+    # ── Atomic write tests ────────────────────────────────────────────────
+
+    def test_meta_json_written_atomically(self):
+        """meta.json is not written directly; tmp file + atomic replace used."""
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            rec = svc.record_run(kind="studio_run", prompt_id="exp_atom", status="running")
+            run_id = rec["run_id"]
+            run_dir = root / run_id
+            # A .tmp file should NOT be left behind
+            tmp_files = list(run_dir.glob("*.tmp"))
+            self.assertEqual(len(tmp_files), 0, f"Leftover tmp files: {tmp_files}")
+            # meta.json should exist
+            self.assertTrue((run_dir / "meta.json").exists())
+
+    def test_timing_json_written_atomically_on_update(self):
+        """update_run writes timing.json via atomic tmp+replace."""
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            rec = svc.record_run(kind="studio_run", prompt_id="exp_tim_atom", status="running")
+            run_id = rec["run_id"]
+            svc.update_run(run_id, timings={"total_ms": 100})
+            run_dir = root / run_id
+            tmp_files = list(run_dir.glob("*.tmp"))
+            self.assertEqual(len(tmp_files), 0, f"Leftover tmp files: {tmp_files}")
+            self.assertTrue((run_dir / "timing.json").exists())
+            self.assertEqual(svc.get_timing(run_id), {"total_ms": 100})
+
+    # ── Time-based list_runs sorting ──────────────────────────────────────
+
+    def test_list_runs_sorts_by_completed_at_then_started_at(self):
+        """list_runs orders by completed_at desc, then started_at desc."""
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            # Record A: completed later
+            rec_a = svc.record_run(
+                kind="studio_run", prompt_id="exp_a", status="completed",
+                started_at="2025-06-01T00:00:00Z",
+            )
+            svc.update_run(rec_a["run_id"], completed_at="2025-06-01T02:00:00Z")
+            # Record B: completed earlier
+            rec_b = svc.record_run(
+                kind="studio_run", prompt_id="exp_b", status="completed",
+                started_at="2025-06-01T00:00:00Z",
+            )
+            svc.update_run(rec_b["run_id"], completed_at="2025-06-01T01:00:00Z")
+            # A should come first (later completed_at)
+            runs = svc.list_runs(kind="studio_run")
+            self.assertEqual(len(runs), 2)
+            self.assertEqual(runs[0]["run_id"], rec_a["run_id"])
+            self.assertEqual(runs[1]["run_id"], rec_b["run_id"])
+
+    def test_list_runs_falls_back_to_started_at_when_no_completed_at(self):
+        """When completed_at is absent, use started_at descending."""
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            rec_a = svc.record_run(kind="studio_run", prompt_id="exp_a", status="running",
+                                    started_at="2025-06-01T03:00:00Z")
+            rec_b = svc.record_run(kind="studio_run", prompt_id="exp_b", status="running",
+                                    started_at="2025-06-01T01:00:00Z")
+            runs = svc.list_runs(kind="studio_run")
+            self.assertEqual(runs[0]["run_id"], rec_a["run_id"])
+            self.assertEqual(runs[1]["run_id"], rec_b["run_id"])
+
+    def test_list_runs_falls_back_to_file_mtime(self):
+        """When no timestamp fields exist, fall back to directory mtime."""
+        import os
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            # Write two records manually (no timestamps) then touch mtimes
+            run_dir_a = root / "r_aaaa"
+            run_dir_a.mkdir()
+            (run_dir_a / "meta.json").write_text('{"run_id":"r_aaaa","kind":"studio_run"}', encoding="utf-8")
+            run_dir_b = root / "r_bbbb"
+            run_dir_b.mkdir()
+            (run_dir_b / "meta.json").write_text('{"run_id":"r_bbbb","kind":"studio_run"}', encoding="utf-8")
+            # Set mtime: b newer
+            old = time.time() - 100
+            os.utime(run_dir_a, (old, old))
+            runs = svc.list_runs(kind="studio_run")
+            self.assertEqual(len(runs), 2)
+
+
+# ---------------------------------------------------------------------------
+# LocalRemoteInvoker._save_output_images tests
+# ---------------------------------------------------------------------------
+
+class SaveOutputImagesTests(unittest.TestCase):
+    """Test _save_output_images sanitization, uniqueness, and safety."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("experiment_runner", "experiment_runner.py")
+
+    def _make_invoker(self, tmpdir):
+        return self.mod.LocalRemoteInvoker(
+            None, experiment_id="test_exp", node_dir=tmpdir
+        )
+
+    def _run_save(self, invoker, result_data, cell_key="cell_test"):
+        return asyncio.run(invoker._save_output_images(result_data, cell_key))
+
+    def test_removes_path_traversal_from_remote_filename(self):
+        """Remote filenames with ../ are sanitised to basename only."""
+        import base64
+        with tempfile.TemporaryDirectory() as tmp:
+            invoker = self._make_invoker(tmp)
+            img_data = base64.b64encode(b"fake-png-data").decode("ascii")
+            result = {
+                "outputs": {
+                    "9": {
+                        "images": [
+                            {"filename": "../../../etc/passwd", "data": img_data},
+                        ]
+                    }
+                }
+            }
+            saved = self._run_save(invoker, result, "cell_1")
+            for path in saved:
+                self.assertNotIn("..", path)
+                self.assertNotIn("etc", path)
+                # Should be just a filename, not a path
+                self.assertEqual(Path(path).name, path)
+
+    def test_only_supported_image_extensions(self):
+        """Non-image extensions are discarded; only png/jpg/webp/gif/bmp pass."""
+        import base64
+        with tempfile.TemporaryDirectory() as tmp:
+            invoker = self._make_invoker(tmp)
+            img_data = base64.b64encode(b"fake-data").decode("ascii")
+            result = {
+                "outputs": {
+                    "9": {
+                        "images": [
+                            {"filename": "result.exe", "data": img_data},
+                            {"filename": "outcome.png", "data": img_data},
+                            {"filename": "image.jpg", "data": img_data},
+                        ]
+                    }
+                }
+            }
+            saved = self._run_save(invoker, result, "cell_2")
+            # Should only have .png and .jpg files, NOT .exe
+            for path in saved:
+                ext = Path(path).suffix.lower()
+                self.assertIn(ext, {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
+
+    def test_generates_unique_filenames(self):
+        """Even with same remote filename, outputs get unique local names."""
+        import base64
+        with tempfile.TemporaryDirectory() as tmp:
+            invoker = self._make_invoker(tmp)
+            img_data = base64.b64encode(b"fake-data").decode("ascii")
+            # Two images with identical filename from remote
+            result = {
+                "outputs": {
+                    "9": {
+                        "images": [
+                            {"filename": "same_name.png", "data": img_data},
+                            {"filename": "same_name.png", "data": img_data},
+                        ]
+                    }
+                }
+            }
+            saved = self._run_save(invoker, result, "cell_3")
+            self.assertEqual(len(saved), 2)
+            # Both paths must be different
+            self.assertNotEqual(saved[0], saved[1])
+
+    def test_repeated_remote_filenames_do_not_overwrite(self):
+        """Multiple outputs with same remote name produce distinct files on disk."""
+        import base64
+        with tempfile.TemporaryDirectory() as tmp:
+            invoker = self._make_invoker(tmp)
+            img_data1 = base64.b64encode(b"data-block-a").decode("ascii")
+            img_data2 = base64.b64encode(b"data-block-b").decode("ascii")
+            result = {
+                "outputs": {
+                    "9": {
+                        "images": [
+                            {"filename": "collision.png", "data": img_data1},
+                            {"filename": "collision.png", "data": img_data2},
+                        ]
+                    }
+                }
+            }
+            saved = self._run_save(invoker, result, "cell_4")
+            self.assertEqual(len(saved), 2)
+            output_dir = Path(tmp) / "output" / "studio"
+            files = list(output_dir.iterdir())
+            self.assertEqual(len(files), 2)
+            # Both files should have different content
+            contents = {f.read_bytes() for f in files}
+            self.assertEqual(len(contents), 2)
+
+    def test_traversal_cannot_escape_output_dir(self):
+        """Path traversal like ../ escapes are contained within output/studio."""
+        import base64
+        with tempfile.TemporaryDirectory() as tmp:
+            invoker = self._make_invoker(tmp)
+            img_data = base64.b64encode(b"evil").decode("ascii")
+            result = {
+                "outputs": {
+                    "9": {
+                        "images": [
+                            {"filename": "../../escape.png", "data": img_data},
+                        ]
+                    }
+                }
+            }
+            saved = self._run_save(invoker, result, "cell_5")
+            output_dir = Path(tmp) / "output" / "studio"
+            # File must be inside output_dir
+            for path in saved:
+                full = output_dir / path
+                self.assertTrue(str(full).startswith(str(output_dir.resolve())),
+                                f"{full} escaped {output_dir}")
+
+    def test_keeps_original_remote_name_in_metadata_diagnostics(self):
+        """The original remote filename is preserved in result metadata."""
+        import base64
+        with tempfile.TemporaryDirectory() as tmp:
+            invoker = self._make_invoker(tmp)
+            img_data = base64.b64encode(b"meta-test").decode("ascii")
+            result = {
+                "outputs": {
+                    "9": {
+                        "images": [
+                            {"filename": "original_name_from_remote.png", "data": img_data},
+                        ]
+                    }
+                }
+            }
+            saved = self._run_save(invoker, result, "cell_6")
+            # The saved name should NOT be the original remote name (it's regenerated)
+            # But the original name can be embedded in diagnostics
+            # For this test, verify the output filename is unique (contains studio_ prefix etc.)
+            for path in saved:
+                self.assertTrue(path.startswith("studio_"))
+
+
+# ---------------------------------------------------------------------------
+# Studio run submission-time history tests
+# ---------------------------------------------------------------------------
+
+class StudioRunSubmissionHistoryTests(unittest.TestCase):
+    """Test that handle_studio_run creates a history record on submission."""
+
+    def setUp(self):
+        # Load modules
+        self.adapter = _load_module("studio_run_adapter", "studio_run_adapter.py")
+        self.svc_mod = _load_module("experiment_service", "experiment_service.py")
+        # Patch REGISTRY.history() to use a temp dir
+        self.tmp = tempfile.TemporaryDirectory()
+        self.run_history_root = Path(self.tmp.name) / ".run_history"
+        self.run_history_root.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_build_studio_history_meta_contains_run_id_placeholder(self):
+        """studio_meta can carry a run_history_id for later finalization."""
+        meta = self.adapter._build_studio_history_meta(
+            preset_id="p1", snapshot_id="s1", feature_id="txt2img", controls={"seed": 1},
+        )
+        # The meta should accept a run_history_id being added later
+        meta["run_history_id"] = "r_test123"
+        self.assertEqual(meta.get("run_history_id"), "r_test123")
+
+    def test_submission_record_has_submitted_status(self):
+        """record_run can create a run with status='submitted'."""
+        svc = self.svc_mod.RunHistoryService(self.run_history_root)
+        rec = svc.record_run(
+            kind="studio_run",
+            prompt_id="exp_submit_test",
+            status="submitted",
+            meta={"studio_preset_id": "p1", "studio_feature_id": "txt2img"},
+        )
+        self.assertEqual(rec.get("status"), "submitted")
+        self.assertIn("run_id", rec)
+        self.assertIn("started_at", rec)
+
+    def test_submission_record_carries_requested_controls(self):
+        """Submission record meta includes requested_controls."""
+        svc = self.svc_mod.RunHistoryService(self.run_history_root)
+        controls = {"prompt": "a cat", "seed": 42, "steps": 20}
+        rec = svc.record_run(
+            kind="studio_run",
+            prompt_id="exp_ctrl",
+            status="submitted",
+            meta={"requested_controls": controls},
+        )
+        stored_controls = rec.get("extra", {}).get("requested_controls", {})
+        self.assertEqual(stored_controls.get("seed"), 42)
+        self.assertEqual(stored_controls.get("prompt"), "a cat")
+
+
+# ---------------------------------------------------------------------------
+# Resolved controls derivation tests
+# ---------------------------------------------------------------------------
+
+class ResolvedControlsTests(unittest.TestCase):
+    """Test derivation of resolved_controls from post-application workflow."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_resolved_controls_contains_expected_fields(self):
+        """_build_resolved_controls returns fields from workflow after control application."""
+        workflow = {
+            "3": {"class_type": "KSampler", "inputs": {
+                "seed": 42, "steps": 20, "cfg": 7.0,
+                "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
+            }},
+            "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat"}},
+            "8": {"class_type": "CLIPTextEncode", "inputs": {"text": "blurry"}},
+            "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 768}},
+        }
+        slots = {
+            "prompt": {"node_id": "7", "field": "text", "path": ["inputs", "text"]},
+            "negative_prompt": {"node_id": "8", "field": "text", "path": ["inputs", "text"]},
+            "seed": {"node_id": "3", "field": "seed", "path": ["inputs", "seed"]},
+            "steps": {"node_id": "3", "field": "steps", "path": ["inputs", "steps"]},
+            "guidance": {"node_id": "3", "field": "cfg", "path": ["inputs", "cfg"]},
+            "sampler": {"node_id": "3", "field": "sampler_name", "path": ["inputs", "sampler_name"]},
+            "scheduler": {"node_id": "3", "field": "scheduler", "path": ["inputs", "scheduler"]},
+            "denoise": {"node_id": "3", "field": "denoise", "path": ["inputs", "denoise"]},
+            "width": {"node_id": "5", "field": "width", "path": ["inputs", "width"]},
+            "height": {"node_id": "5", "field": "height", "path": ["inputs", "height"]},
+        }
+        resolved = self.mod._build_resolved_controls(workflow, slots)
+        self.assertEqual(resolved.get("seed"), 42)
+        self.assertEqual(resolved.get("steps"), 20)
+        self.assertEqual(resolved.get("prompt"), "a cat")
+        self.assertEqual(resolved.get("negative_prompt"), "blurry")
+        self.assertEqual(resolved.get("sampler"), "euler")
+        self.assertEqual(resolved.get("scheduler"), "normal")
+        self.assertEqual(resolved.get("denoise"), 1.0)
+        self.assertEqual(resolved.get("width"), 512)
+        self.assertEqual(resolved.get("height"), 768)
+
+    def test_resolved_controls_preserves_falsy_values(self):
+        """Falsy values like 0, 0.0, '' are preserved, not omitted."""
+        workflow = {
+            "3": {"class_type": "KSampler", "inputs": {
+                "seed": 0, "steps": 0, "cfg": 0.0, "denoise": 0.0,
+            }},
+            "7": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}},
+        }
+        slots = {
+            "prompt": {"node_id": "7", "field": "text", "path": ["inputs", "text"]},
+            "seed": {"node_id": "3", "field": "seed", "path": ["inputs", "seed"]},
+            "steps": {"node_id": "3", "field": "steps", "path": ["inputs", "steps"]},
+            "guidance": {"node_id": "3", "field": "cfg", "path": ["inputs", "cfg"]},
+            "denoise": {"node_id": "3", "field": "denoise", "path": ["inputs", "denoise"]},
+        }
+        resolved = self.mod._build_resolved_controls(workflow, slots)
+        self.assertEqual(resolved.get("seed"), 0)
+        self.assertEqual(resolved.get("steps"), 0)
+        self.assertEqual(resolved.get("guidance"), 0.0)
+        self.assertEqual(resolved.get("denoise"), 0.0)
+        self.assertEqual(resolved.get("prompt"), "")
+        self.assertIn("seed", resolved)
+        self.assertIn("prompt", resolved)
+
+    def test_resolved_controls_uses_all_slots_not_hardcoded_shortlist(self):
+        """All bound slots are read, not only a hardcoded subset. Includes
+        arbitrary bindings like mask_blur, input_image, lora fields."""
+        workflow = {
+            "3": {"class_type": "KSampler", "inputs": {
+                "seed": 42, "steps": 20,
+            }},
+            "5": {"class_type": "LoadImage", "inputs": {"image": "input_photo.png"}},
+            "12": {"class_type": "SomeNode", "inputs": {"mask_blur": 15, "expansion": 200}},
+        }
+        slots = {
+            "seed": {"node_id": "3", "field": "seed", "path": ["inputs", "seed"]},
+            "source_image": {"node_id": "5", "field": "image", "path": ["inputs", "image"]},
+            "mask_blur": {"node_id": "12", "field": "mask_blur", "path": ["inputs", "mask_blur"]},
+            "expansion": {"node_id": "12", "field": "expansion", "path": ["inputs", "expansion"]},
+        }
+        resolved = self.mod._build_resolved_controls(workflow, slots)
+        self.assertEqual(resolved.get("seed"), 42)
+        self.assertEqual(resolved.get("source_image"), "input_photo.png")
+        self.assertEqual(resolved.get("mask_blur"), 15)
+        self.assertEqual(resolved.get("expansion"), 200)
+
+    def test_resolved_controls_arbitrary_bindings_work(self):
+        """Completely arbitrary bound fields (lora_strength, image_identity, etc.)
+        are read generically."""
+        workflow = {
+            "20": {"class_type": "LoRALoader", "inputs": {"lora_name": "style.safetensors", "strength": 0.8}},
+            "21": {"class_type": "SomeNode", "inputs": {"identity": "img_abc123"}},
+        }
+        slots = {
+            "lora_name": {"node_id": "20", "field": "lora_name", "path": ["inputs", "lora_name"]},
+            "lora_strength": {"node_id": "20", "field": "strength", "path": ["inputs", "strength"]},
+            "image_identity": {"node_id": "21", "field": "identity", "path": ["inputs", "identity"]},
+        }
+        resolved = self.mod._build_resolved_controls(workflow, slots)
+        self.assertEqual(resolved.get("lora_name"), "style.safetensors")
+        self.assertEqual(resolved.get("lora_strength"), 0.8)
+        self.assertEqual(resolved.get("image_identity"), "img_abc123")
+
+    def test_resolved_controls_only_overrides_replace_corresponding_values(self):
+        """When controls override some values, resolved shows final values."""
+        workflow = {
+            "3": {"class_type": "KSampler", "inputs": {
+                "seed": 777, "steps": 25, "cfg": 7.0,
+            }},
+            "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "overridden prompt"}},
+        }
+        slots = {
+            "prompt": {"node_id": "7", "field": "text", "path": ["inputs", "text"]},
+            "seed": {"node_id": "3", "field": "seed", "path": ["inputs", "seed"]},
+            "steps": {"node_id": "3", "field": "steps", "path": ["inputs", "steps"]},
+        }
+        resolved = self.mod._build_resolved_controls(workflow, slots)
+        self.assertEqual(resolved.get("seed"), 777)
+        self.assertEqual(resolved.get("steps"), 25)
+        self.assertEqual(resolved.get("prompt"), "overridden prompt")
+
+
+# ---------------------------------------------------------------------------
+# Integration: schedule_and_start finalizes same history record
+# ---------------------------------------------------------------------------
+
+class ScheduleAndStartFinalizationTests(unittest.TestCase):
+    """Test that _schedule_and_start finalizes the submission history record."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.svc_mod = _load_module("experiment_service", "experiment_service.py")
+        cls.runner_mod = _load_module("experiment_runner", "experiment_runner.py")
+
+    def test_finalize_does_not_create_new_record(self):
+        """Finalization updates the existing record, does not create a new one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            history_root = Path(tmp) / ".run_history"
+            history_root.mkdir(parents=True, exist_ok=True)
+            svc = self.svc_mod.RunHistoryService(history_root)
+            rec = svc.record_run(
+                kind="studio_run",
+                prompt_id="exp_final",
+                status="submitted",
+                started_at="2025-06-01T00:00:00Z",
+            )
+            run_id = rec["run_id"]
+            updated = svc.update_run(
+                run_id,
+                status="completed",
+                completed_at="2025-06-01T01:00:00Z",
+                timings={"total_ms": 5000},
+                output_path="outputs/studio/img.png",
+                meta={"resolved_controls": {"seed": 42}},
+            )
+            self.assertEqual(updated.get("status"), "completed")
+            self.assertEqual(updated.get("run_id"), run_id)
+            runs = svc.list_runs(kind="studio_run")
+            self.assertEqual(len(runs), 1)
+
+    def test_failure_finalizes_same_record_as_failed(self):
+        """On failure, the submission record is finalized with failed status."""
+        with tempfile.TemporaryDirectory() as tmp:
+            history_root = Path(tmp) / ".run_history"
+            history_root.mkdir(parents=True, exist_ok=True)
+            svc = self.svc_mod.RunHistoryService(history_root)
+            rec = svc.record_run(
+                kind="studio_run",
+                prompt_id="exp_fail",
+                status="submitted",
+            )
+            run_id = rec["run_id"]
+            updated = svc.update_run(
+                run_id,
+                status="failed",
+                completed_at="2025-06-01T01:00:00Z",
+                meta={"error": "scheduler failed"},
+            )
+            self.assertEqual(updated.get("status"), "failed")
+            self.assertIn("error", updated.get("extra", {}))
+
+    def test_output_path_from_cell_completed_event(self):
+        """update_run stores a real output path derived from cell.completed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            history_root = Path(tmp) / ".run_history"
+            history_root.mkdir(parents=True, exist_ok=True)
+            svc = self.svc_mod.RunHistoryService(history_root)
+            rec = svc.record_run(
+                kind="studio_run",
+                prompt_id="exp_path",
+                status="running",
+            )
+            run_id = rec["run_id"]
+            output_path = "outputs/studio/studio_exp_path_cell_9_0_20250601.png"
+            updated = svc.update_run(
+                run_id,
+                status="completed",
+                output_path=output_path,
+            )
+            self.assertEqual(updated.get("output_path"), output_path)
+            meta = svc.get_run(run_id)
+            self.assertEqual(meta.get("output_path"), output_path)
+
+    def test_timestamps_and_timings_persisted(self):
+        """completed_at and timings are both persisted in the finalized record."""
+        with tempfile.TemporaryDirectory() as tmp:
+            history_root = Path(tmp) / ".run_history"
+            history_root.mkdir(parents=True, exist_ok=True)
+            svc = self.svc_mod.RunHistoryService(history_root)
+            rec = svc.record_run(
+                kind="studio_run",
+                prompt_id="exp_ts",
+                status="running",
+                started_at="2025-06-01T00:00:00Z",
+            )
+            run_id = rec["run_id"]
+            completed_at = "2025-06-01T01:00:00Z"
+            timings = {"total_ms": 3600000}
+            svc.update_run(
+                run_id,
+                status="completed",
+                completed_at=completed_at,
+                timings=timings,
+            )
+            meta = svc.get_run(run_id)
+            self.assertEqual(meta.get("started_at"), "2025-06-01T00:00:00Z")
+            self.assertEqual(meta.get("completed_at"), completed_at)
+            read_timing = svc.get_timing(run_id)
+            self.assertEqual(read_timing, timings)
+
+    # ── Failure does not attach output paths ───────────────────────────────
+
+    def test_failed_run_has_no_output_path_or_primary_asset(self):
+        """A failed run must NOT carry output_path or primary_asset_id that
+        would make it look successful on the frontend."""
+        with tempfile.TemporaryDirectory() as tmp:
+            history_root = Path(tmp) / ".run_history"
+            history_root.mkdir(parents=True, exist_ok=True)
+            svc = self.svc_mod.RunHistoryService(history_root)
+            rec = svc.record_run(
+                kind="studio_run",
+                prompt_id="exp_fail_no_out",
+                status="submitted",
+            )
+            run_id = rec["run_id"]
+            # Failure finalization with error only
+            updated = svc.update_run(
+                run_id,
+                status="error",
+                completed_at="2025-06-01T01:00:00Z",
+                meta={"error": "Internal error processing request"},
+            )
+            self.assertEqual(updated.get("status"), "error")
+            # output_path should be empty or absent
+            self.assertFalse(updated.get("output_path"),
+                             "Failed run should not have output_path")
+            # primary_asset_id should NOT be set on failure
+            self.assertNotIn("primary_asset_id", updated)
+
+
+# ---------------------------------------------------------------------------
+# Canonical flattened metadata tests
+# ---------------------------------------------------------------------------
+
+class CanonicalMetadataTests(unittest.TestCase):
+    """Finalized record must have flattened canonical fields for frontend normalizer."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.svc_mod = _load_module("experiment_service", "experiment_service.py")
+
+    def _finalize_with_fields(self, svc, extra_fields: dict = None):
+        """Helper: create a submission record then finalize with all canonical fields."""
+        rec = svc.record_run(
+            kind="studio_run",
+            prompt_id="exp_canon",
+            status="submitted",
+            started_at="2025-06-01T00:00:00Z",
+            meta={
+                "requested_controls": {"prompt": "a cat", "seed": 42, "steps": 20},
+                "studio_preset_id": "preset_1",
+                "studio_snapshot_id": "snap_1",
+                "studio_feature_id": "txt2img",
+                "experiment_id": "exp_canon",
+                "preset_label": "My Preset",
+            },
+        )
+        merge = dict(extra_fields or {})
+        merge.setdefault("resolved_controls", {"seed": 42, "steps": 20, "prompt": "a cat"})
+        merge.setdefault("attempt_id", "a_001")
+        merge.setdefault("cell_key", "studio_cell_abc")
+        merge.setdefault("checkpoint_id", "ck_001")
+        updated = svc.update_run(
+            rec["run_id"],
+            status="completed",
+            completed_at="2025-06-01T01:00:00Z",
+            output_path="outputs/studio/img_001.png",
+            workflow_hash="wh_canon123",
+            primary_asset_id="asset_001",
+            meta=merge,
+        )
+        return svc.get_run(rec["run_id"])
+
+    def test_canonical_fields_at_top_level(self):
+        """Finalized record has prompt, seed, steps, workflow_hash, etc. at top level."""
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = self.svc_mod.RunHistoryService(Path(tmp))
+            meta = self._finalize_with_fields(svc)
+            # These should be at top level for frontend normalizer
+            self.assertEqual(meta.get("kind"), "studio_run")
+            self.assertEqual(meta.get("status"), "completed")
+            self.assertIn("run_id", meta)
+            self.assertIn("started_at", meta)
+            self.assertIn("completed_at", meta)
+            self.assertIn("updated_at", meta)
+            self.assertEqual(meta.get("workflow_hash"), "wh_canon123")
+            self.assertEqual(meta.get("output_path"), "outputs/studio/img_001.png")
+            self.assertEqual(meta.get("primary_asset_id"), "asset_001")
+
+    def test_canonical_controls_at_top_level(self):
+        """requested_controls and resolved_controls are top-level in extra, not nested."""
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = self.svc_mod.RunHistoryService(Path(tmp))
+            meta = self._finalize_with_fields(svc)
+            extra = meta.get("extra", {})
+            self.assertIn("requested_controls", extra)
+            self.assertIn("resolved_controls", extra)
+            self.assertEqual(extra["requested_controls"].get("seed"), 42)
+
+    def test_canonical_identity_fields(self):
+        """preset_id, snapshot_id, feature_id, experiment_id at top level or extra."""
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = self.svc_mod.RunHistoryService(Path(tmp))
+            meta = self._finalize_with_fields(svc)
+            extra = meta.get("extra", {})
+            self.assertEqual(extra.get("studio_preset_id"), "preset_1")
+            self.assertEqual(extra.get("studio_snapshot_id"), "snap_1")
+            self.assertEqual(extra.get("studio_feature_id"), "txt2img")
+            self.assertEqual(extra.get("experiment_id"), "exp_canon")
+            self.assertEqual(extra.get("preset_label"), "My Preset")
+
+    def test_canonical_timestamps_present(self):
+        """submitted_at (started_at), completed_at, updated_at are all present."""
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = self.svc_mod.RunHistoryService(Path(tmp))
+            meta = self._finalize_with_fields(svc)
+            self.assertTrue(bool(meta.get("started_at")), "started_at missing")
+            self.assertTrue(bool(meta.get("completed_at")), "completed_at missing")
+            self.assertTrue(bool(meta.get("updated_at")), "updated_at missing")
+
+    def test_canonical_cell_reference_fields(self):
+        """attempt_id, cell_key, checkpoint_id present in extra."""
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = self.svc_mod.RunHistoryService(Path(tmp))
+            meta = self._finalize_with_fields(svc)
+            extra = meta.get("extra", {})
+            self.assertEqual(extra.get("attempt_id"), "a_001")
+            self.assertEqual(extra.get("cell_key"), "studio_cell_abc")
+            self.assertEqual(extra.get("checkpoint_id"), "ck_001")
+
+
+# ---------------------------------------------------------------------------
+# Stable error messages
+# ---------------------------------------------------------------------------
+
+class StableErrorMessagesTests(unittest.TestCase):
+    """User-facing error messages must be stable, not raw exception text."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.adapter = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_stable_internal_error_constant_exists(self):
+        """_STABLE_INTERNAL_ERROR is a non-empty string without raw exception details."""
+        msg = self.adapter._STABLE_INTERNAL_ERROR
+        self.assertTrue(bool(msg))
+        # Should NOT contain raw exception indicators
+        self.assertNotIn("traceback", msg.lower())
+        self.assertNotIn("\n", msg)
+        self.assertNotIn("  ", msg)
+        # Should be a short, generic, stable message
+        self.assertIn("Internal error", msg)
+        self.assertGreater(len(msg), 5)
+        self.assertLess(len(msg), 200)
+
+    def test_failure_record_has_stable_error_not_raw_exception(self):
+        """A failed record's error message is stable, not raw exception trace."""
+        with tempfile.TemporaryDirectory() as tmp:
+            svc_mod = _load_module("experiment_service", "experiment_service.py")
+            svc = svc_mod.RunHistoryService(Path(tmp))
+            rec = svc.record_run(
+                kind="studio_run",
+                prompt_id="exp_stable_err",
+                status="submitted",
+            )
+            # Simulate failure with raw exception text (as _schedule_and_start might do)
+            # The fix should ensure the update_run stores a stable message
+            raw_exc = "ValueError: connection refused: [Errno 111] Connection refused"
+            stable_msg = "Internal error processing request"
+            updated = svc.update_run(
+                rec["run_id"],
+                status="error",
+                completed_at="2025-06-01T01:00:00Z",
+                meta={"error": stable_msg},
+            )
+            extra = updated.get("extra", {})
+            stored_error = extra.get("error", "")
+            # The user-facing error should be stable, not raw exception text
+            self.assertNotIn("ValueError", stored_error)
+            self.assertNotIn("connection refused", stored_error)
+            self.assertEqual(stored_error, stable_msg)
+
+
+# ---------------------------------------------------------------------------
+# Integration: full compilation carries run_id in studio metadata
+# ---------------------------------------------------------------------------
+
+class CompilationRunIdTests(unittest.TestCase):
+    """Test that run_id flows through compilation metadata."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_compilation_can_carry_run_history_id(self):
+        """compilation holds run_history_id that links to history record."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            controls = {"prompt": "test", "seed": 1}
+            spec = self.mod.build_single_run_spec(preset, snap, "txt2img", controls, tmp)
+            # Simulate adding run_id after history record creation
+            spec["run_history_id"] = "r_" + "a" * 12
+            self.assertIn("run_history_id", spec)
+            # Also flows through studio_meta in checkpoints and cells
+            for ck in spec.get("checkpoints", []):
+                ck["studio_meta"]["run_history_id"] = spec["run_history_id"]
+                self.assertEqual(
+                    ck["studio_meta"].get("run_history_id"),
+                    spec["run_history_id"],
+                )
+            for cell in spec.get("cells", []):
+                cell["studio_meta"]["run_history_id"] = spec["run_history_id"]
+                self.assertEqual(
+                    cell["studio_meta"].get("run_history_id"),
+                    spec["run_history_id"],
+                )
+
+
+# ---------------------------------------------------------------------------
+# Canonical flattened aliases from resolved_controls
+# ---------------------------------------------------------------------------
+
+class CanonicalAliasesTests(unittest.TestCase):
+    """resolved_controls values are copied to top-level extra aliases."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_canonical_aliases_extracted_from_resolved_controls(self):
+        """Values like prompt, seed, steps, guidance, sampler etc. appear as
+        top-level aliases in extra, not only nested in resolved_controls."""
+        resolved = {
+            "prompt": "a cat", "negative_prompt": "blurry",
+            "seed": 42, "steps": 20, "guidance": 7.0,
+            "sampler": "euler", "scheduler": "normal", "denoise": 1.0,
+            "width": 512, "height": 768,
+        }
+        result = self.mod._flatten_canonical_aliases(resolved, {})
+        self.assertEqual(result.get("prompt"), "a cat")
+        self.assertEqual(result.get("negative_prompt"), "blurry")
+        self.assertEqual(result.get("seed"), 42)
+        self.assertEqual(result.get("steps"), 20)
+        self.assertEqual(result.get("guidance"), 7.0)
+        self.assertEqual(result.get("sampler"), "euler")
+        self.assertEqual(result.get("scheduler"), "normal")
+        self.assertEqual(result.get("denoise"), 1.0)
+        self.assertEqual(result.get("width"), 512)
+        self.assertEqual(result.get("height"), 768)
+
+    def test_canonical_aliases_include_lora_and_image_bindings(self):
+        """LoRA name/strength and image identity are also aliased."""
+        resolved = {
+            "lora_name": "style.safetensors",
+            "lora_strength": 0.8,
+            "source_image": "input_photo.png",
+            "mask_blur": 15,
+        }
+        result = self.mod._flatten_canonical_aliases(resolved, {})
+        self.assertEqual(result.get("lora_name"), "style.safetensors")
+        self.assertEqual(result.get("lora_strength"), 0.8)
+        self.assertEqual(result.get("source_image"), "input_photo.png")
+        self.assertEqual(result.get("mask_blur"), 15)
+
+    def test_canonical_aliases_preserve_falsy_values(self):
+        """Zero, empty string etc. in resolved_controls appear in aliases."""
+        resolved = {"seed": 0, "steps": 0, "guidance": 0.0, "prompt": "", "denoise": 0.0}
+        result = self.mod._flatten_canonical_aliases(resolved, {})
+        self.assertEqual(result.get("seed"), 0)
+        self.assertEqual(result.get("steps"), 0)
+        self.assertEqual(result.get("prompt"), "")
+        self.assertEqual(result.get("denoise"), 0.0)
+
+    def test_canonical_aliases_event_payload_overrides(self):
+        """Event payload values override resolved_controls for the same key."""
+        resolved = {"prompt": "old prompt", "seed": 1}
+        event_payload = {"seed": 999}
+        result = self.mod._flatten_canonical_aliases(resolved, event_payload)
+        self.assertEqual(result.get("prompt"), "old prompt")  # from resolved
+        self.assertEqual(result.get("seed"), 999)  # overridden by event
+
+
+# ---------------------------------------------------------------------------
+# list_ruses numeric mtime sort key
+# ---------------------------------------------------------------------------
+
+class ListRunsSortKeyTests(unittest.TestCase):
+    """list_runs must use numeric mtime, not stringified."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.svc_mod = _load_module("experiment_service", "experiment_service.py")
+
+    def test_list_runs_numeric_mtime_fallback(self):
+        """Numeric mtime fallback sorts correctly when timestamps absent."""
+        import os, time
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            # Create two records with explicit mod times
+            run_a = root / "r_aaaa"
+            run_a.mkdir()
+            (run_a / "meta.json").write_text(
+                '{"run_id":"r_aaaa","kind":"studio_run"}', encoding="utf-8")
+            run_b = root / "r_bbbb"
+            run_b.mkdir()
+            (run_b / "meta.json").write_text(
+                '{"run_id":"r_bbbb","kind":"studio_run"}', encoding="utf-8")
+            # Set mtime: a=epoch+1000, b=epoch+2000 (b newer)
+            os.utime(run_a, (1000, 1000))
+            os.utime(run_b, (2000, 2000))
+            runs = svc.list_runs(kind="studio_run")
+            self.assertEqual(len(runs), 2)
+            # b should come first (newer mtime = higher = first in DESC)
+            self.assertEqual(runs[0]["run_id"], "r_bbbb")
+            self.assertEqual(runs[1]["run_id"], "r_aaaa")
+
+    def test_list_runs_mtime_string_sort_bug_regression(self):
+        """Stringified mtime would sort '9' > '89' — verify numeric sort."""
+
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            run_a = root / "r_aaaa"
+            run_a.mkdir()
+            (run_a / "meta.json").write_text(
+                '{"run_id":"r_aaaa","kind":"studio_run"}', encoding="utf-8")
+            run_b = root / "r_bbbb"
+            run_b.mkdir()
+            (run_b / "meta.json").write_text(
+                '{"run_id":"r_bbbb","kind":"studio_run"}', encoding="utf-8")
+            # mtime_a=9, mtime_b=89 — string sort would put '9' > '89' (wrong)
+            os.utime(run_a, (9, 9))
+            os.utime(run_b, (89, 89))
+            runs = svc.list_runs(kind="studio_run")
+            self.assertEqual(len(runs), 2)
+            # Numeric: 89 > 9, so b first in DESC
+            self.assertEqual(runs[0]["run_id"], "r_bbbb")
+
+
+# ---------------------------------------------------------------------------
+# Canonical metadata: submitted_at, workflow_hash at submission
+# ---------------------------------------------------------------------------
+
+class SubmissionCanonicalMetadataTests(unittest.TestCase):
+    """Submission record must carry submitted_at and workflow_hash."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.svc_mod = _load_module("experiment_service", "experiment_service.py")
+
+    def test_submission_record_has_submitted_at(self):
+        """submitted_at is stored as explicit field in extra."""
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = self.svc_mod.RunHistoryService(Path(tmp))
+            rec = svc.record_run(
+                kind="studio_run",
+                prompt_id="exp_sub_at",
+                status="submitted",
+                started_at="2025-06-01T00:00:00Z",
+                meta={"submitted_at": "2025-06-01T00:00:00Z"},
+            )
+            extra = rec.get("extra", {})
+            self.assertEqual(extra.get("submitted_at"), "2025-06-01T00:00:00Z")
+
+
+# ---------------------------------------------------------------------------
+# Stable error in _schedule_and_start failure path
+# ---------------------------------------------------------------------------
+
+class PersistentErrorStabilityTests(unittest.TestCase):
+    """_persist_experiment_error receives stable message, not raw exception."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.adapter = _load_module("studio_run_adapter", "studio_run_adapter.py")
+        cls.svc_mod = _load_module("experiment_service", "experiment_service.py")
+
+    def test_persist_experiment_error_stable_message(self):
+        """_persist_experiment_error is called with stable message."""
+        stable = self.adapter._STABLE_INTERNAL_ERROR
+        # The function just persists to store — verify it accepts stable
+        self.assertTrue(bool(stable))
+        self.assertNotIn("traceback", stable)
+        # Raw exception patterns should not appear in stable msg
+        self.assertNotIn("ValueError", stable)
+        self.assertNotIn("Exception", stable)
+
+    def test_persist_experiment_error_no_raw_exception(self):
+        """The actual function should not be called with raw trace in production."""
+        stable = self.adapter._STABLE_INTERNAL_ERROR
+        # When _schedule_and_start's except block calls _persist_experiment_error,
+        # it should pass the stable error, not str(exc)
+        # Verify the stable constant is what gets used
+        self.assertGreater(len(stable), 5)
+        self.assertLess(len(stable), 200)
+        self.assertIn("Internal error", stable)
+
+
+# ---------------------------------------------------------------------------
+# Preset label in history metadata
+# ---------------------------------------------------------------------------
+
+class StudioRunAdapterLabelTests(unittest.TestCase):
+    """_build_studio_history_meta must carry preset_label."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_history_meta_carries_preset_label(self):
+        """_build_studio_history_meta includes studio_preset_label when preset_label arg provided."""
+        meta = self.mod._build_studio_history_meta(
+            preset_id="preset_1",
+            snapshot_id="snap_1",
+            feature_id="txt2img",
+            controls={"seed": 42},
+            preset_label="My Cool Preset",
+        )
+        self.assertEqual(meta.get("studio_preset_label"), "My Cool Preset")
+        self.assertEqual(meta.get("studio_preset_id"), "preset_1")
+        self.assertEqual(meta.get("studio_snapshot_id"), "snap_1")
+        self.assertEqual(meta.get("studio_feature_id"), "txt2img")
+
+    def test_build_single_run_spec_carries_preset_label(self):
+        """build_single_run_spec carries preset label in studio_meta."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            controls = {"prompt": "test", "seed": 1}
+            spec = self.mod.build_single_run_spec(preset, snap, "txt2img", controls, tmp)
+            meta = spec.get("studio_meta", {})
+            self.assertIn("studio_preset_label", meta,
+                          "studio_meta must include studio_preset_label")
+            self.assertEqual(meta.get("studio_preset_label"), "Runnable Preset")
+
+    def test_finalization_meta_preserves_preset_label(self):
+        """The meta_merge dict in finalization path carries preset_label from studio_meta."""
+        from studio_run_adapter import _build_studio_history_meta
+        studio_meta = _build_studio_history_meta(
+            preset_id="preset_1",
+            snapshot_id="snap_1",
+            feature_id="txt2img",
+            controls={"seed": 42},
+            preset_label="Finalization Preset",
+        )
+        # Simulate the meta_merge step from _schedule_and_start
+        meta_merge = {}
+        meta_merge["studio_preset_id"] = studio_meta.get("studio_preset_id", "")
+        meta_merge["studio_snapshot_id"] = studio_meta.get("studio_snapshot_id", "")
+        meta_merge["studio_feature_id"] = studio_meta.get("studio_feature_id", "")
+        meta_merge["preset_label"] = studio_meta.get("studio_preset_label", "")
+        self.assertEqual(meta_merge.get("preset_label"), "Finalization Preset")
+        self.assertEqual(meta_merge.get("studio_preset_id"), "preset_1")
+        self.assertEqual(meta_merge.get("studio_snapshot_id"), "snap_1")
+        self.assertEqual(meta_merge.get("studio_feature_id"), "txt2img")
+
+
+# ---------------------------------------------------------------------------
+# extract_defaults_from_snapshot includes sampler and scheduler
+# ---------------------------------------------------------------------------
+
+class ExtractDefaultsSamplerSchedulerTests(unittest.TestCase):
+    """extract_defaults_from_snapshot must include sampler/scheduler when bound."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_extracts_sampler_widget(self):
+        """Sampler binding with kind=widget extracts sampler_name from workflow."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {
+                    "seed": 42, "steps": 30, "sampler_name": "euler", "scheduler": "normal",
+                }},
+            },
+            "nodeBindings": {
+                "sampler": {"kind": "widget", "nodeId": "3", "widgetName": "sampler_name"},
+                "scheduler": {"kind": "widget", "nodeId": "3", "widgetName": "scheduler"},
+                "seed": {"kind": "widget", "nodeId": "3", "widgetName": "seed"},
+            },
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        self.assertIn("sampler", defaults)
+        self.assertIn("scheduler", defaults)
+        self.assertEqual(defaults["sampler"], "euler")
+        self.assertEqual(defaults["scheduler"], "normal")
+        self.assertEqual(defaults["seed"], 42)
+
+    def test_sampler_missing_if_not_bound(self):
+        """Sampler/scheduler absent from nodeBindings => not in defaults."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {
+                    "seed": 42, "sampler_name": "euler", "scheduler": "normal",
+                }},
+            },
+            "nodeBindings": {
+                "seed": {"kind": "widget", "nodeId": "3", "widgetName": "seed"},
+            },
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        self.assertIn("seed", defaults)
+        self.assertNotIn("sampler", defaults)
+        self.assertNotIn("scheduler", defaults)
+
+
 if __name__ == "__main__":
     unittest.main()

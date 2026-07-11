@@ -11,7 +11,7 @@
 //   2. run.asset_id            → /assets/<id>
 //   3. run.output_path         → /studio/outputs/<path>
 
-import { resolveRunImageUrl, hasRunImage } from "./studio-run-normalizer.js";
+import { resolveRunImageUrl, hasRunImage, normalizeStudioRun } from "./studio-run-normalizer.js";
 
 // ── Element helper (local, matches other modules) ─────────────────────────
 
@@ -76,12 +76,43 @@ export function renderHistory(state, context) {
     if (existing) existing.remove();
     if (!previewRun) return;
 
-    const imageUrl = resolveRunImageUrl(previewRun, apiBase);
-    const extra = getRunExtra(previewRun);
-    const rid = previewRun.id || previewRun.run_id || extra.experiment_id || "unknown";
-    const status = getRunStatus(previewRun);
-    const promptText = (extra.prompt || previewRun.prompt || rid).substring(0, 200);
-    const time = previewRun.created_at || previewRun.started_at || previewRun.timestamp || previewRun.created || "";
+    // previewRun is already a normalized run (from normalizeStudioRun)
+    const nr = previewRun;
+    const imageUrl = nr.imageUrl;
+    const rid = nr.id || "unknown";
+    const status = nr.status;
+    const promptText = (nr.prompt != null ? nr.prompt : rid).substring(0, 200);
+
+    // Build metadata using normalized fields (use nullish checks to preserve falsy values)
+    const metaItems = [];
+    if (nr.durationMs != null && nr.durationMs > 0) {
+      const durSecs = (nr.durationMs / 1000).toFixed(1);
+      metaItems.push({ label: "Duration", value: durSecs + "s" });
+    }
+    if (nr.startedAt != null && nr.startedAt) {
+      metaItems.push({ label: "Generated", value: nr.startedAt.substring(0, 19) });
+    }
+    if (nr.presetLabel != null && nr.presetLabel) {
+      metaItems.push({ label: "Preset", value: nr.presetLabel.substring(0, 20) });
+    } else if (nr.presetId != null && nr.presetId) {
+      metaItems.push({ label: "Preset", value: nr.presetId.substring(0, 20) });
+    }
+    if (nr.featureId) {
+      metaItems.push({ label: "Feature", value: nr.featureId });
+    }
+    // Add advanced details from resolved/requested controls
+    const rc = nr.resolvedControls || {};
+    const rqc = nr.requestedControls || {};
+    const seed = rc.seed || rqc.seed || "";
+    if (seed) metaItems.push({ label: "Seed", value: String(seed) });
+    if (rc.steps) metaItems.push({ label: "Steps", value: String(rc.steps) });
+    if (rc.cfg || rc.guidance) metaItems.push({ label: "Guidance", value: String(rc.cfg || rc.guidance) });
+    if (rc.sampler_name || rc.sampler) metaItems.push({ label: "Sampler", value: String(rc.sampler_name || rc.sampler) });
+    if (rc.scheduler) metaItems.push({ label: "Scheduler", value: String(rc.scheduler) });
+    if (rc.denoise) metaItems.push({ label: "Denoise", value: String(rc.denoise) });
+    if (rc.width && rc.height) metaItems.push({ label: "Size", value: rc.width + "\u00d7" + rc.height });
+    if (nr.workflowHash) metaItems.push({ label: "Workflow", value: nr.workflowHash.substring(0, 8) + "\u2026" });
+    if (nr.snapshotId) metaItems.push({ label: "Snapshot", value: nr.snapshotId.substring(0, 12) + "\u2026" });
 
     const overlay = el("div", {
       class: "comfymodal-studio-history-preview",
@@ -115,8 +146,18 @@ export function renderHistory(state, context) {
         el("div", { class: "comfymodal-studio-history-preview-info" }, [
           el("div", { class: "comfymodal-studio-history-preview-status", text: status }),
           el("div", { class: "comfymodal-studio-history-preview-prompt", text: promptText }),
-          time ? el("div", { class: "comfymodal-studio-history-preview-time", text: time }) : null,
         ]),
+        // Generation settings metadata
+        metaItems.length > 0
+          ? el("div", { class: "comfymodal-studio-history-preview-meta" },
+              metaItems.map(function (item) {
+                return el("span", {
+                  class: "comfymodal-studio-history-preview-meta-item",
+                  text: item.label + ": " + item.value,
+                });
+              })
+            )
+          : null,
       ]),
     ]);
     container.appendChild(overlay);
@@ -162,17 +203,21 @@ export function renderHistory(state, context) {
 
         const runList = Array.isArray(runs) ? runs : [];
 
+        // Normalize all runs for consistent field access
+        const normalizedRuns = runList.map(function (run) {
+          return normalizeStudioRun(run, apiBase);
+        }).filter(Boolean);
+
         // Group by experiment_id
         const grouped = {};
         const ungrouped = [];
-        runList.forEach(function (run) {
-          const extra = getRunExtra(run);
-          const expId = run.experiment_id || run.experimentId || extra.experiment_id || null;
-          if (expId) {
+        normalizedRuns.forEach(function (nr) {
+          const expId = nr.experimentId || null;
+          if (expId && expId !== "") {
             if (!grouped[expId]) grouped[expId] = [];
-            grouped[expId].push(run);
+            grouped[expId].push(nr);
           } else {
-            ungrouped.push(run);
+            ungrouped.push(nr);
           }
         });
 
@@ -221,10 +266,6 @@ function renderGroup(expId, groupRuns, apiBase, openPreview) {
   });
 
   const firstRun = groupRuns[0] || {};
-  const extra = getRunExtra(firstRun);
-  const studioMeta = firstRun.studio_meta || extra.studio_meta || (firstRun.metadata && firstRun.metadata.studio_meta) || {};
-  const flatFeatureId = extra.studio_feature_id || "";
-  const flatPresetId = extra.studio_preset_id || "";
 
   // ── Group header ────────────────────────────────────────────────────
   const groupHeader = el("div", {
@@ -232,11 +273,14 @@ function renderGroup(expId, groupRuns, apiBase, openPreview) {
   });
 
   const groupTitle = el("strong");
-  if (studioMeta.studio_feature_id || studioMeta.studio_preset_id || flatFeatureId || flatPresetId) {
-    const featureLabel = studioMeta.studio_feature_id || flatFeatureId || "studio";
-    const presetSource = studioMeta.studio_preset_id || flatPresetId || "";
-    const presetLabel = presetSource ? presetSource.substring(0, 12) : "";
-    groupTitle.textContent = "Studio " + featureLabel + (presetLabel ? " \u2014 " + presetLabel : "");
+  // Use normalized fields from the first run
+  const featureId = firstRun.featureId || "";
+  const presetId = firstRun.presetId || "";
+  const presetLabel = firstRun.presetLabel || firstRun.presetId || "";
+  if (featureId || presetId) {
+    const featureLabel = featureId || "studio";
+    const labelDisplay = presetLabel ? presetLabel.substring(0, 20) : "";
+    groupTitle.textContent = "Studio " + featureLabel + (labelDisplay ? " \u2014 " + labelDisplay : "");
   } else {
     groupTitle.textContent = "Experiment: " + expId;
   }
@@ -267,21 +311,21 @@ function renderGroup(expId, groupRuns, apiBase, openPreview) {
   // ── Gallery grid ───────────────────────────────────────────────────
   const gallery = el("div", { class: "comfymodal-studio-history-gallery" });
 
-  groupRuns.forEach(function (run) {
-    const extra = getRunExtra(run);
-    const hasImage = hasRunImage(run);
-    const imageUrl = hasImage ? resolveRunImageUrl(run, apiBase) : null;
-    const status = getRunStatus(run);
-    const rid = run.id || run.run_id || extra.experiment_id || "unknown";
-    const promptText = (extra.prompt || run.prompt || rid).substring(0, 60);
-    const time = run.created_at || run.started_at || run.timestamp || run.created || "";
+  groupRuns.forEach(function (nr) {
+    const hasImage = !!nr.imageUrl;
+    const imageUrl = nr.imageUrl || null;
+    const status = nr.status;
+    const promptText = (nr.prompt || nr.id || "unknown").substring(0, 60);
+    const time = nr.startedAt || "";
 
     // Card wrapper
+    const isCardCompleted = nr.status === "completed" || nr.status === "success" || nr.status === "done";
+    const isCardFailed = nr.status === "failed" || nr.status === "error";
     const card = el("div", {
       class: "comfymodal-studio-history-card"
-        + (isCompleted(run) ? " completed" : "")
-        + (isFailed(run) ? " failed" : ""),
-      onclick: function () { openPreview(run); },
+        + (isCardCompleted ? " completed" : "")
+        + (isCardFailed ? " failed" : ""),
+      onclick: function () { openPreview(nr); },
     });
 
     // Thumbnail or fallback

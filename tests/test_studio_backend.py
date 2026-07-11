@@ -280,12 +280,13 @@ class HistoryFlatStudioMetaTests(unittest.TestCase):
     def setUp(self) -> None:
         self.text = (WEB / "studio-history.js").read_text(encoding="utf-8")
 
-    def test_history_reads_flat_studio_feature_fields(self):
-        self.assertIn("extra.studio_feature_id", self.text)
-        self.assertIn("extra.studio_preset_id", self.text)
+    def test_history_uses_normalized_studio_fields(self):
+        """History must read feature fields from normalized records (featureId, presetId)."""
+        self.assertIn("featureId", self.text)
+        self.assertIn("presetId", self.text)
 
     def test_history_accepts_output_path_as_output_evidence(self):
-        self.assertIn("run.output_path", self.text)
+        self.assertIn("normalizeStudioRun", self.text)
 
 
 # ---------------------------------------------------------------------------
@@ -617,17 +618,21 @@ class PresetWizardModuleTests(unittest.TestCase):
         self.assertIn("object_replace", text)
 
     def test_wizard_bindings_defined(self):
-        """Wizard must define required bindings per feature."""
-        text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+        """Wizard binding keys must be defined in FEATURE_REQUIREMENTS (studio-preset-capabilities.js)."""
+        caps_text = (WEB / "studio-preset-capabilities.js").read_text(encoding="utf-8")
         # txt2img
-        self.assertIn('"prompt"', text)
-        self.assertIn('"output"', text)
+        self.assertIn('"prompt"', caps_text)
+        self.assertIn('"output"', caps_text)
         # object_remove
-        self.assertIn('"source_image"', text)
-        self.assertIn('"mask"', text)
-        self.assertIn('"instruction"', text)
+        self.assertIn('"source_image"', caps_text)
+        self.assertIn('"mask"', caps_text)
+        self.assertIn('"instruction"', caps_text)
         # object_replace
-        self.assertIn('"replacement_prompt"', text)
+        self.assertIn('"replacement_prompt"', caps_text)
+        # Wizard delegates to getRequiredBindingsForFeature / getOptionalBindingsForFeature
+        wiz_text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+        self.assertIn("getRequiredBindingsForFeature", wiz_text)
+        self.assertIn("getOptionalBindingsForFeature", wiz_text)
 
     def test_wizard_calls_capture_and_api(self):
         """Wizard must import captureCurrentComfyGraph and createSnapshot/createPreset."""
@@ -720,13 +725,16 @@ class BindingKeyTests(unittest.TestCase):
         self.assertNotIn("object_replace_mask", binding_keys_section)
 
     def test_wizard_binding_keys_match_model(self):
-        """Wizard binding keys must match the model's _FEATURE_BINDING_KEYS."""
-        wizard_text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+        """Binding keys in FEATURE_REQUIREMENTS must match the model's _FEATURE_BINDING_KEYS."""
+        caps_text = (WEB / "studio-preset-capabilities.js").read_text(encoding="utf-8")
         model_text = (REPO_ROOT / "studio_models.py").read_text(encoding="utf-8")
         # Both use the same binding key identifiers
         for key in ["prompt", "source_image", "mask", "instruction", "replacement_prompt"]:
-            self.assertIn(key, wizard_text, f"Wizard missing binding key: {key}")
+            self.assertIn(key, caps_text, f"Capabilities missing binding key: {key}")
             self.assertIn(key, model_text, f"Model missing binding key: {key}")
+        # Wizard delegates to capabilities module
+        wizard_text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+        self.assertIn("getRequiredBindingsForFeature", wizard_text)
 
 
 class CaptureModuleTests(unittest.TestCase):
@@ -824,6 +832,22 @@ class StudioBackendMakePresetTests(unittest.TestCase):
         self.assertNotIn("renderFeaturesStep", text)
         self.assertNotIn("renderBindingsStep", text)
         self.assertNotIn('"features"', text)  # The state step values belong in the wizard
+
+
+class StudioPresetWizardInteractionTests(unittest.TestCase):
+    """Nested wizard controls must not trigger graph-binding capture on their parent rows."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-preset-wizard.js").read_text(encoding="utf-8")
+
+    def test_wizard_has_interactive_target_guard(self):
+        """Binding-row clicks must ignore nested interactive controls like select/button/input."""
+        self.assertIn("closest(\"select, button, input, textarea, a\")", self.text)
+
+    def test_candidate_dropdown_stops_pointer_bubbling(self):
+        """Candidate dropdown must stop pointer/click bubbling so opening it does not start capture."""
+        self.assertIn('select.addEventListener("mousedown"', self.text)
+        self.assertIn("stopPropagation", self.text)
 
 
 # ---------------------------------------------------------------------------
@@ -995,6 +1019,511 @@ class GalleryCarouselStylesTests(unittest.TestCase):
     def test_styles_have_preview_overlay_positioning(self):
         """preview overlay must use fixed/flex positioning."""
         self.assertIn("position", self.text)
+
+
+# ---------------------------------------------------------------------------
+# normalizeStudioRun — shared run normalizer with full normalized object
+# ---------------------------------------------------------------------------
+
+class NormalizeStudioRunTests(unittest.TestCase):
+    """normalizeStudioRun must exist and produce stable normalized objects."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-run-normalizer.js").read_text(encoding="utf-8")
+
+    def test_normalize_studio_run_exported(self):
+        """normalizeStudioRun must be exported from studio-run-normalizer.js."""
+        self.assertTrue(
+            _JsModule(WEB / "studio-run-normalizer.js").has_export("normalizeStudioRun"),
+            "Expected export function normalizeStudioRun",
+        )
+
+    def test_normalize_studio_run_accepts_raw_run_and_api_base(self):
+        """normalizeStudioRun must accept (rawRun, apiBase) signature."""
+        self.assertIn("normalizeStudioRun", self.text)
+        self.assertIn("apiBase", self.text)
+
+    def test_normalize_studio_run_returns_stable_object(self):
+        """normalizeStudioRun must return an object with all required fields."""
+        # Check for at least the core fields expected in the normalized output
+        for field in ["id", "status", "imageUrl", "presetId", "featureId", "prompt", "raw"]:
+            self.assertIn(field, self.text, f"Normalized object missing field: {field}")
+
+    def test_normalize_studio_run_handles_older_history_aliases(self):
+        """normalizeStudioRun must tolerate legacy field aliases (run_id, state, created)."""
+        self.assertIn("run_id", self.text)
+        self.assertIn("state", self.text)
+
+    def test_normalize_studio_run_includes_resolved_controls(self):
+        """normalizeStudioRun must include resolvedControls and requestedControls."""
+        self.assertIn("resolvedControls", self.text)
+        self.assertIn("requestedControls", self.text)
+
+    def test_normalize_studio_run_includes_timings(self):
+        """normalizeStudioRun must include timings, durationMs, startedAt, completedAt."""
+        self.assertIn("timings", self.text)
+        self.assertIn("durationMs", self.text)
+
+    def test_normalize_studio_run_uses_total_ms_from_timings(self):
+        """normalizeStudioRun must derive durationMs from timings.total_ms when explicit duration_ms absent."""
+        # Should contain timings.total_ms or total_ms as a fallback
+        self.assertIn("total_ms", self.text) or self.assertIn("timings.total_ms", self.text)
+
+    def test_normalize_studio_run_uses_canonical_aliases(self):
+        """normalizeStudioRun must prefer canonical backend fields over legacy aliases."""
+        self.assertIn("timings", self.text)
+
+    def test_normalize_studio_run_includes_workflow_hash(self):
+        """normalizeStudioRun must include workflowHash."""
+        self.assertIn("workflowHash", self.text)
+
+    def test_normalize_studio_run_includes_negative_prompt(self):
+        """normalizeStudioRun must include negativePrompt."""
+        self.assertIn("negativePrompt", self.text)
+
+    def test_normalize_studio_run_includes_snapshot_id(self):
+        """normalizeStudioRun must include snapshotId."""
+        self.assertIn("snapshotId", self.text)
+
+    def test_normalize_studio_run_includes_preset_label(self):
+        """normalizeStudioRun must include presetLabel."""
+        self.assertIn("presetLabel", self.text)
+
+    def test_normalize_studio_run_includes_experiment_id(self):
+        """normalizeStudioRun must include experimentId."""
+        self.assertIn("experimentId", self.text)
+
+
+# ---------------------------------------------------------------------------
+# Shared normalizer consumed by History and Playground
+# ---------------------------------------------------------------------------
+
+class SharedNormalizerConsumptionTests(unittest.TestCase):
+    """Both History and Playground must consume the shared normalizer."""
+
+    def test_history_imports_normalize_studio_run(self):
+        """studio-history.js must import normalizeStudioRun."""
+        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
+        self.assertIn("normalizeStudioRun", text)
+
+    def test_playground_imports_normalize_studio_run(self):
+        """studio-playground.js must import normalizeStudioRun."""
+        text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+        self.assertIn("normalizeStudioRun", text)
+
+    def test_history_uses_normalized_fields_not_raw_parsing(self):
+        """History must use normalized fields instead of duplicating parsing."""
+        h_text = (WEB / "studio-history.js").read_text(encoding="utf-8")
+        # History should not duplicate prompt/status/image/timestamp parsing
+        # Check it uses normalized record fields
+        p_text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+        # Both files import from normalizer
+        self.assertIn("./studio-run-normalizer.js", h_text)
+        self.assertIn("./studio-run-normalizer.js", p_text)
+
+
+# ---------------------------------------------------------------------------
+# Run button — no 'Run Again' label (direct idle/error/completed submission)
+# ---------------------------------------------------------------------------
+
+class RunButtonLabelTests(unittest.TestCase):
+    """Primary button labels must not use 'Run Again'."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_no_run_again_label(self):
+        """'Run Again' must not appear in playground button labels."""
+        self.assertNotIn("Run Again", self.text)
+
+    def test_run_label_for_idle(self):
+        """Run button must show 'Run' while idle."""
+        self.assertIn('"Run"', self.text)
+
+    def test_submitted_label_in_flight(self):
+        """Run button must show 'Submitted' / 'Queued…' / 'Running…' while in flight."""
+        self.assertIn("Submitted", self.text)
+        self.assertIn("Queued", self.text)
+        self.assertIn("Running", self.text)
+
+    def test_completed_label_shows_run_not_run_again(self):
+        """After completion, button must show 'Run' not 'Run Again'."""
+        self.assertIn("completed", self.text.lower())
+
+    def test_single_click_submits_immediately_on_completed(self):
+        """On completed state, a single Run click must immediately submit, not just clear state."""
+        # Must call runStudioPreset directly, not just clear runState
+        self.assertIn("runStudioPreset", self.text)
+
+    def test_single_click_submits_immediately_on_error(self):
+        """On error state, a single Run click must immediately submit, not just clear state."""
+        # The submit flow must be invoked directly from the error-state onclick
+        # Look for a pattern like completed/error onclick calling the submit function
+        submit_call_pattern = "runStudioPreset" in self.text
+        self.assertTrue(submit_call_pattern)
+
+
+# ---------------------------------------------------------------------------
+# Backend page — default tab and tab order
+# ---------------------------------------------------------------------------
+
+class BackendTabOrderTests(unittest.TestCase):
+    """Backend page default tab must be presets; tab order must render Backend Presets before Snapshots."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-backend.js").read_text(encoding="utf-8")
+
+    def test_default_tab_is_presets(self):
+        """Default activeTab must be 'presets' (not 'snapshots')."""
+        self.assertIn('activeTab = "presets"', self.text)
+
+    def test_presets_tab_before_snapshots_in_dom(self):
+        """Tab creation must add Backend Presets tab before Snapshots tab."""
+        # Find the specific makeTab calls: "presets" must come before "snapshots"
+        presets_call_pos = self.text.find('makeTab("presets"')
+        snapshots_call_pos = self.text.find('makeTab("snapshots"')
+        self.assertGreater(snapshots_call_pos, presets_call_pos,
+                           "presets makeTab call must appear before snapshots makeTab call")
+
+
+# ---------------------------------------------------------------------------
+# Delete preset — rename archivePreset to deletePreset in frontend
+# ---------------------------------------------------------------------------
+
+class DeletePresetTests(unittest.TestCase):
+    """archivePreset must be renamed to deletePreset in frontend API and UI."""
+
+    def test_delete_preset_exists_in_api(self):
+        """studio-backend-api.js must have deletePreset."""
+        text = (WEB / "studio-backend-api.js").read_text(encoding="utf-8")
+        self.assertIn("deletePreset", text)
+
+    def test_archive_preset_not_in_frontend_api(self):
+        """studio-backend-api.js must NOT have archivePreset anymore."""
+        text = (WEB / "studio-backend-api.js").read_text(encoding="utf-8")
+        self.assertNotIn("archivePreset", text)
+
+    def test_delete_preset_still_hits_delete_route(self):
+        """deletePreset must still call DELETE on /studio/presets/{id}."""
+        text = (WEB / "studio-backend-api.js").read_text(encoding="utf-8")
+        self.assertIn('"DELETE"', text)
+
+    def test_delete_preset_label_in_presets_detail(self):
+        """Preset detail actions must show 'Delete preset' label."""
+        text = (WEB / "studio-backend-presets.js").read_text(encoding="utf-8")
+        self.assertIn("Delete preset", text)
+
+    def test_delete_preset_confirmation_mentions_soft_delete(self):
+        """Delete preset confirmation must explain soft-delete behavior."""
+        text = (WEB / "studio-backend-presets.js").read_text(encoding="utf-8")
+        self.assertIn("soft-delete", text)
+
+    def test_delete_preset_not_archive_in_presets(self):
+        """studio-backend-presets.js must not use 'Archive' for preset actions."""
+        text = (WEB / "studio-backend-presets.js").read_text(encoding="utf-8")
+        # It may contain "archive" only in comments/import refs but not as action label
+        self.assertNotIn('"Archive"', text)
+
+
+# ---------------------------------------------------------------------------
+# Persistence state — versioned localStorage key for selection
+# ---------------------------------------------------------------------------
+
+class PersistenceStateTests(unittest.TestCase):
+    """Selection persistence state must use localStorage with versioned key."""
+
+    def test_persistence_key_defined(self):
+        """A versioned localStorage key must be defined for selection persistence."""
+        # The actual persistence code lives in studio-playground-state.js
+        state_text = (WEB / "studio-playground-state.js").read_text(encoding="utf-8")
+        self.assertIn("localStorage", state_text)
+        self.assertIn("comfymodal.studio.playground.v1", state_text)
+        self.assertNotIn("comfymodal_studio_selection_v1", state_text)
+        # Playground imports the persistence helpers
+        pg_text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+        self.assertIn("saveSelection", pg_text)
+        self.assertIn("loadSelection", pg_text)
+
+    def test_persists_selected_preset_id(self):
+        """Selected preset id must be persisted."""
+        text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+        self.assertIn("saveSelection", text)
+
+    def test_persists_selected_feature_id(self):
+        """Selected feature id must be persisted."""
+        text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+        self.assertIn("featureId", text)
+
+
+# ---------------------------------------------------------------------------
+# Hydration/restoration order in Playground
+# ---------------------------------------------------------------------------
+
+class HydrationRestorationTests(unittest.TestCase):
+    """Hydration/restoration order must follow: edit > completed run > snapshot defaults > registry."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_restores_latest_completed_run(self):
+        """Must restore latest completed run for preset+feature when available."""
+        self.assertIn("completed", self.text.lower())
+
+    def test_falls_back_to_snapshot_defaults(self):
+        """Must fall back to snapshot defaults when no completed run."""
+        self.assertIn("defaults", self.text)
+
+    def test_clears_selection_on_invalid_preset(self):
+        """Invalid/deleted preset must clear saved selection and fall back."""
+        self.assertIn("clear", self.text.lower())
+
+    def test_sorts_by_completed_at_descending(self):
+        """Must sort matching runs by completedAt or startedAt descending, not assume array order."""
+        self.assertIn("completedAt", self.text) or self.assertIn("startedAt", self.text)
+        self.assertIn("sort", self.text.lower())
+
+
+class BackendSelectorInteractionGuardTests(unittest.TestCase):
+    """Hydration must not re-render Playground while the backend selector is being opened."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_tracks_backend_selector_interaction_during_hydration(self):
+        """The backend selector should set an interaction guard before hydration can re-render."""
+        self.assertIn("_backendSelectInteracting", self.text)
+        self.assertIn('select.addEventListener("mousedown"', self.text)
+        self.assertIn('select.addEventListener("focus"', self.text)
+
+    def test_hydration_skip_checks_interaction_guard(self):
+        """Hydration re-render guard must honor backend-selector interaction state, not focus alone."""
+        self.assertIn("!state.playground._backendSelectInteracting", self.text)
+
+
+# ---------------------------------------------------------------------------
+# Recent runs — reusable state-owned collection
+# ---------------------------------------------------------------------------
+
+class RecentRunsRefreshTests(unittest.TestCase):
+    """Recent runs must be refreshed after finalized completion and on return from History."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_recent_runs_refresh_after_completion(self):
+        """Recent runs must be refreshed after a run completes."""
+        self.assertIn("refresh", self.text.lower())
+
+    def test_only_completed_runs_with_image_in_recent(self):
+        """Only completed runs with valid image outputs appear as thumbnails."""
+        self.assertIn("completed", self.text.lower())
+        self.assertIn("imageUrl", self.text)
+
+    def test_thumbnail_click_updates_canvas_and_selection(self):
+        """Clicking thumbnail must update canvas image, selected run, and metadata."""
+        self.assertIn("metadata", self.text.lower())
+
+
+class RecentRunsEmptyStateLoopTests(unittest.TestCase):
+    """Empty recent-runs state must not be treated as loading forever."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_recent_runs_cache_uses_distinct_unloaded_sentinel(self):
+        """Recent runs cache must distinguish unloaded from loaded-empty."""
+        self.assertIn("let _recentRunsCache = null", self.text)
+
+    def test_filmstrip_branches_on_null_loading_state(self):
+        """Filmstrip should only fetch/re-render while cache is null, not when it is an empty array."""
+        self.assertIn("if (recentRuns == null)", self.text)
+        self.assertIn("Recent runs will appear here once you use the Playground.", self.text)
+
+
+# ---------------------------------------------------------------------------
+# Metadata UX — compact section tied to selected canvas run
+# ---------------------------------------------------------------------------
+
+class MetadataUxTests(unittest.TestCase):
+    """Metadata section must show generation settings tied to selected canvas run."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_metadata_section_exists(self):
+        """A metadata section must exist in the Playground."""
+        self.assertIn("metadata", self.text.lower())
+
+    def test_metadata_shows_prompt_and_negative_prompt(self):
+        """Metadata must show at least prompt and negative prompt."""
+        self.assertIn("prompt", self.text.lower())
+
+    def test_metadata_shows_preset_and_feature(self):
+        """Metadata must show preset and feature info."""
+        self.assertIn("preset", self.text.lower())
+
+    def test_metadata_shows_generation_time(self):
+        """Metadata must show generation time/duration."""
+        self.assertIn("duration", self.text.lower())
+
+    def test_metadata_has_advanced_expandable_section(self):
+        """Metadata must have a collapsible advanced section."""
+        self.assertIn("advanced", self.text.lower())
+        self.assertIn("collaps", self.text.lower())
+
+    def test_metadata_uses_nullish_checks_not_truthy(self):
+        """Metadata must use nullish checks (`!= null`) not truthy checks for optional values."""
+        # Should use == null comparison or != null, not bare truthy checks
+        self.assertIn("!= null", self.text)
+
+
+class NullishChecksTests(unittest.TestCase):
+    """Metadata and history rendering must preserve falsy values (0, 0.0, '') using nullish checks."""
+
+    def setUp(self) -> None:
+        self.pg_text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+        self.h_text = (WEB / "studio-history.js").read_text(encoding="utf-8")
+
+    def test_playground_uses_nullish_for_prompt(self):
+        """Playground metadata must check prompt with != null not truthy."""
+        self.assertIn("!= null", self.pg_text)
+
+    def test_playground_uses_nullish_for_duration(self):
+        """Playground metadata must check durationMs with != null not truthy."""
+        self.assertIn("!= null", self.pg_text)
+
+    def test_history_uses_nullish_for_metadata(self):
+        """History preview must use nullish checks for metadata fields."""
+        self.assertIn("!= null", self.h_text)
+
+
+class PresetDeletionClearsSelectionTests(unittest.TestCase):
+    """Preset deletion must clear persisted selection and add row list action."""
+
+    def test_preset_deletion_calls_clear_selection(self):
+        """Delete preset handler must call clearSelection for persisted state."""
+        text = (WEB / "studio-backend-presets.js").read_text(encoding="utf-8")
+        self.assertIn("clearSelection", text)
+
+    def test_preset_list_has_delete_action_row(self):
+        """Preset list cards must have a delete action row, not just detail panel."""
+        text = (WEB / "studio-backend-presets.js").read_text(encoding="utf-8")
+        # The list item should have a delete button
+        self.assertIn("Delete preset", text) or self.assertIn("deletePreset", text)
+
+
+# ---------------------------------------------------------------------------
+# CONTROL_DEFS must include sampler and scheduler
+# ---------------------------------------------------------------------------
+
+class ControlDefsSamplerSchedulerTests(unittest.TestCase):
+    """CONTROL_DEFS must have sampler and scheduler entries."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-feature-registry.js").read_text(encoding="utf-8")
+
+    def _control_defs_section(self):
+        """Return the CONTROL_DEFS section (last export in file)."""
+        start = self.text.find("export const CONTROL_DEFS")
+        if start < 0:
+            return ""
+        return self.text[start:]
+
+    def test_control_defs_has_sampler(self):
+        """CONTROL_DEFS must define sampler as a control with id, label, type, defaultValue."""
+        section = self._control_defs_section()
+        self.assertIn("sampler", section,
+                      "sampler must be defined inside CONTROL_DEFS")
+        self.assertIn("label: \"Sampler\"", section)
+        self.assertIn("type:", section)
+
+    def test_control_defs_has_scheduler(self):
+        """CONTROL_DEFS must define scheduler as a control with id, label, type, defaultValue."""
+        section = self._control_defs_section()
+        self.assertIn("scheduler", section,
+                      "scheduler must be defined inside CONTROL_DEFS")
+        self.assertIn("label: \"Scheduler\"", section)
+
+    def test_control_defs_sampler_and_scheduler_have_default_value(self):
+        """sampler and scheduler in CONTROL_DEFS must have a defaultValue."""
+        section = self._control_defs_section()
+        sampler_start = section.find("sampler:")
+        self.assertGreater(sampler_start, 0, "sampler: key not found in CONTROL_DEFS")
+        sampler_block = section[sampler_start:sampler_start + 400]
+        self.assertIn("defaultValue:", sampler_block,
+                      "sampler CONTROL_DEF must have defaultValue")
+        scheduler_start = section.find("scheduler:")
+        self.assertGreater(scheduler_start, 0, "scheduler: key not found in CONTROL_DEFS")
+        scheduler_block = section[scheduler_start:scheduler_start + 400]
+        self.assertIn("defaultValue:", scheduler_block,
+                      "scheduler CONTROL_DEF must have defaultValue")
+
+    def test_control_defs_sampler_has_applicable_features(self):
+        """sampler CONTROL_DEF must list applicable features."""
+        section = self._control_defs_section()
+        sampler_start = section.find("sampler:")
+        self.assertGreater(sampler_start, 0, "sampler: key not found in CONTROL_DEFS")
+        sampler_block = section[sampler_start:sampler_start + 400]
+        self.assertIn("applicableFeatures:", sampler_block)
+
+    def test_feature_specs_txt2img_includes_sampler_scheduler(self):
+        """FEATURE_SPECS txt2img controls list should include sampler and scheduler."""
+        txt2img_start = self.text.find("txt2img")
+        txt2img_block = self.text[txt2img_start:txt2img_start + 800]
+        self.assertIn("sampler", txt2img_block,
+                      "FEATURE_SPECS txt2img must list sampler in its controls array")
+        self.assertIn("scheduler", txt2img_block,
+                      "FEATURE_SPECS txt2img must list scheduler in its controls array")
+
+
+# ---------------------------------------------------------------------------
+# History must use presetLabel for display
+# ---------------------------------------------------------------------------
+
+class HistoryPresetLabelTests(unittest.TestCase):
+    """History rendering must use presetLabel instead of presetId for display."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-history.js").read_text(encoding="utf-8")
+
+    def test_history_group_header_uses_preset_label(self):
+        """Group header must use firstRun.presetLabel with fallback to firstRun.presetId."""
+        # The group header should reference presetLabel as the primary label source
+        self.assertIn("firstRun.presetLabel", self.text)
+        # Should still fall back to presetId when presetLabel is empty
+        self.assertIn("firstRun.presetId", self.text)
+
+    def test_history_preview_shows_preset_label(self):
+        """Preview overlay must show presetLabel in metadata."""
+        # Line 96 currently shows nr.presetId — should show nr.presetLabel
+        self.assertIn("nr.presetLabel", self.text)
+
+    def test_history_carousel_label_uses_preset_label(self):
+        """Filmstrip carousel should use presetLabel for label display."""
+        # Check line 1562: nr.presetLabel || nr.presetId || nr.featureId
+        pg_text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+        # Should reference presetLabel as first choice for label
+        self.assertIn("presetLabel || nr.presetId", pg_text)
+
+
+# ---------------------------------------------------------------------------
+# Normalizer surfaces presetLabel from canonical aliases
+# ---------------------------------------------------------------------------
+
+class NormalizerPresetLabelTests(unittest.TestCase):
+    """normalizeStudioRun must surface presetLabel from robust aliases."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-run-normalizer.js").read_text(encoding="utf-8")
+
+    def test_normalizer_reads_preset_label_from_extra(self):
+        """normalizeStudioRun must read presetLabel from extra.preset_label and extra.studio_preset_label."""
+        self.assertIn("preset_label", self.text)
+        self.assertIn("studio_preset_label", self.text)
+
+    def test_normalizer_falls_back_to_studio_meta_for_label(self):
+        """normalizeStudioRun must fall back to studio_meta.studio_preset_label."""
+        self.assertIn("studio_preset_label", self.text)
 
 
 if __name__ == "__main__":

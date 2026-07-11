@@ -870,6 +870,19 @@ body:has(.comfymodal-studio-modal) {
   flex-shrink: 0;
 }
 
+.comfymodal-studio-history-preview-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  justify-content: center;
+  margin-top: 4px;
+}
+
+.comfymodal-studio-history-preview-meta-item {
+  font-size: 10px;
+  color: #777;
+}
+
 /* ── Settings ────────────────────────────────────────────── */
 
 .comfymodal-studio-settings {
@@ -1240,6 +1253,91 @@ button.comfymodal-studio-feature-chip {
 .comfymodal-studio-legacy {
   height: 100%;
   overflow-y: auto;
+}
+
+/* ── Metadata Section ──────────────────────────────────────── */
+
+.comfymodal-studio-metadata-section {
+  background: #0f0f0f;
+  border: 1px solid #222;
+  border-radius: 3px;
+  padding: 6px 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  flex-shrink: 0;
+}
+
+.comfymodal-studio-metadata-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.comfymodal-studio-metadata-status {
+  font-weight: 600;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.comfymodal-studio-metadata-prompt,
+.comfymodal-studio-metadata-neg-prompt {
+  color: #aaa;
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 300px;
+}
+
+.comfymodal-studio-metadata-source {
+  color: #888;
+  font-size: 10px;
+}
+
+.comfymodal-studio-metadata-duration,
+.comfymodal-studio-metadata-time {
+  color: #666;
+  font-size: 10px;
+}
+
+.comfymodal-studio-metadata-settings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid #1a1a1a;
+}
+
+.comfymodal-studio-metadata-setting {
+  font-size: 10px;
+  color: #777;
+}
+
+.comfymodal-studio-metadata-error {
+  margin-top: 4px;
+  padding: 4px 6px;
+  background: #1a0a0a;
+  border: 1px solid #3a0a0a;
+  border-radius: 2px;
+  color: #f87171;
+  font-size: 10px;
+}
+
+.comfymodal-studio-metadata-advanced {
+  margin-top: 4px;
+  padding: 4px 6px;
+  background: #0a0a0a;
+  border: 1px solid #1a1a1a;
+  border-radius: 2px;
+}
+
+.comfymodal-studio-metadata-advanced-toggle {
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
 }
 
 /* ── Override testing-styles for Nexus look ──────────────── */
