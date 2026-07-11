@@ -5,8 +5,9 @@
 // from the glue module (studio-backend.js).
 
 import { el } from "./studio-ui.js";
-import { listPresets, createPreset, updatePreset, duplicatePreset, archivePreset } from "./studio-backend-api.js";
+import { listPresets, createPreset, updatePreset, duplicatePreset, deletePreset } from "./studio-backend-api.js";
 import { _STATE, renderFeaturesChipGrid, launchPresetWizardForEdit, invalidateRuntimePresetsCache } from "./studio-backend.js";
+import { clearSelection } from "./studio-playground-state.js";
 import {
   getPresetCapabilitySummary,
 } from "./studio-preset-capabilities.js";
@@ -84,6 +85,7 @@ export function renderPresetsList(container, presets, apiBase, detailPanel) {
     const snapshotId = preset.snapshotId || "";
     const disabled = preset.disabledReason || "";
     const desc = preset.description || "";
+    const canEdit = !preset.archived;
 
     const card = el("div", {
       class: "comfymodal-studio-preset-card" + (isActive ? " active" : ""),
@@ -100,6 +102,38 @@ export function renderPresetsList(container, presets, apiBase, detailPanel) {
     ]);
     if (disabled) {
       card.appendChild(el("p", { text: `Disabled: ${disabled}`, style: "color:#f87171;font-size:10px;margin:2px 0;" }));
+    }
+    // Row-level delete action
+    if (canEdit) {
+      const rowActions = el("div", { style: "display:flex;gap:4px;margin-top:4px;" });
+      const delRowBtn = el("button", {
+        class: "comfymodal-destructive-btn",
+        text: "Delete preset",
+        style: "font-size:9px;padding:2px 6px;",
+        onclick: (e) => {
+          e.stopPropagation();
+          if (confirm("Delete this preset? (soft-delete — it can be restored via the server)")) {
+            deletePreset(apiBase, preset.id).then(function () {
+              clearSelection();
+              invalidateRuntimePresetsCache();
+              _STATE.selectedItemId = null;
+              listPresets(apiBase).then(function (fresh) {
+                while (container.firstChild) container.removeChild(container.firstChild);
+                renderPresetsList(container, fresh, apiBase, detailPanel);
+                if (fresh.length > 0) {
+                  _STATE.selectedItemId = fresh[0].id;
+                  while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
+                  renderPresetDetail(detailPanel, fresh[0], apiBase, container);
+                } else {
+                  while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
+                }
+              });
+            });
+          }
+        },
+      });
+      rowActions.appendChild(delRowBtn);
+      card.appendChild(rowActions);
     }
     container.appendChild(card);
   });
@@ -297,13 +331,14 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
   actions.appendChild(dupBtn);
 
   if (canEdit) {
-    const archiveBtn = el("button", {
+    const deleteBtn = el("button", {
       class: "comfymodal-destructive-btn",
-      text: "Archive",
+      text: "Delete preset",
       style: "font-size:10px;padding:5px 12px;",
       onclick: async () => {
-        if (confirm("Archive this preset?")) {
-          await archivePreset(apiBase, preset.id);
+        if (confirm("Delete this preset? (soft-delete — it can be restored via the server)")) {
+          await deletePreset(apiBase, preset.id);
+          clearSelection();
           invalidateRuntimePresetsCache();
           _STATE.selectedItemId = null;
           const fresh = await listPresets(apiBase);
@@ -316,7 +351,7 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
         }
       },
     });
-    actions.appendChild(archiveBtn);
+    actions.appendChild(deleteBtn);
   }
 
   card.appendChild(actions);

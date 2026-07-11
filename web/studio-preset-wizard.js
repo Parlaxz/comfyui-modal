@@ -520,7 +520,8 @@ function renderBindingRowList(bindingDefs, state, graphContext) {
     // Click handler
     if (isCaptureActive) {
       // Capturing — clicking cancels
-      row.addEventListener("click", () => {
+      row.addEventListener("click", (event) => {
+        if (isWizardInteractiveTarget(event)) return;
         cancelGraphBinding();
         state.bindingCaptureActive = null;
         renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
@@ -556,7 +557,8 @@ function renderBindingRowList(bindingDefs, state, graphContext) {
       row.style.opacity = "0.4";
       row.title = "Graph not available";
     } else {
-      row.addEventListener("click", () => {
+      row.addEventListener("click", (event) => {
+        if (isWizardInteractiveTarget(event)) return;
         startBindingCapture(state, bindingDef);
       });
       row.style.cursor = "pointer";
@@ -593,6 +595,12 @@ function renderCandidateDropdown(bindingValue, bindingDef, state) {
     class: "comfymodal-studio-select",
     style: "font-size:10px;padding:2px 4px;",
   });
+  select.addEventListener("mousedown", (event) => {
+    event.stopPropagation();
+  });
+  select.addEventListener("click", (event) => {
+    event.stopPropagation();
+  });
 
   const currentWidget = bindingValue.widgetName;
   const currentInput = bindingValue.inputName;
@@ -625,6 +633,11 @@ function renderCandidateDropdown(bindingValue, bindingDef, state) {
 
   container.appendChild(select);
   return container;
+}
+
+function isWizardInteractiveTarget(event) {
+  const target = event && event.target;
+  return !!(target && target.closest && target.closest("select, button, input, textarea, a"));
 }
 
 function startBindingCapture(state, bindingDef) {

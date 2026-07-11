@@ -23,7 +23,8 @@ import {
   getPresetCapabilitySummary,
   getUnavailableControlReasons,
 } from "./studio-preset-capabilities.js";
-import { resolveRunImageUrl, hasRunImage } from "./studio-run-normalizer.js";
+import { resolveRunImageUrl, hasRunImage, normalizeStudioRun } from "./studio-run-normalizer.js";
+import { saveSelection, loadSelection, clearSelection } from "./studio-playground-state.js";
 
 // ── Element helper ───────────────────────────────────────────────────────
 
@@ -197,6 +198,175 @@ function _startPolling(container, state, context, actions, runState) {
   container._pollTimer = pollTimer;
 }
 
+// ── Effective Controls builder ────────────────────────────────────────────
+//
+// Composes the full set of rendered bound controls from:
+//   1. current user edits (state.playground.controls)
+//   2. hydrated values (from latest completed run or snapshot defaults)
+//   3. preset defaults
+// This ensures all visible bound fields are sent on submission,
+// not only fields that had explicit input events.
+
+function buildEffectiveControls(state, preset, currentFeatureId) {
+  const presetDefaults = (preset && preset.defaults) || {};
+  const userOverrides = (state.playground && state.playground.controls) || {};
+  const hydratedValues = (state.playground && state.playground._hydratedControls) || {};
+  const visibleIds = getVisibleControlsForPreset(preset, currentFeatureId);
+  const controls = {};
+  visibleIds.forEach(function (ctrlId) {
+    // Priority: user override > hydrated value > preset default
+    if (ctrlId in userOverrides) {
+      controls[ctrlId] = userOverrides[ctrlId];
+    } else if (ctrlId in hydratedValues) {
+      controls[ctrlId] = hydratedValues[ctrlId];
+    } else if (ctrlId in presetDefaults) {
+      controls[ctrlId] = presetDefaults[ctrlId];
+    }
+  });
+  return controls;
+}
+
+// ── Recent runs state management ──────────────────────────────────────────
+//
+// Reusable loader/state-owned collection of recent runs, refreshed:
+//   - on initial hydration
+//   - after finalized completion
+//   - after preset deletion if needed
+//   - when returning to Playground after History changes
+
+let _recentRunsCache = null;
+let _recentRunsCacheKey = "";
+
+export async function refreshRecentRuns(apiBase) {
+  try {
+    const resp = await fetch(apiBase + "/run-history?limit=50");
+    if (!resp.ok) { _recentRunsCache = []; return []; }
+    const data = await resp.json();
+    const entries = (data && data.runs) || [];
+    // Filter to Studio runs with images, normalize them
+    const studioRuns = entries.filter(function (r) {
+      const extra = (r && r.extra) || {};
+      const studioMeta = extra.studio_meta || extra.studio_metadata || {};
+      return (r.prompt_id && r.prompt_id.indexOf("studio_") === 0) ||
+             r.kind === "experiment_cell" ||
+             !!(extra.studio_feature_id || extra.studio_preset_id || studioMeta.studio_feature_id || studioMeta.studio_preset_id);
+    });
+    // Normalize and only keep completed/image-producing runs
+    _recentRunsCache = studioRuns.map(function (r) {
+      return normalizeStudioRun(r, apiBase);
+    }).filter(function (nr) {
+      return nr && (nr.status === "completed" || nr.status === "success" || nr.status === "done") && nr.imageUrl;
+    });
+    _recentRunsCacheKey = apiBase;
+    return _recentRunsCache;
+  } catch (e) {
+    _recentRunsCache = [];
+    return [];
+  }
+}
+
+export function getRecentRuns() {
+  return _recentRunsCache;
+}
+
+export function clearRecentRunsCache() {
+  _recentRunsCache = null;
+  _recentRunsCacheKey = "";
+}
+
+// ── Hydration helper ──────────────────────────────────────────────────────
+//
+// Restore saved selection, fetch presets + history, validate preset,
+// restore latest completed run or snapshot defaults.
+
+export async function hydratePlayground(state, context) {
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+
+  // 1. Load saved selection from localStorage
+  const saved = loadSelection();
+
+  // 2. Fetch runtime presets
+  let presets = [];
+  try {
+    const { listPresets } = await import("./studio-backend-api.js");
+    presets = await listPresets(apiBase) || [];
+  } catch (e) {
+    presets = [];
+  }
+
+  // 3. Determine feature ID (saved > default)
+  const featureId = (saved && saved.featureId) || "txt2img";
+  if (state.playground) {
+    state.playground.featureId = featureId;
+  }
+
+  // 4. Determine preset ID (saved > empty)
+  let targetPresetId = (saved && saved.presetId) || "";
+
+  // 5. Validate preset exists
+  const presetExists = targetPresetId && presets.some(function (p) {
+    return (p.id || p.label || "") === targetPresetId;
+  });
+
+  if (!presetExists) {
+    // Invalid/deleted preset — clear saved selection
+    if (targetPresetId) {
+      clearSelection();
+    }
+    targetPresetId = "";
+    if (state.playground) {
+      state.playground.selectedBackendId = "";
+    }
+  } else {
+    if (state.playground) {
+      state.playground.selectedBackendId = targetPresetId;
+    }
+  }
+
+  // 6. If we have a valid preset, try to restore latest completed run
+  if (targetPresetId) {
+    await refreshRecentRuns(apiBase);
+    const matchingCompleted = getRecentRuns().filter(function (nr) {
+      return nr.presetId === targetPresetId && nr.featureId === featureId;
+    });
+    if (matchingCompleted.length > 0) {
+      // Sort by completedAt descending (then startedAt as tiebreaker)
+      // to ensure we get the newest matching run
+      matchingCompleted.sort(function (a, b) {
+        const aTime = (a.completedAt || a.startedAt || "");
+        const bTime = (b.completedAt || b.startedAt || "");
+        return bTime.localeCompare(aTime);
+      });
+      const latest = matchingCompleted[0];
+      if (latest && latest.imageUrl) {
+        state.playground.lastRunOutput = latest.imageUrl;
+        state.playground._selectedRun = latest;
+        // Pre-populate hydrated controls from the completed run's resolved/requested controls
+        const hydratedCtrls = {};
+        const srcControls = latest.resolvedControls || latest.requestedControls || {};
+        Object.keys(srcControls).forEach(function (k) {
+          hydratedCtrls[k] = srcControls[k];
+        });
+        state.playground._hydratedControls = hydratedCtrls;
+        // Set defaults for any controls not in hydrated
+        const preset = presets.find(function (p) { return (p.id || p.label || "") === targetPresetId; });
+        if (preset && preset.defaults) {
+          Object.keys(preset.defaults).forEach(function (k) {
+            if (!(k in hydratedCtrls)) {
+              hydratedCtrls[k] = preset.defaults[k];
+            }
+          });
+        }
+      }
+    }
+  }
+
+  // 7. Persist the resolved selection
+  if (targetPresetId) {
+    saveSelection(targetPresetId, featureId);
+  }
+}
+
 // ── Main Playground renderer ─────────────────────────────────────────────
 
 export function renderPlayground(state, context) {
@@ -222,6 +392,35 @@ function renderControlPanel(state, context) {
 
   // Actions for state mutations (called by event handlers)
   const actions = buildActions(state, context);
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+
+  // Hydrate: restore saved state.
+  // Phase 1 (sync): load saved selection from localStorage so the
+  // initial render shows the correct backend selection without needing
+  // a hydration-triggered re-render that would close an open <select>.
+  if (!state.playground._hydrationDone) {
+    const saved = loadSelection();
+    if (saved) {
+      if (saved.featureId) state.playground.featureId = saved.featureId;
+      if (saved.presetId) state.playground.selectedBackendId = saved.presetId;
+    }
+    state.playground._hydrationDone = true;
+    hydratePlayground(state, context).then(function () {
+      if (context && context.setPage) {
+        // Check if the backend <select> dropdown is open (focused).
+        // Full re-render would destroy the native dropdown causing
+        // "opens then closes instantly". Skip re-render and instead
+        // imperatively update the select value.
+        const select = document.querySelector('[data-testid="backend-select"]');
+        const isSelectOpen = select && document.activeElement === select;
+        if (!isSelectOpen && !state.playground._backendSelectInteracting) {
+          context.setPage("playground");
+        } else if (select && state.playground.selectedBackendId) {
+          select.value = state.playground.selectedBackendId;
+        }
+      }
+    });
+  }
 
   // Experiment toggle (always at top of control panel)
   panel.appendChild(renderExperimentToggle(state, actions));
@@ -245,7 +444,6 @@ function renderControlPanel(state, context) {
   const selectedPresetId = state.playground && state.playground.selectedBackendId;
 
   // Async load presets to derive capabilities
-  const apiBase = (context && context.apiBase) || "/comfymodal";
   getRuntimePresets({ apiBase }).then((presets) => {
     if (!controlsContainer.isConnected) return;
     while (controlsContainer.firstChild) controlsContainer.removeChild(controlsContainer.firstChild);
@@ -372,8 +570,12 @@ function buildActions(state, context) {
       state.playground.featureId = featureId;
       // Clear stale controls when feature changes
       state.playground.controls = {};
+      state.playground._hydratedControls = {};
+      state.playground._selectedRun = null;
       // Clear stale run state so Run button re-enables
       if (state.playground) state.playground.runState = null;
+      // Persist selection
+      saveSelection(state.playground.selectedBackendId, featureId);
       if (context && context.setPage) {
         context.setPage("playground");
       }
@@ -383,8 +585,12 @@ function buildActions(state, context) {
       // Clear stale controls when preset changes to avoid sending
       // controls that the new preset doesn't support
       state.playground.controls = {};
+      state.playground._hydratedControls = {};
+      state.playground._selectedRun = null;
       // Clear stale run state so Run button re-enables
       if (state.playground) state.playground.runState = null;
+      // Persist selection
+      saveSelection(backendId, state.playground.featureId);
       if (context && context.setPage) {
         context.setPage("playground");
       }
@@ -452,11 +658,43 @@ function buildActions(state, context) {
     },
     setRunState(runState) {
       if (!state.playground) state.playground = {};
+      const prevRunState = state.playground.runState;
       state.playground.runState = runState;
-      // Persist the primary output URL so the canvas shows it even after
-      // runState is cleared for a re-run
-      if (runState && runState.primaryOutput) {
-        state.playground.lastRunOutput = runState.primaryOutput;
+      if (runState && runState.status === "completed") {
+        // Persist primary output URL so canvas shows result
+        if (runState.primaryOutput) {
+          state.playground.lastRunOutput = runState.primaryOutput;
+        }
+        // Keep preset/feature selected
+        saveSelection(state.playground.selectedBackendId, state.playground.featureId);
+        // Refresh recent runs and try to select finalized normalized run
+        const apiBase = (context && context.apiBase) || "/comfymodal";
+        refreshRecentRuns(apiBase).then(function (runs) {
+          const experimentId = runState.experimentId;
+          if (experimentId && runs && runs.length > 0) {
+            // Find the matching run by experiment ID
+            var matched = runs.find(function (nr) {
+              return nr.experimentId === experimentId;
+            });
+            if (!matched) {
+              // Fallback: find by preset+feature
+              matched = runs.find(function (nr) {
+                return nr.presetId === state.playground.selectedBackendId &&
+                       nr.featureId === (state.playground.featureId || "txt2img");
+              });
+            }
+            if (matched) {
+              state.playground._selectedRun = matched;
+              if (matched.imageUrl) {
+                state.playground.lastRunOutput = matched.imageUrl;
+              }
+              if (context && context.setPage) context.setPage("playground");
+            }
+          }
+        });
+      } else if (!runState) {
+        // Clearing runState — preserve lastRunOutput and _selectedRun so
+        // prior result stays visible until new submission enters flight
       }
       if (context && context.setPage) {
         context.setPage("playground");
@@ -489,6 +727,15 @@ function renderBackendSelector(state, actions, context) {
   const select = el("select", {
     class: "comfymodal-input comfymodal-studio-select",
     "data-testid": "backend-select",
+  });
+  select.addEventListener("mousedown", () => {
+    if (state.playground) state.playground._backendSelectInteracting = true;
+  });
+  select.addEventListener("focus", () => {
+    if (state.playground) state.playground._backendSelectInteracting = true;
+  });
+  select.addEventListener("blur", () => {
+    if (state.playground) state.playground._backendSelectInteracting = false;
   });
   const loadingOpt = el("option", { value: "", text: "Loading backends…", disabled: true, selected: true });
   select.appendChild(loadingOpt);
@@ -607,7 +854,8 @@ export function createInfoHint(text, options) {
 function renderControl(def, state, actions, preset) {
   const presetDefaults = (preset && preset.defaults) || {};
   const currentOverrides = (state.playground && state.playground.controls) || {};
-  const value = currentOverrides[def.id] ?? presetDefaults[def.id] ?? def.defaultValue;
+  const hydratedValues = (state.playground && state.playground._hydratedControls) || {};
+  const value = currentOverrides[def.id] ?? hydratedValues[def.id] ?? presetDefaults[def.id] ?? def.defaultValue;
   const group = el("div", {
     class: "comfymodal-studio-control-group",
     "data-control-id": def.id,
@@ -650,6 +898,17 @@ function renderControl(def, state, actions, preset) {
       style: "font-size:var(--font-size-xs);color:var(--color-text-muted);",
     });
     group.appendChild(note);
+  } else if (def.type === "text") {
+    input = el("input", {
+      type: "text",
+      class: "comfymodal-input comfymodal-studio-text-input",
+      value: String(value),
+      placeholder: def.placeholder || "",
+      "data-testid": `input-${def.id}`,
+    });
+    input.addEventListener("input", () => {
+      if (actions.setControl) actions.setControl(def.id, input.value);
+    });
   } else {
     // number type
     input = el("input", {
@@ -671,6 +930,52 @@ function renderControl(def, state, actions, preset) {
 }
 
 // ── Run Button ───────────────────────────────────────────────────────────
+
+// ── Single-run submit helper ──────────────────────────────────────────────
+//
+// Immediately submits a single run using visible controls.
+// Deduplicated from the inline handler in renderRunButton so that
+// completed/error state can re-submit in a single click.
+
+async function doRunSubmit(state, context, actions) {
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
+  const selectedId = state.playground && state.playground.selectedBackendId;
+  if (!selectedId) return;
+
+  const { listPresets } = await import("./studio-backend-api.js");
+  const presets = await listPresets(apiBase) || [];
+  const preset = presets.find(function (p) { return (p.id || p.label || "") === selectedId; });
+  if (!preset) return;
+
+  const controls = buildEffectiveControls(state, preset, currentFeatureId);
+
+  if (actions && actions.setRunState) {
+    actions.setRunState({ status: "running" });
+  }
+
+  const result = await runStudioPreset(apiBase, {
+    presetId: preset.id || selectedId,
+    featureId: currentFeatureId,
+    controls: controls,
+    metadata: { source: "studio_playground" },
+  });
+
+  if (result && result.status === "ok") {
+    if (actions && actions.setRunState) {
+      actions.setRunState({
+        status: "submitted",
+        runId: result.runId || result.experimentId,
+        experimentId: result.experimentId,
+      });
+    }
+  } else {
+    const errMsg = (result && result.message) || "Run failed.";
+    if (actions && actions.setRunState) {
+      actions.setRunState({ status: "error", message: errMsg });
+    }
+  }
+}
 
 function renderRunButton(state, context, actions, isExperiment) {
   const container = el("div", { class: "comfymodal-studio-run-section" });
@@ -742,10 +1047,11 @@ function renderRunButton(state, context, actions, isExperiment) {
   }
 
   if (runState && runState.status === "completed") {
-    // Terminal state: enable "Run Again" instead of permanently disabling
+    // Terminal state: keep prior result visible, show "Run" to re-submit
+    // immediately using visible settings
     btn.disabled = false;
-    btn.textContent = "Run Again";
-    btn.title = "Run completed successfully. Click to run again.";
+    btn.textContent = "Run";
+    btn.title = "Run completed. Click to run again with current settings.";
     const messageEl = el("p", {
       style: "font-size:var(--font-size-sm);color:var(--color-success);margin:4px 0 0;",
     });
@@ -753,7 +1059,7 @@ function renderRunButton(state, context, actions, isExperiment) {
       ? "Run completed (" + runState.completedCells + " cell(s))."
       : "Run completed successfully.";
     reason.appendChild(messageEl);
-    // Only show View in History when meaningful history evidence exists
+    // Show View in History when meaningful history evidence exists
     if (runState.hasHistory) {
       const viewLink = el("a", {
         text: "View in History",
@@ -766,25 +1072,28 @@ function renderRunButton(state, context, actions, isExperiment) {
       messageEl.appendChild(document.createTextNode(" "));
       messageEl.appendChild(viewLink);
     }
-    // Run Again clears stale run state so Run becomes clickable
+    // Single click: immediately submit another run using visible settings.
+    // Prioritize doRunSubmit so prior image/metadata stays visible until
+    // the new submission enters flight (setRunState("running") clears the
+    // completed state and triggers re-render).
     btn.onclick = function () {
-      if (actions && actions.setRunState) actions.setRunState(null);
+      doRunSubmit(state, context, actions);
     };
     return container;
   }
 
   if (runState && runState.status === "error") {
-    // Terminal error state: enable "Run Again" instead of just Dismiss
+    // Terminal error state: show "Run" to let user retry immediately
     btn.disabled = false;
-    btn.textContent = "Run Again";
+    btn.textContent = "Run";
     btn.title = "Run failed. Click to try again.";
     reason.appendChild(el("p", {
       text: runState.message || "Run failed. Try again.",
       style: "font-size:var(--font-size-sm);color:var(--color-danger);margin:4px 0 0;",
     }));
-    // Run Again clears stale run state so Run becomes clickable
+    // Single click: immediately submit using visible settings
     btn.onclick = function () {
-      if (actions && actions.setRunState) actions.setRunState(null);
+      doRunSubmit(state, context, actions);
     };
     return container;
   }
@@ -909,15 +1218,8 @@ function renderRunButton(state, context, actions, isExperiment) {
         btn.textContent = "Running\u2026";
         if (actions && actions.setRunState) actions.setRunState({ status: "running" });
 
-        // Only send controls that are bound/supported by the preset
-        const allControls = (state.playground && state.playground.controls) || {};
-        const visibleIds = getVisibleControlsForPreset(preset, currentFeatureId);
-        const controls = {};
-        visibleIds.forEach((id) => {
-          if (id in allControls) {
-            controls[id] = allControls[id];
-          }
-        });
+        // Send all rendered bound fields — hydrated/restored values + current edits
+        const controls = buildEffectiveControls(state, preset, currentFeatureId);
 
         const result = await runStudioPreset(apiBase, {
           presetId: preset.id || selectedId,
@@ -934,6 +1236,8 @@ function renderRunButton(state, context, actions, isExperiment) {
               experimentId: result.experimentId,
             });
           }
+          // Refresh recent runs after successful submission will happen
+          // in the polling completion handler via setRunState
         } else {
           const errMsg = (result && result.message) || "Run failed.";
           if (actions && actions.setRunState) {
@@ -964,6 +1268,9 @@ function renderWorkspace(state, context) {
 
   // Canvas area
   workspace.appendChild(renderCanvas(state, context));
+
+  // Metadata section
+  workspace.appendChild(renderMetadataSection(state, context));
 
   // Recent runs filmstrip
   workspace.appendChild(renderFilmstrip(state, context));
@@ -1032,6 +1339,192 @@ function renderCanvas(state, context) {
   return canvas;
 }
 
+// ── Metadata Section ─────────────────────────────────────────────────────
+//
+// Compact metadata section tied to the selected canvas run with summary
+// and collapsible advanced details.
+
+function renderMetadataSection(state, context) {
+  const section = el("div", {
+    class: "comfymodal-studio-metadata-section",
+    "data-testid": "metadata-section",
+  });
+
+  const selectedRun = state.playground && state.playground._selectedRun;
+  if (!selectedRun) {
+    // No run selected — show only when a canvas result exists
+    return section;
+  }
+
+  const nr = selectedRun;
+  const rc = nr.resolvedControls || {};
+  const rqc = nr.requestedControls || {};
+  const isFailed = nr.status === "error" || nr.status === "failed";
+
+  // ── Summary block ──────────────────────────────────────────────────
+  const summary = el("div", { class: "comfymodal-studio-metadata-summary" });
+
+  // Status
+  summary.appendChild(el("span", {
+    class: "comfymodal-studio-metadata-status",
+    text: isFailed ? "\u26a0 Failed" : "\u2713 Completed",
+    style: "color:" + (isFailed ? "var(--color-danger, #f87171)" : "var(--color-success, #4ade80)"),
+  }));
+
+  // Prompt (use nullish check to preserve empty string)
+  if (nr.prompt != null) {
+    summary.appendChild(el("span", {
+      class: "comfymodal-studio-metadata-prompt",
+      text: "Prompt: " + (nr.prompt ? nr.prompt.substring(0, 120) : "") + (nr.prompt && nr.prompt.length > 120 ? "\u2026" : ""),
+    }));
+  }
+
+  // Negative prompt (use nullish check to preserve empty string)
+  if (nr.negativePrompt != null) {
+    summary.appendChild(el("span", {
+      class: "comfymodal-studio-metadata-neg-prompt",
+      text: "Neg: " + (nr.negativePrompt ? nr.negativePrompt.substring(0, 60) : "") + (nr.negativePrompt && nr.negativePrompt.length > 60 ? "\u2026" : ""),
+    }));
+  }
+
+  // Preset & Feature
+  const labelParts = [];
+  if (nr.presetLabel != null && nr.presetLabel) labelParts.push(nr.presetLabel);
+  else if (nr.presetId != null && nr.presetId) labelParts.push(nr.presetId);
+  if (nr.featureId != null && nr.featureId) labelParts.push(nr.featureId);
+  if (labelParts.length > 0) {
+    summary.appendChild(el("span", {
+      class: "comfymodal-studio-metadata-source",
+      text: labelParts.join(" \u2014 "),
+    }));
+  }
+
+  // Duration (use nullish check to preserve 0)
+  if (nr.durationMs != null && nr.durationMs > 0) {
+    const durSecs = (nr.durationMs / 1000).toFixed(1);
+    summary.appendChild(el("span", {
+      class: "comfymodal-studio-metadata-duration",
+      text: durSecs + "s",
+    }));
+  }
+
+  // Timestamp (use nullish check to preserve empty string)
+  if (nr.startedAt != null && nr.startedAt) {
+    summary.appendChild(el("span", {
+      class: "comfymodal-studio-metadata-time",
+      text: nr.startedAt.substring(0, 19),
+    }));
+  }
+
+  section.appendChild(summary);
+
+  // ── Key generation settings ────────────────────────────────────────
+  const settingsRow = el("div", { class: "comfymodal-studio-metadata-settings" });
+  const genSettings = [];
+
+  const seed = rc.seed || rqc.seed || "";
+  if (seed) genSettings.push({ label: "Seed", value: String(seed) });
+  if (rc.steps) genSettings.push({ label: "Steps", value: String(rc.steps) });
+  if (rc.cfg || rc.guidance) genSettings.push({ label: "CFG", value: String(rc.cfg || rc.guidance) });
+  if (rc.sampler_name || rc.sampler) genSettings.push({ label: "Sampler", value: String(rc.sampler_name || rc.sampler) });
+  if (rc.scheduler) genSettings.push({ label: "Scheduler", value: String(rc.scheduler) });
+  if (rc.denoise) genSettings.push({ label: "Denoise", value: String(rc.denoise) });
+  if (rc.width && rc.height) genSettings.push({ label: "Size", value: rc.width + "\u00d7" + rc.height });
+  if (nr.workflowHash) genSettings.push({ label: "Workflow", value: nr.workflowHash.substring(0, 8) + "\u2026" });
+
+  // LoRAs
+  const loras = rc.loras || rqc.loras || [];
+  if (loras.length > 0) {
+    const loraStrs = loras.map(function (l) {
+      if (typeof l === "object" && l !== null) {
+        return (l.name || l.model || "") + " (" + (l.strength || l.weight || l.strength_model || 1.0) + ")";
+      }
+      return String(l);
+    });
+    if (loraStrs.length > 0) {
+      genSettings.push({ label: "LoRAs", value: loraStrs.join("; ") });
+    }
+  }
+
+  genSettings.forEach(function (s) {
+    settingsRow.appendChild(el("span", {
+      class: "comfymodal-studio-metadata-setting",
+      "data-label": s.label,
+      text: s.label + ": " + s.value,
+    }));
+  });
+
+  section.appendChild(settingsRow);
+
+  // Error display
+  if (nr.error) {
+    section.appendChild(el("div", {
+      class: "comfymodal-studio-metadata-error",
+      text: "Error: " + nr.error.substring(0, 300),
+    }));
+  }
+
+  // ── Collapsible advanced details ───────────────────────────────────
+  const advancedToggle = el("button", {
+    class: "comfymodal-studio-metadata-advanced-toggle",
+    text: "\u25b6 Advanced",
+    style: "font-size:10px;color:#888;cursor:pointer;background:none;border:none;padding:2px 0;",
+    onclick: function () {
+      const panel = section.querySelector(".comfymodal-studio-metadata-advanced");
+      if (panel) {
+        const isHidden = panel.style.display === "none" || panel.style.display === "";
+        panel.style.display = isHidden ? "block" : "none";
+        advancedToggle.textContent = isHidden ? "\u25bc Advanced" : "\u25b6 Advanced";
+      }
+    },
+  });
+  section.appendChild(advancedToggle);
+
+  const advancedPanel = el("div", {
+    class: "comfymodal-studio-metadata-advanced",
+    style: "display:none;font-size:10px;color:#666;",
+  });
+
+  const advancedItems = [];
+
+  // IDs
+  if (nr.id) advancedItems.push({ label: "Run ID", value: nr.id });
+  if (nr.experimentId) advancedItems.push({ label: "Experiment ID", value: nr.experimentId });
+  if (nr.snapshotId) advancedItems.push({ label: "Snapshot ID", value: nr.snapshotId });
+
+  // Full timings
+  if (nr.durationMs) advancedItems.push({ label: "Duration (ms)", value: String(nr.durationMs) });
+  if (Object.keys(nr.timings).length > 0) {
+    advancedItems.push({ label: "Timings", value: JSON.stringify(nr.timings) });
+  }
+
+  // Workflow hash
+  if (nr.workflowHash) advancedItems.push({ label: "Workflow Hash", value: nr.workflowHash });
+
+  // Output reference
+  if (nr.outputPath) advancedItems.push({ label: "Output Path", value: nr.outputPath });
+  if (nr.imageUrl) advancedItems.push({ label: "Image URL", value: nr.imageUrl });
+
+  // Resolved controls
+  if (Object.keys(nr.resolvedControls).length > 0) {
+    advancedItems.push({ label: "Resolved Controls", value: JSON.stringify(nr.resolvedControls, null, 1) });
+  }
+
+  // Error
+  if (nr.error) advancedItems.push({ label: "Error", value: nr.error });
+
+  advancedItems.forEach(function (item) {
+    advancedPanel.appendChild(el("div", { style: "margin:2px 0;" }, [
+      el("strong", { text: item.label + ": ", style: "color:#888;" }),
+      el("span", { text: item.value.substring(0, 200) + (item.value.length > 200 ? "\u2026" : "") }),
+    ]));
+  });
+
+  section.appendChild(advancedPanel);
+
+  return section;
+}
+
 // ── Carousel ────────────────────────────────────────────────────────────
 //
 // Image carousel of thumbnails from recent image-producing runs.
@@ -1045,75 +1538,50 @@ function renderFilmstrip(state, context) {
   });
 
   const apiBase = (context && context.apiBase) || "/comfymodal";
-  carousel.appendChild(el("p", {
-    class: "comfymodal-studio-empty-state",
-    text: "Loading recent runs...",
-    style: "font-size:var(--font-size-xs);color:var(--color-text-muted);padding:8px;",
-  }));
 
-  // Build actions for state mutation
-  function getActions() {
-    return {
-      setRunState(runState) {
-        if (!state.playground) state.playground = {};
-        state.playground.runState = runState;
-        if (runState && runState.primaryOutput) {
-          state.playground.lastRunOutput = runState.primaryOutput;
-        }
-        if (context && context.setPage) {
-          context.setPage("playground");
-        }
-      },
-    };
-  }
+  // Use cached recent runs or trigger async load
+  let recentRuns = getRecentRuns();
 
-  // Fetch recent runs from history
-  fetch(apiBase + "/run-history?limit=50").then(function (resp) {
-    if (!resp.ok) return null;
-    return resp.json();
-  }).then(function (data) {
-    if (!carousel.isConnected) return;
-    while (carousel.firstChild) carousel.removeChild(carousel.firstChild);
+  if (recentRuns == null) {
+    carousel.appendChild(el("p", {
+      class: "comfymodal-studio-empty-state",
+      text: "Loading recent runs...",
+      style: "font-size:var(--font-size-xs);color:var(--color-text-muted);padding:8px;",
+    }));
 
-    const entries = (data && data.runs) || [];
-    // Filter to Studio runs first, then keep only image-producing ones.
-    const studioRuns = entries.filter(function (r) {
-      const extra = (r && r.extra) || {};
-      const studioMeta = extra.studio_meta || extra.studio_metadata || {};
-      return (r.prompt_id && r.prompt_id.indexOf("studio_") === 0) ||
-             r.kind === "experiment_cell" ||
-             !!(extra.studio_feature_id || extra.studio_preset_id || studioMeta.studio_feature_id || studioMeta.studio_preset_id);
+    // Async fetch fills cache — on next render it will show
+    refreshRecentRuns(apiBase).then(function () {
+      if (carousel.isConnected && context && context.setPage) {
+        context.setPage("playground");
+      }
     });
-    const imageRuns = studioRuns.filter(function (r) {
-      return hasRunImage(r);
-    });
-
-    if (imageRuns.length === 0) {
+  } else {
+    if (recentRuns.length === 0) {
       carousel.appendChild(el("p", {
         class: "comfymodal-studio-empty-state",
         text: "Recent runs will appear here once you use the Playground.",
         style: "font-size:var(--font-size-xs);color:var(--color-text-muted);padding:8px;",
       }));
-      return;
+      return carousel;
     }
 
     // Carousel track for horizontal scrolling
     const track = el("div", { class: "comfymodal-studio-carousel-track" });
 
-    imageRuns.forEach(function (run) {
-      const imageUrl = resolveRunImageUrl(run, apiBase);
-      const extra = (run && run.extra) || {};
-      const label = extra.studio_preset_id || extra.studio_feature_id || "Run";
+    recentRuns.forEach(function (nr) {
+      const imageUrl = nr.imageUrl;
+      const label = nr.presetLabel || nr.presetId || nr.featureId || "Run";
 
       const thumb = el("div", {
         class: "comfymodal-studio-carousel-item"
-          + (run.status === "completed" ? " completed" : "")
-          + (run.status === "error" || run.status === "failed" ? " failed" : ""),
-        title: label + " - " + (run.status || ""),
+          + (nr.status === "completed" || nr.status === "success" || nr.status === "done" ? " completed" : "")
+          + (nr.status === "error" || nr.status === "failed" ? " failed" : ""),
+        title: label + " - " + (nr.status || ""),
         onclick: function () {
-          // Update the canvas with this run's output
+          // Update canvas with this run's output
           if (imageUrl && state.playground) {
             state.playground.lastRunOutput = imageUrl;
+            state.playground._selectedRun = nr;
             // Clear current run state so the canvas re-renders with the new output
             if (context && context.setPage) {
               context.setPage("playground");
@@ -1132,24 +1600,18 @@ function renderFilmstrip(state, context) {
       }
 
       // Status dot
+      const isOk = nr.status === "completed" || nr.status === "success" || nr.status === "done";
+      const isErr = nr.status === "error" || nr.status === "failed";
       thumb.appendChild(el("span", {
         class: "comfymodal-studio-carousel-status",
-        style: "background:" + (run.status === "completed" ? "#4ade80" : run.status === "error" || run.status === "failed" ? "#f87171" : "#fbbf24"),
+        style: "background:" + (isOk ? "#4ade80" : isErr ? "#f87171" : "#fbbf24"),
       }));
 
       track.appendChild(thumb);
     });
 
     carousel.appendChild(track);
-  }).catch(function () {
-    if (!carousel.isConnected) return;
-    while (carousel.firstChild) carousel.removeChild(carousel.firstChild);
-    carousel.appendChild(el("p", {
-      class: "comfymodal-studio-empty-state",
-      text: "Could not load recent runs.",
-      style: "font-size:var(--font-size-xs);color:var(--color-text-muted);padding:8px;",
-    }));
-  });
+  }
 
   return carousel;
 }

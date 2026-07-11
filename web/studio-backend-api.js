@@ -114,7 +114,7 @@ export async function duplicatePreset(apiBase, id) {
   });
 }
 
-export async function archivePreset(apiBase, id) {
+export async function deletePreset(apiBase, id) {
   return apiFetch(apiBase, `/studio/presets/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });

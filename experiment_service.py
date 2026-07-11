@@ -477,6 +477,29 @@ class _EventBridge:
             await asyncio.sleep(0.2)
 
 
+# ── Atomic write helpers ────────────────────────────────────────────────
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    """Atomically write JSON to *path* via temp file + os.replace."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Atomically write text to *path* via temp file + os.replace."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 # ── Run-history service ─────────────────────────────────────────────────
 
 
@@ -497,6 +520,7 @@ class RunHistoryService:
         log_text: str = "",
         timings: Optional[dict] = None,
         output_path: str = "",
+        started_at: Optional[str] = None,
     ) -> dict:
         run_id = f"r_{uuid.uuid4().hex[:12]}"
         run_dir = self._root / run_id
@@ -510,16 +534,16 @@ class RunHistoryService:
             "prompt_id": prompt_id,
             "workflow_hash": workflow_hash,
             "status": status,
-            "started_at": _utc_now_iso(),
+            "started_at": started_at if started_at is not None else _utc_now_iso(),
             "updated_at": _utc_now_iso(),
             "output_path": output_path,
             "extra": dict(meta or {}),
         }
-        meta_path.write_text(json.dumps(meta_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(meta_path, meta_obj)
         if log_text:
-            log_path.write_text(log_text, encoding="utf-8")
+            _atomic_write_text(log_path, log_text)
         if timings:
-            timing_path.write_text(json.dumps(timings, ensure_ascii=False, indent=2), encoding="utf-8")
+            _atomic_write_json(timing_path, timings)
         return meta_obj
 
     def update_run(
@@ -529,6 +553,10 @@ class RunHistoryService:
         status: Optional[str] = None,
         meta: Optional[dict] = None,
         output_path: Optional[str] = None,
+        timings: Optional[dict] = None,
+        completed_at: Optional[str] = None,
+        workflow_hash: Optional[str] = None,
+        primary_asset_id: Optional[str] = None,
     ) -> dict:
         run_dir = self._root / run_id
         meta_path = run_dir / "meta.json"
@@ -542,15 +570,25 @@ class RunHistoryService:
             meta_obj["status"] = status
         if output_path is not None:
             meta_obj["output_path"] = output_path
+        if workflow_hash is not None:
+            meta_obj["workflow_hash"] = workflow_hash
+        if completed_at is not None:
+            meta_obj["completed_at"] = completed_at
+        if primary_asset_id is not None:
+            meta_obj["primary_asset_id"] = primary_asset_id
         if meta:
             meta_obj.setdefault("extra", {}).update(meta)
         meta_obj["updated_at"] = _utc_now_iso()
-        meta_path.write_text(json.dumps(meta_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(meta_path, meta_obj)
+        # Write timings atomically if provided
+        if timings is not None:
+            timing_path = run_dir / "timing.json"
+            _atomic_write_json(timing_path, timings)
         return meta_obj
 
     def list_runs(self, *, kind: Optional[str] = None, limit: int = 200) -> list[dict]:
         out: list[dict] = []
-        for run_dir in sorted(self._root.iterdir(), reverse=True):
+        for run_dir in self._root.iterdir():
             if not run_dir.is_dir():
                 continue
             meta_path = run_dir / "meta.json"
@@ -564,9 +602,17 @@ class RunHistoryService:
                 continue
             meta_obj["_path"] = str(run_dir)
             out.append(meta_obj)
-            if len(out) >= limit:
-                break
-        return out
+
+        # Sort by completed_at DESC, then started_at DESC, then file mtime DESC
+        def _sort_key(r: dict) -> tuple:
+            ca = r.get("completed_at", "") or ""
+            sa = r.get("started_at", "") or ""
+            # Use numeric mtime so '9' < '89' sorts correctly (string would invert this)
+            mtime = Path(r.get("_path", "")).stat().st_mtime if r.get("_path") else 0
+            return (ca or "", sa or "", mtime)
+
+        out.sort(key=_sort_key, reverse=True)
+        return out[:limit]
 
     def get_run(self, run_id: str) -> Optional[dict]:
         run_dir = self._root / run_id
