@@ -30,6 +30,7 @@ import {
   clearSelection,
   loadControlDraft,
   saveControlDraft,
+  clearControlDraft,
 } from "./studio-playground-state.js";
 import { getSharedTracker, createScopedTracker } from "./comfymodal-progress.js";
 import { updateRunAnnotation } from "./studio-backend-api.js";
@@ -606,6 +607,17 @@ function renderControlPanel(state, context) {
   // ── Run Button ─────────────────────────────────────────────────────
   panel.appendChild(renderRunButton(state, context, actions, isExperiment));
 
+  // Reset to defaults link
+  const resetLink = el("button", {
+    class: "comfymodal-studio-reset-link",
+    text: "Reset to defaults",
+    style: "background:none;border:none;color:var(--color-accent);cursor:pointer;font-size:var(--font-size-sm);padding:4px 0;text-decoration:underline;",
+    onclick: function () {
+      if (actions && actions.resetToDefaults) actions.resetToDefaults();
+    },
+  });
+  panel.appendChild(resetLink);
+
   return panel;
 }
 
@@ -678,6 +690,25 @@ function buildActions(state, context) {
     },
     setExperimentMode(enabled) {
       state.playground.experimentMode = enabled;
+      if (context && context.setPage) {
+        context.setPage("playground");
+      }
+    },
+    resetToDefaults() {
+      const presetId = state.playground && state.playground.selectedBackendId;
+      const featureId = state.playground && state.playground.featureId;
+      if (!presetId || !featureId) return;
+      // Clear in-memory overrides
+      state.playground.controls = {};
+      state.playground._selectedRun = null;
+      // Clear the saved draft for this preset+feature
+      clearControlDraft(presetId, featureId);
+      // Rehydrate from preset defaults
+      const currentPreset = getCurrentPresetForSelection(state, presetId);
+      hydrateControlsForSelection(state, presetId, featureId, currentPreset);
+      // Clear stale run state
+      if (state.playground) state.playground.runState = null;
+      _disposeScopedTracker(state);
       if (context && context.setPage) {
         context.setPage("playground");
       }
@@ -1201,6 +1232,43 @@ function _createAndStartScopedTracker(state, context, runId, experimentId) {
   return tracker;
 }
 
+/**
+ * Validate control values against their schema options before submission.
+ * Catches cross-domain errors like a scheduler name in the sampler field.
+ * Returns a clear error string or null if valid.
+ */
+function validateControls(controls, preset) {
+  if (!preset || !preset.controlSchemas) return null;
+  
+  const schemas = preset.controlSchemas;
+  
+  // Check sampler value against its schema options
+  if (controls.sampler != null && schemas.sampler && schemas.sampler.options) {
+    if (schemas.sampler.options.indexOf(controls.sampler) === -1) {
+      // Check if this value belongs to the scheduler field
+      if (schemas.scheduler && schemas.scheduler.options && 
+          schemas.scheduler.options.indexOf(controls.sampler) !== -1) {
+        return "Invalid sampler \"" + controls.sampler + "\". This value belongs to the Scheduler field, not the Sampler field. Click \"Reset to defaults\" and set Sampler to a valid value like \"multistep/res_3m\".";
+      }
+      return "Invalid sampler \"" + controls.sampler + "\". Select a valid sampler from the dropdown or click \"Reset to defaults\".";
+    }
+  }
+  
+  // Check scheduler value against its schema options
+  if (controls.scheduler != null && schemas.scheduler && schemas.scheduler.options) {
+    if (schemas.scheduler.options.indexOf(controls.scheduler) === -1) {
+      // Check if this value belongs to the sampler field
+      if (schemas.sampler && schemas.sampler.options && 
+          schemas.sampler.options.indexOf(controls.scheduler) !== -1) {
+        return "Invalid scheduler \"" + controls.scheduler + "\". This value belongs to the Sampler field, not the Scheduler field.";
+      }
+      return "Invalid scheduler \"" + controls.scheduler + "\". Select a valid scheduler from the dropdown or click \"Reset to defaults\".";
+    }
+  }
+  
+  return null;
+}
+
 async function doRunSubmit(state, context, actions) {
   const apiBase = (context && context.apiBase) || "/comfymodal";
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
@@ -1213,6 +1281,14 @@ async function doRunSubmit(state, context, actions) {
   if (!preset) return;
 
   const controls = buildEffectiveControls(state, preset, currentFeatureId);
+
+  const validationError = validateControls(controls, preset);
+  if (validationError) {
+    if (actions && actions.setRunState) {
+      actions.setRunState({ status: "error", message: validationError });
+    }
+    return;
+  }
 
   if (actions && actions.setRunState) {
     actions.setRunState({ status: "running" });
@@ -1506,6 +1582,16 @@ function renderRunButton(state, context, actions, isExperiment) {
 
         // Send all rendered bound fields — hydrated/restored values + current edits
         const controls = buildEffectiveControls(state, preset, currentFeatureId);
+
+        const validationError = validateControls(controls, preset);
+        if (validationError) {
+          btn.disabled = false;
+          btn.textContent = "Run";
+          if (actions && actions.setRunState) {
+            actions.setRunState({ status: "error", message: validationError });
+          }
+          return;
+        }
 
         const result = await runStudioPreset(apiBase, {
           presetId: preset.id || selectedId,
