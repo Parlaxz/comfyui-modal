@@ -84,3 +84,15 @@ export function saveControlDraft(presetId, featureId, controls) {
     // Ignore
   }
 }
+
+export function clearControlDraft(presetId, featureId) {
+  try {
+    const raw = localStorage.getItem(DRAFTS_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    const next = parsed && typeof parsed === "object" ? parsed : {};
+    delete next[makeDraftKey(presetId, featureId)];
+    localStorage.setItem(DRAFTS_STORAGE_KEY, JSON.stringify(next));
+  } catch (e) {
+    // Ignore
+  }
+}
