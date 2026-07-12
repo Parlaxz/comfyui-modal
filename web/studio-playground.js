@@ -24,7 +24,13 @@ import {
   getUnavailableControlReasons,
 } from "./studio-preset-capabilities.js";
 import { resolveRunImageUrl, hasRunImage, normalizeStudioRun } from "./studio-run-normalizer.js";
-import { saveSelection, loadSelection, clearSelection } from "./studio-playground-state.js";
+import {
+  saveSelection,
+  loadSelection,
+  clearSelection,
+  loadControlDraft,
+  saveControlDraft,
+} from "./studio-playground-state.js";
 import { getSharedTracker, createScopedTracker } from "./comfymodal-progress.js";
 import { updateRunAnnotation } from "./studio-backend-api.js";
 
@@ -204,10 +210,26 @@ function _startPolling(container, state, context, actions, runState) {
 //
 // Composes the full set of rendered bound controls from:
 //   1. current user edits (state.playground.controls)
-//   2. hydrated values (from latest completed run or snapshot defaults)
+//   2. hydrated values (from persisted draft or snapshot defaults)
 //   3. preset defaults
 // This ensures all visible bound fields are sent on submission,
 // not only fields that had explicit input events.
+
+function getCurrentPresetForSelection(state, presetId) {
+  const currentPreset = state.playground && state.playground._currentPreset;
+  if (!currentPreset) return null;
+  return (currentPreset.id || currentPreset.label || "") === (presetId || "") ? currentPreset : null;
+}
+
+function hydrateControlsForSelection(state, presetId, featureId, preset) {
+  if (!state.playground) return;
+  const draft = presetId && featureId ? loadControlDraft(presetId, featureId) : {};
+  if (draft && Object.keys(draft).length > 0) {
+    state.playground._hydratedControls = draft;
+    return;
+  }
+  state.playground._hydratedControls = ((preset && preset.defaults) || {});
+}
 
 function buildEffectiveControls(state, preset, currentFeatureId) {
   const presetDefaults = (preset && preset.defaults) || {};
@@ -279,7 +301,7 @@ export function clearRecentRunsCache() {
 // ── Hydration helper ──────────────────────────────────────────────────────
 //
 // Restore saved selection, fetch presets + history, validate preset,
-// restore latest completed run or snapshot defaults.
+// restore latest completed run preview plus draft/snapshot defaults.
 
 export async function hydratePlayground(state, context) {
   const apiBase = (context && context.apiBase) || "/comfymodal";
@@ -325,7 +347,7 @@ export async function hydratePlayground(state, context) {
     }
   }
 
-  // 6. If we have a valid preset, try to restore latest completed run
+  // 6a. If we have a valid preset, try to restore latest completed run preview
   if (targetPresetId) {
     await refreshRecentRuns(apiBase);
     const matchingCompleted = getRecentRuns().filter(function (nr) {
@@ -343,25 +365,16 @@ export async function hydratePlayground(state, context) {
       if (latest && latest.imageUrl) {
         state.playground.lastRunOutput = latest.imageUrl;
         state.playground._selectedRun = latest;
-        // Pre-populate hydrated controls from the completed run's resolved/requested controls
-        const hydratedCtrls = {};
-        const srcControls = latest.resolvedControls || latest.requestedControls || {};
-        Object.keys(srcControls).forEach(function (k) {
-          hydratedCtrls[k] = srcControls[k];
-        });
-        state.playground._hydratedControls = hydratedCtrls;
-        // Set defaults for any controls not in hydrated
-        const preset = presets.find(function (p) { return (p.id || p.label || "") === targetPresetId; });
-        if (preset && preset.defaults) {
-          Object.keys(preset.defaults).forEach(function (k) {
-            if (!(k in hydratedCtrls)) {
-              hydratedCtrls[k] = preset.defaults[k];
-            }
-          });
-        }
       }
     }
   }
+
+  // 6b. Hydrate control values from persisted draft or preset snapshot defaults
+  const preset = presets.find(function (p) { return (p.id || p.label || "") === targetPresetId; });
+  if (preset) {
+    state.playground._currentPreset = preset;
+  }
+  hydrateControlsForSelection(state, targetPresetId, featureId, preset);
 
   // 7. Persist the resolved selection
   if (targetPresetId) {
@@ -457,6 +470,20 @@ function renderControlPanel(state, context) {
   }));
 
   const selectedPresetId = state.playground && state.playground.selectedBackendId;
+  const currentDraft = selectedPresetId
+    ? loadControlDraft(selectedPresetId, currentFeatureId)
+    : {};
+  if (selectedPresetId && currentDraft && Object.keys(currentDraft).length > 0) {
+    const draft = currentDraft;
+    state.playground._hydratedControls = draft;
+  } else if (selectedPresetId) {
+    const currentPreset = getCurrentPresetForSelection(state, selectedPresetId);
+    if (currentPreset) {
+      hydrateControlsForSelection(state, selectedPresetId, currentFeatureId, currentPreset);
+    }
+  } else if (!selectedPresetId) {
+    state.playground._hydratedControls = {};
+  }
 
   // Async load presets to derive capabilities
   getRuntimePresets({ apiBase }).then((presets) => {
@@ -528,11 +555,16 @@ function renderControlPanel(state, context) {
 
       // Check if this control is in the preset's nodeBindings
       const hasBinding = !!(preset.nodeBindings && preset.nodeBindings[ctrlId] && preset.nodeBindings[ctrlId].nodeId);
+      const hasResolvedSchema = !!(
+        preset.controlSchemas
+        && preset.controlSchemas[ctrlId]
+        && preset.controlSchemas[ctrlId].schemaResolved
+      );
 
       const controlRow = renderControl(def, state, actions, preset);
 
       // Disable the control if it's a required binding not yet bound
-      if (!isBound && !hasBinding) {
+      if (!isBound && !hasBinding && !hasResolvedSchema) {
         controlRow.style.opacity = "0.5";
         const reason = reasons[ctrlId] || "Requires node binding";
         const reasonEl = el("p", {
@@ -582,11 +614,14 @@ function renderControlPanel(state, context) {
 function buildActions(state, context) {
   return {
     setFeature(featureId) {
+      clearTimeout(state.playground._draftSaveTimer);
       state.playground.featureId = featureId;
       // Clear stale controls when feature changes
       state.playground.controls = {};
-      state.playground._hydratedControls = {};
       state.playground._selectedRun = null;
+      const presetId = state.playground.selectedBackendId;
+      const currentPreset = getCurrentPresetForSelection(state, presetId);
+      hydrateControlsForSelection(state, presetId, featureId, currentPreset);
       // Clear stale run state so Run button re-enables
       if (state.playground) state.playground.runState = null;
       // Dispose scoped tracker — switching features invalidates current run
@@ -598,12 +633,14 @@ function buildActions(state, context) {
       }
     },
     setBackend(backendId) {
+      clearTimeout(state.playground._draftSaveTimer);
       state.playground.selectedBackendId = backendId;
       // Clear stale controls when preset changes to avoid sending
       // controls that the new preset doesn't support
       state.playground.controls = {};
-      state.playground._hydratedControls = {};
       state.playground._selectedRun = null;
+      const currentPreset = getCurrentPresetForSelection(state, backendId);
+      hydrateControlsForSelection(state, backendId, state.playground.featureId, currentPreset);
       // Clear stale run state so Run button re-enables
       if (state.playground) state.playground.runState = null;
       // Dispose scoped tracker — switching backends invalidates current run
@@ -617,6 +654,16 @@ function buildActions(state, context) {
     setControl(ctrlId, value) {
       if (!state.playground.controls) state.playground.controls = {};
       state.playground.controls[ctrlId] = value;
+      const presetId = state.playground.selectedBackendId;
+      const featureId = state.playground.featureId;
+      const activePreset = getCurrentPresetForSelection(state, presetId);
+      clearTimeout(state.playground._draftSaveTimer);
+      state.playground._draftSaveTimer = setTimeout(function () {
+        const controls = activePreset
+          ? buildEffectiveControls(state, activePreset, featureId)
+          : Object.assign({}, loadControlDraft(presetId, featureId), state.playground._hydratedControls || {}, state.playground.controls || {});
+        saveControlDraft(presetId, featureId, controls);
+      }, 300);
       // Clear stale terminal run state so Run button re-enables on control
       // change, but preserve in-flight states to prevent duplicate submits.
       const currentRunState = state.playground && state.playground.runState;
@@ -678,7 +725,7 @@ function buildActions(state, context) {
     setRunState(runState) {
       if (!state.playground) state.playground = {};
       const prevRunState = state.playground.runState;
-      state.playground.runState = runState;
+      state.playground.runState = { ...state.playground.runState, ...runState };
 
       // Dispose scoped tracker on terminal states
       if (runState && (runState.status === "completed" || runState.status === "error")) {
@@ -883,9 +930,16 @@ export function createInfoHint(text, options) {
 
 function renderControl(def, state, actions, preset) {
   const presetDefaults = (preset && preset.defaults) || {};
+  const ctrlId = def.id;
   const currentOverrides = (state.playground && state.playground.controls) || {};
   const hydratedValues = (state.playground && state.playground._hydratedControls) || {};
-  const value = currentOverrides[def.id] ?? hydratedValues[def.id] ?? presetDefaults[def.id] ?? def.defaultValue;
+  const value = ctrlId in currentOverrides
+    ? currentOverrides[ctrlId]
+    : ctrlId in hydratedValues
+      ? hydratedValues[ctrlId]
+      : ctrlId in presetDefaults
+        ? presetDefaults[ctrlId]
+        : def.defaultValue;
 
   // Resolve schema from the backend preset (if available)
   const schema = (preset && preset.controlSchemas && preset.controlSchemas[def.id]) || null;
@@ -1108,28 +1162,36 @@ function _createAndStartScopedTracker(state, context, runId, experimentId) {
     else if (s.stage === "error") mappedStatus = "error";
     else if (s.stage === "idle" && rs.status !== "submitted") return;
 
-    if (mappedStatus !== rs.status || s.overallPercent != null || s.completedNodes > 0) {
-      rs.overallPercent = s.overallPercent;
-      rs.completedNodes = s.completedNodes;
-      rs.totalNodes = s.totalNodes;
-      rs.samplerStep = s.samplerStep;
-      rs.samplerMaximum = s.samplerMaximum;
-      rs.samplerPercent = s.samplerPercent;
-      rs.elapsedMs = s.elapsedMs;
-      rs.queuePosition = s.queuePosition;
-      rs.currentNodeLabel = s.currentNodeLabel;
-      rs.stage = s.stage;
-      rs.message = s.message;
-      rs.error = s.error;
+    // Always apply tracker snapshot fields to runState (no guard — prevents
+    // stale display after status stabilizes to "in_progress")
+    rs.overallPercent = s.overallPercent;
+    rs.completedNodes = s.completedNodes;
+    rs.totalNodes = s.totalNodes;
+    rs.samplerStep = s.samplerStep;
+    rs.samplerMaximum = s.samplerMaximum;
+    rs.samplerPercent = s.samplerPercent;
+    rs.elapsedMs = s.elapsedMs;
+    rs.queuePosition = s.queuePosition;
+    rs.currentNodeLabel = s.currentNodeLabel;
+    rs.stage = s.stage;
+    rs.message = s.message;
+    rs.error = s.error;
 
-      if (mappedStatus !== rs.status) {
-        rs.status = mappedStatus;
-      }
+    if (mappedStatus !== rs.status) {
+      rs.status = mappedStatus;
+    }
 
-      // Trigger re-render on terminal states
-      if (mappedStatus === "completed" || mappedStatus === "error") {
-        // Dispose scoped tracker on terminal state
-        _disposeScopedTracker(state);
+    // Trigger re-render on terminal states (dispose tracker) or intermediate
+    // progress (throttled to avoid excessive re-renders)
+    if (mappedStatus === "completed" || mappedStatus === "error") {
+      // Dispose scoped tracker on terminal state
+      _disposeScopedTracker(state);
+      if (context && context.setPage) context.setPage("playground");
+    } else {
+      // Throttle re-renders for intermediate progress
+      var now = Date.now();
+      if (!rs._lastRenderMs || now - rs._lastRenderMs >= 250) {
+        rs._lastRenderMs = now;
         if (context && context.setPage) context.setPage("playground");
       }
     }
@@ -1549,7 +1611,7 @@ function renderProgressSection(state, context) {
   else if (runState.status === "waiting") stageLabel = "Waiting";
 
   stageEl.textContent = "Stage: " + stageLabel;
-  nodesEl.textContent = "Nodes: " + (runState.completedNodes || 0) + "/" + (runState.totalNodes || 0);
+  nodesEl.textContent = "Nodes: " + (runState.completedNodes || 0) + "/" + (runState.totalNodes || "?");
   var samplerPct = runState.samplerPercent != null ? " (" + Math.round(runState.samplerPercent) + "%)" : "";
   stepEl.textContent = "Sampler: " + (runState.samplerStep != null ? runState.samplerStep : "?") + "/" + (runState.samplerMaximum || "?") + samplerPct;
   elapsedEl.textContent = "Elapsed: " + _formatDuration(runState.elapsedMs);

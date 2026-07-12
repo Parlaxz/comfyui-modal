@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from typing import Any
@@ -356,7 +357,14 @@ class StudioRunAdapterCompilationTests(unittest.TestCase):
             _make_studio_store_files(tmp, [snap], [preset])
             spec = self.mod.build_single_run_spec(preset, snap, "txt2img", {"seed": 7}, tmp)
             self.assertNotIn("error", spec)
-            self.assertEqual(spec["checkpoints"][0]["workflow"], snap["apiPromptJson"]["output"])
+            self.assertEqual(
+                spec["checkpoints"][0]["workflow"]["3"]["inputs"]["seed"],
+                7,
+            )
+            self.assertEqual(
+                snap["apiPromptJson"]["output"]["3"]["inputs"]["seed"],
+                42,
+            )
 
     def test_single_run_spec_infers_single_value_input_for_node_binding(self):
         """Legacy node-kind prompt bindings should resolve a single 'value' input."""
@@ -1627,7 +1635,7 @@ class CanonicalMetadataTests(unittest.TestCase):
     def setUpClass(cls):
         cls.svc_mod = _load_module("experiment_service", "experiment_service.py")
 
-    def _finalize_with_fields(self, svc, extra_fields: dict = None):
+    def _finalize_with_fields(self, svc, extra_fields: dict | None = None):
         """Helper: create a submission record then finalize with all canonical fields."""
         rec = svc.record_run(
             kind="studio_run",
@@ -2083,7 +2091,7 @@ class ExtractDefaultsSamplerSchedulerTests(unittest.TestCase):
         self.assertEqual(defaults["seed"], 42)
 
     def test_sampler_missing_if_not_bound(self):
-        """Sampler/scheduler absent from nodeBindings => not in defaults."""
+        """Sampler/scheduler are auto-derived from workflow when absent from bindings."""
         snapshot = {
             "apiPromptJson": {
                 "3": {"class_type": "KSampler", "inputs": {
@@ -2096,8 +2104,172 @@ class ExtractDefaultsSamplerSchedulerTests(unittest.TestCase):
         }
         defaults = self.mod.extract_defaults_from_snapshot(snapshot)
         self.assertIn("seed", defaults)
-        self.assertNotIn("sampler", defaults)
-        self.assertNotIn("scheduler", defaults)
+        self.assertEqual(defaults.get("sampler"), "euler")
+        self.assertEqual(defaults.get("scheduler"), "normal")
+
+    def test_sampler_scheduler_auto_derived_when_unbound(self):
+        """Sampler/scheduler are extracted from workflow even without bindings."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {
+                    "seed": 42,
+                    "steps": 30,
+                    "cfg": 6.5,
+                    "sampler_name": "dpmpp_2m",
+                    "scheduler": "karras",
+                    "denoise": 0.55,
+                }},
+            },
+            "nodeBindings": {
+                "seed": {"kind": "widget", "nodeId": "3", "widgetName": "seed"},
+            },
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        self.assertEqual(defaults.get("sampler"), "dpmpp_2m")
+        self.assertEqual(defaults.get("scheduler"), "karras")
+        self.assertEqual(defaults.get("steps"), 30)
+        self.assertEqual(defaults.get("guidance"), 6.5)
+        self.assertEqual(defaults.get("denoise"), 0.55)
+
+    def test_auto_derived_defaults_preserve_zero_values(self):
+        """Auto-derived defaults preserve zero/0.0 values."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {
+                    "seed": 0,
+                    "steps": 0,
+                    "cfg": 0.0,
+                    "sampler_name": "euler",
+                    "scheduler": "normal",
+                    "denoise": 0.0,
+                }},
+            },
+            "nodeBindings": {},
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        self.assertEqual(defaults.get("seed"), 0)
+        self.assertEqual(defaults.get("steps"), 0)
+        self.assertEqual(defaults.get("guidance"), 0.0)
+        self.assertEqual(defaults.get("denoise"), 0.0)
+
+    def test_custom_sampler_node_defaults_auto_derived_when_unbound(self):
+        """Custom sampler nodes with matching widgets also auto-derive defaults."""
+        class _FakeSamplerNode:
+            @classmethod
+            def INPUT_TYPES(cls):
+                return {"required": {
+                    "sampler_name": (["alpha", "beta"], {"default": "alpha"}),
+                    "scheduler": (["sched_a", "sched_b"], {"default": "sched_a"}),
+                    "steps": ("INT", {"default": 20, "min": 1, "max": 100}),
+                    "cfg": ("FLOAT", {"default": 7.0, "min": 0.0, "max": 20.0, "step": 0.5}),
+                    "seed": ("INT", {"default": 0, "min": -1, "max": 999}),
+                    "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                }}
+
+        node_mod = self.mod.nodes
+        if node_mod is None:
+            node_mod = types.SimpleNamespace(NODE_CLASS_MAPPINGS={})
+            setattr(self.mod, "nodes", node_mod)
+        original = node_mod.NODE_CLASS_MAPPINGS.get("FakeSamplerNode")
+        node_mod.NODE_CLASS_MAPPINGS["FakeSamplerNode"] = _FakeSamplerNode
+        try:
+            snapshot = {
+                "apiPromptJson": {
+                    "3": {"class_type": "FakeSamplerNode", "inputs": {
+                        "seed": 55,
+                        "steps": 33,
+                        "cfg": 4.5,
+                        "sampler_name": "beta",
+                        "scheduler": "sched_b",
+                        "denoise": 0.25,
+                    }},
+                },
+                "nodeBindings": {},
+            }
+            defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+            self.assertEqual(defaults.get("sampler"), "beta")
+            self.assertEqual(defaults.get("scheduler"), "sched_b")
+            self.assertEqual(defaults.get("steps"), 33)
+            self.assertEqual(defaults.get("guidance"), 4.5)
+        finally:
+            if original is None:
+                node_mod.NODE_CLASS_MAPPINGS.pop("FakeSamplerNode", None)
+            else:
+                node_mod.NODE_CLASS_MAPPINGS["FakeSamplerNode"] = original
+
+    def test_node_kind_control_binding_uses_alias_for_defaults(self):
+        """Wizard-saved node-kind control bindings should still resolve common defaults."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {
+                    "class_type": "KSampler",
+                    "inputs": {
+                        "seed": 123,
+                        "steps": 33,
+                        "cfg": 6.5,
+                        "sampler_name": "euler",
+                        "scheduler": "normal",
+                    },
+                },
+            },
+            "nodeBindings": {
+                "steps": {"kind": "node", "nodeId": "3"},
+                "guidance": {"kind": "node", "nodeId": "3"},
+                "seed": {"kind": "node", "nodeId": "3"},
+                "sampler": {"kind": "node", "nodeId": "3"},
+                "scheduler": {"kind": "node", "nodeId": "3"},
+            },
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        self.assertEqual(defaults.get("steps"), 33)
+        self.assertEqual(defaults.get("guidance"), 6.5)
+        self.assertEqual(defaults.get("seed"), 123)
+        self.assertEqual(defaults.get("sampler"), "euler")
+        self.assertEqual(defaults.get("scheduler"), "normal")
+
+    def test_node_kind_defaults_use_bound_node_not_first_matching_node(self):
+        """Node-kind control defaults must come from the bound nodeId, not the first KSampler found."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {
+                    "class_type": "KSampler",
+                    "inputs": {"seed": 1, "steps": 20, "cfg": 7.0, "sampler_name": "euler", "scheduler": "normal"},
+                },
+                "9": {
+                    "class_type": "KSampler",
+                    "inputs": {"seed": 999, "steps": 44, "cfg": 3.5, "sampler_name": "dpmpp_2m", "scheduler": "karras"},
+                },
+            },
+            "nodeBindings": {
+                "steps": {"kind": "node", "nodeId": "9"},
+                "guidance": {"kind": "node", "nodeId": "9"},
+                "seed": {"kind": "node", "nodeId": "9"},
+                "sampler": {"kind": "node", "nodeId": "9"},
+                "scheduler": {"kind": "node", "nodeId": "9"},
+            },
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        self.assertEqual(defaults.get("steps"), 44)
+        self.assertEqual(defaults.get("guidance"), 3.5)
+        self.assertEqual(defaults.get("seed"), 999)
+        self.assertEqual(defaults.get("sampler"), "dpmpp_2m")
+        self.assertEqual(defaults.get("scheduler"), "karras")
+
+    def test_node_kind_prompt_defaults_resolve_text_like_fields(self):
+        """Prompt-like node bindings should resolve from the bound node's text/value field."""
+        snapshot = {
+            "apiPromptJson": {
+                "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "a castle at dusk"}},
+                "1497": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "remove the object"}},
+            },
+            "nodeBindings": {
+                "prompt": {"kind": "node", "nodeId": "7"},
+                "instruction": {"kind": "node", "nodeId": "1497"},
+            },
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        self.assertEqual(defaults.get("prompt"), "a castle at dusk")
+        self.assertEqual(defaults.get("instruction"), "remove the object")
 
 
 # ---------------------------------------------------------------------------
@@ -2269,6 +2441,104 @@ class ControlSchemaDerivationTests(unittest.TestCase):
         self.assertIsNotNone(s.get("minimum"))
         self.assertIsNotNone(s.get("maximum"))
         self.assertLessEqual(s.get("minimum", 0), 0.0)
+
+    def test_sampler_schema_auto_derived_when_unbound(self):
+        """Sampler enum schema is derived from workflow when unbound."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {
+                    "seed": 42,
+                    "sampler_name": "dpmpp_2m",
+                    "scheduler": "karras",
+                }},
+            },
+            "nodeBindings": {},
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("sampler", {})
+        self.assertEqual(s.get("kind"), "enum")
+        self.assertTrue(s.get("schemaResolved"))
+        self.assertIn("euler", s.get("options", []))
+        self.assertIn("dpmpp_2m", s.get("options", []))
+        self.assertEqual(s.get("default"), "dpmpp_2m")
+
+    def test_scheduler_schema_auto_derived_when_unbound(self):
+        """Scheduler enum schema is derived from workflow when unbound."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"scheduler": "karras"}},
+            },
+            "nodeBindings": {},
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        s = schemas.get("scheduler", {})
+        self.assertEqual(s.get("kind"), "enum")
+        self.assertTrue(s.get("schemaResolved"))
+        self.assertIn("normal", s.get("options", []))
+        self.assertIn("karras", s.get("options", []))
+        self.assertEqual(s.get("default"), "karras")
+
+    def test_steps_guidance_schema_auto_derived_when_unbound(self):
+        """Numeric KSampler controls are derived from workflow when unbound."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"steps": 30, "cfg": 6.5}},
+            },
+            "nodeBindings": {},
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        self.assertEqual(schemas.get("steps", {}).get("kind"), "integer")
+        self.assertEqual(schemas.get("steps", {}).get("default"), 30)
+        self.assertEqual(schemas.get("guidance", {}).get("kind"), "number")
+        self.assertEqual(schemas.get("guidance", {}).get("default"), 6.5)
+
+    def test_custom_sampler_node_schema_derived_from_node_def_when_unbound(self):
+        """Custom sampler nodes derive enum options from node INPUT_TYPES()."""
+        class _FakeSamplerNode:
+            @classmethod
+            def INPUT_TYPES(cls):
+                return {"required": {
+                    "sampler_name": (["alpha", "beta", "gamma"], {"default": "alpha"}),
+                    "scheduler": (["sched_a", "sched_b"], {"default": "sched_a"}),
+                    "steps": ("INT", {"default": 20, "min": 1, "max": 100}),
+                    "cfg": ("FLOAT", {"default": 7.0, "min": 0.0, "max": 20.0, "step": 0.5}),
+                    "seed": ("INT", {"default": 0, "min": -1, "max": 999}),
+                    "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                }}
+
+        node_mod = self.mod.nodes
+        if node_mod is None:
+            node_mod = types.SimpleNamespace(NODE_CLASS_MAPPINGS={})
+            setattr(self.mod, "nodes", node_mod)
+        original = node_mod.NODE_CLASS_MAPPINGS.get("FakeSamplerNode")
+        node_mod.NODE_CLASS_MAPPINGS["FakeSamplerNode"] = _FakeSamplerNode
+        try:
+            snapshot = {
+                "apiPromptJson": {
+                    "3": {"class_type": "FakeSamplerNode", "inputs": {
+                        "seed": 42,
+                        "steps": 22,
+                        "cfg": 4.5,
+                        "sampler_name": "beta",
+                        "scheduler": "sched_b",
+                        "denoise": 0.9,
+                    }},
+                },
+                "nodeBindings": {},
+            }
+            schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+            self.assertEqual(schemas.get("sampler", {}).get("kind"), "enum")
+            self.assertIn("gamma", schemas.get("sampler", {}).get("options", []))
+            self.assertEqual(schemas.get("sampler", {}).get("default"), "beta")
+            self.assertEqual(schemas.get("scheduler", {}).get("kind"), "enum")
+            self.assertIn("sched_b", schemas.get("scheduler", {}).get("options", []))
+            self.assertEqual(schemas.get("steps", {}).get("kind"), "integer")
+            self.assertEqual(schemas.get("guidance", {}).get("kind"), "number")
+        finally:
+            if original is None:
+                node_mod.NODE_CLASS_MAPPINGS.pop("FakeSamplerNode", None)
+            else:
+                node_mod.NODE_CLASS_MAPPINGS["FakeSamplerNode"] = original
 
 
 class ControlValidationTests(unittest.TestCase):
@@ -2650,6 +2920,45 @@ class CapturedControlSchemasTests(unittest.TestCase):
         self.assertEqual(s.get("minimum"), 0.0)
         self.assertTrue(s.get("schemaResolved"))
 
+    def test_mixed_captured_and_auto_derived_controls(self):
+        """Captured schemas stay intact while missing controls are auto-derived."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {
+                    "seed": 123,
+                    "steps": 44,
+                    "sampler_name": "dpmpp_2m",
+                    "scheduler": "karras",
+                }},
+            },
+            "nodeBindings": {},
+            "controlSchemas": {
+                "seed": {
+                    "kind": "integer",
+                    "default": 123,
+                    "minimum": 0,
+                    "maximum": 999999,
+                    "nodeId": "3",
+                    "widgetName": "seed",
+                },
+                "steps": {
+                    "kind": "integer",
+                    "default": 44,
+                    "minimum": 1,
+                    "maximum": 200,
+                    "nodeId": "3",
+                    "widgetName": "steps",
+                },
+            },
+        }
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+        self.assertEqual(schemas.get("seed", {}).get("maximum"), 999999)
+        self.assertEqual(schemas.get("steps", {}).get("maximum"), 200)
+        self.assertEqual(schemas.get("sampler", {}).get("kind"), "enum")
+        self.assertEqual(schemas.get("sampler", {}).get("default"), "dpmpp_2m")
+        self.assertEqual(schemas.get("scheduler", {}).get("kind"), "enum")
+        self.assertEqual(schemas.get("scheduler", {}).get("default"), "karras")
+
 
 class CapturedControlSchemasSnapshotModelTests(unittest.TestCase):
     """Snapshot model must accept and persist controlSchemas."""
@@ -2907,6 +3216,116 @@ class CapturedSchemaDeepCopyTests(unittest.TestCase):
                          "Snapshot kind must not be mutated by caller")
         self.assertNotIn("injected", original.get("options", []),
                          "Snapshot options must not be mutated by caller")
+
+
+class AutoDerivedSlotsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_augment_slots_adds_unbound_ksampler_controls(self):
+        workflow = {
+            "3": {"class_type": "KSampler", "inputs": {
+                "seed": 42,
+                "steps": 20,
+                "cfg": 7.0,
+                "sampler_name": "euler",
+                "scheduler": "normal",
+                "denoise": 1.0,
+            }},
+        }
+        slots = {"seed": {"node_id": "3", "field": "seed", "path": ["inputs", "seed"]}}
+        augmented = self.mod._augment_slots_with_auto_derive(dict(slots), workflow)
+        self.assertIn("sampler", augmented)
+        self.assertIn("scheduler", augmented)
+        self.assertIn("steps", augmented)
+        self.assertIn("guidance", augmented)
+        self.assertEqual(augmented["sampler"], {
+            "node_id": "3",
+            "field": "sampler_name",
+            "path": ["inputs", "sampler_name"],
+        })
+
+    def test_apply_controls_with_auto_derived_slots(self):
+        workflow = {
+            "3": {"class_type": "KSampler", "inputs": {
+                "seed": 42,
+                "steps": 20,
+                "cfg": 7.0,
+                "sampler_name": "euler",
+                "scheduler": "normal",
+                "denoise": 1.0,
+            }},
+        }
+        slots = self.mod._augment_slots_with_auto_derive({}, workflow)
+        self.mod._apply_controls_to_workflow(workflow, slots, {
+            "sampler": "dpmpp_2m",
+            "scheduler": "karras",
+            "steps": 30,
+            "guidance": 5.5,
+            "denoise": 0.4,
+        })
+        inputs = workflow["3"]["inputs"]
+        self.assertEqual(inputs["sampler_name"], "dpmpp_2m")
+        self.assertEqual(inputs["scheduler"], "karras")
+        self.assertEqual(inputs["steps"], 30)
+        self.assertEqual(inputs["cfg"], 5.5)
+        self.assertEqual(inputs["denoise"], 0.4)
+
+    def test_augment_slots_first_matching_ksampler_wins(self):
+        workflow = {
+            "3": {"class_type": "KSampler", "inputs": {
+                "sampler_name": "euler", "scheduler": "normal", "steps": 20,
+                "cfg": 7.0, "seed": 42, "denoise": 1.0,
+            }},
+            "4": {"class_type": "KSampler", "inputs": {
+                "sampler_name": "heun", "scheduler": "karras", "steps": 50,
+                "cfg": 8.0, "seed": 77, "denoise": 0.5,
+            }},
+        }
+        slots = self.mod._augment_slots_with_auto_derive({}, workflow)
+        self.assertEqual(slots["sampler"]["node_id"], "3")
+        self.assertEqual(slots["scheduler"]["node_id"], "3")
+
+    def test_augment_slots_supports_custom_sampler_nodes(self):
+        class _FakeSamplerNode:
+            @classmethod
+            def INPUT_TYPES(cls):
+                return {"required": {
+                    "sampler_name": (["alpha", "beta"], {"default": "alpha"}),
+                    "scheduler": (["sched_a", "sched_b"], {"default": "sched_a"}),
+                    "steps": ("INT", {"default": 20, "min": 1, "max": 100}),
+                    "cfg": ("FLOAT", {"default": 7.0, "min": 0.0, "max": 20.0, "step": 0.5}),
+                    "seed": ("INT", {"default": 0, "min": -1, "max": 999}),
+                    "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                }}
+
+        node_mod = self.mod.nodes
+        if node_mod is None:
+            node_mod = types.SimpleNamespace(NODE_CLASS_MAPPINGS={})
+            setattr(self.mod, "nodes", node_mod)
+        original = node_mod.NODE_CLASS_MAPPINGS.get("FakeSamplerNode")
+        node_mod.NODE_CLASS_MAPPINGS["FakeSamplerNode"] = _FakeSamplerNode
+        try:
+            workflow = {
+                "3": {"class_type": "FakeSamplerNode", "inputs": {
+                    "sampler_name": "beta",
+                    "scheduler": "sched_b",
+                    "steps": 30,
+                    "cfg": 4.5,
+                    "seed": 55,
+                    "denoise": 0.2,
+                }},
+            }
+            slots = self.mod._augment_slots_with_auto_derive({}, workflow)
+            self.assertEqual(slots["sampler"]["field"], "sampler_name")
+            self.assertEqual(slots["scheduler"]["field"], "scheduler")
+            self.assertEqual(slots["guidance"]["field"], "cfg")
+        finally:
+            if original is None:
+                node_mod.NODE_CLASS_MAPPINGS.pop("FakeSamplerNode", None)
+            else:
+                node_mod.NODE_CLASS_MAPPINGS["FakeSamplerNode"] = original
 
 
 class GitignoreRuntimeDirectoriesTests(unittest.TestCase):

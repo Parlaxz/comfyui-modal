@@ -957,6 +957,13 @@ class HistoryGalleryTests(unittest.TestCase):
         """history gallery must preserve experiment_id grouping."""
         self.assertIn("experiment_id", self.text)
 
+    def test_history_ungrouped_runs_use_gallery_grid(self):
+        """ungrouped history must still render inside the gallery grid wrapper."""
+        self.assertIn(
+            'container.appendChild(renderHistoryGallery(normalizedRuns, apiBase, openPreview));',
+            self.text,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Playground carousel — image thumbnails that update the canvas
@@ -1254,6 +1261,19 @@ class PersistenceStateTests(unittest.TestCase):
         text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
         self.assertIn("featureId", text)
 
+    def test_control_draft_storage_helpers_defined(self):
+        """Playground state must define localStorage helpers for per-preset drafts."""
+        state_text = (WEB / "studio-playground-state.js").read_text(encoding="utf-8")
+        self.assertIn("comfymodal.studio.playground.drafts.v1", state_text)
+        self.assertIn("loadControlDraft", state_text)
+        self.assertIn("saveControlDraft", state_text)
+
+    def test_playground_imports_control_draft_helpers(self):
+        """Playground must import the per-preset draft persistence helpers."""
+        pg_text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+        self.assertIn("loadControlDraft", pg_text)
+        self.assertIn("saveControlDraft", pg_text)
+
 
 # ---------------------------------------------------------------------------
 # Hydration/restoration order in Playground
@@ -1281,6 +1301,26 @@ class HydrationRestorationTests(unittest.TestCase):
         """Must sort matching runs by completedAt or startedAt descending, not assume array order."""
         self.assertIn("completedAt", self.text) or self.assertIn("startedAt", self.text)
         self.assertIn("sort", self.text.lower())
+
+    def test_hydrates_controls_from_persisted_draft(self):
+        """Controls should hydrate from persisted draft before falling back to snapshot defaults."""
+        self.assertIn("loadControlDraft", self.text)
+        self.assertIn("state.playground._hydratedControls = draft", self.text)
+
+    def test_completed_run_preview_no_longer_seeds_hydrated_controls(self):
+        """Latest completed run may restore preview state but must not seed hydrated controls."""
+        self.assertIn("lastRunOutput", self.text)
+        self.assertIn("_selectedRun", self.text)
+        self.assertNotIn("latest.resolvedControls || latest.requestedControls", self.text)
+
+    def test_persists_control_draft_updates_from_user_edits(self):
+        """User control edits must be persisted to per-preset draft storage."""
+        self.assertIn("saveControlDraft", self.text)
+
+    def test_render_control_uses_explicit_precedence_checks(self):
+        """Render path should use explicit precedence checks instead of nullish fallback chains."""
+        self.assertIn("in currentOverrides", self.text)
+        self.assertIn("in hydratedValues", self.text)
 
 
 class BackendSelectorInteractionGuardTests(unittest.TestCase):
