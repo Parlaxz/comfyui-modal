@@ -1355,7 +1355,7 @@ function renderRunButton(state, context, actions, isExperiment) {
         btn.onclick = async () => {
           btn.disabled = true;
           btn.textContent = "Running\u2026";
-          // Dispose any scoped tracker before experiment run (experiments use polling)
+          // Dispose any previous scoped tracker before experiment run
           _disposeScopedTracker(state);
           if (actions && actions.setRunState) actions.setRunState({ status: "running" });
 
@@ -1369,6 +1369,16 @@ function renderRunButton(state, context, actions, isExperiment) {
                 message: result.message,
               });
             }
+
+            // Create scoped tracker for experiment execution events.
+            // experiment.worker.progress events from Modal execution will drive
+            // real-time progress updates (sampler steps, queue position, etc.).
+            // Polling remains as fallback for terminal state detection.
+            _createAndStartScopedTracker(
+              state, context,
+              result.experimentId,
+              result.experimentId
+            );
           } else {
             const errMsg = (result && result.message) || "Experiment run failed.";
             if (actions && actions.setRunState) {

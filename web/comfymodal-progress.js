@@ -673,6 +673,91 @@ export function createScopedTracker(api, identity) {
     }
   }
 
+  // ── Experiment event handlers ──────────────────────────────────────────
+  //
+  // experiment.worker.progress: carries sampler/queue updates from Modal
+  // execution workers during experiment runs. Soft-locks the tracker when
+  // the experiment_id matches, enabling progress display even without a
+  // standard execution_start event.
+  //
+  // experiment.event: carries terminal lifecycle events for experiments
+  // (completed, stopped, error, failed_fatal).
+
+  function onExperimentWorkerProgress(detail) {
+    if (!_started || _disposed) return;
+    const d = detail || {};
+    const eventExperimentId = d.experiment_id || null;
+
+    // If we have an experimentId in identity and this event matches,
+    // soft-lock the tracker so it produces progress even without execution_start
+    if (_identity.experimentId && eventExperimentId && eventExperimentId === _identity.experimentId) {
+      if (!_locked) {
+        _locked = true;
+        state.startTime = Date.now();
+        state.stage = "generating";
+        _startTimer();
+      }
+
+      // Update sampler progress fields
+      if (d.step != null || d.value != null) {
+        state.samplerStep = d.step ?? d.value;
+        state.samplerMaximum = d.max ?? d.max_step ?? d.maxStep ?? state.samplerMaximum;
+      }
+      if (d.queue != null) state.queuePosition = d.queue;
+
+      if (state.samplerMaximum > 0 && state.samplerStep != null) {
+        state.samplerPercent = (state.samplerStep / state.samplerMaximum) * 100;
+      }
+
+      _notify();
+    }
+  }
+
+  function onExperimentEvent(event) {
+    if (!_started || _disposed) return;
+    const detail = (event && event.detail) || {};
+    const eventType = detail.type || "";
+    const eventExperimentId = detail.experiment_id || null;
+
+    // If the event carries an experiment_id, only respond if our identity matches.
+    // Single-run trackers (no experimentId) should reject all experiment events.
+    if (eventExperimentId) {
+      if (!_identity.experimentId || eventExperimentId !== _identity.experimentId) return;
+    }
+    // If not locked, don't process experiment events (no matching run)
+    if (!_locked) return;
+
+    if (eventType === "experiment.completed" || eventType === "experiment.stopped") {
+      _stopTimer();
+      state.stage = "done";
+      state.elapsedMs = state.startTime ? Date.now() - state.startTime : 0;
+      state.overallPercent = 100;
+      _notify();
+
+      setTimeout(() => {
+        if (!_disposed && (state.stage === "done" || state.stage === "error")) {
+          _locked = false;
+          _capturedPromptId = null;
+          _reset();
+        }
+      }, 0);
+    } else if (eventType === "experiment.error" || eventType === "experiment.failed_fatal") {
+      _stopTimer();
+      state.stage = "error";
+      state.elapsedMs = state.startTime ? Date.now() - state.startTime : 0;
+      state.error = detail.error || detail.message || "Experiment error";
+      _notify();
+
+      setTimeout(() => {
+        if (!_disposed) {
+          _locked = false;
+          _capturedPromptId = null;
+          _reset();
+        }
+      }, 4000);
+    }
+  }
+
   // ── Wire up events ─────────────────────────────────────────────────────
   const handlers = [];
 
@@ -691,6 +776,8 @@ export function createScopedTracker(api, identity) {
   _addListener("execution_success", (e) => onExecutionSuccess(e));
   _addListener("execution_error", (e) => onExecutionError(e));
   _addListener("modal_status", (e) => onModalStatus(e?.detail));
+  _addListener("experiment.worker.progress", (e) => onExperimentWorkerProgress(e?.detail));
+  _addListener("experiment.event", (e) => onExperimentEvent(e));
 
   // ── Public API ─────────────────────────────────────────────────────────
   return {
