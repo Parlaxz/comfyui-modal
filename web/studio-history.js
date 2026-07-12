@@ -685,11 +685,8 @@ export function renderHistory(state, context) {
           container.appendChild(groupEl);
         }
       } else {
-        // Ungrouped: render all runs flat
-        normalizedRuns.forEach(function (nr) {
-          var card = renderHistoryCard(nr, apiBase, openPreview);
-          container.appendChild(card);
-        });
+        // Ungrouped: still render inside the gallery grid
+        container.appendChild(renderHistoryGallery(normalizedRuns, apiBase, openPreview));
       }
     }).catch(function (err) {
       while (container.firstChild) container.removeChild(container.firstChild);
@@ -781,6 +778,17 @@ function renderHistoryCard(nr, apiBase, openPreview) {
   return card;
 }
 
+function renderHistoryGallery(runs, apiBase, openPreview) {
+  var gallery = el("div", { class: "comfymodal-studio-history-gallery" });
+
+  runs.forEach(function (nr) {
+    var card = renderHistoryCard(nr, apiBase, openPreview);
+    gallery.appendChild(card);
+  });
+
+  return gallery;
+}
+
 // ── Group renderer ────────────────────────────────────────────────────────
 
 function renderGroup(expId, groupRuns, apiBase, openPreview) {
@@ -832,12 +840,7 @@ function renderGroup(expId, groupRuns, apiBase, openPreview) {
   groupCard.appendChild(groupHeader);
 
   // ── Gallery grid ───────────────────────────────────────────────────
-  var gallery = el("div", { class: "comfymodal-studio-history-gallery" });
-
-  groupRuns.forEach(function (nr) {
-    var card = renderHistoryCard(nr, apiBase, openPreview);
-    gallery.appendChild(card);
-  });
+  var gallery = renderHistoryGallery(groupRuns, apiBase, openPreview);
 
   groupCard.appendChild(gallery);
   return groupCard;

@@ -45,6 +45,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+try:
+    import nodes
+except Exception:  # pragma: no cover - runtime-only dependency in some contexts
+    nodes = None
+
 from studio_store import StudioJsonStore, StudioStoreError
 from studio_models import _FEATURE_BINDING_KEYS, _KNOWN_FEATURE_IDS
 
@@ -127,6 +132,109 @@ _CONTROL_WIDGET_ALIASES: dict[str, str] = {
     "negative_prompt": "text",
 }
 
+# Auto-derivation registry for controls that are never explicitly bound.
+# Maps control ID → candidate node types + widget name in the workflow.
+# Used by _find_node_for_control() to auto-derive schemas, defaults, and slots.
+_AUTO_DERIVE_CONTROLS: dict[str, dict] = {
+    "sampler":   {"node_types": ["KSampler", "KSamplerAdvanced"], "widget": "sampler_name"},
+    "scheduler": {"node_types": ["KSampler", "KSamplerAdvanced"], "widget": "scheduler"},
+    "steps":     {"node_types": ["KSampler", "KSamplerAdvanced"], "widget": "steps"},
+    "guidance":  {"node_types": ["KSampler", "KSamplerAdvanced"], "widget": "cfg"},
+    "seed":      {"node_types": ["KSampler", "KSamplerAdvanced"], "widget": "seed"},
+    "denoise":   {"node_types": ["KSampler", "KSamplerAdvanced"], "widget": "denoise"},
+}
+
+
+def _find_node_for_control(workflow: dict, ctrl_id: str) -> dict | None:
+    """Find the workflow node + widget for an unbound control via auto-derive registry.
+
+    Returns ``{"node_id", "node_type", "widget_name", "value"}`` or ``None``.
+    Scans workflow nodes in insertion order for the first node whose
+    class_type matches one of the control's candidate node types.
+    """
+    spec = _AUTO_DERIVE_CONTROLS.get(ctrl_id)
+    if not spec or not isinstance(workflow, dict):
+        return None
+    widget_name = spec["widget"]
+    for node_id, node_data in workflow.items():
+        if not isinstance(node_data, dict):
+            continue
+        class_type = node_data.get("class_type", "")
+        inputs = node_data.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        if widget_name not in inputs:
+            continue
+        if class_type not in spec["node_types"] and _derive_widget_schema_from_node_def(class_type, widget_name) is None:
+            continue
+        return {
+            "node_id": str(node_id),
+            "node_type": class_type,
+            "widget_name": widget_name,
+            "value": inputs.get(widget_name),
+        }
+    return None
+
+
+def _derive_widget_schema_from_node_def(node_type: str, widget_name: str) -> dict | None:
+    """Probe ComfyUI node definitions for widget schema metadata."""
+    if not nodes or not node_type or not widget_name:
+        return None
+    cls = getattr(nodes, "NODE_CLASS_MAPPINGS", {}).get(node_type)
+    if cls is None:
+        return None
+    input_types = getattr(cls, "INPUT_TYPES", None)
+    if input_types is None:
+        return None
+    try:
+        spec = input_types()
+    except Exception:
+        return None
+    if not isinstance(spec, dict):
+        return None
+    for category in ("required", "optional"):
+        inputs = spec.get(category, {}) or {}
+        entry = inputs.get(widget_name)
+        if entry is None or not isinstance(entry, (list, tuple)) or not entry:
+            continue
+        type_spec = entry[0]
+        config = entry[1] if len(entry) > 1 and isinstance(entry[1], dict) else {}
+        if isinstance(type_spec, (list, tuple)):
+            options = list(type_spec)
+            return {
+                "kind": "enum",
+                "options": options,
+                "default": config.get("default", options[0] if options else ""),
+            }
+        if type_spec == "INT":
+            return {
+                "kind": "integer",
+                "default": config.get("default", 0),
+                "minimum": config.get("min"),
+                "maximum": config.get("max"),
+            }
+        if type_spec == "FLOAT":
+            schema = {
+                "kind": "number",
+                "default": config.get("default", 0.0),
+                "minimum": config.get("min"),
+                "maximum": config.get("max"),
+            }
+            if config.get("step") is not None:
+                schema["step"] = config.get("step")
+            return schema
+        if type_spec == "BOOLEAN":
+            return {
+                "kind": "boolean",
+                "default": config.get("default", False),
+            }
+        if type_spec == "STRING":
+            return {
+                "kind": "string",
+                "default": config.get("default", ""),
+            }
+    return None
+
 
 def derive_control_schemas_from_snapshot(snapshot: dict) -> dict[str, dict]:
     """Derive control schemas from a snapshot's nodeBindings + apiPromptJson.
@@ -149,69 +257,112 @@ def derive_control_schemas_from_snapshot(snapshot: dict) -> dict[str, dict]:
     """
     schemas: dict[str, dict] = {}
     bindings = snapshot.get("nodeBindings", {}) or {}
+    workflow = _get_executable_workflow(snapshot.get("apiPromptJson"))
 
     # ── Phase 4: prefer captured schemas from browser widget metadata ──
     captured = snapshot.get("controlSchemas", {}) or {}
     if captured:
-        # Deep-copy so caller mutations never leak into the stored snapshot.
-        # Also ensure schemaResolved/field are set on the copy, not the stored object.
-        result = copy.deepcopy(captured)
-        for ctrl_id, schema in result.items():
+        schemas = copy.deepcopy(captured)
+        for ctrl_id, schema in schemas.items():
             if isinstance(schema, dict):
                 schema.setdefault("schemaResolved", True)
                 schema.setdefault("field", ctrl_id)
-        return result
 
     # ── Legacy fallback: derive from static registry ─────────────────────
-    workflow = _get_executable_workflow(snapshot.get("apiPromptJson"))
+    if not captured:
+        for ctrl_id, binding in bindings.items():
+            if not isinstance(binding, dict):
+                continue
+            kind = binding.get("kind", "")
+            node_id = str(binding.get("nodeId", ""))
+            node_type = binding.get("nodeType", "") or ""
+            widget_name = binding.get("widgetName") or binding.get("inputName") or ""
 
-    for ctrl_id, binding in bindings.items():
-        if not isinstance(binding, dict):
-            continue
-        kind = binding.get("kind", "")
-        node_id = str(binding.get("nodeId", ""))
-        node_type = binding.get("nodeType", "") or ""
-        widget_name = binding.get("widgetName") or binding.get("inputName") or ""
+            # Skip non-widget bindings (node-kind, output-kind)
+            if kind not in ("widget", "input"):
+                schemas[ctrl_id] = {
+                    "field": ctrl_id,
+                    "kind": "unresolved",
+                    "schemaResolved": False,
+                    "nodeId": node_id,
+                    "nodeType": node_type,
+                }
+                continue
 
-        # Skip non-widget bindings (node-kind, output-kind)
-        if kind not in ("widget", "input"):
-            schemas[ctrl_id] = {
+            # Resolve widget name via aliases
+            resolved_widget = _CONTROL_WIDGET_ALIASES.get(ctrl_id, widget_name)
+
+            # Look up the node type in the workflow
+            node_data = workflow.get(node_id, {}) if isinstance(workflow, dict) else {}
+            actual_type = node_data.get("class_type") or node_type
+
+            schema: dict = {
                 "field": ctrl_id,
-                "kind": "unresolved",
-                "schemaResolved": False,
                 "nodeId": node_id,
-                "nodeType": node_type,
+                "nodeType": actual_type,
+                "widgetName": resolved_widget,
             }
-            continue
 
-        # Resolve widget name via aliases
-        resolved_widget = _CONTROL_WIDGET_ALIASES.get(ctrl_id, widget_name)
+            # Look up widget schema from our registry
+            widget_schemas = _NODE_WIDGET_SCHEMAS.get(actual_type, {})
+            widget_schema = widget_schemas.get(resolved_widget)
 
-        # Look up the node type in the workflow
-        node_data = workflow.get(node_id, {}) if isinstance(workflow, dict) else {}
-        actual_type = node_data.get("class_type") or node_type
+            if not widget_schema:
+                widget_schema = _derive_widget_schema_from_node_def(actual_type, resolved_widget)
 
-        schema: dict = {
-            "field": ctrl_id,
-            "nodeId": node_id,
-            "nodeType": actual_type,
-            "widgetName": resolved_widget,
-        }
+            if widget_schema:
+                schema.update(widget_schema)
+                schema["schemaResolved"] = True
+            else:
+                # Fall back: infer type from the actual value in the workflow
+                actual_value = None
+                if isinstance(node_data, dict):
+                    inputs = node_data.get("inputs", {}) or {}
+                    actual_value = inputs.get(resolved_widget)
+                if actual_value is not None:
+                    if isinstance(actual_value, bool):
+                        schema["kind"] = "boolean"
+                    elif isinstance(actual_value, int):
+                        schema["kind"] = "integer"
+                    elif isinstance(actual_value, float):
+                        schema["kind"] = "number"
+                    else:
+                        schema["kind"] = "string"
+                    schema["default"] = actual_value
+                    schema["schemaResolved"] = True
+                else:
+                    schema["kind"] = "unresolved"
+                    schema["schemaResolved"] = False
 
-        # Look up widget schema from our registry
-        widget_schemas = _NODE_WIDGET_SCHEMAS.get(actual_type, {})
-        widget_schema = widget_schemas.get(resolved_widget)
+            schemas[ctrl_id] = schema
 
-        if widget_schema:
-            schema.update(widget_schema)
-            schema["schemaResolved"] = True
-        else:
-            # Fall back: infer type from the actual value in the workflow
-            actual_value = None
-            if isinstance(node_data, dict):
-                inputs = node_data.get("inputs", {}) or {}
-                actual_value = inputs.get(resolved_widget)
-            if actual_value is not None:
+    # ── Auto-derive schemas for unbound controls ─────────────────────────
+    if isinstance(workflow, dict):
+        for ctrl_id in _AUTO_DERIVE_CONTROLS:
+            existing = schemas.get(ctrl_id)
+            if isinstance(existing, dict) and existing.get("schemaResolved"):
+                continue
+            found = _find_node_for_control(workflow, ctrl_id)
+            if found is None:
+                continue
+            node_type = found["node_type"]
+            widget_name = found["widget_name"]
+            widget_schema = _NODE_WIDGET_SCHEMAS.get(node_type, {}).get(widget_name)
+            if not widget_schema:
+                widget_schema = _derive_widget_schema_from_node_def(node_type, widget_name)
+            schema: dict = {
+                "field": ctrl_id,
+                "nodeId": found["node_id"],
+                "nodeType": node_type,
+                "widgetName": widget_name,
+            }
+            if widget_schema:
+                schema.update(widget_schema)
+                if found["value"] is not None:
+                    schema["default"] = found["value"]
+                schema["schemaResolved"] = True
+            else:
+                actual_value = found["value"]
                 if isinstance(actual_value, bool):
                     schema["kind"] = "boolean"
                 elif isinstance(actual_value, int):
@@ -222,11 +373,7 @@ def derive_control_schemas_from_snapshot(snapshot: dict) -> dict[str, dict]:
                     schema["kind"] = "string"
                 schema["default"] = actual_value
                 schema["schemaResolved"] = True
-            else:
-                schema["kind"] = "unresolved"
-                schema["schemaResolved"] = False
-
-        schemas[ctrl_id] = schema
+            schemas[ctrl_id] = schema
 
     return schemas
 
@@ -427,6 +574,40 @@ def extract_defaults_from_snapshot(snapshot: dict) -> dict:
     workflow = _get_executable_workflow(snapshot.get("apiPromptJson"))
     bindings = snapshot.get("nodeBindings", {}) or {}
     defaults = {}
+
+    def _resolve_bound_node_value(ctrl_id: str, binding: dict) -> Any:
+        node_id = str(binding.get("nodeId", ""))
+        if not node_id:
+            return None
+        node = workflow.get(node_id, {}) if isinstance(workflow, dict) else {}
+        if not isinstance(node, dict):
+            return None
+        inputs = node.get("inputs", {}) or {}
+        if not isinstance(inputs, dict):
+            return None
+
+        explicit_field = binding.get("widgetName") or binding.get("inputName") or ""
+        if explicit_field and explicit_field in inputs:
+            return inputs.get(explicit_field)
+
+        aliased_field = _CONTROL_WIDGET_ALIASES.get(ctrl_id, ctrl_id)
+        if aliased_field in inputs:
+            return inputs.get(aliased_field)
+
+        node_type = node.get("class_type", "")
+        widget_schemas = _NODE_WIDGET_SCHEMAS.get(node_type, {})
+        text_like_fields = []
+        if ctrl_id in ("prompt", "negative_prompt", "instruction", "replacement_prompt"):
+            text_like_fields = ["text", "value"]
+        for field_name in text_like_fields:
+            if field_name in inputs:
+                return inputs.get(field_name)
+        if len(widget_schemas) == 1:
+            only_field = next(iter(widget_schemas.keys()))
+            if only_field in inputs:
+                return inputs.get(only_field)
+        return None
+
     for ctrl_id, binding in bindings.items():
         if not isinstance(binding, dict):
             continue
@@ -435,6 +616,11 @@ def extract_defaults_from_snapshot(snapshot: dict) -> dict:
             name_key = "widgetName"
         elif kind == "input":
             name_key = "inputName"
+        elif kind == "node":
+            value = _resolve_bound_node_value(ctrl_id, binding)
+            if value is not None:
+                defaults[ctrl_id] = value
+            continue
         else:
             continue  # skip "node" and "output" kinds
         node_id = binding.get("nodeId", "")
@@ -445,6 +631,14 @@ def extract_defaults_from_snapshot(snapshot: dict) -> dict:
         inputs = node.get("inputs", {})
         if widget_name in inputs:
             defaults[ctrl_id] = inputs[widget_name]
+
+    for ctrl_id in _AUTO_DERIVE_CONTROLS:
+        if ctrl_id in defaults:
+            continue
+        found = _find_node_for_control(workflow, ctrl_id)
+        if found is not None and found["value"] is not None:
+            defaults[ctrl_id] = found["value"]
+
     return defaults
 
 
@@ -517,6 +711,29 @@ def map_studio_bindings_to_slots(
         slot = _map_binding_to_slot(key, val)
         if slot is not None:
             slots[key] = slot
+    return slots
+
+
+def _augment_slots_with_auto_derive(
+    slots: dict[str, Any],
+    workflow: dict[str, Any],
+) -> dict[str, Any]:
+    """Add slot mappings for controls derivable from workflow nodes."""
+    if not isinstance(slots, dict):
+        slots = {}
+    if not isinstance(workflow, dict):
+        return slots
+    for ctrl_id in _AUTO_DERIVE_CONTROLS:
+        if ctrl_id in slots:
+            continue
+        found = _find_node_for_control(workflow, ctrl_id)
+        if found is None:
+            continue
+        slots[ctrl_id] = {
+            "node_id": found["node_id"],
+            "field": found["widget_name"],
+            "path": ["inputs", found["widget_name"]],
+        }
     return slots
 
 
@@ -718,6 +935,7 @@ def build_single_run_spec(
 
     # Map bindings to slots
     slots = map_studio_bindings_to_slots(node_bindings)
+    slots = _augment_slots_with_auto_derive(slots, workflow)
 
     # Validate all mapped slot node IDs exist in the workflow
     missing = []
@@ -906,6 +1124,9 @@ def build_experiment_spec(
         _repair_missing_vae_inputs(workflow_map[profile_id])
         slots_map[profile_id] = map_studio_bindings_to_slots(
             copy.deepcopy(snapshot.get("nodeBindings", {})) or {}
+        )
+        slots_map[profile_id] = _augment_slots_with_auto_derive(
+            slots_map[profile_id], workflow_map[profile_id]
         )
 
     studio_meta = _build_studio_experiment_meta(

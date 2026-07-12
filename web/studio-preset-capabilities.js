@@ -330,6 +330,7 @@ export function getVisibleControlsForPreset(presetOrSnapshot, featureId) {
   if (!compat.includes(featureId)) return [];
 
   const bindings = presetOrSnapshot.nodeBindings || {};
+  const controlSchemas = presetOrSnapshot.controlSchemas || {};
   const req = FEATURE_REQUIREMENTS[featureId];
   if (!req) return [];
 
@@ -350,11 +351,13 @@ export function getVisibleControlsForPreset(presetOrSnapshot, featureId) {
     });
   }
 
-  // 2. Optional controls — shown only if actually bound
+  // 2. Optional controls — shown if bound or auto-derivable from schema
   req.optionalBindingKeys.forEach((key) => {
     const def = CONTROL_BINDING_DEFS[key];
     if (!def || def.isControl === false) return;
-    if (bindings[key] && bindings[key].nodeId) {
+    const hasBinding = !!(bindings[key] && bindings[key].nodeId);
+    const hasSchema = !!(controlSchemas[key] && controlSchemas[key].schemaResolved);
+    if (hasBinding || hasSchema) {
       visible.add(def.key);
     }
   });
