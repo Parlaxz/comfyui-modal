@@ -5030,5 +5030,174 @@ class JsBuildEffectiveControlsRED(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# RED tests: per_workflow extra-axis forwarding + shared_negative
+# ---------------------------------------------------------------------------
+
+class BuildExperimentSpecNestedInputRED(unittest.TestCase):
+    """RED-phase tests for nested Studio/compiler input in
+    ``build_experiment_spec``.
+
+    Three required behaviors:
+      1. ``per_workflow`` extra-axis values are forwarded to the matrix
+         compiler and override a shared extra-axis value of the same name
+         in the matching preset checkpoint.
+      2. A ``per_workflow`` extra axis without a corresponding slot
+         binding in the target preset returns an adapter error *before*
+         compilation/scheduling.
+      3. ``shared_negative`` from ``experiment_def`` is preserved in the
+         prompts spec and fills in ``negative_prompt`` for prompt items
+         whose negative is omitted (None/absent).
+
+    Each test is expected to FAIL against the current production code
+    (RED phase).  No production code is modified.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+        cls.matrix = _load_module("matrix_compiler", "matrix_compiler.py")
+
+    # ── Test 1: per_workflow extra-axis overrides shared ────────────────
+
+    def test_per_workflow_axis_overrides_shared_value(self):
+        """A per_workflow cfg axis value for a specific preset must
+        override the shared cfg axis value in the matching preset's
+        checkpoint cells."""
+        snap = _make_runnable_snapshot("snap_a")
+        # Add cfg binding to the snapshot
+        snap["apiPromptJson"]["3"]["inputs"]["cfg"] = 7.0
+        snap["nodeBindings"]["cfg"] = {
+            "kind": "widget", "nodeId": "3", "widgetName": "cfg",
+        }
+        preset = _make_runnable_preset("preset_a", "snap_a")
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_studio_store_files(tmp, [snap], [preset])
+            exp_def = {
+                "prompts": [
+                    {"id": "p1", "text": "test", "enabled": True},
+                ],
+                "axes": {
+                    "shared": {
+                        "seed": {"values": [1]},
+                        "cfg": {"values": [7.0]},
+                    },
+                    "per_workflow": {
+                        "preset_a": {
+                            "cfg": {"values": [8.0]},
+                        },
+                    },
+                },
+            }
+            spec = self.mod.build_experiment_spec(
+                [(preset, snap)], "txt2img", exp_def, tmp
+            )
+            # Must not be a compilation error
+            self.assertNotIn(
+                "error", spec,
+                "Per-workflow axis should not cause a compilation error",
+            )
+            cells = spec.get("cells", [])
+            self.assertTrue(
+                len(cells) > 0,
+                "Expected at least one cell from the compilation",
+            )
+            # Every cell for this preset must have cfg=8.0 from per_workflow
+            # (overriding shared cfg=7.0), and seed=1 from shared.
+            for cell in cells:
+                av = cell.get("axis_values", {})
+                self.assertEqual(
+                    av.get("cfg"), 8.0,
+                    "per_workflow cfg=8.0 must override shared cfg=7.0",
+                )
+                self.assertEqual(
+                    av.get("seed"), 1,
+                    "seed should still come from shared axes",
+                )
+
+    # ── Test 2: per_workflow axis without binding returns error ─────────
+
+    def test_per_workflow_axis_without_binding_returns_error(self):
+        """A per_workflow axis whose control ID has no slot binding in
+        the target preset must be rejected with an explicit adapter error
+        before compilation."""
+        snap = _make_runnable_snapshot("snap_b")
+        preset = _make_runnable_preset("preset_b", "snap_b")
+        # snap_b has NO mask_blur binding — it's an unbound axis
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_studio_store_files(tmp, [snap], [preset])
+            exp_def = {
+                "prompts": [
+                    {"id": "p1", "text": "test", "enabled": True},
+                ],
+                "axes": {
+                    "per_workflow": {
+                        "preset_b": {
+                            "mask_blur": {"values": [5, 15]},
+                        },
+                    },
+                },
+            }
+            result = self.mod.build_experiment_spec(
+                [(preset, snap)], "txt2img", exp_def, tmp
+            )
+            # Must return an error — not silently compile with missing axis
+            self.assertIn(
+                "error", result,
+                "Unbound per_workflow axis must produce an explicit error",
+            )
+            self.assertIn(
+                "mask_blur", result.get("error", ""),
+                "Error message must reference the unbound axis name",
+            )
+
+    # ── Test 3: shared_negative preservation ────────────────────────────
+
+    def test_shared_negative_preserved_for_prompts_without_explicit_negative(self):
+        """``shared_negative`` from experiment_def is carried through to
+        the compiler spec and fills in ``negative_prompt`` for prompt
+        items that omit an explicit negative."""
+        snap = _make_runnable_snapshot("snap_c")
+        preset = _make_runnable_preset("preset_c", "snap_c")
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_studio_store_files(tmp, [snap], [preset])
+            exp_def = {
+                "shared_negative": "blurry, low quality",
+                "prompts": [
+                    # p1: no explicit negative — should inherit shared_negative
+                    {"id": "p1", "text": "a cat", "enabled": True},
+                    # p2: has explicit negative — should keep its own
+                    {"id": "p2", "text": "a dog", "negative": "bad anatomy",
+                     "enabled": True},
+                ],
+            }
+            spec = self.mod.build_experiment_spec(
+                [(preset, snap)], "txt2img", exp_def, tmp
+            )
+            self.assertNotIn(
+                "error", spec,
+                "shared_negative in experiment_def should not cause an error",
+            )
+            cells = spec.get("cells", [])
+            self.assertGreaterEqual(
+                len(cells), 2,
+                "Expected at least 2 cells (one per prompt)",
+            )
+            for cell in cells:
+                prompt_text = cell.get("prompt", "")
+                neg = cell.get("negative_prompt", "")
+                if prompt_text == "a cat":
+                    self.assertEqual(
+                        neg, "blurry, low quality",
+                        "Prompt without explicit negative should inherit "
+                        "shared_negative",
+                    )
+                elif prompt_text == "a dog":
+                    self.assertEqual(
+                        neg, "bad anatomy",
+                        "Prompt with explicit negative should keep its own",
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
