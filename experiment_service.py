@@ -865,12 +865,20 @@ class RunHistoryService:
                 _search_lower = search.lower()
                 extra = meta_obj.get("extra", {}) or {}
                 ann = meta_obj.get("annotations", {}) or {}
-                # Fields to search
+                # Fields to search (including user-visible prompt text)
+                _requested_ctrl = extra.get("requested_controls", {}) or {}
+                _resolved_ctrl = extra.get("resolved_controls", {}) or {}
                 _search_fields = [
                     meta_obj.get("prompt_id", ""),
                     meta_obj.get("run_id", ""),
                     extra.get("experiment_id", ""),
                     extra.get("preset_label", ""),
+                    _requested_ctrl.get("prompt", ""),
+                    _requested_ctrl.get("negative_prompt", ""),
+                    _resolved_ctrl.get("prompt", ""),
+                    _resolved_ctrl.get("negative_prompt", ""),
+                    extra.get("studio_prompt", ""),           # backward-compat
+                    extra.get("studio_negative_prompt", ""),  # backward-compat
                     ann.get("note", ""),
                 ]
                 if not any(_search_lower in (f or "").lower() for f in _search_fields):
@@ -892,7 +900,14 @@ class RunHistoryService:
                     continue
             if date_to is not None:
                 sa = meta_obj.get("started_at", "") or ""
-                if sa > date_to:
+                # Extend date-only date_to to end-of-day so the full calendar
+                # day is included (e.g. "2026-07-12" → "2026-07-12T23:59:59Z").
+                # DateTime inputs preserve exact boundaries.
+                if "T" not in date_to:
+                    date_to_effective = date_to + "T23:59:59Z"
+                else:
+                    date_to_effective = date_to
+                if sa > date_to_effective:
                     continue
             # ── Has image filter ────────────────────────────────────
             if has_image is True:

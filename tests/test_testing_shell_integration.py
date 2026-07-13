@@ -334,9 +334,192 @@ class PersistentHostTests(unittest.TestCase):
         )
 
 
-# ---------------------------------------------------------------------------
-# Embedded settings mount hooks & secondary launcher
-# ---------------------------------------------------------------------------
+# ── Phase 2: Parent Modal ARIA / Accessibility ──────────────────────────
+
+class ModalAriaTests(unittest.TestCase):
+    """Parent modal must have correct ARIA semantics and focus management."""
+
+    def setUp(self) -> None:
+        self.text = _JsModule(WEB / "modal-testing.js").text
+
+    def test_build_shell_modal_has_role_dialog(self):
+        """buildShell modal must have role='dialog'."""
+        shell_start = self.text.find("function buildShell")
+        self.assertGreater(shell_start, -1)
+        shell_region = self.text[shell_start:shell_start + 800]
+        self.assertIn(
+            'role: "dialog"',
+            shell_region,
+            "Expected role='dialog' on the modal element in buildShell",
+        )
+
+    def test_build_shell_modal_has_aria_modal(self):
+        """buildShell modal must have aria-modal attribute."""
+        shell_start = self.text.find("function buildShell")
+        self.assertGreater(shell_start, -1)
+        shell_region = self.text[shell_start:shell_start + 800]
+        self.assertIn(
+            "aria-modal",
+            shell_region,
+            "Expected aria-modal attribute on the modal element in buildShell",
+        )
+
+    def test_build_shell_modal_has_aria_labelledby(self):
+        """buildShell modal must have aria-labelledby pointing to the heading."""
+        shell_start = self.text.find("function buildShell")
+        self.assertGreater(shell_start, -1)
+        shell_region = self.text[shell_start:shell_start + 800]
+        self.assertIn(
+            "aria-labelledby",
+            shell_region,
+            "Expected aria-labelledby on the modal element in buildShell",
+        )
+
+    def test_close_button_has_aria_label(self):
+        """buildShell close button must have aria-label."""
+        shell_start = self.text.find("function buildShell")
+        self.assertGreater(shell_start, -1)
+        shell_region = self.text[shell_start:shell_start + 800]
+        self.assertIn(
+            '"aria-label"',
+            shell_region,
+            "Expected aria-label on close button in buildShell",
+        )
+
+    def test_open_moves_focus_into_modal(self):
+        """open_testing_modal must call .focus() on the modal or first focusable."""
+        self.assertIn(
+            ".focus()",
+            self.text,
+            "Expected .focus() call in open_testing_modal for focus management",
+        )
+
+    def test_close_restores_focus_to_trigger(self):
+        """close_testing_modal must restore focus to trigger element."""
+        self.assertIn(
+            "_triggerEl.focus(",
+            self.text,
+            "Expected _triggerEl.focus() call in close_testing_modal for focus restoration",
+        )
+
+    def test_esc_handler_not_duplicated(self):
+        """Escape key handler must avoid duplicate listeners via single reference."""
+        # The escHandler pattern stores the handler on a cache object and removes
+        # the previous before adding a new one. Look for the pattern.
+        self.assertIn(
+            "_escHandler",
+            self.text,
+            "Expected _escHandler pattern for single Escape listener reference",
+        )
+
+    def test_body_scroll_lock_class(self):
+        """open_testing_modal must add a class to body for scroll lock."""
+        self.assertIn(
+            "body-scroll-lock",
+            self.text,
+            "Expected 'body-scroll-lock' class string for scroll lock",
+        )
+
+    def test_body_scroll_unlock_in_close(self):
+        """close_testing_modal must remove body scroll-lock class."""
+        self.assertIn(
+            "body-scroll-lock",
+            self.text,
+            "Expected body-scroll-lock class removal in close_testing_modal",
+        )
+
+    def test_no_has_pseudo_for_body_lock(self):
+        """studio-styles.js must NOT use :has() for body scroll lock."""
+        css_text = _JsModule(WEB / "studio-styles.js").text
+        self.assertNotIn(
+            "body:has(",
+            css_text,
+            "Must not use :has() pseudo-class for body scroll lock — use body class instead",
+        )
+
+    # ── Oracle fix: Tab focus containment for parent modal ────────────
+
+    def test_parent_modal_tab_trap_keydown_handler(self):
+        """open_testing_modal must register a Tab-key focus trap on the modal overlay."""
+        self.assertIn(
+            "keydown",
+            self.text,
+            "Expected keydown handler for Tab trap in open_testing_modal",
+        )
+
+    def test_parent_modal_tab_trap_calls_focus_trap_helper(self):
+        """open_testing_modal must call a focusTrap or _trapTab function."""
+        has_trap = (
+            "focusTrap" in self.text
+            or "_trapTab" in self.text
+            or "tabTrap" in self.text
+            or "_tabTrap" in self.text
+        )
+        self.assertTrue(
+            has_trap,
+            "Expected focusTrap/_trapTab helper in modal-testing.js for Tab containment",
+        )
+
+    def test_parent_modal_close_removes_tab_trap(self):
+        """close_testing_modal must remove the Tab trap keydown listener."""
+        close_start = self.text.find("function close_testing_modal")
+        self.assertGreater(close_start, -1)
+        close_region = self.text[close_start:close_start + 800]
+        self.assertIn(
+            "keydown",
+            close_region,
+            "Expected keydown listener removal in close_testing_modal for Tab trap cleanup",
+        )
+
+    # ── Oracle fix: background inert handling ─────────────────────────
+
+    def test_open_adds_inert_to_main_content(self):
+        """open_testing_modal must set inert or aria-hidden on main content."""
+        self.assertIn(
+            "inert",
+            self.text,
+            "Expected inert attribute handling in open_testing_modal",
+        )
+
+    def test_close_restores_inert_to_main_content(self):
+        """close_testing_modal must restore inert/aria-hidden to prior state."""
+        close_start = self.text.find("function close_testing_modal")
+        self.assertGreater(close_start, -1)
+        close_region = self.text[close_start:close_start + 800]
+        self.assertIn(
+            "inert",
+            close_region,
+            "Expected inert attribute restoration in close_testing_modal",
+        )
+
+    # ── Oracle fix: fallback launcher / tooltip product name → Modal GPU ─
+
+    def test_fallback_launcher_button_says_modal_gpu(self):
+        """ensureFallbackLauncher must show 'Modal GPU' button."""
+        fb_start = self.text.find("function ensureFallbackLauncher")
+        self.assertGreater(fb_start, -1)
+        fb_region = self.text[fb_start:fb_start + 600]
+        self.assertIn(
+            "Modal GPU",
+            fb_region,
+            "Expected 'Modal GPU' in ensureFallbackLauncher button text",
+        )
+
+    def test_sidebar_tooltip_says_modal_gpu(self):
+        """Sidebar registration tooltip must say 'Modal GPU', not 'Modal Studio'."""
+        tooltip_match = re.search(r'tooltip:\s*"([^"]+)"', self.text)
+        self.assertIsNotNone(tooltip_match, "Could not find tooltip string in sidebar registration")
+        tooltip_text = tooltip_match.group(1)
+        self.assertNotIn(
+            "Modal Studio",
+            tooltip_text,
+            "Sidebar tooltip must not contain 'Modal Studio'",
+        )
+        self.assertIn(
+            "Modal GPU",
+            tooltip_text,
+            "Sidebar tooltip must contain 'Modal GPU'",
+        )
 
 class SettingsMountTests(unittest.TestCase):
     """Embedded settings mount hooks from modal-settings.js and secondary launcher."""
@@ -371,14 +554,30 @@ class VisualRedesignTokenTests(unittest.TestCase):
     def setUp(self) -> None:
         self.text = _JsModule(WEB / "testing-styles.js").text
 
-    def test_canonical_studio_header_naming(self):
-        """modal-testing.js / studio-shell.js header must display 'Modal Studio'."""
+    # ── Phase A: Product name consistency → "Modal GPU" ────────────────
+
+    def test_header_shows_modal_gpu_product_name(self):
+        """modal-testing.js buildShell header h2 must display 'Modal GPU'."""
         text = _JsModule(WEB / "modal-testing.js").text
+        shell_start = text.find("function buildShell")
+        self.assertGreater(shell_start, -1)
+        shell_region = text[shell_start:shell_start + 800]
         self.assertIn(
-            "Modal Studio",
-            text,
-            "Expected 'Modal Studio' as the Studio shell header title — "
-            "replaces old 'Modal GPU' header",
+            'text: "Modal GPU"',
+            shell_region,
+            "Expected 'Modal GPU' as the buildShell header title",
+        )
+
+    def test_sidebar_panel_shows_modal_gpu_product_name(self):
+        """buildSidebarPanel must show 'Modal GPU' in the launcher title."""
+        text = _JsModule(WEB / "modal-testing.js").text
+        sidebar_start = text.find("function buildSidebarPanel")
+        self.assertGreater(sidebar_start, -1)
+        sidebar_region = text[sidebar_start:sidebar_start + 800]
+        self.assertIn(
+            "Modal GPU",
+            sidebar_region,
+            "Expected 'Modal GPU' in sidebar panel title",
         )
 
     def test_tokenized_color_tokens_present(self):
@@ -607,6 +806,100 @@ class SettingsNavActiveStateTests(unittest.TestCase):
             "comfymodal-nav-btn-active",
             text,
             "Expected comfymodal-nav-btn-active class reference in settings nav",
+        )
+
+
+# ── Issue 1: Unused STUDIO_PAGES constant ───────────────────────────────
+
+class StudioPagesCleanupTests(unittest.TestCase):
+    """STUDIO_PAGES must be removed from modal-testing.js (unused)."""
+
+    def setUp(self) -> None:
+        self.text = _JsModule(WEB / "modal-testing.js").text
+
+    def test_studio_pages_not_defined(self):
+        """STUDIO_PAGES must not be defined in modal-testing.js."""
+        self.assertNotIn(
+            "STUDIO_PAGES",
+            self.text,
+            "STUDIO_PAGES is unused — PAGES is defined in studio-shell.js",
+        )
+
+    def test_shell_uses_studio_ui_el(self):
+        """modal-testing.js must import el from studio-ui.js."""
+        self.assertIn(
+            './studio-ui.js',
+            self.text,
+            "Expected import of el from studio-ui.js in modal-testing.js",
+        )
+
+    def test_no_local_el_in_modal_testing(self):
+        """modal-testing.js must NOT define a local el() function."""
+        # The module-level function el() must be removed
+        self.assertNotIn(
+            "function el(tag, props = {}, children = [])",
+            self.text,
+            "Local el() must be replaced by import from studio-ui.js",
+        )
+
+    def test_sidebar_render_no_inner_html(self):
+        """Sidebar render must NOT use innerHTML clearing."""
+        self.assertNotIn(
+            "innerHTML = \"\"",
+            self.text,
+            "Sidebar render must use safe child removal, not innerHTML",
+        )
+
+    def test_shell_imports_el_from_studio_ui(self):
+        """studio-shell.js must import el from studio-ui.js."""
+        text = _JsModule(WEB / "studio-shell.js").text
+        self.assertIn(
+            './studio-ui.js',
+            text,
+            "Expected import of el from studio-ui.js in studio-shell.js",
+        )
+
+    def test_shell_no_local_el(self):
+        """studio-shell.js must NOT define a local el() function."""
+        text = _JsModule(WEB / "studio-shell.js").text
+        self.assertNotIn(
+            "function el(tag, props = {}, children = [])",
+            text,
+            "Local el() must be replaced by import from studio-ui.js",
+        )
+
+
+# ── Issue 2: Duplicate comfymodal.open-section listener guard ──────────
+
+class OpenSectionGuardTests(unittest.TestCase):
+    """comfymodal.open-section must have a guard against duplicate registration."""
+
+    def setUp(self) -> None:
+        self.text = _JsModule(WEB / "modal-testing.js").text
+
+    def test_open_section_registration_guard_exists(self):
+        """Extension setup must guard against duplicate open-section registration."""
+        has_guard = (
+            "_openSectionRegistered" in self.text
+            or "_sectionHandler" in self.text
+            or "_openSectionGuard" in self.text
+        )
+        self.assertTrue(
+            has_guard,
+            "Expected a guard variable for comfymodal.open-section in extension setup",
+        )
+
+    def test_open_section_prevents_duplicate_listener(self):
+        """Guard must prevent addEventListener when already registered."""
+        # The guard should check a flag before calling addEventListener
+        guard_pattern = (
+            "!_openSectionRegistered" in self.text
+            or "!_sectionHandler" in self.text
+            or "_openSectionGuard" in self.text
+        )
+        self.assertTrue(
+            guard_pattern,
+            "Expected a condition checking the guard before registering listener",
         )
 
 
@@ -1540,12 +1833,16 @@ class StudioHistorySafetyTests(unittest.TestCase):
         )
 
     def test_history_uses_dom_nodes_for_cards(self):
-        """studio-history.js must use createElement for run data cards."""
+        """studio-history.js must use createElement or el() for run data cards."""
         text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        self.assertIn(
-            "createElement",
-            text,
-            "Expected createElement usage in studio-history.js",
+        has_dom_construction = (
+            "createElement" in text or
+            "el(" in text or
+            "el(" in text[:500]  # el() import/definition earlier in file
+        )
+        self.assertTrue(
+            has_dom_construction,
+            "Expected createElement or el() usage in studio-history.js",
         )
 
     def test_history_has_retry_on_error(self):

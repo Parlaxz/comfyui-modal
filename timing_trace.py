@@ -59,6 +59,7 @@ between ``t3b`` and ``t8``.
 
 TRACE_VERSION = "2.0.0"
 
+import copy
 import os
 import sys
 import time
@@ -676,3 +677,120 @@ class TraceV4(Trace):
             "event_count": len(self._v4_events),
             "process": self.process,
         }
+
+
+# ---------------------------------------------------------------------------
+# Shared timing helpers — usable by both normal graph path and Studio.
+# ---------------------------------------------------------------------------
+
+# Fields to deep-copy from a Modal result dict when extracting a compact
+# timing payload.  Excludes outputs (which may contain base64 image data).
+_REMOTE_TIMING_FIELDS: tuple[str, ...] = (
+    "trace", "wall_clock_trace", "_wall_clock_summary",
+    "_restore_timing", "scheduler_trace",
+)
+
+# Diagnostic/conditionally-relevant timing fields included only when present.
+_REMOTE_TIMING_DIAG_FIELDS: tuple[str, ...] = (
+    "_image_save_diagnostics",
+    "timing_quality", "trace_version",
+)
+
+
+def extract_remote_timing_payload(result_data: dict) -> dict:
+    """Extract a compact timing payload from a Modal result dict.
+
+    Deep-copies only timing-related fields (``trace``, ``wall_clock_trace``,
+    ``_wall_clock_summary``, ``_restore_timing``, ``scheduler_trace``) and
+    diagnostic timing fields when present, **excluding** ``outputs`` (which
+    may contain base64 image data).
+
+    Returns a flat dict containing only the recognised timing keys, or an
+    empty dict if none are present.
+    """
+    payload: dict = {}
+    for key in _REMOTE_TIMING_FIELDS:
+        val = result_data.get(key)
+        if val is not None:
+            payload[key] = copy.deepcopy(val)
+    for key in _REMOTE_TIMING_DIAG_FIELDS:
+        val = result_data.get(key)
+        if val is not None:
+            payload[key] = copy.deepcopy(val)
+    return payload
+
+
+# ── Remote trace merger (normal graph path + Studio) ──────────────────────
+
+
+def merge_remote_trace_into(merged_trace: dict, remote_trace: dict) -> dict:
+    """Merge remote trace data into a local trace summary dict **in-place**.
+
+    Designed for both the normal graph path (where ``trace.summary()``
+    produces the local summary and the Modal result carries
+    ``result["trace"]``) and the Studio path (where a minimal local
+    summary is created from server-observed wall-clock data).
+
+    Merger rules (deterministic, never overwrites truthfully local values):
+
+    * ``stages`` — remote stage entries are added only when the key does
+      not already exist in the local summary (local materialization stages
+      such as ``t9b_*`` / ``t10_*`` are preserved).
+    * ``deltas_ms`` — same: local deltas are never overwritten.
+    * ``derived_ms`` — same: local derived values are never overwritten.
+    * ``restore`` — the full restore dict is deep-copied from remote.
+    * Dependency-validation fields — top-level remote keys are copied
+      when present (they have no local equivalent).
+
+    Returns the (mutated) ``merged_trace`` dict for convenience.
+    """
+    if not isinstance(remote_trace, dict):
+        return merged_trace
+
+    # ── Merge stages (remote entries only when key is absent locally) ──
+    remote_stages = remote_trace.get("stages", {})
+    if isinstance(remote_stages, dict):
+        local_stages = merged_trace.setdefault("stages", {})
+        for k, v in remote_stages.items():
+            if k not in local_stages:
+                local_stages[k] = v
+
+    # ── Merge deltas_ms ───────────────────────────────────────────────
+    remote_deltas = remote_trace.get("deltas_ms", {})
+    if isinstance(remote_deltas, dict):
+        local_deltas = merged_trace.setdefault("deltas_ms", {})
+        for k, v in remote_deltas.items():
+            if k not in local_deltas:
+                local_deltas[k] = v
+
+    # ── Merge derived_ms ─────────────────────────────────────────────
+    remote_derived = remote_trace.get("derived_ms", {})
+    if isinstance(remote_derived, dict):
+        local_derived = merged_trace.setdefault("derived_ms", {})
+        for rdk, rdv in remote_derived.items():
+            if rdk not in local_derived:
+                local_derived[rdk] = rdv
+
+    # ── Preserve restore timing block ────────────────────────────────
+    if "restore" in remote_trace:
+        merged_trace["restore"] = copy.deepcopy(remote_trace["restore"])
+
+    # ── Preserve dependency validation fields ────────────────────────
+    _DEP_FIELDS = (
+        "dependency_validation_ms", "dependency_total_ms",
+        "dependency_validation_result", "dependency_validation_cache_layer",
+        "dependency_validation_cache_hit", "dependency_validation_reason",
+        "dependency_validation_baked_hash", "dependency_validation_current_hash",
+        "dependency_validation_changed_nodes",
+        "dependency_pre_key_check_ms", "dependency_baked_manifest_load_ms",
+        "dependency_source_root_resolve_ms", "dependency_fingerprint_ms",
+        "dependency_cache_key_ms", "dependency_memory_lookup_ms",
+        "dependency_sentinel_lookup_ms", "dependency_full_validation_ms",
+        "dependency_sentinel_write_ms",
+    )
+    for field in _DEP_FIELDS:
+        val = remote_trace.get(field)
+        if val is not None:
+            merged_trace[field] = val
+
+    return merged_trace

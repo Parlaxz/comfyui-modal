@@ -2231,6 +2231,115 @@ class ResolvedMetadataFlowTests(unittest.TestCase):
         self.assertEqual(resolved.resolved_axis.get("guidance"), 7.0)
 
 
+# ── Task 2: Axis value coercion before int() calls ─────────────────────────
+
+class AxisCoercionBeforeIntTests(unittest.TestCase):
+    """resolve_and_inject_cell must reject lists/objects for scalar axes
+    before reaching int()/float() calls, with field-specific errors."""
+
+    def _make_runner(self):
+        return load_runner()
+
+    def _wf_with_slots(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {
+                "seed": 42, "steps": 20, "cfg": 7.0,
+                "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
+            }},
+            "99": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}},
+        }
+        slots = {
+            "prompt": {"node_id": "99", "field": "text", "path": ["inputs", "text"]},
+            "seed": {"node_id": "1", "field": "seed", "path": ["inputs", "seed"]},
+            "steps": {"node_id": "1", "field": "steps", "path": ["inputs", "steps"]},
+            "guidance": {"node_id": "1", "field": "cfg", "path": ["inputs", "cfg"]},
+            "sampler": {"node_id": "1", "field": "sampler_name", "path": ["inputs", "sampler_name"]},
+            "scheduler": {"node_id": "1", "field": "scheduler", "path": ["inputs", "scheduler"]},
+            "denoise": {"node_id": "1", "field": "denoise", "path": ["inputs", "denoise"]},
+        }
+        return wf, slots
+
+    def _cell(self, axis_values):
+        from matrix_compiler import WORKFLOW_OWNED
+        return {
+            "profile_id": "p1",
+            "prompt": "test",
+            "negative_prompt": "",
+            "axis_values": axis_values,
+            "lora_signature": [],
+            "input_image_hash": "",
+            "triple": {},
+            "loader_target_group_id": "g_default",
+        }
+
+    def test_axis_array_seed_rejected_before_int(self):
+        """seed=[42] raises ValueError with field name before int()."""
+        r = self._make_runner()
+        wf, slots = self._wf_with_slots()
+        with self.assertRaises(ValueError) as ctx:
+            r.resolve_and_inject_cell(
+                wf, slots, [], [], self._cell({"seed": [42]}),
+            )
+        self.assertIn("seed", str(ctx.exception))
+
+    def test_axis_array_steps_rejected_before_int(self):
+        """steps=[20] raises ValueError with field name before int()."""
+        r = self._make_runner()
+        wf, slots = self._wf_with_slots()
+        with self.assertRaises(ValueError) as ctx:
+            r.resolve_and_inject_cell(
+                wf, slots, [], [], self._cell({"steps": [20]}),
+            )
+        self.assertIn("steps", str(ctx.exception))
+
+    def test_axis_dict_guidance_rejected_before_float(self):
+        """guidance={"val":7.5} raises ValueError before float()."""
+        r = self._make_runner()
+        wf, slots = self._wf_with_slots()
+        with self.assertRaises(ValueError) as ctx:
+            r.resolve_and_inject_cell(
+                wf, slots, [], [], self._cell({"guidance": {"val": 7.5}}),
+            )
+        self.assertIn("guidance", str(ctx.exception))
+
+    def test_axis_list_sampler_rejected(self):
+        """sampler=["euler"] raises ValueError."""
+        r = self._make_runner()
+        wf, slots = self._wf_with_slots()
+        with self.assertRaises(ValueError) as ctx:
+            r.resolve_and_inject_cell(
+                wf, slots, [], [], self._cell({"sampler": ["euler"]}),
+            )
+        self.assertIn("sampler", str(ctx.exception))
+
+    def test_axis_zero_seed_preserved(self):
+        """seed=0 survives without error."""
+        r = self._make_runner()
+        wf, slots = self._wf_with_slots()
+        resolved = r.resolve_and_inject_cell(
+            wf, slots, [], [], self._cell({"seed": 0, "steps": 20}),
+        )
+        self.assertEqual(resolved.seed, 0)
+
+    def test_axis_zero_guidance_preserved(self):
+        """guidance=0.0 survives without error."""
+        r = self._make_runner()
+        wf, slots = self._wf_with_slots()
+        resolved = r.resolve_and_inject_cell(
+            wf, slots, [], [], self._cell({"guidance": 0.0, "seed": 1, "steps": 20}),
+        )
+        self.assertEqual(resolved.guidance, 0.0)
+
+    def test_axis_zero_denoise_preserved(self):
+        """denoise=0.0 survives without error."""
+        r = self._make_runner()
+        wf, slots = self._wf_with_slots()
+        resolved = r.resolve_and_inject_cell(
+            wf, slots, [], [], self._cell({"denoise": 0.0, "seed": 1, "steps": 20}),
+        )
+        self.assertEqual(resolved.denoise, 0.0)
+
+
 # ── B1: Per-invocation i2i ownership tests ────────────────────────────────
 
 class PerInvocationMaterializationTests(unittest.TestCase):

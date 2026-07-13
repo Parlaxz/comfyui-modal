@@ -149,14 +149,9 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
 
   // ── Status banner ────────────────────────────────────────────────────
   const isRunnable = preset.status === "runnable" && !preset.archived;
-  const statusBanner = el("div", {
-    class: "comfymodal-studio-status-banner",
-    style: `padding:6px 10px;border-radius:3px;margin-bottom:8px;font-size:11px;${
-      isRunnable ? "background:#0a2a0a;border:1px solid #4ade80;color:#4ade80;" :
-      preset.archived ? "background:#2a0a0a;border:1px solid #f87171;color:#f87171;" :
-      "background:#2a2a0a;border:1px solid #fbbf24;color:#fbbf24;"
-    }`,
-  });
+  const bannerClass = "comfymodal-studio-status-banner" +
+    (isRunnable ? " runnable" : preset.archived ? " archived" : " not-runnable");
+  const statusBanner = el("div", { class: bannerClass });
   statusBanner.textContent = isRunnable ? "\u2713 Runnable" : preset.archived ? "\u26a0 Archived" : "\u26a0 Not Runnable";
   card.appendChild(statusBanner);
 
@@ -167,6 +162,28 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
       style: "font-size:10px;color:#f87171;margin:2px 0 6px;",
     }));
   }
+
+  // ── Runnable Checklist ───────────────────────────────────────────────
+  const checklistGroup = el("ul", { class: "comfymodal-studio-checklist" });
+  checklistGroup.appendChild(el("p", {
+    text: "Runnable Checklist",
+    style: "font-size:10px;font-weight:600;color:#888;margin:0 0 4px;text-transform:uppercase;letter-spacing:0.05em;",
+  }));
+  const hasSnapshot = !!(preset.snapshotId);
+  const hasCompatFeatures = (preset.compatibleFeatures || []).length > 0;
+  const hasApiPrompt = !!(preset.apiPromptJson || preset.graphJson);
+  const checklistItems = [
+    { label: "Snapshot linked", ok: hasSnapshot },
+    { label: "Compatible features assigned", ok: hasCompatFeatures },
+    { label: "API prompt available", ok: hasApiPrompt },
+  ];
+  checklistItems.forEach(function (item) {
+    checklistGroup.appendChild(el("li", { class: "comfymodal-studio-checklist-item" }, [
+      el("span", { text: item.ok ? "\u2713" : "\u2717", style: "font-size:10px;color:" + (item.ok ? "var(--color-success, #4ade80)" : "var(--color-danger, #ef4444)") + ";" }),
+      el("span", { text: item.label, style: "font-size:10px;color:#aaa;" }),
+    ]));
+  });
+  card.appendChild(checklistGroup);
 
   // ── Capability Summary ──────────────────────────────────────────────
   (preset.compatibleFeatures || []).forEach((fid) => {
@@ -183,30 +200,30 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
     const featStatus = summary.runnable ? "\u2713 Runnable" : `\u26a0 ${summary.disabledReason || "Not runnable"}`;
     summaryGroup.appendChild(el("p", {
       text: `Status: ${featStatus}`,
-      style: `font-size:10px;color:${summary.runnable ? "#4ade80" : "#fbbf24"};margin:0 0 4px;`,
+      style: `font-size:10px;color:${summary.runnable ? "var(--color-success, #4ade80)" : "var(--color-warning, #fbbf24)"};margin:0 0 4px;`,
     }));
 
     // API graph status
     summaryGroup.appendChild(el("p", {
       text: `API graph: ${summary.hasApiGraph ? "\u2713 available" : "\u2717 missing"}`,
-      style: `font-size:10px;color:${summary.hasApiGraph ? "#4ade80" : "#f87171"};margin:0 0 2px;`,
+      style: `font-size:10px;color:${summary.hasApiGraph ? "var(--color-success, #4ade80)" : "var(--color-danger, #f87171)"};margin:0 0 2px;`,
     }));
 
     // Output mapping status
     summaryGroup.appendChild(el("p", {
       text: `Output mapping: ${summary.hasOutputBinding ? "\u2713 mapped" : "\u2717 missing"}`,
-      style: `font-size:10px;color:${summary.hasOutputBinding ? "#4ade80" : "#f87171"};margin:0 0 4px;`,
+      style: `font-size:10px;color:${summary.hasOutputBinding ? "var(--color-success, #4ade80)" : "var(--color-danger, #f87171)"};margin:0 0 4px;`,
     }));
 
     // Required binding checklist
     summaryGroup.appendChild(el("p", {
       text: `Required bindings: ${summary.totalBoundRequired}/${summary.totalRequired} configured`,
-      style: `font-size:10px;color:${summary.allRequiredMet ? "#4ade80" : "#f87171"};margin:0 0 2px;`,
+      style: `font-size:10px;color:${summary.allRequiredMet ? "var(--color-success, #4ade80)" : "var(--color-danger, #f87171)"};margin:0 0 2px;`,
     }));
 
     summary.requiredBindings.forEach((d) => {
       const item = el("div", { style: "display:flex;align-items:center;gap:4px;margin:2px 0;" }, [
-        el("span", { text: d.bound ? "\u2713" : "\u2717", style: `font-size:10px;color:${d.bound ? "#4ade80" : "#f87171"};` }),
+        el("span", { text: d.bound ? "\u2713" : "\u2717", style: `font-size:10px;color:${d.bound ? "var(--color-success, #4ade80)" : "var(--color-danger, #f87171)"};` }),
         el("span", { text: d.label, style: "font-size:10px;color:#aaa;" }),
       ]);
       summaryGroup.appendChild(item);
@@ -221,7 +238,7 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
       summary.optionalBindings.filter((d) => d.bound).forEach((d) => {
         summaryGroup.appendChild(el("p", {
           text: `  \u2713 ${d.label}`,
-          style: "font-size:9px;color:#4ade80;margin:1px 0;",
+          style: "font-size:9px;color:var(--color-success, #4ade80);margin:1px 0;",
         }));
       });
     }

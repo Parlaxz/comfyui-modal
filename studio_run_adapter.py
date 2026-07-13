@@ -51,7 +51,12 @@ except Exception:  # pragma: no cover - runtime-only dependency in some contexts
     nodes = None
 
 from studio_store import StudioJsonStore, StudioStoreError
-from studio_models import _FEATURE_BINDING_KEYS, _KNOWN_FEATURE_IDS
+from studio_models import (
+    _FEATURE_BINDING_KEYS,
+    _KNOWN_FEATURE_IDS,
+    validate_controls_against_schema,
+)
+from timing_trace import TRACE_VERSION, merge_remote_trace_into
 
 _log = logging.getLogger(__name__)
 
@@ -328,7 +333,8 @@ def derive_control_schemas_from_snapshot(snapshot: dict) -> dict[str, dict]:
                         schema["kind"] = "number"
                     else:
                         schema["kind"] = "string"
-                    schema["default"] = actual_value
+                    if not _is_connection_spec(actual_value):
+                        schema["default"] = actual_value
                     schema["schemaResolved"] = True
                 else:
                     schema["kind"] = "unresolved"
@@ -358,7 +364,7 @@ def derive_control_schemas_from_snapshot(snapshot: dict) -> dict[str, dict]:
             }
             if widget_schema:
                 schema.update(widget_schema)
-                if found["value"] is not None:
+                if found["value"] is not None and not _is_connection_spec(found["value"]):
                     schema["default"] = found["value"]
                 schema["schemaResolved"] = True
             else:
@@ -371,7 +377,8 @@ def derive_control_schemas_from_snapshot(snapshot: dict) -> dict[str, dict]:
                     schema["kind"] = "number"
                 else:
                     schema["kind"] = "string"
-                schema["default"] = actual_value
+                if not _is_connection_spec(actual_value):
+                    schema["default"] = actual_value
                 schema["schemaResolved"] = True
             schemas[ctrl_id] = schema
 
@@ -559,7 +566,163 @@ def validate_studio_run(
     return {}
 
 
+def validate_studio_request_controls(
+    preset_ids: list[str],
+    feature_id: str,
+    controls: dict[str, Any],
+    axes: dict[str, Any],
+    node_dir: str | os.PathLike,
+) -> list[dict]:
+    """Validate controls against ALL requested presets' snapshot schemas.
+
+    For every *preset_id* in *preset_ids*:
+      1. Calls ``load_preset_and_snapshot`` — load failure yields a
+         preset-scoped error ``{"presetId": …, "field": …, "message": …}``.
+      2. On success, derives the snapshot's control schemas.
+      3. Validates *controls* (shared defaults) against those schemas
+         with ``strict_unknown_rejection=False``.
+      4. Validates EACH axis value from *axes* independently against
+         the schemas so heterogeneous schemas catch per-preset incompat
+         at every value.
+
+    Every returned error dict carries ``presetId`` set to the preset that
+    triggered the error.  A heterogeneous experiment (presets A and B with
+    different schemas) must reject a control value that is valid for A but
+    invalid for B — no first-valid-preset shortcut.
+
+    Returns a **list of error dicts**.  An empty list means all controls
+    are valid for all requested presets.
+
+    Single-run callers pass ``[preset_id], controls, {}``.
+    Experiment callers pass all preset IDs, experiment-level defaults,
+    and the experiment's axes dict.
+    """
+    errors: list[dict] = []
+
+    if not preset_ids:
+        errors.append({
+            "presetId": "",
+            "field": "presetIds",
+            "message": "At least one presetId is required",
+        })
+        return errors
+
+    for pid in preset_ids:
+        # Step 1: Load preset + snapshot (thread-safe, inline error)
+        loaded_preset, loaded_snapshot = load_preset_and_snapshot(pid, node_dir)
+        if loaded_preset is None:
+            errors.append({
+                "presetId": pid,
+                "field": "preset",
+                "message": loaded_snapshot or f"Preset {pid!r} could not be loaded",
+            })
+            continue  # Cannot validate controls against a missing preset
+
+        preset = loaded_preset
+        snapshot = loaded_snapshot
+
+        # Step 2: Derive schemas from this snapshot
+        try:
+            schemas = derive_control_schemas_from_snapshot(snapshot)
+        except Exception:
+            _log.exception("Failed to derive schemas for snapshot %s", snapshot.get("id", "?"))
+            errors.append({
+                "presetId": pid,
+                "field": "schema",
+                "message": f"Failed to derive control schemas for preset {pid!r}",
+            })
+            continue
+
+        # Step 3: Validate shared controls (strict_unknown_rejection=False)
+        # Pass all controls in a single call for efficiency.  Each returned
+        # error already carries ``field``; we add ``presetId``.
+        if controls:
+            try:
+                ctrl_errors = validate_controls_against_schema(
+                    controls, schemas, feature_id,
+                    strict_unknown_rejection=False,
+                )
+            except Exception:
+                _log.exception("Control validation error on preset %s", pid)
+                # Fail closed: produce a structured error instead of silently
+                # passing invalid controls through ([] would be a false green).
+                errors.append({
+                    "presetId": pid,
+                    "field": "control",
+                    "message": "Control validation could not be completed",
+                })
+                ctrl_errors = ()
+            for err in ctrl_errors:
+                err.setdefault("presetId", pid)
+                errors.append(err)
+
+        # Step 4: Validate each axis value independently against schemas.
+        # Each value must be validated individually (not flattened into a
+        # single dict) because later values would overwrite earlier ones,
+        # silently skipping validation of the overwritten keys.
+        for axis_id, axis_def in (axes or {}).items():
+            if not isinstance(axis_def, dict):
+                continue
+            values = axis_def.get("values")
+            if not isinstance(values, list):
+                continue
+            for val in values:
+                try:
+                    axis_errors = validate_controls_against_schema(
+                        {axis_id: val}, schemas, feature_id,
+                        strict_unknown_rejection=False,
+                    )
+                except Exception:
+                    _log.exception(
+                        "Axis validation error for %s on preset %s",
+                        axis_id, pid,
+                    )
+                    # Fail closed: structured error for each axis value.
+                    errors.append({
+                        "presetId": pid,
+                        "field": axis_id,
+                        "message": "Control validation could not be completed",
+                    })
+                    continue
+                for err in axis_errors:
+                    err.setdefault("presetId", pid)
+                    errors.append(err)
+
+    return errors
+
+
 # ── Defaults extraction ────────────────────────────────────────────────
+
+
+def get_preset_scalar_defaults(
+    preset_id: str, node_dir: str | os.PathLike,
+) -> tuple[dict | None, str | None]:
+    """Load preset and return merged scalar defaults.
+
+    Merges the preset's own ``defaults`` dict (user-configured) with
+    snapshot-derived widget defaults.  Preset keys take priority; snapshot
+    defaults fill in any missing keys.  The result includes scalar controls
+    such as *steps*, *scheduler*, *width*, *height* when present.
+
+    Returns ``(merged_defaults_dict, None)`` on success or
+    ``(None, error_message)`` on failure.
+    """
+    preset, snapshot_or_err = load_preset_and_snapshot(preset_id, node_dir)
+    if preset is None:
+        return None, snapshot_or_err  # error message
+    if not isinstance(snapshot_or_err, dict):
+        return None, "Snapshot payload is not a dict"
+
+    # Start with preset's own defaults (user-configured, top priority)
+    merged = dict(preset.get("defaults", {}) or {})
+
+    # Derive snapshot widget defaults for any keys the preset does not have
+    snapshot_defaults = extract_defaults_from_snapshot(snapshot_or_err)
+    for ctrl_id, val in snapshot_defaults.items():
+        if ctrl_id not in merged:
+            merged[ctrl_id] = val
+
+    return merged, None
 
 
 def extract_defaults_from_snapshot(snapshot: dict) -> dict:
@@ -630,14 +793,20 @@ def extract_defaults_from_snapshot(snapshot: dict) -> dict:
         node = workflow.get(node_id, {})
         inputs = node.get("inputs", {})
         if widget_name in inputs:
-            defaults[ctrl_id] = inputs[widget_name]
+            value = inputs[widget_name]
+            # Skip ComfyUI internal connection specs (e.g. steps=["937", 0])
+            if not _is_connection_spec(value):
+                defaults[ctrl_id] = value
 
     for ctrl_id in _AUTO_DERIVE_CONTROLS:
         if ctrl_id in defaults:
             continue
         found = _find_node_for_control(workflow, ctrl_id)
         if found is not None and found["value"] is not None:
-            defaults[ctrl_id] = found["value"]
+            value = found["value"]
+            # Skip ComfyUI internal connection specs (e.g. steps=["937", 0])
+            if not _is_connection_spec(value):
+                defaults[ctrl_id] = value
 
     return defaults
 
@@ -778,6 +947,47 @@ def _apply_controls_to_workflow(
 # ── History metadata ───────────────────────────────────────────────────────
 
 
+def _is_connection_spec(value: Any) -> bool:
+    """Return True if *value* looks like a ComfyUI internal node connection spec.
+
+    Connection specs are lists/tuples of length ≥ 2 where the first element
+    is a node identifier (string or int) and the second is an output slot
+    index (int).  Example: ``["1178", 0]`` or ``[9, 0]``.
+
+    These are internal wiring artefacts produced by ``_build_resolved_controls``
+    when a slot maps to a linked node output rather than a widget value.
+    They must be filtered out before persistence so that frontend/history
+    metadata only contains user-facing control values.
+    """
+    if not isinstance(value, (list, tuple)):
+        return False
+    if len(value) < 2:
+        return False
+    # Second element being an int is the strongest signal of a (node_id, slot) pair.
+    if not isinstance(value[1], int):
+        return False
+    # First element must be a node id (string or int).
+    if isinstance(value[0], (str, int)):
+        return True
+    return False
+
+
+def _sanitize_resolved_controls(
+    controls: dict[str, Any],
+) -> dict[str, Any]:
+    """Remove internal connection-spec values from a resolved_controls dict.
+
+    Returns a new dict with only user-facing scalar values preserved.
+    The original dict is not mutated.
+    """
+    if not isinstance(controls, dict):
+        return {}
+    return {
+        k: v for k, v in controls.items()
+        if not _is_connection_spec(v)
+    }
+
+
 def _build_resolved_controls(
     workflow: dict[str, Any],
     slots: dict[str, Any],
@@ -906,6 +1116,7 @@ def build_single_run_spec(
     feature_id: str,
     controls: dict[str, Any],
     node_dir: str | os.PathLike,
+    trace_ctx: dict | None = None,
 ) -> dict[str, Any]:
     """Build a compilation-like spec for a single Studio run.
 
@@ -919,11 +1130,29 @@ def build_single_run_spec(
     4. Apply control overrides to the deep-copied workflow.
     5. Build a single-cell compilation.
     6. Attach studio metadata for history.
+
+    If *trace_ctx* is provided (a dict with browser timestamps such as
+    ``t0_perf_ms`` / ``t0_client_press``), it is stored in each cell's
+    ``"trace"`` key so that ``LocalRemoteInvoker.run_cell`` can forward it
+    to ``run_prompt_stream`` and add local observation stages.
     """
     # Validate first — ensures build helpers never bypass validation
     validation = validate_studio_run(preset, snapshot, feature_id)
     if validation.get("error"):
         return validation
+
+    # ── Task 2: Control coercion before _apply_controls_to_workflow ─────
+    # 1. Required text control must not be whitespace-only
+    _val = controls.get("prompt")
+    if isinstance(_val, str) and _val.strip() == "":
+        return {"error": "prompt: Value must not be empty or whitespace-only"}
+    # 2. Validate scalar controls against snapshot schemas
+    _schemas = derive_control_schemas_from_snapshot(snapshot)
+    _control_errors = validate_controls_against_schema(controls, _schemas, feature_id)
+    if _control_errors:
+        return {"error": "; ".join(
+            f"{e['field']}: {e['message']}" for e in _control_errors
+        )}
 
     exp_id = _make_studio_experiment_id()
 
@@ -1006,6 +1235,7 @@ def build_single_run_spec(
                 "axis_values": axis_values,
                 "workflow_hash": "",
                 "studio_meta": studio_meta,
+                "trace": dict(trace_ctx) if trace_ctx else {},
             }
         ],
         "duplicate_count": 0,
@@ -1214,13 +1444,14 @@ async def _schedule_and_start(
     try:
         result = await sched.start()
     except Exception as exc:
-        # Finalize the submission record as failed — preserve elapsed timings and failure evidence
+        # Finalize the submission record as failed — preserve elapsed
+        # timings without fabricating queue_ms or aliases.
         run_history_id = compilation.get("run_history_id", "")
         if run_history_id:
-            fail_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            fail_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
             try:
-                # Compute known timings even on failure
                 fail_timings: dict[str, Any] = {}
+                fail_timing_sources: dict[str, str] = {}
                 fail_meta: dict[str, Any] = {
                     "error": _STABLE_INTERNAL_ERROR,
                     "_error_detail": str(exc)[:500],
@@ -1232,12 +1463,33 @@ async def _schedule_and_start(
                     if sub_started:
                         try:
                             sub_dt = datetime.fromisoformat(sub_started.replace("Z", "+00:00"))
-                            now_dt = datetime.fromisoformat(fail_ts.replace("Z", "+00:00"))
-                            elapsed_ms = int((now_dt - sub_dt).total_seconds() * 1000)
-                            fail_timings["queue_ms"] = max(0, elapsed_ms)
-                            fail_timings["end_to_end_total_ms"] = max(0, elapsed_ms)
+                            fail_dt = datetime.fromisoformat(fail_ts.replace("Z", "+00:00"))
+                            # end_to_end_total_ms from submission to failure
+                            e2e_ms = int((fail_dt - sub_dt).total_seconds() * 1000)
+                            if e2e_ms >= 0:
+                                fail_timings["end_to_end_total_ms"] = e2e_ms
+                                fail_timing_sources["end_to_end_total_ms"] = "local_server_observed"
+                            # scheduler_execution_ms from generation_start to failure
+                            sched_ms = int((fail_dt - generation_start_dt).total_seconds() * 1000)
+                            if sched_ms >= 0:
+                                fail_timings["scheduler_execution_ms"] = sched_ms
+                                fail_timing_sources["scheduler_execution_ms"] = "local_server_observed"
                         except Exception:
                             pass
+                    # If no submission time, still try scheduler duration
+                    else:
+                        try:
+                            fail_dt = datetime.fromisoformat(fail_ts.replace("Z", "+00:00"))
+                            sched_ms = int((fail_dt - generation_start_dt).total_seconds() * 1000)
+                            if sched_ms >= 0:
+                                fail_timings["scheduler_execution_ms"] = sched_ms
+                                fail_timing_sources["scheduler_execution_ms"] = "local_server_observed"
+                        except Exception:
+                            pass
+                # No queue_ms, studio_queue_ms, generation_ms, or remote aliases
+                # — those are meaningful only for successful runs with a trace.
+                if fail_timing_sources:
+                    fail_timings["timing_sources"] = fail_timing_sources
                 REGISTRY.history().update_run(
                     run_history_id,
                     status="error",
@@ -1269,58 +1521,7 @@ async def _schedule_and_start(
         except Exception:
             pass
 
-    timings: dict[str, Any] = {}
-    timing_sources: dict[str, str] = {}
-    generation_ms = 0
-    if submission_started_at:
-        try:
-            sub_dt = datetime.fromisoformat(submission_started_at.replace("Z", "+00:00"))
-            queue_ms = int((generation_start_dt - sub_dt).total_seconds() * 1000)
-            generation_ms = int((completed_dt - generation_start_dt).total_seconds() * 1000)
-            timings = {
-                "queue_ms": max(0, queue_ms),
-                "generation_ms": max(0, generation_ms),
-                "total_ms": max(0, queue_ms + generation_ms),
-            }
-            timing_sources["queue_ms"] = "server_observed"
-            timing_sources["generation_ms"] = "server_observed"
-            timing_sources["total_ms"] = "server_observed"
-        except Exception:
-            pass
-
-    # Remote-side timing breakdown — flatten into top-level AND keep remote_timings for diagnostics
-    if isinstance(result, dict):
-        remote_breakdown = {}
-        for k in list(result.keys()):
-            if k.endswith("_ms") or k in ("sampling_ms", "queue_remote_ms",
-                                          "inference_ms", "restore_total_ms"):
-                remote_breakdown[k] = result[k]
-        if remote_breakdown:
-            timings["remote_timings"] = remote_breakdown
-            # Flatten remote timing fields to the top level for the frontend normalizer
-            for k, v in remote_breakdown.items():
-                if k not in timings:
-                    timings[k] = v
-                    timing_sources[k] = "remote"
-
-    # Canonical wall-clock summary fields
-    if submission_started_at and completed_at:
-        try:
-            sub_dt = datetime.fromisoformat(submission_started_at.replace("Z", "+00:00"))
-            end_dt = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
-            end_to_end_ms = int((end_dt - sub_dt).total_seconds() * 1000)
-            timings["scheduler_execution_ms"] = max(0, generation_ms) if "generation_ms" in timings else end_to_end_ms
-            timings["end_to_end_total_ms"] = max(0, end_to_end_ms)
-            timing_sources["scheduler_execution_ms"] = "server_observed"
-            timing_sources["end_to_end_total_ms"] = "server_observed"
-        except Exception:
-            pass
-
-    # Attach timing_sources metadata
-    if timing_sources:
-        timings["timing_sources"] = timing_sources
-
-    # ── Inspect experiment journal for the LATEST visible cell.completed ──
+    # ── Inspect experiment journal for timing_payload and output metadata ──
     output_paths: list[str] = []
     primary_asset_id = ""
     attempt_id = ""
@@ -1328,10 +1529,11 @@ async def _schedule_and_start(
     checkpoint_id = ""
     resolved_meta: dict = {}
     has_cell_completed = False
+    has_cell_failed = False
+    timing_payload: dict | None = None
 
     try:
         store = REGISTRY.store(exp_id)
-        # Iterate all events; only the LAST cell.completed is used
         for ev in store.read_events():
             if ev.get("type") == "cell.completed":
                 has_cell_completed = True
@@ -1344,8 +1546,133 @@ async def _schedule_and_start(
                 cell_key = pl.get("cell_key", cell_key)
                 checkpoint_id = pl.get("checkpoint_id", checkpoint_id)
                 resolved_meta["workflow_hash"] = pl.get("workflow_hash", resolved_meta.get("workflow_hash", ""))
+                # Capture timing_payload from the latest cell.completed
+                tp = pl.get("timing_payload")
+                if tp:
+                    timing_payload = tp
+            elif ev.get("type") == "cell.failed":
+                has_cell_failed = True
+                pl = ev.get("payload", {}) or {}
+                # Capture timing_payload from cell.failed if not already obtained
+                tp = pl.get("timing_payload")
+                if tp and timing_payload is None:
+                    timing_payload = tp
     except Exception:
         _log.warning("Failed to read journal events for %s", exp_id)
+
+    # ── Build timing dict ──────────────────────────────────────────────────
+    timings: dict[str, Any] = {}
+    timing_sources: dict[str, str] = {}
+
+    # 1. Local wall-clock observations (exact values, no faked floor)
+    if submission_started_at and completed_at:
+        try:
+            sub_dt = datetime.fromisoformat(submission_started_at.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+            pre_dt = generation_start_dt
+            queue_ms = int((pre_dt - sub_dt).total_seconds() * 1000)
+            scheduler_wall_ms = int((end_dt - pre_dt).total_seconds() * 1000)
+            end_to_end_ms = int((end_dt - sub_dt).total_seconds() * 1000)
+        except Exception:
+            queue_ms = 0
+            scheduler_wall_ms = 0
+            end_to_end_ms = 0
+
+        # New-run queue time: use studio_queue_ms (legacy queue_ms remains
+        # readable for backward compatibility, but we write the new key).
+        if has_cell_completed:
+            timings["studio_queue_ms"] = max(0, queue_ms)
+            timing_sources["studio_queue_ms"] = "local_server_observed"
+
+        # NO generation_ms or total_ms — legacy names not written
+        timings["scheduler_execution_ms"] = max(0, scheduler_wall_ms)
+        timings["end_to_end_total_ms"] = max(0, end_to_end_ms)
+        timing_sources["scheduler_execution_ms"] = "local_server_observed"
+        timing_sources["end_to_end_total_ms"] = "local_server_observed"
+
+    # 2. Create a minimal local Studio timing summary and merge remote trace
+    #    into it using the shared merger (same deterministic rules as the
+    #    normal graph path).
+    local_timing_summary: dict[str, Any] = {
+        "stages": {},
+        "deltas_ms": {},
+        "derived_ms": {},
+        "trace_version": TRACE_VERSION,
+    }
+    if timing_payload:
+        remote_trace = timing_payload.get("trace", {}) or {}
+        merge_remote_trace_into(local_timing_summary, remote_trace)
+
+    # 3. Canonical alias map — translate merged trace deltas to top-level
+    #    canonical keys with _ms suffix for the frontend normalizer.
+    #
+    #    Each entry: (canonical_key, source_location, timing_source_label)
+    merged_deltas = local_timing_summary.get("deltas_ms", {}) or {}
+    merged_derived = local_timing_summary.get("derived_ms", {}) or {}
+
+    _CANONICAL_ALIAS_MAP: list[tuple[str, str, str]] = [
+        # (canonical_key,              raw_deltas_key,     source)
+        ("clip_load_ms",               "clip_load",        "remote_trace"),
+        ("clip_encode_ms",             "clip_encode",      "remote_trace"),
+        ("sampling_ms",                "sampler",          "remote_trace"),
+        ("vae_decode_ms",              "vae_decode",       "remote_trace"),
+        ("image_io_ms",                "image_io",         "remote_trace"),
+        ("remote_inference_total_ms",  "inference_total",  "remote_trace"),
+        # Extended: validation, graph overhead, individual model loads
+        # These only appear when the remote trace provides them —
+        # conditional on merged_deltas.get(raw_key) returning a value.
+        ("remote_validation_ms",       "t3_to_t3b",       "remote_trace"),
+        ("graph_overhead_ms",          "graph_overhead",   "remote_trace"),
+        ("unet_load_ms",               "unet_load",        "remote_trace"),
+        ("vae_load_ms",                "vae_load",         "remote_trace"),
+    ]
+    remote_timings: dict[str, Any] = {}
+    for canonical_key, raw_key, source in _CANONICAL_ALIAS_MAP:
+        val = merged_deltas.get(raw_key)
+        if val is not None:
+            timings[canonical_key] = val
+            timing_sources[canonical_key] = source
+            remote_timings[raw_key] = val
+
+    # Restore timing from _restore_timing block — map to top-level keys
+    # AND remote_timings so both new and legacy consumers find the value.
+    if timing_payload:
+        restore = timing_payload.get("_restore_timing", {}) or {}
+        restore_total = restore.get("restore_total_ms")
+        if restore_total is not None:
+            timings["restore_total_ms"] = restore_total
+            timing_sources["restore_total_ms"] = "remote_trace"
+            timings["remote_restore_ms"] = restore_total
+            timing_sources["remote_restore_ms"] = "remote_trace"
+            remote_timings["restore_total_ms"] = restore_total
+
+    # Preserve raw remote_timings block for diagnostic access (after
+    # restore_total_ms was added above so it appears inside the block).
+    if remote_timings:
+        timings["remote_timings"] = dict(remote_timings)
+        timing_sources["remote_timings"] = "derived"
+
+    # Local materialization wall time from merged derived_ms
+    _local_mat_ms = merged_derived.get("local_output_materialization_ms")
+    if _local_mat_ms is not None:
+        timings["local_output_materialization_ms"] = _local_mat_ms
+        timing_sources["local_output_materialization_ms"] = "derived"
+
+    # 4. Preserve compact raw trace structures (no base64)
+    if timing_payload:
+        for raw_key in ("trace", "wall_clock_trace", "_wall_clock_summary",
+                         "_restore_timing", "scheduler_trace"):
+            val = timing_payload.get(raw_key)
+            if val is not None:
+                timings[raw_key] = copy.deepcopy(val)
+                timing_sources[raw_key] = "remote_trace"
+
+    # 5. trace_available flag
+    timings["trace_available"] = bool(timing_payload)
+
+    # 6. Attach timing_sources metadata
+    if timing_sources:
+        timings["timing_sources"] = timing_sources
 
     # Derive resolved_controls from the post-application workflow
     resolved_controls: dict = {}
@@ -1376,7 +1703,11 @@ async def _schedule_and_start(
     studio_meta = compilation.get("studio_meta", {}) or {}
     meta_merge: dict = {}
     meta_merge["requested_controls"] = dict(studio_meta.get("studio_controls", {}))
-    meta_merge["resolved_controls"] = dict(resolved_controls or {})
+    # Sanitise resolved_controls: remove internal connection-spec values
+    # (e.g. ``output: ["1178", 0]``) that are wiring artefacts, not user
+    # controls.  Use the sanitised copy for persistence and flattening.
+    _resolved_sanitised = _sanitize_resolved_controls(resolved_controls or {})
+    meta_merge["resolved_controls"] = dict(_resolved_sanitised)
     meta_merge["studio_preset_id"] = studio_meta.get("studio_preset_id", "")
     meta_merge["studio_snapshot_id"] = studio_meta.get("studio_snapshot_id", "")
     meta_merge["studio_feature_id"] = studio_meta.get("studio_feature_id", "")
@@ -1392,10 +1723,22 @@ async def _schedule_and_start(
 
     # Flatten canonical aliases from resolved_controls + event payload
     # so frontend/history see prompt, seed, steps, etc. at top level.
+    # Uses the sanitised copy (connection specs already removed).
     canonical_aliases = _flatten_canonical_aliases(
-        resolved_controls or {},
+        _resolved_sanitised,
         resolved_meta if has_cell_completed else None,
     )
+
+    # Fallback to requested_controls for canonical keys that resolved
+    # controls cannot provide (e.g. when auto-derive produces no slot
+    # for seed/steps/guidance/sampler/scheduler/denoise).
+    if meta_merge.get("requested_controls"):
+        for ck in _CANONICAL_ALIAS_KEYS:
+            if ck not in canonical_aliases or canonical_aliases.get(ck) is None:
+                fv = meta_merge["requested_controls"].get(ck)
+                if fv is not None:
+                    canonical_aliases[ck] = fv
+
     for k, v in canonical_aliases.items():
         if v is not None and k not in meta_merge:
             meta_merge[k] = v
@@ -1509,12 +1852,19 @@ def handle_studio_run(
     feature_id: str,
     controls: dict[str, Any],
     node_dir: str | os.PathLike,
+    trace_ctx: dict | None = None,
 ) -> dict[str, Any]:
     """Handle a single Studio run request.
 
     Called from the route handler. Performs validation, builds the
     compilation, creates an experiment via REGISTRY, and schedules
     the runner.
+
+    *trace_ctx* is an optional dict carrying browser-side timestamps
+    (``t0_perf_ms`` / ``t0_client_press``, captured by the Studio UI).
+    It is propagated to each cell's ``"trace"`` key so that
+    ``LocalRemoteInvoker.run_cell`` can forward it to the remote Modal
+    function and add local observation stages.
 
     Returns a response dict with ``status``, ``runId``, ``experimentId``
     on success, or ``status`` + ``message`` on error.  No raw exception
@@ -1540,7 +1890,9 @@ def handle_studio_run(
     _log.info("Studio run validation passed")
 
     # 3. Build single-run compilation (includes validation)
-    compilation = build_single_run_spec(preset, snapshot, feature_id, controls, node_dir)
+    # Pass trace_ctx so each cell carries browser timestamps and the trace
+    # flows through to LocalRemoteInvoker.run_cell -> run_prompt_stream.
+    compilation = build_single_run_spec(preset, snapshot, feature_id, controls, node_dir, trace_ctx=trace_ctx)
     if isinstance(compilation, dict) and compilation.get("error"):
         _log.warning("Studio run compilation failed: %s", compilation["error"])
         return {"status": "error", "message": compilation["error"]}

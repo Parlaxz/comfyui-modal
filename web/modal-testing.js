@@ -6,10 +6,64 @@ import { createDefaultDraft, createPreviewState, normalizeDraft } from "./testin
 import { ensureStudioStyles } from "./studio-styles.js";
 import { mountStudioShell } from "./studio-shell.js";
 import { mountLegacyTab, stopLegacyController } from "./studio-legacy.js";
+import { el } from "./studio-ui.js";
 
 // Backward-compat flag preserved for external scripts/custom nodes that may
 // still read it. Legacy sidebar tabs are now controlled by an explicit opt-in.
 window.__comfyModalUnifiedUI = true;
+
+// ── Focus trap helper (Tab/Shift+Tab containment for modals) ────────────
+
+function _trapTab(e, containerEl) {
+  if (e.key !== "Tab" || !containerEl) return;
+  var focusable = containerEl.querySelectorAll(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+  );
+  if (focusable.length === 0) return;
+  var first = focusable[0];
+  var last = focusable[focusable.length - 1];
+  if (e.shiftKey) {
+    if (document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    }
+  } else {
+    if (document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+}
+
+// ── Inert helper for background content ─────────────────────────────────
+
+function _inertBackground(inert) {
+  // Apply or remove inert/aria-hidden on ComfyUI main content behind the modal
+  var targets = document.querySelectorAll(
+    ".comfyui-body, #comfyui-root, .comfy-app, main, [role='main']"
+  );
+  if (targets.length === 0) {
+    // Fallback: use :not() approach — body's children except our host
+    targets = document.querySelectorAll("body > :not(.comfymodal-testing-host, .comfymodal-testing-fallback, script, style)");
+  }
+  targets.forEach(function (el) {
+    if (inert) {
+      if (!el.hasAttribute("data-inert-restore")) {
+        var wasInert = el.hasAttribute("inert") || el.getAttribute("aria-hidden") === "true";
+        el.setAttribute("data-inert-restore", wasInert ? "true" : "false");
+      }
+      el.setAttribute("inert", "");
+      el.setAttribute("aria-hidden", "true");
+    } else {
+      el.removeAttribute("inert");
+      var restore = el.getAttribute("data-inert-restore");
+      if (restore === "false") {
+        el.removeAttribute("aria-hidden");
+      }
+      el.removeAttribute("data-inert-restore");
+    }
+  });
+}
 
 const MODAL_PREFIX = "/comfymodal";
 const TAB_DASHBOARD = "dashboard";
@@ -21,8 +75,8 @@ const TAB_SETTINGS = "settings";
 const PREFIX = "[comfymodal.testing]";
 const HOST_CLASS = "comfymodal-testing-host";
 
-// Studio shell pages (replaces old 6-tab nav)
-const STUDIO_PAGES = ["Playground", "History", "Backend", "Settings"];
+// Guard for comfymodal.open-section listener (prevents duplicate registration)
+let _openSectionRegistered = false;
 
 console.log(PREFIX, "extension module imported");
 
@@ -52,33 +106,21 @@ export function comfyModalTestingDiagnostics() {
   return { ..._diag };
 }
 
-function el(tag, props = {}, children = []) {
-  const e = document.createElement(tag);
-  for (const k in props) {
-    if (k === "class") e.className = props[k];
-    else if (k === "style") e.style.cssText = props[k];
-    else if (k === "text") e.textContent = props[k];
-    else if (k.startsWith("on") && typeof props[k] === "function") {
-      e.addEventListener(k.slice(2).toLowerCase(), props[k]);
-    } else if (k === "value") {
-      e.value = props[k];
-    } else {
-      e.setAttribute(k, props[k]);
-    }
-  }
-  for (const c of (Array.isArray(children) ? children : [children])) {
-    if (c == null) continue;
-    e.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-  }
-  return e;
-}
-
 function buildShell() {
   const overlay = el("div", { class: "comfymodal-testing-overlay" });
-  const modal = el("div", { class: "comfymodal-studio-modal" });
+  const modal = el("div", {
+    class: "comfymodal-studio-modal",
+    role: "dialog",
+    "aria-modal": "true",
+    "aria-labelledby": "comfymodal-studio-heading",
+  });
   const header = el("div", { class: "comfymodal-studio-header" }, [
-    el("h2", { text: "Modal Studio" }),
-    el("button", { class: "comfymodal-testing-close", text: "✕" }),
+    el("h2", { id: "comfymodal-studio-heading", text: "Modal GPU" }),
+    el("button", {
+      class: "comfymodal-testing-close",
+      "aria-label": "Close modal",
+      text: "✕",
+    }),
   ]);
   const body = el("div", { class: "comfymodal-studio-body", "data-testid": "body" });
   modal.appendChild(header);
@@ -92,6 +134,7 @@ let _isOpen = false;
 let _shellCache = null;
 let _currentTab = null;
 let _currentController = null;
+let _triggerEl = null;
 
 // Draft state: persists across modal close/reopen within a session.
 // Keys: "setup" -> normalized draft (user intent), "results" -> experimentId, etc.
@@ -169,6 +212,15 @@ export function open_testing_modal(tabName) {
   ensureTestingStyles();
   ensureStudioStyles();
 
+  // Store the current active element for focus restoration on close
+  _triggerEl = document.activeElement;
+
+  // Body scroll lock (replaces :has() pseudo-class)
+  document.body.classList.add("comfymodal-body-scroll-lock");
+
+  // Inert/aria-hidden background content so screen readers don't reach behind modal
+  _inertBackground(true);
+
   // Map old tab names to Studio pages
   const pageMap = {
     playground: "playground",
@@ -185,12 +237,16 @@ export function open_testing_modal(tabName) {
     if (!_shellCache._escHandler) {
       const escHandler = (e) => {
         if (e.key === "Escape") close_testing_modal();
+        else _trapTab(e, _shellCache.overlay);
       };
       document.addEventListener("keydown", escHandler);
       _shellCache._escHandler = escHandler;
     }
     _isOpen = true;
     updateDiag("modalOpen", true);
+    // Move focus into the modal
+    var focusTarget = _shellCache.overlay.querySelector(".comfymodal-testing-close, .comfymodal-studio-topnav button, [data-page]");
+    if (focusTarget) focusTarget.focus();
     if (tabName && _shellCache._studioApi) {
       const page = pageMap[tabName] || "playground";
       // Set activeLegacyTab for legacy tabs when shell is cached
@@ -211,9 +267,10 @@ export function open_testing_modal(tabName) {
     if (e.target === shell.overlay) close_testing_modal();
   });
 
-  // Escape handler — store reference for cleanup
+  // Escape handler + Tab trap — store reference for cleanup
   const escHandler = (e) => {
     if (e.key === "Escape") close_testing_modal();
+    else _trapTab(e, shell.overlay);
   };
   document.addEventListener("keydown", escHandler);
   shell._escHandler = escHandler;
@@ -267,6 +324,11 @@ export function open_testing_modal(tabName) {
   _hostEl.appendChild(shell.overlay);
   _isOpen = true;
   updateDiag("modalOpen", true);
+
+  // Move focus into the modal
+  var focusTarget = shell.overlay.querySelector(".comfymodal-testing-close, .comfymodal-studio-topnav button, [data-page]");
+  if (focusTarget) focusTarget.focus();
+
   return shell;
 }
 
@@ -282,6 +344,14 @@ function close_testing_modal() {
   }
   _isOpen = false;
   updateDiag("modalOpen", false);
+  // Restore inert/aria-hidden on background content to prior state
+  _inertBackground(false);
+  // Restore focus to the element that triggered the modal
+  document.body.classList.remove("comfymodal-body-scroll-lock");
+  if (_triggerEl && typeof _triggerEl.focus === "function") {
+    _triggerEl.focus();
+    _triggerEl = null;
+  }
 }
 
 async function resolveModule(path) {
@@ -364,7 +434,7 @@ function mountLazyTab(container, tabName) {
 function buildSidebarPanel() {
   const statusEl = el("div", { class: "launcher-status", text: "Studio shell ready" });
   const panel = el("div", { class: "comfymodal-testing-sidebar-panel" }, [
-    el("div", { class: "launcher-title", text: "Modal Studio" }),
+    el("div", { class: "launcher-title", text: "Modal GPU" }),
     el("div", { class: "launcher-subtitle", text: "Playground, History, Backend, Settings" }),
     el("button", { text: "Open Studio", onclick: () => open_testing_modal() }),
     el("button", {
@@ -390,7 +460,7 @@ let _fallbackLauncher = null;
 function ensureFallbackLauncher() {
   if (_fallbackLauncher) return;
   _fallbackLauncher = el("div", { class: "comfymodal-testing-fallback" }, [
-    el("button", { text: "Modal Studio", onclick: () => open_testing_modal() }),
+    el("button", { text: "Modal GPU", onclick: () => open_testing_modal() }),
   ]);
   document.body.appendChild(_fallbackLauncher);
   updateDiag("fallbackLauncherVisible", true);
@@ -442,12 +512,12 @@ app.registerExtension({
           id: "comfymodal-testing-suite",
           icon: "pi pi-cloud",
           title: "Modal GPU",
-          tooltip: "Modal Studio — Playground, History, Backend, Settings",
+          tooltip: "Modal GPU — Playground, History, Backend, Settings",
           type: "custom",
-          render: async (el) => {
-            el.style.height = "100%";
-            el.innerHTML = "";
-            el.appendChild(buildSidebarPanel());
+          render: async (containerEl) => {
+            containerEl.style.height = "100%";
+            while (containerEl.firstChild) containerEl.removeChild(containerEl.firstChild);
+            containerEl.appendChild(buildSidebarPanel());
           },
         });
         updateDiag("sidebarRegistered", true);
@@ -464,7 +534,10 @@ app.registerExtension({
 
     ensureHost();
 
-    document.addEventListener("comfymodal.open-section", handleOpenSection);
+    if (!_openSectionRegistered) {
+      document.addEventListener("comfymodal.open-section", handleOpenSection);
+      _openSectionRegistered = true;
+    }
 
     window.open_testing_modal = open_testing_modal;
     window.close_testing_modal = close_testing_modal;

@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
+from timing_trace import TRACE_VERSION, Trace, coerce_t0_from_browser, extract_remote_timing_payload, merge_remote_trace_into
 from worker_control import (
     ControlBackend,
     ModalDictControlBackend,
@@ -425,6 +426,12 @@ def resolve_and_inject_cell(
     ]:
         val = resolve_axis_value(axis_values, axis_key)
         if val is not None:
+            # ── Task 2: Reject arrays/objects before int()/float() ──
+            if isinstance(val, (list, dict)):
+                raise ValueError(
+                    f"Axis {axis_key!r} must be a scalar value, "
+                    f"got {type(val).__name__}: {val!r}"
+                )
             # Coerce types
             if axis_key in ("seed", "steps"):
                 val = int(val)
@@ -882,18 +889,40 @@ class ExperimentRunner:
                     # display results. CheckpointStreamInvoker uses the
                     # stream event sink (_on_remote_event) instead.
                     if result.get("output_paths"):
-                        await self._emit("cell.completed", {
+                        cell_completed_payload = {
                             "cell_key": cell.get("cell_key", ""),
                             "checkpoint_id": ck["id"],
                             "output_paths": result["output_paths"],
                             "attempt_id": attempt_id,
-                        })
+                        }
+                        # Propagate timing_payload from invoker result to
+                        # cell.completed event when present.
+                        tp = result.get("timing_payload")
+                        if tp:
+                            cell_completed_payload["timing_payload"] = tp
+                        await self._emit("cell.completed", cell_completed_payload)
                     if result.get("status") == "completed":
                         ck_completed += 1
                     elif result.get("status") == "interrupted":
                         pass
                     else:
                         ck_failures += 1
+                        # Emit cell.failed with identity and timing payload
+                        # when the invoker failure provides any timing data.
+                        # CheckpointStreamInvoker uses its own stream event
+                        # sink (_on_remote_event) so this only fires for
+                        # LocalRemoteInvoker (Studio single runs).
+                        if not hasattr(self._invoker, "_drive"):
+                            cell_failed_payload = {
+                                "cell_key": cell.get("cell_key", ""),
+                                "checkpoint_id": ck["id"],
+                                "error": result.get("error", "Cell execution failed"),
+                                "attempt_id": attempt_id,
+                            }
+                            tp = result.get("timing_payload")
+                            if tp:
+                                cell_failed_payload["timing_payload"] = tp
+                            await self._emit("cell.failed", cell_failed_payload)
                 # Determine checkpoint completion type
                 if self._pause_requested:
                     final_type = "checkpoint.paused"
@@ -1052,6 +1081,10 @@ class LocalRemoteInvoker:
         return saved_urls
 
     async def run_cell(self, worker_invocation_id, cell) -> dict:
+        # Initialise holders so the exception path can check None
+        # instead of probing NameError/UnboundLocalError.
+        _last_remote_data: dict | None = None
+        _local_timing_summary: dict | None = None
         try:
             raw = cell.get("input_images") or {}
             flat = {}
@@ -1060,20 +1093,119 @@ class LocalRemoteInvoker:
                     flat[filename] = entry["data"]
                 elif isinstance(entry, str):
                     flat[filename] = entry
-            async for msg in self._run_prompt_stream(
-                workflow=cell.get("_resolved_workflow", cell.get("_workflow", {})),
-                input_images=flat if flat else None,
-            ):
+
+            # ── Establish local trace from browser context ────────────────
+            # The cell carries a "trace" dict with browser timestamps
+            # (e.g. t0_perf_ms / t0_client_press).  Build a local Trace
+            # from it so we can record genuine observation stages.
+            trace_ctx = cell.get("trace")
+            if isinstance(trace_ctx, dict) and trace_ctx:
+                local_trace = Trace(cell.get("cell_key", ""), t0=coerce_t0_from_browser(trace_ctx))
+                local_trace.update(trace_ctx)  # restore any previously marked stages
+            else:
+                local_trace = Trace(cell.get("cell_key", ""))
+            local_trace.mark("t6_local_stream_opened")
+
+            stream_kwargs: dict = {
+                "workflow": cell.get("_resolved_workflow", cell.get("_workflow", {})),
+            }
+            if flat:
+                stream_kwargs["input_images"] = flat
+            # Forward the browser-trace fields dict to the remote Modal
+            # function so it can establish t0 / add its own stages.
+            if isinstance(trace_ctx, dict) and trace_ctx:
+                stream_kwargs["trace"] = trace_ctx
+            _first_event = True
+            async for msg in self._run_prompt_stream(**stream_kwargs):
+                if _first_event:
+                    local_trace.mark("t7_local_first_remote_event")
+                    _first_event = False
                 mtype = msg.get("type", "")
                 if mtype == "result":
                     data = msg.get("data", {})
+                    _last_remote_data = data
+                    local_trace.mark("t8_local_result_received")
+
+                    # ── Merge remote + local using shared merger ──────────
+                    # The remote result carries a full canonical summary
+                    # (deltas_ms, derived_ms, stages) computed by Modal in
+                    # its own time base.  Build a local summary dict (not
+                    # via summary() which would recompute deltas in the
+                    # local time base) and merge the remote summary into
+                    # it.  The merger adds remote entries only where no
+                    # local equivalent exists, preserving correct remote
+                    # values.
+                    remote_trace_data = data.get("trace", {}) or {}
+                    local_stages = dict(local_trace.fields())
+                    local_summary: dict[str, Any] = {
+                        "stages": local_stages,
+                        "deltas_ms": {},
+                        "derived_ms": {},
+                        "trace_version": TRACE_VERSION,
+                    }
+                    merge_remote_trace_into(local_summary, remote_trace_data)
+                    _local_timing_summary = local_summary
+
                     saved = await self._save_output_images(data, cell.get("cell_key", "unknown"))
-                    return {"status": "completed", "result": data, "output_paths": saved}
+                    local_trace.mark("t9_local_materialized")
+                    result = {"status": "completed", "result": data, "output_paths": saved}
+
+                    # ── Derive local materialization wall time ───────────
+                    # Compute from t8_local_result_received →
+                    # t9_local_materialized only when both numeric
+                    # timestamps exist and order is nonnegative, AND the
+                    # cell carried a browser trace context (otherwise the
+                    # local Trace was created ad-hoc in this method and
+                    # the timestamps are merely time.time() bookmarks
+                    # that do not represent a meaningful span).
+                    if isinstance(trace_ctx, dict) and trace_ctx:
+                        _t8 = local_trace.get("t8_local_result_received")
+                        _t9 = local_trace.get("t9_local_materialized")
+                        if _t8 is not None and _t9 is not None:
+                            _mat_ms = round((_t9 - _t8) * 1000, 2)
+                            if _mat_ms >= 0:
+                                local_summary.setdefault("derived_ms", {})["local_output_materialization_ms"] = _mat_ms
+
+                    # ── Update stages with t9_local_materialized ──────────
+                    # The initial stages snapshot was taken before
+                    # t9_local_materialized was marked (lines above).
+                    # Re-read the live trace so the stage appears in the
+                    # final timing_payload alongside the truthful derived
+                    # delta computed above.  Only update the local key to
+                    # avoid overwriting already-merged remote stages.
+                    _t9_now = local_trace.get("t9_local_materialized")
+                    if _t9_now is not None:
+                        local_summary.setdefault("stages", {})["t9_local_materialized"] = _t9_now
+
+                    # Extract compact timing payload from data, then embed
+                    # the merged trace as the canonical trace record.
+                    merged_payload = extract_remote_timing_payload(data)
+                    merged_payload["trace"] = local_summary
+                    if merged_payload:
+                        result["timing_payload"] = merged_payload
+                    return result
                 if mtype == "error":
-                    return {"status": "failed", "error": msg.get("message", "Remote execution error")}
+                    result = {"status": "failed", "error": msg.get("message", "Remote execution error")}
+                    # Extract compact timing payload from any partial data
+                    error_data = msg.get("data")
+                    if isinstance(error_data, dict):
+                        tp = extract_remote_timing_payload(error_data)
+                        if tp:
+                            result["timing_payload"] = tp
+                    return result
             return {"status": "failed", "error": "run_prompt_stream ended without result"}
         except Exception as exc:
-            return {"status": "failed", "error": str(exc)}
+            result = {"status": "failed", "error": str(exc)}
+            # Preserve any partial timing accumulated before the crash.
+            # Both holders are initialised to None at the top of this
+            # method — plain None checks replace NameError probing.
+            if _last_remote_data is not None:
+                tp = extract_remote_timing_payload(_last_remote_data)
+                if tp:
+                    result["timing_payload"] = tp
+                if _local_timing_summary is not None:
+                    result.setdefault("timing_payload", {})["trace"] = _local_timing_summary
+            return result
 
     async def close_worker(self, worker_invocation_id) -> None:
         return None

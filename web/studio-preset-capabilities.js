@@ -474,19 +474,31 @@ export function getAxisEligibilityForPresets(presets, featureId) {
   if (runnablePresets.length === 0) return [];
 
   const eligible = [];
+  const reasons = {};
 
   for (const [key, def] of Object.entries(CONTROL_BINDING_DEFS)) {
     if (!def.experimentEligible || def.isControl === false) continue;
 
-    const allSupport = runnablePresets.every((p) => {
-      const bindings = p.nodeBindings || {};
-      return !!(bindings[key] && bindings[key].nodeId);
-    });
+    const allSupport = runnablePresets.every((p) =>
+      isControlBound(p, key, featureId),
+    );
 
-    if (allSupport) eligible.push(key);
+    if (allSupport) {
+      eligible.push(key);
+    } else {
+      for (const p of runnablePresets) {
+        if (!isControlBound(p, key, featureId)) {
+          const presetLabel = p.label || p.id || "unknown preset";
+          reasons[key] = `Preset "${presetLabel}" is missing binding for "${def.label}"`;
+          break;
+        }
+      }
+    }
   }
 
-  return eligible;
+  const result = eligible;
+  result.reasons = reasons;
+  return result;
 }
 
 /**

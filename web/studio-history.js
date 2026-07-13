@@ -19,36 +19,9 @@
 //   2. run.asset_id            → /assets/<id>
 //   3. run.output_path         → /studio/outputs/<path>
 
-import { resolveRunImageUrl, hasRunImage, normalizeStudioRun } from "./studio-run-normalizer.js";
+import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings } from "./studio-run-normalizer.js";
 import { listRunHistory, updateRunAnnotation } from "./studio-backend-api.js";
-
-// ── Element helper (local, matches other modules) ─────────────────────────
-
-function el(tag, props = {}, children = []) {
-  const e = document.createElement(tag);
-  for (const k in props) {
-    if (k === "class") e.className = props[k];
-    else if (k === "style") e.style.cssText = props[k];
-    else if (k === "text") e.textContent = props[k];
-    else if (k.startsWith("on") && typeof props[k] === "function") {
-      e.addEventListener(k.slice(2).toLowerCase(), props[k]);
-    } else if (k === "value") {
-      e.value = props[k];
-    } else if (k === "dataset") {
-      Object.assign(e.dataset, props[k]);
-    } else if (k === "disabled" || k === "checked" || k === "hidden" || k === "readonly" || k === "required") {
-      if (props[k]) e.setAttribute(k, "");
-      else e.removeAttribute(k);
-    } else {
-      e.setAttribute(k, props[k]);
-    }
-  }
-  for (const c of (Array.isArray(children) ? children : [children])) {
-    if (c == null) continue;
-    e.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-  }
-  return e;
-}
+import { el } from "./studio-ui.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -79,33 +52,82 @@ function _formatDuration(ms) {
   return m + "m " + s.toFixed(0) + "s";
 }
 
+/**
+ * Safely resolve the total count from API response data, falling back
+ * to the length of the runs array when data.total is null/undefined.
+ * Uses nullish coalescing to preserve an explicit zero from the backend.
+ *
+ * @param {object} data  - API response (may have .total, .runs, .run_history).
+ * @param {Array}  runs  - Normalised runs array (already extracted from data).
+ * @returns {number}
+ */
+export function resolveTotalCount(data, runs) {
+  if (data && data.total != null) return data.total;
+  if (Array.isArray(runs)) return runs.length;
+  return 0;
+}
+
+/**
+ * Build display-ready page-metadata from pagination parameters.
+ * Returns an object with label, currentPage, totalPages, and total.
+ *
+ * Safe defaults:
+ *   - total=0 produces label "(0 total)" and totalPages=1 (not NaN).
+ *   - offset=0 produces currentPage=1.
+ *
+ * @param {number} offset
+ * @param {number} limit
+ * @param {number} total
+ * @returns {{label: string, currentPage: number, totalPages: number, total: number}}
+ */
+export function formatPageMetadata(offset, limit, total) {
+  var currentPage = Math.floor(offset / limit) + 1;
+  var totalPages = Math.ceil(total / limit) || 1;
+  return {
+    label: "Page " + currentPage + "/" + totalPages + " (" + total + " total)",
+    currentPage: currentPage,
+    totalPages: totalPages,
+    total: total,
+  };
+}
+
 // ── Favorite Star ─────────────────────────────────────────────────────────
 
 function renderFavoriteStar(nr, apiBase) {
-  var star = el("span", {
+  var isFav = nr.favorite;
+  var star = el("button", {
+    type: "button",
     class: "comfymodal-studio-favorite-star",
     "data-testid": "favorite-star",
-    text: nr.favorite ? "\u2605" : "\u2606",
-    style: "cursor:pointer;font-size:16px;color:" + (nr.favorite ? "#fbbf24" : "#555") + ";user-select:none;",
-    title: nr.favorite ? "Remove from favorites" : "Add to favorites",
+    "aria-label": isFav ? "Remove from favorites" : "Add to favorites",
+    "aria-pressed": isFav ? "true" : "false",
+    text: isFav ? "\u2605" : "\u2606",
+    style: "font-size:16px;color:" + (isFav ? "#fbbf24" : "#555") + ";",
+    title: isFav ? "Remove from favorites" : "Add to favorites",
   });
 
   star.addEventListener("click", function (e) {
     e.stopPropagation();
     e.preventDefault();
-    var wasFav = nr.favorite;
+    var wasFav = isFav;
     var newFav = !wasFav;
+    isFav = newFav;
     nr.favorite = newFav;
     var runId = nr.id || nr.experimentId;
     star.textContent = newFav ? "\u2605" : "\u2606";
     star.style.color = newFav ? "#fbbf24" : "#555";
+    star.setAttribute("aria-label", newFav ? "Remove from favorites" : "Add to favorites");
+    star.setAttribute("aria-pressed", newFav ? "true" : "false");
     star.title = newFav ? "Remove from favorites" : "Add to favorites";
 
     updateRunAnnotation(apiBase, runId, { favorite: newFav }).then(function (result) {
       if (!result || result.status !== "ok") {
+        isFav = wasFav;
         nr.favorite = wasFav;
         star.textContent = wasFav ? "\u2605" : "\u2606";
         star.style.color = wasFav ? "#fbbf24" : "#555";
+        star.setAttribute("aria-label", wasFav ? "Remove from favorites" : "Add to favorites");
+        star.setAttribute("aria-pressed", wasFav ? "true" : "false");
         star.title = wasFav ? "Remove from favorites" : "Add to favorites";
       }
     });
@@ -216,6 +238,159 @@ function renderNoteEditor(nr, apiBase) {
   return container;
 }
 
+// ── Timing Card ───────────────────────────────────────────────────────────
+//
+// Compact timing summary card for the preview overlay.
+// Includes expandable advanced diagnostics.
+
+function renderTimingCard(nr) {
+  if (!nr.timingStages || nr.timingStages.length === 0) {
+    // Fallback: timing summary string (progress annotation contract)
+    if (nr.timingSummary && typeof nr.timingSummary === "string" && nr.timingSummary.length > 0) {
+      return el("div", {
+        class: "comfymodal-studio-timing-card",
+        "data-testid": "timing-card",
+        style: "margin-top:6px;padding:4px 8px;",
+      }, [
+        el("span", {
+          class: "comfymodal-studio-timing-e2e",
+          text: nr.timingSummary,
+        }),
+      ]);
+    }
+    if (nr.durationMs != null && nr.durationMs > 0) {
+      return el("div", {
+        class: "comfymodal-studio-timing-card",
+        "data-testid": "timing-card",
+        style: "margin-top:6px;padding:4px 8px;",
+      }, [
+        el("span", {
+          class: "comfymodal-studio-timing-e2e",
+          text: "Duration: " + _formatDuration(nr.durationMs),
+        }),
+      ]);
+    }
+    return null;
+  }
+
+  var card = el("div", {
+    class: "comfymodal-studio-timing-card",
+    "data-testid": "timing-card",
+    style: "margin-top:6px;padding:4px 8px;",
+  });
+
+  // Primary E2E time
+  var e2e = nr.timingStages.find(function (s) { return s.label === "End-to-End Total"; });
+  if (e2e) {
+    card.appendChild(el("span", {
+      class: "comfymodal-studio-timing-e2e",
+      text: "End-to-End Total: " + _formatDuration(e2e.durationMs),
+    }));
+  }
+
+  // Top non-total stages (max 3)
+  var nonTotalStages = nr.timingStages.filter(function (s) {
+    return s.label !== "End-to-End Total" && s.durationMs > 0;
+  }).sort(function (a, b) { return b.durationMs - a.durationMs; }).slice(0, 3);
+
+  if (nonTotalStages.length > 0) {
+    var tagRow = el("div", { class: "comfymodal-studio-timing-tags" });
+    nonTotalStages.forEach(function (st) {
+      tagRow.appendChild(el("span", {
+        class: "comfymodal-studio-timing-tag",
+        text: st.label + ": " + _formatDuration(st.durationMs),
+      }));
+    });
+    card.appendChild(tagRow);
+  }
+
+  // Quality indicator
+  if (nr._timingQuality && nr._timingQuality !== "complete") {
+    card.appendChild(el("span", {
+      class: "comfymodal-studio-timing-quality",
+      text: nr._timingQuality + " quality",
+    }));
+  }
+
+  // ── Advanced Diagnostics Toggle ─────────────────────────────────────
+  if (nr.advancedTiming) {
+    var advBtn = el("button", {
+      class: "comfymodal-studio-advanced-timing-toggle",
+      text: "\u25b6 Diagnostics",
+      style: "font-size:9px;color:#666;cursor:pointer;background:none;border:none;padding:2px 0;margin-top:2px;display:block;",
+      onclick: function () {
+        var panel = card.querySelector(".comfymodal-studio-advanced-timing-panel");
+        if (panel) {
+          var isHidden = panel.style.display === "none" || panel.style.display === "";
+          panel.style.display = isHidden ? "block" : "none";
+          advBtn.textContent = isHidden ? "\u25bc Diagnostics" : "\u25b6 Diagnostics";
+        }
+      },
+    });
+    card.appendChild(advBtn);
+
+    var advPanel = el("div", {
+      class: "comfymodal-studio-advanced-timing-panel",
+      style: "display:none;font-size:9px;color:#666;margin-top:2px;padding:2px 4px;background:#0a0a0a;border:1px solid #1a1a1a;border-radius:2px;",
+    });
+
+    var diag = nr.advancedTiming;
+    var diagLines = [];
+
+    if (diag.traceVersion) {
+      // Display exact trace version without adding another "v" prefix
+      diagLines.push("Trace Version: " + diag.traceVersion);
+    }
+    diagLines.push("Quality: " + diag.timingQuality + " \u2014 " + (diag.timingReason || ""));
+    if (diag.missingFields && diag.missingFields.length > 0) {
+      diagLines.push("Missing: " + diag.missingFields.join(", "));
+    }
+    if (diag.rawDeltasMs && Object.keys(diag.rawDeltasMs).length > 0) {
+      diagLines.push("Raw deltas_ms: " + JSON.stringify(diag.rawDeltasMs).substring(0, 120) + "\u2026");
+    }
+    if (diag.rawDerivedMs && Object.keys(diag.rawDerivedMs).length > 0) {
+      diagLines.push("Raw derived_ms: " + JSON.stringify(diag.rawDerivedMs).substring(0, 120) + "\u2026");
+    }
+    if (diag.rawStages && Object.keys(diag.rawStages).length > 0) {
+      diagLines.push("Raw stages: " + JSON.stringify(diag.rawStages).substring(0, 120) + "\u2026");
+    }
+    if (diag.wallClockTrace) {
+      diagLines.push("Wall-Clock Trace: " + JSON.stringify(diag.wallClockTrace).substring(0, 120) + "\u2026");
+    }
+    if (diag.schedulerTrace) {
+      diagLines.push("Scheduler Trace: " + JSON.stringify(diag.schedulerTrace).substring(0, 120) + "\u2026");
+    }
+    if (diag.sources && Object.keys(diag.sources).length > 0) {
+      diagLines.push("Sources: " + JSON.stringify(diag.sources).substring(0, 120) + "\u2026");
+    }
+    if (diag.backendTimingSources && Object.keys(diag.backendTimingSources).length > 0) {
+      diagLines.push("Backend Sources: " + JSON.stringify(diag.backendTimingSources).substring(0, 120) + "\u2026");
+    }
+
+    diagLines.forEach(function (line) {
+      advPanel.appendChild(el("div", { text: line, style: "margin:1px 0;" }));
+    });
+
+    // Full stage list
+    if (nr.timingStages && nr.timingStages.length > 0) {
+      advPanel.appendChild(el("div", {
+        text: "All Stages:",
+        style: "margin:3px 0 1px;font-weight:600;color:#888;",
+      }));
+      nr.timingStages.forEach(function (st) {
+        advPanel.appendChild(el("div", {
+          text: "  " + st.label + ": " + _formatDuration(st.durationMs) + " (" + st.source + ")",
+          style: "margin:0;padding-left:6px;",
+        }));
+      });
+    }
+
+    card.appendChild(advPanel);
+  }
+
+  return card;
+}
+
 // ── Main renderer ─────────────────────────────────────────────────────────
 
 export function renderHistory(state, context) {
@@ -273,7 +448,7 @@ export function renderHistory(state, context) {
       "data-testid": "history-type-filter",
       style: "font-size:11px;padding:3px 4px;width:90px;",
     });
-    var typeOpts = ["", "run", "experiment", "experiment_cell"];
+    var typeOpts = ["", "run", "experiment", "experiment_cell", "studio_run"];
     typeOpts.forEach(function (t) {
       var opt = el("option", { value: t, text: t || "All Types" });
       if (t === queryParams.type) opt.selected = true;
@@ -445,6 +620,7 @@ export function renderHistory(state, context) {
       "data-testid": "history-prev",
       text: "\u2190 Prev",
       style: "font-size:10px;padding:2px 8px;",
+      disabled: queryParams.offset <= 0,
       onclick: function () {
         if (queryParams.offset > 0) {
           queryParams.offset = Math.max(0, queryParams.offset - queryParams.limit);
@@ -458,6 +634,7 @@ export function renderHistory(state, context) {
       "data-testid": "history-next",
       text: "Next \u2192",
       style: "font-size:10px;padding:2px 8px;",
+      disabled: queryParams.offset + queryParams.limit >= totalCount,
       onclick: function () {
         queryParams.offset += queryParams.limit;
         fetchAndRender();
@@ -479,10 +656,9 @@ export function renderHistory(state, context) {
     bar.appendChild(nextBtn);
     bar.appendChild(pageInfo);
 
-    // Update page info
-    var currentPage = Math.floor(queryParams.offset / queryParams.limit) + 1;
-    var totalPages = Math.ceil(totalCount / queryParams.limit) || 1;
-    pageInfo.textContent = "Page " + currentPage + "/" + totalPages + " (" + totalCount + " total)";
+    // Update page info via shared pure helper
+    var meta = formatPageMetadata(queryParams.offset, queryParams.limit, totalCount);
+    pageInfo.textContent = meta.label;
 
     return bar;
   }
@@ -499,7 +675,7 @@ export function renderHistory(state, context) {
     const status = nr.status;
     const promptText = (nr.prompt != null ? nr.prompt : rid).substring(0, 200);
 
-    // Build metadata using normalized fields
+    // Build metadata using normalized fields (shared normalizer for settings)
     const metaItems = [];
     if (nr.durationMs != null && nr.durationMs > 0) {
       metaItems.push({ label: "Duration", value: _formatDuration(nr.durationMs) });
@@ -517,41 +693,82 @@ export function renderHistory(state, context) {
     }
     const rc = nr.resolvedControls || {};
     const rqc = nr.requestedControls || {};
-    const seed = rc.seed != null ? rc.seed : (rqc.seed != null ? rqc.seed : "");
-    if (seed !== "") metaItems.push({ label: "Seed", value: String(seed) });
-    if (rc.steps != null) metaItems.push({ label: "Steps", value: String(rc.steps) });
-    if (rc.cfg != null || rc.guidance != null) {
-      metaItems.push({ label: "Guidance", value: String(rc.cfg != null ? rc.cfg : rc.guidance) });
+    var normalizedSettings = normalizeGenerationSettings(rc, rqc);
+    if (normalizedSettings.seed != null) metaItems.push({ label: "Seed", value: String(normalizedSettings.seed) });
+    if (normalizedSettings.steps != null) metaItems.push({ label: "Steps", value: String(normalizedSettings.steps) });
+    if (normalizedSettings.cfg != null) metaItems.push({ label: "CFG", value: String(normalizedSettings.cfg) });
+    if (normalizedSettings.guidance != null && normalizedSettings.cfg == null) {
+      metaItems.push({ label: "Guidance", value: String(normalizedSettings.guidance) });
     }
-    if (rc.sampler_name || rc.sampler) metaItems.push({ label: "Sampler", value: String(rc.sampler_name || rc.sampler) });
-    if (rc.scheduler) metaItems.push({ label: "Scheduler", value: String(rc.scheduler) });
-    if (rc.denoise != null) metaItems.push({ label: "Denoise", value: String(rc.denoise) });
-    if (rc.width && rc.height) metaItems.push({ label: "Size", value: rc.width + "\u00d7" + rc.height });
+    if (normalizedSettings.sampler != null) metaItems.push({ label: "Sampler", value: String(normalizedSettings.sampler) });
+    if (normalizedSettings.scheduler != null) metaItems.push({ label: "Scheduler", value: String(normalizedSettings.scheduler) });
+    if (normalizedSettings.denoise != null) metaItems.push({ label: "Denoise", value: String(normalizedSettings.denoise) });
+    if (normalizedSettings.width != null && normalizedSettings.height != null) {
+      metaItems.push({ label: "Size", value: normalizedSettings.width + "\u00d7" + normalizedSettings.height });
+    }
     if (nr.workflowHash) metaItems.push({ label: "Workflow", value: nr.workflowHash.substring(0, 8) + "\u2026" });
     if (nr.snapshotId) metaItems.push({ label: "Snapshot", value: nr.snapshotId.substring(0, 12) + "\u2026" });
 
-    // Timing summary
-    if (nr.timingSummary) {
-      metaItems.push({ label: "Timing", value: nr.timingSummary });
+    // Track the preview close function for focus return and Escape handling
+    function closePreview() {
+      previewRun = null;
+      renderPreviewOverlay();
+      // Return focus to the triggering card
+      var triggerCard = container.querySelector(".comfymodal-studio-history-card[data-preview-trigger]");
+      if (triggerCard && typeof triggerCard.focus === "function") {
+        triggerCard.focus();
+      }
+    }
+
+    // Focus trap for preview: cycle Tab/Shift+Tab within the preview
+    function _trapPreviewTab(e, container) {
+      if (e.key !== "Tab" || !container) return;
+      var focusable = container.querySelectorAll(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+      );
+      if (focusable.length === 0) return;
+      var first = focusable[0];
+      var last = focusable[focusable.length - 1];
+      if (e.shiftKey) {
+        if (document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else {
+        if (document.activeElement === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
     }
 
     const overlay = el("div", {
       class: "comfymodal-studio-history-preview",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-label": "Run preview",
       onclick: function (e) {
-        if (e.target === overlay) {
-          previewRun = null;
-          renderPreviewOverlay();
+        // Close on backdrop click; prevent content clicks from closing
+        if (e.target === overlay || e.target.classList.contains("comfymodal-studio-history-preview-backdrop")) {
+          closePreview();
         }
+      },
+      onkeydown: function (e) {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          closePreview();
+        }
+        _trapPreviewTab(e, overlay);
       },
     }, [
       el("div", { class: "comfymodal-studio-history-preview-backdrop" }),
       el("div", { class: "comfymodal-studio-history-preview-content" }, [
         el("button", {
           class: "comfymodal-studio-history-preview-close",
+          "aria-label": "Close preview",
           text: "\u00d7",
           onclick: function () {
-            previewRun = null;
-            renderPreviewOverlay();
+            closePreview();
           },
         }),
         imageUrl
@@ -580,6 +797,8 @@ export function renderHistory(state, context) {
               })
             )
           : null,
+        // ── Timing Card ────────────────────────────────────────────────
+        renderTimingCard(nr),
         // Note editor in preview
         renderNoteEditor(nr, apiBase),
       ]),
@@ -589,7 +808,18 @@ export function renderHistory(state, context) {
 
   function openPreview(run) {
     previewRun = run;
+    // Mark the triggering card for focus return on close
+    var cards = container.querySelectorAll(".comfymodal-studio-history-card");
+    cards.forEach(function (c) { c.removeAttribute("data-preview-trigger"); });
+    var activeCard = container.querySelector(".comfymodal-studio-history-card:focus-within, .comfymodal-studio-history-card:hover");
+    if (activeCard) activeCard.setAttribute("data-preview-trigger", "");
     renderPreviewOverlay();
+    // Move focus to preview close button
+    var closeBtn = container.querySelector(".comfymodal-studio-history-preview-close");
+    if (closeBtn && typeof closeBtn.focus === "function") {
+      // Delay focus until the overlay is rendered
+      requestAnimationFrame(function () { closeBtn.focus(); });
+    }
   }
 
   // ── Fetch and render ─────────────────────────────────────────────────
@@ -626,10 +856,16 @@ export function renderHistory(state, context) {
       // Remove loading
       while (container.firstChild) container.removeChild(container.firstChild);
 
-      // Re-add filter bar
-      container.appendChild(renderFilterBar());
+      // Resolve runs and totalCount for ALL paths (error, empty, success)
+      // so that the filter bar's page info always reflects the response.
+      // This must happen BEFORE any filter-bar re-render call.
+      var r = data && (data.runs || data.run_history || (Array.isArray(data) ? data : null));
+      totalCount = resolveTotalCount(data, r);
 
+      // Error state: show filter bar (totalCount is 0 for absent data),
+      // then error card, then return.
       if (!data) {
+        container.appendChild(renderFilterBar());
         container.appendChild(el("div", {
           class: "comfymodal-studio-card",
           style: "color:var(--color-danger)",
@@ -638,10 +874,10 @@ export function renderHistory(state, context) {
         return;
       }
 
-      var runs = data.runs || data.run_history || (Array.isArray(data) ? data : null);
-      totalCount = data.total || (Array.isArray(runs) ? runs.length : 0);
-
-      if (!runs || (Array.isArray(runs) && runs.length === 0)) {
+      // Empty state: show filter bar (totalCount is 0 from resolveTotalCount),
+      // then empty message.
+      if (!r || (Array.isArray(r) && r.length === 0)) {
+        container.appendChild(renderFilterBar());
         container.appendChild(el("div", {
           class: "comfymodal-studio-card",
           text: "No run history yet. Runs will appear here once you create experiments.",
@@ -649,7 +885,10 @@ export function renderHistory(state, context) {
         return;
       }
 
-      var runList = Array.isArray(runs) ? runs : [];
+      // Success: render filter bar with fresh totalCount, then gallery
+      container.appendChild(renderFilterBar());
+
+      var runList = Array.isArray(r) ? r : [];
 
       // Normalize all runs for consistent field access
       var normalizedRuns = runList.map(function (run) {
@@ -726,6 +965,9 @@ function renderHistoryCard(nr, apiBase, openPreview) {
     class: "comfymodal-studio-history-card"
       + (isCardCompleted ? " completed" : "")
       + (isCardFailed ? " failed" : ""),
+    tabindex: "0",
+    role: "button",
+    "aria-label": "View details for " + promptText,
     onclick: function () { openPreview(nr); },
   });
 
@@ -834,6 +1076,14 @@ function renderGroup(expId, groupRuns, apiBase, openPreview) {
     statsRow.appendChild(el("span", {
       style: "color:var(--color-danger, #f87171)",
       text: "\u00b7 " + failedCount + " failed",
+    }));
+  }
+  // Total from experiment metadata (canonical total when available, fallback loaded runs)
+  var totalCells = firstRun.totalCells ?? groupRuns.length;
+  if (totalCells > 0) {
+    statsRow.appendChild(el("span", {
+      style: "color:var(--color-text-muted)",
+      text: "\u00b7 " + totalCells + " total",
     }));
   }
   groupHeader.appendChild(statsRow);

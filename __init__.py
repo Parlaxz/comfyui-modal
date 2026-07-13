@@ -8,6 +8,7 @@ import re
 import base64
 import copy
 import threading
+import logging
 import subprocess
 import time
 from collections import namedtuple
@@ -17,6 +18,8 @@ import traceback as _traceback
 _NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 if _NODE_DIR not in sys.path:
     sys.path.insert(0, _NODE_DIR)
+
+_log = logging.getLogger(__name__)
 
 from aiohttp import web
 from local_placeholders import (
@@ -44,7 +47,7 @@ from output_converter import (
     DEFAULTS as _CONVERTER_DEFAULTS,
 )
 from output_saver import save_output_image, DEFAULTS as _SAVER_DEFAULTS
-from timing_trace import Trace, TraceV4, coerce_t0_from_browser
+from timing_trace import Trace, TraceV4, coerce_t0_from_browser, merge_remote_trace_into
 from profiler_trace_v4 import (
     make_event, mark_event, EventTrace, profile_enabled, get_profile_level,
     T0_CLIENT_PRESS, T1_LOCAL_BRIDGE_RECEIVED,
@@ -2543,33 +2546,12 @@ async def _execute_job(item: tuple, item_id: int):
         trace.mark("t10c_local_save_end")
         trace.mark("t10_local_materialized")
         _merged_trace = trace.summary()
-        # Preserve restore timing from the Modal container's trace
+        # Merge remote trace data into the local merged trace using the
+        # shared helper from timing_trace (preserves stages, deltas_ms,
+        # derived_ms, restore, and dependency-validation fields without
+        # overwriting truthfully local materialization values).
         _remote_full = result.get("trace", {})
-        if isinstance(_remote_full, dict):
-            if "restore" in _remote_full:
-                _merged_trace["restore"] = _remote_full["restore"]
-            # Preserve dependency validation fields from remote trace
-            for _dep_field in (
-                "dependency_validation_ms", "dependency_total_ms",
-                "dependency_validation_result", "dependency_validation_cache_layer",
-                "dependency_validation_cache_hit", "dependency_validation_reason",
-                "dependency_validation_baked_hash", "dependency_validation_current_hash",
-                "dependency_validation_changed_nodes",
-                "dependency_pre_key_check_ms", "dependency_baked_manifest_load_ms",
-                "dependency_source_root_resolve_ms", "dependency_fingerprint_ms",
-                "dependency_cache_key_ms", "dependency_memory_lookup_ms",
-                "dependency_sentinel_lookup_ms", "dependency_full_validation_ms",
-                "dependency_sentinel_write_ms",
-            ):
-                _dep_v = _remote_full.get(_dep_field)
-                if _dep_v is not None:
-                    _merged_trace[_dep_field] = _dep_v
-            # Also preserve from derived_ms
-            _remote_derived = _remote_full.get("derived_ms", {})
-            if isinstance(_remote_derived, dict):
-                for _rdk, _rdv in _remote_derived.items():
-                    if _rdk not in _merged_trace.get("derived_ms", {}):
-                        _merged_trace.setdefault("derived_ms", {})[_rdk] = _rdv
+        merge_remote_trace_into(_merged_trace, _remote_full)
         result["trace"] = _merged_trace
         if os.environ.get("COMFYMODAL_TRACE_DEBUG_LOG"):
             _dbg_path = os.path.join(_NODE_DIR, "_trace_debug.log")
@@ -5325,7 +5307,9 @@ if _server:
         try:
             store = REGISTRY.store(exp_id)
             et = ev.get("type", "")
-            data = ev.get("data", {}) or {}
+            # Shallow-copy so downstream mutation (data.pop, etc.) never
+            # affects the caller's original ev dict.
+            data = dict(ev.get("data", {}) or {})
 
             # Phase 9: forward non-terminal progress events to the UI
             if et in {"cell.started", "checkpoint.started", "cell.progress", "sampler.step"}:
@@ -5453,14 +5437,15 @@ if _server:
                             payload["output_policy"] = data.get("output_policy", {})
                             # B6: no base64 in durable events
                             data.pop("result", None)
-                            # B2 step 10: rename tmp to final path
+                            # B2 step 10: rename tmp to final path.
+                            # No inner try/except OSError: if the rename fails,
+                            # the OSError propagates to the materialization
+                            # failure handler below which persists cell.failed
+                            # with output_materialization_failed category.
                             final_dir = str(experiment_dir(exp_id) / "outputs" / cell_key / attempt_id)
-                            try:
-                                if os.path.isdir(output_dir):
-                                    os.makedirs(os.path.dirname(final_dir), exist_ok=True)
-                                    os.replace(output_dir, final_dir)
-                            except OSError:
-                                pass  # tmp cleanup is best-effort
+                            if os.path.isdir(output_dir):
+                                os.makedirs(os.path.dirname(final_dir), exist_ok=True)
+                                os.replace(output_dir, final_dir)
                         except Exception as mat_exc:
                             print(f"[comfyui-modal] materialization failed for {cell_key}: {mat_exc}")
                             # B2: on failure, persist cell.failed instead of cell.completed
@@ -5477,8 +5462,7 @@ if _server:
                         "type": et,
                         "payload": payload,
                     })
-                # Auto-record the cell attempt into run history with full metadata.
-                if materialization_ok:
+                    # Auto-record the cell attempt into run history with full metadata.
                     _record_experiment_cell_history(exp_id, data, payload, et)
             elif et in {"checkpoint.completed", "checkpoint.paused", "checkpoint.stopped"}:
                 store.append_event({
@@ -5486,7 +5470,13 @@ if _server:
                     "payload": data,
                 })
         except Exception:
-            pass
+            _ev_type = ev.get("type", "?") if isinstance(ev, dict) else "?"
+            _ev_attempt = ev.get("data", {}).get("attempt_id", "?") if isinstance(ev, dict) else "?"
+            _log.exception(
+                "Unhandled exception in _on_remote_event: "
+                "exp_id=%s event_type=%s attempt=%s",
+                exp_id, _ev_type, _ev_attempt,
+            )
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/pause")
     async def experiment_pause(request: web.Request) -> web.Response:
@@ -6260,20 +6250,39 @@ if _server:
                 {"status": "error", "message": "presetId and featureId are required"}, status=400
             )
         try:
-            from studio_run_adapter import handle_studio_run, derive_control_schemas_from_snapshot, load_preset_and_snapshot
-            from studio_models import validate_controls_against_schema
-            # Validate controls against snapshot-derived schemas
-            _preset, _snapshot_or_err = load_preset_and_snapshot(preset_id, _NODE_DIR)
-            if _preset is not None:
-                schemas = derive_control_schemas_from_snapshot(_snapshot_or_err)
-                validation_errors = validate_controls_against_schema(controls, schemas, feature_id)
-                if validation_errors:
-                    return web.json_response({
-                        "status": "error",
-                        "message": "Control validation failed",
-                        "errors": validation_errors,
-                    }, status=400)
-            result = handle_studio_run(preset_id, feature_id, controls, _NODE_DIR)
+            from studio_run_adapter import handle_studio_run, validate_studio_request_controls
+            # Validate controls against ALL preset snapshots' schemas
+            # Single run: [preset_id], controls, {} (no axes)
+            _run_validation_errors = validate_studio_request_controls(
+                [preset_id], feature_id, controls, {}, _NODE_DIR,
+            )
+            if _run_validation_errors:
+                return web.json_response({
+                    "status": "error",
+                    "message": "Control validation failed",
+                    "errors": _run_validation_errors,
+                }, status=400)
+            # Extract browser-side trace context.  Primary source is the
+            # top-level "trace" dict sent by newer Studio frontends.
+            # Fallback: legacy callers embed t0 timestamps inside a
+            # "metadata" dict — only use it when it contains recognised
+            # t0 trace fields so existing callers do not lose timestamps
+            # while the frontend alignment lands.
+            _body = body or {}
+            _TRACE_T0_FIELDS = frozenset({"t0_perf_ms", "t0_perf_now_ms",
+                                           "t0_client_press", "t0_client_press_ms"})
+            raw_trace = _body.get("trace")
+            if isinstance(raw_trace, dict):
+                browser_trace: dict = raw_trace
+            else:
+                metadata = _body.get("metadata", {}) or {}
+                if isinstance(metadata, dict):
+                    recognized = {k: v for k, v in metadata.items()
+                                  if k in _TRACE_T0_FIELDS}
+                    browser_trace = recognized if recognized else {}
+                else:
+                    browser_trace = {}
+            result = handle_studio_run(preset_id, feature_id, controls, _NODE_DIR, trace_ctx=browser_trace)
             status_code = 200 if result.get("status") == "ok" else 400
             return web.json_response(result, status=status_code)
         except Exception:
@@ -6309,42 +6318,21 @@ if _server:
                 status=400,
             )
         try:
-            from studio_run_adapter import handle_studio_experiment, derive_control_schemas_from_snapshot, load_preset_and_snapshot
-            from studio_models import validate_controls_against_schema
-            # Validate experiment controls/axes against snapshot-derived schemas
-            # Use the first preset's snapshot for schema derivation
-            _first_preset, _first_snap = None, None
-            for _pid in preset_ids:
-                _fp, _fs = load_preset_and_snapshot(_pid, _NODE_DIR)
-                if _fp is not None:
-                    _first_preset, _first_snap = _fp, _fs
-                    break
-            if _first_snap is not None:
-                schemas = derive_control_schemas_from_snapshot(_first_snap)
-                exp_errors: list[dict] = []
-                # Validate shared defaults (one shot — flat dict is safe here)
-                _defaults = experiment_def.get("defaults", {}) or {}
-                if _defaults:
-                    exp_errors.extend(validate_controls_against_schema(
-                        _defaults, schemas, feature_id,
-                        strict_unknown_rejection=False,
-                    ))
-                # Validate each axis value INDIVIDUALLY — do NOT flatten into
-                # a single dict because later values would overwrite earlier
-                # ones, silently skipping validation of earlier values.
-                for _axis_id, _axis_def in (experiment_def.get("axes", {}) or {}).items():
-                    if isinstance(_axis_def, dict) and _axis_def.get("values"):
-                        for _v in _axis_def["values"]:
-                            exp_errors.extend(validate_controls_against_schema(
-                                {_axis_id: _v}, schemas, feature_id,
-                                strict_unknown_rejection=False,
-                            ))
-                if exp_errors:
-                    return web.json_response({
-                        "status": "error",
-                        "message": "Experiment control validation failed",
-                        "errors": exp_errors,
-                    }, status=400)
+            from studio_run_adapter import handle_studio_experiment, validate_studio_request_controls
+            # Validate experiment controls/axes against ALL preset schemas
+            # (no first-valid-preset shortcut — heterogeneous presets must
+            # reject values valid for A but invalid for B)
+            _exp_defaults = experiment_def.get("defaults", {}) or {}
+            _exp_axes = experiment_def.get("axes", {}) or {}
+            _exp_validation_errors = validate_studio_request_controls(
+                preset_ids, feature_id, _exp_defaults, _exp_axes, _NODE_DIR,
+            )
+            if _exp_validation_errors:
+                return web.json_response({
+                    "status": "error",
+                    "message": "Experiment control validation failed",
+                    "errors": _exp_validation_errors,
+                }, status=400)
             result = handle_studio_experiment(preset_ids, feature_id, experiment_def, _NODE_DIR)
             status_code = 200 if result.get("status") == "ok" else 400
             return web.json_response(result, status=status_code)

@@ -605,4 +605,13 @@ def validate_controls_against_schema(
                         "message": f"Value for {field!r} must be a boolean, got {type(value).__name__}",
                     })
 
+        elif kind in ("string", "multiline"):
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                errors.append({
+                    "field": field,
+                    "message": f"Value for {field!r} must be a string, got {type(value).__name__}",
+                })
+
     return errors
