@@ -454,6 +454,34 @@ def resolve_and_inject_cell(
         if h_slot:
             _set_path_value(wf, h_slot, height)
 
+    # ── 6.5. Inject nonstandard (extra) axes through slot paths ──
+    # Handles axes not covered by the 6 sampler axes or resolution.
+    # Each extra axis is looked up by name in profile_slots; if a slot
+    # is found its path is validated and the scalar value injected.
+    _HANDLED_AXES = frozenset({
+        "seed", "steps", "guidance", "sampler", "scheduler", "denoise",
+        "resolution", "lora_model_strengths", "lora_clip_strengths",
+    })
+    for _ax_key, _ax_val in axis_values.items():
+        if _ax_key in _HANDLED_AXES:
+            continue
+        if is_workflow_owned(_ax_val):
+            continue
+        _slot = _find_slot_by_category(profile_slots, _ax_key)
+        if _slot is None:
+            raise MissingMappedField(
+                f"Axis {_ax_key!r} has value {_ax_val!r} but no slot is "
+                f"mapped for it in profile {profile_id!r}. "
+                f"Bind the slot in the preset wizard before using this axis.",
+                profile_id=profile_id,
+            )
+        # Validate the target slot path
+        _node_id = str(_slot.get("node_id", ""))
+        _path = _slot.get("path", [])
+        if _node_id and _path:
+            _validate_path(wf, _node_id, _path, _ax_key, profile_id)
+            _set_path_value(wf, _slot, _ax_val)
+
     # ── 7. Inject input image (i2i) ────────────────────────────────
     input_image_data = None
     image_hash = cell.get("input_image_hash", "")

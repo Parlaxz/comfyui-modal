@@ -65,6 +65,33 @@ _CHEAP_AXIS_ORDER = (
     "seed",
 )
 
+# ── Extra axis handling ─────────────────────────────────────────────────
+
+def _build_axis_values(*, sampler, scheduler, steps, steps_val,
+                       guidance, guidance_val, denoise, denoise_val,
+                       model_str, clip_str, width, width_val,
+                       height, height_val, seed, seed_val,
+                       extra) -> dict:
+    """Build axis_values dict including any extra non-special axes."""
+    result = {
+        "sampler": sampler if (sampler is not None and not is_workflow_owned(sampler)) else WORKFLOW_OWNED,
+        "scheduler": scheduler if (scheduler is not None and not is_workflow_owned(scheduler)) else WORKFLOW_OWNED,
+        "steps": steps_val if (steps is not None and not is_workflow_owned(steps)) else WORKFLOW_OWNED,
+        "guidance": guidance_val if (guidance is not None and not is_workflow_owned(guidance)) else WORKFLOW_OWNED,
+        "denoise": denoise_val if (denoise is not None and not is_workflow_owned(denoise)) else WORKFLOW_OWNED,
+        "lora_model_strengths": model_str,
+        "lora_clip_strengths": clip_str,
+        "resolution": (width_val, height_val) if (width is not None and not is_workflow_owned(width)) else WORKFLOW_OWNED,
+        "seed": seed_val if (seed is not None and not is_workflow_owned(seed)) else WORKFLOW_OWNED,
+    }
+    if extra:
+        for _ek, _ev in extra.items():
+            if is_workflow_owned(_ev):
+                result[_ek] = WORKFLOW_OWNED
+            else:
+                result[_ek] = _ev
+    return result
+
 
 # ── Public API ──────────────────────────────────────────────────────────
 
@@ -110,6 +137,14 @@ def compile_experiment(spec: dict) -> dict:
 
     shared_axes = (spec.get("axes", {}) or {}).get("shared", {}) or {}
     per_workflow_axes = (spec.get("axes", {}) or {}).get("per_workflow", {}) or {}
+
+    # Axes that are handled internally by the compiler (not expanded generically).
+    _COMPILER_INTERNAL_AXES = frozenset({
+        "sampler", "scheduler", "steps", "guidance", "denoise",
+        "lora_model_strengths", "lora_clip_strengths", "resolution", "seed",
+        # Studio-special axes handled at the adapter level
+        "prompt", "negative_prompt",
+    })
 
     warnings: list[str] = []
     checkpoints_out: list[dict] = []
@@ -187,6 +222,19 @@ def compile_experiment(spec: dict) -> dict:
                 ck_cell_count = 0
                 # Build per-checkpoint axis resolution
                 axis_values_per_axis: dict[str, list] = {}
+                extra_axis_names: list[str] = []
+                extra_axis_value_lists: list[list] = []
+                # Collect extra (non-internal) axes from shared and per-workflow.
+                # Per-workflow values override shared for identical names,
+                # matching standard-axis override semantics.
+                _extra_axis_map: dict[str, list] = {}
+                for _src_axes in (shared_axes, pw_axes):
+                    for _name in _src_axes:
+                        if _name in _COMPILER_INTERNAL_AXES:
+                            continue
+                        _extra_axis_map[_name] = _axis_values(_src_axes.get(_name))
+                extra_axis_names = list(_extra_axis_map.keys())
+                extra_axis_value_lists = list(_extra_axis_map.values())
                 for axis_name in _CHEAP_AXIS_ORDER:
                     if axis_name == "lora_model_strengths" or axis_name == "lora_clip_strengths":
                         # handled inside LoRA loop
@@ -229,39 +277,78 @@ def compile_experiment(spec: dict) -> dict:
                                                     else:
                                                         width, height = _res_item
                                                     for seed in axis_values_per_axis["seed"]:
-                                                        sequence += 1
-                                                        cell = _build_cell(
-                                                            spec=spec,
-                                                            sequence=sequence,
-                                                            ck_id=ck_id,
-                                                            profile_id=profile_id,
-                                                            group_id=group_id,
-                                                            triple_id=triple_id,
-                                                            triple=triple,
-                                                            lora_id=lora_id,
-                                                            lora_signature=lora_signature,
-                                                            model_str=model_str,
-                                                            clip_str=clip_str,
-                                                            prompt_id=prompt_id,
-                                                            prompt_text=prompt_text,
-                                                            negative=negative,
-                                                            image_id=image_id,
-                                                            image_hash=image_hash,
-                                                            sampler=sampler,
-                                                            scheduler=scheduler,
-                                                            steps=steps,
-                                                            guidance=guidance,
-                                                            denoise=denoise,
-                                                            width=width,
-                                                            height=height,
-                                                            seed=seed,
-                                                        )
-                                                        if cell["cell_key"] in seen_keys:
-                                                            duplicate_count += 1
+                                                        if extra_axis_names and extra_axis_value_lists:
+                                                            for _extra_combo in itertools.product(*extra_axis_value_lists):
+                                                                _extra_av = dict(zip(extra_axis_names, _extra_combo))
+                                                                sequence += 1
+                                                                cell = _build_cell(
+                                                                    spec=spec,
+                                                                    sequence=sequence,
+                                                                    ck_id=ck_id,
+                                                                    profile_id=profile_id,
+                                                                    group_id=group_id,
+                                                                    triple_id=triple_id,
+                                                                    triple=triple,
+                                                                    lora_id=lora_id,
+                                                                    lora_signature=lora_signature,
+                                                                    model_str=model_str,
+                                                                    clip_str=clip_str,
+                                                                    prompt_id=prompt_id,
+                                                                    prompt_text=prompt_text,
+                                                                    negative=negative,
+                                                                    image_id=image_id,
+                                                                    image_hash=image_hash,
+                                                                    sampler=sampler,
+                                                                    scheduler=scheduler,
+                                                                    steps=steps,
+                                                                    guidance=guidance,
+                                                                    denoise=denoise,
+                                                                    width=width,
+                                                                    height=height,
+                                                                    seed=seed,
+                                                                    extra_axis_values=_extra_av,
+                                                                )
+                                                                if cell["cell_key"] in seen_keys:
+                                                                    duplicate_count += 1
+                                                                else:
+                                                                    seen_keys[cell["cell_key"]] = sequence
+                                                                cells_out.append(cell)
+                                                                ck_cell_count += 1
                                                         else:
-                                                            seen_keys[cell["cell_key"]] = sequence
-                                                        cells_out.append(cell)
-                                                        ck_cell_count += 1
+                                                            sequence += 1
+                                                            cell = _build_cell(
+                                                                spec=spec,
+                                                                sequence=sequence,
+                                                                ck_id=ck_id,
+                                                                profile_id=profile_id,
+                                                                group_id=group_id,
+                                                                triple_id=triple_id,
+                                                                triple=triple,
+                                                                lora_id=lora_id,
+                                                                lora_signature=lora_signature,
+                                                                model_str=model_str,
+                                                                clip_str=clip_str,
+                                                                prompt_id=prompt_id,
+                                                                prompt_text=prompt_text,
+                                                                negative=negative,
+                                                                image_id=image_id,
+                                                                image_hash=image_hash,
+                                                                sampler=sampler,
+                                                                scheduler=scheduler,
+                                                                steps=steps,
+                                                                guidance=guidance,
+                                                                denoise=denoise,
+                                                                width=width,
+                                                                height=height,
+                                                                seed=seed,
+                                                                extra_axis_values={},
+                                                            )
+                                                            if cell["cell_key"] in seen_keys:
+                                                                duplicate_count += 1
+                                                            else:
+                                                                seen_keys[cell["cell_key"]] = sequence
+                                                            cells_out.append(cell)
+                                                            ck_cell_count += 1
 
                 checkpoints_out.append({
                     "id": ck_id,
@@ -449,7 +536,7 @@ def _build_cell(*, spec, sequence, ck_id, profile_id, group_id, triple_id,
                 triple, lora_id, lora_signature, model_str, clip_str,
                 prompt_id, prompt_text, negative, image_id, image_hash,
                 sampler, scheduler, steps, guidance, denoise, width, height,
-                seed) -> dict:
+                seed, extra_axis_values=None) -> dict:
     from experiment_models import canonical_hash
 
     # Coerce WORKFLOW_OWNED / None axes to safe defaults for the cell key.
@@ -485,6 +572,7 @@ def _build_cell(*, spec, sequence, ck_id, profile_id, group_id, triple_id,
     # Build cell key hash from a plain dict (not a CellKey dataclass).
     # All axes use sentinel defaults (0, 0.0, "", etc.) when workflow-owned
     # so that two cells with the same workflow-owned values hash identically.
+    extra = extra_axis_values or {}
     key_dict = {
         "experiment_id": spec.get("experiment_id", ""),
         "profile_id": profile_id,
@@ -505,6 +593,15 @@ def _build_cell(*, spec, sequence, ck_id, profile_id, group_id, triple_id,
         "width": width_val,
         "height": height_val,
     }
+    # Include extra (non-special) axis values in the hash for determinism
+    for _ek in sorted(extra.keys()):
+        _ev = extra[_ek]
+        if is_workflow_owned(_ev):
+            key_dict[_ek] = ""
+        elif isinstance(_ev, (int, float)):
+            key_dict[_ek] = _ev
+        else:
+            key_dict[_ek] = str(_ev)
     cell_key = canonical_hash(key_dict)
     # Compute normalised dimensions (stable metadata for results grouping).
     if width is not None and not is_workflow_owned(width):
@@ -545,15 +642,14 @@ def _build_cell(*, spec, sequence, ck_id, profile_id, group_id, triple_id,
             "prompt_id": prompt_id,
             "image_id": image_id,
         },
-        "axis_values": {
-            "sampler": sampler if (sampler is not None and not is_workflow_owned(sampler)) else WORKFLOW_OWNED,
-            "scheduler": scheduler if (scheduler is not None and not is_workflow_owned(scheduler)) else WORKFLOW_OWNED,
-            "steps": steps_val if (steps is not None and not is_workflow_owned(steps)) else WORKFLOW_OWNED,
-            "guidance": guidance_val if (guidance is not None and not is_workflow_owned(guidance)) else WORKFLOW_OWNED,
-            "denoise": denoise_val if (denoise is not None and not is_workflow_owned(denoise)) else WORKFLOW_OWNED,
-            "lora_model_strengths": model_str,
-            "lora_clip_strengths": clip_str,
-            "resolution": (width_val, height_val) if (width is not None and not is_workflow_owned(width)) else WORKFLOW_OWNED,
-            "seed": seed_val if (seed is not None and not is_workflow_owned(seed)) else WORKFLOW_OWNED,
-        },
+        "axis_values": _build_axis_values(
+            sampler=sampler, scheduler=scheduler, steps=steps, steps_val=steps_val,
+            guidance=guidance, guidance_val=guidance_val,
+            denoise=denoise, denoise_val=denoise_val,
+            model_str=model_str, clip_str=clip_str,
+            width=width, width_val=width_val,
+            height=height, height_val=height_val,
+            seed=seed, seed_val=seed_val,
+            extra=extra,
+        ),
     }

@@ -1134,6 +1134,23 @@ class StackLoraRepresentabilityTests(unittest.TestCase):
         )
 
     # ── Scenario 10 ───────────────────────────────────────────────────
+    def test_per_workflow_extra_axis_overrides_shared(self):
+        """When an extra (non-internal) axis appears in both shared and
+        per_workflow, per_workflow values must be used, matching normal-axis
+        override semantics (shared first, per_workflow wins)."""
+        c = load_compiler()
+        spec = _minimal_spec()
+        # Add a custom extra axis to both shared and per_workflow with
+        # different values — per_workflow [99] must win over shared [1, 2].
+        spec["axes"]["shared"]["my_custom_param"] = {"mode": "list", "values": [1, 2]}
+        spec["axes"]["per_workflow"]["p1"]["my_custom_param"] = {"mode": "list", "values": [99]}
+        result = c.compile_experiment(spec)
+        for cell in result["cells"]:
+            self.assertEqual(
+                cell["axis_values"]["my_custom_param"], 99,
+                "per_workflow extra axis value must override shared value"
+            )
+
     def test_controlled_lora_config_one_per_workflow(self):
         """Controlled LoRA configuration, one per workflow.
 
