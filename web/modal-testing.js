@@ -65,6 +65,25 @@ function _inertBackground(inert) {
   });
 }
 
+// ── Wizard-inert invariant ──────────────────────────────────────────────
+//
+// Establish one rule: active .comfymodal-studio-wizard-overlay =>
+//   graph background non-inert AND .comfymodal-studio-modal not
+//   aria-modal (clicking the graph is intentionally permitted);
+//   no wizard + open modal => background inert and aria-modal="true".
+
+function _syncModalWizardState() {
+  var wizardOv = document.querySelector(".comfymodal-studio-wizard-overlay");
+  var modalRoot = document.querySelector(".comfymodal-studio-modal");
+  if (wizardOv) {
+    _inertBackground(false);
+    if (modalRoot) modalRoot.removeAttribute("aria-modal");
+  } else if (_isOpen) {
+    _inertBackground(true);
+    if (modalRoot) modalRoot.setAttribute("aria-modal", "true");
+  }
+}
+
 const MODAL_PREFIX = "/comfymodal";
 const TAB_DASHBOARD = "dashboard";
 const TAB_SETUP = "setup";
@@ -244,6 +263,10 @@ export function open_testing_modal(tabName) {
     }
     _isOpen = true;
     updateDiag("modalOpen", true);
+    // Sync wizard/modal state — if a wizard overlay already exists
+    // (opened before this cached reopen), release inert + remove
+    // aria-modal so the graph stays clickable.
+    _syncModalWizardState();
     // Move focus into the modal
     var focusTarget = _shellCache.overlay.querySelector(".comfymodal-testing-close, .comfymodal-studio-topnav button, [data-page]");
     if (focusTarget) focusTarget.focus();
@@ -324,6 +347,11 @@ export function open_testing_modal(tabName) {
   _hostEl.appendChild(shell.overlay);
   _isOpen = true;
   updateDiag("modalOpen", true);
+
+  // Sync wizard/modal state — if a wizard overlay already exists
+  // (e.g. opened before this first modal open), release inert + remove
+  // aria-modal so the graph stays clickable.
+  _syncModalWizardState();
 
   // Move focus into the modal
   var focusTarget = shell.overlay.querySelector(".comfymodal-testing-close, .comfymodal-studio-topnav button, [data-page]");
@@ -538,6 +566,15 @@ app.registerExtension({
       document.addEventListener("comfymodal.open-section", handleOpenSection);
       _openSectionRegistered = true;
     }
+
+    // Wizard inert + aria-modal handoff: centralized invariant
+    // helper enforces the correct state on open/close.
+    document.addEventListener("comfymodal:wizard-opening", () => {
+      _syncModalWizardState();
+    });
+    document.addEventListener("comfymodal:wizard-closed", () => {
+      _syncModalWizardState();
+    });
 
     window.open_testing_modal = open_testing_modal;
     window.close_testing_modal = close_testing_modal;

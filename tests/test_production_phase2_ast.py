@@ -42,7 +42,10 @@ class ProductionPhase2InitPyAstTests(unittest.TestCase):
 
     def test_execute_job_warmup_uses_execution_workflow(self):
         source = INIT_PATH.read_text(encoding="utf-8")
-        self.assertIn("_build_next_warmup_activation(execution_workflow, prompt_hash)", source)
+        # The warmup profile preparation now delegates to shared helper
+        self.assertIn("prepare_active_next_profile(", source)
+        self.assertIn("execution_workflow", source)
+        self.assertIn("prompt_hash", source)
 
     def test_execute_job_run_prompt_uses_execution_workflow(self):
         source = INIT_PATH.read_text(encoding="utf-8")

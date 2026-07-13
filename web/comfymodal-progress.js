@@ -694,19 +694,94 @@ export function createScopedTracker(api, identity) {
       if (!_locked) {
         _locked = true;
         state.startTime = Date.now();
-        state.stage = "generating";
         _startTimer();
       }
 
-      // Update sampler progress fields
-      if (d.step != null || d.value != null) {
-        state.samplerStep = d.step ?? d.value;
-        state.samplerMaximum = d.max ?? d.max_step ?? d.maxStep ?? state.samplerMaximum;
+      // ── totalNodes: set from positive numeric payload field ────────────
+      // Derives from the backend's truthful workflow node count.  Only
+      // positive numbers overwrite the tracker value; null/0/undefined
+      // preserve the existing denominator so sampler progress retains a
+      // determinate total.
+      const incomingTotal = d.total_nodes != null ? d.total_nodes : d.totalNodes;
+      if (incomingTotal != null && typeof incomingTotal === 'number' && incomingTotal > 0) {
+        state.totalNodes = incomingTotal;
       }
-      if (d.queue != null) state.queuePosition = d.queue;
 
-      if (state.samplerMaximum > 0 && state.samplerStep != null) {
-        state.samplerPercent = (state.samplerStep / state.samplerMaximum) * 100;
+      // ── Map type-specific fields from stream_event_sink payloads ───────
+      const msgType = d.type || '';
+
+      if (msgType === 'status') {
+        // Phase/message status updates (startup, warmup).
+        // Does NOT change currentNodeId, completedNodes, or sampler state.
+        state.message = d.message || state.message || '';
+        if (d.phase === 'startup' || d.phase === 'warmup') {
+          state.stage = 'startup';
+        }
+      } else if (msgType === 'cell.executing') {
+        // Node-level execution update — mirrors the scoped onExecuting
+        // handler logic (deduplicates in _nodesSeen, tracks wall-clock,
+        // computes overallPercent, resets sampler phase).
+        const node = d.node;
+        if (node == null) {
+          // node=null means the previous node finished (no-op for progress)
+          // but do not update state.
+        } else {
+          // Record previous node's wall-clock duration
+          if (state.currentNodeId != null && state._nodeStartTime) {
+            const prevDur = Date.now() - state._nodeStartTime;
+            state._nodeTimes[String(state.currentNodeId)] = prevDur;
+          }
+          state.currentNodeId = node;
+          state._nodeStartTime = Date.now();
+
+          // Ensure _nodesSeen is initialised, then deduplicate
+          if (!state._nodesSeen) state._nodesSeen = new Set();
+          state._nodesSeen.add(node);
+          state.completedNodes = state._nodesSeen.size;
+
+          // Compute overall percent from completedNodes / totalNodes
+          if (state.totalNodes > 0) {
+            state.overallPercent = (state.completedNodes / state.totalNodes) * 100;
+          } else {
+            state.overallPercent = null;
+          }
+
+          // Reset sampler phase for the new node
+          state.samplerStep = 0;
+          state.samplerMaximum = 0;
+          state.samplerPercent = null;
+
+          state.stage = "generating";
+        }
+      } else if (msgType === 'sampler.step') {
+        // Sampler step progress. Preserves totalNodes from earlier events.
+        state.stage = 'generating';
+        if (d.step != null || d.value != null) {
+          state.samplerStep = d.step ?? d.value;
+          state.samplerMaximum = d.max ?? d.max_step ?? d.maxStep ?? state.samplerMaximum;
+        }
+        if (d.queue != null) state.queuePosition = d.queue;
+
+        if (state.samplerMaximum > 0 && state.samplerStep != null) {
+          state.samplerPercent = (state.samplerStep / state.samplerMaximum) * 100;
+        }
+      } else if (msgType === 'cell.failed') {
+        // Cell-level error — does NOT transition to done/error (terminal
+        // events own that transition), but does set error message so
+        // tracker shows the failure reason.
+        state.message = d.message || state.message || '';
+      } else {
+        // Backward compat: payloads without an explicit "type" field
+        // (older format) still update sampler fields
+        if (d.step != null || d.value != null) {
+          state.samplerStep = d.step ?? d.value;
+          state.samplerMaximum = d.max ?? d.max_step ?? d.maxStep ?? state.samplerMaximum;
+        }
+        if (d.queue != null) state.queuePosition = d.queue;
+
+        if (state.samplerMaximum > 0 && state.samplerStep != null) {
+          state.samplerPercent = (state.samplerStep / state.samplerMaximum) * 100;
+        }
       }
 
       _notify();

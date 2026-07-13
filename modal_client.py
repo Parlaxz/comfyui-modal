@@ -218,21 +218,47 @@ async def run_prompt_stream(
       ``{"type": "result", "data": {...}}`` — final result (last yield).
       ``{"type": "error", "message": "..."}`` — fatal error.
     """
+    import time as _t
     selected = _resolve_workspace(workspace)
     gen = None
+    # ── Local observation markers on the mutable trace dict ────────────
+    # These are wall-clock observations from THIS side of the Modal
+    # client — they do NOT observe internal platform restore boundaries.
+    _is_dict_trace = isinstance(trace, dict)
+
+    if _is_dict_trace:
+        trace.setdefault("t2_local_dispatch", _t.time())
+        trace["modal_handle_lookup_started"] = _t.time()
     print(f"[modal-client] phase=pre_gen workspace={selected.get('name', '?')} gpu={gpu or 'default'}")
     # Semaphore only serializes remote-generator creation, not iteration.
     # This prevents a caller that breaks early from blocking the next request.
     async with _run_prompt_semaphore:
+        if _is_dict_trace:
+            trace["modal_handle_lookup_completed"] = _t.time()
+            trace["remote_generator_create_started"] = _t.time()
         gen = _workspace_api(selected, gpu).run_prompt_stream.remote_gen.aio(
             workflow, input_images or {}, trace or {}, modal_options or {},
         )
+        if _is_dict_trace:
+            trace["remote_generator_create_completed"] = _t.time()
     print(f"[modal-client] phase=post_gen gen_created=True")
+    if _is_dict_trace:
+        _now_iter = _t.time()
+        trace["remote_generator_iteration_started"] = _now_iter
+        # remote_submit: same local-observation time as iteration start,
+        # marking that the remote generator handoff is complete and the
+        # first event is awaited.  This is an alias so both local-driven
+        # (run_cell) and modal_client-driven flows produce a submit marker.
+        if "remote_submit" not in trace:
+            trace["remote_submit"] = _now_iter
+            trace.setdefault("t2_local_dispatch", _now_iter)
     _first_client_msg = True
     try:
         async for msg in gen:
             if _first_client_msg:
                 _first_client_msg = False
+                if _is_dict_trace:
+                    trace["first_remote_message_received"] = _t.time()
                 print(f"[modal-client] phase=first_msg arrived=True")
             yield msg
     except TimeoutError:

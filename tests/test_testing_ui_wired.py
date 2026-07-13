@@ -1725,5 +1725,165 @@ class RemainingTokenTests(_JsTestBase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Regression: Wizard interaction mode must release graph/background inertness
+# on wizard opening and restore it when the wizard closes.
+# Root cause: commit 0e1c8a9 introduced _inertBackground(true) in
+# open_testing_modal (modal-testing.js:222) which blocks the preset wizard's
+# graph binding capture (beginGraphBindingCapture needs the graph clickable).
+# ---------------------------------------------------------------------------
+
+class WizardInertInteractionTests(_JsTestBase):
+    """Regression tests: wizard interaction mode must release background
+    inertness on wizard opening and restore it when the wizard closes."""
+
+    def test_wizard_opening_dispatches_custom_event(self):
+        """openPresetWizard must dispatch a custom DOM event so the
+        modal can release background inertness."""
+        text = self._read("studio-preset-wizard.js")
+        self.assertIn(
+            "comfymodal:wizard-opening",
+            text,
+            "openPresetWizard must dispatch comfymodal:wizard-opening "
+            "so modal-testing.js can release inert on background elements",
+        )
+
+    def test_wizard_closing_dispatches_custom_event(self):
+        """closePresetWizard must dispatch a custom DOM event so the
+        modal can restore background inertness (if parent modal remains open)."""
+        text = self._read("studio-preset-wizard.js")
+        self.assertIn(
+            "comfymodal:wizard-closed",
+            text,
+            "closePresetWizard must dispatch comfymodal:wizard-closed "
+            "so modal-testing.js can re-apply inert on background elements",
+        )
+
+    def test_modal_wizard_opening_handler_calls_sync_modal_wizard_state(self):
+        """modal-testing.js wizard-opening handler body must call
+        _syncModalWizardState() (not bare _inertBackground)."""
+        text = self._read("modal-testing.js")
+        idx = text.find('"comfymodal:wizard-opening"')
+        self.assertGreater(
+            idx, -1,
+            "modal-testing.js must addEventListener for comfymodal:wizard-opening",
+        )
+        # Extract handler body: from the event name up to 120 chars
+        body = text[idx:idx + 120]
+        self.assertIn(
+            "_syncModalWizardState()",
+            body,
+            "wizard-opening handler body must call _syncModalWizardState()",
+        )
+
+    def test_modal_wizard_closed_handler_calls_sync_modal_wizard_state(self):
+        """modal-testing.js wizard-closed handler body must call
+        _syncModalWizardState() (not bare _inertBackground)."""
+        text = self._read("modal-testing.js")
+        idx = text.find('"comfymodal:wizard-closed"')
+        self.assertGreater(
+            idx, -1,
+            "modal-testing.js must addEventListener for comfymodal:wizard-closed",
+        )
+        body = text[idx:idx + 120]
+        self.assertIn(
+            "_syncModalWizardState()",
+            body,
+            "wizard-closed handler body must call _syncModalWizardState()",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Oracle-identified lifecycle failures: invariant between wizard overlay
+# presence and background inert + aria-modal state.
+# HIGH: cached reopen ignores wizard → leaves inert, initial open with
+# wizard → inert, and while wizard permits outside clicks aria-modal
+# stays "true" (semantic contradiction).
+# ---------------------------------------------------------------------------
+
+class WizardInertAriaInvariantTests(_JsTestBase):
+    """Invariant: active wizard overlay => graph background non-inert
+    and parent dialog NOT aria-modal; no wizard + open parent modal =>
+    background inert and aria-modal="true".  Handles first open and
+    cached reopen."""
+
+    def test_sync_modal_wizard_state_defines_invariant_helper(self):
+        """modal-testing.js must define _syncModalWizardState that
+        queries for .comfymodal-studio-wizard-overlay and toggles
+        inert + aria-modal to enforce the invariant."""
+        text = self._read("modal-testing.js")
+        self.assertIn(
+            "function _syncModalWizardState",
+            text,
+            "Expected _syncModalWizardState() helper in modal-testing.js",
+        )
+        self.assertIn(
+            "comfymodal-studio-wizard-overlay",
+            text,
+            "_syncModalWizardState must query for wizard overlay",
+        )
+
+    def test_open_testing_modal_calls_sync_in_both_paths(self):
+        """open_testing_modal must call _syncModalWizardState() in
+        both the initial-open and cached-reopen paths so wizard
+        overlay is respected on first open and on re-show."""
+        text = self._read("modal-testing.js")
+        count = text.count("_syncModalWizardState()")
+        self.assertGreaterEqual(
+            count, 2,
+            f"Expected at least 2 calls to _syncModalWizardState() "
+            f"(initial open + cached reopen), found {count}",
+        )
+
+    def test_wizard_opening_handler_calls_sync(self):
+        """comfymodal:wizard-opening listener must call
+        _syncModalWizardState to release inert + remove aria-modal."""
+        text = self._read("modal-testing.js")
+        idx = text.find("wizard-opening")
+        if idx < 0:
+            self.fail("comfymodal:wizard-opening listener not found")
+        block = text[idx:idx + 200]
+        self.assertIn(
+            "_syncModalWizardState",
+            block,
+            "wizard-opening handler must call _syncModalWizardState",
+        )
+
+    def test_wizard_closed_handler_calls_sync(self):
+        """comfymodal:wizard-closed listener must call
+        _syncModalWizardState to restore inert + aria-modal."""
+        text = self._read("modal-testing.js")
+        idx = text.find("wizard-closed")
+        if idx < 0:
+            self.fail("comfymodal:wizard-closed listener not found")
+        block = text[idx:idx + 200]
+        self.assertIn(
+            "_syncModalWizardState",
+            block,
+            "wizard-closed handler must call _syncModalWizardState",
+        )
+
+    def test_sync_removes_aria_modal_when_wizard_active(self):
+        """_syncModalWizardState must removeAttribute('aria-modal')
+        on .comfymodal-studio-modal when wizard overlay exists."""
+        text = self._read("modal-testing.js")
+        self.assertIn(
+            'removeAttribute("aria-modal"',
+            text,
+            "_syncModalWizardState must remove aria-modal when wizard active",
+        )
+
+    def test_sync_sets_aria_modal_when_wizard_absent_modal_open(self):
+        """_syncModalWizardState must setAttribute('aria-modal','true')
+        on .comfymodal-studio-modal when no wizard overlay and modal
+        is open."""
+        text = self._read("modal-testing.js")
+        self.assertIn(
+            'setAttribute("aria-modal"',
+            text,
+            "_syncModalWizardState must restore aria-modal when wizard absent",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

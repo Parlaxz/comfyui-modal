@@ -150,6 +150,13 @@ export function openPresetWizard(onDone, apiBase, existingPreset, existingSnapsh
   }
 
   renderWizard(panel, _wizardState);
+
+  // Notify modal layer that wizard is opening so it can release
+  // background inertness (blocked by _inertBackground(true) in
+  // open_testing_modal). The wizard's graph binding capture
+  // (beginGraphBindingCapture) needs the underlying ComfyUI graph
+  // clickable — inert on ancestors blocks all pointer events.
+  document.dispatchEvent(new CustomEvent("comfymodal:wizard-opening"));
 }
 
 export function closePresetWizard() {
@@ -177,6 +184,10 @@ export function closePresetWizard() {
 
   _wizardRoot = null;
   _wizardState = null;
+
+  // Notify modal layer that wizard has closed so it can restore
+  // background inertness (if the parent modal is still open).
+  document.dispatchEvent(new CustomEvent("comfymodal:wizard-closed"));
 }
 
 // ── Render helpers ──────────────────────────────────────────────────────
