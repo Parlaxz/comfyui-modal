@@ -9638,7 +9638,7 @@ class _ComfyAPIMixin:
                                 f"[preload] state=slow_running cancelable=0 action=wait_for_existing_future "
                                 f"session={_preload_session_id}"
                             )
-                            for _f, (_fname, _cache_key, _path) in list(fut_to_item.items()):
+                            for _f, (_fname, _cache_key, _path, _role) in list(fut_to_item.items()):
                                 try:
                                     _consume_preload_future(_f, _fname, _cache_key)
                                 except Exception as exc:
@@ -18040,12 +18040,12 @@ class _ComfyAPIMixin:
                 _cfg_policy = _clip_override.get("restore_direct_clip_policy", "auto")
                 if _cfg_policy == "auto":
                     _clip_override["direct_warmup_clip_encode_effective"] = 0
-                    _clip_override["restore_direct_clip_policy_decision"] = "fastpath_load_only"
+                    _clip_override["restore_direct_clip_policy_decision"] = "load_only_explicit"
                     _clip_policy = _clip_override
                     print(
                         f"[fastpath.v21621.clip_policy] configured_policy=auto "
-                        f"fastpath_load_only=1 effective_load=1 effective_encode=0 "
-                        f"decision=fastpath_load_only"
+                        f"load_only=1 effective_load=1 effective_encode=0 "
+                        f"decision=load_only_explicit"
                     )
             if _production_stable_path:
                 _clip_override = _clip_policy.copy() if _clip_policy else {}
@@ -18247,29 +18247,6 @@ class _ComfyAPIMixin:
                         f"total_ms={_preload_total_ms} overlap_ms={_preload_overlap_ms} "
                         f"await_ms={_preload_await_ms} optional_work_ms={_restore_optional_work_total_ms}"
                     )
-                    if _restore_background_code_enabled():
-                        _rbg = self._maybe_submit_restore_background_unet(profile, _clip_policy, preload_result, restore_start, __stages)
-                        __stages["restore_background_unet_existing_future"] = _rbg.get("existing_future", 0)
-                        __stages["restore_background_unet_object_cache_exists"] = _rbg.get("object_cache_exists", 0)
-                        __stages["restore_background_unet_active_large_reads_at_submit"] = _rbg.get("active_large_reads_at_submit", 0)
-                        # GÃ¶Ã‡GÃ¶Ã‡ Expected-path logs GÃ¶Ã‡GÃ¶Ã‡
-                        _rbg_expected = __stages.get("restore_background_unet_expected_source", "")
-                        _rbg_submitted = __stages.get("restore_background_unet_submitted", 0)
-                        _unet_expected = "restore_background_unet_future" if (_rbg_submitted and _rbg_expected == "restore_background_unet") else "actual_load_or_graph_cache"
-                        _clip_expected = "direct_restore_clip_cache" if _clip_policy.get("direct_warmup_clip_encode_effective", 0) else "direct_restore_clip_load"
-                        _vae_expected = "actual_load_or_graph_cache"
-                        __stages["graph_unet_expected_source"] = _unet_expected
-                        __stages["graph_clip_expected_source"] = _clip_expected
-                        __stages["graph_vae_expected_source"] = _vae_expected
-                        __stages["actual_load_unet_expected_source"] = _unet_expected
-                        __stages["actual_load_clip_expected_source"] = _clip_expected
-                        __stages["actual_load_vae_expected_source"] = _vae_expected
-                        # Log expected paths
-                        print(
-                            f"[comfyapp] expected_source unet={_unet_expected} "
-                            f"clip={_clip_expected} vae={_vae_expected} "
-                            f"rbg_expected={_rbg_expected or 'none'} rbg_submitted={_rbg_submitted}"
-                        )
                     if _production_stable_path and profile:
                         # P1 (corrected): the UNET start boundary is
                         # now actually enforced. The selector is read
@@ -18711,8 +18688,24 @@ class _ComfyAPIMixin:
                                 _ep_te_cls._exact_prefill_phase = "generic_warmup"
                     except Exception:
                         pass
+                    # P2 (audit round 8): When exact-prefill grouping positively
+                    # selects a nonempty matching bundle group, temporarily restore
+                    # effective CLIP encoding so the bundle's exact texts are
+                    # pre-filled during direct warmup. No-bundle or fingerprint
+                    # mismatch leaves the policy as-is (load-only).
+                    if _warmup_texts:
+                        _clip_policy_override = dict(_clip_policy or {})
+                        _clip_policy_override["direct_warmup_clip_encode_effective"] = 1
+                        _clip_policy_override["restore_direct_clip_policy_decision"] = "load_and_encode_explicit"
+                        __stages["exact_prefill_override_clip_encode"] = 1
+                        print(
+                            f"[exact_prefill] bundle_match={len(_warmup_texts)} texts "
+                            f"override_clip_encode=1 policy=load_and_encode_explicit"
+                        )
+                    else:
+                        _clip_policy_override = _clip_policy
                     _dw = self._warmup_direct(profile,
-                        clip_policy_overrides=_clip_policy,
+                        clip_policy_overrides=_clip_policy_override,
                         warmup_text=_warmup_text,
                         warmup_texts=_warmup_texts)
                     # Clear phase context

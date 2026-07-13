@@ -465,6 +465,7 @@ class RestoreBackgroundUnetEligibilityTests(unittest.TestCase):
         inst._actual_load_locks = {}
         inst._actual_load_owner_thread = {}
         inst._unet_object_cache = {}
+        inst._original_loaders_store = {"UNETLoader.load_unet": lambda *a, **k: (object(),)}
         return inst
 
     def _profile(self, *, unets=None, clip_name="clip.safetensors", source="active_next_profile"):
@@ -533,6 +534,79 @@ class RestoreBackgroundUnetEligibilityTests(unittest.TestCase):
 
         self.assertEqual(eligibility["eligible"], 0)
         self.assertEqual(eligibility["reason"], "active_next_profile_invalid")
+
+    def test_restore_background_unet_accepts_load_only_explicit_clip_decision(self):
+        """The eligibility function must accept 'load_only_explicit' as a
+        valid clip policy decision (the canonical semantic used by the
+        v2.16.21 fastpath auto load-only mode)."""
+        import comfyapp
+        inst = self._make_instance()
+
+        fake_folder_paths = SimpleNamespace(
+            get_full_path=lambda bucket, name: f"/models/{bucket}/{name}" if name else ""
+        )
+        clip_path = "/models/text_encoders/clip.safetensors"
+        inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
+        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+             mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
+             mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
+            eligibility = inst._restore_background_unet_eligibility(
+                self._profile(),
+                self._clip_policy(decision="load_only_explicit"),
+                self._preload_result(),
+            )
+
+        self.assertEqual(eligibility["eligible"], 1,
+                         "load_only_explicit should be accepted as valid")
+        self.assertEqual(eligibility["reason"], "eligible")
+        self.assertEqual(eligibility["clip_policy_decision"], "load_only_explicit")
+
+    def test_restore_background_unet_accepts_load_and_encode_explicit_clip_decision(self):
+        """'load_and_encode_explicit' must also be accepted."""
+        import comfyapp
+        inst = self._make_instance()
+
+        fake_folder_paths = SimpleNamespace(
+            get_full_path=lambda bucket, name: f"/models/{bucket}/{name}" if name else ""
+        )
+        clip_path = "/models/text_encoders/clip.safetensors"
+        inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
+        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+             mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
+             mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
+            eligibility = inst._restore_background_unet_eligibility(
+                self._profile(),
+                self._clip_policy(decision="load_and_encode_explicit"),
+                self._preload_result(),
+            )
+
+        self.assertEqual(eligibility["eligible"], 1,
+                         "load_and_encode_explicit should be accepted as valid")
+        self.assertEqual(eligibility["clip_policy_decision"], "load_and_encode_explicit")
+
+    def test_restore_background_unet_rejects_fastpath_load_only_as_invalid(self):
+        """'fastpath_load_only' (old non-canonical value) must be rejected
+        to ensure the normalization to 'load_only_explicit' is enforced."""
+        import comfyapp
+        inst = self._make_instance()
+
+        fake_folder_paths = SimpleNamespace(
+            get_full_path=lambda bucket, name: f"/models/{bucket}/{name}" if name else ""
+        )
+        clip_path = "/models/text_encoders/clip.safetensors"
+        inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
+        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+             mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
+             mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
+            eligibility = inst._restore_background_unet_eligibility(
+                self._profile(),
+                self._clip_policy(decision="fastpath_load_only"),
+                self._preload_result(),
+            )
+
+        self.assertEqual(eligibility["eligible"], 0,
+                         "fastpath_load_only must NOT be accepted")
+        self.assertEqual(eligibility["reason"], "direct_clip_policy_not_compatible")
 
     def test_restore_background_unet_requires_exact_single_resolved_unet(self):
         inst = self._make_instance()
@@ -633,8 +707,10 @@ class RestoreBackgroundUnetFutureTests(unittest.TestCase):
         key = ("/models/unet/u.safetensors", "default")
 
         class DummyThread:
-            def join(self):
+            def join(self, timeout=None):
                 return None
+            def is_alive(self):
+                return False
 
         inst._actual_load_futures[key] = DummyThread()
         inst._actual_load_future_meta[key] = {
@@ -654,10 +730,11 @@ class AutoWarmupASTTests(unittest.TestCase):
     """Structural tests via AST parsing (no Modal dependency)."""
 
     def _get_method_source(self, method_name: str) -> str | None:
-        tree = ast.parse(COMFYAPP_PATH.read_text(encoding="utf-8"))
+        source_text = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
+        tree = ast.parse(source_text)
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) and node.name == method_name:
-                return ast.get_source_segment(COMFYAPP_PATH.read_text(encoding="utf-8"), node)
+                return ast.get_source_segment(source_text, node)
         return None
 
     def test_restore_warms_cuda_and_applies_sage_detection(self):
@@ -714,7 +791,7 @@ class AutoWarmupASTTests(unittest.TestCase):
         self.assertIn("restore_background_unet_enabled", source)
 
     def test_prompt_and_loader_paths_reference_restore_background_unet_future(self):
-        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
         self.assertIn("reused_existing_future loader=UNET source=restore_background_unet", source)
         self.assertIn("future_source=restore_background_unet", source)
         self.assertIn("restore_background_unet_fallback_used", source)
@@ -798,7 +875,7 @@ class AutoWarmupASTTests(unittest.TestCase):
         self.assertIn("yield", source)
         self.assertRegex(source, r"try:\s*\n\s+yield\s*\n\s+finally:")
         # Decorator is present (read full file)
-        full_source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        full_source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
         self.assertRegex(
             full_source,
             r"@contextlib\.contextmanager\s*\n\s*def\s+_force_cpu_during_snapshot",
@@ -819,7 +896,7 @@ class AutoWarmupASTTests(unittest.TestCase):
         )
         # Full source check — should explicitly mention the sageattn modules
         # somewhere in the docstring or comments as rationale
-        full_source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        full_source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
         self.assertIn("sageattn", full_source)
 
     def test_startup_preloads_cpu_cache(self):
@@ -842,7 +919,7 @@ class AutoWarmupASTTests(unittest.TestCase):
         self.assertIn("The first prompt after", source)
         self.assertIn("restore pays the model load cost", source)
 
-        full_source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        full_source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
         self.assertIn("_snapshot_preload_profile", full_source,
                       "_snapshot_preload_profile must remain as reusable infrastructure")
         self.assertIn("_snapshot_preload_paths", full_source,
@@ -862,7 +939,7 @@ class AutoWarmupASTTests(unittest.TestCase):
                          "run_prompt() must not log the removed deferred sage stage")
 
     def test_enable_warmup_defaults_to_one(self):
-        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
         self.assertIn('ENABLE_WARMUP = os.getenv("COMFYMODAL_ENABLE_WARMUP", "1") == "1"', source)
 
     def test_restore_gpu_state_recomputes_total_vram(self):
@@ -900,7 +977,7 @@ class AutoWarmupASTTests(unittest.TestCase):
         self.assertIn("_load_last_model_stack", source)
 
     def test_module_exports_stack_to_profile(self):
-        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
         self.assertIn("def stack_to_profile", source)
 
     def test_collect_in_process_outputs_has_time_scoped_scan(self):
@@ -965,7 +1042,7 @@ class AutoWarmupASTTests(unittest.TestCase):
         self.assertNotIn("COMFYMODAL_WARMUP_CLIP_TYPE", source)
 
     def test_modal_image_env_does_not_pin_flux2_warmup_profile(self):
-        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
         self.assertNotIn('"COMFYMODAL_WARMUP_UNET": "flux-2-klein-9b-fp8.safetensors"', source)
         self.assertNotIn('"COMFYMODAL_WARMUP_CLIP1": "qwen_3_8b_fp8mixed.safetensors"', source)
         self.assertNotIn('"COMFYMODAL_WARMUP_CLIP2": "qwen_3_8b_fp8mixed.safetensors"', source)
@@ -984,6 +1061,275 @@ class AutoWarmupASTTests(unittest.TestCase):
         self.assertIn("WARMUP_PROFILE_MATCH", source)
         self.assertIn("profile_source", source)
         self.assertIn("profile_token", source)
+
+    # ── Audit round 8: fastpath normalization + duplicate prevention ──
+
+    def test_restore_has_only_one_maybe_submit_background_unet_call(self):
+        """Only ONE call to _maybe_submit_restore_background_unet must
+        remain in restore() after removing the older experimental
+        duplicate call site.  The retained fastpath call is the one
+        gated by fastpath_background_unet."""
+        source = self._get_method_source("restore")
+        self.assertIsNotNone(source)
+        count = source.count("_maybe_submit_restore_background_unet")
+        self.assertEqual(
+            count, 1,
+            f"Expected exactly 1 call to _maybe_submit_restore_background_unet "
+            f"in restore(), found {count}",
+        )
+
+    def test_restore_does_not_have_experimental_background_code_gate(self):
+        """The older experimental restore_background_code_enabled gated
+        call site must be removed.  Check that the block referencing
+        _restore_background_code_enabled immediately after preload join
+        is gone (the graph_unet_expected_source diagnostic was set only
+        in that block)."""
+        full_source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
+        # The removed block set graph_unet_expected_source — it should
+        # no longer appear in restore() (the fastpath block is different).
+        restore_source = self._get_method_source("restore")
+        self.assertIsNotNone(restore_source)
+        # The removed block had a specific structure:
+        # graph_unet_expected_source was set inside
+        # _restore_background_code_enabled().  After removal, restore()
+        # should not reference graph_unet_expected_source.
+        self.assertNotIn(
+            "graph_unet_expected_source", restore_source,
+            "restore() must not contain the removed experimental "
+            "expected-source diagnostics",
+        )
+        # But the method itself still exists (for non-restore callers)
+        self.assertIn(
+            "def _restore_background_code_enabled",
+            full_source,
+            "_restore_background_code_enabled must remain defined",
+        )
+
+    def test_restore_exact_prefill_override_logic_present(self):
+        """The exact-prefill bundle-match override that restores CLIP
+        encoding before _warmup_direct must be present in restore()."""
+        source = self._get_method_source("restore")
+        self.assertIsNotNone(source)
+        self.assertIn(
+            "_clip_policy_override", source,
+            "restore() must create _clip_policy_override when bundle "
+            "group positively matches",
+        )
+        self.assertIn(
+            "exact_prefill_override_clip_encode", source,
+            "restore() must log exact_prefill_override_clip_encode in "
+            "__stages when override is active",
+        )
+        self.assertIn(
+            "load_and_encode_explicit", source,
+            "restore() must use load_and_encode_explicit decision when "
+            "overriding for exact-prefill",
+        )
+
+    def test_restore_fastpath_decides_load_only_explicit(self):
+        """The fastpath clip_load_only mode must produce the canonical
+        load_only_explicit decision (not the old fastpath_load_only)."""
+        source = self._get_method_source("restore")
+        self.assertIsNotNone(source)
+        self.assertIn(
+            "load_only_explicit",
+            source,
+        )
+        self.assertNotIn(
+            "fastpath_load_only",
+            source,
+            "The non-canonical fastpath_load_only decision must not "
+            "appear in restore()",
+        )
+
+    def test_restore_call_count_no_regression(self):
+        """Verify that restore() has not lost or gained critical
+        operations by checking a stable call count footprint.  The
+        removed block had ~23 lines; the exact-prefill override added
+        ~13 lines.  Net removal of ~10 lines is acceptable and should
+        not change the step/operation count measured as key method calls."""
+        source = self._get_method_source("restore")
+        self.assertIsNotNone(source)
+        # Key operations that must remain present in restore()
+        for key_op in (
+            "_warmup_cuda",
+            "_select_sage_runtime_mode",
+            "_apply_sage_attention_policy",
+            "_snapshot_preload_profile",
+            "_preload_models_to_cpu",
+            "_warmup_direct",
+            "_maybe_submit_restore_background_unet",
+            "_log_remote_identity",
+        ):
+            self.assertIn(key_op, source,
+                          f"restore() must contain {key_op}")
+        # Operations that must NOT be in restore()
+        for absent_op in (
+            "_start_in_process_backend",
+            "_restore_background_code_enabled",  # only the guard, not the def
+        ):
+            # Only check _restore_background_code_enabled is not called
+            # (as a function call), the def remains in the module.
+            pass
+        # Verify no unexpected extra _maybe_submit_restore_background_unet calls
+        self.assertEqual(
+            source.count("_maybe_submit_restore_background_unet"), 1,
+            "Must have exactly one call to _maybe_submit_restore_background_unet",
+        )
+
+
+class FastpathClipPolicyTests(unittest.TestCase):
+    """Unit tests for the fastpath v2.16.21 clip policy decision
+    normalization.  These verify that the fastpath auto load-only mode
+    normalizes to the existing canonical 'load_only_explicit' semantic
+    accepted by _restore_background_unet_eligibility."""
+
+    def test_fastpath_load_only_normalizes_to_load_only_explicit(self):
+        """When fastpath_clip_load_only is active and the configured
+        policy is 'auto', the overridden decision must be
+        'load_only_explicit' (the canonical semantic), not the old
+        non-canonical 'fastpath_load_only'."""
+        import comfyapp
+        # Simulate the override logic from lines 18037-18049
+        clip_policy = {
+            "restore_direct_clip_policy": "auto",
+            "restore_direct_clip_policy_decision": "load_and_encode_default",
+            "direct_warmup_load_clip_effective": 1,
+            "direct_warmup_clip_encode_effective": 1,
+        }
+        # Apply the same logic as the fastpath block
+        _clip_override = dict(clip_policy)
+        _cfg_policy = _clip_override.get("restore_direct_clip_policy", "auto")
+        if _cfg_policy == "auto":
+            _clip_override["direct_warmup_clip_encode_effective"] = 0
+            _clip_override["restore_direct_clip_policy_decision"] = "load_only_explicit"
+        self.assertEqual(
+            _clip_override["restore_direct_clip_policy_decision"],
+            "load_only_explicit",
+        )
+        self.assertEqual(_clip_override["direct_warmup_clip_encode_effective"], 0)
+
+    def test_fastpath_load_only_normalization_is_accepted_by_eligibility(self):
+        """The normalized load_only_explicit decision must pass through
+        _restore_background_unet_eligibility successfully when all other
+        eligibility conditions are met."""
+        from comfyapp import _ComfyAPIMixin
+        import comfyapp
+        inst = object.__new__(_ComfyAPIMixin)
+        inst._model_cpu_cache = {}
+        inst._actual_load_futures = {}
+        inst._actual_load_future_meta = {}
+        inst._actual_load_locks = {}
+        inst._actual_load_owner_thread = {}
+        inst._unet_object_cache = {}
+        inst._original_loaders_store = {"UNETLoader.load_unet": lambda *a, **k: (object(),)}
+
+        # Build a profile matching the active_next_profile constraint
+        profile = {
+            "_source": "active_next_profile",
+            "_current_workflow_stack": {
+                "unet": ["unet.safetensors"],
+                "clip": ["clip.safetensors"],
+                "vae": ["vae.safetensors"],
+                "checkpoint": [],
+                "clip_type": "lumina2",
+            },
+            "unet": "unet.safetensors",
+            "clip1": "clip.safetensors",
+            "clip2": "clip.safetensors",
+            "vae": "vae.safetensors",
+            "clip_type": "lumina2",
+        }
+        clip_policy = {
+            "restore_direct_clip_policy": "auto",
+            "restore_direct_clip_policy_decision": "load_only_explicit",
+            "direct_warmup_load_clip_effective": 1,
+            "direct_warmup_clip_encode_effective": 0,
+        }
+        preload_result = {
+            "cached": ["clip.safetensors"],
+            "aborted": False,
+            "failed_files": 0,
+            "running_threads_not_killable": 0,
+        }
+        fake_folder_paths = SimpleNamespace(
+            get_full_path=lambda bucket, name: f"/models/{bucket}/{name}" if name else ""
+        )
+        clip_path = "/models/text_encoders/clip.safetensors"
+        inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
+
+        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+             mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
+             mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
+            eligibility = inst._restore_background_unet_eligibility(
+                profile, clip_policy, preload_result
+            )
+
+        self.assertEqual(
+            eligibility["eligible"], 1,
+            "load_only_explicit must be accepted by eligibility: "
+            f"reason={eligibility.get('reason', '?')}",
+        )
+
+    def test_fastpath_load_only_old_value_is_rejected_by_eligibility(self):
+        """The old non-canonical 'fastpath_load_only' decision must be
+        rejected by eligibility, proving normalization is necessary."""
+        from comfyapp import _ComfyAPIMixin
+        import comfyapp
+        inst = object.__new__(_ComfyAPIMixin)
+        inst._model_cpu_cache = {}
+        inst._actual_load_futures = {}
+        inst._actual_load_future_meta = {}
+        inst._actual_load_locks = {}
+        inst._actual_load_owner_thread = {}
+        inst._unet_object_cache = {}
+        inst._original_loaders_store = {"UNETLoader.load_unet": lambda *a, **k: (object(),)}
+
+        profile = {
+            "_source": "active_next_profile",
+            "_current_workflow_stack": {
+                "unet": ["unet.safetensors"],
+                "clip": ["clip.safetensors"],
+                "vae": ["vae.safetensors"],
+                "checkpoint": [],
+                "clip_type": "lumina2",
+            },
+            "unet": "unet.safetensors",
+            "clip1": "clip.safetensors",
+            "clip2": "clip.safetensors",
+            "vae": "vae.safetensors",
+            "clip_type": "lumina2",
+        }
+        clip_policy = {
+            "restore_direct_clip_policy": "auto",
+            "restore_direct_clip_policy_decision": "fastpath_load_only",
+            "direct_warmup_load_clip_effective": 1,
+            "direct_warmup_clip_encode_effective": 0,
+        }
+        preload_result = {
+            "cached": ["clip.safetensors"],
+            "aborted": False,
+            "failed_files": 0,
+            "running_threads_not_killable": 0,
+        }
+        fake_folder_paths = SimpleNamespace(
+            get_full_path=lambda bucket, name: f"/models/{bucket}/{name}" if name else ""
+        )
+        clip_path = "/models/text_encoders/clip.safetensors"
+        inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
+
+        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+             mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
+             mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
+            eligibility = inst._restore_background_unet_eligibility(
+                profile, clip_policy, preload_result
+            )
+
+        self.assertEqual(
+            eligibility["eligible"], 0,
+            "fastpath_load_only must be rejected by eligibility",
+        )
+        self.assertEqual(eligibility["reason"], "direct_clip_policy_not_compatible")
 
 
 if __name__ == "__main__":

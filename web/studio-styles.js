@@ -612,6 +612,7 @@ body.comfymodal-body-scroll-lock {
 /* ── Canvas (dotted grid background) ─────────────────────── */
 
 .comfymodal-studio-canvas {
+  position: relative;
   min-height: 300px;
   border: 1px dashed #2a2a2a;
   border-radius: 4px;
@@ -624,6 +625,64 @@ body.comfymodal-body-scroll-lock {
   background-image:
     radial-gradient(circle, #2a2a2a 1px, transparent 1px);
   background-size: 20px 20px;
+}
+
+.comfymodal-studio-live-return {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  left: 8px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.82);
+}
+
+.comfymodal-studio-live-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #aaa;
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.comfymodal-studio-live-indicator::before {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4ade80;
+  content: "";
+}
+
+.comfymodal-studio-live-return-btn {
+  flex-shrink: 0;
+  padding: 3px 8px;
+  border: 1px solid #444;
+  border-radius: 3px;
+  background: transparent;
+  color: #aaa;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 10px;
+}
+
+.comfymodal-studio-live-return-btn:hover,
+.comfymodal-studio-live-return-btn:focus-visible {
+  border-color: var(--color-accent, #5a7fdb);
+  background: #2a2a2a;
+  color: #fff;
+}
+
+.comfymodal-studio-live-return-btn:focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 2px;
 }
 
 /* ── Carousel ───────────────────────────────────────────── */
