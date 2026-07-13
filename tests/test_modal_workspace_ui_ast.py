@@ -52,6 +52,9 @@ class ModalProductionUiAstTests(unittest.TestCase):
     def test_simulate_production_checkbox_present(self):
         source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
         self.assertIn("Simulate Production", source)
+        # Label must be a semantic <label for="..."> element (not a <span> with htmlFor)
+        self.assertIn('createElement("label")', source)
+        self.assertIn("cm-prod-toggle", source)
 
     def test_production_mode_enabled_persisted(self):
         source = UI_SETTINGS_PATH.read_text(encoding="utf-8")

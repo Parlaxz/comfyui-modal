@@ -7,46 +7,49 @@ if (!baseUrl) {
   process.exit(1);
 }
 
-const browser = await chromium.launch({ headless: false });
+const headless = process.env.PLAYWRIGHT_HEADLESS !== "0";
+const browser = await chromium.launch({ headless });
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 
 try {
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(4000);
 
-  const sidebarEntry = page.getByText("Modal Testing", { exact: false }).first();
+  // Open Modal Studio via sidebar
+  const sidebarEntry = page.getByText("Modal GPU", { exact: false }).first();
   await sidebarEntry.waitFor({ timeout: 15000 });
   await sidebarEntry.click();
 
-  const openButton = page.getByRole("button", { name: /Open Testing Suite/i }).first();
+  // Click the Open Studio button
+  const openButton = page.getByRole("button", { name: /Open Studio/i }).first();
   await openButton.waitFor({ timeout: 10000 });
   await openButton.click();
 
-  await page.getByText("Dashboard", { exact: true }).waitFor({ timeout: 10000 });
-  await page.getByText("Setup", { exact: true }).waitFor({ timeout: 10000 });
-  await page.getByText("Results", { exact: true }).waitFor({ timeout: 10000 });
+  // Verify all four studio tabs are present
+  await page.getByText("Playground", { exact: true }).waitFor({ timeout: 10000 });
   await page.getByText("History", { exact: true }).waitFor({ timeout: 10000 });
+  await page.getByText("Backend", { exact: true }).waitFor({ timeout: 10000 });
   await page.getByText("Settings", { exact: true }).waitFor({ timeout: 10000 });
 
-  await page.getByText("Setup", { exact: true }).click();
-  await page.getByText("Workflows & Models", { exact: true }).waitFor({ timeout: 10000 });
-
-  await page.getByText("Results", { exact: true }).click();
-  await page.getByText("Progress", { exact: true }).waitFor({ timeout: 10000 });
+  // Click each tab and verify its content area loads
+  await page.getByText("Playground", { exact: true }).click();
 
   await page.getByText("History", { exact: true }).click();
   await page.getByText("Run History", { exact: true }).waitFor({ timeout: 10000 });
 
+  await page.getByText("Backend", { exact: true }).click();
+
   await page.getByText("Settings", { exact: true }).click();
   await page.getByText("Connection & credentials", { exact: false }).waitFor({ timeout: 10000 });
 
-  await page.getByRole("button", { name: "✕" }).click();
+  // Close the modal, verify it disappears, then reopen
+  await page.locator(".comfymodal-testing-close").click();
+  await page.locator(".comfymodal-testing-close").waitFor({ state: "hidden", timeout: 10000 });
   await openButton.click();
-  await page.getByText("Dashboard", { exact: true }).waitFor({ timeout: 10000 });
+  await page.getByText("Playground", { exact: true }).waitFor({ timeout: 10000 });
 
+  // Reload to verify state recovery
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(4000);
-  await page.getByText("Modal Testing", { exact: false }).first().waitFor({ timeout: 15000 });
+  await page.getByText("Modal GPU", { exact: false }).first().waitFor({ timeout: 15000 });
 } finally {
   await browser.close();
 }

@@ -23,7 +23,7 @@ import {
   getPresetCapabilitySummary,
   getUnavailableControlReasons,
 } from "./studio-preset-capabilities.js";
-import { resolveRunImageUrl, hasRunImage, normalizeStudioRun } from "./studio-run-normalizer.js";
+import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings } from "./studio-run-normalizer.js";
 import {
   saveSelection,
   loadSelection,
@@ -31,37 +31,14 @@ import {
   loadControlDraft,
   saveControlDraft,
   clearControlDraft,
+  saveRunResult,
+  loadRunResult,
+  clearRunResult,
+  clearAllRunResults,
 } from "./studio-playground-state.js";
 import { getSharedTracker, createScopedTracker } from "./comfymodal-progress.js";
 import { updateRunAnnotation } from "./studio-backend-api.js";
-
-// ── Element helper ───────────────────────────────────────────────────────
-
-function el(tag, props = {}, children = []) {
-  const e = document.createElement(tag);
-  for (const k in props) {
-    if (k === "class") e.className = props[k];
-    else if (k === "style") e.style.cssText = props[k];
-    else if (k === "text") e.textContent = props[k];
-    else if (k.startsWith("on") && typeof props[k] === "function") {
-      e.addEventListener(k.slice(2).toLowerCase(), props[k]);
-    } else if (k === "value") {
-      e.value = props[k];
-    } else if (k === "dataset") {
-      Object.assign(e.dataset, props[k]);
-    } else if (k === "disabled" || k === "checked" || k === "hidden" || k === "readonly" || k === "required") {
-      if (props[k]) e.setAttribute(k, "");
-      else e.removeAttribute(k);
-    } else {
-      e.setAttribute(k, props[k]);
-    }
-  }
-  for (const c of (Array.isArray(children) ? children : [children])) {
-    if (c == null) continue;
-    e.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-  }
-  return e;
-}
+import { el } from "./studio-ui.js";
 
 // ── Polling helper for experiment status ──────────────────────────────────
 // Polls getStudioRunStatus and updates runState to reflect queued,
@@ -70,18 +47,84 @@ function el(tag, props = {}, children = []) {
 // Completion requires real evidence: completed cell count > 0,
 // an explicit experiment.completed event, or cell.completed events.
 // Empty/unknown snapshots with no definition stay in waiting state.
+//
+// Polling has a finite timeout (POLL_TIMEOUT_MS). Every tick checks
+// container.isConnected and stops if the container is detached (e.g.,
+// after navigating away). Transient fetch errors keep the timer alive
+// in waiting state until the deadline is reached.
+
+const POLL_INTERVAL_MS = 3000;
+const POLL_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * Idempotent stop: clear the poll timer and null the reference.
+ * Safe to call multiple times.  The timer is stored on the state object
+ * (survives re-renders) rather than the container DOM element (destroyed
+ * on re-render).  Navigation-away detection uses a state flag instead of
+ * container.isConnected so that intermediate polling updates (which call
+ * context.setPage and re-create the container) do not kill the timer.
+ */
+function _stopPolling(state) {
+  const key = state && state.playground && state.playground._pollTimer;
+  if (key != null) {
+    clearInterval(key);
+    if (state.playground) state.playground._pollTimer = null;
+  }
+}
 
 function _startPolling(container, state, context, actions, runState) {
   const experimentId = runState.experimentId || runState.runId;
   if (!experimentId) return;
   const apiBase = (context && context.apiBase) || "/comfymodal";
-  let pollTimer = setInterval(async () => {
-    const data = await getStudioRunStatus(apiBase, experimentId);
-    if (!data) return;
+
+  // Idempotent stop: clear any previous timer before starting new one
+  _stopPolling(state);
+
+  const deadline = Date.now() + POLL_TIMEOUT_MS;
+
+  const pollTimer = setInterval(async () => {
+    // Stop if the Playground is no longer the active shell page (e.g.
+    // user navigated to History).  This is NOT triggered by re-renders
+    // during polling because they keep state.activePage as "playground".
+    if (state.activePage !== "playground") {
+      _stopPolling(state);
+      return;
+    }
+
+    // Finite timeout: if deadline exceeded, transition to error
+    if (Date.now() >= deadline) {
+      _stopPolling(state);
+      if (actions && actions.setRunState) {
+        actions.setRunState({
+          status: "error",
+          message: "Experiment timed out after 5 minutes.",
+        });
+      }
+      return;
+    }
+
+    let data;
+    try {
+      data = await getStudioRunStatus(apiBase, experimentId);
+    } catch (err) {
+      // Transient fetch error — stay in waiting state until deadline
+      if (actions && actions.setRunState) {
+        actions.setRunState({ status: "waiting", experimentId });
+      }
+      return;
+    }
+
+    if (!data) {
+      // Null/empty response — stay in waiting state
+      if (actions && actions.setRunState) {
+        actions.setRunState({ status: "waiting", experimentId });
+      }
+      return;
+    }
 
     // Server-level error response
     if (data.status && data.status !== "ok") {
-      clearInterval(pollTimer);
+      _stopPolling(state);
       const errMsg = (data.message || data.error || "Run failed.").substring(0, 200);
       if (actions && actions.setRunState) {
         actions.setRunState({ status: "error", message: errMsg });
@@ -142,7 +185,7 @@ function _startPolling(container, state, context, actions, runState) {
     } else if (status === "completed" || status === "succeeded") {
       // Require real evidence before showing completed UI
       if (hasCellCompletionEvidence || hasTerminalEvent) {
-        clearInterval(pollTimer);
+        _stopPolling(state);
         // Extract output evidence from cell.completed events
         const outputEvents = events.filter(function (ev) {
           return ev.type === "cell.completed" && ev.payload;
@@ -173,7 +216,7 @@ function _startPolling(container, state, context, actions, runState) {
       }
       // Without evidence, stay in current state (don't claim completion)
     } else if (status === "failed_fatal" || status === "error" || status === "failed" || status === "completed_with_failures") {
-      clearInterval(pollTimer);
+      _stopPolling(state);
       const errMsg = (lastErrorMsg || snapshot.error || data.message || data.error || "Run failed.").substring(0, 200);
       if (actions && actions.setRunState) {
         actions.setRunState({
@@ -186,7 +229,7 @@ function _startPolling(container, state, context, actions, runState) {
       // Safety net: if there are explicit error events even while status
       // shows draft/unknown, surface the error terminal state
       if (hasExplicitErrorEvent) {
-        clearInterval(pollTimer);
+        _stopPolling(state);
         const errMsg = (lastErrorMsg || "Run failed.").substring(0, 200);
         if (actions && actions.setRunState) {
           actions.setRunState({
@@ -202,9 +245,10 @@ function _startPolling(container, state, context, actions, runState) {
         }
       }
     }
-  }, 3000);
-  // Allow the timer to be cleaned up if the container is removed
-  container._pollTimer = pollTimer;
+  }, POLL_INTERVAL_MS);
+  // Store timer reference on state (survives re-renders) instead of
+  // container (destroyed on re-render from context.setPage calls).
+  if (state && state.playground) state.playground._pollTimer = pollTimer;
 }
 
 // ── Effective Controls builder ────────────────────────────────────────────
@@ -224,12 +268,56 @@ function getCurrentPresetForSelection(state, presetId) {
 
 function hydrateControlsForSelection(state, presetId, featureId, preset) {
   if (!state.playground) return;
+
+  // Priority: persisted draft > latest successful controls (same preset+feature) > preset.defaults > definition default
+  // Own-property checks (hasOwnProperty / in operator) preserve 0 and false.
+
+  // 1. Persisted draft (user edits)
   const draft = presetId && featureId ? loadControlDraft(presetId, featureId) : {};
-  if (draft && Object.keys(draft).length > 0) {
+  if (draft && typeof draft === "object" && Object.keys(draft).length > 0) {
     state.playground._hydratedControls = draft;
     return;
   }
-  state.playground._hydratedControls = ((preset && preset.defaults) || {});
+
+  // 2. Latest successful controls from _selectedRun (same preset+feature)
+  const selectedRun = state.playground._selectedRun;
+  if (selectedRun && typeof selectedRun === "object") {
+    const rc = selectedRun.resolvedControls || selectedRun.requestedControls || {};
+    const sameFeature = selectedRun.featureId === featureId;
+    const samePreset = selectedRun.presetId === presetId;
+    if (sameFeature && samePreset && typeof rc === "object" && Object.keys(rc).length > 0) {
+      const fromRun = {};
+      for (const key in rc) {
+        if (Object.prototype.hasOwnProperty.call(rc, key)) {
+          fromRun[key] = rc[key];
+        }
+      }
+      if (Object.keys(fromRun).length > 0) {
+        state.playground._hydratedControls = fromRun;
+        return;
+      }
+    }
+  }
+
+  // 3. Merged: definition defaults + preset defaults (preset wins, own-property checks)
+  const presetDefaults = (preset && preset.defaults) || {};
+  const merged = {};
+
+  // Start with definition defaults (CONTROL_DEFS)
+  for (const defId in CONTROL_DEFS) {
+    if (Object.prototype.hasOwnProperty.call(CONTROL_DEFS[defId], "defaultValue")) {
+      merged[defId] = CONTROL_DEFS[defId].defaultValue;
+    }
+  }
+
+  // Overlay preset defaults (own-property check preserves 0/false)
+  for (const key in presetDefaults) {
+    if (Object.prototype.hasOwnProperty.call(presetDefaults, key)) {
+      merged[key] = presetDefaults[key];
+    }
+  }
+
+  state.playground._hydratedControls = merged;
 }
 
 function buildEffectiveControls(state, preset, currentFeatureId) {
@@ -334,13 +422,24 @@ export async function hydratePlayground(state, context) {
   });
 
   if (!presetExists) {
-    // Invalid/deleted preset — clear saved selection
+    // Invalid/deleted preset — try another runnable preset first
     if (targetPresetId) {
-      clearSelection();
-    }
-    targetPresetId = "";
-    if (state.playground) {
-      state.playground.selectedBackendId = "";
+      const otherRunnable = presets.find(function (p) {
+        return (p.id || p.label || "") !== targetPresetId && p.status === "runnable";
+      });
+      if (otherRunnable) {
+        targetPresetId = otherRunnable.id || otherRunnable.label || "";
+        if (state.playground) {
+          state.playground.selectedBackendId = targetPresetId;
+        }
+        saveSelection(targetPresetId, featureId);
+      } else {
+        clearSelection();
+        targetPresetId = "";
+        if (state.playground) {
+          state.playground.selectedBackendId = "";
+        }
+      }
     }
   } else {
     if (state.playground) {
@@ -348,8 +447,13 @@ export async function hydratePlayground(state, context) {
     }
   }
 
-  // 6a. If we have a valid preset, try to restore latest completed run preview
-  if (targetPresetId) {
+  // 6a. Try to restore from localStorage persisted run result first
+  const persistedRun = loadRunResult(targetPresetId, featureId);
+  if (persistedRun) {
+    state.playground._selectedRun = persistedRun;
+    state.playground.lastRunOutput = persistedRun.imageUrl || null;
+  } else if (targetPresetId) {
+    // 6b. Fallback: fetch server-side recent runs and find latest matching
     await refreshRecentRuns(apiBase);
     const matchingCompleted = getRecentRuns().filter(function (nr) {
       return nr.presetId === targetPresetId && nr.featureId === featureId;
@@ -366,6 +470,8 @@ export async function hydratePlayground(state, context) {
       if (latest && latest.imageUrl) {
         state.playground.lastRunOutput = latest.imageUrl;
         state.playground._selectedRun = latest;
+        // Persist to localStorage for next reload
+        saveRunResult(targetPresetId, featureId, latest);
       }
     }
   }
@@ -551,6 +657,9 @@ function renderControlPanel(state, context) {
       const def = CONTROL_DEFS[ctrlId];
       if (!def) return;
 
+      // Instruction is only visible for placeholder features (object_remove/object_replace)
+      if (ctrlId === "instruction" && !currentSpec.isPlaceholder) return;
+
       const isBound = summary.requiredBindings.some((r) => r.key === ctrlId && r.bound)
         || summary.optionalBindings.some((o) => o.key === ctrlId && o.bound);
 
@@ -627,12 +736,30 @@ function buildActions(state, context) {
   return {
     setFeature(featureId) {
       clearTimeout(state.playground._draftSaveTimer);
+
+      // Preserve current run result before switching
+      const prevPresetId = state.playground.selectedBackendId;
+      const prevFeatureId = state.playground.featureId;
+      const prevRun = state.playground._selectedRun;
+      if (prevPresetId && prevFeatureId && prevRun) {
+        saveRunResult(prevPresetId, prevFeatureId, prevRun);
+      }
+
       state.playground.featureId = featureId;
       // Clear stale controls when feature changes
       state.playground.controls = {};
       state.playground._selectedRun = null;
+      state.playground.lastRunOutput = null;
       const presetId = state.playground.selectedBackendId;
       const currentPreset = getCurrentPresetForSelection(state, presetId);
+
+      // Load persisted run result for the new feature
+      const loadedRun = loadRunResult(presetId, featureId);
+      if (loadedRun) {
+        state.playground._selectedRun = loadedRun;
+        state.playground.lastRunOutput = loadedRun.imageUrl || null;
+      }
+
       hydrateControlsForSelection(state, presetId, featureId, currentPreset);
       // Clear stale run state so Run button re-enables
       if (state.playground) state.playground.runState = null;
@@ -646,12 +773,30 @@ function buildActions(state, context) {
     },
     setBackend(backendId) {
       clearTimeout(state.playground._draftSaveTimer);
+
+      // Preserve current run result before switching
+      const prevPresetId = state.playground.selectedBackendId;
+      const prevFeatureId = state.playground.featureId;
+      const prevRun = state.playground._selectedRun;
+      if (prevPresetId && prevFeatureId && prevRun) {
+        saveRunResult(prevPresetId, prevFeatureId, prevRun);
+      }
+
       state.playground.selectedBackendId = backendId;
       // Clear stale controls when preset changes to avoid sending
       // controls that the new preset doesn't support
       state.playground.controls = {};
       state.playground._selectedRun = null;
+      state.playground.lastRunOutput = null;
       const currentPreset = getCurrentPresetForSelection(state, backendId);
+
+      // Load persisted run result for the new preset+feature
+      const loadedRun = loadRunResult(backendId, state.playground.featureId);
+      if (loadedRun) {
+        state.playground._selectedRun = loadedRun;
+        state.playground.lastRunOutput = loadedRun.imageUrl || null;
+      }
+
       hydrateControlsForSelection(state, backendId, state.playground.featureId, currentPreset);
       // Clear stale run state so Run button re-enables
       if (state.playground) state.playground.runState = null;
@@ -774,9 +919,10 @@ function buildActions(state, context) {
         const apiBase = (context && context.apiBase) || "/comfymodal";
         refreshRecentRuns(apiBase).then(function (runs) {
           const experimentId = runState.experimentId;
+          let matched = null;
           if (experimentId && runs && runs.length > 0) {
             // Find the matching run by experiment ID
-            var matched = runs.find(function (nr) {
+            matched = runs.find(function (nr) {
               return nr.experimentId === experimentId;
             });
             if (!matched) {
@@ -786,13 +932,19 @@ function buildActions(state, context) {
                        nr.featureId === (state.playground.featureId || "txt2img");
               });
             }
-            if (matched) {
-              state.playground._selectedRun = matched;
-              if (matched.imageUrl) {
-                state.playground.lastRunOutput = matched.imageUrl;
-              }
-              if (context && context.setPage) context.setPage("playground");
+          }
+          if (matched) {
+            state.playground._selectedRun = matched;
+            if (matched.imageUrl) {
+              state.playground.lastRunOutput = matched.imageUrl;
             }
+            // Persist the finalized run result to localStorage
+            saveRunResult(
+              state.playground.selectedBackendId,
+              state.playground.featureId || "txt2img",
+              matched
+            );
+            if (context && context.setPage) context.setPage("playground");
           }
         });
       } else if (!runState) {
@@ -1104,6 +1256,24 @@ function renderControl(def, state, actions, preset) {
         input.addEventListener("change", () => {
           if (actions.setControl) actions.setControl(def.id, input.value);
         });
+      } else if (def.dynamicOptions) {
+        // Dynamic-options select (sampler/scheduler) without schema enum:
+        // show disabled text input with current saved value instead of
+        // a misleading "Default" placeholder with a hardcoded fallback.
+        input = el("input", {
+          type: "text",
+          class: "comfymodal-input comfymodal-studio-text-input",
+          value: value != null ? String(value) : "",
+          disabled: true,
+          "data-testid": `input-${def.id}`,
+          title: "Schema options unavailable — value preserved from saved defaults",
+        });
+        const note = el("span", {
+          class: "comfymodal-studio-control-note",
+          text: "Schema unavailable, value preserved",
+          style: "font-size:var(--font-size-xs);color:var(--color-text-muted);",
+        });
+        group.appendChild(note);
       } else {
         // Static select (LoRA etc.): disabled, configured elsewhere
         input = el("select", {
@@ -1294,11 +1464,22 @@ async function doRunSubmit(state, context, actions) {
     actions.setRunState({ status: "running" });
   }
 
+  // Capture client-side timestamps at press time (top-level `trace` for server)
+  const t0_perf_ms = performance.now();
+  const t0_now = Date.now();
+
   const result = await runStudioPreset(apiBase, {
     presetId: preset.id || selectedId,
     featureId: currentFeatureId,
     controls: controls,
-    metadata: { source: "studio_playground" },
+    metadata: {
+      source: "studio_playground",
+    },
+    trace: {
+      t0_perf_ms: t0_perf_ms,
+      t0_perf_now_ms: t0_now,
+      t0_client_press_ms: t0_now,
+    },
   });
 
   if (result && result.status === "ok") {
@@ -1403,6 +1584,7 @@ function renderRunButton(state, context, actions, isExperiment) {
     btn.textContent = "Run";
     btn.title = "Run completed. Click to run again with current settings.";
     const messageEl = el("p", {
+      "data-testid": "run-status-message",
       style: "font-size:var(--font-size-sm);color:var(--color-success);margin:4px 0 0;",
     });
     messageEl.textContent = runState.completedCells
@@ -1433,15 +1615,32 @@ function renderRunButton(state, context, actions, isExperiment) {
   }
 
   if (runState && runState.status === "error") {
-    // Terminal error state: show "Run" to let user retry immediately
+    // Terminal error state: show error with Dismiss + Retry
     btn.disabled = false;
     btn.textContent = "Run";
     btn.title = "Run failed. Click to try again.";
     reason.appendChild(el("p", {
-      text: runState.message || "Run failed. Try again.",
-      style: "font-size:var(--font-size-sm);color:var(--color-danger);margin:4px 0 0;",
+      text: "Run Failed",
+      style: "font-size:var(--font-size-sm);font-weight:var(--font-weight-semibold);color:var(--color-danger);margin:0 0 2px;",
     }));
-    // Single click: immediately submit using visible settings
+    reason.appendChild(el("p", {
+      text: runState.message || "Run failed. Try again.",
+      style: "font-size:var(--font-size-sm);color:var(--color-danger);margin:0 0 4px;",
+    }));
+    // Dismiss action: clears error without triggering re-run
+    const dismissBtn = el("button", {
+      class: "comfymodal-secondary-btn",
+      text: "Dismiss",
+      "data-testid": "error-dismiss-btn",
+      style: "font-size:10px;padding:2px 8px;margin-right:4px;",
+      onclick: function () {
+        if (actions && actions.setRunState) {
+          actions.setRunState(null);
+        }
+      },
+    });
+    reason.appendChild(dismissBtn);
+    // Retry button re-uses the Run button's existing onclick setup
     btn.onclick = function () {
       doRunSubmit(state, context, actions);
     };
@@ -1593,11 +1792,22 @@ function renderRunButton(state, context, actions, isExperiment) {
           return;
         }
 
+        // Capture client-side timestamps at press time (top-level `trace` for server)
+        var t0_perf_ms = performance.now();
+        var t0_now = Date.now();
+
         const result = await runStudioPreset(apiBase, {
           presetId: preset.id || selectedId,
           featureId: currentFeatureId,
           controls: controls,
-          metadata: { source: "studio_playground" },
+          metadata: {
+            source: "studio_playground",
+          },
+          trace: {
+            t0_perf_ms: t0_perf_ms,
+            t0_perf_now_ms: t0_now,
+            t0_client_press_ms: t0_now,
+          },
         });
 
         if (result && result.status === "ok") {
@@ -1664,7 +1874,7 @@ function renderProgressSection(state, context) {
     style: "width:100%;height:8px;background:#1a1a1a;border-radius:4px;overflow:hidden;margin-bottom:6px;",
   });
   const barFill = el("div", {
-    style: "width:0%;height:100%;background:#dc2626;border-radius:4px;transition:width 0.3s ease;",
+    style: "width:0%;height:100%;background:var(--color-accent, #5a7fdb);border-radius:4px;transition:width 0.3s ease;",
   });
   barContainer.appendChild(barFill);
 
@@ -1733,32 +1943,42 @@ function _formatDuration(ms) {
 // ── Favorite Star ────────────────────────────────────────────────────────
 
 function renderFavoriteStar(nr, actions, apiBase) {
-  var star = el("span", {
+  var isFav = nr.favorite;
+  var star = el("button", {
+    type: "button",
     class: "comfymodal-studio-favorite-star",
     "data-testid": "favorite-star",
-    text: nr.favorite ? "\u2605" : "\u2606",
-    style: "cursor:pointer;font-size:18px;color:" + (nr.favorite ? "#fbbf24" : "#555") + ";user-select:none;",
-    title: nr.favorite ? "Remove from favorites" : "Add to favorites",
+    "aria-label": isFav ? "Remove from favorites" : "Add to favorites",
+    "aria-pressed": isFav ? "true" : "false",
+    text: isFav ? "\u2605" : "\u2606",
+    style: "font-size:18px;color:" + (isFav ? "#fbbf24" : "#555") + ";",
+    title: isFav ? "Remove from favorites" : "Add to favorites",
   });
 
   star.addEventListener("click", function (e) {
     e.stopPropagation();
     // Optimistic toggle
-    var wasFav = nr.favorite;
+    var wasFav = isFav;
     var newFav = !wasFav;
+    isFav = newFav;
     nr.favorite = newFav;
     var runId = nr.id || nr.experimentId;
     star.textContent = newFav ? "\u2605" : "\u2606";
     star.style.color = newFav ? "#fbbf24" : "#555";
+    star.setAttribute("aria-label", newFav ? "Remove from favorites" : "Add to favorites");
+    star.setAttribute("aria-pressed", newFav ? "true" : "false");
     star.title = newFav ? "Remove from favorites" : "Add to favorites";
 
     // Optimistic API call with rollback
     updateRunAnnotation(apiBase, runId, { favorite: newFav }).then(function (result) {
       if (!result || result.status !== "ok") {
         // Rollback on failure
+        isFav = wasFav;
         nr.favorite = wasFav;
         star.textContent = wasFav ? "\u2605" : "\u2606";
         star.style.color = wasFav ? "#fbbf24" : "#555";
+        star.setAttribute("aria-label", wasFav ? "Remove from favorites" : "Add to favorites");
+        star.setAttribute("aria-pressed", wasFav ? "true" : "false");
         star.title = wasFav ? "Remove from favorites" : "Add to favorites";
       }
     });
@@ -1784,6 +2004,11 @@ function renderNoteEditor(nr, actions, apiBase) {
     text: currentNote,
   });
   textarea.value = currentNote;
+
+  var noteHeader = el("div", {
+    style: "font-size:10px;color:#888;margin-bottom:2px;font-weight:600;text-transform:uppercase;",
+    text: "Note",
+  });
 
   var buttonRow = el("div", {
     style: "display:flex;gap:4px;margin-top:4px;align-items:center;",
@@ -1811,6 +2036,7 @@ function renderNoteEditor(nr, actions, apiBase) {
   buttonRow.appendChild(saveBtn);
   buttonRow.appendChild(cancelBtn);
   buttonRow.appendChild(statusEl);
+  container.appendChild(noteHeader);
   container.appendChild(textarea);
   container.appendChild(buttonRow);
 
@@ -1934,6 +2160,15 @@ function renderCanvas(state, context) {
       el("p", { text: currentSpec.placeholderReason || "This feature is not available in this release.", style: "font-size:var(--font-size-sm);color:var(--color-text-muted);" }),
     ]);
     canvas.appendChild(placeholderMsg);
+    // Honest accessible mask-controls section (disabled with explanation)
+    const maskSection = el("div", {
+      "data-testid": "mask-controls",
+      style: "padding:12px;border:1px solid #2a2a2a;border-radius:4px;margin:8px;background:#0a0a0a;opacity:0.6;",
+    }, [
+      el("p", { text: "Mask Controls", style: "font-weight:var(--font-weight-semibold);margin:0 0 4px;color:#888;font-size:var(--font-size-sm);" }),
+      el("p", { text: "Mask editing tools (brush, selection) are not implemented in this release.", style: "font-size:var(--font-size-xs);color:var(--color-text-muted);margin:0;" }),
+    ]);
+    canvas.appendChild(maskSection);
   } else if (outputUrl) {
     const img = el("img", {
       src: outputUrl,
@@ -2036,30 +2271,79 @@ function renderMetadataSection(state, context) {
 
   section.appendChild(summary);
 
-  // ── Timing Summary ────────────────────────────────────────────────
-  if (nr.timingSummary) {
+  // ── Timing Summary Card ────────────────────────────────────────────
+  if (nr.timingStages && nr.timingStages.length > 0) {
+    var timingCard = el("div", {
+      class: "comfymodal-studio-timing-card",
+      "data-testid": "timing-card",
+    });
+
+    // Primary E2E time (large)
+    var e2e = nr.timingStages.find(function (s) { return s.label === "End-to-End Total"; });
+    if (e2e) {
+      timingCard.appendChild(el("span", {
+        class: "comfymodal-studio-timing-e2e",
+        text: "End-to-End Total: " + _formatDuration(e2e.durationMs),
+      }));
+    }
+
+    // Top stages as compact tag row (excluding E2E, showing at most 4)
+    var nonTotalStages = nr.timingStages.filter(function (s) {
+      return s.label !== "End-to-End Total" && s.durationMs > 0;
+    }).sort(function (a, b) { return b.durationMs - a.durationMs; }).slice(0, 4);
+
+    if (nonTotalStages.length > 0) {
+      var tagRow = el("div", { class: "comfymodal-studio-timing-tags" });
+      nonTotalStages.forEach(function (st) {
+        tagRow.appendChild(el("span", {
+          class: "comfymodal-studio-timing-tag",
+          text: st.label + ": " + _formatDuration(st.durationMs),
+        }));
+      });
+      timingCard.appendChild(tagRow);
+    }
+
+    // Quality indicator
+    if (nr._timingQuality && nr._timingQuality !== "complete") {
+      var qualDot = el("span", {
+        class: "comfymodal-studio-timing-quality",
+        text: nr._timingQuality === "missing" ? "No timing data" : nr._timingQuality + " quality",
+      });
+      timingCard.appendChild(qualDot);
+    }
+
+    section.appendChild(timingCard);
+  } else if (nr.timingSummary && typeof nr.timingSummary === "string" && nr.timingSummary.length > 0) {
+    // Fallback: timing summary string (progress annotation contract)
     section.appendChild(el("div", {
       class: "comfymodal-studio-timing-summary",
-      style: "font-size:10px;color:#888;margin-top:2px;",
-      text: "Timing: " + nr.timingSummary,
+      text: nr.timingSummary,
+    }));
+  } else if (nr.durationMs != null && nr.durationMs > 0) {
+    // Fallback: just show duration
+    section.appendChild(el("div", {
+      class: "comfymodal-studio-timing-summary",
+      text: "Duration: " + _formatDuration(nr.durationMs),
     }));
   }
 
-  // ── Key generation settings ────────────────────────────────────────
-  const settingsRow = el("div", { class: "comfymodal-studio-metadata-settings" });
-  const genSettings = [];
+  // ── Key generation settings (using shared normalizer) ─────────────
+  var normalizedSettings = normalizeGenerationSettings(rc, rqc);
+  var settingsRow = el("div", { class: "comfymodal-studio-metadata-settings" });
+  var genSettings = [];
 
-  // Use nullish-safe helpers to preserve 0/false values
-  const seed = rc.seed != null ? rc.seed : (rqc.seed != null ? rqc.seed : "");
-  if (seed !== "") genSettings.push({ label: "Seed", value: String(seed) });
-  if (rc.steps != null) genSettings.push({ label: "Steps", value: String(rc.steps) });
-  if (rc.cfg != null || rc.guidance != null) {
-    genSettings.push({ label: "CFG", value: String(rc.cfg != null ? rc.cfg : rc.guidance) });
+  if (normalizedSettings.seed != null) genSettings.push({ label: "Seed", value: String(normalizedSettings.seed) });
+  if (normalizedSettings.steps != null) genSettings.push({ label: "Steps", value: String(normalizedSettings.steps) });
+  if (normalizedSettings.cfg != null) genSettings.push({ label: "CFG", value: String(normalizedSettings.cfg) });
+  if (normalizedSettings.guidance != null && normalizedSettings.cfg == null) {
+    genSettings.push({ label: "Guidance", value: String(normalizedSettings.guidance) });
   }
-  if (rc.sampler_name || rc.sampler) genSettings.push({ label: "Sampler", value: String(rc.sampler_name || rc.sampler) });
-  if (rc.scheduler) genSettings.push({ label: "Scheduler", value: String(rc.scheduler) });
-  if (rc.denoise != null) genSettings.push({ label: "Denoise", value: String(rc.denoise) });
-  if (rc.width && rc.height) genSettings.push({ label: "Size", value: rc.width + "\u00d7" + rc.height });
+  if (normalizedSettings.sampler != null) genSettings.push({ label: "Sampler", value: String(normalizedSettings.sampler) });
+  if (normalizedSettings.scheduler != null) genSettings.push({ label: "Scheduler", value: String(normalizedSettings.scheduler) });
+  if (normalizedSettings.denoise != null) genSettings.push({ label: "Denoise", value: String(normalizedSettings.denoise) });
+  if (normalizedSettings.width != null && normalizedSettings.height != null) {
+    genSettings.push({ label: "Size", value: normalizedSettings.width + "\u00d7" + normalizedSettings.height });
+  }
   if (nr.workflowHash) genSettings.push({ label: "Workflow", value: nr.workflowHash.substring(0, 8) + "\u2026" });
 
   // LoRAs
@@ -2144,6 +2428,40 @@ function renderMetadataSection(state, context) {
     advancedItems.push({ label: "Per-Node Timings", value: nodeSummary });
   }
 
+  // Advanced timing diagnostics (only when diagnostics exist)
+  if (nr.advancedTiming) {
+    var diag = nr.advancedTiming;
+    if (diag.traceVersion) {
+      // Display exact trace version without adding another "v" prefix
+      advancedItems.push({ label: "Trace Version", value: diag.traceVersion });
+    }
+    if (diag.timingReason) advancedItems.push({ label: "Timing Quality", value: diag.timingQuality + " \u2014 " + diag.timingReason });
+    if (diag.missingFields && diag.missingFields.length > 0) {
+      advancedItems.push({ label: "Missing Fields", value: diag.missingFields.join(", ") });
+    }
+    if (diag.rawDeltasMs && Object.keys(diag.rawDeltasMs).length > 0) {
+      advancedItems.push({ label: "Raw deltas_ms", value: JSON.stringify(diag.rawDeltasMs).substring(0, 200) + (JSON.stringify(diag.rawDeltasMs).length > 200 ? "\u2026" : "") });
+    }
+    if (diag.rawDerivedMs && Object.keys(diag.rawDerivedMs).length > 0) {
+      advancedItems.push({ label: "Raw derived_ms", value: JSON.stringify(diag.rawDerivedMs).substring(0, 200) + (JSON.stringify(diag.rawDerivedMs).length > 200 ? "\u2026" : "") });
+    }
+    if (diag.rawStages && Object.keys(diag.rawStages).length > 0) {
+      advancedItems.push({ label: "Raw stages", value: JSON.stringify(diag.rawStages).substring(0, 200) + (JSON.stringify(diag.rawStages).length > 200 ? "\u2026" : "") });
+    }
+    if (diag.wallClockTrace) {
+      advancedItems.push({ label: "Wall-Clock Trace", value: JSON.stringify(diag.wallClockTrace).substring(0, 200) + (JSON.stringify(diag.wallClockTrace).length > 200 ? "\u2026" : "") });
+    }
+    if (diag.schedulerTrace) {
+      advancedItems.push({ label: "Scheduler Trace", value: JSON.stringify(diag.schedulerTrace).substring(0, 200) + (JSON.stringify(diag.schedulerTrace).length > 200 ? "\u2026" : "") });
+    }
+    if (diag.sources && Object.keys(diag.sources).length > 0) {
+      advancedItems.push({ label: "Timing Sources", value: JSON.stringify(diag.sources).substring(0, 200) + (JSON.stringify(diag.sources).length > 200 ? "\u2026" : "") });
+    }
+    if (diag.backendTimingSources && Object.keys(diag.backendTimingSources).length > 0) {
+      advancedItems.push({ label: "Backend Sources", value: JSON.stringify(diag.backendTimingSources).substring(0, 200) + (JSON.stringify(diag.backendTimingSources).length > 200 ? "\u2026" : "") });
+    }
+  }
+
   // Workflow hash
   if (nr.workflowHash) advancedItems.push({ label: "Workflow Hash", value: nr.workflowHash });
 
@@ -2218,10 +2536,13 @@ function renderFilmstrip(state, context) {
       const imageUrl = nr.imageUrl;
       const label = nr.presetLabel || nr.presetId || nr.featureId || "Run";
 
-      const thumb = el("div", {
+      const ariaLabel = label + " - " + (nr.status || "") + (imageUrl ? " - Click to view" : " - No image");
+      const thumb = el("button", {
+        type: "button",
         class: "comfymodal-studio-carousel-item"
           + (nr.status === "completed" || nr.status === "success" || nr.status === "done" ? " completed" : "")
           + (nr.status === "error" || nr.status === "failed" ? " failed" : ""),
+        "aria-label": ariaLabel,
         title: label + " - " + (nr.status || ""),
         onclick: function () {
           // Update canvas with this run's output

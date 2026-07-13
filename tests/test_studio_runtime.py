@@ -42,7 +42,10 @@ def _make_runnable_snapshot(snapshot_id: str = "snap_runnable") -> dict:
         "name": "Runnable Txt2Img Snapshot",
         "compatibleFeatures": ["txt2img"],
         "apiPromptJson": {
-            "3": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 20}},
+            "3": {"class_type": "KSampler", "inputs": {
+                "seed": 42, "steps": 20, "cfg": 7.0,
+                "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
+            }},
             "9": {"class_type": "SaveImage", "inputs": {"images": []}},
         },
         "nodeBindings": {
@@ -2776,6 +2779,19 @@ class CapturedControlSchemasTests(unittest.TestCase):
         self.assertIn("euler", s.get("options", []))
         self.assertIn("dpmpp_2m", s.get("options", []))
 
+    def test_auto_derived_connection_spec_uses_schema_default(self):
+        """Connected widgets must not replace a scalar schema default."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"steps": ["937", 0]}},
+            },
+            "nodeBindings": {},
+        }
+
+        schemas = self.mod.derive_control_schemas_from_snapshot(snapshot)
+
+        self.assertEqual(schemas["steps"].get("default"), 20)
+
     def test_captured_custom_widget_enum_preserved(self):
         """Custom/unknown widget enum values from captured schema, not Python table."""
         snapshot = {
@@ -3338,6 +3354,1038 @@ class GitignoreRuntimeDirectoriesTests(unittest.TestCase):
     def test_comfymodal_experiments_in_gitignore(self):
         text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
         self.assertIn(".comfymodal_experiments/", text)
+
+
+# ---------------------------------------------------------------------------
+# Task 2: Control coercion before queueing
+# ---------------------------------------------------------------------------
+
+class StudioControlCoercionTests(unittest.TestCase):
+    """Coercion of controls before _apply_controls_to_workflow.
+
+    Requirements:
+    - Required text control (prompt) rejects whitespace-only
+    - Optional text control (negative_prompt) allows empty/whitespace
+    - Scalar int/number/bool/enum schemas reject arrays/objects
+    - Zero-like values (seed=0, guidance=0, denoise=0, False) preserved
+    - Coercion before _apply_controls_to_workflow AND before int() in
+      resolve_and_inject_cell
+    - LoRA strength arrays confined to LoRA axes, not canonical scalars
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    # ── Whitespace-only text controls ───────────────────────────────────
+
+    def test_whitespace_only_prompt_rejected(self):
+        """prompt=whitespace-only returns field-specific error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            spec = self.mod.build_single_run_spec(
+                preset, snap, "txt2img", {"prompt": "   "}, tmp,
+            )
+            self.assertIn("error", spec)
+            self.assertIn("prompt", spec["error"])
+
+    def test_optional_negative_prompt_empty_allowed(self):
+        """negative_prompt="" is allowed when no negative_prompt binding exists
+        (live fixture has hasNegative=false)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            spec = self.mod.build_single_run_spec(
+                preset, snap, "txt2img",
+                {"prompt": "test", "negative_prompt": ""}, tmp,
+            )
+            self.assertNotIn("error", spec)
+
+    def test_optional_negative_prompt_whitespace_allowed(self):
+        """negative_prompt=whitespace is allowed when no binding exists."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            spec = self.mod.build_single_run_spec(
+                preset, snap, "txt2img",
+                {"prompt": "test", "negative_prompt": "   "}, tmp,
+            )
+            self.assertNotIn("error", spec)
+
+    # ── Array/object values for scalar schemas ──────────────────────────
+
+    def test_array_steps_rejected_before_apply(self):
+        """steps=[8] rejected with field-specific error before _apply_controls_to_workflow."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            spec = self.mod.build_single_run_spec(
+                preset, snap, "txt2img", {"prompt": "test", "steps": [8]}, tmp,
+            )
+            self.assertIn("error", spec)
+            self.assertIn("steps", spec["error"])
+            self.assertIn("integer", spec["error"].lower())
+
+    def test_array_guidance_rejected(self):
+        """guidance=[7.5] rejected with field-specific error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            spec = self.mod.build_single_run_spec(
+                preset, snap, "txt2img",
+                {"prompt": "test", "guidance": [7.5]}, tmp,
+            )
+            self.assertIn("error", spec)
+            self.assertIn("guidance", spec["error"])
+
+    def test_array_sampler_rejected(self):
+        """sampler=["euler"] rejected with field-specific error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            spec = self.mod.build_single_run_spec(
+                preset, snap, "txt2img",
+                {"prompt": "test", "sampler": ["euler"]}, tmp,
+            )
+            self.assertIn("error", spec)
+            self.assertIn("sampler", spec["error"])
+
+    def test_dict_seed_rejected(self):
+        """seed={"val": 42} rejected with field-specific error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            spec = self.mod.build_single_run_spec(
+                preset, snap, "txt2img",
+                {"prompt": "test", "seed": {"val": 42}}, tmp,
+            )
+            self.assertIn("error", spec)
+            self.assertIn("seed", spec["error"])
+
+    # ── Zero-like values preserved ──────────────────────────────────────
+
+    def test_zero_seed_preserved(self):
+        """seed=0 is preserved, not rejected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            spec = self.mod.build_single_run_spec(
+                preset, snap, "txt2img", {"prompt": "test", "seed": 0}, tmp,
+            )
+            self.assertNotIn("error", spec)
+            cell = spec["cells"][0]
+            self.assertEqual(cell["axis_values"].get("seed"), 0)
+
+    def test_zero_guidance_preserved(self):
+        """guidance=0 is preserved."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            spec = self.mod.build_single_run_spec(
+                preset, snap, "txt2img",
+                {"prompt": "test", "guidance": 0}, tmp,
+            )
+            self.assertNotIn("error", spec)
+            cell = spec["cells"][0]
+            self.assertEqual(cell["axis_values"].get("guidance"), 0)
+
+    def test_zero_denoise_preserved(self):
+        """denoise=0 is preserved."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            spec = self.mod.build_single_run_spec(
+                preset, snap, "txt2img",
+                {"prompt": "test", "denoise": 0.0}, tmp,
+            )
+            self.assertNotIn("error", spec)
+            cell = spec["cells"][0]
+            self.assertEqual(cell["axis_values"].get("denoise"), 0.0)
+
+    def test_false_boolean_preserved(self):
+        """False boolean is preserved through build_single_run_spec."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            # Add a boolean field to the snapshot's control schemas
+            snap["controlSchemas"] = {
+                "enable": {
+                    "kind": "boolean",
+                    "default": False,
+                    "schemaResolved": True,
+                    "nodeId": "3",
+                    "widgetName": "boolean_field",
+                },
+            }
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            spec = self.mod.build_single_run_spec(
+                preset, snap, "txt2img",
+                {"prompt": "test", "enable": False}, tmp,
+            )
+            self.assertNotIn("error", spec)
+
+
+# ---------------------------------------------------------------------------
+# Tests for validate_studio_request_controls
+# ---------------------------------------------------------------------------
+
+class ValidateStudioRequestControlsRED(unittest.TestCase):
+    """RED tests for validate_studio_request_controls().
+
+    Required behavior:
+    - Pure function in studio_run_adapter.
+    - For every preset ID calls load_preset_and_snapshot.
+    - Load failure yields preset-scoped error {presetId, field, message}.
+    - For every loaded snapshot derives its schema; validates shared controls
+      with strict_unknown_rejection=False; validates EACH enabled axis value
+      independently; attaches presetId to every returned validation error.
+    - A heterogeneous experiment must reject a value valid for preset A but
+      invalid for preset B. No first-preset shortcut.
+    - Single run uses helper with [preset_id], controls, {}.
+    - Experiment uses every ID, defaults, axes.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+        cls.model = _load_module("studio_models", "studio_models.py")
+
+    def _make_heterogeneous_snapshot_a(self) -> dict:
+        """Snapshot with "euler" sampler config."""
+        return {
+            "id": "snap_a",
+            "name": "Snapshot A",
+            "compatibleFeatures": ["txt2img"],
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {
+                    "seed": 42, "steps": 20, "cfg": 7.0,
+                    "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
+                }},
+                "9": {"class_type": "SaveImage", "inputs": {"images": []}},
+            },
+            "nodeBindings": {
+                "prompt": {"kind": "widget", "nodeId": "3", "widgetName": "text"},
+                "output": {"kind": "output", "nodeId": "9"},
+            },
+            "outputNodeId": "9",
+            "graphJson": {"nodes": [], "links": []},
+            "archived": False,
+            "status": "runnable",
+            "featureStatus": {
+                "txt2img": {"status": "runnable", "reason": ""},
+            },
+            "disabledReason": "",
+            "controlSchemas": {
+                "sampler": {
+                    "kind": "enum",
+                    "options": ["euler", "dpmpp_2m"],
+                    "default": "euler",
+                    "schemaResolved": True,
+                },
+                "steps": {
+                    "kind": "integer", "minimum": 1, "maximum": 100,
+                    "default": 20, "schemaResolved": True,
+                },
+            },
+        }
+
+    def _make_heterogeneous_snapshot_b(self) -> dict:
+        """Snapshot B with different sampler options — only "lcm" and "turbo"."""
+        return {
+            "id": "snap_b",
+            "name": "Snapshot B",
+            "compatibleFeatures": ["txt2img"],
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {
+                    "seed": 99, "steps": 10, "cfg": 5.0,
+                    "sampler_name": "lcm", "scheduler": "normal", "denoise": 1.0,
+                }},
+                "9": {"class_type": "SaveImage", "inputs": {"images": []}},
+            },
+            "nodeBindings": {
+                "prompt": {"kind": "widget", "nodeId": "3", "widgetName": "text"},
+                "output": {"kind": "output", "nodeId": "9"},
+            },
+            "outputNodeId": "9",
+            "graphJson": {"nodes": [], "links": []},
+            "archived": False,
+            "status": "runnable",
+            "featureStatus": {
+                "txt2img": {"status": "runnable", "reason": ""},
+            },
+            "disabledReason": "",
+            "controlSchemas": {
+                "sampler": {
+                    "kind": "enum",
+                    "options": ["lcm", "turbo"],
+                    "default": "lcm",
+                    "schemaResolved": True,
+                },
+                "steps": {
+                    "kind": "integer", "minimum": 1, "maximum": 50,
+                    "default": 10, "schemaResolved": True,
+                },
+            },
+        }
+
+    # ── RED Test 1: Missing preset returns preset-scoped error ──────────
+
+    def test_missing_preset_returns_preset_scoped_error(self):
+        """A missing preset ID must return a preset-scoped error dict
+        with presetId, field/controlId, and message."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            errors = self.mod.validate_studio_request_controls(
+                preset_ids=["does_not_exist"],
+                feature_id="txt2img",
+                controls={"prompt": "test"},
+                axes={},
+                node_dir=tmp,
+            )
+            self.assertGreater(len(errors), 0,
+                               "Missing preset must produce validation errors")
+            for err in errors:
+                self.assertIn("presetId", err,
+                              "Each error must carry presetId")
+                self.assertEqual(err["presetId"], "does_not_exist")
+                self.assertIn("field", err,
+                              "Each error must carry field/controlId")
+                self.assertIn("message", err,
+                              "Each error must carry a message")
+
+    # ── RED Test 2: Archived preset returns preset-scoped error ─────────
+
+    def test_archived_preset_returns_preset_scoped_error(self):
+        """An archived preset must return a preset-scoped error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_archived_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            errors = self.mod.validate_studio_request_controls(
+                preset_ids=["preset_archived"],
+                feature_id="txt2img",
+                controls={"prompt": "test"},
+                axes={},
+                node_dir=tmp,
+            )
+            self.assertGreater(len(errors), 0,
+                               "Archived preset must produce validation errors")
+            for err in errors:
+                self.assertIn("presetId", err)
+                self.assertEqual(err["presetId"], "preset_archived")
+                self.assertIn("field", err)
+                self.assertIn("message", err)
+
+    # ── RED Test 3: Valid single preset passes ─────────────────────────
+
+    def test_valid_single_preset_passes(self):
+        """A valid single preset with valid controls must return []."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            errors = self.mod.validate_studio_request_controls(
+                preset_ids=["preset_runnable"],
+                feature_id="txt2img",
+                controls={"prompt": "test", "steps": 20},
+                axes={},
+                node_dir=tmp,
+            )
+            self.assertEqual(errors, [],
+                             "Valid controls for a single runnable preset "
+                             "must return no errors")
+
+    # ── RED Test 4: Heterogeneous presets — value valid for A but
+    #                 invalid for B must be rejected ─────────────────────
+
+    def test_heterogeneous_rejects_value_valid_for_a_but_invalid_for_b(self):
+        """A value valid for preset A but NOT for preset B must be rejected.
+        This confirms no first-valid-preset shortcut."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap_a = self._make_heterogeneous_snapshot_a()
+            snap_b = self._make_heterogeneous_snapshot_b()
+            preset_a = _make_runnable_preset("preset_a", "snap_a")
+            preset_b = _make_runnable_preset("preset_b", "snap_b")
+            preset_a["compatibleFeatures"] = ["txt2img"]
+            preset_b["compatibleFeatures"] = ["txt2img"]
+            _make_studio_store_files(tmp, [snap_a, snap_b], [preset_a, preset_b])
+
+            # "euler" is valid for preset A but NOT for preset B (B only has lcm/turbo)
+            errors = self.mod.validate_studio_request_controls(
+                preset_ids=["preset_a", "preset_b"],
+                feature_id="txt2img",
+                controls={"sampler": "euler", "prompt": "test"},
+                axes={},
+                node_dir=tmp,
+            )
+            # Must reject because "euler" is invalid for preset B
+            self.assertGreater(len(errors), 0,
+                               "Value valid for A but invalid for B must be rejected")
+            # At least one error must reference "sampler" and "preset_b"
+            sampler_b_errors = [
+                e for e in errors
+                if e.get("field") == "sampler" and e.get("presetId") == "preset_b"
+            ]
+            self.assertGreater(len(sampler_b_errors), 0,
+                               "Must have an error for sampler on preset_b")
+            self.assertIn("euler", sampler_b_errors[0].get("message", "").lower())
+
+    # ── RED Test 5: Heterogeneous — steps valid for A but invalid for B ─
+
+    def test_heterogeneous_rejects_steps_valid_for_a_but_invalid_for_b(self):
+        """Steps=99 is valid for preset A (max=100) but invalid for preset B
+        (max=50). Must be rejected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap_a = self._make_heterogeneous_snapshot_a()
+            snap_b = self._make_heterogeneous_snapshot_b()
+            preset_a = _make_runnable_preset("preset_a", "snap_a")
+            preset_b = _make_runnable_preset("preset_b", "snap_b")
+            preset_a["compatibleFeatures"] = ["txt2img"]
+            preset_b["compatibleFeatures"] = ["txt2img"]
+            _make_studio_store_files(tmp, [snap_a, snap_b], [preset_a, preset_b])
+
+            errors = self.mod.validate_studio_request_controls(
+                preset_ids=["preset_a", "preset_b"],
+                feature_id="txt2img",
+                controls={"steps": 99, "prompt": "test"},
+                axes={},
+                node_dir=tmp,
+            )
+            # 99 is valid for A (max=100) but invalid for B (max=50)
+            self.assertGreater(len(errors), 0,
+                               "Steps=99 must be rejected for preset B")
+            steps_b_errors = [
+                e for e in errors
+                if e.get("field") == "steps" and e.get("presetId") == "preset_b"
+            ]
+            self.assertGreater(len(steps_b_errors), 0,
+                               "Must have steps error for preset_b")
+
+    # ── RED Test 6: Axis values validated per-preset ───────────────────
+
+    def test_axis_value_validated_per_preset(self):
+        """An axis value must be validated against EVERY preset's schema,
+        not just the first."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap_a = self._make_heterogeneous_snapshot_a()
+            snap_b = self._make_heterogeneous_snapshot_b()
+            preset_a = _make_runnable_preset("preset_a", "snap_a")
+            preset_b = _make_runnable_preset("preset_b", "snap_b")
+            preset_a["compatibleFeatures"] = ["txt2img"]
+            preset_b["compatibleFeatures"] = ["txt2img"]
+            _make_studio_store_files(tmp, [snap_a, snap_b], [preset_a, preset_b])
+
+            # axis sampler with value "euler" which is valid for A but not B
+            axes = {"sampler": {"values": ["euler"]}}
+            errors = self.mod.validate_studio_request_controls(
+                preset_ids=["preset_a", "preset_b"],
+                feature_id="txt2img",
+                controls={"prompt": "test"},
+                axes=axes,
+                node_dir=tmp,
+            )
+            # "euler" must be rejected for preset_b even when used as axis value
+            sampler_b_errors = [
+                e for e in errors
+                if e.get("field") == "sampler" and e.get("presetId") == "preset_b"
+            ]
+            self.assertGreater(len(sampler_b_errors), 0,
+                               "Axis value 'euler' must be rejected for preset_b")
+
+    # ── RED Test 7: Multiple axis values each validated per-preset ─────
+
+    def test_multiple_axis_values_each_validated(self):
+        """Each axis value must be validated independently against every
+        preset (not just the first or last)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap_a = self._make_heterogeneous_snapshot_a()
+            snap_b = self._make_heterogeneous_snapshot_b()
+            preset_a = _make_runnable_preset("preset_a", "snap_a")
+            preset_b = _make_runnable_preset("preset_b", "snap_b")
+            preset_a["compatibleFeatures"] = ["txt2img"]
+            preset_b["compatibleFeatures"] = ["txt2img"]
+            _make_studio_store_files(tmp, [snap_a, snap_b], [preset_a, preset_b])
+
+            # Two axis values: "euler" (valid for A, not B) and "lcm" (valid for both)
+            axes = {"sampler": {"values": ["euler", "lcm"]}}
+            errors = self.mod.validate_studio_request_controls(
+                preset_ids=["preset_a", "preset_b"],
+                feature_id="txt2img",
+                controls={"prompt": "test"},
+                axes=axes,
+                node_dir=tmp,
+            )
+            # "euler" should fail for preset_b even though "lcm" is fine
+            sampler_b_errors = [
+                e for e in errors
+                if e.get("field") == "sampler" and e.get("presetId") == "preset_b"
+            ]
+            self.assertGreater(len(sampler_b_errors), 0,
+                               "Axis value 'euler' must be rejected for preset_b "
+                               "even when 'lcm' is also in the values list")
+
+    # ── RED Test 8: Single run uses helper with [preset_id], controls, {} ─
+
+    def test_single_run_validation(self):
+        """Single run uses validate_studio_request_controls with
+        [preset_id], controls, {} (empty axes)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            # Valid controls: single run path
+            errors = self.mod.validate_studio_request_controls(
+                preset_ids=["preset_runnable"],
+                feature_id="txt2img",
+                controls={"prompt": "test", "steps": 20},
+                axes={},
+                node_dir=tmp,
+            )
+            self.assertEqual(errors, [])
+
+            # Invalid control: should fail
+            errors2 = self.mod.validate_studio_request_controls(
+                preset_ids=["preset_runnable"],
+                feature_id="txt2img",
+                controls={"prompt": "test", "steps": -1},
+                axes={},
+                node_dir=tmp,
+            )
+            self.assertGreater(len(errors2), 0,
+                               "Invalid steps=-1 must be rejected")
+            for err in errors2:
+                self.assertIn("presetId", err)
+                self.assertEqual(err["presetId"], "preset_runnable")
+
+    # ── RED Test 9: Empty preset_ids returns errors ────────────────────
+
+    def test_empty_preset_ids_returns_error(self):
+        """Empty preset_ids list must return an error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            errors = self.mod.validate_studio_request_controls(
+                preset_ids=[],
+                feature_id="txt2img",
+                controls={},
+                axes={},
+                node_dir=tmp,
+            )
+            self.assertGreater(len(errors), 0,
+                               "Empty preset_ids must produce errors")
+
+
+# ── RED Test 10: validate_controls_against_schema raises ─────────────
+
+    def test_validation_function_raises_on_shared_controls_returns_structured_error(self):
+        """When validate_controls_against_schema raises an unexpected
+        exception for shared controls, the validation must fail closed
+        with a structured error {presetId, field/controlId, message:
+        'Control validation could not be completed'} and must NEVER set
+        ctrl_errors=[] (which would silently let invalid controls through)."""
+        import logging
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            with patch(
+                "studio_run_adapter.validate_controls_against_schema",
+                side_effect=RuntimeError("Unexpected schema crash"),
+            ):
+                errors = self.mod.validate_studio_request_controls(
+                    preset_ids=["preset_runnable"],
+                    feature_id="txt2img",
+                    controls={"prompt": "test", "steps": 20},
+                    axes={},
+                    node_dir=tmp,
+                )
+            # Must produce at least one structured error (fail closed)
+            self.assertGreater(len(errors), 0,
+                               "Validation must fail closed when "
+                               "validate_controls_against_schema raises")
+            for err in errors:
+                self.assertIn("presetId", err)
+                self.assertIn("field", err)
+                self.assertIn("message", err)
+                self.assertNotEqual(
+                    err.get("message", "").strip(), "",
+                    "Error message must not be empty",
+                )
+                # Must never be empty error list disguised as no error
+                self.assertNotEqual(
+                    err.get("field"), "",
+                    "field/controlId must not be empty",
+                )
+
+    def test_validation_function_raises_on_axis_values_returns_structured_error(self):
+        """When validate_controls_against_schema raises on axis value
+        validation, must fail closed with structured errors."""
+        import logging
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            with patch(
+                "studio_run_adapter.validate_controls_against_schema",
+                side_effect=RuntimeError("Axis validation crash"),
+            ):
+                errors = self.mod.validate_studio_request_controls(
+                    preset_ids=["preset_runnable"],
+                    feature_id="txt2img",
+                    controls={},
+                    axes={"sampler": {"values": ["euler", "dpmpp_2m"]}},
+                    node_dir=tmp,
+                )
+            self.assertGreater(len(errors), 0,
+                               "Must fail closed on axis validation crash")
+            for err in errors:
+                self.assertIn("presetId", err)
+                self.assertIn("field", err)
+                self.assertIn("message", err)
+
+
+# ---------------------------------------------------------------------------
+# Defect 2: Backend search must include prompt text
+# ---------------------------------------------------------------------------
+
+class HistorySearchPromptTextBehavioralTests(unittest.TestCase):
+    """list_runs search must find runs by their prompt text."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.svc_mod = _load_module("experiment_service", "experiment_service.py")
+
+    def test_search_finds_run_by_prompt_text(self):
+        """Searching for prompt text in extra.requested_controls.prompt must find the run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            rec = svc.record_run(
+                kind="studio_run",
+                prompt_id="exp_search1",
+                status="completed",
+                meta={
+                    "requested_controls": {
+                        "prompt": "a beautiful sunset over mountains",
+                        "negative_prompt": "ugly, blurry",
+                    },
+                },
+            )
+            # Search by positive prompt word
+            result = svc.list_runs(search="sunset")
+            self.assertEqual(len(result["runs"]), 1,
+                             "Must find run by requested_controls.prompt text")
+            self.assertEqual(result["runs"][0]["run_id"], rec["run_id"])
+
+    def test_search_finds_run_by_negative_prompt(self):
+        """Searching for negative prompt text must find the run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            rec = svc.record_run(
+                kind="studio_run",
+                prompt_id="exp_search2",
+                status="completed",
+                meta={
+                    "requested_controls": {
+                        "prompt": "portrait",
+                        "negative_prompt": "deformed, extra fingers",
+                    },
+                },
+            )
+            # Search by negative prompt word
+            result = svc.list_runs(search="deformed")
+            self.assertEqual(len(result["runs"]), 1,
+                             "Must find run by requested_controls.negative_prompt text")
+            self.assertEqual(result["runs"][0]["run_id"], rec["run_id"])
+
+    def test_search_finds_run_by_resolved_controls_prompt(self):
+        """Search must also find prompt text in extra.resolved_controls.prompt."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            rec = svc.record_run(
+                kind="studio_run",
+                prompt_id="exp_search_resolved",
+                status="completed",
+                meta={
+                    "resolved_controls": {
+                        "prompt": "aerial view of coastline",
+                    },
+                },
+            )
+            result = svc.list_runs(search="coastline")
+            self.assertEqual(len(result["runs"]), 1,
+                             "Must find run by resolved_controls.prompt text")
+            self.assertEqual(result["runs"][0]["run_id"], rec["run_id"])
+
+    def test_search_case_insensitive_prompt(self):
+        """Search for prompt text must be case-insensitive."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            rec = svc.record_run(
+                kind="studio_run",
+                prompt_id="exp_search3",
+                status="completed",
+                meta={
+                    "requested_controls": {
+                        "prompt": "Golden Gate Bridge at dusk",
+                    },
+                },
+            )
+            # Search with different case
+            result = svc.list_runs(search="GOLDEN")
+            self.assertEqual(len(result["runs"]), 1,
+                             "Prompt search must be case-insensitive")
+
+
+# ---------------------------------------------------------------------------
+# Defect 4: Date-only date_to includes full calendar day
+# ---------------------------------------------------------------------------
+
+class HistoryDateToInclusiveDayBehavioralTests(unittest.TestCase):
+    """date-only date_to must include the full selected calendar day."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.svc_mod = _load_module("experiment_service", "experiment_service.py")
+
+    def test_date_only_date_to_includes_same_day_runs(self):
+        """A date-only date_to like '2026-07-12' must include runs from that entire day."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            # Create a run started at midday on 2026-07-12
+            rec = svc.record_run(
+                kind="studio_run",
+                prompt_id="exp_date1",
+                status="completed",
+                started_at="2026-07-12T14:30:00Z",
+            )
+            # Filter with date-only date_to
+            result = svc.list_runs(date_to="2026-07-12")
+            self.assertEqual(len(result["runs"]), 1,
+                             "Run from 2026-07-12 must be included when date_to is '2026-07-12'")
+            self.assertEqual(result["runs"][0]["run_id"], rec["run_id"])
+
+    def test_date_only_date_to_excludes_next_day(self):
+        """A date-only date_to must not include runs from the next day."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            # Create a run started early on 2026-07-13
+            svc.record_run(
+                kind="studio_run",
+                prompt_id="exp_date2",
+                status="completed",
+                started_at="2026-07-13T00:01:00Z",
+            )
+            # Filter with date_to = 2026-07-12
+            result = svc.list_runs(date_to="2026-07-12")
+            self.assertEqual(len(result["runs"]), 0,
+                             "Run from 2026-07-13 must be excluded when date_to is '2026-07-12'")
+
+    def test_date_time_date_to_preserves_exact_boundary(self):
+        """DateTime-formatted date_to must preserve exact boundary."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            svc = self.svc_mod.RunHistoryService(root)
+            rec = svc.record_run(
+                kind="studio_run",
+                prompt_id="exp_date3",
+                status="completed",
+                started_at="2026-07-12T23:59:59Z",
+            )
+            # Exact datetime boundary — must still match
+            result = svc.list_runs(date_to="2026-07-12T23:59:59Z")
+            self.assertEqual(len(result["runs"]), 1,
+                             "Exact datetime boundary must match")
+            self.assertEqual(result["runs"][0]["run_id"], rec["run_id"])
+
+
+# ---------------------------------------------------------------------------
+# Extracted defaults filter connection specs; preset defaults prioritised
+# ---------------------------------------------------------------------------
+
+class ExtractDefaultsConnectionSpecRED(unittest.TestCase):
+    """RED: extract_defaults_from_snapshot must omit ComfyUI connection
+    specs (list values like ["937", 0]) in both bound and auto-derived
+    paths.  Scalar values like seed=42 and guidance=7.0 must remain."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_bound_connection_spec_omitted(self):
+        """A bound control whose workflow value is a connection spec
+        (e.g. steps=["937", 0]) must be SKIPPED in returned defaults.
+        Scalar values (seed=42) must remain."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {
+                    "seed": 42, "steps": ["937", 0], "cfg": 7.0,
+                }},
+            },
+            "nodeBindings": {
+                "seed": {"kind": "widget", "nodeId": "3", "widgetName": "seed"},
+                "steps": {"kind": "widget", "nodeId": "3", "widgetName": "steps"},
+                "guidance": {"kind": "widget", "nodeId": "3", "widgetName": "cfg"},
+            },
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        # steps=["937", 0] is a connection spec — must NOT appear
+        self.assertNotIn(
+            "steps", defaults,
+            "steps must be omitted when its value is a connection spec",
+        )
+        # Seed=42 is a scalar — must remain
+        self.assertIn("seed", defaults)
+        self.assertEqual(defaults["seed"], 42)
+        # Guidance=7.0 is a scalar — must remain
+        self.assertIn("guidance", defaults)
+        self.assertEqual(defaults["guidance"], 7.0)
+
+    def test_auto_derived_connection_spec_omitted(self):
+        """An auto-derived control whose workflow value is a connection
+        spec must be SKIPPED in returned defaults."""
+        # Snapshot with no explicit bindings for KSampler controls
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {
+                    "seed": 42, "steps": ["937", 0], "cfg": 7.0,
+                    "sampler_name": "euler", "scheduler": "normal",
+                    "denoise": 1.0,
+                }},
+                "9": {"class_type": "SaveImage", "inputs": {"images": []}},
+            },
+            "nodeBindings": {
+                "prompt": {"kind": "widget", "nodeId": "3", "widgetName": "text"},
+                "output": {"kind": "output", "nodeId": "9"},
+            },
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        # steps should be auto-derived but its value is a connection spec
+        self.assertNotIn(
+            "steps", defaults,
+            "Auto-derived steps must be omitted when value is a connection spec",
+        )
+        # Scalar values that ARE true scalars should appear
+        self.assertIn("seed", defaults)
+        self.assertEqual(defaults["seed"], 42)
+        self.assertIn("sampler", defaults)
+        self.assertEqual(defaults["sampler"], "euler")
+
+    def test_mixed_connection_specs_and_scalars(self):
+        """Mixed connection specs and scalars: only connection specs omitted."""
+        snapshot = {
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {
+                    "seed": 0, "steps": ["937", 0], "cfg": 7.5,
+                    "sampler_name": ["456", 0], "scheduler": "normal",
+                    "denoise": ["789", 0],
+                }},
+                "9": {"class_type": "SaveImage", "inputs": {"images": []}},
+            },
+            "nodeBindings": {
+                "prompt": {"kind": "widget", "nodeId": "3", "widgetName": "text"},
+                "seed": {"kind": "widget", "nodeId": "3", "widgetName": "seed"},
+                "steps": {"kind": "widget", "nodeId": "3", "widgetName": "steps"},
+                "guidance": {"kind": "widget", "nodeId": "3", "widgetName": "cfg"},
+                "sampler": {"kind": "widget", "nodeId": "3", "widgetName": "sampler_name"},
+                "scheduler": {"kind": "widget", "nodeId": "3", "widgetName": "scheduler"},
+                "denoise": {"kind": "widget", "nodeId": "3", "widgetName": "denoise"},
+                "output": {"kind": "output", "nodeId": "9"},
+            },
+        }
+        defaults = self.mod.extract_defaults_from_snapshot(snapshot)
+        # Connection specs must be omitted
+        self.assertNotIn("steps", defaults)
+        self.assertNotIn("sampler", defaults)
+        self.assertNotIn("denoise", defaults)
+        # Scalars must remain
+        self.assertEqual(defaults.get("seed"), 0)
+        self.assertEqual(defaults.get("guidance"), 7.5)
+        self.assertEqual(defaults.get("scheduler"), "normal")
+
+
+class PresetDefaultsPriorityRED(unittest.TestCase):
+    """RED: GET /studio/presets must return explicit preset defaults
+    with priority over snapshot-derived defaults.  Snapshot defaults
+    fill missing preset keys but must NOT overwrite preset keys."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.adapter = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def _make_preset_list_store_files(
+        self, tmpdir: str, presets: list[dict], snapshots: list[dict],
+    ):
+        """Write snapshot and preset JSON store files into tmpdir, then
+        serve the list endpoint logic."""
+        from studio_store import StudioJsonStore
+        snap_store = StudioJsonStore(Path(tmpdir) / ".studio_snapshots.json")
+        snap_store.write_atomic(snapshots)
+        preset_store = StudioJsonStore(Path(tmpdir) / ".studio_presets.json")
+        preset_store.write_atomic(presets)
+
+    def _simulate_presets_list_enrichment(
+        self, tmpdir: str,
+    ) -> list[dict]:
+        """Replicate the enrichment logic from studio_routes.py
+        studio_presets_list to test the defaults merging in isolation."""
+        from studio_store import StudioJsonStore
+        from studio_models import normalize_preset_payload
+        from studio_routes import _build_snapshots_by_id
+
+        presets = StudioJsonStore(Path(tmpdir) / ".studio_presets.json").read()
+        snapshots = StudioJsonStore(Path(tmpdir) / ".studio_snapshots.json").read()
+        snapshots_by_id = _build_snapshots_by_id(snapshots)
+
+        enriched = []
+        for p in presets:
+            normalized = normalize_preset_payload(p, snapshots_by_id)
+            sid = normalized.get("snapshotId", "") or ""
+            snapshot = snapshots_by_id.get(sid) if sid else None
+            if snapshot is not None:
+                snapshot_defaults = self.adapter.extract_defaults_from_snapshot(snapshot)
+                explicit_defaults = normalized.get("defaults", {}) or {}
+                # Merge: snapshot defaults fill missing keys, but explicit
+                # preset defaults take priority.
+                normalized["defaults"] = {**snapshot_defaults, **explicit_defaults}
+                normalized["snapshotSummary"] = {
+                    "name": snapshot.get("name", ""),
+                    "status": snapshot.get("status", ""),
+                }
+            enriched.append(normalized)
+        return enriched
+
+    def test_explicit_preset_defaults_have_priority(self):
+        """Given preset.defaults.steps=8 and snapshot KSampler.inputs.steps
+        =["937",0], the response defaults.steps must be 8 (not the list)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = {
+                "id": "snap_priority",
+                "name": "Priority Snapshot",
+                "compatibleFeatures": ["txt2img"],
+                "apiPromptJson": {
+                    "3": {"class_type": "KSampler", "inputs": {
+                        "seed": 42, "steps": ["937", 0], "cfg": 7.0,
+                        "sampler_name": "euler", "scheduler": "normal",
+                        "denoise": 1.0,
+                    }},
+                    "9": {"class_type": "SaveImage", "inputs": {"images": []}},
+                },
+                "nodeBindings": {
+                    "prompt": {"kind": "widget", "nodeId": "3", "widgetName": "text"},
+                    "output": {"kind": "output", "nodeId": "9"},
+                },
+                "outputNodeId": "9",
+                "status": "runnable",
+                "archived": False,
+            }
+            preset = {
+                "id": "preset_priority",
+                "label": "Priority Preset",
+                "snapshotId": "snap_priority",
+                "compatibleFeatures": ["txt2img"],
+                # Explicit defaults: steps=8 should WIN over snapshot's ["937", 0]
+                "defaults": {"steps": 8, "seed": 99},
+                "sourceType": "snapshot",
+                "archived": False,
+                "status": "runnable",
+            }
+            self._make_preset_list_store_files(tmp, [preset], [snapshot])
+            enriched = self._simulate_presets_list_enrichment(tmp)
+
+            self.assertEqual(len(enriched), 1)
+            entry = enriched[0]
+            d = entry.get("defaults", {})
+
+            # Explicit preset steps=8 must NOT be overwritten by snapshot's
+            # connection spec steps=["937", 0]
+            self.assertIn("steps", d,
+                          "steps must appear in defaults")
+            self.assertEqual(
+                d["steps"], 8,
+                "Explicit preset default steps=8 must take priority "
+                "over snapshot-derived connection spec steps=[\"937\", 0]",
+            )
+            # Snapshot scalar defaults fill missing preset keys
+            # guidance is in snapshot but NOT in preset defaults
+            self.assertEqual(
+                d.get("guidance"), 7.0,
+                "Snapshot-derived scalar guidance must fill missing preset key",
+            )
+            # Preset's explicit seed must be preserved
+            self.assertEqual(
+                d.get("seed"), 99,
+                "Explicit preset default seed=99 must survive enrichment",
+            )
+
+    def test_snapshot_scalar_defaults_fill_missing_preset_keys(self):
+        """Snapshot scalar defaults (e.g. guidance=7.0) must fill in when
+        the preset does not have an explicit value for that control."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = {
+                "id": "snap_fill",
+                "name": "Fill Snapshot",
+                "compatibleFeatures": ["txt2img"],
+                "apiPromptJson": {
+                    "3": {"class_type": "KSampler", "inputs": {
+                        "seed": 42, "steps": 20, "cfg": 7.0,
+                        "sampler_name": "euler", "scheduler": "normal",
+                        "denoise": 1.0,
+                    }},
+                    "9": {"class_type": "SaveImage", "inputs": {"images": []}},
+                },
+                "nodeBindings": {
+                    "prompt": {"kind": "widget", "nodeId": "3", "widgetName": "text"},
+                    "steps": {"kind": "widget", "nodeId": "3", "widgetName": "steps"},
+                    "seed": {"kind": "widget", "nodeId": "3", "widgetName": "seed"},
+                    "guidance": {"kind": "widget", "nodeId": "3", "widgetName": "cfg"},
+                    "output": {"kind": "output", "nodeId": "9"},
+                },
+                "outputNodeId": "9",
+                "status": "runnable",
+                "archived": False,
+            }
+            preset = {
+                "id": "preset_fill",
+                "label": "Fill Preset",
+                "snapshotId": "snap_fill",
+                "compatibleFeatures": ["txt2img"],
+                # Preset only sets steps; guidance should come from snapshot
+                "defaults": {"steps": 30},
+                "sourceType": "snapshot",
+                "archived": False,
+                "status": "runnable",
+            }
+            self._make_preset_list_store_files(tmp, [preset], [snapshot])
+            enriched = self._simulate_presets_list_enrichment(tmp)
+
+            self.assertEqual(len(enriched), 1)
+            d = enriched[0].get("defaults", {})
+
+            # Preset's explicit steps=30 must survive
+            self.assertEqual(d.get("steps"), 30)
+            # Snapshot-derived guidance=7.0 must fill the missing key
+            self.assertEqual(d.get("guidance"), 7.0)
+            # Snapshot-derived seed=42 must fill missing key
+            self.assertEqual(d.get("seed"), 42)
 
 
 if __name__ == "__main__":

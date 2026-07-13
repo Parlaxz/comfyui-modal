@@ -23,7 +23,7 @@ const STUDIO_CSS = `
 }
 
 /* When modal is open, body should not scroll behind it */
-body:has(.comfymodal-studio-modal) {
+body.comfymodal-body-scroll-lock {
   overflow: hidden;
 }
 
@@ -62,6 +62,69 @@ body:has(.comfymodal-studio-modal) {
   flex-shrink: 0;
   padding: 0 8px;
   background: #0d0d0d;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+@media (max-width: 480px) {
+  .comfymodal-studio-topnav button {
+    padding: 10px 10px;
+    min-height: 44px;
+    white-space: nowrap;
+  }
+
+  /* Close button — expand hit area to 44px via padding */
+  .comfymodal-testing-close {
+    min-width: 44px;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Feature tabs — ensure minimum tap height */
+  .comfymodal-studio-feature-tab {
+    min-height: 44px;
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+
+  /* Primary / secondary / destructive buttons */
+  .comfymodal-primary-btn,
+  .comfymodal-secondary-btn,
+  .comfymodal-destructive-btn,
+  .comfymodal-studio-reset-link {
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Inputs, selects, number inputs */
+  .comfymodal-studio-number-input,
+  .comfymodal-studio-select,
+  .comfymodal-input,
+  .comfymodal-testing-input {
+    min-height: 44px;
+  }
+
+  /* History preview close button */
+  .comfymodal-studio-history-preview-close {
+    min-width: 44px;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Favorite star — expand hit area to 44px without growing the icon */
+  .comfymodal-studio-favorite-star {
+    min-width: 44px;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
 }
 
 .comfymodal-studio-topnav button {
@@ -84,8 +147,8 @@ body:has(.comfymodal-studio-modal) {
 }
 
 .comfymodal-studio-topnav button.active {
-  color: #dc2626;
-  border-bottom-color: #dc2626;
+  color: var(--color-accent, #5a7fdb);
+  border-bottom-color: var(--color-accent, #5a7fdb);
 }
 
 /* ── Shell page container ────────────────────────────────── */
@@ -188,7 +251,12 @@ body:has(.comfymodal-studio-modal) {
 }
 
 .comfymodal-studio-textarea:focus {
-  border-color: #dc2626;
+  border-color: var(--color-border-focus, #5a7fdb);
+  outline: none;
+}
+
+.comfymodal-studio-number-input:focus {
+  border-color: var(--color-border-focus, #5a7fdb);
   outline: none;
 }
 
@@ -204,7 +272,7 @@ body:has(.comfymodal-studio-modal) {
 }
 
 .comfymodal-studio-number-input:focus {
-  border-color: #dc2626;
+  border-color: var(--color-border-focus, #5a7fdb);
   outline: none;
 }
 
@@ -272,8 +340,8 @@ body:has(.comfymodal-studio-modal) {
 }
 
 .comfymodal-studio-feature-tab.active {
-  color: #dc2626;
-  border-bottom-color: #dc2626;
+  color: var(--color-accent, #5a7fdb);
+  border-bottom-color: var(--color-accent, #5a7fdb);
 }
 
 /* ── Placeholder notices ─────────────────────────────────── */
@@ -364,7 +432,7 @@ body:has(.comfymodal-studio-modal) {
 
 .comfymodal-studio-run-section .comfymodal-primary-btn,
 .comfymodal-primary-btn {
-  background: #dc2626;
+  background: var(--color-accent, #5a7fdb);
   color: #fff;
   border: none;
   padding: 8px 16px;
@@ -375,11 +443,11 @@ body:has(.comfymodal-studio-modal) {
   border-radius: 3px;
   cursor: pointer;
   width: 100%;
-  transition: background 0.15s;
+  transition: background 0.15s ease, opacity 0.15s ease;
 }
 
 .comfymodal-primary-btn:hover:not(:disabled) {
-  background: #b91c1c;
+  background: var(--color-accent-hover, #6a8ceb);
 }
 
 .comfymodal-primary-btn:disabled {
@@ -407,14 +475,14 @@ body:has(.comfymodal-studio-modal) {
 }
 
 .comfymodal-destructive-btn {
-  background: #1a0000;
-  color: #dc2626;
-  border: 1px solid #3a0a0a;
+  background: var(--color-danger-bg, #1a0000);
+  color: var(--color-danger, #dc2626);
+  border: 1px solid var(--color-border-danger, #ef4444);
   padding: 5px 12px;
   font-size: 11px;
   border-radius: 3px;
   cursor: pointer;
-  transition: background 0.15s;
+  transition: background 0.15s ease;
 }
 
 .comfymodal-destructive-btn:hover {
@@ -438,8 +506,8 @@ body:has(.comfymodal-studio-modal) {
 }
 
 .comfymodal-studio-experiment-active {
-  background: #dc2626 !important;
-  border-color: #dc2626 !important;
+  background: var(--color-accent, #5a7fdb) !important;
+  border-color: var(--color-accent, #5a7fdb) !important;
   color: #fff !important;
 }
 
@@ -510,7 +578,7 @@ body:has(.comfymodal-studio-modal) {
 
 .comfymodal-studio-axis-checkbox {
   cursor: pointer;
-  accent-color: #dc2626;
+  accent-color: var(--color-accent, #5a7fdb);
 }
 
 /* ── Axis Editor ─────────────────────────────────────────── */
@@ -548,7 +616,7 @@ body:has(.comfymodal-studio-modal) {
 
 .comfymodal-studio-axis-editor-values textarea:focus,
 .comfymodal-studio-axis-editor-values input[type="text"]:focus {
-  border-color: #dc2626;
+  border-color: var(--color-border-focus, #5a7fdb);
   outline: none;
 }
 
@@ -611,11 +679,22 @@ body:has(.comfymodal-studio-modal) {
   border: 2px solid #2a2a2a;
   position: relative;
   transition: border-color 0.15s, transform 0.15s;
+  background: none;
+  padding: 0;
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  line-height: 1;
 }
 
 .comfymodal-studio-carousel-item:hover {
-  border-color: #dc2626;
+  border-color: var(--color-accent, #5a7fdb);
   transform: scale(1.05);
+}
+
+.comfymodal-studio-carousel-item:focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 2px;
 }
 
 .comfymodal-studio-carousel-item.completed {
@@ -675,7 +754,7 @@ body:has(.comfymodal-studio-modal) {
 }
 
 .comfymodal-studio-history-card:hover {
-  border-color: #dc2626;
+  border-color: var(--color-accent, #5a7fdb);
   transform: scale(1.03);
   z-index: 1;
 }
@@ -977,8 +1056,8 @@ body:has(.comfymodal-studio-modal) {
 }
 
 .comfymodal-studio-backend-tab.active {
-  color: #dc2626;
-  border-bottom-color: #dc2626;
+  color: var(--color-accent, #5a7fdb);
+  border-bottom-color: var(--color-accent, #5a7fdb);
 }
 
 .comfymodal-studio-backend-body {
@@ -1024,7 +1103,7 @@ body:has(.comfymodal-studio-modal) {
 }
 
 .comfymodal-studio-backend-card.active {
-  border-color: #dc2626;
+  border-color: var(--color-accent, #5a7fdb);
 }
 
 .comfymodal-studio-backend-card h4 {
@@ -1079,6 +1158,34 @@ body:has(.comfymodal-studio-modal) {
   margin-top: 8px;
 }
 
+/* ── Responsive: breakpoint 768px ───────────────────────── */
+
+@media (max-width: 768px) {
+  .comfymodal-studio-playground {
+    flex-direction: column;
+  }
+  .comfymodal-studio-control-panel {
+    width: 100%;
+    min-width: 0;
+    max-height: 40vh;
+    overflow-y: auto;
+  }
+  .comfymodal-studio-backend-body {
+    flex-direction: column;
+  }
+  .comfymodal-studio-backend-list {
+    width: 100%;
+    min-width: 0;
+  }
+  .comfymodal-studio-history-gallery {
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  }
+  .comfymodal-studio-filter-bar input,
+  .comfymodal-studio-filter-bar select {
+    min-height: 44px;
+  }
+}
+
 /* ── Card (generic) ──────────────────────────────────────── */
 
 .comfymodal-studio-card {
@@ -1105,7 +1212,7 @@ body:has(.comfymodal-studio-modal) {
 }
 .comfymodal-studio-snapshot-card.active,
 .comfymodal-studio-preset-card.active {
-  border-color: #dc2626;
+  border-color: var(--color-accent, #5a7fdb);
 }
 .comfymodal-studio-snapshot-card h4,
 .comfymodal-studio-preset-card h4 {
@@ -1177,7 +1284,7 @@ button.comfymodal-studio-feature-chip {
   background: #0a0a0a;
   color: #888;
   cursor: pointer;
-  transition: all 0.15s;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
   user-select: none;
 }
 .comfymodal-studio-feature-chip:hover {
@@ -1186,9 +1293,9 @@ button.comfymodal-studio-feature-chip {
 }
 .comfymodal-studio-feature-chip.checked,
 .comfymodal-studio-feature-chip[aria-pressed="true"] {
-  background: #1a0a0a;
-  border-color: #dc2626;
-  color: #dc2626;
+  background: var(--color-accent-muted, rgba(90, 127, 219, 0.18));
+  border-color: var(--color-accent, #5a7fdb);
+  color: var(--color-accent, #5a7fdb);
 }
 .comfymodal-studio-feature-chip .chip-check {
   display: none;
@@ -1361,22 +1468,33 @@ button.comfymodal-studio-feature-chip {
 
 .comfymodal-studio-progress-bar-fill {
   height: 100%;
-  background: #dc2626;
+  background: var(--color-accent, #5a7fdb);
   border-radius: 4px;
   transition: width 0.3s ease;
 }
 
-/* ── Favorite Star ─────────────────────────────────────── */
+/* ── Favorite Star (also <button> variant) ────────────── */
 
 .comfymodal-studio-favorite-star {
   cursor: pointer;
   font-size: 16px;
   user-select: none;
   transition: transform 0.15s, color 0.15s;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
+  line-height: 1;
+  color: inherit;
 }
 
 .comfymodal-studio-favorite-star:hover {
   transform: scale(1.2);
+}
+
+.comfymodal-studio-favorite-star:focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 2px;
 }
 
 /* ── Note Editor ───────────────────────────────────────── */
@@ -1389,7 +1507,74 @@ button.comfymodal-studio-feature-chip {
   font-family: inherit;
 }
 
-/* ── Timing Summary ────────────────────────────────────── */
+/* ── Timing Card ─────────────────────────────────────────── */
+
+.comfymodal-studio-timing-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin-top: 4px;
+  padding: 4px 8px;
+  background: #0a0a0a;
+  border: 1px solid #1a1a1a;
+  border-radius: 3px;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.comfymodal-studio-timing-e2e {
+  font-weight: 600;
+  color: #d0d0d0;
+  font-size: 11px;
+}
+
+.comfymodal-studio-timing-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 6px;
+  align-items: center;
+}
+
+.comfymodal-studio-timing-tag {
+  color: #888;
+  font-size: 9px;
+  padding: 1px 4px;
+  background: #1a1a1a;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+
+.comfymodal-studio-timing-quality {
+  font-size: 8px;
+  color: #fbbf24;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-left: auto;
+}
+
+.comfymodal-studio-timing-quality:empty {
+  display: none;
+}
+
+.comfymodal-studio-advanced-timing-toggle {
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  color: #666 !important;
+}
+
+.comfymodal-studio-advanced-timing-panel {
+  width: 100%;
+}
+
+.comfymodal-studio-advanced-timing-panel div {
+  font-size: 9px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+/* ── Compat: old-style timing-summary fallback ─────────── */
 
 .comfymodal-studio-timing-summary {
   font-size: 10px;
@@ -1424,6 +1609,33 @@ button.comfymodal-studio-feature-chip {
   cursor: not-allowed;
 }
 
+/* ── Focus-visible styles for interactive Studio elements ──── */
+
+.comfymodal-studio-topnav button:focus-visible,
+.comfymodal-studio-feature-tab:focus-visible,
+.comfymodal-studio-history-card:focus-visible,
+.comfymodal-studio-backend-tab:focus-visible,
+.comfymodal-studio-backend-card:focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 1px;
+}
+
+.comfymodal-studio-history-preview-close:focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 2px;
+}
+
+/* ── Safe-area support ──────────────────────────────── */
+
+@supports (padding: env(safe-area-inset-top)) {
+  .comfymodal-studio-modal {
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+  }
+}
+
 /* ── Card-level favorite star positioning ─────────────── */
 
 .comfymodal-studio-history-card {
@@ -1453,7 +1665,7 @@ button.comfymodal-studio-feature-chip {
 .comfymodal-studio-textarea:focus,
 .comfymodal-studio-number-input:focus,
 .comfymodal-studio-select:focus {
-  border-color: #dc2626 !important;
+  border-color: var(--color-border-focus, #5a7fdb) !important;
   outline: none !important;
 }
 
@@ -1591,9 +1803,9 @@ button.comfymodal-studio-feature-chip {
 }
 
 .comfymodal-studio-wizard-step-dot.active {
-  background: #dc2626;
+  background: var(--color-accent, #5a7fdb);
   color: #fff;
-  border-color: #dc2626;
+  border-color: var(--color-accent, #5a7fdb);
 }
 
 .comfymodal-studio-wizard-step-dot.done {
@@ -1696,8 +1908,8 @@ button.comfymodal-studio-feature-chip {
 }
 
 .comfymodal-studio-wizard-feature-card.selected {
-  border-color: #dc2626;
-  background: #1a0a0a;
+  border-color: var(--color-accent, #5a7fdb);
+  background: var(--color-accent-muted, rgba(90, 127, 219, 0.18));
 }
 
 .comfymodal-studio-wizard-feature-check {
@@ -1719,8 +1931,8 @@ button.comfymodal-studio-feature-chip {
 }
 
 .comfymodal-studio-wizard-checkbox.checked {
-  background: #dc2626;
-  border-color: #dc2626;
+  background: var(--color-accent, #5a7fdb);
+  border-color: var(--color-accent, #5a7fdb);
   color: #fff;
 }
 
@@ -1767,8 +1979,8 @@ button.comfymodal-studio-feature-chip {
 }
 
 .comfymodal-studio-wizard-binding-row.capturing-active {
-  border-color: #dc2626;
-  background: #2a0a0a;
+  border-color: var(--color-accent, #5a7fdb);
+  background: var(--color-accent-muted, rgba(90, 127, 219, 0.18));
 }
 
 .comfymodal-studio-wizard-binding-info {
@@ -1800,7 +2012,7 @@ button.comfymodal-studio-feature-chip {
   width: 24px;
   height: 24px;
   border: 2px solid #2a2a2a;
-  border-top-color: #dc2626;
+  border-top-color: var(--color-accent, #5a7fdb);
   border-radius: 50%;
   animation: comfymodal-spin 0.8s linear infinite;
   margin-top: 12px;
@@ -1822,6 +2034,49 @@ button.comfymodal-studio-feature-chip {
 
 .comfymodal-studio-backend-action-bar {
   padding: 8px 0 0;
+}
+
+/* ── Status Banner (preset detail) ─────────────────────── */
+
+.comfymodal-studio-status-banner {
+  padding: 6px 10px;
+  border-radius: 3px;
+  margin-bottom: 8px;
+  font-size: 11px;
+}
+.comfymodal-studio-status-banner.runnable {
+  background: var(--color-success-bg, rgba(74, 222, 128, 0.12));
+  border: 1px solid var(--color-success, #4ade80);
+  color: var(--color-success, #4ade80);
+}
+.comfymodal-studio-status-banner.archived {
+  background: var(--color-danger-bg, rgba(239, 68, 68, 0.12));
+  border: 1px solid var(--color-danger, #ef4444);
+  color: var(--color-danger, #ef4444);
+}
+.comfymodal-studio-status-banner.not-runnable {
+  background: var(--color-warning-bg, rgba(245, 158, 11, 0.12));
+  border: 1px solid var(--color-warning, #f59e0b);
+  color: var(--color-warning, #f59e0b);
+}
+
+/* ── Runnable Checklist ─────────────────────────────────── */
+
+.comfymodal-studio-checklist {
+  margin-bottom: 6px;
+  padding: 6px;
+  background: #0a0a0a;
+  border: 1px solid #2a2a2a;
+  border-radius: 3px;
+  list-style: none;
+  margin: 4px 0;
+}
+.comfymodal-studio-checklist-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 2px 0;
+  font-size: 10px;
 }
 `;
 

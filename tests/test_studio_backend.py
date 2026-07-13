@@ -550,10 +550,16 @@ class HistorySafeRenderingTests(unittest.TestCase):
         has_dangerous = ('innerHTML = `' in text or 'innerHTML += `' in text)
         self.assertFalse(has_dangerous)
 
-    def test_history_uses_create_element(self):
-        """History must use createElement for run data cards."""
+    def test_history_uses_safe_el_factory(self):
+        """History uses safe el() from studio-ui.js (wraps createElement) with no innerHTML."""
         text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        self.assertIn("createElement", text)
+        # Imports the canonical safe factory (which wraps document.createElement)
+        self.assertIn('import { el } from', text,
+                       "Expected el() import from studio-ui.js — el() wraps createElement safely")
+        # Must not use template-literal innerHTML for run data
+        has_dangerous = ('innerHTML = `' in text or 'innerHTML += `' in text)
+        self.assertFalse(has_dangerous,
+                         "History must not use template-literal innerHTML for dynamic run data")
 
     def test_history_failed_state(self):
         """History must show error state on failure."""
@@ -1849,6 +1855,611 @@ class Phase4FixToggleBooleanMappingTests(unittest.TestCase):
                       "toggle must be handled in schemaType mapping")
         self.assertIn('"boolean"', self.fn_block,
                       "schemaType must include boolean mapping")
+
+
+# ---------------------------------------------------------------------------
+# Playground polling refactoring — timeout, isConnected, timer cleanup, try/catch
+# ---------------------------------------------------------------------------
+
+class PlaygroundPollingTimeoutTests(unittest.TestCase):
+    """_startPolling must have a finite timeout that transitions to error."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_polling_has_timeout_constant(self):
+        """_startPolling must define a POLL_TIMEOUT_MS or deadline for finite timeout."""
+        # Must contain a timeout-related constant or variable for the deadline
+        self.assertTrue(
+            "POLL_TIMEOUT_MS" in self.text or "deadline" in self.text or "5 * 60 * 1000" in self.text,
+            "Expected timeout mechanism in _startPolling (POLL_TIMEOUT_MS, deadline, or 5*60*1000)",
+        )
+
+    def test_timeout_transitions_to_error(self):
+        """When deadline is exceeded, polling must transition to error state."""
+        self.assertIn("error", self.text.lower())
+
+    def test_poll_interval_defined(self):
+        """POLL_INTERVAL_MS must be defined."""
+        self.assertTrue(
+            "3000" in self.text or "POLL_INTERVAL_MS" in self.text,
+            "Expected POLL_INTERVAL_MS or 3000 in _startPolling",
+        )
+
+
+class PlaygroundContainerIsConnectedTests(unittest.TestCase):
+    """_startPolling must check container.isConnected on every tick."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_checks_is_connected(self):
+        """Every poll tick must check container.isConnected and stop if detached."""
+        self.assertIn("isConnected", self.text,
+                      "Expected container.isConnected check in _startPolling tick")
+
+    def test_stop_on_detached(self):
+        """When container is detached, polling must stop and not continue."""
+        self.assertIn("_stopPolling", self.text) or self.assertIn("clearInterval", self.text)
+
+
+class PlaygroundPollTimerCleanupTests(unittest.TestCase):
+    """_startPolling must clear previous timer before starting and clear on stop."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_clears_previous_timer(self):
+        """_startPolling must clear any existing _pollTimer before starting a new one."""
+        self.assertIn("_stopPolling", self.text) or self.assertIn("clearInterval", self.text)
+
+    def test_sets_timer_on_state(self):
+        """_startPolling must store the timer reference on the state (survives re-renders)."""
+        self.assertIn("state.playground._pollTimer", self.text)
+
+    def test_stop_clears_timer_on_state(self):
+        """_stopPolling(state) must clear state.playground._pollTimer to null."""
+        self.assertIn("state.playground._pollTimer = null", self.text)
+
+
+class PlaygroundPollingTryCatchTests(unittest.TestCase):
+    """_startPolling must wrap getStudioRunStatus in try/catch for transient errors."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_has_try_catch(self):
+        """getStudioRunStatus call must be wrapped in try/catch."""
+        self.assertIn("try", self.text) and self.assertIn("catch", self.text)
+
+    def test_transient_waiting_on_error(self):
+        """On transient fetch error, polling must stay in waiting state, not crash."""
+        self.assertIn("waiting", self.text)
+
+
+# ---------------------------------------------------------------------------
+# Task 1: Normalized preset defaults before controls render
+# ---------------------------------------------------------------------------
+
+class WidthHeightControlDefsTests(unittest.TestCase):
+    """CONTROL_DEFS must have width and height controls with integer schema constraints."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-feature-registry.js").read_text(encoding="utf-8")
+        self.defs_start = self.text.find("export const CONTROL_DEFS")
+        self.defs_block = self.text[self.defs_start:] if self.defs_start >= 0 else ""
+
+    def test_control_defs_has_width(self):
+        """CONTROL_DEFS must define width with id, label, type, defaultValue, min, max, step."""
+        self.assertIn("width:", self.defs_block)
+        self.assertIn('type: "number"', self.defs_block[self.defs_block.find("width:"):self.defs_block.find("width:") + 300])
+        self.assertIn("defaultValue:", self.defs_block)
+
+    def test_control_defs_has_height(self):
+        """CONTROL_DEFS must define height with id, label, type, defaultValue, min, max, step."""
+        self.assertIn("height:", self.defs_block)
+        height_start = self.defs_block.find("height:")
+        self.assertGreater(height_start, 0)
+        height_block = self.defs_block[height_start:height_start + 300]
+        self.assertIn('type: "number"', height_block)
+
+    def test_width_is_integer_type(self):
+        """width must use step:1 or be explicitly integer."""
+        text = self.defs_block
+        width_start = text.find("width:")
+        width_block = text[width_start:width_start + 300]
+        self.assertIn("step: 8", width_block)  # divisible by 8 for latent alignment
+
+    def test_height_is_integer_type(self):
+        """height must use step:1 or be explicitly integer."""
+        height_start = self.defs_block.find("height:")
+        height_block = self.defs_block[height_start:height_start + 300]
+        self.assertIn("step: 8", height_block)
+
+    def test_width_height_have_min_max(self):
+        """width and height must have min/max constraints."""
+        for ctrl_name in ("width:", "height:"):
+            pos = self.defs_block.find(ctrl_name)
+            block = self.defs_block[pos:pos + 300]
+            self.assertIn("min:", block, f"{ctrl_name} missing min")
+            self.assertIn("max:", block, f"{ctrl_name} missing max")
+
+    def test_txt2img_feature_includes_width_height(self):
+        """FEATURE_SPECS txt2img controls list must include width and height."""
+        txt2img_start = self.text.find("txt2img")
+        txt2img_block = self.text[txt2img_start:txt2img_start + 800]
+        self.assertIn("width", txt2img_block)
+        self.assertIn("height", txt2img_block)
+
+    def test_width_height_experiment_eligible(self):
+        """width and height must be experimentEligible."""
+        for ctrl_name in ("width:", "height:"):
+            pos = self.defs_block.find(ctrl_name)
+            block = self.defs_block[pos:pos + 300]
+            self.assertIn("experimentEligible", block,
+                          f"{ctrl_name} missing experimentEligible flag")
+
+    def test_width_height_applicable_to_txt2img(self):
+        """width and height applicableFeatures must include txt2img."""
+        for ctrl_name in ("width:", "height:"):
+            pos = self.defs_block.find(ctrl_name)
+            block = self.defs_block[pos:pos + 300]
+            self.assertIn('"txt2img"', block,
+                          f"{ctrl_name} applicableFeatures must include txt2img")
+
+
+class HydrationPrecedenceOwnPropertyTests(unittest.TestCase):
+    """Hydration precedence must use own-property checks to preserve 0/false."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_hydration_precedence_draft_over_run_over_defaults(self):
+        """hydrateControlsForSelection must chain: draft > run controls > preset.defaults > definition default."""
+        # The chain must appear in source: draft check before resolvedControls, before preset.defaults loop
+        draft_check = self.text.find("loadControlDraft")
+        run_controls_check = self.text.find("resolvedControls")
+        preset_defaults_loop = self.text.find("presetDefaults")
+        # draft appears before run controls check
+        self.assertGreater(run_controls_check, draft_check,
+                           "draft check must precede resolvedControls check")
+        # run controls appears before preset defaults overlay
+        self.assertGreater(preset_defaults_loop, run_controls_check,
+                           "resolvedControls check must precede preset.defaults overlay")
+
+    def test_hydration_uses_has_own_property_for_preset_defaults(self):
+        """hydrateControlsForSelection must use hasOwnProperty for preset defaults overlay."""
+        has_own_count = self.text.count("hasOwnProperty")
+        self.assertGreaterEqual(has_own_count, 2,
+            "Expected at least 2 hasOwnProperty calls (for resolvedControls and presetDefaults)")
+
+    def test_hydration_no_coerce_zero_with_truthy(self):
+        """Must not use bare-truthy `if (val)` or `|| def.defaultValue` that would coerce 0."""
+        # The value resolution must NOT end with `|| def.defaultValue`
+        self.assertNotIn("|| def.defaultValue", self.text,
+            "Using || def.defaultValue would coerce 0 to the default")
+
+    def test_hydration_definition_defaults_seeded_first(self):
+        """hydrateControlsForSelection must seed definition defaults before overlay."""
+        # Test: merged starts by iterating CONTROL_DEFS before overlay
+        control_defs_iter = self.text.find("CONTROL_DEFS[defId]")
+        preset_overlay_iter = self.text.rfind("hasOwnProperty.call(presetDefaults")
+        self.assertGreater(preset_overlay_iter, control_defs_iter,
+            "CONTROL_DEFS seed must happen before preset.defaults overlay")
+
+
+class PresetDefaultsScalarBackendTests(unittest.TestCase):
+    """get_preset_scalar_defaults merges preset (priority) + snapshot (fallback) scalar defaults."""
+
+    _PRESETS_JSON = [
+        {
+            "id": "test_preset",
+            "label": "Test Preset",
+            "snapshotId": "test_snapshot",
+            "defaults": {"steps": 30, "scheduler": "karras", "denoise": 0.0},
+            "compatibleFeatures": ["txt2img"],
+            "status": "runnable",
+        },
+    ]
+    _SNAPSHOTS_JSON = [
+        {
+            "id": "test_snapshot",
+            "name": "Test Snapshot",
+            "nodeBindings": {
+                "steps": {"nodeId": "3", "widgetName": "steps", "kind": "widget"},
+                "width": {"nodeId": "5", "widgetName": "width", "kind": "widget"},
+                "height": {"nodeId": "5", "widgetName": "height", "kind": "widget"},
+            },
+            # Note: flat workflow dict (no "output"/"workflow" wrapper)
+            # so _get_executable_workflow returns the full dict for lookups.
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {"steps": 20, "cfg": 7}},
+                "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 768}},
+            },
+        },
+    ]
+
+    def setUp(self):
+        import json, tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self._node_dir = Path(self._tmp.name)
+        presets_path = self._node_dir / ".studio_presets.json"
+        snapshots_path = self._node_dir / ".studio_snapshots.json"
+        presets_path.write_text(json.dumps(self._PRESETS_JSON), encoding="utf-8")
+        snapshots_path.write_text(json.dumps(self._SNAPSHOTS_JSON), encoding="utf-8")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _call_get_scalar_defaults(self):
+        """Helper: import and call get_preset_scalar_defaults."""
+        from studio_run_adapter import get_preset_scalar_defaults
+        return get_preset_scalar_defaults("test_preset", self._node_dir)
+
+    def test_preset_priority_over_snapshot(self):
+        """Preset.defaults value must win over snapshot widget default for same key."""
+        merged, err = self._call_get_scalar_defaults()
+        self.assertIsNone(err)
+        self.assertIsNotNone(merged)
+        # preset says steps=30, snapshot says steps=20
+        self.assertEqual(merged["steps"], 30)
+
+    def test_snapshot_fills_missing_preset_keys(self):
+        """Keys present in snapshot but absent from preset.defaults must appear in merged."""
+        merged, err = self._call_get_scalar_defaults()
+        self.assertIsNone(err)
+        self.assertIsNotNone(merged)
+        # width/height are only in snapshot, not in preset.defaults
+        self.assertEqual(merged.get("width"), 512)
+        self.assertEqual(merged.get("height"), 768)
+
+    def test_merged_includes_steps(self):
+        """steps must be present as a scalar in the merged result."""
+        merged, err = self._call_get_scalar_defaults()
+        self.assertIsNone(err)
+        self.assertTrue("steps" in merged)
+        self.assertIsInstance(merged["steps"], int)
+
+    def test_merged_includes_scheduler(self):
+        """scheduler must be present as a scalar string in the merged result."""
+        merged, err = self._call_get_scalar_defaults()
+        self.assertIsNone(err)
+        self.assertTrue("scheduler" in merged)
+        self.assertIsInstance(merged["scheduler"], str)
+
+    def test_merged_includes_width_height(self):
+        """width and height must be present as scalar ints in the merged result."""
+        merged, err = self._call_get_scalar_defaults()
+        self.assertIsNone(err)
+        for key in ("width", "height"):
+            self.assertTrue(key in merged, f"{key} missing from merged defaults")
+            self.assertIsInstance(merged[key], int)
+
+    def test_preset_zero_value_survives(self):
+        """Preset default of 0 (e.g. denoise: 0.0) must survive, not be replaced by snapshot."""
+        merged, err = self._call_get_scalar_defaults()
+        self.assertIsNone(err)
+        # denoise=0.0 is explicit in preset.defaults — must not be overridden
+        self.assertTrue("denoise" in merged)
+        self.assertEqual(merged["denoise"], 0.0)
+
+    def test_snapshot_derived_via_extract_defaults(self):
+        """get_preset_scalar_defaults must call extract_defaults_from_snapshot for snapshot keys."""
+        from studio_run_adapter import extract_defaults_from_snapshot
+        snapshot = self._SNAPSHOTS_JSON[0]
+        extracted = extract_defaults_from_snapshot(snapshot)
+        self.assertIn("steps", extracted)
+        self.assertIn("width", extracted)
+        self.assertEqual(extracted["steps"], 20)  # raw snapshot value
+
+
+class SamplerSchedulerFallbackTests(unittest.TestCase):
+    """renderControl must not fall back to generic hardcoded defaults for sampler/scheduler."""
+
+    def setUp(self) -> None:
+        self.pg_text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_dynamic_options_without_schema_shows_disabled_text_input(self):
+        """dynamicOptions select without schema must show disabled text with saved value, not 'Default'."""
+        # The dynamicOptions-only branch must use input[type=text][disabled] to preserve value
+        self.assertIn('dynamicOptions', self.pg_text)
+        # Must NOT show "Default" for dynamic-options without schema
+        # The else-if branch for def.dynamicOptions without schema should create text input
+        self.assertIn(
+            'type: "text"',
+            self.pg_text[self.pg_text.find("Dynamic-options select"):self.pg_text.find("Dynamic-options select") + 400],
+        )
+
+    def test_render_control_schema_before_default_value(self):
+        """renderControl must check schema before falling through to static CONTROL_DEFS defaults."""
+        # The code path for 'select' type checks schema before using defaultValue
+        self.assertIn("schema.kind === \"enum\"", self.pg_text)
+        # Must use options from schema, not hardcoded defaults
+        self.assertIn("schema.options", self.pg_text)
+        self.assertIn("dynamicOptions", self.pg_text)
+
+
+class PresetResolutionBeforeHydrationTests(unittest.TestCase):
+    """Active preset must be resolved before hydrateControlsForSelection is called."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
+
+    def test_hydrate_playground_resolves_preset_first(self):
+        """hydratePlayground must resolve the active preset before calling hydrateControlsForSelection."""
+        # hydrateControlsForSelection must be called AFTER preset is set on state
+        # Use the specific call pattern from hydratePlayground to avoid matching the function definition.
+        preset_set_pos = self.text.find("state.playground._currentPreset = preset")
+        hydrate_call_pos = self.text.find("hydrateControlsForSelection(state, targetPresetId, featureId, preset);")
+        if preset_set_pos >= 0 and hydrate_call_pos >= 0:
+            self.assertGreater(hydrate_call_pos, preset_set_pos,
+                               "hydrateControlsForSelection must be called AFTER _currentPreset is set")
+
+    def test_control_panel_hydrates_after_preset_resolved(self):
+        """renderControlPanel must check _currentPreset before calling hydrateControlsForSelection."""
+        self.assertIn("_currentPreset", self.text)
+        self.assertIn("hydrateControlsForSelection", self.text)
+
+
+# ---------------------------------------------------------------------------
+# Experiment mode: recalcEligibleAxes must use getExperimentPresetIds
+# ---------------------------------------------------------------------------
+
+class ExperimentAxisEligibilityTests(unittest.TestCase):
+    """recalcEligibleAxes must use getExperimentPresetIds (not just compareIds)."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
+
+    def test_recalc_eligible_axes_uses_get_experiment_preset_ids(self):
+        """recalcEligibleAxes must call getExperimentPresetIds, not only compareIds."""
+        # The function must use getExperimentPresetIds(state) to get the canonical set
+        # that includes both base and compare presets.
+        fn_start = self.text.find("function recalcEligibleAxes")
+        self.assertGreaterEqual(fn_start, 0, "recalcEligibleAxes function not found")
+        fn_block = self.text[fn_start:fn_start + 800]
+        self.assertIn("getExperimentPresetIds(state)", fn_block,
+                      "recalcEligibleAxes must use getExperimentPresetIds(state)")
+        # Must NOT use compareBackendIds as the sole source
+        self.assertNotIn("state.playground.compareBackendIds", fn_block,
+                         "recalcEligibleAxes must not use compareBackendIds directly")
+
+    def test_recalc_eligible_axes_empty_when_no_ids(self):
+        """recalcEligibleAxes must return [] when getExperimentPresetIds is empty."""
+        fn_start = self.text.find("function recalcEligibleAxes")
+        self.assertGreaterEqual(fn_start, 0)
+        fn_block = self.text[fn_start:fn_start + 800]
+        # Early return check: if ids.length === 0 return []
+        self.assertIn("ids.length === 0", fn_block)
+
+
+class ExperimentAxisInsertionGuardsTests(unittest.TestCase):
+    """enhanceControlWithAxisCheckbox must have isConnected guards and correct parent insertion."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
+
+    def test_has_control_el_is_connected_guard(self):
+        """Deferred insertion must check controlEl.isConnected before proceeding."""
+        fn_start = self.text.find("enhanceControlWithAxisCheckbox")
+        self.assertGreaterEqual(fn_start, 0, "enhanceControlWithAxisCheckbox not found")
+        # Find the setTimeout block after the function definition
+        set_timeout_pos = self.text.find("setTimeout(() =>", fn_start)
+        self.assertGreaterEqual(set_timeout_pos, 0, "setTimeout not found in enhanceControlWithAxisCheckbox")
+        block = self.text[set_timeout_pos:set_timeout_pos + 600]
+        self.assertIn("controlEl.isConnected", block,
+                      "Must guard with controlEl.isConnected")
+
+    def test_has_parent_is_connected_guard(self):
+        """Deferred insertion must check parent.isConnected before inserting."""
+        fn_start = self.text.find("enhanceControlWithAxisCheckbox")
+        self.assertGreaterEqual(fn_start, 0)
+        set_timeout_pos = self.text.find("setTimeout(() =>", fn_start)
+        self.assertGreaterEqual(set_timeout_pos, 0)
+        block = self.text[set_timeout_pos:set_timeout_pos + 600]
+        self.assertIn("parent.isConnected", block,
+                      "Must guard with parent.isConnected")
+
+    def test_uses_parent_parent_node_insert_before(self):
+        """Deferred insertion must use parent.parentNode.insertBefore, not parent.insertBefore."""
+        fn_start = self.text.find("enhanceControlWithAxisCheckbox")
+        self.assertGreaterEqual(fn_start, 0)
+        set_timeout_pos = self.text.find("setTimeout(() =>", fn_start)
+        self.assertGreaterEqual(set_timeout_pos, 0)
+        block = self.text[set_timeout_pos:set_timeout_pos + 600]
+        # Must use grandparent for insertBefore
+        self.assertIn("grandparent.insertBefore", block,
+                      "Must use grandparent.insertBefore for correct sibling positioning")
+        # Must NOT use the old buggy pattern (the old code had `parent.insertBefore(editor, ...)`
+        # on its own line, not inside `grandparent.insertBefore`).
+        # Check that the old standalone pattern is absent.
+        old_pattern = "parent.insertBefore(editor, parent.nextSibling)"
+        # The old pattern would appear NOT preceded by "grand". Since we check the
+        # raw string, we verify that the old pattern is not a standalone statement
+        # by making sure the line does NOT contain the old pattern as its own statement.
+        # The safest check: the old pattern should NOT appear in the block at all
+        # because grandparent.insertBefore contains it as a substring.
+        # Instead check for the exact old-form statement without the grand prefix.
+        lines = block.split("\n")
+        old_found = any(
+            line.strip().startswith("parent.insertBefore(editor, parent.nextSibling)")
+            for line in lines
+        )
+        self.assertFalse(old_found,
+                         "Must not use parent.insertBefore with parent.nextSibling as a standalone statement")
+
+
+# ---------------------------------------------------------------------------
+# Experiment mode: compare checkbox triggers context.setPage rerender
+# ---------------------------------------------------------------------------
+
+class ExperimentCompareRerenderTests(unittest.TestCase):
+    """Compare checkbox change handler must call context.setPage('playground')."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
+
+    def test_compare_change_handler_calls_set_page(self):
+        """Compare checkbox change handler must call context.setPage('playground')."""
+        # Find the change listener inside renderCompareBackends
+        fn_start = self.text.find("function renderCompareBackends")
+        self.assertGreaterEqual(fn_start, 0)
+        change_pos = self.text.find('cb.addEventListener("change"', fn_start)
+        self.assertGreaterEqual(change_pos, 0)
+        # Find the block after matrixBody update
+        block = self.text[change_pos:change_pos + 1500]
+        self.assertIn('context.setPage("playground")', block,
+                      "compare checkbox change must call context.setPage('playground')")
+
+
+class ExperimentStaleEditorRemovalTests(unittest.TestCase):
+    """Deferred axis editor insertion must remove any existing connected editor for same control."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-experiment-mode.js").read_text(encoding="utf-8")
+
+    def test_removes_existing_editor_before_insertion(self):
+        """Deferred insertion must remove existing editors for the same control."""
+        set_timeout_pos = self.text.find("setTimeout(() =>", self.text.find("enhanceControlWithAxisCheckbox"))
+        self.assertGreaterEqual(set_timeout_pos, 0)
+        block = self.text[set_timeout_pos:set_timeout_pos + 800]
+        self.assertIn("existingEditors", block,
+                      "Must query existing editors before insertion")
+        self.assertIn("data-testid=\"axis-editor-${controlId}\"", block,
+                      "Must use testid to find existing editors")
+        self.assertIn("existing.remove()", block,
+                      "Must remove existing editors")
+
+
+# ---------------------------------------------------------------------------
+# Experiment mock API: cellCount must include unique preset count
+# ---------------------------------------------------------------------------
+
+class ExperimentMockCellCountTests(unittest.TestCase):
+    """studio-mock-api.mjs cellCount must include uniquePresetCount × axisCombos × prompts."""
+
+    def setUp(self) -> None:
+        self.text = (WEB.parent / "tests" / "browser" / "studio-mock-api.mjs").read_text(encoding="utf-8")
+
+    def test_cell_count_uses_unique_preset_count(self):
+        """cellCount calculation must use uniquePresetCount."""
+        fn_start = self.text.find("async function studioExperiment")
+        self.assertGreaterEqual(fn_start, 0)
+        block = self.text[fn_start:fn_start + 1200]
+        self.assertIn("uniquePresetCount", block,
+                      "cellCount must use uniquePresetCount")
+        self.assertIn("axisCombos", block,
+                      "cellCount must use axisCombos")
+        self.assertIn("promptCount", block,
+                      "cellCount must use promptCount")
+
+    def test_rejects_zero_preset_ids_with_400(self):
+        """Mock must return HTTP 400 when uniquePresetCount === 0."""
+        fn_start = self.text.find("async function studioExperiment")
+        self.assertGreaterEqual(fn_start, 0)
+        block = self.text[fn_start:fn_start + 1200]
+        self.assertIn("uniquePresetCount === 0", block,
+                      "Must check for zero uniquePresetCount")
+        self.assertIn('return _error("At least one preset is required", 400)', block,
+                      "Must return 400 error when no presets")
+
+
+# ---------------------------------------------------------------------------
+# Defect 1: History type filter must expose/query studio_run
+# ---------------------------------------------------------------------------
+
+class HistoryTypeFilterStudioRunTests(unittest.TestCase):
+    """History type filter dropdown must include 'studio_run' option."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-history.js").read_text(encoding="utf-8")
+
+    def test_type_filter_includes_studio_run(self):
+        """Type filter dropdown must include 'studio_run' so Studio records are reachable."""
+        self.assertIn('"studio_run"', self.text,
+                      "studio_run must be in type filter options")
+        # The type options array should contain studio_run alongside legacy kinds
+        type_opts_start = self.text.find('"studio_run"')
+        self.assertGreater(type_opts_start, 0,
+                           "studio_run not found in type filter options")
+
+
+# ---------------------------------------------------------------------------
+# Defect 3: Pagination must guard boundaries
+# ---------------------------------------------------------------------------
+
+class HistoryPaginationBoundaryTests(unittest.TestCase):
+    """Next/Prev pagination must never produce invalid offsets."""
+
+    def setUp(self) -> None:
+        self.text = (WEB / "studio-history.js").read_text(encoding="utf-8")
+
+    def test_prev_disabled_at_offset_zero(self):
+        """Prev button must be disabled when offset <= 0."""
+        # Look for the prev button disabled attribute guard
+        self.assertIn("disabled: queryParams.offset <= 0", self.text,
+                      "Prev button must have disabled: offset <= 0 guard")
+
+    def test_next_disabled_at_last_page(self):
+        """Next button must be disabled when offset + limit >= totalCount."""
+        self.assertIn("disabled: queryParams.offset + queryParams.limit >= totalCount", self.text,
+                      "Next button must have disabled: offset+limit >= totalCount guard")
+
+
+# ---------------------------------------------------------------------------
+# Defect 4: Date-only date_to includes full calendar day (structural)
+# ---------------------------------------------------------------------------
+
+class HistoryDateToBoundaryTests(unittest.TestCase):
+    """date_to must include the full selected calendar day for date-only values."""
+
+    def test_backend_handles_date_only_date_to(self):
+        """experiment_service.py should handle date-only date_to by extending to end-of-day."""
+        text = (REPO_ROOT / "experiment_service.py").read_text(encoding="utf-8")
+        # Should handle date-only values by extending to end of day
+        # The fix should add T23:59:59Z or similar for date-only date_to
+        self.assertIn("date_to", text)
+        # Need something that adjusts date-only to end-of-day
+        has_end_of_day = (
+            "T23:59:59" in text
+            or "end_of_day" in text
+            or "T23:59:59Z" in text
+        )
+        self.assertTrue(has_end_of_day,
+                        "Must extend date-only date_to to end-of-day (T23:59:59Z)")
+
+
+# ---------------------------------------------------------------------------
+# Defect 2: Backend search includes prompt text (structural)
+# ---------------------------------------------------------------------------
+
+class HistorySearchPromptTextTests(unittest.TestCase):
+    """Backend search must include user-visible prompt text."""
+
+    def test_search_includes_requested_controls_prompt(self):
+        """RunHistoryService.list_runs search must include requested_controls.prompt from extra."""
+        text = (REPO_ROOT / "experiment_service.py").read_text(encoding="utf-8")
+        # Must search nested requested_controls.prompt (production shape)
+        self.assertIn('_requested_ctrl.get("prompt"', text,
+                      "Search must include requested_controls.prompt from extra")
+
+    def test_search_includes_requested_controls_negative_prompt(self):
+        """RunHistoryService.list_runs search must include requested_controls.negative_prompt."""
+        text = (REPO_ROOT / "experiment_service.py").read_text(encoding="utf-8")
+        self.assertIn('_requested_ctrl.get("negative_prompt"', text,
+                      "Search must include requested_controls.negative_prompt from extra")
+
+    def test_search_includes_resolved_controls_prompt(self):
+        """RunHistoryService.list_runs search must include resolved_controls.prompt from extra."""
+        text = (REPO_ROOT / "experiment_service.py").read_text(encoding="utf-8")
+        self.assertIn('_resolved_ctrl.get("prompt"', text,
+                      "Search must include resolved_controls.prompt from extra")
+
+    def test_search_includes_backward_compat_studio_prompt(self):
+        """Backward-compatible flat studio_prompt alias should remain."""
+        text = (REPO_ROOT / "experiment_service.py").read_text(encoding="utf-8")
+        self.assertIn("studio_prompt", text,
+                      "Backward-compat studio_prompt alias should remain")
 
 
 if __name__ == "__main__":

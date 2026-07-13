@@ -15,6 +15,8 @@ export function el(tag, props = {}, children = []) {
       e.addEventListener(k.slice(2).toLowerCase(), props[k]);
     } else if (k === "value") {
       e.value = props[k];
+    } else if (k === "dataset") {
+      Object.assign(e.dataset, props[k]);
     } else if (k === "disabled" || k === "checked" || k === "hidden" || k === "readonly" || k === "required") {
       // Boolean HTML attributes must use the DOM property, not setAttribute,
       // because setAttribute("disabled", false) sets disabled="false" which still disables.

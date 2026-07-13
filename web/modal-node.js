@@ -647,10 +647,12 @@ app.registerExtension({
                 ". Node IDs in canvas do not match serialized workflow. Re-save workflow or re-mark production outputs."
               );
             }
+            const bypassNodeIds = _getBypassNodes().map(n => String(n.id)).sort();
             baseOptions.production = {
               enabled: true,
               schema_version: 1,
               output_node_ids: finalOutIds,
+              bypass_node_ids: bypassNodeIds,
               disable_sampler_previews: true,
               quiet_execution_logs: true,
               progress_min_interval_ms: 500,

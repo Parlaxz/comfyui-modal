@@ -14,6 +14,7 @@ import { renderHistory } from "./studio-history.js";
 import { renderBackend } from "./studio-backend.js";
 import { renderSettings } from "./studio-settings.js";
 import { stopLegacyController } from "./studio-legacy.js";
+import { el } from "./studio-ui.js";
 
 const PAGES = {
   playground: { label: "Playground", render: renderPlayground },
@@ -21,27 +22,6 @@ const PAGES = {
   backend:    { label: "Backend",    render: renderBackend },
   settings:   { label: "Settings",   render: renderSettings },
 };
-
-function el(tag, props = {}, children = []) {
-  const e = document.createElement(tag);
-  for (const k in props) {
-    if (k === "class") e.className = props[k];
-    else if (k === "style") e.style.cssText = props[k];
-    else if (k === "text") e.textContent = props[k];
-    else if (k.startsWith("on") && typeof props[k] === "function") {
-      e.addEventListener(k.slice(2).toLowerCase(), props[k]);
-    } else if (k === "value") {
-      e.value = props[k];
-    } else {
-      e.setAttribute(k, props[k]);
-    }
-  }
-  for (const c of (Array.isArray(children) ? children : [children])) {
-    if (c == null) continue;
-    e.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-  }
-  return e;
-}
 
 export function mountStudioShell(rootEl, context = {}) {
   const state = {

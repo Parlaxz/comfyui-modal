@@ -1850,10 +1850,10 @@ function buildPanel() {
   prodToggle.checked = !!(app.graph?.extra?.comfymodal?.production_mode_enabled);
   prodToggle.style.cssText = "width:16px; height:16px; accent-color:#3a6fcc; flex-shrink:0;";
 
-  const prodLabel = document.createElement("span");
+  const prodLabel = document.createElement("label");
   prodLabel.style.cssText = "font-size:12px; color:#aaa; font-weight:600;";
-  prodLabel.textContent = "Production Mode";
-  prodLabel.htmlFor = "cm-prod-toggle";
+  prodLabel.textContent = "Simulate Production";
+  prodLabel.setAttribute("for", "cm-prod-toggle");
 
   prodRow.appendChild(prodToggle);
   prodRow.appendChild(prodLabel);

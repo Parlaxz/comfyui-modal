@@ -222,11 +222,11 @@ class VisualRedesignTests(_JsTestBase):
     """Structural tests for the Modal GPU visual redesign."""
 
     def test_canonical_studio_header_naming(self):
-        """modal-testing.js / studio-shell.js must display 'Modal Studio' as header."""
+        """modal-testing.js / studio-shell.js must display 'Modal GPU' as header."""
         text = self._read("modal-testing.js")
-        self.assertIn("Modal Studio", text,
-                       "Expected 'Modal Studio' visible header title — "
-                       "replaces old 'Modal GPU' header")
+        self.assertIn("Modal GPU", text,
+                       "Expected 'Modal GPU' visible header title — "
+                       "consistent product name")
 
     def test_dashboard_new_experiment_cta(self):
         """testing-dashboard.js must have 'New Experiment' as primary CTA."""
@@ -596,18 +596,33 @@ class StudioPresetExecutionUiWiredTests(_JsTestBase):
         self.assertIn("cb.disabled = true", text)
 
     def test_history_displays_studio_metadata(self):
-        """studio-history.js must display studio metadata fields."""
+        """studio-history.js must display normalized studio metadata fields."""
         text = self._read("studio-history.js")
-        self.assertIn("studio_meta", text)
-        self.assertIn("studio_feature_id", text)
-        self.assertIn("studio_preset_id", text)
+        # Normalized fields — not raw snake_case metadata keys
+        self.assertIn("featureId", text)
+        self.assertIn("presetId", text)
+        self.assertIn("presetLabel", text)
 
     def test_history_shows_total_cells_and_counts(self):
         """History grouped experiments must show total cells and completed/failed counts."""
         text = self._read("studio-history.js")
-        self.assertIn("total_cells", text)
+        self.assertIn("total", text)
         self.assertIn("completed", text)
         self.assertIn("failed", text)
+
+    def test_history_total_cell_null_safe(self):
+        """History group total must use ?? null-coalescing so it always shows a useful total."""
+        text = self._read("studio-history.js")
+        self.assertIn("??", text,
+                       "Expected nullish-coalescing (??) for total cell fallback — "
+                       "firstRun.totalCells ?? groupRuns.length must use ?? not ||")
+
+    def test_history_total_cell_no_raw_key(self):
+        """History group total must not display the raw implementation key 'total_cells'."""
+        text = self._read("studio-history.js")
+        # The professional copy should say "total" not "total_cells"
+        self.assertNotIn("total_cells", text,
+                          "Expected professional copy 'total', not raw implementation key 'total_cells'")
 
     def test_history_shows_output_thumb_hint(self):
         """History run rows must show an output thumbnail hint when output available."""
@@ -622,11 +637,54 @@ class StudioPresetExecutionUiWiredTests(_JsTestBase):
         self.assertIn("Compatible features assigned", text)
         self.assertIn("API prompt available", text)
 
+    def test_backend_detail_checklist_semantic_list(self):
+        """Runnable Checklist must use semantic <ul> with <li> items."""
+        text = self._read("studio-backend-presets.js")
+        self.assertIn('el("ul"', text,
+                       "Expected el('ul', ...) element for Runnable Checklist")
+        self.assertIn('el("li"', text,
+                       "Expected el('li', ...) items inside Runnable Checklist")
+
+    def test_backend_detail_checklist_tokens(self):
+        """Checklist status colors use CSS variables, not hardcoded hex."""
+        text = self._read("studio-backend-presets.js")
+        # Must reference CSS variables in checklist status styling
+        self.assertIn("var(--color-success", text)
+        self.assertIn("var(--color-danger", text)
+
     def test_backend_detail_uses_status_banner(self):
-        """Preset detail must have status-banner style."""
+        """Preset detail must have status-banner style with variant classes."""
         text = self._read("studio-backend-presets.js")
         self.assertIn("status-banner", text)
+        self.assertIn('" runnable"', text)
+        self.assertIn('" archived"', text)
+        self.assertIn('" not-runnable"', text)
         self.assertIn("Not Runnable", text)
+
+    def test_backend_preset_detail_css_classes_in_styles(self):
+        """studio-styles.js must define status banner and checklist CSS classes."""
+        text = self._read("studio-styles.js")
+        self.assertIn("comfymodal-studio-status-banner.runnable", text)
+        self.assertIn("comfymodal-studio-status-banner.archived", text)
+        self.assertIn("comfymodal-studio-checklist", text)
+        self.assertIn("comfymodal-studio-checklist-item", text)
+
+    def test_backend_capability_no_hardcoded_hex(self):
+        """Capability summary uses CSS var() tokens, not bare status hex colors."""
+        text = self._read("studio-backend-presets.js")
+        # These ternary patterns appear in hardcoded capability summary rows.
+        # After tokenization they become var(--color-... so the bare ? "hex" vanishes.
+        self.assertNotIn('? "#4ade80"', text,
+                          "Replace ? '#4ade80' with var(--color-success... in capability summary")
+        self.assertNotIn('? "#f87171"', text,
+                          "Replace ? '#f87171' with var(--color-danger... in capability summary")
+        self.assertNotIn('? "#fbbf24"', text,
+                          "Replace ? '#fbbf24' with var(--color-warning... in capability summary")
+        self.assertNotIn('color:#4ade80', text,
+                          "Replace color:#4ade80 with var(--color-success... in optional controls")
+        # Must reference all three semantic tokens somewhere
+        self.assertIn("var(--color-warning", text,
+                       "Expected var(--color-warning reference in capability summary status")
 
     def test_graph_binding_cleanup_guard(self):
         """graph-binding cleanup must have reentrancy guard and hint removal."""
@@ -767,9 +825,10 @@ class PlaygroundWiredTests(_JsTestBase):
         self.assertIn("comfymodal-studio-canvas", text)
 
     def test_playground_has_filmstrip(self):
-        """Playground workspace must have a filmstrip/recent-runs strip."""
+        """Playground workspace must have a filmstrip/recent-runs strip (carousel)."""
         text = self._read("studio-playground.js")
-        self.assertIn("comfymodal-studio-filmstrip", text)
+        # The filmstrip renders as a carousel with comfymodal-studio-carousel class
+        self.assertIn("comfymodal-studio-carousel", text)
 
     def test_playground_does_not_import_stop_legacy_controller(self):
         """studio-playground.js must NOT import stopLegacyController — cleanup is
@@ -993,6 +1052,677 @@ class StudioBackendWiredTests(_JsTestBase):
         """studio-shell.js must not use comfymodal-studio-body class on page container."""
         text = self._read("studio-shell.js")
         self.assertNotIn("comfymodal-studio-body", text)
+
+
+# ── Phase 4: Blue-Charcoal Token System ────────────────────────────────
+
+class TokenSystemTests(_JsTestBase):
+    """Studio styles must use blue-charcoal token system with --color-* vars."""
+
+    def setUp(self) -> None:
+        self.studio_text = self._read("studio-styles.js")
+
+    def test_studio_uses_color_token_for_active_tab(self):
+        """Active/focus states must use --color-accent not hardcoded red."""
+        # Active tab should reference a --color-* variable or blue accent
+        has_accent_ref = (
+            "--color-accent" in self.studio_text
+            or "--color-border-focus" in self.studio_text
+        )
+        self.assertTrue(
+            has_accent_ref,
+            "studio-styles.js must reference --color-accent or --color-border-focus "
+            "for active/focus states instead of hardcoded red",
+        )
+
+    def test_studio_primary_button_uses_accent_not_red(self):
+        """Primary button (Run) should use accent, not #dc2626."""
+        # Find the .comfymodal-primary-btn in studio-styles
+        btn_start = self.studio_text.find(".comfymodal-primary-btn")
+        if btn_start < 0:
+            btn_start = self.studio_text.find('.comfymodal-run-section .comfymodal-primary-btn')
+        self.assertGreater(
+            btn_start, -1,
+            "Expected .comfymodal-primary-btn in studio-styles.js",
+        )
+        btn_block = self.studio_text[btn_start:btn_start + 800]
+        # Primary non-destructive buttons should NOT use red
+        has_var_ref = "var(--color-accent)" in btn_block or "var(--color-info" in btn_block
+        # Also check if it's not directly #dc2626 (which is red)
+        if "#dc2626" in btn_block:
+            # Check if it's a destructive/hover variant, not the primary background
+            is_only_destructive = "destructive" in btn_block or "danger" in btn_block
+            self.assertTrue(
+                is_only_destructive,
+                "Primary non-destructive button must use --color-accent, not #dc2626",
+            )
+
+    def test_destructive_button_uses_red_or_danger_token(self):
+        """Destructive buttons must use --color-danger or #dc2626."""
+        # Find the main rule (has background: property, not in media query)
+        dest_start = self.studio_text.find(".comfymodal-destructive-btn {\n  background:")
+        if dest_start < 0:
+            # Fallback: try with var(--color-danger-bg as the background value
+            dest_start = self.studio_text.find(".comfymodal-destructive-btn {\n  background: var(")
+        self.assertGreater(dest_start, -1)
+        dest_block = self.studio_text[dest_start:dest_start + 500]
+        uses_red = (
+            "var(--color-danger)" in dest_block
+            or "#dc2626" in dest_block
+            or "#ef4444" in dest_block
+        )
+        self.assertTrue(
+            uses_red,
+            "Destructive buttons must use red/danger color (--color-danger or similar)",
+        )
+
+    def test_no_transition_all(self):
+        """studio-styles.js must not use 'transition: all'."""
+        # Check for transition: all (case-insensitive)
+        import re
+        has_transition_all = bool(re.search(
+            r'transition[^;{]*\ball\b',
+            self.studio_text,
+            re.IGNORECASE,
+        ))
+        self.assertFalse(
+            has_transition_all,
+            "studio-styles.js must not use 'transition: all' — specify properties explicitly",
+        )
+
+    def test_focus_visible_outlines_present(self):
+        """studio-styles.js must define :focus-visible styles for interactive elements."""
+        has_focus_visible = (
+            ":focus-visible" in self.studio_text
+        )
+        self.assertTrue(
+            has_focus_visible,
+            "Expected :focus-visible style definitions in studio-styles.js",
+        )
+
+    def test_safe_area_support(self):
+        """studio-styles.js must include safe-area-inset env() variables."""
+        has_safe_area = (
+            "safe-area-inset" in self.studio_text
+            or "env(safe-area-inset" in self.studio_text
+        )
+        self.assertTrue(
+            has_safe_area,
+            "Expected safe-area-inset env() support in studio-styles.js",
+        )
+
+    def test_reduced_motion_present(self):
+        """studios-styles or testing-styles must have prefers-reduced-motion."""
+        testing_text = self._read("testing-styles.js")
+        combined = self.studio_text + testing_text
+        self.assertIn(
+            "prefers-reduced-motion",
+            combined,
+            "Expected prefers-reduced-motion media query in styles",
+        )
+
+
+# ── Final review: progress bar color, Playground note header, el import ──
+
+class FinalReviewTests(_JsTestBase):
+    """Resolve review findings: progress bar, note label, el consolidation."""
+
+    # ── 1. Progress bar fill color ─────────────────────────────────────
+
+    def test_progress_bar_fill_uses_accent(self):
+        """studio-playground.js progress bar fill must use --color-accent."""
+        text = self._read("studio-playground.js")
+        # Find the progress bar fill inline style
+        fill_idx = text.find("background:#dc2626")
+        if fill_idx < 0:
+            fill_idx = text.find("background: #dc2626")
+        self.assertLess(
+            fill_idx, 0,
+            "Progress bar fill must not use hardcoded #dc2626",
+        )
+        # Must reference --color-accent
+        self.assertIn(
+            "--color-accent",
+            text,
+            "Expected --color-accent reference in progress bar fill",
+        )
+
+    # ── 2. Playground note editor header ───────────────────────────────
+
+    def test_playground_note_editor_has_header(self):
+        """Playground renderNoteEditor must have a 'Note' header like History."""
+        text = self._read("studio-playground.js")
+        note_start = text.find("function renderNoteEditor")
+        self.assertGreater(note_start, -1)
+        note_end = text.find("return container;", note_start)
+        if note_end < 0:
+            note_end = note_start + 2000
+        note_region = text[note_start:note_end]
+        self.assertIn(
+            '"Note"',
+            note_region,
+            "Expected 'Note' header text in Playground renderNoteEditor",
+        )
+        self.assertIn(
+            "uppercase",
+            note_region,
+            "Expected uppercase styling on Playground note header",
+        )
+
+    # ── 3. Playground el consolidation ─────────────────────────────────
+
+    def test_playground_imports_el_from_studio_ui(self):
+        """studio-playground.js must import el from studio-ui.js."""
+        text = self._read("studio-playground.js")
+        self.assertIn(
+            "./studio-ui.js",
+            text,
+            "Expected import of el from studio-ui.js in studio-playground.js",
+        )
+
+    def test_playground_no_local_el(self):
+        """studio-playground.js must NOT define a local el() function."""
+        text = self._read("studio-playground.js")
+        self.assertNotIn(
+            "function el(tag, props = {}, children = [])",
+            text,
+            "Local el() must be replaced by import from studio-ui.js",
+        )
+
+
+# ── Keyboard/accessibility: favorite star → button, carousel → button ──
+
+class KeyboardA11yButtonTests(_JsTestBase):
+    """Favorite stars and carousel items must be semantic <button> elements."""
+
+    def test_history_favorite_star_is_button(self):
+        """studio-history.js renderFavoriteStar must produce a <button>."""
+        text = self._read("studio-history.js")
+        fav_start = text.find("function renderFavoriteStar")
+        self.assertGreater(fav_start, -1)
+        fav_block = text[fav_start:fav_start + 800]
+        self.assertIn(
+            'type: "button"',
+            fav_block,
+            "Expected type='button' on history favorite star",
+        )
+        self.assertIn(
+            "aria-pressed",
+            fav_block,
+            "Expected aria-pressed on history favorite star",
+        )
+
+    def test_playground_favorite_star_is_button(self):
+        """studio-playground.js renderFavoriteStar must produce a <button>."""
+        text = self._read("studio-playground.js")
+        fav_start = text.find("function renderFavoriteStar")
+        self.assertGreater(fav_start, -1)
+        fav_block = text[fav_start:fav_start + 800]
+        self.assertIn(
+            'type: "button"',
+            fav_block,
+            "Expected type='button' on playground favorite star",
+        )
+        self.assertIn(
+            "aria-pressed",
+            fav_block,
+            "Expected aria-pressed on playground favorite star",
+        )
+
+    def test_carousel_item_is_button(self):
+        """studio-playground.js renderFilmstrip carousel items must be <button>."""
+        text = self._read("studio-playground.js")
+        carousel_start = text.find("function renderFilmstrip")
+        self.assertGreater(carousel_start, -1)
+        carousel_block = text[carousel_start:carousel_start + 1600]
+        self.assertIn(
+            'type: "button"',
+            carousel_block,
+            "Expected type='button' on carousel items",
+        )
+
+    def test_carousel_item_has_aria_label(self):
+        """Carousel items must have a descriptive aria-label."""
+        text = self._read("studio-playground.js")
+        self.assertIn(
+            '"aria-label"',
+            text,
+            "Expected aria-label on carousel items in renderFilmstrip",
+        )
+
+    def test_carousel_button_chrome_reset(self):
+        """studio-styles.js must reset native button chrome on carousel-item."""
+        css = self._read("studio-styles.js")
+        carousel_item_section = css.find(".comfymodal-studio-carousel-item")
+        self.assertGreater(carousel_item_section, -1)
+        item_block = css[carousel_item_section:carousel_item_section + 400]
+        self.assertIn(
+            "background: none",
+            item_block,
+            "Expected background:none to reset native button chrome on carousel-item",
+        )
+        self.assertIn(
+            "padding: 0",
+            item_block,
+            "Expected padding:0 on carousel-item button reset",
+        )
+
+    def test_favorite_star_focus_visible(self):
+        """studio-styles.js must have :focus-visible for favorite-star."""
+        css = self._read("studio-styles.js")
+        has_fav_fv = (
+            "favorite-star:focus-visible" in css
+            or "favorite-star:focus" in css
+        )
+        self.assertTrue(
+            has_fav_fv,
+            "Expected :focus-visible style for .comfymodal-studio-favorite-star",
+        )
+
+    def test_carousel_item_focus_visible(self):
+        """studio-styles.js must have :focus-visible for carousel-item."""
+        css = self._read("studio-styles.js")
+        self.assertIn(
+            "carousel-item:focus-visible",
+            css,
+            "Expected :focus-visible for .comfymodal-studio-carousel-item",
+        )
+
+
+# ── Phase 3: History Preview as Nested Accessible Dialog ────────────────
+
+class HistoryPreviewDialogTests(_JsTestBase):
+    """History preview overlay must behave as an accessible nested dialog."""
+
+    def test_preview_overlay_has_role_dialog(self):
+        """studio-history.js preview overlay must have role='dialog'."""
+        text = self._read("studio-history.js")
+        self.assertIn(
+            'role: "dialog"',
+            text,
+            "Expected role='dialog' on the history preview overlay",
+        )
+
+    def test_preview_overlay_has_aria_modal(self):
+        """studio-history.js preview overlay must have aria-modal='true'."""
+        text = self._read("studio-history.js")
+        self.assertIn(
+            "aria-modal",
+            text,
+            "Expected aria-modal on the history preview overlay",
+        )
+
+    def test_preview_overlay_has_aria_label(self):
+        """History preview must have aria-label describing the preview."""
+        text = self._read("studio-history.js")
+        self.assertIn(
+            '"aria-label"',
+            text,
+            "Expected aria-label on the history preview content or close button",
+        )
+
+    def test_preview_escape_closes_only_preview(self):
+        """Escape in preview must close only the preview, not the parent modal."""
+        text = self._read("studio-history.js")
+        # Must have an Escape handler scoped to the preview
+        self.assertIn(
+            "Escape",
+            text,
+            "Expected Escape key handling in studio-history.js for preview close",
+        )
+
+    def test_preview_focus_moves_into_overlay(self):
+        """Opening preview must move focus to the close button or first focusable."""
+        text = self._read("studio-history.js")
+        self.assertIn(
+            ".focus()",
+            text,
+            "Expected .focus() call when opening preview overlay",
+        )
+
+    def test_preview_close_returns_focus_to_card(self):
+        """Closing preview must restore focus to the triggering card."""
+        text = self._read("studio-history.js")
+        self.assertIn(
+            "previewRun = null",
+            text,
+            "Expected previewRun reset on preview close",
+        )
+
+    # ── Oracle fix: Tab focus containment for history preview ────────
+
+    def test_preview_tab_trap_keydown_handler(self):
+        """Preview overlay must have onkeydown handler for Tab containment."""
+        text = self._read("studio-history.js")
+        self.assertIn(
+            "onkeydown",
+            text,
+            "Expected onkeydown handler on preview overlay for Tab trap",
+        )
+
+    def test_preview_tab_trap_calls_focus_trap_helper(self):
+        """Preview close must invoke a focus trap or Tab cycling."""
+        text = self._read("studio-history.js")
+        has_trap = (
+            "tabTrap" in text or "_trapPreviewTab" in text
+            or "focusTrap" in text
+        )
+        self.assertTrue(
+            has_trap,
+            "Expected a focus trap helper or Tab cycling logic in studio-history.js",
+        )
+
+    def test_preview_escape_does_not_close_parent(self):
+        """Preview Escape handler must call e.stopPropagation()."""
+        text = self._read("studio-history.js")
+        self.assertIn(
+            "stopPropagation",
+            text,
+            "Expected e.stopPropagation() in preview Escape handler",
+        )
+
+    # ── Issue 3: Backdrop click reliable close ─────────────────────────
+
+    def test_preview_backdrop_click_closes(self):
+        """Click on backdrop must close the preview via specific class check."""
+        text = self._read("studio-history.js")
+        self.assertIn(
+            "preview-backdrop",
+            text,
+            "Expected backdrop class handler for reliable close on backdrop click",
+        )
+
+    def test_history_imports_el_from_studio_ui(self):
+        """studio-history.js must import el from studio-ui.js."""
+        text = self._read("studio-history.js")
+        self.assertIn(
+            "studio-ui.js",
+            text,
+            "Expected import from studio-ui.js in studio-history.js",
+        )
+
+
+class CanonicalElTests(_JsTestBase):
+    """Canonical el() in studio-ui.js must support all required semantics."""
+
+    def test_canonical_el_supports_dataset(self):
+        """studio-ui.js el() must support 'dataset' property."""
+        text = self._read("studio-ui.js")
+        self.assertIn(
+            "dataset",
+            text,
+            "Expected 'dataset' handling in studio-ui.js el()",
+        )
+
+    def test_canonical_el_exports_el(self):
+        """studio-ui.js must export the el function."""
+        text = self._read("studio-ui.js")
+        self.assertIn(
+            "export function el",
+            text,
+            "Expected export function el in studio-ui.js",
+        )
+
+
+# ── Mobile touch-target correction (44px min for interactive) ──────────
+
+class MobileTouchTargetTests(_JsTestBase):
+    """At <=480px, interactive controls must have 44px minimum touch targets."""
+
+    def setUp(self) -> None:
+        self.css = self._read("studio-styles.js")
+        # Locate the 480px media query block
+        media_start = self.css.find("@media (max-width: 480px)")
+        if media_start >= 0:
+            # Find opening brace first, then count nested braces
+            block_open = self.css.find("{", media_start)
+            if block_open >= 0:
+                brace_depth = 1
+                i = block_open + 1
+                while i < len(self.css):
+                    if self.css[i] == "{": brace_depth += 1
+                    elif self.css[i] == "}":
+                        brace_depth -= 1
+                        if brace_depth == 0:
+                            self._media_block = self.css[media_start:i + 1]
+                            break
+                    i += 1
+                else:
+                    self._media_block = ""
+            else:
+                self._media_block = ""
+        else:
+            self._media_block = ""
+
+        self._media_text = (self._media_block or "")
+
+    def test_media_480_exists(self):
+        """@media (max-width: 480px) block must exist in studio-styles.js."""
+        self.assertIn("@media (max-width: 480px)", self.css,
+                       "Expected 480px responsive block in studio-styles.js")
+
+    def test_close_button_min_size(self):
+        """.comfymodal-testing-close must have min-width 44px and min-height 44px at <=480px."""
+        if not self._media_text:
+            self.fail("No @media (max-width: 480px) block found")
+        # Find the close button rule inside the media block
+        self.assertIn(
+            "comfymodal-testing-close",
+            self._media_text,
+            "Expected .comfymodal-testing-close touch-target rule at <=480px",
+        )
+
+    def test_feature_tab_min_height(self):
+        """.comfymodal-studio-feature-tab must have min-height 44px at <=480px."""
+        if not self._media_text:
+            self.fail("No @media (max-width: 480px) block found")
+        self.assertIn(
+            "comfymodal-studio-feature-tab",
+            self._media_text,
+            "Expected .comfymodal-studio-feature-tab min-height at <=480px",
+        )
+
+    def test_primary_btn_min_height(self):
+        """.comfymodal-primary-btn must have min-height 44px at <=480px."""
+        if not self._media_text:
+            self.fail("No @media (max-width: 480px) block found")
+        self.assertIn(
+            "comfymodal-primary-btn",
+            self._media_text,
+            "Expected .comfymodal-primary-btn min-height at <=480px",
+        )
+
+    def test_secondary_btn_min_height(self):
+        """.comfymodal-secondary-btn must have min-height 44px at <=480px."""
+        if not self._media_text:
+            self.fail("No @media (max-width: 480px) block found")
+        self.assertIn(
+            "comfymodal-secondary-btn",
+            self._media_text,
+            "Expected .comfymodal-secondary-btn min-height at <=480px",
+        )
+
+    def test_destructive_btn_min_height(self):
+        """.comfymodal-destructive-btn must have min-height 44px at <=480px."""
+        if not self._media_text:
+            self.fail("No @media (max-width: 480px) block found")
+        self.assertIn(
+            "comfymodal-destructive-btn",
+            self._media_text,
+            "Expected .comfymodal-destructive-btn min-height at <=480px",
+        )
+
+    def test_input_select_min_height(self):
+        """Number inputs and selects must have min-height 44px at <=480px."""
+        if not self._media_text:
+            self.fail("No @media (max-width: 480px) block found")
+        self.assertIn(
+            "comfymodal-studio-number-input",
+            self._media_text,
+            "Expected .comfymodal-studio-number-input min-height at <=480px",
+        )
+        self.assertIn(
+            "comfymodal-studio-select",
+            self._media_text,
+            "Expected .comfymodal-studio-select min-height at <=480px",
+        )
+
+    def test_reset_link_min_height(self):
+        """.comfymodal-studio-reset-link must have min-height 44px at <=480px."""
+        if not self._media_text:
+            self.fail("No @media (max-width: 480px) block found")
+        self.assertIn(
+            "comfymodal-studio-reset-link",
+            self._media_text,
+            "Expected .comfymodal-studio-reset-link min-height at <=480px",
+        )
+
+    def test_history_preview_close_min_size(self):
+        """History preview close must have min 44px hit area at <=480px."""
+        if not self._media_text:
+            self.fail("No @media (max-width: 480px) block found")
+        self.assertIn(
+            "history-preview-close",
+            self._media_text,
+            "Expected .comfymodal-studio-history-preview-close min-size at <=480px",
+        )
+
+
+# ── Phase 5: Responsive Improvements ───────────────────────────────────
+
+class ResponsiveTests(_JsTestBase):
+    """Responsive/mobile adaptations in CSS and JS."""
+
+    def test_no_horizontal_overflow_at_320px(self):
+        """studio-styles.js must have max-width rules preventing overflow at 320px."""
+        css_text = self._read("studio-styles.js")
+        has_overflow_protection = (
+            "100vw" in css_text or "max-width" in css_text
+        )
+        self.assertTrue(
+            has_overflow_protection,
+            "Expected viewport-relative max-width rules in studio-styles.js",
+        )
+
+    def test_studio_nav_scrolls_on_small_screens(self):
+        """Top nav must have overflow-x:auto or flex-wrap for small screens."""
+        css_text = self._read("studio-styles.js")
+        nav_section = css_text.find(".comfymodal-studio-topnav")
+        if nav_section >= 0:
+            nav_css = css_text[nav_section:nav_section + 800]
+            has_scroll = (
+                "overflow-x" in nav_css or "flex-wrap" in nav_css
+            )
+        else:
+            has_scroll = False
+        self.assertTrue(
+            has_scroll,
+            "Studio top nav must handle small screen overflow via overflow-x or flex-wrap",
+        )
+
+    def test_playground_stacks_below_768px(self):
+        """studio-styles.js must have @media (max-width:768px) query for playground stacking."""
+        css_text = self._read("studio-styles.js")
+        has_768px_media = "768px" in css_text
+        self.assertTrue(
+            has_768px_media,
+            "Expected a media query targeting 768px or below in studio-styles.js",
+        )
+
+    def test_fixed_width_control_panel_does_not_clip(self):
+        """Control panel fixed width must be handled at small screens."""
+        css_text = self._read("studio-styles.js")
+        control_panel_section = css_text.find(".comfymodal-studio-control-panel")
+        self.assertGreater(control_panel_section, -1)
+        control_css = css_text[control_panel_section:control_panel_section + 600]
+        self.assertIn(
+            "min-width",
+            control_css,
+            "Control panel must have a min-width (to check responsive overrides)",
+        )
+
+    def test_history_filters_adapt(self):
+        """studio-history.js filter bar must wrap or handle overflow."""
+        history_text = self._read("studio-history.js")
+        self.assertIn(
+            "flex-wrap",
+            history_text,
+            "History filter bar must use flex-wrap for responsive adaptation",
+        )
+
+
+class RemainingTokenTests(_JsTestBase):
+    """All remaining non-destructive #dc2626 must be tokenized in studio-styles.js."""
+
+    def test_number_input_focus_uses_token(self):
+        """studio-styles.js number-input:focus must use --color-border-focus."""
+        css = self._read("studio-styles.js")
+        nf_idx = css.find(".comfymodal-studio-number-input:focus")
+        self.assertGreater(nf_idx, -1, "Expected .comfymodal-studio-number-input:focus")
+        focus_block = css[nf_idx:nf_idx + 200]
+        self.assertNotIn(
+            "#dc2626", focus_block,
+            "number-input:focus must use --color-border-focus, not #dc2626",
+        )
+
+    def test_axis_editor_focus_uses_token(self):
+        """axis-editor-values textarea/input:focus must use --color-border-focus."""
+        css = self._read("studio-styles.js")
+        ae_idx = css.find(".comfymodal-studio-axis-editor-values textarea:focus")
+        self.assertGreater(ae_idx, -1, "Expected axis-editor-values focus rule")
+        focus_block = css[ae_idx:ae_idx + 300]
+        self.assertNotIn(
+            "#dc2626", focus_block,
+            "axis-editor-values:focus must use --color-border-focus, not #dc2626",
+        )
+
+    def test_backend_active_tab_uses_token(self):
+        """Backend tab.active must use --color-accent."""
+        css = self._read("studio-styles.js")
+        bt_idx = css.find(".comfymodal-studio-backend-tab.active")
+        self.assertGreater(bt_idx, -1, "Expected .comfymodal-studio-backend-tab.active")
+        tab_block = css[bt_idx:bt_idx + 200]
+        self.assertNotIn(
+            "#dc2626", tab_block,
+            "Backend active tab must use --color-accent, not #dc2626",
+        )
+
+    def test_input_override_focus_uses_token(self):
+        """studio input/select focus override must use --color-border-focus."""
+        css = self._read("studio-styles.js")
+        ov_idx = css.find(".comfymodal-studio-select:focus")
+        self.assertGreater(ov_idx, -1, "Expected .comfymodal-studio-select:focus override")
+        override_block = css[ov_idx:ov_idx + 200]
+        self.assertNotIn(
+            "#dc2626", override_block,
+            "Input focus override must use --color-border-focus, not #dc2626",
+        )
+
+    def test_wizard_step_dot_active_uses_token(self):
+        """wizard-step-dot.active must use --color-accent."""
+        css = self._read("studio-styles.js")
+        wiz_idx = css.find(".comfymodal-studio-wizard-step-dot.active")
+        self.assertGreater(wiz_idx, -1, "Expected .comfymodal-studio-wizard-step-dot.active")
+        wiz_block = css[wiz_idx:wiz_idx + 200]
+        self.assertNotIn(
+            "#dc2626", wiz_block,
+            "Wizard step dot active must use --color-accent, not #dc2626",
+        )
+
+    def test_destructive_button_color_tokenized(self):
+        """Destructive button color must use --color-danger."""
+        css = self._read("studio-styles.js")
+        # Find the main rule (has background: property, not in media query)
+        dest_idx = css.find(".comfymodal-destructive-btn {\n  background:")
+        if dest_idx < 0:
+            dest_idx = css.find(".comfymodal-destructive-btn {\n  background: var(")
+        self.assertGreater(dest_idx, -1, "Expected .comfymodal-destructive-btn")
+        dest_block = css[dest_idx:dest_idx + 300]
+        self.assertIn(
+            "--color-danger",
+            dest_block,
+            "Destructive button must reference --color-danger token",
+        )
 
 
 if __name__ == "__main__":

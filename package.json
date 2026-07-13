@@ -1,0 +1,17 @@
+{
+  "name": "comfyui-modal-e2e",
+  "private": true,
+  "type": "module",
+  "description": "E2E test helpers for Modal Studio browser tests",
+  "devDependencies": {
+    "playwright": "^1.60.0",
+    "@playwright/test": "^1.60.0"
+  },
+  "scripts": {
+    "test:deterministic": "node tests/browser/studio_completion_deterministic.mjs",
+    "test:playwright": "playwright test --project=mocked",
+    "test:playwright:live": "playwright test --project=live",
+    "test:playwright:smoke": "node tests/browser/modal_testing_suite_smoke.mjs",
+    "install:playwright": "npx playwright install chromium"
+  }
+}

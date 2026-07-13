@@ -607,5 +607,445 @@ class ResolvedMetadataTests(unittest.TestCase):
             self.assertEqual(stored_loras[2]["file"], "third.safetensors")
 
 
+# ---------------------------------------------------------------------------
+# RED→GREEN tests: _on_remote_event via production callback
+#
+# Each test loads __init__.py with a stub server so that the actual
+# _on_remote_event is registered via set_remote_event_handler.  Tests
+# then invoke experiment_service._remote_event_handler (the registered
+# lambda) inside an event loop, patching only REGISTRY, experiment_dir,
+# os.replace, and the logger.  No inline reimplementation.
+# ---------------------------------------------------------------------------
+
+
+async def _call_handler(handler, exp_id, ev):
+    """Await the _remote_event_handler inside a running event loop.
+    The handler lambda calls asyncio.create_task which requires a
+    running loop, so we must not evaluate handler(...) outside one."""
+    return await handler(exp_id, ev)
+
+
+def _load_init_and_get_handler():
+    """Load __init__.py with stub PromptServer, return
+    (init_module, remote_event_handler, REGISTRY)."""
+    import sys as _sys
+    from unittest.mock import MagicMock
+    import importlib.util
+    from pathlib import Path
+
+    REPO_ROOT = Path(__file__).resolve().parents[1]
+
+    # Backup sys.modules entries we will replace
+    _backup = {}
+    for _mod_name in ("server", "execution"):
+        _backup[_mod_name] = _sys.modules.pop(_mod_name, None)
+
+    try:
+        # Stub server so __init__.py can import PromptServer.instance
+        stub_server = MagicMock()
+        stub_server.routes = MagicMock()
+        stub_server.routes.get = lambda p: (lambda f: f)
+        stub_server.routes.post = lambda p: (lambda f: f)
+        stub_server.routes.patch = lambda p: (lambda f: f)
+        stub_server.routes.delete = lambda p: (lambda f: f)
+        stub_server.routes.put = lambda p: (lambda f: f)
+        stub_server.send_sync = MagicMock()
+
+        server_stub = type(_sys)("server")
+        server_stub.PromptServer = type("PromptServer", (), {"instance": stub_server})
+        _sys.modules["server"] = server_stub
+
+        exec_stub = type(_sys)("execution")
+        exec_stub.PromptQueue = type("PromptQueue", (), {})
+        _sys.modules["execution"] = exec_stub
+
+        # Need experiment_service already loaded so set_remote_event_handler
+        # writes to the SAME module object we read from later
+        import experiment_service as _es
+
+        module_name = f"_on_remote_event_test_{__name__}"
+        spec = importlib.util.spec_from_file_location(
+            module_name, str(REPO_ROOT / "__init__.py"),
+        )
+        assert spec is not None
+        assert spec.loader is not None
+        init_mod = importlib.util.module_from_spec(spec)
+        _sys.modules[module_name] = init_mod
+        spec.loader.exec_module(init_mod)
+
+        return init_mod, _es._remote_event_handler, _es.REGISTRY
+
+    finally:
+        for _mod_name, _mod_val in _backup.items():
+            if _mod_val is not None:
+                _sys.modules[_mod_name] = _mod_val
+            else:
+                _sys.modules.pop(_mod_name, None)
+        # Clean our temp module
+        for _k in list(_sys.modules.keys()):
+            if _k.startswith("_on_remote_event_test_"):
+                _sys.modules.pop(_k, None)
+
+
+class TerminalEventPersistenceTest(unittest.TestCase):
+    """Test that simple terminal events persist correctly via the actual
+    _on_remote_event callback."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.init_mod, cls.handler, cls.REGISTRY = _load_init_and_get_handler()
+
+    def test_cell_interrupted_persists_one_event(self):
+        """A cell.interrupted event must append exactly one matching event
+        to the store.  This ensures terminal handling runs inside the outer
+        try block (not inside a premature except that would skip it)."""
+        import asyncio
+        import logging
+        from unittest.mock import patch, MagicMock
+        from experiment_store import ExperimentStore
+        from experiment_lease import LeaseRegistry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            exp_id = "exp_term_persist"
+
+            store = ExperimentStore(tmp_path / exp_id, root=tmp_path)
+            store.ensure()
+
+            leases = LeaseRegistry(tmp_path / "leases.db")
+            leases.claim(exp_id, "ck_term", "w_term")
+
+            exp_dir = tmp_path / exp_id
+            mock_history = MagicMock()
+            mock_history.record_run.return_value = {"run_id": "r_term"}
+
+            _orig_store_map = dict(self.REGISTRY._store_singletons)
+            _orig_lease = self.REGISTRY._lease_singletons.get("_default")
+            try:
+                self.REGISTRY._store_singletons[exp_id] = store
+                self.REGISTRY._lease_singletons["_default"] = leases
+
+                with patch.object(self.REGISTRY, "history", return_value=mock_history):
+                    with patch.object(self.REGISTRY, "worker_progress",
+                                      return_value=MagicMock()):
+                        with patch.object(self.init_mod, "experiment_dir",
+                                   return_value=exp_dir):
+                            ev = {
+                                "type": "cell.interrupted",
+                                "data": {
+                                    "cell_key": "c_term",
+                                    "checkpoint_id": "ck_term",
+                                    "lease_generation": 1,
+                                    "worker_invocation_id": "w_term",
+                                    "attempt_id": "a_term_1",
+                                    "experiment_id": exp_id,
+                                },
+                            }
+                            asyncio.run(_call_handler(self.__class__.handler, exp_id, ev))
+
+                events = list(store.read_events())
+                event_types = [e["type"] for e in events]
+                self.assertEqual(
+                    event_types, ["cell.interrupted"],
+                    "Must persist exactly one cell.interrupted event; "
+                    "got %s.  If empty, terminal handling is nested "
+                    "inside a premature except block.",
+                )
+            finally:
+                store.close()
+                leases.close()
+                self.REGISTRY._store_singletons.clear()
+                self.REGISTRY._store_singletons.update(_orig_store_map)
+                if _orig_lease is not None:
+                    self.REGISTRY._lease_singletons["_default"] = _orig_lease
+
+
+class MaterializationOsReplaceTest(unittest.TestCase):
+    """Test that os.replace OSError flows into the materialization failure
+    handler, persisting cell.failed instead of cell.completed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.init_mod, cls.handler, cls.REGISTRY = _load_init_and_get_handler()
+
+    def test_caller_result_preserved_after_processing(self):
+        """The caller's original ev['data']['result'] must remain intact
+        after _on_remote_event processes a cell.completed event.
+        Production code must shallow-copy event data at entry before
+        mutating it (data.pop('result', None))."""
+        import asyncio
+        import base64
+        import logging
+        from unittest.mock import patch, MagicMock
+        from experiment_store import ExperimentStore
+        from experiment_lease import LeaseRegistry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            exp_id = "exp_result_preserve"
+
+            store = ExperimentStore(tmp_path / exp_id, root=tmp_path)
+            store.ensure()
+
+            leases = LeaseRegistry(tmp_path / "leases.db")
+            leases.claim(exp_id, "ck_res", "w_res")
+
+            exp_dir = tmp_path / exp_id
+            mock_history = MagicMock()
+            mock_history.record_run.return_value = {"run_id": "r_res"}
+
+            _orig_store_map = dict(self.REGISTRY._store_singletons)
+            _orig_lease = self.REGISTRY._lease_singletons.get("_default")
+            try:
+                self.REGISTRY._store_singletons[exp_id] = store
+                self.REGISTRY._lease_singletons["_default"] = leases
+
+                with patch.object(self.REGISTRY, "history", return_value=mock_history):
+                    with patch.object(self.REGISTRY, "worker_progress",
+                                      return_value=MagicMock()):
+                        with patch.object(self.init_mod, "experiment_dir",
+                                          return_value=exp_dir):
+                            test_data = base64.b64encode(
+                                b"result-preserve-data"
+                            ).decode("ascii")
+                            original_result = {
+                                "outputs": {
+                                    "7": {
+                                        "images": [{
+                                            "filename": "original.png",
+                                            "data": test_data,
+                                            "mime_type": "image/png",
+                                            "width": 64,
+                                            "height": 64,
+                                        }],
+                                    },
+                                },
+                            }
+                            ev = {
+                                "type": "cell.completed",
+                                "data": {
+                                    "cell_key": "c_res",
+                                    "checkpoint_id": "ck_res",
+                                    "lease_generation": 1,
+                                    "worker_invocation_id": "w_res",
+                                    "attempt_id": "a_res_1",
+                                    "experiment_id": exp_id,
+                                    "result": dict(original_result),
+                                },
+                            }
+
+                            asyncio.run(_call_handler(
+                                self.__class__.handler, exp_id, ev
+                            ))
+
+                # The caller's original ev['data']['result'] must NOT be
+                # mutated or removed by _on_remote_event processing.
+                self.assertIn(
+                    "result", ev.get("data", {}),
+                    "Caller's ev['data']['result'] must still exist "
+                    "after processing.  If absent, _on_remote_event "
+                    "mutated the caller's dict via data.pop('result').",
+                )
+                self.assertEqual(
+                    ev["data"]["result"], original_result,
+                    "Caller's ev['data']['result'] must retain its "
+                    "original value after processing",
+                )
+            finally:
+                store.close()
+                leases.close()
+                self.REGISTRY._store_singletons.clear()
+                self.REGISTRY._store_singletons.update(_orig_store_map)
+                if _orig_lease is not None:
+                    self.REGISTRY._lease_singletons["_default"] = _orig_lease
+
+    def test_os_replace_failure_persists_cell_failed(self):
+        """When os.replace raises OSError after materialization, the store
+        must receive exactly one cell.failed (with output_materialization_failed)
+        and NO cell.completed."""
+        import asyncio
+        import base64
+        import logging
+        from unittest.mock import patch, MagicMock
+        from experiment_store import ExperimentStore
+        from experiment_lease import LeaseRegistry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            exp_id = "exp_osr_green"
+
+            store = ExperimentStore(tmp_path / exp_id, root=tmp_path)
+            store.ensure()
+
+            leases = LeaseRegistry(tmp_path / "leases.db")
+            leases.claim(exp_id, "ck_osr", "w_osr")
+
+            exp_dir = tmp_path / exp_id
+            mock_history = MagicMock()
+            mock_history.record_run.return_value = {"run_id": "r_osr"}
+
+            _orig_store_map = dict(self.REGISTRY._store_singletons)
+            _orig_lease = self.REGISTRY._lease_singletons.get("_default")
+            try:
+                self.REGISTRY._store_singletons[exp_id] = store
+                self.REGISTRY._lease_singletons["_default"] = leases
+
+                with patch.object(self.REGISTRY, "history", return_value=mock_history):
+                    with patch.object(self.REGISTRY, "worker_progress",
+                                      return_value=MagicMock()):
+                        with patch.object(self.init_mod, "experiment_dir",
+                                   return_value=exp_dir):
+                            test_data = base64.b64encode(
+                                b"osr-green-data"
+                            ).decode("ascii")
+                            ev = {
+                                "type": "cell.completed",
+                                "data": {
+                                    "cell_key": "c_osr",
+                                    "checkpoint_id": "ck_osr",
+                                    "lease_generation": 1,
+                                    "worker_invocation_id": "w_osr",
+                                    "attempt_id": "a_osr_1",
+                                    "experiment_id": exp_id,
+                                    "result": {
+                                        "outputs": {
+                                            "7": {
+                                                "images": [{
+                                                    "filename": "test.png",
+                                                    "data": test_data,
+                                                    "mime_type": "image/png",
+                                                    "width": 64,
+                                                    "height": 64,
+                                                }],
+                                            },
+                                        },
+                                    },
+                                },
+                            }
+
+                            with patch("os.replace", side_effect=OSError(
+                                    18, "Simulated rename failure"
+                            )):
+                                asyncio.run(_call_handler(self.__class__.handler, exp_id, ev))
+
+                events = list(store.read_events())
+                event_types = [e["type"] for e in events]
+
+                self.assertNotIn(
+                    "cell.completed", event_types,
+                    "cell.completed must NOT persist when os.replace fails",
+                )
+                self.assertEqual(
+                    event_types, ["cell.failed"],
+                    "Must persist exactly one cell.failed event; "
+                    "got %s.  If empty, os.replace failure is being "
+                    "silently swallowed by an inner try/except.",
+                )
+                failed_ev = next(e for e in events if e["type"] == "cell.failed")
+                self.assertIn(
+                    "output_materialization_failed",
+                    str(failed_ev.get("payload", {}).get("error", "")),
+                    "cell.failed must carry output_materialization_failed",
+                )
+            finally:
+                store.close()
+                leases.close()
+                self.REGISTRY._store_singletons.clear()
+                self.REGISTRY._store_singletons.update(_orig_store_map)
+                if _orig_lease is not None:
+                    self.REGISTRY._lease_singletons["_default"] = _orig_lease
+
+
+class OuterExceptionLoggingTest(unittest.TestCase):
+    """Test that an unexpected exception in _on_remote_event is logged
+    with experiment/event/attempt context and NOT silently swallowed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.init_mod, cls.handler, cls.REGISTRY = _load_init_and_get_handler()
+
+    def test_outer_exception_logged_with_context(self):
+        """When store.append_event raises after valid terminal processing,
+        _log.exception must be called with exp_id, event type, and attempt."""
+        import asyncio
+        import logging
+        import base64
+        from unittest.mock import patch, MagicMock
+        from experiment_store import ExperimentStore
+        from experiment_lease import LeaseRegistry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            exp_id = "exp_log_green"
+
+            store = ExperimentStore(tmp_path / exp_id, root=tmp_path)
+            store.ensure()
+
+            leases = LeaseRegistry(tmp_path / "leases.db")
+            leases.claim(exp_id, "ck_log", "w_log")
+
+            exp_dir = tmp_path / exp_id
+            mock_history = MagicMock()
+            mock_history.record_run.return_value = {"run_id": "r_log"}
+
+            _orig_store_map = dict(self.REGISTRY._store_singletons)
+            _orig_lease = self.REGISTRY._lease_singletons.get("_default")
+            try:
+                self.REGISTRY._store_singletons[exp_id] = store
+                self.REGISTRY._lease_singletons["_default"] = leases
+
+                with patch.object(self.REGISTRY, "history", return_value=mock_history):
+                    with patch.object(self.REGISTRY, "worker_progress",
+                                      return_value=MagicMock()):
+                        with patch.object(self.init_mod, "experiment_dir",
+                                   return_value=exp_dir):
+                            # Use cell.interrupted (no materialization needed)
+                            # to reach store.append_event cleanly, then make
+                            # append_event raise.
+                            ev = {
+                                "type": "cell.interrupted",
+                                "data": {
+                                    "cell_key": "c_log",
+                                    "checkpoint_id": "ck_log",
+                                    "lease_generation": 1,
+                                    "worker_invocation_id": "w_log",
+                                    "attempt_id": "a_log_1",
+                                    "experiment_id": exp_id,
+                                },
+                            }
+
+                            original_append = store.append_event
+
+                            def _failing_append(event):
+                                if event.get("type") == "cell.interrupted":
+                                    raise RuntimeError("Simulated store failure")
+                                return original_append(event)
+
+                            with patch.object(
+                                store, "append_event", _failing_append
+                            ):
+                                with self.assertLogs(
+                                    self.init_mod._log, level=logging.ERROR,
+                                ) as log_cm:
+                                    asyncio.run(_call_handler(self.__class__.handler, exp_id, ev))
+
+                            log_output = "\n".join(log_cm.output)
+                            self.assertIn(exp_id, log_output,
+                                          "Log must contain experiment_id")
+                            self.assertIn("cell.interrupted", log_output,
+                                          "Log must contain event type")
+                            self.assertIn("RuntimeError", log_output,
+                                          "Log must contain exception type")
+                            self.assertIn("Simulated store failure", log_output,
+                                          "Log must contain exception message")
+            finally:
+                store.close()
+                leases.close()
+                self.REGISTRY._store_singletons.clear()
+                self.REGISTRY._store_singletons.update(_orig_store_map)
+                if _orig_lease is not None:
+                    self.REGISTRY._lease_singletons["_default"] = _orig_lease
+
+
 if __name__ == "__main__":
     unittest.main()

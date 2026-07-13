@@ -40,9 +40,9 @@ export function renderExperimentToggle(state, actions) {
 // ── Axis eligibility helper ──────────────────────────────────────────────
 
 function recalcEligibleAxes(state, loadedPresets) {
-  const compareIds = (state.playground && state.playground.compareBackendIds) || [];
-  if (compareIds.length === 0) return [];
-  const selectedPresets = compareIds
+  const ids = getExperimentPresetIds(state);
+  if (ids.length === 0) return [];
+  const selectedPresets = ids
     .map((id) => (loadedPresets || []).find((p) => (p.id || p.label || "") === id))
     .filter(Boolean);
   const featureId = (state.playground && state.playground.featureId) || "txt2img";
@@ -124,6 +124,7 @@ export function renderCompareBackends(state, actions, context) {
       cb.type = "checkbox";
       cb.className = "comfymodal-studio-compare-checkbox";
       cb.setAttribute("data-backend-id", bId);
+      cb.setAttribute("data-testid", `compare-preset-${bId}`);
       if (!canSelect) cb.disabled = true;
       cb.checked = canSelect && compareIds.includes(bId);
       cb.addEventListener("change", () => {
@@ -150,6 +151,11 @@ export function renderCompareBackends(state, actions, context) {
           : null;
         if (matrixBody) {
           updateMatrixSummary(matrixBody, state);
+        }
+        // Trigger full Playground re-render so run-button, controls,
+        // and axis checkboxes reflect the new compare selection.
+        if (context && context.setPage) {
+          context.setPage("playground");
         }
       });
       item.appendChild(cb);
@@ -351,14 +357,22 @@ export function enhanceControlWithAxisCheckbox(controlEl, controlId, state, acti
   if (isAxis && isEligible) {
     const editor = renderAxisEditor(controlId, state, actions);
     if (editor) {
-      // Schedule insertion after controlEl's parent processes
+      // Schedule insertion after controlEl's parent processes.
+      // Uses isConnected guards to prevent stale DOM injection and
+      // parent.parentNode.insertBefore for correct sibling positioning.
+      // Before inserting, remove any existing connected editor for the
+      // same control to prevent duplicate editors after rapid toggling.
       setTimeout(() => {
+        if (!controlEl.isConnected) return;
         const parent = controlEl.parentNode;
-        if (parent && parent.nextSibling) {
-          parent.insertBefore(editor, parent.nextSibling);
-        } else if (parent) {
-          parent.appendChild(editor);
+        if (!parent || !parent.isConnected) return;
+        const grandparent = parent.parentNode;
+        if (!grandparent) return;
+        const existingEditors = grandparent.querySelectorAll(`[data-testid="axis-editor-${controlId}"]`);
+        for (const existing of existingEditors) {
+          if (existing.isConnected) existing.remove();
         }
+        grandparent.insertBefore(editor, parent.nextSibling);
       }, 0);
     }
   }

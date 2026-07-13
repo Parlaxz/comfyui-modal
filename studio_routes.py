@@ -285,7 +285,13 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
                 snapshot = snapshots_by_id.get(sid) if sid else None
                 if snapshot is not None:
                     from studio_run_adapter import extract_defaults_from_snapshot
-                    normalized["defaults"] = extract_defaults_from_snapshot(snapshot)
+                    # Snapshot defaults fill missing preset keys, but explicit
+                    # preset defaults always take priority.  Merge so that
+                    # preset.defaults.steps=8 is never overwritten by a
+                    # snapshot connection spec steps=["937", 0].
+                    snapshot_defaults = extract_defaults_from_snapshot(snapshot)
+                    explicit_defaults = normalized.get("defaults", {}) or {}
+                    normalized["defaults"] = {**snapshot_defaults, **explicit_defaults}
                     normalized["nodeBindings"] = snapshot.get("nodeBindings", {})
                     normalized["outputNodeId"] = snapshot.get("outputNodeId", "")
                     normalized["featureStatus"] = snapshot.get("featureStatus", {})
