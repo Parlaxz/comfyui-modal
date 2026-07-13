@@ -1284,14 +1284,17 @@ def build_experiment_spec(
     all_preset_ids: list[str] = []
     all_snapshot_ids: list[str] = []
 
+    _preset_to_profile: dict[str, str] = {}
     for idx, (preset, snapshot) in enumerate(preset_snapshot_pairs):
         pid = preset.get("id", "")
         sid = snapshot.get("id", "")
         all_preset_ids.append(pid)
         all_snapshot_ids.append(sid)
+        _profile_id = f"studio_{pid}_{idx}"
+        _preset_to_profile[pid] = _profile_id
 
         spec_workflows.append({
-            "profile_id": f"studio_{pid}_{idx}",
+            "profile_id": _profile_id,
             "loader_target_group_id": "g_default",
             "main_triple": {"id": "main", "unet": "", "clip": "", "vae": ""},
             "subprofile_triples": [],
@@ -1330,13 +1333,17 @@ def build_experiment_spec(
     raw_axes = copy.deepcopy(experiment_def.get("axes", {})) or {}
 
     # Detect nested compiler format vs flat Studio format
-    has_nested_format = isinstance(raw_axes, dict) and "shared" in raw_axes
+    has_nested_format = (
+        isinstance(raw_axes, dict)
+        and ("shared" in raw_axes or "per_workflow" in raw_axes)
+    )
 
     if has_nested_format:
         shared_source = raw_axes.get("shared", {}) or {}
-        # per_workflow handled separately; ignore it for axis-level checks
+        per_workflow_source = raw_axes.get("per_workflow", {}) or {}
     else:
         shared_source = raw_axes
+        per_workflow_source = {}
 
     # Extract special axes handled at the adapter level
     prompt_axis_values: list | None = None
@@ -1460,6 +1467,36 @@ def build_experiment_spec(
             if isinstance(values_list, list) and len(values_list) > 0:
                 compiler_axes["shared"][ctrl_id] = {"mode": "list", "values": values_list}
 
+    # ── Validate per_workflow axes against profile-specific slots ─────
+    if per_workflow_source:
+        for pw_key, pw_axes in per_workflow_source.items():
+            if not isinstance(pw_axes, dict):
+                continue
+            pw_profile = _preset_to_profile.get(pw_key, pw_key)
+            pw_slot_keys = preset_slot_keys.get(pw_profile, set())
+            for axis_id, axis_def in pw_axes.items():
+                if not isinstance(axis_def, dict):
+                    continue
+                if axis_id in _AUTO_SLOT_AXES:
+                    continue
+                if axis_id not in pw_slot_keys:
+                    return {"error": (
+                        f"Configured per_workflow axis {axis_id!r} for "
+                        f"preset {pw_key!r} is not bound to any slot in "
+                        f"that preset's snapshot. This axis must be bound "
+                        f"in the preset wizard before it can be used as "
+                        f"a per-workflow axis."
+                    )}
+        # Propagate per_workflow axes into compiler axes (translate keys
+        # from user-facing preset IDs to spec profile_ids).
+        _translated_pw: dict[str, dict] = {}
+        for pw_key, pw_axes in per_workflow_source.items():
+            if not isinstance(pw_axes, dict):
+                continue
+            pw_profile = _preset_to_profile.get(pw_key, pw_key)
+            _translated_pw[pw_profile] = dict(pw_axes)
+        compiler_axes["per_workflow"] = _translated_pw
+
     axes = compiler_axes
 
     spec: dict[str, Any] = {
@@ -1467,7 +1504,7 @@ def build_experiment_spec(
         "revision": 1,
         "name": experiment_def.get("name", f"Studio {feature_id}"),
         "workflows": spec_workflows,
-        "prompts": {"items": spec_prompts, "shared_negative": ""},
+        "prompts": {"items": spec_prompts, "shared_negative": experiment_def.get("shared_negative", "")},
         "images": {"mode": "cartesian", "items": []},
         "loras": {"selections": [
             {"id": "L_no_lora", "label": "No LoRA", "loras": [], "enabled": True},
