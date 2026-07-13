@@ -2059,11 +2059,28 @@ async def _execute_job(item: tuple, item_id: int):
     # Send modal_status for Modal-specific status display (may precede ack).
     _send(sid, "modal_status", {"prompt_id": prompt_id, "message": "Modal execution starting", "phase": "dispatch"})
 
+    # Derive workflow metadata for execution_start
+    _exec_node_count = sum(
+        1 for _n in (execution_workflow or {}).values()
+        if isinstance(_n, dict) and isinstance(_n.get("class_type"), str) and _n["class_type"]
+    )
+    _exec_sampler_max = 0
+    for _n in (execution_workflow or {}).values():
+        if isinstance(_n, dict) and "Sampler" in str(_n.get("class_type", "")):
+            _s = _n.get("inputs", {}).get("steps")
+            if isinstance(_s, (int, float)) and _s > 0:
+                _exec_sampler_max = int(_s)
+                break
+
     # Helper: forward execution_start exactly once
     def _forward_execution_start_once():
         nonlocal execution_start_forwarded
         if not execution_start_forwarded:
-            _send(sid, "execution_start", {"prompt_id": prompt_id})
+            _send(sid, "execution_start", {
+                "prompt_id": prompt_id,
+                "total_nodes": _exec_node_count,
+                "sampler_maximum": _exec_sampler_max,
+            })
             execution_start_forwarded = True
 
     success = False

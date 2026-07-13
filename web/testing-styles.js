@@ -2105,6 +2105,324 @@ const CSS = `
 
 /* ── Responsive helpers ─────────────────────────────────── */
 
+/* ── Results: Matrix layout ──────────────────────────────── */
+
+.testing-results-matrix-wrap {
+  margin-bottom: var(--space-lg);
+}
+
+.testing-results-matrix-scroll {
+  overflow: auto;
+  max-height: 600px;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-surface);
+}
+
+.testing-results-matrix {
+  border-collapse: separate;
+  border-spacing: 0;
+  min-width: 100%;
+  font-size: var(--font-size-xs, 11px);
+}
+
+.testing-results-matrix th,
+.testing-results-matrix td {
+  padding: var(--space-xs);
+  border-bottom: 1px solid var(--color-border-default);
+  border-right: 1px solid var(--color-border-default);
+  text-align: left;
+  vertical-align: top;
+}
+
+.testing-results-matrix th {
+  background: var(--color-bg-toolbar);
+  font-weight: var(--font-weight-semibold, 600);
+  color: var(--color-text-secondary, #9aa3b2);
+  white-space: nowrap;
+}
+
+/* Sticky headers */
+.testing-results-matrix-corner {
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 3;
+  background: var(--color-bg-raised, #252532);
+  min-width: 80px;
+  font-size: var(--font-size-xs, 11px);
+  color: var(--color-text-muted, #6f7785);
+}
+
+.testing-results-matrix-col-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--color-bg-toolbar);
+  min-width: 100px;
+  padding: var(--space-sm) var(--space-xs) !important;
+  font-size: var(--font-size-xs, 11px);
+  color: var(--color-text-secondary, #9aa3b2);
+  border-top: none;
+}
+
+.testing-results-matrix-row-header {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: var(--color-bg-toolbar);
+  min-width: 80px;
+  padding: var(--space-sm) var(--space-xs) !important;
+  font-size: var(--font-size-xs, 11px);
+  color: var(--color-text-secondary, #9aa3b2);
+  border-left: none;
+}
+
+.testing-results-matrix th:first-child,
+.testing-results-matrix td:first-child {
+  border-left: none;
+}
+
+.testing-results-matrix thead tr:first-child th {
+  border-top: none;
+}
+
+/* Matrix cell (compact card wrapper) */
+.testing-results-matrix-cell {
+  padding: 2px !important;
+  min-width: 90px;
+  min-height: 90px;
+  vertical-align: middle;
+}
+
+.testing-results-matrix-empty {
+  background: var(--color-bg-input, #171723);
+}
+
+/* ── Compact cell variant ────────────────────────────────── */
+
+.testing-results-cell-compact {
+  display: inline-block;
+  width: 86px;
+  border-radius: var(--radius-sm, 4px);
+  overflow: hidden;
+  cursor: pointer;
+  background: var(--color-bg-raised, #252532);
+  border: 1px solid var(--color-border-default, #2d2d3a);
+  transition: border-color var(--duration-fast, 120ms) var(--ease-standard, cubic-bezier(0.2,0,0,1));
+}
+
+.testing-results-cell-compact:hover {
+  border-color: var(--color-border-interactive, #454559);
+}
+
+.testing-results-cell-compact .testing-results-cell-thumb {
+  width: 86px;
+  height: 86px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  position: relative;
+}
+
+.testing-results-cell-compact .testing-results-cell-thumb img {
+  width: 86px;
+  height: 86px;
+  object-fit: cover;
+  display: block;
+}
+
+.testing-results-cell-compact .testing-results-cell-thumb-placeholder {
+  width: 86px;
+  height: 86px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--font-size-xs, 11px);
+  color: var(--color-text-muted, #6f7785);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.testing-results-cell-compact .testing-results-cell-attempt {
+  position: absolute;
+  bottom: 2px;
+  right: 2px;
+  background: rgba(0, 0, 0, 0.7);
+  color: var(--color-text-primary, #e1e4ea);
+  font-size: 9px;
+  padding: 1px 4px;
+  border-radius: 2px;
+  line-height: 1.2;
+}
+
+.testing-results-cell-compact .testing-results-cell-meta {
+  display: none;
+}
+
+.testing-results-cell-compact .testing-results-cell-error {
+  display: none;
+}
+
+/* Compact cell status borders */
+.testing-results-cell-compact.testing-results-cell-completed {
+  border-color: var(--color-success, #4ade80);
+}
+
+.testing-results-cell-compact.testing-results-cell-failed {
+  border-color: var(--color-danger, #ef4444);
+}
+
+.testing-results-cell-compact.testing-results-cell-running {
+  border-color: var(--color-accent, #5a7fdb);
+}
+
+.testing-results-cell-compact.testing-results-cell-pending {
+  border-color: var(--color-border-default, #2d2d3a);
+  opacity: 0.6;
+}
+
+/* ── Labeled sequence (1 axis) ────────────────────────────── */
+
+.testing-results-axis-sequence {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.testing-results-axis-sequence-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-md);
+  padding: var(--space-sm);
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  transition: border-color var(--duration-fast, 120ms) var(--ease-standard, cubic-bezier(0.2,0,0,1));
+}
+
+.testing-results-axis-sequence-item:hover {
+  border-color: var(--color-border-interactive, #454559);
+}
+
+.testing-results-axis-label {
+  flex-shrink: 0;
+  min-width: 160px;
+  font-size: var(--font-size-sm, 12px);
+  font-weight: var(--font-weight-medium, 500);
+  color: var(--color-accent, #5a7fdb);
+  padding: var(--space-sm) 0;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 700px) {
+  .testing-results-axis-sequence-item {
+    flex-direction: column;
+    gap: var(--space-sm);
+  }
+  .testing-results-axis-label {
+    min-width: unset;
+  }
+}
+
+/* ── Group headers (3D / 4D) ─────────────────────────────── */
+
+.testing-results-3d-wrapper,
+.testing-results-4d-outer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xl);
+}
+
+.testing-results-3d-group,
+.testing-results-4d-group {
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.testing-results-axis-group-header {
+  margin: 0;
+  padding: var(--space-md) var(--space-lg);
+  font-size: var(--font-size-base, 13px);
+  font-weight: var(--font-weight-semibold, 600);
+  color: var(--color-text-primary, #e1e4ea);
+  background: var(--color-bg-toolbar);
+  border-bottom: 1px solid var(--color-border-default);
+  letter-spacing: 0.01em;
+}
+
+.testing-results-4d-inner {
+  padding: var(--space-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.testing-results-4d-inner-group {
+  background: var(--color-bg-raised);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.testing-results-axis-inner-header {
+  margin: 0;
+  padding: var(--space-sm) var(--space-md);
+  font-size: var(--font-size-sm, 12px);
+  font-weight: var(--font-weight-medium, 500);
+  color: var(--color-accent, #5a7fdb);
+  background: var(--color-bg-raised, #252532);
+  border-bottom: 1px solid var(--color-border-default);
+}
+
+.testing-results-3d-group .testing-results-matrix-wrap,
+.testing-results-4d-inner-group .testing-results-matrix-wrap {
+  margin: var(--space-md);
+}
+
+/* ── Too many axes fallback ──────────────────────────────── */
+
+.testing-results-too-many-axes {
+  border-color: var(--color-warning, #f59e0b) !important;
+  background: var(--color-warning-bg, rgba(245, 158, 11, 0.12)) !important;
+}
+
+/* ── Responsive: matrices on small screens ────────────────── */
+
+@media (max-width: 700px) {
+  .testing-results-matrix-scroll {
+    max-height: 400px;
+  }
+  .testing-results-matrix th,
+  .testing-results-matrix td {
+    padding: 2px;
+  }
+  .testing-results-matrix-cell {
+    min-width: 70px;
+    min-height: 70px;
+  }
+  .testing-results-cell-compact {
+    width: 66px;
+  }
+  .testing-results-cell-compact .testing-results-cell-thumb,
+  .testing-results-cell-compact .testing-results-cell-thumb img,
+  .testing-results-cell-compact .testing-results-cell-thumb-placeholder {
+    width: 66px;
+    height: 66px;
+  }
+  .testing-results-matrix-col-header {
+    min-width: 70px;
+    font-size: 10px;
+  }
+  .testing-results-matrix-row-header {
+    min-width: 60px;
+    font-size: 10px;
+  }
+}
+
 @media (max-width: 900px) {
   .comfymodal-settings-wrapper {
     flex-direction: column;

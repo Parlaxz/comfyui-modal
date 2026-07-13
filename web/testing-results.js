@@ -355,7 +355,7 @@ export function results_tab_render(rootEl, api, options = {}) {
     return "";
   }
 
-  function renderCellCard(cell, attempt, apiBase, cellIndex) {
+  function renderCellCard(cell, attempt, apiBase, cellIndex, compact = false) {
     const assetId = getAssetId(attempt);
     const cellStatus = (attempt && attempt.status) || "pending";
     const errorText = (attempt && cellStatus === "failed" && attempt.error)
@@ -364,7 +364,7 @@ export function results_tab_render(rootEl, api, options = {}) {
     const modelName = getModelShortName(attempt);
     const runtime = getCellRuntime(attempt);
     const card = el("div", {
-      class: `testing-results-cell testing-results-cell-${cellStatus}`,
+      class: `testing-results-cell testing-results-cell-${cellStatus}${compact ? " testing-results-cell-compact" : ""}`,
       "data-cell-key": cell.cell_key,
       "data-testid": "cell-card",
       "data-cell-status": cellStatus,
@@ -481,27 +481,129 @@ export function results_tab_render(rootEl, api, options = {}) {
     }).join(" | ");
   }
 
-  function renderGrid(shell, evs, apiBase, snap) {
-    const grid = shell.querySelector('[data-testid="grid-body"]');
-    if (!grid) return;
-    while (grid.firstChild) grid.removeChild(grid.firstChild);
-    const cellMap = {};
-    evs.forEach((ev) => {
-      const t = ev.type;
-      const p = ev.payload || {};
-      if (t === "cell.attempt_created") {
-        cellMap[p.cell_key] = { attempt: p };
-      } else if (t === "cell.completed" || t === "cell.failed" || t === "cell.interrupted") {
-        const prev = cellMap[p.cell_key] || {};
-        cellMap[p.cell_key] = { cell: { cell_key: p.cell_key, ...(prev.cell || {}) }, attempt: { ...(prev.attempt || {}), ...p, status: t.split(".")[1] } };
-      }
+  // ── Axis-based Results Rendering ────────────────────────────
+  //
+  // Uses experiment.created payload.compilation.cells as the authoritative
+  // cell list with axis_values metadata. Merges latest attempt state from
+  // snapshot.attempts and snapshot.cell_visible. Renders in layouts based
+  // on the number of varying axes (0 = technical fallback, 1 = sequence,
+  // 2 = matrix, 3 = grouped matrices, 4 = nested grouped matrices).
+
+  function getCompilationCells(evs) {
+    if (!evs) return [];
+    const createdEv = evs.find(function (e) { return e.type === "experiment.created"; });
+    if (!createdEv || !createdEv.payload) return [];
+    const compilation = createdEv.payload.compilation;
+    if (!compilation || !Array.isArray(compilation.cells)) return [];
+    return compilation.cells;
+  }
+
+  function mergeCellState(compilationCells, evs, snap) {
+    // Build event-derived attempt map (latest event per cell_key wins)
+    var eventAttempts = {};
+    if (evs) {
+      evs.forEach(function (ev) {
+        var t = ev.type;
+        var p = ev.payload || {};
+        var ck = p.cell_key;
+        if (!ck) return;
+        if (t === "experiment.created") return;
+        if (t === "cell.attempt_created") {
+          eventAttempts[ck] = eventAttempts[ck] || {};
+          eventAttempts[ck].attempt = Object.assign({}, p);
+          eventAttempts[ck].attempt.status = "pending";
+        } else if (["cell.completed", "cell.failed", "cell.interrupted", "cell.skipped"].indexOf(t) >= 0) {
+          var status = t.split(".")[1];
+          var prev = eventAttempts[ck] || {};
+          eventAttempts[ck] = {
+            cell: { cell_key: ck },
+            attempt: Object.assign({}, prev.attempt || {}, p, { status: status }),
+          };
+        }
+      });
+    }
+    // Merge compilation cells with event and snapshot data
+    return compilationCells.map(function (compCell) {
+      var ck = compCell.cell_key;
+      var evData = eventAttempts[ck] || {};
+      var snapAtt = (snap && snap.attempts && snap.attempts[ck]) || {};
+      var visibleStatus = (snap && snap.cell_visible && snap.cell_visible[ck]) || null;
+      // Build attempt: event data for rich fields, snapshot for latest state
+      var attempt = Object.assign({}, evData.attempt || {}, snapAtt);
+      // Prefer snapshot cell_visible status (authoritative), fall back
+      attempt.status = visibleStatus || snapAtt.status || (evData.attempt ? evData.attempt.status : null) || "pending";
+      return {
+        cell: Object.assign({ cell_key: ck, axis_values: compCell.axis_values || {} }, compCell),
+        attempt: attempt,
+      };
     });
-    const strategy = resolveGroupingStrategy(snap);
-    const groups = strategy.type === "dimension"
+  }
+
+  function computeVaryingAxes(entries) {
+    if (!entries || entries.length === 0) return { axes: [], valueSets: {} };
+    var allValues = {};
+    var firstSeenKeys = [];
+    for (var i = 0; i < entries.length; i++) {
+      var av = entries[i].cell.axis_values || {};
+      for (var key in av) {
+        if (!av.hasOwnProperty(key)) continue;
+        if (!allValues[key]) {
+          allValues[key] = new Set();
+          firstSeenKeys.push(key);
+        }
+        var v = av[key];
+        var sv = typeof v === "object" ? JSON.stringify(v) : String(v);
+        allValues[key].add(sv);
+      }
+    }
+    var varying = [];
+    for (var j = 0; j < firstSeenKeys.length; j++) {
+      var k = firstSeenKeys[j];
+      if (allValues[k].size > 1) {
+        varying.push(k);
+      }
+    }
+    return { axes: varying, valueSets: allValues };
+  }
+
+  function getAxisValueLabel(entry, axisKey) {
+    var av = entry.cell.axis_values || {};
+    var v = av[axisKey];
+    if (v === null || v === undefined) return "?";
+    if (typeof v === "object") return JSON.stringify(v);
+    return String(v);
+  }
+
+  function formatAxisLabel(axisKey, axisValue) {
+    return axisKey + ": " + axisValue;
+  }
+
+  // ── Fallback: render from events (old behavior) ─────────────
+
+  function renderFromEvents(grid, evs, apiBase, snap) {
+    var cellMap = {};
+    if (evs) {
+      evs.forEach(function (ev) {
+        var t = ev.type;
+        var p = ev.payload || {};
+        if (t === "cell.attempt_created") {
+          cellMap[p.cell_key] = { attempt: p };
+        } else if (["cell.completed", "cell.failed", "cell.interrupted", "cell.skipped"].indexOf(t) >= 0) {
+          var prev = cellMap[p.cell_key] || {};
+          cellMap[p.cell_key] = {
+            cell: Object.assign({ cell_key: p.cell_key }, prev.cell || {}),
+            attempt: Object.assign({}, prev.attempt || {}, p, { status: t.split(".")[1] }),
+          };
+        }
+      });
+    }
+    var strategy = resolveGroupingStrategy(snap);
+    var groups = strategy.type === "dimension"
       ? groupByDimensions(cellMap, strategy.dimensions)
       : groupByCheckpoint(cellMap);
-    Object.keys(groups).forEach((groupKey) => {
-      const group = el("div", {
+    var groupKeys = Object.keys(groups);
+    groupKeys.forEach(function (groupKey) {
+      var group = el("div", {
         class: "testing-results-group " + strategy.adapterClass,
         "data-group-strategy": strategy.type,
       }, [
@@ -512,12 +614,296 @@ export function results_tab_render(rootEl, api, options = {}) {
         }),
         el("div", { class: "testing-results-row", style: "display:flex;flex-wrap:wrap;gap:var(--space-sm,8px);" }),
       ]);
-      const row = group.querySelector(".testing-results-row");
-      groups[groupKey].forEach((entry, idx) => row.appendChild(renderCellCard(entry.cell || { cell_key: "_" }, entry.attempt, apiBase, idx)));
+      var row = group.querySelector(".testing-results-row");
+      groups[groupKey].forEach(function (entry, idx) {
+        row.appendChild(renderCellCard(entry.cell || { cell_key: "_" }, entry.attempt, apiBase, idx));
+      });
       grid.appendChild(group);
     });
-    if (Object.keys(groups).length === 0) {
+    if (groupKeys.length === 0) {
       grid.appendChild(el("div", { class: "testing-results-empty-state", text: "No cells yet — start an experiment." }));
+    }
+  }
+
+  // ── 0 axes: technical fallback (checkpoint groups) ──────────
+
+  function renderFallbackGroups(grid, entries, apiBase, snap) {
+    var groups = {};
+    entries.forEach(function (entry) {
+      var ck = (entry.attempt && entry.attempt.checkpoint_id) || (entry.cell && entry.cell.checkpoint_id) || "_unknown";
+      groups[ck] = groups[ck] || [];
+      groups[ck].push(entry);
+    });
+    var groupKeys = Object.keys(groups);
+    groupKeys.forEach(function (groupKey) {
+      var group = el("div", {
+        class: "testing-results-group testing-results-technical",
+        "data-group-strategy": "technical",
+      }, [
+        el("h4", {
+          class: "technical-view",
+          style: "font-size:var(--font-size-sm,12px);font-weight:var(--font-weight-medium,500);color:var(--color-text-secondary,#9aa3b2);margin:0 0 var(--space-sm,8px);",
+          text: "Checkpoint " + groupKey,
+        }),
+        el("div", { class: "testing-results-row", style: "display:flex;flex-wrap:wrap;gap:var(--space-sm,8px);" }),
+      ]);
+      var row = group.querySelector(".testing-results-row");
+      groups[groupKey].forEach(function (entry, idx) {
+        row.appendChild(renderCellCard(entry.cell || { cell_key: "_" }, entry.attempt, apiBase, idx));
+      });
+      grid.appendChild(group);
+    });
+    if (groupKeys.length === 0) {
+      grid.appendChild(el("div", { class: "testing-results-empty-state", text: "No cells yet — start an experiment." }));
+    }
+  }
+
+  // ── First-seen order (preserve compilation order) ──────────
+
+  function uniqueInOrder(entries, accessor) {
+    var seen = {};
+    var result = [];
+    for (var i = 0; i < entries.length; i++) {
+      var val = accessor(entries[i]);
+      if (!seen.hasOwnProperty(val)) {
+        seen[val] = true;
+        result.push(val);
+      }
+    }
+    return result;
+  }
+
+  // ── 1 varying axis: labeled sequence ────────────────────────
+
+  function renderLabeledSequence(grid, entries, axes, apiBase) {
+    var axisKey = axes[0];
+    var wrap = el("div", { class: "testing-results-axis-sequence" });
+    entries.forEach(function (entry, idx) {
+      var labelText = formatAxisLabel(axisKey, getAxisValueLabel(entry, axisKey));
+      var item = el("div", { class: "testing-results-axis-sequence-item" }, [
+        el("div", { class: "testing-results-axis-label", text: labelText }),
+        renderCellCard(entry.cell, entry.attempt, apiBase, idx, false),
+      ]);
+      wrap.appendChild(item);
+    });
+    grid.appendChild(wrap);
+  }
+
+  // ── 2 varying axes: matrix ──────────────────────────────────
+
+  function buildMatrix(entries, rowAxis, colAxis) {
+    var rowValues = uniqueInOrder(entries, function (e) { return getAxisValueLabel(e, rowAxis); });
+    var colValues = uniqueInOrder(entries, function (e) { return getAxisValueLabel(e, colAxis); });
+    var grid = {};
+    entries.forEach(function (entry) {
+      var rv = getAxisValueLabel(entry, rowAxis);
+      var cv = getAxisValueLabel(entry, colAxis);
+      var ri = rowValues.indexOf(rv);
+      var ci = colValues.indexOf(cv);
+      if (ri >= 0 && ci >= 0) {
+        grid[ri + "," + ci] = entry;
+      }
+    });
+    return { rowValues: rowValues, colValues: colValues, grid: grid };
+  }
+
+  function renderMatrixLayout(grid, entries, axes, apiBase) {
+    var rowAxis = axes[0];
+    var colAxis = axes[1];
+    var matrix = buildMatrix(entries, rowAxis, colAxis);
+    var wrap = el("div", { class: "testing-results-matrix-wrap" });
+    var scroll = el("div", { class: "testing-results-matrix-scroll" }, [
+      el("table", { class: "testing-results-matrix" }, [
+        el("thead", {}, [
+          el("tr", {}, [
+            el("th", { class: "testing-results-matrix-corner", text: rowAxis + " \\ " + colAxis }),
+          ].concat(matrix.colValues.map(function (cv) {
+            return el("th", { class: "testing-results-matrix-col-header", text: formatAxisLabel(colAxis, cv) });
+          }))),
+        ]),
+        el("tbody", {}, matrix.rowValues.map(function (rv, ri) {
+          return el("tr", {}, [
+            el("th", { class: "testing-results-matrix-row-header", text: formatAxisLabel(rowAxis, rv) }),
+          ].concat(matrix.colValues.map(function (cv, ci) {
+            var entry = matrix.grid[ri + "," + ci];
+            if (entry) {
+              return el("td", { class: "testing-results-matrix-cell" }, [
+                renderCellCard(entry.cell, entry.attempt, apiBase, null, true),
+              ]);
+            }
+            return el("td", { class: "testing-results-matrix-cell testing-results-matrix-empty" });
+          })));
+        })),
+      ]),
+    ]);
+    wrap.appendChild(scroll);
+    grid.appendChild(wrap);
+  }
+
+  // ── 3 varying axes: groups by third axis, each with matrix ──
+
+  function renderGroupedMatrixLayout(grid, entries, axes, apiBase) {
+    var groupAxis = axes[2];
+    var rowAxis = axes[0];
+    var colAxis = axes[1];
+    var groups = {};
+    entries.forEach(function (entry) {
+      var gv = getAxisValueLabel(entry, groupAxis);
+      groups[gv] = groups[gv] || [];
+      groups[gv].push(entry);
+    });
+    var wrap = el("div", { class: "testing-results-3d-wrapper" });
+    var groupKeys = uniqueInOrder(entries, function (e) { return getAxisValueLabel(e, groupAxis); });
+    groupKeys.forEach(function (gv) {
+      var group = el("div", { class: "testing-results-3d-group" }, [
+        el("h4", { class: "testing-results-axis-group-header", text: formatAxisLabel(groupAxis, gv) }),
+      ]);
+      // Render matrix within each group (reuse matrix builder)
+      var matrixWrap = el("div", { class: "testing-results-matrix-wrap" });
+      var matrix = buildMatrix(groups[gv], rowAxis, colAxis);
+      var scroll = el("div", { class: "testing-results-matrix-scroll" }, [
+        el("table", { class: "testing-results-matrix" }, [
+          el("thead", {}, [
+            el("tr", {}, [
+              el("th", { class: "testing-results-matrix-corner", text: rowAxis + " \\ " + colAxis }),
+            ].concat(matrix.colValues.map(function (cv) {
+              return el("th", { class: "testing-results-matrix-col-header", text: formatAxisLabel(colAxis, cv) });
+            }))),
+          ]),
+          el("tbody", {}, matrix.rowValues.map(function (rv, ri) {
+            return el("tr", {}, [
+              el("th", { class: "testing-results-matrix-row-header", text: formatAxisLabel(rowAxis, rv) }),
+            ].concat(matrix.colValues.map(function (cv, ci) {
+              var entry = matrix.grid[ri + "," + ci];
+              if (entry) {
+                return el("td", { class: "testing-results-matrix-cell" }, [
+                  renderCellCard(entry.cell, entry.attempt, apiBase, null, true),
+                ]);
+              }
+              return el("td", { class: "testing-results-matrix-cell testing-results-matrix-empty" });
+            })));
+          })),
+        ]),
+      ]);
+      matrixWrap.appendChild(scroll);
+      group.appendChild(matrixWrap);
+      wrap.appendChild(group);
+    });
+    grid.appendChild(wrap);
+  }
+
+  // ── 4 varying axes: nested groups (4th outer, 3rd inner), each with matrix ──
+
+  function renderNestedGroupedMatrixLayout(grid, entries, axes, apiBase) {
+    var outerAxis = axes[3];
+    var innerAxis = axes[2];
+    var rowAxis = axes[0];
+    var colAxis = axes[1];
+    var outerGroups = {};
+    entries.forEach(function (entry) {
+      var ov = getAxisValueLabel(entry, outerAxis);
+      outerGroups[ov] = outerGroups[ov] || [];
+      outerGroups[ov].push(entry);
+    });
+    var outerWrap = el("div", { class: "testing-results-4d-outer" });
+    var outerKeys = uniqueInOrder(entries, function (e) { return getAxisValueLabel(e, outerAxis); });
+    outerKeys.forEach(function (ov) {
+      var outerGroup = el("div", { class: "testing-results-4d-group" }, [
+        el("h4", { class: "testing-results-axis-group-header", text: formatAxisLabel(outerAxis, ov) }),
+      ]);
+      var innerGroups = {};
+      outerGroups[ov].forEach(function (entry) {
+        var iv = getAxisValueLabel(entry, innerAxis);
+        innerGroups[iv] = innerGroups[iv] || [];
+        innerGroups[iv].push(entry);
+      });
+      var innerWrap = el("div", { class: "testing-results-4d-inner" });
+      var innerKeys = uniqueInOrder(outerGroups[ov], function (e) { return getAxisValueLabel(e, innerAxis); });
+      innerKeys.forEach(function (iv) {
+        var innerGroup = el("div", { class: "testing-results-4d-inner-group" }, [
+          el("h5", { class: "testing-results-axis-inner-header", text: formatAxisLabel(innerAxis, iv) }),
+        ]);
+        var matrix = buildMatrix(innerGroups[iv], rowAxis, colAxis);
+        var matrixWrap = el("div", { class: "testing-results-matrix-wrap" });
+        var scroll = el("div", { class: "testing-results-matrix-scroll" }, [
+          el("table", { class: "testing-results-matrix" }, [
+            el("thead", {}, [
+              el("tr", {}, [
+                el("th", { class: "testing-results-matrix-corner", text: rowAxis + " \\ " + colAxis }),
+              ].concat(matrix.colValues.map(function (cv) {
+                return el("th", { class: "testing-results-matrix-col-header", text: formatAxisLabel(colAxis, cv) });
+              }))),
+            ]),
+            el("tbody", {}, matrix.rowValues.map(function (rv, ri) {
+              return el("tr", {}, [
+                el("th", { class: "testing-results-matrix-row-header", text: formatAxisLabel(rowAxis, rv) }),
+              ].concat(matrix.colValues.map(function (cv, ci) {
+                var entry = matrix.grid[ri + "," + ci];
+                if (entry) {
+                  return el("td", { class: "testing-results-matrix-cell" }, [
+                    renderCellCard(entry.cell, entry.attempt, apiBase, null, true),
+                  ]);
+                }
+                return el("td", { class: "testing-results-matrix-cell testing-results-matrix-empty" });
+              })));
+            })),
+          ]),
+        ]);
+        matrixWrap.appendChild(scroll);
+        innerGroup.appendChild(matrixWrap);
+        innerWrap.appendChild(innerGroup);
+      });
+      outerGroup.appendChild(innerWrap);
+      outerWrap.appendChild(outerGroup);
+    });
+    grid.appendChild(outerWrap);
+  }
+
+  // ── >4 axes: fallback message ─────────────────────────────
+
+  function renderTooManyAxes(grid, numAxes) {
+    grid.appendChild(el("div", { class: "testing-results-empty-state testing-results-too-many-axes" }, [
+      el("p", { style: "font-weight:var(--font-weight-semibold,600);margin:0 0 var(--space-sm,8px);", text: "Too many varying dimensions (" + numAxes + ")" }),
+      el("p", { style: "margin:0;font-size:var(--font-size-xs,11px);color:var(--color-text-muted,#6f7785);", text: "The grid view supports up to 4 varying axes. Reduce the number of test values to see results in a matrix layout." }),
+    ]));
+  }
+
+  // ── Main renderGrid dispatcher ─────────────────────────────
+
+  function renderGrid(shell, evs, apiBase, snap) {
+    var grid = shell.querySelector('[data-testid="grid-body"]');
+    if (!grid) return;
+    while (grid.firstChild) grid.removeChild(grid.firstChild);
+
+    // 1. Get compilation cells from experiment.created event
+    var compilationCells = getCompilationCells(evs);
+
+    // 2. If no compilation cells, fall back to event-based rendering
+    if (compilationCells.length === 0) {
+      renderFromEvents(grid, evs, apiBase, snap);
+      return;
+    }
+
+    // 3. Merge compilation cell metadata with attempt state
+    var mergedEntries = mergeCellState(compilationCells, evs, snap);
+
+    // 4. Compute varying axes (exclude axes with only one value)
+    var vaxes = computeVaryingAxes(mergedEntries);
+    var numAxes = vaxes.axes.length;
+
+    // 5. Route to layout based on number of varying axes
+    if (numAxes === 0) {
+      renderFallbackGroups(grid, mergedEntries, apiBase, snap);
+    } else if (numAxes === 1) {
+      renderLabeledSequence(grid, mergedEntries, vaxes.axes, apiBase);
+    } else if (numAxes === 2) {
+      renderMatrixLayout(grid, mergedEntries, vaxes.axes, apiBase);
+    } else if (numAxes === 3) {
+      renderGroupedMatrixLayout(grid, mergedEntries, vaxes.axes, apiBase);
+    } else if (numAxes === 4) {
+      renderNestedGroupedMatrixLayout(grid, mergedEntries, vaxes.axes, apiBase);
+    } else {
+      renderTooManyAxes(grid, numAxes);
     }
   }
 
@@ -592,9 +978,7 @@ export function results_tab_render(rootEl, api, options = {}) {
         snapshot = data.snapshot;
         lastEvents = data.events || [];
         updateProgressBar(shell, snapshot, lastEvents);
-        if (lastEvents.length) {
-          renderGrid(shell, lastEvents, apiBase, snapshot);
-        }
+        renderGrid(shell, lastEvents, apiBase, snapshot);
       }
     } catch (e) {
       console.error("snapshot fetch failed", e);
