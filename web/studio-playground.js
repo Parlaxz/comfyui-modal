@@ -779,6 +779,9 @@ function buildActions(state, context) {
     setControl(ctrlId, value) {
       if (!state.playground.controls) state.playground.controls = {};
       state.playground.controls[ctrlId] = value;
+      if (ctrlId === 'prompt' && state.playground.experimentAxes && state.playground.experimentAxes.prompt && state.playground.experimentAxes.prompt.enabled && state.playground.experimentAxes.prompt.values && state.playground.experimentAxes.prompt.values.length > 0) {
+        state.playground.experimentAxes.prompt.values[0] = value;
+      }
       const presetId = state.playground.selectedBackendId;
       const featureId = state.playground.featureId;
       const activePreset = getCurrentPresetForSelection(state, presetId);
@@ -830,7 +833,9 @@ function buildActions(state, context) {
       if (!state.playground.experimentAxes) state.playground.experimentAxes = {};
       if (enabled) {
         const presetDefaults = (state.playground._currentPreset && state.playground._currentPreset.defaults) || {};
-        const defaultValue = presetDefaults[ctrlId] ?? (CONTROL_DEFS[ctrlId] ? CONTROL_DEFS[ctrlId].defaultValue : "");
+        const defaultValue = (ctrlId === 'prompt' && state.playground.controls && state.playground.controls.prompt != null)
+          ? state.playground.controls.prompt
+          : presetDefaults[ctrlId] ?? (CONTROL_DEFS[ctrlId] ? CONTROL_DEFS[ctrlId].defaultValue : "");
         state.playground.experimentAxes[ctrlId] = {
           enabled: true,
           values: [defaultValue],
@@ -856,6 +861,10 @@ function buildActions(state, context) {
         return v;
       });
       state.playground.experimentAxes[ctrlId].enabled = true;
+      if (ctrlId === 'prompt' && state.playground.experimentAxes[ctrlId].values && state.playground.experimentAxes[ctrlId].values.length > 0) {
+        if (!state.playground.controls) state.playground.controls = {};
+        state.playground.controls.prompt = state.playground.experimentAxes[ctrlId].values[0];
+      }
       // Re-render when value count changes (add/remove), but NOT on every
       // keystroke — that would thrash the UI during text input.
       if (values.length !== prevLen && context && context.setPage) {
@@ -883,8 +892,9 @@ function buildActions(state, context) {
       const prevRunState = state.playground.runState;
       state.playground.runState = { ...state.playground.runState, ...runState };
 
-      // Dispose scoped tracker on terminal states
+      // Dispose scoped tracker and clean up local timer on terminal states
       if (runState && (runState.status === "completed" || runState.status === "error")) {
+        if (state.playground && state.playground.runState) delete state.playground.runState._localStartTime;
         _disposeScopedTracker(state);
       }
 
@@ -1311,11 +1321,58 @@ function renderControl(def, state, actions, preset) {
 // completed/error state can re-submit in a single click.
 
 function _disposeScopedTracker(state) {
+  // Note: does NOT clean _localElapsedTimer — the local timer is owned by
+  // _startLocalElapsedTimer which handles cleanup and re-creation across
+  // new-run boundaries. Terminal cleanup is done by setRunState.
+
   var st = state.playground && state.playground._scopedTracker;
   if (st && typeof st.dispose === "function") {
     try { st.dispose(); } catch {}
   }
   if (state.playground) state.playground._scopedTracker = null;
+}
+
+function _startLocalElapsedTimer(state, context) {
+  var _existing = state.playground && state.playground._localElapsedTimer;
+  if (_existing) { clearInterval(_existing); if (state.playground) state.playground._localElapsedTimer = null; }
+
+  var _rs = state.playground && state.playground.runState;
+  if (!_rs) return;
+  // Initialize local start timestamp on first call; reuse on subsequent calls
+  // so original button-press time survives through submission and tracker activation.
+  if (_rs._localStartTime == null) {
+    _rs._localStartTime = Date.now();
+  }
+  var _localStart = _rs._localStartTime;
+
+  var _timer = setInterval(function() {
+    var _rs2 = state.playground && state.playground.runState;
+    if (!_rs2 || !_rs2.status) {
+      clearInterval(_timer);
+      if (state.playground) state.playground._localElapsedTimer = null;
+      return;
+    }
+    if (_rs2.status === "completed" || _rs2.status === "error") {
+      clearInterval(_timer);
+      delete _rs2._localStartTime;
+      if (state.playground) state.playground._localElapsedTimer = null;
+      return;
+    }
+    if (state.activePage !== "playground") {
+      clearInterval(_timer);
+      delete _rs2._localStartTime;
+      if (state.playground) state.playground._localElapsedTimer = null;
+      return;
+    }
+    _rs2.elapsedMs = Date.now() - _localStart;
+    var _now = Date.now();
+    if (!_rs2._lastRenderMs || _now - _rs2._lastRenderMs >= 250) {
+      _rs2._lastRenderMs = _now;
+      if (context && context.setPage) context.setPage("playground");
+    }
+  }, 250);
+
+  if (state.playground) state.playground._localElapsedTimer = _timer;
 }
 
 function _createAndStartScopedTracker(state, context, runId, experimentId) {
@@ -1351,7 +1408,7 @@ function _createAndStartScopedTracker(state, context, runId, experimentId) {
     rs.samplerStep = s.samplerStep;
     rs.samplerMaximum = s.samplerMaximum;
     rs.samplerPercent = s.samplerPercent;
-    rs.elapsedMs = s.elapsedMs;
+    // elapsedMs is handled by local timer (preserves original press timestamp)
     rs.queuePosition = s.queuePosition;
     rs.currentNodeLabel = s.currentNodeLabel;
     rs.stage = s.stage;
@@ -1366,6 +1423,7 @@ function _createAndStartScopedTracker(state, context, runId, experimentId) {
     // progress (throttled to avoid excessive re-renders)
     if (mappedStatus === "completed" || mappedStatus === "error") {
       // Dispose scoped tracker on terminal state
+      delete rs._localStartTime;
       _disposeScopedTracker(state);
       if (context && context.setPage) context.setPage("playground");
     } else {
@@ -1440,9 +1498,15 @@ async function doRunSubmit(state, context, actions) {
     return;
   }
 
+  // Put determinate sampler fields into running state BEFORE remote call
+  var _runSteps = controls.steps;
+  var _runMaxSteps = (_runSteps != null && Number(_runSteps) > 0) ? Number(_runSteps) : 0;
+  if (state.playground && state.playground.runState) delete state.playground.runState._localStartTime;
   if (actions && actions.setRunState) {
-    actions.setRunState({ status: "running" });
+    actions.setRunState({ status: "running", samplerStep: 0, samplerMaximum: _runMaxSteps });
   }
+  // Start local elapsed timer immediately on press
+  _startLocalElapsedTimer(state, context);
 
   // Capture client-side timestamps at press time (top-level `trace` for server)
   const t0_perf_ms = performance.now();
@@ -1466,13 +1530,22 @@ async function doRunSubmit(state, context, actions) {
     // Dispose any previous scoped tracker before creating new one
     _disposeScopedTracker(state);
 
+    // Derive initial sampler maximum from submitted steps control
+    var _submittedSteps = controls.steps;
+    var _initialSamplerMax = (_submittedSteps != null && Number(_submittedSteps) > 0) ? Number(_submittedSteps) : 0;
+
     if (actions && actions.setRunState) {
       actions.setRunState({
         status: "submitted",
         runId: result.runId || result.experimentId,
         experimentId: result.experimentId,
+        samplerStep: 0,
+        samplerMaximum: _initialSamplerMax,
       });
     }
+
+    // Restart local elapsed timer after dispose; preserves original _localStartTime
+    _startLocalElapsedTimer(state, context);
 
     // Create scoped tracker for this run's execution events
     _createAndStartScopedTracker(
@@ -1705,10 +1778,16 @@ function renderRunButton(state, context, actions) {
       btn.onclick = async () => {
         btn.disabled = true;
         btn.textContent = "Running\u2026";
-        if (actions && actions.setRunState) actions.setRunState({ status: "running" });
 
-        // Send all rendered bound fields — hydrated/restored values + current edits
+        // Build controls early so sampler fields are available for running state
         const controls = buildEffectiveControls(state, preset, currentFeatureId);
+
+        // Put determinate sampler fields into running state BEFORE remote call
+        var _runSteps = controls.steps;
+        var _runMaxSteps = (_runSteps != null && Number(_runSteps) > 0) ? Number(_runSteps) : 0;
+        if (actions && actions.setRunState) actions.setRunState({ status: "running", samplerStep: 0, samplerMaximum: _runMaxSteps });
+        // Start local elapsed timer immediately on press
+        _startLocalElapsedTimer(state, context);
 
         const validationError = validateControls(controls, preset);
         if (validationError) {
@@ -1742,13 +1821,22 @@ function renderRunButton(state, context, actions) {
           // Dispose any previous scoped tracker before creating new one
           _disposeScopedTracker(state);
 
+          // Derive initial sampler maximum from submitted steps control
+          var _inlineSteps = controls.steps;
+          var _inlineSamplerMax = (_inlineSteps != null && Number(_inlineSteps) > 0) ? Number(_inlineSteps) : 0;
+
           if (actions && actions.setRunState) {
             actions.setRunState({
               status: "submitted",
               runId: result.runId || result.experimentId,
               experimentId: result.experimentId,
+              samplerStep: 0,
+              samplerMaximum: _inlineSamplerMax,
             });
           }
+
+          // Restart local elapsed timer after dispose; preserves original _localStartTime
+          _startLocalElapsedTimer(state, context);
 
           // Create scoped tracker for this run's execution events
           _createAndStartScopedTracker(
@@ -1835,9 +1923,9 @@ function renderProgressSection(state, context) {
   else if (runState.status === "waiting") stageLabel = "Waiting";
 
   stageEl.textContent = "Stage: " + stageLabel;
-  nodesEl.textContent = "Nodes: " + (runState.completedNodes || 0) + "/" + (runState.totalNodes || "?");
+  nodesEl.textContent = "Nodes: " + (runState.completedNodes || 0) + "/" + (runState.totalNodes || 0);
   var samplerPct = runState.samplerPercent != null ? " (" + Math.round(runState.samplerPercent) + "%)" : "";
-  stepEl.textContent = "Sampler: " + (runState.samplerStep != null ? runState.samplerStep : "?") + "/" + (runState.samplerMaximum || "?") + samplerPct;
+  stepEl.textContent = "Sampler: " + (runState.samplerStep != null ? runState.samplerStep : 0) + "/" + (runState.samplerMaximum || 0) + samplerPct;
   elapsedEl.textContent = "Elapsed: " + _formatDuration(runState.elapsedMs);
 
   if (runState.queuePosition > 0) {
@@ -1860,7 +1948,7 @@ function renderProgressSection(state, context) {
 }
 
 function _formatDuration(ms) {
-  if (ms == null) return "?";
+  if (ms == null) return "0ms";
   if (ms < 1000) return ms.toFixed(0) + "ms";
   if (ms < 60000) return (ms / 1000).toFixed(1) + "s";
   var m = Math.floor(ms / 60000);
@@ -2104,6 +2192,15 @@ function renderCanvas(state, context) {
       "data-testid": "canvas-output",
     });
     canvas.appendChild(img);
+    const runState = state.playground && state.playground.runState;
+    const hasActiveRun = runState && runState.status
+      && runState.status !== "completed"
+      && runState.status !== "error"
+      && runState.status !== "idle";
+    const hasCanvasSelection = state.playground && state.playground._selectedRun;
+    if (hasActiveRun && hasCanvasSelection) {
+      canvas.appendChild(renderLiveReturnControl(state, context));
+    }
   } else {
     canvas.appendChild(el("p", {
       text: "Generated output will appear here.",
@@ -2112,6 +2209,30 @@ function renderCanvas(state, context) {
   }
 
   return canvas;
+}
+
+function renderLiveReturnControl(state, context) {
+  const overlay = el("div", {
+    class: "comfymodal-studio-live-return",
+    "data-testid": "live-return-control",
+  });
+  overlay.appendChild(el("span", {
+    class: "comfymodal-studio-live-indicator",
+    text: "Generation in progress",
+  }));
+  overlay.appendChild(el("button", {
+    type: "button",
+    class: "comfymodal-studio-live-return-btn",
+    "data-testid": "live-return-btn",
+    "aria-label": "Return to live generation view",
+    text: "Return to live",
+    onclick: () => {
+      state.playground.lastRunOutput = null;
+      state.playground._selectedRun = null;
+      if (context && context.setPage) context.setPage("playground");
+    },
+  }));
+  return overlay;
 }
 
 // ── Metadata Section ─────────────────────────────────────────────────────

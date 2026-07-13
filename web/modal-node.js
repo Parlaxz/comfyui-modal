@@ -60,6 +60,7 @@ function _trackApiListener(eventName, handler) {
 }
 
 function _disposeModalNodeRuntime() {
+  _clearDoneTimers();
   while (_modalNodeRuntime.listenerRemovers.length) {
     const dispose = _modalNodeRuntime.listenerRemovers.pop();
     try {
@@ -232,6 +233,7 @@ function _pbInjectStyles() {
 }
 
 function _pbCreate() {
+  _clearDoneTimers();
   if (_pb) return;
   _pbInjectStyles();
 
@@ -276,7 +278,7 @@ function _pbCreate() {
     document.body.appendChild(container);
   }
 
-  _pb = { el: container, nodesBar, stepsBar, labelEl: text, dotEl: dot, etaEl: eta, state: PB_STATE.IDLE };
+  _pb = { el: container, nodesBar, stepsBar, labelEl: text, dotEl: dot, etaEl: eta, state: PB_STATE.IDLE, _visibilityTimer: null, _fadeTimer: null };
 }
 
 function _pbSetState(state) {
@@ -293,6 +295,7 @@ function _pbSetState(state) {
 
 function _pbShowIdle() {
   if (!_pb) return;
+  _clearDoneTimers();
   _pbSetState(PB_STATE.IDLE);
   _pb.nodesBar.style.width = "0%";
   _pb.stepsBar.style.width = "0%";
@@ -305,6 +308,7 @@ function _pbShowIdle() {
 
 function _pbShowStartup(message) {
   if (!_pb) return;
+  _clearDoneTimers();
   _pbSetState(PB_STATE.STARTUP);
   _pb.nodesBar.className = "cm-pb-bar startup";
   _pb.stepsBar.className = "cm-pb-bar";
@@ -317,6 +321,7 @@ function _pbShowStartup(message) {
 
 function _pbShowProgress(queue, nodePct, stepPct, nodeLabel, stepLabel) {
   if (!_pb) return;
+  _clearDoneTimers();
   _pbSetState(PB_STATE.GENERATING);
 
   if (nodePct == null) {
@@ -349,6 +354,7 @@ function _pbShowProgress(queue, nodePct, stepPct, nodeLabel, stepLabel) {
 
 function _pbShowError(msg, totalMs) {
   if (!_pb) return;
+  _clearDoneTimers();
   _pbSetState(PB_STATE.ERROR);
   _pb.nodesBar.className = "cm-pb-bar error";
   _pb.stepsBar.className = "cm-pb-bar";
@@ -359,8 +365,24 @@ function _pbShowError(msg, totalMs) {
   _pb.dotEl.style.background = "#b71c1c";
 }
 
+function _clearDoneTimers() {
+  if (!_pb) return;
+  if (_pb._visibilityTimer) {
+    clearTimeout(_pb._visibilityTimer);
+    _pb._visibilityTimer = null;
+  }
+  if (_pb._fadeTimer) {
+    clearTimeout(_pb._fadeTimer);
+    _pb._fadeTimer = null;
+  }
+  // Undo any partial fade so the bar is fully visible for the next state
+  _pb.el.style.transition = "";
+  _pb.el.style.opacity = "";
+}
+
 function _pbShowDone(totalMs, nodeTimes) {
   if (!_pb) return;
+  _clearDoneTimers();
   _pbSetState(PB_STATE.DONE);
   _pb.nodesBar.className = "cm-pb-bar done";
   _pb.stepsBar.className = "cm-pb-bar";
@@ -382,11 +404,13 @@ function _pbShowDone(totalMs, nodeTimes) {
   // Keep everything visible for 10s, then fade out
   _pb.el.style.animation = "none";
   _pb.el.style.opacity = "1";
-  setTimeout(() => {
+  _pb._visibilityTimer = setTimeout(() => {
+    _pb._visibilityTimer = null;
     if (!_pb) return;
     _pb.el.style.transition = "opacity 0.6s ease";
     _pb.el.style.opacity = "0";
-    setTimeout(() => {
+    _pb._fadeTimer = setTimeout(() => {
+      _pb._fadeTimer = null;
       if (!_pb) return;
       _pb.el.style.transition = "";
       _pb.el.style.opacity = "";

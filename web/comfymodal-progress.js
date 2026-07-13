@@ -86,6 +86,7 @@ export function createProgressTracker(api) {
 
   // Internal state
   let _timerInterval = null;
+  let _errorTimer = null;
   let _subscribers = [];
 
   // ── Notify subscribers ─────────────────────────────────────────────────
@@ -142,6 +143,10 @@ export function createProgressTracker(api) {
       clearInterval(_timerInterval);
       _timerInterval = null;
     }
+    if (_errorTimer) {
+      clearTimeout(_errorTimer);
+      _errorTimer = null;
+    }
   }
 
   // ── Node label resolution ──────────────────────────────────────────────
@@ -155,14 +160,16 @@ export function createProgressTracker(api) {
 
   // ── Event handlers ─────────────────────────────────────────────────────
 
-  function onExecutionStart() {
+  function onExecutionStart(event) {
     // Guard re-entry: already in startup or generating — ignore duplicate
     if (state.stage === "generating" || state.stage === "startup") return;
-    // Also guard against reset race: if a reset is scheduled (from error),
-    // skip reset and just update the state
+    const _detail = (event && event.detail) || {};
     _reset();
     state.stage = "startup";
     state.startTime = Date.now();
+    // Consume execution_start metadata
+    if (_detail.total_nodes != null) state.totalNodes = _detail.total_nodes;
+    if (_detail.sampler_maximum != null) state.samplerMaximum = _detail.sampler_maximum;
     _startTimer();
     _notify();
   }
@@ -195,9 +202,8 @@ export function createProgressTracker(api) {
       state.overallPercent = null;
     }
 
-    // Reset sampler step counter
+    // Reset sampler step counter, preserve samplerMaximum from execution_start
     state.samplerStep = 0;
-    state.samplerMaximum = 0;
 
     state.stage = "generating";
     _notify();
@@ -256,17 +262,9 @@ export function createProgressTracker(api) {
 
     _notify();
 
-    // Schedule reset with a microtask delay to avoid race with a new
-    // execution_start that may fire synchronously during the same event loop tick.
-    // If a new execution_start fires before this runs, its guard will see
-    // stage !== "generating" and proceed normally.
-    setTimeout(() => {
-      // Only reset if still in "done" or "error" — a new execution_start
-      // would have advanced to "startup" or "generating".
-      if (state.stage === "done" || state.stage === "error") {
-        _reset();
-      }
-    }, 0);
+    // Done state is retained until next execution_start or dispose.
+    // onExecutionStart will see stage==="done", skip its guard, call
+    // _reset(), and begin a new run cleanly.
   }
 
   function onExecutionError(event) {
@@ -276,8 +274,9 @@ export function createProgressTracker(api) {
     state.error = event?.detail?.message || "Execution error";
     _notify();
 
-    // Schedule return to idle
-    setTimeout(() => {
+    // Schedule return to idle — store reference so dispose can cancel
+    _errorTimer = setTimeout(() => {
+      _errorTimer = null;
       _reset();
     }, 4000);
   }
@@ -422,6 +421,7 @@ export function createScopedTracker(api, identity) {
   };
 
   let _timerInterval = null;
+  let _errorTimer = null;
   let _subscribers = [];
   let _started = false;
   let _locked = false;
@@ -486,6 +486,10 @@ export function createScopedTracker(api, identity) {
       clearInterval(_timerInterval);
       _timerInterval = null;
     }
+    if (_errorTimer) {
+      clearTimeout(_errorTimer);
+      _errorTimer = null;
+    }
   }
 
   // ── Node label resolution ──────────────────────────────────────────────
@@ -501,8 +505,19 @@ export function createScopedTracker(api, identity) {
   function onExecutionStart(event) {
     if (!_started || _disposed) return;
 
-    // If already locked to a promptId, ignore subsequent execution_start
-    if (_locked) return;
+    // If locked and NOT in a terminal state (startup/generating active),
+    // ignore duplicate execution_start.
+    if (_locked && state.stage !== "done" && state.stage !== "error") return;
+
+    // If locked and in a terminal state (done/error), this is a new run
+    // on the same tracker.  Cancel any pending error reset, unlock, and
+    // reset state before capturing the new execution.
+    if (_locked) {
+      _stopTimer();               // clears both _timerInterval and _errorTimer
+      _locked = false;
+      _capturedPromptId = null;
+      _reset();
+    }
 
     // Capture prompt_id from event detail, if available
     const detail = (event && event.detail) || {};
@@ -518,6 +533,9 @@ export function createScopedTracker(api, identity) {
     _reset();
     state.stage = "startup";
     state.startTime = Date.now();
+    // Consume execution_start metadata
+    if (detail.total_nodes != null) state.totalNodes = detail.total_nodes;
+    if (detail.sampler_maximum != null) state.samplerMaximum = detail.sampler_maximum;
     _startTimer();
     _notify();
   }
@@ -549,7 +567,6 @@ export function createScopedTracker(api, identity) {
     }
 
     state.samplerStep = 0;
-    state.samplerMaximum = 0;
     state.samplerPercent = null;
 
     state.stage = "generating";
@@ -619,14 +636,9 @@ export function createScopedTracker(api, identity) {
 
     _notify();
 
-    // Schedule reset to idle after microtask delay
-    setTimeout(() => {
-      if (!_disposed && (state.stage === "done" || state.stage === "error")) {
-        _locked = false;
-        _capturedPromptId = null;
-        _reset();
-      }
-    }, 0);
+    // Done state is retained with terminal identity (locked+capturedPromptId)
+    // until disposed. A new run calls dispose on the old tracker and creates
+    // a fresh one, naturally clearing the terminal identity.
   }
 
   function onExecutionError(event) {
@@ -646,7 +658,8 @@ export function createScopedTracker(api, identity) {
     state.error = detail.message || "Execution error";
     _notify();
 
-    setTimeout(() => {
+    _errorTimer = setTimeout(() => {
+      _errorTimer = null;
       if (!_disposed) {
         _locked = false;
         _capturedPromptId = null;
@@ -746,9 +759,8 @@ export function createScopedTracker(api, identity) {
             state.overallPercent = null;
           }
 
-          // Reset sampler phase for the new node
+          // Reset sampler phase for the new node, preserve samplerMaximum from execution_start
           state.samplerStep = 0;
-          state.samplerMaximum = 0;
           state.samplerPercent = null;
 
           state.stage = "generating";
@@ -809,13 +821,7 @@ export function createScopedTracker(api, identity) {
       state.overallPercent = 100;
       _notify();
 
-      setTimeout(() => {
-        if (!_disposed && (state.stage === "done" || state.stage === "error")) {
-          _locked = false;
-          _capturedPromptId = null;
-          _reset();
-        }
-      }, 0);
+      // Done state is retained with terminal identity until disposed.
     } else if (eventType === "experiment.error" || eventType === "experiment.failed_fatal") {
       _stopTimer();
       state.stage = "error";
@@ -823,7 +829,8 @@ export function createScopedTracker(api, identity) {
       state.error = detail.error || detail.message || "Experiment error";
       _notify();
 
-      setTimeout(() => {
+      _errorTimer = setTimeout(() => {
+        _errorTimer = null;
         if (!_disposed) {
           _locked = false;
           _capturedPromptId = null;
