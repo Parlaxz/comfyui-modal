@@ -57,6 +57,7 @@ from studio_models import (
     validate_controls_against_schema,
 )
 from timing_trace import TRACE_VERSION, merge_remote_trace_into
+from warmup_profile import prepare_active_next_profile
 
 _log = logging.getLogger(__name__)
 
@@ -1319,7 +1320,18 @@ def build_experiment_spec(
             "enabled": True,
         })
 
-    axes = experiment_def.get("axes", {}) or {}
+    raw_axes = experiment_def.get("axes", {}) or {}
+    # Convert frontend axes format to matrix compiler format.
+    # Frontend sends: {ctrlId: {enabled: true, values: [a, b]}}
+    # Compiler expects: {shared: {ctrlId: {mode: "list", values: [a, b]}}}
+    compiler_axes: dict[str, Any] = {"shared": {}}
+    for ctrl_id, axis_def in raw_axes.items():
+        if not isinstance(axis_def, dict):
+            continue
+        values = axis_def.get("values")
+        if isinstance(values, list) and len(values) > 0:
+            compiler_axes["shared"][ctrl_id] = {"mode": "list", "values": values}
+    axes = compiler_axes
 
     spec: dict[str, Any] = {
         "experiment_id": _make_studio_experiment_id(),
@@ -1403,6 +1415,11 @@ async def _schedule_and_start(
     compilation: dict[str, Any],
     REGISTRY: Any,
     node_dir: str | os.PathLike = "",
+    *,
+    profile_preparer: Any = None,
+    gpu: Any = None,
+    modal_options: dict | None = None,
+    workspace: dict | None = None,
 ) -> dict[str, Any]:
     """Create scheduler and start execution. Returns the run result.
 
@@ -1429,10 +1446,36 @@ async def _schedule_and_start(
     from experiment_runner import LocalRemoteInvoker
     from modal_client import run_prompt_stream
 
+    # ── Build a stream_event_sink that broadcasts nonterminal progress ────
+    # as experiment.worker.progress via PromptServer.send_sync (no-op safe
+    # when PromptServer is unavailable / outside ComfyUI).
+    # Import PromptServer dynamically to avoid import cycles.
+    async def _progress_sink(detail: dict) -> None:
+        """Broadcast a progress detail payload as experiment.worker.progress.
+
+        The *detail* dict is the normalised detail from
+        ``_desired_map_stream_message`` (type, phase, message, node, step,
+        max, experiment_id, checkpoint_id, cell_key, attempt_id, sequence).
+        It is sent directly as the ``experiment.worker.progress`` WS event
+        detail so the frontend receives exactly the fields it needs.
+        """
+        try:
+            from server import PromptServer
+            server = PromptServer.instance
+            if server is not None:
+                server.send_sync("experiment.worker.progress", dict(detail))
+        except Exception:
+            pass
+
     invoker = LocalRemoteInvoker(
         run_prompt_stream,
         experiment_id=exp_id,
         node_dir=str(node_dir) if node_dir else "",
+        stream_event_sink=_progress_sink,
+        profile_preparer=profile_preparer,
+        gpu=gpu,
+        modal_options=modal_options,
+        workspace=workspace,
     )
     sched = await REGISTRY.get_or_create_scheduler(
         exp_id,
@@ -1635,7 +1678,8 @@ async def _schedule_and_start(
             remote_timings[raw_key] = val
 
     # Restore timing from _restore_timing block — map to top-level keys
-    # AND remote_timings so both new and legacy consumers find the value.
+    # only (NOT inside remote_timings) so consumers never sum restore
+    # into execution metrics like inference_total.
     if timing_payload:
         restore = timing_payload.get("_restore_timing", {}) or {}
         restore_total = restore.get("restore_total_ms")
@@ -1644,10 +1688,8 @@ async def _schedule_and_start(
             timing_sources["restore_total_ms"] = "remote_trace"
             timings["remote_restore_ms"] = restore_total
             timing_sources["remote_restore_ms"] = "remote_trace"
-            remote_timings["restore_total_ms"] = restore_total
 
-    # Preserve raw remote_timings block for diagnostic access (after
-    # restore_total_ms was added above so it appears inside the block).
+    # Preserve raw remote_timings block for diagnostic access.
     if remote_timings:
         timings["remote_timings"] = dict(remote_timings)
         timing_sources["remote_timings"] = "derived"
@@ -1666,6 +1708,20 @@ async def _schedule_and_start(
             if val is not None:
                 timings[raw_key] = copy.deepcopy(val)
                 timing_sources[raw_key] = "remote_trace"
+
+    # ── platform_pre_restore_ms: cross-process inferred window ─────────
+    # Derived from local t2_submit timestamp + remote restore_start_unix_s.
+    # Only present when BOTH timestamps exist.  Never fabricated.
+    _local_trace_dict = local_timing_summary.get("stages", {}) or {}
+    _t2_submit = _local_trace_dict.get("t2_local_modal_submit_start") or _local_trace_dict.get("t2_local_dispatch")
+    if timing_payload:
+        _restore_block = timing_payload.get("_restore_timing", {}) or {}
+        _restore_start = _restore_block.get("restore_start_unix_s")
+        if _t2_submit is not None and _restore_start is not None:
+            _pre_restore_ms = round((_restore_start - _t2_submit) * 1000, 2)
+            if _pre_restore_ms >= 0:
+                timings["platform_pre_restore_ms"] = _pre_restore_ms
+                timing_sources["platform_pre_restore_ms"] = "cross_process_inferred"
 
     # 5. trace_available flag
     timings["trace_available"] = bool(timing_payload)
@@ -1853,6 +1909,11 @@ def handle_studio_run(
     controls: dict[str, Any],
     node_dir: str | os.PathLike,
     trace_ctx: dict | None = None,
+    *,
+    profile_preparer: Any = None,
+    gpu: Any = None,
+    modal_options: dict | None = None,
+    workspace: dict | None = None,
 ) -> dict[str, Any]:
     """Handle a single Studio run request.
 
@@ -1975,14 +2036,44 @@ def handle_studio_run(
         _create_experiment(exp_id, compilation, definition, REGISTRY)
         _log.info("Studio experiment created: %s", exp_id)
 
+        # ── Build shared profile-preparer closure for the Studio path ──
+        # Uses the same warmup_profile.prepare_active_next_profile that
+        # __init__._execute_job calls, but with a setter sourced from
+        # modal_client.  The workflow hash is computed from the ACTUAL
+        # resolved_workflow (passed to the closure by run_cell), NOT
+        # from the pre-compilation workflow, so that post-resolution
+        # mutations are captured.
+        _ws_captured = workspace
+
+        async def _studio_profile_preparer(resolved_workflow, cell):
+            """Prepare active-next warmup profile using the fully resolved
+            cell workflow.  Hashes the actual resolved_workflow passed by
+            LocalRemoteInvoker.run_cell."""
+            try:
+                from experiment_runner import _workflow_sha256
+                from modal_client import set_active_warmup_profile as _remote_setter
+                _hash = _workflow_sha256(resolved_workflow) if isinstance(resolved_workflow, dict) else ""
+                await prepare_active_next_profile(
+                    resolved_workflow,
+                    _hash,
+                    workspace=_ws_captured,
+                    setter=_remote_setter,
+                )
+            except Exception:
+                _log.warning("Studio profile preparer failed (non-fatal)")
+
         # Start scheduler in background — report truthful submission status
         import asyncio
 
-        async def _start_and_catch(exp_id, compilation, REGISTRY, nd):
+        async def _start_and_catch(exp_id, compilation, REGISTRY, nd,
+                                    pp=None, g=None, mo=None, ws=None):
             """Start scheduler and persist error events on failure."""
             try:
                 _log.info("Scheduler start called for experiment %s", exp_id)
-                result = await _schedule_and_start(exp_id, compilation, REGISTRY, node_dir=nd)
+                result = await _schedule_and_start(
+                    exp_id, compilation, REGISTRY, node_dir=nd,
+                    profile_preparer=pp, gpu=g, modal_options=mo, workspace=ws,
+                )
                 _log.info("Scheduler start completed for experiment %s: %s", exp_id, result)
                 return result
             except Exception as exc:
@@ -2010,13 +2101,16 @@ def handle_studio_run(
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 _fire_and_forget(
-                    _start_and_catch(exp_id, compilation, REGISTRY, node_dir),
+                    _start_and_catch(exp_id, compilation, REGISTRY, node_dir,
+                                     pp=_studio_profile_preparer, g=gpu, mo=modal_options, ws=workspace),
                     exp_id,
                 )
             else:
-                asyncio.run(_start_and_catch(exp_id, compilation, REGISTRY, node_dir))
+                asyncio.run(_start_and_catch(exp_id, compilation, REGISTRY, node_dir,
+                                             pp=_studio_profile_preparer, g=gpu, mo=modal_options, ws=workspace))
         except RuntimeError:
-            asyncio.run(_start_and_catch(exp_id, compilation, REGISTRY, node_dir))
+            asyncio.run(_start_and_catch(exp_id, compilation, REGISTRY, node_dir,
+                                         pp=_studio_profile_preparer, g=gpu, mo=modal_options, ws=workspace))
         except Exception:
             _log.exception("Unexpected error starting scheduler for %s", exp_id)
             _persist_experiment_error(exp_id, _STABLE_INTERNAL_ERROR)

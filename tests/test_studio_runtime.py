@@ -4388,5 +4388,375 @@ class PresetDefaultsPriorityRED(unittest.TestCase):
             self.assertEqual(d.get("seed"), 42)
 
 
+# ---------------------------------------------------------------------------
+# Test 19: Shared warmup_profile helper — both normal and Studio paths
+#          use `warmup_profile.prepare_active_next_profile`
+# ---------------------------------------------------------------------------
+
+class SharedWarmupProfileHelperRED(unittest.TestCase):
+    """RED: ``warmup_profile.prepare_active_next_profile`` must be a
+    shared async helper importable by both ``__init__._execute_job``
+    (the normal graph path) and ``studio_run_adapter._schedule_and_start``
+    (the Studio path).  Both callers must use the same function so
+    that warmup-profile preparation (model-stack extraction, bundle
+    dedup, remote set_active_warmup_profile) is unified.
+
+    The shared helper signature:
+      ``prepare_active_next_profile(workflow, workflow_hash, *,
+                                    production_options=None, workspace=None, setter=None)``
+
+    It must return a dict with status info (profile_key, remote_call,
+    status, payload_bytes, changed).
+    """
+
+    def test_warmup_profile_module_importable(self):
+        """warmup_profile module must be importable."""
+        import warmup_profile as wp
+        self.assertTrue(hasattr(wp, "prepare_active_next_profile"),
+                        "warmup_profile must export prepare_active_next_profile")
+
+    def test_prepare_active_next_profile_signature(self):
+        """The shared helper must accept (workflow, workflow_hash)
+        with optional keyword args (production_options, workspace,
+        setter)."""
+        import warmup_profile as wp
+        import inspect
+        sig = inspect.signature(wp.prepare_active_next_profile)
+        params = list(sig.parameters.keys())
+        for required in ("workflow", "workflow_hash"):
+            self.assertIn(required, params,
+                          f"Required param '{required}' missing from signature")
+        self.assertIn("workspace", params,
+                      "workspace param must be in signature")
+
+    def test_prepare_active_next_profile_returns_structured_status(self):
+        """The helper must return a dict with at least status,
+        remote_call, profile_key, payload_bytes."""
+        import warmup_profile as wp
+        result = asyncio.run(wp.prepare_active_next_profile(
+            {"3": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+            "test_hash",
+            workspace=None,
+            setter=None,
+        ))
+        self.assertIsInstance(result, dict)
+        self.assertIn("status", result)
+
+    def test_normal_path_imports_shared_helper(self):
+        """__init__.py must import prepare_active_next_profile from
+        warmup_profile (meaning _execute_job uses the shared helper)."""
+        import __init__ as init_mod
+        self.assertTrue(
+            hasattr(init_mod, "prepare_active_next_profile"),
+            "__init__ must import/re-export prepare_active_next_profile",
+        )
+
+    def test_studio_path_imports_shared_helper(self):
+        """studio_run_adapter must import prepare_active_next_profile
+        from warmup_profile for use in the Studio closure."""
+        import studio_run_adapter as sra
+        self.assertTrue(
+            hasattr(sra, "prepare_active_next_profile"),
+            "studio_run_adapter must import prepare_active_next_profile",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 20: Effective override payload from browser must omit controls
+#          the user never edited, while preserving edited values and
+#          showing saved preset/snapshot values only as display values
+# ---------------------------------------------------------------------------
+
+class EffectiveOverridePayloadRED(unittest.TestCase):
+    """RED: The browser-side ``buildEffectiveControls`` function (in
+    ``web/studio-playground.js``) must produce an override payload that
+    ONLY includes controls the user explicitly edited.  Controls that
+    derive their value from snapshot defaults or preset defaults must
+    NOT appear in the payload sent to the backend — they serve as
+    display-only values in the UI.
+
+    Additionally, when the backend receives a partial controls dict
+    (e.g. only ``steps=20``), it must apply only those overrides and
+    leave the remaining workflow values at their snapshot defaults.
+
+    Current ``buildEffectiveControls`` (studio-playground.js:323-339)
+    includes ALL visible controls in the output, not just user edits.
+    This test verifies the intended backend+frontend contract.
+    """
+
+    def setUp(self):
+        self.adapter_mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_build_single_run_spec_with_partial_controls_only_overrides_workflow(self):
+        """When controls dict contains only steps=20, the spec must:
+        1. Apply steps=20 to the workflow
+        2. Leave other values at their snapshot defaults
+        3. Store only the overridden controls in studio_meta.studio_controls
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = {
+                "id": "snap_eff",
+                "name": "Effective Override Snapshot",
+                "compatibleFeatures": ["txt2img"],
+                "apiPromptJson": {
+                    "3": {"class_type": "KSampler", "inputs": {
+                        "seed": 42, "steps": 25, "cfg": 7.0,
+                        "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
+                    }},
+                    "9": {"class_type": "SaveImage", "inputs": {"images": []}},
+                },
+                "nodeBindings": {
+                    "prompt": {"kind": "widget", "nodeId": "3", "widgetName": "text"},
+                    "steps": {"kind": "widget", "nodeId": "3", "widgetName": "steps"},
+                    "seed": {"kind": "widget", "nodeId": "3", "widgetName": "seed"},
+                    "guidance": {"kind": "widget", "nodeId": "3", "widgetName": "cfg"},
+                    "output": {"kind": "output", "nodeId": "9"},
+                },
+                "outputNodeId": "9",
+                "graphJson": {"nodes": [], "links": []},
+                "archived": False,
+                "status": "runnable",
+                "featureStatus": {
+                    "txt2img": {"status": "runnable", "reason": ""},
+                },
+                "disabledReason": "",
+            }
+            preset = {
+                "id": "preset_eff",
+                "label": "Effective Override Preset",
+                "snapshotId": "snap_eff",
+                "compatibleFeatures": ["txt2img"],
+                "defaults": {},
+                "sourceType": "snapshot",
+                "sourceId": "",
+                "archived": False,
+                "status": "runnable",
+                "disabledReason": "",
+            }
+            _make_studio_store_files(tmp, [snapshot], [preset])
+
+            # ---- RED: Partial controls — only steps=20 is explicitly edited ----
+            controls = {"prompt": "a cat", "steps": 20}
+            spec = self.adapter_mod.build_single_run_spec(
+                preset, snapshot, "txt2img", controls, tmp,
+            )
+
+            # 1. Steps must be 20 in the workflow (overridden)
+            ck = spec["checkpoints"][0]
+            self.assertEqual(
+                ck["workflow"]["3"]["inputs"]["steps"], 20,
+                "steps must be 20 (the user-provided override)",
+            )
+
+            # 2. Other values must remain at snapshot defaults
+            self.assertEqual(
+                ck["workflow"]["3"]["inputs"]["seed"], 42,
+                "seed must remain at snapshot default (42) since user didn't edit it",
+            )
+            self.assertEqual(
+                ck["workflow"]["3"]["inputs"]["cfg"], 7.0,
+                "cfg must remain at snapshot default (7.0) since user didn't edit it",
+            )
+            self.assertEqual(
+                ck["workflow"]["3"]["inputs"]["sampler_name"], "euler",
+                "sampler_name must remain at snapshot default",
+            )
+
+            # 3. studio_meta.studio_controls must contain the overridden values
+            meta_controls = spec.get("studio_meta", {}).get("studio_controls", {})
+            self.assertIn(
+                "steps", meta_controls,
+                "studio_controls must include the user-edited 'steps'",
+            )
+            self.assertEqual(
+                meta_controls.get("steps"), 20,
+                "studio_controls.steps must be 20",
+            )
+
+            # prompt is always included (required field)
+            self.assertIn(
+                "prompt", meta_controls,
+                "studio_controls must include 'prompt'",
+            )
+
+    def test_partial_controls_axis_values_only_contain_edited_keys(self):
+        """Axis values in the spec must only include keys that the user
+        explicitly edited (steps=20), not all snapshot defaults."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = _make_runnable_snapshot("snap_axis")
+            preset = _make_runnable_preset("preset_axis", "snap_axis")
+            _make_studio_store_files(tmp, [snapshot], [preset])
+
+            # Only steps=20 is user-edited
+            controls = {"prompt": "a cat", "steps": 20}
+            spec = self.adapter_mod.build_single_run_spec(
+                preset, snapshot, "txt2img", controls, tmp,
+            )
+
+            cell = spec["cells"][0]
+            axis_values = cell.get("axis_values", {})
+
+            # steps must be in axis_values (user edited it)
+            self.assertIn(
+                "steps", axis_values,
+                "axis_values must contain user-edited 'steps'",
+            )
+            self.assertEqual(
+                axis_values["steps"], 20,
+                "axis_values.steps must be 20",
+            )
+
+            # seed must NOT be in axis_values (user didn't edit it)
+            self.assertNotIn(
+                "seed", axis_values,
+                "axis_values must NOT contain 'seed' when user didn't edit it",
+            )
+
+            # prompt must NOT be in axis_values (it's a separate field)
+            self.assertNotIn(
+                "prompt", axis_values,
+                "axis_values must NOT contain 'prompt' (handled separately)",
+            )
+
+    def test_empty_controls_only_updates_prompt(self):
+        """When controls only contains prompt (no overrides), the
+        workflow must keep all snapshot defaults unchanged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = _make_runnable_snapshot("snap_no_override")
+            preset = _make_runnable_preset("preset_no_override", "snap_no_override")
+            _make_studio_store_files(tmp, [snapshot], [preset])
+
+            controls = {"prompt": "just a prompt, no edits"}
+            spec = self.adapter_mod.build_single_run_spec(
+                preset, snapshot, "txt2img", controls, tmp,
+            )
+
+            ck = spec["checkpoints"][0]
+            # All non-prompt values must remain at snapshot defaults
+            self.assertEqual(
+                ck["workflow"]["3"]["inputs"]["seed"], 42,
+                "seed must remain at snapshot default",
+            )
+            self.assertEqual(
+                ck["workflow"]["3"]["inputs"]["steps"], 20,
+                "steps must remain at snapshot default (20)",
+            )
+
+            # Axis values must be empty (no overrides)
+            cell = spec["cells"][0]
+            axis_values = cell.get("axis_values", {})
+            self.assertEqual(
+                axis_values, {},
+                "axis_values must be empty when no overrides are provided",
+            )
+
+
+# ---------------------------------------------------------------------------
+# JsEffectiveOverrideStructuralRED — browser buildEffectiveControls
+# function must exist with correct filtering logic
+# ---------------------------------------------------------------------------
+
+class JsBuildEffectiveControlsRED(unittest.TestCase):
+    """RED: ``web/studio-playground.js`` function ``buildEffectiveControls``
+    must produce a payload that ONLY includes controls the user explicitly
+    edited (from ``state.playground.controls``).  Controls that derive
+    their value from the preset defaults or snapshot defaults must NOT
+    appear in the output — they serve as display-only values.
+
+    Current ``buildEffectiveControls`` (studio-playground.js:323-339)
+    iterates over ALL visible control IDs and includes every one in
+    the output, falling back to hydrated/preset defaults for any ID
+    the user did not explicitly override.  This causes the browser to
+    send default values that the user never touched.
+    """
+
+    PLAYGROUND_PATH = REPO_ROOT / "web" / "studio-playground.js"
+
+    def setUp(self):
+        if not self.PLAYGROUND_PATH.exists():
+            self.skipTest(f"web/studio-playground.js not found at {self.PLAYGROUND_PATH}")
+
+    def test_build_effective_controls_exists(self):
+        """buildEffectiveControls function must be defined in
+        studio-playground.js."""
+        text = self.PLAYGROUND_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "function buildEffectiveControls",
+            text,
+            "buildEffectiveControls function must be defined in studio-playground.js",
+        )
+
+    def test_build_effective_controls_must_only_include_user_edited_controls(self):
+        """The function's ``visibleIds.forEach`` callback must ONLY
+        include controls from ``userOverrides`` in the returned dict.
+        The current fallback branches (``hydratedValues`` and
+        ``presetDefaults``) must be REMOVED — they cause non-edited
+        controls to appear in the override payload.
+
+        This test verifies the `forEach` body does NOT contain
+        fallback assignments for non-overridden controls.
+        """
+        text = self.PLAYGROUND_PATH.read_text(encoding="utf-8")
+
+        # Find the buildEffectiveControls function body
+        import re
+        match = re.search(
+            r"function buildEffectiveControls\s*\([^)]+\)\s*\{(.+?)\n\}", text, re.DOTALL,
+        )
+        self.assertIsNotNone(
+            match,
+            "Could not locate buildEffectiveControls function body",
+        )
+        body = match.group(1)
+
+        # The function body currently has fallback branches for
+        # hydratedValues and presetDefaults.  These are the problem.
+        # A corrected version would only assign from userOverrides.
+
+        # ---- RED: The function must only include user override keys ----
+        # Check that it iterates over Object.keys(userOverrides) to
+        # only include explicit user edits in the output.
+        has_user_keys_iteration = (
+            "Object.keys(userOverrides)" in body
+            or "userOverrides" in body
+        )
+        self.assertTrue(
+            has_user_keys_iteration,
+            "buildEffectiveControls must iterate over Object.keys(userOverrides) "
+            "to only include explicit user edits in the output",
+        )
+
+        # ---- RED: Must NOT iterate over all visible IDs with fallbacks ----
+        # The old pattern was: visibleIds.forEach(function(ctrlId) {
+        #   if (ctrlId in userOverrides) { ... }
+        #   else if (ctrlId in hydratedValues) { ... }
+        # }
+        # The new implementation must NOT have the 3-tier fallback pattern
+        # that includes non-edited controls.
+        has_old_visible_ids_loop = "visibleIds.forEach" in body
+        if has_old_visible_ids_loop:
+            self.fail(
+                "buildEffectiveControls must NOT iterate over all visibleIds "
+                "with fallback branches.  It should only include user-edited "
+                "controls (from state.playground.controls)."
+            )
+
+        # ---- RED: The output must NOT include hydratedValues ----
+        if "hydratedValues" in body or "_hydratedControls" in body:
+            self.fail(
+                "buildEffectiveControls must NOT reference hydratedValues / "
+                "_hydratedControls.  These are display-only and should not "
+                "appear in the override payload."
+            )
+
+        # ---- RED: The output must NOT include presetDefaults ----
+        if "presetDefaults" in body:
+            self.fail(
+                "buildEffectiveControls must NOT reference presetDefaults.  "
+                "Preset defaults are display-only and should not appear "
+                "in the override payload."
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

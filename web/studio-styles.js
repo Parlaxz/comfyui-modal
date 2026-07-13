@@ -584,22 +584,11 @@ body.comfymodal-body-scroll-lock {
 /* ── Axis Editor ─────────────────────────────────────────── */
 
 .comfymodal-studio-axis-editor {
-  background: #111;
-  border: 1px solid #2a2a2a;
-  border-radius: 3px;
-  padding: 8px;
   margin: 4px 0 8px;
-}
-
-.comfymodal-studio-axis-editor-mode {
-  display: flex;
-  align-items: center;
-  margin-bottom: 4px;
-  font-size: 11px;
+  padding-left: 20px;
 }
 
 .comfymodal-studio-axis-editor-values {
-  margin-bottom: 4px;
 }
 
 .comfymodal-studio-axis-editor-values textarea,

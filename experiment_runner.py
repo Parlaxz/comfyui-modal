@@ -617,6 +617,99 @@ class InvalidLoRASlotCapacity(MappingError):
     """Raised when a cell has more LoRA entries than the profile has slots."""
 
 
+# ── Stream message normaliser ─────────────────────────────────────────────
+
+def _desired_map_stream_message(msg: dict, context: dict) -> dict | None:
+    """Map a raw Modal stream message to a normalised nonterminal worker-progress payload.
+
+    Handles the ACTUAL ``comfyapp.run_prompt_stream`` event schema:
+
+      - status:  ``{type:'status', phase:'restore', message:'...'}``  (flat)
+      - node:    ``{type:'progress', event:'executing', data:{node:'7', ...}}``
+      - sampler: ``{type:'progress', event:'progress', data:{value:5, max:20, ...}}``
+      - result:  ``{type:'result', data:{...}}``                     (not forwarded)
+      - error:   ``{type:'error', message:'...'}``                   (flat)
+
+    Uses the outer ``type`` and inner ``event`` sub-field as discriminator.
+    Unrelated progress sub-events (``execution_start``, ``execution_cached``,
+    ``progress_state``) return ``None`` and are silently skipped.
+
+    Args:
+        msg: Raw Modal stream message dict.
+        context: Dict with ``experiment_id``, ``checkpoint_id``, ``cell_key``,
+            ``attempt_id``, and optionally ``total_nodes``.
+
+    Returns:
+        ``{"event": ..., "detail": {...}}`` for forwardable messages, or ``None``
+        for messages that must NOT be forwarded (result, unknown, unrelated).
+    """
+    mtype = msg.get("type", "")
+    data = msg.get("data", {}) or {}
+
+    # Result messages are never forwarded (go through return value only)
+    if mtype == "result":
+        return None
+
+    detail: dict = {
+        "experiment_id": context.get("experiment_id", ""),
+        "checkpoint_id": context.get("checkpoint_id", ""),
+        "cell_key": context.get("cell_key", ""),
+        "attempt_id": context.get("attempt_id", ""),
+    }
+
+    # Inject total_nodes from context (truthful workflow node count, set by
+    # LocalRemoteInvoker from the resolved workflow dict, never from remote).
+    total_nodes = context.get("total_nodes")
+    if total_nodes is not None:
+        detail["total_nodes"] = total_nodes
+
+    if mtype == "status":
+        # Flat status: prefer top-level phase/message, fall back to nested data
+        detail["type"] = "status"
+        detail["phase"] = msg.get("phase") if msg.get("phase") is not None else data.get("phase", "")
+        detail["message"] = msg.get("message") if msg.get("message") is not None else data.get("message", "")
+        return {"event": "experiment.worker.progress", "detail": detail}
+
+    if mtype == "progress":
+        # Use sub-event discriminator
+        sub_event = msg.get("event", "")
+
+        # Unrelated sub-events — silently skip
+        if sub_event in ("execution_start", "execution_cached", "progress_state", ""):
+            return None
+
+        if sub_event == "executing":
+            # cell.executing: map data.node
+            detail["type"] = "cell.executing"
+            node = data.get("node")
+            if node is not None:
+                detail["node"] = str(node)
+            return {"event": "experiment.worker.progress", "detail": detail}
+
+        if sub_event == "progress":
+            # sampler.step: map data.step or data.value
+            detail["type"] = "sampler.step"
+            step = data.get("step") if data.get("step") is not None else data.get("value")
+            if step is not None:
+                detail["step"] = step
+            if data.get("max") is not None:
+                detail["max"] = data["max"]
+            if data.get("queue") is not None:
+                detail["queue"] = data["queue"]
+            return {"event": "experiment.worker.progress", "detail": detail}
+
+        # Unknown progress sub-event — silently skip
+        return None
+
+    if mtype == "error":
+        # Flat error: message directly on msg, not nested under data
+        detail["type"] = "cell.failed"
+        detail["message"] = msg.get("message") or data.get("message", "Remote execution error")
+        return {"event": "experiment.event", "detail": detail}
+
+    return None
+
+
 # ── Public types ─────────────────────────────────────────────────────────
 
 class ExperimentRunnerError(RuntimeError):
@@ -983,10 +1076,17 @@ class LocalRemoteInvoker:
     """Production implementation of _RemoteInvoker. Wraps the existing
     modal_client.run_prompt_stream surface."""
 
-    def __init__(self, modal_run_prompt_stream, experiment_id="", node_dir=""):
+    def __init__(self, modal_run_prompt_stream, experiment_id="", node_dir="",
+                 stream_event_sink=None, profile_preparer=None,
+                 gpu=None, modal_options=None, workspace=None):
         self._run_prompt_stream = modal_run_prompt_stream
         self._experiment_id = experiment_id
         self._node_dir = Path(node_dir) if node_dir else Path(os.path.dirname(os.path.abspath(__file__)))
+        self._stream_event_sink = stream_event_sink
+        self._profile_preparer = profile_preparer
+        self._gpu = gpu
+        self._modal_options = modal_options
+        self._workspace = workspace
 
     async def open_worker(self, worker_invocation_id, checkpoint_id, profile_id,
                           workflow, triple) -> None:
@@ -1095,35 +1195,110 @@ class LocalRemoteInvoker:
                     flat[filename] = entry
 
             # ── Establish local trace from browser context ────────────────
-            # The cell carries a "trace" dict with browser timestamps
-            # (e.g. t0_perf_ms / t0_client_press).  Build a local Trace
-            # from it so we can record genuine observation stages.
+            # The cell carries a "trace" dict with browser timestamps.
+            # Build a single mutable dict that we pass to run_prompt_stream
+            # AND use for local markers — so both sides see the same t0.
             trace_ctx = cell.get("trace")
-            if isinstance(trace_ctx, dict) and trace_ctx:
-                local_trace = Trace(cell.get("cell_key", ""), t0=coerce_t0_from_browser(trace_ctx))
-                local_trace.update(trace_ctx)  # restore any previously marked stages
-            else:
-                local_trace = Trace(cell.get("cell_key", ""))
+            _mutable_trace: dict = {}
+            if isinstance(trace_ctx, dict):
+                _mutable_trace.update(trace_ctx)
+            # Also build a Trace object for the local summary (backward compat)
+            local_trace = Trace(cell.get("cell_key", ""), t0=coerce_t0_from_browser(_mutable_trace))
+            local_trace.update(_mutable_trace)
+
+            # Stage: scheduler_execution_started (cell execution entry)
+            _now = time.time()
+            local_trace.mark("scheduler_execution_started")
+            _mutable_trace.setdefault("scheduler_execution_started", _now)
+
+            # Resolved workflow is available
+            _resolved_wf = cell.get("_resolved_workflow", cell.get("_workflow", {}))
+            local_trace.mark("t5_workflow_materialized")
+            local_trace.mark("workflow_materialization_completed")
+            _mutable_trace["t5_workflow_materialized"] = local_trace.get("t5_workflow_materialized")
+            _mutable_trace["workflow_materialization_completed"] = local_trace.get("workflow_materialization_completed")
+
+            # ── Warmup profile write (immediately before/after preparer) ──
+            _preparer = getattr(self, "_profile_preparer", None)
+            local_trace.mark("warmup_profile_write_started")
+            _mutable_trace["warmup_profile_write_started"] = local_trace.get("warmup_profile_write_started")
+            if _preparer is not None:
+                await _preparer(_resolved_wf, cell)
+            local_trace.mark("warmup_profile_write_completed")
+            _mutable_trace["warmup_profile_write_completed"] = local_trace.get("warmup_profile_write_completed")
+
             local_trace.mark("t6_local_stream_opened")
+            _mutable_trace["t6_local_stream_opened"] = local_trace.get("t6_local_stream_opened")
 
             stream_kwargs: dict = {
-                "workflow": cell.get("_resolved_workflow", cell.get("_workflow", {})),
+                "workflow": _resolved_wf,
             }
             if flat:
                 stream_kwargs["input_images"] = flat
-            # Forward the browser-trace fields dict to the remote Modal
-            # function so it can establish t0 / add its own stages.
-            if isinstance(trace_ctx, dict) and trace_ctx:
-                stream_kwargs["trace"] = trace_ctx
+            # Forward the mutable trace dict to run_prompt_stream
+            # so modal_client can add its own markers (handle lookup,
+            # generator create, etc.) and the remote side sees t0.
+            if _mutable_trace:
+                stream_kwargs["trace"] = _mutable_trace
+            # Forward identity/kwargs captured at init (only when set)
+            for _ik_key in ("gpu", "modal_options", "workspace"):
+                _ik_val = getattr(self, f"_{_ik_key}", None)
+                if _ik_val is not None:
+                    stream_kwargs[_ik_key] = _ik_val
+
+            # Stage: remote_submit (immediately before entering stream)
+            _remote_submit = time.time()
+            local_trace.mark("remote_submit")
+            local_trace.mark("t2_local_modal_submit_start")
+            _mutable_trace["remote_submit"] = _remote_submit
+            _mutable_trace["t2_local_modal_submit_start"] = _remote_submit
+            _mutable_trace.setdefault("t2_local_dispatch", _remote_submit)
+
             _first_event = True
+            _sink_seq = 0
             async for msg in self._run_prompt_stream(**stream_kwargs):
                 if _first_event:
+                    local_trace.mark("first_remote_message_received")
                     local_trace.mark("t7_local_first_remote_event")
+                    _mutable_trace["first_remote_message_received"] = local_trace.get("first_remote_message_received")
+                    _mutable_trace["t7_local_first_remote_event"] = local_trace.get("t7_local_first_remote_event")
                     _first_event = False
                 mtype = msg.get("type", "")
+
+                # ── Relay nonterminal events through optional stream_event_sink ──
+                # Only "result" and "error" are terminal; all other types
+                # (status, executing, progress) are relayed as compact progress
+                # payloads without base64 data or raw remote outputs.
+                if mtype not in ("result", "error") and self._stream_event_sink is not None:
+                    try:
+                        # Derive truthful total_nodes from the resolved workflow
+                        # (number of keys in the workflow dict — NOT from remote).
+                        _workflow = cell.get("_resolved_workflow", cell.get("_workflow", {}))
+                        _total_nodes = len(_workflow) if isinstance(_workflow, dict) else None
+                        normalized = _desired_map_stream_message(
+                            msg,
+                            {
+                                "experiment_id": self._experiment_id,
+                                "checkpoint_id": cell.get("checkpoint_id", ""),
+                                "cell_key": cell.get("cell_key", ""),
+                                "attempt_id": cell.get("attempt_id", ""),
+                                "total_nodes": _total_nodes,
+                            },
+                        )
+                        if normalized is not None:
+                            _sink_seq += 1
+                            normalized["detail"]["sequence"] = _sink_seq
+                            # Pass the detail dict directly (the event
+                            # routing info is used by the normaliser's
+                            # caller, not the sink itself).
+                            await self._stream_event_sink(normalized["detail"])
+                    except Exception:
+                        pass  # Sink errors must never disrupt execution
+
                 if mtype == "result":
                     data = msg.get("data", {})
                     _last_remote_data = data
+                    local_trace.mark("remote_result_received")
                     local_trace.mark("t8_local_result_received")
 
                     # ── Merge remote + local using shared merger ──────────
@@ -1147,35 +1322,51 @@ class LocalRemoteInvoker:
                     _local_timing_summary = local_summary
 
                     saved = await self._save_output_images(data, cell.get("cell_key", "unknown"))
+                    local_trace.mark("output_materialized")
                     local_trace.mark("t9_local_materialized")
+                    local_trace.mark("t10_local_materialized")
                     result = {"status": "completed", "result": data, "output_paths": saved}
 
-                    # ── Derive local materialization wall time ───────────
-                    # Compute from t8_local_result_received →
-                    # t9_local_materialized only when both numeric
-                    # timestamps exist and order is nonnegative, AND the
-                    # cell carried a browser trace context (otherwise the
-                    # local Trace was created ad-hoc in this method and
-                    # the timestamps are merely time.time() bookmarks
-                    # that do not represent a meaningful span).
-                    if isinstance(trace_ctx, dict) and trace_ctx:
-                        _t8 = local_trace.get("t8_local_result_received")
-                        _t9 = local_trace.get("t9_local_materialized")
-                        if _t8 is not None and _t9 is not None:
-                            _mat_ms = round((_t9 - _t8) * 1000, 2)
-                            if _mat_ms >= 0:
-                                local_summary.setdefault("derived_ms", {})["local_output_materialization_ms"] = _mat_ms
+                    # ── Merge mutable-trace markers back into local_trace ──
+                    # modal_client.run_prompt_stream may have added its own
+                    # markers (handle_lookup, generator_create, etc.) to the
+                    # mutable trace dict.  Copy them into local_trace so they
+                    # appear in the final stages snapshot.
+                    if isinstance(_mutable_trace, dict):
+                        for _mk, _mv in _mutable_trace.items():
+                            if isinstance(_mk, str) and isinstance(_mv, (int, float)) and local_trace.get(_mk) is None:
+                                local_trace.mark(_mk, _mv)
 
-                    # ── Update stages with t9_local_materialized ──────────
-                    # The initial stages snapshot was taken before
-                    # t9_local_materialized was marked (lines above).
-                    # Re-read the live trace so the stage appears in the
-                    # final timing_payload alongside the truthful derived
-                    # delta computed above.  Only update the local key to
-                    # avoid overwriting already-merged remote stages.
-                    _t9_now = local_trace.get("t9_local_materialized")
-                    if _t9_now is not None:
-                        local_summary.setdefault("stages", {})["t9_local_materialized"] = _t9_now
+                    # ── Derive local materialization wall time ───────────
+                    _t8 = local_trace.get("t8_local_result_received")
+                    _t10 = local_trace.get("t10_local_materialized")
+                    if _t8 is not None and _t10 is not None:
+                        _mat_ms = round((_t10 - _t8) * 1000, 2)
+                        if _mat_ms >= 0:
+                            local_summary.setdefault("derived_ms", {})["local_output_materialization_ms"] = _mat_ms
+
+                    # ── Add semantic aliases from remote trace (C) ──────
+                    # Map remote t3_modal_entry → remote_method_entered
+                    _remote_stages = remote_trace_data.get("stages", {}) or {}
+                    if isinstance(_remote_stages, dict):
+                        _t3 = _remote_stages.get("t3_modal_entry")
+                        if _t3 is not None:
+                            local_summary.setdefault("stages", {})["remote_method_entered"] = _t3
+                    # Map _restore_timing restore_start/end → app_restore_*
+                    _restore_blk = data.get("_restore_timing", {}) or {}
+                    _rs = _restore_blk.get("restore_start_unix_s")
+                    _re = _restore_blk.get("restore_end_unix_s")
+                    if _rs is not None:
+                        local_summary.setdefault("stages", {})["app_restore_started"] = _rs
+                    if _re is not None:
+                        local_summary.setdefault("stages", {})["app_restore_completed"] = _re
+
+                    # ── Snapshot stages AFTER all markers are set ──────────
+                    # Read the live trace fields after t10 is marked, so no
+                    # race or patch-up is needed (eliminates the old approach
+                    # of patching t9 after snapshot).
+                    _final_stages = dict(local_trace.fields())
+                    local_summary["stages"].update(_final_stages)
 
                     # Extract compact timing payload from data, then embed
                     # the merged trace as the canonical trace record.

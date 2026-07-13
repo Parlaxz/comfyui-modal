@@ -353,26 +353,23 @@ export function enhanceControlWithAxisCheckbox(controlEl, controlId, state, acti
 
   wrapper.appendChild(cb);
 
-  // If axis is active and eligible, insert the inline axis editor after the control group
+  // If axis is active and eligible, insert the inline axis editor directly
+  // after this control group (between this control and the next one).
   if (isAxis && isEligible) {
     const editor = renderAxisEditor(controlId, state, actions);
     if (editor) {
       // Schedule insertion after controlEl's parent processes.
-      // Uses isConnected guards to prevent stale DOM injection and
-      // parent.parentNode.insertBefore for correct sibling positioning.
       // Before inserting, remove any existing connected editor for the
       // same control to prevent duplicate editors after rapid toggling.
       setTimeout(() => {
         if (!controlEl.isConnected) return;
         const parent = controlEl.parentNode;
         if (!parent || !parent.isConnected) return;
-        const grandparent = parent.parentNode;
-        if (!grandparent) return;
-        const existingEditors = grandparent.querySelectorAll(`[data-testid="axis-editor-${controlId}"]`);
+        const existingEditors = parent.querySelectorAll(`[data-testid="axis-editor-${controlId}"]`);
         for (const existing of existingEditors) {
           if (existing.isConnected) existing.remove();
         }
-        grandparent.insertBefore(editor, parent.nextSibling);
+        parent.insertBefore(editor, controlEl.nextSibling);
       }, 0);
     }
   }
@@ -382,145 +379,24 @@ export function enhanceControlWithAxisCheckbox(controlEl, controlId, state, acti
 
 // ── Axis Editor ──────────────────────────────────────────────────────────
 //
-// Renders an inline axis editor for a given control. Supports:
-//   - textarea (prompt/instruction): multiline variants textarea
-//   - number (steps, guidance, etc.): comma-separated values with validation
-//   - select (LoRA/backend): disabled with explanation
+// Renders an inline axis editor for a given control. Each axis value is
+// rendered as an individual input matching the original control affordance
+// (number input for numeric axes, textarea for prompt/instruction axes).
+// Supports add/remove of values with the first value always present.
 
 export function renderAxisEditor(controlId, state, actions) {
   const def = CONTROL_DEFS[controlId];
   if (!def) return null;
 
-  const axisData = (state.playground && state.playground.experimentAxes && state.playground.experimentAxes[controlId]) || {};
-  const currentValues = axisData.values || [def.defaultValue != null ? String(def.defaultValue) : ""];
-
   const editor = document.createElement("div");
   editor.className = "comfymodal-studio-axis-editor";
   editor.setAttribute("data-testid", `axis-editor-${controlId}`);
 
-  const modeRow = document.createElement("div");
-  modeRow.className = "comfymodal-studio-axis-editor-mode";
-
-  const modeLabel = document.createElement("span");
-  modeLabel.textContent = "Mode:";
-  modeLabel.style.fontSize = "var(--font-size-xs)";
-  modeLabel.style.marginRight = "6px";
-  modeRow.appendChild(modeLabel);
-
-  const modeDefaults = document.createElement("label");
-  modeDefaults.style.fontSize = "var(--font-size-xs)";
-  modeDefaults.style.marginRight = "8px";
-  const defaultRadio = document.createElement("input");
-  defaultRadio.type = "radio";
-  defaultRadio.name = `axis-mode-${controlId}`;
-  defaultRadio.value = "defaults";
-  defaultRadio.checked = true;
-  modeDefaults.appendChild(defaultRadio);
-  modeDefaults.appendChild(document.createTextNode(" Defaults"));
-  modeRow.appendChild(modeDefaults);
-
-  const modeAll = document.createElement("label");
-  modeAll.style.fontSize = "var(--font-size-xs)";
-  const allRadio = document.createElement("input");
-  allRadio.type = "radio";
-  allRadio.name = `axis-mode-${controlId}`;
-  allRadio.value = "all";
-  modeAll.appendChild(allRadio);
-  modeAll.appendChild(document.createTextNode(" All Selected Axes"));
-  modeRow.appendChild(modeAll);
-
-  editor.appendChild(modeRow);
-
-  // Values area
+  // Values area — repeated individual value inputs
   const valuesArea = document.createElement("div");
   valuesArea.className = "comfymodal-studio-axis-editor-values";
 
-  if (def.type === "textarea") {
-    // Multiline variants textarea for prompt/instruction
-    const textarea = document.createElement("textarea");
-    textarea.className = "comfymodal-input comfymodal-studio-textarea";
-    textarea.placeholder = "Enter prompt variants, one per line\u2026";
-    textarea.rows = 3;
-    textarea.value = currentValues.join("\n");
-    textarea.style.fontSize = "var(--font-size-xs)";
-    textarea.addEventListener("input", () => {
-      const lines = textarea.value.split("\n").filter((l) => l.trim());
-      if (actions && actions.updateExperimentAxisValues) {
-        actions.updateExperimentAxisValues(controlId, lines.length > 0 ? lines : [def.defaultValue || ""]);
-      }
-    });
-    valuesArea.appendChild(textarea);
-  } else if (def.type === "number") {
-    // Comma-separated values input for numeric controls
-    const input = document.createElement("input");
-    input.type = "text";
-    input.className = "comfymodal-input";
-    input.placeholder = "e.g. 20, 30, 40";
-    input.value = currentValues.join(", ");
-    input.style.fontSize = "var(--font-size-xs)";
-    input.addEventListener("input", () => {
-      const parts = input.value.split(",").map((s) => s.trim()).filter((s) => s !== "");
-      const nums = parts.map(Number).filter((n) => !isNaN(n));
-      if (nums.length > 0) {
-        if (actions && actions.updateExperimentAxisValues) {
-          actions.updateExperimentAxisValues(controlId, nums);
-        }
-      }
-    });
-    valuesArea.appendChild(input);
-
-    // Quick-add buttons for common steps values
-    if (controlId === "steps") {
-      const quickRow = document.createElement("div");
-      quickRow.style.marginTop = "4px";
-      quickRow.style.display = "flex";
-      quickRow.style.gap = "4px";
-      [10, 20, 30, 50].forEach((v) => {
-        const btn = document.createElement("button");
-        btn.className = "comfymodal-secondary-btn";
-        btn.textContent = String(v);
-        btn.style.fontSize = "10px";
-        btn.style.padding = "2px 6px";
-        btn.addEventListener("click", () => {
-          const current = input.value.split(",").map((s) => s.trim()).filter((s) => s !== "");
-          if (!current.includes(String(v))) {
-            input.value = current.concat(String(v)).join(", ");
-            if (actions && actions.updateExperimentAxisValues) {
-              actions.updateExperimentAxisValues(controlId, current.concat(v).map(Number));
-            }
-          }
-        });
-        quickRow.appendChild(btn);
-      });
-      valuesArea.appendChild(quickRow);
-    }
-
-    // Quick-add for guidance
-    if (controlId === "guidance") {
-      const quickRow = document.createElement("div");
-      quickRow.style.marginTop = "4px";
-      quickRow.style.display = "flex";
-      quickRow.style.gap = "4px";
-      [5, 7, 10, 15].forEach((v) => {
-        const btn = document.createElement("button");
-        btn.className = "comfymodal-secondary-btn";
-        btn.textContent = String(v);
-        btn.style.fontSize = "10px";
-        btn.style.padding = "2px 6px";
-        btn.addEventListener("click", () => {
-          const current = input.value.split(",").map((s) => s.trim()).filter((s) => s !== "");
-          if (!current.includes(String(v))) {
-            input.value = current.concat(String(v)).join(", ");
-            if (actions && actions.updateExperimentAxisValues) {
-              actions.updateExperimentAxisValues(controlId, current.concat(v).map(Number));
-            }
-          }
-        });
-        quickRow.appendChild(btn);
-      });
-      valuesArea.appendChild(quickRow);
-    }
-  } else if (def.type === "select") {
+  if (def.type === "select") {
     // Disabled with explanation for select controls like LoRA
     const disabledMsg = document.createElement("p");
     disabledMsg.textContent = "Axis configuration not available for this control type. Configure in Legacy Setup.";
@@ -528,56 +404,314 @@ export function renderAxisEditor(controlId, state, actions) {
     disabledMsg.style.color = "var(--color-text-muted)";
     disabledMsg.style.fontStyle = "italic";
     valuesArea.appendChild(disabledMsg);
+  } else {
+    // Repeated value inputs with add/remove for experiment-eligible controls
+    function _renderRepeatedValues() {
+      // Clear existing children (keep the valuesArea element itself)
+      while (valuesArea.firstChild) valuesArea.removeChild(valuesArea.firstChild);
+
+      // Re-read current values from state
+      const axData = (state.playground && state.playground.experimentAxes && state.playground.experimentAxes[controlId]) || {};
+      const vals = axData.values || [""];
+
+      // Collect current values from DOM inputs (live read, not stale closure)
+      function collectValues() {
+        const inputs = valuesArea.querySelectorAll('[data-testid^="axis-value-' + controlId + '-"]');
+        return Array.from(inputs).map(function (inp) { return inp.value; });
+      }
+
+      // Commit values to state without triggering re-render
+      function commitValues() {
+        const v = collectValues();
+        if (actions && actions.updateExperimentAxisValues) {
+          actions.updateExperimentAxisValues(controlId, v);
+        }
+      }
+
+      // Render each value input
+      vals.forEach(function (val, i) {
+        const row = document.createElement("div");
+        row.style.display = "flex";
+        row.style.alignItems = "center";
+        row.style.gap = "4px";
+        row.style.marginBottom = "4px";
+
+        const inputWrapper = document.createElement("div");
+        inputWrapper.style.flex = "1";
+
+        let input;
+        if (def.type === "textarea") {
+          input = document.createElement("textarea");
+          input.className = "comfymodal-input comfymodal-studio-textarea";
+          input.rows = 2;
+          input.style.fontSize = "var(--font-size-xs)";
+        } else {
+          // number, text, etc. — use appropriate input type
+          input = document.createElement("input");
+          input.type = (def.type === "number") ? "number" : "text";
+          input.className = "comfymodal-input";
+          input.style.fontSize = "var(--font-size-xs)";
+        }
+
+        input.value = val;
+        input.setAttribute("data-testid", "axis-value-" + controlId + "-" + i);
+        input.addEventListener("input", commitValues);
+        inputWrapper.appendChild(input);
+        row.appendChild(inputWrapper);
+
+        // Remove button — only on values after the first (index 0 cannot be removed)
+        if (i > 0) {
+          const removeBtn = document.createElement("button");
+          removeBtn.textContent = "\u00d7";
+          removeBtn.className = "comfymodal-destructive-btn";
+          removeBtn.style.fontSize = "12px";
+          removeBtn.style.padding = "2px 6px";
+          removeBtn.setAttribute("data-testid", "axis-remove-value-" + controlId + "-" + i);
+          removeBtn.setAttribute("aria-label", "Remove value " + (i + 1));
+          removeBtn.addEventListener("click", function () {
+            const currentVals = collectValues();
+            currentVals.splice(i, 1);
+            if (actions && actions.updateExperimentAxisValues) {
+              actions.updateExperimentAxisValues(controlId, currentVals);
+            }
+            _renderRepeatedValues();
+          });
+          row.appendChild(removeBtn);
+        }
+
+        valuesArea.appendChild(row);
+      });
+
+      // Plus button — appends a new empty value
+      const addBtn = document.createElement("button");
+      addBtn.textContent = "+";
+      addBtn.className = "comfymodal-secondary-btn";
+      addBtn.style.fontSize = "12px";
+      addBtn.style.padding = "2px 8px";
+      addBtn.setAttribute("data-testid", "axis-add-value-" + controlId);
+      addBtn.setAttribute("aria-label", "Add value");
+      addBtn.addEventListener("click", function () {
+        const currentVals = collectValues();
+        currentVals.push("");
+        if (actions && actions.updateExperimentAxisValues) {
+          actions.updateExperimentAxisValues(controlId, currentVals);
+        }
+        _renderRepeatedValues();
+      });
+      valuesArea.appendChild(addBtn);
+
+      // Quick-add buttons for common steps/guidance values (preserving existing behavior)
+      if (def.type === "number") {
+        let quickValues = [];
+        if (controlId === "steps") quickValues = [10, 20, 30, 50];
+        else if (controlId === "guidance") quickValues = [5, 7, 10, 15];
+
+        if (quickValues.length > 0) {
+          const quickRow = document.createElement("div");
+          quickRow.style.marginTop = "4px";
+          quickRow.style.display = "flex";
+          quickRow.style.gap = "4px";
+          quickValues.forEach(function (v) {
+            const btn = document.createElement("button");
+            btn.className = "comfymodal-secondary-btn";
+            btn.textContent = String(v);
+            btn.style.fontSize = "10px";
+            btn.style.padding = "2px 6px";
+            btn.addEventListener("click", function () {
+              const currentVals = collectValues();
+              if (!currentVals.includes(String(v))) {
+                currentVals.push(String(v));
+                if (actions && actions.updateExperimentAxisValues) {
+                  actions.updateExperimentAxisValues(controlId, currentVals);
+                }
+                _renderRepeatedValues();
+              }
+            });
+            quickRow.appendChild(btn);
+          });
+          valuesArea.appendChild(quickRow);
+        }
+      }
+    }
+
+    _renderRepeatedValues();
   }
 
   editor.appendChild(valuesArea);
 
-  // Add/Update axis button
-  const actionRow = document.createElement("div");
-  actionRow.style.marginTop = "4px";
-  actionRow.style.display = "flex";
-  actionRow.style.gap = "4px";
-
-  const updateBtn = document.createElement("button");
-  updateBtn.className = "comfymodal-secondary-btn";
-  updateBtn.textContent = "Update Axis";
-  updateBtn.style.fontSize = "10px";
-  updateBtn.style.padding = "2px 8px";
-  updateBtn.addEventListener("click", () => {
-    // Re-read values from the editor and update
-    if (actions && actions.updateExperimentAxisValues) {
-      // The input event handlers already update values; this is explicit confirmation
-    }
-  });
-  actionRow.appendChild(updateBtn);
-
-  const removeBtn = document.createElement("button");
-  removeBtn.className = "comfymodal-destructive-btn";
-  removeBtn.textContent = "Remove Axis";
-  removeBtn.style.fontSize = "10px";
-  removeBtn.style.padding = "2px 8px";
-  removeBtn.addEventListener("click", () => {
-    if (actions && actions.toggleExperimentAxis) {
-      actions.toggleExperimentAxis(controlId, false);
-    }
-  });
-  actionRow.appendChild(removeBtn);
-
-  editor.appendChild(actionRow);
-
   return editor;
 }
 
-// ── Experiment run logic ─────────────────────────────────────────────────
+// ── Run Experiment button ──────────────────────────────────────────────────
+//
+// Renders a "Run Experiment" button inside the experiment mode block, right
+// after the Matrix Summary. This makes the run action visible alongside the
+// experiment controls (Compare Presets + Matrix Summary) rather than hiding
+// it at the bottom of the control panel behind all the parameter controls.
+//
+// The button is enabled when the experiment is valid (>= 2 presets selected,
+// or 1 preset + at least 1 axis with >= 2 values, and experiments enabled
+// for the current feature). Otherwise it shows a clear disabled reason inline.
+//
+// On click, it delegates to executeExperimentRun() and updates run state.
+// Progress polling is handled by the existing renderRunButton polling loop.
+
+export function renderExperimentRunButton(state, actions, context) {
+  var container = document.createElement("div");
+  container.className = "comfymodal-studio-experiment-run-section";
+  container.setAttribute("data-testid", "experiment-run-section");
+  container.style.marginTop = "8px";
+
+  var runState = state.playground && state.playground.runState;
+  var isRunning = runState && (
+    runState.status === "running" ||
+    runState.status === "submitted" ||
+    runState.status === "waiting" ||
+    runState.status === "queued" ||
+    runState.status === "in_progress"
+  );
+
+  var btn = document.createElement("button");
+  btn.className = "comfymodal-primary-btn";
+  btn.setAttribute("data-testid", "run-experiment-inline-btn");
+
+  if (isRunning) {
+    btn.disabled = true;
+    if (runState.status === "queued") {
+      btn.textContent = "Queued\u2026";
+    } else if (runState.status === "in_progress") {
+      btn.textContent = "Running\u2026";
+      if (runState.cellProgress) {
+        btn.textContent = "Running (" + runState.cellProgress + ")\u2026";
+      }
+    } else {
+      btn.textContent = "Running\u2026";
+    }
+    container.appendChild(btn);
+    return container;
+  }
+
+  if (runState && runState.status === "completed") {
+    btn.disabled = false;
+    btn.textContent = "Run Experiment";
+    btn.title = "Run completed. Click to run again.";
+    var doneMsg = document.createElement("p");
+    doneMsg.style.cssText = "font-size:var(--font-size-sm);color:var(--color-success);margin:4px 0 0;";
+    doneMsg.textContent = runState.completedCells
+      ? "Run completed (" + runState.completedCells + " cell(s))."
+      : "Run completed successfully.";
+    container.appendChild(btn);
+    container.appendChild(doneMsg);
+    btn.onclick = buildExperimentClickHandler(state, actions, context);
+    return container;
+  }
+
+  if (runState && runState.status === "error") {
+    btn.disabled = false;
+    btn.textContent = "Run Experiment";
+    btn.title = "Run failed. Click to try again.";
+    var errHeading = document.createElement("p");
+    errHeading.style.cssText = "font-size:var(--font-size-sm);font-weight:var(--font-weight-semibold);color:var(--color-danger);margin:0 0 2px;";
+    errHeading.textContent = "Run Failed";
+    var errMsg = document.createElement("p");
+    errMsg.style.cssText = "font-size:var(--font-size-sm);color:var(--color-danger);margin:0 0 4px;";
+    errMsg.textContent = (runState.message || "Run failed. Try again.").substring(0, 200);
+    container.appendChild(btn);
+    container.appendChild(errHeading);
+    container.appendChild(errMsg);
+    btn.onclick = buildExperimentClickHandler(state, actions, context);
+    return container;
+  }
+
+  // Determine eligibility
+  var canRun = canRunExperiment(state);
+  var reason = getExperimentDisabledReason(state);
+  var showReason = !canRun || (reason && reason.length > 0);
+
+  btn.textContent = "Run Experiment";
+  btn.disabled = !canRun;
+
+  if (!canRun && reason) {
+    btn.title = reason;
+  }
+
+  if (canRun) {
+    btn.onclick = buildExperimentClickHandler(state, actions, context);
+  }
+
+  container.appendChild(btn);
+
+  if (showReason) {
+    var reasonEl = document.createElement("p");
+    reasonEl.style.cssText = "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;";
+    reasonEl.textContent = reason || "";
+    container.appendChild(reasonEl);
+  }
+
+  return container;
+}
+
+function buildExperimentClickHandler(state, actions, context) {
+  return async function () {
+    // Update state to prevent double-submit
+    var currentBtn = document.querySelector('[data-testid="run-experiment-inline-btn"]');
+    if (currentBtn) {
+      currentBtn.disabled = true;
+      currentBtn.textContent = "Running\u2026";
+    }
+
+    // Dispose any existing scoped tracker
+    var existingTracker = state.playground && state.playground._scopedTracker;
+    if (existingTracker && typeof existingTracker.dispose === "function") {
+      try { existingTracker.dispose(); } catch (e) {}
+    }
+    if (state.playground) state.playground._scopedTracker = null;
+
+    if (actions && actions.setRunState) {
+      actions.setRunState({ status: "running" });
+    }
+
+    var result = await executeExperimentRun(state, context);
+
+    if (result && result.status === "ok") {
+      if (actions && actions.setRunState) {
+        actions.setRunState({
+          status: "submitted",
+          experimentId: result.experimentId,
+          message: result.message,
+        });
+      }
+    } else {
+      var errMsg = (result && result.message) || "Experiment run failed.";
+      if (actions && actions.setRunState) {
+        actions.setRunState({ status: "error", message: errMsg });
+      }
+    }
+  };
+}
+
+/**
+ * Check if at least one experiment axis has >= 2 values configured.
+ */
+function hasMultiValueAxis(state) {
+  const axes = (state.playground && state.playground.experimentAxes) || {};
+  return Object.values(axes).some(function (def) {
+    return def && def.enabled && def.values && def.values.length >= 2;
+  });
+}
 
 export function canRunExperiment(state) {
   const canonicalPresetIds = getExperimentPresetIds(state);
-  return canonicalPresetIds.length >= 2;
+  if (canonicalPresetIds.length >= 2) return true;
+  return canonicalPresetIds.length >= 1 && hasMultiValueAxis(state);
 }
 
 export function getExperimentDisabledReason(state) {
   const canonicalPresetIds = getExperimentPresetIds(state);
-  if (canonicalPresetIds.length < 2) return "Select at least 2 presets to compare (choose a base + 1+ compare presets).";
+  const hasAxes = hasMultiValueAxis(state);
+
+  if (canonicalPresetIds.length === 0) return "Select at least one preset to run an experiment.";
+  if (canonicalPresetIds.length === 1 && !hasAxes) return "Add another preset to compare, or add at least 2 values to an experiment axis.";
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
   const experimentsEnabled = currentFeatureId === "txt2img";
   if (!experimentsEnabled) return "Experiments are only available for txt2img in this release.";
@@ -610,7 +744,8 @@ export async function executeExperimentRun(state, context) {
   const sharedDefaults = {};
   Object.entries(controls).forEach(([key, value]) => {
     if (key !== "prompt" && key !== "negative_prompt") {
-      sharedDefaults[key] = value;
+      // Parse numeric strings so backend schema validation accepts them
+      sharedDefaults[key] = (typeof value === "string" && value.trim() !== "" && !isNaN(Number(value))) ? Number(value) : value;
     }
   });
   const experimentDef = {
@@ -624,7 +759,13 @@ export async function executeExperimentRun(state, context) {
   const eligibleAxes = (state.playground && state.playground._eligibleAxes) || [];
   Object.entries(axes).forEach(([ctrlId, def]) => {
     if (def && def.enabled && def.values && def.values.length > 0 && eligibleAxes.includes(ctrlId)) {
-      experimentDef.axes[ctrlId] = { enabled: true, values: def.values };
+      var parsedValues = def.values.map(function (v) {
+        // Parse numeric strings so the backend schema validation
+        // (which checks isinstance(value, int)) accepts them.
+        if (typeof v === "string" && v.trim() !== "" && !isNaN(Number(v))) return Number(v);
+        return v;
+      });
+      experimentDef.axes[ctrlId] = { enabled: true, values: parsedValues };
     }
   });
 
@@ -647,9 +788,21 @@ export async function executeExperimentRun(state, context) {
     };
   }
 
+  var errParts = [];
+  if (result) {
+    if (result.message) errParts.push(result.message);
+    if (result.errors && Array.isArray(result.errors) && result.errors.length > 0) {
+      result.errors.forEach(function (e) {
+        if (typeof e === "string") errParts.push(e);
+        else if (e && e.message) errParts.push(e.message);
+      });
+    }
+    if (result.error) errParts.push(result.error);
+    if (result.detail) errParts.push(result.detail);
+  }
   return {
     status: "error",
-    message: (result && result.message) || "Experiment run failed.",
+    message: errParts.length > 0 ? errParts.join("; ") : "Experiment run failed.",
   };
 }
 
@@ -678,6 +831,11 @@ export function renderExperimentMode(state, actions, context) {
 
   // Matrix Summary block
   container.appendChild(renderMatrixSummary(state, actions));
+
+  // Run Experiment button — inside the experiment block so it's visible
+  // alongside the experiment controls, not buried at the bottom of the
+  // entire control panel.
+  container.appendChild(renderExperimentRunButton(state, actions, context));
 
   return container;
 }

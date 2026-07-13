@@ -122,14 +122,15 @@ def _make_modal_result_with_timing(base64_data: str | None = None) -> dict:
 # Fake async generator that yields a result with timing
 # ---------------------------------------------------------------------------
 
-async def _fake_run_prompt_stream(workflow=None, input_images=None, result_data: dict | None = None):
+async def _fake_run_prompt_stream(workflow=None, input_images=None, result_data: dict | None = None, **kwargs):
     """Async generator that yields a single result message.
-    Accepts (and ignores) workflow/input_images kwargs that LocalRemoteInvoker passes."""
+    Accepts (and ignores) workflow/input_images/trace/gpu/modal_options/workspace
+    kwargs that LocalRemoteInvoker passes."""
     data = result_data if result_data is not None else _make_modal_result_with_timing()
     yield {"type": "result", "data": data}
 
 
-async def _fake_run_prompt_stream_with_error(message: str = "Remote execution error"):
+async def _fake_run_prompt_stream_with_error(message: str = "Remote execution error", **kwargs):
     """Async generator that yields an error message."""
     yield {"type": "error", "message": message}
 
@@ -318,13 +319,16 @@ class LocalRemoteInvokerTimingExtractionGREEN(unittest.TestCase):
             self.assertNotIn("AAECAw", tp_json,
                              "timing_payload must exclude base64 image data")
 
-            # 4. local_output_materialization_ms must NOT be fabricated.
-            #    The fake trace has no t9b/t10 local timestamps, so the
-            #    only truthful value is absent — never guessed.
+            # 4. local_output_materialization_ms must be present as a
+            #    truthful local observation (derived from local wall-clock
+            #    t8→t10 delta).  Even without browser trace timestamps,
+            #    the local Trace object records truthful wall-clock
+            #    bookmarks for any interval between result receipt and
+            #    output write.
             derived = tp.get("trace", {}).get("derived_ms", {}) or {}
-            self.assertNotIn("local_output_materialization_ms", derived,
-                             "local_output_materialization_ms must not be "
-                             "fabricated when local trace timestamps are absent")
+            self.assertIn("local_output_materialization_ms", derived,
+                          "local_output_materialization_ms must be derived "
+                          "from local wall-clock t8→t10 delta")
 
             # 5. output_paths remain at the top level (separate from timing)
             self.assertIn("output_paths", result,
@@ -410,6 +414,699 @@ class TraceForwardingRED(unittest.TestCase):
             # 6. Output paths must be separate at the top level
             self.assertIn("output_paths", result)
             self.assertIsInstance(result["output_paths"], list)
+
+
+# ---------------------------------------------------------------------------
+# Test 1c: LocalRemoteInvoker awaits injected profile preparer with
+#          fully resolved workflow before calling run_prompt_stream
+# ---------------------------------------------------------------------------
+
+class ProfilePreparerRED(unittest.TestCase):
+    """RED: LocalRemoteInvoker.__init__ must accept an optional
+    ``profile_preparer`` callable.  When set, ``run_cell`` must
+    ``await self._profile_preparer(resolved_workflow, cell)``
+    BEFORE it opens/iterates ``run_prompt_stream``.  The preparer
+    receives the fully resolved workflow (from
+    ``cell["_resolved_workflow"]``).
+
+    Current code has no profile_preparer parameter in __init__
+    and no preparer call in run_cell.
+    """
+
+    def setUp(self):
+        self.runner_mod = _load_module("experiment_runner", "experiment_runner.py")
+
+    def test_init_accepts_profile_preparer_kwarg(self):
+        """LocalRemoteInvoker.__init__ must accept profile_preparer
+        and store it as self._profile_preparer."""
+        with tempfile.TemporaryDirectory() as tmp:
+
+            async def _fake_gen(**kwargs):
+                data = _make_modal_result_with_timing()
+                yield {"type": "result", "data": data}
+
+            preparer = AsyncMock()
+
+            invoker = self.runner_mod.LocalRemoteInvoker(
+                _fake_gen,
+                experiment_id="exp_preparer",
+                node_dir=tmp,
+                profile_preparer=preparer,
+            )
+
+            # ---- RED: profile_preparer must be accepted and stored ----
+            self.assertTrue(
+                hasattr(invoker, "_profile_preparer"),
+                "LocalRemoteInvoker must have _profile_preparer attribute",
+            )
+            self.assertIs(
+                invoker._profile_preparer, preparer,
+                "_profile_preparer must be the injected preparer callable",
+            )
+
+    def test_run_cell_awaits_preparer_before_stream_with_resolved_workflow(self):
+        """When profile_preparer is set, run_cell must await
+        profile_preparer(resolved_workflow, cell) BEFORE starting
+        the run_prompt_stream iteration.  The preparer receives the
+        fully resolved workflow from cell['_resolved_workflow']."""
+        call_order: list[str] = []
+
+        async def _ordered_gen(**kwargs):
+            call_order.append("stream_opened")
+            data = _make_modal_result_with_timing()
+            yield {"type": "result", "data": data}
+
+        async def _preparer(wf, cell):
+            call_order.append("preparer_called")
+            # Verify the workflow is the fully resolved one
+            self.assertEqual(
+                wf.get("3", {}).get("inputs", {}).get("seed"), 99,
+                "Preparer must receive resolved workflow with overrides applied",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            invoker = self.runner_mod.LocalRemoteInvoker(
+                _ordered_gen,
+                experiment_id="exp_preparer_order",
+                node_dir=tmp,
+                profile_preparer=_preparer,
+            )
+
+            cell = {
+                "cell_key": "cell_preparer_order",
+                "_resolved_workflow": {
+                    "3": {"class_type": "KSampler", "inputs": {"seed": 99, "steps": 20}},
+                    "9": {"class_type": "SaveImage", "inputs": {"images": []}},
+                },
+            }
+
+            asyncio.run(invoker.run_cell("w_preparer", cell))
+
+            # ---- RED: preparer must be called before stream is opened ----
+            self.assertGreater(
+                len(call_order), 0,
+                "profile_preparer was never called",
+            )
+            self.assertEqual(
+                call_order[0], "preparer_called",
+                "profile_preparer must be called BEFORE run_prompt_stream "
+                f"is opened. Call order: {call_order}",
+            )
+
+    def test_run_cell_skips_preparer_when_not_set(self):
+        """When no profile_preparer is provided, run_cell must work
+        normally without error (backward compatible)."""
+        async def _fake_gen(**kwargs):
+            data = _make_modal_result_with_timing()
+            yield {"type": "result", "data": data}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            invoker = self.runner_mod.LocalRemoteInvoker(
+                _fake_gen,
+                experiment_id="exp_no_preparer",
+                node_dir=tmp,
+            )
+
+            cell = {
+                "cell_key": "cell_no_preparer",
+                "_resolved_workflow": {
+                    "3": {"class_type": "KSampler", "inputs": {"seed": 42}},
+                },
+            }
+
+            try:
+                result = asyncio.run(invoker.run_cell("w_no_preparer", cell))
+                self.assertIn("status", result,
+                              "Must return a status even without preparer")
+            except Exception as exc:
+                self.fail(
+                    "run_cell must work without profile_preparer. "
+                    f"Got exception: {exc}"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Test 1d: LocalRemoteInvoker forwards captured GPU / modal_options /
+#          workspace identity unchanged to run_prompt_stream
+# ---------------------------------------------------------------------------
+
+class ForwardIdentityKwargsRED(unittest.TestCase):
+    """RED: LocalRemoteInvoker must forward ``gpu``, ``modal_options``,
+    and ``workspace`` captured at init time as unchanged kwargs
+    to ``run_prompt_stream`` (which accepts ``workspace``).
+    The local invoker parameter and forwarded kwarg are both
+    ``workspace``, matching ``modal_client.run_prompt_stream``.
+
+    Current code does not accept or forward any of these three values.
+    """
+
+    def setUp(self):
+        self.runner_mod = _load_module("experiment_runner", "experiment_runner.py")
+
+    def test_init_accepts_gpu_modal_options_workspace(self):
+        """LocalRemoteInvoker.__init__ must accept gpu, modal_options,
+        and workspace kwargs and store them."""
+        captured: dict = {}
+
+        async def _capturing_gen(**kwargs):
+            captured.update(kwargs)
+            data = _make_modal_result_with_timing()
+            yield {"type": "result", "data": data}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            gpu = {"gpu_type": "H100", "count": 1}
+            modal_options = {"cloud": "aws", "region": "us-east-1"}
+            workspace = {"workspace_id": "ws_abc123", "workspace_name": "test-ws"}
+
+            invoker = self.runner_mod.LocalRemoteInvoker(
+                _capturing_gen,
+                experiment_id="exp_fwd",
+                node_dir=tmp,
+                gpu=gpu,
+                modal_options=modal_options,
+                workspace=workspace,
+            )
+
+            # ---- RED: values must be stored on the invoker ----
+            self.assertTrue(
+                hasattr(invoker, "_gpu"),
+                "LocalRemoteInvoker must store _gpu",
+            )
+            self.assertTrue(
+                hasattr(invoker, "_modal_options"),
+                "LocalRemoteInvoker must store _modal_options",
+            )
+            self.assertTrue(
+                hasattr(invoker, "_workspace"),
+                "LocalRemoteInvoker must store _workspace",
+            )
+
+    def test_gpu_forwarded_unchanged_to_run_prompt_stream(self):
+        """The gpu dict captured at init must be forwarded as the 'gpu'
+        kwarg to run_prompt_stream, preserving all keys and values."""
+        captured: dict = {}
+
+        async def _capturing_gen(**kwargs):
+            captured.update(kwargs)
+            data = _make_modal_result_with_timing()
+            yield {"type": "result", "data": data}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            gpu = {"gpu_type": "H100", "count": 1, "memory_gb": 80}
+            invoker = self.runner_mod.LocalRemoteInvoker(
+                _capturing_gen,
+                experiment_id="exp_gpu_fwd",
+                node_dir=tmp,
+                gpu=gpu,
+            )
+
+            cell = {
+                "cell_key": "cell_gpu",
+                "_resolved_workflow": {
+                    "3": {"class_type": "KSampler", "inputs": {"seed": 42}},
+                },
+            }
+            asyncio.run(invoker.run_cell("w_gpu", cell))
+
+            # ---- RED: gpu must be forwarded as kwarg ----
+            self.assertIn(
+                "gpu", captured,
+                "run_prompt_stream must receive 'gpu' kwarg",
+            )
+            self.assertEqual(
+                captured["gpu"], gpu,
+                "gpu kwarg must be the exact dict passed to __init__",
+            )
+
+    def test_modal_options_forwarded_unchanged(self):
+        """The modal_options dict must be forwarded as 'modal_options'
+        kwarg to run_prompt_stream."""
+        captured: dict = {}
+
+        async def _capturing_gen(**kwargs):
+            captured.update(kwargs)
+            data = _make_modal_result_with_timing()
+            yield {"type": "result", "data": data}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            modal_options = {"cloud": "aws", "region": "us-east-1", "container_ttl": 300}
+            invoker = self.runner_mod.LocalRemoteInvoker(
+                _capturing_gen,
+                experiment_id="exp_mo_fwd",
+                node_dir=tmp,
+                modal_options=modal_options,
+            )
+
+            cell = {
+                "cell_key": "cell_mo",
+                "_resolved_workflow": {
+                    "3": {"class_type": "KSampler", "inputs": {"seed": 1}},
+                },
+            }
+            asyncio.run(invoker.run_cell("w_mo", cell))
+
+            # ---- RED: modal_options must be forwarded ----
+            self.assertIn(
+                "modal_options", captured,
+                "run_prompt_stream must receive 'modal_options' kwarg",
+            )
+            self.assertEqual(
+                captured["modal_options"], modal_options,
+                "modal_options kwarg must be unchanged from init value",
+            )
+
+    def test_workspace_forwarded_unchanged(self):
+        """The workspace dict must be forwarded as the 'workspace'
+        kwarg to run_prompt_stream (matching modal_client's param
+        name, not "workspace_identity")."""
+        captured: dict = {}
+
+        async def _capturing_gen(**kwargs):
+            captured.update(kwargs)
+            data = _make_modal_result_with_timing()
+            yield {"type": "result", "data": data}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = {"workspace_id": "ws_abc", "workspace_name": "test"}
+            invoker = self.runner_mod.LocalRemoteInvoker(
+                _capturing_gen,
+                experiment_id="exp_ws_fwd",
+                node_dir=tmp,
+                workspace=workspace,
+            )
+
+            cell = {
+                "cell_key": "cell_ws",
+                "_resolved_workflow": {
+                    "3": {"class_type": "KSampler", "inputs": {"seed": 1}},
+                },
+            }
+            asyncio.run(invoker.run_cell("w_ws", cell))
+
+            # ---- RED: workspace must be forwarded ----
+            self.assertIn(
+                "workspace", captured,
+                "run_prompt_stream must receive 'workspace' kwarg",
+            )
+            self.assertEqual(
+                captured["workspace"], workspace,
+                "workspace kwarg must be unchanged from init value",
+            )
+
+    def test_all_three_forwarded_simultaneously(self):
+        """When all three identity kwargs are provided, all three must
+        appear together in the run_prompt_stream kwargs."""
+        captured: dict = {}
+
+        async def _capturing_gen(**kwargs):
+            captured.update(kwargs)
+            data = _make_modal_result_with_timing()
+            yield {"type": "result", "data": data}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            gpu = {"gpu_type": "A100", "count": 2}
+            modal_options = {"cloud": "gcp", "container_ttl": 600}
+            workspace = {"workspace_id": "ws_xyz", "workspace_name": "prod"}
+
+            invoker = self.runner_mod.LocalRemoteInvoker(
+                _capturing_gen,
+                experiment_id="exp_all_fwd",
+                node_dir=tmp,
+                gpu=gpu,
+                modal_options=modal_options,
+                workspace=workspace,
+            )
+
+            cell = {
+                "cell_key": "cell_all",
+                "_resolved_workflow": {
+                    "3": {"class_type": "KSampler", "inputs": {"seed": 1}},
+                },
+            }
+            asyncio.run(invoker.run_cell("w_all", cell))
+
+            # ---- RED: all three must be in the forwarded kwargs ----
+            self.assertIn("gpu", captured, "gpu kwarg must be forwarded")
+            self.assertIn("modal_options", captured, "modal_options kwarg must be forwarded")
+            self.assertIn("workspace", captured, "workspace kwarg must be forwarded")
+
+            self.assertEqual(captured["gpu"], gpu)
+            self.assertEqual(captured["modal_options"], modal_options)
+            self.assertEqual(captured["workspace"], workspace)
+
+    def test_all_three_default_to_none_when_not_provided(self):
+        """When no identity kwargs are provided, they must default to None
+        and NOT appear in the stream kwargs (backward compatible)."""
+        captured: dict = {}
+
+        async def _capturing_gen(**kwargs):
+            captured.update(kwargs)
+            data = _make_modal_result_with_timing()
+            yield {"type": "result", "data": data}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            invoker = self.runner_mod.LocalRemoteInvoker(
+                _capturing_gen,
+                experiment_id="exp_defaults",
+                node_dir=tmp,
+            )
+
+            cell = {
+                "cell_key": "cell_defaults",
+                "_resolved_workflow": {
+                    "3": {"class_type": "KSampler", "inputs": {"seed": 1}},
+                },
+            }
+            asyncio.run(invoker.run_cell("w_defaults", cell))
+
+            # Identity kwargs must NOT be forwarded when not provided
+            self.assertNotIn("gpu", captured,
+                             "gpu must not be forwarded when not set")
+            self.assertNotIn("modal_options", captured,
+                             "modal_options must not be forwarded when not set")
+            self.assertNotIn("workspace", captured,
+                             "workspace must not be forwarded when not set")
+
+            # Workflow must still be forwarded
+            self.assertIn("workflow", captured,
+                          "workflow kwarg must still be forwarded normally")
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Timing non-overlap — restore_total_ms must not be summed
+#          inside remote execution metrics, and missing values remain
+#          None/unknown
+# ---------------------------------------------------------------------------
+
+class RestoreTimingNonOverlapRED(unittest.TestCase):
+    """RED: The persisted timing must ensure that ``restore_total_ms``
+    is NOT stored inside ``remote_timings`` at all — it belongs as a
+    top-level key only, so that consumers who iterate over
+    ``remote_timings`` values cannot accidentally sum restore time
+    into execution metrics (sampler, inference_total, etc.).
+
+    Missing remote stage values must remain entirely absent from the
+    persisted timing dict (not fabricated as 0 or defaulted from
+    local wall clock).
+
+    Current _schedule_and_start (line 1669) writes
+    ``remote_timings["restore_total_ms"] = restore_total``, placing
+    restore inside the execution breakdown where consumers can
+    inadvertently sum it.
+    """
+
+    def setUp(self):
+        self.adapter = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_restore_total_ms_not_inside_remote_timings(self):
+        """restore_total_ms must appear ONLY at the top level of the
+        persisted timing dict, NOT inside remote_timings.  This
+        prevents consumers from summing restore into execution
+        metrics like inference_total or sampler."""
+        store = _FakeStore()
+        store.append_event({
+            "type": "cell.completed",
+            "payload": {
+                "cell_key": "cell_restore_sep",
+                "checkpoint_id": "ck_restore_sep",
+                "output_paths": ["outputs/restore/img.png"],
+                "attempt_id": "a_restore_sep",
+                "workflow_hash": "wh_restore",
+                "primary_asset_id": "asset_restore",
+                "timing_payload": {
+                    "trace": {
+                        "deltas_ms": {
+                            "clip_load": 1.0,
+                            "clip_encode": 100.0,
+                            "sampler": 500.0,
+                            "vae_decode": 50.0,
+                            "image_io": 20.0,
+                            "inference_total": 671.0,
+                        },
+                        "derived_ms": {},
+                        "stages": {
+                            "t3_modal_entry": 1000000.0,
+                            "t3d_prompt_start": 1001000.0,
+                            "t6_sampler_start": 1005000.0,
+                            "t6_sampler_end": 1005500.0,
+                            "t7_vae_decode_start": 1005600.0,
+                            "t7_vae_decode_end": 1005650.0,
+                            "t8b_outputs_collected": 1005700.0,
+                            "t9_modal_return": 1005900.0,
+                        },
+                        "trace_version": "2.0.0",
+                    },
+                    "_restore_timing": {
+                        "restore_total_ms": 12000.0,
+                        "cuda_warmup_ms": 500.0,
+                        "warmup_preload_ms": 11000.0,
+                        "sage_runtime_ms": 500.0,
+                    },
+                },
+            },
+        })
+
+        history = _FakeHistoryService()
+        exp_id = "exp_restore_nonoverlap"
+        rec = history.record_run(
+            kind="studio_run", prompt_id=exp_id, status="submitted",
+            started_at="2025-01-01T00:00:00Z",
+        )
+        run_history_id = rec["run_id"]
+
+        compilation = {
+            "experiment_id": exp_id,
+            "revision": 1,
+            "run_history_id": run_history_id,
+            "checkpoints": [
+                {
+                    "id": "ck_restore_sep",
+                    "profile_id": "profile_1",
+                    "workflow": {"3": {"class_type": "KSampler", "inputs": {"seed": 42}}},
+                    "slots": {},
+                }
+            ],
+            "cells": [{"cell_key": "cell_restore_sep"}],
+            "studio_meta": {
+                "studio_preset_id": "preset_restore",
+                "studio_snapshot_id": "snap_restore",
+                "studio_feature_id": "txt2img",
+                "studio_controls": {"prompt": "test", "seed": 42},
+            },
+        }
+
+        REGISTRY = _FakeScheduleAndStartRegistry(store=store, history=history)
+
+        asyncio.run(self.adapter._schedule_and_start(
+            exp_id=exp_id,
+            compilation=compilation,
+            REGISTRY=REGISTRY,
+            node_dir=tempfile.mkdtemp(),
+        ))
+
+        persisted_timing = history.get_timing(run_history_id)
+        self.assertIsNotNone(persisted_timing)
+
+        rt = persisted_timing.get("remote_timings", {})
+
+        # ---- RED: restore_total_ms must NOT be inside remote_timings ----
+        # It belongs at the top level of the timing dict only, partitioned
+        # away from execution metrics so consumers never sum it.
+        self.assertNotIn(
+            "restore_total_ms", rt,
+            "remote_timings must NOT contain 'restore_total_ms'. "
+            "Restore timing is a top-level-only key, not an execution metric. "
+            "Remove 'remote_timings[\"restore_total_ms\"] = restore_total' "
+            "from _schedule_and_start in studio_run_adapter.py",
+        )
+
+        # ---- RED: inference_total in remote_timings must be the pure
+        #     remote value, NOT inflated by restore_total_ms ----
+        self.assertIn(
+            "inference_total", rt,
+            "remote_timings must contain 'inference_total'",
+        )
+        inference_val = rt["inference_total"]
+        self.assertEqual(
+            inference_val, 671.0,
+            "inference_total in remote_timings must be exactly 671.0 "
+            "(pure remote execution, no restore summed in)",
+        )
+
+        # ---- RED: sampler in remote_timings must be pure remote value ----
+        self.assertIn(
+            "sampler", rt,
+            "remote_timings must contain 'sampler'",
+        )
+        self.assertEqual(
+            rt["sampler"], 500.0,
+            "sampler in remote_timings must be exactly 500.0 "
+            "(pure remote execution, no restore summed in)",
+        )
+
+        # ---- RED: restore_total_ms must be at the top level, not in remote_timings ----
+        self.assertIn(
+            "restore_total_ms", persisted_timing,
+            "restore_total_ms=12000 must be at the top level of persisted_timing",
+        )
+        self.assertEqual(
+            persisted_timing["restore_total_ms"], 12000.0,
+            "top-level restore_total_ms must be 12000.0",
+        )
+
+        # ---- RED: inference_total must be LESS than restore_total_ms ----
+        # If restore=12000 were incorrectly summed into inference,
+        # inference would be ~12671.  The pure remote inference is 671.
+        self.assertLess(
+            inference_val, 12000,
+            "inference_total must be less than restore_total_ms. "
+            "If restore=12000 were summed into inference, inference "
+            f"would be ~12671, not {inference_val}",
+        )
+
+    def test_missing_remote_stage_values_are_none_not_zero(self):
+        """When a remote delta is absent from the trace (e.g. vae_decode
+        was never recorded), the corresponding canonical alias must not
+        be present at all (or be explicitly None), not defaulted to 0
+        or fabricated from local wall clock."""
+        store = _FakeStore()
+        # Only clip_load and sampler are present; vae_decode, image_io
+        # are deliberately absent.
+        store.append_event({
+            "type": "cell.completed",
+            "payload": {
+                "cell_key": "cell_missing_stages",
+                "checkpoint_id": "ck_missing_stages",
+                "output_paths": ["outputs/missing/img.png"],
+                "attempt_id": "a_missing_stages",
+                "workflow_hash": "wh_missing",
+                "primary_asset_id": "asset_missing",
+                "timing_payload": {
+                    "trace": {
+                        "deltas_ms": {
+                            "clip_load": 2.0,
+                            "sampler": 300.0,
+                        },
+                        "derived_ms": {},
+                        "stages": {
+                            "t3_modal_entry": 1000000.0,
+                            "t9_modal_return": 1002000.0,
+                        },
+                        "trace_version": "2.0.0",
+                    },
+                    "_restore_timing": {},
+                },
+            },
+        })
+
+        history = _FakeHistoryService()
+        exp_id = "exp_missing_stages"
+        rec = history.record_run(
+            kind="studio_run", prompt_id=exp_id, status="submitted",
+            started_at="2025-01-01T00:00:00Z",
+        )
+        run_history_id = rec["run_id"]
+
+        compilation = {
+            "experiment_id": exp_id,
+            "revision": 1,
+            "run_history_id": run_history_id,
+            "checkpoints": [
+                {
+                    "id": "ck_missing_stages",
+                    "profile_id": "profile_1",
+                    "workflow": {"3": {"class_type": "KSampler", "inputs": {"seed": 42}}},
+                    "slots": {},
+                }
+            ],
+            "cells": [{"cell_key": "cell_missing_stages"}],
+            "studio_meta": {
+                "studio_preset_id": "preset_missing",
+                "studio_snapshot_id": "snap_missing",
+                "studio_feature_id": "txt2img",
+                "studio_controls": {"prompt": "test", "seed": 42},
+            },
+        }
+
+        REGISTRY = _FakeScheduleAndStartRegistry(store=store, history=history)
+
+        asyncio.run(self.adapter._schedule_and_start(
+            exp_id=exp_id,
+            compilation=compilation,
+            REGISTRY=REGISTRY,
+            node_dir=tempfile.mkdtemp(),
+        ))
+
+        persisted_timing = history.get_timing(run_history_id)
+        self.assertIsNotNone(persisted_timing)
+
+        # ---- RED: present deltas must have their canonical aliases ----
+        self.assertEqual(
+            persisted_timing.get("clip_load_ms"), 2.0,
+            "clip_load_ms=2.0 must be present (delta existed)",
+        )
+        self.assertEqual(
+            persisted_timing.get("sampling_ms"), 300.0,
+            "sampling_ms=300.0 must be present (delta existed)",
+        )
+
+        # ---- RED: absent deltas must NOT have canonical aliases ----
+        # vae_decode_ms was absent from the trace — must NOT be written
+        # as 0 or any other fabricated value.
+        self.assertNotIn(
+            "vae_decode_ms", persisted_timing,
+            "vae_decode_ms must not be present when remote delta absent",
+        )
+        # clip_encode_ms was absent — must NOT be written
+        self.assertNotIn(
+            "clip_encode_ms", persisted_timing,
+            "clip_encode_ms must not be present when remote delta absent",
+        )
+        # image_io_ms was absent — must NOT be written
+        self.assertNotIn(
+            "image_io_ms", persisted_timing,
+            "image_io_ms must not be present when remote delta absent",
+        )
+
+        # ---- RED: remote_inference_total_ms must also be absent ----
+        # inference_total was not in the deltas at all (only clip_load
+        # and sampler were provided).
+        self.assertNotIn(
+            "remote_inference_total_ms", persisted_timing,
+            "remote_inference_total_ms must not be present when "
+            "inference_total delta is absent",
+        )
+
+        # ---- RED: restored_total_ms must not be fabricated ----
+        # _restore_timing was empty object — restore_total_ms absent
+        self.assertNotIn(
+            "restore_total_ms", persisted_timing,
+            "restore_total_ms must not be present when "
+            "_restore_timing.restore_total_ms is absent",
+        )
+
+        # ---- RED: remote_timings must contain only deltas that existed ----
+        rt = persisted_timing.get("remote_timings", {})
+        self.assertIn("clip_load", rt, "remote_timings must have clip_load")
+        self.assertIn("sampler", rt, "remote_timings must have sampler")
+        self.assertNotIn(
+            "vae_decode", rt,
+            "remote_timings must not contain vae_decode when delta absent",
+        )
+        self.assertNotIn(
+            "clip_encode", rt,
+            "remote_timings must not contain clip_encode when delta absent",
+        )
+        self.assertNotIn(
+            "inference_total", rt,
+            "remote_timings must not contain inference_total when delta absent",
+        )
+
+        # ---- RED: trace_available flag must be true (timing_payload existed) ----
+        self.assertTrue(
+            persisted_timing.get("trace_available", False),
+            "trace_available must be True when timing_payload was present",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -751,10 +1448,15 @@ class StudioFinalizationTimingPersistenceRED(unittest.TestCase):
                                  "timing_sources['studio_queue_ms'] must exist")
             self.assertIn(src_queue, _allowed_sources)
 
-            # raw remote_timings still intact
+            # raw remote_timings still intact (but restore_total_ms is
+            # top-level-only, NOT inside remote_timings)
             self.assertIn("remote_timings", persisted_timing)
             self.assertEqual(rt.get("clip_load"), 1200.0)
-            self.assertEqual(rt.get("restore_total_ms"), 5200.0)
+            self.assertNotIn("restore_total_ms", rt,
+                             "restore_total_ms must NOT be inside remote_timings")
+            self.assertEqual(persisted_timing.get("restore_total_ms"), 5200.0,
+                             "restore_total_ms must be at top level")
+            self.assertEqual(persisted_timing.get("remote_restore_ms"), 5200.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1265,6 +1967,8 @@ class JsNormalizerBehavioralRED(unittest.TestCase):
                 "sampler": 6400,
                 "inference_total": 22000,
             },
+            # No individual child deltas — Request Execution parent
+            # should appear.
         }
 
         stages = self._run_normalizer(test_input)
@@ -1281,12 +1985,13 @@ class JsNormalizerBehavioralRED(unittest.TestCase):
         self.assertEqual(sampling_stages[0].get("durationMs"), 6400,
                          "Sampling stage must show 6400ms (remote value)")
 
-        # 2. A "Remote Inference Total" stage must exist with durationMs=22000
-        remote_inference_stages = [s for s in stages if s.get("label") == "Remote Inference Total"]
-        self.assertGreater(len(remote_inference_stages), 0,
-                           "Must have a 'Remote Inference Total' stage")
-        self.assertEqual(remote_inference_stages[0].get("durationMs"), 22000,
-                         "Remote Inference Total must show 22000ms")
+        # 2. Since individual children (sampling) exist, the overlapping
+        # parent "Request Execution" should NOT appear (non-additive).
+        # Instead the children are rendered individually.
+        req_exec_stages = [s for s in stages if s.get("label") in ("Request Execution", "Remote Inference Total")]
+        self.assertEqual(len(req_exec_stages), 0,
+                         "'Request Execution' parent must NOT appear when "
+                         "child stages (Sampling, etc.) are present")
 
         # 3. "End-to-End Total" must appear exactly once
         e2e_stages = [s for s in stages if s.get("label") == "End-to-End Total"]
@@ -1297,7 +2002,7 @@ class JsNormalizerBehavioralRED(unittest.TestCase):
 
         # 4. No stage may have a label containing "Generation"
         _disallowed_37000 = frozenset({"Sampling", "legacy Generation"})
-        _allowed_37000 = frozenset({"Scheduler Execution", "Scheduler Execution (local wall clock)", "End-to-End Total"})
+        _allowed_37000 = frozenset({"Scheduler Execution", "Scheduler Execution (local wall)", "Scheduler Execution (local wall clock)", "End-to-End Total"})
         for s in stages:
             label = s.get("label", "")
             self.assertNotIn("Generation", label,

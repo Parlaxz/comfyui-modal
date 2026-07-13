@@ -82,6 +82,7 @@ from production_workflow import (
     compile_production_workflow,
 )
 import experiment_setup_adapter as _experiment_setup_adapter
+from warmup_profile import prepare_active_next_profile as prepare_active_next_profile
 from comparison import (
     create_profile,
     update_profile,
@@ -2020,32 +2021,9 @@ def _compute_stable_warmup_profile_key(warmup_profile: dict) -> str:
 
 
 def _build_next_warmup_activation(workflow: dict, workflow_hash: str, production_options: dict | None = None) -> dict:
-    stack = extract_warmup_stack(workflow) if isinstance(workflow, dict) else {}
-    profile = stack_to_warmup_profile(stack)
-    # Normalize: collapse duplicate CLIP entries
-    if profile and isinstance(profile, dict):
-        _p = dict(profile)
-        if _p.get("clip2") == _p.get("clip1"):
-            _p["clip2"] = ""
-        profile = _p
-    now = time.time()
-    payload = {
-        "profile_token": str(uuid.uuid4()),
-        "validation_token": str(uuid.uuid4()),
-        "workflow_hash": workflow_hash,
-        "created_at": now,
-        "expires_at": now + _ACTIVE_NEXT_PROFILE_TTL_S,
-        "mode": profile.get("mode", "none") if profile else "none",
-        "model_stack": stack,
-        "warmup_profile": profile,
-        "disable_warmup": not bool(profile),
-        "selected_at": None,
-        "preflight_validated": True,
-    }
-    if production_options and production_options.get("enabled"):
-        payload["production_enabled"] = True
-        payload["production_profile_version"] = 1
-    return payload
+    """Compatibility wrapper delegating to ``warmup_profile._build_activation_payload``."""
+    from warmup_profile import build_activation_payload
+    return build_activation_payload(workflow, workflow_hash, production_options)
 
 
 async def _execute_job(item: tuple, item_id: int):
@@ -2154,155 +2132,33 @@ async def _execute_job(item: tuple, item_id: int):
         invocation_plan = _build_generation_invocation_plan(extra_data.get("gpu"), stream=True)
         _log_generation_invocation_plan(prompt_id, invocation_plan)
 
-        # ── Active-next warmup profile (compact, skip if unchanged) ──
+        # ── Active-next warmup profile via shared helper ──
         _active_next_write_start = time.time()
-        _active_next_payload_bytes = 0
-        _active_next_status = "skipped"
-        _active_next_changed = False
-        _active_next_remote_call = 0
-        if not os.environ.get("DISABLE_ACTIVE_NEXT_WRITE"):
-            _modal_options_for_prod = extra_data.get("modal_options", {}) or {}
-            _production_options_for_activation = _modal_options_for_prod.get("production", {})
-            if not isinstance(_production_options_for_activation, dict):
-                _production_options_for_activation = {}
-            activation_payload = _build_next_warmup_activation(execution_workflow, prompt_hash, _production_options_for_activation)
-            _active_next_payload_bytes = len(json.dumps(activation_payload, separators=(",", ":")))
-            # Compute stable profile key from only restore-relevant fields
-            _warmup_profile = activation_payload.get("warmup_profile", {})
-            _model_stack = activation_payload.get("model_stack", {})
-            _stable_key = _compute_stable_warmup_profile_key(_warmup_profile)
-            # P2: fold the safe prompt-bundle hash into the dedup key
-            # whenever EITHER exact-prompt prefill OR persistent-clip
-            # cache is enabled.  Both features depend on the bundle
-            # being attached to the activation payload.  If only
-            # COMFYMODAL_PERSISTENT_CLIP_CACHE=1 is set and we did
-            # not extract the bundle here, the restore lookup and
-            # the candidate builder would silently find nothing.
-            _prompt_bundle_hash = ""
-            _exact_or_persistent = (
-                os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "1") == "1"
-                or os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1"
-            )
-            # Per audit round 7 — exact prefill local diagnostic
-            _local_ep = os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "1") == "1"
+        _modal_options_for_prod = extra_data.get("modal_options", {}) or {}
+        _production_options_for_activation = _modal_options_for_prod.get("production", {})
+        if not isinstance(_production_options_for_activation, dict):
+            _production_options_for_activation = {}
+        _wn_result = await prepare_active_next_profile(
+            execution_workflow,
+            prompt_hash,
+            production_options=_production_options_for_activation,
+            workspace=_request_workspace,
+            setter=set_active_warmup_profile,
+        )
+        _active_next_payload_bytes = _wn_result.get("payload_bytes", 0)
+        _active_next_status = _wn_result.get("status", "skipped")
+        _active_next_changed = _wn_result.get("changed", False)
+        _active_next_remote_call = _wn_result.get("remote_call", 0)
+        _active_next_profile_key = _wn_result.get("profile_key", "")
+        _active_next_elapsed = round((time.time() - _active_next_write_start) * 1000, 1)
+        if _active_next_status not in ("skipped", "unchanged"):
             print(
-                f"[exact_prefill.local] enabled={int(_local_ep)} "
-                f"source=env "
-                f"prompt_id={prompt_id[:8]}"
+                f"[comfyui-modal.profile] stage=active_profile_write prompt_id={prompt_id[:8]} "
+                f"decision={_active_next_status} profile_key={_active_next_profile_key} "
+                f"remote_call={_active_next_remote_call} "
+                f"status={_active_next_status} changed={_active_next_changed} "
+                f"bytes={_active_next_payload_bytes} ms={_active_next_elapsed}"
             )
-            if not _exact_or_persistent:
-                print(
-                    f"[exact_prefill.bundle] enabled=1 eligible=0 "
-                    f"prompt_id={prompt_id[:8]} "
-                    f"reason=neither_exact_clip_prefill_nor_persistent_clip_cache_enabled"
-                )
-            else:
-                try:
-                    from optimizations import extract_safe_prompt_bundle
-                    _bundle_res = extract_safe_prompt_bundle(execution_workflow)
-                    if _bundle_res.get("eligible") and _bundle_res.get("bundle"):
-                        _prompt_bundle_hash = str(
-                            _bundle_res["bundle"].get("bundle_hash", "")
-                        )
-                        activation_payload["prompt_bundle"] = _bundle_res["bundle"]
-                        _encode_count = len(_bundle_res['bundle'].get('encodes', []))
-                        _short_hash = _prompt_bundle_hash[:16]
-                        print(
-                            f"[exact_prefill.bundle] enabled=1 eligible=1 "
-                            f"prompt_id={prompt_id[:8]} "
-                            f"reason=ok "
-                            f"encode_count={_encode_count} "
-                            f"hash={_short_hash}"
-                        )
-                    else:
-                        _reason = _bundle_res.get('reason', '?')
-                        print(
-                            f"[exact_prefill.bundle] enabled=1 eligible=0 "
-                            f"prompt_id={prompt_id[:8]} "
-                            f"reason={_reason}"
-                        )
-                except Exception as _bundle_exc:
-                    print(
-                        f"[exact_prefill.bundle] enabled=1 eligible=0 "
-                        f"prompt_id={prompt_id[:8]} "
-                        f"reason=extraction_exception error={_bundle_exc}"
-                    )
-            if _prompt_bundle_hash:
-                _stable_key = hashlib.sha256(
-                    (_stable_key + ":" + _prompt_bundle_hash).encode("utf-8")
-                ).hexdigest()
-            # Per audit round 7: skip the remote write only when
-            # the stable key matches AND the last write is still
-            # comfortably within the remote TTL.  Without the
-            # timestamp check, the local bridge would silently
-            # skip writes after the first request, the remote
-            # profile would eventually expire, and exact-prefill
-            # and persistent-cache would stop working until the
-            # prompt changed.
-            # Per audit round 7: fix small-TTL handling.  Ensure
-            # refresh always occurs before the remote TTL expires.
-            _effective_ttl_s = max(2.0, float(_ACTIVE_NEXT_PROFILE_TTL_S))
-            _refresh_after_s = min(
-                _effective_ttl_s * 0.5,
-                _effective_ttl_s - 1.0,
-            )
-            _refresh_after_s = max(1.0, _refresh_after_s)
-            # Per audit round 7: dedup state is keyed by
-            # (workspace_id, stable_key) so Workspace A's write
-            # never suppresses Workspace B's.
-            _ws_id = _ws_id_for_active_next(_request_workspace)
-            _dedup_key = (_ws_id, _stable_key)
-            # Prune stale entries older than 2x TTL so the dict
-            # does not grow unbounded across many different prompts.
-            if len(_last_written_stable_profile) > 100:
-                _cutoff = time.time() - _effective_ttl_s * 2
-                _last_written_stable_profile = {
-                    k: v for k, v in _last_written_stable_profile.items()
-                    if v >= _cutoff
-                }
-            _last_write_ts = _last_written_stable_profile.get(_dedup_key, 0.0)
-            _can_skip_active_next = (
-                _last_write_ts > 0.0
-                and (time.time() - _last_write_ts) < _refresh_after_s
-            )
-            if _can_skip_active_next:
-                _active_next_status = "unchanged"
-                print(
-                    f"[comfyui-modal.profile] stage=active_profile_write prompt_id={prompt_id[:8]} "
-                    f"decision=unchanged workspace_id={_ws_id[:12]} profile_key={_stable_key[:12]} remote_call=0 "
-                    f"reason=key_match_within_refresh_window"
-                )
-            else:
-                _active_next_remote_call = 1
-                try:
-                    activation_result = await set_active_warmup_profile(
-                        activation_payload,
-                        workspace=_request_workspace or None,
-                    )
-                    _active_next_status = activation_result.get("status", "written")
-                    _active_next_changed = activation_result.get("changed", True)
-                    if _active_next_status not in ("error",):
-                        _last_written_stable_profile[_dedup_key] = time.time()
-                    print(
-                        f"[comfyui-modal.profile] stage=active_profile_write prompt_id={prompt_id[:8]} "
-                        f"decision=changed profile_key={_stable_key[:12]} remote_call=1 "
-                        f"status={_active_next_status} changed={_active_next_changed} bytes={_active_next_payload_bytes}"
-                    )
-                    # Active-next profile write — prompt bundle diagnostic
-                    _bundle_aw = activation_payload.get("prompt_bundle")
-                    if isinstance(_bundle_aw, dict) and _bundle_aw.get("encodes"):
-                        _bw_hash = str(_bundle_aw.get("bundle_hash", ""))[:16]
-                        print(
-                            f"[exact_prefill.active_next_write] bundle_present=1 "
-                            f"bundle_hash={_bw_hash} "
-                            f"encode_count={len(_bundle_aw['encodes'])} "
-                            f"workspace={_ws_id[:12]}"
-                        )
-                except Exception as exc:
-                    _active_next_status = "error"
-                    print(f"[comfyui-modal] active profile write failed: {exc}")
-        else:
-            print(f"[comfyui-modal] active_next_write SKIPPED (DISABLE_ACTIVE_NEXT_WRITE=1)")
 
         remote_started = time.time()
         # ── v2.16.20: Wait for prompt acknowledgment before forwarding events ──
@@ -6282,7 +6138,18 @@ if _server:
                     browser_trace = recognized if recognized else {}
                 else:
                     browser_trace = {}
-            result = handle_studio_run(preset_id, feature_id, controls, _NODE_DIR, trace_ctx=browser_trace)
+            # Capture workspace synchronously at dispatch time so the
+            # same workspace is used throughout the request (never re-resolved).
+            _studio_ws = _active_workspace() or {}
+            _studio_gpu = (body or {}).get("gpu")
+            _studio_mo = (body or {}).get("modal_options")
+            result = handle_studio_run(
+                preset_id, feature_id, controls, _NODE_DIR,
+                trace_ctx=browser_trace,
+                gpu=_studio_gpu,
+                modal_options=_studio_mo,
+                workspace=_studio_ws,
+            )
             status_code = 200 if result.get("status") == "ok" else 400
             return web.json_response(result, status=status_code)
         except Exception:

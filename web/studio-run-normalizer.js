@@ -127,30 +127,73 @@ export function normalizeTimingStages(timings) {
     return null;
   }
 
-  // ── Canonical stage order (each stage added at most once) ──────────
+  // ── Canonical stage order (non-additive hierarchy) ─────────────────
+  //
+  // Parent stages (End-to-End Total, Remote Invocation Setup, Request
+  // Execution, Scheduler Execution) are NOT summed with their children;
+  // they represent overlapping intervals.  The UI must display them as
+  // parent-level entries that encompass but do not add to the total.
+  //
+  // Remote Inference Total is rendered ONLY when no individual model
+  // child timings exist; otherwise the child stages (Model Load, Prompt
+  // Encoding, Sampling, VAE Decode, Image I/O) are shown individually
+  // and the overlapping parent is suppressed.
 
   // 1. End-to-End Total
-  // NOTE: inference_total is excluded here to avoid conflict with
-  // Remote Inference Total stage — it belongs to that stage, not E2E.
   var e2e = firstValue("end_to_end_total_ms", "modal_to_browser");
   if (e2e) addStage("End-to-End Total", e2e.value, e2e.source);
 
-  // 2. Queue / Local Preparation
-  // Prefer new-run studio_queue_ms, fall back to legacy queue_ms / t0_to_t1
+  // 2. Local Preparation (from studio_queue / local markers)
   var queue = firstValue("studio_queue_ms", "queue_ms", "t0_to_t1");
-  if (queue) addStage("Queue / Local Preparation", queue.value, queue.source);
+  if (queue) addStage("Local Preparation", queue.value, queue.source);
 
-  // 3. Modal Cold Start / Restore
+  // 3. Remote Invocation Setup (handle lookup + generator creation)
+  // Derived from trace markers when present.
+  var _hl_end = firstValue("modal_handle_lookup_completed");
+  var _hl_start = firstValue("modal_handle_lookup_started");
+  var _gc_end = firstValue("remote_generator_create_completed");
+  var _gc_start = firstValue("remote_generator_create_started");
+  var _setup_ms = null;
+  var _setup_src = null;
+  if (_hl_start && _hl_end) {
+    _setup_ms = _hl_end.value - _hl_start.value;
+    _setup_src = "modal_handle_lookup";
+  }
+  if (_gc_start && _gc_end) {
+    var _gc_delta = _gc_end.value - _gc_start.value;
+    if (_gc_delta > 0) {
+      _setup_ms = _setup_ms != null ? _setup_ms + _gc_delta : _gc_delta;
+      _setup_src = _setup_src ? _setup_src + "+remote_generator_create" : "remote_generator_create";
+    }
+  }
+  if (_setup_ms != null && _setup_ms > 0) {
+    addStage("Remote Invocation Setup", Math.round(_setup_ms), _setup_src);
+  }
+
+  // 4. Platform Pre-Restore (inferred, cross-process)
+  var ppr = firstValue("platform_pre_restore_ms");
+  if (ppr) addStage("Platform Pre-Restore (inferred)", ppr.value, ppr.source);
+
+  // 5. Snapshot / Runtime Restore
   var restore = firstValue("restore_total_ms");
-  if (restore) addStage("Modal Cold Start / Restore", restore.value, restore.source);
+  if (restore) addStage("Snapshot / Runtime Restore", restore.value, restore.source);
 
-  // 4. Validation
-  var validation = firstValue("workflow_validation_ms", "t3_to_t3b");
-  if (validation) addStage("Validation", validation.value, validation.source);
+  // 6. Request Execution (parent, non-additive) — only if no child
+  //    model timings exist.  If individual deltas like sampler,
+  //    clip_encode, etc. are available, show children instead.
+  var _hasChildren = (
+    firstValue("clip_load_ms", "clip_load") ||
+    firstValue("clip_encode_ms", "clip_encode") ||
+    firstValue("sampling_ms", "sampler") ||
+    firstValue("vae_decode_ms", "vae_decode") ||
+    firstValue("image_io_ms", "image_io")
+  );
+  if (!_hasChildren) {
+    var reqExec = firstValue("remote_inference_total_ms", "inference_total");
+    if (reqExec) addStage("Request Execution", reqExec.value, reqExec.source);
+  }
 
-  // 5. Model / CLIP Load
-  // Priority: 1) explicit model_load_ms, 2) max of unet_load_ms / vae_load_ms /
-  // clip_load_ms (parallel load windows, not sum), 3) legacy clip_load.
+  // 7. Model / CLIP Load (child)
   var modelMs = d.model_load_ms != null ? d.model_load_ms : timings.model_load_ms;
   if (modelMs != null) {
     if (modelMs > 0) addStage("Model / CLIP Load", modelMs, "model_load_ms");
@@ -174,19 +217,19 @@ export function normalizeTimingStages(timings) {
     }
   }
 
-  // 6. Prompt Encoding
+  // 8. Prompt Encoding (child)
   var pe = firstValue("clip_encode_ms", "clip_encode");
   if (pe) addStage("Prompt Encoding", pe.value, pe.source);
 
-  // 7. Sampling
+  // 9. Sampling (child)
   var samp = firstValue("sampling_ms", "sampler");
   if (samp) addStage("Sampling", samp.value, samp.source);
 
-  // 8. VAE Decode
+  // 10. VAE Decode (child)
   var vae = firstValue("vae_decode_ms", "vae_decode");
   if (vae) addStage("VAE Decode", vae.value, vae.source);
 
-  // 9. Image / Output I/O (combined canonical, then legacy)
+  // 11. Image / Output I/O (child, combined canonical, then legacy)
   var ioMs = d.image_io_ms != null ? d.image_io_ms : timings.image_io_ms;
   var outMs = d.output_transfer_ms != null ? d.output_transfer_ms : timings.output_transfer_ms;
   if (ioMs != null || outMs != null) {
@@ -197,22 +240,14 @@ export function normalizeTimingStages(timings) {
     if (legacyIo) addStage("Image / Output I/O", legacyIo.value, legacyIo.source);
   }
 
-  // 10. Remote Inference Total (total of remote inference pipeline;
-  // distinct from End-to-End which includes local overhead)
-  var remoteInf = firstValue("remote_inference_total_ms", "inference_total");
-  if (remoteInf) addStage("Remote Inference Total", remoteInf.value, remoteInf.source);
-
-  // 11. Local Materialization
-  // Prefer local_output_materialization_ms (derived by LocalRemoteInvoker),
-  // fall back to legacy history_finalization_ms.
+  // 12. Output Delivery (local materialization wall time)
   var lm = firstValue("local_output_materialization_ms", "history_finalization_ms");
-  if (lm) addStage("Local Materialization", lm.value, lm.source);
+  if (lm) addStage("Output Delivery", lm.value, lm.source);
 
-  // 11. Scheduler Execution (local wall clock)
-  // Prefer canonical, fall back to legacy generation_ms
+  // 13. Scheduler Execution (local wall, parent/non-additive)
   var se = firstValue("scheduler_execution_ms");
   if (se) {
-    addStage("Scheduler Execution (local wall clock)", se.value, se.source);
+    addStage("Scheduler Execution (local wall)", se.value, se.source);
   } else {
     var legacyGen = firstValue("generation_ms");
     if (legacyGen) {
@@ -220,26 +255,21 @@ export function normalizeTimingStages(timings) {
     }
   }
 
-  // ── Fallback cold start from trace (only if no restore_total_ms) ──
-  if (!stages.some(function (s) { return s.label === "Modal Cold Start / Restore"; })) {
-    var cs = firstValue("t2_to_t3");
-    if (cs) addStage("Modal Cold Start / Restore", cs.value, cs.source);
-  }
-
   // ── Sort in canonical order ────────────────────────────────────────
   var order = [
     "End-to-End Total",
-    "Queue / Local Preparation",
-    "Modal Cold Start / Restore",
-    "Validation",
+    "Local Preparation",
+    "Remote Invocation Setup",
+    "Platform Pre-Restore (inferred)",
+    "Snapshot / Runtime Restore",
+    "Request Execution",
     "Model / CLIP Load",
     "Prompt Encoding",
     "Sampling",
     "VAE Decode",
     "Image / Output I/O",
-    "Remote Inference Total",
-    "Local Materialization",
-    "Scheduler Execution (local wall clock)",
+    "Output Delivery",
+    "Scheduler Execution (local wall)",
     "Legacy scheduler wall time",
   ];
   stages.sort(function (a, b) {

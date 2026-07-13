@@ -13,11 +13,7 @@ import {
 } from "./studio-experiment-mode.js";
 import { getRuntimePresets } from "./studio-backend.js";
 import { runStudioPreset, getStudioRunStatus } from "./studio-backend-api.js";
-import {
-  canRunExperiment,
-  getExperimentDisabledReason,
-  executeExperimentRun,
-} from "./studio-experiment-mode.js";
+
 import {
   getVisibleControlsForPreset,
   getPresetCapabilitySummary,
@@ -269,37 +265,19 @@ function getCurrentPresetForSelection(state, presetId) {
 function hydrateControlsForSelection(state, presetId, featureId, preset) {
   if (!state.playground) return;
 
-  // Priority: persisted draft > latest successful controls (same preset+feature) > preset.defaults > definition default
-  // Own-property checks (hasOwnProperty / in operator) preserve 0 and false.
-
-  // 1. Persisted draft (user edits)
+  // A persisted draft contains explicit user edits — load into
+  // `state.playground.controls` (which buildEffectiveControls serialises)
+  // rather than _hydratedControls (display-only).
   const draft = presetId && featureId ? loadControlDraft(presetId, featureId) : {};
   if (draft && typeof draft === "object" && Object.keys(draft).length > 0) {
-    state.playground._hydratedControls = draft;
+    state.playground.controls = draft;
+    state.playground._hydratedControls = {};
     return;
   }
 
-  // 2. Latest successful controls from _selectedRun (same preset+feature)
-  const selectedRun = state.playground._selectedRun;
-  if (selectedRun && typeof selectedRun === "object") {
-    const rc = selectedRun.resolvedControls || selectedRun.requestedControls || {};
-    const sameFeature = selectedRun.featureId === featureId;
-    const samePreset = selectedRun.presetId === presetId;
-    if (sameFeature && samePreset && typeof rc === "object" && Object.keys(rc).length > 0) {
-      const fromRun = {};
-      for (const key in rc) {
-        if (Object.prototype.hasOwnProperty.call(rc, key)) {
-          fromRun[key] = rc[key];
-        }
-      }
-      if (Object.keys(fromRun).length > 0) {
-        state.playground._hydratedControls = fromRun;
-        return;
-      }
-    }
-  }
-
-  // 3. Merged: definition defaults + preset defaults (preset wins, own-property checks)
+  // No draft: build display-only hydrated values from preset defaults
+  // and definition defaults (CONTROL_DEFS).  Do NOT carry resolved
+  // controls from a previous successful run forward as implicit overrides.
   const presetDefaults = (preset && preset.defaults) || {};
   const merged = {};
 
@@ -321,19 +299,15 @@ function hydrateControlsForSelection(state, presetId, featureId, preset) {
 }
 
 function buildEffectiveControls(state, preset, currentFeatureId) {
-  const presetDefaults = (preset && preset.defaults) || {};
   const userOverrides = (state.playground && state.playground.controls) || {};
-  const hydratedValues = (state.playground && state.playground._hydratedControls) || {};
   const visibleIds = getVisibleControlsForPreset(preset, currentFeatureId);
   const controls = {};
-  visibleIds.forEach(function (ctrlId) {
-    // Priority: user override > hydrated value > preset default
-    if (ctrlId in userOverrides) {
+  // Only serialize explicit user edits.  Hydrated / preset-default values
+  // are display-only — sending them would override the backend's defaults
+  // with stale values the user never explicitly confirmed.
+  Object.keys(userOverrides).forEach(function (ctrlId) {
+    if (visibleIds.indexOf(ctrlId) !== -1) {
       controls[ctrlId] = userOverrides[ctrlId];
-    } else if (ctrlId in hydratedValues) {
-      controls[ctrlId] = hydratedValues[ctrlId];
-    } else if (ctrlId in presetDefaults) {
-      controls[ctrlId] = presetDefaults[ctrlId];
     }
   });
   return controls;
@@ -577,18 +551,12 @@ function renderControlPanel(state, context) {
   }));
 
   const selectedPresetId = state.playground && state.playground.selectedBackendId;
-  const currentDraft = selectedPresetId
-    ? loadControlDraft(selectedPresetId, currentFeatureId)
-    : {};
-  if (selectedPresetId && currentDraft && Object.keys(currentDraft).length > 0) {
-    const draft = currentDraft;
-    state.playground._hydratedControls = draft;
-  } else if (selectedPresetId) {
+  if (selectedPresetId) {
     const currentPreset = getCurrentPresetForSelection(state, selectedPresetId);
     if (currentPreset) {
       hydrateControlsForSelection(state, selectedPresetId, currentFeatureId, currentPreset);
     }
-  } else if (!selectedPresetId) {
+  } else {
     state.playground._hydratedControls = {};
   }
 
@@ -714,7 +682,7 @@ function renderControlPanel(state, context) {
   panel.appendChild(controlsContainer);
 
   // ── Run Button ─────────────────────────────────────────────────────
-  panel.appendChild(renderRunButton(state, context, actions, isExperiment));
+  panel.appendChild(renderRunButton(state, context, actions));
 
   // Reset to defaults link
   const resetLink = el("button", {
@@ -818,7 +786,7 @@ function buildActions(state, context) {
       state.playground._draftSaveTimer = setTimeout(function () {
         const controls = activePreset
           ? buildEffectiveControls(state, activePreset, featureId)
-          : Object.assign({}, loadControlDraft(presetId, featureId), state.playground._hydratedControls || {}, state.playground.controls || {});
+          : Object.assign({}, state.playground.controls || {});
         saveControlDraft(presetId, featureId, controls);
       }, 300);
       // Clear stale terminal run state so Run button re-enables on control
@@ -879,8 +847,20 @@ function buildActions(state, context) {
       if (!state.playground.experimentAxes[ctrlId]) {
         state.playground.experimentAxes[ctrlId] = { enabled: true, values: [] };
       }
-      state.playground.experimentAxes[ctrlId].values = values;
+      const prevLen = (state.playground.experimentAxes[ctrlId].values || []).length;
+      // Parse numeric strings to numbers so backend integer schema
+      // validation (isinstance(value, int)) accepts them.  Axis values
+      // come from DOM input.value which is always a string.
+      state.playground.experimentAxes[ctrlId].values = values.map(function (v) {
+        if (typeof v === "string" && v.trim() !== "" && !isNaN(Number(v))) return Number(v);
+        return v;
+      });
       state.playground.experimentAxes[ctrlId].enabled = true;
+      // Re-render when value count changes (add/remove), but NOT on every
+      // keystroke — that would thrash the UI during text input.
+      if (values.length !== prevLen && context && context.setPage) {
+        context.setPage("playground");
+      }
     },
     navigateToLegacySetup() {
       if (context && context.setPage) {
@@ -1508,11 +1488,11 @@ async function doRunSubmit(state, context, actions) {
   }
 }
 
-function renderRunButton(state, context, actions, isExperiment) {
+function renderRunButton(state, context, actions) {
   const container = el("div", { class: "comfymodal-studio-run-section" });
 
-  const btnText = isExperiment ? "Run Experiment" : "Run";
-  const testId = isExperiment ? "run-experiment-btn" : "run-btn";
+  const btnText = "Run";
+  const testId = "run-btn";
   const btn = el("button", {
     class: "comfymodal-primary-btn",
     disabled: true,
@@ -1674,60 +1654,8 @@ function renderRunButton(state, context, actions, isExperiment) {
       return;
     }
 
-    if (isExperiment) {
-      // ── Experiment mode run button ──────────────────────────────────
-      const canRun = canRunExperiment(state);
-      const expReason = getExperimentDisabledReason(state);
-
-      if (!canRun || expReason) {
-        btn.disabled = true;
-        btn.title = expReason || "Cannot run experiment";
-        reason.appendChild(el("p", {
-          text: expReason || "Select presets to compare.",
-          style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-        }));
-      } else {
-        btn.disabled = false;
-        btn.title = "";
-        btn.onclick = async () => {
-          btn.disabled = true;
-          btn.textContent = "Running\u2026";
-          // Dispose any previous scoped tracker before experiment run
-          _disposeScopedTracker(state);
-          if (actions && actions.setRunState) actions.setRunState({ status: "running" });
-
-          const result = await executeExperimentRun(state, context);
-
-          if (result && result.status === "ok") {
-            if (actions && actions.setRunState) {
-              actions.setRunState({
-                status: "submitted",
-                experimentId: result.experimentId,
-                message: result.message,
-              });
-            }
-
-            // Create scoped tracker for experiment execution events.
-            // experiment.worker.progress events from Modal execution will drive
-            // real-time progress updates (sampler steps, queue position, etc.).
-            // Polling remains as fallback for terminal state detection.
-            _createAndStartScopedTracker(
-              state, context,
-              result.experimentId,
-              result.experimentId
-            );
-          } else {
-            const errMsg = (result && result.message) || "Experiment run failed.";
-            if (actions && actions.setRunState) {
-              actions.setRunState({ status: "error", message: errMsg });
-            }
-          }
-        };
-      }
-      return;
-    }
-
-    // ── Single run mode ──────────────────────────────────────────────
+    // ── Single run mode (also used in experiment mode, since experiment
+    //     mode has its own dedicated "Run Experiment" button) ──────────
     const selectedId = state.playground && state.playground.selectedBackendId;
     if (!selectedId) {
       btn.disabled = true;
