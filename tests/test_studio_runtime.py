@@ -535,6 +535,278 @@ class StudioRunAdapterExperimentTests(unittest.TestCase):
                 self.assertEqual(ck["workflow"], snap["apiPromptJson"]["output"])
 
 
+class BuildExperimentSpecAxisTests(unittest.TestCase):
+    """RED-phase tests for all-Studio-axis behavior of build_experiment_spec.
+
+    These tests verify five required behaviors that are NOT fully
+    implemented in the current production code:
+      1. Expand prompt axis variants — a ``prompt`` axis in ``axes``
+         with N values overrides the base prompt and produces N×other_axes
+         cells, each carrying the variant text (not the base).
+      2. Retain every extra axis in resulting cell axis_values so that
+         execution can inject them into the workflow — uses a truly
+         bound non-cheap control (mask_blur).
+      3. Accept flat Studio axes and nested {shared: ...} input axes
+         equivalently (same cell count, same axis_values).
+      4. Reject an unbound/unsupported axis with an explicit compilation
+         error instead of silently dropping it.
+
+    Each test is expected to FAIL against the current production code
+    (RED phase).  No production code is modified.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    # ── Test 1: prompt axis variants ───────────────────────────────────
+
+    def test_expands_prompt_axis_variants(self):
+        """A ``prompt`` axis in ``axes`` with 3 variant texts overrides
+        the single base prompt and produces 3×2=6 cells instead of 2.
+        Each cell carries the variant text, not the base."""
+        snap = _make_runnable_snapshot()
+        preset = _make_runnable_preset()
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_studio_store_files(tmp, [snap], [preset])
+            exp_def = {
+                "prompts": [
+                    {"id": "p_base", "text": "default prompt", "enabled": True},
+                ],
+                "axes": {
+                    "prompt": {"values": ["a cat", "a dog", "a bird"]},
+                    "seed": {"values": [1, 2]},
+                },
+            }
+            spec = self.mod.build_experiment_spec(
+                [(preset, snap)], "txt2img", exp_def, tmp
+            )
+            self.assertNotIn("error", spec,
+                "Valid experiment should not produce an error")
+            cells = spec.get("cells", [])
+            # 3 prompt variants × 2 seeds = 6 cells
+            self.assertEqual(len(cells), 6,
+                "Prompt axis must produce 3 variants × 2 seeds = 6 cells")
+            # Every cell must carry one of the axis variant texts,
+            # NOT the base prompt "default prompt"
+            prompt_texts = [c.get("prompt", "") for c in cells]
+            self.assertEqual(prompt_texts.count("a cat"), 2)
+            self.assertEqual(prompt_texts.count("a dog"), 2)
+            self.assertEqual(prompt_texts.count("a bird"), 2)
+            self.assertNotIn("default prompt", prompt_texts,
+                "Axis variant prompt must override the base prompt text")
+
+    # ── Test 2: bound non-cheap axis retention ─────────────────────────
+
+    def test_retains_bound_noncheap_axis_in_cell_values(self):
+        """A truly bound control NOT in _CHEAP_AXIS_ORDER (mask_blur)
+        must produce cartesian expansion and appear in every cell's
+        axis_values.  Expected: 2 seed × 2 steps × 2 mask_blur = 8 cells
+        with mask_blur in axis_values."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            # Add a second node with mask_blur widget and bind it
+            snap["apiPromptJson"]["12"] = {
+                "class_type": "SomeNode",
+                "inputs": {"mask_blur": 15},
+            }
+            snap["nodeBindings"]["mask_blur"] = {
+                "kind": "widget", "nodeId": "12", "widgetName": "mask_blur",
+            }
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            exp_def = {
+                "prompts": [
+                    {"id": "p1", "text": "hello", "enabled": True},
+                ],
+                "axes": {
+                    "seed": {"values": [1, 2]},
+                    "steps": {"values": [20, 30]},
+                    "mask_blur": {"values": [5, 15]},
+                },
+            }
+            spec = self.mod.build_experiment_spec(
+                [(preset, snap)], "txt2img", exp_def, tmp
+            )
+            self.assertNotIn("error", spec)
+            cells = spec.get("cells", [])
+            # 2 seed × 2 steps × 2 mask_blur = 8 cells
+            self.assertEqual(len(cells), 8,
+                "2 seed × 2 steps × 2 mask_blur = 8 cells")
+            for cell in cells:
+                av = cell.get("axis_values", {})
+                self.assertIn("seed", av)
+                self.assertIn("steps", av)
+                self.assertIn("mask_blur", av,
+                    "mask_blur (bound non-cheap axis) must appear in "
+                    "cell axis_values for execution to inject it")
+
+    # ── Test 3: flat vs. nested axes equivalently ─────────────────────
+
+    def test_flat_and_nested_axes_produce_equivalent_cells(self):
+        """Flat Studio axes (frontend format) and nested {shared: ...}
+        axes (compiler format) must produce the same cell count and the
+        same axis_values in every cell."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+
+            # Definition with flat axes
+            exp_def_flat = {
+                "prompts": [
+                    {"id": "p1", "text": "flat test", "enabled": True},
+                ],
+                "axes": {
+                    "seed": {"values": [10, 20]},
+                    "steps": {"values": [25, 35]},
+                },
+            }
+            # Identical definition with nested compiler-format axes
+            exp_def_nested = {
+                "prompts": [
+                    {"id": "p1", "text": "flat test", "enabled": True},
+                ],
+                "axes": {
+                    "shared": {
+                        "seed": {"mode": "list", "values": [10, 20]},
+                        "steps": {"mode": "list", "values": [25, 35]},
+                    },
+                },
+            }
+
+            spec_flat = self.mod.build_experiment_spec(
+                [(preset, snap)], "txt2img", exp_def_flat, tmp
+            )
+            spec_nested = self.mod.build_experiment_spec(
+                [(preset, snap)], "txt2img", exp_def_nested, tmp
+            )
+
+            self.assertNotIn("error", spec_flat,
+                "Flat axes must not produce error")
+            self.assertNotIn("error", spec_nested,
+                "Nested axes must not produce error")
+
+            cells_flat = spec_flat.get("cells", [])
+            cells_nested = spec_nested.get("cells", [])
+
+            # Same cell count
+            self.assertEqual(
+                len(cells_flat), len(cells_nested),
+                "Flat and nested axes must produce the same number of cells"
+            )
+
+            # Same axis_values in corresponding cells
+            for cf, cn in zip(cells_flat, cells_nested):
+                self.assertEqual(
+                    cf.get("axis_values", {}),
+                    cn.get("axis_values", {}),
+                    "axis_values must match between flat and nested formats"
+                )
+
+    # ── Test 4: unbound/unsupported axis produces compilation error ───
+
+    def test_rejects_unbound_axis_with_explicit_error(self):
+        """An axis whose control ID has no slot binding in ANY snapshot
+        and cannot be auto-derived must be rejected with an explicit
+        compilation error, not silently dropped."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = _make_runnable_snapshot()
+            preset = _make_runnable_preset()
+            _make_studio_store_files(tmp, [snap], [preset])
+            # "nonexistent_param" has no slot in the snapshot's
+            # nodeBindings and cannot be auto-derived (not in
+            # _AUTO_DERIVE_CONTROLS).
+            exp_def = {
+                "prompts": [
+                    {"id": "p1", "text": "test", "enabled": True},
+                ],
+                "axes": {
+                    "nonexistent_param": {"values": [1.0, 2.0]},
+                },
+            }
+            result = self.mod.build_experiment_spec(
+                [(preset, snap)], "txt2img", exp_def, tmp
+            )
+            # Must return an error, NOT silently compile with missing axis
+            self.assertIn("error", result,
+                "Unbound axis must produce an explicit compilation error")
+            self.assertIn("nonexistent_param", result.get("error", ""),
+                "Error message must reference the unbound axis name")
+
+    # ── Test 5: reject bound extra axis when ANY preset lacks the slot ──
+
+    def test_rejects_bound_extra_axis_when_any_preset_lacks_slot(self):
+        """A bound extra axis (mask_blur) must be rejected when ANY selected
+        preset lacks the slot binding.  Two presets: one with mask_blur bound,
+        one without."""
+        snap_a = _make_runnable_snapshot("snap_a")
+        snap_a["apiPromptJson"]["12"] = {
+            "class_type": "SomeNode",
+            "inputs": {"mask_blur": 15},
+        }
+        snap_a["nodeBindings"]["mask_blur"] = {
+            "kind": "widget", "nodeId": "12", "widgetName": "mask_blur",
+        }
+        preset_a = _make_runnable_preset("preset_a", "snap_a")
+        snap_b = _make_runnable_snapshot("snap_b")
+        preset_b = _make_runnable_preset("preset_b", "snap_b")
+        # snap_b has NO mask_blur binding
+
+        exp_def = {
+            "prompts": [{"id": "p1", "text": "test", "enabled": True}],
+            "axes": {
+                "mask_blur": {"values": [5, 15]},
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_studio_store_files(tmp, [snap_a, snap_b], [preset_a, preset_b])
+            result = self.mod.build_experiment_spec(
+                [(preset_a, snap_a), (preset_b, snap_b)], "txt2img", exp_def, tmp
+            )
+        self.assertIn("error", result,
+            "Bound extra axis must be rejected when any preset lacks the slot")
+        self.assertIn("mask_blur", result.get("error", ""),
+            "Error message must reference the axis name")
+
+    # ── Test 6: idempotent build_experiment_spec with mutable experiment_def ──
+
+    def test_idempotent_calls_preserve_mutable_experiment_def(self):
+        """Calling build_experiment_spec twice with the same mutable
+        experiment_def containing a prompt axis must produce the same
+        result and leave experiment_def untouched."""
+        snap = _make_runnable_snapshot()
+        preset = _make_runnable_preset()
+        exp_def = {
+            "prompts": [],
+            "axes": {
+                "prompt": {"values": ["cat", "dog", "bird"]},
+                "seed": {"values": [1]},
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_studio_store_files(tmp, [snap], [preset])
+            result1 = self.mod.build_experiment_spec(
+                [(preset, snap)], "txt2img", exp_def, tmp
+            )
+            result2 = self.mod.build_experiment_spec(
+                [(preset, snap)], "txt2img", exp_def, tmp
+            )
+        # Same result — same number of cells
+        cells1 = result1.get("cells", [])
+        cells2 = result2.get("cells", [])
+        self.assertEqual(len(cells1), len(cells2),
+            "Both calls must produce the same number of cells")
+        # Same axis_values for each corresponding cell
+        for c1, c2 in zip(cells1, cells2):
+            self.assertEqual(c1.get("axis_values"), c2.get("axis_values"),
+                "axis_values must match between first and second call")
+        # experiment_def must NOT be mutated
+        axes_after = exp_def.get("axes", {})
+        self.assertIn("prompt", axes_after,
+            "experiment_def axes must still contain 'prompt' after two calls")
+
+
 class StudioRunAdapterHistoryTests(unittest.TestCase):
     """History metadata threading for studio runs."""
 

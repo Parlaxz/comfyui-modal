@@ -1299,38 +1299,167 @@ def build_experiment_spec(
             "lora_slots": [],
         })
 
-    # Build prompts list from experiment_def (avoid double-counting)
-    prompts = experiment_def.get("prompts", [])
-    spec_prompts = []
-    prompt_texts_seen: set[str] = set()
-    for p in prompts:
-        if not isinstance(p, dict) or not p.get("enabled", True):
-            continue
-        text = p.get("text", "")
-        # Deduplicate by text to avoid prompt double-counting
-        if text and text in prompt_texts_seen:
-            continue
-        if text:
-            prompt_texts_seen.add(text)
-        spec_prompts.append({
-            "id": p.get("id", str(uuid.uuid4().hex[:8])),
-            "label": text[:60] if text else "",
-            "text": text,
-            "negative": p.get("negative", ""),
-            "enabled": True,
-        })
+    # ── Build workflow/slot lookup early (for axis validation) ─────────
+    workflow_map: dict[str, dict] = {}
+    slots_map: dict[str, dict] = {}
+    for idx, (preset, snapshot) in enumerate(preset_snapshot_pairs):
+        profile_id = f"studio_{preset.get('id', '')}_{idx}"
+        workflow_map[profile_id] = copy.deepcopy(
+            _get_executable_workflow(snapshot.get("apiPromptJson"))
+        ) or {}
+        _repair_missing_clip_inputs(workflow_map[profile_id])
+        _repair_missing_vae_inputs(workflow_map[profile_id])
+        slots_map[profile_id] = map_studio_bindings_to_slots(
+            copy.deepcopy(snapshot.get("nodeBindings", {})) or {}
+        )
+        slots_map[profile_id] = _augment_slots_with_auto_derive(
+            slots_map[profile_id], workflow_map[profile_id]
+        )
 
-    raw_axes = experiment_def.get("axes", {}) or {}
-    # Convert frontend axes format to matrix compiler format.
-    # Frontend sends: {ctrlId: {enabled: true, values: [a, b]}}
-    # Compiler expects: {shared: {ctrlId: {mode: "list", values: [a, b]}}}
+    # Collect all slot keys across all presets (union)
+    all_slot_keys: set[str] = set()
+    for slots in slots_map.values():
+        all_slot_keys.update(slots.keys())
+
+    # Build per-preset slot key sets for individual validation
+    preset_slot_keys: dict[str, set[str]] = {}
+    for pf_id, slots in slots_map.items():
+        preset_slot_keys[pf_id] = set(slots.keys())
+
+    # ── Parse axes (copy to avoid mutating experiment_def) ────────────
+    raw_axes = copy.deepcopy(experiment_def.get("axes", {})) or {}
+
+    # Detect nested compiler format vs flat Studio format
+    has_nested_format = isinstance(raw_axes, dict) and "shared" in raw_axes
+
+    if has_nested_format:
+        shared_source = raw_axes.get("shared", {}) or {}
+        # per_workflow handled separately; ignore it for axis-level checks
+    else:
+        shared_source = raw_axes
+
+    # Extract special axes handled at the adapter level
+    prompt_axis_values: list | None = None
+    negative_prompt_axis_values: list | None = None
+
+    if "prompt" in shared_source:
+        p_axis = shared_source.pop("prompt", {})
+        if isinstance(p_axis, dict):
+            prompt_axis_values = p_axis.get("values", [])
+
+    if "negative_prompt" in shared_source:
+        np_axis = shared_source.pop("negative_prompt", {})
+        if isinstance(np_axis, dict):
+            negative_prompt_axis_values = np_axis.get("values", [])
+
+    # ── Build prompt items ─────────────────────────────────────────────
+    spec_prompts: list[dict[str, Any]] = []
+
+    if prompt_axis_values:
+        # Prompt axis overrides the base prompt list
+        for i, text in enumerate(prompt_axis_values):
+            text_str = str(text) if text is not None else ""
+            spec_prompts.append({
+                "id": f"prompt_axis_{i}",
+                "label": text_str[:60],
+                "text": text_str,
+                "negative": None,
+                "enabled": True,
+            })
+    else:
+        # Use base prompts from experiment_def
+        prompts = experiment_def.get("prompts", [])
+        prompt_texts_seen: set[str] = set()
+        for p in prompts:
+            if not isinstance(p, dict) or not p.get("enabled", True):
+                continue
+            text = p.get("text", "")
+            # Deduplicate by text to avoid prompt double-counting
+            if text and text in prompt_texts_seen:
+                continue
+            if text:
+                prompt_texts_seen.add(text)
+            spec_prompts.append({
+                "id": p.get("id", str(uuid.uuid4().hex[:8])),
+                "label": text[:60] if text else "",
+                "text": text,
+                "negative": p.get("negative", None),  # None = not set
+                "enabled": True,
+            })
+
+    # Cartesian-expand negative_prompt axis with prompts
+    if negative_prompt_axis_values:
+        expanded: list[dict[str, Any]] = []
+        for p in spec_prompts:
+            for np_text in negative_prompt_axis_values:
+                np_str = str(np_text) if np_text is not None else None
+                new_p = copy.deepcopy(p)
+                new_p["negative"] = np_str
+                new_p["id"] = f"{p['id']}_neg_{len(expanded)}"
+                expanded.append(new_p)
+        spec_prompts = expanded
+
+    # Validate prompt/negative_prompt slots when their axes inject values
+    if prompt_axis_values and "prompt" not in all_slot_keys:
+        return {"error": (
+            f"Prompt axis requires a prompt slot, but no selected preset "
+            f"has a prompt binding. Re-bind the prompt slot in the preset wizard."
+        )}
+    if negative_prompt_axis_values and "negative_prompt" not in all_slot_keys:
+        return {"error": (
+            f"Negative prompt axis requires a negative_prompt slot, but no "
+            f"selected preset has a negative_prompt binding. "
+            f"Re-bind the negative prompt slot in the preset wizard."
+        )}
+
+    # ── Convert remaining shared_source axes to compiler format ────────
+    # Auto-derivable axes that do not need explicit slot bindings
+    _AUTO_SLOT_AXES = frozenset({
+        "seed", "steps", "guidance", "sampler", "scheduler", "denoise",
+    })
+    # Axes that are compiler-internal (not passed as extra axes)
+    _SPECIAL_COMPILER_AXES = frozenset({
+        "resolution", "lora_model_strengths", "lora_clip_strengths",
+        "shared", "per_workflow",
+    })
+
     compiler_axes: dict[str, Any] = {"shared": {}}
-    for ctrl_id, axis_def in raw_axes.items():
+    for ctrl_id, axis_def in shared_source.items():
         if not isinstance(axis_def, dict):
             continue
-        values = axis_def.get("values")
-        if isinstance(values, list) and len(values) > 0:
-            compiler_axes["shared"][ctrl_id] = {"mode": "list", "values": values}
+        # Skip special axes already handled
+        if ctrl_id in _SPECIAL_COMPILER_AXES:
+            continue
+        # Validate: every non-auto-derivable axis must have a slot binding
+        # in EVERY selected preset (not just the union).
+        if ctrl_id not in _AUTO_SLOT_AXES and ctrl_id not in all_slot_keys:
+            return {"error": (
+                f"Configured axis {ctrl_id!r} is not bound to any slot in "
+                f"the selected preset(s). This axis must be bound in the "
+                f"preset wizard before it can be used as an experiment axis."
+            )}
+        if ctrl_id not in _AUTO_SLOT_AXES and ctrl_id in all_slot_keys:
+            # Slot exists in at least one preset — now verify EVERY preset
+            missing_presets = [
+                pf_id for pf_id, psk in preset_slot_keys.items()
+                if ctrl_id not in psk
+            ]
+            if missing_presets:
+                return {"error": (
+                    f"Configured axis {ctrl_id!r} is bound in some selected "
+                    f"presets but is missing from the following preset(s): "
+                    f"{', '.join(missing_presets)}. "
+                    f"Bind this slot in every preset wizard before using it "
+                    f"as an experiment axis."
+                )}
+        # Handle both flat format {values: [...]} and compiler format {mode: "list", values: [...]}
+        if "mode" in axis_def:
+            compiler_axes["shared"][ctrl_id] = dict(axis_def)
+        else:
+            values_list = axis_def.get("values")
+            if isinstance(values_list, list) and len(values_list) > 0:
+                compiler_axes["shared"][ctrl_id] = {"mode": "list", "values": values_list}
+
     axes = compiler_axes
 
     spec: dict[str, Any] = {
@@ -1353,23 +1482,6 @@ def build_experiment_spec(
     except Exception:
         _log.exception("Experiment compilation failed")
         return {"error": "Experiment compilation failed: invalid spec or empty definition"}
-
-    # Build workflow/slot lookup per profile_id
-    workflow_map: dict[str, dict] = {}
-    slots_map: dict[str, dict] = {}
-    for idx, (preset, snapshot) in enumerate(preset_snapshot_pairs):
-        profile_id = f"studio_{preset.get('id', '')}_{idx}"
-        workflow_map[profile_id] = copy.deepcopy(
-            _get_executable_workflow(snapshot.get("apiPromptJson"))
-        ) or {}
-        _repair_missing_clip_inputs(workflow_map[profile_id])
-        _repair_missing_vae_inputs(workflow_map[profile_id])
-        slots_map[profile_id] = map_studio_bindings_to_slots(
-            copy.deepcopy(snapshot.get("nodeBindings", {})) or {}
-        )
-        slots_map[profile_id] = _augment_slots_with_auto_derive(
-            slots_map[profile_id], workflow_map[profile_id]
-        )
 
     studio_meta = _build_studio_experiment_meta(
         preset_ids=all_preset_ids,

@@ -977,6 +977,38 @@ class ResolveAndInjectCellTests(unittest.TestCase):
         self.assertEqual(resolved.workflow["3"]["inputs"]["steps"], 30)
         self.assertEqual(resolved.workflow["3"]["inputs"]["cfg"], 7.0)
 
+    # ── Test 5: nonstandard bound axis injection ─────────────────────────
+
+    def test_injects_nonstandard_bound_axis_through_slot_path(self):
+        """A nonstandard axis value (mask_blur, not in the 6 hardcoded
+        sampler axes) that has a slot binding must be injected through
+        its slot path into the workflow.
+
+        Currently resolve_and_inject_cell only injects 6 axes in a
+        hardcoded loop: seed/steps/guidance/sampler/scheduler/denoise.
+        A nonstandard axis (mask_blur) is silently ignored."""
+        r = self._make_runner()
+        wf = {
+            "12": {"class_type": "SomeNode", "inputs": {"mask_blur": 0}},
+        }
+        wf, slots = self._with_prompt(wf, {"mask_blur": {
+            "node_id": "12", "field": "mask_blur",
+            "path": ["inputs", "mask_blur"],
+        }}, node_id="99")
+        cell = {
+            "prompt": "x", "negative_prompt": self._wf_owned(),
+            "axis_values": {"seed": 42, "mask_blur": 15},
+            "lora_signature": [], "input_image_hash": "",
+            "triple": {}, "loader_target_group_id": "g_default",
+        }
+        resolved = r.resolve_and_inject_cell(wf, slots, [], [], cell)
+        # mask_blur must be injected into the workflow via its slot path
+        self.assertEqual(
+            resolved.workflow["12"]["inputs"]["mask_blur"], 15,
+            "Nonstandard bound axis mask_blur must be injected "
+            "through its slot path into the workflow",
+        )
+
 
 # ── Control Backend Tests ───────────────────────────────────────────────
 
