@@ -3242,14 +3242,48 @@ if _server:
             modal_options_raw = None
         production_options = normalize_production_options(modal_options_raw)
 
+        # Determine execution surface and whether production was default-applied.
+        _execution_surface = "playground"
+        _production_default_applied = bool(
+            not modal_options_raw
+            or "production" not in (modal_options_raw or {})
+        )
+        _production_explicitly_disabled = bool(
+            isinstance(modal_options_raw, dict)
+            and isinstance(modal_options_raw.get("production"), dict)
+            and modal_options_raw["production"].get("enabled") is False
+        )
+
         # Consume browser _production_trace as authoritative fallback for
         # production identity trace fields propagated through the queue.
         _browser_production_trace: dict = body.get("_production_trace", {}) or {}
         if not isinstance(_browser_production_trace, dict):
             _browser_production_trace = {}
         production_report = None
+        production_diagnostics: dict = {}
         execution_workflow = workflow
         if production_options.get("enabled"):
+            if not production_options.get("output_node_ids"):
+                # Generic /prompt route has no surface to derive output bindings.
+                # Fail closed with a clear message — never silently disable.
+                raise web.HTTPBadRequest(text=json.dumps({
+                    "error": (
+                        "Production mode is enabled but no output_node_ids were provided. "
+                        "The generic /prompt endpoint cannot derive output bindings. "
+                        "Either disable production by setting "
+                        "modal_options.production.enabled to false, or provide "
+                        "output_node_ids explicitly."
+                    ),
+                    "production_options_status": {
+                        "execution_surface": _execution_surface,
+                        "production_default_applied": _production_default_applied,
+                        "production_explicitly_disabled": _production_explicitly_disabled,
+                        "production_output_source": "none",
+                        "production_output_ids": [],
+                        "production_output_count": 0,
+                        "production_plan_used": False,
+                    },
+                }), content_type="application/json")
             try:
                 production_options["enabled"] = True
                 if "schema_version" not in production_options:
@@ -3344,10 +3378,18 @@ if _server:
                 "result_route": _result_route_mode,
                 "execution_workflow": _queue_execution_workflow,
                 "production_report": production_report,
-                # Compact production trace fields for request identity tracking.
+                # Compact production diagnostics for request identity tracking.
                 # Carried through queue/scheduler/adapter so the runner can use them.
                 # Use browser _production_trace as authoritative fallback when present,
                 # then fall back to inferred values from the normalized request.
+                "execution_surface": _execution_surface,
+                "production_default_applied": _production_default_applied,
+                "production_explicitly_disabled": _production_explicitly_disabled,
+                "production_output_source": (
+                    "caller" if production_options.get("output_node_ids") and not _production_default_applied
+                    else "none" if not production_options.get("output_node_ids")
+                    else "default"
+                ),
                 "production_ui_enabled": bool(
                     _browser_production_trace.get("production_ui_enabled",
                         (modal_options_raw or {}).get("production", {}).get("enabled", False)
@@ -3369,7 +3411,7 @@ if _server:
                     )
                     if production_options.get("enabled") else []
                 ),
-                "production_source_workflow_hash": (
+                "production_source_hash": (
                     production_report.get("source_workflow_hash", "")
                     if production_report and production_report.get("enabled") else ""
                 ),
@@ -3377,12 +3419,21 @@ if _server:
                     production_report.get("topology_hash", "")
                     if production_report and production_report.get("enabled") else ""
                 ),
-                "production_compiled_workflow_hash": (
+                "production_compiled_hash": (
                     production_report.get("compiled_workflow_hash", "")
                     if production_report and production_report.get("enabled") else ""
                 ),
                 "runner_workflow_hash": (
                     production_report.get("runner_workflow_hash", "")
+                    if production_report and production_report.get("enabled") else ""
+                ),
+                # Legacy aliases for backward compat
+                "production_source_workflow_hash": (
+                    production_report.get("source_workflow_hash", "")
+                    if production_report and production_report.get("enabled") else ""
+                ),
+                "production_compiled_workflow_hash": (
+                    production_report.get("compiled_workflow_hash", "")
                     if production_report and production_report.get("enabled") else ""
                 ),
                 "production_plan_used": bool(
@@ -5476,10 +5527,19 @@ if _server:
         sched = REGISTRY.get_scheduler(exp_id)
         if sched is None:
             sched = await REGISTRY.recover_scheduler(exp_id)
-        if sched is None:
-            return web.json_response({"status": "error", "message": "scheduler not running"}, status=400)
-        await sched.stop_now()
-        return web.json_response({"status": "ok"})
+        if sched is not None:
+            # Scheduler exists — clear any pending marker and invoke stop_now
+            REGISTRY.clear_pending_stop(exp_id)
+            await sched.stop_now()
+            return web.json_response({"status": "ok"})
+        # No scheduler — check if experiment definition exists
+        store = REGISTRY.store(exp_id)
+        defn = store.read_definition()
+        if defn:
+            # Experiment exists but has no scheduler yet — record a pending stop
+            REGISTRY.request_pending_stop(exp_id)
+            return web.json_response({"status": "ok", "pending": True})
+        return web.json_response({"status": "error", "message": "experiment not found"}, status=404)
 
     @_server.routes.post("/comfymodal/experiments/{experiment_id}/resume")
     async def experiment_resume(request: web.Request) -> web.Response:
@@ -6314,7 +6374,11 @@ if _server:
                     "message": "Experiment control validation failed",
                     "errors": _exp_validation_errors,
                 }, status=400)
-            result = handle_studio_experiment(preset_ids, feature_id, experiment_def, _NODE_DIR)
+            _studio_mo_exp = (body or {}).get("modal_options")
+            result = handle_studio_experiment(
+                preset_ids, feature_id, experiment_def, _NODE_DIR,
+                modal_options=_studio_mo_exp,
+            )
             status_code = 200 if result.get("status") == "ok" else 400
             return web.json_response(result, status=status_code)
         except Exception:

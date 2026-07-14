@@ -72,6 +72,7 @@ class ExperimentScheduler:
         self._runner_task: Optional[asyncio.Task] = None
         self._pause_requested: bool = False
         self._stop_after_current_flag: bool = False
+        self._stop_now_requested: bool = False
         self._skipped_checkpoints: set = set()
         # Skip the EventBridge's blocking callback (used in tests)
 
@@ -94,6 +95,22 @@ class ExperimentScheduler:
     # ── Public controls ─────────────────────────────────────────────
 
     async def start(self) -> dict:
+        if self._stop_now_requested:
+            if self._status != STATUS_STOPPED:
+                self._set_status(STATUS_STOPPED)
+                self._emit("experiment.stopped", {
+                    "experiment_id": (self._compilation or {}).get("experiment_id", ""),
+                    "completed": 0,
+                    "failed": 0,
+                    "interrupted": 0,
+                    "total_cells": len(self._compilation.get("cells", [])) if self._compilation else 0,
+                })
+            return {
+                "completed": 0,
+                "failed": 0,
+                "interrupted": 0,
+                "total_cells": len(self._compilation.get("cells", [])) if self._compilation else 0,
+            }
         if self._status not in (STATUS_DRAFT, STATUS_PAUSED, STATUS_STOPPED):
             raise SchedulerError(f"cannot start from status {self._status!r}")
         if self._invoker is None:
@@ -155,8 +172,25 @@ class ExperimentScheduler:
         # Let start() set STATUS_STOPPED after runner.run() returns.
 
     async def stop_now(self) -> None:
-        if self._status != STATUS_RUNNING:
-            raise SchedulerError(f"cannot stop from status {self._status!r}")
+        # Fix: idempotent and valid for draft/pre-start/paused/non-running.
+        # If already terminal, no-op.
+        if self._status in TERMINAL_STATUSES:
+            return
+        # If not yet running (draft) or paused, mark stop-now-requested and
+        # emit the stopped terminal event directly without opening Modal.
+        if self._status in (STATUS_DRAFT, STATUS_PAUSED):
+            self._stop_now_requested = True
+            self._set_status(STATUS_STOPPED)
+            self._emit("experiment.stopped", {
+                "experiment_id": (self._compilation or {}).get("experiment_id", ""),
+                "completed": 0,
+                "failed": 0,
+                "interrupted": 0,
+                "total_cells": len(self._compilation.get("cells", [])) if self._compilation else 0,
+            })
+            return
+        # Running case: delegate to runner stop_now
+        self._stop_now_requested = True
         self._set_status(STATUS_STOP_NOW_REQUESTED)
         if self._runner is not None:
             await self._runner.stop_now()
@@ -168,6 +202,7 @@ class ExperimentScheduler:
         self._pause_event.clear()
         self._pause_requested = False
         self._stop_after_current_flag = False
+        self._stop_now_requested = False
         self._set_status(STATUS_RUNNING)
         result = await self.continue_here()
         # Determine final status after resume from snapshot counters.

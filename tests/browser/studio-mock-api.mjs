@@ -474,6 +474,63 @@ export async function installStudioMockApi(page, options = {}) {
     });
   }
 
+  /** POST /comfymodal/experiments/:experiment_id/stop-now */
+  async function experimentStopNow(route, url, body, params) {
+    const expId = params.experiment_id;
+    const exp = state.experiments.get(expId);
+    if (!exp) return _error("experiment not found", 404);
+
+    // Mark experiment stopped/cancelled
+    const totalCells = exp.snapshot.total_cells || 0;
+    exp.snapshot.status = "stopped";
+    exp.snapshot.counters.interrupted = totalCells;
+    exp.snapshot.counters.completed = 0;
+    exp.snapshot.counters.failed = 0;
+
+    // Emit experiment.stopped terminal event (idempotent)
+    const hasTerminal = exp.events.some(function (e) {
+      return e.type === "experiment.stopped" || e.type === "experiment.completed" || e.type === "experiment.failed_fatal";
+    });
+    if (!hasTerminal) {
+      // Mark incomplete cells as interrupted
+      for (var i = 0; i < totalCells; i++) {
+        var ck = "cell_" + i;
+        var alreadyTerminal = exp.events.some(function (e) {
+          return (e.type === "cell.completed" || e.type === "cell.failed" || e.type === "cell.interrupted") &&
+            e.payload && e.payload.cell_key === ck;
+        });
+        if (!alreadyTerminal) {
+          exp.events.push({
+            type: "cell.interrupted",
+            payload: {
+              cell_key: ck,
+              checkpoint_id: _makeCheckpointId(),
+              attempt_id: "a_" + randomBytes(4).toString("hex"),
+              reason: "cancelled",
+            },
+          });
+        }
+      }
+      exp.events.push({
+        type: "experiment.stopped",
+        payload: {
+          completed: 0,
+          failed: 0,
+          interrupted: totalCells,
+          total_cells: totalCells,
+        },
+      });
+    }
+
+    // Sync run history entry
+    var runEntry = state.history.find(function (r) { return r.experiment_id === expId; });
+    if (runEntry) {
+      runEntry.status = "cancelled";
+    }
+
+    return _json({ status: "ok" });
+  }
+
   /** GET /comfymodal/experiments/:experiment_id */
   async function experimentDetail(route, url, body, params) {
     const expId = params.experiment_id;
@@ -497,8 +554,26 @@ export async function installStudioMockApi(page, options = {}) {
 
     let snapshotStatus = "running";
 
+    // Fix: preserve stopped terminal state set by stop-now
+    if (exp.snapshot.status === "stopped") {
+      // Already stopped by stop-now — keep the stopped snapshot
+      return _json({
+        status: "ok",
+        definition: exp.definition,
+        snapshot: {
+          status: "stopped",
+          counters: exp.snapshot.counters,
+          total_cells: exp.snapshot.total_cells,
+          cell_visible: exp.snapshot.cell_visible,
+          checkpoints: exp.snapshot.checkpoints,
+          attempts: exp.snapshot.attempts,
+        },
+        events: exp.events,
+      });
+    }
+
     if (pollCount >= terminalPoll || forceFailed) {
-      // Determine whether this terminal is failure or success
+      // Determine whether this failure or success
       const shouldFail = forceFailed || pollCount >= failAfter;
 
       // ── Recompute counters consistent with terminal type ─────────────
@@ -653,6 +728,22 @@ export async function installStudioMockApi(page, options = {}) {
     });
   }
 
+  /** GET /comfymodal/experiments — aggregate experiment list for recent runs */
+  async function listExperiments() {
+    const experiments = [];
+    for (const [experimentId, exp] of state.experiments.entries()) {
+      experiments.push({
+        experiment_id: experimentId,
+        definition: { ...exp.definition },
+        snapshot: {
+          ...exp.snapshot,
+          counters: { ...exp.snapshot.counters },
+        },
+      });
+    }
+    return _json({ status: "ok", experiments });
+  }
+
   /** GET /comfymodal/run-history */
   async function listRunHistory(route, url) {
     const limit = parseInt(url.searchParams.get("limit") || "200", 10);
@@ -787,8 +878,10 @@ export async function installStudioMockApi(page, options = {}) {
     ["POST", "/comfymodal/studio/run", studioRun],
     ["POST", "/comfymodal/studio/experiment", studioExperiment],
 
-    // Experiment detail (poll-based lifecycle)
+    // Experiment detail (poll-based lifecycle) & stop-now
     ["GET", "/comfymodal/experiments/:experiment_id", experimentDetail],
+    ["POST", "/comfymodal/experiments/:experiment_id/stop-now", experimentStopNow],
+    ["GET", "/comfymodal/experiments", listExperiments],
 
     // Run history
     ["GET", "/comfymodal/run-history", listRunHistory],

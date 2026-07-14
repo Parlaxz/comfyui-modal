@@ -74,6 +74,9 @@ export function createProgressTracker(api) {
     message: "",
     error: "",
 
+    // Startup phase from modal_status (dispatch, entry, restore, custom_nodes, gpu, warmup, etc.)
+    phase: "",
+
     // Perf tracking
     timingMilestones: {},
     perNodeDurations: {},
@@ -82,6 +85,7 @@ export function createProgressTracker(api) {
     _nodeStartTime: null,
     _nodeTimes: {},
     _nodesSeen: null,
+    _displayNodeId: null,
   };
 
   // Internal state
@@ -120,10 +124,12 @@ export function createProgressTracker(api) {
     state.queuePosition = 0;
     state.message = "";
     state.error = "";
+    state.phase = "";
     state.timingMilestones = {};
     state._nodeStartTime = null;
     state._nodeTimes = {};
     state._nodesSeen = new Set();
+    state._displayNodeId = null;
     _notify();
   }
 
@@ -176,6 +182,7 @@ export function createProgressTracker(api) {
 
   function onExecuting(detail) {
     const node = (detail != null && typeof detail === "object") ? detail.node : detail;
+    const displayNode = (detail != null && typeof detail === "object") ? detail.display_node : undefined;
     if (node === null || node === undefined) return;
 
     // Record previous node's wall-clock duration
@@ -187,8 +194,12 @@ export function createProgressTracker(api) {
     state.currentNodeId = node;
     state._nodeStartTime = Date.now();
 
-    // Resolve label
-    const nodeLabel = _getNodeLabel(node);
+    // Capture display_node for better label resolution
+    state._displayNodeId = displayNode != null ? displayNode : null;
+
+    // Resolve label — prefer display_node when available
+    const labelId = state._displayNodeId != null ? state._displayNodeId : node;
+    const nodeLabel = _getNodeLabel(labelId);
     state.currentNodeLabel = nodeLabel;
 
     // Track seen nodes
@@ -202,8 +213,10 @@ export function createProgressTracker(api) {
       state.overallPercent = null;
     }
 
-    // Reset sampler step counter, preserve samplerMaximum from execution_start
-    state.samplerStep = 0;
+    // Reset sampler step state for the new node
+    state.samplerStep = null;
+    state.samplerMaximum = null;
+    state.samplerPercent = null;
 
     state.stage = "generating";
     _notify();
@@ -223,6 +236,74 @@ export function createProgressTracker(api) {
       }
       _notify();
     }
+  }
+
+  function onProgressState(detail) {
+    const d = detail || {};
+    // Defensively handle detail wrappers: detail.nodes or detail.data.nodes
+    const rawNodes = d.nodes || (d.data && d.data.nodes) || null;
+    if (!rawNodes || typeof rawNodes !== 'object') return;
+
+    const nodeIds = Object.keys(rawNodes);
+    if (nodeIds.length === 0) return;
+
+    // Find the running node and count finished nodes
+    let runningNodeId = null;
+    let runningState = null;
+    let finishedCount = 0;
+
+    for (const nid of nodeIds) {
+      const ns = rawNodes[nid];
+      if (!ns || typeof ns !== 'object') continue;
+      const nodeState = ns.state || '';
+      if (nodeState === 'running') {
+        runningNodeId = nid;
+        runningState = ns;
+      } else if (nodeState === 'finished') {
+        finishedCount++;
+      }
+    }
+
+    // Update completedNodes from truthful finished count
+    state.completedNodes = finishedCount;
+
+    // Update current node info from the running node
+    if (runningNodeId != null) {
+      state.currentNodeId = runningNodeId;
+
+      if (runningState) {
+        // Use display_node_id for label resolution if available
+        if (runningState.display_node_id != null) {
+          state._displayNodeId = runningState.display_node_id;
+        }
+        // Update sampler/step from running node — skip native placeholder {value:0, max:1}
+        if (runningState.max != null && (runningState.max > 1 || (runningState.value != null && runningState.value > 0))) {
+          state.samplerStep = runningState.value != null ? runningState.value : state.samplerStep;
+          state.samplerMaximum = runningState.max;
+          state.samplerPercent = (state.samplerStep / state.samplerMaximum) * 100;
+        } else {
+          state.samplerStep = null;
+          state.samplerMaximum = null;
+          state.samplerPercent = null;
+        }
+      }
+
+      // Resolve label via display_node_id if available
+      const labelId = state._displayNodeId != null ? state._displayNodeId : runningNodeId;
+      state.currentNodeLabel = _getNodeLabel(labelId);
+
+      // Track in _nodesSeen for backwards compat
+      if (state._nodesSeen) state._nodesSeen.add(runningNodeId);
+
+      state.stage = "generating";
+    }
+
+    // Overall percent — only when totalNodes is a truthful denominator
+    if (state.totalNodes > 0) {
+      state.overallPercent = (state.completedNodes / state.totalNodes) * 100;
+    }
+
+    _notify();
   }
 
   function onExecutionCached(detail) {
@@ -284,11 +365,52 @@ export function createProgressTracker(api) {
   function onModalStatus(detail) {
     const d = detail || {};
     if (!d.prompt_id && !d.phase) return;
-    if (d.phase === "startup" || d.phase === "warmup") {
-      state.stage = "startup";
-      state.message = d.message || "Starting up...";
-      state.promptId = d.prompt_id || null;
+
+    const phase = d.phase || '';
+
+    // Startup phases — visible while startup is in progress
+    const startupPhases = ['dispatch', 'entry', 'restore', 'custom_nodes', 'gpu',
+                           'warmup', 'backend_init', 'backend_ready', 'auto_save',
+                           'startup'];
+
+    if (startupPhases.includes(phase)) {
+      // Do not overwrite generating/done/error with startup
+      if (state.stage === 'generating' || state.stage === 'done' || state.stage === 'error') return;
+      state.stage = 'startup';
+      state.phase = phase;
+      state.message = d.message || phase;
+      if (d.prompt_id) state.promptId = d.prompt_id;
       _notify();
+    } else if (phase === 'execution') {
+      // Execution phase: advance to generating if idle/startup/queued
+      if (state.stage === 'idle' || state.stage === 'startup' || state.stage === 'queued') {
+        state.stage = 'generating';
+        state.phase = phase;
+        state.message = d.message || 'Executing...';
+        if (!state.startTime) {
+          state.startTime = Date.now();
+          _startTimer();
+        }
+        _notify();
+      }
+    } else if (phase === 'done') {
+      // Terminal done from modal_status — only if not already generating
+      // (execution_success owns terminal transition for generating runs)
+      if (state.stage !== 'generating') {
+        state.stage = 'done';
+        state.phase = phase;
+        state.message = d.message || '';
+        _notify();
+      }
+    } else if (phase) {
+      // Unknown phase — treat as startup info
+      if (state.stage !== 'generating' && state.stage !== 'done' && state.stage !== 'error') {
+        state.stage = 'startup';
+        state.phase = phase;
+        state.message = d.message || phase;
+        if (d.prompt_id) state.promptId = d.prompt_id;
+        _notify();
+      }
     }
   }
 
@@ -305,6 +427,7 @@ export function createProgressTracker(api) {
   _addListener("execution_start", onExecutionStart);
   _addListener("executing", (e) => onExecuting(e?.detail));
   _addListener("progress", (e) => onProgress(e?.detail));
+  _addListener("progress_state", (e) => onProgressState(e?.detail));
   _addListener("execution_cached", (e) => onExecutionCached(e?.detail));
   _addListener("execution_success", (e) => onExecutionSuccess(e));
   _addListener("execution_error", (e) => onExecutionError(e));
@@ -353,7 +476,7 @@ function createNoopTracker() {
     completedNodes: 0, totalNodes: 0,
     samplerStep: null, samplerMaximum: null, samplerPercent: null,
     elapsedMs: 0, startTime: null, queuePosition: 0,
-    message: "", error: "",
+    message: "", error: "", phase: "",
     timingMilestones: {}, perNodeDurations: {},
   };
   return {
@@ -411,6 +534,7 @@ export function createScopedTracker(api, identity) {
 
     message: "",
     error: "",
+    phase: "",
 
     timingMilestones: {},
     perNodeDurations: {},
@@ -418,6 +542,7 @@ export function createScopedTracker(api, identity) {
     _nodeStartTime: null,
     _nodeTimes: {},
     _nodesSeen: null,
+    _displayNodeId: null,
   };
 
   let _timerInterval = null;
@@ -463,10 +588,12 @@ export function createScopedTracker(api, identity) {
     state.queuePosition = 0;
     state.message = "";
     state.error = "";
+    state.phase = "";
     state.timingMilestones = {};
     state._nodeStartTime = null;
     state._nodeTimes = {};
     state._nodesSeen = new Set();
+    state._displayNodeId = null;
     _notify();
   }
 
@@ -543,6 +670,7 @@ export function createScopedTracker(api, identity) {
   function onExecuting(detail) {
     if (!_started || _disposed || !_locked) return;
     const node = (detail != null && typeof detail === "object") ? detail.node : detail;
+    const displayNode = (detail != null && typeof detail === "object") ? detail.display_node : undefined;
     if (node === null || node === undefined) return;
 
     // Record previous node's wall-clock duration
@@ -554,7 +682,12 @@ export function createScopedTracker(api, identity) {
     state.currentNodeId = node;
     state._nodeStartTime = Date.now();
 
-    const nodeLabel = _getNodeLabel(node);
+    // Capture display_node for better label resolution
+    state._displayNodeId = displayNode != null ? displayNode : null;
+
+    // Resolve label — prefer display_node when available
+    const labelId = state._displayNodeId != null ? state._displayNodeId : node;
+    const nodeLabel = _getNodeLabel(labelId);
     state.currentNodeLabel = nodeLabel;
 
     if (state._nodesSeen) state._nodesSeen.add(node);
@@ -566,7 +699,8 @@ export function createScopedTracker(api, identity) {
       state.overallPercent = null;
     }
 
-    state.samplerStep = 0;
+    state.samplerStep = null;
+    state.samplerMaximum = null;
     state.samplerPercent = null;
 
     state.stage = "generating";
@@ -587,6 +721,66 @@ export function createScopedTracker(api, identity) {
       }
       _notify();
     }
+  }
+
+  function onProgressState(detail) {
+    if (!_started || _disposed || !_locked) return;
+    const d = detail || {};
+    const rawNodes = d.nodes || (d.data && d.data.nodes) || null;
+    if (!rawNodes || typeof rawNodes !== 'object') return;
+
+    const nodeIds = Object.keys(rawNodes);
+    if (nodeIds.length === 0) return;
+
+    let runningNodeId = null;
+    let runningState = null;
+    let finishedCount = 0;
+
+    for (const nid of nodeIds) {
+      const ns = rawNodes[nid];
+      if (!ns || typeof ns !== 'object') continue;
+      const nodeState = ns.state || '';
+      if (nodeState === 'running') {
+        runningNodeId = nid;
+        runningState = ns;
+      } else if (nodeState === 'finished') {
+        finishedCount++;
+      }
+    }
+
+    state.completedNodes = finishedCount;
+
+    if (runningNodeId != null) {
+      state.currentNodeId = runningNodeId;
+
+      if (runningState) {
+        if (runningState.display_node_id != null) {
+          state._displayNodeId = runningState.display_node_id;
+        }
+        if (runningState.max != null && (runningState.max > 1 || (runningState.value != null && runningState.value > 0))) {
+          state.samplerStep = runningState.value != null ? runningState.value : state.samplerStep;
+          state.samplerMaximum = runningState.max;
+          state.samplerPercent = (state.samplerStep / state.samplerMaximum) * 100;
+        } else {
+          state.samplerStep = null;
+          state.samplerMaximum = null;
+          state.samplerPercent = null;
+        }
+      }
+
+      const labelId = state._displayNodeId != null ? state._displayNodeId : runningNodeId;
+      state.currentNodeLabel = _getNodeLabel(labelId);
+
+      if (state._nodesSeen) state._nodesSeen.add(runningNodeId);
+
+      state.stage = "generating";
+    }
+
+    if (state.totalNodes > 0) {
+      state.overallPercent = (state.completedNodes / state.totalNodes) * 100;
+    }
+
+    _notify();
   }
 
   function onExecutionCached(detail) {
@@ -678,11 +872,45 @@ export function createScopedTracker(api, identity) {
       return;
     }
 
-    if (d.phase === "startup" || d.phase === "warmup") {
-      state.stage = "startup";
-      state.message = d.message || "Starting up...";
-      state.promptId = d.prompt_id || null;
+    const phase = d.phase || '';
+
+    const startupPhases = ['dispatch', 'entry', 'restore', 'custom_nodes', 'gpu',
+                           'warmup', 'backend_init', 'backend_ready', 'auto_save',
+                           'startup'];
+
+    if (startupPhases.includes(phase)) {
+      if (state.stage === 'generating' || state.stage === 'done' || state.stage === 'error') return;
+      state.stage = 'startup';
+      state.phase = phase;
+      state.message = d.message || phase;
+      if (d.prompt_id) state.promptId = d.prompt_id;
       _notify();
+    } else if (phase === 'execution') {
+      if (state.stage === 'idle' || state.stage === 'startup' || state.stage === 'queued') {
+        state.stage = 'generating';
+        state.phase = phase;
+        state.message = d.message || 'Executing...';
+        if (!state.startTime) {
+          state.startTime = Date.now();
+          _startTimer();
+        }
+        _notify();
+      }
+    } else if (phase === 'done') {
+      if (state.stage !== 'generating') {
+        state.stage = 'done';
+        state.phase = phase;
+        state.message = d.message || '';
+        _notify();
+      }
+    } else if (phase) {
+      if (state.stage !== 'generating' && state.stage !== 'done' && state.stage !== 'error') {
+        state.stage = 'startup';
+        state.phase = phase;
+        state.message = d.message || phase;
+        if (d.prompt_id) state.promptId = d.prompt_id;
+        _notify();
+      }
     }
   }
 
@@ -854,6 +1082,7 @@ export function createScopedTracker(api, identity) {
   _addListener("execution_start", onExecutionStart);
   _addListener("executing", (e) => onExecuting(e?.detail));
   _addListener("progress", (e) => onProgress(e?.detail));
+  _addListener("progress_state", (e) => onProgressState(e?.detail));
   _addListener("execution_cached", (e) => onExecutionCached(e?.detail));
   _addListener("execution_success", (e) => onExecutionSuccess(e));
   _addListener("execution_error", (e) => onExecutionError(e));

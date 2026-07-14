@@ -115,7 +115,7 @@ function _pbInjectStyles() {
   s.textContent = `
 #cm-pb {
   --cm-pb-h: 16px;
-  --cm-pb-font: 10px;
+  --cm-pb-font: 11px;
   --cm-pb-bg: rgba(18,18,18,0.92);
   --cm-pb-text: #ccc;
   --cm-pb-node: #2e7d32;
@@ -209,10 +209,10 @@ function _pbInjectStyles() {
 }
 #cm-pb .cm-pb-label .cm-pb-eta {
   flex-shrink: 0;
-  opacity: 0.6;
-  font-size: 9px;
+  opacity: 0.7;
+  font-size: 10px;
   font-variant-numeric: tabular-nums;
-  min-width: 40px;
+  min-width: 42px;
   text-align: right;
 }
 #cm-pb.-fixed {
@@ -320,7 +320,7 @@ function _pbShowStartup(message) {
   _pb.dotEl.style.background = "#1565c0";
 }
 
-function _pbShowProgress(queue, nodePct, stepPct, nodeLabel, stepLabel) {
+function _pbShowProgress(queue, nodePct, stepPct, nodeLabel, samplerStep, samplerMax, completedNodes, totalNodes, message) {
   if (!_pb) return;
   _clearDoneTimers();
   _pbSetState(PB_STATE.GENERATING);
@@ -344,11 +344,17 @@ function _pbShowProgress(queue, nodePct, stepPct, nodeLabel, stepLabel) {
     }
   }
 
-  const pct = nodePct != null && nodePct > 0 ? ` ${Math.round(nodePct)}%` : "";
-  const queueText = queue > 0 ? `Q:${queue}` : "";
-  const nodeText = nodeLabel ? ` ${nodeLabel}` : "";
-  const stepText = stepLabel ? ` (${stepLabel})` : "";
-  _pb.labelEl.textContent = `${queueText}${nodeText}${stepText}${pct}`.trim() || "Generating...";
+  // Build informative label — never show bogus 0/0
+  const parts = [];
+  if (queue > 0) parts.push(`Q${queue}`);
+  if (nodeLabel) parts.push(nodeLabel);
+  if (samplerStep != null && samplerMax > 0) {
+    parts.push(`step ${samplerStep}/${samplerMax}`);
+  }
+  if (totalNodes > 0 && completedNodes > 0) {
+    parts.push(`node ${completedNodes}/${totalNodes}`);
+  }
+  _pb.labelEl.textContent = parts.length > 0 ? parts.join(" \u00b7 ") : (message || "Generating...");
   // etaEl is updated live by _startTimer interval — do not touch it here
   _pb.dotEl.style.background = "#2e7d32";
 }
@@ -574,7 +580,7 @@ app.registerExtension({
           _pbShowIdle();
           break;
         case "startup":
-          _pbShowStartup(s.message || "Starting up...");
+          _pbShowStartup(s.message || s.phase || "Starting up...");
           break;
         case "generating":
           _pbShowProgress(
@@ -582,7 +588,11 @@ app.registerExtension({
             s.overallPercent,
             s.samplerPercent,
             s.currentNodeLabel,
-            s.totalNodes > 0 ? `${s.completedNodes}/${s.totalNodes}` : ""
+            s.samplerStep,
+            s.samplerMaximum,
+            s.completedNodes,
+            s.totalNodes,
+            s.message
           );
           break;
         case "done": {
@@ -696,6 +706,9 @@ app.registerExtension({
               metadata_mode: "none",
               return_comparison_a: false
             };
+          } else {
+            // Phase 1: always include a production object (enabled=false) when off
+            baseOptions.production = { enabled: false };
           }
           parsed.modal_options = { ...(parsed.modal_options || {}), ...baseOptions };
           // Attach compact production trace to the request body so the
@@ -760,7 +773,10 @@ function _isOutputCapable(node) {
 
 function _getProductionEnabled() {
   const graphVal = app.graph?.extra?.comfymodal?.production_mode_enabled;
-  return graphVal !== undefined ? graphVal : localStorage.getItem(STORAGE_KEY_PRODUCTION) === "true";
+  if (graphVal !== undefined) return graphVal;
+  const stored = localStorage.getItem(STORAGE_KEY_PRODUCTION);
+  // Phase 1: default On (true) when no stored value exists
+  return stored !== null ? stored === "true" : true;
 }
 
 function _getCloudModeEnabled() {

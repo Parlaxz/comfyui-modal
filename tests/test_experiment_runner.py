@@ -2455,5 +2455,108 @@ class PerInvocationMaterializationTests(unittest.TestCase):
         )
 
 
+# ── LocalRemoteInvoker cancellation tests ───────────────────────────────
+
+
+class LocalRemoteInvokerCancellationTests(unittest.TestCase):
+    """Tests for LocalRemoteInvoker cancel_worker / run_cell task tracking."""
+
+    def _build(self):
+        mod = load_runner()
+
+        async def _noop_stream(**kwargs):
+            if False:
+                yield kwargs
+
+        tmp = tempfile.mkdtemp()
+        invoker = mod.LocalRemoteInvoker(
+            _noop_stream, experiment_id="exp_cancel", node_dir=tmp,
+        )
+        return mod, invoker
+
+    def test_run_cell_short_circuits_on_cancelled_worker(self):
+        """run_cell must return interrupted immediately when worker is cancelled."""
+        mod, invoker = self._build()
+
+        async def _run():
+            # Mark the worker as cancelled before calling run_cell
+            await invoker.cancel_worker("w_cancelled")
+            result = await invoker.run_cell("w_cancelled", {"cell_key": "ck_1"})
+            return result
+
+        result = asyncio.run(_run())
+        self.assertEqual(result["status"], "interrupted")
+
+    def test_run_cell_tracks_and_cleans_task(self):
+        """run_cell must register and then clean up the task in _run_cell_tasks."""
+        mod, invoker = self._build()
+
+        async def _run():
+            # After run_cell completes (with no-op stream that returns error),
+            # the task should be cleaned up from _run_cell_tasks
+            result = await invoker.run_cell("w_clean", {"cell_key": "ck_2", "input_images": {}})
+            return result, dict(invoker._run_cell_tasks)
+
+        result, remaining = asyncio.run(_run())
+        self.assertNotIn("w_clean", remaining,
+                         "task should be popped from _run_cell_tasks after run_cell completes")
+
+    def test_cancel_worker_marks_and_cleans(self):
+        """cancel_worker adds to cancelled_workers and close_worker cleans up."""
+        mod, invoker = self._build()
+
+        async def _run():
+            await invoker.cancel_worker("w_marked")
+            self.assertIn("w_marked", invoker._cancelled_workers)
+            await invoker.close_worker("w_marked")
+            self.assertNotIn("w_marked", invoker._cancelled_workers)
+
+        asyncio.run(_run())
+
+    def test_close_worker_is_idempotent(self):
+        """close_worker must be safe to call multiple times."""
+        mod, invoker = self._build()
+
+        async def _run():
+            await invoker.cancel_worker("w_idem")
+            await invoker.close_worker("w_idem")
+            await invoker.close_worker("w_idem")  # second call should not raise
+            # close_worker with unknown worker also safe
+            await invoker.close_worker("w_unknown")
+
+        asyncio.run(_run())
+
+    def test_cancel_worker_cancels_active_run_cell_task(self):
+        """cancel_worker must interrupt an in-flight stream without
+        cancelling the task that requested cancellation."""
+        mod = load_runner()
+        closed = False
+
+        async def _stream(**kwargs):
+            nonlocal closed
+            yield {"type": "status", "message": "started"}
+            try:
+                await asyncio.sleep(30)
+            finally:
+                closed = True
+
+        invoker = mod.LocalRemoteInvoker(
+            _stream, experiment_id="exp_cancel_active", node_dir=tempfile.mkdtemp(),
+        )
+
+        async def _run():
+            cell_task = asyncio.create_task(
+                invoker.run_cell("w_active", {"cell_key": "ck_active"})
+            )
+            await asyncio.sleep(0.01)
+            await invoker.cancel_worker("w_active")
+            with self.assertRaises(asyncio.CancelledError):
+                await cell_task
+            self.assertTrue(closed)
+            self.assertNotIn("w_active", invoker._run_cell_tasks)
+
+        asyncio.run(_run())
+
+
 if __name__ == "__main__":
     unittest.main()
