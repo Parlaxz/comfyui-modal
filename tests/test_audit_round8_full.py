@@ -622,6 +622,60 @@ class CanonicalHashFunctionalTests(unittest.TestCase):
         # In JSON, 1.0 != 1
         self.assertNotEqual(h1, h2)
 
+    # ── Cross-consistency with production_workflow hashes ────────────
+
+    def test_hash_consistency_with_pw_source_hash(self):
+        """comfyapp and production_workflow source hashes must agree for the
+        same normal JSON workflow (no non-finite values)."""
+        from production_workflow import _compute_source_workflow_hash as pw_src_hash
+        wf = {"1": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 20}},
+              "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello"}}}
+        comfy_h = self.source_hash(wf)
+        pw_h = pw_src_hash(wf)
+        self.assertEqual(comfy_h, pw_h,
+                         "comfyapp and production_workflow source hashes must match")
+
+    def test_hash_consistency_with_pw_compiled_hash(self):
+        """comfyapp and production_workflow compiled hashes must agree for the
+        same normal JSON compiled workflow."""
+        from production_workflow import _compute_compiled_workflow_hash as pw_comp_hash
+        compiled = {"3": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}},
+                    "9": {"class_type": "PreviewImage", "inputs": {"images": ("3", 0)}}}
+        comfy_h = self.compiled_hash(compiled)
+        pw_h = pw_comp_hash(compiled)
+        self.assertEqual(comfy_h, pw_h,
+                         "comfyapp and production_workflow compiled hashes must match")
+
+    def test_options_hash_consistency_with_pw_normalize(self):
+        """comfyapp options hash and production_workflow normalize_production_options
+        must round-trip consistently (same options dict produces same hash)."""
+        from production_workflow import normalize_production_options
+        opts_raw = {"production": {"enabled": True, "schema_version": 1,
+                                   "output_node_ids": ["9"]}}
+        normalized = normalize_production_options(opts_raw)
+        h1 = self.options_hash(normalized)
+        h2 = self.options_hash(normalized)
+        self.assertEqual(h1, h2)
+
+    # ── Non-finite values fail closed (NaN/Infinity) ────────────────
+
+    def test_non_finite_source_hash_fails_closed(self):
+        """A source workflow containing NaN must produce empty hash
+        (fail-closed) rather than a divergent non-empty hash."""
+        wf_with_nan = {"1": {"class_type": "KSampler", "inputs": {"cfg": float("nan")}}}
+        h = self.source_hash(wf_with_nan)
+        self.assertEqual(h, "",
+                         "NaN in source workflow must produce empty hash (fail-closed)")
+
+    def test_non_finite_compiled_hash_fails_closed(self):
+        """A compiled workflow containing NaN must produce empty hash
+        (fail-closed)."""
+        compiled_with_nan = {"3": {"class_type": "VAEDecode",
+                                   "inputs": {"some_val": float("inf")}}}
+        h = self.compiled_hash(compiled_with_nan)
+        self.assertEqual(h, "",
+                         "Infinity in compiled workflow must produce empty hash (fail-closed)")
+
 
 def _reorder_and_hash(hash_fn, workflow):
     """Re-serialize with reordered keys to ensure determinism."""

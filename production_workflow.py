@@ -105,9 +105,17 @@ def _cache_size():
 
 
 def _compute_compiled_workflow_hash(compiled: dict) -> str:
-    """SHA-256 of the compiled workflow dict using deterministic JSON encoding."""
+    """SHA-256 of the compiled workflow dict using deterministic JSON encoding.
+
+    Uses ``allow_nan=False`` so that NaN/Infinity values raise a
+    ``ValueError`` and produce an empty hash (fail-closed) rather than
+    silently producing a divergent hash.
+    """
     try:
-        encoded = json.dumps(compiled, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        encoded = json.dumps(
+            compiled, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        )
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     except Exception:
         return ""
@@ -119,9 +127,17 @@ def _compute_source_workflow_hash(workflow: dict) -> str:
     Includes all workflow values (seeds, prompts, model names, etc.), not only
     topology.  This ensures cache isolation: two workflows with identical
     topology but different literal values produce different source hashes.
+
+    Uses ``allow_nan=False`` — same canonical serialization as
+    ``comfyapp.compute_canonical_source_workflow_hash`` — so that non-finite
+    values raise a ``ValueError`` and produce an empty hash rather than
+    silently diverging from the canonical hash.
     """
     try:
-        encoded = json.dumps(workflow, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        encoded = json.dumps(
+            workflow, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        )
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     except Exception:
         return ""

@@ -1841,6 +1841,7 @@ async def _schedule_and_start(
     generation_start_dt = datetime.fromisoformat(generation_start.replace("Z", "+00:00"))
 
     from experiment_runner import LocalRemoteInvoker
+    from local_artifacts import get_studio_outputs_dir
     from modal_client import run_prompt_stream
 
     # ── Merge compilation's effective production options into modal_options ──
@@ -1891,6 +1892,7 @@ async def _schedule_and_start(
         modal_options=_effective_modal_options,
         workspace=workspace,
         production_report=_prod_report,
+        studio_output_dir=str(get_studio_outputs_dir()),
     )
     sched = await REGISTRY.get_or_create_scheduler(
         exp_id,
@@ -2471,14 +2473,37 @@ def handle_studio_run(
         async def _studio_profile_preparer(resolved_workflow, cell):
             """Prepare active-next warmup profile using the fully resolved
             cell workflow.  Hashes the actual resolved_workflow passed by
-            LocalRemoteInvoker.run_cell."""
+            LocalRemoteInvoker.run_cell.
+
+            Forwards production options from the compilation data so that
+            omitted production (default-enabled) is reflected in the
+            activation payload.
+            """
             try:
                 from experiment_runner import _workflow_sha256
                 from modal_client import set_active_warmup_profile as _remote_setter
                 _hash = _workflow_sha256(resolved_workflow) if isinstance(resolved_workflow, dict) else ""
+                # Derive production options from the compilation data.
+                # The compilation carries production_options when production
+                # is enabled; prefer the cell-level production_report when
+                # available, then fall back to the compilation-level one.
+                _cell_report = cell.get("production_report")
+                _compilation_prod_opts = compilation.get("production_options") or {}
+                _compilation_prod_report = compilation.get("production_report") or {}
+                _active_prod_opts: dict | None = None
+                _prod_report = _cell_report or _compilation_prod_report
+                if _prod_report and _prod_report.get("enabled"):
+                    _active_prod_opts = dict(_compilation_prod_opts) if _compilation_prod_opts else {}
+                    _active_prod_opts.setdefault("enabled", True)
+                    # Forward output_node_ids from the report if not present
+                    if not _active_prod_opts.get("output_node_ids"):
+                        _ids = _prod_report.get("output_node_ids") or _prod_report.get("kept_node_ids") or []
+                        if _ids:
+                            _active_prod_opts["output_node_ids"] = list(_ids)
                 await prepare_active_next_profile(
                     resolved_workflow,
                     _hash,
+                    production_options=_active_prod_opts,
                     workspace=_ws_captured,
                     setter=_remote_setter,
                 )

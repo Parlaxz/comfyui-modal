@@ -5462,6 +5462,20 @@ _CUSTOM_NODE_IMAGE_IGNORE_PATTERNS = [
     ".venv/",
     "venv/",
     "node_modules/",
+    # Generated artifact directories — applied to all custom nodes via
+    # _custom_node_image_ignore_patterns, but only comfyui-modal has them.
+    "output/",
+    "test-results/",
+    "playwright-report/",
+    ".playwright-mcp/",
+    ".experiments/",
+    ".run_history/",
+    "benchmark_runs/",
+    "benchmark_logs/",
+    "optimization_logs/",
+    ".comfymodal_experiments/",
+    ".custom_node_requirements/",
+    ".baked_custom_node_deps/",
 ]
 _COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = [
     ".gitignore",
@@ -5472,6 +5486,7 @@ _COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = [
     ".experiment_leases.db*",
     ".comfymodal_experiments/",
     ".custom_node_requirements/",
+    ".baked_custom_node_deps/",
     ".hf_token",
     ".civitai_token",
     ".deployed_state.json",
@@ -5485,6 +5500,22 @@ _COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = [
     "apply_experiment_preset.py",
     "run_experiment_stage.py",
     "BENCHMARK_WORKFLOW.md",
+    # Development-only state directories
+    ".opencode/",
+    ".slim/",
+    ".presets/",
+    ".preset_blobs/",
+    "MagicMock/",
+    # Generated artifact directories (migrated or to-be-migrated)
+    "output/",
+    "test-results/",
+    "playwright-report/",
+    ".playwright-mcp/",
+    ".experiments/",
+    ".run_history/",
+    "benchmark_runs/",
+    "benchmark_logs/",
+    "optimization_logs/",
 ]
 _COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = [
     "*/.git/",
@@ -5520,6 +5551,22 @@ _COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = [
     "comfyui-modal/apply_experiment_preset.py",
     "comfyui-modal/run_experiment_stage.py",
     "comfyui-modal/BENCHMARK_WORKFLOW.md",
+    # Development-only state directories
+    "comfyui-modal/.opencode/",
+    "comfyui-modal/.slim/",
+    "comfyui-modal/.presets/",
+    "comfyui-modal/.preset_blobs/",
+    "comfyui-modal/MagicMock/",
+    # Generated artifact directories (migrated or to-be-migrated)
+    "comfyui-modal/output/",
+    "comfyui-modal/test-results/",
+    "comfyui-modal/playwright-report/",
+    "comfyui-modal/.playwright-mcp/",
+    "comfyui-modal/.experiments/",
+    "comfyui-modal/.run_history/",
+    "comfyui-modal/benchmark_runs/",
+    "comfyui-modal/benchmark_logs/",
+    "comfyui-modal/optimization_logs/",
 ]
 _CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE = shutil.ignore_patterns(
     ".git",
@@ -5531,6 +5578,23 @@ _CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE = shutil.ignore_patterns(
     ".venv",
     "venv",
     ".last_context_manifest.json",
+    "output",
+    "test-results",
+    "playwright-report",
+    ".playwright-mcp",
+    ".experiments",
+    ".run_history",
+    "benchmark_runs",
+    "benchmark_logs",
+    "optimization_logs",
+    ".comfymodal_experiments",
+    ".custom_node_requirements",
+    ".baked_custom_node_deps",
+    ".opencode",
+    ".slim",
+    ".presets",
+    ".preset_blobs",
+    "MagicMock",
     # Image/media/docs GÃ‡Ã¶ not needed for pip install
     "*.jpg",
     "*.jpeg",
@@ -13842,6 +13906,12 @@ class _ComfyAPIMixin:
         _prod_start_ns = time.perf_counter_ns()
         _production_cache = normalize_production_options(modal_options)
         _production_enabled = _production_cache.get("enabled", False)
+        if _production_enabled and production_report is None and not _production_cache.get("output_node_ids", []):
+            raise RuntimeError(
+                "Production is enabled but no output_node_ids and no precompiled production_report "
+                "were provided. Callers must specify modal_options.production.output_node_ids "
+                "or pass a precompiled production_report, or explicitly disable production."
+            )
         source_workflow = workflow  # save original for known-good marking
         _compiled_workflow = None
         _compile_ms = 0
@@ -15784,7 +15854,7 @@ class _ComfyAPIMixin:
                 mode = profile.get("mode")
             if self._select_backend() == "in_process":
                 _t0 = time.time()
-                self._execute_in_process(workflow, collect_outputs=False)
+                self._execute_in_process(workflow, collect_outputs=False, modal_options={"production": {"enabled": False}})
                 t_exec = round((time.time() - _t0) * 1000, 1)
             else:
                 _t0 = time.time()
@@ -18506,21 +18576,15 @@ class _ComfyAPIMixin:
                           f"optional_cuda_ms={__stages['optional_cuda_total_ms']}")
 
                 # GÃ¶Ã‡GÃ¶Ã‡ Fallback submit if preload was not submitted early GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
-                if preload_paths and _pm != "off" and _restore_preload_handle is None:
+                # Phase 2: production skips CPU preload entirely -- direct
+                # warmup (_warmup_direct) loads UNET+CLIP to GPU directly.
+                if preload_paths and _pm != "off" and _restore_preload_handle is None and not _production_stable_path:
                     _preload_submitted_early = 1
                     _preload_overlap_start = time.time()
                     __stages["restore_preload_submit_at_ms_from_restore_start"] = round((_preload_overlap_start - restore_start) * 1000, 1)
-                    if _production_stable_path:
-                        _restore_preload_handle = self._start_restore_preload(
-                            preload_paths,
-                            read_strategy="normal",
-                            abort_policy="wait_same_future",
-                        )
-                        __stages["restore_preload_submitted_production"] = 1
-                    else:
-                        _restore_preload_handle = self._start_restore_preload(preload_paths)
+                    _restore_preload_handle = self._start_restore_preload(preload_paths)
                     __stages["restore_preload_submitted_early"] = 1
-                    _label = "production" if _production_stable_path else "late"
+                    _label = "late"
                     print(
                         f"[comfyapp] restore_preload_submitted_{_label} files={len(preload_paths)} "
                         f"mode={_pm} at_ms={__stages['restore_preload_submit_at_ms_from_restore_start']}"
@@ -18712,7 +18776,8 @@ class _ComfyAPIMixin:
                                 f"key={_prod_unet.get('key','')} "
                                 f"clip_read_active={_prod_unet.get('clip_read_active',0)}"
                             )
-                elif preload_paths and _pm != "off" and _restore_preload_handle is None:
+                # Phase 2: production skips CPU preload even in the elif fallback.
+                elif preload_paths and _pm != "off" and _restore_preload_handle is None and not _production_stable_path:
                     if _pm == "async_no_wait":
                         import threading
                         _preload_thread = threading.Thread(

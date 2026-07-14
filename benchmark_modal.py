@@ -42,7 +42,7 @@ BENCHMARK_WORKFLOW_ROUTE = f"{LOCAL_BASE_URL}/comfymodal/benchmark/workflow"
 LOCAL_PROMPT_ROUTE = f"{LOCAL_BASE_URL}/comfymodal/prompt"
 LOCAL_RESULT_ROUTE = f"{LOCAL_BASE_URL}/comfymodal/result"
 LOCAL_SYSTEM_STATS_ROUTE = f"{LOCAL_BASE_URL}/system_stats"
-BENCHMARK_RUNS_DIRNAME = "benchmark_runs"
+_BENCHMARK_RUNS_DIRNAME = "standard"  # subdirectory within external benchmarks/runs
 # Match only local ComfyUI\main.py launcher command lines.
 LOCAL_COMFYUI_PROCESS_PATTERN = "ComfyUI\\main.py"
 WINDOWS_COMFYUI_PROCESS_NAMES = ("python.exe", "pythonw.exe")
@@ -75,7 +75,8 @@ def _timestamp() -> str:
 
 
 def _ensure_run_dir() -> Path:
-    run_dir = REPO_ROOT / BENCHMARK_RUNS_DIRNAME / _timestamp()
+    from local_artifacts import get_benchmark_runs_dir
+    run_dir = get_benchmark_runs_dir() / _BENCHMARK_RUNS_DIRNAME / _timestamp()
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
 

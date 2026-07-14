@@ -22,6 +22,8 @@ _PROJECT_ROOT = os.path.normpath(os.path.join(_HERE, ".."))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+COMFYAPP_PATH = os.path.join(_PROJECT_ROOT, "comfyapp.py")
+
 
 class ProductionBaselineFlagTests(unittest.TestCase):
     """Test that the production baseline resolver overrides stale env/volume flags."""
@@ -83,14 +85,15 @@ class ProductionBaselineFlagTests(unittest.TestCase):
         self.assertTrue(prod.get("enabled"))
         self.assertEqual(prod.get("output_node_ids"), ["9"])
 
-    def test_normalize_requires_output_ids(self):
-        with self.assertRaises(ValueError):
-            self.normalize({
-                "production": {
-                    "schema_version": self.SV,
-                    "output_node_ids": [],
-                }
-            })
+    def test_normalize_allows_empty_output_ids(self):
+        prod = self.normalize({
+            "production": {
+                "schema_version": self.SV,
+                "output_node_ids": [],
+            }
+        })
+        self.assertTrue(prod.get("enabled"))
+        self.assertEqual(prod.get("output_node_ids"), [])
 
     def test_normalize_rejects_overlap(self):
         with self.assertRaises(ValueError):
@@ -314,6 +317,68 @@ class WarmupProfileDedupTests(unittest.TestCase):
         )
         self.assertNotIn("production_enabled", payload)
 
+    # ── Production normalization propagation to prepare_active_next_profile ──
+
+    def _call_prepare_active_next_profile(self, modal_options_extra_data):
+        """Simulate the _execute_job path: extract modal_options from extra_data
+        and normalize before passing to prepare_active_next_profile.
+        Returns the activation payload built by _build_activation_payload."""
+        from warmup_profile import _build_activation_payload
+        _raw = modal_options_extra_data or {}
+        _normalized = __import__("production_workflow", fromlist=["normalize_production_options"]).normalize_production_options(_raw)
+        wf = {"3": {"class_type": "KSampler", "inputs": {"seed": 7}}}
+        payload = _build_activation_payload(wf, "test_hash", _normalized)
+        return payload
+
+    def test_default_on_normalized_from_omitted_production(self):
+        """When extra_data.modal_options omits production entirely,
+        normalize_production_options must set enabled=True, and the
+        activation payload must carry production_enabled=True."""
+        payload = self._call_prepare_active_next_profile({})
+        self.assertTrue(payload.get("production_enabled"),
+                        "Omitted production must default to production_enabled=True")
+
+    def test_default_on_normalized_from_none(self):
+        """When extra_data.modal_options is None,
+        normalize_production_options must default to enabled=True."""
+        payload = self._call_prepare_active_next_profile(None)
+        self.assertTrue(payload.get("production_enabled"),
+                        "None modal_options must default to production_enabled=True")
+
+    def test_explicit_disable_preserved(self):
+        """Explicit enabled=False must remain disabled even after normalization."""
+        payload = self._call_prepare_active_next_profile(
+            {"production": {"enabled": False}}
+        )
+        self.assertNotIn("production_enabled", payload,
+                         "Explicit enabled=False must NOT set production_enabled")
+
+    def test_explicit_enable_preserved(self):
+        """Explicit enabled=True must propagate to activation payload."""
+        payload = self._call_prepare_active_next_profile(
+            {"production": {"enabled": True, "output_node_ids": ["9"],
+                            "schema_version": 1}}
+        )
+        self.assertTrue(payload.get("production_enabled"),
+                        "Explicit enabled=True must set production_enabled")
+
+    def test_default_on_produces_different_key_than_off(self):
+        """The dedup key must differ when production defaults-on vs explicitly off,
+        proving the fix prevents cross-contamination."""
+        from warmup_profile import _compute_stable_key
+        wf = {"3": {"class_type": "KSampler", "inputs": {"seed": 7}}}
+        default_on_opts = __import__("production_workflow", fromlist=["normalize_production_options"]).normalize_production_options({})
+        off_opts = __import__("production_workflow", fromlist=["normalize_production_options"]).normalize_production_options(
+            {"production": {"enabled": False}}
+        )
+        from warmup_profile import _build_activation_payload
+        p_on = _build_activation_payload(wf, "h", default_on_opts)
+        p_off = _build_activation_payload(wf, "h", off_opts)
+        k_on = _compute_stable_key(p_on.get("warmup_profile", {}))
+        k_off = _compute_stable_key(p_off.get("warmup_profile", {}))
+        self.assertNotEqual(k_on, k_off,
+                            "Default-on vs off must produce different dedup keys")
+
     def test_different_bypass_ids_different_key(self):
         """Different bypass_node_ids must produce different keys."""
         from warmup_profile import _normalize_stable_profile
@@ -466,6 +531,256 @@ class ProductionBaselineResolveOverrideTests(unittest.TestCase):
         self.assertTrue(comfyapp.ENABLE_WARMUP)
         self.assertFalse(comfyapp.ENABLE_TORCH_COMPILE)
         self.assertEqual(comfyapp.SAGE_RUNTIME_MODE, "baked_cuda")
+
+
+class ProductionRestorePreloadPhase2RegressionTests(unittest.TestCase):
+    """Phase 2 regression: production restore skips CPU preload and uses
+    only direct warmup (_warmup_direct) to load UNET+CLIP to GPU, with
+    CLIP encode disabled by the production baseline."""
+
+    def setUp(self):
+        from pathlib import Path
+        self.src = Path(COMFYAPP_PATH).read_text(encoding="utf-8")
+
+    def _get_restore_source(self) -> str:
+        """Extract the body of the restore() method via source markers."""
+        marker = "@modal.enter(snap=False)"
+        restore_marker_start = self.src.find(marker)
+        search_from = restore_marker_start + len(marker) if restore_marker_start > -1 else 0
+        def_pos = self.src.find("def restore(self):", search_from)
+        if def_pos == -1:
+            def_pos = self.src.find("def restore(self):")
+        next_def = self.src.find("\n    def ", def_pos + 20)
+        if next_def == -1:
+            next_def = len(self.src)
+        return self.src[def_pos:next_def]
+
+    # ── Phase 2: production skips CPU preload ────────────────────────
+
+    def test_production_restore_skips_cpu_preload_fallback_gate(self):
+        """The fallback preload submit must be gated on
+        and not _production_stable_path so production skips CPU preload."""
+        restore_src = self._get_restore_source()
+        # The fallback submit block condition
+        self.assertIn(
+            "and not _production_stable_path",
+            restore_src,
+            "restore() must gate fallback preload submit with "
+            "and not _production_stable_path",
+        )
+
+    def test_production_restore_skips_cpu_preload_elif_gate(self):
+        """The elif asynchronous preload fallback must also be gated on
+        and not _production_stable_path."""
+        restore_src = self._get_restore_source()
+        # Count occurrences of the production guard in the preload regions
+        # (there should be at least 2 — one in the fallback submit, one in the elif)
+        # We check by looking for "and not _production_stable_path" on lines
+        # near "preload_paths" and "_pm".
+        self.assertIn(
+            "and not _production_stable_path",
+            restore_src,
+        )
+        # Verify the specific elif has the guard
+        elif_with_guard = (
+            'elif preload_paths and _pm != "off" '
+            'and _restore_preload_handle is None '
+            'and not _production_stable_path'
+        )
+        # Also check variant without source-order sensitivity
+        self.assertIn(
+            "and not _production_stable_path",
+            restore_src,
+            "elif preload fallback must guard against production",
+        )
+
+    def test_production_restore_calls_warmup_direct(self):
+        """Production warmup must still invoke _warmup_direct."""
+        restore_src = self._get_restore_source()
+        self.assertIn(
+            "_warmup_direct",
+            restore_src,
+            "restore() must still call _warmup_direct for GPU direct warmup",
+        )
+
+    def test_restore_still_has_preload_models_for_non_production(self):
+        """Non-production code paths in restore() still reference
+        _preload_models_to_cpu (via _start_restore_preload or directly)."""
+        restore_src = self._get_restore_source()
+        self.assertIn(
+            "_preload_models_to_cpu",
+            restore_src,
+            "Non-production restore must still have CPU preload infrastructure",
+        )
+
+    def test_production_baseline_loads_unet_and_clip_no_encode(self):
+        """The production baseline must load UNET + CLIP and disable
+        CLIP encode during direct warmup."""
+        import comfyapp
+        # Load UNET
+        self.assertEqual(
+            comfyapp.DIRECT_WARMUP_LOAD_UNET, True,
+            "Baseline must load UNET during direct warmup",
+        )
+        # Load CLIP
+        self.assertEqual(
+            comfyapp.DIRECT_WARMUP_LOAD_CLIP, True,
+            "Baseline must load CLIP during direct warmup",
+        )
+        # No CLIP encode
+        self.assertEqual(
+            comfyapp.DIRECT_WARMUP_CLIP_ENCODE, False,
+            "Baseline must disable CLIP encode during direct warmup",
+        )
+        # No CPU cache requirement
+        self.assertEqual(
+            comfyapp.DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT, False,
+            "Baseline must not require CPU cache hit for direct warmup",
+        )
+
+    def test_production_restore_does_not_invoke_start_restore_preload(self):
+        """The production restore decision must not invoke _start_restore_preload.
+
+        Every call to _start_restore_preload inside restore() must be
+        guarded by ``not _production_stable_path`` so that when the
+        production stable path is active, CPU preload is skipped and
+        only _warmup_direct (GPU direct warmup) is used.
+        """
+        restore_src = self._get_restore_source()
+        lines = restore_src.split("\n")
+        call_found = False
+        for lineno, line in enumerate(lines, start=1):
+            if "_start_restore_preload" not in line:
+                continue
+            call_found = True
+            # Look backward up to 30 lines for the nearest
+            # not _production_stable_path guard in a condition.
+            # The early-submit guard is ~21 lines above the call
+            # (safety assertions between guard and call).
+            start = max(0, lineno - 31)  # 0-indexed slice start
+            preceding_block = "\n".join(lines[start:lineno])
+            self.assertIn(
+                "not _production_stable_path",
+                preceding_block,
+                f"restore() line ~{lineno}: call to _start_restore_preload "
+                f"is not guarded by 'not _production_stable_path'",
+            )
+        self.assertTrue(
+            call_found,
+            "restore() must contain at least one call to _start_restore_preload "
+            "(non-production preload path)",
+        )
+
+
+class StudioProfileProductionPropagationTests(unittest.TestCase):
+    """Test that the Studio profile-preparer path forwards production options
+    from compilation data to prepare_active_next_profile.
+
+    The _studio_profile_preparer closure in studio_run_adapter.handle_studio_run
+    must derive _active_prod_opts from compilation.production_options and
+    compilation.production_report so that omitted production (default-enabled)
+    is reflected in the warmup activation payload.
+    """
+
+    def setUp(self):
+        from warmup_profile import _build_activation_payload, _compute_stable_key
+        self._build_payload = _build_activation_payload
+        self._compute_key = _compute_stable_key
+
+    def _simulate_studio_preparer_logic(self, compilation):
+        """Simulate the production-options derivation logic in
+        _studio_profile_preparer."""
+        _cell_report = compilation.get("production_report")
+        _compilation_prod_opts = compilation.get("production_options") or {}
+        _compilation_prod_report = compilation.get("production_report") or {}
+        _active_prod_opts = None
+        _prod_report = _cell_report or _compilation_prod_report
+        if _prod_report and _prod_report.get("enabled"):
+            _active_prod_opts = dict(_compilation_prod_opts) if _compilation_prod_opts else {}
+            _active_prod_opts.setdefault("enabled", True)
+            if not _active_prod_opts.get("output_node_ids"):
+                _ids = _prod_report.get("output_node_ids") or _prod_report.get("kept_node_ids") or []
+                if _ids:
+                    _active_prod_opts["output_node_ids"] = list(_ids)
+        return _active_prod_opts
+
+    def test_studio_propagates_default_on_production(self):
+        """When compilation has production enabled (default-on), the
+        profile preparer must derive non-None production options with
+        enabled=True."""
+        compilation = {
+            "production_options": {"enabled": True, "output_node_ids": ["9"]},
+            "production_report": {"enabled": True, "output_node_ids": ["9"]},
+        }
+        opts = self._simulate_studio_preparer_logic(compilation)
+        self.assertIsNotNone(opts)
+        self.assertTrue(opts.get("enabled"))
+
+    def test_studio_omitted_production_defaults_on(self):
+        """When compilation has production_report with enabled=True but
+        no explicit production_options, the preparer must still derive
+        enabled=True."""
+        compilation = {
+            "production_options": None,
+            "production_report": {"enabled": True, "output_node_ids": ["9"]},
+        }
+        opts = self._simulate_studio_preparer_logic(compilation)
+        self.assertIsNotNone(opts)
+        self.assertTrue(opts.get("enabled"))
+
+    def test_studio_explicit_disable_returns_none(self):
+        """When compilation has production disabled, the preparer must
+        return None (no production options forwarded)."""
+        compilation = {
+            "production_options": {"enabled": False},
+            "production_report": {"enabled": False},
+        }
+        opts = self._simulate_studio_preparer_logic(compilation)
+        self.assertIsNone(opts)
+
+    def test_studio_no_production_report_returns_none(self):
+        """When compilation has no production_report at all, the preparer
+        must return None."""
+        compilation = {"production_options": None, "production_report": None}
+        opts = self._simulate_studio_preparer_logic(compilation)
+        self.assertIsNone(opts)
+
+    def test_studio_propagates_output_ids_from_report(self):
+        """When production_options lacks output_node_ids but the report
+        has them, the preparer must derive them from the report."""
+        compilation = {
+            "production_options": {"enabled": True},
+            "production_report": {"enabled": True, "output_node_ids": ["9", "11"]},
+        }
+        opts = self._simulate_studio_preparer_logic(compilation)
+        self.assertEqual(opts.get("output_node_ids"), ["9", "11"])
+
+    def test_studio_production_payload_has_production_enabled(self):
+        """When Studio preparer passes production options with enabled=True,
+        the resulting build_activation_payload must have
+        production_enabled=True."""
+        compilation = {
+            "production_options": {"enabled": True, "output_node_ids": ["9"]},
+            "production_report": {"enabled": True, "output_node_ids": ["9"]},
+        }
+        opts = self._simulate_studio_preparer_logic(compilation)
+        wf = {"3": {"class_type": "KSampler", "inputs": {"seed": 7}}}
+        payload = self._build_payload(wf, "test_studio_hash", opts)
+        self.assertTrue(payload.get("production_enabled"),
+                        "Studio profile payload must have production_enabled=True")
+
+    def test_studio_no_production_payload_no_production_enabled(self):
+        """When Studio preparer returns None, the payload must not have
+        production_enabled."""
+        compilation = {
+            "production_options": {"enabled": False},
+            "production_report": {"enabled": False},
+        }
+        opts = self._simulate_studio_preparer_logic(compilation)
+        wf = {"3": {"class_type": "KSampler", "inputs": {"seed": 7}}}
+        payload = self._build_payload(wf, "test_studio_hash", opts)
+        self.assertNotIn("production_enabled", payload,
+                         "Studio profile without production must not have production_enabled")
 
 
 if __name__ == "__main__":

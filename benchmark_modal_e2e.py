@@ -36,10 +36,18 @@ REPO_ROOT = Path(__file__).resolve().parent
 OUTER_ROOT = REPO_ROOT.parents[2]
 REDEPLOY_BATCH = OUTER_ROOT / "redeploy_modal_and_run_comfyui.bat"
 COMFYUI_LAUNCHER = OUTER_ROOT / "run_nvidia_gpu.bat"
-BENCHMARK_RUNS_DIR = REPO_ROOT / "benchmarks"
+# BENCHMARK_RUNS_DIR is resolved lazily to <data-root>/benchmarks/runs
+# below because local_artifacts imports would otherwise run at import time.
+# The actual resolver call is made in _resolve_benchmark_runs_dir().
 
 _STALE_T0_THRESHOLD_S = 60
 _MIN_POLL_INTERVAL = 0.05
+
+
+def _resolve_benchmark_runs_dir() -> Path:
+    """Lazy-resolve the external benchmarks/runs directory."""
+    from local_artifacts import get_benchmark_runs_dir
+    return get_benchmark_runs_dir()
 
 # ── Preset registry ─────────────────────────────────────────────────────────
 # NOTE: Presets marked _disabled:true perform speculative independent model-file
@@ -2044,7 +2052,7 @@ def cmd_benchmark(args: argparse.Namespace, effective_config: dict | None = None
     print(f"  Workflow loaded. Hash: {workflow_hash[:16]}\n")
 
     ts = _timestamp()
-    out_dir = _ensure_dir(BENCHMARK_RUNS_DIR / ts)
+    out_dir = _ensure_dir(_resolve_benchmark_runs_dir() / ts)
     raw_dir = _ensure_dir(out_dir / "raw_results")
     print(f"  Output: {out_dir}\n")
 
@@ -2782,7 +2790,7 @@ def main() -> int:
             if isinstance(resp, dict) and resp.get("status") == "ok":
                 payload = resp.get("payload") or {}
                 if isinstance(payload, dict):
-                    args.workflow = str(BENCHMARK_RUNS_DIR / "_saved_workflow.json")
+                    args.workflow = str(_resolve_benchmark_runs_dir() / "_saved_workflow.json")
                     Path(args.workflow).write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception as e:
             print(f"ERROR: {e}\nProvide --workflow or run a generation first.")

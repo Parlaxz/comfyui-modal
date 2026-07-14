@@ -21,8 +21,9 @@ DEFAULTS = {
     "save_metadata_sidecar": True,
 }
 
-# Default save folder relative to ComfyUI root
-_DEFAULT_SAVE_SUBDIR = os.path.join("output", "modal")
+# Default save folder: resolved to external <data-root>/outputs/modal
+# via a lazy import so local_artifacts is not loaded at module import time.
+_DEFAULT_SAVE_SUBDIR = None  # sentinel; resolved lazily in _resolve_save_folder
 
 
 def _normalize_save_folder(save_folder: str) -> str:
@@ -33,15 +34,29 @@ def _normalize_save_folder(save_folder: str) -> str:
     return normalized
 
 
+def _resolve_modal_output_dir() -> str:
+    """Resolve the default modal output directory from the external data root."""
+    from local_artifacts import get_modal_outputs_dir
+    return str(get_modal_outputs_dir())
+
+
 def _resolve_save_folder(save_folder: str, comfyui_root: str) -> str:
-    """Resolve the save folder, falling back to ComfyUI/output/modal/."""
+    """Resolve the save folder, falling back to external data-root outputs/modal/.
+
+    Empty or legacy ``output/modal`` / ``ComfyUI/output/modal`` folders resolve
+    to the external data root.  Explicit absolute paths remain untouched.
+    Other explicit explicit relative paths retain their ComfyUI-root behavior.
+    """
     if save_folder and os.path.isabs(save_folder):
         return save_folder
     normalized = _normalize_save_folder(save_folder)
     if normalized:
+        # Legacy "output/modal" or "ComfyUI/output/modal" → external
+        if normalized in ("output/modal", "ComfyUI/output/modal"):
+            return _resolve_modal_output_dir()
         candidate = os.path.join(comfyui_root, *normalized.split("/"))
     else:
-        candidate = os.path.join(comfyui_root, _DEFAULT_SAVE_SUBDIR)
+        candidate = _resolve_modal_output_dir()
     return candidate
 
 

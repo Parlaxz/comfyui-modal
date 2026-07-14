@@ -347,6 +347,83 @@ The `comfyapp.py` file defines the Modal app — three independent GPU classes (
 
 ---
 
+## Local generated artifacts
+
+ComfyUI-modal generates local data during development, benchmarking, and Playwright testing:
+outputs, experiment data, run history, benchmark results, Playwright artifacts, and optimization
+logs.  These are stored **outside** the custom node directory to keep Modal deployment source small.
+
+### Default data root
+
+The local data root defaults to `<ComfyUI>/comfymodal-data/`.  Override with the environment variable:
+
+```bash
+export COMFYMODAL_LOCAL_DATA_DIR=/path/to/my-data-root
+```
+
+### Artifact categories
+
+| Category | External path |
+|---|---|
+| Output images | `<data-root>/outputs/` |
+| Studio output images | `<data-root>/outputs/studio/` |
+| Auto-save modal images | `<data-root>/outputs/modal/` |
+| Playwright test results | `<data-root>/playwright/test-results/` |
+| Playwright HTML reports | `<data-root>/playwright/report/` |
+| Playwright MCP data | `<data-root>/playwright/mcp/` |
+| Experiment data | `<data-root>/experiments/` |
+| Run history | `<data-root>/run-history/` |
+| Benchmark runs | `<data-root>/benchmarks/runs/` |
+| Benchmark logs | `<data-root>/benchmarks/logs/` |
+| Optimization logs | `<data-root>/optimization/logs/` |
+
+### Migration
+
+If you have local data that was created before the external data root was introduced
+(located under `custom_nodes/comfyui-modal/`), migrate it with:
+
+```bash
+# Preview what will be moved
+python tools/migrate_local_artifacts.py --dry-run
+
+# Migrate everything
+python tools/migrate_local_artifacts.py
+
+# Migrate specific categories
+python tools/migrate_local_artifacts.py --categories output,experiments
+
+# Migrate using category aliases
+python tools/migrate_local_artifacts.py --categories playwright,benchmarks
+```
+
+The migration tool copies, verifies, and then removes source data per category.
+On filename conflicts, both files are preserved with a timestamp/digest suffix.
+No data is deleted automatically — the tool requires an explicit migration command.
+
+### Show current paths
+
+```bash
+python tools/show_local_artifact_paths.py
+```
+
+Use `--json` for machine-readable output or `--categories` to limit to specific
+paths.
+
+### Deployment guard
+
+Before every Modal deploy, a guard checks that no generated artifact directories
+still contain files inside the plugin root.  If any are found, the deploy is
+blocked with a message like:
+
+```
+Deploy blocked: generated artifact directories still contain files.
+Run 'python tools/migrate_local_artifacts.py' first.
+```
+
+This ensures generated data stays outside the Modal deployment image.
+
+---
+
 ## License
 
 MIT
