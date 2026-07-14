@@ -71,26 +71,26 @@ class ResultsUITests(unittest.TestCase):
         self.assertIn("primary_asset_id", self.m.text,
                        "expected primary_asset_id fallback in getAssetId")
 
-    def test_ab_guards_missing_asset_id(self):
-        """A/B comparison must NOT render slider when asset_id missing (no cell_key fallback)."""
+    def test_ab_guards_missing_image(self):
+        """A/B comparison must NOT render slider when image_url missing (no asset or output path)."""
         text = self.m.text
-        self.assertIn('"One or both cells have no asset yet', text,
-                       "expected guard message when asset_id missing")
-        self.assertIn("!a.asset_id || !b.asset_id", text,
-                       "expected guard against missing asset ids")
+        self.assertIn('"One or both cells have no image yet', text,
+                       "expected guard message when image_url missing")
+        self.assertIn("!a.image_url || !b.image_url", text,
+                       "expected guard against missing image_url")
 
-    def test_ab_urls_use_asset_id_only(self):
-        """A/B comparison URLs must use asset_id only, never cell_key as fallback."""
+    def test_ab_urls_use_image_url(self):
+        """A/B comparison URLs must use image_url (pre-resolved from asset_id or output_path)."""
         text = self.m.text
-        # After the guard, URLs use bare asset_id without cell_key fallback
-        self.assertIn("a.asset_id", text,
-                       "expected asset_id for A src")
+        # After the guard, URLs use image_url which is pre-resolved
+        self.assertIn("a.image_url", text,
+                       "expected image_url for A src")
 
-    def test_fullscreen_guards_missing_asset_id(self):
-        """Fullscreen viewer must guard against missing asset_id."""
+    def test_fullscreen_guards_missing_image(self):
+        """Fullscreen viewer must guard against missing image_url."""
         text = self.m.text
-        self.assertIn("selection[0].asset_id && selection[1].asset_id", text,
-                       "expected fullscreen guard for both asset_ids")
+        self.assertIn("selection[0].image_url && selection[1].image_url", text,
+                       "expected fullscreen guard for both image_urls")
 
     def test_checkpoint_cards_have_detail(self):
         """Worker progress cards must show cell counts per checkpoint."""
@@ -107,6 +107,43 @@ class ResultsUITests(unittest.TestCase):
     def test_selection_cap_remains_2(self):
         """Selection limit must stay at 2."""
         self.assertIn("SELECTION_LIMIT = 2", self.m.text)
+
+    def test_resolve_cell_image_url_function(self):
+        """Cell cards must use resolveCellImageUrl for image URL resolution including output_paths."""
+        self.assertTrue(self.m.has_function("resolveCellImageUrl"),
+                        "expected resolveCellImageUrl helper function")
+
+    def test_cell_thumbnail_uses_image_url(self):
+        """Cell cards must show img src from resolveCellImageUrl, not just assetId."""
+        text = self.m.text
+        self.assertIn("resolveCellImageUrl", text,
+                       "expected resolveCellImageUrl call in renderCellCard")
+
+    def test_output_path_fallback_in_url_resolution(self):
+        """resolveCellImageUrl must fall back to output_paths array when no asset IDs present."""
+        text = self.m.text
+        self.assertIn("output_paths", text,
+                       "expected output_paths array fallback in resolveCellImageUrl")
+        self.assertIn("output_path", text,
+                       "expected output_path string fallback in resolveCellImageUrl")
+
+    def test_studio_outputs_route_in_resolve(self):
+        """resolveCellImageUrl must use /studio/outputs/ route for output_path based URLs."""
+        text = self.m.text
+        self.assertIn("/studio/outputs/", text,
+                       "expected /studio/outputs/ route for output_path images")
+
+    def test_selection_includes_image_url(self):
+        """Cell selection entries must include pre-resolved image_url for comparison workspace."""
+        text = self.m.text
+        self.assertIn("image_url: imageUrl", text,
+                       "expected image_url in selection entries")
+
+    def test_cell_thumbnail_shows_placeholder_when_no_image(self):
+        """Cell cards must show placeholder when neither asset_id nor output_path is available."""
+        text = self.m.text
+        self.assertIn("testing-results-cell-thumb-placeholder", text,
+                       "expected placeholder element when no image source available")
 
 
 class ABSliderTests(unittest.TestCase):

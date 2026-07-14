@@ -97,7 +97,7 @@ test.describe("Studio Playground", () => {
       expect(allTagTexts.some((t) => t.includes("Sampling"))).toBeTruthy();
 
       // Expand Advanced diagnostics
-      await page.locator(".comfymodal-studio-metadata-advanced-toggle").click();
+      await page.locator('[data-testid="advanced-toggle"]').click();
       const advancedPanel = page.locator(".comfymodal-studio-metadata-advanced");
       await expect(advancedPanel).toBeVisible({ timeout: 5000 });
       expect((await advancedPanel.textContent()).length).toBeGreaterThan(0);
@@ -866,6 +866,71 @@ test.describe("Studio Playground", () => {
     }
   });
 
+  // ── Mock state helpers ──────────────────────────────────────────────────
+  //
+  // Injects experiment cell history entries + experiment detail into the mock
+  // API's in-memory state for testing history tiles and carousel items.
+
+  function addExperimentToMock(api, expId, presetId, cellCount) {
+    var now = new Date().toISOString();
+    for (var i = 0; i < cellCount; i++) {
+      api.state.history.push({
+        run_id: "cell_" + expId + "_" + i,
+        experiment_id: expId,
+        kind: "experiment_cell",
+        status: "completed",
+        started_at: now,
+        completed_at: now,
+        output_path: "studio_output_" + expId + "_" + i + ".png",
+        extra: {
+          studio_preset_id: presetId,
+          studio_feature_id: "txt2img",
+          primary_asset_id: "asset_" + expId + "_" + i,
+        },
+      });
+    }
+    api.state.experiments.set(expId, {
+      definition: {
+        schema_version: 1, experiment_id: expId, revision: 1,
+        name: "Test Experiment", created_at: now, updated_at: now,
+      },
+      snapshot: {
+        status: "completed", overall_status: "completed",
+        counters: { completed: cellCount, failed: 0 },
+        total_cells: cellCount,
+        cell_visible: {},
+        checkpoints: {},
+        attempts: {},
+      },
+      events: [
+        {
+          type: "experiment.created",
+          payload: {
+            compilation: {
+              cells: Array.from({ length: cellCount }, function (_, idx) {
+                return { cell_key: "cell_" + idx, axis_values: {} };
+              }),
+            },
+          },
+        },
+        { type: "experiment.completed", payload: { completed: cellCount, failed: 0, total_cells: cellCount } },
+      ].concat(
+        Array.from({ length: cellCount }, function (_, idx) {
+          return {
+            type: "cell.completed",
+            payload: {
+              cell_key: "cell_" + idx,
+              primary_asset_id: "asset_" + expId + "_" + idx,
+              output_paths: ["studio_output_" + expId + "_" + idx + ".png"],
+            },
+          };
+        })
+      ),
+    });
+    // Set terminalPoll=1 so the experiment detail handler returns completed
+    api.setExperimentBehavior(expId, { terminalPoll: 1 });
+  }
+
   // ── Test 14: Preset defaults — no enum schemas ──────────────────────────
   //
   // Verifies that sampler and scheduler render as disabled text inputs
@@ -966,6 +1031,100 @@ test.describe("Studio Playground", () => {
         return t.toLowerCase().includes("schema unavailable");
       });
       expect(hasExplanation).toBe(true);
+
+      api.assertNoUnhandledCalls();
+    } finally {
+      // no guard
+    }
+  });
+
+  // ── Test 15: History experiment tile loads experiment grid ──────────────
+  //
+  // Injects experiment cell history entries into the mock, navigates to
+  // History, verifies a single experiment tile (not individual cards),
+  // clicks it, and verifies the Playground shows the experiment grid.
+
+  test("15. history experiment tile loads experiment grid viewport", async ({ page }) => {
+    const prefix = createOwnerPrefix();
+    const owned = createOwnedRecords();
+
+    try {
+      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
+      await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
+      const presetId = owned.presetIds[0];
+
+      // Inject experiment cell history and experiment detail into mock
+      const expId = "exp_hist_" + Date.now().toString(36);
+      addExperimentToMock(api, expId, presetId, 3);
+
+      await openStudio(page, COMFYUI_URL);
+      await waitVisible(page.locator('[data-testid="control-panel"]'));
+
+      // Navigate to History
+      await page.getByRole("button", { name: "History", exact: true }).click();
+      await waitVisible(page.locator('[data-testid="history-page-info"]'));
+
+      // Verify experiment tile is present (not individual cards)
+      const expTile = page.locator('[data-testid="experiment-tile"]');
+      await expect(expTile).toBeVisible({ timeout: 10000 });
+      // Verify EXP badge is displayed
+      await expect(expTile.locator(".comfymodal-studio-exp-tile-badge")).toBeVisible({ timeout: 5000 });
+      // Verify status text contains cell count
+      const tileText = await expTile.textContent();
+      expect(tileText).toContain("3 cells");
+
+      // Click the experiment tile to load experiment grid in Playground
+      await expTile.click();
+
+      // Wait for experiment grid viewport to appear
+      await expect(page.locator('[data-testid="experiment-grid-viewport"]')).toBeVisible({ timeout: 15000 });
+      // Verify grid outer container is present (cells rendered)
+      await expect(page.locator('[data-testid="experiment-grid-outer"]')).toBeVisible({ timeout: 10000 });
+
+      api.assertNoUnhandledCalls();
+    } finally {
+      // no guard
+    }
+  });
+
+  // ── Test 16: Carousel experiment item has distinctive styling ──────────
+  //
+  // Verifies that experiment cell entries in the carousel have the
+  // experiment-item CSS class and EXP badge.  Also verifies clicking
+  // the experiment item navigates to the experiment grid viewport.
+
+  test("16. carousel experiment item shows EXP badge and opens experiment grid", async ({ page }) => {
+    const prefix = createOwnerPrefix();
+    const owned = createOwnedRecords();
+
+    try {
+      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
+      await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
+      const presetId = owned.presetIds[0];
+
+      // Inject experiment cell history entries + experiment detail
+      const expId = "exp_car_" + Date.now().toString(36);
+      addExperimentToMock(api, expId, presetId, 2);
+
+      await openStudio(page, COMFYUI_URL);
+      await waitVisible(page.locator('[data-testid="control-panel"]'));
+
+      // Wait for carousel to load (refreshRecentRuns fetches injected history)
+      // The carousel track appears after async refresh resolves
+      const carouselItem = page.locator('.comfymodal-studio-carousel-item-experiment').first();
+      await expect(carouselItem).toBeVisible({ timeout: 15000 });
+
+      // Verify the EXP badge is present on experiment items
+      const expBadge = carouselItem.locator('.comfymodal-studio-carousel-exp-badge');
+      await expect(expBadge).toBeVisible({ timeout: 5000 });
+
+      // Verify the experiment item has data-expid attribute
+      const dataExpId = await carouselItem.getAttribute('data-expid');
+      expect(dataExpId).toBeTruthy();
+
+      // Click the experiment carousel item and verify it opens the grid
+      await carouselItem.click();
+      await expect(page.locator('[data-testid="experiment-grid-viewport"]')).toBeVisible({ timeout: 15000 });
 
       api.assertNoUnhandledCalls();
     } finally {

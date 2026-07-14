@@ -20,6 +20,8 @@ def _make_modal_stub():
     stub.App.return_value.cls = lambda **kw: (lambda c: c)
     stub.Volume = MagicMock()
     stub.Volume.from_name.return_value = MagicMock()
+    stub.Dict = MagicMock()
+    stub.Dict.from_name.return_value = MagicMock()
     stub.Secret = MagicMock()
     stub.Secret.from_name.return_value = MagicMock()
     stub.web_server = lambda *a, **kw: (lambda f: f)
@@ -60,6 +62,12 @@ class ComfyAppBuildContextTests(unittest.TestCase):
         self.assertIn(".hf_token", patterns)
         self.assertIn(".civitai_token", patterns)
         self.assertIn("latest_benchmark_workflow.json", patterns)
+        self.assertIn(".experiment_leases.db*", patterns)
+
+        self.assertIn(
+            "comfyui-modal/.experiment_leases.db*",
+            module._COMBINED_CUSTOM_NODE_IGNORE_PATTERNS,
+        )
 
     def test_prepare_requirements_build_context_copies_only_requirements_files(self):
         module = load_module()

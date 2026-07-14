@@ -21,6 +21,7 @@
 
 import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings } from "./studio-run-normalizer.js";
 import { listRunHistory, updateRunAnnotation } from "./studio-backend-api.js";
+import { loadExperimentIntoPlayground } from "./studio-playground.js";
 import { el } from "./studio-ui.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -852,7 +853,15 @@ export function renderHistory(state, context) {
     if (queryParams.has_image) apiParams.has_image = true;
     if (queryParams.sort) apiParams.sort = queryParams.sort;
 
-    listRunHistory(apiBase, apiParams).then(function (data) {
+    // Fetch experiments in parallel with run history
+    var expPromise = fetch(apiBase + "/experiments").then(function (expResp) {
+      if (!expResp.ok) return [];
+      return expResp.json().then(function (expData) {
+        return (expData && expData.experiments) || [];
+      });
+    }).catch(function () { return []; });
+
+    listRunHistory(apiBase, apiParams).then(async function (data) {
       // Remove loading
       while (container.firstChild) container.removeChild(container.firstChild);
 
@@ -895,13 +904,65 @@ export function renderHistory(state, context) {
         return normalizeStudioRun(run, apiBase);
       }).filter(Boolean);
 
+      // Fetch and merge true Studio aggregate experiments
+      var experiments = await expPromise;
+      var expItems = [];
+      experiments.forEach(function (e) {
+        var def = e.definition || {};
+        var snap = e.snapshot || {};
+        var studioMeta = def.studio_meta || {};
+        if (typeof def.name !== "string" || def.name.indexOf("Studio Experiment:") !== 0) return;
+        if (!studioMeta.studio_preset_ids || studioMeta.studio_preset_ids.length === 0) return;
+        if (!snap || snap.total_cells <= 1) return;
+        var expId = e.experiment_id || "";
+        var counters = snap.counters || {};
+        expItems.push({
+          kind: "studio_experiment",
+          experimentId: expId,
+          id: expId,
+          prompt: def.name || "Studio Experiment",
+          promptId: "studio_" + expId,
+          presetId: (studioMeta.studio_preset_ids || [])[0] || "",
+          presetLabel: null,
+          featureId: "txt2img",
+          status: snap.overall_status || snap.status || "completed",
+          imageUrl: null,
+          startedAt: def.created_at || def.createdAt || snap.created_at || "",
+          completedAt: snap.updated_at || snap.updatedAt || "",
+          durationMs: null,
+          favorite: false,
+          totalCells: snap.total_cells || 0,
+          completedCells: counters.completed || 0,
+          failedCells: counters.failed || 0,
+          _experimentData: e,
+        });
+      });
+
+      // Merge experiments into normalized runs, sorted by time (newest first)
+      var allItems = normalizedRuns.concat(expItems);
+      allItems.sort(function (a, b) {
+        var aTime = a.completedAt || a.startedAt || "";
+        var bTime = b.completedAt || b.startedAt || "";
+        return bTime.localeCompare(aTime);
+      });
+      // Deduplicate by ID
+      var seen = {};
+      allItems = allItems.filter(function (item) {
+        var key = item.experimentId || item.id;
+        if (!key) return true;
+        if (seen[key]) return false;
+        seen[key] = true;
+        return true;
+      });
+      totalCount = allItems.length;
+
       if (groupExperiments) {
         // Group by experiment_id
         var grouped = {};
         var ungrouped = [];
-        normalizedRuns.forEach(function (nr) {
+        allItems.forEach(function (nr) {
           var expId = nr.experimentId || null;
-          if (expId && expId !== "") {
+          if (expId && expId !== "" && nr.kind === "experiment_cell") {
             if (!grouped[expId]) grouped[expId] = [];
             grouped[expId].push(nr);
           } else {
@@ -917,15 +978,64 @@ export function renderHistory(state, context) {
           container.appendChild(groupEl);
         });
 
-        // Render ungrouped
+        // Render ungrouped (includes studio_experiment items)
         if (ungrouped.length > 0) {
           var fallbackId = "ungrouped_" + Date.now();
           var groupEl = renderGroup(fallbackId, ungrouped, apiBase, openPreview);
           container.appendChild(groupEl);
         }
       } else {
-        // Ungrouped: still render inside the gallery grid
-        container.appendChild(renderHistoryGallery(normalizedRuns, apiBase, openPreview));
+        // Default (ungrouped) view: studio_experiment items get a tile,
+        // experiment_cell runs sharing an experimentId are collapsed into
+        // one experiment tile, ordinary runs are history cards.
+        var expGroups = {};
+        allItems.forEach(function (nr) {
+          if (nr.kind === "studio_experiment") return; // handled separately
+          if (nr.kind !== "experiment_cell") return;   // only cell runs form experiment groups
+          var eId = nr.experimentId || null;
+          if (eId) {
+            if (!expGroups[eId]) expGroups[eId] = [];
+            expGroups[eId].push(nr);
+          }
+        });
+        var gallery = el("div", { class: "comfymodal-studio-history-gallery" });
+        var seenExpIds = {};
+        allItems.forEach(function (nr) {
+          if (nr.kind === "studio_experiment") {
+            // Render true experiment as an experiment tile (loads grid on click)
+            var groupRuns = expGroups[nr.experimentId];
+            if (groupRuns && groupRuns.length > 0) {
+              if (!seenExpIds[nr.experimentId]) {
+                seenExpIds[nr.experimentId] = true;
+                gallery.appendChild(renderExperimentTile(nr.experimentId, groupRuns, apiBase, context, state));
+              }
+            } else {
+              // Standalone experiment tile (no cell runs yet)
+              if (!seenExpIds[nr.experimentId]) {
+                seenExpIds[nr.experimentId] = true;
+                gallery.appendChild(_renderStandaloneExperimentTile(nr, apiBase, context, state));
+              }
+            }
+          } else if (nr.kind === "experiment_cell") {
+            var eId = nr.experimentId || null;
+            if (eId) {
+              if (!seenExpIds[eId]) {
+                seenExpIds[eId] = true;
+                gallery.appendChild(renderExperimentTile(eId, expGroups[eId], apiBase, context, state));
+              }
+            }
+          } else {
+            gallery.appendChild(renderHistoryCard(nr, apiBase, openPreview));
+          }
+        });
+        container.appendChild(gallery);
+      }
+
+      // Update page info after merging
+      var pageInfoEl = container.querySelector('[data-testid="history-page-info"]');
+      if (pageInfoEl) {
+        var meta = formatPageMetadata(queryParams.offset, queryParams.limit, totalCount);
+        pageInfoEl.textContent = meta.label;
       }
     }).catch(function (err) {
       while (container.firstChild) container.removeChild(container.firstChild);
@@ -1029,6 +1139,240 @@ function renderHistoryGallery(runs, apiBase, openPreview) {
   });
 
   return gallery;
+}
+
+// ── Experiment Tile ────────────────────────────────────────────────────────
+//
+// Compact experiment tile shown in the default (ungrouped) History view.
+// Collapses all experiment_cell rows sharing an experimentId into one tile.
+// Clicking opens the full experiment grid in the Playground via the shared
+// loadExperimentIntoPlayground loader.  Errors surface as an inline message
+// without leaving the current page.
+
+function renderExperimentTile(expId, groupRuns, apiBase, context, state) {
+  var firstRun = groupRuns[0] || {};
+  var completedCount = groupRuns.filter(function (r) { return isCompleted(r); }).length;
+  var failedCount = groupRuns.filter(function (r) { return isFailed(r); }).length;
+  var totalCount = groupRuns.length;
+
+  var hasRunning = groupRuns.some(function (r) {
+    var s = getRunStatus(r);
+    return s === "in_progress" || s === "running" || s === "queued";
+  });
+
+  var overallStatus;
+  if (hasRunning) overallStatus = "running";
+  else if (failedCount > 0 && completedCount === 0) overallStatus = "failed";
+  else if (completedCount === totalCount && totalCount > 0) overallStatus = "completed";
+  else if (completedCount > 0 && failedCount > 0) overallStatus = "partial";
+  else if (completedCount > 0) overallStatus = "running";
+  else overallStatus = "unknown";
+
+  var statusClass = overallStatus === "completed" ? " completed"
+    : overallStatus === "failed" ? " failed"
+    : overallStatus === "running" ? " running" : "";
+
+  var featureLabel = firstRun.featureId || "studio";
+  var presetLabel = firstRun.presetLabel || firstRun.presetId || "";
+  var titleParts = [];
+  titleParts.push("Experiment");
+  if (presetLabel) titleParts.push("\u2014 " + presetLabel.substring(0, 24));
+  var titleText = titleParts.join(" ");
+
+  var card = el("div", {
+    class: "comfymodal-studio-history-card comfymodal-studio-experiment-tile" + statusClass,
+    tabindex: "0",
+    role: "button",
+    "data-expid": expId,
+    "data-testid": "experiment-tile",
+    "aria-label": "Open experiment " + expId + " in playground",
+  });
+
+  // Experiment badge / label
+  var badgeRow = el("div", {
+    style: "display:flex;align-items:center;gap:6px;padding:8px 8px 2px;width:100%;box-sizing:border-box;",
+  });
+  badgeRow.appendChild(el("span", {
+    class: "comfymodal-studio-exp-tile-badge",
+    text: "EXP",
+    "aria-hidden": "true",
+  }));
+  badgeRow.appendChild(el("span", {
+    class: "comfymodal-studio-exp-tile-title",
+    text: titleText,
+  }));
+  card.appendChild(badgeRow);
+
+  // Status line
+  var statusLine = el("div", {
+    style: "display:flex;align-items:center;gap:6px;padding:0 8px;font-size:10px;width:100%;box-sizing:border-box;",
+  });
+  var statusColor = overallStatus === "completed" ? "#4ade80"
+    : overallStatus === "failed" ? "#f87171"
+    : overallStatus === "running" ? "#fbbf24" : "#888";
+  statusLine.appendChild(el("span", {
+    style: "color:" + statusColor + ";font-weight:600;text-transform:uppercase;",
+    text: overallStatus,
+  }));
+  statusLine.appendChild(el("span", {
+    style: "color:#888;",
+    text: "\u00b7 " + totalCount + " cell" + (totalCount !== 1 ? "s" : ""),
+  }));
+  if (completedCount > 0) {
+    statusLine.appendChild(el("span", {
+      style: "color:#4ade80;",
+      text: "\u00b7 " + completedCount + " done",
+    }));
+  }
+  if (failedCount > 0) {
+    statusLine.appendChild(el("span", {
+      style: "color:#f87171;",
+      text: "\u00b7 " + failedCount + " failed",
+    }));
+  }
+  // Feature
+  if (firstRun.featureId) {
+    statusLine.appendChild(el("span", {
+      style: "color:#666;margin-left:auto;font-size:9px;",
+      text: firstRun.featureId,
+    }));
+  }
+  card.appendChild(statusLine);
+
+  // Thumbnail strip (first few cell thumbnails)
+  if (groupRuns.length > 0) {
+    var thumbStrip = el("div", {
+      class: "comfymodal-studio-exp-tile-thumbs",
+      style: "display:flex;gap:2px;padding:4px 8px 8px;width:100%;box-sizing:border-box;overflow:hidden;",
+    });
+    var maxThumbs = Math.min(groupRuns.length, 4);
+    for (var ti = 0; ti < maxThumbs; ti++) {
+      var cellRun = groupRuns[ti];
+      if (cellRun.imageUrl) {
+        thumbStrip.appendChild(el("img", {
+          class: "comfymodal-studio-exp-tile-thumb",
+          src: cellRun.imageUrl,
+          alt: "",
+          loading: "lazy",
+          style: "width:36px;height:36px;object-fit:cover;border-radius:2px;border:1px solid #2a2a2a;flex-shrink:0;",
+        }));
+      }
+    }
+    if (groupRuns.length > maxThumbs) {
+      thumbStrip.appendChild(el("span", {
+        style: "font-size:9px;color:#666;display:flex;align-items:center;padding-left:2px;",
+        text: "+" + (groupRuns.length - maxThumbs),
+      }));
+    }
+    card.appendChild(thumbStrip);
+  }
+
+  // Click handler — load the full experiment grid in Playground
+  var _loading = false;
+  card.addEventListener("click", async function () {
+    if (_loading) return;
+    _loading = true;
+    card.style.opacity = "0.6";
+    var result = await loadExperimentIntoPlayground(state, context, expId);
+    _loading = false;
+    if (!result || !result.ok) {
+      // Restore tile and surface a concise error message
+      card.style.opacity = "";
+      var errEl = card.querySelector(".comfymodal-studio-exp-tile-error");
+      if (!errEl) {
+        errEl = el("div", {
+          class: "comfymodal-studio-exp-tile-error",
+          style: "font-size:9px;color:#f87171;padding:0 8px 4px;width:100%;box-sizing:border-box;",
+          text: result && result.error ? result.error : "Failed to load experiment.",
+        });
+        card.appendChild(errEl);
+      } else {
+        errEl.textContent = result && result.error ? result.error : "Failed to load experiment.";
+      }
+    }
+  });
+
+  return card;
+}
+
+/**
+ * Render a standalone experiment tile for a true Studio aggregate experiment
+ * that has no associated cell runs yet. Shows the EXP badge, title, and status.
+ * Click loads the experiment grid viewport in Playground.
+ */
+function _renderStandaloneExperimentTile(nr, apiBase, context, state) {
+  var expId = nr.experimentId;
+  var status = nr.status || "unknown";
+  var titleText = "Experiment";
+
+  var card = el("div", {
+    class: "comfymodal-studio-history-card comfymodal-studio-experiment-tile"
+      + (status === "completed" ? " completed" : "")
+      + (status === "failed" || status === "error" ? " failed" : ""),
+    tabindex: "0",
+    role: "button",
+    "data-expid": expId,
+    "data-testid": "experiment-tile",
+    "aria-label": "Open experiment " + expId + " in playground",
+  });
+
+  // Experiment badge
+  var badgeRow = el("div", {
+    style: "display:flex;align-items:center;gap:6px;padding:8px 8px 2px;width:100%;box-sizing:border-box;",
+  });
+  badgeRow.appendChild(el("span", {
+    class: "comfymodal-studio-exp-tile-badge",
+    text: "EXP",
+    "aria-hidden": "true",
+  }));
+  badgeRow.appendChild(el("span", {
+    class: "comfymodal-studio-exp-tile-title",
+    text: titleText,
+  }));
+  card.appendChild(badgeRow);
+
+  // Status
+  var statusLine = el("div", {
+    style: "display:flex;align-items:center;gap:6px;padding:0 8px;font-size:10px;width:100%;box-sizing:border-box;",
+  });
+  var statusColor = status === "completed" ? "#4ade80"
+    : status === "failed" ? "#f87171"
+    : status === "running" ? "#fbbf24" : "#888";
+  statusLine.appendChild(el("span", {
+    style: "color:" + statusColor + ";font-weight:600;text-transform:uppercase;",
+    text: status,
+  }));
+  if (nr.totalCells) {
+    statusLine.appendChild(el("span", {
+      style: "color:#888;",
+      text: "\u00b7 " + nr.totalCells + " cell" + (nr.totalCells !== 1 ? "s" : ""),
+    }));
+  }
+  card.appendChild(statusLine);
+
+  // Click handler — load experiment grid in Playground
+  var _loading = false;
+  card.addEventListener("click", async function () {
+    if (_loading) return;
+    _loading = true;
+    card.style.opacity = "0.6";
+    var result = await loadExperimentIntoPlayground(state, context, expId);
+    _loading = false;
+    if (!result || !result.ok) {
+      card.style.opacity = "";
+      var errEl = card.querySelector(".comfymodal-studio-exp-tile-error");
+      if (!errEl) {
+        errEl = el("div", {
+          class: "comfymodal-studio-exp-tile-error",
+          style: "font-size:9px;color:#f87171;padding:0 8px 4px;width:100%;box-sizing:border-box;",
+          text: result && result.error ? result.error : "Failed to load experiment.",
+        });
+        card.appendChild(errEl);
+      }
+    }
+  });
+
+  return card;
 }
 
 // ── Group renderer ────────────────────────────────────────────────────────

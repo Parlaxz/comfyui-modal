@@ -31,6 +31,10 @@ import {
   loadRunResult,
   clearRunResult,
   clearAllRunResults,
+  saveExperimentDraft,
+  loadExperimentDraft,
+  setCarouselCleared,
+  isCarouselCleared,
 } from "./studio-playground-state.js";
 import { getSharedTracker, createScopedTracker } from "./comfymodal-progress.js";
 import { updateRunAnnotation } from "./studio-backend-api.js";
@@ -166,12 +170,28 @@ function _startPolling(container, state, context, actions, runState) {
     }).length;
     const hasCellCompletionEvidence = completedCellCount > 0 || cellCompletedEvents > 0;
 
+    // Build cell output URL map from cell.completed events so the grid
+    // can show individual thumbnails in their correct axis position.
+    var _pollCellOutputs = _buildCellOutputMap(events, apiBase);
+
     if (status === "queued") {
       if (actions && actions.setRunState) {
-        actions.setRunState({ status: "queued", experimentId });
+        actions.setRunState({
+          status: "queued",
+          experimentId,
+          _snapshot: snapshot,
+          _events: events,
+          _cellOutputs: _pollCellOutputs,
+        });
       }
     } else if (status === "in_progress" || status === "running") {
-      const progressState = { status: "in_progress", experimentId };
+      const progressState = {
+        status: "in_progress",
+        experimentId,
+        _snapshot: snapshot,
+        _events: events,
+        _cellOutputs: _pollCellOutputs,
+      };
       if (completedCellCount > 0 && totalCells > 0) {
         progressState.cellProgress = completedCellCount + "/" + totalCells;
       }
@@ -207,6 +227,9 @@ function _startPolling(container, state, context, actions, runState) {
             totalCells: totalCells,
             primaryOutput: primaryOutput,
             hasHistory: true,
+            _snapshot: snapshot,
+            _events: events,
+            _cellOutputs: _pollCellOutputs,
           });
         }
       }
@@ -300,17 +323,37 @@ function hydrateControlsForSelection(state, presetId, featureId, preset) {
 
 function buildEffectiveControls(state, preset, currentFeatureId) {
   const userOverrides = (state.playground && state.playground.controls) || {};
+  const hydratedControls = (state.playground && state.playground._hydratedControls) || {};
   const visibleIds = getVisibleControlsForPreset(preset, currentFeatureId);
   const controls = {};
-  // Only serialize explicit user edits.  Hydrated / preset-default values
-  // are display-only — sending them would override the backend's defaults
-  // with stale values the user never explicitly confirmed.
-  Object.keys(userOverrides).forEach(function (ctrlId) {
-    if (visibleIds.indexOf(ctrlId) !== -1) {
+  visibleIds.forEach(function (ctrlId) {
+    if (Object.prototype.hasOwnProperty.call(hydratedControls, ctrlId)) {
+      controls[ctrlId] = hydratedControls[ctrlId];
+    }
+    if (Object.prototype.hasOwnProperty.call(userOverrides, ctrlId)) {
       controls[ctrlId] = userOverrides[ctrlId];
     }
   });
   return controls;
+}
+
+/**
+ * Persist the current experiment draft (experimentAxes + compareBackendIds)
+ * for the active selection if both presetId and featureId are set.
+ * Safe to call on every render — performs a synchronous localStorage write.
+ */
+function _saveExperimentDraftFromState(state) {
+  const pg = state && state.playground;
+  if (!pg) return;
+  const presetId = pg.selectedBackendId;
+  const featureId = pg.featureId;
+  if (!presetId || !featureId) return;
+  saveExperimentDraft(
+    presetId,
+    featureId,
+    pg.experimentAxes || {},
+    pg.compareBackendIds || []
+  );
 }
 
 // ── Recent runs state management ──────────────────────────────────────────
@@ -326,24 +369,95 @@ let _recentRunsCacheKey = "";
 
 export async function refreshRecentRuns(apiBase) {
   try {
-    const resp = await fetch(apiBase + "/run-history?limit=50");
-    if (!resp.ok) { _recentRunsCache = []; return []; }
-    const data = await resp.json();
-    const entries = (data && data.runs) || [];
-    // Filter to Studio runs with images, normalize them
-    const studioRuns = entries.filter(function (r) {
-      const extra = (r && r.extra) || {};
-      const studioMeta = extra.studio_meta || extra.studio_metadata || {};
-      return (r.prompt_id && r.prompt_id.indexOf("studio_") === 0) ||
-             r.kind === "experiment_cell" ||
-             !!(extra.studio_feature_id || extra.studio_preset_id || studioMeta.studio_feature_id || studioMeta.studio_preset_id);
+    // Fetch ordinary runs AND true Studio aggregate experiments in parallel
+    var [runResp, expResp] = await Promise.all([
+      fetch(apiBase + "/run-history?limit=50"),
+      fetch(apiBase + "/experiments"),
+    ]);
+
+    // ── Process ordinary runs ───────────────────────────────────────────
+    var normalRuns = [];
+    if (runResp && runResp.ok) {
+      var data = await runResp.json();
+      var entries = (data && data.runs) || [];
+      // Filter to Studio runs
+      var studioRuns = entries.filter(function (r) {
+        var extra = (r && r.extra) || {};
+        var studioMeta = extra.studio_meta || extra.studio_metadata || {};
+        return (r.prompt_id && r.prompt_id.indexOf("studio_") === 0) ||
+               r.kind === "experiment_cell" ||
+               !!(extra.studio_feature_id || extra.studio_preset_id || studioMeta.studio_feature_id || studioMeta.studio_preset_id);
+      });
+      // Normalize and only keep completed/image-producing runs
+      normalRuns = studioRuns.map(function (r) {
+        return normalizeStudioRun(r, apiBase);
+      }).filter(function (nr) {
+        return nr && (nr.status === "completed" || nr.status === "success" || nr.status === "done") && nr.imageUrl;
+      });
+    }
+
+    // ── Process true Studio aggregate experiments ───────────────────────
+    var experimentItems = [];
+    if (expResp && expResp.ok) {
+      var expData = await expResp.json();
+      var experiments = (expData && expData.experiments) || [];
+      experimentItems = experiments
+        .filter(function (e) {
+          // Only true Studio aggregate experiments:
+          // definition name prefix "Studio Experiment:" AND studio_meta AND total_cells > 1
+          var def = e.definition || {};
+          var snap = e.snapshot || {};
+          var studioMeta = def.studio_meta || {};
+          var isStudioExp = (typeof def.name === "string" && def.name.indexOf("Studio Experiment:") === 0);
+          var hasPresets = !!(studioMeta.studio_preset_ids && studioMeta.studio_preset_ids.length > 0);
+          var multiCell = snap.total_cells > 1;
+          return isStudioExp && hasPresets && multiCell;
+        })
+        .map(function (e) {
+          var def = e.definition || {};
+          var snap = e.snapshot || {};
+          var studioMeta = def.studio_meta || {};
+          var presetIds = studioMeta.studio_preset_ids || [];
+          var expId = e.experiment_id || "";
+          var counters = snap.counters || {};
+          return {
+            kind: "studio_experiment",
+            experimentId: expId,
+            id: expId,
+            prompt: def.name || "Studio Experiment",
+            promptId: "studio_" + expId,
+            presetId: presetIds[0] || "",
+            presetLabel: null,
+            featureId: "txt2img",
+            status: snap.overall_status || snap.status || "completed",
+            imageUrl: null,
+            startedAt: def.created_at || def.createdAt || snap.created_at || "",
+            completedAt: snap.updated_at || snap.updatedAt || "",
+            durationMs: null,
+            favorite: false,
+            _experimentData: e,
+          };
+        });
+    }
+
+    // ── Merge and sort by created time (newest first) ───────────────────
+    var merged = normalRuns.concat(experimentItems);
+    merged.sort(function (a, b) {
+      var aTime = a.completedAt || a.startedAt || "";
+      var bTime = b.completedAt || b.startedAt || "";
+      return bTime.localeCompare(aTime);
     });
-    // Normalize and only keep completed/image-producing runs
-    _recentRunsCache = studioRuns.map(function (r) {
-      return normalizeStudioRun(r, apiBase);
-    }).filter(function (nr) {
-      return nr && (nr.status === "completed" || nr.status === "success" || nr.status === "done") && nr.imageUrl;
+
+    // Deduplicate by ID (first occurrence of each key wins — newest)
+    var seen = {};
+    _recentRunsCache = merged.filter(function (item) {
+      var key = item.experimentId || item.id;
+      if (!key) return true;
+      if (seen[key]) return false;
+      seen[key] = true;
+      return true;
     });
+
     _recentRunsCacheKey = apiBase;
     return _recentRunsCache;
   } catch (e) {
@@ -357,7 +471,7 @@ export function getRecentRuns() {
 }
 
 export function clearRecentRunsCache() {
-  _recentRunsCache = null;
+  _recentRunsCache = [];
   _recentRunsCacheKey = "";
 }
 
@@ -421,13 +535,21 @@ export async function hydratePlayground(state, context) {
     }
   }
 
+  const experimentDraft = loadExperimentDraft(targetPresetId, featureId);
+  if (state.playground) {
+    state.playground.experimentAxes = experimentDraft ? experimentDraft.experimentAxes : {};
+    state.playground.compareBackendIds = experimentDraft ? experimentDraft.compareBackendIds : [];
+  }
+
   // 6a. Try to restore from localStorage persisted run result first
   const persistedRun = loadRunResult(targetPresetId, featureId);
   if (persistedRun) {
     state.playground._selectedRun = persistedRun;
     state.playground.lastRunOutput = persistedRun.imageUrl || null;
-  } else if (targetPresetId) {
-    // 6b. Fallback: fetch server-side recent runs and find latest matching
+  } else if (targetPresetId && !isCarouselCleared()) {
+    // 6b. Fallback: fetch server-side recent runs and find latest matching.
+    //     Skip if the carousel was explicitly cleared — the clear should
+    //     persist across refreshes until a new run completes.
     await refreshRecentRuns(apiBase);
     const matchingCompleted = getRecentRuns().filter(function (nr) {
       return nr.presetId === targetPresetId && nr.featureId === featureId;
@@ -482,12 +604,77 @@ export function renderPlayground(state, context) {
   // for progress UI updates.
 
   const leftPanel = renderControlPanel(state, context);
+  const resizeHandle = _createResizeHandle(leftPanel);
   const rightWorkspace = renderWorkspace(state, context);
 
   container.appendChild(leftPanel);
+  container.appendChild(resizeHandle);
   container.appendChild(rightWorkspace);
 
   return container;
+}
+
+var _PANEL_WIDTH_KEY = "comfymodal-studio-panel-width";
+var _PANEL_WIDTH_MIN = 200;
+var _PANEL_WIDTH_MAX = 600;
+var _PANEL_WIDTH_DEFAULT = 400;
+
+function _createResizeHandle(leftPanel) {
+  var handle = el("div", { class: "comfymodal-studio-resize-handle" });
+
+  var saved = localStorage.getItem(_PANEL_WIDTH_KEY);
+  if (saved) {
+    var w = parseInt(saved, 10);
+    if (!isNaN(w) && w >= _PANEL_WIDTH_MIN && w <= _PANEL_WIDTH_MAX) {
+      leftPanel.style.width = w + "px";
+    } else {
+      leftPanel.style.width = _PANEL_WIDTH_DEFAULT + "px";
+    }
+  } else {
+    leftPanel.style.width = _PANEL_WIDTH_DEFAULT + "px";
+  }
+
+  var isDragging = false;
+  var startX = 0;
+  var startWidth = 0;
+
+  function _onPointerDown(e) {
+    isDragging = true;
+    startX = e.clientX;
+    startWidth = leftPanel.offsetWidth;
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add("active");
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    e.preventDefault();
+  }
+
+  function _onPointerMove(e) {
+    if (!isDragging) return;
+    var delta = e.clientX - startX;
+    var newWidth = startWidth + delta;
+    if (newWidth < _PANEL_WIDTH_MIN) newWidth = _PANEL_WIDTH_MIN;
+    if (newWidth > _PANEL_WIDTH_MAX) newWidth = _PANEL_WIDTH_MAX;
+    leftPanel.style.width = newWidth + "px";
+    e.preventDefault();
+  }
+
+  function _onPointerEnd(e) {
+    if (!isDragging) return;
+    isDragging = false;
+    handle.classList.remove("active");
+    handle.releasePointerCapture(e.pointerId);
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    localStorage.setItem(_PANEL_WIDTH_KEY, String(leftPanel.offsetWidth));
+  }
+
+  handle.addEventListener("pointerdown", _onPointerDown);
+  handle.addEventListener("pointermove", _onPointerMove);
+  handle.addEventListener("pointerup", _onPointerEnd);
+  handle.addEventListener("pointercancel", _onPointerEnd);
+
+  return handle;
 }
 
 // ── Left Control Panel (preset-driven) ──────────────────────────────────
@@ -512,6 +699,18 @@ function renderControlPanel(state, context) {
     if (saved) {
       if (saved.featureId) state.playground.featureId = saved.featureId;
       if (saved.presetId) state.playground.selectedBackendId = saved.presetId;
+      // Synchronously hydrate experiment draft from localStorage
+      // so experiment mode state (axes + compare selections) is restored
+      // on reload without waiting for the async hydratePlayground to finish.
+      const draft = loadExperimentDraft(saved.presetId, saved.featureId || "txt2img");
+      if (draft) {
+        if (draft.experimentAxes && Object.keys(draft.experimentAxes).length > 0) {
+          state.playground.experimentAxes = draft.experimentAxes;
+        }
+        if (draft.compareBackendIds && draft.compareBackendIds.length > 0) {
+          state.playground.compareBackendIds = draft.compareBackendIds;
+        }
+      }
     }
     state.playground._hydrationDone = true;
     hydratePlayground(state, context).then(function () {
@@ -658,6 +857,12 @@ function renderControlPanel(state, context) {
         if (checkboxWrapper && controlRow.firstChild) {
           controlRow.insertBefore(checkboxWrapper, controlRow.firstChild);
         }
+        const axisData = state.playground && state.playground.experimentAxes && state.playground.experimentAxes[ctrlId];
+        const eligibleAxes = (state.playground && state.playground._eligibleAxes) || [];
+        if (axisData && axisData.enabled && eligibleAxes.includes(ctrlId)) {
+          const originalInput = controlRow.querySelector('[data-testid="input-' + ctrlId + '"]');
+          if (originalInput) originalInput.remove();
+        }
       }
 
       controlsContainer.appendChild(controlRow);
@@ -677,6 +882,15 @@ function renderControlPanel(state, context) {
       text: "Could not load preset data.",
       style: "font-size:11px;color:#f87171;padding:8px;",
     }));
+  }).then(() => {
+    if (!panel.isConnected) return;
+    const pg = state.playground;
+    if (pg && pg._controlPanelScrollRestorePending && pg._controlPanelScrollTop != null) {
+      panel.scrollTop = pg._controlPanelScrollTop;
+      if (panel.scrollTop === pg._controlPanelScrollTop) {
+        pg._controlPanelScrollRestorePending = false;
+      }
+    }
   });
 
   panel.appendChild(controlsContainer);
@@ -781,6 +995,8 @@ function buildActions(state, context) {
       state.playground.controls[ctrlId] = value;
       if (ctrlId === 'prompt' && state.playground.experimentAxes && state.playground.experimentAxes.prompt && state.playground.experimentAxes.prompt.enabled && state.playground.experimentAxes.prompt.values && state.playground.experimentAxes.prompt.values.length > 0) {
         state.playground.experimentAxes.prompt.values[0] = value;
+        // Persist experiment draft — prompt-axis first value changed
+        _saveExperimentDraftFromState(state);
       }
       const presetId = state.playground.selectedBackendId;
       const featureId = state.playground.featureId;
@@ -809,6 +1025,9 @@ function buildActions(state, context) {
       if (context && context.setPage) {
         context.setPage("playground");
       }
+    },
+    persistExperimentDraft() {
+      _saveExperimentDraftFromState(state);
     },
     resetToDefaults() {
       const presetId = state.playground && state.playground.selectedBackendId;
@@ -843,6 +1062,8 @@ function buildActions(state, context) {
       } else {
         delete state.playground.experimentAxes[ctrlId];
       }
+      // Persist experiment draft — axes toggles are a persistence trigger
+      _saveExperimentDraftFromState(state);
       if (context && context.setPage) {
         context.setPage("playground");
       }
@@ -865,6 +1086,8 @@ function buildActions(state, context) {
         if (!state.playground.controls) state.playground.controls = {};
         state.playground.controls.prompt = state.playground.experimentAxes[ctrlId].values[0];
       }
+      // Persist experiment draft — axis values changed
+      _saveExperimentDraftFromState(state);
       // Re-render when value count changes (add/remove), but NOT on every
       // keystroke — that would thrash the UI during text input.
       if (values.length !== prevLen && context && context.setPage) {
@@ -895,10 +1118,18 @@ function buildActions(state, context) {
       // Dispose scoped tracker and clean up local timer on terminal states
       if (runState && (runState.status === "completed" || runState.status === "error")) {
         if (state.playground && state.playground.runState) delete state.playground.runState._localStartTime;
+        // Clean up captured running config — a new run will re-capture
+        if (state.playground) delete state.playground._runningExperimentConfig;
         _disposeScopedTracker(state);
       }
 
       if (runState && runState.status === "completed") {
+        // A new run completed — re-enable the carousel synchronously so
+        // subsequent re-renders and page loads show recent runs again.
+        // Done BEFORE the async refresh so the flag does not persist and
+        // suppress the hydrated output on the next render.
+        setCarouselCleared(false);
+
         // Persist primary output URL so canvas shows result
         if (runState.primaryOutput) {
           state.playground.lastRunOutput = runState.primaryOutput;
@@ -925,6 +1156,8 @@ function buildActions(state, context) {
           }
           if (matched) {
             state.playground._selectedRun = matched;
+            // Never nullify lastRunOutput — primaryOutput has already been set.
+            // Only overwrite if the matched run carries a valid imageUrl.
             if (matched.imageUrl) {
               state.playground.lastRunOutput = matched.imageUrl;
             }
@@ -936,10 +1169,13 @@ function buildActions(state, context) {
             );
             if (context && context.setPage) context.setPage("playground");
           }
+          // Note: setCarouselCleared was already called synchronously above
         });
       } else if (!runState) {
         // Clearing runState — preserve lastRunOutput and _selectedRun so
-        // prior result stays visible until new submission enters flight
+        // prior result stays visible until new submission enters flight.
+        // Also clear captured running config since the run is abandoned.
+        if (state.playground) delete state.playground._runningExperimentConfig;
       }
       if (context && context.setPage) {
         context.setPage("playground");
@@ -1365,10 +1601,10 @@ function _startLocalElapsedTimer(state, context) {
       return;
     }
     _rs2.elapsedMs = Date.now() - _localStart;
-    var _now = Date.now();
-    if (!_rs2._lastRenderMs || _now - _rs2._lastRenderMs >= 250) {
-      _rs2._lastRenderMs = _now;
-      if (context && context.setPage) context.setPage("playground");
+    // DOM-targeted elapsed update — avoids full page teardown on every tick
+    var elapsedEl = document.querySelector('[data-testid="progress-elapsed"]');
+    if (elapsedEl) {
+      elapsedEl.textContent = "Elapsed: " + _formatDuration(_rs2.elapsedMs);
     }
   }, 250);
 
@@ -1415,24 +1651,25 @@ function _createAndStartScopedTracker(state, context, runId, experimentId) {
     rs.message = s.message;
     rs.error = s.error;
 
-    if (mappedStatus !== rs.status) {
+    var statusChanged = mappedStatus !== rs.status;
+    if (statusChanged) {
       rs.status = mappedStatus;
     }
 
-    // Trigger re-render on terminal states (dispose tracker) or intermediate
-    // progress (throttled to avoid excessive re-renders)
+    // Trigger re-render on terminal states (dispose tracker) or meaningful
+    // status transitions.  Intermediate progress uses DOM-targeted patching
+    // to avoid 4-8Hz full page teardown.
     if (mappedStatus === "completed" || mappedStatus === "error") {
       // Dispose scoped tracker on terminal state
       delete rs._localStartTime;
       _disposeScopedTracker(state);
       if (context && context.setPage) context.setPage("playground");
+    } else if (statusChanged) {
+      // Meaningful status transition (submitted→in_progress, etc.) — full rerender
+      if (context && context.setPage) context.setPage("playground");
     } else {
-      // Throttle re-renders for intermediate progress
-      var now = Date.now();
-      if (!rs._lastRenderMs || now - rs._lastRenderMs >= 250) {
-        rs._lastRenderMs = now;
-        if (context && context.setPage) context.setPage("playground");
-      }
+      // Intermediate progress: DOM-targeted patch, no full re-render
+      _domPatchProgress(state);
     }
   });
 
@@ -1498,6 +1735,11 @@ async function doRunSubmit(state, context, actions) {
     return;
   }
 
+  // Clear previous output so canvas shows live progress immediately
+  if (state.playground) {
+    state.playground.lastRunOutput = null;
+    state.playground._selectedRun = null;
+  }
   // Put determinate sampler fields into running state BEFORE remote call
   var _runSteps = controls.steps;
   var _runMaxSteps = (_runSteps != null && Number(_runSteps) > 0) ? Number(_runSteps) : 0;
@@ -1601,7 +1843,13 @@ function renderRunButton(state, context, actions) {
       text: "Waiting for server response\u2026",
       style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
     }));
-    _startPolling(container, state, context, actions, runState);
+    // Start polling only once per run lifecycle.  The elapsed timer
+    // triggers re-renders every 250ms; without this guard, each re-render
+    // would call _startPolling which calls _stopPolling/clearInterval,
+    // resetting the 3s poll interval so it never fires.
+    if (!state.playground || !state.playground._pollTimer) {
+      _startPolling(container, state, context, actions, runState);
+    }
     return container;
   }
 
@@ -1782,6 +2030,10 @@ function renderRunButton(state, context, actions) {
         // Build controls early so sampler fields are available for running state
         const controls = buildEffectiveControls(state, preset, currentFeatureId);
 
+        // Clear previous output so canvas shows live progress immediately
+        state.playground.lastRunOutput = null;
+        state.playground._selectedRun = null;
+
         // Put determinate sampler fields into running state BEFORE remote call
         var _runSteps = controls.steps;
         var _runMaxSteps = (_runSteps != null && Number(_runSteps) > 0) ? Number(_runSteps) : 0;
@@ -1891,6 +2143,7 @@ function renderProgressSection(state, context) {
   });
   const barFill = el("div", {
     style: "width:0%;height:100%;background:var(--color-accent, #5a7fdb);border-radius:4px;transition:width 0.3s ease;",
+    "data-testid": "progress-bar-fill",
   });
   barContainer.appendChild(barFill);
 
@@ -1923,7 +2176,11 @@ function renderProgressSection(state, context) {
   else if (runState.status === "waiting") stageLabel = "Waiting";
 
   stageEl.textContent = "Stage: " + stageLabel;
-  nodesEl.textContent = "Nodes: " + (runState.completedNodes || 0) + "/" + (runState.totalNodes || 0);
+  if (runState.totalNodes != null && runState.totalNodes > 0) {
+    nodesEl.textContent = "Nodes: " + (runState.completedNodes || 0) + "/" + runState.totalNodes;
+  } else {
+    nodesEl.style.display = "none";
+  }
   var samplerPct = runState.samplerPercent != null ? " (" + Math.round(runState.samplerPercent) + "%)" : "";
   stepEl.textContent = "Sampler: " + (runState.samplerStep != null ? runState.samplerStep : 0) + "/" + (runState.samplerMaximum || 0) + samplerPct;
   elapsedEl.textContent = "Elapsed: " + _formatDuration(runState.elapsedMs);
@@ -1947,6 +2204,984 @@ function renderProgressSection(state, context) {
   return section;
 }
 
+// ── Running Config Panel ────────────────────────────────────────────────
+//
+// Displays the parameter values that were captured at experiment submit
+// time, so the user can see what's being run even after editing form
+// controls.  Only renders when state.playground._runningExperimentConfig
+// is set (experiment-mode submissions via buildExperimentClickHandler).
+// Shows prompt, CFG, steps, seed, sampler, scheduler, denoise, dimensions,
+// experiment axes, and preset info.
+
+function renderRunningConfigPanel(state) {
+  const panel = el("div", {
+    class: "comfymodal-studio-running-config",
+    "data-testid": "running-config-panel",
+  });
+
+  const config = state.playground && state.playground._runningExperimentConfig;
+  const runState = state.playground && state.playground.runState;
+
+  // Only show during active runs with a captured config snapshot
+  if (!config || !runState) return panel;
+  var rs = runState.status;
+  var isActive = rs && rs !== "completed" && rs !== "error" && rs !== "idle";
+  if (!isActive) return panel;
+  panel.classList.add("is-visible");
+
+  var controls = config.controls || {};
+  var axes = config.axes || {};
+
+  // ── Header ────────────────────────────────────────────────────────
+  var headerChildren = [
+    el("span", { class: "comfymodal-studio-running-config-title", text: "Run Config" }),
+  ];
+  if (config.presetLabel) {
+    headerChildren.push(el("span", {
+      class: "comfymodal-studio-running-config-preset",
+      text: config.presetLabel,
+    }));
+  }
+  panel.appendChild(el("div", { class: "comfymodal-studio-running-config-header" }, headerChildren));
+
+  // ── Prompt ────────────────────────────────────────────────────────
+  if (controls.prompt != null && controls.prompt !== "") {
+    var promptText = controls.prompt;
+    if (promptText.length > 200) promptText = promptText.substring(0, 200) + "\u2026";
+    panel.appendChild(el("div", { class: "comfymodal-studio-running-config-prompt" }, [
+      el("span", { class: "comfymodal-studio-running-config-label", text: "Prompt" }),
+      el("span", { class: "comfymodal-studio-running-config-prompt-text", text: promptText }),
+    ]));
+  }
+
+  // ── Negative prompt ───────────────────────────────────────────────
+  if (controls.negative_prompt != null && controls.negative_prompt !== "") {
+    var negText = controls.negative_prompt;
+    if (negText.length > 120) negText = negText.substring(0, 120) + "\u2026";
+    panel.appendChild(el("div", { class: "comfymodal-studio-running-config-prompt", style: "border-bottom:none;margin-bottom:2px;padding-bottom:2px;" }, [
+      el("span", { class: "comfymodal-studio-running-config-label", text: "Negative" }),
+      el("span", { class: "comfymodal-studio-running-config-prompt-text", text: negText }),
+    ]));
+  }
+
+  // ── Parameter grid ────────────────────────────────────────────────
+  var paramKeys = ["guidance", "steps", "seed", "sampler", "scheduler", "denoise", "width", "height"];
+  var paramEntries = [];
+  paramKeys.forEach(function (key) {
+    if (controls[key] != null && controls[key] !== "") {
+      var def = CONTROL_DEFS[key];
+      var label = def ? def.label : key;
+      paramEntries.push({ label: label, value: String(controls[key]) });
+    }
+  });
+
+  if (paramEntries.length > 0) {
+    var grid = el("div", { class: "comfymodal-studio-running-config-grid" });
+    paramEntries.forEach(function (entry) {
+      grid.appendChild(el("span", { class: "comfymodal-studio-running-config-item" }, [
+        el("span", { class: "comfymodal-studio-running-config-label", text: entry.label + ": " }),
+        el("span", { class: "comfymodal-studio-running-config-value", text: entry.value }),
+      ]));
+    });
+    panel.appendChild(grid);
+  }
+
+  // ── Experiment axes ───────────────────────────────────────────────
+  var activeAxes = [];
+  for (var _ctrlId in axes) {
+    if (Object.prototype.hasOwnProperty.call(axes, _ctrlId)) {
+      var _adef = axes[_ctrlId];
+      if (_adef && _adef.enabled && _adef.values && _adef.values.length > 0) {
+        activeAxes.push([_ctrlId, _adef]);
+      }
+    }
+  }
+
+  if (activeAxes.length > 0) {
+    var axesSection = el("div", { class: "comfymodal-studio-running-config-axes" }, [
+      el("span", { class: "comfymodal-studio-running-config-axes-title", text: "Experiment Axes" }),
+    ]);
+    var axesList = el("div", { class: "comfymodal-studio-running-config-axes-list" });
+    activeAxes.forEach(function (pair) {
+      var _id = pair[0];
+      var _def = pair[1];
+      var _ctrlDef = CONTROL_DEFS[_id] || {};
+      var _label = _ctrlDef.label || _id;
+      var _vals = (_def.values || []).map(String).join(", ");
+      axesList.appendChild(el("span", {
+        class: "comfymodal-studio-running-config-axis-item",
+        text: _label + ": " + _vals,
+      }));
+    });
+    axesSection.appendChild(axesList);
+    panel.appendChild(axesSection);
+  }
+
+  // ── Preset count (multi-preset experiments) ────────────────────────
+  var presetIds = config.presetIds || [];
+  if (presetIds.length > 1) {
+    panel.appendChild(el("div", {
+      class: "comfymodal-studio-running-config-preset-count",
+      text: presetIds.length + " preset" + (presetIds.length > 1 ? "s" : ""),
+    }));
+  }
+
+  return panel;
+}
+
+// ── Experiment Grid Viewport ─────────────────────────────────────────────
+//
+// Renders the experiment results grid in the workspace when experiment mode
+// is active and snapshot data is available.  Replaces the normal single-run
+// canvas/progress/metadata/filmstrip sections.
+//
+// Layout adapts to the number of varying axes:
+//   0 axes → checkpoint-based groups (fallback)
+//   1 axis → horizontal row with axis-value headers
+//   2 axes → 2D matrix with row/column axis-value headers
+//   3-4 axes → 2D matrix (first 2 axes as axes) with remaining axes in cell labels
+//
+// During active runs, pending cells show clickable placeholders and the
+// currently-running cell shows an animated loading indicator.  Two progress
+// bars at bottom: current cell sampler progress + overall cell completion.
+//
+// After completion, output thumbnails appear in their correct grid cells.
+// Clicking any cell opens a detail overlay showing axis values (in red).
+
+export function _buildCellOutputMap(events, apiBase) {
+  var map = {};
+  if (!events) return map;
+  events.forEach(function (ev) {
+    if (ev.type === "cell.completed" && ev.payload) {
+      var ck = ev.payload.cell_key;
+      if (!ck) return;
+      var url = null;
+      if (ev.payload.primary_asset_id) {
+        url = apiBase + "/assets/" + encodeURIComponent(ev.payload.primary_asset_id);
+      } else if (ev.payload.output_paths && ev.payload.output_paths.length > 0) {
+        url = apiBase + "/studio/outputs/" + encodeURIComponent(ev.payload.output_paths[0]);
+      }
+      if (url) map[ck] = url;
+    }
+  });
+  return map;
+}
+
+// ── Experiment Loader (exported for History reuse) ─────────────────────────
+//
+// Fetches experiment detail via getStudioRunStatus and populates state so
+// the Experiment Grid viewport renders in the Playground.  On error returns
+// { ok: false, error: string } without navigating.
+
+export async function loadExperimentIntoPlayground(state, context, experimentId) {
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  try {
+    const data = await getStudioRunStatus(apiBase, experimentId);
+    if (!data) {
+      return { ok: false, error: "No response from server." };
+    }
+    if (data.status && data.status !== "ok") {
+      return { ok: false, error: (data.message || data.error || "Failed to load experiment.").substring(0, 200) };
+    }
+    if (!data.snapshot) {
+      return { ok: false, error: "Experiment has no snapshot data yet." };
+    }
+    const snapshot = data.snapshot || {};
+    const events = data.events || [];
+    const cellOutputs = _buildCellOutputMap(events, apiBase);
+    const snapStatus = snapshot.overall_status || snapshot.status || "completed";
+
+    if (!state.playground) state.playground = {};
+    state.playground.experimentMode = true;
+    state.playground.runState = {
+      status: snapStatus,
+      experimentId: experimentId,
+      _snapshot: snapshot,
+      _events: events,
+      _cellOutputs: cellOutputs,
+    };
+
+    if (context && context.setPage) {
+      context.setPage("playground");
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message || "Failed to load experiment." };
+  }
+}
+
+function renderExperimentGridViewport(state, context) {
+  const viewport = el("div", {
+    class: "comfymodal-studio-experiment-grid-viewport",
+    "data-testid": "experiment-grid-viewport",
+  });
+
+  const runState = state.playground && state.playground.runState;
+  const snapshot = runState && runState._snapshot;
+  const events = runState && runState._events;
+  const cellOutputs = runState && runState._cellOutputs;
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+
+  // If experiment run is active but no snapshot yet, show building state
+  if (!snapshot) {
+    viewport.appendChild(el("div", {
+      class: "comfymodal-studio-experiment-grid-building",
+      "data-testid": "experiment-grid-building",
+      text: "Assembling experiment cells\u2026",
+    }));
+    return viewport;
+  }
+
+  // Extract compilation cells from experiment.created event
+  var compilationCells = _getCompilationCells(events);
+  if (!compilationCells || compilationCells.length === 0) {
+    // Fall back to snapshot cell_visible keys if compilation not available
+    var cellVisible = snapshot.cell_visible;
+    if (cellVisible && typeof cellVisible === "object") {
+      var vKeys = Object.keys(cellVisible);
+      if (vKeys.length > 0) {
+        compilationCells = vKeys.map(function (ck) {
+          return { cell_key: ck, axis_values: {} };
+        });
+      }
+    }
+  }
+  if (!compilationCells || compilationCells.length === 0) {
+    // Last resort: synthesize cells from cell.completed / cell.failed events
+    var synthesized = _synthesizeCellsFromEvents(events);
+    if (synthesized && synthesized.length > 0) {
+      compilationCells = synthesized;
+    }
+  }
+  if (!compilationCells || compilationCells.length === 0) {
+    // Fallback to total_cells count from snapshot
+    var totalExpected = snapshot.total_cells || 0;
+    if (totalExpected > 0) {
+      compilationCells = [];
+      for (var ci = 0; ci < totalExpected; ci++) {
+        compilationCells.push({ cell_key: "cell_" + ci, axis_values: {} });
+      }
+    }
+  }
+  if (!compilationCells || compilationCells.length === 0) {
+    viewport.appendChild(el("div", {
+      class: "comfymodal-studio-experiment-grid-building",
+      "data-testid": "experiment-grid-building",
+      text: "No cell data available yet\u2026",
+    }));
+    return viewport;
+  }
+
+  // Merge compilation cells with snapshot + event data + output URLs
+  var entries = _mergeCellStateForGrid(compilationCells, events, snapshot, cellOutputs, apiBase);
+
+  // Determine varying axes for layout
+  var axisInfo = _computeGridAxes(entries);
+  var varyingAxes = axisInfo.axes;
+
+  // Grid container (scrollable)
+  var gridOuter = el("div", { class: "comfymodal-studio-experiment-grid-outer", "data-testid": "experiment-grid-outer" });
+
+  // Axis-count-based layout dispatch
+  if (varyingAxes.length === 0) {
+    _renderGridFallback(gridOuter, entries, apiBase, state, context, snapshot);
+  } else if (varyingAxes.length === 1) {
+    _renderGridLinear(gridOuter, entries, varyingAxes, apiBase, state, context, snapshot);
+  } else {
+    _renderGridMatrix(gridOuter, entries, varyingAxes, apiBase, state, context, snapshot);
+  }
+
+  viewport.appendChild(gridOuter);
+
+  // Two progress bars at bottom
+  viewport.appendChild(_renderExperimentProgressBars(runState, state));
+
+  // Cell detail overlay (shown when _selectedCellKey is set)
+  var selectedCellKey = state.playground && state.playground._selectedCellKey;
+  if (selectedCellKey) {
+    var detailEntry = null;
+    for (var i = 0; i < entries.length; i++) {
+      if (entries[i].cell.cell_key === selectedCellKey) {
+        detailEntry = entries[i];
+        break;
+      }
+    }
+    if (detailEntry) {
+      viewport.appendChild(_renderCellDetailOverlay(detailEntry, apiBase, state, context, varyingAxes));
+    }
+  }
+
+  return viewport;
+}
+
+function _getCompilationCells(events) {
+  if (!events) return null;
+  var createdEv = null;
+  for (var i = 0; i < events.length; i++) {
+    if (events[i].type === "experiment.created") {
+      createdEv = events[i];
+      break;
+    }
+  }
+  if (!createdEv || !createdEv.payload) return null;
+  var compilation = createdEv.payload.compilation;
+  if (!compilation || !Array.isArray(compilation.cells)) return null;
+  return compilation.cells;
+}
+
+function _synthesizeCellsFromEvents(events) {
+  if (!events) return null;
+  var seen = {};
+  var cells = [];
+  events.forEach(function (ev) {
+    var ck = ev.payload && ev.payload.cell_key;
+    if (!ck) return;
+    if (seen[ck]) return;
+    seen[ck] = true;
+    cells.push({ cell_key: ck, axis_values: {} });
+  });
+  return cells.length > 0 ? cells : null;
+}
+
+function _mergeCellStateForGrid(compilationCells, events, snapshot, cellOutputs, apiBase) {
+  // Build event-derived attempt map (latest event per cell_key wins)
+  var eventAttempts = {};
+  if (events) {
+    events.forEach(function (ev) {
+      var t = ev.type;
+      var p = ev.payload || {};
+      var ck = p.cell_key;
+      if (!ck) return;
+      if (t === "experiment.created") return;
+      if (t === "cell.attempt_created") {
+        eventAttempts[ck] = eventAttempts[ck] || {};
+        eventAttempts[ck].attempt = Object.assign({}, p);
+        eventAttempts[ck].attempt.status = "pending";
+      } else if (["cell.completed", "cell.failed", "cell.interrupted", "cell.skipped"].indexOf(t) >= 0) {
+        var status = t.split(".")[1];
+        var prev = eventAttempts[ck] || {};
+        eventAttempts[ck] = {
+          cell: { cell_key: ck },
+          attempt: Object.assign({}, prev.attempt || {}, p, { status: status }),
+        };
+      }
+    });
+  }
+  // Merge compilation cells with event/snapshot/output data
+  return compilationCells.map(function (compCell) {
+    var ck = compCell.cell_key;
+    var evData = eventAttempts[ck] || {};
+    var snapAtt = (snapshot && snapshot.attempts && snapshot.attempts[ck]) || {};
+    var visibleStatus = (snapshot && snapshot.cell_visible && snapshot.cell_visible[ck]) || null;
+    var attempt = Object.assign({}, evData.attempt || {}, snapAtt);
+    attempt.status = visibleStatus || snapAtt.status || (evData.attempt ? evData.attempt.status : null) || "pending";
+    // Resolve output URL
+    var outputUrl = null;
+    if (cellOutputs && cellOutputs[ck]) {
+      outputUrl = cellOutputs[ck];
+    } else if (attempt.primary_asset_id) {
+      outputUrl = apiBase + "/assets/" + encodeURIComponent(attempt.primary_asset_id);
+    } else if (attempt.output_paths && attempt.output_paths.length > 0) {
+      outputUrl = apiBase + "/studio/outputs/" + encodeURIComponent(attempt.output_paths[0]);
+    }
+    return {
+      cell: Object.assign({ cell_key: ck, axis_values: compCell.axis_values || {} }, compCell),
+      attempt: attempt,
+      outputUrl: outputUrl,
+    };
+  });
+}
+
+function _computeGridAxes(entries) {
+  if (!entries || entries.length === 0) return { axes: [] };
+  var allValues = {};
+  var firstSeenKeys = [];
+  for (var i = 0; i < entries.length; i++) {
+    var av = entries[i].cell.axis_values || {};
+    for (var key in av) {
+      if (!Object.prototype.hasOwnProperty.call(av, key)) continue;
+      // Skip workflow-owned sentinel keys
+      if (typeof key === "string" && key.indexOf("__") === 0) continue;
+      if (!allValues[key]) {
+        allValues[key] = new Set();
+        firstSeenKeys.push(key);
+      }
+      var v = av[key];
+      var sv = typeof v === "object" ? JSON.stringify(v) : String(v);
+      // Skip workflow-owned sentinel values
+      if (sv.indexOf("__COMFYMODAL_WORKFLOW_OWNED__") >= 0) continue;
+      allValues[key].add(sv);
+    }
+  }
+  // Detect varying prompts: compile cell.prompt values across entries
+  var prompts = [];
+  for (var pi = 0; pi < entries.length; pi++) {
+    var pv = entries[pi].cell.prompt;
+    if (pv != null && pv !== "") prompts.push(pv);
+  }
+  var promptsVary = false;
+  if (prompts.length >= 2) {
+    var firstP = prompts[0];
+    for (var pj = 1; pj < prompts.length; pj++) {
+      if (prompts[pj] !== firstP) { promptsVary = true; break; }
+    }
+  }
+  var varying = [];
+  for (var j = 0; j < firstSeenKeys.length; j++) {
+    var k = firstSeenKeys[j];
+    // Only include axes where the value Set has >1 distinct, non-sentinel entries
+    if (allValues[k].size > 1) {
+      varying.push(k);
+    }
+  }
+  // If prompts vary, add "prompt" as a synthetic axis (takes priority after real axes)
+  if (promptsVary) {
+    varying.push("prompt");
+  }
+  return { axes: varying, valueSets: allValues };
+}
+
+function _getAxisValueLabel(entry, axisKey) {
+  if (axisKey === "prompt") {
+    // Synthetic prompt axis: value comes from cell.prompt not axis_values
+    var p = entry.cell.prompt;
+    if (p == null || p === "") return "(empty)";
+    return String(p);
+  }
+  var av = entry.cell.axis_values || {};
+  var v = av[axisKey];
+  if (v === null || v === undefined) return "?";
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v);
+}
+
+function _renderGridFallback(gridOuter, entries, apiBase, state, context, snapshot) {
+  // Group by checkpoint_id
+  var groups = {};
+  entries.forEach(function (entry) {
+    var ck = (entry.attempt && entry.attempt.checkpoint_id) || "_unknown";
+    groups[ck] = groups[ck] || [];
+    groups[ck].push(entry);
+  });
+  var groupKeys = Object.keys(groups);
+  groupKeys.forEach(function (groupKey) {
+    var group = el("div", { class: "comfymodal-studio-experiment-grid-group" }, [
+      el("h4", {
+        class: "comfymodal-studio-experiment-grid-group-label",
+        text: "Checkpoint " + groupKey,
+      }),
+    ]);
+    var row = el("div", { class: "comfymodal-studio-experiment-grid-row" });
+    groups[groupKey].forEach(function (entry) {
+      row.appendChild(_renderExperimentCell(entry, apiBase, state, context));
+    });
+    group.appendChild(row);
+    gridOuter.appendChild(group);
+  });
+  if (groupKeys.length === 0) {
+    gridOuter.appendChild(el("div", {
+      class: "comfymodal-studio-experiment-grid-empty",
+      text: "No cells yet\u2026",
+    }));
+  }
+}
+
+function _renderGridLinear(gridOuter, entries, varyingAxes, apiBase, state, context, snapshot) {
+  var axisKey = varyingAxes[0];
+  // Collect unique values preserving compilation order
+  var uniqueVals = [];
+  var seen = {};
+  entries.forEach(function (entry) {
+    var val = _getAxisValueLabel(entry, axisKey);
+    if (!seen.hasOwnProperty(val)) {
+      seen[val] = true;
+      uniqueVals.push(val);
+    }
+  });
+  var container = el("div", { class: "comfymodal-studio-experiment-grid-container" });
+  // Column headers
+  var headerRow = el("div", { class: "comfymodal-studio-experiment-grid-row" });
+  headerRow.appendChild(el("div", { class: "comfymodal-studio-experiment-grid-corner" }));
+  var colHeaders = el("div", { class: "comfymodal-studio-experiment-grid-row-cells" });
+  var isPromptAxis = axisKey === "prompt";
+  uniqueVals.forEach(function (val) {
+    var headerEl = el("div", {
+      class: "comfymodal-studio-experiment-grid-header" + (isPromptAxis ? " is-prompt" : ""),
+    });
+    if (isPromptAxis) {
+      headerEl.appendChild(el("span", {
+        class: "comfymodal-studio-experiment-grid-header-prompt-text",
+        text: val,
+        title: val,
+      }));
+    } else {
+      headerEl.textContent = val;
+    }
+    colHeaders.appendChild(headerEl);
+  });
+  headerRow.appendChild(colHeaders);
+  container.appendChild(headerRow);
+  // Cell row
+  var cellRow = el("div", { class: "comfymodal-studio-experiment-grid-row" });
+  cellRow.appendChild(el("div", { class: "comfymodal-studio-experiment-grid-corner" }));
+  var cellRowCells = el("div", { class: "comfymodal-studio-experiment-grid-row-cells" });
+  uniqueVals.forEach(function (val) {
+    var match = null;
+    for (var i = 0; i < entries.length; i++) {
+      if (_getAxisValueLabel(entries[i], axisKey) === val) {
+        match = entries[i];
+        break;
+      }
+    }
+    // Find the CONTROL_DEFS label for this axis key for the cell label
+    var ctrlDef = CONTROL_DEFS[axisKey];
+    var axisLabel = ctrlDef ? ctrlDef.label : axisKey;
+    if (match) {
+      // Augment entry with axis display info for cell detail
+      match._axisLabels = match._axisLabels || {};
+      match._axisLabels[axisKey] = val;
+      cellRowCells.appendChild(_renderExperimentCell(match, apiBase, state, context));
+    } else {
+      cellRowCells.appendChild(_renderEmptyCell(axisKey + ": " + val));
+    }
+  });
+  cellRow.appendChild(cellRowCells);
+  container.appendChild(cellRow);
+  gridOuter.appendChild(container);
+}
+
+function _renderGridMatrix(gridOuter, entries, varyingAxes, apiBase, state, context, snapshot) {
+  var rowAxisKey = varyingAxes[0];
+  var colAxisKey = varyingAxes[1];
+  var extraAxes = varyingAxes.slice(2);
+  // Collect unique values for row/col axes preserving order
+  var rowVals = [];
+  var colVals = [];
+  var rowSeen = {}, colSeen = {};
+  entries.forEach(function (entry) {
+    var rv = _getAxisValueLabel(entry, rowAxisKey);
+    var cv = _getAxisValueLabel(entry, colAxisKey);
+    if (!rowSeen.hasOwnProperty(rv)) { rowSeen[rv] = true; rowVals.push(rv); }
+    if (!colSeen.hasOwnProperty(cv)) { colSeen[cv] = true; colVals.push(cv); }
+  });
+  var container = el("div", { class: "comfymodal-studio-experiment-grid-container" });
+  // Build multi-entry lookup: (rowVal, colVal) → [entry, ...]
+  // For 3+ varying axes, multiple cells share the same row/col coordinates.
+  // All cells at the same coordinate are stacked vertically in one grid cell.
+  var lookup = {};
+  entries.forEach(function (entry) {
+    var rv = _getAxisValueLabel(entry, rowAxisKey);
+    var cv = _getAxisValueLabel(entry, colAxisKey);
+    var key = rv + "::" + cv;
+    if (!lookup[key]) lookup[key] = [];
+    lookup[key].push(entry);
+  });
+  var isColPrompt = colAxisKey === "prompt";
+  // Header row
+  var headerRow = el("div", { class: "comfymodal-studio-experiment-grid-row" });
+  headerRow.appendChild(el("div", { class: "comfymodal-studio-experiment-grid-corner", text: colAxisKey }));
+  var colHeaderCells = el("div", { class: "comfymodal-studio-experiment-grid-row-cells" });
+  colVals.forEach(function (cv) {
+    var colHeaderEl = el("div", {
+      class: "comfymodal-studio-experiment-grid-header" + (isColPrompt ? " is-prompt" : ""),
+    });
+    if (isColPrompt) {
+      colHeaderEl.appendChild(el("span", {
+        class: "comfymodal-studio-experiment-grid-header-prompt-text",
+        text: cv,
+        title: cv,
+      }));
+    } else {
+      colHeaderEl.textContent = cv;
+    }
+    colHeaderCells.appendChild(colHeaderEl);
+  });
+  headerRow.appendChild(colHeaderCells);
+  container.appendChild(headerRow);
+  var isRowPrompt = rowAxisKey === "prompt";
+  // Data rows
+  rowVals.forEach(function (rv) {
+    var dataRow = el("div", { class: "comfymodal-studio-experiment-grid-row" });
+    var rowLabelEl = el("div", {
+      class: "comfymodal-studio-experiment-grid-row-label" + (isRowPrompt ? " is-prompt" : ""),
+    });
+    if (isRowPrompt) {
+      rowLabelEl.appendChild(el("span", {
+        class: "comfymodal-studio-experiment-grid-row-label-prompt-text",
+        text: rv,
+        title: rv,
+      }));
+    } else {
+      rowLabelEl.textContent = rv;
+    }
+    dataRow.appendChild(rowLabelEl);
+    var dataCells = el("div", { class: "comfymodal-studio-experiment-grid-row-cells" });
+    colVals.forEach(function (cv) {
+      var key = rv + "::" + cv;
+      var cellEntries = lookup[key];
+      if (cellEntries && cellEntries.length > 0) {
+        // Stack multiple cells at the same coordinate vertically
+        var stack = el("div", { class: "comfymodal-studio-experiment-grid-cell-stack" });
+        cellEntries.forEach(function (entry, idx) {
+          // Attach axis display labels to entry for cell detail
+          entry._axisLabels = entry._axisLabels || {};
+          entry._axisLabels[rowAxisKey] = rv;
+          entry._axisLabels[colAxisKey] = cv;
+          extraAxes.forEach(function (ax) {
+            entry._axisLabels[ax] = _getAxisValueLabel(entry, ax);
+          });
+          stack.appendChild(_renderExperimentCell(entry, apiBase, state, context));
+        });
+        dataCells.appendChild(stack);
+      } else {
+        dataCells.appendChild(_renderEmptyCell(""));
+      }
+    });
+    dataRow.appendChild(dataCells);
+    container.appendChild(dataRow);
+  });
+  gridOuter.appendChild(container);
+}
+
+function _renderEmptyCell(label) {
+  return el("div", {
+    class: "comfymodal-studio-experiment-grid-cell comfymodal-studio-experiment-grid-cell-empty",
+    text: label || "",
+  });
+}
+
+function _renderExperimentCell(entry, apiBase, state, context) {
+  var ck = entry.cell.cell_key;
+  var attempt = entry.attempt || {};
+  var status = attempt.status || "pending";
+  var outputUrl = entry.outputUrl;
+  var isCompleted = status === "completed" || status === "succeeded" || status === "done";
+  var isFailed = status === "failed" || status === "error";
+  var isSkipped = status === "skipped";
+  var isInterrupted = status === "interrupted";
+  var isRunning = status === "running" || status === "in_progress";
+  var isPending = !isCompleted && !isFailed && !isRunning && !isSkipped && !isInterrupted;
+
+  var isSelected = state.playground && state.playground._selectedCellKey === ck;
+
+  var cell = el("button", {
+    type: "button",
+    class: "comfymodal-studio-experiment-grid-cell"
+      + (isCompleted ? " completed" : "")
+      + (isFailed ? " failed" : "")
+      + (isSkipped ? " skipped" : "")
+      + (isInterrupted ? " interrupted" : "")
+      + (isRunning ? " running" : "")
+      + (isPending ? " pending" : "")
+      + (isSelected ? " selected" : ""),
+    "data-testid": "experiment-cell-" + ck,
+    "data-cell-key": ck,
+    "data-cell-status": status,
+  });
+
+  // Thumbnail or loading placeholder
+  if (outputUrl) {
+    cell.appendChild(el("img", {
+      class: "comfymodal-studio-experiment-grid-cell-img",
+      src: outputUrl,
+      alt: "Cell " + ck,
+      loading: "lazy",
+    }));
+  } else if (isRunning) {
+    cell.appendChild(el("div", { class: "comfymodal-studio-experiment-grid-cell-loading", "data-testid": "cell-loading-" + ck }));
+  } else if (isCompleted) {
+    // Completed but no output URL — show checkmark
+    cell.appendChild(el("div", { class: "comfymodal-studio-experiment-grid-cell-done-icon", text: "\u2713" }));
+  } else if (isFailed) {
+    cell.appendChild(el("div", { class: "comfymodal-studio-experiment-grid-cell-fail-icon", text: "\u2717" }));
+  } else if (isSkipped) {
+    cell.appendChild(el("div", { class: "comfymodal-studio-experiment-grid-cell-skip-icon", text: "\u21b7" }));
+  } else if (isInterrupted) {
+    cell.appendChild(el("div", { class: "comfymodal-studio-experiment-grid-cell-interrupt-icon", text: "\u23f8" }));
+  } else {
+    // Pending: empty placeholder
+    cell.appendChild(el("div", { class: "comfymodal-studio-experiment-grid-cell-placeholder" }));
+  }
+
+  // Status dot / label
+  var statusLabel = isCompleted ? "Done" : isFailed ? "Failed" : isSkipped ? "Skipped" : isInterrupted ? "Interrupted" : isRunning ? "Running" : "Pending";
+  cell.appendChild(el("span", {
+    class: "comfymodal-studio-experiment-grid-cell-status",
+    text: statusLabel,
+  }));
+
+  // Click handler — select cell for detail view
+  cell.addEventListener("click", function () {
+    if (state.playground) {
+      if (state.playground._selectedCellKey === ck) {
+        // Deselect
+        state.playground._selectedCellKey = null;
+      } else {
+        state.playground._selectedCellKey = ck;
+      }
+      if (context && context.setPage) context.setPage("playground");
+    }
+  });
+
+  return cell;
+}
+
+function _renderExperimentProgressBars(runState, state) {
+  var container = el("div", {
+    class: "comfymodal-studio-experiment-grid-progress",
+    "data-testid": "experiment-grid-progress",
+  });
+
+  var counters = (runState && runState._snapshot && runState._snapshot.counters) || {};
+  var total = runState && runState._snapshot && runState._snapshot.total_cells;
+  var completed = counters.completed || 0;
+  var failed = counters.failed || 0;
+  var skipped = counters.skipped || 0;
+  var interrupted = counters.interrupted || 0;
+  var terminalTotal = completed + failed + skipped + interrupted;
+  var totalCells = total || terminalTotal || 0;
+  var isMultiCell = totalCells > 1;
+
+  // Bar 1: Current cell / image progress (from scoped tracker sampler).
+  // Only rendered when sampler telemetry has arrived (max > 0).
+  // Without real sampler data, no swinging indeterminate bar — for
+  // multi-cell experiments, total cell progress is the primary indicator.
+  var currentPct = runState && runState.samplerPercent;
+  var hasSamplerData = runState && runState.samplerMaximum > 0 && runState.samplerStep != null;
+  if (hasSamplerData && currentPct != null) {
+    // Determinate: sampler step / max known
+    var currentBarRow = el("div", { class: "comfymodal-studio-experiment-grid-progress-row" });
+    currentBarRow.appendChild(el("span", {
+      class: "comfymodal-studio-experiment-grid-progress-label",
+      text: "Current image",
+    }));
+    var currentBarTrack = el("div", { class: "comfymodal-studio-experiment-grid-progress-track" });
+    var currentBarFill = el("div", {
+      class: "comfymodal-studio-experiment-grid-progress-fill",
+      style: "width:" + Math.max(0, Math.min(100, currentPct)) + "%;",
+    });
+    currentBarTrack.appendChild(currentBarFill);
+    currentBarRow.appendChild(currentBarTrack);
+    currentBarRow.appendChild(el("span", {
+      class: "comfymodal-studio-experiment-grid-progress-pct",
+      text: Math.round(currentPct) + "%",
+    }));
+    container.appendChild(currentBarRow);
+  } else if (!isMultiCell) {
+    // Single-cell experiment without sampler data: show a compact
+    // waiting state without the swinging indeterminate animation.
+    var currentBarRow = el("div", { class: "comfymodal-studio-experiment-grid-progress-row" });
+    currentBarRow.appendChild(el("span", {
+      class: "comfymodal-studio-experiment-grid-progress-label",
+      text: "Current image",
+    }));
+    var currentBarTrack = el("div", { class: "comfymodal-studio-experiment-grid-progress-track" });
+    var currentBarFill = el("div", {
+      class: "comfymodal-studio-experiment-grid-progress-fill",
+      style: "width:8%;background:#333;",
+    });
+    currentBarTrack.appendChild(currentBarFill);
+    currentBarRow.appendChild(currentBarTrack);
+    currentBarRow.appendChild(el("span", {
+      class: "comfymodal-studio-experiment-grid-progress-pct",
+      text: "Starting\u2026",
+      style: "font-size:9px;color:#888;font-style:italic;",
+    }));
+    container.appendChild(currentBarRow);
+  }
+  // Multi-cell without sampler data: omit the "Current image" row entirely
+  // — total cell progress is the meaningful indicator.
+
+  // Bar 2: Total cells progress (all terminal states matter)
+  var cellPct = totalCells > 0 ? (terminalTotal / totalCells) * 100 : 0;
+  var cellBarRow = el("div", { class: "comfymodal-studio-experiment-grid-progress-row" });
+  cellBarRow.appendChild(el("span", {
+    class: "comfymodal-studio-experiment-grid-progress-label",
+    text: "Total cells",
+  }));
+  var cellBarTrack = el("div", { class: "comfymodal-studio-experiment-grid-progress-track" });
+  var cellBarFill = el("div", {
+    class: "comfymodal-studio-experiment-grid-progress-fill",
+    style: "width:" + Math.max(0, Math.min(100, cellPct)) + "%;",
+  });
+  cellBarTrack.appendChild(cellBarFill);
+  cellBarRow.appendChild(cellBarTrack);
+  // Show breakdown: completed/failed/skipped/interrupted/total
+  var breakdownParts = [];
+  if (completed > 0) breakdownParts.push(completed + " done");
+  if (failed > 0) breakdownParts.push(failed + " failed");
+  if (skipped > 0) breakdownParts.push(skipped + " skipped");
+  if (interrupted > 0) breakdownParts.push(interrupted + " interrupted");
+  var breakdownText = breakdownParts.length > 0 ? breakdownParts.join(", ") + " / " + totalCells : terminalTotal + "/" + totalCells;
+  cellBarRow.appendChild(el("span", {
+    class: "comfymodal-studio-experiment-grid-progress-pct",
+    text: breakdownText,
+  }));
+  container.appendChild(cellBarRow);
+
+  return container;
+}
+
+function _renderCellDetailOverlay(entry, apiBase, state, context, varyingAxes) {
+  varyingAxes = varyingAxes || [];
+  var overlay = el("div", {
+    class: "comfymodal-studio-experiment-grid-detail-overlay",
+    "data-testid": "experiment-cell-detail-overlay",
+  });
+
+  // Backdrop click to close
+  var backdrop = el("div", { class: "comfymodal-studio-experiment-grid-detail-backdrop" });
+  backdrop.addEventListener("click", function () {
+    if (state.playground) state.playground._selectedCellKey = null;
+    if (context && context.setPage) context.setPage("playground");
+  });
+  overlay.appendChild(backdrop);
+
+  var panel = el("div", {
+    class: "comfymodal-studio-experiment-grid-detail-panel",
+    "data-testid": "experiment-cell-detail-panel",
+  });
+
+  // Close button
+  var closeBtn = el("button", {
+    class: "comfymodal-studio-experiment-grid-detail-close",
+    "data-testid": "experiment-cell-detail-close",
+    text: "\u2715",
+    onclick: function () {
+      if (state.playground) state.playground._selectedCellKey = null;
+      if (context && context.setPage) context.setPage("playground");
+    },
+  });
+  panel.appendChild(closeBtn);
+
+  // Image
+  if (entry.outputUrl) {
+    panel.appendChild(el("img", {
+      class: "comfymodal-studio-experiment-grid-detail-image",
+      src: entry.outputUrl,
+      alt: "Cell output",
+    }));
+  } else {
+    panel.appendChild(el("div", {
+      class: "comfymodal-studio-experiment-grid-detail-noimage",
+      text: "No output",
+    }));
+  }
+
+  // Cell key
+  panel.appendChild(el("div", {
+    class: "comfymodal-studio-experiment-grid-detail-key",
+    text: "Cell: " + entry.cell.cell_key,
+  }));
+
+  // Status
+  panel.appendChild(el("div", {
+    class: "comfymodal-studio-experiment-grid-detail-status",
+    text: "Status: " + (entry.attempt.status || "unknown"),
+  }));
+
+  // ── Axis values ───────────────────────────────────────────
+  // Varying axes (shown prominently in red glyph).
+  // Non-varying axes (shown in a collapsed accessible toggle).
+  // Filter out workflow-owned sentinel keys and values.
+  var av = entry.cell.axis_values || {};
+  var allAxisKeys = Object.keys(av).filter(function (k) {
+    if (typeof k === "string" && k.indexOf("__") === 0) return false;
+    var rawVal = av[k];
+    var sv = rawVal != null ? (typeof rawVal === "object" ? JSON.stringify(rawVal) : String(rawVal)) : "";
+    if (sv.indexOf("__COMFYMODAL_WORKFLOW_OWNED__") >= 0) return false;
+    return true;
+  });
+  // Split into varying vs non-varying based on the grid axis computation
+  var varyingKeys = allAxisKeys.filter(function (k) { return varyingAxes.indexOf(k) >= 0; });
+  var nonVaryingKeys = allAxisKeys.filter(function (k) { return varyingAxes.indexOf(k) < 0; });
+  var hasPrompt = entry.cell.prompt != null && entry.cell.prompt !== "";
+  var hasAnyAxes = varyingKeys.length > 0 || nonVaryingKeys.length > 0 || hasPrompt;
+
+  if (hasAnyAxes) {
+    var axisSection = el("div", { class: "comfymodal-studio-experiment-grid-detail-axes" });
+    axisSection.appendChild(el("div", {
+      class: "comfymodal-studio-experiment-grid-detail-axes-title",
+      text: "Axis Values",
+    }));
+
+    // Prompt as first varying item
+    if (hasPrompt) {
+      var promptVal = String(entry.cell.prompt);
+      if (promptVal.length > 200) promptVal = promptVal.substring(0, 200) + "\u2026";
+      axisSection.appendChild(el("div", {
+        class: "comfymodal-studio-experiment-grid-detail-axis-row",
+        "data-testid": "detail-axis-row-prompt",
+      }, [
+        el("span", { class: "comfymodal-studio-experiment-grid-detail-axis-key", text: "Prompt: " }),
+        el("span", { class: "comfymodal-studio-experiment-grid-detail-axis-value", text: promptVal }),
+      ]));
+    }
+
+    // Varying axes (always visible, red-highlighted)
+    varyingKeys.forEach(function (key) {
+      var ctrlDef = CONTROL_DEFS[key];
+      var label = ctrlDef ? ctrlDef.label : key;
+      var val = _getAxisValueLabel(entry, key);
+      axisSection.appendChild(el("div", {
+        class: "comfymodal-studio-experiment-grid-detail-axis-row",
+        "data-testid": "detail-axis-row-" + key,
+      }, [
+        el("span", { class: "comfymodal-studio-experiment-grid-detail-axis-key", text: label + ": " }),
+        el("span", { class: "comfymodal-studio-experiment-grid-detail-axis-value", text: val }),
+      ]));
+    });
+
+    // Non-varying axes (initially collapsed accessible toggle)
+    if (nonVaryingKeys.length > 0) {
+      var nvToggle = el("button", {
+        class: "comfymodal-studio-experiment-grid-detail-nonvarying-toggle",
+        "data-testid": "detail-nonvarying-toggle",
+        type: "button",
+        "aria-expanded": "false",
+        text: "\u25b6 Non-varying (" + nonVaryingKeys.length + ")",
+      });
+      var nvContent = el("div", {
+        class: "comfymodal-studio-experiment-grid-detail-nonvarying-content",
+        "data-testid": "detail-nonvarying-content",
+      });
+      nonVaryingKeys.forEach(function (key) {
+        var ctrlDef = CONTROL_DEFS[key];
+        var label = ctrlDef ? ctrlDef.label : key;
+        var val = _getAxisValueLabel(entry, key);
+        nvContent.appendChild(el("div", {
+          class: "comfymodal-studio-experiment-grid-detail-nonvarying-row",
+          "data-testid": "detail-nonvarying-row-" + key,
+        }, [
+          el("span", { class: "comfymodal-studio-experiment-grid-detail-nonvarying-key", text: label + ": " }),
+          el("span", { class: "comfymodal-studio-experiment-grid-detail-nonvarying-value", text: val }),
+        ]));
+      });
+      nvToggle.addEventListener("click", function () {
+        var isOpen = nvContent.classList.contains("is-visible");
+        nvContent.classList.toggle("is-visible");
+        nvToggle.textContent = isOpen ? "\u25b6 Non-varying (" + nonVaryingKeys.length + ")" : "\u25bc Non-varying (" + nonVaryingKeys.length + ")";
+        nvToggle.setAttribute("aria-expanded", !isOpen ? "true" : "false");
+      });
+      axisSection.appendChild(nvToggle);
+      axisSection.appendChild(nvContent);
+    }
+
+    panel.appendChild(axisSection);
+  }
+
+  // Preset / backend info
+  if (entry.attempt.checkpoint_id != null) {
+    panel.appendChild(el("div", {
+      class: "comfymodal-studio-experiment-grid-detail-checkpoint",
+      text: "Checkpoint: " + entry.attempt.checkpoint_id,
+    }));
+  }
+
+  overlay.appendChild(panel);
+  return overlay;
+}
+
 function _formatDuration(ms) {
   if (ms == null) return "0ms";
   if (ms < 1000) return ms.toFixed(0) + "ms";
@@ -1954,6 +3189,66 @@ function _formatDuration(ms) {
   var m = Math.floor(ms / 60000);
   var s = (ms % 60000) / 1000;
   return m + "m " + s.toFixed(0) + "s";
+}
+
+// ── DOM Progress Patch (avoids full page teardown for frequent updates) ──
+
+function _domPatchProgress(state) {
+  var rs = state.playground && state.playground.runState;
+  if (!rs) return;
+
+  var stageEl = document.querySelector('[data-testid="progress-stage"]');
+  if (stageEl) {
+    var stageLabel = "Starting...";
+    if (rs.status === "queued") stageLabel = "Queued";
+    else if (rs.status === "in_progress") stageLabel = "Generating";
+    else if (rs.status === "running") stageLabel = "Running";
+    else if (rs.status === "submitted") stageLabel = "Submitted";
+    else if (rs.status === "waiting") stageLabel = "Waiting";
+    stageEl.textContent = "Stage: " + stageLabel;
+  }
+
+  var nodesEl = document.querySelector('[data-testid="progress-nodes"]');
+  if (nodesEl) {
+    if (rs.totalNodes != null && rs.totalNodes > 0) {
+      nodesEl.textContent = "Nodes: " + (rs.completedNodes || 0) + "/" + rs.totalNodes;
+      nodesEl.style.display = "";
+    } else {
+      nodesEl.style.display = "none";
+    }
+  }
+
+  var elapsedEl = document.querySelector('[data-testid="progress-elapsed"]');
+  if (elapsedEl && rs.elapsedMs != null) {
+    elapsedEl.textContent = "Elapsed: " + _formatDuration(rs.elapsedMs);
+  }
+
+  var stepEl = document.querySelector('[data-testid="progress-step"]');
+  if (stepEl) {
+    var sp = rs.samplerPercent != null ? " (" + Math.round(rs.samplerPercent) + "%)" : "";
+    stepEl.textContent = "Sampler: " + (rs.samplerStep != null ? rs.samplerStep : 0) + "/" + (rs.samplerMaximum || 0) + sp;
+  }
+
+  var queueEl = document.querySelector('[data-testid="progress-queue"]');
+  if (queueEl) {
+    if (rs.queuePosition > 0) {
+      queueEl.textContent = "Queue: " + rs.queuePosition;
+      queueEl.style.display = "";
+    } else {
+      queueEl.style.display = "none";
+    }
+  }
+
+  var barFill = document.querySelector('[data-testid="progress-bar-fill"]');
+  if (barFill) {
+    if (rs.overallPercent != null) {
+      barFill.style.width = Math.max(0, Math.min(100, rs.overallPercent)) + "%";
+      barFill.style.animation = "";
+    } else {
+      barFill.style.width = "30%";
+      barFill.style.animation = "cm-pb-pulse 1.6s ease-in-out infinite";
+    }
+  }
 }
 
 // ── Favorite Star ────────────────────────────────────────────────────────
@@ -2114,6 +3409,17 @@ function renderNoteEditor(nr, actions, apiBase) {
 function renderWorkspace(state, context) {
   const workspace = el("div", { class: "comfymodal-studio-workspace", "data-testid": "workspace" });
 
+  // When experiment mode is active and the poller has delivered snapshot
+  // data, show the experiment grid instead of the normal single-run UI.
+  var _pg = state.playground;
+  var _rs = _pg && _pg.runState;
+  var _showGrid = _pg && _pg.experimentMode && _rs && _rs._snapshot;
+  if (_showGrid) {
+    workspace.appendChild(renderExperimentGridViewport(state, context));
+    return workspace;
+  }
+
+  // Normal single-run UI (non-experiment or no active experiment data)
   // Feature tabs
   workspace.appendChild(renderFeatureTabs(state, context));
 
@@ -2207,6 +3513,11 @@ function renderCanvas(state, context) {
       style: "color:var(--color-text-muted);",
     }));
   }
+
+  // Floating running-config overlay — always appended to canvas so it
+  // sits visually on top of output images.  Renders only during active
+  // experiment runs (visibility controlled by CSS + is-visible class).
+  canvas.appendChild(renderRunningConfigPanel(state));
 
   return canvas;
 }
@@ -2427,12 +3738,32 @@ function renderMetadataSection(state, context) {
     }));
   }
 
-  // ── Note Editor ───────────────────────────────────────────────────
-  section.appendChild(renderNoteEditor(nr, actions, apiBase));
+  // ── Collapsible toggles (Note | Advanced) ──────────────────────────
+  const togglesRow = el("div", {
+    style: "display:flex;gap:12px;margin-top:4px;",
+  });
 
-  // ── Collapsible advanced details ───────────────────────────────────
+  // Note toggle
+  const noteToggle = el("button", {
+    class: "comfymodal-studio-metadata-advanced-toggle",
+    "data-testid": "note-toggle",
+    text: "\u25b6 Note",
+    style: "font-size:10px;color:#888;cursor:pointer;background:none;border:none;padding:2px 0;",
+    onclick: function () {
+      const panel = section.querySelector(".comfymodal-studio-metadata-note-panel");
+      if (panel) {
+        const isHidden = panel.style.display === "none" || panel.style.display === "";
+        panel.style.display = isHidden ? "block" : "none";
+        noteToggle.textContent = isHidden ? "\u25bc Note" : "\u25b6 Note";
+      }
+    },
+  });
+  togglesRow.appendChild(noteToggle);
+
+  // Advanced toggle
   const advancedToggle = el("button", {
     class: "comfymodal-studio-metadata-advanced-toggle",
+    "data-testid": "advanced-toggle",
     text: "\u25b6 Advanced",
     style: "font-size:10px;color:#888;cursor:pointer;background:none;border:none;padding:2px 0;",
     onclick: function () {
@@ -2444,8 +3775,18 @@ function renderMetadataSection(state, context) {
       }
     },
   });
-  section.appendChild(advancedToggle);
+  togglesRow.appendChild(advancedToggle);
+  section.appendChild(togglesRow);
 
+  // ── Note panel (collapsible) ──────────────────────────────────────
+  const notePanel = el("div", {
+    class: "comfymodal-studio-metadata-note-panel",
+    style: "display:none;",
+  });
+  notePanel.appendChild(renderNoteEditor(nr, actions, apiBase));
+  section.appendChild(notePanel);
+
+  // ── Advanced panel (collapsible) ───────────────────────────────────
   const advancedPanel = el("div", {
     class: "comfymodal-studio-metadata-advanced",
     style: "display:none;font-size:10px;color:#666;",
@@ -2555,6 +3896,25 @@ function renderFilmstrip(state, context) {
   // Use cached recent runs or trigger async load
   let recentRuns = getRecentRuns();
 
+  // Re-render helper
+  function rerender() {
+    if (context && context.setPage) context.setPage("playground");
+  }
+
+  // If the user explicitly cleared the carousel, show empty state and
+  // skip server fetch.  This persists across refreshes until a new run
+  // completes, which clears the flag.
+  if (isCarouselCleared()) {
+    // Guard against stale cache from any other code path
+    clearRecentRunsCache();
+    carousel.appendChild(el("p", {
+      class: "comfymodal-studio-empty-state",
+      text: "Recent runs cleared. Submit a new run to see results here.",
+      style: "font-size:var(--font-size-xs);color:var(--color-text-muted);padding:8px;",
+    }));
+    return carousel;
+  }
+
   if (recentRuns == null) {
     carousel.appendChild(el("p", {
       class: "comfymodal-studio-empty-state",
@@ -2564,11 +3924,27 @@ function renderFilmstrip(state, context) {
 
     // Async fetch fills cache — on next render it will show
     refreshRecentRuns(apiBase).then(function () {
-      if (carousel.isConnected && context && context.setPage) {
-        context.setPage("playground");
-      }
+      if (carousel.isConnected) rerender();
     });
   } else {
+    // ── Hidden state: show reveal bar ──────────────────────────────────
+    if (state.playground && state.playground._carouselHidden) {
+      const revealBtn = el("button", {
+        type: "button",
+        class: "comfymodal-studio-carousel-reveal",
+        onclick: function () {
+          if (state.playground) {
+            state.playground._carouselHidden = false;
+            rerender();
+          }
+        },
+        text: "Show recent runs (" + recentRuns.length + ")",
+      });
+      carousel.appendChild(revealBtn);
+      return carousel;
+    }
+
+    // ── Empty state ────────────────────────────────────────────────────
     if (recentRuns.length === 0) {
       carousel.appendChild(el("p", {
         class: "comfymodal-studio-empty-state",
@@ -2578,33 +3954,87 @@ function renderFilmstrip(state, context) {
       return carousel;
     }
 
+    // ── Header row with actions ────────────────────────────────────────
+    const header = el("div", { class: "comfymodal-studio-carousel-header" });
+    header.appendChild(el("span", {
+      class: "comfymodal-studio-carousel-header-label",
+      text: "Recent runs",
+    }));
+
+    const actions = el("div", { class: "comfymodal-studio-carousel-actions" });
+
+    // Clear button — removes all cached and persisted runs
+    actions.appendChild(el("button", {
+      type: "button",
+      class: "comfymodal-studio-carousel-btn danger",
+      text: "Clear",
+      title: "Remove all recent runs",
+      onclick: function () {
+        clearRecentRunsCache();
+        clearAllRunResults();
+        setCarouselCleared(true);
+        rerender();
+      },
+    }));
+
+    // Close button — hides the carousel (per-session)
+    actions.appendChild(el("button", {
+      type: "button",
+      class: "comfymodal-studio-carousel-btn close-btn",
+      text: "\u2715",
+      "aria-label": "Hide recent runs",
+      title: "Hide recent runs",
+      onclick: function () {
+        if (state.playground) {
+          state.playground._carouselHidden = true;
+          rerender();
+        }
+      },
+    }));
+
+    header.appendChild(actions);
+    carousel.appendChild(header);
+
     // Carousel track for horizontal scrolling
     const track = el("div", { class: "comfymodal-studio-carousel-track" });
 
     recentRuns.forEach(function (nr) {
       const imageUrl = nr.imageUrl;
       const label = nr.presetLabel || nr.presetId || nr.featureId || "Run";
+      const isExperiment = nr.kind === "studio_experiment";
+      const ariaLabel = label + " - " + (nr.status || "") + (imageUrl ? " - Click to view" : " - No image")
+        + (isExperiment ? " (experiment)" : "");
 
-      const ariaLabel = label + " - " + (nr.status || "") + (imageUrl ? " - Click to view" : " - No image");
       const thumb = el("button", {
         type: "button",
         class: "comfymodal-studio-carousel-item"
           + (nr.status === "completed" || nr.status === "success" || nr.status === "done" ? " completed" : "")
-          + (nr.status === "error" || nr.status === "failed" ? " failed" : ""),
+          + (nr.status === "error" || nr.status === "failed" ? " failed" : "")
+          + (isExperiment ? " comfymodal-studio-carousel-item-experiment" : ""),
         "aria-label": ariaLabel,
-        title: label + " - " + (nr.status || ""),
+        title: (isExperiment ? "Experiment: " : "") + label + " - " + (nr.status || ""),
+        "data-expid": isExperiment ? nr.experimentId : "",
         onclick: function () {
-          // Update canvas with this run's output
-          if (imageUrl && state.playground) {
+          if (isExperiment && nr.experimentId) {
+            // Experiment item — open experiment grid viewport
+            loadExperimentIntoPlayground(state, context, nr.experimentId);
+          } else if (imageUrl && state.playground) {
+            // Ordinary run — update canvas with this run's output
             state.playground.lastRunOutput = imageUrl;
             state.playground._selectedRun = nr;
-            // Clear current run state so the canvas re-renders with the new output
-            if (context && context.setPage) {
-              context.setPage("playground");
-            }
+            rerender();
           }
         },
       });
+
+      if (isExperiment) {
+        // Experiment badge overlaid on the thumbnail
+        thumb.appendChild(el("span", {
+          class: "comfymodal-studio-carousel-exp-badge",
+          text: "EXP",
+          "aria-hidden": "true",
+        }));
+      }
 
       if (imageUrl) {
         thumb.appendChild(el("img", {

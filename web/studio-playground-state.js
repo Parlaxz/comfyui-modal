@@ -9,6 +9,7 @@
 const STORAGE_KEY = "comfymodal.studio.playground.v1";
 const DRAFTS_STORAGE_KEY = "comfymodal.studio.playground.drafts.v1";
 const RESULTS_STORAGE_KEY = "comfymodal.studio.playground.results.v1";
+const CAROUSEL_CLEARED_KEY = "comfymodal.studio.playground.carousel-cleared.v1";
 
 function makeDraftKey(presetId, featureId) {
   return `${presetId || ""}::${featureId || ""}`;
@@ -57,6 +58,35 @@ export function clearSelection() {
     localStorage.removeItem(STORAGE_KEY);
   } catch (e) {
     // Ignore
+  }
+}
+
+/**
+ * Persist the carousel-cleared flag so the carousel stays empty across
+ * page refreshes until a new run completes.
+ * @param {boolean} cleared
+ */
+export function setCarouselCleared(cleared) {
+  try {
+    if (cleared) {
+      localStorage.setItem(CAROUSEL_CLEARED_KEY, "true");
+    } else {
+      localStorage.removeItem(CAROUSEL_CLEARED_KEY);
+    }
+  } catch (e) {
+    // Ignore
+  }
+}
+
+/**
+ * Check whether the carousel was explicitly cleared by the user.
+ * @returns {boolean}
+ */
+export function isCarouselCleared() {
+  try {
+    return localStorage.getItem(CAROUSEL_CLEARED_KEY) === "true";
+  } catch (e) {
+    return false;
   }
 }
 
@@ -206,5 +236,115 @@ export function clearAllRunResults() {
     localStorage.removeItem(RESULTS_STORAGE_KEY);
   } catch (e) {
     // Ignore
+  }
+}
+
+// ── Experiment Draft Persistence ──────────────────────────────────────────
+//
+// Persists experiment axes configuration and compare-preset selections
+// per (presetId, featureId) pair so that experiment mode state survives
+// page reloads without requiring a run to save it.
+//
+// Only stores validated deep-copies of experimentAxes and compareBackendIds.
+// Key is versioned (v1) to allow future migration.
+//
+// The draft is loaded synchronously during first render after saved selection
+// (see renderControlPanel in studio-playground.js).  It is persisted when
+// axes values/toggles, prompt-axis first value, or compare preset selection
+// changes — without requiring an experiment run.
+
+const EXPERIMENT_DRAFT_KEY = "comfymodal.studio.experiment.draft.v1";
+
+/**
+ * Save experiment draft for a preset+feature pair.
+ * Stores a validated deep-copy of experimentAxes and compareBackendIds.
+ * @param {string} presetId
+ * @param {string} featureId
+ * @param {object} experimentAxes
+ * @param {string[]} compareBackendIds
+ */
+export function saveExperimentDraft(presetId, featureId, experimentAxes, compareBackendIds) {
+  if (!presetId || !featureId) return;
+  try {
+    const key = makeDraftKey(presetId, featureId);
+    const raw = localStorage.getItem(EXPERIMENT_DRAFT_KEY);
+    const all = raw ? JSON.parse(raw) : {};
+    const store = all && typeof all === "object" ? all : {};
+
+    store[key] = {
+      experimentAxes: _deepCloneObject(experimentAxes),
+      compareBackendIds: Array.isArray(compareBackendIds) ? compareBackendIds.slice() : [],
+    };
+
+    localStorage.setItem(EXPERIMENT_DRAFT_KEY, JSON.stringify(store));
+  } catch (e) {
+    // localStorage quota exceeded or unavailable — silently ignore
+  }
+}
+
+/**
+ * Load experiment draft for a preset+feature pair.
+ * Returns a validated deep-copy or null if no draft exists.
+ * @param {string} presetId
+ * @param {string} featureId
+ * @returns {{experimentAxes: object, compareBackendIds: string[]}|null}
+ */
+export function loadExperimentDraft(presetId, featureId) {
+  if (!presetId || !featureId) return null;
+  try {
+    const raw = localStorage.getItem(EXPERIMENT_DRAFT_KEY);
+    if (!raw) return null;
+    const all = JSON.parse(raw);
+    if (!all || typeof all !== "object") return null;
+    const entry = all[makeDraftKey(presetId, featureId)];
+    if (!entry || typeof entry !== "object") return null;
+
+    const axes = (entry.experimentAxes && typeof entry.experimentAxes === "object")
+      ? _deepCloneObject(entry.experimentAxes)
+      : {};
+    const ids = Array.isArray(entry.compareBackendIds)
+      ? entry.compareBackendIds.slice()
+      : [];
+
+    return { experimentAxes: axes, compareBackendIds: ids };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Remove experiment draft for a specific preset+feature pair.
+ * @param {string} presetId
+ * @param {string} featureId
+ */
+export function clearExperimentDraft(presetId, featureId) {
+  if (!presetId || !featureId) return;
+  try {
+    const raw = localStorage.getItem(EXPERIMENT_DRAFT_KEY);
+    if (!raw) return;
+    const all = JSON.parse(raw);
+    if (!all || typeof all !== "object") return;
+    const key = makeDraftKey(presetId, featureId);
+    if (key in all) {
+      delete all[key];
+      localStorage.setItem(EXPERIMENT_DRAFT_KEY, JSON.stringify(all));
+    }
+  } catch (e) {
+    // Ignore
+  }
+}
+
+/**
+ * Deep-clone a plain object (JSON-safe values only).
+ * @param {*} obj
+ * @returns {*}
+ */
+function _deepCloneObject(obj) {
+  if (obj === null || obj === undefined) return {};
+  if (typeof obj !== "object") return {};
+  try {
+    return JSON.parse(JSON.stringify(obj));
+  } catch (e) {
+    return {};
   }
 }

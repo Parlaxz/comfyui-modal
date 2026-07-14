@@ -289,6 +289,7 @@ class ExperimentStore:
         # through cell_visible instead.
         raw_counter: Counter[str] = Counter()
 
+        started_total_cells = 0
         for ev in self.read_events():
             seq = ev.get("sequence", 0)
             if isinstance(seq, int) and seq > last_sequence:
@@ -298,8 +299,13 @@ class ExperimentStore:
             cell_key = payload.get("cell_key", "")
             checkpoint_id = payload.get("checkpoint_id", "")
 
-            if et in {"experiment.started", "experiment.resumed"}:
+            if et == "experiment.status":
+                new_status = payload.get("status", "")
+                if new_status:
+                    status = new_status
+            elif et in {"experiment.started", "experiment.resumed"}:
                 status = "running"
+                started_total_cells = int(payload.get("total_cells", 0))
             elif et == "experiment.paused":
                 status = "paused"
             elif et == "experiment.stopped":
@@ -424,6 +430,11 @@ class ExperimentStore:
         # Add raw-event counts for events without cell_key
         for k, v in raw_counter.items():
             counters[k] += v
+
+        # Infer total_cells from experiment.started/resumed event payload
+        # when no explicit arg was provided (total_cells == 0).
+        if total_cells == 0 and started_total_cells > 0:
+            total_cells = started_total_cells
 
         snapshot = {
             "status": status,

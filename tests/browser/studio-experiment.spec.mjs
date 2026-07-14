@@ -72,6 +72,7 @@ async function enableStepsAxis(page) {
   // wait for the axis editor to appear (re-render driven by
   // toggleExperimentAxis which calls context.setPage("playground"))
   await expect(page.locator('[data-testid="axis-editor-steps"]')).toBeVisible({ timeout: 5000 });
+  await expect(page.locator('[data-testid="input-steps"]')).toHaveCount(0);
 }
 
 async function setStepsAxisValues(page, values) {
@@ -92,20 +93,20 @@ async function setStepsAxisValues(page, values) {
 }
 
 async function submitExperiment(page) {
-  const runBtn = page.locator('[data-testid="run-experiment-btn"]');
+  const runBtn = page.locator('[data-testid="run-experiment-inline-btn"]');
   await runBtn.waitFor({ state: "visible", timeout: 10000 });
   await expect(runBtn).toBeEnabled({ timeout: 10000 });
   await runBtn.click();
 }
 
 async function waitForExperimentTerminal(page, timeout = 60000) {
-  // Wait until run-experiment-btn is re-enabled (terminal state)
-  const runBtn = page.locator('[data-testid="run-experiment-btn"]');
+  // Wait until run-experiment-inline-btn is re-enabled (terminal state)
+  const runBtn = page.locator('[data-testid="run-experiment-inline-btn"]');
   await expect(runBtn).toBeEnabled({ timeout });
 }
 
 async function getDisabledReasonText(page) {
-  const reason = page.locator(".comfymodal-studio-disabled-reason");
+  const reason = page.locator('[data-testid="experiment-run-section"]');
   await reason.waitFor({ state: "visible", timeout: 10000 });
   return (await reason.textContent()) || "";
 }
@@ -261,9 +262,9 @@ test.describe("Studio Experiment", () => {
       expect(lastExp.snapshot.counters.failed).toBe(0);
 
       // Completed UI: button should say "Run" (re-enabled after terminal)
-      const runBtn = page.locator('[data-testid="run-experiment-btn"]');
+      const runBtn = page.locator('[data-testid="run-experiment-inline-btn"]');
       const btnText = (await runBtn.textContent()).trim();
-      expect(btnText).toBe("Run");
+      expect(btnText).toBe("Run Experiment");
 
       // Completion message shows exact cell count via canonical testid
       await expect(page.locator('[data-testid="run-status-message"]')).toContainText("Run completed (4 cell(s)).");
@@ -306,7 +307,7 @@ test.describe("Studio Experiment", () => {
       await enableExperimentMode(page);
 
       // With only base (no compare), should be disabled
-      const runBtn = page.locator('[data-testid="run-experiment-btn"]');
+      const runBtn = page.locator('[data-testid="run-experiment-inline-btn"]');
       await runBtn.waitFor({ state: "visible", timeout: 10000 });
 
       // Poll for disabled state (button state computed after async preset load)
@@ -325,7 +326,7 @@ test.describe("Studio Experiment", () => {
       // context.setPage in the compare change handler.
       await expect(runBtn).toBeEnabled({ timeout: 5000 });
       const title = await runBtn.getAttribute("title");
-      expect(title).toBe(""); // no disabled title
+      expect(title).toBeFalsy(); // no disabled title
 
       api.assertNoUnhandledCalls();
     } finally {

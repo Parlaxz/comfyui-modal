@@ -39,6 +39,7 @@ const STORAGE_KEY_OUTPUT_WEBP_LC = "comfymodal_webp_lossless_compression";
 const STORAGE_KEY_OUTPUT_AUTOSAVE = "comfymodal_auto_save_local";
 const STORAGE_KEY_OUTPUT_SAVEFOLDER = "comfymodal_save_folder";
 const STORAGE_KEY_OUTPUT_SIDECAR = "comfymodal_save_metadata_sidecar";
+const STORAGE_KEY_PRODUCTION = "comfymodal_production";
 const DEFAULT_OUTPUT_SAVEFOLDER = "output/modal";
 
 const STATUS = {
@@ -72,6 +73,9 @@ let _prevDeployState = "idle";
 let _showDeploySuccess = false;
 let _logViewerMinimized = false;
 let _showLogLinkEl = null;
+
+// Transient production-plan evidence (last known from execution_success)
+let _lastProductionEvidence = null;
 
 // Download progress tracking
 let _downloadProgressEl = null;
@@ -677,6 +681,15 @@ api.addEventListener("executing", (e) => {
 api.addEventListener("execution_error", () => {
   setRuntimeStatus("");
   setStatus(STATUS.OFFLINE);
+});
+api.addEventListener("execution_success", (e) => {
+  const detail = e?.detail || {};
+  if (detail._production_evidence) {
+    _lastProductionEvidence = detail._production_evidence;
+    if (prodSummaryEl && prodToggle.checked) {
+      _updateProductionSummary(prodSummaryEl);
+    }
+  }
 });
 api.addEventListener("progress", () => {
   // Keep status as GENERATING while progress events are flowing
@@ -1801,30 +1814,74 @@ function buildPanel() {
       const nOutputs = outputNodes.length;
       const nBypass = bypassNodes.length;
       const nRemoved = 0;
+      if (!prodToggle.checked) {
+        el.textContent = "Production disabled";
+        return;
+      }
+      if (!graph._nodes || graph._nodes.length === 0) {
+        el.textContent = "No workflow available";
+        return;
+      }
       if (nOutputs === 0) {
         el.textContent = "";
         const errSpan = document.createElement("span");
         errSpan.style.color = "#e05050";
-        errSpan.textContent = "No production outputs selected";
+        errSpan.textContent = "No production output selected";
+        el.appendChild(errSpan);
+        return;
+      }
+      // Check if selected output IDs exist in serialized workflow (API prompt request)
+      const serializedKeys = Object.keys(graph._nodes_by_id || {});
+      const outputIds = outputNodes.map(n => String(n.id));
+      const missingInSerialized = outputIds.filter(id => !serializedKeys.includes(id) && !graph._nodes.find(n => String(n.id) === id));
+      if (missingInSerialized.length > 0 && serializedKeys.length > 0) {
+        el.textContent = "";
+        const errSpan = document.createElement("span");
+        errSpan.style.color = "#e05050";
+        errSpan.textContent = "Output missing from serialized workflow: " + missingInSerialized.join(", ");
         el.appendChild(errSpan);
         return;
       }
       el.textContent = "";
-      const titleDiv = document.createElement("div");
-      titleDiv.style.cssText = "font-weight:600;margin-bottom:2px;";
-      titleDiv.textContent = "Production plan";
-      el.appendChild(titleDiv);
-      el.appendChild(document.createTextNode("Kept: " + kept + " nodes"));
-      el.appendChild(document.createElement("br"));
-      el.appendChild(document.createTextNode("Removed: " + nRemoved + " nodes"));
-      el.appendChild(document.createElement("br"));
-      el.appendChild(document.createTextNode("Bypassed: " + nBypass + " nodes"));
-      el.appendChild(document.createElement("br"));
-      el.appendChild(document.createTextNode("Outputs: " + nOutputs));
-      el.appendChild(document.createElement("br"));
-      el.appendChild(document.createTextNode("Sampler previews: disabled"));
-      el.appendChild(document.createElement("br"));
-      el.appendChild(document.createTextNode("Direct outputs: " + nOutputs));
+      if (_lastProductionEvidence) {
+        // Result-only state: plan was already used
+        const ev = _lastProductionEvidence;
+        const hashShort = (ev.production_plan_hash || "").substring(0, 8);
+        const titleDiv = document.createElement("div");
+        titleDiv.style.cssText = "font-weight:600;margin-bottom:2px;color:#7ed321;";
+        titleDiv.textContent = "Production plan ready: " + (ev.kept_count || 0) + " kept, " + (ev.removed_count || 0) + " removed, " + (ev.output_count || 0) + " outputs";
+        el.appendChild(titleDiv);
+        const lastRun = document.createElement("div");
+        lastRun.style.cssText = "font-size:10px;color:#888;margin-bottom:4px;";
+        lastRun.textContent = "Last run used production plan: " + hashShort;
+        el.appendChild(lastRun);
+        const bypassedCount = ev.bypassed_count != null ? ev.bypassed_count : 0;
+        el.appendChild(document.createTextNode("Bypassed: " + bypassedCount + " nodes"));
+        if (ev.executed_workflow_hash === ev.compiled_workflow_hash) {
+          el.appendChild(document.createElement("br"));
+          const okSpan = document.createElement("span");
+          okSpan.style.color = "#7ed321";
+          okSpan.textContent = "\u2713 Executed == compiled";
+          el.appendChild(okSpan);
+        }
+      } else {
+        // Preview: show counts but never say "ready"
+        const titleDiv = document.createElement("div");
+        titleDiv.style.cssText = "font-weight:600;margin-bottom:2px;";
+        titleDiv.textContent = "Production selection";
+        el.appendChild(titleDiv);
+        el.appendChild(document.createTextNode("Kept: " + kept + " nodes"));
+        el.appendChild(document.createElement("br"));
+        el.appendChild(document.createTextNode("Removed: " + nRemoved + " nodes"));
+        el.appendChild(document.createElement("br"));
+        el.appendChild(document.createTextNode("Bypassed: " + nBypass + " nodes"));
+        el.appendChild(document.createElement("br"));
+        el.appendChild(document.createTextNode("Outputs: " + nOutputs));
+        el.appendChild(document.createElement("br"));
+        el.appendChild(document.createTextNode("Sampler previews: disabled"));
+        el.appendChild(document.createElement("br"));
+        el.appendChild(document.createTextNode("Direct outputs: " + nOutputs));
+      }
     } catch (e) {
       el.textContent = "";
       const errSpan = document.createElement("span");
@@ -1847,7 +1904,8 @@ function buildPanel() {
   const prodToggle = document.createElement("input");
   prodToggle.type = "checkbox";
   prodToggle.id = "cm-prod-toggle";
-  prodToggle.checked = !!(app.graph?.extra?.comfymodal?.production_mode_enabled);
+  const _storedProd = app.graph?.extra?.comfymodal?.production_mode_enabled;
+  prodToggle.checked = _storedProd !== undefined ? _storedProd : localStorage.getItem(STORAGE_KEY_PRODUCTION) === "true";
   prodToggle.style.cssText = "width:16px; height:16px; accent-color:#3a6fcc; flex-shrink:0;";
 
   const prodLabel = document.createElement("label");
@@ -1861,20 +1919,24 @@ function buildPanel() {
 
   const prodSummaryEl = document.createElement("div");
   prodSummaryEl.style.cssText = "font-size:11px; color:#666; line-height:1.5; padding:6px 8px; background:#1a1a2a; border-radius:4px; border:1px solid #2a2a3a; display:" + (prodToggle.checked ? "" : "none") + ";";
-  prodSummaryEl.textContent = "No production plan";
+  prodSummaryEl.textContent = "Production disabled";
   scrollContent.appendChild(prodSummaryEl);
+  if (prodToggle.checked) {
+    setTimeout(() => { _updateProductionSummary(prodSummaryEl); }, 100);
+  }
 
   prodToggle.addEventListener("change", () => {
     if (!app.graph) return;
     if (!app.graph.extra) app.graph.extra = {};
     if (!app.graph.extra.comfymodal) app.graph.extra.comfymodal = {};
     app.graph.extra.comfymodal.production_mode_enabled = prodToggle.checked;
+    localStorage.setItem(STORAGE_KEY_PRODUCTION, String(prodToggle.checked));
     if (prodToggle.checked) {
       prodSummaryEl.style.display = "";
-      prodSummaryEl.textContent = "Compiling plan...";
-      setTimeout(() => { _updateProductionSummary(prodSummaryEl); }, 100);
+      _updateProductionSummary(prodSummaryEl);
     } else {
       prodSummaryEl.style.display = "none";
+      _lastProductionEvidence = null;
     }
     app.graph.setDirtyCanvas(true, true);
   });

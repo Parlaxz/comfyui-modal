@@ -162,6 +162,17 @@ export async function getStudioRunStatus(apiBase, id) {
  * @param {string} [params.sort] - Sort order (newest, oldest, fastest, slowest, preset_az, preset_za).
  * @returns {Promise<{runs: Array, total: number}|null>}
  */
+/**
+ * List real Studio aggregate experiments from /experiments.
+ * @param {string} apiBase
+ * @returns {Promise<Array|null>}
+ */
+export async function listExperiments(apiBase) {
+  const data = await apiFetch(apiBase, "/experiments");
+  if (data === null) return null;
+  return (data && data.experiments) || [];
+}
+
 export async function listRunHistory(apiBase, params) {
   const query = new URLSearchParams();
   if (params) {

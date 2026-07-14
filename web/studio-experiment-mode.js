@@ -146,6 +146,9 @@ export function renderCompareBackends(state, actions, context) {
             delete axes[ctrlId];
           }
         });
+        if (actions && actions.persistExperimentDraft) {
+          actions.persistExperimentDraft();
+        }
         const matrixBody = container.parentNode
           ? container.parentNode.querySelector('[data-testid="matrix-body"]')
           : null;
@@ -667,6 +670,62 @@ function buildExperimentClickHandler(state, actions, context) {
     }
     if (state.playground) state.playground._scopedTracker = null;
 
+    // ── Capture config snapshot before submission ──────────────────
+    // Freeze the current control values so the running panel shows
+    // accurate values even if the user edits form controls while the
+    // run is in flight.  Build resolved controls (CONTROL_DEFS
+    // defaults → preset defaults → user edits) so every expected
+    // parameter appears even when the user didn't explicitly touch it.
+    var _capFeatureId = (state.playground && state.playground.featureId) || "txt2img";
+    var _srcControls = (state.playground && state.playground.controls) || {};
+    var _capResolved = {};
+    // 1. CONTROL_DEFS defaults
+    for (var _defId in CONTROL_DEFS) {
+      if (Object.prototype.hasOwnProperty.call(CONTROL_DEFS, _defId)) {
+        var _ctrlDef = CONTROL_DEFS[_defId];
+        if (_ctrlDef.defaultValue !== undefined) {
+          _capResolved[_defId] = _ctrlDef.defaultValue;
+        }
+      }
+    }
+    // 2. Preset defaults (overlay)
+    var _presetForDefaults = state.playground && state.playground._currentPreset;
+    var _presetDefaults = (_presetForDefaults && _presetForDefaults.defaults) || {};
+    for (var _pdKey in _presetDefaults) {
+      if (Object.prototype.hasOwnProperty.call(_presetDefaults, _pdKey)) {
+        _capResolved[_pdKey] = _presetDefaults[_pdKey];
+      }
+    }
+    // 3. User edits (highest priority)
+    for (var _ctrlKey in _srcControls) {
+      if (Object.prototype.hasOwnProperty.call(_srcControls, _ctrlKey)) {
+        _capResolved[_ctrlKey] = _srcControls[_ctrlKey];
+      }
+    }
+    var _capAxes = JSON.parse(JSON.stringify((state.playground && state.playground.experimentAxes) || {}));
+    var _capPresetIds = getExperimentPresetIds(state);
+    var _capPresetLabel = "";
+    var _curPreset = state.playground && state.playground._currentPreset;
+    if (_curPreset) {
+      _capPresetLabel = _curPreset.label || _curPreset.id || "";
+    }
+    if (state.playground) {
+      state.playground._runningExperimentConfig = {
+        controls: _capResolved,
+        axes: _capAxes,
+        presetIds: _capPresetIds,
+        presetLabel: _capPresetLabel,
+        featureId: _capFeatureId,
+        submittedAt: Date.now(),
+      };
+    }
+
+    // Clear previous output so canvas shows live progress immediately
+    if (state.playground) {
+      state.playground.lastRunOutput = null;
+      state.playground._selectedRun = null;
+    }
+
     if (actions && actions.setRunState) {
       actions.setRunState({ status: "running" });
     }
@@ -836,6 +895,27 @@ export function renderExperimentMode(state, actions, context) {
   // alongside the experiment controls, not buried at the bottom of the
   // entire control panel.
   container.appendChild(renderExperimentRunButton(state, actions, context));
+
+  // Experiment Settings button — scrolls controls container into view and
+  // focuses the first eligible axis checkbox, without navigating away.
+  var settingsBtn = document.createElement("button");
+  settingsBtn.className = "comfymodal-secondary-btn";
+  settingsBtn.textContent = "Experiment Settings";
+  settingsBtn.setAttribute("data-testid", "experiment-settings-btn");
+  settingsBtn.setAttribute("aria-label", "Scroll to experiment controls and focus first axis");
+  settingsBtn.addEventListener("click", function () {
+    var controlsContainer = document.querySelector('[data-testid="controls-container"]');
+    if (controlsContainer) {
+      controlsContainer.scrollIntoView({ behavior: "smooth", block: "start" });
+      var firstAxisCheckbox = controlsContainer.querySelector(
+        '[data-testid^="axis-checkbox-"] input[type="checkbox"]:not([disabled])'
+      );
+      if (firstAxisCheckbox) {
+        firstAxisCheckbox.focus({ preventScroll: true });
+      }
+    }
+  });
+  container.appendChild(settingsBtn);
 
   return container;
 }
