@@ -12,7 +12,7 @@
 
 import { CONTROL_DEFS } from "./studio-feature-registry.js";
 import { getRuntimePresets } from "./studio-backend.js";
-import { runStudioExperiment } from "./studio-backend-api.js";
+import { runStudioExperiment, stopExperiment } from "./studio-backend-api.js";
 import { getAxisEligibilityForPresets } from "./studio-preset-capabilities.js";
 
 // ── Experiment toggle ────────────────────────────────────────────────────
@@ -49,6 +49,59 @@ function recalcEligibleAxes(state, loadedPresets) {
   return getAxisEligibilityForPresets(selectedPresets, featureId);
 }
 
+// ── Helpers for collapsible and grouping ──────────────────────────────
+
+/**
+ * Create a collapsible toggle button with content panel.
+ * Returns { summary, content } where both are live DOM elements.
+ */
+function _createCollapsible(labelText, isExpanded, testId) {
+  var summary = document.createElement("button");
+  summary.className = "comfymodal-studio-collapsible-summary";
+  summary.setAttribute("aria-expanded", isExpanded ? "true" : "false");
+  if (testId) summary.setAttribute("data-testid", testId);
+
+  // Build arrow + label with safe DOM methods (no innerHTML for user text)
+  var arrowSpan = document.createElement("span");
+  arrowSpan.className = "arrow";
+  arrowSpan.textContent = "\u25b6";
+  summary.appendChild(arrowSpan);
+
+  var labelSpan = document.createElement("span");
+  labelSpan.textContent = labelText;
+  summary.appendChild(labelSpan);
+
+  summary.addEventListener("click", function () {
+    var expanded = summary.getAttribute("aria-expanded") === "true";
+    summary.setAttribute("aria-expanded", String(!expanded));
+    content.classList.toggle("is-visible");
+  });
+
+  var content = document.createElement("div");
+  content.className = "comfymodal-studio-collapsible-content" + (isExpanded ? " is-visible" : "");
+
+  return { summary: summary, content: content };
+}
+
+/**
+ * Group presets by their optional `group` field.
+ * Returns { groups: { groupName: [preset, ...] }, ungrouped: [preset, ...] }
+ */
+function _groupPresetsByField(presets) {
+  var groups = {};
+  var ungrouped = [];
+  presets.forEach(function (p) {
+    var g = p.group;
+    if (g && typeof g === "string" && g.trim() !== "") {
+      if (!groups[g]) groups[g] = [];
+      groups[g].push(p);
+    } else {
+      ungrouped.push(p);
+    }
+  });
+  return { groups: groups, ungrouped: ungrouped };
+}
+
 // ── Compare Backends block ───────────────────────────────────────────────
 
 export function renderCompareBackends(state, actions, context) {
@@ -61,15 +114,20 @@ export function renderCompareBackends(state, actions, context) {
   heading.textContent = "Compare Presets";
   container.appendChild(heading);
 
-  const list = document.createElement("div");
-  list.className = "comfymodal-studio-compare-list";
-  container.appendChild(list);
+  // Main collapsible wrapper
+  var mainCollapsible = _createCollapsible("Presets", false, "compare-presets-toggle");
+  container.appendChild(mainCollapsible.summary);
+  container.appendChild(mainCollapsible.content);
 
   const apiBase = (context && context.apiBase) || "/comfymodal";
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
 
   getRuntimePresets({ apiBase }).then((presets) => {
-    while (list.firstChild) list.removeChild(list.firstChild);
+    while (mainCollapsible.content.firstChild) mainCollapsible.content.removeChild(mainCollapsible.content.firstChild);
+
+    // Update main summary count
+    var countLabel = mainCollapsible.summary.querySelector("span:last-child");
+    if (countLabel) countLabel.textContent = "Presets (" + (presets ? presets.length : 0) + ")";
 
     // Calculate eligible axes from compared presets
     const eligible = recalcEligibleAxes(state, presets);
@@ -99,20 +157,21 @@ export function renderCompareBackends(state, actions, context) {
       emptyState.textContent = "No presets configured. ";
       emptyState.appendChild(link);
       emptyState.appendChild(document.createTextNode(" to create presets."));
-      list.appendChild(emptyState);
+      mainCollapsible.content.appendChild(emptyState);
       return;
     }
 
     const compareIds = (state.playground && state.playground.compareBackendIds) || [];
 
-    presets.forEach((b) => {
+    // Shared render function for a single preset row
+    function _renderPresetRow(b) {
       const bId = b.id || b.label || "";
       const isRunnable = b.status === "runnable" && !b.archived;
       const featureCompat = (b.compatibleFeatures || []).includes(currentFeatureId);
       const canSelect = isRunnable && featureCompat;
       let disabledReason = "";
       if (b.archived) disabledReason = "Archived";
-      else if (!featureCompat) disabledReason = `Not compatible with "${currentFeatureId}"`;
+      else if (!featureCompat) disabledReason = 'Not compatible with "' + currentFeatureId + '"';
       else if (!isRunnable && b.disabledReason) disabledReason = b.disabledReason;
       else if (!isRunnable) disabledReason = "Not runnable";
 
@@ -124,66 +183,88 @@ export function renderCompareBackends(state, actions, context) {
       cb.type = "checkbox";
       cb.className = "comfymodal-studio-compare-checkbox";
       cb.setAttribute("data-backend-id", bId);
-      cb.setAttribute("data-testid", `compare-preset-${bId}`);
+      cb.setAttribute("data-testid", "compare-preset-" + bId);
       if (!canSelect) cb.disabled = true;
       cb.checked = canSelect && compareIds.includes(bId);
-      cb.addEventListener("change", () => {
+      cb.addEventListener("change", function () {
         const current = (state.playground && state.playground.compareBackendIds) || [];
-        let updated;
+        var updated;
         if (cb.checked) {
-          updated = [...current, bId];
+          updated = current.concat([bId]);
         } else {
-          updated = current.filter((id) => id !== bId);
+          updated = current.filter(function (id) { return id !== bId; });
         }
         state.playground.compareBackendIds = updated;
         // Recalculate eligible axes and clear ineligible ones
-        const eligible = recalcEligibleAxes(state, presets);
-        state.playground._eligibleAxes = eligible;
-        // Remove axes that are no longer eligible
-        const axes = state.playground.experimentAxes || {};
-        Object.keys(axes).forEach((ctrlId) => {
-          if (!eligible.includes(ctrlId)) {
-            delete axes[ctrlId];
+        var eligible2 = recalcEligibleAxes(state, presets);
+        state.playground._eligibleAxes = eligible2;
+        var _axes = state.playground.experimentAxes || {};
+        Object.keys(_axes).forEach(function (ctrlId) {
+          if (!eligible2.includes(ctrlId)) {
+            delete _axes[ctrlId];
           }
         });
         if (actions && actions.persistExperimentDraft) {
           actions.persistExperimentDraft();
         }
-        const matrixBody = container.parentNode
+        var _matrixBody = container.parentNode
           ? container.parentNode.querySelector('[data-testid="matrix-body"]')
           : null;
-        if (matrixBody) {
-          updateMatrixSummary(matrixBody, state);
+        if (_matrixBody) {
+          updateMatrixSummary(_matrixBody, state);
         }
-        // Trigger full Playground re-render so run-button, controls,
-        // and axis checkboxes reflect the new compare selection.
         if (context && context.setPage) {
           context.setPage("playground");
         }
       });
       item.appendChild(cb);
 
-      const label = document.createElement("span");
+      var label = document.createElement("span");
       label.textContent = b.label || b.id || "Unknown";
       label.style.fontSize = "var(--font-size-sm)";
       item.appendChild(label);
 
       if (disabledReason) {
-        const reasonEl = document.createElement("span");
-        reasonEl.textContent = ` (${disabledReason})`;
+        var reasonEl = document.createElement("span");
+        reasonEl.textContent = " (" + disabledReason + ")";
         reasonEl.style.fontSize = "var(--font-size-xs)";
         reasonEl.style.color = "var(--color-text-muted)";
         reasonEl.style.marginLeft = "4px";
         item.appendChild(reasonEl);
       }
 
-      list.appendChild(item);
+      return item;
+    }
+
+    // Group presets by their `group` field
+    var grouped = _groupPresetsByField(presets);
+    var groupNames = Object.keys(grouped.groups).sort(function (a, b) { return a.localeCompare(b); });
+
+    // Render each named group as a nested collapsible
+    groupNames.forEach(function (gName) {
+      var groupCollapsible = _createCollapsible(gName, false, "compare-preset-group-" + gName.replace(/[^a-zA-Z0-9_-]/g, "_"));
+      var gPresets = grouped.groups[gName];
+      gPresets.forEach(function (bp) {
+        groupCollapsible.content.appendChild(_renderPresetRow(bp));
+      });
+      mainCollapsible.content.appendChild(groupCollapsible.summary);
+      mainCollapsible.content.appendChild(groupCollapsible.content);
     });
-  }).catch(() => {
-    const errorMsg = document.createElement("p");
+
+    // Ungrouped section (no group or empty group)
+    if (grouped.ungrouped.length > 0) {
+      var ungroupedCollapsible = _createCollapsible("Ungrouped", false, "compare-preset-group-ungrouped");
+      grouped.ungrouped.forEach(function (bp) {
+        ungroupedCollapsible.content.appendChild(_renderPresetRow(bp));
+      });
+      mainCollapsible.content.appendChild(ungroupedCollapsible.summary);
+      mainCollapsible.content.appendChild(ungroupedCollapsible.content);
+    }
+  }).catch(function () {
+    var errorMsg = document.createElement("p");
     errorMsg.className = "comfymodal-studio-empty-state";
     errorMsg.textContent = "Could not load presets.";
-    list.appendChild(errorMsg);
+    mainCollapsible.content.appendChild(errorMsg);
   });
 
   return container;
@@ -367,12 +448,13 @@ export function enhanceControlWithAxisCheckbox(controlEl, controlId, state, acti
       setTimeout(() => {
         if (!controlEl.isConnected) return;
         const parent = controlEl.parentNode;
+        const grandparent = parent;
         if (!parent || !parent.isConnected) return;
         const existingEditors = parent.querySelectorAll(`[data-testid="axis-editor-${controlId}"]`);
         for (const existing of existingEditors) {
           if (existing.isConnected) existing.remove();
         }
-        parent.insertBefore(editor, controlEl.nextSibling);
+        grandparent.insertBefore(editor, controlEl.nextSibling);
       }, 0);
     }
   }
@@ -400,13 +482,113 @@ export function renderAxisEditor(controlId, state, actions) {
   valuesArea.className = "comfymodal-studio-axis-editor-values";
 
   if (def.type === "select") {
-    // Disabled with explanation for select controls like LoRA
-    const disabledMsg = document.createElement("p");
-    disabledMsg.textContent = "Axis configuration not available for this control type. Configure in Legacy Setup.";
-    disabledMsg.style.fontSize = "var(--font-size-xs)";
-    disabledMsg.style.color = "var(--color-text-muted)";
-    disabledMsg.style.fontStyle = "italic";
-    valuesArea.appendChild(disabledMsg);
+    // Select-type axes: dropdowns populated from the backend schema options
+    // when available (sampler names, scheduler names, etc.), falling back to
+    // text inputs if the preset schema is not yet resolved.
+    function _renderSelectValues() {
+      while (valuesArea.firstChild) valuesArea.removeChild(valuesArea.firstChild);
+
+      const axData = (state.playground && state.playground.experimentAxes && state.playground.experimentAxes[controlId]) || {};
+      const vals = axData.values || [""];
+
+      // Resolve schema options from the current preset (if available)
+      const preset = state.playground && state.playground._currentPreset;
+      const schema = preset && preset.controlSchemas && preset.controlSchemas[controlId];
+      const options = schema && schema.options && schema.options.length > 0 ? schema.options : null;
+
+      function collectValues() {
+        const inputs = valuesArea.querySelectorAll('[data-testid^="axis-value-' + controlId + '-"]');
+        return Array.from(inputs).map(function (inp) { return inp.value; });
+      }
+
+      function commitValues() {
+        const v = collectValues();
+        if (actions && actions.updateExperimentAxisValues) {
+          actions.updateExperimentAxisValues(controlId, v);
+        }
+      }
+
+      vals.forEach(function (val, i) {
+        const row = document.createElement("div");
+        row.style.display = "flex";
+        row.style.alignItems = "center";
+        row.style.gap = "4px";
+        row.style.marginBottom = "4px";
+
+        const inputWrapper = document.createElement("div");
+        inputWrapper.style.flex = "1";
+
+        if (options) {
+          // Dropdown for each axis value — respects the type of the non-experiment version
+          const select = document.createElement("select");
+          select.className = "comfymodal-input comfymodal-studio-select";
+          select.style.fontSize = "var(--font-size-xs)";
+          select.setAttribute("data-testid", "axis-value-" + controlId + "-" + i);
+          options.forEach(function (optVal) {
+            const opt = document.createElement("option");
+            opt.value = optVal;
+            opt.textContent = optVal;
+            if (String(optVal) === String(val)) opt.selected = true;
+            select.appendChild(opt);
+          });
+          select.addEventListener("change", commitValues);
+          inputWrapper.appendChild(select);
+        } else {
+          // Fallback: text input when schema options are unavailable
+          const input = document.createElement("input");
+          input.type = "text";
+          input.className = "comfymodal-input";
+          input.style.fontSize = "var(--font-size-xs)";
+          input.value = val;
+          input.setAttribute("data-testid", "axis-value-" + controlId + "-" + i);
+          input.addEventListener("input", commitValues);
+          inputWrapper.appendChild(input);
+        }
+
+        row.appendChild(inputWrapper);
+
+        if (i > 0) {
+          const removeBtn = document.createElement("button");
+          removeBtn.textContent = "\u00d7";
+          removeBtn.className = "comfymodal-destructive-btn";
+          removeBtn.style.fontSize = "12px";
+          removeBtn.style.padding = "2px 6px";
+          removeBtn.setAttribute("data-testid", "axis-remove-value-" + controlId + "-" + i);
+          removeBtn.setAttribute("aria-label", "Remove value " + (i + 1));
+          removeBtn.addEventListener("click", function () {
+            const currentVals = collectValues();
+            currentVals.splice(i, 1);
+            if (actions && actions.updateExperimentAxisValues) {
+              actions.updateExperimentAxisValues(controlId, currentVals);
+            }
+            _renderSelectValues();
+          });
+          row.appendChild(removeBtn);
+        }
+
+        valuesArea.appendChild(row);
+      });
+
+      // Plus button — appends a new value (first option for dropdowns, empty for text fallback)
+      const addBtn = document.createElement("button");
+      addBtn.textContent = "+";
+      addBtn.className = "comfymodal-secondary-btn";
+      addBtn.style.fontSize = "12px";
+      addBtn.style.padding = "2px 8px";
+      addBtn.setAttribute("data-testid", "axis-add-value-" + controlId);
+      addBtn.setAttribute("aria-label", "Add value");
+      addBtn.addEventListener("click", function () {
+        const currentVals = collectValues();
+        currentVals.push(options ? options[0] : "");
+        if (actions && actions.updateExperimentAxisValues) {
+          actions.updateExperimentAxisValues(controlId, currentVals);
+        }
+        _renderSelectValues();
+      });
+      valuesArea.appendChild(addBtn);
+    }
+
+    _renderSelectValues();
   } else {
     // Repeated value inputs with add/remove for experiment-eligible controls
     function _renderRepeatedValues() {
@@ -445,7 +627,12 @@ export function renderAxisEditor(controlId, state, actions) {
         let input;
         if (def.type === "textarea") {
           input = document.createElement("textarea");
-          input.className = "comfymodal-input comfymodal-studio-textarea";
+          var aeClass = "comfymodal-input comfymodal-studio-textarea";
+          if (controlId === "prompt" || controlId === "negative_prompt") {
+            aeClass += " comfymodal-studio-prompt-textarea";
+            if (controlId === "negative_prompt") aeClass += " negative";
+          }
+          input.className = aeClass;
           input.rows = 2;
           input.style.fontSize = "var(--font-size-xs)";
         } else {
@@ -591,6 +778,27 @@ export function renderExperimentRunButton(state, actions, context) {
       btn.textContent = "Running\u2026";
     }
     container.appendChild(btn);
+
+    // Cancel button for experiment runs
+    var _expApiBase = (context && context.apiBase) || "/comfymodal";
+    var _cancelBtn = document.createElement("button");
+    _cancelBtn.className = "comfymodal-destructive-btn";
+    _cancelBtn.setAttribute("data-testid", "cancel-experiment-btn");
+    _cancelBtn.textContent = runState._cancelling ? "Cancelling\u2026" : "Cancel";
+    _cancelBtn.disabled = !!runState._cancelling;
+    _cancelBtn.style.marginLeft = "6px";
+    _cancelBtn.addEventListener("click", async function () {
+      if (runState._cancelling) return;
+      runState._cancelling = true;
+      _cancelBtn.textContent = "Cancelling\u2026";
+      _cancelBtn.disabled = true;
+      var expId = runState.experimentId || runState.runId;
+      if (expId) {
+        try { await stopExperiment(_expApiBase, expId); } catch (e) {}
+      }
+    });
+    container.appendChild(_cancelBtn);
+
     return container;
   }
 
@@ -740,6 +948,30 @@ function buildExperimentClickHandler(state, actions, context) {
           message: result.message,
         });
       }
+
+      // Create scoped tracker for this experiment's execution events
+      try {
+        var { createScopedTracker } = await import("./comfymodal-progress.js");
+        var _expApi = (context && context.comfyApi) || (context && context.api);
+        if (_expApi && typeof _expApi.addEventListener === "function") {
+          var _expTracker = createScopedTracker(_expApi, {
+            runId: result.experimentId,
+            experimentId: result.experimentId,
+            promptId: null,
+          });
+          if (state.playground) {
+            // Dispose any existing scoped tracker first
+            var _old = state.playground._scopedTracker;
+            if (_old && typeof _old.dispose === "function") {
+              try { _old.dispose(); } catch (e) {}
+            }
+            state.playground._scopedTracker = _expTracker;
+          }
+          _expTracker.start();
+        }
+      } catch (_stErr) {
+        // Scoped tracker not essential — polling handles progress
+      }
     } else {
       var errMsg = (result && result.message) || "Experiment run failed.";
       if (actions && actions.setRunState) {
@@ -769,7 +1001,7 @@ export function getExperimentDisabledReason(state) {
   const canonicalPresetIds = getExperimentPresetIds(state);
   const hasAxes = hasMultiValueAxis(state);
 
-  if (canonicalPresetIds.length === 0) return "Select at least one preset to run an experiment.";
+  if (canonicalPresetIds.length === 0) return "Select at least 2 presets (or 1 preset with a multi-value axis) to run an experiment.";
   if (canonicalPresetIds.length === 1 && !hasAxes) return "Add another preset to compare, or add at least 2 values to an experiment axis.";
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
   const experimentsEnabled = currentFeatureId === "txt2img";
@@ -814,8 +1046,39 @@ export async function executeExperimentRun(state, context) {
     prompts: [{ text: controls.prompt || "", negative: controls.negative_prompt || "" }],
   };
 
-  // Only submit axes that are eligible (supported by all selected presets)
-  const eligibleAxes = (state.playground && state.playground._eligibleAxes) || [];
+  // Only submit axes that are eligible (supported by all selected presets).
+  // Fix first-load/refresh race: eligibleAxes may not be populated yet if
+  // renderCompareBackends hasn't completed its async getRuntimePresets call.
+  // Recompute from runtime presets at submit time to guarantee accuracy.
+  let eligibleAxes = (state.playground && state.playground._eligibleAxes) || [];
+  var _hasEnabledAxes = false;
+  for (var _ea in axes) {
+    if (Object.prototype.hasOwnProperty.call(axes, _ea) && axes[_ea] && axes[_ea].enabled) {
+      _hasEnabledAxes = true;
+      break;
+    }
+  }
+  if (_hasEnabledAxes && (eligibleAxes.length === 0 || Object.keys(axes).some(function (c) {
+    var _a = axes[c];
+    return _a && _a.enabled && !eligibleAxes.includes(c);
+  }))) {
+    try {
+      var { listPresets } = await import("./studio-backend-api.js");
+      var _allPresets = await listPresets(apiBase) || [];
+      var _selPresets = canonicalPresetIds.map(function (id) {
+        return _allPresets.find(function (p) { return (p.id || p.label || "") === id; });
+      }).filter(Boolean);
+      if (_selPresets.length > 0) {
+        var recomputed = getAxisEligibilityForPresets(_selPresets, currentFeatureId);
+        if (recomputed && recomputed.length > 0) {
+          eligibleAxes = recomputed;
+          if (state.playground) state.playground._eligibleAxes = recomputed;
+        }
+      }
+    } catch (_eligErr) {
+      // Fallback: use whatever eligibleAxes we already have
+    }
+  }
   Object.entries(axes).forEach(([ctrlId, def]) => {
     if (def && def.enabled && def.values && def.values.length > 0 && eligibleAxes.includes(ctrlId)) {
       var parsedValues = def.values.map(function (v) {
@@ -896,26 +1159,18 @@ export function renderExperimentMode(state, actions, context) {
   // entire control panel.
   container.appendChild(renderExperimentRunButton(state, actions, context));
 
-  // Experiment Settings button — scrolls controls container into view and
-  // focuses the first eligible axis checkbox, without navigating away.
-  var settingsBtn = document.createElement("button");
-  settingsBtn.className = "comfymodal-secondary-btn";
-  settingsBtn.textContent = "Experiment Settings";
-  settingsBtn.setAttribute("data-testid", "experiment-settings-btn");
-  settingsBtn.setAttribute("aria-label", "Scroll to experiment controls and focus first axis");
-  settingsBtn.addEventListener("click", function () {
-    var controlsContainer = document.querySelector('[data-testid="controls-container"]');
-    if (controlsContainer) {
-      controlsContainer.scrollIntoView({ behavior: "smooth", block: "start" });
-      var firstAxisCheckbox = controlsContainer.querySelector(
-        '[data-testid^="axis-checkbox-"] input[type="checkbox"]:not([disabled])'
-      );
-      if (firstAxisCheckbox) {
-        firstAxisCheckbox.focus({ preventScroll: true });
-      }
-    }
-  });
-  container.appendChild(settingsBtn);
+  // Reset to Default button — resets all experiment controls and axes to preset defaults
+  if (actions && actions.resetToDefaults) {
+    var resetBtn = document.createElement("button");
+    resetBtn.className = "comfymodal-secondary-btn";
+    resetBtn.textContent = "Reset to Default";
+    resetBtn.setAttribute("data-testid", "reset-to-default-btn");
+    resetBtn.setAttribute("aria-label", "Reset all experiment controls to their default values");
+    resetBtn.addEventListener("click", function () {
+      actions.resetToDefaults();
+    });
+    container.appendChild(resetBtn);
+  }
 
   return container;
 }

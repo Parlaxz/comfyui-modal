@@ -650,33 +650,43 @@ app.registerExtension({
           const baseOptions = { ..._getOutputOptions() };
           delete baseOptions.production;  // ensure clean start
           const productionEnabled = _getProductionEnabled();
+          // Compact production trace fields for request identity tracking.
+          const productionTrace = {
+            production_ui_enabled: productionEnabled,
+            production_persisted_enabled: productionEnabled,
+            production_output_ids: [],
+            production_bypass_ids: [],
+            production_plan_hash: "",
+          };
           if (productionEnabled) {
             const prodOutputNodes = _getProdOutputNodes();
             if (prodOutputNodes.length === 0) {
               throw new Error("Simulate Production is enabled but no nodes are marked as Production Output. Right-click an output-capable node and select 'Mark as Production Output', or disable Simulate Production.");
             }
             const outputNodeIds = prodOutputNodes.map(n => String(n.id)).sort();
-            // Validate output_node_ids exist in the serialized prompt keys
+            // Strictly validate output_node_ids exist in the serialized prompt keys.
+            // Do NOT hide invalid IDs as disabled — fail closed with clear message.
             const serializedKeys = parsed.prompt ? Object.keys(parsed.prompt) : [];
-            const finalOutIds = serializedKeys.length > 0
-              ? outputNodeIds.filter(id => serializedKeys.includes(id))
-              : outputNodeIds;
-            if (serializedKeys.length > 0 && finalOutIds.length === 0 && outputNodeIds.length > 0) {
-              log("Production output node IDs not found in serialized prompt: " + outputNodeIds.join(", ") + ". Available keys: " + serializedKeys.join(", "));
-              throw new Error("Production output nodes not found in serialized prompt. The canvas node IDs do not match the serialized workflow. Try re-saving the workflow or re-marking production outputs.");
-            }
-            if (finalOutIds.length < outputNodeIds.length) {
+            if (serializedKeys.length > 0) {
               const missing = outputNodeIds.filter(id => !serializedKeys.includes(id));
-              throw new Error(
-                "Production output nodes not found in serialized prompt: " + missing.join(", ") +
-                ". Node IDs in canvas do not match serialized workflow. Re-save workflow or re-mark production outputs."
-              );
+              if (missing.length > 0) {
+                log("Production output node IDs not found in serialized prompt: " + missing.join(", ") + ". Available keys: " + serializedKeys.join(", "));
+                throw new Error(
+                  "Production output nodes not found in serialized prompt: " + missing.join(", ") +
+                  ". Node IDs in canvas do not match serialized workflow. Re-save workflow or re-mark production outputs."
+                );
+              }
+              const finalOutIds = outputNodeIds;
+              productionTrace.production_output_ids = finalOutIds;
+            } else {
+              productionTrace.production_output_ids = outputNodeIds;
             }
             const bypassNodeIds = _getBypassNodes().map(n => String(n.id)).sort();
+            productionTrace.production_bypass_ids = bypassNodeIds;
             baseOptions.production = {
               enabled: true,
               schema_version: 1,
-              output_node_ids: finalOutIds,
+              output_node_ids: productionTrace.production_output_ids,
               bypass_node_ids: bypassNodeIds,
               disable_sampler_previews: true,
               quiet_execution_logs: true,
@@ -688,6 +698,9 @@ app.registerExtension({
             };
           }
           parsed.modal_options = { ...(parsed.modal_options || {}), ...baseOptions };
+          // Attach compact production trace to the request body so the
+          // backend can log and propagate it through the queue/adapter.
+          parsed._production_trace = productionTrace;
           options = {
             ...options,
             body: JSON.stringify(parsed),

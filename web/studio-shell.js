@@ -51,6 +51,12 @@ export function mountStudioShell(rootEl, context = {}) {
   // class-name collision with page-level containers
   const pageContainer = el("div", { class: "comfymodal-studio-pagecontainer", "data-testid": "studio-page" });
 
+  // Deferred scroll restoration state — handles rapid successive re-renders
+  // (e.g. rapid experiment checkbox toggles) by coalescing into one callback
+  // that always uses the latest captured scroll values.
+  let _pendingScrollRestore = null;
+  let _scrollRestoreScheduled = false;
+
   function renderActivePage(preserveScroll = true) {
     const pageScrollTop = preserveScroll ? pageContainer.scrollTop : 0;
     const controlPanelScrollTop = preserveScroll
@@ -88,13 +94,29 @@ export function mountStudioShell(rootEl, context = {}) {
     const content = pageDef.render(state, pageContext);
     if (content) pageContainer.appendChild(content);
 
-    pageContainer.scrollTop = pageScrollTop;
-    const controlPanel = pageContainer.querySelector(".comfymodal-studio-control-panel");
-    if (controlPanel && controlPanelScrollTop != null) {
-      controlPanel.scrollTop = controlPanelScrollTop;
-      if (controlPanel.scrollTop !== controlPanelScrollTop) {
-        state.playground._controlPanelScrollRestorePending = true;
-      }
+    // Defer scroll restoration to a macrotask so it fires after all
+    // setTimeout(0) callbacks scheduled during rendering (e.g. axis editor
+    // insertion in enhanceControlWithAxisCheckbox). By that point the DOM
+    // has been laid out and all deferred insertions have settled, making
+    // scrollTop assignments effective.
+    _pendingScrollRestore = { pageScrollTop, controlPanelScrollTop, pageContainer };
+    if (!_scrollRestoreScheduled) {
+      _scrollRestoreScheduled = true;
+      setTimeout(() => {
+        _scrollRestoreScheduled = false;
+        const restore = _pendingScrollRestore;
+        _pendingScrollRestore = null;
+        if (!restore) return;
+
+        restore.pageContainer.scrollTop = restore.pageScrollTop;
+        const controlPanel = restore.pageContainer.querySelector(".comfymodal-studio-control-panel");
+        if (controlPanel && restore.controlPanelScrollTop != null) {
+          controlPanel.scrollTop = restore.controlPanelScrollTop;
+          if (controlPanel.scrollTop !== restore.controlPanelScrollTop) {
+            state.playground._controlPanelScrollRestorePending = true;
+          }
+        }
+      }, 0);
     }
   }
 

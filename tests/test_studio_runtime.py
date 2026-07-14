@@ -5199,5 +5199,353 @@ class BuildExperimentSpecNestedInputRED(unittest.TestCase):
                     )
 
 
+# ---------------------------------------------------------------------------
+# Preset group field tests
+# ---------------------------------------------------------------------------
+
+class PresetGroupFieldTests(unittest.TestCase):
+    """The optional ``group`` string on presets must be backward-compatible,
+    default to empty, and be consistently sanitized across all CRUD paths."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.models = _load_module("studio_models", "studio_models.py")
+
+    def test_normalize_preset_payload_adds_group_default(self):
+        """normalize_preset_payload must set group to '' when absent."""
+        payload = {"snapshotId": ""}
+        result = self.models.normalize_preset_payload(payload, {})
+        self.assertEqual(result.get("group"), "",
+            "group must default to empty string")
+
+    def test_normalize_preset_payload_preserves_existing_group(self):
+        """normalize_preset_payload must preserve an existing group value."""
+        payload = {"snapshotId": "", "group": "my-group"}
+        result = self.models.normalize_preset_payload(payload, {})
+        self.assertEqual(result.get("group"), "my-group")
+
+    def test_normalize_preset_payload_sanitizes_group(self):
+        """normalize_preset_payload must strip and truncate group."""
+        payload = {"snapshotId": "", "group": "  " + "x" * 200 + "  "}
+        result = self.models.normalize_preset_payload(payload, {})
+        self.assertEqual(len(result.get("group", "")), 100,
+            "group must be truncated to 100 characters")
+        self.assertNotIn("  ", result.get("group", ""),
+            "group must be stripped of whitespace")
+
+    def test_make_preset_includes_group(self):
+        """make_preset must include the group field."""
+        body = {"snapshotId": "", "group": "experiment-a"}
+        result = self.models.make_preset(body, {})
+        self.assertIn("group", result)
+        self.assertEqual(result["group"], "experiment-a")
+
+    def test_make_preset_defaults_group_empty(self):
+        """make_preset must default group to '' when body has no group."""
+        body = {"snapshotId": ""}
+        result = self.models.make_preset(body, {})
+        self.assertEqual(result.get("group"), "",
+            "group must default to empty string when not provided")
+
+    def test_make_preset_sanitizes_group(self):
+        """make_preset must strip and truncate group."""
+        body = {"snapshotId": "", "group": "  long-group-name-wit trailing  "}
+        result = self.models.make_preset(body, {})
+        self.assertEqual(result.get("group"), "long-group-name-wit trailing",
+            "group must be stripped and truncated")
+
+    def test_update_preset_adds_group(self):
+        """update_preset must apply the group field from the body."""
+        preset = {"id": "p1", "snapshotId": "", "group": ""}
+        result = self.models.update_preset(preset, {"group": "new-group"}, {})
+        self.assertEqual(result.get("group"), "new-group")
+
+    def test_update_preset_sanitizes_group(self):
+        """update_preset must sanitize the group field."""
+        preset = {"id": "p1", "snapshotId": "", "group": ""}
+        body = {"group": "  " + "x" * 150 + "  "}
+        result = self.models.update_preset(preset, body, {})
+        self.assertEqual(len(result.get("group", "")), 100,
+            "updated group must be truncated to 100 characters")
+
+    def test_update_preset_preserves_existing_group_when_not_in_body(self):
+        """update_preset must not change group when body omits it."""
+        preset = {"id": "p1", "snapshotId": "", "group": "existing-group"}
+        result = self.models.update_preset(preset, {"description": "new desc"}, {})
+        self.assertEqual(result.get("group"), "existing-group",
+            "group must be preserved when not in update body")
+
+    def test_duplicated_preset_carries_group(self):
+        """Duplicating a preset must carry the group field via deepcopy."""
+        orig = {"id": "p1", "label": "Original", "snapshotId": "s1",
+                "compatibleFeatures": ["txt2img"], "group": "my-group"}
+        # Build snapshots_by_id so normalize_preset_payload does not error
+        snaps = {"s1": {"id": "s1", "status": "runnable",
+                        "compatibleFeatures": ["txt2img"],
+                        "apiPromptJson": {"3": {}},
+                        "nodeBindings": {},
+                        "outputNodeId": "3"}}
+        dup = self.models.normalize_preset_payload(
+            dict(orig, id="p2", label="Original (Copy)"), snaps)
+        self.assertEqual(dup.get("group"), "my-group",
+            "Duplicated preset must carry group from original")
+
+    def test_existing_preset_without_group_still_works(self):
+        """A preset loaded from storage that lacks a group field must work."""
+        old_preset = {"id": "p_legacy", "label": "Legacy",
+                      "snapshotId": "", "sourceType": "legacy"}
+        result = self.models.normalize_preset_payload(old_preset, {})
+        self.assertEqual(result.get("group"), "",
+            "Legacy preset without group must get empty string default")
+        self.assertIn("status", result,
+            "Legacy preset without group must still derive status")
+
+
+# ---------------------------------------------------------------------------
+# Mixed-format prompt axis extraction tests
+# ---------------------------------------------------------------------------
+
+class BuildExperimentSpecMixedFormatTest(unittest.TestCase):
+    """When axes are in nested format (with 'shared' key) BUT prompt axis
+    is at the flat level, the adapter must still extract prompt values."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def _make_snap_preset(self, tmp):
+        """Create a minimal runnable snapshot + preset pair in tmp."""
+        snap = {
+            "id": "snap_mixed",
+            "name": "Mixed Format Snapshot",
+            "compatibleFeatures": ["txt2img"],
+            "apiPromptJson": {
+                "3": {"class_type": "KSampler", "inputs": {
+                    "seed": 42, "steps": 20, "cfg": 7.0,
+                    "sampler_name": "euler", "scheduler": "normal",
+                    "denoise": 1.0,
+                }},
+                "9": {"class_type": "SaveImage", "inputs": {"images": []}},
+            },
+            "nodeBindings": {
+                "prompt": {"kind": "widget", "nodeId": "3", "widgetName": "text"},
+                "output": {"kind": "output", "nodeId": "9"},
+            },
+            "outputNodeId": "9",
+            "graphJson": {"nodes": [], "links": []},
+            "archived": False,
+            "status": "runnable",
+            "featureStatus": {"txt2img": {"status": "runnable", "reason": ""}},
+            "disabledReason": "",
+        }
+        preset = {
+            "id": "preset_mixed", "label": "Mixed Preset",
+            "snapshotId": "snap_mixed",
+            "compatibleFeatures": ["txt2img"],
+            "defaults": {}, "sourceType": "snapshot",
+            "sourceId": "", "archived": False,
+            "status": "runnable", "disabledReason": "",
+        }
+        _make_studio_store_files(tmp, [snap], [preset])
+        return snap, preset
+
+    def test_prompt_axis_at_flat_level_with_nested_axes(self):
+        """When axes has 'shared' key (nested) but prompt axis is at the
+        flat level, prompt values must NOT be lost."""
+        snap, preset = self._make_snap_preset(tempfile.mkdtemp())
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_studio_store_files(tmp, [snap], [preset])
+            exp_def = {
+                "prompts": [
+                    {"id": "p1", "text": "fallback", "enabled": True},
+                ],
+                "axes": {
+                    # prompt at FLAT level
+                    "prompt": {"values": ["a cat", "a dog", "a bird"]},
+                    # other axes under 'shared' (nested format)
+                    "shared": {
+                        "seed": {"mode": "list", "values": [1, 2]},
+                    },
+                },
+            }
+            spec = self.mod.build_experiment_spec(
+                [(preset, snap)], "txt2img", exp_def, tmp
+            )
+            self.assertNotIn("error", spec,
+                "Mixed format must not produce a compilation error")
+            cells = spec.get("cells", [])
+            # 3 prompt variants × 2 seeds = 6 cells
+            self.assertEqual(len(cells), 6,
+                "Mixed format: 3 prompt axis variants × 2 seeds = 6 cells")
+            prompt_texts = [c.get("prompt", "") for c in cells]
+            self.assertEqual(prompt_texts.count("a cat"), 2)
+            self.assertEqual(prompt_texts.count("a dog"), 2)
+            self.assertEqual(prompt_texts.count("a bird"), 2)
+            self.assertNotIn("fallback", prompt_texts,
+                "Axis prompt must override base prompt")
+
+    def test_prompt_axis_inside_shared_still_works(self):
+        """Pure nested format (prompt inside 'shared') must still work."""
+        snap, preset = self._make_snap_preset(tempfile.mkdtemp())
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_studio_store_files(tmp, [snap], [preset])
+            exp_def = {
+                "prompts": [
+                    {"id": "p1", "text": "fallback", "enabled": True},
+                ],
+                "axes": {
+                    "shared": {
+                        "prompt": {"values": ["cat", "dog"]},
+                        "seed": {"mode": "list", "values": [1]},
+                    },
+                },
+            }
+            spec = self.mod.build_experiment_spec(
+                [(preset, snap)], "txt2img", exp_def, tmp
+            )
+            self.assertNotIn("error", spec)
+            cells = spec.get("cells", [])
+            self.assertEqual(len(cells), 2,
+                "Nested format: 2 prompt variants × 1 seed = 2 cells")
+
+
+# ---------------------------------------------------------------------------
+# Enhanced experiment metadata tests
+# ---------------------------------------------------------------------------
+
+class StudioExperimentMetaDataTests(unittest.TestCase):
+    """Experiment metadata must carry the full experiment definition."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module("studio_run_adapter", "studio_run_adapter.py")
+
+    def test_studio_meta_contains_experiment_definition(self):
+        """studio_meta must include experiment_definition with prompts/axes."""
+        meta = self.mod._build_studio_experiment_meta(
+            preset_ids=["p1"], snapshot_ids=["s1"], feature_id="txt2img",
+            experiment_source={
+                "prompts": [{"text": "cat"}, {"text": "dog"}],
+                "axes": {"steps": {"values": [20]}},
+                "shared_negative": None,
+                "defaults": {"seed": 42},
+                "name": "My Experiment",
+            },
+        )
+        ed = meta.get("experiment_definition", {})
+        self.assertIn("prompts", ed)
+        self.assertIn("axes", ed)
+        self.assertEqual(len(ed["prompts"]), 2)
+        # shared_negative=None should not be stored (keeps metadata compact)
+        self.assertNotIn("shared_negative", ed)
+
+    def test_experiment_source_retained_in_compilation(self):
+        """The full experiment definition must be threaded into compilation
+        studio_meta via the build_experiment_spec call."""
+        snap = _make_runnable_snapshot()
+        preset = _make_runnable_preset()
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_studio_store_files(tmp, [snap], [preset])
+            exp_def = {
+                "name": "Test Exp",
+                "prompts": [
+                    {"id": "p1", "text": "alpha", "enabled": True},
+                    {"id": "p2", "text": "beta", "enabled": True},
+                ],
+                "axes": {"seed": {"values": [1]}},
+                "defaults": {"steps": 30},
+            }
+            spec = self.mod.build_experiment_spec(
+                [(preset, snap)], "txt2img", exp_def, tmp
+            )
+            self.assertNotIn("error", spec)
+            studio_meta = spec.get("studio_meta", {})
+            ed = studio_meta.get("experiment_definition", {})
+            self.assertIn("prompts", ed, "experiment_definition must include prompts")
+            self.assertIn("axes", ed, "experiment_definition must include axes")
+            self.assertIn("defaults", ed, "experiment_definition must include defaults")
+            self.assertEqual(ed.get("name"), "Test Exp")
+
+
+# ---------------------------------------------------------------------------
+# RED tests: getAxisEligibilityForPresets schema-aware eligibility
+# ---------------------------------------------------------------------------
+
+class JsAxisEligibilityRED(unittest.TestCase):
+    """RED: ``web/studio-preset-capabilities.js`` function
+    ``getAxisEligibilityForPresets`` must consider a control available when
+    the preset has either a valid ``nodeBindings`` entry OR a resolved schema
+    entry (``controlSchemas[controlId].schemaResolved``).  Controls like
+    steps, guidance, denoise, sampler, scheduler that have resolved schemas
+    but no explicit node bindings must appear eligible.
+    """
+
+    CAPABILITIES_PATH = REPO_ROOT / "web" / "studio-preset-capabilities.js"
+
+    def setUp(self):
+        if not self.CAPABILITIES_PATH.exists():
+            self.skipTest(f"web/studio-preset-capabilities.js not found at {self.CAPABILITIES_PATH}")
+
+    def test_axis_eligibility_uses_schema_aware_check(self):
+        """getAxisEligibilityForPresets must call _isControlAvailable
+        (not plain isControlBound) so controls with only resolved schemas
+        are eligible."""
+        text = self.CAPABILITIES_PATH.read_text(encoding="utf-8")
+        import re
+        # Find the getAxisEligibilityForPresets function body
+        match = re.search(
+            r"export function getAxisEligibilityForPresets\s*\([^)]+\)\s*\{(.+?)\n\}",
+            text, re.DOTALL,
+        )
+        self.assertIsNotNone(
+            match,
+            "Could not locate getAxisEligibilityForPresets function body",
+        )
+        body = match.group(1)
+
+        # Must call _isControlAvailable (schema-aware), not isControlBound
+        self.assertIn(
+            "_isControlAvailable",
+            body,
+            "getAxisEligibilityForPresets must use _isControlAvailable "
+            "(schema-aware) not isControlBound",
+        )
+        self.assertNotIn(
+            "isControlBound",
+            body,
+            "getAxisEligibilityForPresets must NOT use isControlBound "
+            "(binding-only); use _isControlAvailable for schema support",
+        )
+
+    def test_is_control_available_checks_schema_resolved(self):
+        """The _isControlAvailable helper must check both nodeBindings
+        and controlSchemas[controlId].schemaResolved."""
+        text = self.CAPABILITIES_PATH.read_text(encoding="utf-8")
+        import re
+        # Find the _isControlAvailable function body
+        match = re.search(
+            r"function _isControlAvailable\s*\([^)]+\)\s*\{(.+?)\n\}",
+            text, re.DOTALL,
+        )
+        self.assertIsNotNone(
+            match,
+            "Could not locate _isControlAvailable function body",
+        )
+        body = match.group(1)
+
+        # Must check schemaResolved
+        self.assertIn(
+            "schemaResolved",
+            body,
+            "_isControlAvailable must check controlSchemas[ctrlId].schemaResolved",
+        )
+        # Must also check nodeBindings via _isAnyBound
+        self.assertIn(
+            "_isAnyBound",
+            body,
+            "_isControlAvailable must check nodeBindings via _isAnyBound",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ from production_workflow import (
     analyze_duplicate_work,
     _reset_cache,
     _cache_size,
+    _compute_source_workflow_hash,
     COMPILER_SCHEMA_VERSION,
 )
 
@@ -565,7 +566,9 @@ class CacheTests(unittest.TestCase):
         compiled_second, report = compile_production_workflow(
             wf, prod, allow_direct_output_rewrite=True
         )
-        self.assertTrue(report["cache_hit"])
+        # source_workflow_hash is now part of the cache key, so changing
+        # seed (a literal) changes the hash -> cache miss.
+        self.assertFalse(report["cache_hit"])
         self.assertEqual(compiled_second["1"]["inputs"]["seed"], 99)
 
     def test_cache_hit_reconstructs_rewrite_status(self):
@@ -600,7 +603,9 @@ class CacheTests(unittest.TestCase):
         compiled, report = compile_production_workflow(
             wf, prod, allow_direct_output_rewrite=False
         )
-        self.assertTrue(report["cache_hit"])
+        # source_workflow_hash is now part of the cache key, so changing
+        # literals (seed, steps) changes the hash -> cache miss.
+        self.assertFalse(report["cache_hit"])
         self.assertEqual(compiled["1"]["inputs"]["seed"], 42)
         self.assertEqual(compiled["1"]["inputs"]["steps"], 50)
 
@@ -790,19 +795,22 @@ class RgthreeComparerRewriteTests(unittest.TestCase):
         self.assertIn("5", report_second["rgthree_comparer_rewritten_node_ids"])
 
     def test_cache_hit_reconstruction_uses_current_scalars(self):
-        """Cache-hit reconstruction uses current scalar values."""
+        """Cache-miss on scalar change still produces current scalar values
+        and preserves inputs_are_same."""
         wf = self._make_workflow()
         prod = _minimal_production(output_ids=["5"])
         compiled_first, _ = compile_production_workflow(
             wf, prod, allow_direct_output_rewrite=True
         )
         self.assertEqual(compiled_first["5"]["inputs"]["inputs_are_same"], True)
-        # Change seed (scalar) to verify cache hit uses current value
+        # Change seed (scalar) — source_workflow_hash is now part of
+        # the cache key, so a literal change causes a cache miss.
         wf["1"]["inputs"]["seed"] = 99
         compiled_second, report = compile_production_workflow(
             wf, prod, allow_direct_output_rewrite=True
         )
-        self.assertTrue(report["cache_hit"])
+        self.assertFalse(report["cache_hit"],
+                         "Scalar change causes cache miss with source_workflow_hash in key")
         self.assertEqual(compiled_second["1"]["inputs"]["seed"], 99)
 
     def test_report_has_accurate_rewrite_counts(self):
@@ -1278,3 +1286,291 @@ class TerminalEvidenceTests(unittest.TestCase):
         from production_workflow import normalize_production_options, compile_production_workflow
         prod = normalize_production_options(None)
         self.assertEqual(prod, {"enabled": False})
+
+    # ── Cache key isolation tests ────────────────────────────────────
+
+    def test_cache_key_includes_direct_output_rewrite(self):
+        """Cache key topology_hash changes when allow_direct_output_rewrite changes."""
+        _reset_cache()
+        # Use WORKFLOW_MULTI_OUTPUT (has SaveImage/PreviewImage at 11,12)
+        prod = _minimal_production(output_ids=["11"])
+        _, r1 = compile_production_workflow(
+            WORKFLOW_MULTI_OUTPUT, prod,
+            allow_direct_output_rewrite=True, allow_rgthree_comparer_rewrite=False,
+        )
+        _, r2 = compile_production_workflow(
+            WORKFLOW_MULTI_OUTPUT, prod,
+            allow_direct_output_rewrite=False, allow_rgthree_comparer_rewrite=False,
+        )
+        # Topology hash includes the direct_output_rewrite flag
+        self.assertNotEqual(r1["topology_hash"], r2["topology_hash"],
+                            "allow_direct_output_rewrite must change topology_hash")
+
+    def test_cache_key_includes_direct_output_sink(self):
+        """Cache key changes when direct_output_sink changes."""
+        _reset_cache()
+        # Use WORKFLOW_MULTI_OUTPUT (has SaveImage/PreviewImage at 11,12)
+        prod1 = _minimal_production(output_ids=["11"], direct_output_sink=True)
+        prod2 = _minimal_production(output_ids=["11"], direct_output_sink=False)
+        _, r1 = compile_production_workflow(
+            WORKFLOW_MULTI_OUTPUT, prod1,
+            allow_direct_output_rewrite=True, allow_rgthree_comparer_rewrite=False,
+        )
+        _, r2 = compile_production_workflow(
+            WORKFLOW_MULTI_OUTPUT, prod2,
+            allow_direct_output_rewrite=True, allow_rgthree_comparer_rewrite=False,
+        )
+        # Topology hash includes the direct_output_sink flag
+        self.assertNotEqual(r1["topology_hash"], r2["topology_hash"],
+                            "direct_output_sink must change topology_hash")
+
+    def test_cache_key_includes_bypass_policy(self):
+        """Cache key changes when bypass_node_ids changes."""
+        _reset_cache()
+        prod1 = _minimal_production(output_ids=["9"], bypass_ids=[])
+        prod2 = _minimal_production(output_ids=["9"], bypass_ids=["8"])
+        _, r1 = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod1,
+            allow_direct_output_rewrite=False, stable=True,
+        )
+        _, r2 = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod2,
+            allow_direct_output_rewrite=False, stable=True,
+        )
+        self.assertNotEqual(r1["topology_hash"], r2["topology_hash"],
+                            "bypass_node_ids must change topology_hash")
+
+    # ── Report fields ───────────────────────────────────────────────
+
+    def test_report_includes_runner_workflow_hash(self):
+        """Report must include runner_workflow_hash (= compiled hash)."""
+        prod = _minimal_production(output_ids=["9"])
+        _, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False
+        )
+        self.assertIn("runner_workflow_hash", report)
+        self.assertEqual(
+            report["runner_workflow_hash"],
+            report["compiled_workflow_hash"],
+            "runner_workflow_hash must equal compiled_workflow_hash",
+        )
+
+    def test_report_includes_plan_and_source_hash_placeholders(self):
+        """Report has topology_hash (plan) and compiled_workflow_hash."""
+        prod = _minimal_production(output_ids=["9"])
+        _, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False
+        )
+        self.assertIn("topology_hash", report)
+        self.assertIn("compiled_workflow_hash", report)
+        self.assertTrue(len(report["topology_hash"]) > 0)
+        self.assertTrue(len(report["compiled_workflow_hash"]) > 0)
+
+    # ── Stable production output collection semantics ───────────────
+
+    def test_stable_production_preserves_all_nodes(self):
+        """Stable mode keeps ALL nodes (no pruning)."""
+        prod = _minimal_production(output_ids=["9"])
+        compiled, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod,
+            allow_direct_output_rewrite=False, stable=True,
+        )
+        self.assertEqual(report["original_node_count"], len(WORKFLOW_SINGLE_OUTPUT))
+        self.assertEqual(report["compiled_node_count"], len(WORKFLOW_SINGLE_OUTPUT))
+        self.assertEqual(report["removed_node_count"], 0)
+
+    def test_selected_output_single(self):
+        """Non-stable mode prunes to transitive dependencies of selected output."""
+        prod = _minimal_production(output_ids=["9"])
+        compiled, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod,
+            allow_direct_output_rewrite=False, stable=False,
+        )
+        # Output node 9 (VAEDecode) must be kept
+        self.assertIn("9", compiled)
+        # Output node 11 (PreviewImage) is NOT selected -> pruned
+        self.assertNotIn("11", compiled,
+                         "Non-selected output should be pruned in non-stable mode")
+        self.assertGreater(report["removed_node_count"], 0,
+                           "Non-selected nodes must be removed")
+
+    def test_selected_output_multi_keeps_only_selected(self):
+        """Only selected output nodes are kept; non-selected outputs are pruned."""
+        prod = _minimal_production(output_ids=["11"])
+        compiled, report = compile_production_workflow(
+            WORKFLOW_MULTI_OUTPUT, prod,
+            allow_direct_output_rewrite=False, stable=False,
+        )
+        # Output node 11 (SaveImage) must be kept
+        self.assertIn("11", compiled)
+        # Output node 12 (PreviewImage) is NOT selected -> pruned
+        self.assertNotIn("12", compiled,
+                         "Non-selected output must be pruned")
+        # Both receive from VAEDecode 9, which must be kept (transitive dep)
+        self.assertIn("9", compiled)
+
+    # ── Duplicate analysis ──────────────────────────────────────────
+
+    def test_duplicate_output_detected(self):
+        """Duplicate outputs on same source are detected."""
+        analysis = analyze_duplicate_work(WORKFLOW_MULTI_OUTPUT)
+        outputs = analysis.get("duplicate_output_groups", [])
+        # Both SaveImage (11) and PreviewImage (12) receive from VAEDecode (9)
+        groups_found = [
+            g for g in outputs
+            if g["source_node_id"] == "9"
+        ]
+        self.assertTrue(len(groups_found) >= 1,
+                        "Should detect duplicate output group on node 9")
+
+
+class SourceWorkflowHashTests(unittest.TestCase):
+    """Tests for source_workflow_hash cache-key contract (Task 3).
+
+    The cache key must include a deterministic hash of the full source
+    workflow, so that two workflows with identical topology but different
+    literal values (seed, prompt text, model name) produce different
+    cache keys and therefore different cache entries.
+    """
+
+    def setUp(self):
+        _reset_cache()
+
+    # ── Report field presence ────────────────────────────────────────
+
+    def test_source_workflow_hash_in_report(self):
+        """source_workflow_hash appears in the compile report."""
+        prod = _minimal_production(output_ids=["9"])
+        _, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod,
+            allow_direct_output_rewrite=False,
+        )
+        self.assertIn("source_workflow_hash", report)
+        self.assertIsInstance(report["source_workflow_hash"], str)
+        self.assertEqual(len(report["source_workflow_hash"]), 64)
+
+    def test_source_workflow_hash_differs_from_topology_hash(self):
+        """The source hash includes literal values so it differs from topology."""
+        prod = _minimal_production(output_ids=["9"])
+        _, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod,
+            allow_direct_output_rewrite=False,
+        )
+        self.assertNotEqual(
+            report["source_workflow_hash"],
+            report["topology_hash"],
+            "Source hash includes literals; topology hash is topology-only",
+        )
+
+    def test_source_workflow_hash_differs_from_compiled_hash(self):
+        """Source hash differs from compiled hash when nodes are removed."""
+        prod = _minimal_production(output_ids=["9"])
+        _, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod,
+            allow_direct_output_rewrite=False,
+        )
+        self.assertNotEqual(
+            report["source_workflow_hash"],
+            report["compiled_workflow_hash"],
+            "Source and compiled hashes must differ when nodes are pruned",
+        )
+
+    # ── Cache isolation: same topology, different literals ───────────
+
+    def test_cache_miss_when_seed_differs_same_topology(self):
+        """Changing only seed (same topology) causes cache miss.
+
+        The source_workflow_hash in the cache key includes seed,
+        so a different seed → different cache key → cache miss.
+        """
+        wf_a = dict(WORKFLOW_SINGLE_OUTPUT)
+        wf_a["3"] = dict(wf_a["3"])
+        wf_a["3"]["inputs"] = dict(wf_a["3"]["inputs"], seed=7)
+
+        wf_b = dict(WORKFLOW_SINGLE_OUTPUT)
+        wf_b["3"] = dict(wf_b["3"])
+        wf_b["3"]["inputs"] = dict(wf_b["3"]["inputs"], seed=42)
+
+        prod = _minimal_production(output_ids=["9"])
+        _, r1 = compile_production_workflow(
+            wf_a, prod, allow_direct_output_rewrite=False,
+        )
+        self.assertFalse(r1["cache_hit"])
+        _, r2 = compile_production_workflow(
+            wf_b, prod, allow_direct_output_rewrite=False,
+        )
+        self.assertFalse(r2["cache_hit"],
+                         "Different seed must cause cache miss")
+        # Verify topology hashes are same but source hashes differ
+        self.assertEqual(r1["topology_hash"], r2["topology_hash"],
+                         "Topology must be unchanged by seed")
+        self.assertNotEqual(r1["source_workflow_hash"],
+                            r2["source_workflow_hash"],
+                            "Source hash must differ when seed differs")
+
+    def test_cache_miss_when_prompt_text_differs(self):
+        """Changing prompt text (same topology) causes cache miss."""
+        wf_a = dict(WORKFLOW_SINGLE_OUTPUT)
+        wf_b = dict(WORKFLOW_SINGLE_OUTPUT)
+        wf_b["6"] = dict(wf_b["6"])
+        wf_b["6"]["inputs"] = dict(wf_b["6"]["inputs"], text="a different prompt")
+
+        prod = _minimal_production(output_ids=["9"])
+        _, r1 = compile_production_workflow(
+            wf_a, prod, allow_direct_output_rewrite=False,
+        )
+        self.assertFalse(r1["cache_hit"])
+        _, r2 = compile_production_workflow(
+            wf_b, prod, allow_direct_output_rewrite=False,
+        )
+        self.assertFalse(r2["cache_hit"],
+                         "Different prompt text must cause cache miss")
+        self.assertEqual(r1["topology_hash"], r2["topology_hash"],
+                         "Topology must be unchanged by prompt text")
+        self.assertNotEqual(r1["source_workflow_hash"],
+                            r2["source_workflow_hash"],
+                            "Source hash must differ when prompt text differs")
+
+    def test_cache_miss_when_model_name_differs(self):
+        """Changing model name (same topology) causes cache miss."""
+        wf_a = dict(WORKFLOW_SINGLE_OUTPUT)
+        wf_b = dict(WORKFLOW_SINGLE_OUTPUT)
+        wf_b["4"] = dict(wf_b["4"])
+        wf_b["4"]["inputs"] = dict(wf_b["4"]["inputs"],
+                                  unet_name="different-model.safetensors")
+
+        prod = _minimal_production(output_ids=["9"])
+        _, r1 = compile_production_workflow(
+            wf_a, prod, allow_direct_output_rewrite=False,
+        )
+        self.assertFalse(r1["cache_hit"])
+        _, r2 = compile_production_workflow(
+            wf_b, prod, allow_direct_output_rewrite=False,
+        )
+        self.assertFalse(r2["cache_hit"],
+                         "Different model name must cause cache miss")
+        self.assertEqual(r1["topology_hash"], r2["topology_hash"],
+                         "Topology must be unchanged by model name")
+        self.assertNotEqual(r1["source_workflow_hash"],
+                            r2["source_workflow_hash"],
+                            "Source hash must differ when model name differs")
+
+    # ── Cache hit on identical workflow ──────────────────────────────
+
+    def test_cache_hit_on_exact_duplicate(self):
+        """Exactly identical workflow still hits cache."""
+        prod = _minimal_production(output_ids=["9"])
+        _, r1 = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod,
+            allow_direct_output_rewrite=False,
+        )
+        self.assertFalse(r1["cache_hit"])
+        _, r2 = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod,
+            allow_direct_output_rewrite=False,
+        )
+        self.assertTrue(r2["cache_hit"],
+                        "Identical workflow must hit cache")
+        self.assertEqual(r1["source_workflow_hash"],
+                         r2["source_workflow_hash"],
+                         "Source hash must be stable for identical workflow")

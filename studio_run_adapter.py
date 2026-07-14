@@ -1099,13 +1099,37 @@ def _build_studio_experiment_meta(
     preset_ids: list[str],
     snapshot_ids: list[str],
     feature_id: str,
+    experiment_source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build metadata dict for experiment definition, carrying Studio info."""
-    return {
+    """Build metadata dict for experiment definition, carrying Studio info.
+
+    Includes the full experiment source definition (prompts, axes, defaults,
+    shared_negative, name) in ``experiment_definition`` so that stored
+    metadata retains everything needed for frontend reconstruction and
+    history display.
+    """
+    meta: dict[str, Any] = {
         "studio_preset_ids": preset_ids,
         "studio_snapshot_ids": snapshot_ids,
         "studio_feature_id": feature_id,
     }
+    if experiment_source:
+        # Store the full experiment definition for later retrieval.
+        # Only include non-empty fields to keep metadata compact.
+        _src = {}
+        if experiment_source.get("prompts"):
+            _src["prompts"] = experiment_source["prompts"]
+        if experiment_source.get("axes"):
+            _src["axes"] = experiment_source["axes"]
+        if experiment_source.get("shared_negative"):
+            _src["shared_negative"] = experiment_source["shared_negative"]
+        if experiment_source.get("defaults"):
+            _src["defaults"] = experiment_source["defaults"]
+        if experiment_source.get("name"):
+            _src["name"] = experiment_source["name"]
+        if _src:
+            meta["experiment_definition"] = _src
+    return meta
 
 
 # ── Spec / compilation building ────────────────────────────────────────────
@@ -1345,16 +1369,31 @@ def build_experiment_spec(
         shared_source = raw_axes
         per_workflow_source = {}
 
-    # Extract special axes handled at the adapter level
+    # Extract special axes handled at the adapter level.
+    # Check BOTH the flat raw_axes level AND the nested shared_source level
+    # so that mixed-format payloads (prompt at flat level + shared at nested)
+    # are handled robustly and prompt axis values are never lost.
     prompt_axis_values: list | None = None
     negative_prompt_axis_values: list | None = None
 
-    if "prompt" in shared_source:
+    # 1. Check flat level (applies to pure flat AND mixed-format payloads)
+    if "prompt" in raw_axes:
+        p_axis = raw_axes.pop("prompt", {})
+        if isinstance(p_axis, dict):
+            prompt_axis_values = p_axis.get("values", [])
+
+    if "negative_prompt" in raw_axes:
+        np_axis = raw_axes.pop("negative_prompt", {})
+        if isinstance(np_axis, dict):
+            negative_prompt_axis_values = np_axis.get("values", [])
+
+    # 2. Fallback: check nested shared level (pure nested format)
+    if prompt_axis_values is None and has_nested_format:
         p_axis = shared_source.pop("prompt", {})
         if isinstance(p_axis, dict):
             prompt_axis_values = p_axis.get("values", [])
 
-    if "negative_prompt" in shared_source:
+    if negative_prompt_axis_values is None and has_nested_format:
         np_axis = shared_source.pop("negative_prompt", {})
         if isinstance(np_axis, dict):
             negative_prompt_axis_values = np_axis.get("values", [])
@@ -1499,12 +1538,26 @@ def build_experiment_spec(
 
     axes = compiler_axes
 
+    # Preserve the original experiment definition in metadata for history
+    # and frontend reconstruction.  Include the full prompts list, axes,
+    # and shared_negative so that the stored metadata is self-describing.
+    _experiment_source = {
+        "prompts": experiment_def.get("prompts", []),
+        "axes": experiment_def.get("axes", {}),
+        "shared_negative": experiment_def.get("shared_negative"),
+        "defaults": experiment_def.get("defaults", {}),
+        "name": experiment_def.get("name", ""),
+    }
+
     spec: dict[str, Any] = {
         "experiment_id": _make_studio_experiment_id(),
         "revision": 1,
         "name": experiment_def.get("name", f"Studio {feature_id}"),
         "workflows": spec_workflows,
-        "prompts": {"items": spec_prompts, "shared_negative": experiment_def.get("shared_negative", "")},
+        # shared_negative defaults to None (not "") so that
+        # _build_prompt_image_pairs correctly distinguishes "no shared
+        # negative" from "explicit empty string" in _resolve_negative.
+        "prompts": {"items": spec_prompts, "shared_negative": experiment_def.get("shared_negative")},
         "images": {"mode": "cartesian", "items": []},
         "loras": {"selections": [
             {"id": "L_no_lora", "label": "No LoRA", "loras": [], "enabled": True},
@@ -1524,6 +1577,7 @@ def build_experiment_spec(
         preset_ids=all_preset_ids,
         snapshot_ids=all_snapshot_ids,
         feature_id=feature_id,
+        experiment_source=_experiment_source,
     )
 
     for ck in compilation.get("checkpoints", []):

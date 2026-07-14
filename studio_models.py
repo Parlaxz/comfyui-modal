@@ -66,6 +66,11 @@ def _sanitize_description(s: str) -> str:
     return (s or "").strip()[:2000]
 
 
+def _sanitize_preset_group(s: str) -> str:
+    """Strip whitespace and truncate to 100 characters; default to empty."""
+    return (s or "").strip()[:100]
+
+
 def _validate_feature_ids(features: Any) -> list[str]:
     """Return only the recognised feature IDs from *features*.
 
@@ -277,12 +282,17 @@ def normalize_preset_payload(
     # Required fields
     result.setdefault("label", result.get("name", "Untitled Preset"))
     result.setdefault("description", "")
+    result.setdefault("group", "")
     result.setdefault("snapshotId", "")
     result.setdefault("compatibleFeatures", [])
     result.setdefault("defaults", {})
     result.setdefault("sourceType", "manual")
     result.setdefault("sourceId", "")
     result.setdefault("archived", False)
+
+    # Sanitize group string if present
+    if "group" in result and isinstance(result["group"], str):
+        result["group"] = _sanitize_preset_group(result["group"])
 
     # Derive status from the referenced snapshot
     snapshot_id = result.get("snapshotId", "") or ""
@@ -438,6 +448,7 @@ def make_preset(
             body.get("label", body.get("name", "Untitled Preset"))
         ),
         "description": _sanitize_description(body.get("description", "")),
+        "group": _sanitize_preset_group(body.get("group", "")),
         "snapshotId": body.get("snapshotId", ""),
         "compatibleFeatures": features,
         "defaults": body.get("defaults", {}),
@@ -470,6 +481,8 @@ def update_preset(
         preset["label"] = _normalize_label(body["label"])
     if "description" in body and isinstance(body["description"], str):
         preset["description"] = _sanitize_description(body["description"])
+    if "group" in body and isinstance(body["group"], str):
+        preset["group"] = _sanitize_preset_group(body["group"])
     if "snapshotId" in body and isinstance(body["snapshotId"], str):
         preset["snapshotId"] = body["snapshotId"]
     if "compatibleFeatures" in body:

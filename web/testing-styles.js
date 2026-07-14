@@ -2199,6 +2199,137 @@ const CSS = `
   background: var(--color-bg-input, #171723);
 }
 
+/* ── Full-size cell card ─────────────────────────────────── */
+
+.testing-results-cell {
+  display: inline-flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 250px;
+  background: #141414;
+  border: 1px solid var(--color-border-default, #2d2d3a);
+  border-radius: var(--radius-lg, 8px);
+  overflow: hidden;
+  cursor: pointer;
+  box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+  transition: border-color var(--duration-fast, 120ms) var(--ease-standard, cubic-bezier(0.2,0,0,1)),
+              transform var(--duration-fast, 120ms) var(--ease-standard, cubic-bezier(0.2,0,0,1)),
+              box-shadow var(--duration-fast, 120ms) var(--ease-standard, cubic-bezier(0.2,0,0,1));
+}
+
+.testing-results-cell:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px rgba(90,127,219,0.3);
+}
+
+.testing-results-cell .testing-results-cell-thumb {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-bg-input, #171723);
+}
+
+.testing-results-cell .testing-results-cell-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.testing-results-cell .testing-results-cell-thumb-placeholder {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--font-size-xs, 11px);
+  color: var(--color-text-muted, #6f7785);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.testing-results-cell .testing-results-cell-meta {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--font-size-xs, 11px);
+  color: var(--color-text-primary, #e1e4ea);
+}
+
+.testing-results-cell .testing-results-cell-prompt {
+  font-size: var(--font-size-xs, 11px);
+  font-weight: var(--font-weight-medium, 500);
+  color: var(--color-text-primary, #e1e4ea);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.testing-results-cell .testing-results-cell-seed {
+  font-size: 10px;
+}
+
+.testing-results-cell .testing-results-cell-model {
+  font-size: 10px;
+}
+
+/* ── Cell image overlay badges ──────────────────────────── */
+
+.testing-results-cell-badge {
+  position: absolute;
+  bottom: 8px;
+  background: rgba(0, 0, 0, 0.85);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 3px 7px;
+  border-radius: 3px;
+  line-height: 1.4;
+  pointer-events: none;
+  font-variant-numeric: tabular-nums;
+  border: 1px solid rgba(255,255,255,0.1);
+}
+
+.testing-results-cell-index {
+  left: 4px;
+}
+
+.testing-results-cell-time {
+  right: 4px;
+}
+
+/* Status borders for full-size and compact cards */
+.testing-results-cell.testing-results-cell-completed {
+  border-color: var(--color-success, #4ade80);
+}
+
+.testing-results-cell.testing-results-cell-failed {
+  border-color: var(--color-danger, #ef4444);
+}
+
+.testing-results-cell.testing-results-cell-running {
+  border-color: var(--color-accent, #5a7fdb);
+}
+
+.testing-results-cell.testing-results-cell-pending {
+  border-color: var(--color-border-default, #2d2d3a);
+  opacity: 0.6;
+}
+
+/* ── Results row grid ───────────────────────────────────── */
+
+.testing-results-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 250px));
+  justify-content: start;
+  gap: 10px;
+}
+
 /* ── Compact cell variant ────────────────────────────────── */
 
 .testing-results-cell-compact {
@@ -2245,16 +2376,11 @@ const CSS = `
   letter-spacing: 0.04em;
 }
 
-.testing-results-cell-compact .testing-results-cell-attempt {
-  position: absolute;
+.testing-results-cell-compact .testing-results-cell-badge {
   bottom: 2px;
-  right: 2px;
-  background: rgba(0, 0, 0, 0.7);
-  color: var(--color-text-primary, #e1e4ea);
   font-size: 9px;
   padding: 1px 4px;
   border-radius: 2px;
-  line-height: 1.2;
 }
 
 .testing-results-cell-compact .testing-results-cell-meta {
@@ -2393,6 +2519,15 @@ const CSS = `
 /* ── Responsive: matrices on small screens ────────────────── */
 
 @media (max-width: 700px) {
+  .testing-results-row {
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 8px;
+  }
+
+  .testing-results-cell {
+    max-width: 100%;
+  }
+
   .testing-results-matrix-scroll {
     max-height: 400px;
   }
@@ -2420,6 +2555,16 @@ const CSS = `
   .testing-results-matrix-row-header {
     min-width: 60px;
     font-size: 10px;
+  }
+}
+
+@media (max-width: 500px) {
+  .testing-results-row {
+    grid-template-columns: 1fr;
+  }
+
+  .testing-results-cell .testing-results-cell-meta {
+    padding: 10px;
   }
 }
 

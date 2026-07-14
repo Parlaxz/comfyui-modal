@@ -1801,7 +1801,7 @@ function buildPanel() {
   function _updateProductionSummary(el) {
     try {
       const graph = app.graph;
-      if (!graph) { el.textContent = "No graph available"; return; }
+      if (!graph) { el.textContent = "Disabled: no graph available"; return; }
       const outputNodes = [];
       const bypassNodes = [];
       for (const node of graph._nodes || []) {
@@ -1815,30 +1815,43 @@ function buildPanel() {
       const nBypass = bypassNodes.length;
       const nRemoved = 0;
       if (!prodToggle.checked) {
-        el.textContent = "Production disabled";
+        el.textContent = "Disabled: production toggle off";
         return;
       }
       if (!graph._nodes || graph._nodes.length === 0) {
-        el.textContent = "No workflow available";
+        el.textContent = "Disabled: no workflow loaded";
         return;
       }
       if (nOutputs === 0) {
         el.textContent = "";
         const errSpan = document.createElement("span");
         errSpan.style.color = "#e05050";
-        errSpan.textContent = "No production output selected";
+        errSpan.textContent = "Disabled: no production output selected";
         el.appendChild(errSpan);
         return;
       }
-      // Check if selected output IDs exist in serialized workflow (API prompt request)
+      // Check if options are attached to graph.extra (indicates settings UI was initialized)
+      const extraProd = app.graph?.extra?.comfymodal?.production_mode_enabled;
+      if (extraProd === undefined && nOutputs > 0) {
+        // Options not yet attached to graph extra — this is a preview-only state
+        el.textContent = "";
+        const warnSpan = document.createElement("span");
+        warnSpan.style.color = "#e8a020";
+        warnSpan.textContent = "Options not attached: production not persisted";
+        el.appendChild(warnSpan);
+        return;
+      }
+      // Check if selected output IDs exist in serialized API prompt keys
+      // (strict validation against the actual serialized graph)
       const serializedKeys = Object.keys(graph._nodes_by_id || {});
       const outputIds = outputNodes.map(n => String(n.id));
-      const missingInSerialized = outputIds.filter(id => !serializedKeys.includes(id) && !graph._nodes.find(n => String(n.id) === id));
+      // All output IDs must be valid keys in the serialized graph
+      const missingInSerialized = outputIds.filter(id => !serializedKeys.includes(id));
       if (missingInSerialized.length > 0 && serializedKeys.length > 0) {
         el.textContent = "";
         const errSpan = document.createElement("span");
         errSpan.style.color = "#e05050";
-        errSpan.textContent = "Output missing from serialized workflow: " + missingInSerialized.join(", ");
+        errSpan.textContent = "Selected output absent from serialized workflow: " + missingInSerialized.join(", ");
         el.appendChild(errSpan);
         return;
       }
@@ -1847,32 +1860,48 @@ function buildPanel() {
         // Result-only state: plan was already used
         const ev = _lastProductionEvidence;
         const hashShort = (ev.production_plan_hash || "").substring(0, 8);
+        const runnerHashShort = (ev.runner_workflow_hash || ev.executed_workflow_hash || "").substring(0, 8);
+        const nProduced = ev.production_output_count != null ? ev.production_output_count : (ev.output_count || 0);
         const titleDiv = document.createElement("div");
         titleDiv.style.cssText = "font-weight:600;margin-bottom:2px;color:#7ed321;";
-        titleDiv.textContent = "Production plan ready: " + (ev.kept_count || 0) + " kept, " + (ev.removed_count || 0) + " removed, " + (ev.output_count || 0) + " outputs";
+        titleDiv.textContent = "Plan ready: " + (ev.kept_count || 0) + " kept, " + (ev.removed_count || 0) + " removed, " + nProduced + "/1 outputs";
         el.appendChild(titleDiv);
         const lastRun = document.createElement("div");
         lastRun.style.cssText = "font-size:10px;color:#888;margin-bottom:4px;";
-        lastRun.textContent = "Last run used production plan: " + hashShort;
+        lastRun.textContent = "Last run plan: " + hashShort + " | runner: " + runnerHashShort;
         el.appendChild(lastRun);
         const bypassedCount = ev.bypassed_count != null ? ev.bypassed_count : 0;
         el.appendChild(document.createTextNode("Bypassed: " + bypassedCount + " nodes"));
-        if (ev.executed_workflow_hash === ev.compiled_workflow_hash) {
+        if (ev.executed_workflow_hash && ev.executed_workflow_hash === ev.compiled_workflow_hash) {
           el.appendChild(document.createElement("br"));
           const okSpan = document.createElement("span");
           okSpan.style.color = "#7ed321";
           okSpan.textContent = "\u2713 Executed == compiled";
+          el.appendChild(okSpan);
+        } else if (ev.executed_workflow_hash && ev.compiled_workflow_hash) {
+          el.appendChild(document.createElement("br"));
+          const warnSpan = document.createElement("span");
+          warnSpan.style.color = "#e8a020";
+          warnSpan.textContent = "Warning: executed \u2260 compiled";
+          el.appendChild(warnSpan);
+        }
+        // Show production_plan_used flag when present
+        if (ev.production_plan_used) {
+          el.appendChild(document.createElement("br"));
+          const okSpan = document.createElement("span");
+          okSpan.style.color = "#7ed321";
+          okSpan.textContent = "\u2713 production_plan_used=true";
           el.appendChild(okSpan);
         }
       } else {
         // Preview: show counts but never say "ready"
         const titleDiv = document.createElement("div");
         titleDiv.style.cssText = "font-weight:600;margin-bottom:2px;";
-        titleDiv.textContent = "Production selection";
+        titleDiv.textContent = "Production preview (" + nOutputs + "/1 output)";
         el.appendChild(titleDiv);
         el.appendChild(document.createTextNode("Kept: " + kept + " nodes"));
         el.appendChild(document.createElement("br"));
-        el.appendChild(document.createTextNode("Removed: " + nRemoved + " nodes"));
+        el.appendChild(document.createTextNode("Removed: " + nRemoved + " nodes (preview)"));
         el.appendChild(document.createElement("br"));
         el.appendChild(document.createTextNode("Bypassed: " + nBypass + " nodes"));
         el.appendChild(document.createElement("br"));

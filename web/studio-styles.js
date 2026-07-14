@@ -108,8 +108,8 @@ body.comfymodal-body-scroll-lock {
     min-height: 44px;
   }
 
-  /* History preview close button */
-  .comfymodal-studio-history-preview-close {
+  /* Preview overlay close button */
+  .comfymodal-studio-preview-overlay-close {
     min-width: 44px;
     min-height: 44px;
     display: flex;
@@ -281,6 +281,34 @@ body.comfymodal-body-scroll-lock {
 .comfymodal-studio-textarea:focus {
   border-color: var(--color-border-focus, #5a7fdb);
   outline: none;
+}
+
+/* ── Prompt textarea (primary input treatment) ──────────── */
+
+.comfymodal-studio-prompt-textarea {
+  min-height: 100px;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 10px 12px;
+  background: #0d0d0d;
+  border-color: #3a3a3a;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  resize: vertical;
+}
+.comfymodal-studio-prompt-textarea:focus {
+  border-color: var(--color-accent, #5a7fdb);
+  box-shadow: 0 0 0 1px rgba(90, 127, 219, 0.2);
+  background: #111;
+}
+
+.comfymodal-studio-prompt-textarea.negative {
+  min-height: 80px;
+  font-size: 12px;
+  border-color: #3a2a2a;
+}
+.comfymodal-studio-prompt-textarea.negative:focus {
+  border-color: #ef4444;
+  box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.15);
 }
 
 .comfymodal-studio-number-input:focus {
@@ -566,6 +594,100 @@ body.comfymodal-body-scroll-lock {
   gap: 4px;
 }
 
+/* ── Collapsible group sections ───────────────────────── */
+
+.comfymodal-studio-collapsible-summary {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 8px;
+  background: #0a0a0a;
+  border: 1px solid #2a2a2a;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 600;
+  color: #a0a0a0;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  transition: background 0.15s, color 0.15s;
+  width: 100%;
+  font-family: inherit;
+  line-height: inherit;
+  text-align: left;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.comfymodal-studio-collapsible-summary:hover {
+  background: #1a1a1a;
+  color: #d0d0d0;
+}
+.comfymodal-studio-collapsible-summary:focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 1px;
+}
+.comfymodal-studio-collapsible-summary .arrow {
+  font-size: 8px;
+  transition: transform 0.2s;
+  flex-shrink: 0;
+}
+.comfymodal-studio-collapsible-summary[aria-expanded="true"] .arrow {
+  transform: rotate(90deg);
+}
+.comfymodal-studio-collapsible-content {
+  display: none;
+  padding: 4px 0 4px 12px;
+  border-left: 1px solid #2a2a2a;
+  margin-left: 8px;
+}
+.comfymodal-studio-collapsible-content.is-visible {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.comfymodal-studio-collapsible-content.is-visible > .comfymodal-studio-collapsible-content {
+  margin-left: 0;
+  border-left: none;
+}
+
+/* ── Compare preset item ─────────────────────────────── */
+
+.comfymodal-studio-compare-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  font-size: 11px;
+}
+.comfymodal-studio-compare-checkbox {
+  accent-color: var(--color-accent, #5a7fdb);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.comfymodal-studio-compare-item label {
+  cursor: pointer;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Backend group section ───────────────────────────── */
+
+.comfymodal-studio-backend-group-heading {
+  font-size: 10px;
+  font-weight: 600;
+  color: #666;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 6px 8px 2px;
+  margin: 0;
+}
+.comfymodal-studio-backend-group-section {
+  margin-bottom: 4px;
+}
+
 .comfymodal-studio-matrix-summary {
   margin-bottom: 12px;
 }
@@ -637,40 +759,37 @@ body.comfymodal-body-scroll-lock {
   outline: none;
 }
 
-/* ── Running Config Panel (floating overlay) ──────────────── */
-/* Positioned inside .comfymodal-studio-canvas, overlaying the  */
-/* output image. Translucent with backdrop blur.                */
+/* ── Running Config Panel (inline in control panel) ──────── */
+/* Renders inside the left control panel, below the experiment */
+/* mode controls.  Uses flex column layout so the prompt       */
+/* section stretches to fill min-height.  Translucent surface. */
 
 .comfymodal-studio-running-config {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  max-width: 280px;
-  min-width: 190px;
-  min-height: 220px;
+  margin-bottom: 8px;
+  min-height: 360px;
   background: rgba(12, 12, 12, 0.88);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
   border: 1px solid rgba(40, 40, 40, 0.7);
   border-radius: 4px;
   padding: 7px 10px;
-  font-size: 11px;
-  line-height: 1.5;
-  z-index: 10;
-  pointer-events: auto;
   display: none;
-  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.45);
+  flex-direction: column;
+  box-sizing: border-box;
 }
 
 .comfymodal-studio-running-config.is-visible {
-  display: block;
+  display: flex;
 }
+
+/* ── Header (fixed) ─────────────────────────────────────── */
 
 .comfymodal-studio-running-config-header {
   display: flex;
   align-items: center;
   gap: 6px;
   margin-bottom: 4px;
+  flex-shrink: 0;
 }
 
 .comfymodal-studio-running-config-title {
@@ -693,7 +812,12 @@ body.comfymodal-body-scroll-lock {
   border-radius: 2px;
 }
 
+/* ── Prompt section (flex-grows to fill remaining height) ─ */
+
 .comfymodal-studio-running-config-prompt {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   margin-bottom: 3px;
   padding-bottom: 3px;
   border-bottom: 1px solid rgba(26, 26, 26, 0.7);
@@ -705,18 +829,20 @@ body.comfymodal-body-scroll-lock {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   display: block;
+  flex-shrink: 0;
 }
 
 .comfymodal-studio-running-config-prompt-text {
   font-size: 10px;
   color: #d0d0d0;
   word-wrap: break-word;
-  max-height: 96px;
-  overflow-y: auto;
   display: block;
   margin-top: 1px;
   line-height: 1.4;
+  /* Fill remaining space in the prompt container — no max-height clamp */
 }
+
+/* ── Parameter grid (fixed summary row) ─────────────────── */
 
 .comfymodal-studio-running-config-grid {
   display: flex;
@@ -725,6 +851,7 @@ body.comfymodal-body-scroll-lock {
   margin-bottom: 3px;
   padding-bottom: 3px;
   border-bottom: 1px solid rgba(26, 26, 26, 0.7);
+  flex-shrink: 0;
 }
 
 .comfymodal-studio-running-config-item {
@@ -749,7 +876,10 @@ body.comfymodal-body-scroll-lock {
   white-space: nowrap;
 }
 
+/* ── Experiment axes section (fixed) ────────────────────── */
+
 .comfymodal-studio-running-config-axes {
+  flex-shrink: 0;
   margin-top: 3px;
   padding-top: 3px;
   border-top: 1px solid rgba(26, 26, 26, 0.7);
@@ -779,7 +909,10 @@ body.comfymodal-body-scroll-lock {
   white-space: nowrap;
 }
 
+/* ── Preset count (fixed footer) ────────────────────────── */
+
 .comfymodal-studio-running-config-preset-count {
+  flex-shrink: 0;
   margin-top: 3px;
   font-size: 8px;
   color: #777;
@@ -1028,9 +1161,37 @@ body.comfymodal-body-scroll-lock {
 
 .comfymodal-studio-history-gallery {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-template-columns: repeat(var(--columns, 6), 1fr);
   gap: 8px;
   margin-top: 8px;
+}
+
+.comfymodal-studio-history-column-select {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: #888;
+  margin-left: auto;
+}
+.comfymodal-studio-history-column-select label {
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.comfymodal-studio-history-column-select input {
+  width: 36px;
+  font-size: 10px;
+  padding: 2px 4px;
+  background: #111;
+  border: 1px solid #2a2a2a;
+  color: #d0d0d0;
+  border-radius: 2px;
+  text-align: center;
+  font-family: inherit;
+}
+.comfymodal-studio-history-column-select input:focus {
+  border-color: var(--color-accent, #5a7fdb);
+  outline: none;
 }
 
 .comfymodal-studio-history-card {
@@ -1145,7 +1306,85 @@ body.comfymodal-body-scroll-lock {
 
 /* ── History Preview Overlay / Lightbox ────────────────── */
 
-.comfymodal-studio-history-preview {
+/* ── Shared zoom wrap ──────────────────────────────────── */
+
+.comfymodal-studio-zoom-wrap {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+}
+.comfymodal-studio-zoom-image-container {
+  overflow: auto;
+  position: relative;
+  width: 100%;
+  max-width: 100%;
+  max-height: 80vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: pan-x pan-y;
+}
+.comfymodal-studio-zoom-image-container img {
+  max-width: 100%;
+  max-height: 80vh;
+  object-fit: contain;
+  border-radius: 4px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.6);
+  transition: transform 0.2s ease;
+  transform-origin: center center;
+  display: block;
+}
+.comfymodal-studio-zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  background: rgba(0,0,0,0.7);
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 2px 4px;
+}
+.comfymodal-studio-zoom-btn {
+  background: transparent;
+  border: none;
+  color: #ccc;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  line-height: 1;
+  border-radius: 2px;
+  font-family: inherit;
+  transition: color 0.15s, background 0.15s;
+}
+.comfymodal-studio-zoom-btn:hover {
+  color: #fff;
+  background: rgba(255,255,255,0.1);
+}
+.comfymodal-studio-zoom-btn:focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 1px;
+}
+.comfymodal-studio-zoom-label {
+  font-size: 10px;
+  color: #888;
+  min-width: 36px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+.comfymodal-studio-zoom-btn.fit-active {
+  color: var(--color-accent, #5a7fdb);
+}
+.comfymodal-studio-zoom-btn.fullscreen-active {
+  color: var(--color-accent, #5a7fdb);
+}
+
+/* ── Shared Preview Overlay ─────────────────────────────── */
+
+.comfymodal-studio-preview-overlay {
   position: fixed;
   top: 0;
   left: 0;
@@ -1156,8 +1395,7 @@ body.comfymodal-body-scroll-lock {
   align-items: center;
   justify-content: center;
 }
-
-.comfymodal-studio-history-preview-backdrop {
+.comfymodal-studio-preview-overlay-backdrop {
   position: absolute;
   top: 0;
   left: 0;
@@ -1165,8 +1403,7 @@ body.comfymodal-body-scroll-lock {
   bottom: 0;
   background: rgba(0, 0, 0, 0.85);
 }
-
-.comfymodal-studio-history-preview-content {
+.comfymodal-studio-preview-overlay-content {
   position: relative;
   max-width: 90vw;
   max-height: 90vh;
@@ -1175,8 +1412,7 @@ body.comfymodal-body-scroll-lock {
   align-items: center;
   gap: 8px;
 }
-
-.comfymodal-studio-history-preview-close {
+.comfymodal-studio-preview-overlay-close {
   position: absolute;
   top: -32px;
   right: 0;
@@ -1189,20 +1425,14 @@ body.comfymodal-body-scroll-lock {
   line-height: 1;
   z-index: 1;
 }
-
-.comfymodal-studio-history-preview-close:hover {
+.comfymodal-studio-preview-overlay-close:hover {
   color: #fff;
 }
-
-.comfymodal-studio-history-preview-image {
-  max-width: 100%;
-  max-height: 80vh;
-  border-radius: 4px;
-  object-fit: contain;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.6);
+.comfymodal-studio-preview-overlay-close:focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 2px;
 }
-
-.comfymodal-studio-history-preview-noimage {
+.comfymodal-studio-preview-overlay-noimage {
   width: 240px;
   height: 160px;
   display: flex;
@@ -1214,8 +1444,16 @@ body.comfymodal-body-scroll-lock {
   color: #555;
   font-size: 12px;
 }
+.comfymodal-studio-preview-overlay-sections {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  width: 100%;
+}
 
-.comfymodal-studio-history-preview-info {
+.comfymodal-studio-preview-info {
   display: flex;
   gap: 8px;
   align-items: center;
@@ -1224,7 +1462,7 @@ body.comfymodal-body-scroll-lock {
   max-width: 100%;
 }
 
-.comfymodal-studio-history-preview-status {
+.comfymodal-studio-preview-status {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -1232,18 +1470,18 @@ body.comfymodal-body-scroll-lock {
   color: #4ade80;
 }
 
-.comfymodal-studio-history-preview-prompt {
+.comfymodal-studio-preview-prompt {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.comfymodal-studio-history-preview-time {
+.comfymodal-studio-preview-time {
   color: #666;
   flex-shrink: 0;
 }
 
-.comfymodal-studio-history-preview-meta {
+.comfymodal-studio-preview-meta {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 10px;
@@ -1251,7 +1489,7 @@ body.comfymodal-body-scroll-lock {
   margin-top: 4px;
 }
 
-.comfymodal-studio-history-preview-meta-item {
+.comfymodal-studio-preview-meta-item {
   font-size: 10px;
   color: #777;
 }
@@ -1475,7 +1713,11 @@ body.comfymodal-body-scroll-lock {
     min-width: 0;
   }
   .comfymodal-studio-history-gallery {
-    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    --columns: 3 !important;
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .comfymodal-studio-history-column-select {
+    display: none;
   }
   .comfymodal-studio-filter-bar input,
   .comfymodal-studio-filter-bar select {
@@ -1486,19 +1728,9 @@ body.comfymodal-body-scroll-lock {
     padding: 8px 8px;
   }
 
-  /* Floating config panel: span full width at top on narrow screens,
-     with capped height to avoid obscuring the output image. */
-  .comfymodal-studio-running-config.is-visible {
-    top: 0;
-    right: 0;
-    left: 0;
-    max-width: none;
-    min-width: 0;
-    max-height: 40%;
-    overflow-y: auto;
-    border-radius: 0 0 4px 4px;
-    border-top: none;
-  }
+  /* Running config panel is no longer absolutely positioned —
+     it flows naturally in the control panel.  No narrow-screen
+     override needed; the control panel handles its own scrolling. */
 }
 
 /* ── Card (generic) ──────────────────────────────────────── */
@@ -1936,7 +2168,7 @@ button.comfymodal-studio-feature-chip {
   outline-offset: 1px;
 }
 
-.comfymodal-studio-history-preview-close:focus-visible {
+.comfymodal-studio-preview-overlay-close:focus-visible {
   outline: 2px solid var(--color-accent, #5a7fdb);
   outline-offset: 2px;
 }
@@ -1974,8 +2206,7 @@ button.comfymodal-studio-feature-chip {
   justify-content: flex-start;
   gap: 0;
   padding: 0;
-  aspect-ratio: auto;
-  min-height: 100px;
+  aspect-ratio: 1;
   border-color: #2a2a2a;
   transition: border-color 0.15s, opacity 0.15s;
 }
@@ -2020,22 +2251,64 @@ button.comfymodal-studio-feature-chip {
   white-space: nowrap;
 }
 
-.comfymodal-studio-exp-tile-thumbs {
-  display: flex;
-  gap: 2px;
-  padding: 4px 8px 8px;
+.comfymodal-studio-exp-tile-images {
+  position: relative;
   width: 100%;
-  box-sizing: border-box;
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
 }
 
-.comfymodal-studio-exp-tile-thumb {
-  width: 36px;
-  height: 36px;
+.comfymodal-studio-exp-tile-grid {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 1px;
+  background: #0a0a0a;
+}
+
+.comfymodal-studio-exp-tile-grid-img,
+.comfymodal-studio-exp-tile-single-img {
+  width: 100%;
+  height: 100%;
   object-fit: cover;
-  border-radius: 2px;
-  border: 1px solid #2a2a2a;
-  flex-shrink: 0;
+  display: block;
+}
+
+.comfymodal-studio-exp-tile-grid-empty {
+  background: #111;
+  width: 100%;
+  height: 100%;
+}
+
+.comfymodal-studio-exp-tile-single-img {
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+.comfymodal-studio-exp-tile-time,
+.comfymodal-studio-history-card-time-badge {
+  position: absolute;
+  bottom: 6px;
+  right: 6px;
+  background: rgba(0,0,0,0.72);
+  color: rgba(255,255,255,0.9);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1.5;
+  pointer-events: none;
+  z-index: 5;
+  border: 1px solid rgba(255,255,255,0.06);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
 }
 
 .comfymodal-studio-exp-tile-error {
@@ -2513,6 +2786,8 @@ button.comfymodal-studio-feature-chip {
   min-height: 0;
   overflow: hidden;
   padding: 12px 16px;
+  background-image: radial-gradient(#222 1px, transparent 1px);
+  background-size: 30px 30px;
 }
 
 .comfymodal-studio-experiment-grid-building {
@@ -2531,7 +2806,7 @@ button.comfymodal-studio-feature-chip {
   overflow-x: auto;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 12px;
   min-height: 0;
 }
 
@@ -2548,7 +2823,13 @@ button.comfymodal-studio-feature-chip {
 }
 
 .comfymodal-studio-experiment-grid-group {
-  margin-bottom: 8px;
+  margin: 0;
+  padding-bottom: 14px;
+}
+
+.comfymodal-studio-experiment-grid-group + .comfymodal-studio-experiment-grid-group {
+  border-top: 1px solid #2a2a2a;
+  padding-top: 14px;
 }
 
 .comfymodal-studio-experiment-grid-group-label {
@@ -2563,19 +2844,23 @@ button.comfymodal-studio-feature-chip {
 .comfymodal-studio-experiment-grid-container {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  align-items: stretch;
+  gap: 10px;
 }
 
 .comfymodal-studio-experiment-grid-row {
   display: flex;
-  gap: 2px;
+  flex-wrap: wrap;
+  align-self: center;
+  width: max-content;
+  gap: 10px;
   align-items: stretch;
 }
 
 .comfymodal-studio-experiment-grid-row-cells {
   display: flex;
-  gap: 2px;
-  flex: 1;
+  gap: 10px;
+  flex: 0 0 auto;
   min-width: 0;
 }
 
@@ -2612,8 +2897,10 @@ button.comfymodal-studio-feature-chip {
 }
 
 .comfymodal-studio-experiment-grid-header {
-  flex: 1;
-  min-width: 80px;
+  flex: 0 0 250px;
+  width: 250px;
+  min-width: 150px;
+  max-width: 250px;
   font-size: 10px;
   color: #aaa;
   text-align: center;
@@ -2711,43 +2998,253 @@ button.comfymodal-studio-feature-chip {
   border-radius: 2px;
 }
 
-/* ── Cell Card ──────────────────────────────────────────── */
+/* ── Experiment Grid Cell — Card Redesign ────────────── */
 
 .comfymodal-studio-experiment-grid-cell {
-  flex: 1 1 var(--cell-min-width, 100px);
-  min-width: var(--cell-min-width, 60px);
-  max-width: none;
+  flex: 0 1 250px;
+  width: 250px;
+  min-width: 150px;
+  max-width: 500px;
   min-height: var(--cell-min-height, 60px);
   max-height: none;
-  aspect-ratio: var(--cell-aspect-ratio, 1/1);
-  border: 1px solid #2a2a2a;
-  border-radius: 4px;
-  background: #0a0a0a;
+  border: 1px solid #222;
+  border-radius: 8px;
+  background: #141414;
   cursor: pointer;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 2px;
-  padding: 3px;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  padding: 0;
+  transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;
   position: relative;
   font-family: inherit;
   font-size: inherit;
   line-height: inherit;
   color: inherit;
   overflow: hidden;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+  contain: layout style paint;
+  will-change: transform;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .comfymodal-studio-experiment-grid-cell:hover {
-  border-color: var(--color-accent, #5a7fdb);
-  box-shadow: 0 0 8px rgba(90, 127, 219, 0.2);
+  border-color: #00d1b2;
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px rgba(0,209,178,0.20);
 }
 
 .comfymodal-studio-experiment-grid-cell:focus-visible {
   outline: 2px solid var(--color-accent, #5a7fdb);
   outline-offset: 2px;
 }
+
+.cm-exp-cell-card {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.cm-exp-cell-imgwrap {
+  position: relative;
+  width: 100%;
+  padding-bottom: 100%;
+  background: #1a1a1a;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.cm-exp-cell-image {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  border-radius: 0;
+  opacity: 1;
+  transition: opacity 0.3s;
+}
+
+.cm-exp-cell-loading,
+.cm-exp-cell-icon,
+.cm-exp-cell-placeholder {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.cm-exp-cell-loading {
+  width: 24px;
+  height: 24px;
+  border: 2px solid #333;
+  border-top-color: var(--color-accent, #5a7fdb);
+  border-radius: 50%;
+  animation: cm-exp-spin 0.8s linear infinite;
+}
+
+@keyframes cm-exp-spin {
+  to { transform: rotate(360deg); }
+}
+
+.cm-exp-cell-icon {
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+}
+
+.cm-exp-cell-icon-done {
+  color: #4ade80;
+}
+
+.cm-exp-cell-icon-fail {
+  color: #f87171;
+}
+
+.cm-exp-cell-icon-skip {
+  color: #fbbf24;
+}
+
+.cm-exp-cell-icon-interrupt {
+  color: #fb923c;
+}
+
+.cm-exp-cell-placeholder {
+  width: 60%;
+  height: 60%;
+  min-height: 30px;
+  border: 1px dashed #333;
+  border-radius: 4px;
+}
+
+/* ── Badges on image (order + timing) ────────────────── */
+
+.cm-exp-cell-badge {
+  position: absolute;
+  background: rgba(0,0,0,0.78);
+  color: rgba(255,255,255,0.92);
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-weight: 700;
+  font-size: 10px;
+  pointer-events: none;
+  z-index: 5;
+  line-height: 1.5;
+  border: 1px solid rgba(255,255,255,0.08);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+
+.cm-exp-cell-index {
+  bottom: 8px;
+  left: 8px;
+}
+
+.cm-exp-cell-time {
+  bottom: 8px;
+  right: 8px;
+}
+
+/* ── Label tag overlay (top-left axis value badges) ──── */
+
+.cm-exp-cell-tags {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  pointer-events: none;
+  z-index: 4;
+  max-width: calc(100% - 12px);
+}
+
+.cm-exp-cell-tag {
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 700;
+  font-family: monospace;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.5;
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+
+.cm-exp-cell-tag-model,
+.cm-exp-cell-tag-checkpoint { background: rgba(80, 20, 100, 0.7); }
+
+.cm-exp-cell-tag-lora { background: rgba(90, 60, 10, 0.7); }
+
+.cm-exp-cell-tag-prompt { background: rgba(15, 70, 50, 0.7); }
+
+.cm-exp-cell-tag-sampler { background: rgba(20, 55, 100, 0.7); }
+
+.cm-exp-cell-tag-scheduler { background: rgba(20, 55, 100, 0.7); }
+
+.cm-exp-cell-tag-guidance { background: rgba(90, 30, 30, 0.7); }
+
+.cm-exp-cell-tag-steps { background: rgba(90, 30, 30, 0.7); }
+
+.cm-exp-cell-tag-seed { background: rgba(40, 40, 40, 0.7); }
+
+.cm-exp-cell-tag-denoise { background: rgba(0, 70, 60, 0.7); }
+
+/* ── Info section below image ────────────────────────── */
+
+.cm-exp-cell-info {
+  padding: 10px 12px 8px;
+  max-height: 112px;
+  overflow: hidden;
+  font-size: 10px;
+  line-height: 1.5;
+  color: #ccc;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.cm-exp-cell-stat {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 2px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+
+.cm-exp-cell-stat:last-child {
+  border-bottom: none;
+}
+
+.cm-exp-cell-stat-key {
+  color: #888;
+  font-weight: 600;
+  flex-shrink: 0;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  min-width: 40px;
+}
+
+.cm-exp-cell-stat-val {
+  color: #e0e0e0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  font-size: 10px;
+}
+
+/* ── Status border colours on the cell card ──────────── */
 
 .comfymodal-studio-experiment-grid-cell.completed {
   border-color: #1a4a1a;
@@ -2768,13 +3265,13 @@ button.comfymodal-studio-feature-chip {
 }
 
 .comfymodal-studio-experiment-grid-cell.running {
-  border-color: var(--color-accent, #5a7fdb);
-  box-shadow: 0 0 6px rgba(90, 127, 219, 0.3);
+  border-color: #00d1b2;
+  box-shadow: 0 0 8px rgba(0,209,178,0.25);
 }
 
 .comfymodal-studio-experiment-grid-cell.selected {
   border-color: #fbbf24;
-  box-shadow: 0 0 10px rgba(251, 191, 36, 0.3);
+  box-shadow: 0 0 12px rgba(251, 191, 36, 0.30);
 }
 
 .comfymodal-studio-experiment-grid-cell-empty {
@@ -2784,102 +3281,84 @@ button.comfymodal-studio-feature-chip {
   color: #555;
   min-width: 60px;
   min-height: 60px;
+  flex: 0 1 120px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
 }
 
-.comfymodal-studio-experiment-grid-cell-img {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  border-radius: 2px;
-  display: block;
-  flex: 1;
-  max-width: 100%;
-}
-
-/* Prompt block in cells constrained to a readable max width.
-   min-width:0 + width:100% ensures ellipsis works when parent
-   cell is narrower than max-width. */
-.comfymodal-studio-experiment-grid-cell-prompt {
-  font-size: 9px;
-  color: #aaa;
-  max-width: 280px;
-  min-width: 0;
-  width: 100%;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-  line-height: 1.4;
-  padding: 2px 4px;
-}
-
-.comfymodal-studio-experiment-grid-cell-loading {
-  width: 24px;
-  height: 24px;
-  border: 2px solid #333;
-  border-top-color: var(--color-accent, #5a7fdb);
-  border-radius: 50%;
-  animation: cm-exp-spin 0.8s linear infinite;
-}
-
-@keyframes cm-exp-spin {
-  to { transform: rotate(360deg); }
-}
-
-@keyframes cm-exp-indeterminate {
-  0%   { width: 20%; opacity: 0.6; }
-  50%  { width: 70%; opacity: 1; }
-  100% { width: 20%; opacity: 0.6; }
-}
-
-.comfymodal-studio-experiment-grid-cell-done-icon {
-  font-size: 18px;
-  color: #4ade80;
-}
-
-.comfymodal-studio-experiment-grid-cell-fail-icon {
-  font-size: 18px;
-  color: #f87171;
-}
-
-.comfymodal-studio-experiment-grid-cell-skip-icon {
-  font-size: 16px;
-  color: #fbbf24;
-}
-
-.comfymodal-studio-experiment-grid-cell-interrupt-icon {
-  font-size: 16px;
-  color: #fb923c;
-}
+/* ── Stack layout for 3+ varying axes ────────────────── */
 
 .comfymodal-studio-experiment-grid-cell-stack {
   flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  min-width: 80px;
+  gap: 14px;
+  min-width: 150px;
 }
 
 .comfymodal-studio-experiment-grid-cell-stack > .comfymodal-studio-experiment-grid-cell {
   flex: none;
   min-width: 0;
-  min-height: 60px;
+  min-height: 120px;
 }
 
-.comfymodal-studio-experiment-grid-cell-placeholder {
-  width: 100%;
-  height: 100%;
-  min-height: 40px;
-  border: 1px dashed #2a2a2a;
-  border-radius: 2px;
-  flex: 1;
+.comfymodal-studio-experiment-grid-cell-stack > .comfymodal-studio-experiment-grid-cell + .comfymodal-studio-experiment-grid-cell::before {
+  content: "";
+  position: absolute;
+  top: -8px;
+  left: 0;
+  right: 0;
+  border-top: 1px solid #2a2a2a;
+  pointer-events: none;
 }
 
-.comfymodal-studio-experiment-grid-cell-status {
-  font-size: 9px;
-  color: #555;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-  flex-shrink: 0;
+@media (max-width: 768px) {
+  .comfymodal-studio-experiment-grid-header {
+    flex-basis: 220px;
+    width: 220px;
+    max-width: 220px;
+  }
+
+  .comfymodal-studio-experiment-grid-row-cells {
+    flex: 0 0 auto;
+  }
+
+  .comfymodal-studio-experiment-grid-cell {
+    width: 220px;
+    flex-basis: 220px;
+  }
+}
+
+@media (max-width: 480px) {
+  .comfymodal-studio-experiment-grid-row {
+    align-self: flex-start;
+  }
+
+  .comfymodal-studio-experiment-grid-header {
+    flex-basis: 170px;
+    width: 170px;
+    max-width: 170px;
+  }
+
+  .comfymodal-studio-experiment-grid-cell {
+    width: 170px;
+    flex-basis: 170px;
+  }
+
+  .comfymodal-studio-experiment-grid-row,
+  .comfymodal-studio-experiment-grid-row-cells {
+    gap: 8px;
+  }
+
+  .comfymodal-studio-experiment-grid-cell-stack {
+    gap: 10px;
+  }
+
+  .comfymodal-studio-experiment-grid-cell-stack > .comfymodal-studio-experiment-grid-cell + .comfymodal-studio-experiment-grid-cell::before {
+    top: -6px;
+  }
 }
 
 .comfymodal-studio-experiment-grid-empty {
@@ -2945,98 +3424,6 @@ button.comfymodal-studio-feature-chip {
 }
 
 /* ── Cell Detail Overlay ──────────────────────────────────── */
-
-.comfymodal-studio-experiment-grid-detail-overlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  z-index: 10000;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.comfymodal-studio-experiment-grid-detail-backdrop {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: rgba(0, 0, 0, 0.85);
-}
-
-.comfymodal-studio-experiment-grid-detail-panel {
-  position: relative;
-  max-width: 90vw;
-  max-height: 90vh;
-  background: #0a0a0a;
-  border: 1px solid #333;
-  border-radius: 6px;
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  overflow-y: auto;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.6);
-  min-width: 240px;
-}
-
-.comfymodal-studio-experiment-grid-detail-panel::-webkit-scrollbar {
-  width: 6px;
-}
-.comfymodal-studio-experiment-grid-detail-panel::-webkit-scrollbar-track {
-  background: transparent;
-}
-.comfymodal-studio-experiment-grid-detail-panel::-webkit-scrollbar-thumb {
-  background: #2a2a2a;
-  border-radius: 3px;
-}
-
-.comfymodal-studio-experiment-grid-detail-close {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  background: transparent;
-  border: none;
-  color: #aaa;
-  font-size: 20px;
-  cursor: pointer;
-  padding: 6px 10px;
-  line-height: 1;
-  z-index: 1;
-  transition: color 0.15s;
-  border-radius: 3px;
-}
-
-.comfymodal-studio-experiment-grid-detail-close:hover {
-  color: #fff;
-}
-
-.comfymodal-studio-experiment-grid-detail-close:focus-visible {
-  outline: 2px solid var(--color-accent, #5a7fdb);
-  outline-offset: 2px;
-}
-
-.comfymodal-studio-experiment-grid-detail-image {
-  max-width: 100%;
-  max-height: 60vh;
-  object-fit: contain;
-  border-radius: 4px;
-}
-
-.comfymodal-studio-experiment-grid-detail-noimage {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 120px;
-  background: #111;
-  border: 1px solid #2a2a2a;
-  border-radius: 4px;
-  color: #555;
-  font-size: 12px;
-}
 
 .comfymodal-studio-experiment-grid-detail-key {
   font-size: 11px;

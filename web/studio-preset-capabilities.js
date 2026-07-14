@@ -159,7 +159,7 @@ export const CONTROL_BINDING_DEFS = {
     label: "Sampler",
     type: "select",
     isControl: true,
-    experimentEligible: false,
+    experimentEligible: true,
     helpText: "Sampler name.",
   },
   scheduler: {
@@ -167,7 +167,7 @@ export const CONTROL_BINDING_DEFS = {
     label: "Scheduler",
     type: "select",
     isControl: true,
-    experimentEligible: false,
+    experimentEligible: true,
     helpText: "Scheduler name.",
   },
   width: {
@@ -260,6 +260,25 @@ function _isBound(presetOrSnapshot, bindingKey) {
 
 function _isAnyBound(presetOrSnapshot, bindingKeys) {
   return bindingKeys.some((k) => _isBound(presetOrSnapshot, k));
+}
+
+/**
+ * True if the control is available on this preset: either through a
+ * valid node binding OR through a resolved schema entry
+ * (controlSchemas[controlId].schemaResolved).  Unresolved schemas
+ * (schemaResolved: false) are NOT considered available.
+ */
+function _isControlAvailable(presetOrSnapshot, controlId, featureId) {
+  if (_isAnyBound(presetOrSnapshot, _getBindingKeysForControl(controlId, featureId))) return true;
+  if (
+    presetOrSnapshot &&
+    presetOrSnapshot.controlSchemas &&
+    presetOrSnapshot.controlSchemas[controlId] &&
+    presetOrSnapshot.controlSchemas[controlId].schemaResolved
+  ) {
+    return true;
+  }
+  return false;
 }
 
 // ── Pure Query Functions ─────────────────────────────────────────────────
@@ -463,7 +482,8 @@ export function getPresetCapabilitySummary(presetOrSnapshot, featureId) {
 /**
  * Determine which control IDs are eligible as experiment axes given a set
  * of presets (selected for comparison).  An axis is eligible only if ALL
- * selected runnable presets have a binding for it AND support the feature.
+ * selected runnable presets have a binding OR resolved schema entry for it,
+ * AND support the feature.
  */
 export function getAxisEligibilityForPresets(presets, featureId) {
   if (!presets || presets.length === 0 || !featureId) return [];
@@ -480,16 +500,16 @@ export function getAxisEligibilityForPresets(presets, featureId) {
     if (!def.experimentEligible || def.isControl === false) continue;
 
     const allSupport = runnablePresets.every((p) =>
-      isControlBound(p, key, featureId),
+      _isControlAvailable(p, key, featureId),
     );
 
     if (allSupport) {
       eligible.push(key);
     } else {
       for (const p of runnablePresets) {
-        if (!isControlBound(p, key, featureId)) {
+        if (!_isControlAvailable(p, key, featureId)) {
           const presetLabel = p.label || p.id || "unknown preset";
-          reasons[key] = `Preset "${presetLabel}" is missing binding for "${def.label}"`;
+          reasons[key] = `Preset "${presetLabel}" is missing binding or schema for "${def.label}"`;
           break;
         }
       }

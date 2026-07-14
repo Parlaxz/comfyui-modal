@@ -12,7 +12,7 @@ import {
   enhanceControlWithAxisCheckbox,
 } from "./studio-experiment-mode.js";
 import { getRuntimePresets } from "./studio-backend.js";
-import { runStudioPreset, getStudioRunStatus } from "./studio-backend-api.js";
+import { runStudioPreset, getStudioRunStatus, stopExperiment } from "./studio-backend-api.js";
 
 import {
   getVisibleControlsForPreset,
@@ -38,7 +38,7 @@ import {
 } from "./studio-playground-state.js";
 import { getSharedTracker, createScopedTracker } from "./comfymodal-progress.js";
 import { updateRunAnnotation } from "./studio-backend-api.js";
-import { el } from "./studio-ui.js";
+import { el, createZoomableImageEl, createImagePreviewOverlay } from "./studio-ui.js";
 
 // ── Polling helper for experiment status ──────────────────────────────────
 // Polls getStudioRunStatus and updates runState to reflect queued,
@@ -149,7 +149,8 @@ function _startPolling(container, state, context, actions, runState) {
     // Check for explicit terminal event evidence in the journal
     const hasTerminalEvent = events.some(function (ev) {
       return ev.type === "experiment.completed" ||
-             ev.type === "experiment.stopped";
+             ev.type === "experiment.stopped" ||
+             ev.type === "experiment.cancelled";
     });
 
     // Check for explicit error events in the journal (safety net for
@@ -198,8 +199,11 @@ function _startPolling(container, state, context, actions, runState) {
       if (actions && actions.setRunState) {
         actions.setRunState(progressState);
       }
-    } else if (status === "completed" || status === "succeeded") {
-      // Require real evidence before showing completed UI
+    } else if (status === "completed" || status === "succeeded" || status === "cancelled" || status === "stopped") {
+      // Terminal success/cancelled/stopped state.  When evidence exists
+      // (completed cells or a terminal event in the journal), extract
+      // outputs and mark completed with full snapshot/events/cellOutputs
+      // so the grid viewport renders partial results after cancellation.
       if (hasCellCompletionEvidence || hasTerminalEvent) {
         _stopPolling(state);
         // Extract output evidence from cell.completed events
@@ -232,8 +236,29 @@ function _startPolling(container, state, context, actions, runState) {
             _cellOutputs: _pollCellOutputs,
           });
         }
+      } else if (status === "completed" || status === "succeeded") {
+        // Completed but no evidence yet — stay in current state,
+        // bounded by the 5-minute POLL_TIMEOUT_MS above.
+        // (Existing behavior: snapshot may be populated on next poll.)
+      } else {
+        // cancelled/stopped without evidence — still a terminal event.
+        // Stop polling and show as completed with no cell data so the
+        // grid does not hang indefinitely.
+        _stopPolling(state);
+        if (actions && actions.setRunState) {
+          actions.setRunState({
+            status: "completed",
+            experimentId: experimentId,
+            completedCells: 0,
+            totalCells: totalCells || 0,
+            message: "Run was " + status + " before any cells completed.",
+            hasHistory: false,
+            _snapshot: snapshot,
+            _events: events,
+            _cellOutputs: _pollCellOutputs,
+          });
+        }
       }
-      // Without evidence, stay in current state (don't claim completion)
     } else if (status === "failed_fatal" || status === "error" || status === "failed" || status === "completed_with_failures") {
       _stopPolling(state);
       const errMsg = (lastErrorMsg || snapshot.error || data.message || data.error || "Run failed.").substring(0, 200);
@@ -290,17 +315,17 @@ function hydrateControlsForSelection(state, presetId, featureId, preset) {
 
   // A persisted draft contains explicit user edits — load into
   // `state.playground.controls` (which buildEffectiveControls serialises)
-  // rather than _hydratedControls (display-only).
+  // and _hydratedControls (backward-compatible source/behavior expectations).
   const draft = presetId && featureId ? loadControlDraft(presetId, featureId) : {};
   if (draft && typeof draft === "object" && Object.keys(draft).length > 0) {
     state.playground.controls = draft;
-    state.playground._hydratedControls = {};
+    state.playground._hydratedControls = draft;
     return;
   }
 
-  // No draft: build display-only hydrated values from preset defaults
-  // and definition defaults (CONTROL_DEFS).  Do NOT carry resolved
-  // controls from a previous successful run forward as implicit overrides.
+  // No draft: build resolvedControls from preset defaults
+  // and definition defaults (CONTROL_DEFS).  Do NOT carry resolvedControls
+  // from a previous successful run forward as implicit submission overrides.
   const presetDefaults = (preset && preset.defaults) || {};
   const merged = {};
 
@@ -321,18 +346,14 @@ function hydrateControlsForSelection(state, presetId, featureId, preset) {
   state.playground._hydratedControls = merged;
 }
 
-function buildEffectiveControls(state, preset, currentFeatureId) {
+function buildEffectiveControls(state) {
+  // Only include explicit user overrides from state.playground.controls.
+  // The backend fills in defaults for any missing controls.
+  // No fallback to display-only defaults or binding-visible iteration.
   const userOverrides = (state.playground && state.playground.controls) || {};
-  const hydratedControls = (state.playground && state.playground._hydratedControls) || {};
-  const visibleIds = getVisibleControlsForPreset(preset, currentFeatureId);
   const controls = {};
-  visibleIds.forEach(function (ctrlId) {
-    if (Object.prototype.hasOwnProperty.call(hydratedControls, ctrlId)) {
-      controls[ctrlId] = hydratedControls[ctrlId];
-    }
-    if (Object.prototype.hasOwnProperty.call(userOverrides, ctrlId)) {
-      controls[ctrlId] = userOverrides[ctrlId];
-    }
+  Object.keys(userOverrides).forEach(function (ctrlId) {
+    controls[ctrlId] = userOverrides[ctrlId];
   });
   return controls;
 }
@@ -737,6 +758,11 @@ function renderControlPanel(state, context) {
   if (isExperiment) {
     const expBlock = renderExperimentMode(state, actions, context);
     panel.appendChild(expBlock);
+
+    // Running config panel — sits directly below the experiment controls so
+    // it remains visible even when the experiment grid replaces the normal
+    // workspace content.  Shows frozen parameter values during active runs.
+    panel.appendChild(renderRunningConfigPanel(state));
   }
 
   // ── Backend Selector ───────────────────────────────────────────────
@@ -1003,9 +1029,7 @@ function buildActions(state, context) {
       const activePreset = getCurrentPresetForSelection(state, presetId);
       clearTimeout(state.playground._draftSaveTimer);
       state.playground._draftSaveTimer = setTimeout(function () {
-        const controls = activePreset
-          ? buildEffectiveControls(state, activePreset, featureId)
-          : Object.assign({}, state.playground.controls || {});
+        const controls = buildEffectiveControls(state);
         saveControlDraft(presetId, featureId, controls);
       }, 300);
       // Clear stale terminal run state so Run button re-enables on control
@@ -1117,7 +1141,10 @@ function buildActions(state, context) {
 
       // Dispose scoped tracker and clean up local timer on terminal states
       if (runState && (runState.status === "completed" || runState.status === "error")) {
-        if (state.playground && state.playground.runState) delete state.playground.runState._localStartTime;
+        if (state.playground && state.playground.runState) {
+          delete state.playground.runState._localStartTime;
+          delete state.playground.runState._cancelling;
+        }
         // Clean up captured running config — a new run will re-capture
         if (state.playground) delete state.playground._runningExperimentConfig;
         _disposeScopedTracker(state);
@@ -1421,8 +1448,13 @@ function renderControl(def, state, actions, preset) {
       if (actions.setControl) actions.setControl(def.id, isNaN(parsed) ? input.value : parsed);
     });
   } else if (schemaKind === "multiline") {
+    var tareaClass = "comfymodal-input comfymodal-studio-textarea";
+    if (def.id === "prompt" || def.id === "negative_prompt") {
+      tareaClass += " comfymodal-studio-prompt-textarea";
+      if (def.id === "negative_prompt") tareaClass += " negative";
+    }
     input = el("textarea", {
-      class: "comfymodal-input comfymodal-studio-textarea",
+      class: tareaClass,
       placeholder: def.placeholder || "",
       value: value != null ? String(value) : "",
       "data-testid": `input-${def.id}`,
@@ -1455,8 +1487,13 @@ function renderControl(def, state, actions, preset) {
   // ── Static CONTROL_DEFS type dispatch (fallback) ─────────────────────
   if (!input) {
     if (def.type === "textarea") {
+      var tareaClass = "comfymodal-input comfymodal-studio-textarea";
+      if (def.id === "prompt" || def.id === "negative_prompt") {
+        tareaClass += " comfymodal-studio-prompt-textarea";
+        if (def.id === "negative_prompt") tareaClass += " negative";
+      }
       input = el("textarea", {
-        class: "comfymodal-input comfymodal-studio-textarea",
+        class: tareaClass,
         placeholder: def.placeholder || "",
         value: String(value),
         "data-testid": `input-${def.id}`,
@@ -1824,14 +1861,41 @@ function renderRunButton(state, context, actions) {
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
   const runState = state.playground && state.playground.runState;
 
+  function _renderCancelBtn(rs) {
+    // In experiment mode, the dedicated experiment section owns the cancel
+    // button.  The ordinary single-run section must not add a second one.
+    if (state.playground && state.playground.experimentMode) return null;
+    var _cb = el("button", {
+      class: "comfymodal-destructive-btn",
+      "data-testid": "cancel-run-btn",
+      text: rs._cancelling ? "Cancelling\u2026" : "Cancel",
+      disabled: !!rs._cancelling,
+      style: "font-size:10px;padding:2px 8px;margin-left:6px;",
+    });
+    _cb.addEventListener("click", async function () {
+      if (rs._cancelling) return;
+      rs._cancelling = true;
+      _cb.textContent = "Cancelling\u2026";
+      _cb.disabled = true;
+      var _eid = rs.experimentId || rs.runId;
+      if (_eid) {
+        try { await stopExperiment(apiBase, _eid); } catch (e) {}
+      }
+    });
+    return _cb;
+  }
+
   if (runState && runState.status === "running") {
     btn.disabled = true;
     btn.textContent = "Running\u2026";
     btn.title = "Run in progress";
-    reason.appendChild(el("p", {
+    var _runMsg = el("p", {
       text: "Your run has been submitted\u2026",
       style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-    }));
+    });
+    reason.appendChild(_runMsg);
+    var _rb = _renderCancelBtn(runState);
+    if (_rb) reason.appendChild(_rb);
     return container;
   }
 
@@ -1839,10 +1903,13 @@ function renderRunButton(state, context, actions) {
     btn.disabled = true;
     btn.textContent = "Submitted";
     btn.title = "Run submitted, waiting for status\u2026";
-    reason.appendChild(el("p", {
+    var _subMsg = el("p", {
       text: "Waiting for server response\u2026",
       style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-    }));
+    });
+    reason.appendChild(_subMsg);
+    var _sb = _renderCancelBtn(runState);
+    if (_sb) reason.appendChild(_sb);
     // Start polling only once per run lifecycle.  The elapsed timer
     // triggers re-renders every 250ms; without this guard, each re-render
     // would call _startPolling which calls _stopPolling/clearInterval,
@@ -1857,10 +1924,13 @@ function renderRunButton(state, context, actions) {
     btn.disabled = true;
     btn.textContent = "Waiting\u2026";
     btn.title = "Waiting for experiment to be ready on server";
-    reason.appendChild(el("p", {
+    var _waitMsg = el("p", {
       text: "Waiting for server setup\u2026",
       style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-    }));
+    });
+    reason.appendChild(_waitMsg);
+    var _wb = _renderCancelBtn(runState);
+    if (_wb) reason.appendChild(_wb);
     return container;
   }
 
@@ -1871,10 +1941,13 @@ function renderRunButton(state, context, actions) {
     const progressText = runState.cellProgress
       ? "Cells completed: " + runState.cellProgress
       : "Run is in progress\u2026";
-    reason.appendChild(el("p", {
+    var _progMsg = el("p", {
       text: progressText,
       style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-    }));
+    });
+    reason.appendChild(_progMsg);
+    var _pb = _renderCancelBtn(runState);
+    if (_pb) reason.appendChild(_pb);
     return container;
   }
 
@@ -2028,7 +2101,7 @@ function renderRunButton(state, context, actions) {
         btn.textContent = "Running\u2026";
 
         // Build controls early so sampler fields are available for running state
-        const controls = buildEffectiveControls(state, preset, currentFeatureId);
+        const controls = buildEffectiveControls(state);
 
         // Clear previous output so canvas shows live progress immediately
         state.playground.lastRunOutput = null;
@@ -2664,6 +2737,7 @@ function _renderGridFallback(gridOuter, entries, apiBase, state, context, snapsh
     groups[ck].push(entry);
   });
   var groupKeys = Object.keys(groups);
+  var _cellIdx = 0;
   groupKeys.forEach(function (groupKey) {
     var group = el("div", { class: "comfymodal-studio-experiment-grid-group" }, [
       el("h4", {
@@ -2673,7 +2747,8 @@ function _renderGridFallback(gridOuter, entries, apiBase, state, context, snapsh
     ]);
     var row = el("div", { class: "comfymodal-studio-experiment-grid-row" });
     groups[groupKey].forEach(function (entry) {
-      row.appendChild(_renderExperimentCell(entry, apiBase, state, context));
+      row.appendChild(_renderExperimentCell(entry, apiBase, state, context, _cellIdx));
+      _cellIdx++;
     });
     group.appendChild(row);
     gridOuter.appendChild(group);
@@ -2727,20 +2802,19 @@ function _renderGridLinear(gridOuter, entries, varyingAxes, apiBase, state, cont
   var cellRowCells = el("div", { class: "comfymodal-studio-experiment-grid-row-cells" });
   uniqueVals.forEach(function (val) {
     var match = null;
+    var matchIdx = -1;
     for (var i = 0; i < entries.length; i++) {
       if (_getAxisValueLabel(entries[i], axisKey) === val) {
         match = entries[i];
+        matchIdx = i;
         break;
       }
     }
-    // Find the CONTROL_DEFS label for this axis key for the cell label
-    var ctrlDef = CONTROL_DEFS[axisKey];
-    var axisLabel = ctrlDef ? ctrlDef.label : axisKey;
     if (match) {
       // Augment entry with axis display info for cell detail
       match._axisLabels = match._axisLabels || {};
       match._axisLabels[axisKey] = val;
-      cellRowCells.appendChild(_renderExperimentCell(match, apiBase, state, context));
+      cellRowCells.appendChild(_renderExperimentCell(match, apiBase, state, context, matchIdx));
     } else {
       cellRowCells.appendChild(_renderEmptyCell(axisKey + ": " + val));
     }
@@ -2799,6 +2873,7 @@ function _renderGridMatrix(gridOuter, entries, varyingAxes, apiBase, state, cont
   headerRow.appendChild(colHeaderCells);
   container.appendChild(headerRow);
   var isRowPrompt = rowAxisKey === "prompt";
+  var _matCellIdx = 0;
   // Data rows
   rowVals.forEach(function (rv) {
     var dataRow = el("div", { class: "comfymodal-studio-experiment-grid-row" });
@@ -2820,17 +2895,16 @@ function _renderGridMatrix(gridOuter, entries, varyingAxes, apiBase, state, cont
       var key = rv + "::" + cv;
       var cellEntries = lookup[key];
       if (cellEntries && cellEntries.length > 0) {
-        // Stack multiple cells at the same coordinate vertically
         var stack = el("div", { class: "comfymodal-studio-experiment-grid-cell-stack" });
         cellEntries.forEach(function (entry, idx) {
-          // Attach axis display labels to entry for cell detail
           entry._axisLabels = entry._axisLabels || {};
           entry._axisLabels[rowAxisKey] = rv;
           entry._axisLabels[colAxisKey] = cv;
           extraAxes.forEach(function (ax) {
             entry._axisLabels[ax] = _getAxisValueLabel(entry, ax);
           });
-          stack.appendChild(_renderExperimentCell(entry, apiBase, state, context));
+          stack.appendChild(_renderExperimentCell(entry, apiBase, state, context, _matCellIdx));
+          _matCellIdx++;
         });
         dataCells.appendChild(stack);
       } else {
@@ -2843,6 +2917,206 @@ function _renderGridMatrix(gridOuter, entries, varyingAxes, apiBase, state, cont
   gridOuter.appendChild(container);
 }
 
+function _getCellDuration(attempt) {
+  if (!attempt) return null;
+
+  // Safe number conversion: returns null for non-numeric inputs
+  function _toNum(v) {
+    if (v == null) return null;
+    if (typeof v === "number") return v;
+    if (typeof v === "string") {
+      var n = Number(v);
+      return isNaN(n) ? null : n;
+    }
+    return null;
+  }
+
+  // 1. Truthful total/runtime fields (top-level)
+  var _topFields = ["duration_ms", "durationMs", "duration", "end_to_end_total_ms"];
+  for (var _i = 0; _i < _topFields.length; _i++) {
+    var _tv = _toNum(attempt[_topFields[_i]]);
+    if (_tv != null) return _tv;
+  }
+
+  // 2. timing_payload: extract total from trace/deltas_ms or its own fields
+  if (attempt.timing_payload && typeof attempt.timing_payload === "object") {
+    var tp = attempt.timing_payload;
+    var tpTotal = _toNum(tp.total_ms) || _toNum(tp.end_to_end_total_ms) || _toNum(tp.duration_ms);
+    if (tpTotal != null) return tpTotal;
+    // Sum deltas_ms if trace/deltas_ms is present
+    if (tp.trace && typeof tp.trace === "object") {
+      // Prefer explicit parent totals in trace (non-overlapping)
+      var traceTotal = _toNum(tp.trace.end_to_end_total_ms);
+      if (traceTotal != null) return traceTotal;
+      // Check derived_ms totals
+      if (tp.trace.derived_ms && typeof tp.trace.derived_ms === "object") {
+        var derivedTotal = _toNum(tp.trace.derived_ms.end_to_end_total_ms);
+        if (derivedTotal != null) return derivedTotal;
+      }
+      // Check deltas_ms parent totals (not child stages)
+      if (tp.trace.deltas_ms && typeof tp.trace.deltas_ms === "object") {
+        var infTotal = _toNum(tp.trace.deltas_ms.inference_total) || _toNum(tp.trace.deltas_ms.remote_inference_total);
+        if (infTotal != null) return infTotal;
+        // No parent total found — sum non-overlapping child stages only
+        var childKeys = ["clip_load", "clip_encode", "sampler", "vae_decode", "image_io", "output_transfer"];
+        var sum = 0;
+        var hasAny = false;
+        for (var ci = 0; ci < childKeys.length; ci++) {
+          var cv = _toNum(tp.trace.deltas_ms[childKeys[ci]]);
+          if (cv != null) { sum += cv; hasAny = true; }
+        }
+        if (hasAny) return sum;
+      }
+    }
+  }
+
+  // 3. timings object (backward compat) — but NOT restore-only timing
+  if (attempt.timings && typeof attempt.timings === "object") {
+    var timTotal = _toNum(attempt.timings.end_to_end_total_ms) || _toNum(attempt.timings.total_ms);
+    if (timTotal != null) return timTotal;
+  }
+
+  // 4. Fallback: scheduler_execution_ms (inference/scheduler, only when present)
+  var schedVal = _toNum(attempt.scheduler_execution_ms);
+  if (schedVal != null) return schedVal;
+  if (attempt.timings && typeof attempt.timings === "object") {
+    var schedTim = _toNum(attempt.timings.scheduler_execution_ms);
+    if (schedTim != null) return schedTim;
+  }
+
+  // NOT returned: restore-only timing (remote_timings.restore_total_ms)
+  return null;
+}
+
+function _buildCellMetaRows(entry) {
+  var attempt = entry.attempt || {};
+  var axisValues = entry.cell.axis_values || {};
+  var rows = [];
+
+  // Helper: get value from attempt metadata first, then axis_values as fallback
+  function _val(key) {
+    if (attempt[key] != null && attempt[key] !== "" && String(attempt[key]) !== "?") return attempt[key];
+    if (axisValues[key] != null && axisValues[key] !== "" && String(axisValues[key]) !== "?") return axisValues[key];
+    return null;
+  }
+
+  // Helper: check sentinel/empty values
+  function _isSentinel(v) {
+    var sv = v != null ? (typeof v === "object" ? JSON.stringify(v) : String(v)) : "";
+    return sv === "?" || sv === "" || sv.indexOf("__COMFYMODAL_WORKFLOW_OWNED__") >= 0;
+  }
+
+  // 1. Model row: unet > model > checkpoint_id (attempt then axis_values)
+  var modelVal = _val("unet") || _val("model") || _val("checkpoint_id");
+  if (modelVal != null && !_isSentinel(modelVal)) {
+    rows.push({ key: "Model", val: String(modelVal) });
+  }
+
+  // 2. LoRA row: lora_chain (attempt then axis_values)
+  var loraVal = _val("lora_chain");
+  if (loraVal != null) {
+    if (Array.isArray(loraVal)) {
+      if (loraVal.length > 0) {
+        var loraParts = loraVal.map(function(l) {
+          if (typeof l === "object" && l != null) {
+            return (l.name || l.model || "") + (l.strength != null ? " (" + l.strength + ")" : "");
+          }
+          return String(l);
+        });
+        rows.push({ key: "LoRA", val: loraParts.join(", ") });
+      }
+      // else omit empty lora_chain array
+    } else {
+      var loraStr = String(loraVal);
+      if (!_isSentinel(loraStr)) {
+        rows.push({ key: "LoRA", val: loraStr });
+      }
+    }
+  }
+
+  // 3. Sampler
+  var samplerVal = _val("sampler");
+  if (samplerVal != null && !_isSentinel(samplerVal)) {
+    rows.push({ key: "Sampler", val: String(samplerVal) });
+  }
+
+  // 4. Scheduler
+  var schedulerVal = _val("scheduler");
+  if (schedulerVal != null && !_isSentinel(schedulerVal)) {
+    rows.push({ key: "Scheduler", val: String(schedulerVal) });
+  }
+
+  // 5. Guidance / CFG
+  var guidanceVal = _val("guidance");
+  if (guidanceVal != null && !_isSentinel(guidanceVal)) {
+    rows.push({ key: "Guidance", val: String(guidanceVal) });
+  }
+
+  // 6. Steps
+  var stepsVal = _val("steps");
+  if (stepsVal != null && !_isSentinel(stepsVal)) {
+    rows.push({ key: "Steps", val: String(stepsVal) });
+  }
+
+  // 7. Denoise
+  var denoiseVal = _val("denoise");
+  if (denoiseVal != null && !_isSentinel(denoiseVal)) {
+    rows.push({ key: "Denoise", val: String(denoiseVal) });
+  }
+
+  // 8. Prompt (attempt metadata, then cell.prompt, then axis_values)
+  var promptVal = attempt.prompt != null && attempt.prompt !== ""
+    ? attempt.prompt
+    : (entry.cell.prompt != null && entry.cell.prompt !== ""
+        ? entry.cell.prompt
+        : _val("prompt"));
+  if (promptVal != null && promptVal !== "") {
+    var shortP = String(promptVal);
+    if (shortP.length > 50) shortP = shortP.substring(0, 48) + "\u2026";
+    rows.push({ key: "Prompt", val: shortP, full: String(promptVal) });
+  }
+
+  // 9. Negative prompt (attempt metadata, then axis_values)
+  var negPromptVal = _val("negative_prompt");
+  if (negPromptVal != null && negPromptVal !== "") {
+    var shortNeg = String(negPromptVal);
+    if (shortNeg.length > 50) shortNeg = shortNeg.substring(0, 48) + "\u2026";
+    rows.push({ key: "Negative", val: shortNeg, full: String(negPromptVal) });
+  }
+
+  // 10. Size (width x height)
+  var w = _val("width");
+  var h = _val("height");
+  if (w != null && h != null && !_isSentinel(w) && !_isSentinel(h)) {
+    rows.push({ key: "Size", val: String(w) + "\u00d7" + String(h) });
+  }
+
+  // 11. Seed
+  var seedVal = _val("seed");
+  if (seedVal != null && !_isSentinel(seedVal)) {
+    rows.push({ key: "Seed", val: String(seedVal) });
+  }
+
+  // Extra varying axes not already covered (preserves existing sentinel filtering)
+  var covered = {};
+  for (var ci = 0; ci < rows.length; ci++) covered[rows[ci].key.toLowerCase()] = true;
+  for (var ax in axisValues) {
+    if (!Object.prototype.hasOwnProperty.call(axisValues, ax)) continue;
+    if (typeof ax === "string" && ax.indexOf("__") === 0) continue;
+    var rawVal = axisValues[ax];
+    var sv = rawVal != null ? (typeof rawVal === "object" ? JSON.stringify(rawVal) : String(rawVal)) : "";
+    if (sv.indexOf("__COMFYMODAL_WORKFLOW_OWNED__") >= 0 || sv === "" || sv === "?") continue;
+    var lowAx = ax.toLowerCase();
+    if (covered[lowAx]) continue;
+    var ctrlDef = CONTROL_DEFS[ax];
+    var displayLabel = ctrlDef ? ctrlDef.label : ax;
+    rows.push({ key: displayLabel, val: sv });
+    covered[lowAx] = true;
+  }
+
+  return rows;
+}
+
 function _renderEmptyCell(label) {
   return el("div", {
     class: "comfymodal-studio-experiment-grid-cell comfymodal-studio-experiment-grid-cell-empty",
@@ -2850,7 +3124,7 @@ function _renderEmptyCell(label) {
   });
 }
 
-function _renderExperimentCell(entry, apiBase, state, context) {
+function _renderExperimentCell(entry, apiBase, state, context, index) {
   var ck = entry.cell.cell_key;
   var attempt = entry.attempt || {};
   var status = attempt.status || "pending";
@@ -2879,42 +3153,102 @@ function _renderExperimentCell(entry, apiBase, state, context) {
     "data-cell-status": status,
   });
 
-  // Thumbnail or loading placeholder
+  var card = el("div", { class: "cm-exp-cell-card" });
+
+  // ── Image wrapper ──────────────────────────────────────────────
+  var imgwrap = el("div", { class: "cm-exp-cell-imgwrap" });
+
   if (outputUrl) {
-    cell.appendChild(el("img", {
-      class: "comfymodal-studio-experiment-grid-cell-img",
+    imgwrap.appendChild(el("img", {
+      class: "cm-exp-cell-image",
       src: outputUrl,
       alt: "Cell " + ck,
       loading: "lazy",
     }));
   } else if (isRunning) {
-    cell.appendChild(el("div", { class: "comfymodal-studio-experiment-grid-cell-loading", "data-testid": "cell-loading-" + ck }));
+    imgwrap.appendChild(el("div", { class: "cm-exp-cell-loading", "data-testid": "cell-loading-" + ck }));
   } else if (isCompleted) {
-    // Completed but no output URL — show checkmark
-    cell.appendChild(el("div", { class: "comfymodal-studio-experiment-grid-cell-done-icon", text: "\u2713" }));
+    imgwrap.appendChild(el("div", { class: "cm-exp-cell-icon cm-exp-cell-icon-done", text: "\u2713" }));
   } else if (isFailed) {
-    cell.appendChild(el("div", { class: "comfymodal-studio-experiment-grid-cell-fail-icon", text: "\u2717" }));
+    imgwrap.appendChild(el("div", { class: "cm-exp-cell-icon cm-exp-cell-icon-fail", text: "\u2717" }));
   } else if (isSkipped) {
-    cell.appendChild(el("div", { class: "comfymodal-studio-experiment-grid-cell-skip-icon", text: "\u21b7" }));
+    imgwrap.appendChild(el("div", { class: "cm-exp-cell-icon cm-exp-cell-icon-skip", text: "\u21b7" }));
   } else if (isInterrupted) {
-    cell.appendChild(el("div", { class: "comfymodal-studio-experiment-grid-cell-interrupt-icon", text: "\u23f8" }));
+    imgwrap.appendChild(el("div", { class: "cm-exp-cell-icon cm-exp-cell-icon-interrupt", text: "\u23f8" }));
   } else {
-    // Pending: empty placeholder
-    cell.appendChild(el("div", { class: "comfymodal-studio-experiment-grid-cell-placeholder" }));
+    imgwrap.appendChild(el("div", { class: "cm-exp-cell-placeholder" }));
   }
 
-  // Status dot / label
-  var statusLabel = isCompleted ? "Done" : isFailed ? "Failed" : isSkipped ? "Skipped" : isInterrupted ? "Interrupted" : isRunning ? "Running" : "Pending";
-  cell.appendChild(el("span", {
-    class: "comfymodal-studio-experiment-grid-cell-status",
-    text: statusLabel,
-  }));
+  // Order badge (#N)
+  if (index != null) {
+    imgwrap.appendChild(el("span", {
+      class: "cm-exp-cell-badge cm-exp-cell-index",
+      text: "#" + (index + 1),
+    }));
+  }
+
+  // Runtime badge
+  var durationMs = _getCellDuration(attempt);
+  if (durationMs != null && durationMs > 0) {
+    imgwrap.appendChild(el("span", {
+      class: "cm-exp-cell-badge cm-exp-cell-time",
+      text: _formatDuration(durationMs),
+      title: (typeof durationMs === "number" ? durationMs : Number(durationMs)).toFixed(0) + "ms",
+    }));
+  }
+
+  // Label overlay tags (axis values that vary in this experiment)
+  var axisLabels = entry._axisLabels || {};
+  var axisKeys = Object.keys(axisLabels);
+  if (axisKeys.length > 0) {
+    var tagOverlay = el("div", { class: "cm-exp-cell-tags" });
+    for (var ti = 0; ti < axisKeys.length; ti++) {
+      var ak = axisKeys[ti];
+      var av = axisLabels[ak];
+      if (av == null || av === "") continue;
+      var tagClass = "cm-exp-cell-tag";
+      var knownTypes = { model: 1, checkpoint: 1, lora: 1, sampler: 1, scheduler: 1, guidance: 1, steps: 1, seed: 1, denoise: 1, prompt: 1 };
+      if (knownTypes[ak]) tagClass += " cm-exp-cell-tag-" + ak;
+      var displayVal = String(av);
+      if (displayVal.length > 40) displayVal = displayVal.substring(0, 38) + "\u2026";
+      tagOverlay.appendChild(el("span", {
+        class: tagClass,
+        text: displayVal,
+        title: String(av),
+      }));
+    }
+    if (tagOverlay.children.length > 0) {
+      imgwrap.appendChild(tagOverlay);
+    }
+  }
+
+  card.appendChild(imgwrap);
+
+  // ── Info section ───────────────────────────────────────────────
+  var metaRows = _buildCellMetaRows(entry);
+  if (metaRows.length > 0) {
+    var info = el("div", { class: "cm-exp-cell-info" });
+    for (var mi = 0; mi < metaRows.length; mi++) {
+      var mr = metaRows[mi];
+      var stat = el("div", { class: "cm-exp-cell-stat" }, [
+        el("span", { class: "cm-exp-cell-stat-key", text: mr.key + ": " }),
+        el("span", {
+          class: "cm-exp-cell-stat-val",
+          text: mr.val,
+          title: mr.full || mr.val,
+        }),
+      ]);
+      info.appendChild(stat);
+    }
+    card.appendChild(info);
+  }
+
+  cell.appendChild(card);
 
   // Click handler — select cell for detail view
   cell.addEventListener("click", function () {
     if (state.playground) {
       if (state.playground._selectedCellKey === ck) {
-        // Deselect
         state.playground._selectedCellKey = null;
       } else {
         state.playground._selectedCellKey = ck;
@@ -3024,66 +3358,27 @@ function _renderExperimentProgressBars(runState, state) {
 
 function _renderCellDetailOverlay(entry, apiBase, state, context, varyingAxes) {
   varyingAxes = varyingAxes || [];
-  var overlay = el("div", {
-    class: "comfymodal-studio-experiment-grid-detail-overlay",
-    "data-testid": "experiment-cell-detail-overlay",
-  });
 
-  // Backdrop click to close
-  var backdrop = el("div", { class: "comfymodal-studio-experiment-grid-detail-backdrop" });
-  backdrop.addEventListener("click", function () {
+  function _close() {
     if (state.playground) state.playground._selectedCellKey = null;
     if (context && context.setPage) context.setPage("playground");
-  });
-  overlay.appendChild(backdrop);
-
-  var panel = el("div", {
-    class: "comfymodal-studio-experiment-grid-detail-panel",
-    "data-testid": "experiment-cell-detail-panel",
-  });
-
-  // Close button
-  var closeBtn = el("button", {
-    class: "comfymodal-studio-experiment-grid-detail-close",
-    "data-testid": "experiment-cell-detail-close",
-    text: "\u2715",
-    onclick: function () {
-      if (state.playground) state.playground._selectedCellKey = null;
-      if (context && context.setPage) context.setPage("playground");
-    },
-  });
-  panel.appendChild(closeBtn);
-
-  // Image
-  if (entry.outputUrl) {
-    panel.appendChild(el("img", {
-      class: "comfymodal-studio-experiment-grid-detail-image",
-      src: entry.outputUrl,
-      alt: "Cell output",
-    }));
-  } else {
-    panel.appendChild(el("div", {
-      class: "comfymodal-studio-experiment-grid-detail-noimage",
-      text: "No output",
-    }));
   }
 
+  var sections = [];
+
   // Cell key
-  panel.appendChild(el("div", {
+  sections.push(el("div", {
     class: "comfymodal-studio-experiment-grid-detail-key",
     text: "Cell: " + entry.cell.cell_key,
   }));
 
   // Status
-  panel.appendChild(el("div", {
+  sections.push(el("div", {
     class: "comfymodal-studio-experiment-grid-detail-status",
     text: "Status: " + (entry.attempt.status || "unknown"),
   }));
 
   // ── Axis values ───────────────────────────────────────────
-  // Varying axes (shown prominently in red glyph).
-  // Non-varying axes (shown in a collapsed accessible toggle).
-  // Filter out workflow-owned sentinel keys and values.
   var av = entry.cell.axis_values || {};
   var allAxisKeys = Object.keys(av).filter(function (k) {
     if (typeof k === "string" && k.indexOf("__") === 0) return false;
@@ -3092,7 +3387,6 @@ function _renderCellDetailOverlay(entry, apiBase, state, context, varyingAxes) {
     if (sv.indexOf("__COMFYMODAL_WORKFLOW_OWNED__") >= 0) return false;
     return true;
   });
-  // Split into varying vs non-varying based on the grid axis computation
   var varyingKeys = allAxisKeys.filter(function (k) { return varyingAxes.indexOf(k) >= 0; });
   var nonVaryingKeys = allAxisKeys.filter(function (k) { return varyingAxes.indexOf(k) < 0; });
   var hasPrompt = entry.cell.prompt != null && entry.cell.prompt !== "";
@@ -3105,7 +3399,6 @@ function _renderCellDetailOverlay(entry, apiBase, state, context, varyingAxes) {
       text: "Axis Values",
     }));
 
-    // Prompt as first varying item
     if (hasPrompt) {
       var promptVal = String(entry.cell.prompt);
       if (promptVal.length > 200) promptVal = promptVal.substring(0, 200) + "\u2026";
@@ -3118,7 +3411,6 @@ function _renderCellDetailOverlay(entry, apiBase, state, context, varyingAxes) {
       ]));
     }
 
-    // Varying axes (always visible, red-highlighted)
     varyingKeys.forEach(function (key) {
       var ctrlDef = CONTROL_DEFS[key];
       var label = ctrlDef ? ctrlDef.label : key;
@@ -3132,7 +3424,6 @@ function _renderCellDetailOverlay(entry, apiBase, state, context, varyingAxes) {
       ]));
     });
 
-    // Non-varying axes (initially collapsed accessible toggle)
     if (nonVaryingKeys.length > 0) {
       var nvToggle = el("button", {
         class: "comfymodal-studio-experiment-grid-detail-nonvarying-toggle",
@@ -3167,23 +3458,34 @@ function _renderCellDetailOverlay(entry, apiBase, state, context, varyingAxes) {
       axisSection.appendChild(nvContent);
     }
 
-    panel.appendChild(axisSection);
+    sections.push(axisSection);
   }
 
   // Preset / backend info
   if (entry.attempt.checkpoint_id != null) {
-    panel.appendChild(el("div", {
+    sections.push(el("div", {
       class: "comfymodal-studio-experiment-grid-detail-checkpoint",
       text: "Checkpoint: " + entry.attempt.checkpoint_id,
     }));
   }
 
-  overlay.appendChild(panel);
-  return overlay;
+  var preview = createImagePreviewOverlay({
+    imageUrl: entry.outputUrl || null,
+    alt: "Cell output",
+    onClose: _close,
+    sections: sections,
+  });
+
+  return preview.overlay;
 }
 
 function _formatDuration(ms) {
   if (ms == null) return "0ms";
+  // Safe numeric conversion — never call .toFixed on a non-number
+  if (typeof ms !== "number") {
+    ms = Number(ms);
+    if (isNaN(ms)) return "0ms";
+  }
   if (ms < 1000) return ms.toFixed(0) + "ms";
   if (ms < 60000) return (ms / 1000).toFixed(1) + "s";
   var m = Math.floor(ms / 60000);
@@ -3513,11 +3815,6 @@ function renderCanvas(state, context) {
       style: "color:var(--color-text-muted);",
     }));
   }
-
-  // Floating running-config overlay — always appended to canvas so it
-  // sits visually on top of output images.  Renders only during active
-  // experiment runs (visibility controlled by CSS + is-visible class).
-  canvas.appendChild(renderRunningConfigPanel(state));
 
   return canvas;
 }
@@ -3860,7 +4157,7 @@ function renderMetadataSection(state, context) {
   if (nr.imageUrl) advancedItems.push({ label: "Image URL", value: nr.imageUrl });
 
   // Resolved controls
-  if (Object.keys(nr.resolvedControls).length > 0) {
+  if (nr.resolvedControls && Object.keys(nr.resolvedControls).length > 0) {
     advancedItems.push({ label: "Resolved Controls", value: JSON.stringify(nr.resolvedControls, null, 1) });
   }
 

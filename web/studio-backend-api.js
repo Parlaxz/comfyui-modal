@@ -142,6 +142,20 @@ export async function getStudioRunStatus(apiBase, id) {
   return apiFetch(apiBase, `/experiments/${encodeURIComponent(id)}`);
 }
 
+/**
+ * Cancel/stop an experiment or single run by experiment ID.
+ * Uses POST /experiments/{id}/stop-now (not /cancel/{client_id}).
+ * @param {string} apiBase
+ * @param {string} experimentId
+ * @returns {Promise<object|null>}
+ */
+export async function stopExperiment(apiBase, experimentId) {
+  if (!experimentId) return null;
+  return apiFetch(apiBase, `/experiments/${encodeURIComponent(experimentId)}/stop-now`, {
+    method: "POST",
+  });
+}
+
 // ── Run History API (with pagination, filter, sort) ──────────────────────
 
 /**

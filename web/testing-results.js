@@ -399,7 +399,7 @@ export function results_tab_render(rootEl, api, options = {}) {
       "data-testid": "cell-card",
       "data-cell-status": cellStatus,
     }, [
-      el("div", { class: "testing-results-cell-thumb", style: "position:relative;" }, [
+      el("div", { class: "testing-results-cell-thumb" }, [
         imageUrl
           ? el("img", { src: imageUrl, class: "testing-results-cell-img", alt: "cell output" })
           : el("div", { class: "testing-results-cell-thumb-placeholder", text: cellStatus === "running" ? "" : cellStatus }),
@@ -407,17 +407,19 @@ export function results_tab_render(rootEl, api, options = {}) {
           ? el("div", { class: "testing-results-running-spinner" })
           : null,
         cellIndex != null
-          ? el("span", { class: "testing-results-cell-attempt", text: `#${cellIndex + 1}` })
+          ? el("span", { class: "testing-results-cell-badge testing-results-cell-index testing-results-cell-attempt", text: `#${cellIndex + 1}` })
+          : null,
+        runtime
+          ? el("span", { class: "testing-results-cell-badge testing-results-cell-time testing-results-cell-runtime", text: runtime })
           : null,
       ]),
-      el("div", { class: "testing-results-cell-meta" }, [
+      ...(compact ? [] : [el("div", { class: "testing-results-cell-meta" }, [
         el("span", { class: "testing-results-cell-prompt", text: (cell.axis_values && cell.axis_values.prompt) || cell.cell_key.slice(0, 12) }),
         el("div", { style: "display:flex;gap:8px;font-size:var(--font-size-xs,11px);color:var(--color-text-muted,#6f7785);flex-wrap:wrap;" }, [
           el("span", { class: "testing-results-cell-seed", text: `seed ${(cell.axis_values && cell.axis_values.seed) || "?"}` }),
           modelName ? el("span", { class: "testing-results-cell-model", text: modelName }) : null,
-          runtime ? el("span", { class: "testing-results-cell-runtime", text: runtime }) : null,
         ]),
-      ]),
+      ])]),
       errorText
         ? el("div", {
             class: "testing-results-cell-error",
@@ -783,7 +785,7 @@ export function results_tab_render(rootEl, api, options = {}) {
           style: "font-size:var(--font-size-sm,12px);font-weight:var(--font-weight-medium,500);color:var(--color-text-secondary,#9aa3b2);margin:0 0 var(--space-sm,8px);",
           text: renderGroupLabel(groupKey, strategy),
         }),
-        el("div", { class: "testing-results-row", style: "display:flex;flex-wrap:wrap;gap:var(--space-sm,8px);" }),
+        el("div", { class: "testing-results-row" }),
       ]);
       var row = group.querySelector(".testing-results-row");
       groups[groupKey].forEach(function (entry, idx) {
@@ -816,7 +818,7 @@ export function results_tab_render(rootEl, api, options = {}) {
           style: "font-size:var(--font-size-sm,12px);font-weight:var(--font-weight-medium,500);color:var(--color-text-secondary,#9aa3b2);margin:0 0 var(--space-sm,8px);",
           text: "Checkpoint " + groupKey,
         }),
-        el("div", { class: "testing-results-row", style: "display:flex;flex-wrap:wrap;gap:var(--space-sm,8px);" }),
+        el("div", { class: "testing-results-row" }),
       ]);
       var row = group.querySelector(".testing-results-row");
       groups[groupKey].forEach(function (entry, idx) {

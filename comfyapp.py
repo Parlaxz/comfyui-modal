@@ -690,13 +690,14 @@ class ComfyModalProductionImageComparerOutput:
             },
             "optional": {
                 "image_b": ("IMAGE",),
+                "inputs_are_same": ("BOOLEAN", {"default": False, "forceInput": False}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
             },
         }
 
-    def encode_compare(self, image_a, image_b=None, unique_id=None):
+    def encode_compare(self, image_a, image_b=None, inputs_are_same=False, unique_id=None):
         import time as _time
 
         from comfy_execution.utils import get_executing_context
@@ -1138,6 +1139,116 @@ FASTPATH_V21621_BACKGROUND_UNET = os.getenv("COMFYMODAL_FASTPATH_V21621_BACKGROU
 FASTPATH_V21621_CLIP_LOAD_ONLY = os.getenv("COMFYMODAL_FASTPATH_V21621_CLIP_LOAD_ONLY", "1") == "1"
 FASTPATH_V21621_CLIP_READ_BYTES = os.getenv("COMFYMODAL_FASTPATH_V21621_CLIP_READ_BYTES", "1") == "1"
 
+# =========================================================================
+# PRODUCTION BASELINE — effective override resolver
+# =========================================================================
+# These in-memory overrides ensure that stale volume runtime files cannot
+# reactivate the known-disabled experimental background path or wrong
+# preload/CPU-cache/encode settings.  They produce the user's exact
+# required effective values in logs and tests without overwriting arbitrary
+# user settings — any flag NOT in this list falls through to the normal
+# env/volume-file precedence.
+#
+# To let an explicit experiment mode override a baseline flag, set the
+# corresponding env var *before* import (volume files are still overridden).
+# The resolver prints a diagnostic line at module load time so logs show
+# the effective value and its source.
+#
+# Effective baseline (authoritative per user requirements):
+#   COMFYMODAL_EXECUTION_BACKEND=in_process
+#   PRELOAD_MODE=workers_2
+#   DIRECT_WARMUP_LOAD_UNET=1
+#   DIRECT_WARMUP_LOAD_CLIP=1
+#   DIRECT_WARMUP_CLIP_ENCODE=0
+#   DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT=0
+#   SAGE_RUNTIME_MODE=baked_cuda
+#   SAGE_RUNTIME_PROBE_ON_RESTORE=0
+#   ENABLE_WARMUP=1
+#   ENABLE_TORCH_COMPILE=0
+#   EXPERIMENTAL_RESTORE_BACKGROUND_CODE=False
+#   RESTORE_BACKGROUND_UNET=False
+#   RESTORE_DIRECT_CLIP_POLICY=auto  (not overridden; explicit encode=0 wins)
+# =========================================================================
+
+_PRODUCTION_BASELINE_OVERRIDES: dict[str, str] = {
+    # Backend
+    "COMFYMODAL_EXECUTION_BACKEND": "in_process",
+    # Sage: baked_cuda, no probe
+    "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
+    "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
+    # Preload: workers_2 (not clip_only or sequential)
+    "COMFYMODAL_PRELOAD_MODE": "workers_2",
+    # Direct warmup: load UNET+CLIP, skip CLIP encode, no CPU-cache requirement
+    "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "1",
+    "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
+    "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "0",
+    "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "0",
+    # Warmup on, torch compile off
+    "COMFYMODAL_ENABLE_WARMUP": "1",
+    "COMFYMODAL_ENABLE_TORCH_COMPILE": "0",
+    # Experimental restore background — disabled
+    "COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "0",
+    "COMFYMODAL_RESTORE_BACKGROUND_UNET": "0",
+}
+
+
+def _resolve_production_baseline_flag(env_name: str) -> str | None:
+    """Return the production baseline override for *env_name*, or None.
+
+    Only overrides flags in ``_PRODUCTION_BASELINE_OVERRIDES``.  Returns
+    the baseline value without touching ``os.environ``.  Callers that
+    need to log the effective value should compare the baseline against
+    the current env value.
+    """
+    return _PRODUCTION_BASELINE_OVERRIDES.get(env_name)
+
+
+# Apply the same authoritative baseline to module-level flags that are read
+# directly by the restore/backend paths. Resolver-backed flags already use
+# _resolve_production_baseline_flag() at their call sites; these globals need
+# the equivalent treatment or stale import-time environment values could make
+# diagnostics disagree with the behavior they describe.
+DEFAULT_EXECUTION_BACKEND = _PRODUCTION_BASELINE_OVERRIDES.get(
+    "COMFYMODAL_EXECUTION_BACKEND", DEFAULT_EXECUTION_BACKEND
+)
+ENABLE_WARMUP = (
+    _PRODUCTION_BASELINE_OVERRIDES.get(
+        "COMFYMODAL_ENABLE_WARMUP", "1" if ENABLE_WARMUP else "0"
+    )
+    == "1"
+)
+ENABLE_TORCH_COMPILE = (
+    _PRODUCTION_BASELINE_OVERRIDES.get(
+        "COMFYMODAL_ENABLE_TORCH_COMPILE", "1" if ENABLE_TORCH_COMPILE else "0"
+    )
+    == "1"
+)
+SAGE_RUNTIME_MODE = _PRODUCTION_BASELINE_OVERRIDES.get(
+    "COMFYMODAL_SAGE_RUNTIME_MODE", SAGE_RUNTIME_MODE
+)
+
+
+def _log_effective_baseline_diagnostics() -> None:
+    """Print a diagnostic line showing each baseline flag's effective value."""
+    for env_name, baseline_val in sorted(_PRODUCTION_BASELINE_OVERRIDES.items()):
+        env_val = os.environ.get(env_name, "").strip().lower()
+        cur_val = env_val if env_val else "(not set)"
+        if env_val and env_val != baseline_val:
+            print(
+                f"[production_baseline] OVERRIDE {env_name} "
+                f"env={cur_val} -> effective={baseline_val} "
+                f"source=production_baseline_override"
+            )
+        else:
+            print(
+                f"[production_baseline] OK {env_name} "
+                f"effective={baseline_val} source={'env_var' if env_val else 'code_default'}"
+            )
+
+
+# Emit baseline diagnostics at module load time.
+_log_effective_baseline_diagnostics()
+
 
 def _resolve_fastpath_v21621() -> dict:
     """Resolve effective fast-path feature state at runtime."""
@@ -1336,7 +1447,21 @@ def _production_vae_wait_for_unet(
     Waits only on the specific per-load Event that transitions from
     UNSET (loading) to SET (complete).  If no matching UNET is active,
     returns immediately.
+
+    IMPORTANT: Returns immediately (no wait) unless restore-background
+    UNET is actually enabled.  The VAE gate must not block behind a
+    disabled operation.
     """
+    # No VAE gate behind a disabled operation.
+    if not _restore_background_unet_enabled():
+        if _PRODUCTION_UNET_VAE_DIAG:
+            print(
+                f"[unet_vae_gate] event=vae_skip background_unet_disabled "
+                f"unet_digest={_canonical_path_digest(canonical_key)[:12]}",
+                flush=True,
+            )
+        return True
+
     event = _find_active_unet_gate(canonical_key, join_context)
     if event is None:
         # No matching active UNET
@@ -2774,13 +2899,23 @@ def _apply_return_mode(result: dict, return_mode: str, payload_image_count: int,
 
 
 def _resolve_runtime_flag(name: str, default: str) -> bool:
-    """Read a runtime ``0``/``1`` flag from file or env var.
+    """Read a runtime ``0``/``1`` flag from file, env var, or baseline override.
 
     Priority:
-    1. File on the model volume at ``runtime_config/{name}.txt``.
-    2. Env var ``COMFYMODAL_{name}``.
-    3. ``default`` string (``"0"`` or ``"1"``).
+    1. Production baseline override (in-memory, for production-critical flags).
+    2. File on the model volume at ``runtime_config/{name}.txt``.
+    3. Env var ``COMFYMODAL_{name}``.
+    4. ``default`` string (``"0"`` or ``"1"``).
+
+    The production baseline (item 1) ensures stale volume files cannot
+    reactivate known-disabled experimental paths or wrong preload settings.
     """
+    # Production baseline overrides take highest priority so stale volume
+    # files cannot re-enable disabled experimental paths.
+    _env_name = f"COMFYMODAL_{name}"
+    _baseline = _resolve_production_baseline_flag(_env_name)
+    if _baseline is not None:
+        return _baseline == "1"
     path = os.path.join(RUNTIME_CONFIG_DIR, f"{name}.txt")
     try:
         if os.path.isfile(path):
@@ -2789,7 +2924,7 @@ def _resolve_runtime_flag(name: str, default: str) -> bool:
                 return v == "1"
     except Exception:
         pass
-    env = os.environ.get(f"COMFYMODAL_{name}", default)
+    env = os.environ.get(_env_name, default)
     return env == "1"
 
 
@@ -2834,12 +2969,16 @@ def _resolve_restore_direct_clip_policy_name() -> str:
 
 
 def _resolve_sage_runtime_env_override() -> str:
-    """Return the effective SAGE_RUNTIME_MODE from file, env, or module default.
+    """Return the effective SAGE_RUNTIME_MODE from production baseline, file, or module default.
 
     Priority:
-    1. File ``runtime_config/sage_runtime_mode.txt``.
-    2. Module-level ``SAGE_RUNTIME_MODE`` (from env var ``COMFYMODAL_SAGE_RUNTIME_MODE``).
+    1. Production baseline override (in-memory, authoritative).
+    2. File ``runtime_config/sage_runtime_mode.txt``.
+    3. Module-level ``SAGE_RUNTIME_MODE`` (from env var ``COMFYMODAL_SAGE_RUNTIME_MODE``).
     """
+    _baseline = _resolve_production_baseline_flag("COMFYMODAL_SAGE_RUNTIME_MODE")
+    if _baseline is not None:
+        return _baseline
     path = os.path.join(RUNTIME_CONFIG_DIR, "sage_runtime_mode.txt")
     try:
         if os.path.isfile(path):
@@ -2855,9 +2994,13 @@ def _resolve_sage_probe_on_restore() -> bool:
     """Return whether to probe Sage runtime during restore.
 
     Priority:
-    1. File ``runtime_config/sage_runtime_probe.txt``.
-    2. Module-level ``SAGE_RUNTIME_PROBE_ON_RESTORE``.
+    1. Production baseline override (in-memory, authoritative).
+    2. File ``runtime_config/sage_runtime_probe.txt``.
+    3. Module-level ``SAGE_RUNTIME_PROBE_ON_RESTORE``.
     """
+    _baseline = _resolve_production_baseline_flag("COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE")
+    if _baseline is not None:
+        return _baseline == "1"
     path = os.path.join(RUNTIME_CONFIG_DIR, "sage_runtime_probe.txt")
     try:
         if os.path.isfile(path):
@@ -2873,9 +3016,13 @@ def _resolve_preload_mode() -> str:
     """Return the effective preload mode.
 
     Priority:
-    1. File on the model volume (set by ``set_preload_mode``).
-    2. Module-level env-var default (``PRELOAD_MODE``).
+    1. Production baseline override (in-memory, authoritative).
+    2. File on the model volume (set by ``set_preload_mode``).
+    3. Module-level env-var default (``PRELOAD_MODE``).
     """
+    _baseline = _resolve_production_baseline_flag("COMFYMODAL_PRELOAD_MODE")
+    if _baseline is not None:
+        return _baseline
     try:
         if os.path.isfile(PRELOAD_MODE_PATH):
             _v = open(PRELOAD_MODE_PATH).read().strip().lower()
@@ -14265,7 +14412,11 @@ class _ComfyAPIMixin:
         # caches/UI state. It does not unload the warm model/runtime state we
         # want to preserve across prompts.
         # â€”â€” Set active production request state for direct-memory sink â€”â€”
-        _prod_for_sink = normalize_production_options(modal_options)
+        # Reuse the _production_cache already normalized above (line 13640)
+        # instead of re-normalizing modal_options.  This ensures sink
+        # registration uses the same normalized production options as the
+        # compilation branch.
+        _prod_for_sink = _production_cache  # already normalized at method entry (line 13640)
         _prod_sink_enabled = _prod_for_sink.get("enabled", False)
         _authorized_sink_node_ids = []
         if isinstance(production_report, dict):
@@ -14494,8 +14645,10 @@ class _ComfyAPIMixin:
             _production_evidence["source_workflow_hash"] = _src_hash
             _production_evidence["compiled_workflow_hash"] = _comp_hash
             _production_evidence["executed_workflow_hash"] = _exec_hash
+            _production_evidence["runner_workflow_hash"] = _exec_hash
             _production_evidence["production_plan_hash"] = production_report.get("topology_hash", "")
             _production_evidence["production_plan_used"] = True
+            _production_evidence["production_output_count"] = len(production_report.get("output_node_ids", []))
             _production_evidence["kept_count"] = production_report.get("compiled_node_count", 0)
             _production_evidence["removed_count"] = production_report.get("removed_node_count", 0)
             _production_evidence["bypassed_count"] = len(production_report.get("bypass_node_ids", []))
@@ -17359,15 +17512,23 @@ class _ComfyAPIMixin:
             print(f"[comfyapp] restore synced new custom nodes: {_cn_created}")
 
         __stages["preload_mode"] = _resolve_preload_mode()
-        __stages["preload_mode_source"] = "file" if os.path.isfile(PRELOAD_MODE_PATH) else "env_var"
+        __stages["preload_mode_source"] = (
+            "production_baseline_override"
+            if _resolve_production_baseline_flag("COMFYMODAL_PRELOAD_MODE") is not None
+            else ("file" if os.path.isfile(PRELOAD_MODE_PATH) else "env_var")
+        )
         __stages["preload_env_raw"] = os.environ.get("COMFYMODAL_PRELOAD_MODE", "not_set")
         __stages["preload_unknown_profiles"] = 1 if PRELOAD_UNKNOWN_PROFILES else 0
         __stages["disable_restore_warmup_for_z_image"] = 1 if _resolve_disable_restore_warmup_for_z_image() else 0
         __stages["disable_restore_warmup_for_z_image_effective"] = __stages["disable_restore_warmup_for_z_image"]
-        __stages["direct_warmup_load_unet_flag"] = 1 if DIRECT_WARMUP_LOAD_UNET else 0
-        __stages["direct_warmup_load_clip_flag"] = 1 if DIRECT_WARMUP_LOAD_CLIP else 0
-        __stages["direct_warmup_clip_encode_flag"] = 1 if DIRECT_WARMUP_CLIP_ENCODE else 0
+        __stages["direct_warmup_load_unet_flag"] = 1 if _resolve_runtime_flag("DIRECT_WARMUP_LOAD_UNET", "0") else 0
+        __stages["direct_warmup_load_clip_flag"] = 1 if _resolve_runtime_flag("DIRECT_WARMUP_LOAD_CLIP", "0") else 0
+        __stages["direct_warmup_clip_encode_flag"] = 1 if _resolve_runtime_flag("DIRECT_WARMUP_CLIP_ENCODE", "0") else 0
+        __stages["require_cpu_cache_hit"] = 1 if _resolve_runtime_flag("DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT", "0") else 0
         __stages["enable_warmup"] = 1 if ENABLE_WARMUP else 0
+        __stages["effective_PRELOAD_MODE"] = _resolve_preload_mode()
+        __stages["sage_env_mode"] = _resolve_sage_runtime_env_override()
+        __stages["sage_probe"] = 1 if _resolve_sage_probe_on_restore() else 0
 
         # GÃ¶Ã‡GÃ¶Ã‡ CacheDiT override GÃ¶Ã‡GÃ¶Ã‡
         if DISABLE_CACHEDIT_FOR_Z_IMAGE and is_in_proc:
@@ -17847,8 +18008,8 @@ class _ComfyAPIMixin:
                 __stages["sage_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                 __stages["sage_mode"] = mode
                 __stages["sage_reason"] = reason
-                __stages["sage_env_mode"] = SAGE_RUNTIME_MODE
-                __stages["sage_probe_on_restore"] = 1 if SAGE_RUNTIME_PROBE_ON_RESTORE else 0
+                __stages["sage_env_mode"] = _resolve_sage_runtime_env_override()
+                __stages["sage_probe_on_restore"] = 1 if _resolve_sage_probe_on_restore() else 0
                 self._log_profile(
                     "restore_sage_runtime",
                     mode=mode,
@@ -17937,8 +18098,8 @@ class _ComfyAPIMixin:
                 __stages["sage_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                 __stages["sage_mode"] = mode
                 __stages["sage_reason"] = reason
-                __stages["sage_env_mode"] = SAGE_RUNTIME_MODE
-                __stages["sage_probe_on_restore"] = 1 if SAGE_RUNTIME_PROBE_ON_RESTORE else 0
+                __stages["sage_env_mode"] = _resolve_sage_runtime_env_override()
+                __stages["sage_probe_on_restore"] = 1 if _resolve_sage_probe_on_restore() else 0
                 self._log_profile(
                     "restore_sage_runtime",
                     mode=mode,
@@ -18098,16 +18259,30 @@ class _ComfyAPIMixin:
             if _production_stable_path:
                 _clip_override = _clip_policy.copy() if _clip_policy else {}
                 _clip_override["direct_warmup_load_clip_effective"] = 1
-                _clip_override["direct_warmup_clip_encode_effective"] = 1
+                # Preserve CLIP object load=1, but do NOT force encode=1 when
+                # the effective DIRECT_WARMUP_CLIP_ENCODE baseline/runtime is 0.
+                # Check production baseline first, then env var.
+                _baseline_clip_encode = _resolve_production_baseline_flag(
+                    "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE"
+                )
+                _effective_clip_encode = (
+                    _baseline_clip_encode
+                    if _baseline_clip_encode is not None
+                    else os.environ.get("COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE", "0")
+                )
+                _encode_val = 1 if _effective_clip_encode == "1" else 0
+                _clip_override["direct_warmup_clip_encode_effective"] = _encode_val
                 _clip_override["restore_direct_clip_policy"] = "load_and_encode"
-                _clip_override["restore_direct_clip_policy_decision"] = "production_stable"
+                _clip_override["restore_direct_clip_policy_decision"] = (
+                    "production_stable" if _encode_val else "production_stable_load_only"
+                )
                 _clip_policy = _clip_override
                 _fp_state["fastpath_clip_load_only"] = 0
                 _fp_state["fastpath_clip_read_bytes"] = 0
                 __stages.update(_clip_policy)
                 print(
                     f"[production.clip] strategy=normal policy=load_and_encode "
-                    f"effective_load=1 effective_encode=1"
+                    f"effective_load=1 effective_encode={_encode_val}"
                 )
             __stages["warmup_profile_source"] = _warmup_src
             __stages["warmup_profile_token"] = _warmup_tok
@@ -18312,80 +18487,99 @@ class _ComfyAPIMixin:
                         #   * ``after_clip_encode``   — wait for
                         #     _warmup_direct to finish the full CLIP
                         #     encode; fully serialized diagnostic.
-                        _boundary = (
-                            current_unet_start_boundary()
-                            if _OPTIMIZATIONS_AVAILABLE
-                            else "after_clip_preload"
+                        #
+                        # When DIRECT_WARMUP_LOAD_UNET is true (required
+                        # baseline), the direct warmup already loads the
+                        # UNET itself, so a separate production UNET
+                        # future is unnecessary.  Skip the entire
+                        # production UNET submission path.
+                        _rt_direct_warmup_load_unet = _resolve_runtime_flag(
+                            "DIRECT_WARMUP_LOAD_UNET", "0",
                         )
-                        __stages["production_unet_start_boundary"] = _boundary
-                        _prod_unet = None
-                        if _boundary == "after_clip_preload":
-                            _prod_unet = self._start_production_restore_unet(
-                                profile, restore_start=restore_start, restore_stages=__stages
+                        if _rt_direct_warmup_load_unet:
+                            __stages["production_unet_decision"] = "direct_warmup_load_unet"
+                            __stages["production_unet_submitted"] = 0
+                            __stages["background_unet_submitted"] = False
+                            print(
+                                f"[production.unet] decision=direct_warmup_load_unet "
+                                f"submitted=0 background=false "
+                                f"reason=DIRECT_WARMUP_LOAD_UNET=1"
                             )
                         else:
-                            # Submit a barrier worker that waits
-                            # for the corresponding warmup event
-                            # before starting the production UNET.
-                            import threading as _thr_b
-                            if _boundary == "after_clip_object":
-                                _barrier_event = self._production_unet_barrier_event
-                            else:
-                                _barrier_event = self._production_unet_encode_barrier_event
-                            _barrier_kind = _boundary
-                            def _barrier_worker(
-                                _ev=_barrier_event, _bk=_barrier_kind,
-                                _p=profile, _rs=restore_start, _stg=__stages,
-                            ):
-                                # Cap the wait to avoid indefinite stalls
-                                _t0 = time.time()
-                                _got = _ev.wait(timeout=600)
-                                _wait_ms = round((time.time() - _t0) * 1000, 1)
-                                _stg[f"production_unet_barrier_wait_ms_{_bk}"] = _wait_ms
-                                _stg[f"production_unet_barrier_signaled_{_bk}"] = 1 if _got else 0
-                                # Assert the actual submission
-                                # timestamp is not earlier than the
-                                # requested boundary timestamp. This
-                                # proves the boundary actually
-                                # serialized the production UNET
-                                # behind the warmup phase.
-                                _anchor = getattr(
-                                    self, "_production_unet_boundary_anchor_unix_s", _t0,
-                                )
-                                _submit_unix = time.time()
-                                _stg[f"production_unet_submit_at_unix_s_{_bk}"] = _submit_unix
-                                _stg[f"production_unet_submit_after_anchor_s_{_bk}"] = round(
-                                    _submit_unix - _anchor, 4
-                                )
-                                if _submit_unix < _anchor - 0.001:
-                                    _stg[f"production_unet_boundary_violation_{_bk}"] = 1
-                                    print(
-                                        f"[production.unet] BOUNDARY_VIOLATION "
-                                        f"kind={_bk} anchor={_anchor} submit={_submit_unix}"
-                                    )
-                                _res = self._start_production_restore_unet(
-                                    _p, restore_start=_rs, restore_stages=_stg
-                                )
-                                _stg["production_unet_decision"] = _res.get("decision", "none")
-                                _stg["production_unet_submitted"] = 1 if _res.get("submitted") else 0
-                                print(
-                                    f"[production.unet] barrier_kind={_bk} wait_ms={_wait_ms} "
-                                    f"signaled={int(_got)} "
-                                    f"decision={_res.get('decision','none')} "
-                                    f"key={_res.get('key','')}"
-                                )
-                            _bt = _thr_b.Thread(
-                                target=_barrier_worker, daemon=True,
-                                name="production_unet_barrier"
+                            _boundary = (
+                                current_unet_start_boundary()
+                                if _OPTIMIZATIONS_AVAILABLE
+                                else "after_clip_preload"
                             )
-                            _bt.start()
-                            __stages["production_unet_barrier_thread_started"] = 1
-                            __stages["production_unet_decision"] = "barrier_waiting"
-                            __stages["production_unet_submitted"] = 0
-                            _prod_unet = {"decision": "barrier_waiting", "submitted": False}
-                        if _prod_unet is not None:
-                            __stages["production_unet_decision"] = _prod_unet.get("decision", "none")
-                            __stages["production_unet_submitted"] = 1 if _prod_unet.get("submitted") else 0
+                            __stages["production_unet_start_boundary"] = _boundary
+                            _prod_unet = None
+                            if _boundary == "after_clip_preload":
+                                _prod_unet = self._start_production_restore_unet(
+                                    profile, restore_start=restore_start, restore_stages=__stages
+                                )
+                            else:
+                                # Submit a barrier worker that waits
+                                # for the corresponding warmup event
+                                # before starting the production UNET.
+                                import threading as _thr_b
+                                if _boundary == "after_clip_object":
+                                    _barrier_event = self._production_unet_barrier_event
+                                else:
+                                    _barrier_event = self._production_unet_encode_barrier_event
+                                _barrier_kind = _boundary
+                                def _barrier_worker(
+                                    _ev=_barrier_event, _bk=_barrier_kind,
+                                    _p=profile, _rs=restore_start, _stg=__stages,
+                                ):
+                                    # Cap the wait to avoid indefinite stalls
+                                    _t0 = time.time()
+                                    _got = _ev.wait(timeout=600)
+                                    _wait_ms = round((time.time() - _t0) * 1000, 1)
+                                    _stg[f"production_unet_barrier_wait_ms_{_bk}"] = _wait_ms
+                                    _stg[f"production_unet_barrier_signaled_{_bk}"] = 1 if _got else 0
+                                    # Assert the actual submission
+                                    # timestamp is not earlier than the
+                                    # requested boundary timestamp. This
+                                    # proves the boundary actually
+                                    # serialized the production UNET
+                                    # behind the warmup phase.
+                                    _anchor = getattr(
+                                        self, "_production_unet_boundary_anchor_unix_s", _t0,
+                                    )
+                                    _submit_unix = time.time()
+                                    _stg[f"production_unet_submit_at_unix_s_{_bk}"] = _submit_unix
+                                    _stg[f"production_unet_submit_after_anchor_s_{_bk}"] = round(
+                                        _submit_unix - _anchor, 4
+                                    )
+                                    if _submit_unix < _anchor - 0.001:
+                                        _stg[f"production_unet_boundary_violation_{_bk}"] = 1
+                                        print(
+                                            f"[production.unet] BOUNDARY_VIOLATION "
+                                            f"kind={_bk} anchor={_anchor} submit={_submit_unix}"
+                                        )
+                                    _res = self._start_production_restore_unet(
+                                        _p, restore_start=_rs, restore_stages=_stg
+                                    )
+                                    _stg["production_unet_decision"] = _res.get("decision", "none")
+                                    _stg["production_unet_submitted"] = 1 if _res.get("submitted") else 0
+                                    print(
+                                        f"[production.unet] barrier_kind={_bk} wait_ms={_wait_ms} "
+                                        f"signaled={int(_got)} "
+                                        f"decision={_res.get('decision','none')} "
+                                        f"key={_res.get('key','')}"
+                                    )
+                                _bt = _thr_b.Thread(
+                                    target=_barrier_worker, daemon=True,
+                                    name="production_unet_barrier"
+                                )
+                                _bt.start()
+                                __stages["production_unet_barrier_thread_started"] = 1
+                                __stages["production_unet_decision"] = "barrier_waiting"
+                                __stages["production_unet_submitted"] = 0
+                                _prod_unet = {"decision": "barrier_waiting", "submitted": False}
+                            if _prod_unet is not None:
+                                __stages["production_unet_decision"] = _prod_unet.get("decision", "none")
+                                __stages["production_unet_submitted"] = 1 if _prod_unet.get("submitted") else 0
                             print(
                                 f"[production.unet] decision={_prod_unet.get('decision','none')} "
                                 f"key={_prod_unet.get('key','')} "
@@ -18741,7 +18935,20 @@ class _ComfyAPIMixin:
                     # effective CLIP encoding so the bundle's exact texts are
                     # pre-filled during direct warmup. No-bundle or fingerprint
                     # mismatch leaves the policy as-is (load-only).
-                    if _warmup_texts:
+                    #
+                    # EXCEPTION: The explicit effective DIRECT_WARMUP_CLIP_ENCODE=0
+                    # overrides this policy.  The baseline resolver enforces the
+                    # user-required flag, so stale volume files or auto-policy
+                    # cannot force encode=1 when the explicit flag says 0.
+                    _baseline_clip_encode = _resolve_production_baseline_flag(
+                        "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE"
+                    )
+                    _effective_clip_encode = (
+                        _baseline_clip_encode
+                        if _baseline_clip_encode is not None
+                        else os.environ.get("COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE", "0")
+                    )
+                    if _warmup_texts and _effective_clip_encode != "0":
                         _clip_policy_override = dict(_clip_policy or {})
                         _clip_policy_override["direct_warmup_clip_encode_effective"] = 1
                         _clip_policy_override["restore_direct_clip_policy_decision"] = "load_and_encode_explicit"
@@ -18749,6 +18956,17 @@ class _ComfyAPIMixin:
                         print(
                             f"[exact_prefill] bundle_match={len(_warmup_texts)} texts "
                             f"override_clip_encode=1 policy=load_and_encode_explicit"
+                        )
+                    elif _warmup_texts:
+                        # Baseline forces encode=0; load CLIP only, no encoding.
+                        __stages["exact_prefill_override_clip_encode"] = 0
+                        _clip_policy_override = dict(_clip_policy or {})
+                        _clip_policy_override["direct_warmup_clip_encode_effective"] = 0
+                        _clip_policy_override["restore_direct_clip_policy_decision"] = "load_only_baseline_override"
+                        print(
+                            f"[exact_prefill] bundle_match={len(_warmup_texts)} texts "
+                            f"override_clip_encode=0 "
+                            f"reason=baseline_DIRECT_WARMUP_CLIP_ENCODE=0"
                         )
                     else:
                         _clip_policy_override = _clip_policy
