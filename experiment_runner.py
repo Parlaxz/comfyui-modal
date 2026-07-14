@@ -243,8 +243,11 @@ def _set_field(workflow: dict, node_id: str, field: str, value: Any) -> None:
 
 
 def _workflow_sha256(workflow: dict) -> str:
-    normalized = json.dumps(workflow, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    """Canonical workflow hash.  Delegates to
+    ``production_workflow._canonical_workflow_hash`` so there is one
+    canonical implementation."""
+    from production_workflow import _canonical_workflow_hash
+    return _canonical_workflow_hash(workflow)
 
 
 def resolve_and_inject_cell(

@@ -191,6 +191,10 @@ from production_workflow import (
     normalize_production_options,
     compile_production_workflow,
     build_production_topology_hash,
+    _canonical_workflow_hash,
+    COMPILER_SCHEMA_VERSION,
+    HASH_SCHEMA_VERSION,
+    PRODUCTION_PLAN_SCHEMA_VERSION,
 )
 
 
@@ -2046,62 +2050,27 @@ def _compute_workflow_struct_hash_static(workflow: dict) -> str:
 def compute_canonical_source_workflow_hash(workflow: dict) -> str:
     """SHA-256 hash of the EXACT source workflow using deterministic JSON encoding.
 
-    Includes every node ID, class_type, input key and value (seed, text, width,
-    height, batch_size, model filenames, links, output-slot indices, arrays,
-    dicts, booleans, nulls, integers, floats, strings).  List ordering is
-    preserved.  Dictionary key ordering is normalized via sort_keys=True.
-
-    Fail-closed: returns empty string on serialization error (never raises).
+    Delegates to ``production_workflow._canonical_workflow_hash`` so there is
+    exactly one canonical implementation.  This function is a compatibility
+    alias for existing callers.
     """
-    try:
-        encoded = json.dumps(
-            workflow,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
-    except Exception:
-        return ""
+    return _canonical_workflow_hash(workflow)
 
 
 def compute_canonical_compiled_workflow_hash(compiled_workflow: dict) -> str:
     """SHA-256 hash of the compiled/compiled execution workflow.
 
-    Same deterministic JSON + SHA-256 rules as
-    compute_canonical_source_workflow_hash.
+    Delegates to ``production_workflow._canonical_workflow_hash``.
     """
-    try:
-        encoded = json.dumps(
-            compiled_workflow,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
-    except Exception:
-        return ""
+    return _canonical_workflow_hash(compiled_workflow)
 
 
 def compute_canonical_options_hash(production_options: dict) -> str:
     """SHA-256 hash of normalized production options dict.
 
-    Same deterministic JSON + SHA-256 rules as
-    compute_canonical_source_workflow_hash.
+    Delegates to ``production_workflow._canonical_workflow_hash``.
     """
-    try:
-        encoded = json.dumps(
-            production_options,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
-    except Exception:
-        return ""
+    return _canonical_workflow_hash(production_options)
 
 
 def _build_validation_certificate_identity(
@@ -7096,6 +7065,27 @@ def validate_active_warmup_profile_payload(payload: dict) -> None:
                 "must be exactly 1 when present, "
                 f"got {_prod_ver!r}"
             )
+        # Accept/check optional identity fields when present
+        for _id_field in ("source_workflow_hash", "compiled_workflow_hash", "production_plan_hash"):
+            _val = payload.get(_id_field)
+            if _val is not None and not (isinstance(_val, str) and _val):
+                raise RuntimeError(
+                    f"Refusing to write active_next_profile: {_id_field} "
+                    f"must be a non-empty string when present, got {_val!r}"
+                )
+        _out_ids = payload.get("output_node_ids")
+        if _out_ids is not None:
+            if not isinstance(_out_ids, (list, tuple)):
+                raise RuntimeError(
+                    "Refusing to write active_next_profile: output_node_ids "
+                    f"must be a list when present, got {_out_ids!r}"
+                )
+            for _oid in _out_ids:
+                if not isinstance(_oid, str):
+                    raise RuntimeError(
+                        f"Refusing to write active_next_profile: output_node_ids "
+                        f"entries must be strings, got {_oid!r}"
+                    )
 
 
 def _write_active_warmup_profile_payload(payload: dict) -> dict:
@@ -9071,9 +9061,21 @@ class _ComfyAPIMixin:
                     if active.get("production_enabled") is True:
                         profile["_production_enabled"] = True
                         profile["_production_profile_version"] = active.get("production_profile_version", 0)
-                    print(
-                        f"[comfyapp] snapshot_preload_profile source={source} profile_token={profile.get('_profile_token','')} workflow_hash={profile.get('_workflow_hash','')} data={profile}"
-                    )
+                        # Propagate lightweight identity fields without changing model selection
+                        for _pf in ("source_workflow_hash", "compiled_workflow_hash", "production_plan_hash", "output_node_ids"):
+                            if _pf in active:
+                                profile["_" + _pf] = active[_pf]
+                                profile[_pf] = active[_pf]
+                        print(
+                            f"[comfyapp] snapshot_preload_profile source={source} "
+                            f"profile_token={profile.get('_profile_token','')} "
+                            f"workflow_hash={profile.get('_workflow_hash','')} "
+                            f"production=1 "
+                            f"source_hash={profile.get('_source_workflow_hash','')[:12] or '-'} "
+                            f"compiled_hash={profile.get('_compiled_workflow_hash','')[:12] or '-'} "
+                            f"plan_hash={profile.get('_production_plan_hash','')[:12] or '-'} "
+                            f"output_ids={profile.get('_output_node_ids', [])}",
+                        )
                     return profile
         if env_profile:
             profile = dict(env_profile)
@@ -13918,29 +13920,72 @@ class _ComfyAPIMixin:
         if _production_enabled:
             if production_report is not None:
                 # Caller pre-compiled; workflow is already the compiled version
-                # Verify compiled_workflow_hash matches the received workflow
+                # Exact version guard
+                _cv = production_report.get("compiler_version", 0)
+                _hv = production_report.get("hash_schema_version", 0)
+                if not isinstance(_cv, int) or _cv != COMPILER_SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"Rejecting supplied production plan: compiler_version={_cv}, "
+                        f"expected {COMPILER_SCHEMA_VERSION}. Recompile and redeploy."
+                    )
+                if not isinstance(_hv, int) or _hv != HASH_SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"Rejecting supplied production plan: hash_schema_version={_hv}, "
+                        f"expected {HASH_SCHEMA_VERSION}. Recompile and redeploy."
+                    )
+                # Exact production plan schema version guard
+                _pv = production_report.get("production_plan_schema_version", 0)
+                if not isinstance(_pv, int) or _pv != PRODUCTION_PLAN_SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"Rejecting supplied production plan: production_plan_schema_version={_pv}, "
+                        f"expected {PRODUCTION_PLAN_SCHEMA_VERSION}. Recompile and redeploy."
+                    )
+                # Verify compiled_workflow_hash matches the received workflow.
+                # Defence in depth: reject immediately when the report is enabled
+                # but has no compiled_workflow_hash, even on the remote side.
                 _expected_cwf_hash = production_report.get("compiled_workflow_hash", "")
-                if _expected_cwf_hash:
-                    _actual_cwf_hash = compute_canonical_compiled_workflow_hash(workflow)
-                    if _actual_cwf_hash != _expected_cwf_hash:
-                        raise RuntimeError(
-                            f"Rejecting supplied production plan: compiled_workflow_hash mismatch. "
-                            f"Expected {_expected_cwf_hash[:16]}..., got {_actual_cwf_hash[:16]}..."
-                        )
+                if not _expected_cwf_hash:
+                    _src_h = production_report.get("source_workflow_hash", "")[:16] or "?"
+                    _dispatch_h = compute_canonical_compiled_workflow_hash(workflow)[:16] or "?"
+                    raise RuntimeError(
+                        f"Rejecting supplied production plan: compiled_workflow_hash is empty. "
+                        f"source={_src_h} compiled=n/a dispatch={_dispatch_h}. Recompile."
+                    )
+                _actual_cwf_hash = compute_canonical_compiled_workflow_hash(workflow)
+                if _actual_cwf_hash != _expected_cwf_hash:
+                    _src_h = production_report.get("source_workflow_hash", "")[:8] or "?"
+                    raise RuntimeError(
+                        f"Rejecting supplied production plan: compiled_workflow_hash mismatch. "
+                        f"source={_src_h} compiled={_expected_cwf_hash[:16]}... "
+                        f"dispatch={_actual_cwf_hash[:16]}..."
+                    )
+                # Compact boundary identity log
+                _sh_src = production_report.get("source_workflow_hash", "")[:8] or "?"
+                _sh_cwf = _expected_cwf_hash[:8] if _expected_cwf_hash else "?"
+                _sh_pph = production_report.get("production_plan_hash", "")[:8] or "?"
+                _oid_count = len(production_report.get("output_node_ids", []))
+                _plan_sv = production_report.get("production_plan_schema_version", "?")
+                __import__('builtins').print(
+                    f"[production.validate] source={_sh_src} compiled={_sh_cwf} "
+                    f"plan={_sh_pph} outputs={_oid_count} "
+                    f"compiler_v={_cv} hash_schema_v={_hv} plan_schema_v={_plan_sv}"
+                )
                 _compiled_workflow = workflow
             else:
                 _exec_t0 = time.time()
-                # source_workflow_hash must be set from original workflow BEFORE compilation
-                _source_wf_hash = compute_canonical_source_workflow_hash(workflow)
-                _compiled_workflow, production_report = compile_production_workflow(
+                _plan = compile_production_workflow(
                     workflow,
                     _production_cache,
                     allow_direct_output_rewrite=True,
                     stable=bool(_resolve_runtime_flag("PRODUCTION_STABLE_PATH", "1")),
                 )
-                production_report["source_workflow_hash"] = _source_wf_hash
+                _compiled_workflow = _plan.compiled_workflow
+                production_report = _plan.report
+                # The plan already carries source_workflow_hash
+                # (computed and set by compile_production_workflow).
+                # Do NOT overwrite here — the plan's deep copy is authoritative.
                 _compile_ms = round((time.time() - _exec_t0) * 1000, 1)
-                _th = production_report.get('topology_hash', '?')[:12]
+                _pph = production_report.get('production_plan_hash', '?')[:12]
                 _cc = production_report.get('compiled_node_count', 0)
                 _rc = production_report.get('removed_node_count', 0)
                 _ch = production_report.get('cache_hit', False)
@@ -13950,7 +13995,7 @@ class _ComfyAPIMixin:
                 _soc_count = len(production_report.get('selected_output_classes', {}))
                 _soc_str = __import__('json').dumps(production_report.get('selected_output_classes', {}))
                 __import__('builtins').print(
-                    '[production.compile] enabled=1 topology_hash=' + _th +
+                    '[production.compile] enabled=1 plan_hash=' + _pph +
                     ' compiled_nodes=' + str(_cc) + ' removed_nodes=' + str(_rc) +
                     ' cache_hit=' + str(_ch) +
                     ' compile_ms=' + str(_compile_ms) +
@@ -13996,8 +14041,14 @@ class _ComfyAPIMixin:
                 _wf_cache_key = f"wf_exec:v2:{_cert_identity}"
             # [cert.identity] diagnostic log
             _log_certificate_identity_digest(_cert_identity, _cert_identity_components)
-            # Source-change vs compiled-change detection
-            _exact_source_hash = compute_canonical_source_workflow_hash(source_workflow)
+            # Source-change vs compiled-change detection.
+            # For precompiled reports use the report's source_workflow_hash
+            # (workflow at this point is already compiled).  For locally
+            # compiled plans compute from the saved source_workflow ref.
+            if production_report is not None and production_report.get("source_workflow_hash"):
+                _exact_source_hash = production_report["source_workflow_hash"]
+            else:
+                _exact_source_hash = compute_canonical_source_workflow_hash(source_workflow)
             # Store source hash in identity components for payload storage
             _cert_identity_components["source_workflow"] = _exact_source_hash
             _cwf_hash = _cert_identity_components.get("compiled_workflow", "")
@@ -14756,6 +14807,17 @@ class _ComfyAPIMixin:
         # â”€â”€ Build _production_evidence for hash-integrity audit â”€â”€
         _production_evidence = {}
         if isinstance(production_report, dict) and production_report.get("enabled"):
+            # Stale version guard (defense-in-depth)
+            _cv = production_report.get("compiler_version", 0)
+            _hv = production_report.get("hash_schema_version", 0)
+            if not isinstance(_cv, int) or _cv < 1:
+                raise RuntimeError(
+                    f"Production evidence integrity failure: stale compiler_version={_cv}"
+                )
+            if not isinstance(_hv, int) or _hv < 1:
+                raise RuntimeError(
+                    f"Production evidence integrity failure: stale hash_schema_version={_hv}"
+                )
             # source_workflow_hash: read from the local compiler's pre-compile hash
             # (NOT computed from source_workflow here, which is already compiled when report supplied)
             _src_hash = production_report.get("source_workflow_hash", "")
@@ -14772,8 +14834,11 @@ class _ComfyAPIMixin:
             _production_evidence["compiled_workflow_hash"] = _comp_hash
             _production_evidence["executed_workflow_hash"] = _exec_hash
             _production_evidence["runner_workflow_hash"] = _exec_hash
-            _production_evidence["production_plan_hash"] = production_report.get("topology_hash", "")
+            _production_evidence["production_plan_hash"] = production_report.get("production_plan_hash", "")
             _production_evidence["production_plan_used"] = True
+            _production_evidence["compiler_version"] = _cv
+            _production_evidence["hash_schema_version"] = _hv
+            _production_evidence["production_plan_schema_version"] = production_report.get("production_plan_schema_version", 0)
             _production_evidence["production_output_count"] = len(production_report.get("output_node_ids", []))
             _production_evidence["kept_count"] = production_report.get("compiled_node_count", 0)
             _production_evidence["removed_count"] = production_report.get("removed_node_count", 0)
@@ -14781,6 +14846,20 @@ class _ComfyAPIMixin:
             _production_evidence["output_count"] = len(production_report.get("output_node_ids", []))
             _production_evidence["direct_output_rewritten_count"] = production_report.get("direct_output_rewritten_count", 0)
             _production_evidence["rgthree_comparer_rewritten_count"] = production_report.get("rgthree_comparer_rewritten_count", 0)
+            # Compact runner evidence log with all three identities
+            _runner_wfh = _exec_hash[:16]
+            _runner_pph = _production_evidence.get("production_plan_hash", "")[:16] or "?"
+            _runner_pp_used = "yes" if _production_evidence.get("production_plan_used") else "no"
+            _runner_src = (_src_hash or "")[:16] or "?"
+            _runner_cwf = (_comp_hash or "")[:16] or "?"
+            print(
+                f"[production.evidence] runner_workflow_hash={_runner_wfh} "
+                f"source_workflow_hash={_runner_src} "
+                f"compiled_workflow_hash={_runner_cwf} "
+                f"production_plan_hash={_runner_pph} "
+                f"production_plan_used={_runner_pp_used}",
+                flush=True,
+            )
         if _production_evidence:
             result["_production_evidence"] = _production_evidence
         # Collector consumed the registry — safety cleanup is a no-op after successful pop
@@ -16273,11 +16352,16 @@ class _ComfyAPIMixin:
                 f"direct_warmup_require_cpu_cache_hit={int(_rt_require_cpu_hit)}"
             )
 
-            # GÃ¶Ã‡GÃ¶Ã‡ 1. Load UNET via UNETLoader (if enabled) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
+            # Gö─Gö─ 1+2. Load UNET & CLIP concurrently via 2-worker executor Gö─Gö─
+            # Phase timestamps for overlap telemetry stored from inside workers
+            _phases_unix["direct_unet_start_unix_s"] = 0.0  # set inside _load_unet_fn
+            _phases_unix["direct_clip_start_unix_s"] = 0.0  # set inside _load_clip_fn
             _phases["direct_warmup_load_unet"] = 1.0 if _rt_load_unet else 0.0
+            _phases["direct_warmup_load_clip"] = 1.0 if _rt_load_clip else 0.0
             _phases["direct_warmup_require_cpu_cache_hit"] = 1.0 if _rt_require_cpu_hit else 0.0
-            _s = time.time()
+
             _skip_unet = False
+            _skip_clip = False
             if _rt_require_cpu_hit and _unet_full_path:
                 if not self._model_in_cpu_cache(_unet_full_path):
                     print(f"[comfyapp] direct warmup: UNET {unet_name} not in CPU cache, skipping (REQUIRE_CPU_CACHE_HIT)")
@@ -16285,44 +16369,6 @@ class _ComfyAPIMixin:
                     _phases["direct_unet_cpu_hit"] = 0.0
                 else:
                     _phases["direct_unet_cpu_hit"] = 1.0
-            _unet_loaded = False
-            if _rt_load_unet and unet_name and not _skip_unet:
-                unet_cls = nodes.NODE_CLASS_MAPPINGS.get("UNETLoader")
-                if unet_cls:
-                    unet_loader = unet_cls()
-                    _unet_result = unet_loader.load_unet(unet_name=unet_name, weight_dtype="default")
-                    _unet_loaded = True
-                    _phases["direct_unet_load_ms"] = round((time.time() - _s) * 1000, 1)
-                    # Store in UNET object cache for real prompt reuse
-                    if _unet_result and _unet_result[0] is not None:
-                        self._init_unet_cache()
-                        try:
-                            _unet_cache_path = folder_paths.get_full_path("unet", unet_name) or ""
-                            if _unet_cache_path:
-                                _key = self._unet_cache_key(_unet_cache_path, "default")
-                                self._unet_object_cache[_key] = _unet_result[0]
-                                _phases["direct_unet_cache_key"] = str(_key)
-                                _phases["direct_unet_object_cache_exists"] = 1.0
-                                print(
-                                    f"[comfyapp] direct UNET warmup completed: "
-                                    f"key={_key} "
-                                    f"object_cache_exists=1 "
-                                    f"id={id(_unet_result[0])}"
-                                )
-                        except Exception as exc:
-                            print(f"[comfyapp] direct warmup: UNET cache store failed: {exc}")
-                else:
-                    _phases["direct_unet_load_ms"] = 0.0
-            else:
-                _phases["direct_unet_load_ms"] = 0.0
-
-            # GÃ¶Ã‡GÃ¶Ã‡ 2. Load CLIP via CLIPLoader (if enabled) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
-            _phases["direct_warmup_load_clip"] = 1.0 if _rt_load_clip else 0.0
-            _phases_unix["direct_clip_load_start_unix_s"] = time.time()
-            _s = time.time()
-            clip_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPLoader")
-            clip_out = None
-            _skip_clip = False
             if _rt_require_cpu_hit and _clip_full_path:
                 if not self._model_in_cpu_cache(_clip_full_path):
                     print(f"[comfyapp] direct warmup: CLIP {clip_name} not in CPU cache, skipping (REQUIRE_CPU_CACHE_HIT)")
@@ -16330,26 +16376,181 @@ class _ComfyAPIMixin:
                     _phases["direct_clip_cpu_hit"] = 0.0
                 else:
                     _phases["direct_clip_cpu_hit"] = 1.0
-            if _rt_load_clip and clip_cls and clip_name and not _skip_clip:
-                clip_loader = clip_cls()
-                clip_out = clip_loader.load_clip(clip_name=clip_name, type=clip_type)
-                _phases["direct_clip_load_ms"] = round((time.time() - _s) * 1000, 1)
-                _phases_unix["direct_clip_load_end_unix_s"] = time.time()
-                # Store in CLIP object cache for real prompt reuse
-                if clip_out:
-                    self._init_clip_cache()
-                    try:
-                        if _clip_full_path:
-                            _key = self._clip_cache_key(_clip_full_path, clip_type)
-                            self._clip_object_cache[_key] = clip_out[0]
+
+            _same_file = (
+                _unet_full_path and _clip_full_path and _unet_full_path == _clip_full_path
+            )
+            _load_unet_eligible = bool(_rt_load_unet and unet_name and not _skip_unet)
+            _load_clip_eligible = bool(_rt_load_clip and clip_name and not _skip_clip)
+
+            # NOTE: _unet_result_container/clip_out_container store the unwrapped
+            # return value: UNETLoader.load_unet returns (ModelPatcher,) so
+            # result[0] is the ModelPatcher (NOT unwrapped to .model); CLIPLoader
+            # returns (CLIP,) so result[0] is the CLIP.
+            _unet_result_container = []
+            _clip_out_container = []
+            _exceptions: list[Exception] = []
+            _load_start = time.time()
+            _unet_start = _load_start
+            _unet_end = _load_start
+            _clip_start = _load_start
+            _clip_end = _load_start
+
+            def _load_unet_fn():
+                nonlocal _unet_start, _unet_end
+                cls = nodes.NODE_CLASS_MAPPINGS.get("UNETLoader")
+                if cls is None:
+                    raise RuntimeError("UNETLoader node class not found")
+                inst = cls()
+                _local_start = time.time()
+                _unet_start = _local_start
+                _phases_unix["direct_unet_start_unix_s"] = _local_start
+                result = inst.load_unet(unet_name=unet_name, weight_dtype="default")
+                _local_end = time.time()
+                _unet_end = _local_end
+                _phases_unix["direct_unet_end_unix_s"] = _local_end
+                # Result is (ModelPatcher,) — unwrap tuple to get ModelPatcher
+                if isinstance(result, tuple) and len(result) >= 1:
+                    return result[0]
+                return result
+
+            def _load_clip_fn():
+                nonlocal _clip_start, _clip_end
+                cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPLoader")
+                if cls is None:
+                    raise RuntimeError("CLIPLoader node class not found")
+                inst = cls()
+                _local_start = time.time()
+                _clip_start = _local_start
+                _phases_unix["direct_clip_start_unix_s"] = _local_start
+                result = inst.load_clip(clip_name=clip_name, type=clip_type)
+                _local_end = time.time()
+                _clip_end = _local_end
+                _phases_unix["direct_clip_end_unix_s"] = _local_end
+                # Result is (CLIP,) — unwrap tuple to get CLIP
+                if isinstance(result, tuple) and len(result) >= 1:
+                    return result[0]
+                return result
+
+            if _same_file and _load_unet_eligible and _load_clip_eligible:
+                # Both resolve to the same file — load UNET first, then CLIP
+                # (safe sequential fallback avoids duplicate physical read).
+                if _load_unet_eligible:
+                    _unet_result_container.append(_load_unet_fn())
+                if _load_clip_eligible:
+                    _clip_out_container.append(_load_clip_fn())
+            elif _load_unet_eligible and _load_clip_eligible:
+                # Different files — submit both to a 2-worker executor
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                with ThreadPoolExecutor(max_workers=2) as _pool:
+                    _fut_unet = _pool.submit(_load_unet_fn)
+                    _fut_clip = _pool.submit(_load_clip_fn)
+                    for _fut in as_completed([_fut_unet, _fut_clip]):
+                        try:
+                            _result = _fut.result()
+                            if _fut is _fut_unet:
+                                _unet_result_container.append(_result)
+                            else:
+                                _clip_out_container.append(_result)
+                        except Exception as exc:
+                            _exceptions.append(exc)
+            else:
+                # At most one eligible — run sequentially (no executor needed)
+                if _load_unet_eligible:
+                    _unet_result_container.append(_load_unet_fn())
+                if _load_clip_eligible:
+                    _clip_out_container.append(_load_clip_fn())
+
+            _load_end = time.time()
+            # Per-loader end timestamps are set by the worker functions
+            # (_unet_end / _clip_end).  Do NOT override them here — that
+            # would make UNET's duration include CLIP's duration on the
+            # same-file path.
+            _phases_unix["direct_unet_end_unix_s"] = _unet_end
+            _phases_unix["direct_clip_end_unix_s"] = _clip_end
+            _phases["direct_unet_start_ms"] = round((_unet_start - _load_start) * 1000, 1)
+            _phases["direct_unet_end_ms"] = round((_unet_end - _load_start) * 1000, 1)
+            _phases["direct_clip_start_ms"] = round((_clip_start - _load_start) * 1000, 1)
+            _phases["direct_clip_end_ms"] = round((_clip_end - _load_start) * 1000, 1)
+            _unet_wall_ms = round((_unet_end - _unet_start) * 1000, 1)
+            _clip_wall_ms = round((_clip_end - _clip_start) * 1000, 1)
+            _phases["direct_unet_load_ms"] = _unet_wall_ms
+            _phases["direct_clip_load_ms"] = _clip_wall_ms
+
+            # Join all workers: propagate any exception clearly after both
+            # have finished (never silently continue past a failed load).
+            if _exceptions:
+                _all_exc_msgs = [
+                    f"{type(_e).__name__}: {_e}" for _e in _exceptions
+                ]
+                # Cache whatever results we already have before raising
+                if _unet_result_container and _unet_result_container[0] is not None:
+                    _unet_model = _unet_result_container[0]
+                if _clip_out_container and _clip_out_container[0] is not None:
+                    _clip_model = _clip_out_container[0]
+                raise RuntimeError(
+                    "Direct warmup load(s) failed: " + "; ".join(_all_exc_msgs)
+                )
+
+            # Store UNET result in object cache exactly once.
+            # _unet_result_container[0] is the ModelPatcher (NOT unwrapped .model).
+            _unet_loaded = bool(_unet_result_container)
+            if _unet_result_container and _unet_result_container[0] is not None:
+                _unet_model = _unet_result_container[0]
+                self._init_unet_cache()
+                try:
+                    _unet_cache_path = folder_paths.get_full_path("unet", unet_name) or ""
+                    if _unet_cache_path:
+                        _key = self._unet_cache_key(_unet_cache_path, "default")
+                        if _key not in self._unet_object_cache:
+                            self._unet_object_cache[_key] = _unet_model
+                            _phases["direct_unet_cache_key"] = str(_key)
+                            _phases["direct_unet_object_cache_exists"] = 1.0
+                            print(
+                                f"[comfyapp] direct UNET warmup completed: "
+                                f"key={_key} "
+                                f"object_cache_exists=1 "
+                                f"id={id(_unet_model)}"
+                            )
+                        else:
+                            print(f"[comfyapp] direct UNET warmup: already in cache, key={_key}")
+                except Exception as exc:
+                    print(f"[comfyapp] direct warmup: UNET cache store failed: {exc}")
+
+            # Store CLIP result in object cache exactly once.
+            # _clip_out_container[0] is the CLIP (NOT unwrapped).
+            _clip_loaded = bool(_clip_out_container)
+            if _clip_out_container and _clip_out_container[0] is not None:
+                _clip_model = _clip_out_container[0]
+                self._init_clip_cache()
+                try:
+                    if _clip_full_path:
+                        _key = self._clip_cache_key(_clip_full_path, clip_type)
+                        if _key not in self._clip_object_cache:
+                            self._clip_object_cache[_key] = _clip_model
                             _phases["direct_clip_cached"] = 1.0
                             print(f"[comfyapp] direct warmup: CLIP cached key={_key} "
-                                  f"id={id(clip_out[0])}")
-                    except Exception as exc:
-                        print(f"[comfyapp] direct warmup: CLIP cache store failed: {exc}")
+                                  f"id={id(_clip_model)}")
+                        else:
+                            print(f"[comfyapp] direct warmup: CLIP already in cache, key={_key}")
+                except Exception as exc:
+                    print(f"[comfyapp] direct warmup: CLIP cache store failed: {exc}")
+
+            # Overlap = unet_ms + clip_ms - wall_block_ms (clamped >= 0) for
+            # different-file concurrent loads.  For sequential/same-file overlap is 0.
+            _wall_block_ms = round((_load_end - _load_start) * 1000, 1)
+            if _load_unet_eligible and _load_clip_eligible and not _same_file:
+                _phases["direct_load_overlap_ms"] = round(
+                    max(0.0, _unet_wall_ms + _clip_wall_ms - _wall_block_ms), 1
+                )
             else:
-                _phases["direct_clip_load_ms"] = 0.0
-                _phases_unix["direct_clip_load_end_unix_s"] = _s
+                _phases["direct_load_overlap_ms"] = 0.0
+            # Critical path = max(unet_ms, clip_ms)
+            _phases["direct_load_critical_path_ms"] = round(
+                max(_unet_wall_ms, _clip_wall_ms), 1
+            )
+            # _clip_out_container[0] is the CLIP object (already unwrapped from tuple).
+            clip_out = _clip_out_container[0] if _clip_out_container else None
 
             # P1: signal the production UNET barrier that the CLIP
             # object construction is complete.  This unblocks the
@@ -16393,7 +16594,7 @@ class _ComfyAPIMixin:
                             if _wt:
                                 _exact_req += 1
                                 try:
-                                    encoder.encode(clip=clip_out[0], text=_wt)
+                                    encoder.encode(clip=clip_out, text=_wt)
                                     _exact_ok += 1
                                 except Exception as _wt_exc:
                                     _exact_fail += 1
@@ -16405,7 +16606,7 @@ class _ComfyAPIMixin:
                     enc_cls = nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
                     if enc_cls:
                         encoder = enc_cls()
-                        encoder.encode(clip=clip_out[0], text=_effective_warmup_text)
+                        encoder.encode(clip=clip_out, text=_effective_warmup_text)
             _phases["direct_clip_encode_ms"] = round((time.time() - _s) * 1000, 1)
             _phases_unix["direct_clip_encode_end_unix_s"] = time.time()
             _phases_unix["direct_clip_warmup_end_unix_s"] = time.time()
@@ -18494,11 +18695,24 @@ class _ComfyAPIMixin:
             )
             _prod_enabled = _warmup_profile.get("_production_enabled") if _warmup_profile else None
             if _prod_enabled:
+                _pp_source = _warmup_profile.get("_source_workflow_hash", _warmup_profile.get("source_workflow_hash", ""))
+                _pp_compiled = _warmup_profile.get("_compiled_workflow_hash", _warmup_profile.get("compiled_workflow_hash", ""))
+                _pp_plan = _warmup_profile.get("_production_plan_hash", _warmup_profile.get("production_plan_hash", ""))
+                _pp_outputs = _warmup_profile.get("_output_node_ids", _warmup_profile.get("output_node_ids", []))
+                # Add corresponding __stages fields for restore timing telemetry
+                __stages["_production_source_workflow_hash"] = _pp_source[:16] if _pp_source else ""
+                __stages["_production_compiled_workflow_hash"] = _pp_compiled[:16] if _pp_compiled else ""
+                __stages["_production_plan_hash"] = _pp_plan[:16] if _pp_plan else ""
+                __stages["_production_output_node_ids"] = str(_pp_outputs) if _pp_outputs else ""
                 print(
                     f"[production.profile] enabled=1 "
                     f"profile_version={_warmup_profile.get('_production_profile_version', 0)} "
                     f"profile_token={_warmup_tok} "
-                    f"workflow_hash={_warmup_wf_hash}"
+                    f"workflow_hash={_warmup_wf_hash} "
+                    f"source_workflow_hash={_pp_source[:16] or '-'} "
+                    f"compiled_workflow_hash={_pp_compiled[:16] or '-'} "
+                    f"production_plan_hash={_pp_plan[:16] or '-'} "
+                    f"output_node_ids={_pp_outputs}"
                 )
             else:
                 print(f"[production.profile] enabled=0")
@@ -19254,6 +19468,15 @@ class _ComfyAPIMixin:
                         _v = _dw.get(_k)
                         if _v is not None:
                             __stages[f"warmup_{_k}"] = _v
+                    # Copy all direct timing interval fields from _dw into __stages
+                    for _dw_field in ("direct_unet_start_ms", "direct_unet_end_ms",
+                                      "direct_clip_start_ms", "direct_clip_end_ms",
+                                      "direct_load_overlap_ms", "direct_load_critical_path_ms",
+                                      "direct_unet_load_ms", "direct_clip_load_ms",
+                                      "direct_clip_encode_ms"):
+                        _v = _dw.get(_dw_field)
+                        if _v is not None:
+                            __stages[_dw_field] = _v
                     for _flag in ("direct_warmup_load_unet", "direct_warmup_load_clip",
                                   "direct_warmup_clip_encode", "direct_warmup_require_cpu_cache_hit",
                                   "direct_unet_cpu_hit", "direct_clip_cpu_hit",
@@ -19265,11 +19488,19 @@ class _ComfyAPIMixin:
                         if _v is not None:
                             __stages[_flag] = _v
 
-                    # GÃ¶Ã‡GÃ¶Ã‡ CLIP/UNET overlap telemetry GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
+                    # Copy all _phases_unix direct_*_start/end fields into __stages for
+                    # restore timing telemetry
                     _pu = _dw.get("_phases_unix", {})
+                    if isinstance(_pu, dict):
+                        for _uk, _uv in _pu.items():
+                            if _uk.startswith("direct_") and _uv is not None:
+                                __stages[_uk] = _uv
                     _rbs_unix = __stages.get("restore_background_unet_submit_unix_s")
-                    _clip_load_start = _pu.get("direct_clip_load_start_unix_s")
-                    _clip_load_end = _pu.get("direct_clip_load_end_unix_s")
+                    # Overlap telemetry: use direct_clip_start_unix_s / direct_clip_end_unix_s
+                    # (the correct names emitted by _warmup_direct) with backward fallback
+                    # to the old names that were never emitted.
+                    _clip_load_start = _pu.get("direct_clip_start_unix_s") or _pu.get("direct_clip_load_start_unix_s")
+                    _clip_load_end = _pu.get("direct_clip_end_unix_s") or _pu.get("direct_clip_load_end_unix_s")
                     _clip_encode_start = _pu.get("direct_clip_encode_start_unix_s")
                     _clip_encode_end = _pu.get("direct_clip_encode_end_unix_s")
                     _dw_start = _pu.get("direct_clip_warmup_start_unix_s")
@@ -19543,6 +19774,21 @@ class _ComfyAPIMixin:
         the trace and returns the merged dict in the response under
         the ``"trace"`` key.
         """
+
+        # ── Runner identity / workflow hash logging ──
+        _received_wf_hash = compute_canonical_compiled_workflow_hash(workflow)
+        _report_cwf_hash = (production_report or {}).get("compiled_workflow_hash", "")
+        _report_match = (
+            "yes" if _report_cwf_hash and _received_wf_hash == _report_cwf_hash
+            else "no_report" if not _report_cwf_hash
+            else "mismatch"
+        )
+        print(
+            f"[comfyapp.runner] received_workflow_hash={_received_wf_hash[:16]} "
+            f"production_report_compiled_hash={_report_cwf_hash[:16] if _report_cwf_hash else 'n/a'} "
+            f"match={_report_match}",
+            flush=True,
+        )
 
         # Build a Trace anchored at the earliest known wall-clock time
         # we can find (t0 from the browser).  When no browser t0 is
@@ -20565,6 +20811,21 @@ class _ComfyAPIMixin:
             f"restore_session={_rt_identity.get('restore_session_id', '-')[:12]} "
             f"instance={_rt_identity.get('restored_instance_id', '-')[:12]} "
             f"seq={_container_request_count}",
+            flush=True,
+        )
+
+        # ── Runner identity / workflow hash logging ──
+        _received_wf_hash_stream = compute_canonical_compiled_workflow_hash(workflow)
+        _report_cwf_hash_stream = (production_report or {}).get("compiled_workflow_hash", "")
+        _report_match_stream = (
+            "yes" if _report_cwf_hash_stream and _received_wf_hash_stream == _report_cwf_hash_stream
+            else "no_report" if not _report_cwf_hash_stream
+            else "mismatch"
+        )
+        print(
+            f"[comfyapp.runner] received_workflow_hash={_received_wf_hash_stream[:16]} "
+            f"production_report_compiled_hash={_report_cwf_hash_stream[:16] if _report_cwf_hash_stream else 'n/a'} "
+            f"match={_report_match_stream}",
             flush=True,
         )
 

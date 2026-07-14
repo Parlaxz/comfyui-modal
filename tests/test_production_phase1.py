@@ -389,7 +389,7 @@ class DiagnosticsContractTests(unittest.TestCase):
             "production_output_source": "caller",
             "production_output_ids": ["9"],
             "production_source_hash": report.get("source_workflow_hash", ""),
-            "production_plan_hash": report.get("topology_hash", ""),
+            "production_plan_hash": report.get("production_plan_hash", ""),
             "production_compiled_hash": report.get("compiled_workflow_hash", ""),
             "runner_workflow_hash": report.get("runner_workflow_hash", ""),
             "production_plan_used": True,

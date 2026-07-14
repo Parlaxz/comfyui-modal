@@ -146,6 +146,18 @@ def _build_activation_payload(
             profile["direct_output_sink"] = bool(production_options.get("direct_output_sink", True))
             profile["allow_direct_output_rewrite"] = bool(production_options.get("allow_direct_output_rewrite", True))
             profile["allow_rgthree_comparer_rewrite"] = bool(production_options.get("allow_rgthree_comparer_rewrite", True))
+        # Production identity fields carried on the payload for
+        # the activation/adapter to use in production.profile diagnostics.
+        # Legacy prefixed aliases (backward compat during migration)
+        payload["production_output_ids"] = list(prod_out) if isinstance(prod_out, (list, tuple)) else []
+        payload["production_source_workflow_hash"] = production_options.get("source_workflow_hash", "")
+        payload["production_compiled_workflow_hash"] = production_options.get("compiled_workflow_hash", "")
+        payload["production_plan_hash"] = production_options.get("production_plan_hash", "")
+        # Direct un-prefixed aliases (canonical forward field names)
+        payload["source_workflow_hash"] = production_options.get("source_workflow_hash", "")
+        payload["compiled_workflow_hash"] = production_options.get("compiled_workflow_hash", "")
+        payload["production_plan_hash"] = production_options.get("production_plan_hash", "")
+        payload["output_node_ids"] = list(prod_out) if isinstance(prod_out, (list, tuple)) else []
 
     # Exact prompt bundle extraction
     _exact_or_persistent = (

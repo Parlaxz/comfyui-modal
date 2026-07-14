@@ -1270,10 +1270,11 @@ def build_single_run_spec(
         # enabled=False checked above.  No existence pre-check — let
         # compile_production_workflow's precise ValueError propagate.
         try:
-            compiled, production_report = compile_production_workflow(
+            plan = compile_production_workflow(
                 workflow, production_options, allow_direct_output_rewrite=True
             )
-            production_workflow = compiled
+            production_workflow = plan.compiled_workflow
+            production_report = plan.report
         except Exception:
             raise
 
@@ -1354,7 +1355,7 @@ def build_single_run_spec(
         "production_plan_used": _prod_plan_used,
         "production_output_count": len(_prod_output_ids),
         "production_source_hash": (production_report or {}).get("source_workflow_hash", ""),
-        "production_plan_hash": (production_report or {}).get("topology_hash", ""),
+        "production_plan_hash": (production_report or {}).get("production_plan_hash", ""),
         "production_compiled_hash": (production_report or {}).get("compiled_workflow_hash", ""),
         "runner_workflow_hash": (production_report or {}).get("runner_workflow_hash", ""),
     }
@@ -1755,10 +1756,11 @@ def build_experiment_spec(
             # No existence pre-check — let compile_production_workflow's
             # precise ValueError propagate.
             try:
-                _compiled_wf, _ck_prod_report = compile_production_workflow(
+                _ck_plan = compile_production_workflow(
                     wf, _ck_prod_options, allow_direct_output_rewrite=True
                 )
-                ck["workflow"] = _compiled_wf
+                ck["workflow"] = _ck_plan.compiled_workflow
+                _ck_prod_report = _ck_plan.report
             except Exception:
                 raise
         ck["production_report"] = _ck_prod_report
@@ -1798,7 +1800,7 @@ def build_experiment_spec(
     )
     _first_report = (_first_compiled_ck or {}).get("production_report") or {}
     compilation["production_source_hash"] = _first_report.get("source_workflow_hash", "")
-    compilation["production_plan_hash"] = _first_report.get("topology_hash", "")
+    compilation["production_plan_hash"] = _first_report.get("production_plan_hash", "")
     compilation["production_compiled_hash"] = _first_report.get("compiled_workflow_hash", "")
     compilation["runner_workflow_hash"] = _first_report.get("runner_workflow_hash", "")
     return compilation

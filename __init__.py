@@ -86,6 +86,10 @@ from profiler_trace_v4 import (
 from production_workflow import (
     normalize_production_options,
     compile_production_workflow,
+    ProductionPlan,
+    _canonical_workflow_hash,
+    HASH_SCHEMA_VERSION,
+    COMPILER_SCHEMA_VERSION as PRODUCTION_COMPILER_VERSION,
 )
 import experiment_setup_adapter as _experiment_setup_adapter
 from warmup_profile import prepare_active_next_profile as prepare_active_next_profile
@@ -2220,9 +2224,26 @@ async def _execute_job(item: tuple, item_id: int):
         _active_next_write_start = time.time()
         _modal_options_for_prod = extra_data.get("modal_options", {}) or {}
         _production_options_for_activation = normalize_production_options(_modal_options_for_prod)
+        # Determine which workflow hash to use for the activation profile.
+        # When production is enabled, use the report's source_workflow_hash
+        # as the stable source identity.  Fall back to the dispatch
+        # workflow_hash (prompt_hash) for source-only/disabled requests.
+        _production_active_profile = bool(
+            _production_options_for_activation.get("enabled")
+            and isinstance(production_report, dict)
+            and production_report.get("enabled")
+        )
+        if _production_active_profile:
+            _activation_workflow_hash = production_report.get("source_workflow_hash", prompt_hash)
+            # Enrich production options with identity hashes from the report
+            _production_options_for_activation["source_workflow_hash"] = production_report.get("source_workflow_hash", "")
+            _production_options_for_activation["compiled_workflow_hash"] = production_report.get("compiled_workflow_hash", "")
+            _production_options_for_activation["production_plan_hash"] = production_report.get("production_plan_hash", "")
+        else:
+            _activation_workflow_hash = prompt_hash
         _wn_result = await prepare_active_next_profile(
             execution_workflow,
-            prompt_hash,
+            _activation_workflow_hash,
             production_options=_production_options_for_activation,
             workspace=_request_workspace,
             setter=set_active_warmup_profile,
@@ -2233,13 +2254,23 @@ async def _execute_job(item: tuple, item_id: int):
         _active_next_remote_call = _wn_result.get("remote_call", 0)
         _active_next_profile_key = _wn_result.get("profile_key", "")
         _active_next_elapsed = round((time.time() - _active_next_write_start) * 1000, 1)
-        if _active_next_status not in ("skipped", "unchanged"):
+        _prod_enabled_log = bool(_production_options_for_activation.get("enabled"))
+        _prod_source_log = _production_options_for_activation.get("source_workflow_hash", "")[:8] or "?"
+        _prod_compiled_log = _production_options_for_activation.get("compiled_workflow_hash", "")[:8] or "?"
+        _prod_plan_log = _production_options_for_activation.get("production_plan_hash", "")[:8] or "?"
+        _prod_output_log = sorted(_production_options_for_activation.get("output_node_ids", []))
+        print(
+            f"[comfyui-modal.profile] stage=active_profile_write prompt_id={prompt_id[:8]} "
+            f"decision={_active_next_status} profile_key={_active_next_profile_key} "
+            f"remote_call={_active_next_remote_call} "
+            f"status={_active_next_status} changed={_active_next_changed} "
+            f"bytes={_active_next_payload_bytes} ms={_active_next_elapsed}"
+        )
+        if _prod_enabled_log:
             print(
-                f"[comfyui-modal.profile] stage=active_profile_write prompt_id={prompt_id[:8]} "
-                f"decision={_active_next_status} profile_key={_active_next_profile_key} "
-                f"remote_call={_active_next_remote_call} "
-                f"status={_active_next_status} changed={_active_next_changed} "
-                f"bytes={_active_next_payload_bytes} ms={_active_next_elapsed}"
+                f"[production.profile] prompt_id={prompt_id[:8]} "
+                f"enabled=1 source={_prod_source_log} compiled={_prod_compiled_log} "
+                f"plan={_prod_plan_log} outputs={_prod_output_log}"
             )
 
         remote_started = time.time()
@@ -3321,26 +3352,31 @@ if _server:
                 production_options["enabled"] = True
                 if "schema_version" not in production_options:
                     production_options["schema_version"] = 1
-                # Compute source_workflow_hash BEFORE compilation (authoritative original)
-                _source_workflow_hash = prompt_sha256(workflow)
-                compiled, production_report = compile_production_workflow(
+                # Compile returns a ProductionPlan; named fields are authoritative.
+                # The compatibility ``__iter__`` also works for tuple unpacking.
+                plan = compile_production_workflow(
                     workflow, production_options, allow_direct_output_rewrite=True
                 )
-                production_report["source_workflow_hash"] = _source_workflow_hash
-                execution_workflow = compiled
+                production_report = plan.report
+                execution_workflow = plan.compiled_workflow
                 kept = production_report.get("compiled_node_count", 0)
                 removed = production_report.get("removed_node_count", 0)
                 bypassed = len(production_options.get("bypass_node_ids", []))
                 outputs = len(production_options.get("output_node_ids", []))
+                # Compact boundary identity log
+                _sh_source = plan.source_workflow_hash[:8] if plan.source_workflow_hash else "?"
+                _sh_compiled = plan.compiled_workflow_hash[:8] if plan.compiled_workflow_hash else "?"
+                _sh_plan = plan.production_plan_hash[:8] if plan.production_plan_hash else "?"
                 print(
-                    f"[comfyui-modal] Production plan: kept={kept} removed={removed} "
-                    f"bypassed={bypassed} outputs={outputs}"
+                    f"[comfyui-modal] Production plan: source={_sh_source} "
+                    f"compiled={_sh_compiled} plan={_sh_plan} "
+                    f"kept={kept} removed={removed} bypassed={bypassed} outputs={outputs}"
                 )
             except Exception:
                 print(f"[comfyui-modal] Production compile failed, failing closed")
                 raise
         else:
-            production_report = {"enabled": False}
+            production_report = None  # explicitly disabled → source-only dispatch
 
         # ── Stack extraction (prompt hashing + model stack) ──
         print(f"[predispatch] phase=before_stack_extract t={time.time()}")
@@ -3449,7 +3485,7 @@ if _server:
                     if production_report and production_report.get("enabled") else ""
                 ),
                 "production_plan_hash": (
-                    production_report.get("topology_hash", "")
+                    production_report.get("production_plan_hash", "")
                     if production_report and production_report.get("enabled") else ""
                 ),
                 "production_compiled_hash": (

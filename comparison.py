@@ -152,8 +152,14 @@ def _comparison_dir(comparisons_root: str, comparison_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _workflow_sha256(workflow: dict) -> str:
-    normalized = json.dumps(workflow, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    """Canonical workflow identity hash.
+
+    This is a workflow *identity* function, not a byte-level hash.
+    Delegates to ``production_workflow._canonical_workflow_hash`` so there
+    is one canonical implementation across the project.
+    """
+    from production_workflow import _canonical_workflow_hash
+    return _canonical_workflow_hash(workflow)
 
 
 # ---------------------------------------------------------------------------
