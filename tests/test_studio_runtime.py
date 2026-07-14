@@ -358,7 +358,10 @@ class StudioRunAdapterCompilationTests(unittest.TestCase):
             }
             preset = _make_runnable_preset()
             _make_studio_store_files(tmp, [snap], [preset])
-            spec = self.mod.build_single_run_spec(preset, snap, "txt2img", {"seed": 7}, tmp)
+            spec = self.mod.build_single_run_spec(
+                preset, snap, "txt2img", {"seed": 7}, tmp,
+                modal_options={"production": {"enabled": False}},
+            )
             self.assertNotIn("error", spec)
             self.assertEqual(
                 spec["checkpoints"][0]["workflow"]["3"]["inputs"]["seed"],
@@ -384,7 +387,8 @@ class StudioRunAdapterCompilationTests(unittest.TestCase):
             preset = _make_runnable_preset()
             _make_studio_store_files(tmp, [snap], [preset])
             spec = self.mod.build_single_run_spec(
-                preset, snap, "txt2img", {"prompt": "new prompt"}, tmp
+                preset, snap, "txt2img", {"prompt": "new prompt"}, tmp,
+                modal_options={"production": {"enabled": False}},
             )
             self.assertNotIn("error", spec)
             self.assertEqual(
@@ -418,7 +422,8 @@ class StudioRunAdapterCompilationTests(unittest.TestCase):
             preset = _make_runnable_preset()
             _make_studio_store_files(tmp, [snap], [preset])
             spec = self.mod.build_single_run_spec(
-                preset, snap, "txt2img", {"prompt": "new prompt"}, tmp
+                preset, snap, "txt2img", {"prompt": "new prompt"}, tmp,
+                modal_options={"production": {"enabled": False}},
             )
             self.assertNotIn("error", spec)
             self.assertEqual(
@@ -452,7 +457,8 @@ class StudioRunAdapterCompilationTests(unittest.TestCase):
             preset = _make_runnable_preset()
             _make_studio_store_files(tmp, [snap], [preset])
             spec = self.mod.build_single_run_spec(
-                preset, snap, "txt2img", {"prompt": "new prompt"}, tmp
+                preset, snap, "txt2img", {"prompt": "new prompt"}, tmp,
+                modal_options={"production": {"enabled": False}},
             )
             self.assertNotIn("error", spec)
             self.assertEqual(
@@ -508,7 +514,8 @@ class StudioRunAdapterExperimentTests(unittest.TestCase):
             _make_studio_store_files(tmp, [snap], [preset])
             exp_def = {"prompts": [{"id": "p1", "text": "test", "enabled": True}]}
             spec = self.mod.build_experiment_spec(
-                [(preset, snap)], "txt2img", exp_def, tmp
+                [(preset, snap)], "txt2img", exp_def, tmp,
+                modal_options={"production": {"enabled": False}},
             )
             for ck in spec.get("checkpoints", []):
                 self.assertIn("workflow", ck)
@@ -528,7 +535,8 @@ class StudioRunAdapterExperimentTests(unittest.TestCase):
             _make_studio_store_files(tmp, [snap], [preset])
             exp_def = {"prompts": [{"id": "p1", "text": "test", "enabled": True}]}
             spec = self.mod.build_experiment_spec(
-                [(preset, snap)], "txt2img", exp_def, tmp
+                [(preset, snap)], "txt2img", exp_def, tmp,
+                modal_options={"production": {"enabled": False}},
             )
             self.assertNotIn("error", spec)
             for ck in spec.get("checkpoints", []):
@@ -4811,6 +4819,7 @@ class EffectiveOverridePayloadRED(unittest.TestCase):
             controls = {"prompt": "a cat", "steps": 20}
             spec = self.adapter_mod.build_single_run_spec(
                 preset, snapshot, "txt2img", controls, tmp,
+                modal_options={"production": {"enabled": False}},
             )
 
             # 1. Steps must be 20 in the workflow (overridden)
@@ -4863,6 +4872,7 @@ class EffectiveOverridePayloadRED(unittest.TestCase):
             controls = {"prompt": "a cat", "steps": 20}
             spec = self.adapter_mod.build_single_run_spec(
                 preset, snapshot, "txt2img", controls, tmp,
+                modal_options={"production": {"enabled": False}},
             )
 
             cell = spec["cells"][0]
@@ -4901,6 +4911,7 @@ class EffectiveOverridePayloadRED(unittest.TestCase):
             controls = {"prompt": "just a prompt, no edits"}
             spec = self.adapter_mod.build_single_run_spec(
                 preset, snapshot, "txt2img", controls, tmp,
+                modal_options={"production": {"enabled": False}},
             )
 
             ck = spec["checkpoints"][0]

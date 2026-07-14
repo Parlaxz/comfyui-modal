@@ -9,7 +9,11 @@ Covers:
 - Truthful diagnostics with required keys (F)
 """
 
+import copy
+import importlib.util
+import sys
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock, patch
 import json
 
@@ -501,6 +505,316 @@ class ProductionIntegrationTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             compile_production_workflow(WORKFLOW, prod, allow_direct_output_rewrite=True)
         self.assertIn("999", str(ctx.exception))
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# H. Phase 1 correction: modal_options=None compiles, explicit false skips
+# ══════════════════════════════════════════════════════════════════════════
+
+class Phase1CorrectionTests(unittest.TestCase):
+    """modal_options=None compiles production from preset bindings; explicit false skips."""
+
+    _REPO_ROOT = Path(__file__).resolve().parents[1]
+
+    @classmethod
+    def setUpClass(cls):
+        _reset_cache()
+        # Load studio_run_adapter module (same pattern as test_studio_runtime)
+        _mod_path = cls._REPO_ROOT / "studio_run_adapter.py"
+        _spec = importlib.util.spec_from_file_location("studio_run_adapter", str(_mod_path))
+        assert _spec is not None, "Could not find studio_run_adapter.py"
+        assert _spec.loader is not None
+        _mod = importlib.util.module_from_spec(_spec)
+        sys.modules[_spec.name] = _mod
+        _spec.loader.exec_module(_mod)
+        cls.adapter = _mod
+
+    def setUp(self):
+        _reset_cache()
+
+    @staticmethod
+    def _make_snapshot(output_node_id: str = "11",
+                       snapshot_id: str = "snap_h") -> dict:
+        """Minimal runnable snapshot with a single output node."""
+        return {
+            "id": snapshot_id,
+            "name": "Phase1H Snapshot",
+            "compatibleFeatures": ["txt2img"],
+            "apiPromptJson": copy.deepcopy(WORKFLOW),
+            "nodeBindings": {},
+            "outputNodeId": output_node_id,
+            "graphJson": {"nodes": [], "links": []},
+            "archived": False,
+            "status": "runnable",
+            "featureStatus": {
+                "txt2img": {"status": "runnable", "reason": ""},
+            },
+            "disabledReason": "",
+        }
+
+    @staticmethod
+    def _make_preset(preset_id: str = "preset_h",
+                     snapshot_id: str = "snap_h") -> dict:
+        return {
+            "id": preset_id,
+            "label": "Phase1H Preset",
+            "snapshotId": snapshot_id,
+            "compatibleFeatures": ["txt2img"],
+            "defaults": {},
+            "sourceType": "snapshot",
+            "sourceId": "",
+            "archived": False,
+            "status": "runnable",
+            "disabledReason": "",
+        }
+
+    # ── Single-run tests ───────────────────────────────────────────────
+
+    def test_single_run_none_compiles_production(self):
+        """build_single_run_spec(modal_options=None) compiles from preset outputNodeId."""
+        snap = self._make_snapshot(output_node_id="11")
+        preset = self._make_preset()
+        spec = self.adapter.build_single_run_spec(
+            preset, snap, "txt2img", {"prompt": "hello"}, "/tmp",
+            modal_options=None,
+        )
+        self.assertNotIn("error", spec,
+                         "modal_options=None should not produce an error")
+        ck = spec["checkpoints"][0]
+        self.assertIsNotNone(ck.get("production_report"),
+                             "production_report must be present after compile")
+        self.assertTrue(ck["production_report"]["enabled"],
+                        "production must be enabled")
+        self.assertIn("11", ck["production_report"]["output_node_ids"],
+                      "output_node_ids must contain the derived output node")
+        # Output node should be rewritten to ComfyModalProductionOutput
+        self.assertEqual(
+            ck["workflow"]["11"]["class_type"],
+            "ComfyModalProductionOutput",
+            "SaveImage output node must be rewritten",
+        )
+        # Top-level diagnostics
+        self.assertFalse(spec.get("production_explicitly_disabled"))
+        self.assertEqual(spec.get("production_output_source"), "preset_binding")
+        # Hash diagnostics from compiler report
+        self.assertIn("production_source_hash", spec)
+        self.assertIn("production_compiled_hash", spec)
+        self.assertIn("runner_workflow_hash", spec)
+        self.assertTrue(spec.get("production_plan_used"))
+
+    def test_single_run_none_no_output_binding_errors(self):
+        """build_single_run_spec(modal_options=None) without binding returns precise error."""
+        snap = self._make_snapshot(output_node_id="")
+        snap["nodeBindings"] = {}
+        preset = self._make_preset()
+        spec = self.adapter.build_single_run_spec(
+            preset, snap, "txt2img", {"prompt": "hello"}, "/tmp",
+            modal_options=None,
+        )
+        self.assertIn("error", spec)
+        msg = spec["error"]
+        self.assertIn("no output node id could be derived", msg.lower())
+        self.assertIn("outputnodeid", msg.lower())
+        self.assertIn("output binding", msg.lower())
+
+    def test_single_run_explicit_false_skips_production(self):
+        """build_single_run_spec(modal_options={"production": {"enabled": False}}) skips."""
+        snap = self._make_snapshot(output_node_id="11")
+        preset = self._make_preset()
+        spec = self.adapter.build_single_run_spec(
+            preset, snap, "txt2img", {"prompt": "hello"}, "/tmp",
+            modal_options={"production": {"enabled": False}},
+        )
+        self.assertNotIn("error", spec)
+        ck = spec["checkpoints"][0]
+        # No production report when explicitly disabled
+        self.assertIsNone(ck.get("production_report"),
+                          "production_report must be None when explicitly disabled")
+        # Workflow should NOT be compiled (original class_type preserved)
+        self.assertEqual(
+            ck["workflow"]["11"]["class_type"],
+            "SaveImage",
+            "Output node must retain original class_type when production is disabled",
+        )
+        self.assertTrue(spec.get("production_explicitly_disabled"),
+                        "production_explicitly_disabled must be True")
+        self.assertFalse(spec.get("production_plan_used"),
+                         "production_plan_used must be False")
+
+    def test_single_run_explicit_true_still_compiles(self):
+        """build_single_run_spec with explicit production.enabled=True compiles."""
+        snap = self._make_snapshot(output_node_id="11")
+        preset = self._make_preset()
+        spec = self.adapter.build_single_run_spec(
+            preset, snap, "txt2img", {"prompt": "hello"}, "/tmp",
+            modal_options={"production": {"enabled": True, "schema_version": 1}},
+        )
+        self.assertNotIn("error", spec)
+        ck = spec["checkpoints"][0]
+        self.assertIsNotNone(ck.get("production_report"))
+        self.assertTrue(ck["production_report"]["enabled"])
+        self.assertIn("11", ck["production_report"]["output_node_ids"])
+        # Output rewritten
+        self.assertEqual(
+            ck["workflow"]["11"]["class_type"],
+            "ComfyModalProductionOutput",
+        )
+
+    def test_single_run_none_with_output_binding_in_nodebindings(self):
+        """Derives output from nodeBindings[output].kind==output when outputNodeId absent."""
+        snap = self._make_snapshot(output_node_id="")
+        snap["nodeBindings"] = {
+            "output": {"kind": "output", "nodeId": "11"},
+        }
+        preset = self._make_preset()
+        spec = self.adapter.build_single_run_spec(
+            preset, snap, "txt2img", {"prompt": "hello"}, "/tmp",
+            modal_options=None,
+        )
+        self.assertNotIn("error", spec)
+        ck = spec["checkpoints"][0]
+        self.assertIsNotNone(ck.get("production_report"))
+        self.assertEqual(
+            spec.get("production_output_source"), "preset_binding",
+        )
+
+    def test_single_run_absent_output_node_id_fails_closed(self):
+        """build_single_run_spec raises ValueError when outputNodeId not in workflow
+        (Phase 1 hardening: no silent skip, precise missing-node error propagates)."""
+        snap = self._make_snapshot(output_node_id="999")  # 999 does not exist in WORKFLOW
+        preset = self._make_preset()
+        with self.assertRaises(ValueError) as ctx:
+            self.adapter.build_single_run_spec(
+                preset, snap, "txt2img", {"prompt": "hello"}, "/tmp",
+                modal_options=None,
+            )
+        self.assertIn("999", str(ctx.exception),
+                      "ValueError must reference the missing output node ID")
+
+    # ── Experiment tests ───────────────────────────────────────────────
+
+    def test_experiment_none_compiles_production(self):
+        """build_experiment_spec(modal_options=None) compiles from preset outputNodeId."""
+        snap = self._make_snapshot(output_node_id="11")
+        preset = self._make_preset()
+        exp_def = {
+            "prompts": [{"id": "p1", "text": "a cat", "enabled": True}],
+            "axes": {},
+        }
+        spec = self.adapter.build_experiment_spec(
+            [(preset, snap)], "txt2img", exp_def, "/tmp",
+            modal_options=None,
+        )
+        self.assertNotIn("error", spec)
+        ck = spec["checkpoints"][0]
+        self.assertIsNotNone(ck.get("production_report"),
+                             "checkpoint must have production_report")
+        self.assertTrue(ck["production_report"]["enabled"])
+        self.assertIn("11", ck["production_report"]["output_node_ids"])
+        # Output node rewritten
+        self.assertEqual(
+            ck["workflow"]["11"]["class_type"],
+            "ComfyModalProductionOutput",
+        )
+        # Cell should carry the same report
+        cell = spec["cells"][0]
+        self.assertIsNotNone(cell.get("production_report"),
+                             "cell must carry production_report from its checkpoint")
+        self.assertEqual(
+            cell["production_report"]["output_node_ids"],
+            ["11"],
+        )
+
+    def test_experiment_none_no_output_binding_errors(self):
+        """build_experiment_spec(modal_options=None) without binding fails closed."""
+        snap = self._make_snapshot(output_node_id="")
+        snap["nodeBindings"] = {}
+        preset = self._make_preset()
+        exp_def = {
+            "prompts": [{"id": "p1", "text": "a cat", "enabled": True}],
+            "axes": {},
+        }
+        spec = self.adapter.build_experiment_spec(
+            [(preset, snap)], "txt2img", exp_def, "/tmp",
+            modal_options=None,
+        )
+        self.assertIn("error", spec)
+        msg = spec["error"]
+        self.assertIn("no output node id could be derived", msg.lower())
+
+    def test_experiment_explicit_false_skips_production(self):
+        """build_experiment_spec with explicit enabled=False skips compile."""
+        snap = self._make_snapshot(output_node_id="11")
+        preset = self._make_preset()
+        exp_def = {
+            "prompts": [{"id": "p1", "text": "a cat", "enabled": True}],
+            "axes": {},
+        }
+        spec = self.adapter.build_experiment_spec(
+            [(preset, snap)], "txt2img", exp_def, "/tmp",
+            modal_options={"production": {"enabled": False}},
+        )
+        self.assertNotIn("error", spec)
+        ck = spec["checkpoints"][0]
+        self.assertIsNone(ck.get("production_report"),
+                          "No production_report when explicitly disabled")
+        # Original class_type preserved
+        self.assertEqual(
+            ck["workflow"]["11"]["class_type"],
+            "SaveImage",
+        )
+        self.assertTrue(spec.get("production_explicitly_disabled"))
+
+    def test_experiment_source_hash_preserved(self):
+        """source_workflow_hash from the compiler report is not overwritten with empty."""
+        snap = self._make_snapshot(output_node_id="11")
+        preset = self._make_preset()
+        exp_def = {
+            "prompts": [{"id": "p1", "text": "a cat", "enabled": True}],
+            "axes": {},
+        }
+        spec = self.adapter.build_experiment_spec(
+            [(preset, snap)], "txt2img", exp_def, "/tmp",
+            modal_options=None,
+        )
+        self.assertNotIn("error", spec)
+        ck = spec["checkpoints"][0]
+        report = ck.get("production_report") or {}
+        src_hash = report.get("source_workflow_hash", "")
+        self.assertTrue(len(src_hash) > 0,
+                        "source_workflow_hash must not be empty")
+        self.assertEqual(len(src_hash), 64,
+                         "source_workflow_hash must be a valid 64-char SHA-256")
+        # compiled and runner hashes must also be present
+        self.assertIn("compiled_workflow_hash", report)
+        self.assertIn("runner_workflow_hash", report)
+        self.assertEqual(report["compiled_workflow_hash"],
+                         report["runner_workflow_hash"])
+
+    def test_single_run_source_hash_preserved(self):
+        """source_workflow_hash from compiler report is not overwritten with empty (single)."""
+        snap = self._make_snapshot(output_node_id="11")
+        preset = self._make_preset()
+        spec = self.adapter.build_single_run_spec(
+            preset, snap, "txt2img", {"prompt": "hello"}, "/tmp",
+            modal_options=None,
+        )
+        self.assertNotIn("error", spec)
+        ck = spec["checkpoints"][0]
+        report = ck.get("production_report") or {}
+        src_hash = report.get("source_workflow_hash", "")
+        self.assertTrue(len(src_hash) > 0,
+                        "source_workflow_hash must not be empty")
+        self.assertEqual(len(src_hash), 64)
+        self.assertIn("compiled_workflow_hash", report)
+        self.assertIn("runner_workflow_hash", report)
+        # Top-level diagnostics match report
+        self.assertEqual(spec.get("production_source_hash"), src_hash)
+        self.assertEqual(spec.get("production_compiled_hash"),
+                         report.get("compiled_workflow_hash"))
+        self.assertEqual(spec.get("runner_workflow_hash"),
+                         report.get("runner_workflow_hash"))
 
 
 if __name__ == "__main__":
