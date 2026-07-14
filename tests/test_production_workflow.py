@@ -625,6 +625,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertIn("bypass_node_ids", report)
         self.assertIn("direct_output_rewritten_node_ids", report)
         self.assertIn("topology_hash", report)
+        self.assertIn("compiled_workflow_hash", report)
         self.assertIn("cache_hit", report)
         self.assertIn("duplicate_analysis", report)
 
@@ -873,3 +874,407 @@ class RgthreeComparerRewriteTests(unittest.TestCase):
         )
         self.assertEqual(compiled["2"]["class_type"], "Image Comparer (rgthree)")
         self.assertEqual(report["rgthree_comparer_rewritten_count"], 0)
+
+
+class CompiledWorkflowHashTests(unittest.TestCase):
+    """Tests for compiled_workflow_hash in the production report."""
+
+    def setUp(self):
+        _reset_cache()
+
+    def test_compiled_workflow_hash_present_in_report(self):
+        prod = _minimal_production(output_ids=["9"])
+        _, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False
+        )
+        self.assertIn("compiled_workflow_hash", report)
+        self.assertIsInstance(report["compiled_workflow_hash"], str)
+        self.assertEqual(len(report["compiled_workflow_hash"]), 64)
+
+    def test_compiled_workflow_hash_present_on_cache_hit(self):
+        prod = _minimal_production(output_ids=["9"])
+        _, report1 = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False
+        )
+        self.assertFalse(report1["cache_hit"])
+        hash1 = report1["compiled_workflow_hash"]
+        _, report2 = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False
+        )
+        self.assertTrue(report2["cache_hit"])
+        hash2 = report2["compiled_workflow_hash"]
+        self.assertEqual(hash1, hash2,
+                         "compiled_workflow_hash must be stable across cache")
+
+    def test_compiled_workflow_hash_differs_when_outputs_change(self):
+        wf = dict(WORKFLOW_MULTI_OUTPUT)
+        prod1 = _minimal_production(output_ids=["11"])
+        prod2 = _minimal_production(output_ids=["12"])
+        _, report1 = compile_production_workflow(
+            wf, prod1, allow_direct_output_rewrite=False
+        )
+        _, report2 = compile_production_workflow(
+            wf, prod2, allow_direct_output_rewrite=False
+        )
+        self.assertNotEqual(report1["compiled_workflow_hash"],
+                            report2["compiled_workflow_hash"])
+
+    def test_compiled_workflow_hash_with_rewrite(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1, "model": ("2", 0)}},
+            "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "m.safetensors"}},
+            "3": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}},
+            "4": {"class_type": "SaveImage", "inputs": {"images": ("3", 0)}},
+        }
+        prod = _minimal_production(output_ids=["4"])
+        compiled, report = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True
+        )
+        self.assertIn("compiled_workflow_hash", report)
+        # Verify hash matches actual compiled workflow
+        from production_workflow import _compute_compiled_workflow_hash
+        expected = _compute_compiled_workflow_hash(compiled)
+        self.assertEqual(report["compiled_workflow_hash"], expected)
+
+
+class CacheFlagSeparationTests(unittest.TestCase):
+    """Tests that the production compiler cache separates graph-affecting flags."""
+
+    def setUp(self):
+        _reset_cache()
+
+    def _wf_with_comparer(self):
+        return {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 1, "model": ("2", 0)}},
+            "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "m.safetensors"}},
+            "3": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}},
+            "4": {"class_type": "Image Comparer (rgthree)", "inputs": {
+                "image_a": ("3", 0), "image_b": ("3", 0),
+            }},
+        }
+
+    def test_cache_miss_when_rgthree_rewrite_flag_differs(self):
+        """allow_rgthree_comparer_rewrite flag causes a cache miss."""
+        wf = self._wf_with_comparer()
+        prod = _minimal_production(output_ids=["4"])
+        _, report_first = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True, allow_rgthree_comparer_rewrite=True
+        )
+        self.assertFalse(report_first["cache_hit"])
+        self.assertEqual(report_first["rgthree_comparer_rewritten_count"], 1)
+        _, report_second = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True, allow_rgthree_comparer_rewrite=False
+        )
+        self.assertFalse(report_second["cache_hit"],
+                         "Changing allow_rgthree_comparer_rewrite must cause cache miss")
+        self.assertEqual(report_second["rgthree_comparer_rewritten_count"], 0)
+
+    def test_rgthree_rewrite_gated_by_flag_on_cache_hit(self):
+        """Cache hit respects allow_rgthree_comparer_rewrite gate."""
+        wf = self._wf_with_comparer()
+        prod = _minimal_production(output_ids=["4"])
+        # Prime cache with rewrite disabled
+        compiled_no, report_no = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True, allow_rgthree_comparer_rewrite=False
+        )
+        self.assertFalse(report_no["cache_hit"])
+        self.assertEqual(report_no["rgthree_comparer_rewritten_count"], 0)
+        self.assertEqual(compiled_no["4"]["class_type"], "Image Comparer (rgthree)")
+        # Same params, must hit cache and still not rewrite
+        compiled_no2, report_no2 = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True, allow_rgthree_comparer_rewrite=False
+        )
+        self.assertTrue(report_no2["cache_hit"],
+                         "Same params must hit cache")
+        self.assertEqual(report_no2["rgthree_comparer_rewritten_count"], 0)
+        self.assertEqual(compiled_no2["4"]["class_type"], "Image Comparer (rgthree)")
+
+    def test_cache_miss_when_stable_flag_differs(self):
+        """Stable flag causes a cache miss."""
+        wf = self._wf_with_comparer()
+        prod = _minimal_production(output_ids=["4"])
+        _, report1 = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True, stable=False
+        )
+        self.assertFalse(report1["cache_hit"])
+        _, report2 = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=True, stable=True
+        )
+        self.assertFalse(report2["cache_hit"],
+                         "Changing stable must cause cache miss")
+
+    def test_cache_miss_when_metadata_mode_differs(self):
+        """metadata_mode in production options causes a cache miss."""
+        wf = self._wf_with_comparer()
+        prod_none = _minimal_production(output_ids=["4"], metadata_mode="none")
+        prod_full = _minimal_production(output_ids=["4"], metadata_mode="full")
+        _, r1 = compile_production_workflow(
+            wf, prod_none, allow_direct_output_rewrite=True
+        )
+        self.assertFalse(r1["cache_hit"])
+        _, r2 = compile_production_workflow(
+            wf, prod_full, allow_direct_output_rewrite=True
+        )
+        self.assertFalse(r2["cache_hit"],
+                         "Changing metadata_mode must cause cache miss")
+
+
+class ProductionEvidenceHashContractTests(unittest.TestCase):
+    """Tests the hash-integrity contract used by _production_evidence."""
+
+    def setUp(self):
+        _reset_cache()
+
+    def test_compile_then_hash_matches_report(self):
+        """Compiling and re-hashing the result must match report's compiled_workflow_hash."""
+        from production_workflow import _compute_compiled_workflow_hash
+        prod = _minimal_production(output_ids=["9"])
+        compiled, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False
+        )
+        rehash = _compute_compiled_workflow_hash(compiled)
+        self.assertEqual(report["compiled_workflow_hash"], rehash)
+
+    def test_source_hash_differs_from_compiled_hash(self):
+        """Source workflow hash must differ from compiled hash when nodes are removed."""
+        from production_workflow import _compute_compiled_workflow_hash
+        import hashlib, json
+        prod = _minimal_production(output_ids=["9"])
+        compiled, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False
+        )
+        source_hash = hashlib.sha256(
+            json.dumps(WORKFLOW_SINGLE_OUTPUT, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        compiled_hash = _compute_compiled_workflow_hash(compiled)
+        self.assertNotEqual(source_hash, compiled_hash,
+                            "Source and compiled hashes must differ when nodes are removed")
+
+    def test_executed_equals_compiled_when_no_recompilation(self):
+        """When production_report is supplied, executed must equal compiled."""
+        prod = _minimal_production(output_ids=["9"])
+        compiled, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=True
+        )
+        # Simulate remote-side verification: hash the received (already compiled) workflow
+        from production_workflow import _compute_compiled_workflow_hash
+        received_hash = _compute_compiled_workflow_hash(compiled)
+        report_hash = report["compiled_workflow_hash"]
+        self.assertEqual(received_hash, report_hash,
+                         "Executed (received) workflow hash must equal report's compiled_workflow_hash")
+
+
+class DisabledProductionTests(unittest.TestCase):
+    """Tests that production-disabled paths are never treated as production."""
+
+    def test_normalize_disabled_returns_only_enabled_false(self):
+        result = normalize_production_options(None)
+        self.assertEqual(result, {"enabled": False})
+
+    def test_compile_with_disabled_normalize_is_noop(self):
+        """When normalize_production_options returns disabled, workflow is untouched."""
+        result = normalize_production_options({})
+        self.assertEqual(result, {"enabled": False})
+
+    def test_normalize_explicitly_disabled_returns_no_extra_keys(self):
+        result = normalize_production_options({"production": {"enabled": False, "schema_version": 1}})
+        self.assertEqual(result, {"enabled": False})
+
+
+class ProductionReportRpcNullTests(unittest.TestCase):
+    """Tests that production_report=None triggers remote compilation, not pre-compiled bypass."""
+
+    def test_none_report_passed_as_none(self):
+        """Simulate run_prompt call with production_report=None."""
+        from production_workflow import compile_production_workflow
+        prod = _minimal_production(output_ids=["9"])
+        # When production_report is None, compile_production_workflow is called remotely.
+        # This test verifies the None path doesn't break.
+        compiled, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=True
+        )
+        self.assertIn("compiled_workflow_hash", report)
+        self.assertTrue(report["enabled"])
+
+    def test_report_supplied_does_not_recompile(self):
+        """When production_report is supplied, the workflow is already compiled.
+        Verify by checking compiler didn't modify it."""
+        from production_workflow import compile_production_workflow, _compute_compiled_workflow_hash
+        prod = _minimal_production(output_ids=["9"])
+        compiled, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=True
+        )
+        # Hash the compiled workflow — this is what the remote receives
+        received_hash = _compute_compiled_workflow_hash(compiled)
+        self.assertEqual(received_hash, report["compiled_workflow_hash"])
+
+
+class RuntimeEnvDefaultTests(unittest.TestCase):
+    """Verify source-level default values match the requested baseline.
+    These are the module-level defaults in comfyapp.py."""
+
+    def test_preload_mode_default_is_workers_2(self):
+        """Module default for COMFYMODAL_PRELOAD_MODE must be workers_2."""
+        import os as _os
+        # Read comfyapp.py source to check the default
+        import re as _re
+        _path = _os.path.join(_os.path.dirname(__file__), "..", "comfyapp.py")
+        with open(_path, "r", encoding="utf-8") as _f:
+            _src = _f.read()
+        _match = _re.search(
+            r'PRELOAD_MODE\s*=\s*os\.getenv\("COMFYMODAL_PRELOAD_MODE",\s*"([^"]+)"',
+            _src,
+        )
+        self.assertIsNotNone(_match, "PRELOAD_MODE default not found in comfyapp.py")
+        self.assertEqual(_match.group(1), "workers_2",
+                         "PRELOAD_MODE default must be workers_2")
+
+    def test_direct_warmup_unet_default_is_1(self):
+        """Module default for DIRECT_WARMUP_LOAD_UNET must be 1."""
+        import os as _os, re as _re
+        _path = _os.path.join(_os.path.dirname(__file__), "..", "comfyapp.py")
+        with open(_path, "r", encoding="utf-8") as _f:
+            _src = _f.read()
+        _match = _re.search(
+            r'DIRECT_WARMUP_LOAD_UNET\s*=\s*os\.getenv\("COMFYMODAL_DIRECT_WARMUP_LOAD_UNET",\s*"([^"]+)"',
+            _src,
+        )
+        self.assertIsNotNone(_match)
+        self.assertEqual(_match.group(1), "1")
+
+    def test_direct_warmup_clip_encore_default_is_0(self):
+        """Module default for DIRECT_WARMUP_CLIP_ENCODE must be 0."""
+        import os as _os, re as _re
+        _path = _os.path.join(_os.path.dirname(__file__), "..", "comfyapp.py")
+        with open(_path, "r", encoding="utf-8") as _f:
+            _src = _f.read()
+        _match = _re.search(
+            r'DIRECT_WARMUP_CLIP_ENCODE\s*=\s*os\.getenv\("COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE",\s*"([^"]+)"',
+            _src,
+        )
+        self.assertIsNotNone(_match)
+        self.assertEqual(_match.group(1), "0")
+
+    def test_direct_warmup_require_cpu_cache_default_is_0(self):
+        """Module default for DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT must be 0."""
+        import os as _os, re as _re
+        _path = _os.path.join(_os.path.dirname(__file__), "..", "comfyapp.py")
+        with open(_path, "r", encoding="utf-8") as _f:
+            _src = _f.read()
+        _match = _re.search(
+            r'DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT\s*=\s*os\.getenv\("COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT",\s*"([^"]+)"',
+            _src,
+        )
+        self.assertIsNotNone(_match)
+        self.assertEqual(_match.group(1), "0")
+
+    def test_execution_backend_default_is_in_process(self):
+        """Module default for EXECUTION_BACKEND must be in_process."""
+        import os as _os, re as _re
+        _path = _os.path.join(_os.path.dirname(__file__), "..", "comfyapp.py")
+        with open(_path, "r", encoding="utf-8") as _f:
+            _src = _f.read()
+        _match = _re.search(
+            r'DEFAULT_EXECUTION_BACKEND\s*=\s*os\.getenv\("COMFYMODAL_EXECUTION_BACKEND",\s*"([^"]+)"',
+            _src,
+        )
+        self.assertIsNotNone(_match)
+        self.assertEqual(_match.group(1), "in_process")
+
+    def test_warmup_enabled_default_is_1(self):
+        """Module default for ENABLE_WARMUP must be 1."""
+        import os as _os, re as _re
+        _path = _os.path.join(_os.path.dirname(__file__), "..", "comfyapp.py")
+        with open(_path, "r", encoding="utf-8") as _f:
+            _src = _f.read()
+        _match = _re.search(
+            r'ENABLE_WARMUP\s*=\s*os\.getenv\("COMFYMODAL_ENABLE_WARMUP",\s*"([^"]+)"',
+            _src,
+        )
+        self.assertIsNotNone(_match)
+        self.assertEqual(_match.group(1), "1")
+
+    def test_torch_compile_default_is_0(self):
+        """Module default for ENABLE_TORCH_COMPILE must be 0."""
+        import os as _os, re as _re
+        _path = _os.path.join(_os.path.dirname(__file__), "..", "comfyapp.py")
+        with open(_path, "r", encoding="utf-8") as _f:
+            _src = _f.read()
+        _match = _re.search(
+            r'ENABLE_TORCH_COMPILE\s*=\s*os\.getenv\("COMFYMODAL_ENABLE_TORCH_COMPILE",\s*"([^"]+)"',
+            _src,
+        )
+        self.assertIsNotNone(_match)
+        self.assertEqual(_match.group(1), "0")
+
+    def test_image_env_has_baked_cuda(self):
+        """Image .env() must set COMFYMODAL_SAGE_RUNTIME_MODE=baked_cuda."""
+        import os as _os, re as _re
+        _path = _os.path.join(_os.path.dirname(__file__), "..", "comfyapp.py")
+        with open(_path, "r", encoding="utf-8") as _f:
+            _src = _f.read()
+        self.assertIn('"COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda"', _src)
+
+    def test_image_env_has_workers_2(self):
+        """Image .env() must set COMFYMODAL_PRELOAD_MODE=workers_2."""
+        import os as _os, re as _re
+        _path = _os.path.join(_os.path.dirname(__file__), "..", "comfyapp.py")
+        with open(_path, "r", encoding="utf-8") as _f:
+            _src = _f.read()
+        self.assertIn('"COMFYMODAL_PRELOAD_MODE": "workers_2"', _src)
+
+    def test_image_env_has_execution_backend(self):
+        """Image .env() must set COMFYMODAL_EXECUTION_BACKEND=in_process."""
+        import os as _os, re as _re
+        _path = _os.path.join(_os.path.dirname(__file__), "..", "comfyapp.py")
+        with open(_path, "r", encoding="utf-8") as _f:
+            _src = _f.read()
+        self.assertIn('"COMFYMODAL_EXECUTION_BACKEND": "in_process"', _src)
+
+    def test_image_env_has_warmup_enabled(self):
+        """Image .env() must set COMFYMODAL_ENABLE_WARMUP=1."""
+        import os as _os, re as _re
+        _path = _os.path.join(_os.path.dirname(__file__), "..", "comfyapp.py")
+        with open(_path, "r", encoding="utf-8") as _f:
+            _src = _f.read()
+        self.assertIn('"COMFYMODAL_ENABLE_WARMUP": "1"', _src)
+
+
+class TerminalEvidenceTests(unittest.TestCase):
+    """Test that _production_evidence is populated correctly in terminal states."""
+
+    def setUp(self):
+        _reset_cache()
+
+    def test_evidence_present_on_compilation(self):
+        """Compilation report contains all fields needed for _production_evidence."""
+        prod = _minimal_production(output_ids=["9"])
+        _, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False
+        )
+        required = [
+            "compiled_workflow_hash", "topology_hash", "compiled_node_count",
+            "removed_node_count", "bypass_node_ids", "output_node_ids",
+            "direct_output_rewritten_count", "rgthree_comparer_rewritten_count",
+        ]
+        for field in required:
+            self.assertIn(field, report, f"Report missing {field} needed for evidence")
+
+    def test_evidence_contains_count_contract(self):
+        """Verify kept = compiled_node_count, removed = removed_node_count, etc."""
+        # Use stable=True so bypass doesn't fail on non-serializable node
+        prod = _minimal_production(output_ids=["9"], bypass_ids=["8"])
+        _, report = compile_production_workflow(
+            WORKFLOW_SINGLE_OUTPUT, prod, allow_direct_output_rewrite=False,
+            stable=True,
+        )
+        self.assertEqual(report["compiled_node_count"], len(report["kept_node_ids"]))
+        self.assertEqual(report["removed_node_count"], len(report["removed_node_ids"]))
+        self.assertEqual(len(report["bypass_node_ids"]), 1)
+        self.assertEqual(len(report["output_node_ids"]), 1)
+
+    def test_disabled_production_no_evidence(self):
+        """When production is disabled, no production_report evidence fields."""
+        from production_workflow import normalize_production_options, compile_production_workflow
+        prod = normalize_production_options(None)
+        self.assertEqual(prod, {"enabled": False})

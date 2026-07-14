@@ -11,6 +11,7 @@ const STORAGE_KEY_OUTPUT_WEBP_LC = "comfymodal_webp_lossless_compression";
 const STORAGE_KEY_OUTPUT_AUTOSAVE = "comfymodal_auto_save_local";
 const STORAGE_KEY_OUTPUT_SAVEFOLDER = "comfymodal_save_folder";
 const STORAGE_KEY_OUTPUT_SIDECAR = "comfymodal_save_metadata_sidecar";
+const STORAGE_KEY_PRODUCTION = "comfymodal_production";
 const DEFAULT_OUTPUT_SAVEFOLDER = "output/modal";
 
 let _originalFetchApi = null;
@@ -745,7 +746,8 @@ function _isOutputCapable(node) {
 }
 
 function _getProductionEnabled() {
-  return !!(app.graph?.extra?.comfymodal?.production_mode_enabled);
+  const graphVal = app.graph?.extra?.comfymodal?.production_mode_enabled;
+  return graphVal !== undefined ? graphVal : localStorage.getItem(STORAGE_KEY_PRODUCTION) === "true";
 }
 
 function _getCloudModeEnabled() {

@@ -46,7 +46,9 @@ class _FakeInvoker:
         if cell["cell_key"] in self.fail_cell_keys:
             return {"status": "failed", "cell_key": cell["cell_key"], "error": "x"}
         self.processed.append(cell["cell_key"])
-        return {"status": "completed", "cell_key": cell["cell_key"]}
+        # Include output_paths so the runner emits cell.completed events
+        return {"status": "completed", "cell_key": cell["cell_key"],
+                "output_paths": [f"/tmp/out_{cell['cell_key'][:8]}.png"]}
 
 
 def _store_for(tmp, exp_id):
@@ -502,6 +504,122 @@ class ContinueRestartSkipTests(_ClosingTestCase):
             self.assertGreaterEqual(len(invoker.processed), 8)
             self._close_now()
 
+
+class BoundedBackendCorrectnessTests(_ClosingTestCase):
+    """Regression tests for backend correctness fixes:
+
+    - Partial completion must not yield completed status.
+    - completed_with_failures requires all cells terminal.
+    - Snapshots honor experiment.status as latest status state.
+    """
+
+    def _make_all(self, tmp):
+        store = _store_for(tmp, "exp_bc")
+        self._track(store)
+        spec = _two_checkpoint_spec()
+        _write_definition(store, spec)
+        leases = _leases_for(tmp)
+        self._track(leases)
+        invoker = _FakeInvoker()
+        compilation = _compile(spec)
+        s_mod = load_module()
+        scheduler = s_mod.ExperimentScheduler(
+            store=store, leases=leases, invoker=invoker,
+            compilation=compilation, max_containers=1,
+        )
+        return store, leases, invoker, compilation, scheduler
+
+    def test_partial_1_of_2_not_completed(self):
+        """Partial 1-of-2 completion must NOT yield completed status."""
+        s = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                store, leases, invoker, compilation, scheduler = self._make_all(tmp)
+                total = len(compilation["cells"])
+                self.assertGreaterEqual(total, 2, "test needs at least 2 cells")
+                # Seed exactly 1 cell completed (no other terminal events)
+                cell0 = compilation["cells"][0]
+                store.append_event({
+                    "type": "cell.completed",
+                    "payload": {"cell_key": cell0["cell_key"],
+                                "checkpoint_id": cell0["checkpoint_id"],
+                                "attempt_id": "a_1"},
+                })
+                # Simulate experiment.started in journal (scheduler emits this)
+                store.append_event({
+                    "type": "experiment.started",
+                    "payload": {"experiment_id": "exp_bc", "revision": 1,
+                                "total_cells": total},
+                })
+                # _compute_terminal_status should NOT produce completed
+                scheduler._compute_terminal_status()
+                status = scheduler.status()["status"]
+                self.assertNotEqual(status, "completed",
+                    "partial 1-of-2 must not yield completed")
+                self.assertNotEqual(status, "completed_with_failures",
+                    "partial 1-of-2 with no failures must not yield completed_with_failures")
+            finally:
+                self._close_now()
+
+    def test_partial_with_failures_not_completed_with_failures(self):
+        """completed_with_failures requires all cells terminal.
+        1 completed + 1 failed out of 3 total must NOT yield completed_with_failures."""
+        s = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                store, leases, invoker, compilation, scheduler = self._make_all(tmp)
+                total = len(compilation["cells"])
+                self.assertGreaterEqual(total, 3, "test needs at least 3 cells")
+                cell0 = compilation["cells"][0]
+                cell1 = compilation["cells"][1]
+                store.append_event({
+                    "type": "cell.completed",
+                    "payload": {"cell_key": cell0["cell_key"],
+                                "checkpoint_id": cell0["checkpoint_id"],
+                                "attempt_id": "a_ok"},
+                })
+                store.append_event({
+                    "type": "cell.failed",
+                    "payload": {"cell_key": cell1["cell_key"],
+                                "checkpoint_id": cell1["checkpoint_id"],
+                                "attempt_id": "a_fail", "error": "x"},
+                })
+                store.append_event({
+                    "type": "experiment.started",
+                    "payload": {"experiment_id": "exp_bc", "revision": 1,
+                                "total_cells": total},
+                })
+                scheduler._compute_terminal_status()
+                status = scheduler.status()["status"]
+                self.assertNotEqual(status, "completed_with_failures",
+                    "partial 1-completed-1-failed out of 3 must not yield completed_with_failures")
+                self.assertNotEqual(status, "completed",
+                    "partial must not yield completed")
+            finally:
+                self._close_now()
+
+    def test_snapshot_status_event_precedence(self):
+        """Snapshots rebuilt via scheduler must honor experiment.status
+        events as the latest status state, not stale experiment.completed."""
+        s = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                store, leases, invoker, compilation, scheduler = self._make_all(tmp)
+                # Simulate: runner emits experiment.completed (stale)
+                store.append_event({
+                    "type": "experiment.completed",
+                    "payload": {"completed": 2},
+                })
+                # Then scheduler emits experiment.status with paused
+                store.append_event({
+                    "type": "experiment.status",
+                    "payload": {"status": "paused"},
+                })
+                snap = store.rebuild_snapshot()
+                self.assertEqual(snap["status"], "paused",
+                    "experiment.status must override stale experiment.completed in snapshot")
+            finally:
+                self._close_now()
 
 class VisibleStateFinalStatusTests(_ClosingTestCase):
     """C1: start/resume compute final status from rebuild_snapshot counters."""

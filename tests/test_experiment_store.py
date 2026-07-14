@@ -293,6 +293,113 @@ class CrossInstanceTests(unittest.TestCase):
                 self.assertEqual(sorted(seqs), [1, 2])
 
 
+class StatusEventPrecedenceTests(unittest.TestCase):
+    """experiment.status events must take precedence over stale
+    experiment.completed in rebuild_snapshot."""
+
+    def test_status_event_overrides_stale_completed(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            with module.ExperimentStore(Path(tmp) / "exp1", root=Path(tmp)) as store:
+                store.ensure()
+                store.append_event({"type": "experiment.started", "payload": {"total_cells": 2}})
+                store.append_event({"type": "cell.completed", "payload": {"cell_key": "k1"}})
+                store.append_event({"type": "experiment.completed", "payload": {"completed": 1}})
+                store.append_event({"type": "experiment.status", "payload": {"status": "paused"}})
+                snap = store.rebuild_snapshot()
+                self.assertEqual(snap["status"], "paused",
+                    "experiment.status with paused must override stale completed")
+
+    def test_status_event_completed_with_failures(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            with module.ExperimentStore(Path(tmp) / "exp1", root=Path(tmp)) as store:
+                store.ensure()
+                store.append_event({"type": "experiment.started", "payload": {"total_cells": 2}})
+                store.append_event({"type": "experiment.status", "payload": {"status": "completed_with_failures"}})
+                snap = store.rebuild_snapshot()
+                self.assertEqual(snap["status"], "completed_with_failures")
+
+    def test_status_event_stopped_precedence(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            with module.ExperimentStore(Path(tmp) / "exp1", root=Path(tmp)) as store:
+                store.ensure()
+                store.append_event({"type": "experiment.started", "payload": {"total_cells": 2}})
+                store.append_event({"type": "experiment.completed", "payload": {"completed": 1}})
+                store.append_event({"type": "experiment.status", "payload": {"status": "stopped"}})
+                snap = store.rebuild_snapshot()
+                self.assertEqual(snap["status"], "stopped")
+
+    def test_status_event_failed_fatal_precedence(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            with module.ExperimentStore(Path(tmp) / "exp1", root=Path(tmp)) as store:
+                store.ensure()
+                store.append_event({"type": "experiment.started", "payload": {"total_cells": 2}})
+                store.append_event({"type": "experiment.completed", "payload": {"completed": 1}})
+                store.append_event({"type": "experiment.status", "payload": {"status": "failed_fatal"}})
+                snap = store.rebuild_snapshot()
+                self.assertEqual(snap["status"], "failed_fatal")
+
+    def test_multiple_status_events_last_wins(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            with module.ExperimentStore(Path(tmp) / "exp1", root=Path(tmp)) as store:
+                store.ensure()
+                store.append_event({"type": "experiment.status", "payload": {"status": "running"}})
+                store.append_event({"type": "experiment.status", "payload": {"status": "paused"}})
+                store.append_event({"type": "experiment.status", "payload": {"status": "completed"}})
+                snap = store.rebuild_snapshot()
+                self.assertEqual(snap["status"], "completed",
+                    "last experiment.status event must win")
+
+
+class TotalCellsInferenceTests(unittest.TestCase):
+    """rebuild_snapshot must infer total_cells from experiment.started/resumed
+    when explicit arg is not provided."""
+
+    def test_infers_from_started_event(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            with module.ExperimentStore(Path(tmp) / "exp1", root=Path(tmp)) as store:
+                store.ensure()
+                store.append_event({"type": "experiment.started", "payload": {"total_cells": 10}})
+                snap = store.rebuild_snapshot()
+                self.assertEqual(snap["total_cells"], 10,
+                    "must infer total_cells from experiment.started event")
+
+    def test_infers_from_resumed_event(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            with module.ExperimentStore(Path(tmp) / "exp1", root=Path(tmp)) as store:
+                store.ensure()
+                store.append_event({"type": "experiment.resumed", "payload": {"total_cells": 7}})
+                snap = store.rebuild_snapshot()
+                self.assertEqual(snap["total_cells"], 7,
+                    "must infer total_cells from experiment.resumed event")
+
+    def test_explicit_arg_not_overridden(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            with module.ExperimentStore(Path(tmp) / "exp1", root=Path(tmp)) as store:
+                store.ensure()
+                store.append_event({"type": "experiment.started", "payload": {"total_cells": 10}})
+                snap = store.rebuild_snapshot(total_cells=5)
+                self.assertEqual(snap["total_cells"], 5,
+                    "explicit total_cells arg must not be overridden by inference")
+
+    def test_default_zero_when_no_started_event(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            with module.ExperimentStore(Path(tmp) / "exp1", root=Path(tmp)) as store:
+                store.ensure()
+                store.append_event({"type": "cell.completed", "payload": {"cell_key": "k1"}})
+                snap = store.rebuild_snapshot()
+                self.assertEqual(snap["total_cells"], 0,
+                    "default total_cells must be 0 when no started/resumed event")
+
+
 class DefinitionTests(unittest.TestCase):
     def test_write_and_read_definition(self):
         module = load_module()

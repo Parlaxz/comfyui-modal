@@ -193,6 +193,7 @@ export function closePresetWizard() {
 // ── Render helpers ──────────────────────────────────────────────────────
 
 function renderWizard(panel, state) {
+  const scrollTop = panel.scrollTop;
   while (panel.firstChild) panel.removeChild(panel.firstChild);
 
   // Header
@@ -370,6 +371,7 @@ function renderWizard(panel, state) {
     }));
   }
   panel.appendChild(footer);
+  panel.scrollTop = scrollTop;
 }
 
 // ── Step: Features ──────────────────────────────────────────────────────

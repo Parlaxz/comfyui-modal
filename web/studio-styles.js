@@ -183,15 +183,15 @@ body.comfymodal-body-scroll-lock {
 .comfymodal-studio-playground {
   display: flex;
   flex-direction: row;
-  gap: 16px;
+  gap: 0;
   height: 100%;
   min-height: 0;
   overflow: hidden;
 }
 
 .comfymodal-studio-control-panel {
-  width: 300px;
-  min-width: 300px;
+  width: 400px;
+  min-width: 200px;
   flex-shrink: 0;
   overflow-y: auto;
   overflow-x: hidden;
@@ -211,6 +211,34 @@ body.comfymodal-body-scroll-lock {
   gap: 12px;
   overflow-y: auto;
   max-height: 100%;
+}
+
+.comfymodal-studio-resize-handle {
+  width: 12px;
+  cursor: col-resize;
+  flex-shrink: 0;
+  touch-action: none;
+  position: relative;
+  background: transparent;
+  user-select: none;
+}
+
+.comfymodal-studio-resize-handle::before {
+  content: '';
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 2px;
+  background: #2a2a2a;
+  border-radius: 1px;
+  transition: background 0.15s;
+}
+
+.comfymodal-studio-resize-handle:hover::before,
+.comfymodal-studio-resize-handle.active::before {
+  background: var(--color-accent, #5a7fdb);
 }
 
 /* ── Control Groups ──────────────────────────────────────── */
@@ -609,6 +637,156 @@ body.comfymodal-body-scroll-lock {
   outline: none;
 }
 
+/* ── Running Config Panel (floating overlay) ──────────────── */
+/* Positioned inside .comfymodal-studio-canvas, overlaying the  */
+/* output image. Translucent with backdrop blur.                */
+
+.comfymodal-studio-running-config {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  max-width: 280px;
+  min-width: 190px;
+  min-height: 220px;
+  background: rgba(12, 12, 12, 0.88);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border: 1px solid rgba(40, 40, 40, 0.7);
+  border-radius: 4px;
+  padding: 7px 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  z-index: 10;
+  pointer-events: auto;
+  display: none;
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.45);
+}
+
+.comfymodal-studio-running-config.is-visible {
+  display: block;
+}
+
+.comfymodal-studio-running-config-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.comfymodal-studio-running-config-title {
+  font-weight: 600;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #a0a0a0;
+  flex-shrink: 0;
+}
+
+.comfymodal-studio-running-config-preset {
+  font-size: 8px;
+  color: #777;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: rgba(26, 26, 26, 0.8);
+  padding: 1px 5px;
+  border-radius: 2px;
+}
+
+.comfymodal-studio-running-config-prompt {
+  margin-bottom: 3px;
+  padding-bottom: 3px;
+  border-bottom: 1px solid rgba(26, 26, 26, 0.7);
+}
+
+.comfymodal-studio-running-config-label {
+  font-size: 8px;
+  color: #777;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  display: block;
+}
+
+.comfymodal-studio-running-config-prompt-text {
+  font-size: 10px;
+  color: #d0d0d0;
+  word-wrap: break-word;
+  max-height: 96px;
+  overflow-y: auto;
+  display: block;
+  margin-top: 1px;
+  line-height: 1.4;
+}
+
+.comfymodal-studio-running-config-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1px 6px;
+  margin-bottom: 3px;
+  padding-bottom: 3px;
+  border-bottom: 1px solid rgba(26, 26, 26, 0.7);
+}
+
+.comfymodal-studio-running-config-item {
+  display: inline-flex;
+  gap: 2px;
+  font-size: 9px;
+  line-height: 1.6;
+}
+
+.comfymodal-studio-running-config-item .comfymodal-studio-running-config-label {
+  font-size: 9px;
+  color: #888;
+  text-transform: none;
+  letter-spacing: normal;
+  display: inline;
+  white-space: nowrap;
+}
+
+.comfymodal-studio-running-config-item .comfymodal-studio-running-config-value {
+  font-size: 9px;
+  color: #ccc;
+  white-space: nowrap;
+}
+
+.comfymodal-studio-running-config-axes {
+  margin-top: 3px;
+  padding-top: 3px;
+  border-top: 1px solid rgba(26, 26, 26, 0.7);
+}
+
+.comfymodal-studio-running-config-axes-title {
+  font-size: 8px;
+  color: #666;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 1px;
+  display: block;
+}
+
+.comfymodal-studio-running-config-axes-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+}
+
+.comfymodal-studio-running-config-axis-item {
+  font-size: 8px;
+  color: #999;
+  background: rgba(26, 26, 26, 0.7);
+  padding: 1px 5px;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+
+.comfymodal-studio-running-config-preset-count {
+  margin-top: 3px;
+  font-size: 8px;
+  color: #777;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
 /* ── Canvas (dotted grid background) ─────────────────────── */
 
 .comfymodal-studio-canvas {
@@ -768,6 +946,74 @@ body.comfymodal-body-scroll-lock {
   height: 8px;
   border-radius: 50%;
   border: 1px solid rgba(0,0,0,0.5);
+}
+
+/* ── Carousel Header & Actions ──────────────────────────── */
+
+.comfymodal-studio-carousel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  min-height: 24px;
+}
+
+.comfymodal-studio-carousel-header-label {
+  font-size: 12px;
+  color: #888;
+}
+
+.comfymodal-studio-carousel-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.comfymodal-studio-carousel-btn {
+  background: transparent;
+  border: none;
+  color: #666;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 6px;
+  line-height: 1;
+  font-family: inherit;
+  transition: color 0.15s;
+}
+
+.comfymodal-studio-carousel-btn:hover {
+  color: #fff;
+}
+
+.comfymodal-studio-carousel-btn.danger:hover {
+  color: #f87171;
+}
+
+.comfymodal-studio-carousel-btn.close-btn {
+  font-size: 16px;
+  padding: 2px 4px;
+}
+
+/* ── Carousel Reveal Bar ─────────────────────────────────── */
+
+.comfymodal-studio-carousel-reveal {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px;
+  border: 1px dashed #333;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  color: #666;
+  background: transparent;
+  width: 100%;
+  font-family: inherit;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.comfymodal-studio-carousel-reveal:hover {
+  border-color: var(--color-accent, #5a7fdb);
+  color: #ccc;
 }
 
 /* ── History ─────────────────────────────────────────────── */
@@ -1213,10 +1459,13 @@ body.comfymodal-body-scroll-lock {
     flex-direction: column;
   }
   .comfymodal-studio-control-panel {
-    width: 100%;
+    width: 100% !important;
     min-width: 0;
     max-height: 40vh;
     overflow-y: auto;
+  }
+  .comfymodal-studio-resize-handle {
+    display: none;
   }
   .comfymodal-studio-backend-body {
     flex-direction: column;
@@ -1231,6 +1480,24 @@ body.comfymodal-body-scroll-lock {
   .comfymodal-studio-filter-bar input,
   .comfymodal-studio-filter-bar select {
     min-height: 44px;
+  }
+  /* Experiment grid: reduce viewport padding to reclaim space */
+  .comfymodal-studio-experiment-grid-viewport {
+    padding: 8px 8px;
+  }
+
+  /* Floating config panel: span full width at top on narrow screens,
+     with capped height to avoid obscuring the output image. */
+  .comfymodal-studio-running-config.is-visible {
+    top: 0;
+    right: 0;
+    left: 0;
+    max-width: none;
+    min-width: 0;
+    max-height: 40%;
+    overflow-y: auto;
+    border-radius: 0 0 4px 4px;
+    border-top: none;
   }
 }
 
@@ -1481,7 +1748,8 @@ button.comfymodal-studio-feature-chip {
   font-size: 10px;
 }
 
-.comfymodal-studio-metadata-advanced {
+.comfymodal-studio-metadata-advanced,
+.comfymodal-studio-metadata-note-panel {
   margin-top: 4px;
   padding: 4px 6px;
   background: #0a0a0a;
@@ -1695,6 +1963,114 @@ button.comfymodal-studio-feature-chip {
   top: 4px;
   right: 4px;
   z-index: 2;
+}
+
+/* ── Experiment Tile (ungrouped History) ─────────────── */
+
+.comfymodal-studio-experiment-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 0;
+  padding: 0;
+  aspect-ratio: auto;
+  min-height: 100px;
+  border-color: #2a2a2a;
+  transition: border-color 0.15s, opacity 0.15s;
+}
+
+.comfymodal-studio-experiment-tile.completed {
+  border-color: #1a4a1a;
+}
+
+.comfymodal-studio-experiment-tile.failed {
+  border-color: #4a1a1a;
+}
+
+.comfymodal-studio-experiment-tile.running {
+  border-color: #4a3a00;
+}
+
+.comfymodal-studio-experiment-tile:hover {
+  border-color: var(--color-accent, #5a7fdb) !important;
+}
+
+.comfymodal-studio-exp-tile-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 8px;
+  font-weight: 700;
+  color: #fff;
+  background: var(--color-accent, #5a7fdb);
+  padding: 1px 5px;
+  border-radius: 3px;
+  letter-spacing: 0.06em;
+  line-height: 1.4;
+  flex-shrink: 0;
+}
+
+.comfymodal-studio-exp-tile-title {
+  font-size: 10px;
+  font-weight: 600;
+  color: #d0d0d0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.comfymodal-studio-exp-tile-thumbs {
+  display: flex;
+  gap: 2px;
+  padding: 4px 8px 8px;
+  width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.comfymodal-studio-exp-tile-thumb {
+  width: 36px;
+  height: 36px;
+  object-fit: cover;
+  border-radius: 2px;
+  border: 1px solid #2a2a2a;
+  flex-shrink: 0;
+}
+
+.comfymodal-studio-exp-tile-error {
+  font-size: 9px;
+  color: #f87171;
+  padding: 0 8px 4px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* ── Carousel Experiment Badge ─────────────────────── */
+
+.comfymodal-studio-carousel-item-experiment {
+  border-color: var(--color-accent, #5a7fdb) !important;
+  border-style: dashed;
+}
+
+.comfymodal-studio-carousel-item-experiment:hover {
+  border-color: #7a9ffb !important;
+}
+
+.comfymodal-studio-carousel-exp-badge {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  font-size: 7px;
+  font-weight: 700;
+  color: #fff;
+  background: var(--color-accent, #5a7fdb);
+  padding: 1px 4px;
+  border-radius: 2px;
+  letter-spacing: 0.05em;
+  line-height: 1.3;
+  z-index: 3;
+  pointer-events: none;
 }
 
 /* ── Override testing-styles for Nexus look ──────────────── */
@@ -2125,6 +2501,626 @@ button.comfymodal-studio-feature-chip {
   gap: 4px;
   margin: 2px 0;
   font-size: 10px;
+}
+
+/* ── Experiment Grid Viewport ────────────────────────────── */
+
+.comfymodal-studio-experiment-grid-viewport {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overflow: hidden;
+  padding: 12px 16px;
+}
+
+.comfymodal-studio-experiment-grid-building {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  color: #555;
+  font-size: 12px;
+  font-style: italic;
+}
+
+.comfymodal-studio-experiment-grid-outer {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+
+.comfymodal-studio-experiment-grid-outer::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.comfymodal-studio-experiment-grid-outer::-webkit-scrollbar-track {
+  background: transparent;
+}
+.comfymodal-studio-experiment-grid-outer::-webkit-scrollbar-thumb {
+  background: #2a2a2a;
+  border-radius: 3px;
+}
+
+.comfymodal-studio-experiment-grid-group {
+  margin-bottom: 8px;
+}
+
+.comfymodal-studio-experiment-grid-group-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #888;
+  margin: 0 0 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.comfymodal-studio-experiment-grid-container {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.comfymodal-studio-experiment-grid-row {
+  display: flex;
+  gap: 2px;
+  align-items: stretch;
+}
+
+.comfymodal-studio-experiment-grid-row-cells {
+  display: flex;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.comfymodal-studio-experiment-grid-corner {
+  width: 60px;
+  flex-shrink: 0;
+  font-size: 10px;
+  color: #555;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 4px;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.comfymodal-studio-experiment-grid-row-label {
+  width: 60px;
+  flex-shrink: 0;
+  font-size: 10px;
+  color: #aaa;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 4px;
+  font-weight: 500;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  max-width: 140px;
+  line-height: 1.3;
+}
+
+.comfymodal-studio-experiment-grid-header {
+  flex: 1;
+  min-width: 80px;
+  font-size: 10px;
+  color: #aaa;
+  text-align: center;
+  padding: 2px 4px;
+  font-weight: 500;
+  background: #111;
+  border: 1px solid #2a2a2a;
+  border-radius: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Prompt-specific headers: no width cap — flex to match cell column.
+   Text lives in an inner .*-prompt-text element that caps width &
+   height for readability. */
+.comfymodal-studio-experiment-grid-header.is-prompt {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-weight: 400;
+  overflow: visible;
+  text-overflow: clip;
+  line-height: 1.4;
+  padding: 4px 6px;
+}
+
+/* Inner element for prompt text in column headers: readable
+   max inline width, capped height with scroll, no single-line
+   ellipsis. Full text exposed via title/aria-label on the span. */
+.comfymodal-studio-experiment-grid-header-prompt-text {
+  display: block;
+  max-width: 60ch;
+  width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  max-height: 7em;               /* ~5 lines at line-height 1.4 */
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #2a2a2a transparent;
+  text-align: center;
+  line-height: 1.4;
+}
+
+.comfymodal-studio-experiment-grid-header-prompt-text::-webkit-scrollbar {
+  width: 4px;
+}
+.comfymodal-studio-experiment-grid-header-prompt-text::-webkit-scrollbar-track {
+  background: transparent;
+}
+.comfymodal-studio-experiment-grid-header-prompt-text::-webkit-scrollbar-thumb {
+  background: #2a2a2a;
+  border-radius: 2px;
+}
+
+/* Row label as prompt axis: grow width for readability without
+   becoming hundreds of px wide. Inner element handles wrapping. */
+.comfymodal-studio-experiment-grid-row-label.is-prompt {
+  width: auto;
+  min-width: 80px;
+  max-width: 220px;
+  padding: 4px 8px;
+  align-items: flex-start;
+  white-space: normal;
+  overflow: visible;
+}
+
+.comfymodal-studio-experiment-grid-row-label-prompt-text {
+  display: block;
+  max-width: 60ch;
+  width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  max-height: 7em;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #2a2a2a transparent;
+  text-align: right;
+  line-height: 1.4;
+}
+
+.comfymodal-studio-experiment-grid-row-label-prompt-text::-webkit-scrollbar {
+  width: 4px;
+}
+.comfymodal-studio-experiment-grid-row-label-prompt-text::-webkit-scrollbar-track {
+  background: transparent;
+}
+.comfymodal-studio-experiment-grid-row-label-prompt-text::-webkit-scrollbar-thumb {
+  background: #2a2a2a;
+  border-radius: 2px;
+}
+
+/* ── Cell Card ──────────────────────────────────────────── */
+
+.comfymodal-studio-experiment-grid-cell {
+  flex: 1 1 var(--cell-min-width, 100px);
+  min-width: var(--cell-min-width, 60px);
+  max-width: none;
+  min-height: var(--cell-min-height, 60px);
+  max-height: none;
+  aspect-ratio: var(--cell-aspect-ratio, 1/1);
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  background: #0a0a0a;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 3px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  position: relative;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  color: inherit;
+  overflow: hidden;
+}
+
+.comfymodal-studio-experiment-grid-cell:hover {
+  border-color: var(--color-accent, #5a7fdb);
+  box-shadow: 0 0 8px rgba(90, 127, 219, 0.2);
+}
+
+.comfymodal-studio-experiment-grid-cell:focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 2px;
+}
+
+.comfymodal-studio-experiment-grid-cell.completed {
+  border-color: #1a4a1a;
+}
+
+.comfymodal-studio-experiment-grid-cell.failed {
+  border-color: #4a1a1a;
+}
+
+.comfymodal-studio-experiment-grid-cell.skipped {
+  border-color: #3a3a00;
+  opacity: 0.75;
+}
+
+.comfymodal-studio-experiment-grid-cell.interrupted {
+  border-color: #4a2a00;
+  opacity: 0.75;
+}
+
+.comfymodal-studio-experiment-grid-cell.running {
+  border-color: var(--color-accent, #5a7fdb);
+  box-shadow: 0 0 6px rgba(90, 127, 219, 0.3);
+}
+
+.comfymodal-studio-experiment-grid-cell.selected {
+  border-color: #fbbf24;
+  box-shadow: 0 0 10px rgba(251, 191, 36, 0.3);
+}
+
+.comfymodal-studio-experiment-grid-cell-empty {
+  cursor: default;
+  opacity: 0.35;
+  font-size: 10px;
+  color: #555;
+  min-width: 60px;
+  min-height: 60px;
+}
+
+.comfymodal-studio-experiment-grid-cell-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  border-radius: 2px;
+  display: block;
+  flex: 1;
+  max-width: 100%;
+}
+
+/* Prompt block in cells constrained to a readable max width.
+   min-width:0 + width:100% ensures ellipsis works when parent
+   cell is narrower than max-width. */
+.comfymodal-studio-experiment-grid-cell-prompt {
+  font-size: 9px;
+  color: #aaa;
+  max-width: 280px;
+  min-width: 0;
+  width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.4;
+  padding: 2px 4px;
+}
+
+.comfymodal-studio-experiment-grid-cell-loading {
+  width: 24px;
+  height: 24px;
+  border: 2px solid #333;
+  border-top-color: var(--color-accent, #5a7fdb);
+  border-radius: 50%;
+  animation: cm-exp-spin 0.8s linear infinite;
+}
+
+@keyframes cm-exp-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes cm-exp-indeterminate {
+  0%   { width: 20%; opacity: 0.6; }
+  50%  { width: 70%; opacity: 1; }
+  100% { width: 20%; opacity: 0.6; }
+}
+
+.comfymodal-studio-experiment-grid-cell-done-icon {
+  font-size: 18px;
+  color: #4ade80;
+}
+
+.comfymodal-studio-experiment-grid-cell-fail-icon {
+  font-size: 18px;
+  color: #f87171;
+}
+
+.comfymodal-studio-experiment-grid-cell-skip-icon {
+  font-size: 16px;
+  color: #fbbf24;
+}
+
+.comfymodal-studio-experiment-grid-cell-interrupt-icon {
+  font-size: 16px;
+  color: #fb923c;
+}
+
+.comfymodal-studio-experiment-grid-cell-stack {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 80px;
+}
+
+.comfymodal-studio-experiment-grid-cell-stack > .comfymodal-studio-experiment-grid-cell {
+  flex: none;
+  min-width: 0;
+  min-height: 60px;
+}
+
+.comfymodal-studio-experiment-grid-cell-placeholder {
+  width: 100%;
+  height: 100%;
+  min-height: 40px;
+  border: 1px dashed #2a2a2a;
+  border-radius: 2px;
+  flex: 1;
+}
+
+.comfymodal-studio-experiment-grid-cell-status {
+  font-size: 9px;
+  color: #555;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  flex-shrink: 0;
+}
+
+.comfymodal-studio-experiment-grid-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  color: #555;
+  font-size: 12px;
+  font-style: italic;
+}
+
+/* ── Experiment Progress Bars ─────────────────────────────── */
+
+.comfymodal-studio-experiment-grid-progress {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  background: #0f0f0f;
+  border: 1px solid #222;
+  border-radius: 3px;
+}
+
+.comfymodal-studio-experiment-grid-progress-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.comfymodal-studio-experiment-grid-progress-label {
+  font-size: 10px;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  width: 80px;
+  flex-shrink: 0;
+}
+
+.comfymodal-studio-experiment-grid-progress-track {
+  flex: 1;
+  height: 8px;
+  background: #1a1a1a;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.comfymodal-studio-experiment-grid-progress-fill {
+  height: 100%;
+  background: var(--color-accent, #5a7fdb);
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}
+
+.comfymodal-studio-experiment-grid-progress-pct {
+  font-size: 10px;
+  color: #aaa;
+  width: 50px;
+  text-align: right;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Cell Detail Overlay ──────────────────────────────────── */
+
+.comfymodal-studio-experiment-grid-detail-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.comfymodal-studio-experiment-grid-detail-backdrop {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.85);
+}
+
+.comfymodal-studio-experiment-grid-detail-panel {
+  position: relative;
+  max-width: 90vw;
+  max-height: 90vh;
+  background: #0a0a0a;
+  border: 1px solid #333;
+  border-radius: 6px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.6);
+  min-width: 240px;
+}
+
+.comfymodal-studio-experiment-grid-detail-panel::-webkit-scrollbar {
+  width: 6px;
+}
+.comfymodal-studio-experiment-grid-detail-panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+.comfymodal-studio-experiment-grid-detail-panel::-webkit-scrollbar-thumb {
+  background: #2a2a2a;
+  border-radius: 3px;
+}
+
+.comfymodal-studio-experiment-grid-detail-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: transparent;
+  border: none;
+  color: #aaa;
+  font-size: 20px;
+  cursor: pointer;
+  padding: 6px 10px;
+  line-height: 1;
+  z-index: 1;
+  transition: color 0.15s;
+  border-radius: 3px;
+}
+
+.comfymodal-studio-experiment-grid-detail-close:hover {
+  color: #fff;
+}
+
+.comfymodal-studio-experiment-grid-detail-close:focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 2px;
+}
+
+.comfymodal-studio-experiment-grid-detail-image {
+  max-width: 100%;
+  max-height: 60vh;
+  object-fit: contain;
+  border-radius: 4px;
+}
+
+.comfymodal-studio-experiment-grid-detail-noimage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 120px;
+  background: #111;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  color: #555;
+  font-size: 12px;
+}
+
+.comfymodal-studio-experiment-grid-detail-key {
+  font-size: 11px;
+  color: #888;
+}
+
+.comfymodal-studio-experiment-grid-detail-status {
+  font-size: 11px;
+  color: #888;
+}
+
+.comfymodal-studio-experiment-grid-detail-axes {
+  border-top: 1px solid #2a2a2a;
+  padding-top: 6px;
+}
+
+.comfymodal-studio-experiment-grid-detail-axes-title {
+  font-size: 10px;
+  font-weight: 600;
+  color: #aaa;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+
+.comfymodal-studio-experiment-grid-detail-axis-row {
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.comfymodal-studio-experiment-grid-detail-axis-key {
+  color: #888;
+}
+
+.comfymodal-studio-experiment-grid-detail-axis-value {
+  color: #f87171;
+  font-weight: 600;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.comfymodal-studio-experiment-grid-detail-checkpoint {
+  font-size: 10px;
+  color: #666;
+  border-top: 1px solid #2a2a2a;
+  padding-top: 6px;
+}
+
+/* Non-varying values toggle in cell detail */
+.comfymodal-studio-experiment-grid-detail-nonvarying-toggle {
+  background: none;
+  border: none;
+  color: #666;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 10px;
+  padding: 6px 6px;
+  text-align: left;
+  width: 100%;
+  border-radius: 2px;
+  transition: background 0.15s, color 0.15s;
+}
+.comfymodal-studio-experiment-grid-detail-nonvarying-toggle:hover {
+  background: #1a1a1a;
+  color: #aaa;
+}
+.comfymodal-studio-experiment-grid-detail-nonvarying-content {
+  display: none;
+}
+.comfymodal-studio-experiment-grid-detail-nonvarying-content.is-visible {
+  display: block;
+}
+.comfymodal-studio-experiment-grid-detail-nonvarying-row {
+  font-size: 10px;
+  color: #777;
+  line-height: 1.5;
+  padding: 1px 0;
+}
+.comfymodal-studio-experiment-grid-detail-nonvarying-key {
+  color: #888;
+}
+.comfymodal-studio-experiment-grid-detail-nonvarying-value {
+  color: #aaa;
 }
 `;
 

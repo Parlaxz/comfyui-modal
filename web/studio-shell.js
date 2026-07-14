@@ -51,7 +51,19 @@ export function mountStudioShell(rootEl, context = {}) {
   // class-name collision with page-level containers
   const pageContainer = el("div", { class: "comfymodal-studio-pagecontainer", "data-testid": "studio-page" });
 
-  function renderActivePage() {
+  function renderActivePage(preserveScroll = true) {
+    const pageScrollTop = preserveScroll ? pageContainer.scrollTop : 0;
+    const controlPanelScrollTop = preserveScroll
+      ? pageContainer.querySelector(".comfymodal-studio-control-panel")?.scrollTop
+      : undefined;
+
+    if (!state.playground._controlPanelScrollRestorePending) {
+      const oldPanel = pageContainer.querySelector(".comfymodal-studio-control-panel");
+      if (oldPanel) {
+        state.playground._controlPanelScrollTop = oldPanel.scrollTop;
+      }
+    }
+
     // Clear page container
     while (pageContainer.firstChild) pageContainer.removeChild(pageContainer.firstChild);
 
@@ -75,6 +87,15 @@ export function mountStudioShell(rootEl, context = {}) {
 
     const content = pageDef.render(state, pageContext);
     if (content) pageContainer.appendChild(content);
+
+    pageContainer.scrollTop = pageScrollTop;
+    const controlPanel = pageContainer.querySelector(".comfymodal-studio-control-panel");
+    if (controlPanel && controlPanelScrollTop != null) {
+      controlPanel.scrollTop = controlPanelScrollTop;
+      if (controlPanel.scrollTop !== controlPanelScrollTop) {
+        state.playground._controlPanelScrollRestorePending = true;
+      }
+    }
   }
 
   function updateNavActive() {
@@ -108,7 +129,7 @@ export function mountStudioShell(rootEl, context = {}) {
       state.settings.activeLegacyTab = "";
     }
     updateNavActive();
-    renderActivePage();
+    renderActivePage(prevPage === nextPage);
   }
 
   // Assemble shell

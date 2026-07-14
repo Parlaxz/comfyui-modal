@@ -86,9 +86,15 @@ export function results_tab_render(rootEl, api, options = {}) {
   function gridSection() {
     return el("section", { class: "testing-results-gallery", "data-section": "grid" }, [
       el("h3", { style: "font-size:var(--font-size-sm,12px);font-weight:var(--font-weight-semibold,600);color:var(--color-text-primary,#e1e4ea);margin:0 0 var(--space-sm,8px);", text: "Results" }),
-      el("div", { class: "testing-results-grid-body", "data-testid": "grid-body" }, [
-        el("div", { class: "testing-results-empty-state", text: "Select an experiment above and start it. Cells appear here as they complete." }),
+      el("div", { class: "testing-results-gallery-layout" }, [
+        el("div", { class: "testing-results-gallery-body-wrap" }, [
+          el("div", { class: "testing-results-grid-body", "data-testid": "grid-body" }, [
+            el("div", { class: "testing-results-empty-state", text: "Select an experiment above and start it. Cells appear here as they complete." }),
+          ]),
+        ]),
+        el("div", { class: "testing-results-side-panel testing-results-side-panel-hidden", "data-testid": "detail-panel" }),
       ]),
+      el("div", { class: "testing-results-progress-bars", "data-testid": "progress-bars" }),
     ]);
   }
 
@@ -320,15 +326,36 @@ export function results_tab_render(rootEl, api, options = {}) {
   function updateProgressBar(shell, snap, events) {
     updateSummary(shell, snap, events);
     updateCheckpoints(shell, snap, events);
+    renderProgressBars(shell, snap, events);
   }
 
   function getAssetId(attempt) {
     return (attempt && (attempt.primary_asset_id || (attempt.asset_ids && attempt.asset_ids[0]))) || null;
   }
 
+  function resolveCellImageUrl(attempt, apiBase) {
+    if (!attempt) return null;
+    if (attempt.primary_asset_id) {
+      return apiBase + "/assets/" + encodeURIComponent(attempt.primary_asset_id);
+    }
+    if (attempt.asset_ids && attempt.asset_ids.length > 0) {
+      return apiBase + "/assets/" + encodeURIComponent(attempt.asset_ids[0]);
+    }
+    if (attempt.output_paths && attempt.output_paths.length > 0) {
+      return apiBase + "/studio/outputs/" + encodeURIComponent(attempt.output_paths[0]);
+    }
+    if (attempt.output_path) {
+      return apiBase + "/studio/outputs/" + encodeURIComponent(attempt.output_path);
+    }
+    return null;
+  }
+
   // ─── Selection state ───
   const SELECTION_LIMIT = 2;
   let selection = [];
+  // Detail panel: single cell clicked to show full metadata
+  let _detailCell = null;
+  let _varyingAxes = [];
 
   function addToSelection(entry) {
     const idx = selection.findIndex((s) => s.cell_key === entry.cell_key);
@@ -357,6 +384,9 @@ export function results_tab_render(rootEl, api, options = {}) {
 
   function renderCellCard(cell, attempt, apiBase, cellIndex, compact = false) {
     const assetId = getAssetId(attempt);
+    const imageUrl = assetId
+      ? apiBase + "/assets/" + encodeURIComponent(assetId)
+      : resolveCellImageUrl(attempt, apiBase);
     const cellStatus = (attempt && attempt.status) || "pending";
     const errorText = (attempt && cellStatus === "failed" && attempt.error)
       ? String(attempt.error)
@@ -369,10 +399,13 @@ export function results_tab_render(rootEl, api, options = {}) {
       "data-testid": "cell-card",
       "data-cell-status": cellStatus,
     }, [
-      el("div", { class: "testing-results-cell-thumb" }, [
-        assetId
-          ? el("img", { src: `${apiBase}/assets/${encodeURIComponent(assetId)}`, class: "testing-results-cell-img", alt: "cell output" })
-          : el("div", { class: "testing-results-cell-thumb-placeholder", text: cellStatus }),
+      el("div", { class: "testing-results-cell-thumb", style: "position:relative;" }, [
+        imageUrl
+          ? el("img", { src: imageUrl, class: "testing-results-cell-img", alt: "cell output" })
+          : el("div", { class: "testing-results-cell-thumb-placeholder", text: cellStatus === "running" ? "" : cellStatus }),
+        cellStatus === "running"
+          ? el("div", { class: "testing-results-running-spinner" })
+          : null,
         cellIndex != null
           ? el("span", { class: "testing-results-cell-attempt", text: `#${cellIndex + 1}` })
           : null,
@@ -400,6 +433,7 @@ export function results_tab_render(rootEl, api, options = {}) {
       addToSelection({
         cell_key: cell.cell_key,
         asset_id: assetId,
+        image_url: imageUrl,
         attempt_id: (attempt && attempt.attempt_id) || "",
         prompt: (cell.axis_values && cell.axis_values.prompt) || "",
         lora: cell.lora_selection_id || "",
@@ -409,12 +443,149 @@ export function results_tab_render(rootEl, api, options = {}) {
       addToSelection({
         cell_key: cell.cell_key,
         asset_id: assetId,
+        image_url: imageUrl,
         attempt_id: (attempt && attempt.attempt_id) || "",
         prompt: (cell.axis_values && cell.axis_values.prompt) || "",
         lora: cell.lora_selection_id || "",
       });
     });
+    card.addEventListener("click", (ev) => {
+      if (ev.defaultPrevented) return;
+      _detailCell = { cell, attempt, cellIndex };
+      _varyingAxes = _varyingAxes || [];
+      renderDetailPanel(shell, apiBase);
+    });
     return card;
+  }
+
+  // ── Detail Panel (side panel for cell metadata) ──────────────
+
+  function closeDetailPanel() {
+    _detailCell = null;
+    renderDetailPanel(shell, apiBase);
+  }
+
+  function renderDetailPanel(shell, apiBase) {
+    const panel = shell.querySelector('[data-testid="detail-panel"]');
+    if (!panel) return;
+    while (panel.firstChild) panel.removeChild(panel.firstChild);
+    if (!_detailCell) {
+      panel.classList.add("testing-results-side-panel-hidden");
+      return;
+    }
+    panel.classList.remove("testing-results-side-panel-hidden");
+    const entry = _detailCell;
+    const c = entry.cell || {};
+    const att = entry.attempt || {};
+    const ax = c.axis_values || {};
+    const status = att.status || "pending";
+    const cellIdx = entry.cellIndex;
+    const statusClass = status === "completed" ? "success"
+      : status === "failed" ? "danger"
+      : status === "running" || status === "pending" ? "warning"
+      : "info";
+    panel.appendChild(el("div", { class: "testing-results-detail-header" }, [
+      el("span", { class: "testing-results-detail-title", text: "Cell Details" }),
+      el("button", { class: "testing-results-detail-close", text: "\u00d7",
+        onclick: closeDetailPanel }),
+    ]));
+    const body = el("div", { class: "testing-results-detail-body" });
+    // Cell key row
+    body.appendChild(el("div", { class: "testing-results-detail-row" }, [
+      el("span", { class: "testing-results-detail-label", text: "Cell Key" }),
+      el("span", { class: "testing-results-detail-value", text: c.cell_key || "?" }),
+    ]));
+    // Index row
+    if (cellIdx != null) {
+      body.appendChild(el("div", { class: "testing-results-detail-row" }, [
+        el("span", { class: "testing-results-detail-label", text: "Index" }),
+        el("span", { class: "testing-results-detail-value", text: String(cellIdx + 1) }),
+      ]));
+    }
+    // Status row
+    body.appendChild(el("div", { class: "testing-results-detail-row" }, [
+      el("span", { class: "testing-results-detail-label", text: "Status" }),
+      el("span", { class: "comfymodal-status-badge " + statusClass, text: status }),
+    ]));
+    // Attempt ID
+    if (att.attempt_id) {
+      body.appendChild(el("div", { class: "testing-results-detail-row" }, [
+        el("span", { class: "testing-results-detail-label", text: "Attempt ID" }),
+        el("span", { class: "testing-results-detail-value", text: att.attempt_id }),
+      ]));
+    }
+    // Error
+    if (att.error) {
+      body.appendChild(el("div", { class: "testing-results-detail-row" }, [
+        el("span", { class: "testing-results-detail-label", text: "Error" }),
+        el("span", { class: "testing-results-detail-value", style: "color:var(--color-danger,#ef4444);", text: String(att.error).slice(0, 120) }),
+      ]));
+    }
+    // All axis values (parameters)
+    var axisKeys = Object.keys(ax);
+    axisKeys.forEach(function (k) {
+      var isAxis = _varyingAxes.indexOf(k) >= 0;
+      var v = ax[k];
+      var vStr = v === null || v === undefined ? "?" : (typeof v === "object" ? JSON.stringify(v) : String(v));
+      body.appendChild(el("div", {
+        class: "testing-results-detail-row" + (isAxis ? " testing-results-detail-axis" : ""),
+      }, [
+        el("span", { class: "testing-results-detail-label", text: k }),
+        el("span", { class: "testing-results-detail-value", text: vStr }),
+      ]));
+    });
+    panel.appendChild(body);
+  }
+
+  // ── Progress bars (image progress + total run progress) ──────
+
+  function renderProgressBars(shell, snap, events) {
+    var barsEl = shell.querySelector('[data-testid="progress-bars"]');
+    if (!barsEl) return;
+    while (barsEl.firstChild) barsEl.removeChild(barsEl.firstChild);
+    // Image progress: aggregate pct from worker progress cells
+    var wp = window.__comfymodal_worker_progress || null;
+    var imagePct = null;
+    if (wp && wp.cells && typeof wp.cells === "object") {
+      imagePct = computeAggregatePct(wp.cells);
+    }
+    var counters = (snap && snap.counters) || {};
+    var totalCells = getTotalCells(events, snap);
+    // Terminal count = every finished cell regardless of outcome
+    var terminal = (counters.completed || 0) + (counters.failed || 0) + (counters.skipped || 0) + (counters.interrupted || 0);
+    var totalPct = totalCells !== null && totalCells > 0
+      ? Math.min(100, Math.round((terminal / totalCells) * 100))
+      : null;
+    // Image progress bar
+    barsEl.appendChild(el("div", { class: "testing-results-progress-bar-row" }, [
+      el("div", { class: "testing-results-progress-bar-header" }, [
+        el("span", { text: "Image Progress" }),
+        el("span", { class: "testing-results-progress-bar-pct",
+          text: imagePct !== null ? imagePct + "%" : "queued" }),
+      ]),
+      el("div", { class: "testing-results-progress-track" }, [
+        el("div", {
+          class: "testing-results-progress-fill testing-results-progress-fill-image",
+          style: "width:" + (imagePct !== null ? imagePct : 0) + "%;",
+        }),
+      ]),
+    ]));
+    // Total progress bar
+    barsEl.appendChild(el("div", { class: "testing-results-progress-bar-row" }, [
+      el("div", { class: "testing-results-progress-bar-header" }, [
+        el("span", { text: "Total Progress" }),
+        el("span", { class: "testing-results-progress-bar-pct",
+          text: totalPct !== null
+            ? terminal + " / " + totalCells + " (" + totalPct + "%)"
+            : terminal > 0 ? terminal + " done" : "queued" }),
+      ]),
+      el("div", { class: "testing-results-progress-track" }, [
+        el("div", {
+          class: "testing-results-progress-fill testing-results-progress-fill-total",
+          style: "width:" + (totalPct !== null ? totalPct : 0) + "%;",
+        }),
+      ]),
+    ]));
   }
 
   // ── Results Grouping Adapter ──────────────────────────────────
@@ -881,6 +1052,8 @@ export function results_tab_render(rootEl, api, options = {}) {
     // 2. If no compilation cells, fall back to event-based rendering
     if (compilationCells.length === 0) {
       renderFromEvents(grid, evs, apiBase, snap);
+      _varyingAxes = [];
+      renderProgressBars(shell, snap, evs);
       return;
     }
 
@@ -890,6 +1063,7 @@ export function results_tab_render(rootEl, api, options = {}) {
     // 4. Compute varying axes (exclude axes with only one value)
     var vaxes = computeVaryingAxes(mergedEntries);
     var numAxes = vaxes.axes.length;
+    _varyingAxes = vaxes.axes;
 
     // 5. Route to layout based on number of varying axes
     if (numAxes === 0) {
@@ -905,6 +1079,27 @@ export function results_tab_render(rootEl, api, options = {}) {
     } else {
       renderTooManyAxes(grid, numAxes);
     }
+
+    // 6. Reconcile detail panel: refresh _detailCell from fresh merged state
+    if (_detailCell && _detailCell.cell && _detailCell.cell.cell_key) {
+      var ck = _detailCell.cell.cell_key;
+      var updated = null;
+      for (var ei = 0; ei < mergedEntries.length; ei++) {
+        if (mergedEntries[ei].cell && mergedEntries[ei].cell.cell_key === ck) {
+          updated = mergedEntries[ei];
+          break;
+        }
+      }
+      if (updated) {
+        _detailCell = { cell: updated.cell, attempt: updated.attempt, cellIndex: _detailCell.cellIndex };
+        renderDetailPanel(shell, apiBase);
+      } else {
+        closeDetailPanel();
+      }
+    }
+
+    // 7. Render progress bars below the grid
+    renderProgressBars(shell, snap, evs);
   }
 
   function renderComparison(shell, apiBase) {
@@ -923,22 +1118,22 @@ export function results_tab_render(rootEl, api, options = {}) {
     }
     const a = selection[selection.length - 2];
     const b = selection[selection.length - 1];
-    if (!a.asset_id || !b.asset_id) {
+    if (!a.image_url || !b.image_url) {
       body.appendChild(el("p", { class: "testing-results-empty-state",
-        text: "One or both cells have no asset yet — wait for completion." }));
+        text: "One or both cells have no image yet — wait for completion." }));
       return;
     }
     import("./testing-ab-slider.js").then((m) => {
       while (body.firstChild) body.removeChild(body.firstChild);
       const slider = m.ab_slider_render(body, {
-        aSrc: `${apiBase}/assets/${encodeURIComponent(a.asset_id)}`,
-        bSrc: `${apiBase}/assets/${encodeURIComponent(b.asset_id)}`,
+        aSrc: a.image_url,
+        bSrc: b.image_url,
         aLabel: a.prompt || a.cell_key,
         bLabel: b.prompt || b.cell_key,
       });
       slider.on_fullscreen = () => m.ab_slider_open_fullscreen({
-        aSrc: `${apiBase}/assets/${encodeURIComponent(a.asset_id)}`,
-        bSrc: `${apiBase}/assets/${encodeURIComponent(b.asset_id)}`,
+        aSrc: a.image_url,
+        bSrc: b.image_url,
         aLabel: a.prompt || a.cell_key,
         bLabel: b.prompt || b.cell_key,
       });
@@ -1017,6 +1212,14 @@ export function results_tab_render(rootEl, api, options = {}) {
   const _selectionListener = () => renderComparison(shell, apiBase);
   window.addEventListener("testing-selection-changed", _selectionListener);
 
+  // Escape key closes the detail panel
+  const _detailKeyHandler = function (ev) {
+    if (ev.key === "Escape" && _detailCell) {
+      closeDetailPanel();
+    }
+  };
+  window.addEventListener("keydown", _detailKeyHandler);
+
   // Event delegation for comparison action buttons
   shell.addEventListener("click", (ev) => {
     const compareActions = ev.target.closest(".testing-results-compare-actions");
@@ -1028,10 +1231,10 @@ export function results_tab_render(rootEl, api, options = {}) {
       selection.reverse();
       renderComparison(shell, apiBase);
     } else if (action === "compare-fullscreen") {
-      if (selection.length === 2 && selection[0].asset_id && selection[1].asset_id) {
+      if (selection.length === 2 && selection[0].image_url && selection[1].image_url) {
         import("./testing-ab-slider.js").then((m) => m.ab_slider_open_fullscreen({
-          aSrc: `${apiBase}/assets/${encodeURIComponent(selection[0].asset_id)}`,
-          bSrc: `${apiBase}/assets/${encodeURIComponent(selection[1].asset_id)}`,
+          aSrc: selection[0].image_url,
+          bSrc: selection[1].image_url,
           aLabel: selection[0].prompt || selection[0].cell_key,
           bLabel: selection[1].prompt || selection[1].cell_key,
         }));
@@ -1046,6 +1249,7 @@ export function results_tab_render(rootEl, api, options = {}) {
       if (_selectionListener) {
         window.removeEventListener("testing-selection-changed", _selectionListener);
       }
+      window.removeEventListener("keydown", _detailKeyHandler);
     },
     updateProgress(snap, evs) { snapshot = snap; if (evs) lastEvents = evs; updateProgressBar(shell, snap, lastEvents); },
   };

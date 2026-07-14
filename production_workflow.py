@@ -4,6 +4,7 @@ No Modal, Torch, ComfyUI server, filesystem, or GPU dependencies.
 """
 
 import hashlib
+import json
 import threading
 from collections import OrderedDict
 
@@ -101,6 +102,15 @@ def _reset_cache():
 
 def _cache_size():
     return len(_topology_plan_cache)
+
+
+def _compute_compiled_workflow_hash(compiled: dict) -> str:
+    """SHA-256 of the compiled workflow dict using deterministic JSON encoding."""
+    try:
+        encoded = json.dumps(compiled, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -297,13 +307,15 @@ def compile_production_workflow(
                 original_key = nid_map[nid]
                 compiled[nid] = _copy_node(workflow[original_key])
         rewritten_ids = []
-        for oid in cached_rewritten:
-            if oid in compiled:
-                _try_rewrite_output(oid, compiled, nid_map, rewritten_ids)
+        if allow_direct_output_rewrite and production.get("direct_output_sink", True):
+            for oid in cached_rewritten:
+                if oid in compiled:
+                    _try_rewrite_output(oid, compiled, nid_map, rewritten_ids)
         rgthree_rewritten_ids = []
-        for oid in cached_rgthree:
-            if oid in compiled:
-                _try_rewrite_rgthree_comparer(oid, compiled, nid_map, rgthree_rewritten_ids)
+        if allow_direct_output_rewrite and allow_rgthree_comparer_rewrite and production.get("direct_output_sink", True):
+            for oid in cached_rgthree:
+                if oid in compiled:
+                    _try_rewrite_rgthree_comparer(oid, compiled, nid_map, rgthree_rewritten_ids)
         removed_ids = [nid for nid in nid_map if nid not in cached_kept_set]
         duplicate_analysis = {}
         _selected_output_classes = {}
@@ -311,6 +323,7 @@ def compile_production_workflow(
             if oid in nid_map:
                 orig_key = nid_map[oid]
                 _selected_output_classes[oid] = workflow.get(orig_key, {}).get("class_type", "?")
+        compiled_workflow_hash = _compute_compiled_workflow_hash(compiled)
         report = {
             "enabled": True,
             "schema_version": production.get("schema_version", 0),
@@ -324,6 +337,7 @@ def compile_production_workflow(
             "direct_output_rewritten_node_ids": rewritten_ids,
             "rgthree_comparer_rewritten_node_ids": rgthree_rewritten_ids,
             "topology_hash": topology_hash,
+            "compiled_workflow_hash": compiled_workflow_hash,
             "cache_hit": True,
             "duplicate_analysis": duplicate_analysis,
             "direct_output_sink_enabled": bool(production.get("direct_output_sink", True)),
@@ -375,6 +389,7 @@ def compile_production_workflow(
         if oid in nid_map:
             orig_key = nid_map[oid]
             _selected_output_classes[oid] = workflow.get(orig_key, {}).get("class_type", "?")
+    compiled_workflow_hash = _compute_compiled_workflow_hash(compiled)
 
     report = {
         "enabled": True,
@@ -389,6 +404,7 @@ def compile_production_workflow(
         "direct_output_rewritten_node_ids": rewritten_ids,
         "rgthree_comparer_rewritten_node_ids": rgthree_rewritten_ids,
         "topology_hash": topology_hash,
+        "compiled_workflow_hash": compiled_workflow_hash,
         "cache_hit": False,
         "duplicate_analysis": duplicate_analysis,
         "direct_output_sink_enabled": bool(production.get("direct_output_sink", True)),

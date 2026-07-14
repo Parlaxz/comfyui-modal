@@ -187,6 +187,7 @@ async def run_prompt(
     workflow: dict,
     input_images: dict | None = None,
     trace: dict | None = None,
+    production_report: dict | None = None,
     gpu: str | None = None,
     modal_options: dict | None = None,
     workspace: dict | None = None,
@@ -195,7 +196,7 @@ async def run_prompt(
     async with _run_prompt_semaphore:
         return await asyncio.to_thread(
             lambda: _workspace_api(selected, gpu).run_prompt.remote(
-                workflow, input_images or {}, trace or {}, modal_options or {},
+                workflow, input_images or {}, trace or {}, modal_options or {}, production_report,
             ),
         )
 
@@ -206,6 +207,7 @@ async def run_prompt_stream(
     workflow: dict,
     input_images: dict | None = None,
     trace: dict | None = None,
+    production_report: dict | None = None,
     gpu: str | None = None,
     modal_options: dict | None = None,
     workspace: dict | None = None,
@@ -213,10 +215,10 @@ async def run_prompt_stream(
     """Execute workflow on Modal and stream progress events back to the caller.
 
     Yields dicts with types:
-      ``{"type": "status", "message": "..."}`` — startup/restore phase.
-      ``{"type": "progress", "event": "...", "data": {...}}`` — ComfyUI events.
-      ``{"type": "result", "data": {...}}`` — final result (last yield).
-      ``{"type": "error", "message": "..."}`` — fatal error.
+      {"type": "status", "message": "..."} — startup/restore phase.
+      {"type": "progress", "event": "...", "data": {...}} — ComfyUI events.
+      {"type": "result", "data": {...}} — final result (last yield).
+      {"type": "error", "message": "..."} — fatal error.
     """
     import time as _t
     selected = _resolve_workspace(workspace)
@@ -237,7 +239,7 @@ async def run_prompt_stream(
             trace["modal_handle_lookup_completed"] = _t.time()
             trace["remote_generator_create_started"] = _t.time()
         gen = _workspace_api(selected, gpu).run_prompt_stream.remote_gen.aio(
-            workflow, input_images or {}, trace or {}, modal_options or {},
+            workflow, input_images or {}, trace or {}, modal_options or {}, production_report,
         )
         if _is_dict_trace:
             trace["remote_generator_create_completed"] = _t.time()

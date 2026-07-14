@@ -2089,6 +2089,8 @@ async def _execute_job(item: tuple, item_id: int):
     prompt_hash = extra_data.get("workflow_hash", "")
     prompt_summary = extra_data.get("prompt_summary", {})
     model_stack = extra_data.get("model_stack", {})
+    # Extract production_report from extra_data (set by modal_prompt route)
+    production_report = extra_data.get("production_report")
     try:
         _send(sid, "modal_status", {"prompt_id": prompt_id, "message": "Starting up", "phase": "startup"})
         # Verify workflow integrity immediately before remote call
@@ -2109,13 +2111,43 @@ async def _execute_job(item: tuple, item_id: int):
         try:
             import nodes as _validate_nodes
             _requested_types = set()
+            _PRODUCTION_REMOTE_CLASSES = frozenset({
+                "ComfyModalProductionOutput",
+                "ComfyModalProductionImageComparerOutput",
+            })
             for _spec in execution_workflow.values():
                 if isinstance(_spec, dict):
                     _ct = _spec.get("class_type")
                     if isinstance(_ct, str) and _ct:
                         _requested_types.add(_ct)
+            # Only exempt remote-only class types that appear at
+            # compiler-rewritten node IDs in the production_report.
+            # Use production_report from extra_data (available in scope);
+            # production_options is NOT defined in _execute_job scope.
+            _production_active = bool(
+                production_report
+                and isinstance(production_report, dict)
+                and production_report.get("enabled")
+            )
+            if _production_active:
+                _rewritten_out_ids = set(production_report.get("direct_output_rewritten_node_ids", []))
+                _rewritten_rgthree_ids = set(production_report.get("rgthree_comparer_rewritten_node_ids", []))
+                _validated_types = set()
+                for _nid, _spec in execution_workflow.items():
+                    if not isinstance(_spec, dict):
+                        continue
+                    _ct = _spec.get("class_type")
+                    if not isinstance(_ct, str) or not _ct:
+                        continue
+                    if _ct == "ComfyModalProductionOutput" and str(_nid) in _rewritten_out_ids:
+                        continue  # compiler-generated; skip local validation
+                    if _ct == "ComfyModalProductionImageComparerOutput" and str(_nid) in _rewritten_rgthree_ids:
+                        continue  # compiler-generated; skip local validation
+                    _validated_types.add(_ct)
+            else:
+                _validated_types = _requested_types
             _missing = sorted(
-                ct for ct in _requested_types
+                ct for ct in _validated_types
                 if ct not in _validate_nodes.NODE_CLASS_MAPPINGS
             )
             if _missing:
@@ -2218,6 +2250,7 @@ async def _execute_job(item: tuple, item_id: int):
             execution_workflow,
             input_images,
             trace={**trace.fields(), "prompt_id": prompt_id},
+            production_report=extra_data.get("production_report"),
             gpu=extra_data.get("gpu"),
             modal_options=_mo if _mo else None,
             workspace=_request_workspace or None,
@@ -2440,12 +2473,17 @@ async def _execute_job(item: tuple, item_id: int):
                 _f.flush()
         print(trace.log_line())
 
+        # Extract production evidence from remote result
+        _production_evidence = result.get("_production_evidence") if isinstance(result, dict) else None
         trace.mark("t10d_local_response_sent")
         trace.mark("client_comfy_notify_start")
         trace.mark("client_comfy_notify_done")
         _send(sid, "executing", {"node": None, "display_node": None, "prompt_id": prompt_id})
         _send(sid, "modal_status", {"prompt_id": prompt_id, "message": None, "phase": "done"})
-        _send(sid, "execution_success", {"prompt_id": prompt_id, "trace": result.get("trace")})
+        _exec_success_data = {"prompt_id": prompt_id, "trace": result.get("trace")}
+        if _production_evidence is not None:
+            _exec_success_data["_production_evidence"] = _production_evidence
+        _send(sid, "execution_success", _exec_success_data)
         _meta = {
             "model_stack": model_stack,
             "prompt_summary": prompt_summary,
@@ -2454,6 +2492,7 @@ async def _execute_job(item: tuple, item_id: int):
             "restore_timing": result.get("_restore_timing", {}),
             "scheduler_trace": result.get("scheduler_trace"),
             "primary_output": result.get("primary_output") or result.get("_local_primary_output"),
+            "_production_evidence": result.get("_production_evidence") if isinstance(result, dict) else None,
         }
         _finish_job(task_key, prompt_id, outputs, success=True, meta=_meta)
 
@@ -3209,9 +3248,12 @@ if _server:
                 production_options["enabled"] = True
                 if "schema_version" not in production_options:
                     production_options["schema_version"] = 1
+                # Compute source_workflow_hash BEFORE compilation (authoritative original)
+                _source_workflow_hash = prompt_sha256(workflow)
                 compiled, production_report = compile_production_workflow(
-                    workflow, production_options, allow_direct_output_rewrite=False
+                    workflow, production_options, allow_direct_output_rewrite=True
                 )
+                production_report["source_workflow_hash"] = _source_workflow_hash
                 execution_workflow = compiled
                 kept = production_report.get("compiled_node_count", 0)
                 removed = production_report.get("removed_node_count", 0)

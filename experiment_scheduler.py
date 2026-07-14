@@ -345,18 +345,18 @@ class ExperimentScheduler:
             self._set_status(STATUS_STOPPED)
         elif snap.get("status") == STATUS_FAILED_FATAL or has_fatal_checkpoint:
             self._set_status(STATUS_FAILED_FATAL)
-        elif failed > 0:
-            # Some cells currently visible as failed → completed_with_failures
-            self._set_status(STATUS_COMPLETED_WITH_FAILURES)
-        elif completed > 0 or (total > 0 and visible_count >= total):
-            # All cells accounted for, no failures → completed
-            # Also completed if there are no cells
-            self._set_status(STATUS_COMPLETED)
         elif total == 0:
             # No cells at all
             self._set_status(STATUS_COMPLETED)
+        elif visible_count < total:
+            # Not all expected cells are terminal — incomplete unrequested run.
+            # Use a safe non-completed terminal/error status.
+            self._set_status(STATUS_FAILED_FATAL)
+        elif failed > 0:
+            # All cells terminal, some with failures
+            self._set_status(STATUS_COMPLETED_WITH_FAILURES)
         else:
-            # Should not reach here in normal flow
+            # All cells terminal, no failures
             self._set_status(STATUS_COMPLETED)
 
     def _eligible_from(self, cells: list) -> list:

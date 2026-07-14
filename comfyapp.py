@@ -1000,7 +1000,7 @@ _CUSTOM_NODE_SET_MISMATCH_IGNORE_ENV = os.getenv("COMFYMODAL_CUSTOM_NODE_SET_MIS
 #   off            GÃ‡Ã¶ skip CPU preload entirely
 #   async_no_wait  GÃ‡Ã¶ fire preload in background thread, don't block restore
 #   budgeted_1500ms GÃ‡Ã¶ preload with 1500ms time budget, stop when exceeded
-PRELOAD_MODE = os.getenv("COMFYMODAL_PRELOAD_MODE", "off").strip().lower()
+PRELOAD_MODE = os.getenv("COMFYMODAL_PRELOAD_MODE", "workers_2").strip().lower()
 PROMPT_ASYNC_PRELOAD = os.getenv("PROMPT_ASYNC_PRELOAD", "0") == "1"
 PROMPT_PRELOAD_WORKERS = int(os.getenv("PROMPT_PRELOAD_WORKERS", "2"))
 PROMPT_ASYNC_ACTUAL_LOAD = os.getenv("PROMPT_ASYNC_ACTUAL_LOAD", "0") == "1"
@@ -1076,14 +1076,14 @@ if ACTUAL_LOAD_MODE not in ("off", "clip_vae_only", "unet_only", "unet_vae_only"
 # during direct warmup at all.  Default both to 0 so that synchronous
 # model reads during restore (16+ GB) are opt-in rather than the default.
 # DIRECT_WARMUP_CLIP_ENCODE gates the dummy CLIPTextEncode forward pass.
-DIRECT_WARMUP_LOAD_UNET = os.getenv("COMFYMODAL_DIRECT_WARMUP_LOAD_UNET", "0") == "1"
-DIRECT_WARMUP_LOAD_CLIP = os.getenv("COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP", "0") == "1"
+DIRECT_WARMUP_LOAD_UNET = os.getenv("COMFYMODAL_DIRECT_WARMUP_LOAD_UNET", "1") == "1"
+DIRECT_WARMUP_LOAD_CLIP = os.getenv("COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP", "1") == "1"
 DIRECT_WARMUP_CLIP_ENCODE = os.getenv("COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE", "0") == "1"
 # When enabled, direct warmup only loads a model file if it is already
 # present in the CPU cache (populated by CPU preload).  This prevents
 # direct warmup from becoming a synchronous 16.85 GB volume read when
 # CPU preload is disabled or async.
-DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT = os.getenv("COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT", "1") == "1"
+DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT = os.getenv("COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT", "0") == "1"
 
 # P2 GÃ‡Ã¶ Sage runtime policy.
 #   auto           GÃ‡Ã¶ (default) probe and select automatically
@@ -5297,6 +5297,7 @@ _COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = [
     ".deploy_log",
     ".tmp",
     "*.tmp",
+    ".experiment_leases.db*",
     ".comfymodal_experiments/",
     ".custom_node_requirements/",
     ".hf_token",
@@ -5326,6 +5327,7 @@ _COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = [
     "comfyui-modal/.deploy_log",
     "comfyui-modal/.tmp",
     "comfyui-modal/*.tmp",
+    "comfyui-modal/.experiment_leases.db*",
     "comfyui-modal/*.log",
     "comfyui-modal/modal_logs.txt",
     "comfyui-modal/_deploy_output.log",
@@ -6053,18 +6055,24 @@ _image_base = (
             "TRITON_CACHE_DIR": "/tmp/triton_cache",
             "TORCHINDUCTOR_EMULATE_PRECISION_CASTS": "1",
             "TORCHINDUCTOR_COMPILE_THREADS": "1",
+            # Baseline env per requirements: warmup enabled, torch compile disabled
             "COMFYMODAL_ENABLE_TORCH_COMPILE": "0",
+            "COMFYMODAL_ENABLE_WARMUP": "1",
             "COMFYMODAL_ENABLE_GPU_SNAPSHOT": "0",
             "COMFYMODAL_WARMUP_TEXT": "warmup",
-            # Restore latency fix GÃ‡Ã¶ default production profile (Config D)
+            # Backend: in_process execution
+            "COMFYMODAL_EXECUTION_BACKEND": "in_process",
+            # Sage: baked_cuda path, no probe
             "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
             "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
-            "COMFYMODAL_PRELOAD_MODE": "clip_only",
-            "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "0",
+            # Preload: workers_2 (2 concurrent workers), not clip_only
+            "COMFYMODAL_PRELOAD_MODE": "workers_2",
+            # Direct warmup: load UNET+CLIP, skip CLIP encode, no CPU cache requirement
+            "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "1",
             "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
-             "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "1",
+            "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "0",
+            "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "0",
             "COMFYMODAL_EXACT_CLIP_PREFILL": "1",
-            "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "1",
             "COMFYMODAL_SAFETENSORS_READ_MODE": "normal",
             "COMFYMODAL_RUNTIME": "1",
             "PROMPT_ASYNC_PRELOAD": "0",
@@ -6081,7 +6089,7 @@ _image_base = (
             "COMFYMODAL_PRELOAD_MAX_FILE_GB": "10",
             "COMFYMODAL_PRELOAD_MIN_THROUGHPUT_GBPS": "0.5",
             "COMFYMODAL_PRELOAD_OUTLIER_ABORT_SECONDS": "10",
-                        "COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY": "0",
+            "COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY": "0",
             "COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "0",
             "COMFYMODAL_RESTORE_BACKGROUND_UNET": "0",
         }
@@ -13637,15 +13645,27 @@ class _ComfyAPIMixin:
         if _production_enabled:
             if production_report is not None:
                 # Caller pre-compiled; workflow is already the compiled version
+                # Verify compiled_workflow_hash matches the received workflow
+                _expected_cwf_hash = production_report.get("compiled_workflow_hash", "")
+                if _expected_cwf_hash:
+                    _actual_cwf_hash = compute_canonical_compiled_workflow_hash(workflow)
+                    if _actual_cwf_hash != _expected_cwf_hash:
+                        raise RuntimeError(
+                            f"Rejecting supplied production plan: compiled_workflow_hash mismatch. "
+                            f"Expected {_expected_cwf_hash[:16]}..., got {_actual_cwf_hash[:16]}..."
+                        )
                 _compiled_workflow = workflow
             else:
                 _exec_t0 = time.time()
+                # source_workflow_hash must be set from original workflow BEFORE compilation
+                _source_wf_hash = compute_canonical_source_workflow_hash(workflow)
                 _compiled_workflow, production_report = compile_production_workflow(
                     workflow,
                     _production_cache,
                     allow_direct_output_rewrite=True,
                     stable=bool(_resolve_runtime_flag("PRODUCTION_STABLE_PATH", "1")),
                 )
+                production_report["source_workflow_hash"] = _source_wf_hash
                 _compile_ms = round((time.time() - _exec_t0) * 1000, 1)
                 _th = production_report.get('topology_hash', '?')[:12]
                 _cc = production_report.get('compiled_node_count', 0)
@@ -14456,6 +14476,34 @@ class _ComfyAPIMixin:
                   f"registry_used={_registry_used} "
                   f"registry_node_count={0} "
                   f"registry_entry_count={_registry_entries}")
+        # â”€â”€ Build _production_evidence for hash-integrity audit â”€â”€
+        _production_evidence = {}
+        if isinstance(production_report, dict) and production_report.get("enabled"):
+            # source_workflow_hash: read from the local compiler's pre-compile hash
+            # (NOT computed from source_workflow here, which is already compiled when report supplied)
+            _src_hash = production_report.get("source_workflow_hash", "")
+            # executed_workflow_hash: freshly computed from the workflow we just executed,
+            # verified against report's compiled_workflow_hash (fail-closed on mismatch)
+            _exec_hash = compute_canonical_compiled_workflow_hash(workflow)
+            _comp_hash = production_report.get("compiled_workflow_hash", "")
+            if _comp_hash and _exec_hash != _comp_hash:
+                raise RuntimeError(
+                    f"Production evidence integrity failure: executed workflow hash "
+                    f"{_exec_hash[:16]}... != compiled_workflow_hash {_comp_hash[:16]}..."
+                )
+            _production_evidence["source_workflow_hash"] = _src_hash
+            _production_evidence["compiled_workflow_hash"] = _comp_hash
+            _production_evidence["executed_workflow_hash"] = _exec_hash
+            _production_evidence["production_plan_hash"] = production_report.get("topology_hash", "")
+            _production_evidence["production_plan_used"] = True
+            _production_evidence["kept_count"] = production_report.get("compiled_node_count", 0)
+            _production_evidence["removed_count"] = production_report.get("removed_node_count", 0)
+            _production_evidence["bypassed_count"] = len(production_report.get("bypass_node_ids", []))
+            _production_evidence["output_count"] = len(production_report.get("output_node_ids", []))
+            _production_evidence["direct_output_rewritten_count"] = production_report.get("direct_output_rewritten_count", 0)
+            _production_evidence["rgthree_comparer_rewritten_count"] = production_report.get("rgthree_comparer_rewritten_count", 0)
+        if _production_evidence:
+            result["_production_evidence"] = _production_evidence
         # Collector consumed the registry — safety cleanup is a no-op after successful pop
         _cleanup_production_registry(prompt_id)
         return result
@@ -19001,6 +19049,7 @@ class _ComfyAPIMixin:
         input_images: dict | None = None,
         trace: dict | None = None,
         modal_options: dict | None = None,
+        production_report: dict | None = None,
     ) -> dict:
         global _container_request_count
         _container_request_count += 1
@@ -19103,7 +19152,7 @@ class _ComfyAPIMixin:
         if self._select_backend() == "in_process":
             total_started = time.time()
             _last_graph_validate_ms = getattr(self, "_last_graph_validate_ms", None)
-            result = self._execute_in_process(workflow, input_images, trace=server_trace, modal_options=modal_options)
+            result = self._execute_in_process(workflow, input_images, trace=server_trace, modal_options=modal_options, production_report=production_report)
             _graph_validate_ms = getattr(self, "_last_graph_validate_ms", None)
 
             # GÃ¶Ã‡GÃ¶Ã‡ Model residency log GÃ¶Ã‡GÃ¶Ã‡
@@ -20026,6 +20075,7 @@ class _ComfyAPIMixin:
         input_images: dict | None = None,
         trace: dict | None = None,
         modal_options: dict | None = None,
+        production_report: dict | None = None,
     ):
         global _container_request_count
         _container_request_count += 1
@@ -20217,7 +20267,7 @@ class _ComfyAPIMixin:
             def _exec() -> None:
                 try:
                     _t_exec_start = time.time()
-                    _r = self._execute_in_process(workflow, input_images or {}, trace=server_trace, modal_options=modal_options)
+                    _r = self._execute_in_process(workflow, input_images or {}, trace=server_trace, modal_options=modal_options, production_report=production_report)
                     # GÃ¶Ã‡GÃ¶Ã‡ Cache diagnostics for streaming path GÃ¶Ã‡GÃ¶Ã‡
                     try:
                         _r["_cache_diagnostics"] = {
