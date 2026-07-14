@@ -1264,29 +1264,18 @@ def build_single_run_spec(
 
         production_options["output_node_ids"] = _derived_output_ids
 
-        # ── Validate before compiling ────────────────────────────────────
-        # Default-applied production (no explicit modal_options) derives
-        # output IDs for diagnostics but does NOT compile — the controlled
-        # workflow with bindings applied must remain intact for the caller.
-        # Only compile when the caller explicitly enabled production via
-        # modal_options.production.
-        _caller_enabled_production = bool(
-            isinstance(modal_options, dict)
-            and isinstance(modal_options.get("production"), dict)
-            and modal_options["production"].get("enabled", True) is not False
-            and ("schema_version" in modal_options["production"]
-                 or "output_node_ids" in modal_options["production"])
-        )
-        _all_ids_exist = all(str(oid) in workflow for oid in _derived_output_ids)
-        if _caller_enabled_production and _all_ids_exist:
-            try:
-                compiled, production_report = compile_production_workflow(
-                    workflow, production_options, allow_direct_output_rewrite=True
-                )
-                production_report["source_workflow_hash"] = ""
-                production_workflow = compiled
-            except Exception:
-                raise
+        # ── Compile ───────────────────────────────────────────────────────
+        # Compile whenever production is enabled (including default-applied
+        # when modal_options is omitted).  The only skip is explicit
+        # enabled=False checked above.  No existence pre-check — let
+        # compile_production_workflow's precise ValueError propagate.
+        try:
+            compiled, production_report = compile_production_workflow(
+                workflow, production_options, allow_direct_output_rewrite=True
+            )
+            production_workflow = compiled
+        except Exception:
+            raise
 
     # Build axis_values from controls (for history)
     axis_values: dict[str, Any] = {}
@@ -1356,7 +1345,7 @@ def build_single_run_spec(
         "studio_meta": studio_meta,
         "production_report": production_report,
         "production_options": production_options if _prod_enabled else None,
-        # Diagnostic fields
+        # Diagnostic fields — hash values sourced from compiler report
         "execution_surface": "studio_single",
         "production_default_applied": _prod_default_applied,
         "production_explicitly_disabled": _prod_explicitly_disabled,
@@ -1364,6 +1353,10 @@ def build_single_run_spec(
         "production_output_ids": _prod_output_ids,
         "production_plan_used": _prod_plan_used,
         "production_output_count": len(_prod_output_ids),
+        "production_source_hash": (production_report or {}).get("source_workflow_hash", ""),
+        "production_plan_hash": (production_report or {}).get("topology_hash", ""),
+        "production_compiled_hash": (production_report or {}).get("compiled_workflow_hash", ""),
+        "runner_workflow_hash": (production_report or {}).get("runner_workflow_hash", ""),
     }
 
     return compilation
@@ -1747,27 +1740,30 @@ def build_experiment_spec(
                             _derived_ids = [_nid]
                             break
 
-            if _derived_ids and isinstance(wf, dict) and wf:
-                _ck_prod_options["output_node_ids"] = _derived_ids
-                # Only compile when caller explicitly enabled production AND
-                # all derived IDs exist in the workflow.  Skip for default-
-                # applied (omitted modal_options) and wrapper-format snapshots.
-                _caller_enabled = bool(
-                    isinstance(modal_options, dict)
-                    and isinstance(modal_options.get("production"), dict)
-                    and modal_options["production"].get("enabled", True) is not False
-                    and ("schema_version" in modal_options["production"]
-                         or "output_node_ids" in modal_options["production"])
+            if not _derived_ids:
+                return {"error": (
+                    f"Production mode is enabled for preset {pf!r} but no output node ID "
+                    f"could be derived from its snapshot. The preset snapshot has no "
+                    f"outputNodeId and no output binding. Either disable production or "
+                    f"bind an output node in the preset wizard."
+                )}
+
+            _ck_prod_options["output_node_ids"] = _derived_ids
+            # Compile whenever production is enabled (including default-applied
+            # when modal_options is omitted).  The only skip is explicit
+            # enabled=False checked before the derivation loop.
+            # No existence pre-check — let compile_production_workflow's
+            # precise ValueError propagate.
+            try:
+                _compiled_wf, _ck_prod_report = compile_production_workflow(
+                    wf, _ck_prod_options, allow_direct_output_rewrite=True
                 )
-                if _caller_enabled and all(str(oid) in wf for oid in _derived_ids):
-                    try:
-                        _compiled_wf, _ck_prod_report = compile_production_workflow(
-                            wf, _ck_prod_options, allow_direct_output_rewrite=True
-                        )
-                        ck["workflow"] = _compiled_wf
-                    except Exception:
-                        raise
+                ck["workflow"] = _compiled_wf
+            except Exception:
+                raise
         ck["production_report"] = _ck_prod_report
+        if _ck_prod_options:
+            ck["production_options"] = _ck_prod_options
 
     for cell in compilation.get("cells", []):
         cell["studio_meta"] = studio_meta
@@ -1779,11 +1775,12 @@ def build_experiment_spec(
         )
         if _match_ck:
             cell["production_report"] = _match_ck.get("production_report")
+            cell["production_options"] = _match_ck.get("production_options")
 
     compilation["studio_meta"] = studio_meta
     compilation["production_report"] = None  # experiments have per-cell reports
     compilation["production_options"] = _prod_options if (_prod_options or {}).get("enabled") else None
-    # Diagnostic fields
+    # Diagnostic fields — per-checkpoint hashes sourced from each report
     compilation["execution_surface"] = "studio_experiment"
     compilation["production_default_applied"] = _prod_default_applied
     compilation["production_explicitly_disabled"] = _prod_explicitly_disabled
@@ -1793,6 +1790,17 @@ def build_experiment_spec(
             for ck in compilation.get("checkpoints", [])
         )
     )
+    # Reference hashes from the first compiled checkpoint's report (if any).
+    # Each checkpoint carries its own full report for per-cell matching.
+    _first_compiled_ck = next(
+        (ck for ck in compilation.get("checkpoints", []) if ck.get("production_report")),
+        None,
+    )
+    _first_report = (_first_compiled_ck or {}).get("production_report") or {}
+    compilation["production_source_hash"] = _first_report.get("source_workflow_hash", "")
+    compilation["production_plan_hash"] = _first_report.get("topology_hash", "")
+    compilation["production_compiled_hash"] = _first_report.get("compiled_workflow_hash", "")
+    compilation["runner_workflow_hash"] = _first_report.get("runner_workflow_hash", "")
     return compilation
 
 

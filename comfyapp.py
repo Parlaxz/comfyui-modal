@@ -960,6 +960,14 @@ PRELOAD_MIN_THROUGHPUT_GBPS = float(os.getenv("COMFYMODAL_PRELOAD_MIN_THROUGHPUT
 # After this many seconds of preload, evaluate throughput and abort if below threshold.
 PRELOAD_OUTLIER_ABORT_SECONDS = float(os.getenv("COMFYMODAL_PRELOAD_OUTLIER_ABORT_SECONDS", "10"))
 
+# Active-profile preload caps — used when a known active-next profile (production)
+# is available.  These are intentionally higher than the generic caps so that
+# the known 11.46 GiB active UNET + CLIP can both be preloaded concurrently.
+# The generic caps (PRELOAD_MAX_FILE_GB / PRELOAD_MAX_TOTAL_GB) still protect
+# unknown/speculative profiles.
+ACTIVE_PROFILE_PRELOAD_MAX_FILE_GB = float(os.getenv("COMFYMODAL_ACTIVE_PROFILE_MAX_FILE_GB", "20"))
+ACTIVE_PROFILE_PRELOAD_MAX_TOTAL_GB = float(os.getenv("COMFYMODAL_ACTIVE_PROFILE_MAX_TOTAL_GB", "25"))
+
 # GÃ¶Ã‡GÃ¶Ã‡ PART 4: Custom-node requirements repair mode GÃ¶Ã‡GÃ¶Ã‡
 #   off        - Never install requirements during prompt execution.
 #   fail_fast  - If requirements hash is missing/stale, fail with
@@ -3031,6 +3039,23 @@ def _resolve_preload_mode() -> str:
     except Exception:
         pass
     return PRELOAD_MODE
+
+
+def _resolve_preload_worker_count(preload_mode: str) -> int:
+    """Return the configured worker count for the given preload mode.
+
+    Matches the real worker-configuration block inside
+    ``_preload_models_to_cpu``.  Extracted as a standalone helper so
+    tests can exercise the real logic without duplicating the mapping.
+    """
+    if preload_mode == "workers_1":
+        return 1
+    elif preload_mode == "workers_2":
+        return 2
+    elif preload_mode == "sequential":
+        return 1
+    # "default", "vae", "unet_only", "clip_only", "off", etc.
+    return 4
 
 
 def _resolve_return_mode() -> str:
@@ -7621,60 +7646,97 @@ def lookup_clip_cache(bundle_hash: str, clip_fingerprint_key: str) -> dict:
         return {"status": "miss", "reason": f"error:{exc}"[:120]}
 
 
-def _filter_preload_paths_by_size(file_paths: list) -> tuple[list, dict]:
+def _filter_preload_paths_by_size(file_paths: list, profile: dict | None = None) -> tuple[list, dict]:
     """Filter preload candidate paths by size guardrails.
 
     Returns ``(filtered_paths, result_dict)`` where ``result_dict``
     contains the decision reason and per-file details.
 
+    When *profile* is provided and originates from an active-next (production)
+    profile, the active-profile caps (``ACTIVE_PROFILE_PRELOAD_MAX_FILE_GB`` /
+    ``ACTIVE_PROFILE_PRELOAD_MAX_TOTAL_GB``) are used instead of the generic
+    caps.  This allows the known ~11.46 GiB active UNET + CLIP to be preloaded
+    concurrently without being blocked by the conservative generic limits.
+
     Policy:
-    1. Remove individual files above ``PRELOAD_MAX_FILE_GB``.
-    2. Compute total size of remaining candidates.
-    3. If total exceeds ``PRELOAD_MAX_TOTAL_GB``, return empty list
-       with ``reason=max_total_gb_exceeded`` GÃ‡Ã¶ no partial preload.
-    4. Otherwise return the filtered list.
+    1. Determine cap source: active-profile caps for active production profiles,
+       generic caps for unknown/speculative profiles.
+    2. Remove individual files above the file cap.
+    3. Compute total size of remaining candidates.
+    4. If total exceeds the total cap, return empty list
+       with ``reason=max_total_gb_exceeded`` — no partial preload.
+    5. Otherwise return the filtered list.
     """
+    # Determine whether this is an active production profile
+    _profile_source = (profile or {}).get("_source", "")
+    _is_active_profile = _profile_source in ("active_next_profile", "active_next_profile_expired")
+    _is_production = bool((profile or {}).get("_production_enabled"))
+
+    if _is_active_profile or _is_production:
+        _max_file_gb = ACTIVE_PROFILE_PRELOAD_MAX_FILE_GB
+        _max_total_gb = ACTIVE_PROFILE_PRELOAD_MAX_TOTAL_GB
+        _cap_source = "active_profile"
+    else:
+        _max_file_gb = PRELOAD_MAX_FILE_GB
+        _max_total_gb = PRELOAD_MAX_TOTAL_GB
+        _cap_source = "generic"
+
     result: dict = {
         "total_gb": 0.0,
         "files_input": len(file_paths),
         "files_kept": 0,
         "files_skipped": [],
         "skipped_reason": "",
+        "cap_source": _cap_source,
+        "effective_max_file_gb": _max_file_gb,
+        "effective_max_total_gb": _max_total_gb,
     }
     kept: list = []
     _total_gb = 0.0
 
-    # Phase 1: remove files above PRELOAD_MAX_FILE_GB
+    print(
+        f"[comfyapp] preload_filter caps_source={_cap_source} "
+        f"max_file_gb={_max_file_gb} max_total_gb={_max_total_gb} "
+        f"is_active_profile={int(_is_active_profile)} "
+        f"is_production={int(_is_production)} "
+        f"profile_source={_profile_source!r}"
+    )
+
+    # Phase 1: remove files above the file cap
     for _raw in file_paths:
         _p = _raw["path"] if isinstance(_raw, dict) else _raw
+        _role = _raw.get("role", "unknown") if isinstance(_raw, dict) else "unknown"
         try:
             _sz_gb = os.path.getsize(_p) / (1024**3)
         except OSError:
             continue
-        if _sz_gb > PRELOAD_MAX_FILE_GB:
+        if _sz_gb > _max_file_gb:
             result["files_skipped"].append({
                 "path": _p,
+                "role": _role,
                 "size_gb": round(_sz_gb, 2),
                 "reason": "max_file_gb_exceeded",
+                "cap": _max_file_gb,
             })
             print(
                 f"[comfyapp] preload_skipped reason=max_file_gb_exceeded "
-                f"file={os.path.basename(_p)} size_gb={round(_sz_gb, 2)} "
-                f"max_file_gb={PRELOAD_MAX_FILE_GB}"
+                f"role={_role} file={os.path.basename(_p)} "
+                f"size_gb={round(_sz_gb, 2)} "
+                f"max_file_gb={_max_file_gb} cap_source={_cap_source}"
             )
             continue
         kept.append(_raw)
         _total_gb += _sz_gb
 
     # Phase 2: if total exceeds max_total_gb, reject everything
-    if _total_gb > PRELOAD_MAX_TOTAL_GB:
+    if _total_gb > _max_total_gb:
         result["total_gb"] = round(_total_gb, 2)
         result["files_kept"] = 0
         result["reason"] = "max_total_gb_exceeded"
         print(
             f"[comfyapp] preload_skipped reason=max_total_gb_exceeded "
             f"total_gb={round(_total_gb, 2)} "
-            f"max_total_gb={PRELOAD_MAX_TOTAL_GB}"
+            f"max_total_gb={_max_total_gb} cap_source={_cap_source}"
         )
         return [], result
 
@@ -9398,14 +9460,8 @@ class _ComfyAPIMixin:
                 except OSError:
                     pass
             # Determine worker count from PRELOAD_MODE
-            _preload_max_workers = 4
             _pm = _resolve_preload_mode()
-            if _pm == "workers_1":
-                _preload_max_workers = 1
-            elif _pm == "workers_2":
-                _preload_max_workers = 2
-            elif _pm in ("sequential",):
-                _preload_max_workers = 1
+            _preload_max_workers = _resolve_preload_worker_count(_pm)
 
             print(
                 f"[comfyapp] preload_models_to_cpu: files={len(file_paths)} "
@@ -16128,7 +16184,24 @@ class _ComfyAPIMixin:
                 _encode_eff = clip_policy_overrides.get("direct_warmup_clip_encode_effective", 0)
                 _rt_load_clip = bool(_load_clip_eff)
                 _rt_clip_encode = bool(_encode_eff)
-                _rt_require_cpu_hit = bool(_load_clip_eff)
+                # NOTE: _rt_require_cpu_hit is intentionally NOT overwritten here.
+                # It must retain its canonical resolved value from the baseline/
+                # runtime/file/env precedence chain.  clip_policy_overrides only
+                # controls CLIP load/encode, not CPU-cache requirement.
+                print(
+                    f"[comfyapp] direct warmup: clip_policy_overrides applied, "
+                    f"load_clip={int(_rt_load_clip)} encode={int(_rt_clip_encode)} "
+                    f"require_cpu_hit_unchanged={int(_rt_require_cpu_hit)}"
+                )
+
+            # Log the single effective CPU-cache requirement value
+            # The compact boundary diagnostic token is consumed by
+            # external tooling — keep the exact format stable.
+            print(
+                f"[comfyapp] direct warmup: effective require_cpu_cache_hit={int(_rt_require_cpu_hit)} "
+                f"source=canonical_runtime_resolve "
+                f"direct_warmup_require_cpu_cache_hit={int(_rt_require_cpu_hit)}"
+            )
 
             # GÃ¶Ã‡GÃ¶Ã‡ 1. Load UNET via UNETLoader (if enabled) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             _phases["direct_warmup_load_unet"] = 1.0 if _rt_load_unet else 0.0
@@ -16158,7 +16231,14 @@ class _ComfyAPIMixin:
                             if _unet_cache_path:
                                 _key = self._unet_cache_key(_unet_cache_path, "default")
                                 self._unet_object_cache[_key] = _unet_result[0]
-                                print(f"[comfyapp] direct warmup: UNET cached key={_key} id={id(_unet_result[0])}")
+                                _phases["direct_unet_cache_key"] = str(_key)
+                                _phases["direct_unet_object_cache_exists"] = 1.0
+                                print(
+                                    f"[comfyapp] direct UNET warmup completed: "
+                                    f"key={_key} "
+                                    f"object_cache_exists=1 "
+                                    f"id={id(_unet_result[0])}"
+                                )
                         except Exception as exc:
                             print(f"[comfyapp] direct warmup: UNET cache store failed: {exc}")
                 else:
@@ -16592,7 +16672,15 @@ class _ComfyAPIMixin:
                 _diag["unet_object_cache_size_after"] = len(_cache)
                 _diag["unet_object_cache_keys_after"] = str(list(_cache.keys())) if _cache else "empty"
                 _diag["unet_cpu_cache_size_after"] = len(_cpu_cache)
-                print(f"[unet_loader_cache] cache_hit path={unet_name}")
+                # Guard: direct-warmup cache hit means no future wait and no actual load occurred.
+                # These prove the request-time loader hit the warmup cache without blocking.
+                _diag["unet_future_waited"] = "0"
+                _diag["unet_actual_load_occurred"] = "0"
+                print(
+                    f"[unet_loader_cache] cache_hit path={unet_name} "
+                    f"future_waited=0 actual_load=0 "
+                    f"source=direct_warmup"
+                )
                 _api._unet_load_diagnostics = _diag
                 return (_cache[key],)
             _diag["unet_object_cache_miss"] = "1"
@@ -18144,9 +18232,10 @@ class _ComfyAPIMixin:
                         _preload_skip_reason_early = "unknown_profile"
                 else:
                     _preload_skip_reason_early = "unknown_profile"
-            # Guard 2: Size guardrails
+            # Guard 2: Size guardrails — pass profile context so active
+            # production profiles can use the higher active-profile caps.
             if _preload_skip_reason_early is None and _warmup_paths:
-                _filtered_paths_e, _filter_result_e = _filter_preload_paths_by_size(_warmup_paths)
+                _filtered_paths_e, _filter_result_e = _filter_preload_paths_by_size(_warmup_paths, _warmup_profile)
                 if not _filtered_paths_e:
                     _preload_skip_reason_early = _filter_result_e.get("reason", "size_filtered")
                     _warmup_paths = []
@@ -18159,6 +18248,44 @@ class _ComfyAPIMixin:
                     _preload_skip_reason_early = "z_image_guard"
                     _warmup_paths = []
                     print(f"[comfyapp] DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=1: skipping restore warmup (detected early)")
+            # ── Preload path/role diagnostics ──
+            # Log resolved paths with roles for clarity, and resolved/computed
+            # worker counts to prove workers_2 semantics.
+            if _warmup_paths:
+                _preload_paths_diag = []
+                for _p_entry in _warmup_paths:
+                    _p_path = _p_entry["path"] if isinstance(_p_entry, dict) else _p_entry
+                    _p_role = _p_entry.get("role", "?") if isinstance(_p_entry, dict) else "?"
+                    _preload_paths_diag.append(f"{_p_role}:{os.path.basename(_p_path)}")
+                _configured_workers = 4  # "default"
+                if _pm == "sequential":
+                    _configured_workers = 1
+                elif _pm == "workers_2":
+                    _configured_workers = 2
+                elif _pm in ("workers_1", "unet_only", "clip_only", "off"):
+                    _configured_workers = 1
+                elif _pm == "vae":
+                    _configured_workers = 4
+                # effective_workers derived later from min(configured, len(paths))
+                _effective_workers = min(_configured_workers, len(_warmup_paths))
+                __stages["preload_paths_resolved"] = ",".join(_preload_paths_diag)
+                __stages["preload_configured_workers"] = _configured_workers
+                __stages["preload_effective_workers"] = _effective_workers
+                print(
+                    f"[comfyapp] preload_paths paths={_preload_paths_diag} "
+                    f"configured_workers={_configured_workers} "
+                    f"effective_workers={_effective_workers} "
+                    f"mode={_pm}"
+                )
+                # Per-role preload submission/completion tracking
+                for _role in ("unet", "clip", "vae"):
+                    __stages.setdefault(f"preload_{_role}_submitted", 0)
+                    __stages.setdefault(f"preload_{_role}_completed", 0)
+            else:
+                __stages["preload_paths_resolved"] = ""
+                __stages["preload_configured_workers"] = 0
+                __stages["preload_effective_workers"] = 0
+
             # Submit preload thread now if eligible (v2.16.20: use handle with worker-start signal)
             _restore_preload_handle: _RestorePreloadHandle | None = None
             _preload_worker_started_ns = 0
@@ -18612,6 +18739,23 @@ class _ComfyAPIMixin:
                 for fname, d_ms in preload_result.get("file_timing_ms", {}).items():
                     safe_key = f"warmup_{fname.replace('.','_').replace('-','_').lower()}_ms"
                     __stages[safe_key] = d_ms
+                # Per-role preload completion tracking: correlate file_timing_ms
+                # basenames back to preload_paths to determine which roles completed.
+                _role_completion: dict[str, bool] = {}
+                _fn_role_map: dict[str, str] = {}
+                for _pp in preload_paths:
+                    _p_role = _pp.get("role", "?") if isinstance(_pp, dict) else "?"
+                    _p_basename = os.path.basename(_pp["path"] if isinstance(_pp, dict) else _pp)
+                    _fn_role_map[_p_basename] = _p_role
+                    _role_completion[_p_role] = False
+                for _fn_file in preload_result.get("file_timing_ms", {}):
+                    _fn_role = _fn_role_map.get(_fn_file, "?")
+                    if _fn_role in _role_completion:
+                        _role_completion[_fn_role] = True
+                # Set per-role submission (all submitted together) and completion
+                for _role in _role_completion:
+                    __stages[f"preload_{_role}_submitted"] = 1
+                    __stages[f"preload_{_role}_completed"] = 1 if _role_completion[_role] else 0
                 self._log_profile(
                     "restore_warmup_preload",
                     mode=profile.get("mode", "none") if profile else "none",
@@ -18970,6 +19114,21 @@ class _ComfyAPIMixin:
                         )
                     else:
                         _clip_policy_override = _clip_policy
+                    # Log the effective DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT at
+                    # the restore/direct-warmup boundary before calling into
+                    # _warmup_direct.  The canonical resolved value must remain
+                    # the single source of truth (not overwritten by CLIP policy).
+                    _boundary_require_cpu_hit = _resolve_runtime_flag(
+                        "DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT", "0"
+                    )
+                    __stages["direct_boundary_require_cpu_cache_hit"] = (
+                        1 if _boundary_require_cpu_hit else 0
+                    )
+                    print(
+                        f"[comfyapp] direct warmup boundary: "
+                        f"direct_boundary_require_cpu_cache_hit={int(_boundary_require_cpu_hit)} "
+                        f"source=canonical_runtime_resolve"
+                    )
                     _dw = self._warmup_direct(profile,
                         clip_policy_overrides=_clip_policy_override,
                         warmup_text=_warmup_text,
@@ -19033,6 +19192,8 @@ class _ComfyAPIMixin:
                     for _flag in ("direct_warmup_load_unet", "direct_warmup_load_clip",
                                   "direct_warmup_clip_encode", "direct_warmup_require_cpu_cache_hit",
                                   "direct_unet_cpu_hit", "direct_clip_cpu_hit",
+                                  "direct_unet_cache_key", "direct_unet_object_cache_exists",
+                                  "direct_clip_cached",
                                   "warmup_status", "warmup_clip_requested",
                                   "warmup_clip_completed", "warmup_clip_skip_reason"):
                         _v = _dw.get(_flag)
