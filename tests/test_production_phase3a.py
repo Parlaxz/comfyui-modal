@@ -235,6 +235,26 @@ class ProductionPhase3aComfyappPyAstTests(unittest.TestCase):
             self.src,
         )
 
+    def test_execute_in_process_guards_production_enabled_empty_output_ids(self):
+        """_execute_in_process must raise RuntimeError when production is
+        enabled, production_report is None, and output_node_ids is empty."""
+        self.assertIn(
+            "if _production_enabled and production_report is None and not _production_cache.get(\"output_node_ids\", []):",
+            self.src,
+        )
+        self.assertIn(
+            "Production is enabled but no output_node_ids and no precompiled production_report",
+            self.src,
+        )
+
+    def test_preload_warmup_profile_disables_production(self):
+        """_preload_warmup_profile must pass modal_options={\"production\": {\"enabled\": False}}
+        to _execute_in_process so warmup never attempts production compilation."""
+        self.assertIn(
+            'modal_options={"production": {"enabled": False}}',
+            self.src,
+        )
+
 
 
 class ProductionPhase3aBehavioralTests(unittest.TestCase):
@@ -261,15 +281,16 @@ class ProductionPhase3aBehavioralTests(unittest.TestCase):
                 }
             })
 
-    def test_normalize_rejects_empty_output_node_ids(self):
-        with self.assertRaises(ValueError):
-            normalize_production_options({
-                "production": {
-                    "enabled": True,
-                    "schema_version": 1,
-                    "output_node_ids": [],
-                }
-            })
+    def test_normalize_allows_empty_output_node_ids(self):
+        result = normalize_production_options({
+            "production": {
+                "enabled": True,
+                "schema_version": 1,
+                "output_node_ids": [],
+            }
+        })
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["output_node_ids"], [])
 
     # ── Scheduler-test bypasses invalid production payloads ───────────
 

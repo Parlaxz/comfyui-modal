@@ -47,6 +47,12 @@ from output_converter import (
     DEFAULTS as _CONVERTER_DEFAULTS,
 )
 from output_saver import save_output_image, DEFAULTS as _SAVER_DEFAULTS
+from local_artifacts import (
+    get_studio_outputs_dir,
+    get_modal_outputs_dir,
+    get_benchmark_logs_dir,
+    get_optimization_logs_dir,
+)
 from timing_trace import Trace, TraceV4, coerce_t0_from_browser, merge_remote_trace_into
 from profiler_trace_v4 import (
     make_event, mark_event, EventTrace, profile_enabled, get_profile_level,
@@ -749,7 +755,14 @@ def _default_modal_settings() -> dict:
         "save_metadata_sidecar": _SAVER_DEFAULTS["save_metadata_sidecar"],
     }
 
-_CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
+_CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {
+    ".git", "__pycache__", "node_modules", ".venv", "venv",
+    "output", "test-results", "playwright-report",
+    ".playwright-mcp", ".experiments", ".run_history",
+    "benchmark_runs", "benchmark_logs", "optimization_logs",
+    ".comfymodal_experiments", ".custom_node_requirements", ".baked_custom_node_deps",
+    ".presets", ".preset_blobs",
+}
 _CUSTOM_NODE_SYNC_EXCLUDE_EXTENSIONS = {".pyc", ".pyo"}
 
 _pip_install_error = ""
@@ -1275,6 +1288,23 @@ def _record_manual_deploy_state(workspace_id: str | None = None, deployment_comm
 
 def _run_deploy_background(workspace: dict, custom_nodes_fingerprint: str | None = None):
     global _deploy_status
+
+    # Pre-deploy artifact guard: fail if generated dirs still contain data
+    try:
+        from deployment_guard import guard_generated_artifacts
+        guard_generated_artifacts()
+    except SystemExit:
+        _deploy_status = {
+            "state": "error",
+            "message": (
+                "Deploy blocked: generated artifact directories still contain files. "
+                "Run 'python tools/migrate_local_artifacts.py' first."
+            ),
+        }
+        print(f"[comfyui-modal] {_deploy_status['message']}")
+        return
+    except Exception as exc:
+        print(f"[comfyui-modal] deployment guard check failed (non-fatal): {exc}")
 
     modal_cmd = _find_modal_executable()
     if not modal_cmd:
@@ -2182,11 +2212,14 @@ async def _execute_job(item: tuple, item_id: int):
         _log_generation_invocation_plan(prompt_id, invocation_plan)
 
         # ── Active-next warmup profile via shared helper ──
+        # Normalize production options so that omitted production
+        # (which defaults to enabled=True) is forwarded correctly.
+        # The raw extra_data.modal_options may be None or lack the
+        # "production" key, but normalize_production_options fills in
+        # canonical defaults (including enabled=True).
         _active_next_write_start = time.time()
         _modal_options_for_prod = extra_data.get("modal_options", {}) or {}
-        _production_options_for_activation = _modal_options_for_prod.get("production", {})
-        if not isinstance(_production_options_for_activation, dict):
-            _production_options_for_activation = {}
+        _production_options_for_activation = normalize_production_options(_modal_options_for_prod)
         _wn_result = await prepare_active_next_profile(
             execution_workflow,
             prompt_hash,
@@ -6103,8 +6136,8 @@ if _server:
     #   PATCH|DELETE       /comfymodal/studio/presets/{preset_id}
     #   POST        /comfymodal/studio/presets/{preset_id}/duplicate
 
-    # Register all snapshot and preset routes
-    register_studio_routes(_server, _NODE_DIR)
+    # Register all snapshot and preset routes (external studio output dir)
+    register_studio_routes(_server, _NODE_DIR, studio_output_dir=get_studio_outputs_dir())
 
     # — Studio Backends (legacy compatibility / import-only) —
     # The .studio_backends.json persistence layer is maintained as a

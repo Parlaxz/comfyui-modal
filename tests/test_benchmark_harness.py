@@ -39,10 +39,11 @@ class BenchmarkHarnessASTTests(unittest.TestCase):
         self.assertIn("saved workflows", source)
         self.assertIn("flux_2-klein-9b(2).json", source)
 
-    def test_benchmark_script_references_redeploy_batch_and_output_folder(self):
+    def test_benchmark_script_references_redeploy_batch_and_uses_external_runs_dir(self):
         source = BENCHMARK_SCRIPT_PATH.read_text(encoding="utf-8")
         self.assertIn("redeploy_modal_and_run_comfyui.bat", source)
-        self.assertIn("benchmark_runs", source)
+        self.assertIn("get_benchmark_runs_dir", source)
+        self.assertIn("_BENCHMARK_RUNS_DIRNAME", source)
 
     def test_benchmark_script_has_utf8_deploy_fallback_and_direct_launcher(self):
         source = BENCHMARK_SCRIPT_PATH.read_text(encoding="utf-8")

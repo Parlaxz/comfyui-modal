@@ -1153,6 +1153,46 @@ class ProductionReportRpcNullTests(unittest.TestCase):
         self.assertEqual(received_hash, report["compiled_workflow_hash"])
 
 
+class ProductionWorkflowHashNonFiniteTests(unittest.TestCase):
+    """Tests that non-finite values (NaN, Infinity) fail closed with empty hash."""
+
+    def test_non_finite_source_hash_returns_empty(self):
+        """Source workflow with NaN must produce empty hash (fail-closed)."""
+        from production_workflow import _compute_source_workflow_hash
+        wf = {"1": {"class_type": "KSampler", "inputs": {"cfg": float("nan")}}}
+        h = _compute_source_workflow_hash(wf)
+        self.assertEqual(h, "",
+                         "NaN in source workflow must produce empty hash")
+
+    def test_non_finite_compiled_hash_returns_empty(self):
+        """Compiled workflow with Infinity must produce empty hash (fail-closed)."""
+        from production_workflow import _compute_compiled_workflow_hash
+        compiled = {"3": {"class_type": "VAEDecode", "inputs": {"val": float("inf")}}}
+        h = _compute_compiled_workflow_hash(compiled)
+        self.assertEqual(h, "",
+                         "Infinity in compiled workflow must produce empty hash")
+
+    def test_cross_consistency_source_hash_with_comfyapp(self):
+        """production_workflow and comfyapp source hashes match for normal values."""
+        from production_workflow import _compute_source_workflow_hash as pw_src
+        try:
+            from comfyapp import compute_canonical_source_workflow_hash as ca_src
+        except Exception:
+            self.skipTest("comfyapp not importable in isolation")
+        wf = {"1": {"class_type": "KSampler", "inputs": {"seed": 42}}}
+        self.assertEqual(pw_src(wf), ca_src(wf))
+
+    def test_cross_consistency_compiled_hash_with_comfyapp(self):
+        """production_workflow and comfyapp compiled hashes match for normal values."""
+        from production_workflow import _compute_compiled_workflow_hash as pw_comp
+        try:
+            from comfyapp import compute_canonical_compiled_workflow_hash as ca_comp
+        except Exception:
+            self.skipTest("comfyapp not importable in isolation")
+        compiled = {"3": {"class_type": "VAEDecode", "inputs": {"samples": ("1", 0)}}}
+        self.assertEqual(pw_comp(compiled), ca_comp(compiled))
+
+
 class RuntimeEnvDefaultTests(unittest.TestCase):
     """Verify source-level default values match the requested baseline.
     These are the module-level defaults in comfyapp.py."""

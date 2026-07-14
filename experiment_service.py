@@ -37,18 +37,22 @@ NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def experiments_root() -> Path:
-    p = Path(NODE_DIR) / ".experiments"
+    """External experiments directory (local data root)."""
+    from local_artifacts import get_experiments_dir
+    p = get_experiments_dir()
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
 def presets_root() -> Path:
+    """Plugin-root presets (runtime state, not migrated)."""
     p = Path(NODE_DIR) / ".presets"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
 def blobs_root() -> Path:
+    """Plugin-root blobs (runtime state, not migrated)."""
     p = Path(NODE_DIR) / ".preset_blobs"
     p.mkdir(parents=True, exist_ok=True)
     return p
@@ -80,7 +84,9 @@ def set_remote_event_handler(handler):
 
 
 def run_history_root() -> Path:
-    p = Path(NODE_DIR) / ".run_history"
+    """External run-history directory (local data root)."""
+    from local_artifacts import get_run_history_dir
+    p = get_run_history_dir()
     p.mkdir(parents=True, exist_ok=True)
     return p
 

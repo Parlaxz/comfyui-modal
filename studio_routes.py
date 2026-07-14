@@ -92,7 +92,7 @@ def _json_error(status: int, message: str) -> web.Response:
 # ── Route registration ───────────────────────────────────────────────────
 
 
-def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
+def register_studio_routes(server: Any, node_dir: str | os.PathLike, studio_output_dir: str | os.PathLike | None = None) -> None:
     """Register all Studio snapshot and preset routes on *server*.
 
     *server* must expose ``server.routes.get(path)``, ``.post(path)``,
@@ -101,6 +101,9 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
 
     Data files are stored under ``<node_dir>/.studio_snapshots.json`` and
     ``<node_dir>/.studio_presets.json``.
+
+    Studio-generated output images are served from *studio_output_dir* if
+    provided, otherwise fall back to ``<node_dir>/output/studio``.
     """
     _node_dir = Path(node_dir)
     _snapshots_store = StudioJsonStore(_node_dir / ".studio_snapshots.json")
@@ -496,7 +499,10 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike) -> None:
         filename = request.match_info.get("filename", "")
         if not filename or ".." in filename or "/" in filename:
             return _json_error(404, "Not found")
-        output_dir = _node_dir / "output" / "studio"
+        if studio_output_dir is not None:
+            output_dir = Path(studio_output_dir)
+        else:
+            output_dir = _node_dir / "output" / "studio"
         filepath = output_dir / filename
         if not filepath.exists() or not filepath.is_file():
             return _json_error(404, "File not found")

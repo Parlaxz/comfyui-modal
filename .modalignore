@@ -10,4 +10,23 @@ node_modules/
 .deploy_log
 .tmp
 *.tmp
+.opencode/
+.slim/
+output/
+test-results/
+playwright-report/
+.playwright-mcp/
+.experiments/
+.run_history/
+benchmark_runs/
+benchmark_logs/
+optimization_logs/
+.comfymodal_experiments/
+.custom_node_requirements/
+.baked_custom_node_deps/
+.presets/
+.preset_blobs/
+MagicMock/
+docs/
+web/node_modules/
 

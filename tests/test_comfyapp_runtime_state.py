@@ -522,7 +522,7 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
         async def fake_validate_prompt(prompt_id, workflow, partial_execution_list):
             return True, {}, ["1"], {}
 
-        def fake_collect(prompt_id, prompt_start_time=None, modal_options=None):
+        def fake_collect(prompt_id, prompt_start_time=None, modal_options=None, **_kwargs):
             filename = mixin._executor.history_result["outputs"]["1"]["images"][0]["filename"]
             entry = {"filename": filename, "data": "ZmFrZQ==", "node_id": "1"}
             return {"images": [entry], "videos": [], "outputs": {"1": {"images": [entry]}}}
@@ -548,8 +548,9 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
         mixin._preflight_already_ran = True
 
         with patch.dict(sys.modules, {"execution": types.SimpleNamespace(validate_prompt=fake_validate_prompt)}):
-            first = mixin._execute_in_process(workflow)
-            second = mixin._execute_in_process(workflow)
+            production_disabled = {"production": {"enabled": False}}
+            first = mixin._execute_in_process(workflow, modal_options=production_disabled)
+            second = mixin._execute_in_process(workflow, modal_options=production_disabled)
 
         self.assertEqual(first["images"][0]["filename"], "fresh_1.png")
         self.assertEqual(second["images"][0]["filename"], "fresh_2.png")

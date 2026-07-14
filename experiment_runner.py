@@ -1107,7 +1107,8 @@ class LocalRemoteInvoker:
     def __init__(self, modal_run_prompt_stream, experiment_id="", node_dir="",
                  stream_event_sink=None, profile_preparer=None,
                  gpu=None, modal_options=None, workspace=None,
-                 production_report=None):
+                 production_report=None,
+                 studio_output_dir=None):
         self._run_prompt_stream = modal_run_prompt_stream
         self._experiment_id = experiment_id
         self._node_dir = Path(node_dir) if node_dir else Path(os.path.dirname(os.path.abspath(__file__)))
@@ -1117,6 +1118,7 @@ class LocalRemoteInvoker:
         self._modal_options = modal_options
         self._workspace = workspace
         self._production_report = production_report  # global report for single-run
+        self._studio_output_dir = Path(studio_output_dir) if studio_output_dir else None
         # Fix: track the asyncio task currently executing run_cell per worker
         self._run_cell_tasks: dict[str, asyncio.Task] = {}
         # Fix: track cancellation-requested workers
@@ -1145,7 +1147,10 @@ class LocalRemoteInvoker:
 
         outputs = (result_data or {}).get("outputs", {})
         saved_urls: list[str] = []
-        output_dir = self._node_dir / "output" / "studio"
+        if self._studio_output_dir is not None:
+            output_dir = self._studio_output_dir
+        else:
+            output_dir = self._node_dir / "output" / "studio"
         output_dir.mkdir(parents=True, exist_ok=True)
         supported_exts = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
         diagnostic_meta: list[dict] = []
