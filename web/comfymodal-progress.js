@@ -814,7 +814,7 @@ export function createScopedTracker(api, identity) {
     // If not locked, don't process experiment events (no matching run)
     if (!_locked) return;
 
-    if (eventType === "experiment.completed" || eventType === "experiment.stopped") {
+    if (eventType === "experiment.completed" || eventType === "experiment.stopped" || eventType === "experiment.cancelled") {
       _stopTimer();
       state.stage = "done";
       state.elapsedMs = state.startTime ? Date.now() - state.startTime : 0;

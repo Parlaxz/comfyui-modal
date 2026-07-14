@@ -22,7 +22,7 @@
 import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings } from "./studio-run-normalizer.js";
 import { listRunHistory, updateRunAnnotation } from "./studio-backend-api.js";
 import { loadExperimentIntoPlayground } from "./studio-playground.js";
-import { el } from "./studio-ui.js";
+import { el, createImagePreviewOverlay } from "./studio-ui.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -398,6 +398,20 @@ export function renderHistory(state, context) {
   const container = el("div", { class: "comfymodal-studio-history" });
   const apiBase = (context && context.apiBase) || "/comfymodal";
 
+  // ── Safe child removal (tolerates synchronous re-entrancy) ────────
+  // Takes a snapshot of childNodes before iterating so that blur/change
+  // events fired during removal cannot corrupt the live collection.
+  // Each node is removed only if it is still a child of the container.
+  function _removeAllChildren(el) {
+    var nodes = Array.from(el.childNodes);
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i];
+      if (node.parentNode === el) {
+        try { node.remove(); } catch { /* detached during re-entry */ }
+      }
+    }
+  }
+
   // ── Internal state ──────────────────────────────────────────────────
   var queryParams = {
     limit: 50,
@@ -416,6 +430,9 @@ export function renderHistory(state, context) {
   var previewRun = null;
   var groupExperiments = false;
   var totalCount = 0;
+  var _COLUMNS_KEY = "comfymodal-studio-history-columns";
+  var columnCount = parseInt(localStorage.getItem(_COLUMNS_KEY), 10) || 6;
+  if (columnCount < 2 || columnCount > 12) columnCount = 6;
 
   // ── Debounce helper ─────────────────────────────────────────────────
   var _searchTimer = null;
@@ -610,6 +627,32 @@ export function renderHistory(state, context) {
     groupLabel.appendChild(groupCb);
     groupLabel.appendChild(document.createTextNode("Group experiments"));
 
+    // Column count selector
+    var colSelector = el("div", {
+      class: "comfymodal-studio-history-column-select",
+      "data-testid": "history-column-select",
+    }, [
+      el("label", { text: "Cols" }),
+    ]);
+    var colInput = el("input", {
+      type: "number",
+      min: "2",
+      max: "12",
+      value: String(columnCount),
+      "data-testid": "history-columns-input",
+      "aria-label": "Number of columns",
+    });
+    colInput.addEventListener("change", function () {
+      var val = parseInt(colInput.value, 10);
+      if (isNaN(val) || val < 2) val = 2;
+      if (val > 12) val = 12;
+      columnCount = val;
+      colInput.value = String(columnCount);
+      localStorage.setItem(_COLUMNS_KEY, String(columnCount));
+      fetchAndRender();
+    });
+    colSelector.appendChild(colInput);
+
     // Pagination info + controls
     var pageInfo = el("span", {
       "data-testid": "history-page-info",
@@ -653,6 +696,7 @@ export function renderHistory(state, context) {
     bar.appendChild(dateFrom);
     bar.appendChild(dateTo);
     bar.appendChild(groupLabel);
+    bar.appendChild(colSelector);
     bar.appendChild(prevBtn);
     bar.appendChild(nextBtn);
     bar.appendChild(pageInfo);
@@ -666,7 +710,7 @@ export function renderHistory(state, context) {
 
   // ── Preview Overlay ──────────────────────────────────────────────────
   function renderPreviewOverlay() {
-    const existing = container.querySelector(".comfymodal-studio-history-preview");
+    const existing = container.querySelector(".comfymodal-studio-preview-overlay");
     if (existing) existing.remove();
     if (!previewRun) return;
 
@@ -710,101 +754,61 @@ export function renderHistory(state, context) {
     if (nr.workflowHash) metaItems.push({ label: "Workflow", value: nr.workflowHash.substring(0, 8) + "\u2026" });
     if (nr.snapshotId) metaItems.push({ label: "Snapshot", value: nr.snapshotId.substring(0, 12) + "\u2026" });
 
-    // Track the preview close function for focus return and Escape handling
+    // Track trigger card for focus return
+    var triggerCard = container.querySelector(".comfymodal-studio-history-card[data-preview-trigger]");
+
     function closePreview() {
       previewRun = null;
-      renderPreviewOverlay();
-      // Return focus to the triggering card
-      var triggerCard = container.querySelector(".comfymodal-studio-history-card[data-preview-trigger]");
+      var existingOverlay = container.querySelector(".comfymodal-studio-preview-overlay");
+      if (existingOverlay) existingOverlay.remove();
       if (triggerCard && typeof triggerCard.focus === "function") {
         triggerCard.focus();
       }
     }
 
-    // Focus trap for preview: cycle Tab/Shift+Tab within the preview
-    function _trapPreviewTab(e, container) {
-      if (e.key !== "Tab" || !container) return;
-      var focusable = container.querySelectorAll(
-        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
-      );
-      if (focusable.length === 0) return;
-      var first = focusable[0];
-      var last = focusable[focusable.length - 1];
-      if (e.shiftKey) {
-        if (document.activeElement === first) {
-          e.preventDefault();
-          last.focus();
-        }
-      } else {
-        if (document.activeElement === last) {
-          e.preventDefault();
-          first.focus();
-        }
-      }
+    var sections = [];
+
+    // Info bar: favorite star, status, prompt
+    sections.push(el("div", { class: "comfymodal-studio-preview-info" }, [
+      renderFavoriteStar(nr, apiBase),
+      el("span", { class: "comfymodal-studio-preview-status", text: status }),
+      el("span", { class: "comfymodal-studio-preview-prompt", text: promptText }),
+    ]));
+
+    // Generation settings metadata
+    if (metaItems.length > 0) {
+      sections.push(el("div", { class: "comfymodal-studio-preview-meta" },
+        metaItems.map(function (item) {
+          return el("span", {
+            class: "comfymodal-studio-preview-meta-item",
+            text: item.label + ": " + item.value,
+          });
+        })
+      ));
     }
 
-    const overlay = el("div", {
-      class: "comfymodal-studio-history-preview",
-      role: "dialog",
-      "aria-modal": "true",
-      "aria-label": "Run preview",
-      onclick: function (e) {
-        // Close on backdrop click; prevent content clicks from closing
-        if (e.target === overlay || e.target.classList.contains("comfymodal-studio-history-preview-backdrop")) {
-          closePreview();
-        }
-      },
-      onkeydown: function (e) {
-        if (e.key === "Escape") {
-          e.stopPropagation();
-          closePreview();
-        }
-        _trapPreviewTab(e, overlay);
-      },
-    }, [
-      el("div", { class: "comfymodal-studio-history-preview-backdrop" }),
-      el("div", { class: "comfymodal-studio-history-preview-content" }, [
-        el("button", {
-          class: "comfymodal-studio-history-preview-close",
-          "aria-label": "Close preview",
-          text: "\u00d7",
-          onclick: function () {
-            closePreview();
-          },
-        }),
-        imageUrl
-          ? el("img", {
-              src: imageUrl,
-              class: "comfymodal-studio-history-preview-image",
-              alt: promptText,
-            })
-          : el("div", {
-              class: "comfymodal-studio-history-preview-noimage",
-              text: "No image available",
-            }),
-        el("div", { class: "comfymodal-studio-history-preview-info" }, [
-          renderFavoriteStar(nr, apiBase),
-          el("span", { class: "comfymodal-studio-history-preview-status", text: status }),
-          el("span", { class: "comfymodal-studio-history-preview-prompt", text: promptText }),
-        ]),
-        // Generation settings metadata
-        metaItems.length > 0
-          ? el("div", { class: "comfymodal-studio-history-preview-meta" },
-              metaItems.map(function (item) {
-                return el("span", {
-                  class: "comfymodal-studio-history-preview-meta-item",
-                  text: item.label + ": " + item.value,
-                });
-              })
-            )
-          : null,
-        // ── Timing Card ────────────────────────────────────────────────
-        renderTimingCard(nr),
-        // Note editor in preview
-        renderNoteEditor(nr, apiBase),
-      ]),
-    ]);
-    container.appendChild(overlay);
+    // Timing card
+    var timingCard = renderTimingCard(nr);
+    if (timingCard) sections.push(timingCard);
+
+    // Note editor
+    sections.push(renderNoteEditor(nr, apiBase));
+
+    var preview = createImagePreviewOverlay({
+      imageUrl: imageUrl,
+      alt: promptText,
+      onClose: closePreview,
+      sections: sections,
+      focusTrap: true,
+    });
+
+    container.appendChild(preview.overlay);
+
+    // Move focus to close button
+    var closeBtn = preview.overlay.querySelector(".comfymodal-studio-preview-overlay-close");
+    if (closeBtn && typeof closeBtn.focus === "function") {
+      requestAnimationFrame(function () { closeBtn.focus(); });
+    }
   }
 
   function openPreview(run) {
@@ -815,18 +819,12 @@ export function renderHistory(state, context) {
     var activeCard = container.querySelector(".comfymodal-studio-history-card:focus-within, .comfymodal-studio-history-card:hover");
     if (activeCard) activeCard.setAttribute("data-preview-trigger", "");
     renderPreviewOverlay();
-    // Move focus to preview close button
-    var closeBtn = container.querySelector(".comfymodal-studio-history-preview-close");
-    if (closeBtn && typeof closeBtn.focus === "function") {
-      // Delay focus until the overlay is rendered
-      requestAnimationFrame(function () { closeBtn.focus(); });
-    }
   }
 
   // ── Fetch and render ─────────────────────────────────────────────────
   function fetchAndRender() {
-    // Clear
-    while (container.firstChild) container.removeChild(container.firstChild);
+    // Clear (safe helper tolerates re-entrant blur/change during removal)
+    _removeAllChildren(container);
 
     // Add filter bar
     container.appendChild(renderFilterBar());
@@ -862,8 +860,8 @@ export function renderHistory(state, context) {
     }).catch(function () { return []; });
 
     listRunHistory(apiBase, apiParams).then(async function (data) {
-      // Remove loading
-      while (container.firstChild) container.removeChild(container.firstChild);
+      // Remove loading (safe helper)
+      _removeAllChildren(container);
 
       // Resolve runs and totalCount for ALL paths (error, empty, success)
       // so that the filter bar's page info always reflects the response.
@@ -974,14 +972,14 @@ export function renderHistory(state, context) {
         Object.entries(grouped).forEach(function (_ref) {
           var expId = _ref[0];
           var groupRuns = _ref[1];
-          var groupEl = renderGroup(expId, groupRuns, apiBase, openPreview);
+          var groupEl = renderGroup(expId, groupRuns, apiBase, openPreview, columnCount);
           container.appendChild(groupEl);
         });
 
         // Render ungrouped (includes studio_experiment items)
         if (ungrouped.length > 0) {
           var fallbackId = "ungrouped_" + Date.now();
-          var groupEl = renderGroup(fallbackId, ungrouped, apiBase, openPreview);
+          var groupEl = renderGroup(fallbackId, ungrouped, apiBase, openPreview, columnCount);
           container.appendChild(groupEl);
         }
       } else {
@@ -998,37 +996,49 @@ export function renderHistory(state, context) {
             expGroups[eId].push(nr);
           }
         });
-        var gallery = el("div", { class: "comfymodal-studio-history-gallery" });
-        var seenExpIds = {};
-        allItems.forEach(function (nr) {
-          if (nr.kind === "studio_experiment") {
-            // Render true experiment as an experiment tile (loads grid on click)
-            var groupRuns = expGroups[nr.experimentId];
-            if (groupRuns && groupRuns.length > 0) {
-              if (!seenExpIds[nr.experimentId]) {
-                seenExpIds[nr.experimentId] = true;
-                gallery.appendChild(renderExperimentTile(nr.experimentId, groupRuns, apiBase, context, state));
+        var hasExpOrCell = allItems.some(function (nr) {
+          return nr.kind === "studio_experiment" || nr.kind === "experiment_cell";
+        });
+        if (!hasExpOrCell) {
+          container.appendChild(renderHistoryGallery(normalizedRuns, apiBase, openPreview));
+          container.querySelector('[data-testid="history-gallery"]').style.setProperty("--columns", columnCount);
+        } else {
+          var gallery = el("div", {
+            class: "comfymodal-studio-history-gallery",
+            style: "--columns:" + columnCount + ";",
+            "data-testid": "history-gallery",
+          });
+          var seenExpIds = {};
+          allItems.forEach(function (nr) {
+            if (nr.kind === "studio_experiment") {
+              // Render true experiment as an experiment tile (loads grid on click)
+              var groupRuns = expGroups[nr.experimentId];
+              if (groupRuns && groupRuns.length > 0) {
+                if (!seenExpIds[nr.experimentId]) {
+                  seenExpIds[nr.experimentId] = true;
+                  gallery.appendChild(renderExperimentTile(nr.experimentId, groupRuns, apiBase, context, state));
+                }
+              } else {
+                // Standalone experiment tile (no cell runs yet)
+                if (!seenExpIds[nr.experimentId]) {
+                  seenExpIds[nr.experimentId] = true;
+                  gallery.appendChild(_renderStandaloneExperimentTile(nr, apiBase, context, state));
+                }
+              }
+            } else if (nr.kind === "experiment_cell") {
+              var eId = nr.experimentId || null;
+              if (eId) {
+                if (!seenExpIds[eId]) {
+                  seenExpIds[eId] = true;
+                  gallery.appendChild(renderExperimentTile(eId, expGroups[eId], apiBase, context, state));
+                }
               }
             } else {
-              // Standalone experiment tile (no cell runs yet)
-              if (!seenExpIds[nr.experimentId]) {
-                seenExpIds[nr.experimentId] = true;
-                gallery.appendChild(_renderStandaloneExperimentTile(nr, apiBase, context, state));
-              }
+              gallery.appendChild(renderHistoryCard(nr, apiBase, openPreview));
             }
-          } else if (nr.kind === "experiment_cell") {
-            var eId = nr.experimentId || null;
-            if (eId) {
-              if (!seenExpIds[eId]) {
-                seenExpIds[eId] = true;
-                gallery.appendChild(renderExperimentTile(eId, expGroups[eId], apiBase, context, state));
-              }
-            }
-          } else {
-            gallery.appendChild(renderHistoryCard(nr, apiBase, openPreview));
-          }
-        });
-        container.appendChild(gallery);
+          });
+          container.appendChild(gallery);
+        }
       }
 
       // Update page info after merging
@@ -1038,7 +1048,7 @@ export function renderHistory(state, context) {
         pageInfoEl.textContent = meta.label;
       }
     }).catch(function (err) {
-      while (container.firstChild) container.removeChild(container.firstChild);
+      _removeAllChildren(container);
       container.appendChild(renderFilterBar());
       var errorCard = el("div", { class: "comfymodal-studio-card" });
       errorCard.appendChild(el("p", {
@@ -1096,6 +1106,14 @@ function renderHistoryCard(nr, apiBase, openPreview) {
       alt: promptText,
       loading: "lazy",
     }));
+    // Time badge at bottom right (always visible)
+    if (time) {
+      var shortTime = time.length > 16 ? time.substring(11, 16) : time;
+      card.appendChild(el("span", {
+        class: "comfymodal-studio-history-card-time-badge",
+        text: shortTime,
+      }));
+    }
   } else {
     var fallback = el("div", { class: "comfymodal-studio-history-fallback" });
     fallback.appendChild(el("span", {
@@ -1130,8 +1148,13 @@ function renderHistoryCard(nr, apiBase, openPreview) {
   return card;
 }
 
-function renderHistoryGallery(runs, apiBase, openPreview) {
-  var gallery = el("div", { class: "comfymodal-studio-history-gallery" });
+function renderHistoryGallery(runs, apiBase, openPreview, columnCount) {
+  columnCount = typeof columnCount === "number" ? columnCount : 6;
+  var gallery = el("div", {
+    class: "comfymodal-studio-history-gallery",
+    style: "--columns:" + columnCount + ";",
+    "data-testid": "history-gallery",
+  });
 
   runs.forEach(function (nr) {
     var card = renderHistoryCard(nr, apiBase, openPreview);
@@ -1172,12 +1195,7 @@ function renderExperimentTile(expId, groupRuns, apiBase, context, state) {
     : overallStatus === "failed" ? " failed"
     : overallStatus === "running" ? " running" : "";
 
-  var featureLabel = firstRun.featureId || "studio";
-  var presetLabel = firstRun.presetLabel || firstRun.presetId || "";
-  var titleParts = [];
-  titleParts.push("Experiment");
-  if (presetLabel) titleParts.push("\u2014 " + presetLabel.substring(0, 24));
-  var titleText = titleParts.join(" ");
+  var titleText = "Experiment";
 
   var card = el("div", {
     class: "comfymodal-studio-history-card comfymodal-studio-experiment-tile" + statusClass,
@@ -1230,41 +1248,57 @@ function renderExperimentTile(expId, groupRuns, apiBase, context, state) {
       text: "\u00b7 " + failedCount + " failed",
     }));
   }
-  // Feature
-  if (firstRun.featureId) {
-    statusLine.appendChild(el("span", {
-      style: "color:#666;margin-left:auto;font-size:9px;",
-      text: firstRun.featureId,
-    }));
-  }
   card.appendChild(statusLine);
 
-  // Thumbnail strip (first few cell thumbnails)
+  // Image area: 2x2 grid for 4+ images, single image for <4
   if (groupRuns.length > 0) {
-    var thumbStrip = el("div", {
-      class: "comfymodal-studio-exp-tile-thumbs",
-      style: "display:flex;gap:2px;padding:4px 8px 8px;width:100%;box-sizing:border-box;overflow:hidden;",
-    });
-    var maxThumbs = Math.min(groupRuns.length, 4);
-    for (var ti = 0; ti < maxThumbs; ti++) {
-      var cellRun = groupRuns[ti];
-      if (cellRun.imageUrl) {
-        thumbStrip.appendChild(el("img", {
-          class: "comfymodal-studio-exp-tile-thumb",
-          src: cellRun.imageUrl,
+    var imgArea = el("div", { class: "comfymodal-studio-exp-tile-images" });
+
+    if (totalCount >= 4) {
+      // 2x2 grid of first 4 images
+      var grid = el("div", { class: "comfymodal-studio-exp-tile-grid" });
+      var limit = Math.min(groupRuns.length, 4);
+      for (var ti = 0; ti < limit; ti++) {
+        var cellRun = groupRuns[ti];
+        if (cellRun.imageUrl) {
+          grid.appendChild(el("img", {
+            class: "comfymodal-studio-exp-tile-grid-img",
+            src: cellRun.imageUrl,
+            alt: "",
+            loading: "lazy",
+          }));
+        } else {
+          grid.appendChild(el("div", { class: "comfymodal-studio-exp-tile-grid-empty" }));
+        }
+      }
+      imgArea.appendChild(grid);
+    } else {
+      // Single image for 1-3 total tiles
+      var firstWithImg = null;
+      for (var si = 0; si < groupRuns.length; si++) {
+        if (groupRuns[si].imageUrl) { firstWithImg = groupRuns[si]; break; }
+      }
+      if (firstWithImg) {
+        imgArea.appendChild(el("img", {
+          class: "comfymodal-studio-exp-tile-single-img",
+          src: firstWithImg.imageUrl,
           alt: "",
           loading: "lazy",
-          style: "width:36px;height:36px;object-fit:cover;border-radius:2px;border:1px solid #2a2a2a;flex-shrink:0;",
         }));
       }
     }
-    if (groupRuns.length > maxThumbs) {
-      thumbStrip.appendChild(el("span", {
-        style: "font-size:9px;color:#666;display:flex;align-items:center;padding-left:2px;",
-        text: "+" + (groupRuns.length - maxThumbs),
+
+    // Time badge on bottom right
+    var firstRunTime = firstRun.startedAt || "";
+    if (firstRunTime) {
+      var shortTime = firstRunTime.length > 16 ? firstRunTime.substring(11, 16) : firstRunTime;
+      imgArea.appendChild(el("span", {
+        class: "comfymodal-studio-exp-tile-time",
+        text: shortTime,
       }));
     }
-    card.appendChild(thumbStrip);
+
+    card.appendChild(imgArea);
   }
 
   // Click handler — load the full experiment grid in Playground
@@ -1377,7 +1411,7 @@ function _renderStandaloneExperimentTile(nr, apiBase, context, state) {
 
 // ── Group renderer ────────────────────────────────────────────────────────
 
-function renderGroup(expId, groupRuns, apiBase, openPreview) {
+function renderGroup(expId, groupRuns, apiBase, openPreview, columnCount) {
   var groupCard = el("div", {
     class: "comfymodal-studio-card",
     style: "margin-bottom:var(--space-md)",
@@ -1434,7 +1468,7 @@ function renderGroup(expId, groupRuns, apiBase, openPreview) {
   groupCard.appendChild(groupHeader);
 
   // ── Gallery grid ───────────────────────────────────────────────────
-  var gallery = renderHistoryGallery(groupRuns, apiBase, openPreview);
+  var gallery = renderHistoryGallery(groupRuns, apiBase, openPreview, columnCount);
 
   groupCard.appendChild(gallery);
   return groupCard;

@@ -76,67 +76,132 @@ function renderPresetsEmpty(apiBase) {
   ]);
 }
 
+/**
+ * Render a single preset card (shared by grouped and ungrouped sections).
+ */
+function _renderPresetCard(preset, apiBase, listContainer, detailPanel) {
+  const id = preset.id || "unknown";
+  const isActive = _STATE.selectedItemId === id;
+  const label = preset.label || preset.name || preset.id || "Unnamed";
+  const snapshotId = preset.snapshotId || "";
+  const disabled = preset.disabledReason || "";
+  const desc = preset.description || "";
+  const canEdit = !preset.archived;
+
+  const card = el("div", {
+    class: "comfymodal-studio-preset-card" + (isActive ? " active" : ""),
+    onclick: function () {
+      _STATE.selectedItemId = id;
+      var allCards = listContainer.querySelectorAll(".comfymodal-studio-preset-card");
+      allCards.forEach(function (c) { c.classList.remove("active"); });
+      card.classList.add("active");
+      while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
+      renderPresetDetail(detailPanel, preset, apiBase, listContainer);
+    },
+    "data-testid": "preset-card-" + id.replace(/[^a-zA-Z0-9_-]/g, "_"),
+  }, [
+    el("h4", { text: label.substring(0, 60) }),
+    el("p", { text: ((desc || (snapshotId ? "Snapshot: " + snapshotId.substring(0, 12) : "") || "No description")).substring(0, 80) }),
+  ]);
+  if (preset.group) {
+    card.appendChild(el("p", { text: "Group: " + preset.group, style: "color:#666;font-size:9px;margin:2px 0;font-style:italic;" }));
+  }
+  if (disabled) {
+    card.appendChild(el("p", { text: "Disabled: " + disabled, style: "color:#f87171;font-size:10px;margin:2px 0;" }));
+  }
+  if (canEdit) {
+    var rowActions = el("div", { style: "display:flex;gap:4px;margin-top:4px;" });
+    var delRowBtn = el("button", {
+      class: "comfymodal-destructive-btn",
+      text: "Delete preset",
+      style: "font-size:9px;padding:2px 6px;",
+      onclick: function (e) {
+        e.stopPropagation();
+        if (confirm("Delete this preset? (soft-delete \u2014 it can be restored via the server)")) {
+          deletePreset(apiBase, preset.id).then(function () {
+            clearSelection();
+            invalidateRuntimePresetsCache();
+            _STATE.selectedItemId = null;
+            listPresets(apiBase).then(function (fresh) {
+              while (listContainer.firstChild) listContainer.removeChild(listContainer.firstChild);
+              renderPresetsList(listContainer, fresh, apiBase, detailPanel);
+              if (fresh.length > 0) {
+                _STATE.selectedItemId = fresh[0].id;
+                while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
+                renderPresetDetail(detailPanel, fresh[0], apiBase, listContainer);
+              } else {
+                while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
+              }
+            });
+          });
+        }
+      },
+    });
+    rowActions.appendChild(delRowBtn);
+    card.appendChild(rowActions);
+  }
+  return card;
+}
+
 export function renderPresetsList(container, presets, apiBase, detailPanel) {
   while (container.firstChild) container.removeChild(container.firstChild);
-  presets.forEach((preset) => {
-    const id = preset.id || "unknown";
-    const isActive = _STATE.selectedItemId === id;
-    const label = preset.label || preset.name || preset.id || "Unnamed";
-    const snapshotId = preset.snapshotId || "";
-    const disabled = preset.disabledReason || "";
-    const desc = preset.description || "";
-    const canEdit = !preset.archived;
 
-    const card = el("div", {
-      class: "comfymodal-studio-preset-card" + (isActive ? " active" : ""),
-      onclick: () => {
-        _STATE.selectedItemId = id;
-        container.querySelectorAll(".comfymodal-studio-preset-card").forEach((c) => c.classList.remove("active"));
-        card.classList.add("active");
-        while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
-        renderPresetDetail(detailPanel, preset, apiBase, container);
-      },
-    }, [
-      el("h4", { text: label.substring(0, 60) }),
-      el("p", { text: ((desc || (snapshotId ? `Snapshot: ${snapshotId.substring(0, 12)}` : "") || "No description")).substring(0, 80) }),
-    ]);
-    if (disabled) {
-      card.appendChild(el("p", { text: `Disabled: ${disabled}`, style: "color:#f87171;font-size:10px;margin:2px 0;" }));
+  // Group presets by their optional `group` field
+  var groups = {};
+  var ungrouped = [];
+  presets.forEach(function (preset) {
+    var g = preset.group;
+    if (g && typeof g === "string" && g.trim() !== "") {
+      if (!groups[g]) groups[g] = [];
+      groups[g].push(preset);
+    } else {
+      ungrouped.push(preset);
     }
-    // Row-level delete action
-    if (canEdit) {
-      const rowActions = el("div", { style: "display:flex;gap:4px;margin-top:4px;" });
-      const delRowBtn = el("button", {
-        class: "comfymodal-destructive-btn",
-        text: "Delete preset",
-        style: "font-size:9px;padding:2px 6px;",
-        onclick: (e) => {
-          e.stopPropagation();
-          if (confirm("Delete this preset? (soft-delete — it can be restored via the server)")) {
-            deletePreset(apiBase, preset.id).then(function () {
-              clearSelection();
-              invalidateRuntimePresetsCache();
-              _STATE.selectedItemId = null;
-              listPresets(apiBase).then(function (fresh) {
-                while (container.firstChild) container.removeChild(container.firstChild);
-                renderPresetsList(container, fresh, apiBase, detailPanel);
-                if (fresh.length > 0) {
-                  _STATE.selectedItemId = fresh[0].id;
-                  while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
-                  renderPresetDetail(detailPanel, fresh[0], apiBase, container);
-                } else {
-                  while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
-                }
-              });
-            });
-          }
-        },
-      });
-      rowActions.appendChild(delRowBtn);
-      card.appendChild(rowActions);
-    }
-    container.appendChild(card);
   });
+
+  var groupNames = Object.keys(groups).sort(function (a, b) { return a.localeCompare(b); });
+
+  // Helper to create a collapsible group section
+  function _createGroupSection(groupLabel, presetsArr, testIdSuffix) {
+    var section = el("div", { class: "comfymodal-studio-backend-group-section" });
+
+    var summary = el("button", {
+      class: "comfymodal-studio-collapsible-summary",
+      "aria-expanded": "true",
+      "data-testid": "preset-group-" + testIdSuffix,
+    }, [
+      el("span", { class: "arrow", text: "\u25b6" }),
+      el("span", { text: groupLabel + " (" + presetsArr.length + ")" }),
+    ]);
+    summary.addEventListener("click", function () {
+      var expanded = summary.getAttribute("aria-expanded") === "true";
+      summary.setAttribute("aria-expanded", String(!expanded));
+      content.classList.toggle("is-visible");
+    });
+
+    var content = el("div", { class: "comfymodal-studio-collapsible-content is-visible" });
+    presetsArr.forEach(function (preset) {
+      content.appendChild(_renderPresetCard(preset, apiBase, container, detailPanel));
+    });
+
+    section.appendChild(summary);
+    section.appendChild(content);
+    return section;
+  }
+
+  // Render each named group
+  groupNames.forEach(function (gName) {
+    container.appendChild(_createGroupSection(
+      gName,
+      groups[gName],
+      gName.replace(/[^a-zA-Z0-9_-]/g, "_")
+    ));
+  });
+
+  // Render ungrouped section
+  if (ungrouped.length > 0) {
+    container.appendChild(_createGroupSection("Ungrouped", ungrouped, "ungrouped"));
+  }
 }
 
 export function renderPresetDetail(container, preset, apiBase, listContainer) {
@@ -259,6 +324,7 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
   const fields = [
     { key: "label", label: "Label", type: "text", value: preset.label || preset.name || "" },
     { key: "description", label: "Description", type: "textarea", value: preset.description || "" },
+    { key: "group", label: "Group", type: "text", value: preset.group || "" },
     { key: "snapshotId", label: "Snapshot ID", type: "text", value: preset.snapshotId || "" },
     { key: "sourceType", label: "Source Type", type: "text", value: preset.sourceType || "" },
     { key: "sourceId", label: "Source ID", type: "text", value: preset.sourceId || "" },
@@ -400,10 +466,11 @@ export function renderPresetForm(existing, apiBase, listPanel, detailPanel) {
   });
   formCard.appendChild(heading);
 
-  const fieldValues = { label: "", description: "", snapshotId: "", compatibleFeatures: [] };
+  const fieldValues = { label: "", description: "", group: "", snapshotId: "", compatibleFeatures: [] };
   const fields = [
     { key: "label", label: "Label", type: "text" },
     { key: "description", label: "Description", type: "textarea" },
+    { key: "group", label: "Group", type: "text" },
     { key: "snapshotId", label: "Snapshot ID", type: "text" },
   ];
 

@@ -44,18 +44,43 @@ def _ws_id(workspace: dict | None) -> str:
 
 
 def _normalize_stable_profile(warmup_profile: dict | None) -> dict:
-    """Return a canonical warmup profile with only restore-relevant fields.
+    """Return a canonical warmup profile with production-identity fields.
 
-    Strips UUIDs, timestamps, workflow_hash, output nodes, and
-    production-mode settings so identical model stacks always produce
-    the same key regardless of workflow display state.
+    Includes restore-relevant fields plus production identity (output IDs,
+    bypass IDs, direct_output_sink, metadata_mode) so that a same-stack
+    non-production profile does NOT suppress writing a production profile.
+
+    The identity fields are only included when production_enabled=True on
+    the incoming profile (or when ``_production_enabled`` is passed).
     """
     if not isinstance(warmup_profile, dict):
         return {}
-    # Keep mode, unet, clip1, clip2, vae, clip_type — the fields the
-    # Modal worker actually uses at restore time.
+    # Always include model-stack fields the Modal worker uses at restore.
     _KEYS = frozenset({"mode", "unet", "clip1", "clip2", "vae", "clip_type"})
-    return {k: warmup_profile.get(k) for k in _KEYS if k in warmup_profile}
+    stable = {k: warmup_profile.get(k) for k in _KEYS if k in warmup_profile}
+    # Include production identity when enabled so a same-stack non-production
+    # profile produces a different key and cannot suppress the production write.
+    if warmup_profile.get("production_enabled"):
+        stable["_production_enabled"] = True
+        stable["_production_output_ids"] = str(
+            sorted(warmup_profile.get("output_node_ids", []))
+        )
+        stable["_production_bypass_ids"] = str(
+            sorted(warmup_profile.get("bypass_node_ids", []))
+        )
+        stable["_production_metadata_mode"] = str(
+            warmup_profile.get("metadata_mode", "none")
+        )
+        stable["_production_direct_output_sink"] = bool(
+            warmup_profile.get("direct_output_sink", True)
+        )
+        stable["_production_allow_rewrite"] = bool(
+            warmup_profile.get("allow_direct_output_rewrite", True)
+        )
+        stable["_production_allow_rgthree"] = bool(
+            warmup_profile.get("allow_rgthree_comparer_rewrite", True)
+        )
+    return stable
 
 
 def _compute_stable_key(warmup_profile: dict) -> str:
@@ -80,6 +105,9 @@ def _build_activation_payload(
     """Build the activation payload dict sent to ``set_active_warmup_profile``.
 
     Mirrors the body of ``__init__._build_next_warmup_activation``.
+    When production is enabled the warmup_profile carries production
+    identity fields so the dedup key distinguishes production from
+    non-production profiles with the same model stack.
     """
     stack = extract_warmup_stack(workflow) if isinstance(workflow, dict) else {}
     profile = stack_to_warmup_profile(stack)
@@ -106,6 +134,18 @@ def _build_activation_payload(
     if production_options and production_options.get("enabled"):
         payload["production_enabled"] = True
         payload["production_profile_version"] = 1
+        # Carry production identity into the warmup_profile so the
+        # dedup key changes when production state changes.
+        profile["production_enabled"] = True  # consumed by _normalize_stable_profile
+        prod_out = production_options.get("output_node_ids", [])
+        prod_byp = production_options.get("bypass_node_ids", [])
+        if isinstance(prod_out, (list, tuple)) and prod_out:
+            profile["output_node_ids"] = list(prod_out)
+            profile["bypass_node_ids"] = list(prod_byp) if isinstance(prod_byp, (list, tuple)) else []
+            profile["metadata_mode"] = str(production_options.get("metadata_mode", "none"))
+            profile["direct_output_sink"] = bool(production_options.get("direct_output_sink", True))
+            profile["allow_direct_output_rewrite"] = bool(production_options.get("allow_direct_output_rewrite", True))
+            profile["allow_rgthree_comparer_rewrite"] = bool(production_options.get("allow_rgthree_comparer_rewrite", True))
 
     # Exact prompt bundle extraction
     _exact_or_persistent = (

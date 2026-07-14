@@ -113,6 +113,20 @@ def _compute_compiled_workflow_hash(compiled: dict) -> str:
         return ""
 
 
+def _compute_source_workflow_hash(workflow: dict) -> str:
+    """SHA-256 of the full source workflow dict using deterministic JSON encoding.
+
+    Includes all workflow values (seeds, prompts, model names, etc.), not only
+    topology.  This ensures cache isolation: two workflows with identical
+    topology but different literal values produce different source hashes.
+    """
+    try:
+        encoded = json.dumps(workflow, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
+
 # ---------------------------------------------------------------------------
 # ID normalization helpers
 # ---------------------------------------------------------------------------
@@ -288,11 +302,16 @@ def compile_production_workflow(
         workflow, production, allow_direct_output_rewrite=allow_direct_output_rewrite
     )
 
+    source_workflow_hash = _compute_source_workflow_hash(workflow)
     cache_key = (
         topology_hash,
+        source_workflow_hash,
         bool(stable),
         str(production.get("metadata_mode", "none")),
         bool(allow_rgthree_comparer_rewrite),
+        bool(allow_direct_output_rewrite),
+        bool(production.get("direct_output_sink", True)),
+        int(production.get("schema_version", COMPILER_SCHEMA_VERSION)),
     )
     cached = _topology_plan_cache.get(cache_key)
 
@@ -324,6 +343,9 @@ def compile_production_workflow(
                 orig_key = nid_map[oid]
                 _selected_output_classes[oid] = workflow.get(orig_key, {}).get("class_type", "?")
         compiled_workflow_hash = _compute_compiled_workflow_hash(compiled)
+        # The runner hash is the same as compiled hash when we execute the
+        # compiled workflow.  Set here so downstream validation can compare.
+        runner_workflow_hash = compiled_workflow_hash
         report = {
             "enabled": True,
             "schema_version": production.get("schema_version", 0),
@@ -337,7 +359,9 @@ def compile_production_workflow(
             "direct_output_rewritten_node_ids": rewritten_ids,
             "rgthree_comparer_rewritten_node_ids": rgthree_rewritten_ids,
             "topology_hash": topology_hash,
+            "source_workflow_hash": source_workflow_hash,
             "compiled_workflow_hash": compiled_workflow_hash,
+            "runner_workflow_hash": runner_workflow_hash,
             "cache_hit": True,
             "duplicate_analysis": duplicate_analysis,
             "direct_output_sink_enabled": bool(production.get("direct_output_sink", True)),
@@ -390,6 +414,7 @@ def compile_production_workflow(
             orig_key = nid_map[oid]
             _selected_output_classes[oid] = workflow.get(orig_key, {}).get("class_type", "?")
     compiled_workflow_hash = _compute_compiled_workflow_hash(compiled)
+    runner_workflow_hash = compiled_workflow_hash
 
     report = {
         "enabled": True,
@@ -404,7 +429,9 @@ def compile_production_workflow(
         "direct_output_rewritten_node_ids": rewritten_ids,
         "rgthree_comparer_rewritten_node_ids": rgthree_rewritten_ids,
         "topology_hash": topology_hash,
+        "source_workflow_hash": source_workflow_hash,
         "compiled_workflow_hash": compiled_workflow_hash,
+        "runner_workflow_hash": runner_workflow_hash,
         "cache_hit": False,
         "duplicate_analysis": duplicate_analysis,
         "direct_output_sink_enabled": bool(production.get("direct_output_sink", True)),
@@ -615,7 +642,8 @@ def _try_rewrite_rgthree_comparer(oid, compiled, nid_map, rewritten_ids):
         return False
     image_b_val = inputs.get("image_b")
     image_b_conn = _extract_connection(image_b_val, nid_map) if image_b_val is not None else None
-    new_inputs = {"image_a": image_a_val}
+    inputs_are_same = (image_a_conn is not None and image_a_conn == image_b_conn)
+    new_inputs = {"image_a": image_a_val, "inputs_are_same": inputs_are_same}
     if image_b_conn is not None:
         new_inputs["image_b"] = image_b_val
     compiled[oid] = {

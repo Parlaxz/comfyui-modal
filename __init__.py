@@ -3241,6 +3241,12 @@ if _server:
         if not isinstance(modal_options_raw, dict):
             modal_options_raw = None
         production_options = normalize_production_options(modal_options_raw)
+
+        # Consume browser _production_trace as authoritative fallback for
+        # production identity trace fields propagated through the queue.
+        _browser_production_trace: dict = body.get("_production_trace", {}) or {}
+        if not isinstance(_browser_production_trace, dict):
+            _browser_production_trace = {}
         production_report = None
         execution_workflow = workflow
         if production_options.get("enabled"):
@@ -3338,6 +3344,55 @@ if _server:
                 "result_route": _result_route_mode,
                 "execution_workflow": _queue_execution_workflow,
                 "production_report": production_report,
+                # Compact production trace fields for request identity tracking.
+                # Carried through queue/scheduler/adapter so the runner can use them.
+                # Use browser _production_trace as authoritative fallback when present,
+                # then fall back to inferred values from the normalized request.
+                "production_ui_enabled": bool(
+                    _browser_production_trace.get("production_ui_enabled",
+                        (modal_options_raw or {}).get("production", {}).get("enabled", False)
+                    )
+                ),
+                "production_persisted_enabled": bool(
+                    _browser_production_trace.get("production_persisted_enabled",
+                        production_options.get("enabled", False)
+                    )
+                ) if production_report and production_report.get("enabled") else bool(
+                    _browser_production_trace.get("production_persisted_enabled", False)
+                ),
+                "production_request_enabled": bool(
+                    production_options.get("enabled", False)
+                ),
+                "production_output_ids": (
+                    _browser_production_trace.get("production_output_ids",
+                        production_options.get("output_node_ids", [])
+                    )
+                    if production_options.get("enabled") else []
+                ),
+                "production_source_workflow_hash": (
+                    production_report.get("source_workflow_hash", "")
+                    if production_report and production_report.get("enabled") else ""
+                ),
+                "production_plan_hash": (
+                    production_report.get("topology_hash", "")
+                    if production_report and production_report.get("enabled") else ""
+                ),
+                "production_compiled_workflow_hash": (
+                    production_report.get("compiled_workflow_hash", "")
+                    if production_report and production_report.get("enabled") else ""
+                ),
+                "runner_workflow_hash": (
+                    production_report.get("runner_workflow_hash", "")
+                    if production_report and production_report.get("enabled") else ""
+                ),
+                "production_plan_used": bool(
+                    production_report and production_report.get("enabled", False)
+                ),
+                "production_output_count": (
+                    len(_browser_production_trace.get("production_output_ids",
+                        production_options.get("output_node_ids", [])))
+                    if production_options.get("enabled") else 0
+                ),
                 "_modal_prompt_ack_ready": ack_ready,
                 # Carry the request workspace into the queue
                 # worker so the detached persistence thread
