@@ -1,5 +1,7 @@
 import asyncio
 import functools
+import hashlib
+import json
 import os
 from collections.abc import Callable
 
@@ -15,6 +17,102 @@ from gpu_catalog import (
     is_gpu_hidden,
     normalize_gpu_value,
 )
+
+# Delegate canonical hashing to the shared production_workflow module so
+# there is one source of truth.
+from production_workflow import _canonical_workflow_hash, COMPILER_SCHEMA_VERSION, HASH_SCHEMA_VERSION, PRODUCTION_PLAN_SCHEMA_VERSION
+
+
+def _short_hash(h: str) -> str:
+    """Return the first 8 characters of a hex hash, or '?' if empty."""
+    return h[:8] if h else "?"
+
+
+def validate_production_dispatch(
+    workflow: dict,
+    production_report: dict | None,
+    *,
+    label: str = "",
+) -> None:
+    """Local dispatch invariant: verify the compiled workflow matches the report.
+
+    Raised ``AssertionError`` (locally, before Modal) when:
+    - The report is enabled but its compiled_workflow_hash does not match
+      the actual hash of *workflow*.
+    - The report's compiler_version or hash_schema_version is stale or does
+      not match the current compiled version.
+    - The report is missing required provenance fields.
+    - The report is enabled but has no compiled_workflow_hash.
+
+    This is a **no-op** when ``production_report`` is None, disabled
+    (``enabled=False``).
+
+    The mismatch message includes short hashes for quick diagnosis:
+      source=abc12345 compiled=def67890 dispatch=ghi12345
+    """
+    if not production_report:
+        return
+    if not isinstance(production_report, dict):
+        return
+    if not production_report.get("enabled"):
+        return
+
+    compiled_hash = production_report.get("compiled_workflow_hash", "")
+    if not compiled_hash:
+        _src_h = _short_hash(production_report.get("source_workflow_hash", ""))
+        _dispatch_h = _short_hash(_canonical_workflow_hash(workflow))
+        raise AssertionError(
+            f"[{label}] production dispatch missing compiled_workflow_hash: "
+            f"report has no compiled identity. "
+            f"source={_src_h} compiled=n/a dispatch={_dispatch_h}. Recompile."
+        )
+
+    # Exact version guard — must match current compiled versions
+    cv = production_report.get("compiler_version", 0)
+    hv = production_report.get("hash_schema_version", 0)
+    if cv != COMPILER_SCHEMA_VERSION:
+        raise AssertionError(
+            f"[{label}] stale or mismatched production compiler_version: "
+            f"got {cv}, expected {COMPILER_SCHEMA_VERSION}"
+        )
+    if hv != HASH_SCHEMA_VERSION:
+        raise AssertionError(
+            f"[{label}] stale or mismatched production hash_schema_version: "
+            f"got {hv}, expected {HASH_SCHEMA_VERSION}"
+        )
+
+    # Exact plan schema version guard
+    pv = production_report.get("production_plan_schema_version", 0)
+    if pv != PRODUCTION_PLAN_SCHEMA_VERSION:
+        raise AssertionError(
+            f"[{label}] stale or mismatched production_plan_schema_version: "
+            f"got {pv}, expected {PRODUCTION_PLAN_SCHEMA_VERSION}"
+        )
+
+    # Compute actual hash of the dispatched workflow using the canonical helper
+    actual_hash = _canonical_workflow_hash(workflow)
+    if not actual_hash:
+        raise AssertionError(
+            f"[{label}] failed to hash dispatch workflow"
+        )
+
+    if actual_hash != compiled_hash:
+        _src_h = _short_hash(production_report.get("source_workflow_hash", ""))
+        raise AssertionError(
+            f"[{label}] production dispatch hash mismatch: "
+            f"source={_src_h} compiled={_short_hash(compiled_hash)} "
+            f"dispatch={_short_hash(actual_hash)}. "
+            "The compiled workflow no longer matches the report. Recompile."
+        )
+
+    # Success: log compact boundary identity
+    source_hash = production_report.get("source_workflow_hash", "")
+    plan_hash = production_report.get("production_plan_hash", "")
+    print(
+        f"[{label}] dispatch validated: source={_short_hash(source_hash)} "
+        f"compiled={_short_hash(compiled_hash)} "
+        f"plan={_short_hash(plan_hash)}"
+    )
 
 APP_NAME = os.environ.get("COMFYMODAL_APP_NAME", "comfyui").strip() or "comfyui"
 
@@ -193,6 +291,8 @@ async def run_prompt(
     workspace: dict | None = None,
 ) -> dict:
     selected = _resolve_workspace(workspace)
+    # Local dispatch invariant: verify compiled workflow matches report
+    validate_production_dispatch(workflow, production_report, label="run_prompt")
     async with _run_prompt_semaphore:
         return await asyncio.to_thread(
             lambda: _workspace_api(selected, gpu).run_prompt.remote(
@@ -222,6 +322,8 @@ async def run_prompt_stream(
     """
     import time as _t
     selected = _resolve_workspace(workspace)
+    # Local dispatch invariant: verify compiled workflow matches report
+    validate_production_dispatch(workflow, production_report, label="run_prompt_stream")
     gen = None
     # ── Local observation markers on the mutable trace dict ────────────
     # These are wall-clock observations from THIS side of the Modal

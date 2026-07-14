@@ -3,15 +3,41 @@
 No Modal, Torch, ComfyUI server, filesystem, or GPU dependencies.
 """
 
+import copy
 import hashlib
 import json
 import threading
 from collections import OrderedDict
+from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 COMPILER_SCHEMA_VERSION = 1
+HASH_SCHEMA_VERSION = 1
+PRODUCTION_PLAN_SCHEMA_VERSION = 1
+
+# Canonical JSON serialisation
+_CANONICAL_JSON_KWARGS = {
+    "sort_keys": True,
+    "separators": (",", ":"),
+    "ensure_ascii": False,
+    "allow_nan": False,
+}
+
+
+def _canonical_workflow_hash(workflow: dict) -> str:
+    """SHA-256 of a workflow dict using canonical UTF-8 JSON encoding.
+
+    Uses ``allow_nan=False`` so that NaN/Infinity values raise a
+    ``ValueError`` and produce an empty hash (fail-closed) rather than
+    silently producing a divergent hash.
+    """
+    try:
+        encoded = json.dumps(workflow, **_CANONICAL_JSON_KWARGS)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
 
 _DEFAULT_PRODUCTION = {
     "enabled": True,
@@ -105,42 +131,101 @@ def _cache_size():
 
 
 def _compute_compiled_workflow_hash(compiled: dict) -> str:
-    """SHA-256 of the compiled workflow dict using deterministic JSON encoding.
-
-    Uses ``allow_nan=False`` so that NaN/Infinity values raise a
-    ``ValueError`` and produce an empty hash (fail-closed) rather than
-    silently producing a divergent hash.
-    """
-    try:
-        encoded = json.dumps(
-            compiled, sort_keys=True, separators=(",", ":"),
-            ensure_ascii=False, allow_nan=False,
-        )
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-    except Exception:
-        return ""
+    """SHA-256 of the compiled workflow dict. Delegates to canonical helper."""
+    return _canonical_workflow_hash(compiled)
 
 
 def _compute_source_workflow_hash(workflow: dict) -> str:
-    """SHA-256 of the full source workflow dict using deterministic JSON encoding.
+    """SHA-256 of the full source workflow dict. Delegates to canonical helper."""
+    return _canonical_workflow_hash(workflow)
 
-    Includes all workflow values (seeds, prompts, model names, etc.), not only
-    topology.  This ensures cache isolation: two workflows with identical
-    topology but different literal values produce different source hashes.
 
-    Uses ``allow_nan=False`` — same canonical serialization as
-    ``comfyapp.compute_canonical_source_workflow_hash`` — so that non-finite
-    values raise a ``ValueError`` and produce an empty hash rather than
-    silently diverging from the canonical hash.
+def _canonical_options_key(production: dict) -> str:
+    """Canonical JSON serialization of the full normalized production options dict.
+
+    Delegates to the same ``_CANONICAL_JSON_KWARGS`` used by
+    ``_canonical_workflow_hash`` so that NaN/Infinity values raise a
+    ``ValueError`` (fail-closed) rather than silently producing a
+    divergent hash.
     """
-    try:
-        encoded = json.dumps(
-            workflow, sort_keys=True, separators=(",", ":"),
-            ensure_ascii=False, allow_nan=False,
-        )
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-    except Exception:
-        return ""
+    return json.dumps(production, **_CANONICAL_JSON_KWARGS)
+
+
+def _compute_production_plan_hash(
+    source_hash: str,
+    compiled_hash: str,
+    production: dict,
+    *,
+    allow_direct_output_rewrite: bool = True,
+    allow_rgthree_comparer_rewrite: bool = True,
+    stable: bool = False,
+) -> str:
+    """Deterministic hash covering the full production plan provenance.
+
+    Includes source/compiled identities, every normalized production option,
+    compiler/hash/plan schema versions, and context flags so any semantic
+    change invalidates the plan hash.
+    """
+    raw = (
+        f"source={source_hash}|compiled={compiled_hash}"
+        f"|options={_canonical_options_key(production)}"
+        f"|cv={COMPILER_SCHEMA_VERSION}|hv={HASH_SCHEMA_VERSION}"
+        f"|pv={PRODUCTION_PLAN_SCHEMA_VERSION}"
+        f"|dow={str(allow_direct_output_rewrite)}"
+        f"|rgthree={str(allow_rgthree_comparer_rewrite)}"
+        f"|stable={str(stable)}"
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ProductionPlan:
+    """Frozen value object representing a complete production compilation result.
+
+    Carries source and compiled workflows with their identities, the
+    production report, and version/schema metadata.
+
+    Compatibility: supports ``tuple`` unpacking ``plan.compiled, plan.report``
+    via the iterator protocol so existing ``compiled, report = compile_*(…)``
+    call sites continue to work during migration.
+    """
+    source_workflow: dict
+    source_workflow_hash: str
+    compiled_workflow: dict
+    compiled_workflow_hash: str
+    production_plan_hash: str
+    source_output_node_ids: list = field(default_factory=list)
+    compiled_output_node_ids: list = field(default_factory=list)
+    production_options: dict = field(default_factory=dict)
+    report: dict = field(default_factory=dict)
+    compiler_version: int = COMPILER_SCHEMA_VERSION
+    hash_schema_version: int = HASH_SCHEMA_VERSION
+    production_plan_schema_version: int = PRODUCTION_PLAN_SCHEMA_VERSION
+    # Schema aliases for backward compat during migration
+    schema_version: int = COMPILER_SCHEMA_VERSION
+    hash_schema: int = HASH_SCHEMA_VERSION
+
+    def __iter__(self):
+        """Compatibility iterator yielding (compiled_workflow, report).
+
+        This allows existing ``compiled, report = compile_production_workflow(…)``
+        call sites to continue working.  New code should use named fields:
+        ``plan.compiled_workflow`` and ``plan.report``.
+        """
+        yield self.compiled_workflow
+        yield self.report
+
+    def __getitem__(self, index):
+        """Compatibility subscript access for tuple-indexing [0] / [1].
+
+        Allows existing callers that do ``result[1]`` to get the report
+        without migrating to named fields.
+        """
+        if index == 0:
+            return self.compiled_workflow
+        if index == 1:
+            return self.report
+        raise IndexError("ProductionPlan subscript out of range")
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +379,7 @@ def build_production_topology_hash(
 
 def compile_production_workflow(
     workflow: dict, production: dict, *, allow_direct_output_rewrite: bool, allow_rgthree_comparer_rewrite: bool = True, stable: bool = False
-) -> tuple[dict, dict]:
+) -> ProductionPlan:
     original_count = len(workflow)
     nid_map = _build_normalized_id_map(workflow)
     output_ids = production.get("output_node_ids", [])
@@ -350,6 +435,9 @@ def compile_production_workflow(
         bool(allow_direct_output_rewrite),
         bool(production.get("direct_output_sink", True)),
         int(production.get("schema_version", COMPILER_SCHEMA_VERSION)),
+        COMPILER_SCHEMA_VERSION,
+        HASH_SCHEMA_VERSION,
+        PRODUCTION_PLAN_SCHEMA_VERSION,
     )
     cached = _topology_plan_cache.get(cache_key)
 
@@ -384,19 +472,37 @@ def compile_production_workflow(
         # The runner hash is the same as compiled hash when we execute the
         # compiled workflow.  Set here so downstream validation can compare.
         runner_workflow_hash = compiled_workflow_hash
+        # compiled_output_node_ids = selected output IDs that survive in compiled
+        _surviving_output_ids = [oid for oid in output_ids if oid in compiled]
+        sf = bool(stable)
+        ador = bool(allow_direct_output_rewrite)
+        arcr = bool(allow_rgthree_comparer_rewrite)
+        production_plan_hash = _compute_production_plan_hash(
+            source_workflow_hash, compiled_workflow_hash,
+            production,
+            allow_direct_output_rewrite=ador,
+            allow_rgthree_comparer_rewrite=arcr,
+            stable=sf,
+        )
         report = {
             "enabled": True,
             "schema_version": production.get("schema_version", 0),
+            "compiler_version": COMPILER_SCHEMA_VERSION,
+            "hash_schema_version": HASH_SCHEMA_VERSION,
+            "production_plan_schema_version": PRODUCTION_PLAN_SCHEMA_VERSION,
             "original_node_count": original_count,
             "compiled_node_count": len(compiled),
             "removed_node_count": len(removed_ids),
             "kept_node_ids": list(compiled.keys()),
             "removed_node_ids": removed_ids,
             "output_node_ids": list(output_ids),
+            "source_output_node_ids": list(output_ids),
+            "compiled_output_node_ids": list(_surviving_output_ids),
             "bypass_node_ids": list(bypass_ids),
             "direct_output_rewritten_node_ids": rewritten_ids,
             "rgthree_comparer_rewritten_node_ids": rgthree_rewritten_ids,
             "topology_hash": topology_hash,
+            "production_plan_hash": production_plan_hash,
             "source_workflow_hash": source_workflow_hash,
             "compiled_workflow_hash": compiled_workflow_hash,
             "runner_workflow_hash": runner_workflow_hash,
@@ -409,7 +515,21 @@ def compile_production_workflow(
             "rgthree_comparer_rewritten_count": len(rgthree_rewritten_ids),
             "direct_output_rewrite_allowed": allow_direct_output_rewrite,
         }
-        return dict(compiled), report
+        compiled_wf = dict(compiled)
+        return ProductionPlan(
+            source_workflow=copy.deepcopy(workflow),
+            source_workflow_hash=source_workflow_hash,
+            compiled_workflow=copy.deepcopy(compiled_wf),
+            compiled_workflow_hash=compiled_workflow_hash,
+            production_plan_hash=production_plan_hash,
+            source_output_node_ids=list(output_ids),
+            compiled_output_node_ids=list(_surviving_output_ids),
+            production_options=copy.deepcopy(production),
+            report=copy.deepcopy(report),
+            compiler_version=COMPILER_SCHEMA_VERSION,
+            hash_schema_version=HASH_SCHEMA_VERSION,
+            production_plan_schema_version=PRODUCTION_PLAN_SCHEMA_VERSION,
+        )
 
     compiled = OrderedDict()
     for nid in kept_ids:
@@ -453,20 +573,38 @@ def compile_production_workflow(
             _selected_output_classes[oid] = workflow.get(orig_key, {}).get("class_type", "?")
     compiled_workflow_hash = _compute_compiled_workflow_hash(compiled)
     runner_workflow_hash = compiled_workflow_hash
+    # compiled_output_node_ids = selected output IDs that survive in compiled
+    _surviving_output_ids = [oid for oid in output_ids if oid in compiled]
+    sf = bool(stable)
+    ador = bool(allow_direct_output_rewrite)
+    arcr = bool(allow_rgthree_comparer_rewrite)
+    production_plan_hash = _compute_production_plan_hash(
+        source_workflow_hash, compiled_workflow_hash,
+        production,
+        allow_direct_output_rewrite=ador,
+        allow_rgthree_comparer_rewrite=arcr,
+        stable=sf,
+    )
 
     report = {
         "enabled": True,
         "schema_version": production.get("schema_version", 0),
+        "compiler_version": COMPILER_SCHEMA_VERSION,
+        "hash_schema_version": HASH_SCHEMA_VERSION,
+        "production_plan_schema_version": PRODUCTION_PLAN_SCHEMA_VERSION,
         "original_node_count": original_count,
         "compiled_node_count": len(compiled),
         "removed_node_count": len(removed_ids),
         "kept_node_ids": list(compiled.keys()),
         "removed_node_ids": removed_ids,
         "output_node_ids": list(output_ids),
+        "source_output_node_ids": list(output_ids),
+        "compiled_output_node_ids": list(_surviving_output_ids),
         "bypass_node_ids": list(bypass_ids),
         "direct_output_rewritten_node_ids": rewritten_ids,
         "rgthree_comparer_rewritten_node_ids": rgthree_rewritten_ids,
         "topology_hash": topology_hash,
+        "production_plan_hash": production_plan_hash,
         "source_workflow_hash": source_workflow_hash,
         "compiled_workflow_hash": compiled_workflow_hash,
         "runner_workflow_hash": runner_workflow_hash,
@@ -479,7 +617,21 @@ def compile_production_workflow(
         "rgthree_comparer_rewritten_count": len(rgthree_rewritten_ids),
         "direct_output_rewrite_allowed": allow_direct_output_rewrite,
     }
-    return dict(compiled), report
+    compiled_wf = dict(compiled)
+    return ProductionPlan(
+        source_workflow=copy.deepcopy(workflow),
+        source_workflow_hash=source_workflow_hash,
+        compiled_workflow=copy.deepcopy(compiled_wf),
+        compiled_workflow_hash=compiled_workflow_hash,
+        production_plan_hash=production_plan_hash,
+        source_output_node_ids=list(output_ids),
+        compiled_output_node_ids=list(_surviving_output_ids),
+        production_options=copy.deepcopy(production),
+        report=copy.deepcopy(report),
+        compiler_version=COMPILER_SCHEMA_VERSION,
+        hash_schema_version=HASH_SCHEMA_VERSION,
+        production_plan_schema_version=PRODUCTION_PLAN_SCHEMA_VERSION,
+    )
 
 
 def analyze_duplicate_work(workflow: dict) -> dict:

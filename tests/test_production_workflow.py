@@ -1651,3 +1651,34 @@ class SourceWorkflowHashTests(unittest.TestCase):
         self.assertEqual(r1["source_workflow_hash"],
                          r2["source_workflow_hash"],
                          "Source hash must be stable for identical workflow")
+
+
+class CanonicalOptionsKeyJoinTests(unittest.TestCase):
+    """_canonical_options_key must use the shared _CANONICAL_JSON_KWARGS
+    including allow_nan=False."""
+
+    def test_uses_canonical_kwargs(self):
+        from production_workflow import _canonical_options_key, _CANONICAL_JSON_KWARGS
+        import json
+        opts = {"enabled": True, "output_node_ids": ["9"]}
+        expected = json.dumps(opts, **_CANONICAL_JSON_KWARGS)
+        self.assertEqual(_canonical_options_key(opts), expected)
+
+    def test_nan_raises_value_error(self):
+        from production_workflow import _canonical_options_key
+        with self.assertRaises(ValueError):
+            _canonical_options_key({"value": float("nan")})
+
+    def test_plan_hash_deterministic_with_equal_options(self):
+        from production_workflow import _compute_production_plan_hash
+        h1 = _compute_production_plan_hash(
+            "a" * 64, "b" * 64,
+            {"enabled": True, "output_node_ids": ["9"]},
+            allow_direct_output_rewrite=False,
+        )
+        h2 = _compute_production_plan_hash(
+            "a" * 64, "b" * 64,
+            {"enabled": True, "output_node_ids": ["9"]},
+            allow_direct_output_rewrite=False,
+        )
+        self.assertEqual(h1, h2)

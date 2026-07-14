@@ -3,6 +3,19 @@
 import hashlib
 import json
 
+# Canonical hashing: delegate to the single production_workflow implementation.
+from production_workflow import _canonical_workflow_hash
+
+# Canonical JSON serialisation constants (maintained here for backward
+# compatibility with legacy callers; new code should use
+# production_workflow._canonical_workflow_hash directly).
+_CANONICAL_JSON_KWARGS = {
+    "sort_keys": True,
+    "separators": (",", ":"),
+    "ensure_ascii": False,
+    "allow_nan": False,
+}
+
 # ---------------------------------------------------------------------------
 # Loader → (bucket key, input field) mappings for model-stack extraction
 # ---------------------------------------------------------------------------
@@ -32,11 +45,11 @@ def normalize_flux_clip_pair(clip1: str, clip2: str) -> tuple[str, str]:
 def prompt_sha256(prompt: dict) -> str:
     """Return a deterministic SHA-256 hex digest for a prompt dict.
 
-    Uses ``json.dumps`` with ``sort_keys=True`` so that semantically
-    identical prompts differing only in key ordering produce the same hash.
+    Delegates to ``production_workflow._canonical_workflow_hash`` so there is
+    one canonical implementation.  Maintained here for backward compatibility;
+    new callers should use ``_canonical_workflow_hash`` directly.
     """
-    normalized = json.dumps(prompt, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return _canonical_workflow_hash(prompt)
 
 
 def summarize_prompt_fields(prompt: dict) -> dict:
