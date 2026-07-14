@@ -792,12 +792,47 @@ export function renderExperimentRunButton(state, actions, context) {
       runState._cancelling = true;
       _cancelBtn.textContent = "Cancelling\u2026";
       _cancelBtn.disabled = true;
+      // Clear any prior cancel error
+      if (runState._cancelError) {
+        delete runState._cancelError;
+      }
       var expId = runState.experimentId || runState.runId;
       if (expId) {
-        try { await stopExperiment(_expApiBase, expId); } catch (e) {}
+        try {
+          var _resp = await stopExperiment(_expApiBase, expId);
+          if (!_resp || _resp.status !== "ok") {
+            throw new Error((_resp && _resp.message) || "Cancel request failed");
+          }
+          runState._cancelling = true;
+          delete runState._cancelError;
+          if (actions && actions.setRunState) {
+            actions.setRunState({ _cancelling: true, _cancelError: null });
+          }
+        } catch (e) {
+          runState._cancelling = false;
+          runState._cancelError = e && e.message ? e.message : "Cancel request failed";
+          if (actions && actions.setRunState) {
+            actions.setRunState({
+              _cancelling: false,
+              _cancelError: runState._cancelError,
+            });
+          }
+        }
+      } else {
+        runState._cancelling = false;
+        runState._cancelError = "Experiment ID unavailable";
+        if (actions && actions.setRunState) {
+          actions.setRunState({ _cancelling: false, _cancelError: runState._cancelError });
+        }
       }
     });
     container.appendChild(_cancelBtn);
+    if (runState._cancelError) {
+      var _cancelErrorEl = document.createElement("p");
+      _cancelErrorEl.style.cssText = "font-size:var(--font-size-sm);color:var(--color-danger);margin:4px 0 0;";
+      _cancelErrorEl.textContent = runState._cancelError;
+      container.appendChild(_cancelErrorEl);
+    }
 
     return container;
   }

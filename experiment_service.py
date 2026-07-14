@@ -200,6 +200,9 @@ class ServiceRegistry:
         self._bridges: dict[str, "_EventBridge"] = {}
         self._progress_buffers: dict[str, "WorkerProgressBuffer"] = {}
         self._lock = asyncio.Lock()
+        # Fix: in-memory pending-stop set for experiments that exist but
+        # have no scheduler yet.  {experiment_id: True}
+        self._pending_stops: set[str] = set()
 
     # ── Stores / leases ──
 
@@ -405,6 +408,28 @@ class ServiceRegistry:
         if buf is not None:
             for ck_id in list(buf._checkpoints.keys()):
                 buf.clear_checkpoint(ck_id)
+
+    # ── Pending-stop mechanism ──────────────────────────────────────
+    # Allows stop-now to be recorded for an experiment that exists but
+    # has no scheduler yet.  The pending stop is consumed when the
+    # scheduler is created in _schedule_and_start.
+
+    def request_pending_stop(self, exp_id: str) -> None:
+        """Record that stop-now was requested for an experiment that has
+        no scheduler yet.  Idempotent."""
+        self._pending_stops.add(exp_id)
+
+    def consume_pending_stop(self, exp_id: str) -> bool:
+        """Check and clear a pending stop for *exp_id*.
+        Returns True if a pending stop was present and was consumed."""
+        if exp_id in self._pending_stops:
+            self._pending_stops.discard(exp_id)
+            return True
+        return False
+
+    def clear_pending_stop(self, exp_id: str) -> None:
+        """Clear any pending stop marker for *exp_id* without consuming it."""
+        self._pending_stops.discard(exp_id)
 
     # ── Event bridge ──
 

@@ -65,17 +65,29 @@ WORKFLOW_MULTI_OUTPUT = {
 
 
 class NormalizeProductionOptionsTests(unittest.TestCase):
-    def test_none_returns_disabled(self):
+    def test_none_returns_enabled_with_defaults(self):
+        """modal_options=None → enabled=True with canonical defaults, empty output_node_ids."""
         result = normalize_production_options(None)
-        self.assertEqual(result, {"enabled": False})
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["schema_version"], COMPILER_SCHEMA_VERSION)
+        self.assertEqual(result["output_node_ids"], [])
+        self.assertTrue(result["disable_sampler_previews"])
+        self.assertTrue(result["quiet_execution_logs"])
+        self.assertEqual(result["progress_min_interval_ms"], 500)
 
-    def test_empty_dict_returns_disabled(self):
+    def test_empty_dict_returns_enabled_with_defaults(self):
+        """modal_options={} → enabled=True with canonical defaults."""
         result = normalize_production_options({})
-        self.assertEqual(result, {"enabled": False})
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["schema_version"], COMPILER_SCHEMA_VERSION)
+        self.assertEqual(result["output_node_ids"], [])
 
-    def test_no_production_key_returns_disabled(self):
+    def test_no_production_key_returns_enabled_with_defaults(self):
+        """modal_options without production key → enabled=True with defaults."""
         result = normalize_production_options({"other": "data"})
-        self.assertEqual(result, {"enabled": False})
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["schema_version"], COMPILER_SCHEMA_VERSION)
+        self.assertEqual(result["output_node_ids"], [])
 
     def test_rejects_non_dict(self):
         with self.assertRaises(TypeError):
@@ -110,11 +122,13 @@ class NormalizeProductionOptionsTests(unittest.TestCase):
         })
         self.assertEqual(result["output_node_ids"], ["8", "9", "10"])
 
-    def test_rejects_empty_output_node_ids(self):
-        with self.assertRaises(ValueError):
-            normalize_production_options({
-                "production": {"schema_version": COMPILER_SCHEMA_VERSION, "output_node_ids": []}
-            })
+    def test_allows_empty_output_node_ids(self):
+        """Normalizer no longer rejects empty output_node_ids - surface derives them."""
+        result = normalize_production_options({
+            "production": {"schema_version": COMPILER_SCHEMA_VERSION, "output_node_ids": []}
+        })
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["output_node_ids"], [])
 
     def test_rejects_overlap(self):
         with self.assertRaises(ValueError):
@@ -1075,18 +1089,40 @@ class ProductionEvidenceHashContractTests(unittest.TestCase):
 class DisabledProductionTests(unittest.TestCase):
     """Tests that production-disabled paths are never treated as production."""
 
-    def test_normalize_disabled_returns_only_enabled_false(self):
+    def test_normalize_none_is_now_enabled(self):
+        """None returns enabled=True with defaults (not disabled)."""
         result = normalize_production_options(None)
-        self.assertEqual(result, {"enabled": False})
+        self.assertTrue(result["enabled"])
 
-    def test_compile_with_disabled_normalize_is_noop(self):
-        """When normalize_production_options returns disabled, workflow is untouched."""
+    def test_normalize_empty_is_now_enabled(self):
+        """Empty dict returns enabled=True with defaults (not disabled)."""
         result = normalize_production_options({})
-        self.assertEqual(result, {"enabled": False})
+        self.assertTrue(result["enabled"])
 
     def test_normalize_explicitly_disabled_returns_no_extra_keys(self):
         result = normalize_production_options({"production": {"enabled": False, "schema_version": 1}})
         self.assertEqual(result, {"enabled": False})
+
+    def test_normalize_explicit_false_remains_disabled(self):
+        """Explicit enabled=false must remain disabled regardless of other keys."""
+        result = normalize_production_options({"production": {"enabled": False}})
+        self.assertEqual(result, {"enabled": False})
+
+    def test_normalize_explicit_true_no_output_ids_passes(self):
+        """Explicit enabled=true with no output_node_ids passes through to compiler boundary."""
+        result = normalize_production_options({
+            "production": {"enabled": True, "schema_version": 1}
+        })
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["output_node_ids"], [],
+                         "Normalizer no longer rejects empty IDs — surface/compile boundary does")
+
+    def test_normalize_implicit_enabled_empty_production(self):
+        """production={} → enabled=True with defaults, empty output IDs allowed."""
+        result = normalize_production_options({"production": {}})
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["output_node_ids"], [])
+        self.assertEqual(result["schema_version"], COMPILER_SCHEMA_VERSION)
 
 
 class ProductionReportRpcNullTests(unittest.TestCase):
@@ -1284,7 +1320,8 @@ class TerminalEvidenceTests(unittest.TestCase):
     def test_disabled_production_no_evidence(self):
         """When production is disabled, no production_report evidence fields."""
         from production_workflow import normalize_production_options, compile_production_workflow
-        prod = normalize_production_options(None)
+        # Use explicit disabled (None now returns enabled=True with defaults)
+        prod = normalize_production_options({"production": {"enabled": False}})
         self.assertEqual(prod, {"enabled": False})
 
     # ── Cache key isolation tests ────────────────────────────────────

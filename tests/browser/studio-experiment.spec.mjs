@@ -54,6 +54,15 @@ async function enableExperimentMode(page) {
 }
 
 async function checkComparePreset(page, presetIdOrLabel) {
+  const compareSections = page.locator(
+    '[data-testid="compare-backends"] button.comfymodal-studio-collapsible-summary'
+  );
+  for (let i = 0; i < await compareSections.count(); i++) {
+    const section = compareSections.nth(i);
+    if ((await section.getAttribute("aria-expanded")) !== "true") {
+      await section.click();
+    }
+  }
   const cb = page.locator(`[data-testid="compare-preset-${presetIdOrLabel}"], [data-backend-id="${presetIdOrLabel}"]`).first();
   await cb.waitFor({ state: "visible", timeout: 10000 });
   const isChecked = await cb.isChecked();
@@ -274,6 +283,46 @@ test.describe("Studio Experiment", () => {
       expect(failedEvents).toHaveLength(0);
 
       // Assert no console errors
+      guard.assertNoErrors();
+      api.assertNoUnhandledCalls();
+    } finally {
+      if (guard) guard.dispose();
+    }
+  });
+
+  test("cancels a running experiment through the stop-now endpoint", async ({ page }) => {
+    const prefix = createOwnerPrefix();
+    const owned = createOwnedRecords();
+    let guard;
+
+    try {
+      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
+      await createOwnedSnapshotAndPresets(page, prefix, 2, owned);
+      await openStudio(page, COMFYUI_URL);
+      await waitVisible(page.locator('[data-testid="control-panel"]'));
+      await selectBackendPreset(page, owned.presetIds[0]);
+
+      guard = installConsoleGuard(page);
+      await enableExperimentMode(page);
+      await checkComparePreset(page, owned.presetIds[1]);
+      await submitExperiment(page);
+
+      const cancelBtn = page.locator('[data-testid="cancel-experiment-btn"]');
+      await cancelBtn.waitFor({ state: "visible", timeout: 10000 });
+      await expect.poll(() => api.state.experiments.size, { timeout: 5000 }).toBeGreaterThan(0);
+      const expId = [...api.state.experiments.keys()][0];
+
+      await cancelBtn.click();
+      await waitForExperimentTerminal(page, 15000);
+
+      const stopCalls = api.state.calls.filter(function (call) {
+        return call.method === "POST" && call.pathname === "/comfymodal/experiments/" + expId + "/stop-now";
+      });
+      expect(stopCalls.length).toBeGreaterThan(0);
+      expect(api.state.experiments.get(expId).snapshot.status).toBe("stopped");
+      expect(api.state.experiments.get(expId).events.some((event) => event.type === "experiment.stopped")).toBe(true);
+      await expect(page.locator('[data-testid="cancel-experiment-btn"]')).toHaveCount(0);
+
       guard.assertNoErrors();
       api.assertNoUnhandledCalls();
     } finally {

@@ -1924,5 +1924,75 @@ class EventBridgeTests(_ClosingTestCase):
             self._close_now()
 
 
+# ── Scheduler stop-now idempotency / draft stop tests ────────────────────
+
+
+class StopNowDraftTests(_ClosingTestCase):
+    """stop_now must be valid for draft/pre-start/paused schedulers."""
+
+    def _make_draft_scheduler(self, tmp):
+        s = load_module()
+        store = _store_for(tmp, "exp_draft_stop")
+        self._track(store)
+        spec = _two_checkpoint_spec()
+        _write_definition(store, spec)
+        leases = _leases_for(tmp)
+        self._track(leases)
+        invoker = _FakeInvoker()
+        scheduler = s.ExperimentScheduler(
+            store=store, leases=leases, invoker=invoker,
+            compilation=_compile(spec), max_containers=1,
+        )
+        # Return close callback so tempdir cleanup doesn't hit open DB
+        def _cleanup():
+            _close(store, leases)
+        return scheduler, _cleanup
+
+    def test_stop_now_on_draft_scheduler_returns_stopped(self):
+        """stop_now on a draft scheduler must set status to stopped and
+        emit experiment.stopped without opening Modal."""
+        s = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler, _cleanup = self._make_draft_scheduler(tmp)
+            self.assertEqual(scheduler._status, s.STATUS_DRAFT)
+
+            asyncio.run(scheduler.stop_now())
+            self.assertEqual(scheduler._status, s.STATUS_STOPPED)
+
+            # Subsequent start() should return immediately without running
+            result = asyncio.run(scheduler.start())
+            self.assertEqual(scheduler._status, s.STATUS_STOPPED)
+            self.assertEqual(result["completed"], 0, "no cells completed")
+            _cleanup()
+
+    def test_stop_now_is_idempotent(self):
+        """stop_now multiple times must stay stopped."""
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler, _cleanup = self._make_draft_scheduler(tmp)
+            asyncio.run(scheduler.stop_now())
+            asyncio.run(scheduler.stop_now())  # second call must not raise
+            self.assertEqual(scheduler._status, "stopped")
+            _cleanup()
+
+    def test_stop_now_on_paused_scheduler(self):
+        """stop_now on a paused scheduler still sets stopped."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = load_module()
+            scheduler, _cleanup = self._make_draft_scheduler(tmp)
+            # Force-pause the scheduler
+            scheduler._set_status(s.STATUS_PAUSED)
+            asyncio.run(scheduler.stop_now())
+            self.assertEqual(scheduler._status, s.STATUS_STOPPED)
+            _cleanup()
+
+    def test_stop_now_sets_flag_before_start(self):
+        """stop_now before start must set _stop_now_requested flag."""
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler, _cleanup = self._make_draft_scheduler(tmp)
+            asyncio.run(scheduler.stop_now())
+            self.assertTrue(scheduler._stop_now_requested)
+            _cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()

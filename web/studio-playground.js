@@ -1137,10 +1137,13 @@ function buildActions(state, context) {
     setRunState(runState) {
       if (!state.playground) state.playground = {};
       const prevRunState = state.playground.runState;
+      const prevStatus = prevRunState && prevRunState.status;
       state.playground.runState = { ...state.playground.runState, ...runState };
 
+      const newStatus = runState && runState.status;
+
       // Dispose scoped tracker and clean up local timer on terminal states
-      if (runState && (runState.status === "completed" || runState.status === "error")) {
+      if (runState && (newStatus === "completed" || newStatus === "error")) {
         if (state.playground && state.playground.runState) {
           delete state.playground.runState._localStartTime;
           delete state.playground.runState._cancelling;
@@ -1150,7 +1153,7 @@ function buildActions(state, context) {
         _disposeScopedTracker(state);
       }
 
-      if (runState && runState.status === "completed") {
+      if (runState && newStatus === "completed") {
         // A new run completed — re-enable the carousel synchronously so
         // subsequent re-renders and page loads show recent runs again.
         // Done BEFORE the async refresh so the flag does not persist and
@@ -1204,7 +1207,8 @@ function buildActions(state, context) {
         // Also clear captured running config since the run is abandoned.
         if (state.playground) delete state.playground._runningExperimentConfig;
       }
-      if (context && context.setPage) {
+      const rerender = !runState || !newStatus || prevStatus !== newStatus;
+      if (rerender && context && context.setPage) {
         context.setPage("playground");
       }
     },
@@ -2317,23 +2321,21 @@ function renderRunningConfigPanel(state) {
   }
   panel.appendChild(el("div", { class: "comfymodal-studio-running-config-header" }, headerChildren));
 
-  // ── Prompt ────────────────────────────────────────────────────────
-  if (controls.prompt != null && controls.prompt !== "") {
-    var promptText = controls.prompt;
-    if (promptText.length > 200) promptText = promptText.substring(0, 200) + "\u2026";
+  // ── Prompt (skip if it's an experiment axis — axes section shows values) ──
+  var promptIsAxis = axes.prompt && axes.prompt.enabled;
+  if (!promptIsAxis && controls.prompt != null && controls.prompt !== "") {
     panel.appendChild(el("div", { class: "comfymodal-studio-running-config-prompt" }, [
       el("span", { class: "comfymodal-studio-running-config-label", text: "Prompt" }),
-      el("span", { class: "comfymodal-studio-running-config-prompt-text", text: promptText }),
+      el("span", { class: "comfymodal-studio-running-config-prompt-text", text: controls.prompt }),
     ]));
   }
 
-  // ── Negative prompt ───────────────────────────────────────────────
-  if (controls.negative_prompt != null && controls.negative_prompt !== "") {
-    var negText = controls.negative_prompt;
-    if (negText.length > 120) negText = negText.substring(0, 120) + "\u2026";
+  // ── Negative prompt (skip if it's an experiment axis) ─────────────
+  var negIsAxis = axes.negative_prompt && axes.negative_prompt.enabled;
+  if (!negIsAxis && controls.negative_prompt != null && controls.negative_prompt !== "") {
     panel.appendChild(el("div", { class: "comfymodal-studio-running-config-prompt", style: "border-bottom:none;margin-bottom:2px;padding-bottom:2px;" }, [
       el("span", { class: "comfymodal-studio-running-config-label", text: "Negative" }),
-      el("span", { class: "comfymodal-studio-running-config-prompt-text", text: negText }),
+      el("span", { class: "comfymodal-studio-running-config-prompt-text", text: controls.negative_prompt }),
     ]));
   }
 
@@ -3365,12 +3367,6 @@ function _renderCellDetailOverlay(entry, apiBase, state, context, varyingAxes) {
   }
 
   var sections = [];
-
-  // Cell key
-  sections.push(el("div", {
-    class: "comfymodal-studio-experiment-grid-detail-key",
-    text: "Cell: " + entry.cell.cell_key,
-  }));
 
   // Status
   sections.push(el("div", {

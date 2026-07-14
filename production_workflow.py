@@ -175,31 +175,52 @@ def _extract_connection(value, normalized_ids):
 # ---------------------------------------------------------------------------
 
 def normalize_production_options(modal_options: dict | None) -> dict:
+    """Canonical normalizer for production options.
+
+    Semantics
+    ---------
+    * ``None`` / ``{}`` / no ``production`` key          → ``enabled=True`` (defaults)
+    * ``production={}`` / ``production.enabled`` omitted  → ``enabled=True`` (defaults)
+    * ``production.enabled=false``                         → ``{"enabled": False}``
+    * ``production.enabled=true`` (with or without IDs)   → ``enabled=True`` (normalized)
+
+    Output ``output_node_ids`` may remain **empty** after normalization — the
+    calling surface (Studio, Experiment) is responsible for deriving them before
+    compilation.  The compiler itself raises a clear ``ValueError`` if it receives
+    empty ``output_node_ids``.
+    """
+    # ── None / empty / absent — enabled=True with canonical defaults ──
     if not modal_options:
-        return {"enabled": False}
+        return dict(_DEFAULT_PRODUCTION)
 
     production_raw = modal_options.get("production")
-    if production_raw is None and isinstance(modal_options, dict):
+
+    # ── Legacy inline flat dict ──
+    if production_raw is None:
         if "schema_version" in modal_options or "output_node_ids" in modal_options:
             production_raw = modal_options
-
-    if production_raw is None:
-        return {"enabled": False}
+        else:
+            return dict(_DEFAULT_PRODUCTION)
 
     if not isinstance(production_raw, dict):
         raise TypeError("production options must be a dict when present")
 
     prod = dict(production_raw)
-    enabled = bool(prod.get("enabled", True))
 
-    if not enabled:
+    # ── Explicit disabled ────────────────────────────────────────────
+    if prod.get("enabled") is False:
         return {"enabled": False}
 
+    # ── Enabled (explicit or implicit) — normalize defaults ──────────
+    prod.setdefault("enabled", True)
+
+    # Validate explicit schema_version when caller provides one
     sv = prod.get("schema_version")
-    if sv != COMPILER_SCHEMA_VERSION:
+    if sv is not None and sv != COMPILER_SCHEMA_VERSION:
         raise ValueError(
             f"production schema_version must be {COMPILER_SCHEMA_VERSION}, got {sv!r}"
         )
+    prod["schema_version"] = COMPILER_SCHEMA_VERSION
 
     for key in _DEFAULT_MISSING_KEYS:
         if key not in prod:
@@ -208,24 +229,18 @@ def normalize_production_options(modal_options: dict | None) -> dict:
     output_ids = prod.get("output_node_ids", [])
     if not isinstance(output_ids, (list, tuple)):
         raise TypeError("output_node_ids must be a list")
-    normalized_output = _normalize_ids(output_ids)
-    if not normalized_output:
-        raise ValueError("output_node_ids must not be empty when production is enabled")
-    prod["output_node_ids"] = normalized_output
+    prod["output_node_ids"] = _normalize_ids(output_ids)
 
     bypass_ids = prod.get("bypass_node_ids", [])
     if not isinstance(bypass_ids, (list, tuple)):
         raise TypeError("bypass_node_ids must be a list")
     prod["bypass_node_ids"] = _normalize_ids(bypass_ids)
 
-    overlap = set(normalized_output) & set(prod["bypass_node_ids"])
+    overlap = set(prod["output_node_ids"]) & set(prod["bypass_node_ids"])
     if overlap:
         raise ValueError(
             f"output_node_ids and bypass_node_ids overlap: {sorted(overlap)}"
         )
-
-    prod["enabled"] = True
-    prod["schema_version"] = COMPILER_SCHEMA_VERSION
     return prod
 
 
@@ -279,6 +294,13 @@ def compile_production_workflow(
     for oid in output_ids:
         if oid in bypass_ids:
             raise ValueError(f"output_node_id {oid!r} is also marked as bypassed")
+
+    if not output_ids:
+        raise ValueError(
+            "output_node_ids must not be empty when production compilation is called. "
+            "Derive output node IDs from the surface (preset outputNodeId, node binding, "
+            "or caller-provided option) before compiling."
+        )
 
     if not stable:
         for bid in bypass_ids:

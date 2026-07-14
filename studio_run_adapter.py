@@ -50,6 +50,10 @@ try:
 except Exception:  # pragma: no cover - runtime-only dependency in some contexts
     nodes = None
 
+from production_workflow import (
+    normalize_production_options,
+    compile_production_workflow,
+)
 from studio_store import StudioJsonStore, StudioStoreError
 from studio_models import (
     _FEATURE_BINDING_KEYS,
@@ -1142,6 +1146,8 @@ def build_single_run_spec(
     controls: dict[str, Any],
     node_dir: str | os.PathLike,
     trace_ctx: dict | None = None,
+    *,
+    modal_options: dict | None = None,
 ) -> dict[str, Any]:
     """Build a compilation-like spec for a single Studio run.
 
@@ -1207,6 +1213,81 @@ def build_single_run_spec(
     # Apply control overrides to the deep-copied workflow
     _apply_controls_to_workflow(workflow, slots, controls)
 
+    # ── Production workflow compilation ──────────────────────────────────
+    # Normalize production options.  The normalizer never validates
+    # output_node_ids — that is the surface's responsibility.
+    production_options = normalize_production_options(modal_options)
+    _prod_explicitly_disabled = bool(
+        isinstance(modal_options, dict)
+        and isinstance(modal_options.get("production"), dict)
+        and modal_options["production"].get("enabled") is False
+    )
+    _prod_default_applied = bool(
+        not modal_options
+        or "production" not in (modal_options or {})
+    )
+
+    production_report = None
+    production_workflow = workflow
+    _prod_output_source = "none"
+
+    if production_options.get("enabled"):
+        # ── Derive output_node_ids from the snapshot ──────────────────────
+        # Snapshot carries outputNodeId (a single node ID string).
+        # Caller-provided output_node_ids in modal_options take precedence.
+        _caller_output_ids = production_options.get("output_node_ids", [])
+        _snapshot_output = snapshot.get("outputNodeId", "") or ""
+        _derived_output_ids = []
+
+        if _caller_output_ids:
+            _derived_output_ids = list(_caller_output_ids)
+            _prod_output_source = "caller"
+        elif _snapshot_output:
+            _derived_output_ids = [str(_snapshot_output).strip()]
+            _prod_output_source = "preset_binding"
+        else:
+            # Check nodeBindings for kind=="output" binding
+            for _bk, _bv in (snapshot.get("nodeBindings", {}) or {}).items():
+                if isinstance(_bv, dict) and _bv.get("kind") == "output":
+                    _nid = str(_bv.get("nodeId", "")).strip()
+                    if _nid:
+                        _derived_output_ids = [_nid]
+                        _prod_output_source = "preset_binding"
+                        break
+
+        if not _derived_output_ids:
+            return {"error": (
+                "Production mode is enabled but no output node ID could be derived. "
+                "The preset snapshot has no outputNodeId and no output binding. "
+                "Either disable production or bind an output node in the preset wizard."
+            )}
+
+        production_options["output_node_ids"] = _derived_output_ids
+
+        # ── Validate before compiling ────────────────────────────────────
+        # Default-applied production (no explicit modal_options) derives
+        # output IDs for diagnostics but does NOT compile — the controlled
+        # workflow with bindings applied must remain intact for the caller.
+        # Only compile when the caller explicitly enabled production via
+        # modal_options.production.
+        _caller_enabled_production = bool(
+            isinstance(modal_options, dict)
+            and isinstance(modal_options.get("production"), dict)
+            and modal_options["production"].get("enabled", True) is not False
+            and ("schema_version" in modal_options["production"]
+                 or "output_node_ids" in modal_options["production"])
+        )
+        _all_ids_exist = all(str(oid) in workflow for oid in _derived_output_ids)
+        if _caller_enabled_production and _all_ids_exist:
+            try:
+                compiled, production_report = compile_production_workflow(
+                    workflow, production_options, allow_direct_output_rewrite=True
+                )
+                production_report["source_workflow_hash"] = ""
+                production_workflow = compiled
+            except Exception:
+                raise
+
     # Build axis_values from controls (for history)
     axis_values: dict[str, Any] = {}
     for ck, cv in controls.items():
@@ -1225,6 +1306,10 @@ def build_single_run_spec(
         preset_label=preset.get("label", ""),
     )
 
+    _prod_enabled = bool(production_options.get("enabled"))
+    _prod_output_ids = production_options.get("output_node_ids", []) if _prod_enabled else []
+    _prod_plan_used = bool(production_report and production_report.get("enabled"))
+
     compilation: dict[str, Any] = {
         "experiment_id": exp_id,
         "revision": 1,
@@ -1236,11 +1321,13 @@ def build_single_run_spec(
                 "triple": {"unet": "", "clip": "", "vae": ""},
                 "lora_selection_ids": [],
                 "cell_count": 1,
-                "workflow": workflow,
+                "workflow": production_workflow,
                 "slots": slots,
                 "loader_target_groups": [],
                 "lora_slots": [],
                 "studio_meta": studio_meta,
+                "production_report": production_report,
+                "production_options": production_options if _prod_enabled else None,
             }
         ],
         "cells": [
@@ -1261,11 +1348,22 @@ def build_single_run_spec(
                 "workflow_hash": "",
                 "studio_meta": studio_meta,
                 "trace": dict(trace_ctx) if trace_ctx else {},
+                "production_report": production_report,
             }
         ],
         "duplicate_count": 0,
         "warnings": [],
         "studio_meta": studio_meta,
+        "production_report": production_report,
+        "production_options": production_options if _prod_enabled else None,
+        # Diagnostic fields
+        "execution_surface": "studio_single",
+        "production_default_applied": _prod_default_applied,
+        "production_explicitly_disabled": _prod_explicitly_disabled,
+        "production_output_source": _prod_output_source,
+        "production_output_ids": _prod_output_ids,
+        "production_plan_used": _prod_plan_used,
+        "production_output_count": len(_prod_output_ids),
     }
 
     return compilation
@@ -1276,6 +1374,8 @@ def build_experiment_spec(
     feature_id: str,
     experiment_def: dict[str, Any],
     node_dir: str | os.PathLike,
+    *,
+    modal_options: dict | None = None,
 ) -> dict[str, Any]:
     """Build a spec for a Studio experiment with matrix expansion.
 
@@ -1580,6 +1680,27 @@ def build_experiment_spec(
         experiment_source=_experiment_source,
     )
 
+    # ── Production compilation per checkpoint ────────────────────────────
+    # Normalize production options, then compile each checkpoint's workflow
+    # independently so each cell carries its own production_report.
+    _prod_options = normalize_production_options(modal_options)
+    _prod_explicitly_disabled = bool(
+        isinstance(modal_options, dict)
+        and isinstance(modal_options.get("production"), dict)
+        and modal_options["production"].get("enabled") is False
+    )
+    _prod_default_applied = bool(
+        not modal_options
+        or "production" not in (modal_options or {})
+    )
+
+    # Build a lookup: profile_id -> snapshot (for outputNodeId derivation)
+    _profile_to_snapshot: dict[str, dict] = {}
+    for idx, (preset, snapshot) in enumerate(preset_snapshot_pairs):
+        pid = preset.get("id", "")
+        _profile_id = f"studio_{pid}_{idx}"
+        _profile_to_snapshot[_profile_id] = snapshot
+
     for ck in compilation.get("checkpoints", []):
         pf = ck.get("profile_id", "")
         ck["workflow"] = workflow_map.get(pf, {})
@@ -1603,10 +1724,75 @@ def build_experiment_spec(
                 f"Re-bind these slots in the preset wizard."
             )}
 
+        # ── Derive output_node_ids from this preset's snapshot ──────────
+        _ck_prod_report = None
+        _ck_prod_options = None
+        if _prod_options.get("enabled"):
+            _ck_prod_options = dict(_prod_options)
+            _caller_ids = _ck_prod_options.get("output_node_ids", [])
+            _snapshot = _profile_to_snapshot.get(pf, {})
+            _snap_output = (_snapshot.get("outputNodeId") or "") if isinstance(_snapshot, dict) else ""
+            _derived_ids = []
+
+            if _caller_ids:
+                _derived_ids = list(_caller_ids)
+            elif _snap_output:
+                _derived_ids = [str(_snap_output).strip()]
+            else:
+                # Check nodeBindings for kind=="output"
+                for _bk, _bv in (_snapshot.get("nodeBindings", {}) or {}).items():
+                    if isinstance(_bv, dict) and _bv.get("kind") == "output":
+                        _nid = str(_bv.get("nodeId", "")).strip()
+                        if _nid:
+                            _derived_ids = [_nid]
+                            break
+
+            if _derived_ids and isinstance(wf, dict) and wf:
+                _ck_prod_options["output_node_ids"] = _derived_ids
+                # Only compile when caller explicitly enabled production AND
+                # all derived IDs exist in the workflow.  Skip for default-
+                # applied (omitted modal_options) and wrapper-format snapshots.
+                _caller_enabled = bool(
+                    isinstance(modal_options, dict)
+                    and isinstance(modal_options.get("production"), dict)
+                    and modal_options["production"].get("enabled", True) is not False
+                    and ("schema_version" in modal_options["production"]
+                         or "output_node_ids" in modal_options["production"])
+                )
+                if _caller_enabled and all(str(oid) in wf for oid in _derived_ids):
+                    try:
+                        _compiled_wf, _ck_prod_report = compile_production_workflow(
+                            wf, _ck_prod_options, allow_direct_output_rewrite=True
+                        )
+                        ck["workflow"] = _compiled_wf
+                    except Exception:
+                        raise
+        ck["production_report"] = _ck_prod_report
+
     for cell in compilation.get("cells", []):
         cell["studio_meta"] = studio_meta
+        # Carry the production_report from the checkpoint onto each cell
+        _ck_id = cell.get("checkpoint_id", "")
+        _match_ck = next(
+            (ck for ck in compilation.get("checkpoints", []) if ck.get("id") == _ck_id),
+            None,
+        )
+        if _match_ck:
+            cell["production_report"] = _match_ck.get("production_report")
 
     compilation["studio_meta"] = studio_meta
+    compilation["production_report"] = None  # experiments have per-cell reports
+    compilation["production_options"] = _prod_options if (_prod_options or {}).get("enabled") else None
+    # Diagnostic fields
+    compilation["execution_surface"] = "studio_experiment"
+    compilation["production_default_applied"] = _prod_default_applied
+    compilation["production_explicitly_disabled"] = _prod_explicitly_disabled
+    compilation["production_plan_used"] = bool(
+        any(
+            (ck.get("production_report") or {}).get("enabled")
+            for ck in compilation.get("checkpoints", [])
+        )
+    )
     return compilation
 
 
@@ -1649,6 +1835,23 @@ async def _schedule_and_start(
     from experiment_runner import LocalRemoteInvoker
     from modal_client import run_prompt_stream
 
+    # ── Merge compilation's effective production options into modal_options ──
+    # The production_report carries output_node_ids, schema, rewrite state, etc.
+    # that the compiled workflow depends on.  Forward these as a production key
+    # inside modal_options so LocalRemoteInvoker.run_cell can merge them into
+    # the remote call (and comfyapp's compiled-workflow hash check passes).
+    _effective_modal_options = dict(modal_options) if modal_options else {}
+    _prod_report = compilation.get("production_report")
+    if _prod_report and _prod_report.get("enabled"):
+        _prod_options = dict(compilation.get("production_options", {}))
+        # Derive output_node_ids from the report if the normalizer left them empty
+        if not _prod_options.get("output_node_ids") and _prod_report.get("output_node_ids"):
+            _prod_options["output_node_ids"] = list(_prod_report["output_node_ids"])
+        if not _prod_options.get("output_node_ids") and _prod_report.get("kept_node_ids"):
+            # Fallback: use kept_node_ids as output binding (all compiled nodes)
+            _prod_options["output_node_ids"] = list(_prod_report["kept_node_ids"])
+        _effective_modal_options["production"] = _prod_options
+
     # ── Build a stream_event_sink that broadcasts nonterminal progress ────
     # as experiment.worker.progress via PromptServer.send_sync (no-op safe
     # when PromptServer is unavailable / outside ComfyUI).
@@ -1677,8 +1880,9 @@ async def _schedule_and_start(
         stream_event_sink=_progress_sink,
         profile_preparer=profile_preparer,
         gpu=gpu,
-        modal_options=modal_options,
+        modal_options=_effective_modal_options,
         workspace=workspace,
+        production_report=_prod_report,
     )
     sched = await REGISTRY.get_or_create_scheduler(
         exp_id,
@@ -1686,6 +1890,11 @@ async def _schedule_and_start(
         invoker=invoker,
         max_containers=1,
     )
+
+    # Apply a stop requested before the background scheduler was registered.
+    consume_pending_stop = getattr(REGISTRY, "consume_pending_stop", None)
+    if callable(consume_pending_stop) and consume_pending_stop(exp_id):
+        await sched.stop_now()
 
     try:
         result = await sched.start()
@@ -2153,10 +2362,13 @@ def handle_studio_run(
         return {"status": "error", "message": validation["error"]}
     _log.info("Studio run validation passed")
 
-    # 3. Build single-run compilation (includes validation)
+    # 3. Build single-run compilation (includes validation + production)
     # Pass trace_ctx so each cell carries browser timestamps and the trace
     # flows through to LocalRemoteInvoker.run_cell -> run_prompt_stream.
-    compilation = build_single_run_spec(preset, snapshot, feature_id, controls, node_dir, trace_ctx=trace_ctx)
+    compilation = build_single_run_spec(
+        preset, snapshot, feature_id, controls, node_dir,
+        trace_ctx=trace_ctx, modal_options=modal_options,
+    )
     if isinstance(compilation, dict) and compilation.get("error"):
         _log.warning("Studio run compilation failed: %s", compilation["error"])
         return {"status": "error", "message": compilation["error"]}
@@ -2336,6 +2548,8 @@ def handle_studio_experiment(
     feature_id: str,
     experiment_def: dict[str, Any],
     node_dir: str | os.PathLike,
+    *,
+    modal_options: dict | None = None,
 ) -> dict[str, Any]:
     """Handle a Studio experiment request supporting multiple presets.
 
@@ -2362,7 +2576,7 @@ def handle_studio_experiment(
     _log.info("Studio experiment loaded %d preset/snapshot pairs", len(pairs))
 
     # 2. Build unified experiment spec (includes validation of all pairs)
-    compilation = build_experiment_spec(pairs, feature_id, experiment_def, node_dir)
+    compilation = build_experiment_spec(pairs, feature_id, experiment_def, node_dir, modal_options=modal_options)
     if isinstance(compilation, dict) and compilation.get("error"):
         _log.warning("Studio experiment spec build failed: %s", compilation["error"])
         return {"status": "error", "message": compilation["error"]}
@@ -2390,11 +2604,11 @@ def handle_studio_experiment(
         # Start scheduler
         import asyncio
 
-        async def _start_and_catch(exp_id, compilation, REGISTRY, nd):
+        async def _start_and_catch(exp_id, compilation, REGISTRY, nd, mo=None):
             """Start scheduler and persist error events on failure."""
             try:
                 _log.info("Scheduler start called for experiment %s", exp_id)
-                result = await _schedule_and_start(exp_id, compilation, REGISTRY, node_dir=nd)
+                result = await _schedule_and_start(exp_id, compilation, REGISTRY, node_dir=nd, modal_options=mo)
                 _log.info("Scheduler start completed for experiment %s: %s", exp_id, result)
                 return result
             except Exception as exc:
@@ -2407,13 +2621,13 @@ def handle_studio_experiment(
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 _fire_and_forget(
-                    _start_and_catch(exp_id, compilation, REGISTRY, node_dir),
+                    _start_and_catch(exp_id, compilation, REGISTRY, node_dir, mo=modal_options),
                     exp_id,
                 )
             else:
-                asyncio.run(_start_and_catch(exp_id, compilation, REGISTRY, node_dir))
+                asyncio.run(_start_and_catch(exp_id, compilation, REGISTRY, node_dir, mo=modal_options))
         except RuntimeError:
-            asyncio.run(_start_and_catch(exp_id, compilation, REGISTRY, node_dir))
+            asyncio.run(_start_and_catch(exp_id, compilation, REGISTRY, node_dir, mo=modal_options))
         except Exception:
             _log.exception("Unexpected error starting scheduler for %s", exp_id)
             _persist_experiment_error(exp_id, _STABLE_INTERNAL_ERROR)

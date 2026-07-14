@@ -1106,7 +1106,8 @@ class LocalRemoteInvoker:
 
     def __init__(self, modal_run_prompt_stream, experiment_id="", node_dir="",
                  stream_event_sink=None, profile_preparer=None,
-                 gpu=None, modal_options=None, workspace=None):
+                 gpu=None, modal_options=None, workspace=None,
+                 production_report=None):
         self._run_prompt_stream = modal_run_prompt_stream
         self._experiment_id = experiment_id
         self._node_dir = Path(node_dir) if node_dir else Path(os.path.dirname(os.path.abspath(__file__)))
@@ -1115,6 +1116,11 @@ class LocalRemoteInvoker:
         self._gpu = gpu
         self._modal_options = modal_options
         self._workspace = workspace
+        self._production_report = production_report  # global report for single-run
+        # Fix: track the asyncio task currently executing run_cell per worker
+        self._run_cell_tasks: dict[str, asyncio.Task] = {}
+        # Fix: track cancellation-requested workers
+        self._cancelled_workers: set[str] = set()
 
     async def open_worker(self, worker_invocation_id, checkpoint_id, profile_id,
                           workflow, triple) -> None:
@@ -1209,6 +1215,15 @@ class LocalRemoteInvoker:
         return saved_urls
 
     async def run_cell(self, worker_invocation_id, cell) -> dict:
+        # Fix: short-circuit if cancellation was requested before entering the stream
+        if worker_invocation_id in self._cancelled_workers:
+            return {"status": "interrupted", "cell_key": cell.get("cell_key", ""),
+                    "error": "cancelled"}
+
+        # Fix: track the current task so cancel_worker can interrupt it
+        _current_task = asyncio.current_task()
+        if _current_task is not None:
+            self._run_cell_tasks[worker_invocation_id] = _current_task
         # Initialise holders so the exception path can check None
         # instead of probing NameError/UnboundLocalError.
         _last_remote_data: dict | None = None
@@ -1258,6 +1273,25 @@ class LocalRemoteInvoker:
             local_trace.mark("t6_local_stream_opened")
             _mutable_trace["t6_local_stream_opened"] = local_trace.get("t6_local_stream_opened")
 
+            # ── Select per-cell or global production report ────────────
+            # Experiment cells carry their own production_report on the cell;
+            # single runs use the invoker's global report (set via init).
+            _cell_report = cell.get("production_report")
+            _effective_prod_report = _cell_report if _cell_report is not None else self._production_report
+
+            # ── Merge production report into remote modal_options ──────
+            # Forward output_node_ids, schema, and options so comfyapp's
+            # compiled-workflow hash check succeeds for each cell.
+            _mo = dict(self._modal_options) if self._modal_options else {}
+            if _effective_prod_report and _effective_prod_report.get("enabled"):
+                _mo.setdefault("production", {}).update({
+                    "enabled": True,
+                    "schema_version": _effective_prod_report.get("schema_version", 1),
+                    "output_node_ids": list(_effective_prod_report.get("output_node_ids", [])),
+                    "direct_output_sink": _effective_prod_report.get("direct_output_sink_enabled", True),
+                    "metadata_mode": "none",
+                })
+
             stream_kwargs: dict = {
                 "workflow": _resolved_wf,
             }
@@ -1269,10 +1303,17 @@ class LocalRemoteInvoker:
             if _mutable_trace:
                 stream_kwargs["trace"] = _mutable_trace
             # Forward identity/kwargs captured at init (only when set)
-            for _ik_key in ("gpu", "modal_options", "workspace"):
+            for _ik_key in ("gpu", "workspace"):
                 _ik_val = getattr(self, f"_{_ik_key}", None)
                 if _ik_val is not None:
                     stream_kwargs[_ik_key] = _ik_val
+            # Forward modal_options (with merged production)
+            if _mo:
+                stream_kwargs["modal_options"] = _mo
+            # Forward the effective production_report so comfyapp can verify
+            # the compiled-workflow hash.
+            if _effective_prod_report:
+                stream_kwargs["production_report"] = _effective_prod_report
 
             # Stage: remote_submit (immediately before entering stream)
             _remote_submit = time.time()
@@ -1425,12 +1466,22 @@ class LocalRemoteInvoker:
                 if _local_timing_summary is not None:
                     result.setdefault("timing_payload", {})["trace"] = _local_timing_summary
             return result
+        finally:
+            # Fix: clean task tracking in finally block
+            if self._run_cell_tasks.get(worker_invocation_id) is _current_task:
+                self._run_cell_tasks.pop(worker_invocation_id, None)
 
     async def close_worker(self, worker_invocation_id) -> None:
-        return None
+        # Fix: clean up cancelled state so it's safe and idempotent
+        self._cancelled_workers.discard(worker_invocation_id)
+        self._run_cell_tasks.pop(worker_invocation_id, None)
 
     async def cancel_worker(self, worker_invocation_id) -> None:
-        return None
+        # Fix: mark the worker and cancel the active run_cell task
+        self._cancelled_workers.add(worker_invocation_id)
+        task = self._run_cell_tasks.get(worker_invocation_id)
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
 
     async def request_pause(self, worker_invocation_id: str) -> None:
         return None
