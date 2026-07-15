@@ -990,6 +990,8 @@ _FAIL_FAST_REQ_MSG = (
 ENABLE_REMOTE_BACKGROUND_DEPLOY = os.getenv("COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY", "0") == "1"
 WARMUP_PROFILE = os.getenv("COMFYMODAL_WARMUP_PROFILE", "off")
 WARMUP_CHECKPOINT = os.getenv("COMFYMODAL_WARMUP_CHECKPOINT", "").strip()
+# Snapshot CPU preload model filenames.  Explicit env vars or active profile
+# data supply model names; no hardcoded model-specific fallback.
 WARMUP_UNET = os.getenv("COMFYMODAL_WARMUP_UNET", "").strip()
 WARMUP_CLIP1 = os.getenv("COMFYMODAL_WARMUP_CLIP1", "").strip()
 WARMUP_CLIP2 = os.getenv("COMFYMODAL_WARMUP_CLIP2", "").strip()
@@ -1089,14 +1091,14 @@ if ACTUAL_LOAD_MODE not in ("off", "clip_vae_only", "unet_only", "unet_vae_only"
 # during direct warmup at all.  Default both to 0 so that synchronous
 # model reads during restore (16+ GB) are opt-in rather than the default.
 # DIRECT_WARMUP_CLIP_ENCODE gates the dummy CLIPTextEncode forward pass.
-DIRECT_WARMUP_LOAD_UNET = os.getenv("COMFYMODAL_DIRECT_WARMUP_LOAD_UNET", "1") == "1"
-DIRECT_WARMUP_LOAD_CLIP = os.getenv("COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP", "1") == "1"
+DIRECT_WARMUP_LOAD_UNET = os.getenv("COMFYMODAL_DIRECT_WARMUP_LOAD_UNET", "0") == "1"
+DIRECT_WARMUP_LOAD_CLIP = os.getenv("COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP", "0") == "1"
 DIRECT_WARMUP_CLIP_ENCODE = os.getenv("COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE", "0") == "1"
 # When enabled, direct warmup only loads a model file if it is already
 # present in the CPU cache (populated by CPU preload).  This prevents
 # direct warmup from becoming a synchronous 16.85 GB volume read when
 # CPU preload is disabled or async.
-DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT = os.getenv("COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT", "0") == "1"
+DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT = os.getenv("COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT", "1") == "1"
 
 # P2 GÃ‡Ã¶ Sage runtime policy.
 #   auto           GÃ‡Ã¶ (default) probe and select automatically
@@ -1166,20 +1168,20 @@ FASTPATH_V21621_CLIP_READ_BYTES = os.getenv("COMFYMODAL_FASTPATH_V21621_CLIP_REA
 # The resolver prints a diagnostic line at module load time so logs show
 # the effective value and its source.
 #
-# Effective baseline (authoritative per user requirements):
+# Effective baseline (authoritative per historical 34b6274 restore):
 #   COMFYMODAL_EXECUTION_BACKEND=in_process
-#   PRELOAD_MODE=workers_2
-#   DIRECT_WARMUP_LOAD_UNET=1
+#   PRELOAD_MODE=clip_only
+#   DIRECT_WARMUP_LOAD_UNET=0
 #   DIRECT_WARMUP_LOAD_CLIP=1
-#   DIRECT_WARMUP_CLIP_ENCODE=0
-#   DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT=0
+#   DIRECT_WARMUP_CLIP_ENCODE=1
+#   DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT=1
 #   SAGE_RUNTIME_MODE=baked_cuda
 #   SAGE_RUNTIME_PROBE_ON_RESTORE=0
 #   ENABLE_WARMUP=1
 #   ENABLE_TORCH_COMPILE=0
 #   EXPERIMENTAL_RESTORE_BACKGROUND_CODE=False
 #   RESTORE_BACKGROUND_UNET=False
-#   RESTORE_DIRECT_CLIP_POLICY=auto  (not overridden; explicit encode=0 wins)
+#   RESTORE_DIRECT_CLIP_POLICY=auto  (not overridden; clip encode=1 wins from baseline)
 # =========================================================================
 
 _PRODUCTION_BASELINE_OVERRIDES: dict[str, str] = {
@@ -1188,13 +1190,14 @@ _PRODUCTION_BASELINE_OVERRIDES: dict[str, str] = {
     # Sage: baked_cuda, no probe
     "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
     "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
-    # Preload: sequential (UNET then CLIP, never concurrent)
-    "COMFYMODAL_PRELOAD_MODE": "sequential",
-    # Direct warmup: load UNET+CLIP, skip CLIP encode, no CPU-cache requirement
-    "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "1",
+    # Preload: clip_only (CLIP only — UNET loaded by production restore UNET)
+    "COMFYMODAL_PRELOAD_MODE": "clip_only",
+    # Direct warmup: skip UNET load (production UNET handles it),
+    # load CLIP, run CLIP encode, require CPU cache hit for direct warmup
+    "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "0",
     "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
-    "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "0",
-    "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "0",
+    "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "1",
+    "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "1",
     # Warmup on, torch compile off
     "COMFYMODAL_ENABLE_WARMUP": "1",
     "COMFYMODAL_ENABLE_TORCH_COMPILE": "0",
@@ -6270,13 +6273,14 @@ _image_base = (
             # Sage: baked_cuda path, no probe
             "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
             "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
-            # Preload: workers_2 (2 concurrent workers), not clip_only
-            "COMFYMODAL_PRELOAD_MODE": "workers_2",
-            # Direct warmup: load UNET+CLIP, skip CLIP encode, no CPU cache requirement
-            "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "1",
+            # Preload: clip_only (CLIP only — UNET loaded by production restore UNET)
+            "COMFYMODAL_PRELOAD_MODE": "clip_only",
+            # Direct warmup: skip UNET load (production UNET handles it),
+            # load CLIP, run CLIP encode, require CPU cache hit for direct warmup
+            "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "0",
             "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
-            "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "0",
-            "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "0",
+            "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "1",
+            "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "1",
             "COMFYMODAL_EXACT_CLIP_PREFILL": "1",
             "COMFYMODAL_SAFETENSORS_READ_MODE": "normal",
             "COMFYMODAL_RUNTIME": "1",
@@ -9130,16 +9134,22 @@ class _ComfyAPIMixin:
         print(f"  CLIP_TYPE: warmup={_wu_clip_type} workflow={ws_clip_type} match={_wu_clip_type==ws_clip_type}")
         return result
 
-    def _snapshot_preload_paths(self, profile: dict) -> list:
-        """Resolve model file paths for snapshot CPU preload.
+    def _snapshot_preload_paths(self, profile: dict, for_snapshot: bool = False) -> list:
+        """Resolve model file paths for CPU preload.
 
         Preloads all model files (checkpoint or split) into CPU RAM during
         startup so Modal's memory snapshot captures them.  On restore, the
         cached state dicts are returned by ``_patch_model_cpu_cache``,
         eliminating volume reads during the first prompt execution.
 
-        Which files are preloaded is controlled by PRELOAD_MODE (env var
+        When *for_snapshot* is True (snap=True startup), ALL models (UNET,
+        CLIP, VAE) are included regardless of PRELOAD_MODE — the snapshot
+        must contain the full CPU cache for instant restore-time cache hits.
+        When *for_snapshot* is False (normal restore-time call), the set of
+        preloaded files is controlled by PRELOAD_MODE (env var
         ``COMFYMODAL_PRELOAD_MODE``).
+
+        Returns a list of dicts with keys ``path`` and ``role``.
         """
         if not profile:
             print("[comfyapp] snapshot_preload_paths: no profile, nothing to preload")
@@ -9153,13 +9163,10 @@ class _ComfyAPIMixin:
             clip1_f = profile.get("clip1", "")
             clip2_f = profile.get("clip2", "")
             vae_f = profile.get("vae", "")
-            _pm = _resolve_preload_mode()
-            if _pm == "unet_only":
-                checks.append(("unet", unet_f))
-            elif _pm == "clip_only":
-                checks.append(("clip", clip1_f))
-                checks.append(("clip", clip2_f))
-            elif _pm == "vae":
+            if for_snapshot:
+                # Snapshot preload: include ALL models regardless of
+                # PRELOAD_MODE so the snapshot CPU cache covers every
+                # model the workflow needs.
                 checks.extend([
                     ("unet", unet_f),
                     ("clip", clip1_f),
@@ -9167,11 +9174,25 @@ class _ComfyAPIMixin:
                     ("vae", vae_f),
                 ])
             else:
-                checks.extend([
-                    ("unet", unet_f),
-                    ("clip", clip1_f),
-                    ("clip", clip2_f),
-                ])
+                _pm = _resolve_preload_mode()
+                if _pm == "unet_only":
+                    checks.append(("unet", unet_f))
+                elif _pm == "clip_only":
+                    checks.append(("clip", clip1_f))
+                    checks.append(("clip", clip2_f))
+                elif _pm == "vae":
+                    checks.extend([
+                        ("unet", unet_f),
+                        ("clip", clip1_f),
+                        ("clip", clip2_f),
+                        ("vae", vae_f),
+                    ])
+                else:
+                    checks.extend([
+                        ("unet", unet_f),
+                        ("clip", clip1_f),
+                        ("clip", clip2_f),
+                    ])
         # Deduplicate paths before resolution.
         # When clip1 and clip2 are the same model file (e.g. Qwen 8B used
         # as both text_encoders in Flux), we only need one FUSE stat call.
@@ -9467,6 +9488,7 @@ class _ComfyAPIMixin:
         *,
         read_strategy: str = "auto",
         abort_policy: str = "existing",
+        max_workers: int | None = None,
     ) -> dict:
         """Preload model state dicts into CPU RAM.
 
@@ -9528,6 +9550,11 @@ class _ComfyAPIMixin:
             # Determine worker count from PRELOAD_MODE
             _pm = _resolve_preload_mode()
             _preload_max_workers = _resolve_preload_worker_count(_pm)
+            # Snapshot override: max_workers overrides the resolved count.
+            # Used by startup(snap=True) to force sequential reads during
+            # snapshot CPU preload. Does not alter restore-time mode semantics.
+            if max_workers is not None:
+                _preload_max_workers = max(1, int(max_workers))
 
             print(
                 f"[comfyapp] preload_models_to_cpu: files={len(file_paths)} "
@@ -16110,6 +16137,26 @@ class _ComfyAPIMixin:
                 with self._force_cpu_during_snapshot():
                     self._start_backend()
                 self._log_profile("backend_start", backend=self._select_backend(), duration_ms=self._profile_ms(stage_started))
+            # â”€â”€ Snapshot CPU preload: load model state dicts into CPU RAM â”€â”€
+            # so Modal's memory snapshot captures them.  On restore the
+            # _model_cpu_cache is already populated, eliminating volume reads.
+            # This preloads ALL models (UNET + CLIP + VAE) regardless of
+            # PRELOAD_MODE — the snapshot must cover every model the workflow
+            # needs for instant cache hits on restore.
+            _snap_preload_start = time.time()
+            _snap_profile = self._snapshot_preload_profile()
+            _snap_paths = self._snapshot_preload_paths(_snap_profile, for_snapshot=True) if _snap_profile else []
+            if _snap_paths:
+                _snap_preload_result = self._preload_models_to_cpu(_snap_paths, max_workers=1)
+                self._log_profile(
+                    "snapshot_preload_cpu",
+                    mode=_snap_profile.get("_source", "profile") if _snap_profile else "none",
+                    requested=len(_snap_paths),
+                    cached=_snap_preload_result.get("count", 0),
+                    duration_ms=self._profile_ms(_snap_preload_start),
+                )
+            else:
+                print("[comfyapp] snapshot_preload: no profile/paths, skipping CPU preload")
         elif _need_backend:
             stage_started = time.time()
             self._start_backend()
@@ -18458,6 +18505,8 @@ class _ComfyAPIMixin:
                         pass
                     else:
                         _preload_skip_reason_early = "unknown_profile"
+                elif _profile_source_early == "env_default":
+                    pass
                 else:
                     _preload_skip_reason_early = "unknown_profile"
             # Guard 2: Size guardrails — pass profile context so active
@@ -18747,15 +18796,24 @@ class _ComfyAPIMixin:
                           f"optional_cuda_ms={__stages['optional_cuda_total_ms']}")
 
                 # GÃ¶Ã‡GÃ¶Ã‡ Fallback submit if preload was not submitted early GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
-                # Phase 2: production skips CPU preload entirely -- direct
-                # warmup (_warmup_direct) loads UNET+CLIP to GPU directly.
-                if preload_paths and _pm != "off" and _restore_preload_handle is None and not _production_stable_path:
+                # Production runs CPU preload (CLIP only) so direct warmup CLIP
+                # encode hits the prepared CPU cache.  UNET is loaded by the
+                # production restore UNET path, not by direct warmup.
+                if preload_paths and _pm != "off" and _restore_preload_handle is None:
                     _preload_submitted_early = 1
                     _preload_overlap_start = time.time()
                     __stages["restore_preload_submit_at_ms_from_restore_start"] = round((_preload_overlap_start - restore_start) * 1000, 1)
-                    _restore_preload_handle = self._start_restore_preload(preload_paths)
+                    if _production_stable_path:
+                        _restore_preload_handle = self._start_restore_preload(
+                            preload_paths,
+                            read_strategy="normal",
+                            abort_policy="wait_same_future",
+                        )
+                        __stages["restore_preload_submitted_production"] = 1
+                    else:
+                        _restore_preload_handle = self._start_restore_preload(preload_paths)
                     __stages["restore_preload_submitted_early"] = 1
-                    _label = "late"
+                    _label = "production" if _production_stable_path else "late"
                     print(
                         f"[comfyapp] restore_preload_submitted_{_label} files={len(preload_paths)} "
                         f"mode={_pm} at_ms={__stages['restore_preload_submit_at_ms_from_restore_start']}"
@@ -18947,8 +19005,8 @@ class _ComfyAPIMixin:
                                 f"key={_prod_unet.get('key','')} "
                                 f"clip_read_active={_prod_unet.get('clip_read_active',0)}"
                             )
-                # Phase 2: production skips CPU preload even in the elif fallback.
-                elif preload_paths and _pm != "off" and _restore_preload_handle is None and not _production_stable_path:
+                # Phase 2: last-resort CPU preload fallback (handle still None).
+                elif preload_paths and _pm != "off" and _restore_preload_handle is None:
                     if _pm == "async_no_wait":
                         import threading
                         _preload_thread = threading.Thread(

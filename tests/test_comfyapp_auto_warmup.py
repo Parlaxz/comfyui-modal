@@ -506,6 +506,7 @@ class RestoreBackgroundUnetEligibilityTests(unittest.TestCase):
         import comfyapp
 
         with tempfile.TemporaryDirectory() as tmpdir, \
+             mock.patch.object(comfyapp, "_PRODUCTION_BASELINE_OVERRIDES", {}), \
              mock.patch.object(comfyapp, "RUNTIME_CONFIG_DIR", tmpdir), \
              mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", False), \
              mock.patch.dict(os.environ, {}, clear=False):
@@ -523,7 +524,8 @@ class RestoreBackgroundUnetEligibilityTests(unittest.TestCase):
         fake_folder_paths = SimpleNamespace(
             get_full_path=lambda bucket, name: f"/models/{bucket}/{name}" if name else ""
         )
-        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+        with mock.patch.object(comfyapp, "_PRODUCTION_BASELINE_OVERRIDES", {}), \
+             mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
              mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
              mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
             eligibility = inst._restore_background_unet_eligibility(
@@ -547,7 +549,8 @@ class RestoreBackgroundUnetEligibilityTests(unittest.TestCase):
         )
         clip_path = "/models/text_encoders/clip.safetensors"
         inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
-        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+        with mock.patch.object(comfyapp, "_PRODUCTION_BASELINE_OVERRIDES", {}), \
+             mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
              mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
              mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
             eligibility = inst._restore_background_unet_eligibility(
@@ -571,7 +574,8 @@ class RestoreBackgroundUnetEligibilityTests(unittest.TestCase):
         )
         clip_path = "/models/text_encoders/clip.safetensors"
         inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
-        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+        with mock.patch.object(comfyapp, "_PRODUCTION_BASELINE_OVERRIDES", {}), \
+             mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
              mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
              mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
             eligibility = inst._restore_background_unet_eligibility(
@@ -595,7 +599,8 @@ class RestoreBackgroundUnetEligibilityTests(unittest.TestCase):
         )
         clip_path = "/models/text_encoders/clip.safetensors"
         inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
-        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+        with mock.patch.object(comfyapp, "_PRODUCTION_BASELINE_OVERRIDES", {}), \
+             mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
              mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
              mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
             eligibility = inst._restore_background_unet_eligibility(
@@ -617,7 +622,8 @@ class RestoreBackgroundUnetEligibilityTests(unittest.TestCase):
         )
         clip_path = "/models/text_encoders/clip.safetensors"
         inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
-        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+        with mock.patch.object(comfyapp, "_PRODUCTION_BASELINE_OVERRIDES", {}), \
+             mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
              mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
              mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
             eligibility = inst._restore_background_unet_eligibility(
@@ -636,7 +642,8 @@ class RestoreBackgroundUnetEligibilityTests(unittest.TestCase):
         fake_folder_paths = SimpleNamespace(
             get_full_path=lambda bucket, name: f"/models/{bucket}/{name}" if name else ""
         )
-        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+        with mock.patch.object(comfyapp, "_PRODUCTION_BASELINE_OVERRIDES", {}), \
+             mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
              mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
              mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
             eligibility = inst._restore_background_unet_eligibility(
@@ -657,7 +664,8 @@ class RestoreBackgroundUnetEligibilityTests(unittest.TestCase):
         )
         clip_path = "/models/text_encoders/clip.safetensors"
         inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
-        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+        with mock.patch.object(comfyapp, "_PRODUCTION_BASELINE_OVERRIDES", {}), \
+             mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
              mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[{"canonical_key": "busy", "status": "running", "active_read_is_large": 1}]), \
              mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
             eligibility = inst._restore_background_unet_eligibility(
@@ -680,7 +688,8 @@ class RestoreBackgroundUnetEligibilityTests(unittest.TestCase):
         unet_path = "/models/unet/unet.safetensors"
         inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
         inst._actual_load_futures[inst._unet_cache_key(unet_path, "default")] = object()
-        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+        with mock.patch.object(comfyapp, "_PRODUCTION_BASELINE_OVERRIDES", {}), \
+             mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
              mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
              mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
             eligibility = inst._restore_background_unet_eligibility(
@@ -900,24 +909,31 @@ class AutoWarmupASTTests(unittest.TestCase):
         self.assertIn("sageattn", full_source)
 
     def test_startup_preloads_cpu_cache(self):
-        """CPU cache preload is intentionally disabled in startup — loading
-        model state dicts (17+ GB) into the snapshot made Modal restore
-        ~3× slower (7.9s → 26.4s), far outweighing the ~1s volume read
-        savings.  The lean snapshot keeps restore fast; model files are
-        loaded from the volume on restore or on first use during prompt
-        execution.
+        """CPU cache preload IS enabled in startup — model state dicts are
+        loaded into CPU RAM during snap=True so Modal's memory snapshot
+        captures them.  On restore the _model_cpu_cache is already populated,
+        eliminating volume reads for the first prompt.  The preload uses
+        for_snapshot=True to bypass PRELOAD_MODE filtering and load ALL
+        models (UNET + CLIP + VAE).
         """
         source = self._get_method_source("startup")
         self.assertIsNotNone(source, "startup method not found")
-        # The preload infrastructure methods must NOT be called in startup
-        self.assertNotIn("_snapshot_preload_profile", source,
-                         "CPU cache preload is disabled — see comment in startup()")
-        self.assertNotIn("_snapshot_preload_paths", source,
-                         "CPU cache preload is disabled — see comment in startup()")
-        self.assertNotIn("_preload_models_to_cpu(", source,
-                         "startup() must not preload CPU model cache during snap=True")
-        self.assertIn("The first prompt after", source)
-        self.assertIn("restore pays the model load cost", source)
+        # The preload infrastructure methods MUST be called in startup
+        self.assertIn("_snapshot_preload_profile", source,
+                      "startup() must call _snapshot_preload_profile for snapshot CPU preload")
+        self.assertIn("_snapshot_preload_paths", source,
+                      "startup() must call _snapshot_preload_paths for snapshot CPU preload")
+        self.assertIn("_preload_models_to_cpu", source,
+                      "startup() must call _preload_models_to_cpu for snapshot CPU preload")
+        # Must use for_snapshot=True so all models are included
+        self.assertIn("for_snapshot=True", source,
+                      "startup() snapshot preload must use for_snapshot=True")
+        # Must be called after _start_backend() (cache patching happens inside)
+        self.assertLess(
+            source.find("_start_backend()"),
+            source.find("_snapshot_preload_profile"),
+            "snapshot preload must run after _start_backend()",
+        )
 
         full_source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
         self.assertIn("_snapshot_preload_profile", full_source,
@@ -926,6 +942,147 @@ class AutoWarmupASTTests(unittest.TestCase):
                       "_snapshot_preload_paths must remain as reusable infrastructure")
         self.assertIn("_preload_models_to_cpu", full_source,
                       "_preload_models_to_cpu must remain as reusable infrastructure")
+
+    def test_snapshot_preload_paths_includes_all_models(self):
+        """Snapshot preload (for_snapshot=True) must include UNET, CLIP1,
+        CLIP2, and VAE regardless of the effective PRELOAD_MODE."""
+        from comfyapp import _ComfyAPIMixin
+        inst = object.__new__(_ComfyAPIMixin)
+        profile = {
+            "mode": "split",
+            "unet": "unet.safetensors",
+            "clip1": "clip.safetensors",
+            "clip2": "clip.safetensors",
+            "vae": "vae.safetensors",
+            "clip_type": "flux",
+        }
+        # Return distinct paths per bucket to avoid dedup collapsing them
+        _fake_paths = {
+            "unet": "/models/unet/unet.safetensors",
+            "clip": "/models/text_encoders/clip.safetensors",
+            "vae": "/models/vae/vae.safetensors",
+        }
+        def _fake_find(bucket, filename):
+            return _fake_paths.get(bucket)
+        with mock.patch.object(inst, "_find_model_file", side_effect=_fake_find):
+            paths = inst._snapshot_preload_paths(profile, for_snapshot=True)
+        roles = {p["role"] for p in paths}
+        self.assertIn("unet", roles, "snapshot preload must include UNET")
+        self.assertIn("clip", roles, "snapshot preload must include CLIP")
+        self.assertIn("vae", roles, "snapshot preload must include VAE")
+
+    def test_snapshot_preload_paths_respects_preload_mode_by_default(self):
+        """Restore-time preload (for_snapshot=False) must still respect
+        PRELOAD_MODE filtering (e.g., clip_only loads only CLIP)."""
+        from comfyapp import _ComfyAPIMixin, _resolve_preload_mode
+        inst = object.__new__(_ComfyAPIMixin)
+        profile = {
+            "mode": "split",
+            "unet": "unet.safetensors",
+            "clip1": "clip.safetensors",
+            "clip2": "clip.safetensors",
+            "vae": "vae.safetensors",
+            "clip_type": "flux",
+        }
+        # Override preload mode to clip_only for this test
+        with mock.patch("comfyapp._resolve_preload_mode", return_value="clip_only"):
+            with mock.patch.object(inst, "_find_model_file", return_value="/models/unet/unet.safetensors"):
+                paths = inst._snapshot_preload_paths(profile, for_snapshot=False)
+        roles = {p["role"] for p in paths}
+        self.assertNotIn("unet", roles,
+                         "restore-time preload must not include UNET when PRELOAD_MODE=clip_only")
+        self.assertIn("clip", roles,
+                      "restore-time preload must include CLIP when PRELOAD_MODE=clip_only")
+
+    def test_snapshot_cpu_cache_populated_on_startup(self):
+        """The startup() method must contain the concrete snapshot preload
+        call that populates _model_cpu_cache.  Verify by checking the source
+        code for the full call chain: profile resolution -> path resolution
+        with for_snapshot=True -> _preload_models_to_cpu."""
+        source = self._get_method_source("startup")
+        self.assertIsNotNone(source)
+        self.assertIn("_snapshot_preload_profile()", source)
+        self.assertIn("_snapshot_preload_paths(_snap_profile, for_snapshot=True)", source)
+        self.assertIn("_preload_models_to_cpu(_snap_paths, max_workers=1)", source)
+        self.assertIn("snapshot_preload_cpu", source)
+
+    def test_snapshot_preload_module_defaults_are_generic(self):
+        """The module-level WARMUP_* defaults must be empty model filenames
+        and 'flux' clip type — no hardcoded Z-Image-specific values."""
+        import comfyapp as _ca
+        self.assertEqual(_ca.WARMUP_UNET, "")
+        self.assertEqual(_ca.WARMUP_CLIP1, "")
+        self.assertEqual(_ca.WARMUP_CLIP2, "")
+        self.assertEqual(_ca.WARMUP_VAE, "")
+        self.assertEqual(_ca.WARMUP_CLIP_TYPE, "flux")
+
+    def test_snapshot_preload_paths_validate_profile(self):
+        """_snapshot_preload_paths must return empty list when given an empty
+        profile, preserving existing profile validation."""
+        from comfyapp import _ComfyAPIMixin
+        inst = object.__new__(_ComfyAPIMixin)
+        paths = inst._snapshot_preload_paths({}, for_snapshot=True)
+        self.assertEqual(paths, [])
+        paths2 = inst._snapshot_preload_paths(None, for_snapshot=True)
+        self.assertEqual(paths2, [])
+
+    def test_restore_cache_hit_on_preloaded_models(self):
+        """When _model_cpu_cache already has entries (populated by snapshot),
+        _patch_model_cpu_cache must return cached data without volume reads."""
+        from comfyapp import _ComfyAPIMixin
+        inst = object.__new__(_ComfyAPIMixin)
+        inst._model_cpu_cache = {"clip.safetensors": ({"tensor": 1}, {"format": "fp8"})}
+        inst._cpu_cache_hits = {}
+        inst._cpu_cache_misses = {}
+        inst._actual_load_futures = {}
+        inst._actual_load_future_meta = {}
+
+        class FakeComfyUtils:
+            def load_torch_file(path, *args, **kwargs):
+                raise RuntimeError("volume read should not happen on cache hit")
+
+        fake_utils = FakeComfyUtils()
+        # _patch_model_cpu_cache needs comfy.utils (module, not instance)
+        import types
+        fake_mod = types.ModuleType("fake_comfy_utils")
+        fake_mod.load_torch_file = lambda path, *a, **kw: (
+            {"tensor": "from_disk"}, {"format": "fp8"}
+        )
+        # Check that patching works and cache hit returns cached data
+        inst._patch_model_cpu_cache(fake_mod)
+        # Now call the patched loader with a path matching the cached filename
+        result = fake_mod.load_torch_file("/models/text_encoders/clip.safetensors", return_metadata=True)
+        if isinstance(result, tuple) and len(result) == 2:
+            state_dict, metadata = result
+        else:
+            state_dict = result
+            metadata = None
+        self.assertEqual(state_dict, {"tensor": 1},
+                         "cache hit must return the cached state dict, not read from disk")
+
+    def test_restore_cache_miss_falls_through_to_original_loader(self):
+        """When _model_cpu_cache is empty (no snapshot preload), the patched
+        loader must fall through to the original comfy.utils.load_torch_file."""
+        from comfyapp import _ComfyAPIMixin
+        inst = object.__new__(_ComfyAPIMixin)
+        inst._model_cpu_cache = {}
+        inst._cpu_cache_hits = {}
+        inst._cpu_cache_misses = {}
+        inst._actual_load_futures = {}
+        inst._actual_load_future_meta = {}
+
+        fallback_called = False
+
+        class FakeComfyUtils:
+            def load_torch_file(path, *args, **kwargs):
+                nonlocal fallback_called
+                fallback_called = True
+                return ({"tensor": "from_disk"}, {"format": "fp8"})
+
+        fake_utils = FakeComfyUtils()
+        inst._patch_model_cpu_cache(fake_utils)
+        result = fake_utils.load_torch_file("/models/unet/unet.safetensors")
+        self.assertTrue(fallback_called, "original loader must be called on cache miss")
 
     def test_run_prompt_does_not_repeat_sage_detection(self):
         """run_prompt() should not repeat restore-time sage setup."""
@@ -1177,6 +1334,41 @@ class AutoWarmupASTTests(unittest.TestCase):
             "Must have exactly one call to _maybe_submit_restore_background_unet",
         )
 
+    # ── Task-specific regression tests: env_default eligibility + max_workers override ──
+
+    def test_preload_eligibility_guard_accepts_env_default(self):
+        """The preload eligibility guard must accept _source='env_default'
+        instead of rejecting it with 'unknown_profile'."""
+        source = self._get_method_source("restore")
+        self.assertIsNotNone(source)
+        self.assertIn(
+            '_profile_source_early == "env_default"',
+            source,
+            "restore() must handle env_default in preload eligibility guard",
+        )
+
+    def test_startup_preload_uses_max_workers_override(self):
+        """Startup(snap=True) must call _preload_models_to_cpu with
+        max_workers=1 so snapshot-time model reads are sequential."""
+        source = self._get_method_source("startup")
+        self.assertIsNotNone(source)
+        self.assertIn(
+            "max_workers=1",
+            source,
+            "startup() must pass max_workers=1 to _preload_models_to_cpu",
+        )
+
+    def test_preload_models_to_cpu_has_max_workers_param(self):
+        """_preload_models_to_cpu must accept an optional keyword-only
+        max_workers parameter defaulting to None."""
+        source = self._get_method_source("_preload_models_to_cpu")
+        self.assertIsNotNone(source)
+        self.assertIn(
+            "max_workers: int | None = None",
+            source,
+            "_preload_models_to_cpu must accept max_workers param",
+        )
+
 
 class FastpathClipPolicyTests(unittest.TestCase):
     """Unit tests for the fastpath v2.16.21 clip policy decision
@@ -1258,7 +1450,8 @@ class FastpathClipPolicyTests(unittest.TestCase):
         clip_path = "/models/text_encoders/clip.safetensors"
         inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
 
-        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+        with mock.patch.object(comfyapp, "_PRODUCTION_BASELINE_OVERRIDES", {}), \
+             mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
              mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
              mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
             eligibility = inst._restore_background_unet_eligibility(
@@ -1318,7 +1511,8 @@ class FastpathClipPolicyTests(unittest.TestCase):
         clip_path = "/models/text_encoders/clip.safetensors"
         inst._model_cpu_cache[comfyapp._model_cpu_cache_key(clip_path)] = ({"tensor": 1}, None)
 
-        with mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
+        with mock.patch.object(comfyapp, "_PRODUCTION_BASELINE_OVERRIDES", {}), \
+             mock.patch.object(comfyapp, "RESTORE_BACKGROUND_UNET_ENABLED", True), \
              mock.patch.object(comfyapp, "_running_large_reads_locked", return_value=[]), \
              mock.patch.dict("sys.modules", {"folder_paths": fake_folder_paths}):
             eligibility = inst._restore_background_unet_eligibility(
