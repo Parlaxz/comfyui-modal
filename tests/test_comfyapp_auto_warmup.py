@@ -908,32 +908,25 @@ class AutoWarmupASTTests(unittest.TestCase):
         full_source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
         self.assertIn("sageattn", full_source)
 
-    def test_startup_preloads_cpu_cache(self):
-        """CPU cache preload IS enabled in startup — model state dicts are
-        loaded into CPU RAM during snap=True so Modal's memory snapshot
-        captures them.  On restore the _model_cpu_cache is already populated,
-        eliminating volume reads for the first prompt.  The preload uses
-        for_snapshot=True to bypass PRELOAD_MODE filtering and load ALL
-        models (UNET + CLIP + VAE).
+    def test_startup_does_not_preload_cpu_cache(self):
+        """CPU cache preload IS disabled in startup — model state dicts are
+        NOT loaded during snap=True so Modal's memory snapshot does NOT
+        capture UNET/CLIP/VAE state dictionaries in _model_cpu_cache.
+        Restore-time preload (with PRELOAD_MODE filtering) loads the CLIP
+        model normally.  A cache-empty diagnostic must be emitted.
         """
         source = self._get_method_source("startup")
         self.assertIsNotNone(source, "startup method not found")
-        # The preload infrastructure methods MUST be called in startup
-        self.assertIn("_snapshot_preload_profile", source,
-                      "startup() must call _snapshot_preload_profile for snapshot CPU preload")
-        self.assertIn("_snapshot_preload_paths", source,
-                      "startup() must call _snapshot_preload_paths for snapshot CPU preload")
-        self.assertIn("_preload_models_to_cpu", source,
-                      "startup() must call _preload_models_to_cpu for snapshot CPU preload")
-        # Must use for_snapshot=True so all models are included
-        self.assertIn("for_snapshot=True", source,
-                      "startup() snapshot preload must use for_snapshot=True")
-        # Must be called after _start_backend() (cache patching happens inside)
-        self.assertLess(
-            source.find("_start_backend()"),
-            source.find("_snapshot_preload_profile"),
-            "snapshot preload must run after _start_backend()",
-        )
+        # Startup must NOT call snapshot preload infrastructure
+        self.assertNotIn("_snapshot_preload_paths", source,
+                         "startup() must NOT call _snapshot_preload_paths")
+        self.assertNotIn("_preload_models_to_cpu", source,
+                         "startup() must NOT call _preload_models_to_cpu")
+        self.assertNotIn("for_snapshot=True", source,
+                         "startup() must NOT use for_snapshot=True")
+        # Startup MUST contain the cache-empty diagnostic
+        self.assertIn("snapshot_cpu_cache_diag", source,
+                      "startup() must contain the snapshot CPU cache diagnostic")
 
         full_source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
         self.assertIn("_snapshot_preload_profile", full_source,
@@ -994,17 +987,20 @@ class AutoWarmupASTTests(unittest.TestCase):
         self.assertIn("clip", roles,
                       "restore-time preload must include CLIP when PRELOAD_MODE=clip_only")
 
-    def test_snapshot_cpu_cache_populated_on_startup(self):
-        """The startup() method must contain the concrete snapshot preload
-        call that populates _model_cpu_cache.  Verify by checking the source
-        code for the full call chain: profile resolution -> path resolution
-        with for_snapshot=True -> _preload_models_to_cpu."""
+    def test_snapshot_cpu_cache_empty_on_startup(self):
+        """The startup() method must NOT populate _model_cpu_cache during
+        snapshot creation.  Instead it must emit a cache-empty diagnostic
+        confirming no UNET/CLIP/VAE state dicts were preloaded."""
         source = self._get_method_source("startup")
         self.assertIsNotNone(source)
-        self.assertIn("_snapshot_preload_profile()", source)
-        self.assertIn("_snapshot_preload_paths(_snap_profile, for_snapshot=True)", source)
-        self.assertIn("_preload_models_to_cpu(_snap_paths, max_workers=1)", source)
-        self.assertIn("snapshot_preload_cpu", source)
+        self.assertNotIn("_snapshot_preload_paths(_snap_profile, for_snapshot=True)", source,
+                         "startup() must NOT have for_snapshot=True preload call")
+        self.assertNotIn("_preload_models_to_cpu(_snap_paths, max_workers=1)", source,
+                         "startup() must NOT call _preload_models_to_cpu")
+        self.assertNotIn("snapshot_preload_cpu", source,
+                         "startup() must NOT log snapshot_preload_cpu")
+        self.assertIn("snapshot_cpu_cache_diag", source,
+                      "startup() must contain the snapshot CPU cache diagnostic")
 
     def test_snapshot_preload_module_defaults_are_generic(self):
         """The module-level WARMUP_* defaults must be empty model filenames
@@ -1347,15 +1343,22 @@ class AutoWarmupASTTests(unittest.TestCase):
             "restore() must handle env_default in preload eligibility guard",
         )
 
-    def test_startup_preload_uses_max_workers_override(self):
-        """Startup(snap=True) must call _preload_models_to_cpu with
-        max_workers=1 so snapshot-time model reads are sequential."""
+    def test_startup_has_cpu_cache_diagnostic(self):
+        """Startup(snap=True) must emit the snapshot CPU cache diagnostic
+        confirming the workflow-model cache is empty before Modal captures
+        the memory snapshot."""
         source = self._get_method_source("startup")
         self.assertIsNotNone(source)
         self.assertIn(
+            "snapshot_cpu_cache_diag",
+            source,
+            "startup() must contain the snapshot CPU cache diagnostic",
+        )
+        # Must NOT contain the old snapshot preload infrastructure
+        self.assertNotIn(
             "max_workers=1",
             source,
-            "startup() must pass max_workers=1 to _preload_models_to_cpu",
+            "startup() must NOT call _preload_models_to_cpu with max_workers=1",
         )
 
     def test_preload_models_to_cpu_has_max_workers_param(self):
