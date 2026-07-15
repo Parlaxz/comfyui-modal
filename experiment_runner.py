@@ -941,34 +941,49 @@ class ExperimentRunner:
                 })
 
                 # ── Phase 3: resolve and inject cell values with real i2i image resolver ──
+                # When the cell already carries _resolved_workflow (production
+                # single-run path where controls were applied before compile),
+                # skip resolve_and_inject_cell — it would deep-copy the workflow
+                # and re-inject values, changing its canonical hash and failing
+                # the fail-closed hash guard in LocalRemoteInvoker.run_cell.
                 profile_slots = ck.get("slots", {})
                 loader_target_groups = ck.get("loader_target_groups", [])
                 lora_slots = ck.get("lora_slots", [])
                 for cell in cells:
-                    resolved = resolve_and_inject_cell(
-                        profile_workflow=ck.get("workflow", {}),
-                        profile_slots=profile_slots,
-                        loader_target_groups=loader_target_groups,
-                        lora_slots=lora_slots,
-                        cell=cell,
-                        preset_resolver=_resolve_preset_image,
-                    )
-                    cell["_resolved_workflow"] = resolved.workflow
-                    # Also add resolved values for the remote invoker
-                    cell["_resolved_prompt"] = resolved.positive_prompt
-                    cell["_resolved_negative"] = resolved.negative_prompt
-                    cell["_resolved_unet"] = resolved.unet
-                    cell["_resolved_clip"] = resolved.clip
-                    cell["_resolved_vae"] = resolved.vae
-                    cell["_resolved_lora_chain"] = resolved.lora_chain
-                    # input_images is already built inside resolve_and_inject_cell.
-                    # The canonical payload lives at cell["input_images"]; it is
-                    # consumed directly by LocalRemoteInvoker.run_cell and the
-                    # remote-side run_checkpoint_stream / _materialize_input_images.
-                    # Remove any stale _input_images field from a previous version.
-                    cell.pop("_input_images", None)
-                    cell.pop("_input_image_b64", None)
-                    cell.pop("_input_image_mime", None)
+                    if "_resolved_workflow" not in cell or cell["_resolved_workflow"] is None:
+                        resolved = resolve_and_inject_cell(
+                            profile_workflow=ck.get("workflow", {}),
+                            profile_slots=profile_slots,
+                            loader_target_groups=loader_target_groups,
+                            lora_slots=lora_slots,
+                            cell=cell,
+                            preset_resolver=_resolve_preset_image,
+                        )
+                        cell["_resolved_workflow"] = resolved.workflow
+                        # Also add resolved values for the remote invoker
+                        cell["_resolved_prompt"] = resolved.positive_prompt
+                        cell["_resolved_negative"] = resolved.negative_prompt
+                        cell["_resolved_unet"] = resolved.unet
+                        cell["_resolved_clip"] = resolved.clip
+                        cell["_resolved_vae"] = resolved.vae
+                        cell["_resolved_lora_chain"] = resolved.lora_chain
+                        # input_images is already built inside resolve_and_inject_cell.
+                        # The canonical payload lives at cell["input_images"]; it is
+                        # consumed directly by LocalRemoteInvoker.run_cell and the
+                        # remote-side run_checkpoint_stream / _materialize_input_images.
+                        # Remove any stale _input_images field from a previous version.
+                        cell.pop("_input_images", None)
+                        cell.pop("_input_image_b64", None)
+                        cell.pop("_input_image_mime", None)
+                    else:
+                        # Production single-run: workflow is already fully resolved.
+                        # Still populate the resolved metadata fields for event logging.
+                        cell.setdefault("_resolved_prompt", cell.get("prompt", ""))
+                        cell.setdefault("_resolved_negative", cell.get("negative_prompt", ""))
+                        cell.setdefault("_resolved_unet", "")
+                        cell.setdefault("_resolved_clip", "")
+                        cell.setdefault("_resolved_vae", "")
+                        cell.setdefault("_resolved_lora_chain", [])
 
                 # If the invoker is a CheckpointStreamInvoker, configure
                 # it with the full cell list so the deployed side can run
@@ -1287,6 +1302,59 @@ class LocalRemoteInvoker:
             _cell_report = cell.get("production_report")
             _effective_prod_report = _cell_report if _cell_report is not None else self._production_report
 
+            # ── Fail-closed local validation before remote dispatch ──
+            # Immediately before dispatching, verify:
+            #   1. compiler_version / hash_schema_version / production_plan_schema_version
+            #      are present and current (not stale/zero/absent).
+            #   2. compiled_workflow_hash is present and non-empty.
+            #   3. The resolved workflow's canonical SHA-256 matches the
+            #      compiled_workflow_hash from the production report.
+            # Any failure prevents calling the remote stream.
+            if _effective_prod_report and _effective_prod_report.get("enabled"):
+                from production_workflow import (
+                    _canonical_workflow_hash, COMPILER_SCHEMA_VERSION,
+                    HASH_SCHEMA_VERSION, PRODUCTION_PLAN_SCHEMA_VERSION,
+                )
+                _cv = _effective_prod_report.get("compiler_version", 0)
+                _hv = _effective_prod_report.get("hash_schema_version", 0)
+                _pv = _effective_prod_report.get("production_plan_schema_version", 0)
+                if (_cv != COMPILER_SCHEMA_VERSION
+                        or _hv != HASH_SCHEMA_VERSION
+                        or _pv != PRODUCTION_PLAN_SCHEMA_VERSION):
+                    return {
+                        "status": "failed",
+                        "error": (
+                            f"Production schema version mismatch: "
+                            f"compiler_version={_cv} "
+                            f"(expected {COMPILER_SCHEMA_VERSION}), "
+                            f"hash_schema_version={_hv} "
+                            f"(expected {HASH_SCHEMA_VERSION}), "
+                            f"production_plan_schema_version={_pv} "
+                            f"(expected {PRODUCTION_PLAN_SCHEMA_VERSION}). "
+                            f"Recompile the production plan before dispatching."
+                        ),
+                    }
+                _prod_hash_to_check = _effective_prod_report.get("compiled_workflow_hash")
+                if not _prod_hash_to_check:
+                    return {
+                        "status": "failed",
+                        "error": (
+                            f"Production compiled_workflow_hash is missing or empty. "
+                            f"Recompile the production plan before dispatching."
+                        ),
+                    }
+                _actual_hash = _canonical_workflow_hash(_resolved_wf)
+                if not _actual_hash or _actual_hash != _prod_hash_to_check:
+                    return {
+                        "status": "failed",
+                        "error": (
+                            f"Production compiled workflow hash mismatch: "
+                            f"actual={_actual_hash}, "
+                            f"expected={_prod_hash_to_check}. "
+                            f"Recompile the production plan before dispatching."
+                        ),
+                    }
+
             # ── Merge production report into remote modal_options ──────
             # Forward output_node_ids, schema, and options so comfyapp's
             # compiled-workflow hash check succeeds for each cell.
@@ -1300,6 +1368,10 @@ class LocalRemoteInvoker:
                     "metadata_mode": "none",
                 })
 
+            # The workflow passed in stream_kwargs MUST be the compiled
+            # workflow from the checkpoint/plan when production is enabled.
+            # _resolved_wf already comes from the checkpoint (which carries
+            # the compiled workflow).  Never fall back to the source workflow.
             stream_kwargs: dict = {
                 "workflow": _resolved_wf,
             }

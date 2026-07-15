@@ -397,12 +397,14 @@ class RemoteValidationGuardTests(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-class DirectLoaderOverlapAstTests(unittest.TestCase):
-    """Source-level assertions for the concurrent UNET/CLIP loader overlap
+class DirectLoaderSequentialAstTests(unittest.TestCase):
+    """Source-level assertions for the sequential UNET-then-CLIP loading
     in comfyapp.py _warmup_direct.
 
-    These tests read comfyapp.py source rather than importing it (which
-    would bring in ComfyUI+torch dependencies).
+    The production path loads UNET first, then CLIP sequentially (no
+    ThreadPoolExecutor, no concurrent execution). These tests read
+    comfyapp.py source rather than importing it (which would bring in
+    ComfyUI+torch dependencies).
     """
 
     def setUp(self):
@@ -413,44 +415,60 @@ class DirectLoaderOverlapAstTests(unittest.TestCase):
             raise unittest.SkipTest("comfyapp.py not found")
         self.src = open(_path, encoding="utf-8").read()
 
-    def test_concurrent_future_import(self):
-        """Must import ThreadPoolExecutor for concurrent loader overlap."""
-        self.assertIn("from concurrent.futures import ThreadPoolExecutor", self.src)
+    def test_no_thread_pool_in_warmup_direct_block(self):
+        """The _warmup_direct block must not use ThreadPoolExecutor for loading.
+        (ThreadPoolExecutor may exist elsewhere in the file for unrelated tasks.)"""
+        # Find the warmup direct section boundaries
+        _warmup_section = self.src[self.src.find("def _warmup_direct"):self.src.find("def _load_unet_fn")]
+        # Check that the section before the loader function definitions does
+        # not import ThreadPoolExecutor
+        self.assertNotIn("ThreadPoolExecutor", _warmup_section)
 
-    def test_as_completed_used_for_object_loads(self):
-        """Must use as_completed to join both UNET and CLIP futures."""
-        self.assertIn("as_completed", self.src)
+    def test_no_as_completed_in_loader_region(self):
+        """The loader region must not reference as_completed."""
+        _loader_region = self.src[self.src.find("def _load_unet_fn"):self.src.find("Prime CLIPTextEncode cache")]
+        self.assertNotIn("as_completed", _loader_region)
 
-    def test_overlap_timing_fields(self):
+    def test_sequential_loader_fields(self):
         """Direct load timing fields must exist in _warmup_direct output."""
-        self.assertIn("direct_load_overlap_ms", self.src)
-        self.assertIn("direct_load_critical_path_ms", self.src)
         self.assertIn("direct_unet_start_unix_s", self.src)
         self.assertIn("direct_clip_start_unix_s", self.src)
 
     def test_exception_propagation(self):
-        """Must propagate exceptions from either or both loader futures."""
-        self.assertIn("_exceptions.append", self.src)
+        """Exceptions from loader calls propagate naturally (no _exceptions list
+        needed since sequential loading has no futures to collect)."""
+        # The loader is sequential so _exceptions list is not used
+        self.assertNotIn("_exceptions.append", self.src[self.src.find("def _warmup_direct"):self.src.find("Prime CLIPTextEncode cache")])
 
     def test_cache_check_before_store(self):
         """Must check cache before storing objects (exactly-once)."""
         self.assertIn("if _key not in self._unet_object_cache", self.src)
         self.assertIn("if _key not in self._clip_object_cache", self.src)
 
-    def test_same_file_sequential_fallback(self):
-        """When UNET and CLIP resolve to the same file, must fall back to
-        sequential loading to avoid duplicate physical reads."""
-        self.assertIn("_same_file", self.src)
+    def test_sequential_unet_then_clip(self):
+        """The UNET load call must appear before the CLIP load call in the
+        sequential block."""
+        # Find the sequential block comment or the load_unet_fn call site
+        idx_unet_call = self.src.find("_unet_result_container.append(_load_unet_fn())")
+        idx_clip_call = self.src.find("_clip_out_container.append(_load_clip_fn())")
+        if idx_unet_call >= 0 and idx_clip_call >= 0:
+            self.assertLess(idx_unet_call, idx_clip_call,
+                            "UNET must be loaded before CLIP")
+        else:
+            # Fallback: check older comment pattern
+            idx_seq = self.src.find("# Sequential UNET-first")
+            self.assertGreater(idx_seq, 0,
+                               "Sequential UNET-first comment must exist")
 
     def test_clip_encode_after_object_loads(self):
-        """CLIPTextEncode section must appear after the concurrent UNET/CLIP
-        loader block. We verify by checking that the 'Prime CLIPTextEncode'
-        comment inside _warmup_direct appears after the '_load_unet_fn' def."""
+        """CLIPTextEncode section must appear after the UNET/CLIP loader
+        functions. We verify by checking that the 'Prime CLIPTextEncode'
+        comment appears after the '_load_unet_fn' def."""
         idx_prime = self.src.find("Prime CLIPTextEncode cache")
         idx_unet_fn = self.src.find("def _load_unet_fn")
         if idx_unet_fn >= 0 and idx_prime >= 0:
             self.assertGreater(idx_prime, idx_unet_fn,
-                               "CLIP encode section should appear after concurrent loader functions")
+                               "CLIP encode section should appear after loader functions")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -1188,8 +1188,8 @@ _PRODUCTION_BASELINE_OVERRIDES: dict[str, str] = {
     # Sage: baked_cuda, no probe
     "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
     "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
-    # Preload: workers_2 (not clip_only or sequential)
-    "COMFYMODAL_PRELOAD_MODE": "workers_2",
+    # Preload: sequential (UNET then CLIP, never concurrent)
+    "COMFYMODAL_PRELOAD_MODE": "sequential",
     # Direct warmup: load UNET+CLIP, skip CLIP encode, no CPU-cache requirement
     "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "1",
     "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
@@ -16352,8 +16352,8 @@ class _ComfyAPIMixin:
                 f"direct_warmup_require_cpu_cache_hit={int(_rt_require_cpu_hit)}"
             )
 
-            # Gö─Gö─ 1+2. Load UNET & CLIP concurrently via 2-worker executor Gö─Gö─
-            # Phase timestamps for overlap telemetry stored from inside workers
+            # ── Sequential UNET-then-CLIP direct loading ──
+            # Phase timestamps for telemetry stored from inside workers
             _phases_unix["direct_unet_start_unix_s"] = 0.0  # set inside _load_unet_fn
             _phases_unix["direct_clip_start_unix_s"] = 0.0  # set inside _load_clip_fn
             _phases["direct_warmup_load_unet"] = 1.0 if _rt_load_unet else 0.0
@@ -16377,9 +16377,6 @@ class _ComfyAPIMixin:
                 else:
                     _phases["direct_clip_cpu_hit"] = 1.0
 
-            _same_file = (
-                _unet_full_path and _clip_full_path and _unet_full_path == _clip_full_path
-            )
             _load_unet_eligible = bool(_rt_load_unet and unet_name and not _skip_unet)
             _load_clip_eligible = bool(_rt_load_clip and clip_name and not _skip_clip)
 
@@ -16389,7 +16386,6 @@ class _ComfyAPIMixin:
             # returns (CLIP,) so result[0] is the CLIP.
             _unet_result_container = []
             _clip_out_container = []
-            _exceptions: list[Exception] = []
             _load_start = time.time()
             _unet_start = _load_start
             _unet_end = _load_start
@@ -16432,34 +16428,13 @@ class _ComfyAPIMixin:
                     return result[0]
                 return result
 
-            if _same_file and _load_unet_eligible and _load_clip_eligible:
-                # Both resolve to the same file — load UNET first, then CLIP
-                # (safe sequential fallback avoids duplicate physical read).
-                if _load_unet_eligible:
-                    _unet_result_container.append(_load_unet_fn())
-                if _load_clip_eligible:
-                    _clip_out_container.append(_load_clip_fn())
-            elif _load_unet_eligible and _load_clip_eligible:
-                # Different files — submit both to a 2-worker executor
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-                with ThreadPoolExecutor(max_workers=2) as _pool:
-                    _fut_unet = _pool.submit(_load_unet_fn)
-                    _fut_clip = _pool.submit(_load_clip_fn)
-                    for _fut in as_completed([_fut_unet, _fut_clip]):
-                        try:
-                            _result = _fut.result()
-                            if _fut is _fut_unet:
-                                _unet_result_container.append(_result)
-                            else:
-                                _clip_out_container.append(_result)
-                        except Exception as exc:
-                            _exceptions.append(exc)
-            else:
-                # At most one eligible — run sequentially (no executor needed)
-                if _load_unet_eligible:
-                    _unet_result_container.append(_load_unet_fn())
-                if _load_clip_eligible:
-                    _clip_out_container.append(_load_clip_fn())
+            # Sequential UNET-first, then CLIP regardless of same/different file.
+            # No ThreadPoolExecutor, no concurrent loading — guarantees ordered
+            # physical reads and avoids competing for Modal volume bandwidth.
+            if _load_unet_eligible:
+                _unet_result_container.append(_load_unet_fn())
+            if _load_clip_eligible:
+                _clip_out_container.append(_load_clip_fn())
 
             _load_end = time.time()
             # Per-loader end timestamps are set by the worker functions
@@ -16477,20 +16452,8 @@ class _ComfyAPIMixin:
             _phases["direct_unet_load_ms"] = _unet_wall_ms
             _phases["direct_clip_load_ms"] = _clip_wall_ms
 
-            # Join all workers: propagate any exception clearly after both
-            # have finished (never silently continue past a failed load).
-            if _exceptions:
-                _all_exc_msgs = [
-                    f"{type(_e).__name__}: {_e}" for _e in _exceptions
-                ]
-                # Cache whatever results we already have before raising
-                if _unet_result_container and _unet_result_container[0] is not None:
-                    _unet_model = _unet_result_container[0]
-                if _clip_out_container and _clip_out_container[0] is not None:
-                    _clip_model = _clip_out_container[0]
-                raise RuntimeError(
-                    "Direct warmup load(s) failed: " + "; ".join(_all_exc_msgs)
-                )
+            # Sequential load: any exception propagates directly from the
+            # loader call (no thread pool, no _exceptions list needed).
 
             # Store UNET result in object cache exactly once.
             # _unet_result_container[0] is the ModelPatcher (NOT unwrapped .model).
@@ -16536,15 +16499,9 @@ class _ComfyAPIMixin:
                 except Exception as exc:
                     print(f"[comfyapp] direct warmup: CLIP cache store failed: {exc}")
 
-            # Overlap = unet_ms + clip_ms - wall_block_ms (clamped >= 0) for
-            # different-file concurrent loads.  For sequential/same-file overlap is 0.
+            # Sequential UNET→CLIP has zero overlap by definition.
             _wall_block_ms = round((_load_end - _load_start) * 1000, 1)
-            if _load_unet_eligible and _load_clip_eligible and not _same_file:
-                _phases["direct_load_overlap_ms"] = round(
-                    max(0.0, _unet_wall_ms + _clip_wall_ms - _wall_block_ms), 1
-                )
-            else:
-                _phases["direct_load_overlap_ms"] = 0.0
+            _phases["direct_load_overlap_ms"] = 0.0
             # Critical path = max(unet_ms, clip_ms)
             _phases["direct_load_critical_path_ms"] = round(
                 max(_unet_wall_ms, _clip_wall_ms), 1
@@ -20860,6 +20817,56 @@ class _ComfyAPIMixin:
         print(f"[predispatch] phase=modal_entry t={time.time()}")
         # ── Early status yield — before cold UNET / dependency policy ──
         yield {"type": "status", "message": "Prompt received", "phase": "entry"}
+
+        # ── Production report validation before any model I/O ──
+        # Must happen before _cold_unet_early_actual_load, _prompt_async_preload,
+        # and any dependency policy that triggers model reads.  This ensures
+        # stale/mismatched production plans are rejected before I/O starts.
+        _pre_io_production_valid = True
+        if production_report and production_report.get("enabled"):
+            _report_cwf = production_report.get("compiled_workflow_hash", "")
+            _report_cv = production_report.get("compiler_version", 0)
+            _report_hv = production_report.get("hash_schema_version", 0)
+            _report_pv = production_report.get("production_plan_schema_version", 0)
+            if not _report_cwf:
+                _pre_io_production_valid = False
+                yield {"type": "error",
+                       "message": "Production report has no compiled_workflow_hash. Recompile."}
+                return
+            if not isinstance(_report_cv, int) or _report_cv != COMPILER_SCHEMA_VERSION:
+                _pre_io_production_valid = False
+                yield {"type": "error",
+                       "message": f"Production report has stale compiler_version={_report_cv}, "
+                       f"expected {COMPILER_SCHEMA_VERSION}. Recompile and redeploy."}
+                return
+            if not isinstance(_report_hv, int) or _report_hv != HASH_SCHEMA_VERSION:
+                _pre_io_production_valid = False
+                yield {"type": "error",
+                       "message": f"Production report has stale hash_schema_version={_report_hv}, "
+                       f"expected {HASH_SCHEMA_VERSION}. Recompile and redeploy."}
+                return
+            if not isinstance(_report_pv, int) or _report_pv != PRODUCTION_PLAN_SCHEMA_VERSION:
+                _pre_io_production_valid = False
+                yield {"type": "error",
+                       "message": f"Production report has stale production_plan_schema_version={_report_pv}, "
+                       f"expected {PRODUCTION_PLAN_SCHEMA_VERSION}. Recompile and redeploy."}
+                return
+            # Also verify the received workflow hash matches the report
+            _received_cwf = compute_canonical_compiled_workflow_hash(workflow)
+            if _received_cwf != _report_cwf:
+                _pre_io_production_valid = False
+                _src_h = production_report.get("source_workflow_hash", "")[:8] or "?"
+                yield {"type": "error",
+                       "message": f"Production compiled_workflow_hash mismatch: "
+                       f"source={_src_h} compiled={_report_cwf[:16]} "
+                       f"dispatch={_received_cwf[:16]}."}
+                return
+            print(
+                f"[production.pre_io] validated: "
+                f"source={production_report.get('source_workflow_hash','')[:8]} "
+                f"compiled={_report_cwf[:8]} "
+                f"compiler_v={_report_cv} hash_v={_report_hv} plan_v={_report_pv}"
+            )
 
         _prog_q = _qm.Queue()
         self._prog_queue = _prog_q

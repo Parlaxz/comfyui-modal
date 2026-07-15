@@ -2239,6 +2239,9 @@ async def _execute_job(item: tuple, item_id: int):
             _production_options_for_activation["source_workflow_hash"] = production_report.get("source_workflow_hash", "")
             _production_options_for_activation["compiled_workflow_hash"] = production_report.get("compiled_workflow_hash", "")
             _production_options_for_activation["production_plan_hash"] = production_report.get("production_plan_hash", "")
+            _production_options_for_activation["compiler_version"] = production_report.get("compiler_version", PRODUCTION_COMPILER_VERSION)
+            _production_options_for_activation["hash_schema_version"] = production_report.get("hash_schema_version", HASH_SCHEMA_VERSION)
+            _production_options_for_activation["production_plan_schema_version"] = production_report.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION)
         else:
             _activation_workflow_hash = prompt_hash
         _wn_result = await prepare_active_next_profile(

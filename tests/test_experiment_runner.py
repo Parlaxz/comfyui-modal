@@ -2558,5 +2558,213 @@ class LocalRemoteInvokerCancellationTests(unittest.TestCase):
         asyncio.run(_run())
 
 
+class LocalRemoteInvokerProductionHashCheckTests(unittest.TestCase):
+    """Tests for LocalRemoteInvoker run_cell fail-closed hash validation."""
+
+    def _build_invoker(self, prod_report=None):
+        mod = load_runner()
+
+        async def _noop_stream(**kwargs):
+            if False:
+                yield kwargs
+
+        tmp = tempfile.mkdtemp()
+        invoker = mod.LocalRemoteInvoker(
+            _noop_stream, experiment_id="exp_hash", node_dir=tmp,
+            production_report=prod_report,
+        )
+        return mod, invoker
+
+    def test_stale_compiler_version_returns_failed_before_stream(self):
+        """Stale compiler_version in production report must fail before stream."""
+        mod, invoker = self._build_invoker(
+            prod_report={
+                "enabled": True,
+                "compiled_workflow_hash": "a" * 64,
+                "compiler_version": 0,
+                "hash_schema_version": 1,
+                "production_plan_schema_version": 1,
+                "output_node_ids": ["107"],
+                "schema_version": 1,
+                "direct_output_sink_enabled": True,
+            }
+        )
+        cell = {
+            "cell_key": "ck_stale_cv",
+            "_resolved_workflow": {"1": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello"}}},
+        }
+        result = asyncio.run(invoker.run_cell("w_stale_cv", cell))
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("compiler_version", result.get("error", ""))
+
+    def test_stale_hash_schema_version_returns_failed_before_stream(self):
+        """Stale hash_schema_version in production report must fail before stream."""
+        mod, invoker = self._build_invoker(
+            prod_report={
+                "enabled": True,
+                "compiled_workflow_hash": "a" * 64,
+                "compiler_version": 1,
+                "hash_schema_version": 0,
+                "production_plan_schema_version": 1,
+                "output_node_ids": ["107"],
+                "schema_version": 1,
+                "direct_output_sink_enabled": True,
+            }
+        )
+        cell = {
+            "cell_key": "ck_stale_hv",
+            "_resolved_workflow": {"1": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello"}}},
+        }
+        result = asyncio.run(invoker.run_cell("w_stale_hv", cell))
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("hash_schema_version", result.get("error", ""))
+
+    def test_stale_production_plan_schema_version_returns_failed_before_stream(self):
+        """Stale production_plan_schema_version in production report must fail before stream."""
+        mod, invoker = self._build_invoker(
+            prod_report={
+                "enabled": True,
+                "compiled_workflow_hash": "a" * 64,
+                "compiler_version": 1,
+                "hash_schema_version": 1,
+                "production_plan_schema_version": 0,
+                "output_node_ids": ["107"],
+                "schema_version": 1,
+                "direct_output_sink_enabled": True,
+            }
+        )
+        cell = {
+            "cell_key": "ck_stale_pv",
+            "_resolved_workflow": {"1": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello"}}},
+        }
+        result = asyncio.run(invoker.run_cell("w_stale_pv", cell))
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("production_plan_schema_version", result.get("error", ""))
+
+    def test_missing_compiled_workflow_hash_returns_failed_before_stream(self):
+        """Missing compiled_workflow_hash in enabled production report must fail before stream."""
+        mod, invoker = self._build_invoker(
+            prod_report={
+                "enabled": True,
+                "compiled_workflow_hash": "",
+                "compiler_version": 1,
+                "hash_schema_version": 1,
+                "production_plan_schema_version": 1,
+                "output_node_ids": ["107"],
+                "schema_version": 1,
+                "direct_output_sink_enabled": True,
+            }
+        )
+        cell = {
+            "cell_key": "ck_missing_hash",
+            "_resolved_workflow": {"1": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello"}}},
+        }
+        result = asyncio.run(invoker.run_cell("w_missing_hash", cell))
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("missing or empty", result.get("error", "").lower())
+
+    def test_all_version_fields_current_passes_hash_check(self):
+        """When all version fields are current and hash matches, the stream is entered."""
+        from production_workflow import _canonical_workflow_hash
+        wf = {"1": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello"}}}
+        wf_hash = _canonical_workflow_hash(wf)
+        mod, invoker = self._build_invoker(
+            prod_report={
+                "enabled": True,
+                "compiled_workflow_hash": wf_hash,
+                "compiler_version": 1,
+                "hash_schema_version": 1,
+                "production_plan_schema_version": 1,
+                "output_node_ids": ["107"],
+                "schema_version": 1,
+                "direct_output_sink_enabled": True,
+            }
+        )
+        cell = {
+            "cell_key": "ck_all_current",
+            "_resolved_workflow": wf,
+        }
+        result = asyncio.run(invoker.run_cell("w_all_current", cell))
+        # Stream should have been entered
+        self.assertIn(result["status"], ("failed", "completed"))
+
+    def test_hash_mismatch_returns_failed_before_stream(self):
+        """When production report has compiled_workflow_hash and workflow
+        hash does not match, run_cell must return failed without calling
+        the stream."""
+        mod, invoker = self._build_invoker(
+            prod_report={
+                "enabled": True,
+                "compiled_workflow_hash": "a" * 64,
+                "compiler_version": 1,
+                "hash_schema_version": 1,
+                "production_plan_schema_version": 1,
+                "output_node_ids": ["107"],
+                "schema_version": 1,
+                "direct_output_sink_enabled": True,
+            }
+        )
+        cell = {
+            "cell_key": "ck_hash",
+            "_resolved_workflow": {"1": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello"}}},
+        }
+        result = asyncio.run(invoker.run_cell("w_hash", cell))
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("hash mismatch", result.get("error", "").lower())
+
+    def test_hash_match_passes_through(self):
+        """When production report hash matches the resolved workflow,
+        run_cell must proceed (stream is entered, which returns
+        appropriate error for no-op stream)."""
+        # Compute actual hash of a minimal workflow
+        from production_workflow import _canonical_workflow_hash
+        wf = {"1": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello"}}}
+        wf_hash = _canonical_workflow_hash(wf)
+
+        mod, invoker = self._build_invoker(
+            prod_report={
+                "enabled": True,
+                "compiled_workflow_hash": wf_hash,
+                "compiler_version": 1,
+                "hash_schema_version": 1,
+                "production_plan_schema_version": 1,
+                "output_node_ids": ["107"],
+                "schema_version": 1,
+                "direct_output_sink_enabled": True,
+            }
+        )
+        cell = {
+            "cell_key": "ck_match",
+            "_resolved_workflow": wf,
+        }
+        result = asyncio.run(invoker.run_cell("w_match", cell))
+        # Stream should have been entered (which for no-op stream returns failed)
+        self.assertIn(result["status"], ("failed", "completed"))
+
+    def test_no_production_report_passes_through(self):
+        """Without production report, hash check must be skipped."""
+        mod, invoker = self._build_invoker(prod_report=None)
+        cell = {
+            "cell_key": "ck_no_prod",
+            "_resolved_workflow": {"1": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello"}}},
+        }
+        result = asyncio.run(invoker.run_cell("w_no_prod", cell))
+        # Should proceed to stream (which returns failed for no-op)
+        self.assertIn(result["status"], ("failed",))
+
+    def test_disabled_production_report_passes_through(self):
+        """Disabled production report must skip hash check."""
+        mod, invoker = self._build_invoker(
+            prod_report={"enabled": False, "compiled_workflow_hash": ""}
+        )
+        cell = {
+            "cell_key": "ck_disabled",
+            "_resolved_workflow": {"1": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello"}}},
+        }
+        result = asyncio.run(invoker.run_cell("w_disabled", cell))
+        self.assertIn(result["status"], ("failed",))
+
+
+
 if __name__ == "__main__":
     unittest.main()
