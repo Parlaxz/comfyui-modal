@@ -53,6 +53,8 @@ except Exception:  # pragma: no cover - runtime-only dependency in some contexts
 from production_workflow import (
     normalize_production_options,
     compile_production_workflow,
+    HASH_SCHEMA_VERSION,
+    PRODUCTION_PLAN_SCHEMA_VERSION,
 )
 from studio_store import StudioJsonStore, StudioStoreError
 from studio_models import (
@@ -1339,6 +1341,13 @@ def build_single_run_spec(
                 "studio_meta": studio_meta,
                 "trace": dict(trace_ctx) if trace_ctx else {},
                 "production_report": production_report,
+                # Pre-set _resolved_workflow to the compiled workflow so
+                # _run_checkpoint skips the redundant resolve_and_inject_cell
+                # pass (which would deep-copy + re-inject, mutating the hash).
+                # For production single-runs the workflow is already fully
+                # resolved after controls-apply + compile; re-injection would
+                # produce a different canonical hash, failing the guard.
+                "_resolved_workflow": production_workflow if _prod_enabled else None,
             }
         ],
         "duplicate_count": 0,
@@ -2480,6 +2489,12 @@ def handle_studio_run(
             Forwards production options from the compilation data so that
             omitted production (default-enabled) is reflected in the
             activation payload.
+
+            Enriches from the effective production report with all hash
+            identity fields (source_workflow_hash, compiled_workflow_hash,
+            production_plan_hash, compiler_version, hash_schema_version,
+            production_plan_schema_version) so the remote side can validate
+            profile identity.
             """
             try:
                 from experiment_runner import _workflow_sha256
@@ -2502,6 +2517,22 @@ def handle_studio_run(
                         _ids = _prod_report.get("output_node_ids") or _prod_report.get("kept_node_ids") or []
                         if _ids:
                             _active_prod_opts["output_node_ids"] = list(_ids)
+                    # Enrich with hash identity fields from the effective report.
+                    # These are required by prepare_active_next_profile →
+                    # _build_activation_payload for the profile dedup key and
+                    # remote-side compiled-workflow validation.
+                    _active_prod_opts.setdefault("source_workflow_hash",
+                        _prod_report.get("source_workflow_hash", ""))
+                    _active_prod_opts.setdefault("compiled_workflow_hash",
+                        _prod_report.get("compiled_workflow_hash", ""))
+                    _active_prod_opts.setdefault("production_plan_hash",
+                        _prod_report.get("production_plan_hash", ""))
+                    _active_prod_opts.setdefault("compiler_version",
+                        _prod_report.get("compiler_version", 1))
+                    _active_prod_opts.setdefault("hash_schema_version",
+                        _prod_report.get("hash_schema_version", HASH_SCHEMA_VERSION))
+                    _active_prod_opts.setdefault("production_plan_schema_version",
+                        _prod_report.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION))
                 await prepare_active_next_profile(
                     resolved_workflow,
                     _hash,

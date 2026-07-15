@@ -5558,5 +5558,174 @@ class JsAxisEligibilityRED(unittest.TestCase):
         )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Test: Production single-run hash guard — no post-compile mutation
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ProductionSingleRunHashGuardTests(unittest.TestCase):
+    """Regression: Studio single-run with production enabled must not fail
+    the fail-closed hash guard in LocalRemoteInvoker.run_cell.
+
+    Root cause: build_single_run_spec applied controls, compiled the
+    production workflow, but _run_checkpoint then called
+    resolve_and_inject_cell which deep-copied the compiled workflow and
+    re-injected the same values, changing its canonical hash.  The fix:
+    pre-set _resolved_workflow on the cell so the injection pass is
+    skipped for production single-runs.
+    """
+
+    def setUp(self):
+        _repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _repo not in sys.path:
+            sys.path.insert(0, _repo)
+
+    def _make_build_single_run_spec(self):
+        """Import and call build_single_run_spec with a synthetic
+        snapshot that has an output node binding."""
+        from studio_run_adapter import build_single_run_spec
+        return build_single_run_spec
+
+    def _minimal_preset(self):
+        return {
+            "id": "preset_a39044fa498043e0",
+            "status": "runnable",
+            "snapshotId": "snap_test",
+            "compatibleFeatures": ["txt2img"],
+            "defaults": {},
+        }
+
+    def _minimal_snapshot(self):
+        """Minimal snapshot with a txt2img workflow and an output binding."""
+        return {
+            "id": "snap_test",
+            "status": "runnable",
+            "archived": False,
+            "outputNodeId": "107",
+            "apiPromptJson": {
+                "output": {
+                    "3": {"class_type": "KSampler", "inputs": {
+                        "seed": 42, "steps": 20, "cfg": 8.0,
+                        "sampler_name": "euler", "scheduler": "normal",
+                        "denoise": 1.0,
+                        "model": ["4", 0], "positive": ["6", 0],
+                        "negative": ["7", 0], "latent_image": ["5", 0],
+                    }},
+                    "4": {"class_type": "UNETLoader",
+                          "inputs": {"unet_name": "flux-model.safetensors",
+                                     "weight_dtype": "default"}},
+                    "5": {"class_type": "EmptyLatentImage",
+                          "inputs": {"width": 1024, "height": 1024}},
+                    "6": {"class_type": "CLIPTextEncode",
+                          "inputs": {"text": "a cat", "clip": ["8", 0]}},
+                    "7": {"class_type": "CLIPTextEncode",
+                          "inputs": {"text": "", "clip": ["8", 0]}},
+                    "8": {"class_type": "CLIPLoader",
+                          "inputs": {"clip_name": "clip.safetensors"}},
+                    "9": {"class_type": "VAEDecode",
+                          "inputs": {"samples": ["3", 0],
+                                     "vae": ["10", 0]}},
+                    "10": {"class_type": "VAELoader",
+                           "inputs": {"vae_name": "vae.safetensors"}},
+                    "107": {"class_type": "SaveImage",
+                            "inputs": {"images": ["9", 0],
+                                       "filename_prefix": "comfy"}},
+                },
+                "workflow": {"3": {"class_type": "KSampler", "inputs": {}}},
+            },
+            "nodeBindings": {
+                "prompt": {"kind": "widget", "nodeId": "6",
+                           "widgetName": "text"},
+                "negative_prompt": {"kind": "widget", "nodeId": "7",
+                                    "widgetName": "text"},
+            },
+            "featureStatus": {
+                "txt2img": {"status": "runnable"},
+            },
+            "controlSchemas": {},
+        }
+
+    def test_hash_guard_passes_for_studio_single_run(self):
+        """Simulate a full Studio single-run flow and verify the hash
+        guard in LocalRemoteInvoker.run_cell does NOT reject the
+        workflow."""
+
+        # 1. Build single-run spec (production enabled, steps=8)
+        build_spec = self._make_build_single_run_spec()
+        compilation = build_spec(
+            preset=self._minimal_preset(),
+            snapshot=self._minimal_snapshot(),
+            feature_id="txt2img",
+            controls={"prompt": "a cat", "steps": 8},
+            node_dir=os.path.dirname(os.path.abspath(__file__)) + "/..",
+            modal_options={"production": {"enabled": True,
+                                          "output_node_ids": ["107"]}},
+        )
+
+        # Must not have an error
+        self.assertNotIn("error", compilation,
+                         f"build_single_run_spec returned error: "
+                         f"{compilation.get('error')}")
+
+        # 2. Verify the cell carries _resolved_workflow
+        cells = compilation.get("cells", [])
+        self.assertEqual(len(cells), 1)
+        cell = cells[0]
+        self.assertIn("_resolved_workflow", cell,
+                       "Cell must carry _resolved_workflow for production single-run")
+        self.assertIsNotNone(cell["_resolved_workflow"],
+                             "_resolved_workflow must not be None")
+
+        # 3. Verify the production report has a compiled_workflow_hash
+        prod_report = compilation.get("production_report")
+        self.assertIsNotNone(prod_report)
+        compiled_hash = prod_report.get("compiled_workflow_hash", "")
+        self.assertTrue(len(compiled_hash) > 0,
+                        "compiled_workflow_hash must be non-empty")
+
+        # 4. Simulate what LocalRemoteInvoker.run_cell does:
+        #    compute canonical hash of _resolved_workflow and compare
+        from production_workflow import _canonical_workflow_hash
+        resolved_wf = cell["_resolved_workflow"]
+        actual_hash = _canonical_workflow_hash(resolved_wf)
+        self.assertEqual(
+            actual_hash, compiled_hash,
+            "Hash of _resolved_workflow MUST match compiled_workflow_hash "
+            "from the production report.  If this fails, resolve_and_inject_cell "
+            "is mutating the workflow after compile."
+        )
+
+    def test_hash_guard_rejects_if_cell_workflow_mutated(self):
+        """If _resolved_workflow is deliberately mutated (simulating
+        the old buggy post-compile injection), the hash guard must
+        detect the mismatch."""
+        from studio_run_adapter import build_single_run_spec
+        compilation = build_single_run_spec(
+            preset=self._minimal_preset(),
+            snapshot=self._minimal_snapshot(),
+            feature_id="txt2img",
+            controls={"prompt": "a cat", "steps": 8},
+            node_dir=os.path.dirname(os.path.abspath(__file__)) + "/..",
+            modal_options={"production": {"enabled": True,
+                                          "output_node_ids": ["107"]}},
+        )
+        cell = compilation["cells"][0]
+        prod_report = compilation["production_report"]
+        compiled_hash = prod_report["compiled_workflow_hash"]
+
+        from production_workflow import _canonical_workflow_hash
+
+        # Simulate the old bug: mutation after compile changes the hash
+        mutated = dict(cell["_resolved_workflow"])
+        # Change a value on the KSampler node (steps=8 → steps=10)
+        if "3" in mutated:
+            mutated["3"]["inputs"]["steps"] = 10
+        mutated_hash = _canonical_workflow_hash(mutated)
+
+        self.assertNotEqual(
+            mutated_hash, compiled_hash,
+            "Mutating the resolved workflow MUST change the hash"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

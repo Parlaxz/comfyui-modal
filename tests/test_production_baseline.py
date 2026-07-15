@@ -7,7 +7,7 @@ Covers:
   - Production baseline flags resolve correctly
   - _resolve_runtime_flag respects baseline overrides
   - DIRECT_WARMUP_CLIP_ENCODE=0 overrides auto/exact-prefill policy
-  - workers_2: effective workers count
+  - sequential: production preload baseline
   - No CPU-cache-hit prerequisite when baseline says 0
 """
 
@@ -405,7 +405,7 @@ class ProductionBaselineResolveOverrideTests(unittest.TestCase):
     _resolve_sage_probe_on_restore, and the
     DIRECT_WARMUP_CLIP_ENCODE baseline take priority over stale volume files.
 
-    Task 1: Baseline before volume-file reads → workers_2, baked_cuda, probe=False.
+    Task 1: Baseline before volume-file reads → sequential, baked_cuda, probe=False.
     Task 2: DIRECT_WARMUP_CLIP_ENCODE=0 in production_baseline keeps encode=0.
     """
 
@@ -433,24 +433,24 @@ class ProductionBaselineResolveOverrideTests(unittest.TestCase):
     @patch("comfyapp.os.path.isfile")
     @patch("comfyapp.open")
     def test_preload_mode_baseline_overrides_stale_file(self, mock_open, mock_isfile):
-        """production baseline says workers_2 even if volume file says clip_only."""
+        """production baseline says sequential even if volume file says clip_only."""
         mock_isfile.return_value = True
         mock_file = mock_open.return_value.__enter__.return_value
         mock_file.read.return_value = "clip_only"
         result = self._import_resolve_preload_mode()()
-        self.assertEqual(result, "workers_2",
+        self.assertEqual(result, "sequential",
                          "Baseline must override stale volume file clip_only")
 
     @patch("comfyapp.os.path.isfile")
     @patch("comfyapp.open")
     def test_preload_mode_baseline_overrides_sequential(self, mock_open, mock_isfile):
-        """production baseline says workers_2 even if volume file says sequential."""
+        """production baseline remains sequential when volume file says sequential."""
         mock_isfile.return_value = True
         mock_file = mock_open.return_value.__enter__.return_value
         mock_file.read.return_value = "sequential"
         result = self._import_resolve_preload_mode()()
-        self.assertEqual(result, "workers_2",
-                         "Baseline must override stale volume file sequential")
+        self.assertEqual(result, "sequential",
+                         "Production baseline must resolve to sequential")
 
     # ── Task 1: Baseline-first for sage runtime env override ─────────
 

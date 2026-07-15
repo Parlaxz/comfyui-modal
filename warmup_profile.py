@@ -19,6 +19,7 @@ import time
 import uuid
 
 from workflow_metadata import extract_warmup_stack, stack_to_warmup_profile
+from production_workflow import HASH_SCHEMA_VERSION, COMPILER_SCHEMA_VERSION, PRODUCTION_PLAN_SCHEMA_VERSION
 
 # ── Module-global dedup state ───────────────────────────────────────────
 # Shares the same semantics as __init__._last_written_stable_profile.
@@ -80,6 +81,11 @@ def _normalize_stable_profile(warmup_profile: dict | None) -> dict:
         stable["_production_allow_rgthree"] = bool(
             warmup_profile.get("allow_rgthree_comparer_rewrite", True)
         )
+        # Schema versions ensure the dedup key changes when the compiler
+        # or hash schema version is bumped.
+        stable["_production_compiler_version"] = warmup_profile.get("compiler_version", COMPILER_SCHEMA_VERSION)
+        stable["_production_hash_schema_version"] = warmup_profile.get("hash_schema_version", HASH_SCHEMA_VERSION)
+        stable["_production_plan_schema_version"] = warmup_profile.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION)
     return stable
 
 
@@ -139,13 +145,24 @@ def _build_activation_payload(
         profile["production_enabled"] = True  # consumed by _normalize_stable_profile
         prod_out = production_options.get("output_node_ids", [])
         prod_byp = production_options.get("bypass_node_ids", [])
-        if isinstance(prod_out, (list, tuple)) and prod_out:
+        # Always write production identity fields — not gated on truthy
+        # output list — so even empty output_node_ids distinguishes production
+        # from non-production profiles with the same model stack.
+        if isinstance(prod_out, (list, tuple)):
             profile["output_node_ids"] = list(prod_out)
             profile["bypass_node_ids"] = list(prod_byp) if isinstance(prod_byp, (list, tuple)) else []
-            profile["metadata_mode"] = str(production_options.get("metadata_mode", "none"))
-            profile["direct_output_sink"] = bool(production_options.get("direct_output_sink", True))
-            profile["allow_direct_output_rewrite"] = bool(production_options.get("allow_direct_output_rewrite", True))
-            profile["allow_rgthree_comparer_rewrite"] = bool(production_options.get("allow_rgthree_comparer_rewrite", True))
+        else:
+            profile["output_node_ids"] = []
+            profile["bypass_node_ids"] = []
+        profile["metadata_mode"] = str(production_options.get("metadata_mode", "none"))
+        profile["direct_output_sink"] = bool(production_options.get("direct_output_sink", True))
+        profile["allow_direct_output_rewrite"] = bool(production_options.get("allow_direct_output_rewrite", True))
+        profile["allow_rgthree_comparer_rewrite"] = bool(production_options.get("allow_rgthree_comparer_rewrite", True))
+        # Schema version fields on the profile so _normalize_stable_profile
+        # includes them in the stable dedup key.
+        profile["compiler_version"] = production_options.get("compiler_version", COMPILER_SCHEMA_VERSION)
+        profile["hash_schema_version"] = production_options.get("hash_schema_version", HASH_SCHEMA_VERSION)
+        profile["production_plan_schema_version"] = production_options.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION)
         # Production identity fields carried on the payload for
         # the activation/adapter to use in production.profile diagnostics.
         # Legacy prefixed aliases (backward compat during migration)
@@ -153,10 +170,14 @@ def _build_activation_payload(
         payload["production_source_workflow_hash"] = production_options.get("source_workflow_hash", "")
         payload["production_compiled_workflow_hash"] = production_options.get("compiled_workflow_hash", "")
         payload["production_plan_hash"] = production_options.get("production_plan_hash", "")
+        payload["production_compiler_version"] = production_options.get("compiler_version", COMPILER_SCHEMA_VERSION)
         # Direct un-prefixed aliases (canonical forward field names)
         payload["source_workflow_hash"] = production_options.get("source_workflow_hash", "")
         payload["compiled_workflow_hash"] = production_options.get("compiled_workflow_hash", "")
         payload["production_plan_hash"] = production_options.get("production_plan_hash", "")
+        payload["compiler_version"] = production_options.get("compiler_version", COMPILER_SCHEMA_VERSION)
+        payload["hash_schema_version"] = production_options.get("hash_schema_version", HASH_SCHEMA_VERSION)
+        payload["production_plan_schema_version"] = production_options.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION)
         payload["output_node_ids"] = list(prod_out) if isinstance(prod_out, (list, tuple)) else []
 
     # Exact prompt bundle extraction

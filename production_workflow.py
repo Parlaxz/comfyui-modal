@@ -205,6 +205,11 @@ class ProductionPlan:
     schema_version: int = COMPILER_SCHEMA_VERSION
     hash_schema: int = HASH_SCHEMA_VERSION
 
+    @property
+    def production_report(self) -> dict:
+        """Read-only alias for ``report``, required by some downstream consumers."""
+        return self.report
+
     def __iter__(self):
         """Compatibility iterator yielding (compiled_workflow, report).
 
@@ -349,7 +354,7 @@ def build_production_topology_hash(
     workflow: dict, production: dict, *, allow_direct_output_rewrite: bool = True
 ) -> str:
     parts = []
-    parts.append(f"schema_v:{production.get('schema_version', 0)}")
+    parts.append(f"schema_v:{COMPILER_SCHEMA_VERSION}")
     nid_map = _build_normalized_id_map(workflow)
     for nid in nid_map:
         original_key = nid_map[nid]
@@ -441,7 +446,33 @@ def compile_production_workflow(
     )
     cached = _topology_plan_cache.get(cache_key)
 
-    if cached is not None:
+    # ── Cache validation ───────────────────────────────────────────────
+    # Reject stale/incomplete cache entries before attempting reconstruction.
+    # After reconstruction, also validate the actual hash of the rebuilt
+    # workflow against the stored hash — if they differ the entry is stale
+    # and we must fall through to a full compile.
+    _use_cache = cached is not None
+    if _use_cache:
+        _cached_report = cached.get("report", {})
+        if not _cached_report:
+            _use_cache = False  # report missing → invalidate
+        else:
+            _cv = _cached_report.get("compiler_version", 0)
+            _hv = _cached_report.get("hash_schema_version", 0)
+            _pv = _cached_report.get("production_plan_schema_version", 0)
+            _cwf = _cached_report.get("compiled_workflow_hash", "")
+            if (_cv != COMPILER_SCHEMA_VERSION or _hv != HASH_SCHEMA_VERSION
+                    or _pv != PRODUCTION_PLAN_SCHEMA_VERSION):
+                _use_cache = False
+            if not _cwf:
+                _use_cache = False
+        # Validate compiled_workflow stored in cache entry
+        if _use_cache:
+            _cached_compiled = cached.get("compiled_workflow")
+            if not isinstance(_cached_compiled, dict) or not _cached_compiled:
+                _use_cache = False
+
+    if _use_cache:
         cached_kept_set = cached["kept_ids_set"]
         cached_rewritten = cached.get("rewritten_ids", ())
         cached_rgthree = cached.get("rgthree_rewritten_ids", ())
@@ -469,6 +500,14 @@ def compile_production_workflow(
                 orig_key = nid_map[oid]
                 _selected_output_classes[oid] = workflow.get(orig_key, {}).get("class_type", "?")
         compiled_workflow_hash = _compute_compiled_workflow_hash(compiled)
+        # Validate the reconstructed workflow's hash matches the cached report.
+        # A mismatch means the cache entry is stale — fall through to rebuild.
+        _stored_cwf = _cached_report.get("compiled_workflow_hash", "")
+        if _stored_cwf and compiled_workflow_hash != _stored_cwf:
+            _use_cache = False
+            _reset_cache()
+
+    if _use_cache:
         # The runner hash is the same as compiled hash when we execute the
         # compiled workflow.  Set here so downstream validation can compare.
         runner_workflow_hash = compiled_workflow_hash
@@ -486,7 +525,7 @@ def compile_production_workflow(
         )
         report = {
             "enabled": True,
-            "schema_version": production.get("schema_version", 0),
+            "schema_version": COMPILER_SCHEMA_VERSION,
             "compiler_version": COMPILER_SCHEMA_VERSION,
             "hash_schema_version": HASH_SCHEMA_VERSION,
             "production_plan_schema_version": PRODUCTION_PLAN_SCHEMA_VERSION,
@@ -551,8 +590,12 @@ def compile_production_workflow(
                 _try_rewrite_rgthree_comparer(oid, compiled, nid_map, rgthree_rewritten_ids)
 
     removed_ids = [nid for nid in nid_map if nid not in reachable]
+    compiled_workflow_hash = _compute_compiled_workflow_hash(compiled)
 
     _topology_plan_cache.put(cache_key, {
+        # Store the complete compiled_workflow so cache-hit validation can
+        # verify integrity and downstream consumers can deep-copy it.
+        "compiled_workflow": copy.deepcopy(dict(compiled)),
         "kept_ids_set": frozenset(compiled.keys()),
         "rewritten_ids": tuple(rewritten_ids),
         "rgthree_rewritten_ids": tuple(rgthree_rewritten_ids),
@@ -563,6 +606,14 @@ def compile_production_workflow(
             }
             for oid in rgthree_rewritten_ids
         },
+        # Store report with compiled_workflow_hash so cache-hit validation
+        # can confirm the workflow hashes as expected.
+        "report": {
+            "compiled_workflow_hash": compiled_workflow_hash,
+            "compiler_version": COMPILER_SCHEMA_VERSION,
+            "hash_schema_version": HASH_SCHEMA_VERSION,
+            "production_plan_schema_version": PRODUCTION_PLAN_SCHEMA_VERSION,
+        },
     })
 
     duplicate_analysis = analyze_duplicate_work(workflow)
@@ -571,7 +622,6 @@ def compile_production_workflow(
         if oid in nid_map:
             orig_key = nid_map[oid]
             _selected_output_classes[oid] = workflow.get(orig_key, {}).get("class_type", "?")
-    compiled_workflow_hash = _compute_compiled_workflow_hash(compiled)
     runner_workflow_hash = compiled_workflow_hash
     # compiled_output_node_ids = selected output IDs that survive in compiled
     _surviving_output_ids = [oid for oid in output_ids if oid in compiled]
@@ -588,7 +638,7 @@ def compile_production_workflow(
 
     report = {
         "enabled": True,
-        "schema_version": production.get("schema_version", 0),
+        "schema_version": COMPILER_SCHEMA_VERSION,
         "compiler_version": COMPILER_SCHEMA_VERSION,
         "hash_schema_version": HASH_SCHEMA_VERSION,
         "production_plan_schema_version": PRODUCTION_PLAN_SCHEMA_VERSION,

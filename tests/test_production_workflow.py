@@ -624,6 +624,64 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(compiled["1"]["inputs"]["steps"], 50)
 
 
+    def test_cache_miss_when_compiled_workflow_deleted(self):
+        """Removing compiled_workflow from the private cache entry causes cache miss."""
+        wf = {**WORKFLOW_SINGLE_OUTPUT}
+        prod = _minimal_production(output_ids=["9"])
+        _, report1 = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=False
+        )
+        self.assertFalse(report1["cache_hit"])
+        # Access private LRU cache and remove compiled_workflow from every entry
+        from production_workflow import _topology_plan_cache
+        for key in list(_topology_plan_cache._data.keys()):
+            entry = _topology_plan_cache._data[key]
+            if "compiled_workflow" in entry:
+                del entry["compiled_workflow"]
+        _, report2 = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=False
+        )
+        self.assertFalse(report2["cache_hit"],
+                         "Missing compiled_workflow must cause cache miss")
+
+    def test_cache_miss_when_compiled_workflow_empty_dict(self):
+        """Empty dict compiled_workflow in cache entry causes cache miss."""
+        wf = {**WORKFLOW_SINGLE_OUTPUT}
+        prod = _minimal_production(output_ids=["9"])
+        _, report1 = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=False
+        )
+        self.assertFalse(report1["cache_hit"])
+        from production_workflow import _topology_plan_cache
+        for key in list(_topology_plan_cache._data.keys()):
+            entry = _topology_plan_cache._data[key]
+            entry["compiled_workflow"] = {}
+        _, report2 = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=False
+        )
+        self.assertFalse(report2["cache_hit"],
+                         "Empty compiled_workflow dict must cause cache miss")
+
+    def test_cache_miss_when_compiled_workflow_hash_corrupted(self):
+        """Corrupted compiled_workflow_hash in cached report causes cache miss
+        (reconstructed hash mismatches)."""
+        wf = {**WORKFLOW_SINGLE_OUTPUT}
+        prod = _minimal_production(output_ids=["9"])
+        _, report1 = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=False
+        )
+        self.assertFalse(report1["cache_hit"])
+        from production_workflow import _topology_plan_cache
+        for key in list(_topology_plan_cache._data.keys()):
+            entry = _topology_plan_cache._data[key]
+            entry["report"]["compiled_workflow_hash"] = "0" * 64
+        _, report2 = compile_production_workflow(
+            wf, prod, allow_direct_output_rewrite=False
+        )
+        self.assertFalse(report2["cache_hit"],
+                         "Corrupted compiled_workflow_hash must cause cache miss")
+
+
 class WorkflowIntegrationTests(unittest.TestCase):
     def setUp(self):
         _reset_cache()
