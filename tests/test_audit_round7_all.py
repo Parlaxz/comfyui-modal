@@ -215,10 +215,10 @@ class ValidationCertificateIntegrationTests(unittest.TestCase):
         self.assertIn("execution.validate_prompt", self.eip_src)
 
     def test_cert_write_after_successful_execution(self):
-        """Certificate write must reference the write function somewhere."""
-        self.assertIn("_write_validation_certificate", self.eip_src)
-        # Certificate data is stored for later write
+        """Certificate data must be deferred until after delivery."""
+        self.assertNotIn("_write_validation_certificate", self.eip_src)
         self.assertIn("_pending_cert_data", self.eip_src)
+        self.assertIn("_certificate_candidate", self.eip_src)
 
     def test_metrics_surfaced(self):
         """Certificate metrics are stored on self for trace enrichment."""

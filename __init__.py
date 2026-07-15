@@ -1580,7 +1580,7 @@ sys.path.insert(0, _NODE_DIR)
 
 try:
     import modal as _modal_pkg
-    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, download_model_stream, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile, set_workspace_resolver, get_handle_cache_stats, get_modal_app_name, get_modal_class_name, get_modal_lookup_target
+    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, download_model_stream, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile, set_workspace_resolver, get_handle_cache_stats, get_modal_app_name, get_modal_class_name, get_modal_lookup_target, persist_validation_certificate
 
     # ── Runtime flag helpers (lazy init to avoid import-time failures) ──
     _runtime_flag_funcs: dict = {}
@@ -2659,6 +2659,52 @@ async def _execute_job(item: tuple, item_id: int):
         except Exception as _post_persist_exc:
             # Never fail the request due to persistence.
             print(f"[comfyui-modal.post_delivery] dispatcher error: {_post_persist_exc!r}")
+
+        # ── P3: post-delivery validation certificate persistence ──
+        # Attach the certificate candidate to the result on the GPU side so
+        # the local bridge can schedule persistence without delaying delivery.
+        try:
+            _cert_candidate = result.get("_certificate_candidate") if isinstance(result, dict) else None
+            if _cert_candidate and isinstance(_cert_candidate, dict) and _cert_candidate.get("identity"):
+                _workspace_id = ""
+                if isinstance(_request_workspace, dict):
+                    _workspace_id = str(
+                        _request_workspace.get("id", "")
+                        or _request_workspace.get("workspace_id", "")
+                        or ""
+                    )
+                _cert_identity = str(_cert_candidate.get("identity", ""))
+                # Collision-resistant task_id: workspace + identity ensures
+                # different workspaces never poison each other's dedup.
+                _persist_task_id = ":".join(x for x in (_workspace_id, _cert_identity) if x)
+                if _persist_task_id:
+                    from optimizations import _POST_DELIVERY_SINGLETON as _CERT_DISPATCHER
+                    if _CERT_DISPATCHER is not None:
+                        def _cert_persist_call():
+                            try:
+                                return persist_validation_certificate(
+                                    _cert_candidate,
+                                    workspace=_request_workspace if _request_workspace else None,
+                                    timeout_s=60.0,
+                                )
+                            except Exception as _persist_exc:
+                                print(
+                                    f"[comfyui-modal.post_delivery] cert persist failed: {_persist_exc!r}"
+                                )
+                                return {"status": "error", "error": str(_persist_exc)}
+                        _CERT_DISPATCHER.submit(
+                            task_id=_persist_task_id,
+                            fn=_cert_persist_call,
+                            timeout_s=60.0,
+                        )
+                        print(
+                            f"[comfyui-modal.post_delivery] scheduled cert prompt_id={prompt_id[:8]} "
+                            f"workspace_id={_workspace_id[:12] or '-'} "
+                            f"identity={_cert_identity[:16]}"
+                        )
+        except Exception as _post_cert_exc:
+            # Never fail the request due to persistence.
+            print(f"[comfyui-modal.post_delivery] cert dispatcher error: {_post_cert_exc!r}")
 
         # ── Direct route: store completed result for non-polling retrieval ──
         if _result_route_mode == "direct" and isinstance(result, dict):
@@ -5557,6 +5603,34 @@ if _server:
                     })
                     # Auto-record the cell attempt into run history with full metadata.
                     _record_experiment_cell_history(exp_id, data, payload, et)
+                    if et == "cell.completed" and result_data:
+                        try:
+                            _cert_candidate = result_data.get("_certificate_candidate")
+                            if isinstance(_cert_candidate, dict) and _cert_candidate.get("identity"):
+                                from optimizations import _POST_DELIVERY_SINGLETON
+
+                                _cert_identity = str(_cert_candidate["identity"])
+
+                                def _persist_experiment_certificate():
+                                    return persist_validation_certificate(
+                                        _cert_candidate,
+                                        timeout_s=60.0,
+                                    )
+
+                                _POST_DELIVERY_SINGLETON.submit(
+                                    task_id=f"experiment:{exp_id}:{data.get('attempt_id', '')}:{_cert_identity}",
+                                    fn=_persist_experiment_certificate,
+                                    timeout_s=60.0,
+                                )
+                                print(
+                                    f"[comfyui-modal.post_delivery] scheduled experiment cert "
+                                    f"experiment_id={exp_id} identity={_cert_identity[:16]}"
+                                )
+                        except Exception as _post_cert_exc:
+                            print(
+                                f"[comfyui-modal.post_delivery] experiment cert dispatcher error: "
+                                f"{_post_cert_exc!r}"
+                            )
             elif et in {"checkpoint.completed", "checkpoint.paused", "checkpoint.stopped"}:
                 store.append_event({
                     "type": et,

@@ -665,6 +665,34 @@ def persist_clip_cache_payload(
         return {"status": "error", "error": _err, "deadline_unix_s": _deadline}
 
 
+def persist_validation_certificate(
+    candidate: dict,
+    workspace: dict | None = None,
+    *,
+    timeout_s: float = 60.0,
+) -> dict:
+    """Synchronous post-delivery persistence of a validation certificate.
+
+    Calls a small CPU-only Modal function mounted to the models volume.
+    Failures are returned as a dict with ``status="error"``; the caller
+    never raises out of this path.
+
+    Wraps the same workspace-capture pattern as persist_clip_cache_payload.
+    """
+    import time as _t
+    _deadline = _t.time() + max(1.0, float(timeout_s))
+    try:
+        selected = _resolve_workspace(workspace)
+        fn = _workspace_function("persist_validation_certificate", selected)
+        return fn.remote(candidate)
+    except Exception as exc:
+        try:
+            _err = f"{type(exc).__name__}: {exc}"[:200]
+        except Exception:
+            _err = "persist_validation_certificate_unreachable"
+        return {"status": "error", "error": _err, "deadline_unix_s": _deadline}
+
+
 def lookup_clip_cache(
     bundle_hash: str,
     clip_fingerprint_key: str,

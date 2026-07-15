@@ -2250,11 +2250,18 @@ def _build_validation_certificate_identity(
         return ""
 
 
-def _write_validation_certificate(cert_hash, outputs_to_execute, node_errors, *, identity_components=None, vol=None, commit=False):
+def _write_validation_certificate(cert_hash, outputs_to_execute, node_errors, *, identity_components=None, vol=None, commit=False, node_errors_encoded=False):
     """Atomically write a validation certificate.  Never raises.
 
     When *commit* is True and *vol* is provided, the models volume is
     committed synchronously after a successful write and retention cleanup.
+
+    When *node_errors_encoded* is True, *node_errors* is assumed to already
+    be JSON-safe (pre-encoded via _CertNodeErrorEncoder).  When False
+    (default), the raw node_errors are encoded via _CertNodeErrorEncoder
+    before writing.  This avoids double-encoding when the caller has already
+    pre-encoded the data (e.g. GPU-side candidate passed to the CPU persist
+    function).
     """
     try:
         import json as _cert_json
@@ -2268,13 +2275,14 @@ def _write_validation_certificate(cert_hash, outputs_to_execute, node_errors, *,
             return {"status": "exists"}
 
         # Build payload with all identity components
+        _encoded_errors = node_errors if node_errors_encoded else (_CertNodeErrorEncoder.encode(node_errors) if node_errors else {})
         payload = {
             "schema_version": _VALIDATION_CERT_SCHEMA_VERSION,
             "identity": cert_hash,
             "created_at": time.time(),
             "comfyapp_version": COMFYAPP_VERSION,
             "outputs_to_execute": outputs_to_execute,
-            "node_errors": _CertNodeErrorEncoder.encode(node_errors) if node_errors else {},
+            "node_errors": _encoded_errors,
         }
         # Store every identity component for later miss diagnostics
         if identity_components and isinstance(identity_components, dict):
@@ -6443,19 +6451,81 @@ _COMFYMODAL_LOCAL_PYTHON_SOURCES = (
     "run_history",
 )
 
-def _add_comfymodal_local_python_sources(img):
-    for _module_name in _COMFYMODAL_LOCAL_PYTHON_SOURCES:
-        img = img.add_local_python_source(_module_name)
+# GPU runtime source list — modules required by comfyapp.py at module level
+# plus optimizations (try/except guarded for robustness).
+# This is the ONLY set baked into GPU container images.
+_GPU_COMFYMODAL_PYTHON_SOURCES = (
+    "gpu_catalog",
+    "timing_trace",
+    "wall_clock_trace_v3",
+    "profiler_trace_v4",
+    "api_prompt_validator",
+    "failure_summary",
+    "production_workflow",
+    "optimizations",
+    "worker_control",
+)
+
+# CPU-only function images only need the modules comfyapp.py imports
+# unconditionally at module level (optimizations is try/except guarded).
+_CPU_COMFYMODAL_PYTHON_SOURCES = (
+    "gpu_catalog",
+    "timing_trace",
+    "wall_clock_trace_v3",
+    "profiler_trace_v4",
+    "api_prompt_validator",
+    "failure_summary",
+    "production_workflow",
+    "worker_control",
+)
+
+
+def _add_gpu_python_sources(img):
+    for _module_name in _GPU_COMFYMODAL_PYTHON_SOURCES:
+        img = img.add_local_python_source(_module_name, copy=True)
+    img = img.add_local_python_source("comfyapp", copy=True)
     return img
 
-image = _add_comfymodal_local_python_sources(_image_base)
 
-download_image = _add_comfymodal_local_python_sources(
+def _add_cpu_python_sources(img):
+    for _module_name in _CPU_COMFYMODAL_PYTHON_SOURCES:
+        img = img.add_local_python_source(_module_name, copy=True)
+    img = img.add_local_python_source("comfyapp", copy=True)
+    return img
+
+
+image = _add_gpu_python_sources(_image_base)
+
+download_image = _add_cpu_python_sources(
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("httpx>=0.27.0")
 )
 
-app = modal.App(APP_NAME, image=image)
+app = modal.App(APP_NAME, image=image, include_source=False)
+
+# ── Deployment source-inclusion diagnostic ──
+_COMFYMODAL_INCLUDE_SOURCE = False
+_GPU_SOURCE_BYTES = 0
+for _m in _GPU_COMFYMODAL_PYTHON_SOURCES:
+    _mp = os.path.join(_COMFYUI_MODAL_DIR, f"{_m}.py")
+    if os.path.isfile(_mp):
+        try:
+            _GPU_SOURCE_BYTES += os.path.getsize(_mp)
+        except OSError:
+            pass
+_APP_SOURCE_BYTES = 0
+_ap = os.path.join(_COMFYUI_MODAL_DIR, "comfyapp.py")
+if os.path.isfile(_ap):
+    try:
+        _APP_SOURCE_BYTES += os.path.getsize(_ap)
+    except OSError:
+        pass
+print(f"[comfyapp] source-diagnostic: "
+      f"gpu_modules={len(_GPU_COMFYMODAL_PYTHON_SOURCES)} "
+      f"module_list={','.join(_GPU_COMFYMODAL_PYTHON_SOURCES)} "
+      f"baked_source_bytes={_GPU_SOURCE_BYTES + _APP_SOURCE_BYTES} "
+      f"mounted_source_bytes=0 "
+      f"auto_include={int(_COMFYMODAL_INCLUDE_SOURCE)}")
 vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 # P2: dedicated prompt-encoding cache volume. Independent of the
 # models and custom-nodes volumes so a bundle change cannot perturb
@@ -6666,7 +6736,7 @@ def _validate_safe_tar_member(member, staging_dir: str) -> None:
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=2,
@@ -6763,7 +6833,7 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=1,
@@ -6804,7 +6874,7 @@ def get_volume_status() -> dict:
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=1,
@@ -6833,7 +6903,7 @@ def set_preload_mode(mode: str) -> str:
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=1,
@@ -6870,7 +6940,7 @@ def _clear_runtime_flag_internal(name: str) -> tuple[str, bool]:
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=1,
@@ -6889,7 +6959,7 @@ def clear_runtime_flag(name: str) -> str:
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=1,
@@ -6915,7 +6985,7 @@ def clear_runtime_flags(names: list[str]) -> list[str]:
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=1,
@@ -6984,7 +7054,7 @@ def reset_runtime_defaults() -> dict:
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=2,
@@ -7008,7 +7078,7 @@ def upload_model_to_volume(file_data: bytes, folder: str, filename: str) -> dict
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=2,
@@ -7146,7 +7216,7 @@ def _write_active_warmup_profile_payload(payload: dict) -> dict:
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=2,
@@ -7205,7 +7275,7 @@ def upload_model_chunk(chunk_data: bytes, folder: str, filename: str, offset: in
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=1,
@@ -7218,7 +7288,7 @@ def health_cpu():
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=1,
@@ -7263,7 +7333,7 @@ def list_models_cpu() -> dict:
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=1,
@@ -7286,7 +7356,7 @@ def delete_model_cpu(folder: str, filename: str) -> dict:
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=1,
@@ -7474,7 +7544,7 @@ def _verify_prompt_cache_checksums(bundle_dir: str, manifest_entry: dict) -> boo
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=1,
@@ -7665,7 +7735,50 @@ def persist_clip_cache_payload(payload: dict) -> dict:
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
+    image=_add_cpu_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
+    cpu=1,
+    memory=512,
+    timeout=60,
+    volumes={MODELS_PATH: vol},
+)
+def persist_validation_certificate(candidate: dict) -> dict:
+    """Persist a validation certificate. Exception-safe, called post-delivery.
+
+    Delegates to _write_validation_certificate with the models volume.
+    Never raises; returns status dict.
+    """
+    try:
+        if not isinstance(candidate, dict):
+            return {"status": "error", "error": "invalid_candidate"}
+        _identity = candidate.get("identity", "")
+        _outputs_to_execute = candidate.get("outputs_to_execute", [])
+        _node_errors = candidate.get("node_errors", {})
+        _identity_components = candidate.get("identity_components")
+        if not isinstance(_identity, str) or re.fullmatch(r"[0-9a-f]{64}", _identity) is None:
+            return {"status": "error", "error": "invalid_identity"}
+        if not isinstance(_outputs_to_execute, list) or not all(
+            isinstance(_node_id, str) for _node_id in _outputs_to_execute
+        ):
+            return {"status": "error", "error": "invalid_outputs"}
+        if not isinstance(_node_errors, dict):
+            return {"status": "error", "error": "invalid_node_errors"}
+        if _identity_components is not None and not isinstance(_identity_components, dict):
+            return {"status": "error", "error": "invalid_identity_components"}
+        return _write_validation_certificate(
+            _identity, _outputs_to_execute, _node_errors,
+            identity_components=_identity_components,
+            vol=vol,
+            commit=True,
+            node_errors_encoded=True,
+        )
+    except Exception as _cert_exc:
+        return {"status": "error", "error": str(_cert_exc)[:200]}
+
+
+@app.function(
+    image=_add_cpu_python_sources(
         modal.Image.debian_slim(python_version="3.11")
     ),
     cpu=1,
@@ -14783,16 +14896,19 @@ class _ComfyAPIMixin:
         _pending = getattr(self, '_pending_cert_data', None)
         if _pending is not None:
             try:
-                _wr = _write_validation_certificate(
-                    _pending["identity"],
-                    _pending["outputs_to_execute"],
-                    _pending["node_errors"],
-                    identity_components=_pending.get("identity_components"),
-                    vol=vol,
-                    commit=True,
-                )
-                self._validation_certificate_write_submitted = 1
-                self._validation_certificate_write_result = _wr.get("status", "error")
+                # Pre-encode node_errors so the candidate dict is JSON-safe
+                # for transport through Modal to the CPU persist function.
+                _encoded_node_errors = _CertNodeErrorEncoder.encode(_pending["node_errors"]) if _pending.get("node_errors") else {}
+                result["_certificate_candidate"] = {
+                    "identity": _pending["identity"],
+                    "outputs_to_execute": _pending["outputs_to_execute"],
+                    "node_errors": _encoded_node_errors,
+                    "identity_components": _pending.get("identity_components"),
+                }
+                # Honest telemetry: cert write is NOT yet submitted to the
+                # local dispatcher — it will be scheduled post-delivery.
+                self._validation_certificate_write_submitted = 0
+                self._validation_certificate_write_result = "deferred"
             except Exception:
                 self._validation_certificate_write_result = "error"
             finally:
@@ -21929,8 +22045,8 @@ def _register_gpu_classes():
             cpu=profile["cpu"],
             memory=profile["memory"],
             timeout=3600,
+            # Hard policy: GPU workers always scale to zero after four idle seconds.
             min_containers=0,
-            # Scale down quickly to avoid holding GPU resources when idle
             scaledown_window=4,
             volumes=_build_gpu_volumes(),
             enable_memory_snapshot=True,

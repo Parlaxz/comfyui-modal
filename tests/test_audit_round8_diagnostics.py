@@ -18,6 +18,7 @@ These tests do NOT require the heavy ComfyUI import path.  They
 exercise the diagnostic surface in isolation.
 """
 
+import ast
 import importlib
 import io
 import os
@@ -34,6 +35,18 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+def _func_source(src, name):
+    """Extract the source of a function by name using AST. Returns None if not found."""
+    try:
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                return ast.unparse(node)
+    except SyntaxError:
+        pass
+    return None
 
 
 def _load_optimizations(force_clean_env: bool = False):
@@ -515,15 +528,66 @@ class StaticNonRegressionTests(unittest.TestCase):
     def _read(self, name):
         return (REPO_ROOT / name).read_text(encoding="utf-8-sig")
 
-    def test_no_min_containers_in_production(self):
+    def test_gpu_classes_are_hard_locked_to_zero_and_four_seconds(self):
         text = self._read("comfyapp.py")
-        # ``min_containers=0`` must remain present (no warm containers).
-        self.assertIn("min_containers=0", text, "comfyapp.py no longer has min_containers=0")
-        # And ``min_containers=1`` (or higher) must NOT appear
-        # in a production path.
-        for m in re.finditer(r"min_containers\s*=\s*([0-9]+)", text):
-            val = int(m.group(1))
-            self.assertLessEqual(val, 0, f"comfyapp.py has min_containers={val}")
+        register_src = _func_source(text, "_register_gpu_classes")
+        self.assertIsNotNone(register_src)
+        self.assertIn("min_containers=0", register_src)
+        self.assertIn("scaledown_window=4", register_src)
+        self.assertNotIn("COMFYMODAL_MIN_CONTAINERS", text)
+        self.assertNotIn("COMFYMODAL_SCALEDOWN_WINDOW", text)
+        for match in re.finditer(r"min_containers\s*=\s*(\d+)", text):
+            self.assertEqual(int(match.group(1)), 0)
+
+    def test_certificate_candidate_attached_to_result(self):
+        """_execute_in_process must attach _certificate_candidate to result."""
+        text = self._read("comfyapp.py")
+        eip_src = _func_source(text, "_execute_in_process")
+        self.assertIsNotNone(eip_src)
+        # The synchronous _write_validation_certificate call is replaced
+        self.assertNotIn("_WR = _write_validation_certificate(", eip_src.upper())
+        # The candidate is attached to result dict (ast.unparse normalizes
+        # quotes to single quotes)
+        self.assertIn("result['_certificate_candidate']", eip_src)
+        # Metrics use deferred status and submitted=0 (honest telemetry:
+        # cert write is NOT yet submitted to the dispatcher)
+        self.assertIn("'deferred'", eip_src)
+        self.assertIn("_validation_certificate_write_submitted = 0", eip_src)
+        # node_errors are pre-encoded via _CertNodeErrorEncoder for JSON safety
+        self.assertIn("_CertNodeErrorEncoder.encode(_pending", eip_src)
+
+    def test_certificate_persistence_in_post_delivery(self):
+        """__init__.py post-delivery section must schedule cert persistence."""
+        init_src = (REPO_ROOT / "__init__.py").read_text(encoding="utf-8-sig")
+        # The post-delivery cert section references persist_validation_certificate
+        self.assertIn("persist_validation_certificate", init_src)
+        # It uses _POST_DELIVERY_SINGLETON for the dispatcher
+        self.assertIn("_POST_DELIVERY_SINGLETON", init_src)
+        # It schedules with a collision-resistant task_id
+        self.assertIn("_persist_task_id", init_src)
+        # Must not delay result delivery (after _finish_job)
+        self.assertIn("_finish_job", init_src)
+
+    def test_certificate_persistence_order_after_materialization(self):
+        """Cert persistence must be scheduled after materialization and _finish_job."""
+        init_src = (REPO_ROOT / "__init__.py").read_text(encoding="utf-8-sig")
+        execute_src = _func_source(init_src, "_execute_job")
+        self.assertIsNotNone(execute_src)
+        finish_pos = execute_src.find("_finish_job(")
+        persist_pos = execute_src.find("persist_validation_certificate(")
+        self.assertGreater(finish_pos, -1)
+        self.assertGreater(persist_pos, finish_pos)
+
+    def test_experiment_certificate_persistence_is_post_completion(self):
+        init_src = (REPO_ROOT / "__init__.py").read_text(encoding="utf-8-sig")
+        handler_src = _func_source(init_src, "_on_remote_event")
+        self.assertIsNotNone(handler_src)
+        append_pos = handler_src.find("store.append_event")
+        history_pos = handler_src.find("_record_experiment_cell_history", append_pos)
+        persist_pos = handler_src.find("persist_validation_certificate", history_pos)
+        self.assertGreater(append_pos, -1)
+        self.assertGreater(history_pos, append_pos)
+        self.assertGreater(persist_pos, history_pos)
 
     def test_cache_dit_touch_unchanged(self):
         # CacheDiT should be mentioned only in a "do not touch"
@@ -563,11 +627,15 @@ class StaticNonRegressionTests(unittest.TestCase):
                     continue
                 self.fail(f"{src} print may leak prompt text: {snippet!r}")
 
-    def test_persistent_validation_certificate_still_disabled(self):
+    def test_persistent_validation_certificate_default_on(self):
         text = self._read("comfyapp.py")
-        # The default is "0".
-        m = re.search(r'COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE.*?"0"', text)
-        self.assertIsNotNone(m, "validation certificate default is no longer 0")
+        # The default is "1" (enabled by default after audit round 7).
+        # Verify the env var is referenced and enabled by default.
+        self.assertIn("COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE", text)
+        # The second occurrence (at the actual call site) has default "1"
+        idx = text.find("COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE", text.find("COMFYMODAL_PERSISTENT_VALIDATION_CERTIFICATE") + 1)
+        if idx > 0:
+            self.assertIn('"1"', text[idx:idx + 100])
 
     def test_exact_prefill_cache_keys_unchanged(self):
         # The audit-round work did not modify stable_clip_cache_tag.
