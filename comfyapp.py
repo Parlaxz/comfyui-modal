@@ -16137,26 +16137,26 @@ class _ComfyAPIMixin:
                 with self._force_cpu_during_snapshot():
                     self._start_backend()
                 self._log_profile("backend_start", backend=self._select_backend(), duration_ms=self._profile_ms(stage_started))
-            # â”€â”€ Snapshot CPU preload: load model state dicts into CPU RAM â”€â”€
-            # so Modal's memory snapshot captures them.  On restore the
-            # _model_cpu_cache is already populated, eliminating volume reads.
-            # This preloads ALL models (UNET + CLIP + VAE) regardless of
-            # PRELOAD_MODE — the snapshot must cover every model the workflow
-            # needs for instant cache hits on restore.
-            _snap_preload_start = time.time()
-            _snap_profile = self._snapshot_preload_profile()
-            _snap_paths = self._snapshot_preload_paths(_snap_profile, for_snapshot=True) if _snap_profile else []
-            if _snap_paths:
-                _snap_preload_result = self._preload_models_to_cpu(_snap_paths, max_workers=1)
-                self._log_profile(
-                    "snapshot_preload_cpu",
-                    mode=_snap_profile.get("_source", "profile") if _snap_profile else "none",
-                    requested=len(_snap_paths),
-                    cached=_snap_preload_result.get("count", 0),
-                    duration_ms=self._profile_ms(_snap_preload_start),
-                )
-            else:
-                print("[comfyapp] snapshot_preload: no profile/paths, skipping CPU preload")
+            # ── Snapshot CPU cache diagnostic ──
+            # Confirm the workflow-model CPU cache is empty before Modal
+            # captures the memory snapshot.  A non-empty cache at this
+            # point means state dicts are frozen into the snapshot and
+            # must be reloaded on restore (losing the cold-start benefit).
+            _cpu_cache = getattr(self, "_model_cpu_cache", {})
+            _cache_entries = len(_cpu_cache)
+            _approx_bytes = 0
+            if _cpu_cache:
+                for _ck, (_sd, _) in _cpu_cache.items():
+                    if isinstance(_sd, dict):
+                        for _v in _sd.values():
+                            if hasattr(_v, "numel") and hasattr(_v, "element_size"):
+                                _approx_bytes += _v.numel() * _v.element_size()
+            print(
+                f"[comfyapp] snapshot_cpu_cache_diag:"
+                f" entries={_cache_entries}"
+                f" approx_bytes={_approx_bytes}"
+                f" cache_empty={_cache_entries == 0}"
+            )
         elif _need_backend:
             stage_started = time.time()
             self._start_backend()
