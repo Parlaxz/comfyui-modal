@@ -1271,8 +1271,8 @@ class RuntimeEnvDefaultTests(unittest.TestCase):
         self.assertEqual(_match.group(1), "workers_2",
                          "PRELOAD_MODE default must be workers_2")
 
-    def test_direct_warmup_unet_default_is_1(self):
-        """Module default for DIRECT_WARMUP_LOAD_UNET must be 1."""
+    def test_direct_warmup_unet_default_is_0(self):
+        """Module default for DIRECT_WARMUP_LOAD_UNET must be 0."""
         import os as _os, re as _re
         _path = _os.path.join(_os.path.dirname(__file__), "..", "comfyapp.py")
         with open(_path, "r", encoding="utf-8") as _f:
@@ -1282,7 +1282,7 @@ class RuntimeEnvDefaultTests(unittest.TestCase):
             _src,
         )
         self.assertIsNotNone(_match)
-        self.assertEqual(_match.group(1), "1")
+        self.assertEqual(_match.group(1), "0")
 
     def test_direct_warmup_clip_encore_default_is_0(self):
         """Module default for DIRECT_WARMUP_CLIP_ENCODE must be 0."""
@@ -1297,8 +1297,8 @@ class RuntimeEnvDefaultTests(unittest.TestCase):
         self.assertIsNotNone(_match)
         self.assertEqual(_match.group(1), "0")
 
-    def test_direct_warmup_require_cpu_cache_default_is_0(self):
-        """Module default for DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT must be 0."""
+    def test_direct_warmup_require_cpu_cache_default_is_1(self):
+        """Module default for DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT must be 1."""
         import os as _os, re as _re
         _path = _os.path.join(_os.path.dirname(__file__), "..", "comfyapp.py")
         with open(_path, "r", encoding="utf-8") as _f:
@@ -1308,7 +1308,7 @@ class RuntimeEnvDefaultTests(unittest.TestCase):
             _src,
         )
         self.assertIsNotNone(_match)
-        self.assertEqual(_match.group(1), "0")
+        self.assertEqual(_match.group(1), "1")
 
     def test_execution_backend_default_is_in_process(self):
         """Module default for EXECUTION_BACKEND must be in_process."""
@@ -1357,13 +1357,13 @@ class RuntimeEnvDefaultTests(unittest.TestCase):
             _src = _f.read()
         self.assertIn('"COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda"', _src)
 
-    def test_image_env_has_workers_2(self):
-        """Image .env() must set COMFYMODAL_PRELOAD_MODE=workers_2."""
+    def test_image_env_has_clip_only(self):
+        """Image .env() / baseline must set COMFYMODAL_PRELOAD_MODE=clip_only."""
         import os as _os, re as _re
         _path = _os.path.join(_os.path.dirname(__file__), "..", "comfyapp.py")
         with open(_path, "r", encoding="utf-8") as _f:
             _src = _f.read()
-        self.assertIn('"COMFYMODAL_PRELOAD_MODE": "workers_2"', _src)
+        self.assertIn('"COMFYMODAL_PRELOAD_MODE": "clip_only"', _src)
 
     def test_image_env_has_execution_backend(self):
         """Image .env() must set COMFYMODAL_EXECUTION_BACKEND=in_process."""

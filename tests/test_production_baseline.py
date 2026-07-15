@@ -433,24 +433,24 @@ class ProductionBaselineResolveOverrideTests(unittest.TestCase):
     @patch("comfyapp.os.path.isfile")
     @patch("comfyapp.open")
     def test_preload_mode_baseline_overrides_stale_file(self, mock_open, mock_isfile):
-        """production baseline says sequential even if volume file says clip_only."""
-        mock_isfile.return_value = True
-        mock_file = mock_open.return_value.__enter__.return_value
-        mock_file.read.return_value = "clip_only"
-        result = self._import_resolve_preload_mode()()
-        self.assertEqual(result, "sequential",
-                         "Baseline must override stale volume file clip_only")
-
-    @patch("comfyapp.os.path.isfile")
-    @patch("comfyapp.open")
-    def test_preload_mode_baseline_overrides_sequential(self, mock_open, mock_isfile):
-        """production baseline remains sequential when volume file says sequential."""
+        """production baseline says clip_only even if volume file says sequential."""
         mock_isfile.return_value = True
         mock_file = mock_open.return_value.__enter__.return_value
         mock_file.read.return_value = "sequential"
         result = self._import_resolve_preload_mode()()
-        self.assertEqual(result, "sequential",
-                         "Production baseline must resolve to sequential")
+        self.assertEqual(result, "clip_only",
+                         "Baseline must override stale volume file sequential")
+
+    @patch("comfyapp.os.path.isfile")
+    @patch("comfyapp.open")
+    def test_preload_mode_baseline_overrides_stale(self, mock_open, mock_isfile):
+        """production baseline remains clip_only even when volume file says workers_2."""
+        mock_isfile.return_value = True
+        mock_file = mock_open.return_value.__enter__.return_value
+        mock_file.read.return_value = "workers_2"
+        result = self._import_resolve_preload_mode()()
+        self.assertEqual(result, "clip_only",
+                         "Production baseline must resolve to clip_only")
 
     # ── Task 1: Baseline-first for sage runtime env override ─────────
 
@@ -491,37 +491,37 @@ class ProductionBaselineResolveOverrideTests(unittest.TestCase):
 
     # ── Task 2: DIRECT_WARMUP_CLIP_ENCODE baseline ───────────────────
 
-    def test_direct_warmup_clip_encode_baseline_is_zero(self):
-        """Production baseline says DIRECT_WARMUP_CLIP_ENCODE=0."""
+    def test_direct_warmup_clip_encode_baseline_is_one(self):
+        """Production baseline says DIRECT_WARMUP_CLIP_ENCODE=1 (historical 34b6274)."""
         val = self._import_baseline_flag()("COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE")
-        self.assertEqual(val, "0",
-                         "Baseline must be 0 so encode is not forced on")
+        self.assertEqual(val, "1",
+                         "Baseline must be 1 so CLIP encode runs during direct warmup")
 
     def test_direct_warmup_clip_encode_overrides_env(self):
-        """Baseline=0 wins even when env var says 1."""
-        with patch.dict(os.environ, {"COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "1"}):
+        """Baseline=1 wins even when env var says 0."""
+        with patch.dict(os.environ, {"COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "0"}):
             val = self._import_baseline_flag()("COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE")
-            self.assertEqual(val, "0",
-                             "Baseline=0 must override env=1")
+            self.assertEqual(val, "1",
+                             "Baseline=1 must override env=0")
 
-    def test_direct_warmup_load_unet_baseline_is_one(self):
-        """Production baseline says DIRECT_WARMUP_LOAD_UNET=1 (required baseline)."""
+    def test_direct_warmup_load_unet_baseline_is_zero(self):
+        """Production baseline says DIRECT_WARMUP_LOAD_UNET=0 (UNET loaded by production restore UNET)."""
         val = self._import_baseline_flag()("COMFYMODAL_DIRECT_WARMUP_LOAD_UNET")
-        self.assertEqual(val, "1",
-                         "Baseline must be 1 so direct warmup loads UNET")
+        self.assertEqual(val, "0",
+                         "Baseline must be 0 so production UNET handles UNET load")
 
-    def test_direct_warmup_load_unet_prevents_production_unet_submit(self):
-        """When DIRECT_WARMUP_LOAD_UNET resolves to True, _resolve_runtime_flag
-        returns True under the production baseline, proving the
-        production_unet_start_boundary branch in comfyapp.py will skip
-        calling _start_production_restore_unet."""
+    def test_direct_warmup_load_unet_production_unet_submit(self):
+        """When DIRECT_WARMUP_LOAD_UNET resolves to False, _resolve_runtime_flag
+        returns False under the production baseline, proving the
+        production_unet_start_boundary branch in comfyapp.py will call
+        _start_production_restore_unet."""
         from comfyapp import _resolve_runtime_flag, _resolve_production_baseline_flag
         baseline_val = _resolve_production_baseline_flag("COMFYMODAL_DIRECT_WARMUP_LOAD_UNET")
-        self.assertEqual(baseline_val, "1",
-                         "Baseline overrides must set DIRECT_WARMUP_LOAD_UNET=1")
+        self.assertEqual(baseline_val, "0",
+                         "Baseline overrides must set DIRECT_WARMUP_LOAD_UNET=0")
         rt_val = _resolve_runtime_flag("DIRECT_WARMUP_LOAD_UNET", "0")
-        self.assertTrue(rt_val,
-                        "_resolve_runtime_flag must return True under baseline")
+        self.assertFalse(rt_val,
+                         "_resolve_runtime_flag must return False under baseline")
 
     def test_direct_module_flags_follow_production_baseline(self):
         """Directly-read module flags must match the authoritative baseline."""
@@ -613,63 +613,53 @@ class ProductionRestorePreloadPhase2RegressionTests(unittest.TestCase):
             "Non-production restore must still have CPU preload infrastructure",
         )
 
-    def test_production_baseline_loads_unet_and_clip_no_encode(self):
-        """The production baseline must load UNET + CLIP and disable
-        CLIP encode during direct warmup."""
+    def test_production_baseline_loads_clip_with_encode_and_skip_unet(self):
+        """The production baseline must skip UNET direct load (production UNET handles it),
+        load CLIP, run CLIP encode, and require CPU cache hit for direct warmup
+        (per historical 34b6274 baseline)."""
         import comfyapp
-        # Load UNET
+        # Module defaults (no env var set): UNET=0, CLIP=0, ENCODE=0, CPU_HIT=1
         self.assertEqual(
-            comfyapp.DIRECT_WARMUP_LOAD_UNET, True,
-            "Baseline must load UNET during direct warmup",
+            comfyapp.DIRECT_WARMUP_LOAD_UNET, False,
+            "Module default must skip UNET",
         )
-        # Load CLIP
-        self.assertEqual(
-            comfyapp.DIRECT_WARMUP_LOAD_CLIP, True,
-            "Baseline must load CLIP during direct warmup",
+        # The module default for LOAD_CLIP is 0 (env default),
+        # but the production baseline override at runtime sets it to 1.
+        # Check the runtime-resolved value:
+        from comfyapp import _resolve_runtime_flag
+        self.assertTrue(
+            _resolve_runtime_flag("DIRECT_WARMUP_LOAD_CLIP", "0"),
+            "Runtime baseline override must load CLIP during direct warmup",
         )
-        # No CLIP encode
+        # CLIP encode: module default is 0, but runtime baseline override is 1
         self.assertEqual(
             comfyapp.DIRECT_WARMUP_CLIP_ENCODE, False,
-            "Baseline must disable CLIP encode during direct warmup",
+            "Module default must disable CLIP encode (env default 0)",
         )
-        # No CPU cache requirement
-        self.assertEqual(
-            comfyapp.DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT, False,
-            "Baseline must not require CPU cache hit for direct warmup",
-        )
-
-    def test_production_restore_does_not_invoke_start_restore_preload(self):
-        """The production restore decision must not invoke _start_restore_preload.
-
-        Every call to _start_restore_preload inside restore() must be
-        guarded by ``not _production_stable_path`` so that when the
-        production stable path is active, CPU preload is skipped and
-        only _warmup_direct (GPU direct warmup) is used.
-        """
-        restore_src = self._get_restore_source()
-        lines = restore_src.split("\n")
-        call_found = False
-        for lineno, line in enumerate(lines, start=1):
-            if "_start_restore_preload" not in line:
-                continue
-            call_found = True
-            # Look backward up to 30 lines for the nearest
-            # not _production_stable_path guard in a condition.
-            # The early-submit guard is ~21 lines above the call
-            # (safety assertions between guard and call).
-            start = max(0, lineno - 31)  # 0-indexed slice start
-            preceding_block = "\n".join(lines[start:lineno])
-            self.assertIn(
-                "not _production_stable_path",
-                preceding_block,
-                f"restore() line ~{lineno}: call to _start_restore_preload "
-                f"is not guarded by 'not _production_stable_path'",
-            )
         self.assertTrue(
-            call_found,
-            "restore() must contain at least one call to _start_restore_preload "
-            "(non-production preload path)",
+            _resolve_runtime_flag("DIRECT_WARMUP_CLIP_ENCODE", "0"),
+            "Runtime baseline override must enable CLIP encode",
         )
+        # CPU cache hit: module default is 1
+        self.assertEqual(
+            comfyapp.DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT, True,
+            "Module default must require CPU cache hit",
+        )
+
+    def test_production_restore_invokes_start_restore_preload_with_production_params(self):
+        """The production restore path calls _start_restore_preload for CLIP
+        preload with production-specific parameters (read_strategy='normal',
+        abort_policy='wait_same_future')."""
+        restore_src = self._get_restore_source()
+        # Non-production calls must still be guarded by not _production_stable_path
+        non_prod_guarded_pattern = (
+            'and not _production_stable_path'
+        )
+        self.assertIn(non_prod_guarded_pattern, restore_src)
+        # Production-specific call must exist with production parameters
+        self.assertIn('read_strategy="normal"', restore_src)
+        self.assertIn('abort_policy="wait_same_future"', restore_src)
+        self.assertIn('restore_preload_submitted_production', restore_src)
 
 
 class StudioProfileProductionPropagationTests(unittest.TestCase):
