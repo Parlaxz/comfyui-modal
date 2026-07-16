@@ -80,6 +80,50 @@ export function nilOrEmptyTo(value, fallback) {
 // No progress-derived values (overall_percent, completed_nodes, etc.) are
 // ever used as timing stages.
 
+function _timingTraceStages(timings) {
+  if (!timings || typeof timings !== "object") return {};
+  var trace = timings.trace && typeof timings.trace === "object" ? timings.trace : {};
+  var wallClock = timings.wall_clock_trace && typeof timings.wall_clock_trace === "object"
+    ? timings.wall_clock_trace
+    : {};
+  return Object.assign(
+    {},
+    wallClock.stages_unix_s && typeof wallClock.stages_unix_s === "object"
+      ? wallClock.stages_unix_s
+      : {},
+    trace.stages && typeof trace.stages === "object" ? trace.stages : {},
+    timings
+  );
+}
+
+function _timingTraceDerived(timings) {
+  if (!timings || typeof timings !== "object") return {};
+  var trace = timings.trace && typeof timings.trace === "object" ? timings.trace : {};
+  var wallClock = timings.wall_clock_trace && typeof timings.wall_clock_trace === "object"
+    ? timings.wall_clock_trace
+    : {};
+  return Object.assign(
+    {},
+    wallClock.post_sampler_summary && typeof wallClock.post_sampler_summary === "object"
+      ? wallClock.post_sampler_summary
+      : {},
+    trace.deltas_ms && typeof trace.deltas_ms === "object" ? trace.deltas_ms : {},
+    trace.derived_ms && typeof trace.derived_ms === "object" ? trace.derived_ms : {},
+    timings.derived_ms && typeof timings.derived_ms === "object" ? timings.derived_ms : {}
+  );
+}
+
+function _deriveTraceEndToEndMs(timings) {
+  var stages = _timingTraceStages(timings);
+  var start = stages.browser_run_click;
+  if (start == null) start = stages.t0_client_press;
+  var end = stages.output_materialized;
+  if (end == null) end = stages.t10_local_materialized;
+  if (typeof start !== "number" || typeof end !== "number") return null;
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
+  return Math.round((end - start) * 1000 * 100) / 100;
+}
+
 /**
  * Normalize raw timings into readable stages.
  *
@@ -97,6 +141,7 @@ export function normalizeTimingStages(timings) {
   // Resolve the best available timing payload.
   // Order: flat canonical fields > deltas_ms > remote_timings.
   const d = timings.deltas_ms || timings;
+  var traceDerived = _timingTraceDerived(timings);
 
   // ── Helpers ─────────────────────────────────────────────────────────
   /**
@@ -122,6 +167,9 @@ export function normalizeTimingStages(timings) {
       if (v == null && timings.remote_timings && timings.remote_timings[f] != null) {
         v = timings.remote_timings[f];
       }
+      if (v == null && traceDerived[f] != null) {
+        v = traceDerived[f];
+      }
       if (v != null && typeof v === "number") return { value: v, source: f };
     }
     return null;
@@ -139,8 +187,15 @@ export function normalizeTimingStages(timings) {
   // Encoding, Sampling, VAE Decode, Image I/O) are shown individually
   // and the overlapping parent is suppressed.
 
-  // 1. End-to-End Total
+  // 1. End-to-End Total. Older records may only have the authoritative
+  // client/materialization markers in trace.stages.
   var e2e = firstValue("end_to_end_total_ms", "modal_to_browser");
+  if (!e2e) {
+    var traceE2e = _deriveTraceEndToEndMs(timings);
+    if (traceE2e != null) {
+      e2e = { value: traceE2e, source: "trace:browser_run_click->output_materialized" };
+    }
+  }
   if (e2e) addStage("End-to-End Total", e2e.value, e2e.source);
 
   // 2. Local Preparation (from studio_queue / local markers)
@@ -237,7 +292,14 @@ export function normalizeTimingStages(timings) {
     if (ioCombined > 0) addStage("Image / Output I/O", ioCombined, "image_io_ms + output_transfer_ms");
   } else {
     var legacyIo = firstValue("image_io");
-    if (legacyIo) addStage("Image / Output I/O", legacyIo.value, legacyIo.source);
+    if (legacyIo) {
+      addStage("Image / Output I/O", legacyIo.value, legacyIo.source);
+    } else {
+      var outputCollectionMs = traceDerived.output_collection_total_ms;
+      if (typeof outputCollectionMs === "number" && outputCollectionMs > 0) {
+        addStage("Image / Output I/O", outputCollectionMs, "trace.derived_ms.output_collection_total_ms");
+      }
+    }
   }
 
   // 12. Output Delivery (local materialization wall time)
@@ -309,6 +371,9 @@ export function normalizeAdvancedTimingDiagnostics(timings, stages) {
 
   var d = timings.deltas_ms || timings;
   var trace = timings.trace || {};
+  var traceStages = _timingTraceStages(timings);
+  var traceDerived = _timingTraceDerived(timings);
+  var traceE2eMs = _deriveTraceEndToEndMs(timings);
 
   // ── Trace version — read exact version, never fabricate ────────────
   var traceVersion = trace.trace_version
@@ -320,24 +385,40 @@ export function normalizeAdvancedTimingDiagnostics(timings, stages) {
   // Instead of an exact canonical field list, group related keys so a
   // single field can satisfy its semantic group.
   var semanticGroups = [
-    { group: "end-to-end", keys: ["end_to_end_total_ms"] },
-    { group: "queue", keys: ["studio_queue_ms", "queue_ms"] },
+    { group: "end-to-end", keys: ["end_to_end_total_ms", "modal_to_browser"] },
+    { group: "queue", keys: ["studio_queue_ms", "queue_ms", "t0_to_t1"] },
     { group: "validation", keys: ["workflow_validation_ms", "remote_validation_ms", "t3_to_t3b"] },
-    { group: "model load", keys: ["model_load_ms", "unet_load_ms", "vae_load_ms", "clip_load_ms"] },
-    { group: "encode", keys: ["clip_encode_ms"] },
-    { group: "sampling", keys: ["sampling_ms"] },
-    { group: "vae decode", keys: ["vae_decode_ms"] },
-    { group: "image io", keys: ["image_io_ms"] },
-    { group: "remote inference", keys: ["remote_inference_total_ms"] },
-    { group: "materialization", keys: ["local_output_materialization_ms"] },
-    { group: "scheduler", keys: ["scheduler_execution_ms"] },
+    { group: "model load", keys: ["model_load_ms", "unet_load_ms", "vae_load_ms", "clip_load_ms", "unet_load", "vae_load", "clip_load"] },
+    { group: "encode", keys: ["clip_encode_ms", "clip_encode"] },
+    { group: "sampling", keys: ["sampling_ms", "sampler"] },
+    { group: "vae decode", keys: ["vae_decode_ms", "vae_decode"] },
+    { group: "image io", keys: ["image_io_ms", "image_io", "output_collection_total_ms"] },
+    { group: "remote inference", keys: ["remote_inference_total_ms", "inference_total"] },
+    { group: "materialization", keys: ["local_output_materialization_ms", "history_finalization_ms"] },
+    { group: "scheduler", keys: ["scheduler_execution_ms", "generation_ms"] },
   ];
+  var runType = timings._run_type || "unknown";
+  if (
+    runType === "unknown"
+    && traceStages.browser_run_click != null
+    && (traceStages.output_materialized != null || traceStages.t10_local_materialized != null)
+    && d.studio_queue_ms == null
+    && d.queue_ms == null
+    && d.scheduler_execution_ms == null
+  ) {
+    // Backfill the run type for direct records written before _run_type existed.
+    runType = "direct";
+  }
+  var applicableGroups = semanticGroups.filter(function (sg) {
+    return !(runType === "direct" && (sg.group === "queue" || sg.group === "scheduler"));
+  });
   var satisfiedGroups = [];
   var missingGroups = [];
-  semanticGroups.forEach(function (sg) {
+  applicableGroups.forEach(function (sg) {
     var found = sg.keys.some(function (k) {
-      return d[k] != null || timings[k] != null;
+      return d[k] != null || timings[k] != null || traceDerived[k] != null;
     });
+    if (sg.group === "end-to-end" && traceE2eMs != null) found = true;
     if (found) {
       satisfiedGroups.push(sg.group);
     } else {
@@ -346,14 +427,15 @@ export function normalizeAdvancedTimingDiagnostics(timings, stages) {
   });
 
   // ── Timing quality based on semantic groups ────────────────────────
-  var totalGroupCount = semanticGroups.length;
+  var totalGroupCount = applicableGroups.length;
   var presentGroupCount = satisfiedGroups.length;
   var timingQuality, timingReason;
+  var hasEndToEnd = satisfiedGroups.indexOf("end-to-end") !== -1;
 
   if (!stages || stages.length === 0) {
     timingQuality = "missing";
     timingReason = "No timing data available";
-  } else if (presentGroupCount >= totalGroupCount - 1) {
+  } else if (hasEndToEnd && presentGroupCount >= totalGroupCount - 1) {
     timingQuality = "complete";
     timingReason = "All stages present";
   } else if (presentGroupCount >= 4) {
@@ -361,7 +443,7 @@ export function normalizeAdvancedTimingDiagnostics(timings, stages) {
     timingReason = "Partial data. Missing groups: " + (missingGroups.length > 0 ? missingGroups.join(", ") : "some fields");
   } else if (presentGroupCount >= 1) {
     timingQuality = "minimal";
-    timingReason = "Minimal timing data. Only " + presentGroupCount + " of " + totalGroupCount + " semantic groups present";
+    timingReason = "Minimal timing data. Only " + presentGroupCount + " of " + totalGroupCount + " applicable semantic groups present";
   } else {
     timingQuality = "missing";
     timingReason = "No canonical timing fields present";
@@ -676,6 +758,12 @@ export function normalizeStudioRun(rawRun, apiBase) {
 
   // ── Timing normalization ────────────────────────────────────────────
   const timingStages = normalizeTimingStages(timings);
+  const normalizedEndToEnd = timingStages.find(function (stage) {
+    return stage.label === "End-to-End Total";
+  });
+  if (!durationMs && normalizedEndToEnd) {
+    durationMs = normalizedEndToEnd.durationMs;
+  }
   const perNodeTimings = normalizePerNodeTimings(timings);
   const advancedTimingDiagnostics = normalizeAdvancedTimingDiagnostics(timings, timingStages);
 

@@ -1176,7 +1176,14 @@ class ExperimentRunnerCellCompletedTimingRED(unittest.TestCase):
                     "status": "completed",
                     "output_paths": self.output_paths,
                     "timing_payload": self.timing_payload,
-                    "result": {"outputs": {"9": {"images": []}}},
+                    "result": {
+                        "outputs": {"9": {"images": []}},
+                        "_certificate_candidate": {
+                            "identity": "a" * 64,
+                            "outputs_to_execute": ["9"],
+                            "node_errors": {},
+                        },
+                    },
                 }
 
             async def close_worker(self, worker_invocation_id):
@@ -1290,6 +1297,13 @@ class ExperimentRunnerCellCompletedTimingRED(unittest.TestCase):
             self.assertIn("wall_clock_trace", tp)
             self.assertIn("_restore_timing", tp)
             self.assertEqual(tp["_restore_timing"].get("restore_total_ms"), 5200.0)
+
+            # The Studio finalizer receives the compact certificate candidate,
+            # not the remote output payload.
+            self.assertEqual(
+                payload["_certificate_candidate"]["identity"],
+                "a" * 64,
+            )
 
 
 # ---------------------------------------------------------------------------

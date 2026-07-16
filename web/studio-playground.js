@@ -1755,6 +1755,90 @@ function validateControls(controls, preset) {
   return null;
 }
 
+/**
+ * Handle a direct-run completed result — no polling or journal needed.
+ * Returns true when the result was a direct_run and was handled,
+ * false when the caller should fall through to the scheduler/polling path.
+ */
+function _handleDirectRunResult(result, state, context, actions, controls) {
+  if (!result || !result.direct_run) return false;
+  if (result.status !== "ok") return false;
+
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  const outputPaths = result.output_paths || [];
+  var primaryOutput = null;
+  if (outputPaths.length > 0) {
+    primaryOutput = apiBase + "/studio/outputs/" + encodeURIComponent(outputPaths[0]);
+  }
+
+  // Build the normalized run before the terminal state update.  setRunState
+  // re-renders synchronously, so assigning the run afterward can leave the
+  // completed direct result's timing card out of the first render.
+  const meta = result.meta || {};
+  const timings = result.timings || {};
+  var rawRun = {
+    id: result.runId || result.runHistoryId || meta.experiment_id || "",
+    experiment_id: result.experimentId || meta.experiment_id || "",
+    status: "completed",
+    output_path: result.output_path || (outputPaths.length > 0 ? outputPaths[0] : ""),
+    started_at: null,
+    completed_at: result.completed_at || null,
+    duration_ms: null,
+    workflow_hash: meta.workflow_hash || "",
+    extra: {
+      experiment_id: result.experimentId || meta.experiment_id || "",
+      studio_preset_id: meta.studio_preset_id || "",
+      studio_preset_label: meta.preset_label || "",
+      studio_snapshot_id: meta.studio_snapshot_id || "",
+      studio_feature_id: meta.studio_feature_id || "",
+      prompt: (controls && controls.prompt) || "",
+      negative_prompt: (controls && controls.negative_prompt) || "",
+      resolved_controls: meta.resolved_controls || {},
+      requested_controls: meta.requested_controls || {},
+      output_paths: outputPaths,
+      timings: timings,
+      output_count: meta.output_count || 0,
+      production_plan_used: meta.production_plan_used || "no",
+    },
+    timings: timings,
+    timing_summary: timings,
+  };
+
+  var normalized = normalizeStudioRun(rawRun, apiBase);
+  if (normalized) {
+    if (state.playground) {
+      state.playground.lastRunOutput = normalized.imageUrl || primaryOutput;
+      state.playground._selectedRun = normalized;
+    }
+    // Persist via saveRunResult so the result survives reload.
+    var _presetId = meta.studio_preset_id || "";
+    var _featureId = meta.studio_feature_id || "";
+    if (_presetId && _featureId) {
+      saveRunResult(_presetId, _featureId, normalized);
+    }
+  }
+
+  // Dispose scoped tracker — no polling needed for direct run
+  _disposeScopedTracker(state);
+
+  if (actions && actions.setRunState) {
+    actions.setRunState({
+      status: "completed",
+      runId: result.runId || result.runHistoryId || result.experimentId || "",
+      experimentId: result.experimentId || result.runId || "",
+      runHistoryId: result.runHistoryId || result.runId || "",
+      primaryOutput: primaryOutput,
+      hasHistory: true,
+      completedCells: 1,
+      totalCells: 1,
+      _directTiming: result.timings || null,
+      _directMeta: result.meta || null,
+    });
+  }
+
+  return true;
+}
+
 async function doRunSubmit(state, context, actions) {
   const apiBase = (context && context.apiBase) || "/comfymodal";
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
@@ -1810,6 +1894,12 @@ async function doRunSubmit(state, context, actions) {
   });
 
   if (result && result.status === "ok") {
+    // ── Direct run: result is already completed, no polling ──────────
+    if (_handleDirectRunResult(result, state, context, actions, controls)) {
+      return;
+    }
+
+    // ── Scheduler path: result is a submission, start polling ───────
     // Dispose any previous scoped tracker before creating new one
     _disposeScopedTracker(state);
 
@@ -2147,6 +2237,12 @@ function renderRunButton(state, context, actions) {
         });
 
         if (result && result.status === "ok") {
+          // ── Direct run: result is already completed, no polling ──
+          if (_handleDirectRunResult(result, state, context, actions, controls)) {
+            return;
+          }
+
+          // ── Scheduler path: submission, start polling ────────────
           // Dispose any previous scoped tracker before creating new one
           _disposeScopedTracker(state);
 
@@ -4161,9 +4257,10 @@ function renderMetadataSection(state, context) {
   if (nr.error) advancedItems.push({ label: "Error", value: nr.error });
 
   advancedItems.forEach(function (item) {
+    const itemValue = item.value == null ? "" : String(item.value);
     advancedPanel.appendChild(el("div", { style: "margin:2px 0;" }, [
       el("strong", { text: item.label + ": ", style: "color:#888;" }),
-      el("span", { text: (item.value || "").substring(0, 200) + ((item.value || "").length > 200 ? "\u2026" : "") }),
+      el("span", { text: itemValue.substring(0, 200) + (itemValue.length > 200 ? "\u2026" : "") }),
     ]));
   });
 
