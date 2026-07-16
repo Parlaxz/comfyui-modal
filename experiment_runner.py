@@ -1298,21 +1298,36 @@ class LocalRemoteInvoker:
             # Both legacy (warmup_profile_write_*) and canonical
             # (active_profile_write_*) markers are set so the trace dict
             # contains exact aliases that the direct path reads.
+            # The preparer now returns a result dict with dedup/timing fields.
+            # Prompt-only changes (same model stack, different prompt text)
+            # return "unchanged" without calling the remote setter.
             _preparer = getattr(self, "_profile_preparer", None)
             _active_start = time.time()
             local_trace.mark("warmup_profile_write_started")
             local_trace.mark("active_profile_write_start")
             _mutable_trace["warmup_profile_write_started"] = _active_start
             _mutable_trace["active_profile_write_start"] = _active_start
+            _preparer_result = None
             try:
                 if _preparer is not None:
-                    await _preparer(_resolved_wf, cell)
+                    _preparer_result = await _preparer(_resolved_wf, cell)
             finally:
                 _active_end = time.time()
                 local_trace.mark("warmup_profile_write_completed")
                 local_trace.mark("active_profile_write_end")
                 _mutable_trace["warmup_profile_write_completed"] = _active_end
                 _mutable_trace["active_profile_write_end"] = _active_end
+
+            # Capture preparer metrics into mutable trace
+            if isinstance(_preparer_result, dict):
+                for _pk in ("active_profile_build_ms", "active_profile_dedup_status",
+                            "active_profile_remote_call", "active_profile_remote_ms"):
+                    if _pk in _preparer_result:
+                        _mutable_trace[_pk] = _preparer_result[_pk]
+                _ds = (_preparer_result.get("active_profile_dedup_status")
+                       or _preparer_result.get("status", ""))
+                if _ds:
+                    _mutable_trace["active_profile_dedup_status"] = _ds
 
             local_trace.mark("t6_local_stream_opened")
             _mutable_trace["t6_local_stream_opened"] = local_trace.get("t6_local_stream_opened")
@@ -1423,6 +1438,15 @@ class LocalRemoteInvoker:
             _mutable_trace["remote_submit"] = _remote_submit
             _mutable_trace["t2_local_modal_submit_start"] = _remote_submit
             _mutable_trace.setdefault("t2_local_dispatch", _remote_submit)
+
+            # active_profile_to_gpu_submit_ms: wall time from profile-helper
+            # start to remote-submit.  Exposes the full blocking helper delay
+            # on first/model-stack writes and is near-zero on prompt-only
+            # unchanged runs.
+            _write_start = _mutable_trace.get("active_profile_write_start")
+            if _write_start is not None:
+                _to_gpu_ms = round((_remote_submit - _write_start) * 1000, 2)
+                _mutable_trace["active_profile_to_gpu_submit_ms"] = _to_gpu_ms
 
             _first_event = True
             _sink_seq = 0
@@ -1542,6 +1566,31 @@ class LocalRemoteInvoker:
                     # of patching t9 after snapshot).
                     _final_stages = dict(local_trace.fields())
                     local_summary["stages"].update(_final_stages)
+
+                    # ── Copy preparer diagnostic metadata into local_summary ──
+                    # String-valued fields (active_profile_dedup_status) are not
+                    # stored in stages (which only holds floats); add them as
+                    # top-level keys on the trace dict so downstream consumers
+                    # (direct_studio_run_completion, _schedule_and_start) can
+                    # extract them from the merged timing_payload trace.
+                    # All numeric preparer fields are promoted to derived_ms
+                    # for consistent consumption across scheduler and direct paths.
+                    if isinstance(_preparer_result, dict):
+                        _ds = (_preparer_result.get("active_profile_dedup_status")
+                               or _preparer_result.get("status", ""))
+                        if _ds:
+                            local_summary["active_profile_dedup_status"] = _ds
+                        for _nk in ("active_profile_build_ms", "active_profile_remote_call",
+                                    "active_profile_remote_ms"):
+                            _nv = _preparer_result.get(_nk)
+                            if _nv is not None:
+                                local_summary.setdefault("derived_ms", {})[_nk] = _nv
+                    # active_profile_to_gpu_submit_ms is a numeric delta (ms) that
+                    # was already set on _mutable_trace → local_trace → _final_stages.
+                    # Also promote it to derived_ms for consistent consumption.
+                    _to_gpu = local_summary.get("stages", {}).get("active_profile_to_gpu_submit_ms")
+                    if _to_gpu is not None:
+                        local_summary.setdefault("derived_ms", {})["active_profile_to_gpu_submit_ms"] = _to_gpu
 
                     # Extract compact timing payload from data, then embed
                     # the merged trace as the canonical trace record.

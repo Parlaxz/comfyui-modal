@@ -2258,6 +2258,10 @@ async def _execute_job(item: tuple, item_id: int):
         _active_next_remote_call = _wn_result.get("remote_call", 0)
         _active_next_profile_key = _wn_result.get("profile_key", "")
         _active_next_elapsed = round((time.time() - _active_next_write_start) * 1000, 1)
+        # Capture new honest result fields
+        _active_next_build_ms = _wn_result.get("active_profile_build_ms", 0.0)
+        _active_next_dedup_status = _wn_result.get("active_profile_dedup_status", _active_next_status)
+        _active_next_remote_ms = _wn_result.get("active_profile_remote_ms", 0.0)
         _prod_enabled_log = bool(_production_options_for_activation.get("enabled"))
         _prod_source_log = _production_options_for_activation.get("source_workflow_hash", "")[:8] or "?"
         _prod_compiled_log = _production_options_for_activation.get("compiled_workflow_hash", "")[:8] or "?"
@@ -2269,6 +2273,8 @@ async def _execute_job(item: tuple, item_id: int):
             f"remote_call={_active_next_remote_call} "
             f"status={_active_next_status} changed={_active_next_changed} "
             f"bytes={_active_next_payload_bytes} ms={_active_next_elapsed}"
+            f" build_ms={_active_next_build_ms} dedup={_active_next_dedup_status}"
+            f" remote_ms={_active_next_remote_ms}"
         )
         if _prod_enabled_log:
             print(
@@ -2278,6 +2284,7 @@ async def _execute_job(item: tuple, item_id: int):
             )
 
         remote_started = time.time()
+
         # ── v2.16.20: Wait for prompt acknowledgment before forwarding events ──
         if ack_ready is not None:
             await ack_ready.wait()
@@ -2314,6 +2321,15 @@ async def _execute_job(item: tuple, item_id: int):
         _st = extra_data.get("scheduler_test")
         if isinstance(_st, dict):
             _mo["comfymodal_scheduler_test"] = _st
+
+        # active_profile_to_gpu_submit_ms: wall time from profile-helper
+        # write start to the actual GPU stream call (after ack/runtime pre-submit work).
+        _active_next_to_gpu_ms = round((time.time() - _active_next_write_start) * 1000, 1)
+        print(
+            f"[comfyui-modal.profile] stage=active_profile_to_gpu prompt_id={prompt_id[:8]} "
+            f"to_gpu_ms={_active_next_to_gpu_ms}"
+        )
+
         async for _msg in run_prompt_stream(
             execution_workflow,
             input_images,
@@ -2526,6 +2542,16 @@ async def _execute_job(item: tuple, item_id: int):
         # overwriting truthfully local materialization values).
         _remote_full = result.get("trace", {})
         merge_remote_trace_into(_merged_trace, _remote_full)
+
+        # Stash active-next preparer metrics into the merged trace.
+        # Numeric fields go into derived_ms; string dedup status at top level.
+        _MERGED_DERIVED = _merged_trace.setdefault("derived_ms", {})
+        _MERGED_DERIVED["active_profile_build_ms"] = _active_next_build_ms
+        _MERGED_DERIVED["active_profile_remote_ms"] = _active_next_remote_ms
+        _MERGED_DERIVED["active_profile_to_gpu_submit_ms"] = _active_next_to_gpu_ms
+        _MERGED_DERIVED["active_profile_remote_call"] = _active_next_remote_call
+        _merged_trace["active_profile_dedup_status"] = _active_next_dedup_status
+
         result["trace"] = _merged_trace
         if os.environ.get("COMFYMODAL_TRACE_DEBUG_LOG"):
             _dbg_path = os.path.join(_NODE_DIR, "_trace_debug.log")
