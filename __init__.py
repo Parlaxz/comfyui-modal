@@ -92,6 +92,10 @@ from production_workflow import (
     COMPILER_SCHEMA_VERSION as PRODUCTION_COMPILER_VERSION,
     PRODUCTION_PLAN_SCHEMA_VERSION,
 )
+from run_prompt_options import (
+    build_run_prompt_options,
+    ensure_run_prompt_options,
+)
 import experiment_setup_adapter as _experiment_setup_adapter
 from warmup_profile import prepare_active_next_profile as prepare_active_next_profile
 from comparison import (
@@ -1291,6 +1295,55 @@ def _record_manual_deploy_state(workspace_id: str | None = None, deployment_comm
     return payload
 
 
+def _auto_migrate_generated_artifacts() -> bool:
+    """Auto-migrate all detected generated artifact directories before deploy.
+
+    Uses ``deployment_guard._scan_generated_dirs`` to discover categories and
+    ``tools/migrate_local_artifacts.migrate_category`` to perform copy-verify-remove
+    on each.  Returns ``True`` when nothing to migrate or all categories succeeded.
+    Returns ``False`` when any category fails (SystemExit on verification mismatch
+    or unexpected exception).  Never raises — all exceptions (import errors,
+    root-scan failures, etc.) are converted to ``False`` so the caller
+    (background deploy thread) is never crashed.
+    """
+    try:
+        from deployment_guard import _scan_generated_dirs
+        from local_artifacts import get_plugin_root, get_local_data_root
+        from tools.migrate_local_artifacts import migrate_category, MigrationStats
+
+        plugin_root = get_plugin_root()
+        data_root = get_local_data_root()
+
+        generated = _scan_generated_dirs(plugin_root)
+        if not generated:
+            return True  # nothing to do
+
+        categories = sorted(generated.keys())
+        print(f"[comfyui-modal] Auto-migrating {len(categories)} generated artifact "
+              f"categor{'y' if len(categories) == 1 else 'ies'}: {', '.join(categories)}")
+
+        stats = MigrationStats()
+        for cat in categories:
+            try:
+                migrate_category(cat, plugin_root, data_root, dry_run=False, stats=stats)
+            except SystemExit:
+                print(f"[comfyui-modal] Auto-migration verification failed for '{cat}' — "
+                      f"migration may be partial (earlier categories may have migrated); "
+                      f"safe to rerun; manual verification recommended "
+                      f"(run 'python tools/migrate_local_artifacts.py')")
+                return False
+            except Exception as exc:
+                print(f"[comfyui-modal] Auto-migration failed for '{cat}': {exc}")
+                return False
+
+        print(f"[comfyui-modal] Auto-migration complete: {stats.total_files} files, "
+              f"{stats.total_bytes} bytes migrated")
+        return True
+    except BaseException as exc:
+        print(f"[comfyui-modal] Auto-migration setup or scan failed: {exc}")
+        return False
+
+
 def _run_deploy_background(workspace: dict, custom_nodes_fingerprint: str | None = None):
     global _deploy_status
 
@@ -1299,15 +1352,25 @@ def _run_deploy_background(workspace: dict, custom_nodes_fingerprint: str | None
         from deployment_guard import guard_generated_artifacts
         guard_generated_artifacts()
     except SystemExit:
-        _deploy_status = {
-            "state": "error",
-            "message": (
-                "Deploy blocked: generated artifact directories still contain files. "
-                "Run 'python tools/migrate_local_artifacts.py' first."
-            ),
-        }
-        print(f"[comfyui-modal] {_deploy_status['message']}")
-        return
+        print("[comfyui-modal] Generated artifacts detected, attempting auto-migration...")
+        try:
+            auto_ok = _auto_migrate_generated_artifacts()
+        except BaseException as exc:
+            print(f"[comfyui-modal] Auto-migration crashed unexpectedly: {exc}")
+            auto_ok = False
+        if auto_ok:
+            print("[comfyui-modal] Auto-migration succeeded, continuing with deploy...")
+        else:
+            _deploy_status = {
+                "state": "error",
+                "message": (
+                    "Automatic migration of generated artifacts failed. "
+                    "Run 'python tools/migrate_local_artifacts.py' manually, "
+                    "then retry deployment."
+                ),
+            }
+            print(f"[comfyui-modal] {_deploy_status['message']}")
+            return
     except Exception as exc:
         print(f"[comfyui-modal] deployment guard check failed (non-fatal): {exc}")
 
@@ -2329,6 +2392,22 @@ async def _execute_job(item: tuple, item_id: int):
             f"[comfyui-modal.profile] stage=active_profile_to_gpu prompt_id={prompt_id[:8]} "
             f"to_gpu_ms={_active_next_to_gpu_ms}"
         )
+
+        # ── Build run_prompt_options from production report ─────────────
+        # Derive production_output_node_ids from the existing report or
+        # from modal_options so the shared builder produces correct
+        # production/actual_load defaults.
+        _rep = extra_data.get("production_report")
+        _prod_output_ids = []
+        if _rep and isinstance(_rep, dict) and _rep.get("enabled"):
+            _prod_output_ids = _rep.get("output_node_ids", [])
+        elif isinstance(_mo.get("production"), dict) and _mo["production"].get("enabled"):
+            _prod_output_ids = _mo["production"].get("output_node_ids", [])
+        _builder_options = build_run_prompt_options(
+            production_output_node_ids=_prod_output_ids,
+            enable_actual_load=True,
+        )
+        _mo = ensure_run_prompt_options(_mo, _builder_options)
 
         async for _msg in run_prompt_stream(
             execution_workflow,

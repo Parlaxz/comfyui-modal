@@ -29,6 +29,10 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
 from timing_trace import TRACE_VERSION, Trace, coerce_t0_from_browser, extract_remote_timing_payload, merge_remote_trace_into
+from run_prompt_options import (
+    build_run_prompt_options,
+    ensure_run_prompt_options,
+)
 from worker_control import (
     ControlBackend,
     ModalDictControlBackend,
@@ -1403,6 +1407,20 @@ class LocalRemoteInvoker:
                     "direct_output_sink": _effective_prod_report.get("direct_output_sink_enabled", True),
                     "metadata_mode": "none",
                 })
+
+            # ── Merge actual_load defaults via shared builder ──────────
+            # Derive production output IDs from the merged _mo, then build
+            # and merge canonical production/actual_load defaults.  The
+            # builder ensures actual_load.enabled=True and
+            # mode="unet_vae_only" for default/normal runs.
+            _prod_ids_for_builder = []
+            if _mo.get("production") and _mo["production"].get("enabled"):
+                _prod_ids_for_builder = _mo["production"].get("output_node_ids", [])
+            _builder_opts = build_run_prompt_options(
+                production_output_node_ids=_prod_ids_for_builder,
+                enable_actual_load=True,
+            )
+            _mo = ensure_run_prompt_options(_mo, _builder_opts)
 
             # The workflow passed in stream_kwargs MUST be the compiled
             # workflow from the checkpoint/plan when production is enabled.

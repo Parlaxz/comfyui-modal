@@ -11157,24 +11157,41 @@ class _ComfyAPIMixin:
             object.__setattr__(self, '_original_loaders_store', {})
         return self._original_loaders_store
 
-    def _prompt_async_actual_load(self, workflow: dict) -> dict:
+    def _prompt_async_actual_load(self, workflow: dict, modal_options: dict | None = None) -> dict:
         _al_t0 = time.time()
         # Per-invocation sequence identifier for the narrow UNET->VAE coordinator
         _request_seq = uuid.uuid4().hex[:12]
+
+        # ── Resolve request-level actual_load settings ────────────────
+        # Priority: request modal_options > module-level env defaults.
+        _req_al = (modal_options or {}).get("actual_load", {})
+        if isinstance(_req_al, dict):
+            _eff_enabled = _req_al.get("enabled", PROMPT_ASYNC_ACTUAL_LOAD)
+            _eff_mode = _req_al.get("mode", ACTUAL_LOAD_MODE)
+        else:
+            _eff_enabled = PROMPT_ASYNC_ACTUAL_LOAD
+            _eff_mode = ACTUAL_LOAD_MODE
+        # Coerce types
+        _eff_enabled = bool(_eff_enabled)
+        _eff_mode = str(_eff_mode).strip().lower()
+        if _eff_mode not in ("off", "clip_vae_only", "unet_only", "unet_vae_only"):
+            _eff_mode = ACTUAL_LOAD_MODE  # fall back to env default if unknown
+
         result = {
             "enabled": False, "submitted": [], "skipped_unet": False, "futures": {},
             "clip_submitted": False, "clip_cache_hit": False, "clip_duration_ms": 0.0,
-            "actual_load_mode": ACTUAL_LOAD_MODE,
-            "actual_load_mode_effective": ACTUAL_LOAD_MODE,
+            "actual_load_mode": _eff_mode,
+            "actual_load_mode_effective": _eff_mode,
             "actual_load_submit_order": [],
             "actual_load_clip_skipped_reason": "",
             "actual_load_vae_skipped_reason": "",
+            "actual_load_summary": {"enabled": False, "mode": _eff_mode},
         }
-        if not PROMPT_ASYNC_ACTUAL_LOAD:
-            print("[actual_load] enabled=0")
+        if not _eff_enabled:
+            print(f"[actual_load] enabled=0 (request={_req_al!r})")
             return result
-        print("[actual_load] enabled=1")
-        if ACTUAL_LOAD_MODE == "off":
+        print(f"[actual_load] enabled=1 mode={_eff_mode}")
+        if _eff_mode == "off":
             result["enabled"] = False
             result["actual_load_clip_skipped_reason"] = "mode_off"
             result["actual_load_vae_skipped_reason"] = "mode_off"
@@ -11211,17 +11228,17 @@ class _ComfyAPIMixin:
             and int(_rt_restore.get("direct_warmup_load_clip_effective", 0) or 0) == 1
             and int(_rt_restore.get("direct_warmup_clip_encode_effective", 0) or 0) == 1
         )
-        _mode_clip = ACTUAL_LOAD_MODE == "clip_vae_only" and not _restore_direct_clip_effective
-        _mode_vae = ACTUAL_LOAD_MODE in ("clip_vae_only", "unet_vae_only")
-        _mode_unet = ACTUAL_LOAD_MODE in ("unet_only", "unet_vae_only")
+        _mode_clip = _eff_mode == "clip_vae_only" and not _restore_direct_clip_effective
+        _mode_vae = _eff_mode in ("clip_vae_only", "unet_vae_only")
+        _mode_unet = _eff_mode in ("unet_only", "unet_vae_only")
         if _restore_direct_clip_effective:
             result["actual_load_clip_skipped_reason"] = "restore_direct_clip_effective"
         elif not _mode_clip:
-            result["actual_load_clip_skipped_reason"] = f"mode_{ACTUAL_LOAD_MODE}"
+            result["actual_load_clip_skipped_reason"] = f"mode_{_eff_mode}"
         if not _mode_vae:
-            result["actual_load_vae_skipped_reason"] = "mode_unet_only" if ACTUAL_LOAD_MODE == "unet_only" else f"mode_{ACTUAL_LOAD_MODE}"
+            result["actual_load_vae_skipped_reason"] = "mode_unet_only" if _eff_mode == "unet_only" else f"mode_{_eff_mode}"
         print(
-            f"[actual_load] actual_load_mode_effective={ACTUAL_LOAD_MODE} "
+            f"[actual_load] actual_load_mode_effective={_eff_mode} "
             f"will_start_clip={1 if _mode_clip else 0} will_start_vae={1 if _mode_vae else 0} "
             f"will_start_unet={1 if _mode_unet else 0} "
             f"actual_load_clip_skipped_reason={result.get('actual_load_clip_skipped_reason','')} "
@@ -11350,8 +11367,8 @@ class _ComfyAPIMixin:
                         result["submitted"].append(f"DualCLIP key={key}")
                         result["actual_load_submit_order"].append("DualCLIP")
                         print(f"[actual_load] submit_raw_key=({clip_path}, {clip_type}) submit_canonical_key={key}")
-        elif ACTUAL_LOAD_MODE in ("unet_vae_only", "unet_only"):
-            print(f"[actual_load] mode_violation_check mode={ACTUAL_LOAD_MODE} started_clip=0 correct=1")
+        elif _eff_mode in ("unet_vae_only", "unet_only"):
+            print(f"[actual_load] mode_violation_check mode={_eff_mode} started_clip=0 correct=1")
 
         # GÃ¶Ã‡GÃ¶Ã‡ UNET (submitted before VAE for better head start) GÃ¶Ã‡GÃ¶Ã‡
         if _mode_unet:
@@ -11369,7 +11386,7 @@ class _ComfyAPIMixin:
                 resolved_keys.append(key)
                 lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
                 with lock:
-                    if not PROMPT_ASYNC_ACTUAL_LOAD_UNET:
+                    if not PROMPT_ASYNC_ACTUAL_LOAD_UNET and _eff_mode not in ("unet_only", "unet_vae_only"):
                         result["skipped_unet"] = True
                         print(f"[actual_load] skipped_unet flag_disabled=1 key={key}")
                         continue
@@ -11472,7 +11489,7 @@ class _ComfyAPIMixin:
                     print(f"[actual_load] submitted loader=UNET key={key}")
         else:
             result["skipped_unet"] = True
-            print(f"[actual_load] skipped_unet mode={ACTUAL_LOAD_MODE}")
+            print(f"[actual_load] skipped_unet mode={_eff_mode}")
 
         # GÃ¶Ã‡GÃ¶Ã‡ VAE (submitted after UNET, deprioritized) GÃ¶Ã‡GÃ¶Ã‡
         if _mode_vae:
@@ -11748,6 +11765,10 @@ class _ComfyAPIMixin:
                     print(f"[actual_load] submitted loader=VAE key={key}")
 
         result["enabled"] = True
+        # Trace-visible actual_load summary (present even when disabled)
+        result.setdefault("actual_load_summary", {})
+        result["actual_load_summary"]["enabled"] = bool(result.get("enabled", False))
+        result["actual_load_summary"]["mode"] = _eff_mode
         # P1: surface VAE gate metrics so cold-collapse analysis is visible
         if _OPTIMIZATIONS_AVAILABLE:
             try:
@@ -20131,12 +20152,22 @@ class _ComfyAPIMixin:
             trace_summary["restore_count"] = _container_restore_count
             trace_summary["request_sequence_id"] = _container_request_count
             print(f"[container_id] session={CONTAINER_SESSION_ID} import_unix={CONTAINER_IMPORT_UNIX_S} restore_count={_container_restore_count} request_seq={_container_request_count} restore_session={trace_summary['restore_session_id']}")
+            # Build a lightweight actual_load_summary from modal_options for
+            # the run_prompt in-process path (where _prompt_async_actual_load is
+            # not called directly).  Overlay onto both result surfaces.
+            _req_al_ip = (modal_options or {}).get("actual_load", {})
+            _ip_enabled = bool(_req_al_ip.get("enabled", PROMPT_ASYNC_ACTUAL_LOAD)) if isinstance(_req_al_ip, dict) else bool(PROMPT_ASYNC_ACTUAL_LOAD)
+            _ip_mode = str(_req_al_ip.get("mode", ACTUAL_LOAD_MODE)).strip().lower() if isinstance(_req_al_ip, dict) else ACTUAL_LOAD_MODE
+            if _ip_mode not in ("off", "clip_vae_only", "unet_only", "unet_vae_only"):
+                _ip_mode = ACTUAL_LOAD_MODE
+            _ip_summary = {"enabled": _ip_enabled, "mode": _ip_mode}
+            trace_summary.setdefault("actual_load_summary", {}).update({"enabled": _ip_enabled, "mode": _ip_mode})
             result["trace"] = trace_summary
             _log_cold_start_waterfall(trace_summary, label="run_prompt")
             if isinstance(_scheduler_trace_ns, dict):
                 result["scheduler_trace"] = dict(_scheduler_trace_ns)
 
-            # GÃ¶Ã‡GÃ¶Ã‡ Wall-clock trace v3 GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
+            # ── Wall-clock trace v3 ─────────────────────────────────────────────────────────────
             self._finalize_actual_load_records()
             _rt_wct = getattr(self, "_last_restore_timing", None) or {}
             _wct_stages = server_trace._t
@@ -20184,6 +20215,9 @@ class _ComfyAPIMixin:
                 restore_count=_container_restore_count,
             )
             result["wall_clock_trace"] = _wall_clock_trace
+            # Overlay actual_load_summary on wall_clock_trace (_ip_summary is
+            # defined above alongside trace_summary enrichment).
+            result["wall_clock_trace"].setdefault("actual_load_summary", {}).update({"enabled": _ip_enabled, "mode": _ip_mode})
             result["_wall_clock_summary"] = make_wall_clock_summary(_wall_clock_trace)
             print(make_summary_log_line(_wall_clock_trace))
 
@@ -20790,6 +20824,16 @@ class _ComfyAPIMixin:
         if _t3_entry_sp is not None and _prompt_start_ts_sp is not None:
             trace_summary["derived_ms"]["modal_entry_to_prompt_start_ms"] = round((_prompt_start_ts_sp - _t3_entry_sp) * 1000, 1)
         trace_summary["derived_ms"]["total_input_execution_ms"] = total_ms
+        # Subprocess path: build lightweight actual_load_summary from modal_options
+        # (actual_load futures are not submitted in the subprocess backend, but
+        # request-level enabled/mode must be visible on both result surfaces).
+        _req_al_sp = (modal_options or {}).get("actual_load", {})
+        _sp_enabled = bool(_req_al_sp.get("enabled", PROMPT_ASYNC_ACTUAL_LOAD)) if isinstance(_req_al_sp, dict) else bool(PROMPT_ASYNC_ACTUAL_LOAD)
+        _sp_mode = str(_req_al_sp.get("mode", ACTUAL_LOAD_MODE)).strip().lower() if isinstance(_req_al_sp, dict) else ACTUAL_LOAD_MODE
+        if _sp_mode not in ("off", "clip_vae_only", "unet_only", "unet_vae_only"):
+            _sp_mode = ACTUAL_LOAD_MODE
+        _sp_summary = {"enabled": _sp_enabled, "mode": _sp_mode}
+        trace_summary.setdefault("actual_load_summary", {}).update({"enabled": _sp_enabled, "mode": _sp_mode})
         result["trace"] = trace_summary
         _log_cold_start_waterfall(trace_summary, label="run_prompt_stream")
 
@@ -20832,6 +20876,9 @@ class _ComfyAPIMixin:
             restore_count=_container_restore_count,
         )
         result["wall_clock_trace"] = _wall_clock_trace_sub
+        # Overlay actual_load_summary on wall_clock_trace (_sp_summary is
+        # defined above alongside the trace_summary enrichment).
+        result["wall_clock_trace"].setdefault("actual_load_summary", {}).update({"enabled": _sp_enabled, "mode": _sp_mode})
         result["_wall_clock_summary"] = make_wall_clock_summary(_wall_clock_trace_sub)
         print(make_summary_log_line(_wall_clock_trace_sub))
 
@@ -21081,7 +21128,7 @@ class _ComfyAPIMixin:
 
                 self._preflight_already_ran = True
                 _preload_info = {"enabled": False, "workers": 0, "deduped_paths": [], "cache_hit": [], "submitted": [], "duplicate_skipped": 0}
-                _actual_load_info = {"enabled": False, "submitted": [], "skipped_unet": True, "futures": {}}
+                _actual_load_info = {"enabled": False, "submitted": [], "skipped_unet": True, "futures": {}, "actual_load_summary": {"enabled": False, "mode": "clip_vae_only"}}
             else:
                 # GÃ¶Ã‡GÃ¶Ã‡ Shared custom-node sync and dependency policy GÃ¶Ã‡GÃ¶Ã‡
                 # Runs before prompt preload, actual_load, and execution.
@@ -21105,7 +21152,7 @@ class _ComfyAPIMixin:
                     _preload_info = self._prompt_async_preload(workflow)
 
                 # GÃ¶Ã‡GÃ¶Ã‡ Prompt-time actual loader futures (after dependency policy) GÃ¶Ã‡GÃ¶Ã‡
-                _actual_load_info: dict = self._prompt_async_actual_load(workflow)
+                _actual_load_info: dict = self._prompt_async_actual_load(workflow, modal_options=modal_options)
                 _scheduler_trace = None
                 # Finalize cold UNET early load (compute overlap/graph_wait metrics)
                 self._finalize_cold_unet_early_load(_cold_unet_info)
@@ -21286,6 +21333,21 @@ class _ComfyAPIMixin:
                         _vc_v = getattr(self, f"_{_vc_k}", None)
                         if _vc_v is not None:
                             trace_summary.setdefault("derived_ms", {})[_vc_k] = _vc_v
+                    # Propagate actual_load_summary into the trace object
+                    _als = _actual_load_info.get("actual_load_summary")
+                    if isinstance(_als, dict):
+                        trace_summary.setdefault("actual_load_summary", {}).update({
+                            "enabled": _als.get("enabled", False),
+                            "mode": _als.get("mode", "clip_vae_only"),
+                        })
+                    else:
+                        # Ensure trace still has the summary even when
+                        # _actual_load_info is a minimal stub (scheduler-test /
+                        # already-ran path).
+                        _req_al_stub = (modal_options or {}).get("actual_load", {})
+                        _stub_enabled = bool(_req_al_stub.get("enabled", False)) if isinstance(_req_al_stub, dict) else False
+                        _stub_mode = str(_req_al_stub.get("mode", "clip_vae_only")).strip().lower() if isinstance(_req_al_stub, dict) else "clip_vae_only"
+                        trace_summary.setdefault("actual_load_summary", {}).update({"enabled": _stub_enabled, "mode": _stub_mode})
                     print(f"[container_id] session={CONTAINER_SESSION_ID} import_unix={CONTAINER_IMPORT_UNIX_S} restore_count={_container_restore_count} request_seq={_container_request_count} restore_session={trace_summary['restore_session_id']}")
                     _r["trace"] = trace_summary
                     # Per audit round 7: waterfall on the in-process
@@ -21332,6 +21394,13 @@ class _ComfyAPIMixin:
                         restore_count=_container_restore_count,
                     )
                     _r["wall_clock_trace"] = _wall_clock_trace_st
+                    # Overlay actual_load_summary on wall_clock_trace so both
+                    # result surfaces carry the request-level enabled/mode.
+                    if isinstance(_als, dict):
+                        _r["wall_clock_trace"].setdefault("actual_load_summary", {}).update({
+                            "enabled": _als.get("enabled", False),
+                            "mode": _als.get("mode", "clip_vae_only"),
+                        })
                     _r["_wall_clock_summary"] = make_wall_clock_summary(_wall_clock_trace_st)
                     print(make_summary_log_line(_wall_clock_trace_st))
 

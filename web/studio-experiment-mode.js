@@ -899,118 +899,141 @@ export function renderExperimentRunButton(state, actions, context) {
 
 function buildExperimentClickHandler(state, actions, context) {
   return async function () {
-    // Update state to prevent double-submit
-    var currentBtn = document.querySelector('[data-testid="run-experiment-inline-btn"]');
-    if (currentBtn) {
-      currentBtn.disabled = true;
-      currentBtn.textContent = "Running\u2026";
+    // ── Early double-submit guard (reads fresh state, survives re-render) ──
+    var _preRunState = state.playground && state.playground.runState;
+    if (_preRunState && (
+      _preRunState.status === "running" ||
+      _preRunState.status === "submitted" ||
+      _preRunState.status === "waiting" ||
+      _preRunState.status === "queued" ||
+      _preRunState.status === "in_progress"
+    )) {
+      return; // Already submitting — no-op
     }
 
-    // Dispose any existing scoped tracker
-    var existingTracker = state.playground && state.playground._scopedTracker;
-    if (existingTracker && typeof existingTracker.dispose === "function") {
-      try { existingTracker.dispose(); } catch (e) {}
-    }
-    if (state.playground) state.playground._scopedTracker = null;
+    try {
+      // Update state to prevent double-submit
+      var currentBtn = document.querySelector('[data-testid="run-experiment-inline-btn"]');
+      if (currentBtn) {
+        currentBtn.disabled = true;
+        currentBtn.textContent = "Running\u2026";
+      }
 
-    // ── Capture config snapshot before submission ──────────────────
-    // Freeze the current control values so the running panel shows
-    // accurate values even if the user edits form controls while the
-    // run is in flight.  Build resolved controls (CONTROL_DEFS
-    // defaults → preset defaults → user edits) so every expected
-    // parameter appears even when the user didn't explicitly touch it.
-    var _capFeatureId = (state.playground && state.playground.featureId) || "txt2img";
-    var _srcControls = (state.playground && state.playground.controls) || {};
-    var _capResolved = {};
-    // 1. CONTROL_DEFS defaults
-    for (var _defId in CONTROL_DEFS) {
-      if (Object.prototype.hasOwnProperty.call(CONTROL_DEFS, _defId)) {
-        var _ctrlDef = CONTROL_DEFS[_defId];
-        if (_ctrlDef.defaultValue !== undefined) {
-          _capResolved[_defId] = _ctrlDef.defaultValue;
+      // Dispose any existing scoped tracker
+      var existingTracker = state.playground && state.playground._scopedTracker;
+      if (existingTracker && typeof existingTracker.dispose === "function") {
+        try { existingTracker.dispose(); } catch (e) {}
+      }
+      if (state.playground) state.playground._scopedTracker = null;
+
+      // ── Capture config snapshot before submission ──────────────────
+      // Freeze the current control values so the running panel shows
+      // accurate values even if the user edits form controls while the
+      // run is in flight.  Build resolved controls (CONTROL_DEFS
+      // defaults → preset defaults → user edits) so every expected
+      // parameter appears even when the user didn't explicitly touch it.
+      var _capFeatureId = (state.playground && state.playground.featureId) || "txt2img";
+      var _srcControls = (state.playground && state.playground.controls) || {};
+      var _capResolved = {};
+      // 1. CONTROL_DEFS defaults
+      for (var _defId in CONTROL_DEFS) {
+        if (Object.prototype.hasOwnProperty.call(CONTROL_DEFS, _defId)) {
+          var _ctrlDef = CONTROL_DEFS[_defId];
+          if (_ctrlDef.defaultValue !== undefined) {
+            _capResolved[_defId] = _ctrlDef.defaultValue;
+          }
         }
       }
-    }
-    // 2. Preset defaults (overlay)
-    var _presetForDefaults = state.playground && state.playground._currentPreset;
-    var _presetDefaults = (_presetForDefaults && _presetForDefaults.defaults) || {};
-    for (var _pdKey in _presetDefaults) {
-      if (Object.prototype.hasOwnProperty.call(_presetDefaults, _pdKey)) {
-        _capResolved[_pdKey] = _presetDefaults[_pdKey];
+      // 2. Preset defaults (overlay)
+      var _presetForDefaults = state.playground && state.playground._currentPreset;
+      var _presetDefaults = (_presetForDefaults && _presetForDefaults.defaults) || {};
+      for (var _pdKey in _presetDefaults) {
+        if (Object.prototype.hasOwnProperty.call(_presetDefaults, _pdKey)) {
+          _capResolved[_pdKey] = _presetDefaults[_pdKey];
+        }
       }
-    }
-    // 3. User edits (highest priority)
-    for (var _ctrlKey in _srcControls) {
-      if (Object.prototype.hasOwnProperty.call(_srcControls, _ctrlKey)) {
-        _capResolved[_ctrlKey] = _srcControls[_ctrlKey];
+      // 3. User edits (highest priority)
+      for (var _ctrlKey in _srcControls) {
+        if (Object.prototype.hasOwnProperty.call(_srcControls, _ctrlKey)) {
+          _capResolved[_ctrlKey] = _srcControls[_ctrlKey];
+        }
       }
-    }
-    var _capAxes = JSON.parse(JSON.stringify((state.playground && state.playground.experimentAxes) || {}));
-    var _capPresetIds = getExperimentPresetIds(state);
-    var _capPresetLabel = "";
-    var _curPreset = state.playground && state.playground._currentPreset;
-    if (_curPreset) {
-      _capPresetLabel = _curPreset.label || _curPreset.id || "";
-    }
-    if (state.playground) {
-      state.playground._runningExperimentConfig = {
-        controls: _capResolved,
-        axes: _capAxes,
-        presetIds: _capPresetIds,
-        presetLabel: _capPresetLabel,
-        featureId: _capFeatureId,
-        submittedAt: Date.now(),
-      };
-    }
+      var _capAxes = JSON.parse(JSON.stringify((state.playground && state.playground.experimentAxes) || {}));
+      var _capPresetIds = getExperimentPresetIds(state);
+      var _capPresetLabel = "";
+      var _curPreset = state.playground && state.playground._currentPreset;
+      if (_curPreset) {
+        _capPresetLabel = _curPreset.label || _curPreset.id || "";
+      }
+      if (state.playground) {
+        state.playground._runningExperimentConfig = {
+          controls: _capResolved,
+          axes: _capAxes,
+          presetIds: _capPresetIds,
+          presetLabel: _capPresetLabel,
+          featureId: _capFeatureId,
+          submittedAt: Date.now(),
+        };
+      }
 
-    // Clear previous output so canvas shows live progress immediately
-    if (state.playground) {
-      state.playground.lastRunOutput = null;
-      state.playground._selectedRun = null;
-    }
+      // Clear previous output so canvas shows live progress immediately
+      if (state.playground) {
+        state.playground.lastRunOutput = null;
+        state.playground._selectedRun = null;
+      }
 
-    if (actions && actions.setRunState) {
-      actions.setRunState({ status: "running" });
-    }
+      if (actions && actions.setRunState) {
+        actions.setRunState({ status: "running" });
+      }
 
-    var result = await executeExperimentRun(state, context);
+      var result = await executeExperimentRun(state, context);
 
-    if (result && result.status === "ok") {
+      if (result && result.status === "ok") {
+        if (actions && actions.setRunState) {
+          actions.setRunState({
+            status: "submitted",
+            experimentId: result.experimentId,
+            message: result.message,
+          });
+        }
+
+        // Create scoped tracker for this experiment's execution events
+        try {
+          var { createScopedTracker } = await import("./comfymodal-progress.js");
+          var _expApi = (context && context.comfyApi) || (context && context.api);
+          if (_expApi && typeof _expApi.addEventListener === "function") {
+            var _expTracker = createScopedTracker(_expApi, {
+              runId: result.experimentId,
+              experimentId: result.experimentId,
+              promptId: null,
+            });
+            if (state.playground) {
+              // Dispose any existing scoped tracker first
+              var _old = state.playground._scopedTracker;
+              if (_old && typeof _old.dispose === "function") {
+                try { _old.dispose(); } catch (e) {}
+              }
+              state.playground._scopedTracker = _expTracker;
+            }
+            _expTracker.start();
+          }
+        } catch (_stErr) {
+          // Scoped tracker not essential — polling handles progress
+        }
+      } else {
+        var errMsg = (result && result.message) || "Experiment run failed.";
+        if (actions && actions.setRunState) {
+          actions.setRunState({ status: "error", message: errMsg });
+        }
+      }
+    } catch (_expSubmitErr) {
+      // Top-level catch: any unexpected sync/async error becomes a
+      // structured error state instead of an unhandled pageerror.
       if (actions && actions.setRunState) {
         actions.setRunState({
-          status: "submitted",
-          experimentId: result.experimentId,
-          message: result.message,
+          status: "error",
+          message: (_expSubmitErr && _expSubmitErr.message) || "Experiment run failed.",
         });
-      }
-
-      // Create scoped tracker for this experiment's execution events
-      try {
-        var { createScopedTracker } = await import("./comfymodal-progress.js");
-        var _expApi = (context && context.comfyApi) || (context && context.api);
-        if (_expApi && typeof _expApi.addEventListener === "function") {
-          var _expTracker = createScopedTracker(_expApi, {
-            runId: result.experimentId,
-            experimentId: result.experimentId,
-            promptId: null,
-          });
-          if (state.playground) {
-            // Dispose any existing scoped tracker first
-            var _old = state.playground._scopedTracker;
-            if (_old && typeof _old.dispose === "function") {
-              try { _old.dispose(); } catch (e) {}
-            }
-            state.playground._scopedTracker = _expTracker;
-          }
-          _expTracker.start();
-        }
-      } catch (_stErr) {
-        // Scoped tracker not essential — polling handles progress
-      }
-    } else {
-      var errMsg = (result && result.message) || "Experiment run failed.";
-      if (actions && actions.setRunState) {
-        actions.setRunState({ status: "error", message: errMsg });
       }
     }
   };

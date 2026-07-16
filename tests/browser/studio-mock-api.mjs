@@ -564,6 +564,7 @@ export async function installStudioMockApi(page, options = {}) {
           status: "stopped",
           counters: exp.snapshot.counters,
           total_cells: exp.snapshot.total_cells,
+          total_duration_ms: 1000,
           cell_visible: exp.snapshot.cell_visible,
           checkpoints: exp.snapshot.checkpoints,
           attempts: exp.snapshot.attempts,
@@ -713,6 +714,15 @@ export async function installStudioMockApi(page, options = {}) {
       snapshotStatus = "waiting";
     }
 
+    // Attach experiment-level wall-clock total for terminal snapshots
+    var totalDurationMs;
+    if (snapshotStatus === "completed" || snapshotStatus === "failed_fatal") {
+      var _tc = exp.snapshot.total_cells || 1;
+      totalDurationMs = snapshotStatus === "completed"
+        ? 4523 + (_tc - 1) * 200 + 300
+        : 1200 + (_tc - 1) * 100 + 200;
+    }
+
     return _json({
       status: "ok",
       definition: exp.definition,
@@ -720,6 +730,7 @@ export async function installStudioMockApi(page, options = {}) {
         status: snapshotStatus,
         counters: exp.snapshot.counters,
         total_cells: exp.snapshot.total_cells,
+        total_duration_ms: totalDurationMs,
         cell_visible: exp.snapshot.cell_visible,
         checkpoints: exp.snapshot.checkpoints,
         attempts: exp.snapshot.attempts,

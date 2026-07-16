@@ -2897,10 +2897,10 @@ button.comfymodal-studio-feature-chip {
 }
 
 .comfymodal-studio-experiment-grid-header {
-  flex: 0 0 250px;
-  width: 250px;
+  flex: 0 0 313px;
+  width: 313px;
   min-width: 150px;
-  max-width: 250px;
+  max-width: 313px;
   font-size: 10px;
   color: #aaa;
   text-align: center;
@@ -3001,10 +3001,10 @@ button.comfymodal-studio-feature-chip {
 /* ── Experiment Grid Cell — Card Redesign ────────────── */
 
 .comfymodal-studio-experiment-grid-cell {
-  flex: 0 1 250px;
-  width: 250px;
+  flex: 0 1 313px;
+  width: 313px;
   min-width: 150px;
-  max-width: 500px;
+  max-width: 626px;
   min-height: var(--cell-min-height, 60px);
   max-height: none;
   border: 1px solid #222;
@@ -3048,20 +3048,17 @@ button.comfymodal-studio-feature-chip {
 .cm-exp-cell-imgwrap {
   position: relative;
   width: 100%;
-  padding-bottom: 100%;
+  aspect-ratio: 1;
   background: #1a1a1a;
   overflow: hidden;
   flex-shrink: 0;
 }
 
 .cm-exp-cell-image {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
   display: block;
+  width: 100%;
+  height: auto;
+  object-fit: contain;
   border-radius: 0;
   opacity: 1;
   transition: opacity 0.3s;
@@ -3148,101 +3145,7 @@ button.comfymodal-studio-feature-chip {
   right: 8px;
 }
 
-/* ── Label tag overlay (top-left axis value badges) ──── */
 
-.cm-exp-cell-tags {
-  position: absolute;
-  top: 6px;
-  left: 6px;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-  pointer-events: none;
-  z-index: 4;
-  max-width: calc(100% - 12px);
-}
-
-.cm-exp-cell-tag {
-  background: rgba(0, 0, 0, 0.65);
-  color: #fff;
-  padding: 1px 6px;
-  border-radius: 3px;
-  font-size: 9px;
-  font-weight: 700;
-  font-family: monospace;
-  white-space: nowrap;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  line-height: 1.5;
-  backdrop-filter: blur(2px);
-  -webkit-backdrop-filter: blur(2px);
-}
-
-.cm-exp-cell-tag-model,
-.cm-exp-cell-tag-checkpoint { background: rgba(80, 20, 100, 0.7); }
-
-.cm-exp-cell-tag-lora { background: rgba(90, 60, 10, 0.7); }
-
-.cm-exp-cell-tag-prompt { background: rgba(15, 70, 50, 0.7); }
-
-.cm-exp-cell-tag-sampler { background: rgba(20, 55, 100, 0.7); }
-
-.cm-exp-cell-tag-scheduler { background: rgba(20, 55, 100, 0.7); }
-
-.cm-exp-cell-tag-guidance { background: rgba(90, 30, 30, 0.7); }
-
-.cm-exp-cell-tag-steps { background: rgba(90, 30, 30, 0.7); }
-
-.cm-exp-cell-tag-seed { background: rgba(40, 40, 40, 0.7); }
-
-.cm-exp-cell-tag-denoise { background: rgba(0, 70, 60, 0.7); }
-
-/* ── Info section below image ────────────────────────── */
-
-.cm-exp-cell-info {
-  padding: 10px 12px 8px;
-  max-height: 112px;
-  overflow: hidden;
-  font-size: 10px;
-  line-height: 1.5;
-  color: #ccc;
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-}
-
-.cm-exp-cell-stat {
-  display: flex;
-  align-items: baseline;
-  gap: 4px;
-  padding: 2px 0;
-  border-bottom: 1px solid rgba(255,255,255,0.04);
-}
-
-.cm-exp-cell-stat:last-child {
-  border-bottom: none;
-}
-
-.cm-exp-cell-stat-key {
-  color: #888;
-  font-weight: 600;
-  flex-shrink: 0;
-  font-size: 9px;
-  text-transform: uppercase;
-  letter-spacing: 0.02em;
-  min-width: 40px;
-}
-
-.cm-exp-cell-stat-val {
-  color: #e0e0e0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-  font-size: 10px;
-}
 
 /* ── Status border colours on the cell card ──────────── */
 
@@ -3316,9 +3219,9 @@ button.comfymodal-studio-feature-chip {
 
 @media (max-width: 768px) {
   .comfymodal-studio-experiment-grid-header {
-    flex-basis: 220px;
-    width: 220px;
-    max-width: 220px;
+    flex-basis: 275px;
+    width: 275px;
+    max-width: 275px;
   }
 
   .comfymodal-studio-experiment-grid-row-cells {
@@ -3326,8 +3229,8 @@ button.comfymodal-studio-feature-chip {
   }
 
   .comfymodal-studio-experiment-grid-cell {
-    width: 220px;
-    flex-basis: 220px;
+    width: 275px;
+    flex-basis: 275px;
   }
 }
 
@@ -3337,14 +3240,14 @@ button.comfymodal-studio-feature-chip {
   }
 
   .comfymodal-studio-experiment-grid-header {
-    flex-basis: 170px;
-    width: 170px;
-    max-width: 170px;
+    flex-basis: 213px;
+    width: 213px;
+    max-width: 213px;
   }
 
   .comfymodal-studio-experiment-grid-cell {
-    width: 170px;
-    flex-basis: 170px;
+    width: 213px;
+    flex-basis: 213px;
   }
 
   .comfymodal-studio-experiment-grid-row,
