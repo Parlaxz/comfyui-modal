@@ -1034,6 +1034,16 @@ class ExperimentRunner:
                             "output_paths": result["output_paths"],
                             "attempt_id": attempt_id,
                         }
+                        # Keep the compact validation candidate available to
+                        # the Studio finalizer without carrying remote output
+                        # data through the durable event.
+                        _result_data = result.get("result")
+                        if isinstance(_result_data, dict):
+                            _cert_candidate = _result_data.get("_certificate_candidate")
+                            if isinstance(_cert_candidate, dict) and _cert_candidate.get("identity"):
+                                cell_completed_payload["_certificate_candidate"] = copy.deepcopy(
+                                    _cert_candidate
+                                )
                         # Propagate timing_payload from invoker result to
                         # cell.completed event when present.
                         tp = result.get("timing_payload")
@@ -1285,13 +1295,24 @@ class LocalRemoteInvoker:
             _mutable_trace["workflow_materialization_completed"] = local_trace.get("workflow_materialization_completed")
 
             # ── Warmup profile write (immediately before/after preparer) ──
+            # Both legacy (warmup_profile_write_*) and canonical
+            # (active_profile_write_*) markers are set so the trace dict
+            # contains exact aliases that the direct path reads.
             _preparer = getattr(self, "_profile_preparer", None)
+            _active_start = time.time()
             local_trace.mark("warmup_profile_write_started")
-            _mutable_trace["warmup_profile_write_started"] = local_trace.get("warmup_profile_write_started")
-            if _preparer is not None:
-                await _preparer(_resolved_wf, cell)
-            local_trace.mark("warmup_profile_write_completed")
-            _mutable_trace["warmup_profile_write_completed"] = local_trace.get("warmup_profile_write_completed")
+            local_trace.mark("active_profile_write_start")
+            _mutable_trace["warmup_profile_write_started"] = _active_start
+            _mutable_trace["active_profile_write_start"] = _active_start
+            try:
+                if _preparer is not None:
+                    await _preparer(_resolved_wf, cell)
+            finally:
+                _active_end = time.time()
+                local_trace.mark("warmup_profile_write_completed")
+                local_trace.mark("active_profile_write_end")
+                _mutable_trace["warmup_profile_write_completed"] = _active_end
+                _mutable_trace["active_profile_write_end"] = _active_end
 
             local_trace.mark("t6_local_stream_opened")
             _mutable_trace["t6_local_stream_opened"] = local_trace.get("t6_local_stream_opened")
@@ -1408,8 +1429,10 @@ class LocalRemoteInvoker:
             async for msg in self._run_prompt_stream(**stream_kwargs):
                 if _first_event:
                     local_trace.mark("first_remote_message_received")
+                    local_trace.mark("first_remote_event")
                     local_trace.mark("t7_local_first_remote_event")
                     _mutable_trace["first_remote_message_received"] = local_trace.get("first_remote_message_received")
+                    _mutable_trace["first_remote_event"] = local_trace.get("first_remote_event")
                     _mutable_trace["t7_local_first_remote_event"] = local_trace.get("t7_local_first_remote_event")
                     _first_event = False
                 mtype = msg.get("type", "")
@@ -1447,10 +1470,12 @@ class LocalRemoteInvoker:
                 if mtype == "result":
                     data = msg.get("data", {})
                     _last_remote_data = data
+                    # result_received must be marked before output save
+                    # to accurately measure save wall time.
+                    local_trace.mark("result_received")
                     local_trace.mark("remote_result_received")
                     local_trace.mark("t8_local_result_received")
-
-                    # ── Merge remote + local using shared merger ──────────
+                    _mutable_trace["result_received"] = local_trace.get("result_received")
                     # The remote result carries a full canonical summary
                     # (deltas_ms, derived_ms, stages) computed by Modal in
                     # its own time base.  Build a local summary dict (not
@@ -1474,6 +1499,7 @@ class LocalRemoteInvoker:
                     local_trace.mark("output_materialized")
                     local_trace.mark("t9_local_materialized")
                     local_trace.mark("t10_local_materialized")
+                    _mutable_trace["output_materialized"] = local_trace.get("output_materialized")
                     result = {"status": "completed", "result": data, "output_paths": saved}
 
                     # ── Merge mutable-trace markers back into local_trace ──

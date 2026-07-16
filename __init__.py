@@ -90,6 +90,7 @@ from production_workflow import (
     _canonical_workflow_hash,
     HASH_SCHEMA_VERSION,
     COMPILER_SCHEMA_VERSION as PRODUCTION_COMPILER_VERSION,
+    PRODUCTION_PLAN_SCHEMA_VERSION,
 )
 import experiment_setup_adapter as _experiment_setup_adapter
 from warmup_profile import prepare_active_next_profile as prepare_active_next_profile
@@ -6426,7 +6427,7 @@ if _server:
                 {"status": "error", "message": "presetId and featureId are required"}, status=400
             )
         try:
-            from studio_run_adapter import handle_studio_run, validate_studio_request_controls
+            from studio_run_adapter import handle_studio_run_async, validate_studio_request_controls
             # Validate controls against ALL preset snapshots' schemas
             # Single run: [preset_id], controls, {} (no axes)
             _run_validation_errors = validate_studio_request_controls(
@@ -6458,12 +6459,19 @@ if _server:
                     browser_trace = recognized if recognized else {}
                 else:
                     browser_trace = {}
+            # Set studio_route_received at route entry (before validation/compile)
+            # so the incoming trace dict preserves when this server started
+            # processing the request.  This flows through trace_ctx →
+            # build_single_run_spec → cell trace dict.
+            import time as _studio_trace_time
+            if "studio_route_received" not in browser_trace:
+                browser_trace["studio_route_received"] = _studio_trace_time.time()
             # Capture workspace synchronously at dispatch time so the
             # same workspace is used throughout the request (never re-resolved).
             _studio_ws = _active_workspace() or {}
             _studio_gpu = (body or {}).get("gpu")
             _studio_mo = (body or {}).get("modal_options")
-            result = handle_studio_run(
+            result = await handle_studio_run_async(
                 preset_id, feature_id, controls, _NODE_DIR,
                 trace_ctx=browser_trace,
                 gpu=_studio_gpu,

@@ -110,9 +110,190 @@ test.describe("Studio Playground", () => {
     }
   });
 
-  // ── Test 2: HTTP submit error keeps Run enabled ─────────────────────────
+  // ── Test 2: Direct run displays the wall-clock end-to-end total ──────────
+  test("2. direct run displays the client-to-materialized end-to-end total", async ({ page }) => {
+    const prefix = createOwnerPrefix();
+    const owned = createOwnedRecords();
+    const expectedTotalMs = 5380;
+    let directRequest = null;
 
-  test("2. HTTP submit error leaves Run enabled and shows error message", async ({ page }) => {
+    await page.route("**/comfymodal/studio/run", async (route) => {
+      directRequest = route.request().postDataJSON();
+      const now = new Date().toISOString();
+      const timings = {
+        end_to_end_total_ms: expectedTotalMs,
+        sampling_ms: 3200,
+        vae_decode_ms: 280,
+        restore_total_ms: 120,
+        timing_sources: {
+          end_to_end_total_ms: "local_server_observed",
+          sampling_ms: "remote_trace",
+        },
+      };
+      const presetId = directRequest?.presetId || "";
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "ok",
+          direct_run: true,
+          runId: "run_direct_playwright",
+          runHistoryId: "run_direct_playwright",
+          experimentId: "exp_direct_playwright",
+          output_paths: ["direct_playwright.png"],
+          output_path: "direct_playwright.png",
+          completed_at: now,
+          timings,
+          meta: {
+            experiment_id: "exp_direct_playwright",
+            studio_preset_id: presetId,
+            studio_feature_id: "txt2img",
+            preset_label: "Direct Playwright",
+            output_count: 1,
+          },
+        }),
+      });
+    });
+
+    await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
+    await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
+    const presetId = owned.presetIds[0];
+
+    await openStudio(page, COMFYUI_URL);
+    await waitVisible(page.locator('[data-testid="control-panel"]'));
+    await selectBackendPreset(page, presetId);
+    await waitVisible(page.locator('[data-testid="input-prompt"]'));
+    await page.locator('[data-testid="input-prompt"]').fill("direct timing cat");
+
+    const runBtn = page.locator('[data-testid="run-btn"]');
+    await expect(runBtn).toBeEnabled({ timeout: 10000 });
+    await runBtn.click();
+    await expect(page.locator('[data-testid="canvas-output"]')).toBeVisible({ timeout: 15000 });
+
+    const timingCard = page.locator('[data-testid="timing-card"]');
+    await expect(timingCard).toBeVisible({ timeout: 10000 });
+    await expect(timingCard.locator(".comfymodal-studio-timing-e2e"))
+      .toHaveText("End-to-End Total: 5.4s");
+    await expect(timingCard.locator(".comfymodal-studio-timing-tag").filter({ hasText: "Sampling: 3.2s" }))
+      .toBeVisible();
+
+    expect(directRequest).toBeTruthy();
+    expect(typeof directRequest.trace?.t0_client_press_ms).toBe("number");
+  });
+
+  // ── Test 2a: Legacy direct-run timing (no top-level end_to_end_total_ms) ─
+
+  test("2a. legacy direct-run timing without end_to_end_total_ms uses trace stages", async ({ page }) => {
+    const prefix = createOwnerPrefix();
+    const owned = createOwnedRecords();
+    const browserClickEpoch = 1000000000.0;
+    // 5.38s delta → 5380ms → renders as "5.4s"
+    const outputMaterializedEpoch = browserClickEpoch + 5.38;
+    let directRequest = null;
+
+    await page.route("**/comfymodal/studio/run", async (route) => {
+      directRequest = route.request().postDataJSON();
+      const now = new Date().toISOString();
+      const presetId = directRequest?.presetId || "";
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "ok",
+          direct_run: true,
+          runId: "run_legacy_direct",
+          runHistoryId: "run_legacy_direct",
+          experimentId: "exp_legacy_direct",
+          output_paths: ["legacy_direct.png"],
+          output_path: "legacy_direct.png",
+          completed_at: now,
+          timings: {
+            // Legacy payload — no top-level end_to_end_total_ms.
+            // Individual timing values at top level (as backend normalizes):
+            sampling_ms: 3200,
+            vae_decode_ms: 280,
+            clip_encode_ms: 350,
+            model_load_ms: 450,
+            workflow_validation_ms: 50,
+            remote_inference_total_ms: 4200,
+            local_output_materialization_ms: 30,
+            // Trace stages for end-to-end derivation:
+            trace: {
+              stages: {
+                browser_run_click: browserClickEpoch,
+                output_materialized: outputMaterializedEpoch,
+              },
+              derived_ms: {
+                output_collection_total_ms: 250,
+              },
+              trace_version: 3,
+            },
+            timing_sources: {
+              sampling_ms: "remote_trace",
+              vae_decode_ms: "remote_trace",
+              clip_encode_ms: "remote_trace",
+              model_load_ms: "remote_trace",
+              workflow_validation_ms: "remote_trace",
+              remote_inference_total_ms: "remote_trace",
+              local_output_materialization_ms: "remote_trace",
+            },
+          },
+          meta: {
+            experiment_id: "exp_legacy_direct",
+            studio_preset_id: presetId,
+            studio_feature_id: "txt2img",
+            preset_label: "Legacy Direct",
+            output_count: 1,
+          },
+        }),
+      });
+    });
+
+    await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
+    await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
+    const presetId = owned.presetIds[0];
+
+    await openStudio(page, COMFYUI_URL);
+    await waitVisible(page.locator('[data-testid="control-panel"]'));
+    await selectBackendPreset(page, presetId);
+    await waitVisible(page.locator('[data-testid="input-prompt"]'));
+    await page.locator('[data-testid="input-prompt"]').fill("legacy timing cat");
+
+    const runBtn = page.locator('[data-testid="run-btn"]');
+    await expect(runBtn).toBeEnabled({ timeout: 10000 });
+    await runBtn.click();
+    await expect(page.locator('[data-testid="canvas-output"]')).toBeVisible({ timeout: 15000 });
+
+    // Timing card shows End-to-End Total derived from trace stages
+    const timingCard = page.locator('[data-testid="timing-card"]');
+    await expect(timingCard).toBeVisible({ timeout: 10000 });
+    await expect(timingCard.locator(".comfymodal-studio-timing-e2e"))
+      .toHaveText("End-to-End Total: 5.4s");
+
+    // Sampling stage tag is present (pulled from top-level flat keys)
+    await expect(timingCard.locator(".comfymodal-studio-timing-tag").filter({ hasText: "Sampling: 3.2s" }))
+      .toBeVisible();
+
+    // Expand Advanced diagnostics to verify timing quality
+    await page.locator('[data-testid="advanced-toggle"]').click();
+    const advancedPanel = page.locator(".comfymodal-studio-metadata-advanced");
+    await expect(advancedPanel).toBeVisible({ timeout: 5000 });
+    const advancedText = await advancedPanel.textContent();
+
+    // Timing quality is "complete" for direct-run legacy payload
+    expect(advancedText).toContain("complete");
+    // Queue and scheduler groups are excluded from applicable groups for
+    // direct-run timing and must NOT appear in missing groups
+    expect(advancedText).not.toContain("queue");
+    expect(advancedText).not.toContain("scheduler");
+
+    expect(directRequest).toBeTruthy();
+    expect(typeof directRequest.trace?.t0_client_press_ms).toBe("number");
+  });
+
+  // ── Test 3: HTTP submit error keeps Run enabled ─────────────────────────
+
+  test("3. HTTP submit error leaves Run enabled and shows error message", async ({ page }) => {
     const prefix = createOwnerPrefix();
     const owned = createOwnedRecords();
 
@@ -144,9 +325,9 @@ test.describe("Studio Playground", () => {
     }
   });
 
-  // ── Test 3: forceFailed experiment shows error ──────────────────────────
+  // ── Test 4: forceFailed experiment shows error ──────────────────────────
 
-  test("3. forceFailed experiment shows error state", async ({ page }) => {
+  test("4. forceFailed experiment shows error state", async ({ page }) => {
     const prefix = createOwnerPrefix();
     const owned = createOwnedRecords();
 
@@ -180,9 +361,9 @@ test.describe("Studio Playground", () => {
     }
   });
 
-  // ── Test 4: Missing asset does not fabricate canvas image ───────────────
+  // ── Test 5: Missing asset does not fabricate canvas image ───────────────
 
-  test("4. completed event without asset does not show canvas image", async ({ page }) => {
+  test("5. completed event without asset does not show canvas image", async ({ page }) => {
     const prefix = createOwnerPrefix();
     const owned = createOwnedRecords();
 
@@ -215,9 +396,9 @@ test.describe("Studio Playground", () => {
     }
   });
 
-  // ── Test 5: Archived preset disappears, unrelated remains ───────────────
+  // ── Test 6: Archived preset disappears, unrelated remains ───────────────
 
-  test("5. archived test preset disappears, unrelated preset remains", async ({ page }) => {
+  test("6. archived test preset disappears, unrelated preset remains", async ({ page }) => {
     const prefix = createOwnerPrefix();
     const owned = createOwnedRecords();
 
@@ -272,9 +453,9 @@ test.describe("Studio Playground", () => {
     }
   });
 
-  // ── Test 6: Stalled experiment 5-minute timeout ─────────────────────────
+  // ── Test 7: Stalled experiment 5-minute timeout ─────────────────────────
 
-  test("6. stalled experiment reaches 5-minute timeout", async ({ page }) => {
+  test("7. stalled experiment reaches 5-minute timeout", async ({ page }) => {
     const prefix = createOwnerPrefix();
     const owned = createOwnedRecords();
 
@@ -311,9 +492,9 @@ test.describe("Studio Playground", () => {
     }
   });
 
-  // ── Test 7: Navigating away stops polling ───────────────────────────────
+  // ── Test 8: Navigating away stops polling ───────────────────────────────
 
-  test("7. navigating away stops polling", async ({ page }) => {
+  test("8. navigating away stops polling", async ({ page }) => {
     const prefix = createOwnerPrefix();
     const owned = createOwnedRecords();
 
@@ -354,14 +535,14 @@ test.describe("Studio Playground", () => {
     }
   });
 
-  // ── Test 8: Console/page errors during Playground interaction ───────────
+  // ── Test 9: Console/page errors during Playground interaction ───────────
   //
   // Install console guard AFTER Studio is open and the control panel is
   // visible, so ComfyUI startup noise is excluded.  Perform a small
   // Playground interaction, then assert no console.errors or pageerrors
   // were emitted by the pipeline under test.
 
-  test("8. console and page errors are guarded and disposed", async ({ page }) => {
+  test("9. console and page errors are guarded and disposed", async ({ page }) => {
     const prefix = createOwnerPrefix();
     const owned = createOwnedRecords();
 
@@ -392,14 +573,14 @@ test.describe("Studio Playground", () => {
     }
   });
 
-  // ── Test 9: Reload restores last run from localStorage ──────────────────
+  // ── Test 10: Reload restores last run from localStorage ─────────────────
   //
   // Unlike test 1 which uses server-side recent runs, this test clears the
   // mock API's in-memory history before reload to prove the run identity is
   // persisted client-side in localStorage and survives when server data is
   // unavailable.
 
-  test("9. reload restores selection, controls, canvas image, and run metadata from localStorage", async ({ page }) => {
+  test("10. reload restores selection, controls, canvas image, and run metadata from localStorage", async ({ page }) => {
     const prefix = createOwnerPrefix();
     const owned = createOwnedRecords();
 
@@ -479,13 +660,13 @@ test.describe("Studio Playground", () => {
     }
   });
 
-  // ── Test 10: Deleted preset fallback from localStorage ──────────────────
+  // ── Test 11: Deleted preset fallback from localStorage ─────────────────
   //
   // Verifies that when a persisted-and-run preset is deleted on the server,
   // the next reload safely selects another runnable preset or shows the
   // empty state — no dangling selection to a deleted preset.
 
-  test("10. deleted preset falls back to another runnable preset or empty state", async ({ page }) => {
+  test("11. deleted preset falls back to another runnable preset or empty state", async ({ page }) => {
     const prefix = createOwnerPrefix();
     const owned = createOwnedRecords();
 
@@ -558,7 +739,7 @@ test.describe("Studio Playground", () => {
     }
   });
 
-  // ── Test 11: Per-preset run preview independence ─────────────────────────
+  // ── Test 12: Per-preset run preview independence ─────────────────────────
   //
   // Verifies that when switching between presets that have both had a
   // successful run, each preset's last run preview (image + metadata) is
@@ -566,7 +747,7 @@ test.describe("Studio Playground", () => {
   // (which contains the preset ID) to distinguish which preset's run is
   // currently displayed.
 
-  test("11. switching presets preserves independent run previews", async ({ page }) => {
+  test("12. switching presets preserves independent run previews", async ({ page }) => {
     const prefix = createOwnerPrefix();
     const owned = createOwnedRecords();
 
@@ -650,7 +831,7 @@ test.describe("Studio Playground", () => {
     }
   });
 
-  // ── Test 12: Preset defaults — width/height ─────────────────────────────
+  // ── Test 13: Preset defaults — width/height ─────────────────────────────
   //
   // Verifies that width and height render as visible, enabled numeric
   // inputs reflecting the preset's fixture defaults (width 768, height 512).
@@ -658,7 +839,7 @@ test.describe("Studio Playground", () => {
   // active feature tab triggers a re-render so the sync hydration block
   // picks up preset defaults.
 
-  test("12. preset defaults — width and height render as visible numeric controls with saved defaults", async ({ page }) => {
+  test("13. preset defaults — width and height render as visible numeric controls with saved defaults", async ({ page }) => {
     const prefix = createOwnerPrefix();
     const owned = createOwnedRecords();
 
@@ -747,7 +928,7 @@ test.describe("Studio Playground", () => {
     }
   });
 
-  // ── Test 13: Preset defaults — enum schemas (sampler/scheduler) ─────────
+  // ── Test 14: Preset defaults — enum schemas (sampler/scheduler) ─────────
   //
   // Verifies that sampler and scheduler render as enabled <select> elements
   // when the preset carries an enum control schema, with the fixture
@@ -756,7 +937,7 @@ test.describe("Studio Playground", () => {
   // active feature tab triggers a re-render so the sync hydration block
   // picks up preset defaults.
 
-  test("13. preset defaults — with enum schemas, sampler and scheduler render enabled selects with saved dpmpp_2m/karras selected and options present; denoise 0 remains 0", async ({ page }) => {
+  test("14. preset defaults — with enum schemas, sampler and scheduler render enabled selects with saved dpmpp_2m/karras selected and options present; denoise 0 remains 0", async ({ page }) => {
     const prefix = createOwnerPrefix();
     const owned = createOwnedRecords();
 
@@ -931,7 +1112,7 @@ test.describe("Studio Playground", () => {
     api.setExperimentBehavior(expId, { terminalPoll: 1 });
   }
 
-  // ── Test 14: Preset defaults — no enum schemas ──────────────────────────
+  // ── Test 15: Preset defaults — no enum schemas ──────────────────────────
   //
   // Verifies that sampler and scheduler render as disabled text inputs
   // holding the fixture default values when the preset has no enum schema
@@ -940,7 +1121,7 @@ test.describe("Studio Playground", () => {
   // active feature tab triggers a re-render so the sync hydration block
   // picks up preset defaults.
 
-  test("14. preset defaults — without enum schemas, sampler and scheduler render disabled text inputs holding saved values and a Schema unavailable explanation", async ({ page }) => {
+  test("15. preset defaults — without enum schemas, sampler and scheduler render disabled text inputs holding saved values and a Schema unavailable explanation", async ({ page }) => {
     const prefix = createOwnerPrefix();
     const owned = createOwnedRecords();
 
@@ -1038,13 +1219,13 @@ test.describe("Studio Playground", () => {
     }
   });
 
-  // ── Test 15: History experiment tile loads experiment grid ──────────────
+  // ── Test 16: History experiment tile loads experiment grid ──────────────
   //
   // Injects experiment cell history entries into the mock, navigates to
   // History, verifies a single experiment tile (not individual cards),
   // clicks it, and verifies the Playground shows the experiment grid.
 
-  test("15. history experiment tile loads experiment grid viewport", async ({ page }) => {
+  test("16. history experiment tile loads experiment grid viewport", async ({ page }) => {
     const prefix = createOwnerPrefix();
     const owned = createOwnedRecords();
 
@@ -1087,13 +1268,13 @@ test.describe("Studio Playground", () => {
     }
   });
 
-  // ── Test 16: Carousel experiment item has distinctive styling ──────────
+  // ── Test 17: Carousel experiment item has distinctive styling ──────────
   //
   // Verifies that experiment cell entries in the carousel have the
   // experiment-item CSS class and EXP badge.  Also verifies clicking
   // the experiment item navigates to the experiment grid viewport.
 
-  test("16. carousel experiment item shows EXP badge and opens experiment grid", async ({ page }) => {
+  test("17. carousel experiment item shows EXP badge and opens experiment grid", async ({ page }) => {
     const prefix = createOwnerPrefix();
     const owned = createOwnedRecords();
 

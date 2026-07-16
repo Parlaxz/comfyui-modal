@@ -589,6 +589,17 @@ class StaticNonRegressionTests(unittest.TestCase):
         self.assertGreater(history_pos, append_pos)
         self.assertGreater(persist_pos, history_pos)
 
+    def test_studio_certificate_candidate_is_forwarded_and_deferred(self):
+        runner_src = (REPO_ROOT / "experiment_runner.py").read_text(encoding="utf-8-sig")
+        adapter_src = (REPO_ROOT / "studio_run_adapter.py").read_text(encoding="utf-8-sig")
+        self.assertIn('_result_data.get("_certificate_candidate")', runner_src)
+        self.assertIn('cell_completed_payload["_certificate_candidate"]', runner_src)
+        update_pos = adapter_src.find("REGISTRY.history().update_run")
+        persist_pos = adapter_src.find("persist_validation_certificate", update_pos)
+        self.assertGreater(update_pos, -1)
+        self.assertGreater(persist_pos, update_pos)
+        self.assertIn("_POST_DELIVERY_SINGLETON.submit", adapter_src)
+
     def test_cache_dit_touch_unchanged(self):
         # CacheDiT should be mentioned only in a "do not touch"
         # context or by third-party code.  We don't expect any new

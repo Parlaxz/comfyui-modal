@@ -1,16 +1,23 @@
 """Backend adapter for Studio preset execution runtime.
 
 Bridges Studio presets/snapshots into the existing experiment
-scheduler/runner pipeline.
+scheduler/runner pipeline OR a direct single-run path.
 
 Key workflows
 -------------
-1. **Single run** (``POST /comfymodal/studio/run``):
+1. **Single run — Direct** (``POST /comfymodal/studio/run`` — one normal run):
    Load preset + snapshot, validate, build a single-cell compilation
    with the snapshot workflow, mapped bindings, and control overrides.
-   Schedule via ``REGISTRY.get_or_create_scheduler`` → ``start()``.
+   Execute the cell directly via ``LocalRemoteInvoker.run_cell`` —
+   no experiment scheduler, runner, leases, or journal created.
+   Returns the completed result synchronously.
 
-2. **Experiment** (``POST /comfymodal/studio/experiment``):
+2. **Single run — Scheduler** (same endpoint, multi-cell/experiment):
+   Same preparation, then schedule via ``REGISTRY.get_or_create_scheduler``
+   → ``start()``.  Used when the request is an experiment or the caller
+   explicitly requests the scheduler path.
+
+3. **Experiment** (``POST /comfymodal/studio/experiment``):
    Accepts one or more ``presetIds``, loads each + its snapshot,
    validates, builds a multi-workflow spec from the experiment
    definition (prompts, axes), compiles via ``compile_experiment``,
@@ -62,7 +69,7 @@ from studio_models import (
     _KNOWN_FEATURE_IDS,
     validate_controls_against_schema,
 )
-from timing_trace import TRACE_VERSION, merge_remote_trace_into
+from timing_trace import TRACE_VERSION, coerce_t0_from_browser, merge_remote_trace_into
 from warmup_profile import prepare_active_next_profile
 
 _log = logging.getLogger(__name__)
@@ -1035,6 +1042,42 @@ _CANONICAL_ALIAS_KEYS = frozenset({
     "sampler", "scheduler", "denoise", "width", "height",
 })
 
+# Shared canonical alias map used by both scheduler and direct-run paths.
+# Maps (top-level_timing_key, raw_deltas_key, timing_source_label).
+_CANONICAL_ALIAS_MAP: list[tuple[str, str, str]] = [
+    ("clip_load_ms",               "clip_load",        "remote_trace"),
+    ("clip_encode_ms",             "clip_encode",      "remote_trace"),
+    ("sampling_ms",                "sampler",          "remote_trace"),
+    ("vae_decode_ms",              "vae_decode",       "remote_trace"),
+    ("image_io_ms",                "image_io",         "remote_trace"),
+    ("remote_inference_total_ms",  "inference_total",  "remote_trace"),
+    ("remote_validation_ms",       "t3_to_t3b",        "remote_trace"),
+    ("graph_overhead_ms",          "graph_overhead",   "remote_trace"),
+    ("unet_load_ms",               "unet_load",        "remote_trace"),
+    ("vae_load_ms",                "vae_load",         "remote_trace"),
+]
+
+
+def _derive_end_to_end_total_ms(stages: dict[str, Any] | None) -> float | None:
+    """Return client-press to materialized-output wall time when observable."""
+    if not isinstance(stages, dict):
+        return None
+
+    start = stages.get("browser_run_click")
+    if start is None:
+        start = stages.get("t0_client_press")
+    end = stages.get("output_materialized")
+    if end is None:
+        end = stages.get("t10_local_materialized")
+
+    if isinstance(start, bool) or isinstance(end, bool):
+        return None
+    if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+        return None
+
+    total_ms = round((float(end) - float(start)) * 1000, 2)
+    return total_ms if total_ms >= 0 else None
+
 
 def _flatten_canonical_aliases(
     resolved_controls: dict[str, Any],
@@ -1347,7 +1390,7 @@ def build_single_run_spec(
                 # For production single-runs the workflow is already fully
                 # resolved after controls-apply + compile; re-injection would
                 # produce a different canonical hash, failing the guard.
-                "_resolved_workflow": production_workflow if _prod_enabled else None,
+                "_resolved_workflow": production_workflow,  # always the actual workflow (compiled or source)
             }
         ],
         "duplicate_count": 0,
@@ -2004,6 +2047,7 @@ async def _schedule_and_start(
     cell_key = ""
     checkpoint_id = ""
     resolved_meta: dict = {}
+    certificate_candidates: list[dict] = []
     has_cell_completed = False
     has_cell_failed = False
     timing_payload: dict | None = None
@@ -2022,6 +2066,9 @@ async def _schedule_and_start(
                 cell_key = pl.get("cell_key", cell_key)
                 checkpoint_id = pl.get("checkpoint_id", checkpoint_id)
                 resolved_meta["workflow_hash"] = pl.get("workflow_hash", resolved_meta.get("workflow_hash", ""))
+                _cert_candidate = pl.get("_certificate_candidate")
+                if isinstance(_cert_candidate, dict) and _cert_candidate.get("identity"):
+                    certificate_candidates.append(copy.deepcopy(_cert_candidate))
                 # Capture timing_payload from the latest cell.completed
                 tp = pl.get("timing_payload")
                 if tp:
@@ -2039,6 +2086,8 @@ async def _schedule_and_start(
     # ── Build timing dict ──────────────────────────────────────────────────
     timings: dict[str, Any] = {}
     timing_sources: dict[str, str] = {}
+    timings["_run_type"] = "scheduler"
+    timing_sources["_run_type"] = "local_server_observed"
 
     # 1. Local wall-clock observations (exact values, no faked floor)
     if submission_started_at and completed_at:
@@ -2086,22 +2135,15 @@ async def _schedule_and_start(
     merged_deltas = local_timing_summary.get("deltas_ms", {}) or {}
     merged_derived = local_timing_summary.get("derived_ms", {}) or {}
 
-    _CANONICAL_ALIAS_MAP: list[tuple[str, str, str]] = [
-        # (canonical_key,              raw_deltas_key,     source)
-        ("clip_load_ms",               "clip_load",        "remote_trace"),
-        ("clip_encode_ms",             "clip_encode",      "remote_trace"),
-        ("sampling_ms",                "sampler",          "remote_trace"),
-        ("vae_decode_ms",              "vae_decode",       "remote_trace"),
-        ("image_io_ms",                "image_io",         "remote_trace"),
-        ("remote_inference_total_ms",  "inference_total",  "remote_trace"),
-        # Extended: validation, graph overhead, individual model loads
-        # These only appear when the remote trace provides them —
-        # conditional on merged_deltas.get(raw_key) returning a value.
-        ("remote_validation_ms",       "t3_to_t3b",       "remote_trace"),
-        ("graph_overhead_ms",          "graph_overhead",   "remote_trace"),
-        ("unet_load_ms",               "unet_load",        "remote_trace"),
-        ("vae_load_ms",                "vae_load",         "remote_trace"),
-    ]
+    # Prefer the cross-process wall-clock trace for the user-visible total.
+    trace_e2e_ms = _derive_end_to_end_total_ms(
+        local_timing_summary.get("stages", {})
+    )
+    if trace_e2e_ms is not None:
+        timings["end_to_end_total_ms"] = trace_e2e_ms
+        timing_sources["end_to_end_total_ms"] = "local_server_observed"
+
+    # Uses module-level _CANONICAL_ALIAS_MAP (same as direct-run path)
     remote_timings: dict[str, Any] = {}
     for canonical_key, raw_key, source in _CANONICAL_ALIAS_MAP:
         val = merged_deltas.get(raw_key)
@@ -2271,6 +2313,44 @@ async def _schedule_and_start(
         except Exception:
             _log.warning("Failed to record fallback run history for %s", exp_id)
 
+    # Validation certificates are persisted only after Studio output
+    # materialization and run-history finalization have completed.
+    if certificate_candidates:
+        try:
+            from modal_client import persist_validation_certificate
+            from optimizations import _POST_DELIVERY_SINGLETON
+
+            _scheduled_cert_ids: set[str] = set()
+            for _cert_candidate in certificate_candidates:
+                _cert_identity = str(_cert_candidate.get("identity", ""))
+                if not _cert_identity or _cert_identity in _scheduled_cert_ids:
+                    continue
+                _scheduled_cert_ids.add(_cert_identity)
+
+                def _persist_studio_certificate(candidate=_cert_candidate):
+                    return persist_validation_certificate(
+                        candidate,
+                        workspace=workspace,
+                        timeout_s=60.0,
+                    )
+
+                _POST_DELIVERY_SINGLETON.submit(
+                    task_id=f"studio:{exp_id}:{_cert_identity}",
+                    fn=_persist_studio_certificate,
+                    timeout_s=60.0,
+                )
+                print(
+                    f"[comfyui-modal.post_delivery] scheduled studio cert "
+                    f"experiment_id={exp_id} identity={_cert_identity[:16]}"
+                )
+        except Exception as _post_cert_exc:
+            # Certificate persistence is best-effort and must not change the
+            # already-completed Studio result.
+            print(
+                f"[comfyui-modal.post_delivery] studio cert dispatcher error: "
+                f"{_post_cert_exc!r}"
+            )
+
     return result
 
 
@@ -2336,45 +2416,47 @@ def _persist_experiment_error(exp_id: str, error_message: str) -> None:
         _log.warning("Failed to persist error event for experiment %s", exp_id)
 
 
-def handle_studio_run(
+# ── Shared preparation (scheduler and direct paths) ──────────────────────
+
+
+def _prepare_studio_run_context(
     preset_id: str,
     feature_id: str,
     controls: dict[str, Any],
     node_dir: str | os.PathLike,
     trace_ctx: dict | None = None,
     *,
-    profile_preparer: Any = None,
-    gpu: Any = None,
     modal_options: dict | None = None,
     workspace: dict | None = None,
 ) -> dict[str, Any]:
-    """Handle a single Studio run request.
+    """Shared sync preparation for both scheduler and direct-run paths.
 
-    Called from the route handler. Performs validation, builds the
-    compilation, creates an experiment via REGISTRY, and schedules
-    the runner.
+    Uses ``import time`` locally for server-side timing markers.
 
-    *trace_ctx* is an optional dict carrying browser-side timestamps
-    (``t0_perf_ms`` / ``t0_client_press``, captured by the Studio UI).
-    It is propagated to each cell's ``"trace"`` key so that
-    ``LocalRemoteInvoker.run_cell`` can forward it to the remote Modal
-    function and add local observation stages.
+    Loads preset + snapshot, validates, builds the single-run compilation
+    (including production compilation), creates the submission-time history
+    record (status submitted → running), and returns a context dict with
+    everything both paths need.
 
-    Returns a response dict with ``status``, ``runId``, ``experimentId``
-    on success, or ``status`` + ``message`` on error.  No raw exception
-    strings are exposed in the message.
+    Returns ``{"status": "ok", "preset": …, "compilation": …,
+    "run_history_id": …, "exp_id": …, "studio_meta": …,
+    "profile_preparer": …}`` on success, or ``{"status": "error",
+    "message": …}`` on failure.
+
+    Does NOT create an experiment journal, scheduler, or runner.
     """
+    import time as _time  # noqa: F401 — used for server-side timing markers
     node_dir = Path(node_dir)
-    _log.info("Studio run received: preset_id=%s feature_id=%s", preset_id, feature_id)
+    _log.info("Studio run context prep: preset_id=%s feature_id=%s", preset_id, feature_id)
 
-    # 1. Load (returns (preset, snapshot) or (None, error) — thread-safe, no global state)
+    # 1. Load
     loaded_preset, loaded_snapshot = load_preset_and_snapshot(preset_id, node_dir)
     if loaded_preset is None:
         _log.warning("Studio run load failed: %s", loaded_snapshot)
         return {"status": "error", "message": loaded_snapshot}
-    _log.info("Studio run preset/snapshot loaded: preset=%s snapshot=%s",
-              loaded_preset.get("id", ""), loaded_snapshot.get("id", ""))
     preset, snapshot = loaded_preset, loaded_snapshot
+    _log.info("Studio run preset/snapshot loaded: preset=%s snapshot=%s",
+              preset.get("id", ""), snapshot.get("id", ""))
 
     # 2. Validate
     validation = validate_studio_run(preset, snapshot, feature_id)
@@ -2383,9 +2465,14 @@ def handle_studio_run(
         return {"status": "error", "message": validation["error"]}
     _log.info("Studio run validation passed")
 
-    # 3. Build single-run compilation (includes validation + production)
-    # Pass trace_ctx so each cell carries browser timestamps and the trace
-    # flows through to LocalRemoteInvoker.run_cell -> run_prompt_stream.
+    # 3. Seed studio_route_received BEFORE build_single_run_spec so it
+    #    captures when the server started processing (before validate/compile).
+    #    The trace_ctx dict was already seeded at route entry if the caller
+    #    followed the convention, but set a deterministic fallback here.
+    if trace_ctx is not None and "studio_route_received" not in trace_ctx:
+        trace_ctx["studio_route_received"] = _time.time()
+
+    # Build single-run compilation (includes validation + production)
     compilation = build_single_run_spec(
         preset, snapshot, feature_id, controls, node_dir,
         trace_ctx=trace_ctx, modal_options=modal_options,
@@ -2394,27 +2481,45 @@ def handle_studio_run(
         _log.warning("Studio run compilation failed: %s", compilation["error"])
         return {"status": "error", "message": compilation["error"]}
 
+    # ── Seed mutable trace with server-side timing markers ──────────────
+    # These markers live on the cell's trace dict so they flow into
+    # LocalRemoteInvoker.run_cell as _mutable_trace and appear in the
+    # merged timing_payload trace after execution.
+    _cells = compilation.get("cells", [])
+    if _cells:
+        _cell_trace = _cells[0].setdefault("trace", {})
+        # browser_run_click: alias from browser t0 using shared
+        # coerce_t0_from_browser logic (same precedence as normal path).
+        # Always set — server-side current time fallback when no browser
+        # timestamp exists.
+        _t0 = coerce_t0_from_browser(_cell_trace)
+        _cell_trace["browser_run_click"] = _t0 if _t0 is not None else _time.time()
+        # studio_route_received was set on trace_ctx before build_single_run_spec
+        # and is now on _cell_trace already.  Fallback when no trace_ctx was given.
+        if "studio_route_received" not in _cell_trace:
+            _cell_trace["studio_route_received"] = _time.time()
+        # production_compile_complete: captured right after build_single_run_spec
+        if compilation.get("production_plan_used"):
+            _cell_trace["production_compile_complete"] = _time.time()
+
     # 4. Create submission-time history record
     try:
         from experiment_service import REGISTRY
+        from datetime import datetime, timezone
 
         exp_id = compilation["experiment_id"]
-        from datetime import datetime, timezone
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        now_iso = datetime.now(timezone.utc).isoformat()
 
-        # Build requested_controls from the controls dict + studio meta
-        requested_controls = dict(controls or {})
         studio_meta = compilation.get("studio_meta", {})
+        requested_controls = dict(controls or {})
 
-        # Compute workflow_hash from the built workflow if possible
+        # Compute workflow_hash from the built workflow
         workflow_hash_at_submit = ""
         try:
             ck_list = compilation.get("checkpoints", [])
             if ck_list and isinstance(ck_list[0], dict):
                 wf = ck_list[0].get("workflow", {})
                 if wf:
-                    # Import inline to avoid circular dependency at module level
                     from experiment_runner import _workflow_sha256
                     workflow_hash_at_submit = _workflow_sha256(wf)
         except Exception:
@@ -2432,7 +2537,6 @@ def handle_studio_run(
         if workflow_hash_at_submit:
             meta_payload["workflow_hash"] = workflow_hash_at_submit
 
-        # Create the submission history record
         submission_record = REGISTRY.history().record_run(
             kind="studio_run",
             prompt_id=exp_id,
@@ -2452,13 +2556,467 @@ def handle_studio_run(
 
         _log.info("Studio run history record created: %s (status=submitted)", run_history_id)
 
-        # Update the submission record to "running" right before scheduling
+        # Update to "running" right before returning
+        REGISTRY.history().update_run(run_history_id, status="running")
+
+    except Exception:
+        _log.exception("Studio run history creation failed")
+        return {"status": "error", "message": _STABLE_INTERNAL_ERROR}
+
+    # 5. Build profile-preparer closure
+    _ws_captured = workspace
+
+    async def _studio_profile_preparer(resolved_workflow, cell):
+        """Prepare active-next warmup profile using the fully resolved cell workflow."""
+        try:
+            from experiment_runner import _workflow_sha256
+            from modal_client import set_active_warmup_profile as _remote_setter
+            _hash = _workflow_sha256(resolved_workflow) if isinstance(resolved_workflow, dict) else ""
+            _cell_report = cell.get("production_report")
+            _compilation_prod_opts = compilation.get("production_options") or {}
+            _compilation_prod_report = compilation.get("production_report") or {}
+            _active_prod_opts: dict | None = None
+            _prod_report = _cell_report or _compilation_prod_report
+            if _prod_report and _prod_report.get("enabled"):
+                _active_prod_opts = dict(_compilation_prod_opts) if _compilation_prod_opts else {}
+                _active_prod_opts.setdefault("enabled", True)
+                if not _active_prod_opts.get("output_node_ids"):
+                    _ids = _prod_report.get("output_node_ids") or _prod_report.get("kept_node_ids") or []
+                    if _ids:
+                        _active_prod_opts["output_node_ids"] = list(_ids)
+                _active_prod_opts.setdefault("source_workflow_hash",
+                    _prod_report.get("source_workflow_hash", ""))
+                _active_prod_opts.setdefault("compiled_workflow_hash",
+                    _prod_report.get("compiled_workflow_hash", ""))
+                _active_prod_opts.setdefault("production_plan_hash",
+                    _prod_report.get("production_plan_hash", ""))
+                _active_prod_opts.setdefault("compiler_version",
+                    _prod_report.get("compiler_version", 1))
+                _active_prod_opts.setdefault("hash_schema_version",
+                    _prod_report.get("hash_schema_version", HASH_SCHEMA_VERSION))
+                _active_prod_opts.setdefault("production_plan_schema_version",
+                    _prod_report.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION))
+            await prepare_active_next_profile(
+                resolved_workflow,
+                _hash,
+                production_options=_active_prod_opts,
+                workspace=_ws_captured,
+                setter=_remote_setter,
+            )
+        except Exception:
+            _log.warning("Studio profile preparer failed (non-fatal)")
+
+    return {
+        "status": "ok",
+        "preset": preset,
+        "compilation": compilation,
+        "run_history_id": run_history_id,
+        "exp_id": exp_id,
+        "studio_meta": studio_meta,
+        "profile_preparer": _studio_profile_preparer,
+    }
+
+
+# ── Direct single-run completion helper ────────────────────────────────
+
+
+async def direct_studio_run_completion(
+    ctx: dict[str, Any],
+    node_dir: str | os.PathLike,
+    *,
+    gpu: Any = None,
+    modal_options: dict | None = None,
+    workspace: dict | None = None,
+) -> dict[str, Any]:
+    """Execute a single Studio run directly via LocalRemoteInvoker.
+
+    Takes the context dict produced by ``_prepare_studio_run_context``
+    (which must carry ``status="ok"``).  Runs the single cell through
+    ``LocalRemoteInvoker.run_cell`` — no ExperimentScheduler,
+    ExperimentRunner, leases, checkpoints collection, or experiment
+    journal created.
+
+    Preserves production hash guards, output node handling, output
+    saving, progress events, timing merge, and fail-closed behavior.
+
+    Returns a dict with ``status``, ``output_paths``, ``timings``,
+    ``studio_meta``, and ``production_plan_used``.
+    """
+    from datetime import datetime, timezone
+    import time as _time
+    import uuid as _uuid
+
+    if ctx.get("status") != "ok":
+        return {"status": "error", "message": ctx.get("message", "Preparation failed")}
+
+    node_dir = Path(node_dir)
+    preset = ctx["preset"]
+    compilation = ctx["compilation"]
+    run_history_id = ctx["run_history_id"]
+    exp_id = ctx["exp_id"]
+    studio_meta = ctx["studio_meta"]
+    profile_preparer = ctx["profile_preparer"]
+
+    # Extract the single cell from the compilation
+    cells = compilation.get("cells", [])
+    checkpoints = compilation.get("checkpoints", [])
+
+    if not cells or not checkpoints:
+        return {"status": "error", "message": "Compilation has no cells or checkpoints"}
+
+    cell = cells[0]
+    ck = checkpoints[0]
+
+    # Set up the cell with everything run_cell expects
+    cell.setdefault("attempt_id", f"a_{_uuid.uuid4().hex[:8]}")
+    cell.setdefault("_resolved_prompt", cell.get("prompt", ""))
+    cell.setdefault("_resolved_negative", cell.get("negative_prompt", ""))
+    cell.setdefault("_resolved_unet", "")
+    cell.setdefault("_resolved_clip", "")
+    cell.setdefault("_resolved_vae", "")
+    cell.setdefault("_resolved_lora_chain", [])
+
+    # Build production report from compilation data (same logic as scheduler path)
+    _prod_report = compilation.get("production_report")
+    _prod_options_from_comp = compilation.get("production_options")
+
+    _effective_modal_options = dict(modal_options) if modal_options else {}
+    if _prod_report and _prod_report.get("enabled"):
+        _prod_opts = dict(_prod_options_from_comp) if _prod_options_from_comp else {}
+        if not _prod_opts.get("output_node_ids") and _prod_report.get("output_node_ids"):
+            _prod_opts["output_node_ids"] = list(_prod_report["output_node_ids"])
+        if not _prod_opts.get("output_node_ids") and _prod_report.get("kept_node_ids"):
+            _prod_opts["output_node_ids"] = list(_prod_report["kept_node_ids"])
+        _effective_modal_options["production"] = _prod_opts
+
+    # ── Build stream_event_sink for progress events ──────────────────────
+    async def _progress_sink(detail: dict) -> None:
+        """Broadcast progress as experiment.worker.progress (no-op safe)."""
+        try:
+            from server import PromptServer
+            server = PromptServer.instance
+            if server is not None:
+                server.send_sync("experiment.worker.progress", dict(detail))
+        except Exception:
+            pass
+
+    from experiment_runner import LocalRemoteInvoker
+    from local_artifacts import get_studio_outputs_dir
+    from modal_client import run_prompt_stream
+
+    # ── Mutable trace is already seeded by _prepare_studio_run_context ──
+    # _prepare_studio_run_context set browser_run_click, studio_route_received,
+    # and production_compile_complete on the cell trace.  LocalRemoteInvoker
+    # .run_cell will add active_profile_write_{start,end} with try/finally,
+    # remote_submit, first_remote_event, result_received, and
+    # output_materialized directly on _mutable_trace.  No fallback needed here.
+    _mutable_trace = cell.setdefault("trace", {})
+
+    invoker = LocalRemoteInvoker(
+        run_prompt_stream,
+        experiment_id=exp_id,
+        node_dir=str(node_dir),
+        stream_event_sink=_progress_sink,
+        profile_preparer=profile_preparer,
+        gpu=gpu,
+        modal_options=_effective_modal_options,
+        workspace=workspace,
+        production_report=_prod_report,
+        studio_output_dir=str(get_studio_outputs_dir()),
+    )
+
+    # ── Run cell directly (no scheduler/runner/leases/journal) ─────────
+    _worker_id = f"w_{_uuid.uuid4().hex[:8]}"
+    await invoker.open_worker(
+        _worker_id,
+        cell.get("checkpoint_id", ck.get("id", "")),
+        ck.get("profile_id", ""),
+        workflow=ck.get("workflow", {}),
+        triple=ck.get("triple", {}),
+    )
+
+    result = await invoker.run_cell(_worker_id, cell)
+
+    # ── Read merged trace from timing payload ──────────────────────────
+    # The invoker.run_cell set active_profile_write_{start,end},
+    # remote_submit, first_remote_event, result_received, and
+    # output_materialized directly on _mutable_trace, which was merged
+    # into the returned timing_payload trace.  No fallback/aliasing needed.
+    _merged_stages: dict[str, float] = {}
+    _merged_trace_dict: dict = {}
+    timing_payload = result.get("timing_payload")
+    if timing_payload:
+        _mt = timing_payload.get("trace", {})
+        if isinstance(_mt, dict):
+            _merged_trace_dict = _mt
+            _merged_stages = _mt.get("stages", {}) or {}
+
+    # ── Process result ──────────────────────────────────────────────────
+    if result.get("status") == "completed":
+        output_paths = result.get("output_paths", [])
+
+        # ── Build timings dict for history ─────────────────────────────
+        timings: dict[str, Any] = {}
+        timing_sources: dict[str, str] = {}
+        timings["_run_type"] = "direct"
+        timing_sources["_run_type"] = "local_server_observed"
+
+        # Expose all required marker aliases at top-level timings.
+        # These are set by LocalRemoteInvoker.run_cell directly on
+        # _mutable_trace and flowed through the merged trace stages.
+        _required_markers = [
+            "browser_run_click", "studio_route_received",
+            "production_compile_complete",
+            "active_profile_write_start", "active_profile_write_end",
+            "remote_submit", "first_remote_event",
+            "result_received", "output_materialized",
+        ]
+        for _mk in _required_markers:
+            _mv = _merged_stages.get(_mk)
+            if _mv is not None:
+                timings[_mk] = _mv
+                timing_sources[_mk] = "local_server_observed"
+
+        # The Playground total is the complete client-press to materialized
+        # output wall time, not the sum of overlapping remote child stages.
+        _trace_e2e_ms = _derive_end_to_end_total_ms(_merged_stages)
+        if _trace_e2e_ms is not None:
+            timings["end_to_end_total_ms"] = _trace_e2e_ms
+            timing_sources["end_to_end_total_ms"] = "local_server_observed"
+
+        # Compute deltas from merged stages
+        _stage_pairs = [
+            ("studio_route_received", "production_compile_complete", "compile_ms"),
+            ("active_profile_write_start", "active_profile_write_end", "profile_write_ms"),
+            ("remote_submit", "result_received", "remote_execution_ms"),
+            ("result_received", "output_materialized", "materialize_ms"),
+        ]
+        for _start_key, _end_key, _ms_key in _stage_pairs:
+            _s = _merged_stages.get(_start_key)
+            _e = _merged_stages.get(_end_key)
+            if _s is not None and _e is not None:
+                _delta = round((_e - _s) * 1000, 2)
+                if _delta >= 0:
+                    timings[_ms_key] = _delta
+                    timing_sources[_ms_key] = "local_server_observed"
+
+        # ── Merge remote timing payload ───────────────────────────────────
+        # Uses the shared module-level _CANONICAL_ALIAS_MAP (same keys as
+        # the scheduler path in _schedule_and_start).
+        _merged_deltas: dict = {}
+        _merged_derived: dict = {}
+        if timing_payload:
+            _merged_trace = timing_payload.get("trace", {}) or {}
+            _merged_deltas = _merged_trace.get("deltas_ms", {}) or {}
+            _merged_derived = _merged_trace.get("derived_ms", {}) or {}
+
+        # Canonical alias map — iterates module-level _CANONICAL_ALIAS_MAP
+        # so both scheduler and direct-run paths derive timing identically.
+        _remote_timings_blk: dict[str, Any] = {}
+        for _canon_key, _raw_key, _source in _CANONICAL_ALIAS_MAP:
+            _val = _merged_deltas.get(_raw_key)
+            if _val is not None:
+                timings[_canon_key] = _val
+                timing_sources[_canon_key] = _source
+                _remote_timings_blk[_raw_key] = _val
+
+        # Restore timing from _restore_timing block — map to top-level keys
+        # only (NOT inside remote_timings) so consumers never sum restore
+        # into execution metrics like inference_total.
+        if timing_payload:
+            _restore = timing_payload.get("_restore_timing", {}) or {}
+            _restore_total = _restore.get("restore_total_ms")
+            if _restore_total is not None:
+                timings["restore_total_ms"] = _restore_total
+                timing_sources["restore_total_ms"] = "remote_trace"
+                timings["remote_restore_ms"] = _restore_total
+                timing_sources["remote_restore_ms"] = "remote_trace"
+
+        # Preserve raw remote_timings block for diagnostic access.
+        if _remote_timings_blk:
+            timings["remote_timings"] = dict(_remote_timings_blk)
+            timing_sources["remote_timings"] = "derived"
+
+        # Local materialization wall time from merged derived_ms
+        _local_mat_ms = _merged_derived.get("local_output_materialization_ms")
+        if _local_mat_ms is not None:
+            timings["local_output_materialization_ms"] = _local_mat_ms
+            timing_sources["local_output_materialization_ms"] = "derived"
+
+        # Preserve compact raw trace structures (no base64)
+        if timing_payload:
+            for _raw_key in ("trace", "wall_clock_trace", "_wall_clock_summary",
+                             "_restore_timing", "scheduler_trace"):
+                _val = timing_payload.get(_raw_key)
+                if _val is not None:
+                    timings[_raw_key] = copy.deepcopy(_val)
+                    timing_sources[_raw_key] = "remote_trace"
+
+        # platform_pre_restore_ms: cross-process inferred window
+        _t2_submit = _merged_stages.get("t2_local_modal_submit_start") or _merged_stages.get("t2_local_dispatch")
+        if timing_payload:
+            _restore_block = timing_payload.get("_restore_timing", {}) or {}
+            _restore_start = _restore_block.get("restore_start_unix_s")
+            if _t2_submit is not None and _restore_start is not None:
+                _pre_restore_ms = round((_restore_start - _t2_submit) * 1000, 2)
+                if _pre_restore_ms >= 0:
+                    timings["platform_pre_restore_ms"] = _pre_restore_ms
+                    timing_sources["platform_pre_restore_ms"] = "cross_process_inferred"
+
+        # trace_available flag
+        timings["trace_available"] = bool(timing_payload)
+
+        # Attach timing_sources metadata
+        if timing_sources:
+            timings["timing_sources"] = timing_sources
+
+        # ── Build meta for history ────────────────────────────────────
+        meta_merge: dict = {
+            "requested_controls": dict(studio_meta.get("studio_controls", {})),
+            "studio_preset_id": studio_meta.get("studio_preset_id", ""),
+            "studio_snapshot_id": studio_meta.get("studio_snapshot_id", ""),
+            "studio_feature_id": studio_meta.get("studio_feature_id", ""),
+            "experiment_id": exp_id,
+            "preset_label": studio_meta.get("studio_preset_label", ""),
+            "production_plan_used": "yes" if compilation.get("production_plan_used") else "no",
+        }
+
+        # Resolved controls from post-application workflow
+        try:
+            wf = ck.get("workflow", {})
+            slots = ck.get("slots", {})
+            resolved_controls = _build_resolved_controls(wf, slots)
+            _resolved_sanitised = _sanitize_resolved_controls(resolved_controls or {})
+            meta_merge["resolved_controls"] = dict(_resolved_sanitised)
+            canonical_aliases = _flatten_canonical_aliases(_resolved_sanitised)
+            for k, v in canonical_aliases.items():
+                if v is not None and k not in meta_merge:
+                    meta_merge[k] = v
+        except Exception:
+            pass
+
+        # Output paths
+        if output_paths:
+            meta_merge["output_paths"] = list(output_paths)
+
+        # Exactly one output
+        meta_merge["output_count"] = len(output_paths) if isinstance(output_paths, list) else 0
+
+        # ── Finalize history ──────────────────────────────────────────
+        completed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            from experiment_service import REGISTRY
+
+            update_kwargs: dict = {
+                "status": "completed",
+                "completed_at": completed_at,
+                "timings": timings,
+                "meta": meta_merge,
+            }
+            if output_paths:
+                update_kwargs["output_path"] = output_paths[0]
+            REGISTRY.history().update_run(run_history_id, **update_kwargs)
+        except Exception:
+            _log.warning("Failed to finalize run history for %s", exp_id)
+
+        # ── Certificate persistence (post-delivery) ──────────────────
+        _result_data = result.get("result")
+        if isinstance(_result_data, dict):
+            _cert_candidate = _result_data.get("_certificate_candidate")
+            if isinstance(_cert_candidate, dict) and _cert_candidate.get("identity"):
+                try:
+                    from modal_client import persist_validation_certificate
+                    from optimizations import _POST_DELIVERY_SINGLETON
+
+                    def _persist_studio_certificate(candidate=_cert_candidate):
+                        return persist_validation_certificate(
+                            candidate,
+                            workspace=workspace,
+                            timeout_s=60.0,
+                        )
+
+                    _POST_DELIVERY_SINGLETON.submit(
+                        task_id=f"studio:{exp_id}:{_cert_candidate['identity'][:16]}",
+                        fn=_persist_studio_certificate,
+                        timeout_s=60.0,
+                    )
+                except Exception:
+                    pass
+
+        return {
+            "status": "ok",
+            "runId": run_history_id,
+            "experimentId": exp_id,
+            "runHistoryId": run_history_id,
+            "completed_at": completed_at,
+            "output_paths": output_paths,
+            "output_path": output_paths[0] if output_paths else "",
+            "timings": timings,
+            "meta": meta_merge,
+            "studio_meta": studio_meta,
+            "production_plan_used": compilation.get("production_plan_used", False),
+            "direct_run": True,
+        }
+
+    # ── Failure path ──────────────────────────────────────────────────
+    error_message = result.get("error", "Studio direct run failed")
+    _log.error("Studio direct run failed for %s: %s", exp_id, error_message)
+    try:
+        from experiment_service import REGISTRY
+        from datetime import datetime, timezone
+        fail_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         REGISTRY.history().update_run(
             run_history_id,
-            status="running",
+            status="error",
+            completed_at=fail_ts,
+            meta={"error": _STABLE_INTERNAL_ERROR, "_error_detail": error_message[:500]},
         )
+    except Exception:
+        pass
 
-        # 5. Create experiment via REGISTRY and start scheduler
+    return {"status": "error", "message": _STABLE_INTERNAL_ERROR}
+
+
+# ── Scheduler path (legacy, extracted from original handle_studio_run) ──
+
+
+def _handle_studio_run_scheduler(
+    ctx: dict[str, Any],
+    node_dir: str | os.PathLike,
+    *,
+    gpu: Any = None,
+    modal_options: dict | None = None,
+    workspace: dict | None = None,
+) -> dict[str, Any]:
+    """Legacy scheduler path for single runs.
+
+    Takes the context from ``_prepare_studio_run_context``, creates an
+    experiment via REGISTRY, and fires the scheduler in the background.
+    Returns the submission response immediately.
+
+    Behavior and scheduler path unchanged from the original
+    ``handle_studio_run`` — only the shared preparation logic has been
+    extracted.
+    """
+    if ctx.get("status") != "ok":
+        return {"status": "error", "message": ctx.get("message", "Preparation failed")}
+
+    node_dir = Path(node_dir)
+    compilation = ctx["compilation"]
+    run_history_id = ctx["run_history_id"]
+    exp_id = ctx["exp_id"]
+    studio_meta = ctx["studio_meta"]
+    preset = ctx["preset"]
+    preset_id = preset.get("id", "")
+    feature_id = studio_meta.get("studio_feature_id", "")
+    profile_preparer = ctx["profile_preparer"]
+
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    try:
+        from experiment_service import REGISTRY
+
         definition = {
             "experiment_id": exp_id,
             "revision": 1,
@@ -2472,78 +3030,6 @@ def handle_studio_run(
         _create_experiment(exp_id, compilation, definition, REGISTRY)
         _log.info("Studio experiment created: %s", exp_id)
 
-        # ── Build shared profile-preparer closure for the Studio path ──
-        # Uses the same warmup_profile.prepare_active_next_profile that
-        # __init__._execute_job calls, but with a setter sourced from
-        # modal_client.  The workflow hash is computed from the ACTUAL
-        # resolved_workflow (passed to the closure by run_cell), NOT
-        # from the pre-compilation workflow, so that post-resolution
-        # mutations are captured.
-        _ws_captured = workspace
-
-        async def _studio_profile_preparer(resolved_workflow, cell):
-            """Prepare active-next warmup profile using the fully resolved
-            cell workflow.  Hashes the actual resolved_workflow passed by
-            LocalRemoteInvoker.run_cell.
-
-            Forwards production options from the compilation data so that
-            omitted production (default-enabled) is reflected in the
-            activation payload.
-
-            Enriches from the effective production report with all hash
-            identity fields (source_workflow_hash, compiled_workflow_hash,
-            production_plan_hash, compiler_version, hash_schema_version,
-            production_plan_schema_version) so the remote side can validate
-            profile identity.
-            """
-            try:
-                from experiment_runner import _workflow_sha256
-                from modal_client import set_active_warmup_profile as _remote_setter
-                _hash = _workflow_sha256(resolved_workflow) if isinstance(resolved_workflow, dict) else ""
-                # Derive production options from the compilation data.
-                # The compilation carries production_options when production
-                # is enabled; prefer the cell-level production_report when
-                # available, then fall back to the compilation-level one.
-                _cell_report = cell.get("production_report")
-                _compilation_prod_opts = compilation.get("production_options") or {}
-                _compilation_prod_report = compilation.get("production_report") or {}
-                _active_prod_opts: dict | None = None
-                _prod_report = _cell_report or _compilation_prod_report
-                if _prod_report and _prod_report.get("enabled"):
-                    _active_prod_opts = dict(_compilation_prod_opts) if _compilation_prod_opts else {}
-                    _active_prod_opts.setdefault("enabled", True)
-                    # Forward output_node_ids from the report if not present
-                    if not _active_prod_opts.get("output_node_ids"):
-                        _ids = _prod_report.get("output_node_ids") or _prod_report.get("kept_node_ids") or []
-                        if _ids:
-                            _active_prod_opts["output_node_ids"] = list(_ids)
-                    # Enrich with hash identity fields from the effective report.
-                    # These are required by prepare_active_next_profile →
-                    # _build_activation_payload for the profile dedup key and
-                    # remote-side compiled-workflow validation.
-                    _active_prod_opts.setdefault("source_workflow_hash",
-                        _prod_report.get("source_workflow_hash", ""))
-                    _active_prod_opts.setdefault("compiled_workflow_hash",
-                        _prod_report.get("compiled_workflow_hash", ""))
-                    _active_prod_opts.setdefault("production_plan_hash",
-                        _prod_report.get("production_plan_hash", ""))
-                    _active_prod_opts.setdefault("compiler_version",
-                        _prod_report.get("compiler_version", 1))
-                    _active_prod_opts.setdefault("hash_schema_version",
-                        _prod_report.get("hash_schema_version", HASH_SCHEMA_VERSION))
-                    _active_prod_opts.setdefault("production_plan_schema_version",
-                        _prod_report.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION))
-                await prepare_active_next_profile(
-                    resolved_workflow,
-                    _hash,
-                    production_options=_active_prod_opts,
-                    workspace=_ws_captured,
-                    setter=_remote_setter,
-                )
-            except Exception:
-                _log.warning("Studio profile preparer failed (non-fatal)")
-
-        # Start scheduler in background — report truthful submission status
         import asyncio
 
         async def _start_and_catch(exp_id, compilation, REGISTRY, nd,
@@ -2561,7 +3047,6 @@ def handle_studio_run(
                 error_detail = str(exc)[:300]
                 fail_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 _log.error("Scheduler start failed for experiment %s: %s", exp_id, error_detail)
-                # Finalize the submission record as failed with stable message
                 if run_history_id:
                     try:
                         REGISTRY.history().update_run(
@@ -2583,15 +3068,15 @@ def handle_studio_run(
             if loop.is_running():
                 _fire_and_forget(
                     _start_and_catch(exp_id, compilation, REGISTRY, node_dir,
-                                     pp=_studio_profile_preparer, g=gpu, mo=modal_options, ws=workspace),
+                                     pp=profile_preparer, g=gpu, mo=modal_options, ws=workspace),
                     exp_id,
                 )
             else:
                 asyncio.run(_start_and_catch(exp_id, compilation, REGISTRY, node_dir,
-                                             pp=_studio_profile_preparer, g=gpu, mo=modal_options, ws=workspace))
+                                             pp=profile_preparer, g=gpu, mo=modal_options, ws=workspace))
         except RuntimeError:
             asyncio.run(_start_and_catch(exp_id, compilation, REGISTRY, node_dir,
-                                         pp=_studio_profile_preparer, g=gpu, mo=modal_options, ws=workspace))
+                                         pp=profile_preparer, g=gpu, mo=modal_options, ws=workspace))
         except Exception:
             _log.exception("Unexpected error starting scheduler for %s", exp_id)
             _persist_experiment_error(exp_id, _STABLE_INTERNAL_ERROR)
@@ -2605,7 +3090,113 @@ def handle_studio_run(
             "studio_meta": studio_meta,
         }
     except Exception:
-        _log.exception("Studio run failed for experiment %s", compilation.get("experiment_id", "unknown"))
+        _log.exception("Studio run scheduler failed for experiment %s", exp_id)
+        return {"status": "error", "message": _STABLE_INTERNAL_ERROR}
+
+
+async def handle_studio_run_async(
+    preset_id: str,
+    feature_id: str,
+    controls: dict[str, Any],
+    node_dir: str | os.PathLike,
+    trace_ctx: dict | None = None,
+    *,
+    profile_preparer: Any = None,
+    gpu: Any = None,
+    modal_options: dict | None = None,
+    workspace: dict | None = None,
+    direct: bool = True,
+) -> dict[str, Any]:
+    """Async handler for a single Studio run.
+
+    Uses shared preparation then either executes the cell directly via
+    ``direct_studio_run_completion`` (``direct=True``, default) or
+    schedules via the experiment scheduler (``direct=False``).
+
+    Returns a completed result dict on success in direct mode, or a
+    submission response dict in scheduler (legacy) mode.
+    """
+    ctx = _prepare_studio_run_context(
+        preset_id, feature_id, controls, node_dir,
+        trace_ctx=trace_ctx, modal_options=modal_options, workspace=workspace,
+    )
+    if ctx.get("status") != "ok":
+        return ctx
+
+    if not direct:
+        return _handle_studio_run_scheduler(
+            ctx, node_dir,
+            gpu=gpu, modal_options=modal_options, workspace=workspace,
+        )
+
+    return await direct_studio_run_completion(
+        ctx, node_dir,
+        gpu=gpu, modal_options=modal_options, workspace=workspace,
+    )
+
+
+def handle_studio_run(
+    preset_id: str,
+    feature_id: str,
+    controls: dict[str, Any],
+    node_dir: str | os.PathLike,
+    trace_ctx: dict | None = None,
+    *,
+    profile_preparer: Any = None,
+    gpu: Any = None,
+    modal_options: dict | None = None,
+    workspace: dict | None = None,
+    direct: bool = True,
+) -> dict[str, Any]:
+    """Sync wrapper for ``handle_studio_run_async``.
+
+    Runs the async handler in a new event loop (thread) when called from
+    a context with a running loop.  Falls back to ``asyncio.run()`` when
+    no loop is running.
+
+    Prefer calling ``handle_studio_run_async`` directly from async route
+    handlers to avoid the thread overhead.
+    """
+    import asyncio
+
+    async def _run():
+        return await handle_studio_run_async(
+            preset_id, feature_id, controls, node_dir,
+            trace_ctx=trace_ctx,
+            profile_preparer=profile_preparer,
+            gpu=gpu, modal_options=modal_options,
+            workspace=workspace, direct=direct,
+        )
+
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is not None and loop.is_running():
+        import threading
+        _result_holder: list[dict] = []
+
+        def _run_in_thread():
+            _inner_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(_inner_loop)
+            try:
+                r = _inner_loop.run_until_complete(_run())
+                _result_holder.append(r)
+            finally:
+                _inner_loop.close()
+
+        t = threading.Thread(target=_run_in_thread, daemon=True)
+        t.start()
+        t.join(timeout=600)
+        if not _result_holder:
+            return {"status": "error", "message": "Direct run timed out"}
+        return _result_holder[0]
+
+    try:
+        return asyncio.run(_run())
+    except Exception:
+        _log.exception("Direct studio run failed for %s", preset_id)
         return {"status": "error", "message": _STABLE_INTERNAL_ERROR}
 
 
