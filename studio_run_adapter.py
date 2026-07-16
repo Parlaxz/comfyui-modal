@@ -63,6 +63,10 @@ from production_workflow import (
     HASH_SCHEMA_VERSION,
     PRODUCTION_PLAN_SCHEMA_VERSION,
 )
+from run_prompt_options import (
+    build_run_prompt_options,
+    ensure_run_prompt_options,
+)
 from studio_store import StudioJsonStore, StudioStoreError
 from studio_models import (
     _FEATURE_BINDING_KEYS,
@@ -1915,6 +1919,16 @@ async def _schedule_and_start(
             _prod_options["output_node_ids"] = list(_prod_report["kept_node_ids"])
         _effective_modal_options["production"] = _prod_options
 
+    # ── Merge actual_load defaults via shared builder ──────────────────
+    _prod_ids = []
+    if _effective_modal_options.get("production") and _effective_modal_options["production"].get("enabled"):
+        _prod_ids = _effective_modal_options["production"].get("output_node_ids", [])
+    _builder_opts = build_run_prompt_options(
+        production_output_node_ids=_prod_ids,
+        enable_actual_load=True,
+    )
+    _effective_modal_options = ensure_run_prompt_options(_effective_modal_options, _builder_opts)
+
     # ── Build a stream_event_sink that broadcasts nonterminal progress ────
     # as experiment.worker.progress via PromptServer.send_sync (no-op safe
     # when PromptServer is unavailable / outside ComfyUI).
@@ -2724,6 +2738,16 @@ async def direct_studio_run_completion(
         if not _prod_opts.get("output_node_ids") and _prod_report.get("kept_node_ids"):
             _prod_opts["output_node_ids"] = list(_prod_report["kept_node_ids"])
         _effective_modal_options["production"] = _prod_opts
+
+    # ── Merge actual_load defaults via shared builder ──────────────────
+    _prod_ids = []
+    if _effective_modal_options.get("production") and _effective_modal_options["production"].get("enabled"):
+        _prod_ids = _effective_modal_options["production"].get("output_node_ids", [])
+    _builder_opts = build_run_prompt_options(
+        production_output_node_ids=_prod_ids,
+        enable_actual_load=True,
+    )
+    _effective_modal_options = ensure_run_prompt_options(_effective_modal_options, _builder_opts)
 
     # ── Build stream_event_sink for progress events ──────────────────────
     async def _progress_sink(detail: dict) -> None:

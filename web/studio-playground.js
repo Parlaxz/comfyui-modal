@@ -2667,6 +2667,23 @@ function renderExperimentGridViewport(state, context) {
   // Two progress bars at bottom
   viewport.appendChild(_renderExperimentProgressBars(runState, state));
 
+  // Total time display (always rendered, uses — placeholder when unavailable)
+  var totalTimeRow = el("div", {
+    class: "comfymodal-studio-experiment-grid-progress-row",
+    "data-testid": "experiment-total-time",
+    style: "margin-top:4px;padding-top:4px;border-top:1px solid #222;",
+  });
+  totalTimeRow.appendChild(el("span", {
+    class: "comfymodal-studio-experiment-grid-progress-label",
+    text: "Total time",
+  }));
+  totalTimeRow.appendChild(el("span", {
+    style: "font-size:10px;color:#aaa;margin-left:auto;font-variant-numeric:tabular-nums;",
+    "data-testid": "experiment-total-time-value",
+    text: _formatTotalExperimentTime(runState, snapshot, events, entries),
+  }));
+  viewport.appendChild(totalTimeRow);
+
   // Cell detail overlay (shown when _selectedCellKey is set)
   var selectedCellKey = state.playground && state.playground._selectedCellKey;
   if (selectedCellKey) {
@@ -2683,6 +2700,66 @@ function renderExperimentGridViewport(state, context) {
   }
 
   return viewport;
+}
+
+/**
+ * Compute total experiment wall-clock time using prioritized sources:
+ *   1. Snapshot-level total_duration_ms (explicit field)
+ *   2. Experiment definition timestamps (completed_at - created_at)
+ *   3. Cell-duration sum (fallback)
+ *   4. Live elapsed when active (non-terminal)
+ * Returns formatted string or placeholder dash.
+ */
+function _formatTotalExperimentTime(runState, snapshot, events, entries) {
+  // ── Priority 1: explicit total_duration_ms on snapshot ──
+  if (snapshot && snapshot.total_duration_ms != null) {
+    var td = Number(snapshot.total_duration_ms);
+    if (!isNaN(td) && td > 0) return _formatDuration(td);
+  }
+
+  // ── Priority 2: wall-clock from event timestamps ──
+  if (events && events.length >= 2) {
+    var startEv = null;
+    var endEv = null;
+    for (var _ei = 0; _ei < events.length; _ei++) {
+      var t = events[_ei].type;
+      if (t === "experiment.started" || t === "experiment.created") {
+        startEv = events[_ei];
+      } else if (t === "experiment.completed" || t === "experiment.failed_fatal" || t === "experiment.stopped") {
+        endEv = events[_ei];
+      }
+    }
+    // Check for timestamp at event level, then created_at at payload or event level
+    var startTs = startEv && (startEv.timestamp || startEv.created_at || (startEv.payload && startEv.payload.created_at));
+    var endTs = endEv && (endEv.timestamp || endEv.created_at || (endEv.payload && endEv.payload.created_at));
+    if (startTs && endTs) {
+      var s = new Date(startTs).getTime();
+      var e = new Date(endTs).getTime();
+      if (!isNaN(s) && !isNaN(e) && e > s) return _formatDuration(e - s);
+    }
+  }
+
+  // ── Priority 3: live elapsed when active ──
+  var isTerminal = runState.status === "completed" || runState.status === "error";
+  if (runState.elapsedMs != null && !isTerminal) {
+    var el = Number(runState.elapsedMs);
+    if (!isNaN(el) && el > 0) return _formatDuration(el);
+  }
+
+  // ── Priority 4: cell-duration sum (fallback) ──
+  var sumMs = 0;
+  var hasAnyDuration = false;
+  for (var _si = 0; _si < entries.length; _si++) {
+    var dur = _getCellDuration(entries[_si].attempt);
+    if (dur != null && dur > 0) {
+      sumMs += dur;
+      hasAnyDuration = true;
+    }
+  }
+  if (hasAnyDuration && sumMs > 0) return _formatDuration(sumMs);
+
+  // ── No data available — visible placeholder ──
+  return "\u2014";
 }
 
 function _getCompilationCells(events) {
@@ -3257,6 +3334,7 @@ function _renderExperimentCell(entry, apiBase, state, context, index) {
   var imgwrap = el("div", { class: "cm-exp-cell-imgwrap" });
 
   if (outputUrl) {
+    imgwrap.style.aspectRatio = "auto";
     imgwrap.appendChild(el("img", {
       class: "cm-exp-cell-image",
       src: outputUrl,
@@ -3295,52 +3373,7 @@ function _renderExperimentCell(entry, apiBase, state, context, index) {
     }));
   }
 
-  // Label overlay tags (axis values that vary in this experiment)
-  var axisLabels = entry._axisLabels || {};
-  var axisKeys = Object.keys(axisLabels);
-  if (axisKeys.length > 0) {
-    var tagOverlay = el("div", { class: "cm-exp-cell-tags" });
-    for (var ti = 0; ti < axisKeys.length; ti++) {
-      var ak = axisKeys[ti];
-      var av = axisLabels[ak];
-      if (av == null || av === "") continue;
-      var tagClass = "cm-exp-cell-tag";
-      var knownTypes = { model: 1, checkpoint: 1, lora: 1, sampler: 1, scheduler: 1, guidance: 1, steps: 1, seed: 1, denoise: 1, prompt: 1 };
-      if (knownTypes[ak]) tagClass += " cm-exp-cell-tag-" + ak;
-      var displayVal = String(av);
-      if (displayVal.length > 40) displayVal = displayVal.substring(0, 38) + "\u2026";
-      tagOverlay.appendChild(el("span", {
-        class: tagClass,
-        text: displayVal,
-        title: String(av),
-      }));
-    }
-    if (tagOverlay.children.length > 0) {
-      imgwrap.appendChild(tagOverlay);
-    }
-  }
-
   card.appendChild(imgwrap);
-
-  // ── Info section ───────────────────────────────────────────────
-  var metaRows = _buildCellMetaRows(entry);
-  if (metaRows.length > 0) {
-    var info = el("div", { class: "cm-exp-cell-info" });
-    for (var mi = 0; mi < metaRows.length; mi++) {
-      var mr = metaRows[mi];
-      var stat = el("div", { class: "cm-exp-cell-stat" }, [
-        el("span", { class: "cm-exp-cell-stat-key", text: mr.key + ": " }),
-        el("span", {
-          class: "cm-exp-cell-stat-val",
-          text: mr.val,
-          title: mr.full || mr.val,
-        }),
-      ]);
-      info.appendChild(stat);
-    }
-    card.appendChild(info);
-  }
-
   cell.appendChild(card);
 
   // Click handler — select cell for detail view
