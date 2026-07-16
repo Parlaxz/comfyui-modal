@@ -11157,41 +11157,26 @@ class _ComfyAPIMixin:
             object.__setattr__(self, '_original_loaders_store', {})
         return self._original_loaders_store
 
-    def _prompt_async_actual_load(self, workflow: dict, modal_options: dict | None = None) -> dict:
+    def _prompt_async_actual_load(self, workflow: dict) -> dict:
         _al_t0 = time.time()
         # Per-invocation sequence identifier for the narrow UNET->VAE coordinator
         _request_seq = uuid.uuid4().hex[:12]
 
-        # ── Resolve request-level actual_load settings ────────────────
-        # Priority: request modal_options > module-level env defaults.
-        _req_al = (modal_options or {}).get("actual_load", {})
-        if isinstance(_req_al, dict):
-            _eff_enabled = _req_al.get("enabled", PROMPT_ASYNC_ACTUAL_LOAD)
-            _eff_mode = _req_al.get("mode", ACTUAL_LOAD_MODE)
-        else:
-            _eff_enabled = PROMPT_ASYNC_ACTUAL_LOAD
-            _eff_mode = ACTUAL_LOAD_MODE
-        # Coerce types
-        _eff_enabled = bool(_eff_enabled)
-        _eff_mode = str(_eff_mode).strip().lower()
-        if _eff_mode not in ("off", "clip_vae_only", "unet_only", "unet_vae_only"):
-            _eff_mode = ACTUAL_LOAD_MODE  # fall back to env default if unknown
-
         result = {
             "enabled": False, "submitted": [], "skipped_unet": False, "futures": {},
             "clip_submitted": False, "clip_cache_hit": False, "clip_duration_ms": 0.0,
-            "actual_load_mode": _eff_mode,
-            "actual_load_mode_effective": _eff_mode,
+            "actual_load_mode": ACTUAL_LOAD_MODE,
+            "actual_load_mode_effective": ACTUAL_LOAD_MODE,
             "actual_load_submit_order": [],
             "actual_load_clip_skipped_reason": "",
             "actual_load_vae_skipped_reason": "",
-            "actual_load_summary": {"enabled": False, "mode": _eff_mode},
+            "actual_load_summary": {"enabled": False, "mode": ACTUAL_LOAD_MODE},
         }
-        if not _eff_enabled:
-            print(f"[actual_load] enabled=0 (request={_req_al!r})")
+        if not PROMPT_ASYNC_ACTUAL_LOAD:
+            print("[actual_load] enabled=0")
             return result
-        print(f"[actual_load] enabled=1 mode={_eff_mode}")
-        if _eff_mode == "off":
+        print("[actual_load] enabled=1")
+        if ACTUAL_LOAD_MODE == "off":
             result["enabled"] = False
             result["actual_load_clip_skipped_reason"] = "mode_off"
             result["actual_load_vae_skipped_reason"] = "mode_off"
@@ -11228,17 +11213,17 @@ class _ComfyAPIMixin:
             and int(_rt_restore.get("direct_warmup_load_clip_effective", 0) or 0) == 1
             and int(_rt_restore.get("direct_warmup_clip_encode_effective", 0) or 0) == 1
         )
-        _mode_clip = _eff_mode == "clip_vae_only" and not _restore_direct_clip_effective
-        _mode_vae = _eff_mode in ("clip_vae_only", "unet_vae_only")
-        _mode_unet = _eff_mode in ("unet_only", "unet_vae_only")
+        _mode_clip = ACTUAL_LOAD_MODE == "clip_vae_only" and not _restore_direct_clip_effective
+        _mode_vae = ACTUAL_LOAD_MODE in ("clip_vae_only", "unet_vae_only")
+        _mode_unet = ACTUAL_LOAD_MODE in ("unet_only", "unet_vae_only")
         if _restore_direct_clip_effective:
             result["actual_load_clip_skipped_reason"] = "restore_direct_clip_effective"
         elif not _mode_clip:
-            result["actual_load_clip_skipped_reason"] = f"mode_{_eff_mode}"
+            result["actual_load_clip_skipped_reason"] = f"mode_{ACTUAL_LOAD_MODE}"
         if not _mode_vae:
-            result["actual_load_vae_skipped_reason"] = "mode_unet_only" if _eff_mode == "unet_only" else f"mode_{_eff_mode}"
+            result["actual_load_vae_skipped_reason"] = "mode_unet_only" if ACTUAL_LOAD_MODE == "unet_only" else f"mode_{ACTUAL_LOAD_MODE}"
         print(
-            f"[actual_load] actual_load_mode_effective={_eff_mode} "
+            f"[actual_load] actual_load_mode_effective={ACTUAL_LOAD_MODE} "
             f"will_start_clip={1 if _mode_clip else 0} will_start_vae={1 if _mode_vae else 0} "
             f"will_start_unet={1 if _mode_unet else 0} "
             f"actual_load_clip_skipped_reason={result.get('actual_load_clip_skipped_reason','')} "
@@ -11367,8 +11352,8 @@ class _ComfyAPIMixin:
                         result["submitted"].append(f"DualCLIP key={key}")
                         result["actual_load_submit_order"].append("DualCLIP")
                         print(f"[actual_load] submit_raw_key=({clip_path}, {clip_type}) submit_canonical_key={key}")
-        elif _eff_mode in ("unet_vae_only", "unet_only"):
-            print(f"[actual_load] mode_violation_check mode={_eff_mode} started_clip=0 correct=1")
+        elif ACTUAL_LOAD_MODE in ("unet_vae_only", "unet_only"):
+            print(f"[actual_load] mode_violation_check mode={ACTUAL_LOAD_MODE} started_clip=0 correct=1")
 
         # GÃ¶Ã‡GÃ¶Ã‡ UNET (submitted before VAE for better head start) GÃ¶Ã‡GÃ¶Ã‡
         if _mode_unet:
@@ -11386,7 +11371,7 @@ class _ComfyAPIMixin:
                 resolved_keys.append(key)
                 lock = self._actual_load_locks.setdefault(key, _al_thr.Lock())
                 with lock:
-                    if not PROMPT_ASYNC_ACTUAL_LOAD_UNET and _eff_mode not in ("unet_only", "unet_vae_only"):
+                    if not PROMPT_ASYNC_ACTUAL_LOAD_UNET and ACTUAL_LOAD_MODE not in ("unet_only", "unet_vae_only"):
                         result["skipped_unet"] = True
                         print(f"[actual_load] skipped_unet flag_disabled=1 key={key}")
                         continue
@@ -11489,7 +11474,7 @@ class _ComfyAPIMixin:
                     print(f"[actual_load] submitted loader=UNET key={key}")
         else:
             result["skipped_unet"] = True
-            print(f"[actual_load] skipped_unet mode={_eff_mode}")
+            print(f"[actual_load] skipped_unet mode={ACTUAL_LOAD_MODE}")
 
         # GÃ¶Ã‡GÃ¶Ã‡ VAE (submitted after UNET, deprioritized) GÃ¶Ã‡GÃ¶Ã‡
         if _mode_vae:
@@ -11768,7 +11753,7 @@ class _ComfyAPIMixin:
         # Trace-visible actual_load summary (present even when disabled)
         result.setdefault("actual_load_summary", {})
         result["actual_load_summary"]["enabled"] = bool(result.get("enabled", False))
-        result["actual_load_summary"]["mode"] = _eff_mode
+        result["actual_load_summary"]["mode"] = ACTUAL_LOAD_MODE
         # P1: surface VAE gate metrics so cold-collapse analysis is visible
         if _OPTIMIZATIONS_AVAILABLE:
             try:
@@ -16517,14 +16502,14 @@ class _ComfyAPIMixin:
                 _encode_eff = clip_policy_overrides.get("direct_warmup_clip_encode_effective", 0)
                 _rt_load_clip = bool(_load_clip_eff)
                 _rt_clip_encode = bool(_encode_eff)
-                # NOTE: _rt_require_cpu_hit is intentionally NOT overwritten here.
-                # It must retain its canonical resolved value from the baseline/
-                # runtime/file/env precedence chain.  clip_policy_overrides only
-                # controls CLIP load/encode, not CPU-cache requirement.
+                # CPU-cache requirement follows CLIP load effectiveness so that
+                # when restore direct-clip policy says "load CLIP", the CPU cache
+                # guard is active, preventing a cold volume read during warmup.
+                _rt_require_cpu_hit = bool(_load_clip_eff)
                 print(
                     f"[comfyapp] direct warmup: clip_policy_overrides applied, "
                     f"load_clip={int(_rt_load_clip)} encode={int(_rt_clip_encode)} "
-                    f"require_cpu_hit_unchanged={int(_rt_require_cpu_hit)}"
+                    f"require_cpu_hit={int(_rt_require_cpu_hit)}"
                 )
 
             # Log the single effective CPU-cache requirement value
@@ -18024,7 +18009,7 @@ class _ComfyAPIMixin:
         __stages["direct_warmup_load_unet_flag"] = 1 if _resolve_runtime_flag("DIRECT_WARMUP_LOAD_UNET", "0") else 0
         __stages["direct_warmup_load_clip_flag"] = 1 if _resolve_runtime_flag("DIRECT_WARMUP_LOAD_CLIP", "0") else 0
         __stages["direct_warmup_clip_encode_flag"] = 1 if _resolve_runtime_flag("DIRECT_WARMUP_CLIP_ENCODE", "0") else 0
-        __stages["require_cpu_cache_hit"] = 1 if _resolve_runtime_flag("DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT", "0") else 0
+        __stages["require_cpu_cache_hit"] = 1 if _resolve_runtime_flag("DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT", "1") else 0
         __stages["enable_warmup"] = 1 if ENABLE_WARMUP else 0
         __stages["effective_PRELOAD_MODE"] = _resolve_preload_mode()
         __stages["sage_env_mode"] = _resolve_sage_runtime_env_override()
@@ -19044,104 +19029,85 @@ class _ComfyAPIMixin:
                         #   * ``after_clip_encode``   — wait for
                         #     _warmup_direct to finish the full CLIP
                         #     encode; fully serialized diagnostic.
-                        #
-                        # When DIRECT_WARMUP_LOAD_UNET is true (required
-                        # baseline), the direct warmup already loads the
-                        # UNET itself, so a separate production UNET
-                        # future is unnecessary.  Skip the entire
-                        # production UNET submission path.
-                        _rt_direct_warmup_load_unet = _resolve_runtime_flag(
-                            "DIRECT_WARMUP_LOAD_UNET", "0",
+                        _boundary = (
+                            current_unet_start_boundary()
+                            if _OPTIMIZATIONS_AVAILABLE
+                            else "after_clip_preload"
                         )
-                        if _rt_direct_warmup_load_unet:
-                            __stages["production_unet_decision"] = "direct_warmup_load_unet"
-                            __stages["production_unet_submitted"] = 0
-                            __stages["background_unet_submitted"] = False
-                            print(
-                                f"[production.unet] decision=direct_warmup_load_unet "
-                                f"submitted=0 background=false "
-                                f"reason=DIRECT_WARMUP_LOAD_UNET=1"
+                        __stages["production_unet_start_boundary"] = _boundary
+                        _prod_unet = None
+                        if _boundary == "after_clip_preload":
+                            _prod_unet = self._start_production_restore_unet(
+                                profile, restore_start=restore_start, restore_stages=__stages
                             )
                         else:
-                            _boundary = (
-                                current_unet_start_boundary()
-                                if _OPTIMIZATIONS_AVAILABLE
-                                else "after_clip_preload"
-                            )
-                            __stages["production_unet_start_boundary"] = _boundary
-                            _prod_unet = None
-                            if _boundary == "after_clip_preload":
-                                _prod_unet = self._start_production_restore_unet(
-                                    profile, restore_start=restore_start, restore_stages=__stages
-                                )
+                            # Submit a barrier worker that waits
+                            # for the corresponding warmup event
+                            # before starting the production UNET.
+                            import threading as _thr_b
+                            if _boundary == "after_clip_object":
+                                _barrier_event = self._production_unet_barrier_event
                             else:
-                                # Submit a barrier worker that waits
-                                # for the corresponding warmup event
-                                # before starting the production UNET.
-                                import threading as _thr_b
-                                if _boundary == "after_clip_object":
-                                    _barrier_event = self._production_unet_barrier_event
-                                else:
-                                    _barrier_event = self._production_unet_encode_barrier_event
-                                _barrier_kind = _boundary
-                                def _barrier_worker(
-                                    _ev=_barrier_event, _bk=_barrier_kind,
-                                    _p=profile, _rs=restore_start, _stg=__stages,
-                                ):
-                                    # Cap the wait to avoid indefinite stalls
-                                    _t0 = time.time()
-                                    _got = _ev.wait(timeout=600)
-                                    _wait_ms = round((time.time() - _t0) * 1000, 1)
-                                    _stg[f"production_unet_barrier_wait_ms_{_bk}"] = _wait_ms
-                                    _stg[f"production_unet_barrier_signaled_{_bk}"] = 1 if _got else 0
-                                    # Assert the actual submission
-                                    # timestamp is not earlier than the
-                                    # requested boundary timestamp. This
-                                    # proves the boundary actually
-                                    # serialized the production UNET
-                                    # behind the warmup phase.
-                                    _anchor = getattr(
-                                        self, "_production_unet_boundary_anchor_unix_s", _t0,
-                                    )
-                                    _submit_unix = time.time()
-                                    _stg[f"production_unet_submit_at_unix_s_{_bk}"] = _submit_unix
-                                    _stg[f"production_unet_submit_after_anchor_s_{_bk}"] = round(
-                                        _submit_unix - _anchor, 4
-                                    )
-                                    if _submit_unix < _anchor - 0.001:
-                                        _stg[f"production_unet_boundary_violation_{_bk}"] = 1
-                                        print(
-                                            f"[production.unet] BOUNDARY_VIOLATION "
-                                            f"kind={_bk} anchor={_anchor} submit={_submit_unix}"
-                                        )
-                                    _res = self._start_production_restore_unet(
-                                        _p, restore_start=_rs, restore_stages=_stg
-                                    )
-                                    _stg["production_unet_decision"] = _res.get("decision", "none")
-                                    _stg["production_unet_submitted"] = 1 if _res.get("submitted") else 0
-                                    print(
-                                        f"[production.unet] barrier_kind={_bk} wait_ms={_wait_ms} "
-                                        f"signaled={int(_got)} "
-                                        f"decision={_res.get('decision','none')} "
-                                        f"key={_res.get('key','')}"
-                                    )
-                                _bt = _thr_b.Thread(
-                                    target=_barrier_worker, daemon=True,
-                                    name="production_unet_barrier"
+                                _barrier_event = self._production_unet_encode_barrier_event
+                            _barrier_kind = _boundary
+                            def _barrier_worker(
+                                _ev=_barrier_event, _bk=_barrier_kind,
+                                _p=profile, _rs=restore_start, _stg=__stages,
+                            ):
+                                # Cap the wait to avoid indefinite stalls
+                                _t0 = time.time()
+                                _got = _ev.wait(timeout=600)
+                                _wait_ms = round((time.time() - _t0) * 1000, 1)
+                                _stg[f"production_unet_barrier_wait_ms_{_bk}"] = _wait_ms
+                                _stg[f"production_unet_barrier_signaled_{_bk}"] = 1 if _got else 0
+                                # Assert the actual submission
+                                # timestamp is not earlier than the
+                                # requested boundary timestamp. This
+                                # proves the boundary actually
+                                # serialized the production UNET
+                                # behind the warmup phase.
+                                _anchor = getattr(
+                                    self, "_production_unet_boundary_anchor_unix_s", _t0,
                                 )
-                                _bt.start()
-                                __stages["production_unet_barrier_thread_started"] = 1
-                                __stages["production_unet_decision"] = "barrier_waiting"
-                                __stages["production_unet_submitted"] = 0
-                                _prod_unet = {"decision": "barrier_waiting", "submitted": False}
-                            if _prod_unet is not None:
-                                __stages["production_unet_decision"] = _prod_unet.get("decision", "none")
-                                __stages["production_unet_submitted"] = 1 if _prod_unet.get("submitted") else 0
-                            print(
-                                f"[production.unet] decision={_prod_unet.get('decision','none')} "
-                                f"key={_prod_unet.get('key','')} "
-                                f"clip_read_active={_prod_unet.get('clip_read_active',0)}"
+                                _submit_unix = time.time()
+                                _stg[f"production_unet_submit_at_unix_s_{_bk}"] = _submit_unix
+                                _stg[f"production_unet_submit_after_anchor_s_{_bk}"] = round(
+                                    _submit_unix - _anchor, 4
+                                )
+                                if _submit_unix < _anchor - 0.001:
+                                    _stg[f"production_unet_boundary_violation_{_bk}"] = 1
+                                    print(
+                                        f"[production.unet] BOUNDARY_VIOLATION "
+                                        f"kind={_bk} anchor={_anchor} submit={_submit_unix}"
+                                    )
+                                _res = self._start_production_restore_unet(
+                                    _p, restore_start=_rs, restore_stages=_stg
+                                )
+                                _stg["production_unet_decision"] = _res.get("decision", "none")
+                                _stg["production_unet_submitted"] = 1 if _res.get("submitted") else 0
+                                print(
+                                    f"[production.unet] barrier_kind={_bk} wait_ms={_wait_ms} "
+                                    f"signaled={int(_got)} "
+                                    f"decision={_res.get('decision','none')} "
+                                    f"key={_res.get('key','')}"
+                                )
+                            _bt = _thr_b.Thread(
+                                target=_barrier_worker, daemon=True,
+                                name="production_unet_barrier"
                             )
+                            _bt.start()
+                            __stages["production_unet_barrier_thread_started"] = 1
+                            __stages["production_unet_decision"] = "barrier_waiting"
+                            __stages["production_unet_submitted"] = 0
+                            _prod_unet = {"decision": "barrier_waiting", "submitted": False}
+                        if _prod_unet is not None:
+                            __stages["production_unet_decision"] = _prod_unet.get("decision", "none")
+                            __stages["production_unet_submitted"] = 1 if _prod_unet.get("submitted") else 0
+                        print(
+                            f"[production.unet] decision={_prod_unet.get('decision','none')} "
+                            f"key={_prod_unet.get('key','')} "
+                            f"clip_read_active={_prod_unet.get('clip_read_active',0)}"
+                        )
                 # Phase 2: last-resort CPU preload fallback (handle still None).
                 elif preload_paths and _pm != "off" and _restore_preload_handle is None:
                     if _pm == "async_no_wait":
@@ -19505,63 +19471,10 @@ class _ComfyAPIMixin:
                                 _ep_te_cls._exact_prefill_phase = "generic_warmup"
                     except Exception:
                         pass
-                    # P2 (audit round 8): When exact-prefill grouping positively
-                    # selects a nonempty matching bundle group, temporarily restore
-                    # effective CLIP encoding so the bundle's exact texts are
-                    # pre-filled during direct warmup. No-bundle or fingerprint
-                    # mismatch leaves the policy as-is (load-only).
-                    #
-                    # EXCEPTION: The explicit effective DIRECT_WARMUP_CLIP_ENCODE=0
-                    # overrides this policy.  The baseline resolver enforces the
-                    # user-required flag, so stale volume files or auto-policy
-                    # cannot force encode=1 when the explicit flag says 0.
-                    _baseline_clip_encode = _resolve_production_baseline_flag(
-                        "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE"
-                    )
-                    _effective_clip_encode = (
-                        _baseline_clip_encode
-                        if _baseline_clip_encode is not None
-                        else os.environ.get("COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE", "0")
-                    )
-                    if _warmup_texts and _effective_clip_encode != "0":
-                        _clip_policy_override = dict(_clip_policy or {})
-                        _clip_policy_override["direct_warmup_clip_encode_effective"] = 1
-                        _clip_policy_override["restore_direct_clip_policy_decision"] = "load_and_encode_explicit"
-                        __stages["exact_prefill_override_clip_encode"] = 1
-                        print(
-                            f"[exact_prefill] bundle_match={len(_warmup_texts)} texts "
-                            f"override_clip_encode=1 policy=load_and_encode_explicit"
-                        )
-                    elif _warmup_texts:
-                        # Baseline forces encode=0; load CLIP only, no encoding.
-                        __stages["exact_prefill_override_clip_encode"] = 0
-                        _clip_policy_override = dict(_clip_policy or {})
-                        _clip_policy_override["direct_warmup_clip_encode_effective"] = 0
-                        _clip_policy_override["restore_direct_clip_policy_decision"] = "load_only_baseline_override"
-                        print(
-                            f"[exact_prefill] bundle_match={len(_warmup_texts)} texts "
-                            f"override_clip_encode=0 "
-                            f"reason=baseline_DIRECT_WARMUP_CLIP_ENCODE=0"
-                        )
-                    else:
-                        _clip_policy_override = _clip_policy
-                    # Log the effective DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT at
-                    # the restore/direct-warmup boundary before calling into
-                    # _warmup_direct.  The canonical resolved value must remain
-                    # the single source of truth (not overwritten by CLIP policy).
-                    _boundary_require_cpu_hit = _resolve_runtime_flag(
-                        "DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT", "0"
-                    )
-                    __stages["direct_boundary_require_cpu_cache_hit"] = (
-                        1 if _boundary_require_cpu_hit else 0
-                    )
-                    print(
-                        f"[comfyapp] direct warmup boundary: "
-                        f"direct_boundary_require_cpu_cache_hit={int(_boundary_require_cpu_hit)} "
-                        f"source=canonical_runtime_resolve"
-                    )
+                    # Restore direct-clip policy is passed through without exact-prefill
+                    # override.  The restore-time loader policy governs CLIP load/encode.
                     _dw = self._warmup_direct(profile,
-                        clip_policy_overrides=_clip_policy_override,
+                        clip_policy_overrides=_clip_policy,
                         warmup_text=_warmup_text,
                         warmup_texts=_warmup_texts)
                     # Clear phase context
@@ -20152,16 +20065,8 @@ class _ComfyAPIMixin:
             trace_summary["restore_count"] = _container_restore_count
             trace_summary["request_sequence_id"] = _container_request_count
             print(f"[container_id] session={CONTAINER_SESSION_ID} import_unix={CONTAINER_IMPORT_UNIX_S} restore_count={_container_restore_count} request_seq={_container_request_count} restore_session={trace_summary['restore_session_id']}")
-            # Build a lightweight actual_load_summary from modal_options for
-            # the run_prompt in-process path (where _prompt_async_actual_load is
-            # not called directly).  Overlay onto both result surfaces.
-            _req_al_ip = (modal_options or {}).get("actual_load", {})
-            _ip_enabled = bool(_req_al_ip.get("enabled", PROMPT_ASYNC_ACTUAL_LOAD)) if isinstance(_req_al_ip, dict) else bool(PROMPT_ASYNC_ACTUAL_LOAD)
-            _ip_mode = str(_req_al_ip.get("mode", ACTUAL_LOAD_MODE)).strip().lower() if isinstance(_req_al_ip, dict) else ACTUAL_LOAD_MODE
-            if _ip_mode not in ("off", "clip_vae_only", "unet_only", "unet_vae_only"):
-                _ip_mode = ACTUAL_LOAD_MODE
-            _ip_summary = {"enabled": _ip_enabled, "mode": _ip_mode}
-            trace_summary.setdefault("actual_load_summary", {}).update({"enabled": _ip_enabled, "mode": _ip_mode})
+            # Minimal actual_load_summary from environment flags.
+            trace_summary.setdefault("actual_load_summary", {}).update({"enabled": bool(PROMPT_ASYNC_ACTUAL_LOAD), "mode": ACTUAL_LOAD_MODE})
             result["trace"] = trace_summary
             _log_cold_start_waterfall(trace_summary, label="run_prompt")
             if isinstance(_scheduler_trace_ns, dict):
@@ -20215,9 +20120,8 @@ class _ComfyAPIMixin:
                 restore_count=_container_restore_count,
             )
             result["wall_clock_trace"] = _wall_clock_trace
-            # Overlay actual_load_summary on wall_clock_trace (_ip_summary is
-            # defined above alongside trace_summary enrichment).
-            result["wall_clock_trace"].setdefault("actual_load_summary", {}).update({"enabled": _ip_enabled, "mode": _ip_mode})
+            # Overlay actual_load_summary on wall_clock_trace from environment flags.
+            result["wall_clock_trace"].setdefault("actual_load_summary", {}).update({"enabled": bool(PROMPT_ASYNC_ACTUAL_LOAD), "mode": ACTUAL_LOAD_MODE})
             result["_wall_clock_summary"] = make_wall_clock_summary(_wall_clock_trace)
             print(make_summary_log_line(_wall_clock_trace))
 
@@ -20824,16 +20728,8 @@ class _ComfyAPIMixin:
         if _t3_entry_sp is not None and _prompt_start_ts_sp is not None:
             trace_summary["derived_ms"]["modal_entry_to_prompt_start_ms"] = round((_prompt_start_ts_sp - _t3_entry_sp) * 1000, 1)
         trace_summary["derived_ms"]["total_input_execution_ms"] = total_ms
-        # Subprocess path: build lightweight actual_load_summary from modal_options
-        # (actual_load futures are not submitted in the subprocess backend, but
-        # request-level enabled/mode must be visible on both result surfaces).
-        _req_al_sp = (modal_options or {}).get("actual_load", {})
-        _sp_enabled = bool(_req_al_sp.get("enabled", PROMPT_ASYNC_ACTUAL_LOAD)) if isinstance(_req_al_sp, dict) else bool(PROMPT_ASYNC_ACTUAL_LOAD)
-        _sp_mode = str(_req_al_sp.get("mode", ACTUAL_LOAD_MODE)).strip().lower() if isinstance(_req_al_sp, dict) else ACTUAL_LOAD_MODE
-        if _sp_mode not in ("off", "clip_vae_only", "unet_only", "unet_vae_only"):
-            _sp_mode = ACTUAL_LOAD_MODE
-        _sp_summary = {"enabled": _sp_enabled, "mode": _sp_mode}
-        trace_summary.setdefault("actual_load_summary", {}).update({"enabled": _sp_enabled, "mode": _sp_mode})
+        # Minimal actual_load_summary from environment flags.
+        trace_summary.setdefault("actual_load_summary", {}).update({"enabled": bool(PROMPT_ASYNC_ACTUAL_LOAD), "mode": ACTUAL_LOAD_MODE})
         result["trace"] = trace_summary
         _log_cold_start_waterfall(trace_summary, label="run_prompt_stream")
 
@@ -20876,9 +20772,8 @@ class _ComfyAPIMixin:
             restore_count=_container_restore_count,
         )
         result["wall_clock_trace"] = _wall_clock_trace_sub
-        # Overlay actual_load_summary on wall_clock_trace (_sp_summary is
-        # defined above alongside the trace_summary enrichment).
-        result["wall_clock_trace"].setdefault("actual_load_summary", {}).update({"enabled": _sp_enabled, "mode": _sp_mode})
+        # Overlay actual_load_summary on wall_clock_trace from environment flags.
+        result["wall_clock_trace"].setdefault("actual_load_summary", {}).update({"enabled": bool(PROMPT_ASYNC_ACTUAL_LOAD), "mode": ACTUAL_LOAD_MODE})
         result["_wall_clock_summary"] = make_wall_clock_summary(_wall_clock_trace_sub)
         print(make_summary_log_line(_wall_clock_trace_sub))
 
@@ -21152,7 +21047,7 @@ class _ComfyAPIMixin:
                     _preload_info = self._prompt_async_preload(workflow)
 
                 # GÃ¶Ã‡GÃ¶Ã‡ Prompt-time actual loader futures (after dependency policy) GÃ¶Ã‡GÃ¶Ã‡
-                _actual_load_info: dict = self._prompt_async_actual_load(workflow, modal_options=modal_options)
+                _actual_load_info: dict = self._prompt_async_actual_load(workflow)
                 _scheduler_trace = None
                 # Finalize cold UNET early load (compute overlap/graph_wait metrics)
                 self._finalize_cold_unet_early_load(_cold_unet_info)
@@ -21341,13 +21236,8 @@ class _ComfyAPIMixin:
                             "mode": _als.get("mode", "clip_vae_only"),
                         })
                     else:
-                        # Ensure trace still has the summary even when
-                        # _actual_load_info is a minimal stub (scheduler-test /
-                        # already-ran path).
-                        _req_al_stub = (modal_options or {}).get("actual_load", {})
-                        _stub_enabled = bool(_req_al_stub.get("enabled", False)) if isinstance(_req_al_stub, dict) else False
-                        _stub_mode = str(_req_al_stub.get("mode", "clip_vae_only")).strip().lower() if isinstance(_req_al_stub, dict) else "clip_vae_only"
-                        trace_summary.setdefault("actual_load_summary", {}).update({"enabled": _stub_enabled, "mode": _stub_mode})
+                        # Minimal fallback from environment flags.
+                        trace_summary.setdefault("actual_load_summary", {}).update({"enabled": bool(PROMPT_ASYNC_ACTUAL_LOAD), "mode": ACTUAL_LOAD_MODE})
                     print(f"[container_id] session={CONTAINER_SESSION_ID} import_unix={CONTAINER_IMPORT_UNIX_S} restore_count={_container_restore_count} request_seq={_container_request_count} restore_session={trace_summary['restore_session_id']}")
                     _r["trace"] = trace_summary
                     # Per audit round 7: waterfall on the in-process

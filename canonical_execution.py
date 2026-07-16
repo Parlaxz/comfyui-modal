@@ -23,7 +23,7 @@ from production_workflow import (
     PRODUCTION_PLAN_SCHEMA_VERSION,
     normalize_production_options,
 )
-from run_prompt_options import build_run_prompt_options, ensure_run_prompt_options
+# Note: modal_options are passed through without reconstructing model-loading policy.
 from warmup_profile import prepare_active_next_profile
 from workflow_metadata import (
     extract_model_stack,
@@ -573,24 +573,20 @@ async def prepare_modal_execution(
             _prod_meta["run_surface"] = run_trace.run_surface
             run_trace.set_meta(**_prod_meta)
 
-        # 6. Build run-prompt-options
-        _prod_output_ids: list[str] = []
+        # 6. Pass caller modal_options through without reconstructing model-loading policy.
+        # Production output_node_ids are only set when a valid enabled production_report
+        # is explicitly provided by the caller.  No default production is injected.
+        _mo: dict = {}
+        if modal_options:
+            _mo = dict(modal_options)
         if production_report and isinstance(production_report, dict) and production_report.get("enabled"):
-            _prod_output_ids = production_report.get("output_node_ids", [])
-        elif modal_options and isinstance(modal_options.get("production"), dict) and modal_options["production"].get("enabled"):
-            _prod_output_ids = modal_options["production"].get("output_node_ids", [])
-
-        _builder_options = build_run_prompt_options(
-            production_output_node_ids=_prod_output_ids,
-            enable_actual_load=True,
-        )
-        _mo = ensure_run_prompt_options(modal_options, _builder_options)
+            _mo["production"] = {
+                "enabled": True,
+                "output_node_ids": production_report.get("output_node_ids", []),
+            }
 
         if run_trace is not None:
             run_trace.record_payload_size("modal_args_workflow_bytes", len(str(workflow)))
-            _serialized = json.dumps(workflow, sort_keys=True, separators=(",", ":"))
-            run_trace.count("workflow_serialization_count", 1)
-            run_trace.record_payload_size("workflow_serialized_bytes", len(_serialized))
 
         # Stash the computed dispatch hash so modal_client can skip recomputation
         _trace_for_modal = dict(trace_payload or {})
