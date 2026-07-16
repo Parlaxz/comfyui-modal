@@ -59,7 +59,6 @@ except Exception:  # pragma: no cover - runtime-only dependency in some contexts
 
 from production_workflow import (
     normalize_production_options,
-    compile_production_workflow,
     HASH_SCHEMA_VERSION,
     PRODUCTION_PLAN_SCHEMA_VERSION,
 )
@@ -67,6 +66,7 @@ from run_prompt_options import (
     build_run_prompt_options,
     ensure_run_prompt_options,
 )
+from canonical_execution import RunTrace, execute_modal_prompt, prepare_modal_execution
 from studio_store import StudioJsonStore, StudioStoreError
 from studio_models import (
     _FEATURE_BINDING_KEYS,
@@ -1313,19 +1313,12 @@ def build_single_run_spec(
 
         production_options["output_node_ids"] = _derived_output_ids
 
-        # ── Compile ───────────────────────────────────────────────────────
-        # Compile whenever production is enabled (including default-applied
-        # when modal_options is omitted).  The only skip is explicit
-        # enabled=False checked above.  No existence pre-check — let
-        # compile_production_workflow's precise ValueError propagate.
-        try:
-            plan = compile_production_workflow(
-                workflow, production_options, allow_direct_output_rewrite=True
-            )
-            production_workflow = plan.compiled_workflow
-            production_report = plan.report
-        except Exception:
-            raise
+        # Compile is NOT performed here for direct single runs — it is
+        # delegated to the canonical executor (execute_modal_prompt) so
+        # the workflow is compiled exactly once.  The resolved
+        # production_options (with output_node_ids) are passed through
+        # to the canonical executor via the compilation dict.
+        # Production_report remains None (canonical executor will set it).
 
     # Build axis_values from controls (for history)
     axis_values: dict[str, Any] = {}
@@ -1347,7 +1340,10 @@ def build_single_run_spec(
 
     _prod_enabled = bool(production_options.get("enabled"))
     _prod_output_ids = production_options.get("output_node_ids", []) if _prod_enabled else []
-    _prod_plan_used = bool(production_report and production_report.get("enabled"))
+    # production_plan_used means production is enabled AND output IDs are
+    # resolved (even though the actual compile happens in the canonical
+    # executor for direct single runs).
+    _prod_plan_used = _prod_enabled and bool(_prod_output_ids)
 
     compilation: dict[str, Any] = {
         "experiment_id": exp_id,
@@ -1730,9 +1726,10 @@ def build_experiment_spec(
         experiment_source=_experiment_source,
     )
 
-    # ── Production compilation per checkpoint ────────────────────────────
-    # Normalize production options, then compile each checkpoint's workflow
-    # independently so each cell carries its own production_report.
+    # ── Production options per checkpoint (no compile — deferred to canonical executor) ──
+    # Normalize production options, resolve output_node_ids from each preset's
+    # snapshot, but do NOT compile.  The canonical executor compiles each
+    # resolved cell exactly once at execution time.
     _prod_options = normalize_production_options(modal_options)
     _prod_explicitly_disabled = bool(
         isinstance(modal_options, dict)
@@ -1775,8 +1772,8 @@ def build_experiment_spec(
             )}
 
         # ── Derive output_node_ids from this preset's snapshot ──────────
-        _ck_prod_report = None
-        _ck_prod_options = None
+        # The canonical executor will compile each cell; we only resolve
+        # and store the normalized production_options with output_node_ids.
         if _prod_options.get("enabled"):
             _ck_prod_options = dict(_prod_options)
             _caller_ids = _ck_prod_options.get("output_node_ids", [])
@@ -1806,59 +1803,41 @@ def build_experiment_spec(
                 )}
 
             _ck_prod_options["output_node_ids"] = _derived_ids
-            # Compile whenever production is enabled (including default-applied
-            # when modal_options is omitted).  The only skip is explicit
-            # enabled=False checked before the derivation loop.
-            # No existence pre-check — let compile_production_workflow's
-            # precise ValueError propagate.
-            try:
-                _ck_plan = compile_production_workflow(
-                    wf, _ck_prod_options, allow_direct_output_rewrite=True
-                )
-                ck["workflow"] = _ck_plan.compiled_workflow
-                _ck_prod_report = _ck_plan.report
-            except Exception:
-                raise
-        ck["production_report"] = _ck_prod_report
-        if _ck_prod_options:
+            # Keep source workflow (do NOT compile here — canonical executor compiles exactly once)
             ck["production_options"] = _ck_prod_options
+        else:
+            ck["production_options"] = None
+        # production_report is None until canonical executor compiles
+        ck["production_report"] = None
 
     for cell in compilation.get("cells", []):
         cell["studio_meta"] = studio_meta
-        # Carry the production_report from the checkpoint onto each cell
+        # Carry the production_options from the checkpoint onto each cell
         _ck_id = cell.get("checkpoint_id", "")
         _match_ck = next(
             (ck for ck in compilation.get("checkpoints", []) if ck.get("id") == _ck_id),
             None,
         )
         if _match_ck:
-            cell["production_report"] = _match_ck.get("production_report")
             cell["production_options"] = _match_ck.get("production_options")
+        # production_report is None until canonical executor compiles each cell
+        cell["production_report"] = None
 
     compilation["studio_meta"] = studio_meta
     compilation["production_report"] = None  # experiments have per-cell reports
     compilation["production_options"] = _prod_options if (_prod_options or {}).get("enabled") else None
-    # Diagnostic fields — per-checkpoint hashes sourced from each report
+    # Diagnostic fields — no hashes before execution; downstream receives them from canonical trace
     compilation["execution_surface"] = "studio_experiment"
     compilation["production_default_applied"] = _prod_default_applied
     compilation["production_explicitly_disabled"] = _prod_explicitly_disabled
     compilation["production_plan_used"] = bool(
-        any(
-            (ck.get("production_report") or {}).get("enabled")
+        _prod_options.get("enabled")
+        and any(
+            (ck.get("production_options") or {}).get("output_node_ids")
             for ck in compilation.get("checkpoints", [])
         )
     )
-    # Reference hashes from the first compiled checkpoint's report (if any).
-    # Each checkpoint carries its own full report for per-cell matching.
-    _first_compiled_ck = next(
-        (ck for ck in compilation.get("checkpoints", []) if ck.get("production_report")),
-        None,
-    )
-    _first_report = (_first_compiled_ck or {}).get("production_report") or {}
-    compilation["production_source_hash"] = _first_report.get("source_workflow_hash", "")
-    compilation["production_plan_hash"] = _first_report.get("production_plan_hash", "")
-    compilation["production_compiled_hash"] = _first_report.get("compiled_workflow_hash", "")
-    compilation["runner_workflow_hash"] = _first_report.get("runner_workflow_hash", "")
+    # No fake production_report or hashes before execution — downstream history receives hashes from canonical trace
     return compilation
 
 
@@ -2678,16 +2657,17 @@ async def direct_studio_run_completion(
     modal_options: dict | None = None,
     workspace: dict | None = None,
 ) -> dict[str, Any]:
-    """Execute a single Studio run directly via LocalRemoteInvoker.
+    """Execute a single Studio run via the canonical ``execute_modal_prompt``.
 
     Takes the context dict produced by ``_prepare_studio_run_context``
-    (which must carry ``status="ok"``).  Runs the single cell through
-    ``LocalRemoteInvoker.run_cell`` — no ExperimentScheduler,
-    ExperimentRunner, leases, checkpoints collection, or experiment
-    journal created.
+    (which must carry ``status="ok"``).  Calls the shared canonical executor
+    directly — no ``LocalRemoteInvoker``, experiment scheduler, runner,
+    leases, checkpoints collection, or experiment journal created.
 
-    Preserves production hash guards, output node handling, output
-    saving, progress events, timing merge, and fail-closed behavior.
+    One deep copy of the compiled workflow is made, one control application
+    (already done by ``build_single_run_spec``).  All production compile/
+    hash/validation, profile preparation, and modal-args construction are
+    delegated to the canonical executor.
 
     Returns a dict with ``status``, ``output_paths``, ``timings``,
     ``studio_meta``, and ``production_plan_used``.
@@ -2705,7 +2685,6 @@ async def direct_studio_run_completion(
     run_history_id = ctx["run_history_id"]
     exp_id = ctx["exp_id"]
     studio_meta = ctx["studio_meta"]
-    profile_preparer = ctx["profile_preparer"]
 
     # Extract the single cell from the compilation
     cells = compilation.get("cells", [])
@@ -2717,113 +2696,80 @@ async def direct_studio_run_completion(
     cell = cells[0]
     ck = checkpoints[0]
 
-    # Set up the cell with everything run_cell expects
-    cell.setdefault("attempt_id", f"a_{_uuid.uuid4().hex[:8]}")
-    cell.setdefault("_resolved_prompt", cell.get("prompt", ""))
-    cell.setdefault("_resolved_negative", cell.get("negative_prompt", ""))
-    cell.setdefault("_resolved_unet", "")
-    cell.setdefault("_resolved_clip", "")
-    cell.setdefault("_resolved_vae", "")
-    cell.setdefault("_resolved_lora_chain", [])
+    # The workflow is already deep-copied and controls-applied by
+    # build_single_run_spec.  Production compilation is delegated to the
+    # canonical executor (execute_modal_prompt) so it occurs exactly once.
+    workflow = ck.get("workflow", {})
+    if not workflow:
+        return {"status": "error", "message": "Compilation checkpoint has no workflow"}
 
-    # Build production report from compilation data (same logic as scheduler path)
-    _prod_report = compilation.get("production_report")
-    _prod_options_from_comp = compilation.get("production_options")
+    # Production options (resolved by build_single_run_spec) for the
+    # canonical executor to compile.
+    _prod_report = compilation.get("production_report")  # None for direct runs (compiled by canonical)
+    _prod_opts = compilation.get("production_options")  # Resolved options with output_node_ids
 
-    _effective_modal_options = dict(modal_options) if modal_options else {}
-    if _prod_report and _prod_report.get("enabled"):
-        _prod_opts = dict(_prod_options_from_comp) if _prod_options_from_comp else {}
-        if not _prod_opts.get("output_node_ids") and _prod_report.get("output_node_ids"):
-            _prod_opts["output_node_ids"] = list(_prod_report["output_node_ids"])
-        if not _prod_opts.get("output_node_ids") and _prod_report.get("kept_node_ids"):
-            _prod_opts["output_node_ids"] = list(_prod_report["kept_node_ids"])
-        _effective_modal_options["production"] = _prod_opts
-
-    # ── Merge actual_load defaults via shared builder ──────────────────
-    _prod_ids = []
-    if _effective_modal_options.get("production") and _effective_modal_options["production"].get("enabled"):
-        _prod_ids = _effective_modal_options["production"].get("output_node_ids", [])
-    _builder_opts = build_run_prompt_options(
-        production_output_node_ids=_prod_ids,
-        enable_actual_load=True,
+    # Build the RunTrace for instrumentation
+    _run_trace = RunTrace(
+        run_surface="playground_direct",
     )
-    _effective_modal_options = ensure_run_prompt_options(_effective_modal_options, _builder_opts)
+    _run_trace.begin("direct_studio_run_completion", reason="playground_single")
+    # Record that LocalRemoteInvoker/scheduler/runner/lease/checkpoint
+    # are NOT used (optional spans default to called=False).
+    _run_trace.count("local_remote_invoker_used", 0)
+    _run_trace.count("scheduler_used", 0)
+    _run_trace.count("runner_used", 0)
 
-    # ── Build stream_event_sink for progress events ──────────────────────
-    async def _progress_sink(detail: dict) -> None:
-        """Broadcast progress as experiment.worker.progress (no-op safe)."""
-        try:
-            from server import PromptServer
-            server = PromptServer.instance
-            if server is not None:
-                server.send_sync("experiment.worker.progress", dict(detail))
-        except Exception:
-            pass
+    try:
+        # ── Execute via canonical executor ─────────────────────────────
+        # execute_modal_prompt handles compile (when production_options
+        # is provided), validation, profile prep, run_prompt_options
+        # construction, and the run_prompt_stream call.
+        _trace_payload = cell.get("trace", {}).copy()
+        _trace_payload.setdefault("workflow_hash", "")
+        _trace_payload.update({
+            "browser_run_click": cell.get("trace", {}).get("browser_run_click", _time.time()),
+            "studio_route_received": cell.get("trace", {}).get("studio_route_received", _time.time()),
+        })
 
-    from experiment_runner import LocalRemoteInvoker
-    from local_artifacts import get_studio_outputs_dir
-    from modal_client import run_prompt_stream
+        # Profile setter for execute_modal_prompt (the canonical executor
+        # handles production options enrichment internally)
+        from modal_client import set_active_warmup_profile as _ws_setter
 
-    # ── Mutable trace is already seeded by _prepare_studio_run_context ──
-    # _prepare_studio_run_context set browser_run_click, studio_route_received,
-    # and production_compile_complete on the cell trace.  LocalRemoteInvoker
-    # .run_cell will add active_profile_write_{start,end} with try/finally,
-    # remote_submit, first_remote_event, result_received, and
-    # output_materialized directly on _mutable_trace.  No fallback needed here.
-    _mutable_trace = cell.setdefault("trace", {})
+        result = await execute_modal_prompt(
+            workflow,
+            prompt_id=exp_id,
+            client_id="",
+            input_images=None,
+            modal_options=modal_options,
+            production_report=_prod_report,
+            production_options=_prod_opts,
+            gpu=gpu,
+            workspace=workspace,
+            trace_payload=_trace_payload,
+            profile_setter=_ws_setter,
+            run_trace=_run_trace,
+        )
 
-    invoker = LocalRemoteInvoker(
-        run_prompt_stream,
-        experiment_id=exp_id,
-        node_dir=str(node_dir),
-        stream_event_sink=_progress_sink,
-        profile_preparer=profile_preparer,
-        gpu=gpu,
-        modal_options=_effective_modal_options,
-        workspace=workspace,
-        production_report=_prod_report,
-        studio_output_dir=str(get_studio_outputs_dir()),
-    )
-
-    # ── Run cell directly (no scheduler/runner/leases/journal) ─────────
-    _worker_id = f"w_{_uuid.uuid4().hex[:8]}"
-    await invoker.open_worker(
-        _worker_id,
-        cell.get("checkpoint_id", ck.get("id", "")),
-        ck.get("profile_id", ""),
-        workflow=ck.get("workflow", {}),
-        triple=ck.get("triple", {}),
-    )
-
-    result = await invoker.run_cell(_worker_id, cell)
-
-    # ── Read merged trace from timing payload ──────────────────────────
-    # The invoker.run_cell set active_profile_write_{start,end},
-    # remote_submit, first_remote_event, result_received, and
-    # output_materialized directly on _mutable_trace, which was merged
-    # into the returned timing_payload trace.  No fallback/aliasing needed.
-    _merged_stages: dict[str, float] = {}
-    _merged_trace_dict: dict = {}
-    timing_payload = result.get("timing_payload")
-    if timing_payload:
-        _mt = timing_payload.get("trace", {})
-        if isinstance(_mt, dict):
-            _merged_trace_dict = _mt
-            _merged_stages = _mt.get("stages", {}) or {}
-
-    # ── Process result ──────────────────────────────────────────────────
-    if result.get("status") == "completed":
-        output_paths = result.get("output_paths", [])
+        if _run_trace is not None:
+            _run_trace.begin("post_processing")
 
         # ── Build timings dict for history ─────────────────────────────
+        _result_trace = result.get("trace", {}) if isinstance(result, dict) else {}
+        _merged_stages: dict[str, float] = {}
+        if isinstance(_result_trace, dict):
+            _merged_stages = _result_trace.get("stages", {}) or {}
+        _merged_deltas: dict = {}
+        _merged_derived: dict = {}
+        if isinstance(_result_trace, dict):
+            _merged_deltas = _result_trace.get("deltas_ms", {}) or {}
+            _merged_derived = _result_trace.get("derived_ms", {}) or {}
+
         timings: dict[str, Any] = {}
         timing_sources: dict[str, str] = {}
         timings["_run_type"] = "direct"
         timing_sources["_run_type"] = "local_server_observed"
 
-        # Expose all required marker aliases at top-level timings.
-        # These are set by LocalRemoteInvoker.run_cell directly on
-        # _mutable_trace and flowed through the merged trace stages.
+        # Expose marker aliases at top-level timings
         _required_markers = [
             "browser_run_click", "studio_route_received",
             "production_compile_complete",
@@ -2838,26 +2784,19 @@ async def direct_studio_run_completion(
                 timings[_mk] = _mv
                 timing_sources[_mk] = "local_server_observed"
 
-        # Capture active_profile_dedup_status from the merged trace.
-        # It lives at the trace top level (as a string, not in stages).
-        # Fall back to stages for backward compat with older recordings.
-        _dedup_status = _merged_trace_dict.get("active_profile_dedup_status")
-        if _dedup_status is None:
-            _dedup_status = _merged_trace_dict.get("stages", {}).get("active_profile_dedup_status")
-        if _dedup_status is None:
-            _dedup_status = _merged_stages.get("active_profile_dedup_status")
+        # active_profile_dedup_status from trace top level
+        _dedup_status = _result_trace.get("active_profile_dedup_status")
         if _dedup_status is not None and isinstance(_dedup_status, str):
             timings["active_profile_dedup_status"] = _dedup_status
             timing_sources["active_profile_dedup_status"] = "local_server_observed"
 
-        # The Playground total is the complete client-press to materialized
-        # output wall time, not the sum of overlapping remote child stages.
+        # End-to-end total
         _trace_e2e_ms = _derive_end_to_end_total_ms(_merged_stages)
         if _trace_e2e_ms is not None:
             timings["end_to_end_total_ms"] = _trace_e2e_ms
             timing_sources["end_to_end_total_ms"] = "local_server_observed"
 
-        # Compute deltas from merged stages
+        # Stage-based delta timings
         _stage_pairs = [
             ("studio_route_received", "production_compile_complete", "compile_ms"),
             ("active_profile_write_start", "active_profile_write_end", "profile_write_ms"),
@@ -2873,16 +2812,6 @@ async def direct_studio_run_completion(
                     timings[_ms_key] = _delta
                     timing_sources[_ms_key] = "local_server_observed"
 
-        # ── Merge remote timing payload ───────────────────────────────────
-        # Uses the shared module-level _CANONICAL_ALIAS_MAP (same keys as
-        # the scheduler path in _schedule_and_start).
-        _merged_deltas: dict = {}
-        _merged_derived: dict = {}
-        if timing_payload:
-            _merged_trace = timing_payload.get("trace", {}) or {}
-            _merged_deltas = _merged_trace.get("deltas_ms", {}) or {}
-            _merged_derived = _merged_trace.get("derived_ms", {}) or {}
-
         # Preparser numeric fields from merged_derived
         for _pk in ("active_profile_build_ms", "active_profile_remote_call",
                      "active_profile_remote_ms"):
@@ -2891,8 +2820,7 @@ async def direct_studio_run_completion(
                 timings[_pk] = _pv
                 timing_sources[_pk] = "local_server_observed"
 
-        # Canonical alias map — iterates module-level _CANONICAL_ALIAS_MAP
-        # so both scheduler and direct-run paths derive timing identically.
+        # Canonical alias map — same keys as scheduler path
         _remote_timings_blk: dict[str, Any] = {}
         for _canon_key, _raw_key, _source in _CANONICAL_ALIAS_MAP:
             _val = _merged_deltas.get(_raw_key)
@@ -2901,57 +2829,38 @@ async def direct_studio_run_completion(
                 timing_sources[_canon_key] = _source
                 _remote_timings_blk[_raw_key] = _val
 
-        # Restore timing from _restore_timing block — map to top-level keys
-        # only (NOT inside remote_timings) so consumers never sum restore
-        # into execution metrics like inference_total.
-        if timing_payload:
-            _restore = timing_payload.get("_restore_timing", {}) or {}
-            _restore_total = _restore.get("restore_total_ms")
-            if _restore_total is not None:
-                timings["restore_total_ms"] = _restore_total
-                timing_sources["restore_total_ms"] = "remote_trace"
-                timings["remote_restore_ms"] = _restore_total
-                timing_sources["remote_restore_ms"] = "remote_trace"
+        # Restore timing from _restore_timing
+        _restore_timing = result.get("_restore_timing", {}) if isinstance(result, dict) else {}
+        _restore_total = _restore_timing.get("restore_total_ms")
+        if _restore_total is not None:
+            timings["restore_total_ms"] = _restore_total
+            timing_sources["restore_total_ms"] = "remote_trace"
+            timings["remote_restore_ms"] = _restore_total
+            timing_sources["remote_restore_ms"] = "remote_trace"
 
-        # Preserve raw remote_timings block for diagnostic access.
         if _remote_timings_blk:
             timings["remote_timings"] = dict(_remote_timings_blk)
             timing_sources["remote_timings"] = "derived"
 
-        # Local materialization wall time from merged derived_ms
-        _local_mat_ms = _merged_derived.get("local_output_materialization_ms")
-        if _local_mat_ms is not None:
-            timings["local_output_materialization_ms"] = _local_mat_ms
-            timing_sources["local_output_materialization_ms"] = "derived"
-
-        # Preserve compact raw trace structures (no base64)
-        if timing_payload:
-            for _raw_key in ("trace", "wall_clock_trace", "_wall_clock_summary",
-                             "_restore_timing", "scheduler_trace"):
-                _val = timing_payload.get(_raw_key)
-                if _val is not None:
-                    timings[_raw_key] = copy.deepcopy(_val)
-                    timing_sources[_raw_key] = "remote_trace"
-
-        # platform_pre_restore_ms: cross-process inferred window
+        # platform_pre_restore_ms
         _t2_submit = _merged_stages.get("t2_local_modal_submit_start") or _merged_stages.get("t2_local_dispatch")
-        if timing_payload:
-            _restore_block = timing_payload.get("_restore_timing", {}) or {}
-            _restore_start = _restore_block.get("restore_start_unix_s")
-            if _t2_submit is not None and _restore_start is not None:
-                _pre_restore_ms = round((_restore_start - _t2_submit) * 1000, 2)
-                if _pre_restore_ms >= 0:
-                    timings["platform_pre_restore_ms"] = _pre_restore_ms
-                    timing_sources["platform_pre_restore_ms"] = "cross_process_inferred"
+        _restore_start = _restore_timing.get("restore_start_unix_s")
+        if _t2_submit is not None and _restore_start is not None:
+            _pre_restore_ms = round((_restore_start - _t2_submit) * 1000, 2)
+            if _pre_restore_ms >= 0:
+                timings["platform_pre_restore_ms"] = _pre_restore_ms
+                timing_sources["platform_pre_restore_ms"] = "cross_process_inferred"
 
-        # trace_available flag
-        timings["trace_available"] = bool(timing_payload)
-
-        # Attach timing_sources metadata
+        timings["trace_available"] = bool(result)
         if timing_sources:
             timings["timing_sources"] = timing_sources
 
         # ── Build meta for history ────────────────────────────────────
+        # Determine production_plan_used from run_trace counts
+        _rt_summary = _run_trace.emit_remote_summary() if _run_trace else {}
+        _rt_counts = _rt_summary.get("counts", {}) if isinstance(_rt_summary, dict) else {}
+        _prod_called = _rt_counts.get("production_compile_count", 0) > 0
+
         meta_merge: dict = {
             "requested_controls": dict(studio_meta.get("studio_controls", {})),
             "studio_preset_id": studio_meta.get("studio_preset_id", ""),
@@ -2959,7 +2868,7 @@ async def direct_studio_run_completion(
             "studio_feature_id": studio_meta.get("studio_feature_id", ""),
             "experiment_id": exp_id,
             "preset_label": studio_meta.get("studio_preset_label", ""),
-            "production_plan_used": "yes" if compilation.get("production_plan_used") else "no",
+            "production_plan_used": "yes" if _prod_called else "no",
         }
 
         # Resolved controls from post-application workflow
@@ -2976,12 +2885,24 @@ async def direct_studio_run_completion(
         except Exception:
             pass
 
-        # Output paths
+        # Output paths — extract from result
+        output_paths: list[str] = []
+        if isinstance(result, dict):
+            _primary = result.get("primary_output") or result.get("_local_primary_output")
+            if isinstance(_primary, dict) and _primary.get("path"):
+                output_paths = [_primary["path"]]
+            elif result.get("outputs"):
+                for _nid, _nouts in result["outputs"].items():
+                    if isinstance(_nouts, dict):
+                        for _entries in _nouts.values():
+                            if isinstance(_entries, list):
+                                for _e in _entries:
+                                    if isinstance(_e, dict) and _e.get("filename"):
+                                        output_paths.append(_e["filename"])
+
         if output_paths:
             meta_merge["output_paths"] = list(output_paths)
-
-        # Exactly one output
-        meta_merge["output_count"] = len(output_paths) if isinstance(output_paths, list) else 0
+        meta_merge["output_count"] = len(output_paths)
 
         # ── Finalize history ──────────────────────────────────────────
         completed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3001,9 +2922,8 @@ async def direct_studio_run_completion(
             _log.warning("Failed to finalize run history for %s", exp_id)
 
         # ── Certificate persistence (post-delivery) ──────────────────
-        _result_data = result.get("result")
-        if isinstance(_result_data, dict):
-            _cert_candidate = _result_data.get("_certificate_candidate")
+        if isinstance(result, dict):
+            _cert_candidate = result.get("_certificate_candidate")
             if isinstance(_cert_candidate, dict) and _cert_candidate.get("identity"):
                 try:
                     from modal_client import persist_validation_certificate
@@ -3024,6 +2944,9 @@ async def direct_studio_run_completion(
                 except Exception:
                     pass
 
+        if _run_trace is not None:
+            _run_trace.end("post_processing")
+
         return {
             "status": "ok",
             "runId": run_history_id,
@@ -3035,27 +2958,28 @@ async def direct_studio_run_completion(
             "timings": timings,
             "meta": meta_merge,
             "studio_meta": studio_meta,
-            "production_plan_used": compilation.get("production_plan_used", False),
+            "production_plan_used": _prod_called,
             "direct_run": True,
         }
 
-    # ── Failure path ──────────────────────────────────────────────────
-    error_message = result.get("error", "Studio direct run failed")
-    _log.error("Studio direct run failed for %s: %s", exp_id, error_message)
-    try:
-        from experiment_service import REGISTRY
-        from datetime import datetime, timezone
-        fail_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        REGISTRY.history().update_run(
-            run_history_id,
-            status="error",
-            completed_at=fail_ts,
-            meta={"error": _STABLE_INTERNAL_ERROR, "_error_detail": error_message[:500]},
-        )
-    except Exception:
-        pass
-
-    return {"status": "error", "message": _STABLE_INTERNAL_ERROR}
+    except Exception as exc:
+        _log.error("Studio direct run failed for %s: %s", exp_id, exc)
+        try:
+            from experiment_service import REGISTRY
+            from datetime import datetime, timezone
+            fail_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            REGISTRY.history().update_run(
+                run_history_id,
+                status="error",
+                completed_at=fail_ts,
+                meta={"error": _STABLE_INTERNAL_ERROR, "_error_detail": str(exc)[:500]},
+            )
+        except Exception:
+            pass
+        return {"status": "error", "message": _STABLE_INTERNAL_ERROR}
+    finally:
+        if _run_trace is not None:
+            _run_trace.end("direct_studio_run_completion")
 
 
 # ── Scheduler path (legacy, extracted from original handle_studio_run) ──

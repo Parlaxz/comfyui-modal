@@ -98,6 +98,7 @@ from run_prompt_options import (
 )
 import experiment_setup_adapter as _experiment_setup_adapter
 from warmup_profile import prepare_active_next_profile as prepare_active_next_profile
+from canonical_execution import RunTrace, execute_modal_prompt, prepare_modal_execution
 from comparison import (
     create_profile,
     update_profile,
@@ -2184,192 +2185,27 @@ async def _execute_job(item: tuple, item_id: int):
     success = False
     finalized = False
     outputs = {}
-    prompt_hash = extra_data.get("workflow_hash", "")
-    prompt_summary = extra_data.get("prompt_summary", {})
-    model_stack = extra_data.get("model_stack", {})
-    # Extract production_report from extra_data (set by modal_prompt route)
-    production_report = extra_data.get("production_report")
+    # Production options from route (canonical executor handles compile)
+    production_options = extra_data.get("production_options") or {}
+    # Metadata populated after execution from run_trace/result
+    prompt_hash = ""
+    prompt_summary: dict = {}
+    model_stack: dict = {}
     try:
         _send(sid, "modal_status", {"prompt_id": prompt_id, "message": "Starting up", "phase": "startup"})
-        # Verify workflow integrity immediately before remote call
-        current_hash = prompt_sha256(execution_workflow)
-        expected_hash = extra_data.get("workflow_hash", "")
-        if expected_hash and current_hash != expected_hash:
-            raise RuntimeError(
-                f"Workflow hash mismatch: expected {expected_hash[:12]}…, got {current_hash[:12]}…"
-            )
 
-        # API prompt structure validation (local defense-in-depth)
-        assert_valid_api_prompt_structure(execution_workflow)
-
-        # ── PART 2: Class-type validation before warmup profile write ──
-        # Also validate that referenced node class types exist in the
-        # local ComfyUI registry.  Missing nodes should fail fast rather
-        # than wasting Modal worker time.
-        try:
-            import nodes as _validate_nodes
-            _requested_types = set()
-            _PRODUCTION_REMOTE_CLASSES = frozenset({
-                "ComfyModalProductionOutput",
-                "ComfyModalProductionImageComparerOutput",
-            })
-            for _spec in execution_workflow.values():
-                if isinstance(_spec, dict):
-                    _ct = _spec.get("class_type")
-                    if isinstance(_ct, str) and _ct:
-                        _requested_types.add(_ct)
-            # Only exempt remote-only class types that appear at
-            # compiler-rewritten node IDs in the production_report.
-            # Use production_report from extra_data (available in scope);
-            # production_options is NOT defined in _execute_job scope.
-            _production_active = bool(
-                production_report
-                and isinstance(production_report, dict)
-                and production_report.get("enabled")
-            )
-            if _production_active:
-                _rewritten_out_ids = set(production_report.get("direct_output_rewritten_node_ids", []))
-                _rewritten_rgthree_ids = set(production_report.get("rgthree_comparer_rewritten_node_ids", []))
-                _validated_types = set()
-                for _nid, _spec in execution_workflow.items():
-                    if not isinstance(_spec, dict):
-                        continue
-                    _ct = _spec.get("class_type")
-                    if not isinstance(_ct, str) or not _ct:
-                        continue
-                    if _ct == "ComfyModalProductionOutput" and str(_nid) in _rewritten_out_ids:
-                        continue  # compiler-generated; skip local validation
-                    if _ct == "ComfyModalProductionImageComparerOutput" and str(_nid) in _rewritten_rgthree_ids:
-                        continue  # compiler-generated; skip local validation
-                    _validated_types.add(_ct)
-            else:
-                _validated_types = _requested_types
-            _missing = sorted(
-                ct for ct in _validated_types
-                if ct not in _validate_nodes.NODE_CLASS_MAPPINGS
-            )
-            if _missing:
-                raise RuntimeError(
-                    f"Missing custom node class(es): {_missing}. "
-                    f"Install the missing custom nodes or fix the workflow."
-                )
-        except RuntimeError:
-            raise
-        except Exception as _val_exc:
-            print(f"[comfyui-modal] Warning: class-type validation failed: {_val_exc}")
-
-        # Log prompt metadata before remote execution
-        print(f"[comfyui-modal] Running prompt {prompt_hash[:12]}… summary={prompt_summary} model_stack={model_stack}")
-
-        collect_started = time.time()
-        collect_started = time.time()
-        input_collect_ms = 0
-        input_collect_bytes = 0
-        if workflow_needs_local_input_files(execution_workflow):
-            input_images = _collect_input_images(execution_workflow)
-            input_collect_ms = round((time.time() - collect_started) * 1000, 1)
-            input_collect_bytes = sum(len(base64.b64decode(data)) for data in input_images.values())
-            print(
-                f"[comfyui-modal.profile] stage=input_collect prompt_id={prompt_id[:8]} "
-                f"duration_ms={input_collect_ms} count={len(input_images)} bytes={input_collect_bytes}"
-            )
-        else:
-            input_images = {}
+        # Log prompt metadata before remote execution (hash computed by canonical executor)
+        print(f"[comfyui-modal] Starting prompt execution…")
 
         invocation_plan = _build_generation_invocation_plan(extra_data.get("gpu"), stream=True)
         _log_generation_invocation_plan(prompt_id, invocation_plan)
 
-        # ── Active-next warmup profile via shared helper ──
-        # Normalize production options so that omitted production
-        # (which defaults to enabled=True) is forwarded correctly.
-        # The raw extra_data.modal_options may be None or lack the
-        # "production" key, but normalize_production_options fills in
-        # canonical defaults (including enabled=True).
-        _active_next_write_start = time.time()
-        _modal_options_for_prod = extra_data.get("modal_options", {}) or {}
-        _production_options_for_activation = normalize_production_options(_modal_options_for_prod)
-        # Determine which workflow hash to use for the activation profile.
-        # When production is enabled, use the report's source_workflow_hash
-        # as the stable source identity.  Fall back to the dispatch
-        # workflow_hash (prompt_hash) for source-only/disabled requests.
-        _production_active_profile = bool(
-            _production_options_for_activation.get("enabled")
-            and isinstance(production_report, dict)
-            and production_report.get("enabled")
-        )
-        if _production_active_profile:
-            _activation_workflow_hash = production_report.get("source_workflow_hash", prompt_hash)
-            # Enrich production options with identity hashes from the report
-            _production_options_for_activation["source_workflow_hash"] = production_report.get("source_workflow_hash", "")
-            _production_options_for_activation["compiled_workflow_hash"] = production_report.get("compiled_workflow_hash", "")
-            _production_options_for_activation["production_plan_hash"] = production_report.get("production_plan_hash", "")
-            _production_options_for_activation["compiler_version"] = production_report.get("compiler_version", PRODUCTION_COMPILER_VERSION)
-            _production_options_for_activation["hash_schema_version"] = production_report.get("hash_schema_version", HASH_SCHEMA_VERSION)
-            _production_options_for_activation["production_plan_schema_version"] = production_report.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION)
-        else:
-            _activation_workflow_hash = prompt_hash
-        _wn_result = await prepare_active_next_profile(
-            execution_workflow,
-            _activation_workflow_hash,
-            production_options=_production_options_for_activation,
-            workspace=_request_workspace,
-            setter=set_active_warmup_profile,
-        )
-        _active_next_payload_bytes = _wn_result.get("payload_bytes", 0)
-        _active_next_status = _wn_result.get("status", "skipped")
-        _active_next_changed = _wn_result.get("changed", False)
-        _active_next_remote_call = _wn_result.get("remote_call", 0)
-        _active_next_profile_key = _wn_result.get("profile_key", "")
-        _active_next_elapsed = round((time.time() - _active_next_write_start) * 1000, 1)
-        # Capture new honest result fields
-        _active_next_build_ms = _wn_result.get("active_profile_build_ms", 0.0)
-        _active_next_dedup_status = _wn_result.get("active_profile_dedup_status", _active_next_status)
-        _active_next_remote_ms = _wn_result.get("active_profile_remote_ms", 0.0)
-        _prod_enabled_log = bool(_production_options_for_activation.get("enabled"))
-        _prod_source_log = _production_options_for_activation.get("source_workflow_hash", "")[:8] or "?"
-        _prod_compiled_log = _production_options_for_activation.get("compiled_workflow_hash", "")[:8] or "?"
-        _prod_plan_log = _production_options_for_activation.get("production_plan_hash", "")[:8] or "?"
-        _prod_output_log = sorted(_production_options_for_activation.get("output_node_ids", []))
-        print(
-            f"[comfyui-modal.profile] stage=active_profile_write prompt_id={prompt_id[:8]} "
-            f"decision={_active_next_status} profile_key={_active_next_profile_key} "
-            f"remote_call={_active_next_remote_call} "
-            f"status={_active_next_status} changed={_active_next_changed} "
-            f"bytes={_active_next_payload_bytes} ms={_active_next_elapsed}"
-            f" build_ms={_active_next_build_ms} dedup={_active_next_dedup_status}"
-            f" remote_ms={_active_next_remote_ms}"
-        )
-        if _prod_enabled_log:
-            print(
-                f"[production.profile] prompt_id={prompt_id[:8]} "
-                f"enabled=1 source={_prod_source_log} compiled={_prod_compiled_log} "
-                f"plan={_prod_plan_log} outputs={_prod_output_log}"
-            )
-
         remote_started = time.time()
-
-        # ── v2.16.20: Wait for prompt acknowledgment before forwarding events ──
-        if ack_ready is not None:
-            await ack_ready.wait()
-        # Forward execution_start now that ack is done
-        _forward_execution_start_once()
-        trace.mark("t2_local_dispatch")
-        trace.mark("t2b_modal_handle_resolved")
-        trace.mark("t2c_modal_call_start")
-        trace.mark("client_modal_call_start", trace.get("t2c_modal_call_start") or remote_started)
-        trace.mark("client_modal_submit_done", trace.get("t2c_modal_call_start") or remote_started)
-        if os.environ.get("COMFYMODAL_PREDISPATCH_DEBUG"):
-            print(f"[predispatch] phase=before_gpu_spawn t={time.time()}")
-        # Stream prompt execution with real-time progress from the Modal
-        # container.  Progress events (executing, progress, execution_start)
-        # are forwarded to the ComfyUI frontend as they arrive.
-        _modal_result = None
-        _first_msg = True
         _result_route_mode = extra_data.get("result_route", _RESULT_ROUTE)
+
+        # ── Prepare modal_options (runtime flags, scheduler_test) ──
         _mo = dict(extra_data.get("modal_options") or {})
         # Propagate runtime restore_background_unet flag to volume file
-        # so the next container cold start can read it during restore().
-        # Only active when EXPERIMENTAL_RESTORE_BACKGROUND_CODE is on.
         _rbg_enabled = False
         if isinstance(_mo.get("runtime"), dict):
             _rbg_runtime = _mo["runtime"].get("restore_background_unet", {})
@@ -2385,73 +2221,72 @@ async def _execute_job(item: tuple, item_id: int):
         if isinstance(_st, dict):
             _mo["comfymodal_scheduler_test"] = _st
 
-        # active_profile_to_gpu_submit_ms: wall time from profile-helper
-        # write start to the actual GPU stream call (after ack/runtime pre-submit work).
-        _active_next_to_gpu_ms = round((time.time() - _active_next_write_start) * 1000, 1)
-        print(
-            f"[comfyui-modal.profile] stage=active_profile_to_gpu prompt_id={prompt_id[:8]} "
-            f"to_gpu_ms={_active_next_to_gpu_ms}"
+        # Build RunTrace for instrumentation
+        _run_trace = RunTrace(
+            prompt_id=prompt_id,
+            run_surface="normal",
         )
 
-        # ── Build run_prompt_options from production report ─────────────
-        # Derive production_output_node_ids from the existing report or
-        # from modal_options so the shared builder produces correct
-        # production/actual_load defaults.
-        _rep = extra_data.get("production_report")
-        _prod_output_ids = []
-        if _rep and isinstance(_rep, dict) and _rep.get("enabled"):
-            _prod_output_ids = _rep.get("output_node_ids", [])
-        elif isinstance(_mo.get("production"), dict) and _mo["production"].get("enabled"):
-            _prod_output_ids = _mo["production"].get("output_node_ids", [])
-        _builder_options = build_run_prompt_options(
-            production_output_node_ids=_prod_output_ids,
-            enable_actual_load=True,
-        )
-        _mo = ensure_run_prompt_options(_mo, _builder_options)
+        # ── v2.16.20: Wait for prompt acknowledgment before forwarding events ──
+        if ack_ready is not None:
+            await ack_ready.wait()
+        # Forward execution_start now that ack is done
+        _forward_execution_start_once()
+        trace.mark("t2_local_dispatch")
+        trace.mark("t2b_modal_handle_resolved")
+        trace.mark("t2c_modal_call_start")
+        trace.mark("client_modal_call_start", trace.get("t2c_modal_call_start") or remote_started)
+        trace.mark("client_modal_submit_done", trace.get("t2c_modal_call_start") or remote_started)
+        if os.environ.get("COMFYMODAL_PREDISPATCH_DEBUG"):
+            print(f"[predispatch] phase=before_gpu_spawn t={time.time()}")
 
-        async for _msg in run_prompt_stream(
-            execution_workflow,
-            input_images,
-            trace={**trace.fields(), "prompt_id": prompt_id},
-            production_report=extra_data.get("production_report"),
-            gpu=extra_data.get("gpu"),
-            modal_options=_mo if _mo else None,
-            workspace=_request_workspace or None,
-        ):
-            if _first_msg:
-                _first_msg = False
-                trace.mark("client_first_remote_log_seen")
-                if os.environ.get("COMFYMODAL_PREDISPATCH_DEBUG"):
-                    print(f"[predispatch] phase=first_gpu_response t={time.time()}")
-            if not isinstance(_msg, dict):
-                continue
-            if _msg["type"] == "progress":
-                _evt = _msg["event"]
-                if not isinstance(_msg.get("data"), dict):
-                    continue
-                _data = dict(_msg["data"])
-                # Remote execution uses its own internal prompt_id, but the
-                # local ComfyUI frontend is tracking the local prompt_id.
-                # Rewrite streamed events so the frontend associates them with
-                # the active local prompt and updates aggregate UI correctly.
+        # ── Event sink: forward progress/status events to frontend ──
+        def _event_sink(event_type: str, payload: dict) -> None:
+            if event_type == "progress" and isinstance(payload, dict):
+                _evt = payload.get("event", "executing")
+                _data = dict(payload)
                 _data["prompt_id"] = prompt_id
                 _send(sid, _evt, _data)
-                await asyncio.sleep(0)
-            elif _msg["type"] == "status":
-                _send(sid, "modal_status", {
-                    "prompt_id": prompt_id,
-                    "message": _msg.get("message") or "Starting up",
-                    "phase": _msg.get("phase") or "startup",
-                })
-                await asyncio.sleep(0)
-            elif _msg["type"] == "result":
-                _modal_result = _msg["data"]
-                break
-            elif _msg["type"] == "error":
-                raise RuntimeError(_msg["message"])
-        if _modal_result is None:
-            raise RuntimeError("run_prompt_stream ended without result")
-        result = _modal_result
+            elif event_type == "status" and isinstance(payload, dict):
+                _p = dict(payload)
+                _p["prompt_id"] = prompt_id
+                _send(sid, "modal_status", _p)
+            elif event_type == "executing":
+                _forward_execution_start_once()
+
+        # ── Delegate to canonical executor ──
+        # execute_modal_prompt handles: compile (from production_options),
+        # hash validation, API structure, class-type validation, input image
+        # collection, profile preparation, run-prompt-options construction,
+        # and the run_prompt_stream call with event forwarding.
+        # This is the single canonical call — no second compile/hash path.
+        result = await execute_modal_prompt(
+            execution_workflow,
+            prompt_id=prompt_id,
+            client_id=sid,
+            input_images=None,
+            modal_options=_mo if _mo else None,
+            production_options=production_options if production_options.get("enabled") else None,
+            gpu=extra_data.get("gpu"),
+            workspace=_request_workspace or None,
+            trace_payload={**trace.fields(), "prompt_id": prompt_id, "client_id": sid},
+            profile_setter=set_active_warmup_profile,
+            run_trace=_run_trace,
+            comfyui_root=_COMFYUI_ROOT,
+            event_sink=_event_sink,
+        )
+        # ── Extract canonical metadata from run_trace ──
+        _result_trace = result.get("trace", {}) if isinstance(result, dict) else {}
+        _run_trace_summary = _result_trace.get("_run_trace", {}) if isinstance(_result_trace, dict) else {}
+        _rt_meta = _run_trace_summary.get("meta", {}) if isinstance(_run_trace_summary, dict) else {}
+        if _rt_meta:
+            prompt_hash = _rt_meta.get("source_workflow_hash",
+                         _rt_meta.get("compiled_workflow_hash", ""))
+            prompt_summary = _rt_meta.get("prompt_summary", {})
+            model_stack = _rt_meta.get("model_stack", {})
+        # Log after canonical extraction
+        print(f"[comfyui-modal] Running prompt {prompt_hash[:12] if prompt_hash else '?'}…")
+
         # ── Diagnostics: result received ──
         _flat_imgs = result.get("images", []) if isinstance(result, dict) else []
         _outs = result.get("outputs", {}) if isinstance(result, dict) else {}
@@ -2540,9 +2375,10 @@ async def _execute_job(item: tuple, item_id: int):
     # ── Post-materialization block: guarded so _finish_job always runs ──
     try:
         # Update last successful model stack after successful remote result
+        # (populated from canonical executor's run_trace metadata)
         global _last_successful_model_stack
         _last_successful_model_stack.clear()
-        _last_successful_model_stack.update(extra_data.get("model_stack", {}))
+        _last_successful_model_stack.update(model_stack)
 
         output_dir = os.path.join(_COMFYUI_ROOT, "output")
         os.makedirs(output_dir, exist_ok=True)
@@ -2623,13 +2459,21 @@ async def _execute_job(item: tuple, item_id: int):
         merge_remote_trace_into(_merged_trace, _remote_full)
 
         # Stash active-next preparer metrics into the merged trace.
-        # Numeric fields go into derived_ms; string dedup status at top level.
+        # Extract from the _run_trace spans and counts which were recorded
+        # by execute_modal_prompt / prepare_modal_execution.
         _MERGED_DERIVED = _merged_trace.setdefault("derived_ms", {})
-        _MERGED_DERIVED["active_profile_build_ms"] = _active_next_build_ms
-        _MERGED_DERIVED["active_profile_remote_ms"] = _active_next_remote_ms
-        _MERGED_DERIVED["active_profile_to_gpu_submit_ms"] = _active_next_to_gpu_ms
-        _MERGED_DERIVED["active_profile_remote_call"] = _active_next_remote_call
-        _merged_trace["active_profile_dedup_status"] = _active_next_dedup_status
+        _run_trace_summary = result.get("trace", {}).get("_run_trace", {}) if isinstance(result.get("trace"), dict) else {}
+        _rt_counts = _run_trace_summary.get("counts", {}) if isinstance(_run_trace_summary, dict) else {}
+        _rt_spans = _run_trace_summary.get("spans", {}) if isinstance(_run_trace_summary, dict) else {}
+        _profile_span = _rt_spans.get("prepare_active_next_profile", {}) if isinstance(_rt_spans, dict) else {}
+        if _profile_span and isinstance(_profile_span, dict) and _profile_span.get("called"):
+            _MERGED_DERIVED["active_profile_build_ms"] = _profile_span.get("duration_ms", 0)
+        else:
+            _MERGED_DERIVED["active_profile_build_ms"] = 0.0
+        if "active_profile_prepare_count" in _rt_counts:
+            _MERGED_DERIVED["active_profile_remote_call"] = _rt_counts.get("active_profile_prepare_count", 0)
+        _MERGED_DERIVED["active_profile_to_gpu_submit_ms"] = 0.0  # Not tracked in canonical executor
+        _merged_trace["active_profile_dedup_status"] = ""  # Not tracked in canonical executor
 
         result["trace"] = _merged_trace
         if os.environ.get("COMFYMODAL_TRACE_DEBUG_LOG"):
@@ -3455,7 +3299,7 @@ if _server:
         local_et.mark(T1B_LOCAL_PAYLOAD_PARSE_END, phase=PHASE_LOCAL_BRIDGE)
         print(f"[predispatch] phase=recv t={time.time()}")
 
-        # ── Production workflow compilation ──
+        # ── Production options validation (no compile — deferred to canonical executor) ──
         modal_options_raw = body.get("modal_options", None)
         if not isinstance(modal_options_raw, dict):
             modal_options_raw = None
@@ -3478,9 +3322,6 @@ if _server:
         _browser_production_trace: dict = body.get("_production_trace", {}) or {}
         if not isinstance(_browser_production_trace, dict):
             _browser_production_trace = {}
-        production_report = None
-        production_diagnostics: dict = {}
-        execution_workflow = workflow
         if production_options.get("enabled"):
             if not production_options.get("output_node_ids"):
                 # Generic /prompt route has no surface to derive output bindings.
@@ -3503,56 +3344,9 @@ if _server:
                         "production_plan_used": False,
                     },
                 }), content_type="application/json")
-            try:
-                production_options["enabled"] = True
-                if "schema_version" not in production_options:
-                    production_options["schema_version"] = 1
-                # Compile returns a ProductionPlan; named fields are authoritative.
-                # The compatibility ``__iter__`` also works for tuple unpacking.
-                plan = compile_production_workflow(
-                    workflow, production_options, allow_direct_output_rewrite=True
-                )
-                production_report = plan.report
-                execution_workflow = plan.compiled_workflow
-                kept = production_report.get("compiled_node_count", 0)
-                removed = production_report.get("removed_node_count", 0)
-                bypassed = len(production_options.get("bypass_node_ids", []))
-                outputs = len(production_options.get("output_node_ids", []))
-                # Compact boundary identity log
-                _sh_source = plan.source_workflow_hash[:8] if plan.source_workflow_hash else "?"
-                _sh_compiled = plan.compiled_workflow_hash[:8] if plan.compiled_workflow_hash else "?"
-                _sh_plan = plan.production_plan_hash[:8] if plan.production_plan_hash else "?"
-                print(
-                    f"[comfyui-modal] Production plan: source={_sh_source} "
-                    f"compiled={_sh_compiled} plan={_sh_plan} "
-                    f"kept={kept} removed={removed} bypassed={bypassed} outputs={outputs}"
-                )
-            except Exception:
-                print(f"[comfyui-modal] Production compile failed, failing closed")
-                raise
-        else:
-            production_report = None  # explicitly disabled → source-only dispatch
-
-        # ── Stack extraction (prompt hashing + model stack) ──
-        print(f"[predispatch] phase=before_stack_extract t={time.time()}")
-        trace.mark("t1k_stack_extract_start", time.time())
-        local_et.mark(T1Q_STACK_EXTRACT_START, phase=PHASE_LOCAL_BRIDGE)
-        _stack_start_ts = time.perf_counter()
-        local_payload_hash = prompt_sha256(body)
-        workflow_hash = prompt_sha256(execution_workflow)
-        prompt_summary = summarize_prompt_fields(execution_workflow)
-        model_stack = extract_model_stack(execution_workflow)
-        _stack_end_ts = time.perf_counter()
-        stack_extract_ms = round((_stack_end_ts - _stack_start_ts) * 1000, 3)
-        if stack_extract_ms > _STACK_EXTRACT_WARN_MS:
-            print(f"[comfyui-modal] CRITICAL slow stack extraction: {stack_extract_ms}ms")
-        if stack_extract_ms > _STACK_EXTRACT_FAIL_S * 1000:
-            _clear_request_state(prompt_id)
-            return web.json_response({"status": "error", "error": f"Stack extraction took {stack_extract_ms}ms, exceeding {_STACK_EXTRACT_FAIL_S}s limit"}, status=500)
-        _stack_end_ts_wall = time.time()
-        trace.mark("t1l_stack_extract_end", _stack_end_ts_wall)
-        local_et.mark(T1R_STACK_EXTRACT_END, phase=PHASE_LOCAL_BRIDGE)
-        print(f"[predispatch] phase=after_stack_extract t={_stack_end_ts_wall}")
+        # Canonical executor handles compile/hash/model-stack extraction.
+        # Queue the source workflow + normalized production_options.
+        execution_workflow = workflow  # source workflow, not compiled
 
         # Extract modal_options from body
         modal_options = modal_options_raw
@@ -3590,10 +3384,6 @@ if _server:
             extra_data = {
                 "client_id": client_id,
                 "create_time": int(time.time() * 1000),
-                "local_payload_hash": local_payload_hash,
-                "workflow_hash": workflow_hash,
-                "prompt_summary": prompt_summary,
-                "model_stack": model_stack,
                 "gpu": selected_gpu,
                 "trace": {**trace.fields(), "prompt_id": prompt_id},
                 "_client_trace": _client_trace_dict,
@@ -3601,7 +3391,7 @@ if _server:
                 "scheduler_test": scheduler_test,
                 "result_route": _result_route_mode,
                 "execution_workflow": _queue_execution_workflow,
-                "production_report": production_report,
+                "production_options": production_options,
                 # Compact production diagnostics for request identity tracking.
                 # Carried through queue/scheduler/adapter so the runner can use them.
                 # Use browser _production_trace as authoritative fallback when present,
@@ -3623,8 +3413,6 @@ if _server:
                     _browser_production_trace.get("production_persisted_enabled",
                         production_options.get("enabled", False)
                     )
-                ) if production_report and production_report.get("enabled") else bool(
-                    _browser_production_trace.get("production_persisted_enabled", False)
                 ),
                 "production_request_enabled": bool(
                     production_options.get("enabled", False)
@@ -3634,34 +3422,6 @@ if _server:
                         production_options.get("output_node_ids", [])
                     )
                     if production_options.get("enabled") else []
-                ),
-                "production_source_hash": (
-                    production_report.get("source_workflow_hash", "")
-                    if production_report and production_report.get("enabled") else ""
-                ),
-                "production_plan_hash": (
-                    production_report.get("production_plan_hash", "")
-                    if production_report and production_report.get("enabled") else ""
-                ),
-                "production_compiled_hash": (
-                    production_report.get("compiled_workflow_hash", "")
-                    if production_report and production_report.get("enabled") else ""
-                ),
-                "runner_workflow_hash": (
-                    production_report.get("runner_workflow_hash", "")
-                    if production_report and production_report.get("enabled") else ""
-                ),
-                # Legacy aliases for backward compat
-                "production_source_workflow_hash": (
-                    production_report.get("source_workflow_hash", "")
-                    if production_report and production_report.get("enabled") else ""
-                ),
-                "production_compiled_workflow_hash": (
-                    production_report.get("compiled_workflow_hash", "")
-                    if production_report and production_report.get("enabled") else ""
-                ),
-                "production_plan_used": bool(
-                    production_report and production_report.get("enabled", False)
                 ),
                 "production_output_count": (
                     len(_browser_production_trace.get("production_output_ids",
@@ -3705,7 +3465,8 @@ if _server:
         # ── Stall detector ──
         local_ts = {"t1_local_recv": _route_entry_ts, "t2_local_dispatch": _dispatch_ts,
                     "body_read_ms": body_read_ms, "json_parse_ms": body_read_ms, "preflight_ms": preflight_ms,
-                    "stack_extract_ms": stack_extract_ms, "active_next_write_ms": 0,
+                    "stack_extract_ms": 0,  # deferred to canonical executor
+                    "active_next_write_ms": 0,
                     "lock_wait_total_ms": _lock_trace.get("wait_ms", 0), "local_recv_to_dispatch_ms": local_recv_to_dispatch_ms}
         degradation_flags = []
         _detect_local_predispatch_stall(local_ts, prompt_id, degradation_flags)

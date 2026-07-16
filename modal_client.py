@@ -33,6 +33,7 @@ def validate_production_dispatch(
     production_report: dict | None,
     *,
     label: str = "",
+    workflow_hash: str = "",
 ) -> None:
     """Local dispatch invariant: verify the compiled workflow matches the report.
 
@@ -60,7 +61,7 @@ def validate_production_dispatch(
     compiled_hash = production_report.get("compiled_workflow_hash", "")
     if not compiled_hash:
         _src_h = _short_hash(production_report.get("source_workflow_hash", ""))
-        _dispatch_h = _short_hash(_canonical_workflow_hash(workflow))
+        _dispatch_h = _short_hash(workflow_hash or _canonical_workflow_hash(workflow))
         raise AssertionError(
             f"[{label}] production dispatch missing compiled_workflow_hash: "
             f"report has no compiled identity. "
@@ -89,8 +90,9 @@ def validate_production_dispatch(
             f"got {pv}, expected {PRODUCTION_PLAN_SCHEMA_VERSION}"
         )
 
-    # Compute actual hash of the dispatched workflow using the canonical helper
-    actual_hash = _canonical_workflow_hash(workflow)
+    # Use precomputed hash when provided (avoids re-serializing the workflow
+    # on the hot path).  Otherwise compute it from the workflow dict.
+    actual_hash = workflow_hash or _canonical_workflow_hash(workflow)
     if not actual_hash:
         raise AssertionError(
             f"[{label}] failed to hash dispatch workflow"
@@ -116,16 +118,22 @@ def validate_production_dispatch(
 
 APP_NAME = os.environ.get("COMFYMODAL_APP_NAME", "comfyui").strip() or "comfyui"
 
+# Environment-gated Modal placement: empty means global scheduling.
+# Only set nonempty values to pin to a specific region or cloud provider.
+# Example: COMFYMODAL_COMPUTE_REGION=us  COMFYMODAL_COMPUTE_CLOUD=aws
+_COMFYMODAL_COMPUTE_REGION = os.environ.get("COMFYMODAL_COMPUTE_REGION", "").strip()
+_COMFYMODAL_COMPUTE_CLOUD = os.environ.get("COMFYMODAL_COMPUTE_CLOUD", "").strip()
+
 # Client-side backpressure: only one in-flight prompt execution at a time
 _run_prompt_semaphore = asyncio.Semaphore(1)
 
 # Per-workspace caches — populated lazily on first use per workspace.
 # Key: workspace["id"] for clients, (workspace["id"], name) for function handles,
-# (workspace["id"], gpu_value) for Cls instances.
+# (workspace["id"], gpu_value, region, cloud) for Cls instances.
 _workspace_resolver: Callable[[], dict | None] | None = None
 _workspace_clients: dict[str, object] = {}
 _workspace_function_handles: dict[tuple[str, str], object] = {}
-_workspace_cls_instances: dict[tuple[str, str], object] = {}
+_workspace_cls_instances: dict[tuple[str, str, str, str], object] = {}
 _current_gpu = DEFAULT_GPU
 _handle_cache_hits = 0
 _handle_cache_misses = 0
@@ -184,18 +192,32 @@ def _workspace_api(workspace: dict, gpu: str | None = None):
     """Return (and cache) a GPU-class Cls instance scoped to *workspace*.
 
     If *gpu* is ``None`` the module-level ``_current_gpu`` is used.
+
+    When ``COMFYMODAL_COMPUTE_REGION`` or ``COMFYMODAL_COMPUTE_CLOUD`` is
+    set to a non-empty value, ``with_options(region=..., cloud=...)`` is
+    applied to pin container scheduling.  Both default to empty (global
+    scheduling).  Region and cloud are folded into the instance cache key.
     """
     global _handle_cache_hits, _handle_cache_misses
     selected_gpu = _current_gpu if gpu is None else normalize_gpu_value(gpu)
     entry = GPU_BY_VALUE.get(selected_gpu)
     if entry is None:
         raise ValueError(f"Unsupported GPU: {selected_gpu}")
-    key = (workspace["id"], selected_gpu)
+    region = _COMFYMODAL_COMPUTE_REGION
+    cloud = _COMFYMODAL_COMPUTE_CLOUD
+    key = (workspace["id"], selected_gpu, region, cloud)
     instance = _workspace_cls_instances.get(key)
     if instance is None:
         _handle_cache_misses += 1
         cls_handle = modal.Cls.from_name(APP_NAME, entry["class_name"], client=_workspace_client(workspace))
         instance = cls_handle()
+        if region or cloud:
+            kwargs = {}
+            if region:
+                kwargs["region"] = region
+            if cloud:
+                kwargs["cloud"] = cloud
+            instance = instance.with_options(**kwargs)
         _workspace_cls_instances[key] = instance
     else:
         _handle_cache_hits += 1
@@ -292,7 +314,12 @@ async def run_prompt(
 ) -> dict:
     selected = _resolve_workspace(workspace)
     # Local dispatch invariant: verify compiled workflow matches report
-    validate_production_dispatch(workflow, production_report, label="run_prompt")
+    _precomputed_hash = (trace or {}).get("canonical_workflow_hash", "")
+    validate_production_dispatch(
+        workflow, production_report,
+        label="run_prompt",
+        workflow_hash=_precomputed_hash,
+    )
     async with _run_prompt_semaphore:
         return await asyncio.to_thread(
             lambda: _workspace_api(selected, gpu).run_prompt.remote(
@@ -323,7 +350,12 @@ async def run_prompt_stream(
     import time as _t
     selected = _resolve_workspace(workspace)
     # Local dispatch invariant: verify compiled workflow matches report
-    validate_production_dispatch(workflow, production_report, label="run_prompt_stream")
+    _precomputed_hash = (trace or {}).get("canonical_workflow_hash", "")
+    validate_production_dispatch(
+        workflow, production_report,
+        label="run_prompt_stream",
+        workflow_hash=_precomputed_hash,
+    )
     gen = None
     # ── Local observation markers on the mutable trace dict ────────────
     # These are wall-clock observations from THIS side of the Modal

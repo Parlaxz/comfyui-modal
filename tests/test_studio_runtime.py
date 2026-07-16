@@ -5563,16 +5563,9 @@ class JsAxisEligibilityRED(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ProductionSingleRunHashGuardTests(unittest.TestCase):
-    """Regression: Studio single-run with production enabled must not fail
-    the fail-closed hash guard in LocalRemoteInvoker.run_cell.
-
-    Root cause: build_single_run_spec applied controls, compiled the
-    production workflow, but _run_checkpoint then called
-    resolve_and_inject_cell which deep-copied the compiled workflow and
-    re-injected the same values, changing its canonical hash.  The fix:
-    pre-set _resolved_workflow on the cell so the injection pass is
-    skipped for production single-runs.
-    """
+    """Canonical-owner contract: build_single_run_spec defers production
+    compilation; execute_modal_prompt compiles exactly once and the
+    canonical hash guard rejects mismatched workflows."""
 
     def setUp(self):
         _repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -5580,8 +5573,6 @@ class ProductionSingleRunHashGuardTests(unittest.TestCase):
             sys.path.insert(0, _repo)
 
     def _make_build_single_run_spec(self):
-        """Import and call build_single_run_spec with a synthetic
-        snapshot that has an output node binding."""
         from studio_run_adapter import build_single_run_spec
         return build_single_run_spec
 
@@ -5645,11 +5636,11 @@ class ProductionSingleRunHashGuardTests(unittest.TestCase):
         }
 
     def test_hash_guard_passes_for_studio_single_run(self):
-        """Simulate a full Studio single-run flow and verify the hash
-        guard in LocalRemoteInvoker.run_cell does NOT reject the
-        workflow."""
+        """build_single_run_spec returns source workflow + production_options;
+        execute_modal_prompt compiles exactly once and produces report/hash."""
+        from unittest.mock import patch
 
-        # 1. Build single-run spec (production enabled, steps=8)
+        # 1. Build single-run spec (production enabled)
         build_spec = self._make_build_single_run_spec()
         compilation = build_spec(
             preset=self._minimal_preset(),
@@ -5661,44 +5652,97 @@ class ProductionSingleRunHashGuardTests(unittest.TestCase):
                                           "output_node_ids": ["107"]}},
         )
 
-        # Must not have an error
         self.assertNotIn("error", compilation,
                          f"build_single_run_spec returned error: "
                          f"{compilation.get('error')}")
 
-        # 2. Verify the cell carries _resolved_workflow
-        cells = compilation.get("cells", [])
-        self.assertEqual(len(cells), 1)
-        cell = cells[0]
-        self.assertIn("_resolved_workflow", cell,
-                       "Cell must carry _resolved_workflow for production single-run")
-        self.assertIsNotNone(cell["_resolved_workflow"],
-                             "_resolved_workflow must not be None")
-
-        # 3. Verify the production report has a compiled_workflow_hash
+        # 2. Assert deferred-compilation contract
         prod_report = compilation.get("production_report")
-        self.assertIsNotNone(prod_report)
-        compiled_hash = prod_report.get("compiled_workflow_hash", "")
-        self.assertTrue(len(compiled_hash) > 0,
-                        "compiled_workflow_hash must be non-empty")
+        self.assertIsNone(prod_report,
+                          "production_report must be None — compile deferred")
+        prod_opts = compilation.get("production_options")
+        self.assertIsNotNone(prod_opts)
+        self.assertTrue(prod_opts.get("enabled"))
+        self.assertEqual(prod_opts.get("output_node_ids"), ["107"])
 
-        # 4. Simulate what LocalRemoteInvoker.run_cell does:
-        #    compute canonical hash of _resolved_workflow and compare
-        from production_workflow import _canonical_workflow_hash
-        resolved_wf = cell["_resolved_workflow"]
-        actual_hash = _canonical_workflow_hash(resolved_wf)
+        ck = compilation["checkpoints"][0]
+        self.assertIsNone(ck.get("production_report"),
+                          "checkpoint production_report must be None")
+        ck_opts = ck.get("production_options")
+        self.assertIsNotNone(ck_opts)
+        self.assertEqual(ck_opts.get("output_node_ids"), ["107"])
+
+        # Workflow is source — node 107 (SaveImage) still present
+        workflow = ck["workflow"]
+        self.assertIn("107", workflow,
+                      "Source workflow must still contain node 107")
+
+        # Cell carries _resolved_workflow
+        cell = compilation["cells"][0]
+        self.assertIn("_resolved_workflow", cell)
+
+        # 3. Invoke execute_modal_prompt with mocked dependencies
+        from canonical_execution import execute_modal_prompt, RunTrace
+        from workflow_metadata import prompt_sha256
+
+        wf_hash = prompt_sha256(workflow)
+
+        class _MockPlan:
+            report = {
+                "enabled": True,
+                "source_workflow_hash": wf_hash,
+                "compiled_workflow_hash": wf_hash,
+                "production_plan_hash": "mock_pph",
+                "output_node_ids": ["107"],
+                "bypass_node_ids": [],
+                "compiler_version": 1,
+                "hash_schema_version": 1,
+                "production_plan_schema_version": 1,
+            }
+            compiled_workflow = workflow
+
+        async def _mock_stream(*_a, **_kw):
+            yield {"type": "result", "data": {"outputs": {}, "images": []}}
+
+        async def _mock_profile(*_a, **_kw):
+            return {"status": "noop", "profile_key": "", "remote_call": False,
+                    "payload_bytes": 0, "changed": False}
+
+        with patch("production_workflow.compile_production_workflow",
+                   return_value=_MockPlan()) as mock_compile:
+            with patch("modal_client.run_prompt_stream", new=_mock_stream):
+                with patch("warmup_profile.prepare_active_next_profile",
+                           new=_mock_profile):
+                    rt = RunTrace(run_surface="studio_single")
+                    result = asyncio.run(execute_modal_prompt(
+                        workflow,
+                        prompt_id="test_hash_guard",
+                        production_options=prod_opts,
+                        run_trace=rt,
+                    ))
+
+        # 4. Exactly one production compile
+        self.assertEqual(mock_compile.call_count, 1,
+                         "execute_modal_prompt must compile exactly once")
+
+        # 5. Trace records production_compile_count
+        trace = result.get("trace", {}).get("_run_trace", {})
         self.assertEqual(
-            actual_hash, compiled_hash,
-            "Hash of _resolved_workflow MUST match compiled_workflow_hash "
-            "from the production report.  If this fails, resolve_and_inject_cell "
-            "is mutating the workflow after compile."
-        )
+            trace.get("counts", {}).get("production_compile_count"), 1,
+            "RunTrace must record production_compile_count=1")
+
+        # 6. Trace metadata carries workflow hashes
+        meta = trace.get("meta", {})
+        self.assertIn("source_workflow_hash", meta)
+        self.assertIn("compiled_workflow_hash", meta)
 
     def test_hash_guard_rejects_if_cell_workflow_mutated(self):
-        """If _resolved_workflow is deliberately mutated (simulating
-        the old buggy post-compile injection), the hash guard must
-        detect the mismatch."""
+        """A mutated workflow is rejected by the canonical hash guard
+        when its hash does not match the production_report — no caller-side
+        compile is restored."""
+        from unittest.mock import patch
         from studio_run_adapter import build_single_run_spec
+
         compilation = build_single_run_spec(
             preset=self._minimal_preset(),
             snapshot=self._minimal_snapshot(),
@@ -5708,23 +5752,42 @@ class ProductionSingleRunHashGuardTests(unittest.TestCase):
             modal_options={"production": {"enabled": True,
                                           "output_node_ids": ["107"]}},
         )
-        cell = compilation["cells"][0]
-        prod_report = compilation["production_report"]
-        compiled_hash = prod_report["compiled_workflow_hash"]
+        workflow = compilation["checkpoints"][0]["workflow"]
 
-        from production_workflow import _canonical_workflow_hash
+        from workflow_metadata import prompt_sha256
+        from canonical_execution import prepare_modal_execution, RunTrace
 
-        # Simulate the old bug: mutation after compile changes the hash
-        mutated = dict(cell["_resolved_workflow"])
-        # Change a value on the KSampler node (steps=8 → steps=10)
-        if "3" in mutated:
-            mutated["3"]["inputs"]["steps"] = 10
-        mutated_hash = _canonical_workflow_hash(mutated)
+        # Mutate the workflow
+        mutated = copy.deepcopy(workflow)
+        mutated["3"]["inputs"]["steps"] = 10
 
-        self.assertNotEqual(
-            mutated_hash, compiled_hash,
-            "Mutating the resolved workflow MUST change the hash"
-        )
+        # Production report carrying hash of ORIGINAL (not mutated) workflow
+        original_hash = prompt_sha256(workflow)
+        bad_report = {
+            "enabled": True,
+            "compiled_workflow_hash": original_hash,
+            "source_workflow_hash": original_hash,
+            "output_node_ids": ["107"],
+            "bypass_node_ids": [],
+            "compiler_version": 1,
+            "hash_schema_version": 1,
+            "production_plan_schema_version": 1,
+        }
+
+        async def _mock_profile(*_a, **_kw):
+            return {"status": "noop", "profile_key": "", "remote_call": False,
+                    "payload_bytes": 0, "changed": False}
+
+        with patch("warmup_profile.prepare_active_next_profile",
+                   new=_mock_profile):
+            rt = RunTrace(run_surface="studio_single")
+            with self.assertRaises((AssertionError, RuntimeError)):
+                asyncio.run(prepare_modal_execution(
+                    mutated,
+                    prompt_id="test_hash_reject",
+                    production_report=bad_report,
+                    run_trace=rt,
+                ))
 
 
 if __name__ == "__main__":

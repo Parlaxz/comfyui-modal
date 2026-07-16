@@ -1298,177 +1298,32 @@ class LocalRemoteInvoker:
             _mutable_trace["t5_workflow_materialized"] = local_trace.get("t5_workflow_materialized")
             _mutable_trace["workflow_materialization_completed"] = local_trace.get("workflow_materialization_completed")
 
-            # ── Warmup profile write (immediately before/after preparer) ──
-            # Both legacy (warmup_profile_write_*) and canonical
-            # (active_profile_write_*) markers are set so the trace dict
-            # contains exact aliases that the direct path reads.
-            # The preparer now returns a result dict with dedup/timing fields.
-            # Prompt-only changes (same model stack, different prompt text)
-            # return "unchanged" without calling the remote setter.
-            _preparer = getattr(self, "_profile_preparer", None)
-            _active_start = time.time()
-            local_trace.mark("warmup_profile_write_started")
-            local_trace.mark("active_profile_write_start")
-            _mutable_trace["warmup_profile_write_started"] = _active_start
-            _mutable_trace["active_profile_write_start"] = _active_start
-            _preparer_result = None
-            try:
-                if _preparer is not None:
-                    _preparer_result = await _preparer(_resolved_wf, cell)
-            finally:
-                _active_end = time.time()
-                local_trace.mark("warmup_profile_write_completed")
-                local_trace.mark("active_profile_write_end")
-                _mutable_trace["warmup_profile_write_completed"] = _active_end
-                _mutable_trace["active_profile_write_end"] = _active_end
+            # ── Delegate to canonical executor ──
+            # execute_modal_prompt handles: production compile (if not
+            # pre-compiled), hash validation, model-stack extraction,
+            # profile preparation, run-prompt-options construction, and
+            # the run_prompt_stream call with event forwarding.
+            # This replaces the pre-work (preparer, hash validation,
+            # options building) and the stream loop that previously
+            # lived here.  No second modal invocation is created.
 
-            # Capture preparer metrics into mutable trace
-            if isinstance(_preparer_result, dict):
-                for _pk in ("active_profile_build_ms", "active_profile_dedup_status",
-                            "active_profile_remote_call", "active_profile_remote_ms"):
-                    if _pk in _preparer_result:
-                        _mutable_trace[_pk] = _preparer_result[_pk]
-                _ds = (_preparer_result.get("active_profile_dedup_status")
-                       or _preparer_result.get("status", ""))
-                if _ds:
-                    _mutable_trace["active_profile_dedup_status"] = _ds
-
-            local_trace.mark("t6_local_stream_opened")
-            _mutable_trace["t6_local_stream_opened"] = local_trace.get("t6_local_stream_opened")
-
-            # ── Select per-cell or global production report ────────────
-            # Experiment cells carry their own production_report on the cell;
-            # single runs use the invoker's global report (set via init).
+            # Select per-cell or global production options/report.
             _cell_report = cell.get("production_report")
+            _cell_prod_opts = cell.get("production_options")
             _effective_prod_report = _cell_report if _cell_report is not None else self._production_report
-
-            # ── Fail-closed local validation before remote dispatch ──
-            # Immediately before dispatching, verify:
-            #   1. compiler_version / hash_schema_version / production_plan_schema_version
-            #      are present and current (not stale/zero/absent).
-            #   2. compiled_workflow_hash is present and non-empty.
-            #   3. The resolved workflow's canonical SHA-256 matches the
-            #      compiled_workflow_hash from the production report.
-            # Any failure prevents calling the remote stream.
-            if _effective_prod_report and _effective_prod_report.get("enabled"):
-                from production_workflow import (
-                    _canonical_workflow_hash, COMPILER_SCHEMA_VERSION,
-                    HASH_SCHEMA_VERSION, PRODUCTION_PLAN_SCHEMA_VERSION,
-                )
-                _cv = _effective_prod_report.get("compiler_version", 0)
-                _hv = _effective_prod_report.get("hash_schema_version", 0)
-                _pv = _effective_prod_report.get("production_plan_schema_version", 0)
-                if (_cv != COMPILER_SCHEMA_VERSION
-                        or _hv != HASH_SCHEMA_VERSION
-                        or _pv != PRODUCTION_PLAN_SCHEMA_VERSION):
-                    return {
-                        "status": "failed",
-                        "error": (
-                            f"Production schema version mismatch: "
-                            f"compiler_version={_cv} "
-                            f"(expected {COMPILER_SCHEMA_VERSION}), "
-                            f"hash_schema_version={_hv} "
-                            f"(expected {HASH_SCHEMA_VERSION}), "
-                            f"production_plan_schema_version={_pv} "
-                            f"(expected {PRODUCTION_PLAN_SCHEMA_VERSION}). "
-                            f"Recompile the production plan before dispatching."
-                        ),
-                    }
-                _prod_hash_to_check = _effective_prod_report.get("compiled_workflow_hash")
-                if not _prod_hash_to_check:
-                    return {
-                        "status": "failed",
-                        "error": (
-                            f"Production compiled_workflow_hash is missing or empty. "
-                            f"Recompile the production plan before dispatching."
-                        ),
-                    }
-                _actual_hash = _canonical_workflow_hash(_resolved_wf)
-                if not _actual_hash or _actual_hash != _prod_hash_to_check:
-                    return {
-                        "status": "failed",
-                        "error": (
-                            f"Production compiled workflow hash mismatch: "
-                            f"actual={_actual_hash}, "
-                            f"expected={_prod_hash_to_check}. "
-                            f"Recompile the production plan before dispatching."
-                        ),
-                    }
-
-            # ── Merge production report into remote modal_options ──────
-            # Forward output_node_ids, schema, and options so comfyapp's
-            # compiled-workflow hash check succeeds for each cell.
-            _mo = dict(self._modal_options) if self._modal_options else {}
-            if _effective_prod_report and _effective_prod_report.get("enabled"):
-                _mo.setdefault("production", {}).update({
-                    "enabled": True,
-                    "schema_version": _effective_prod_report.get("schema_version", 1),
-                    "output_node_ids": list(_effective_prod_report.get("output_node_ids", [])),
-                    "direct_output_sink": _effective_prod_report.get("direct_output_sink_enabled", True),
-                    "metadata_mode": "none",
-                })
-
-            # ── Merge actual_load defaults via shared builder ──────────
-            # Derive production output IDs from the merged _mo, then build
-            # and merge canonical production/actual_load defaults.  The
-            # builder ensures actual_load.enabled=True and
-            # mode="unet_vae_only" for default/normal runs.
-            _prod_ids_for_builder = []
-            if _mo.get("production") and _mo["production"].get("enabled"):
-                _prod_ids_for_builder = _mo["production"].get("output_node_ids", [])
-            _builder_opts = build_run_prompt_options(
-                production_output_node_ids=_prod_ids_for_builder,
-                enable_actual_load=True,
+            _effective_prod_opts = _cell_prod_opts if _cell_prod_opts else (
+                self._modal_options.get("production") if self._modal_options else None
             )
-            _mo = ensure_run_prompt_options(_mo, _builder_opts)
 
-            # The workflow passed in stream_kwargs MUST be the compiled
-            # workflow from the checkpoint/plan when production is enabled.
-            # _resolved_wf already comes from the checkpoint (which carries
-            # the compiled workflow).  Never fall back to the source workflow.
-            stream_kwargs: dict = {
-                "workflow": _resolved_wf,
-            }
-            if flat:
-                stream_kwargs["input_images"] = flat
-            # Forward the mutable trace dict to run_prompt_stream
-            # so modal_client can add its own markers (handle lookup,
-            # generator create, etc.) and the remote side sees t0.
-            if _mutable_trace:
-                stream_kwargs["trace"] = _mutable_trace
-            # Forward identity/kwargs captured at init (only when set)
-            for _ik_key in ("gpu", "workspace"):
-                _ik_val = getattr(self, f"_{_ik_key}", None)
-                if _ik_val is not None:
-                    stream_kwargs[_ik_key] = _ik_val
-            # Forward modal_options (with merged production)
-            if _mo:
-                stream_kwargs["modal_options"] = _mo
-            # Forward the effective production_report so comfyapp can verify
-            # the compiled-workflow hash.
-            if _effective_prod_report:
-                stream_kwargs["production_report"] = _effective_prod_report
-
-            # Stage: remote_submit (immediately before entering stream)
-            _remote_submit = time.time()
-            local_trace.mark("remote_submit")
-            local_trace.mark("t2_local_modal_submit_start")
-            _mutable_trace["remote_submit"] = _remote_submit
-            _mutable_trace["t2_local_modal_submit_start"] = _remote_submit
-            _mutable_trace.setdefault("t2_local_dispatch", _remote_submit)
-
-            # active_profile_to_gpu_submit_ms: wall time from profile-helper
-            # start to remote-submit.  Exposes the full blocking helper delay
-            # on first/model-stack writes and is near-zero on prompt-only
-            # unchanged runs.
-            _write_start = _mutable_trace.get("active_profile_write_start")
-            if _write_start is not None:
-                _to_gpu_ms = round((_remote_submit - _write_start) * 1000, 2)
-                _mutable_trace["active_profile_to_gpu_submit_ms"] = _to_gpu_ms
-
+            # Event sink: forward progress/status events to the existing
+            # stream_event_sink AND record timing markers.
+            # This is a sync callback (execute_modal_prompt expects sync)
+            # so async forwarding uses fire-and-forget via ensure_future.
             _first_event = True
             _sink_seq = 0
-            async for msg in self._run_prompt_stream(**stream_kwargs):
+
+            def _canonical_event_sink(event_type: str, payload: dict) -> None:
+                nonlocal _first_event, _sink_seq
                 if _first_event:
                     local_trace.mark("first_remote_message_received")
                     local_trace.mark("first_remote_event")
@@ -1477,20 +1332,13 @@ class LocalRemoteInvoker:
                     _mutable_trace["first_remote_event"] = local_trace.get("first_remote_event")
                     _mutable_trace["t7_local_first_remote_event"] = local_trace.get("t7_local_first_remote_event")
                     _first_event = False
-                mtype = msg.get("type", "")
-
-                # ── Relay nonterminal events through optional stream_event_sink ──
-                # Only "result" and "error" are terminal; all other types
-                # (status, executing, progress) are relayed as compact progress
-                # payloads without base64 data or raw remote outputs.
-                if mtype not in ("result", "error") and self._stream_event_sink is not None:
+                # Forward to existing stream_event_sink with normalized mapping
+                if self._stream_event_sink is not None and event_type in ("progress", "status"):
                     try:
-                        # Derive truthful total_nodes from the resolved workflow
-                        # (number of keys in the workflow dict — NOT from remote).
                         _workflow = cell.get("_resolved_workflow", cell.get("_workflow", {}))
                         _total_nodes = len(_workflow) if isinstance(_workflow, dict) else None
                         normalized = _desired_map_stream_message(
-                            msg,
+                            {"type": event_type, **payload},
                             {
                                 "experiment_id": self._experiment_id,
                                 "checkpoint_id": cell.get("checkpoint_id", ""),
@@ -1502,136 +1350,139 @@ class LocalRemoteInvoker:
                         if normalized is not None:
                             _sink_seq += 1
                             normalized["detail"]["sequence"] = _sink_seq
-                            # Pass the detail dict directly (the event
-                            # routing info is used by the normaliser's
-                            # caller, not the sink itself).
-                            await self._stream_event_sink(normalized["detail"])
+                            # Fire-and-forget: async sink must not block the sync callback
+                            asyncio.ensure_future(self._stream_event_sink(normalized["detail"]))
                     except Exception:
-                        pass  # Sink errors must never disrupt execution
+                        pass
 
-                if mtype == "result":
-                    data = msg.get("data", {})
-                    _last_remote_data = data
-                    # result_received must be marked before output save
-                    # to accurately measure save wall time.
-                    local_trace.mark("result_received")
-                    local_trace.mark("remote_result_received")
-                    local_trace.mark("t8_local_result_received")
-                    _mutable_trace["result_received"] = local_trace.get("result_received")
-                    # The remote result carries a full canonical summary
-                    # (deltas_ms, derived_ms, stages) computed by Modal in
-                    # its own time base.  Build a local summary dict (not
-                    # via summary() which would recompute deltas in the
-                    # local time base) and merge the remote summary into
-                    # it.  The merger adds remote entries only where no
-                    # local equivalent exists, preserving correct remote
-                    # values.
-                    remote_trace_data = data.get("trace", {}) or {}
-                    local_stages = dict(local_trace.fields())
-                    local_summary: dict[str, Any] = {
-                        "stages": local_stages,
-                        "deltas_ms": {},
-                        "derived_ms": {},
-                        "trace_version": TRACE_VERSION,
-                    }
-                    merge_remote_trace_into(local_summary, remote_trace_data)
-                    _local_timing_summary = local_summary
+            from canonical_execution import execute_modal_prompt as _canonical_exec
+            from canonical_execution import RunTrace as _RunTrace
 
-                    saved = await self._save_output_images(data, cell.get("cell_key", "unknown"))
-                    local_trace.mark("output_materialized")
-                    local_trace.mark("t9_local_materialized")
-                    local_trace.mark("t10_local_materialized")
-                    _mutable_trace["output_materialized"] = local_trace.get("output_materialized")
-                    result = {"status": "completed", "result": data, "output_paths": saved}
+            # Collect input images for canonical executor
+            _canonical_input_images = flat if flat else None
 
-                    # ── Merge mutable-trace markers back into local_trace ──
-                    # modal_client.run_prompt_stream may have added its own
-                    # markers (handle_lookup, generator_create, etc.) to the
-                    # mutable trace dict.  Copy them into local_trace so they
-                    # appear in the final stages snapshot.
-                    if isinstance(_mutable_trace, dict):
-                        for _mk, _mv in _mutable_trace.items():
-                            if isinstance(_mk, str) and isinstance(_mv, (int, float)) and local_trace.get(_mk) is None:
-                                local_trace.mark(_mk, _mv)
+            # Profile setter for the canonical executor (matches direct_studio_run_completion pattern)
+            try:
+                from modal_client import set_active_warmup_profile as _canonical_profile_setter
+            except ImportError:
+                _canonical_profile_setter = None
 
-                    # ── Derive local materialization wall time ───────────
-                    _t8 = local_trace.get("t8_local_result_received")
-                    _t10 = local_trace.get("t10_local_materialized")
-                    if _t8 is not None and _t10 is not None:
-                        _mat_ms = round((_t10 - _t8) * 1000, 2)
-                        if _mat_ms >= 0:
-                            local_summary.setdefault("derived_ms", {})["local_output_materialization_ms"] = _mat_ms
+            # ── Create RunTrace for this cell ──────────────────────────────
+            # Use a stable trace_id from _mutable_trace when present.
+            _cell_trace_id = _mutable_trace.get("trace_id", "")
+            _cell_run_id = _mutable_trace.get("run_id", cell.get("cell_key", "exp_cell"))
+            _cell_run_trace = _RunTrace(
+                trace_id=_cell_trace_id,
+                run_id=_cell_run_id,
+                prompt_id=cell.get("cell_key", "exp_cell"),
+                run_surface="experiment",
+            )
+            _cell_run_trace.begin("local_remote_invoker_run_cell", reason="experiment_cell")
 
-                    # ── Add semantic aliases from remote trace (C) ──────
-                    # Map remote t3_modal_entry → remote_method_entered
-                    _remote_stages = remote_trace_data.get("stages", {}) or {}
-                    if isinstance(_remote_stages, dict):
-                        _t3 = _remote_stages.get("t3_modal_entry")
-                        if _t3 is not None:
-                            local_summary.setdefault("stages", {})["remote_method_entered"] = _t3
-                    # Map _restore_timing restore_start/end → app_restore_*
-                    _restore_blk = data.get("_restore_timing", {}) or {}
-                    _rs = _restore_blk.get("restore_start_unix_s")
-                    _re = _restore_blk.get("restore_end_unix_s")
-                    if _rs is not None:
-                        local_summary.setdefault("stages", {})["app_restore_started"] = _rs
-                    if _re is not None:
-                        local_summary.setdefault("stages", {})["app_restore_completed"] = _re
+            # Call canonical executor (single path — no second compile/stream)
+            _remote_submit = time.time()
+            local_trace.mark("remote_submit")
+            local_trace.mark("t2_local_modal_submit_start")
+            _mutable_trace["remote_submit"] = _remote_submit
+            _mutable_trace["t2_local_modal_submit_start"] = _remote_submit
+            _mutable_trace.setdefault("t2_local_dispatch", _remote_submit)
 
-                    # ── Snapshot stages AFTER all markers are set ──────────
-                    # Read the live trace fields after t10 is marked, so no
-                    # race or patch-up is needed (eliminates the old approach
-                    # of patching t9 after snapshot).
-                    _final_stages = dict(local_trace.fields())
-                    local_summary["stages"].update(_final_stages)
+            # Derive comfyui_root from node_dir for LoadImage collection.
+            # node_dir = <comfyui_root>/custom_nodes/comfyui-modal
+            _comfyui_root = str(self._node_dir.parent.parent) if self._node_dir else ""
 
-                    # ── Copy preparer diagnostic metadata into local_summary ──
-                    # String-valued fields (active_profile_dedup_status) are not
-                    # stored in stages (which only holds floats); add them as
-                    # top-level keys on the trace dict so downstream consumers
-                    # (direct_studio_run_completion, _schedule_and_start) can
-                    # extract them from the merged timing_payload trace.
-                    # All numeric preparer fields are promoted to derived_ms
-                    # for consistent consumption across scheduler and direct paths.
-                    if isinstance(_preparer_result, dict):
-                        _ds = (_preparer_result.get("active_profile_dedup_status")
-                               or _preparer_result.get("status", ""))
-                        if _ds:
-                            local_summary["active_profile_dedup_status"] = _ds
-                        for _nk in ("active_profile_build_ms", "active_profile_remote_call",
-                                    "active_profile_remote_ms"):
-                            _nv = _preparer_result.get(_nk)
-                            if _nv is not None:
-                                local_summary.setdefault("derived_ms", {})[_nk] = _nv
-                    # active_profile_to_gpu_submit_ms is a numeric delta (ms) that
-                    # was already set on _mutable_trace → local_trace → _final_stages.
-                    # Also promote it to derived_ms for consistent consumption.
-                    _to_gpu = local_summary.get("stages", {}).get("active_profile_to_gpu_submit_ms")
-                    if _to_gpu is not None:
-                        local_summary.setdefault("derived_ms", {})["active_profile_to_gpu_submit_ms"] = _to_gpu
+            data = await _canonical_exec(
+                _resolved_wf,
+                prompt_id=cell.get("cell_key", "exp_cell"),
+                client_id="",
+                input_images=_canonical_input_images,
+                modal_options=self._modal_options,
+                production_report=_effective_prod_report,
+                production_options=_effective_prod_opts,
+                gpu=self._gpu,
+                workspace=self._workspace,
+                trace_payload=_mutable_trace,
+                profile_setter=_canonical_profile_setter,
+                comfyui_root=_comfyui_root,
+                event_sink=_canonical_event_sink,
+                run_trace=_cell_run_trace,
+                run_prompt_stream_fn=self._run_prompt_stream,
+            )
 
-                    # Extract compact timing payload from data, then embed
-                    # the merged trace as the canonical trace record.
-                    merged_payload = extract_remote_timing_payload(data)
-                    merged_payload["trace"] = local_summary
-                    if merged_payload:
-                        result["timing_payload"] = merged_payload
-                    return result
-                if mtype == "error":
-                    result = {"status": "failed", "error": msg.get("message", "Remote execution error")}
-                    # Extract compact timing payload from any partial data
-                    error_data = msg.get("data")
-                    if isinstance(error_data, dict):
-                        tp = extract_remote_timing_payload(error_data)
-                        if tp:
-                            result["timing_payload"] = tp
-                    return result
-            return {"status": "failed", "error": "run_prompt_stream ended without result"}
+            # ── Merge RunTrace summary into result trace ──────────────────
+            _cell_run_trace.end("local_remote_invoker_run_cell", reason="experiment_cell_complete")
+            if isinstance(data, dict):
+                _data_trace = data.setdefault("trace", {})
+                _cell_run_trace.merge_into_trace(_data_trace)
+
+            # ── Result processing (preserves existing output/timing path) ──
+            _last_remote_data = data
+            local_trace.mark("result_received")
+            local_trace.mark("remote_result_received")
+            local_trace.mark("t8_local_result_received")
+            _mutable_trace["result_received"] = local_trace.get("result_received")
+
+            remote_trace_data = data.get("trace", {}) or {}
+            local_stages = dict(local_trace.fields())
+            local_summary: dict[str, Any] = {
+                "stages": local_stages,
+                "deltas_ms": {},
+                "derived_ms": {},
+                "trace_version": TRACE_VERSION,
+            }
+            merge_remote_trace_into(local_summary, remote_trace_data)
+            _local_timing_summary = local_summary
+
+            saved = await self._save_output_images(data, cell.get("cell_key", "unknown"))
+            local_trace.mark("output_materialized")
+            local_trace.mark("t9_local_materialized")
+            local_trace.mark("t10_local_materialized")
+            _mutable_trace["output_materialized"] = local_trace.get("output_materialized")
+            result = {"status": "completed", "result": data, "output_paths": saved}
+
+            # ── Merge mutable-trace markers back into local_trace ──
+            if isinstance(_mutable_trace, dict):
+                for _mk, _mv in _mutable_trace.items():
+                    if isinstance(_mk, str) and isinstance(_mv, (int, float)) and local_trace.get(_mk) is None:
+                        local_trace.mark(_mk, _mv)
+
+            # ── Derive local materialization wall time ───────────
+            _t8 = local_trace.get("t8_local_result_received")
+            _t10 = local_trace.get("t10_local_materialized")
+            if _t8 is not None and _t10 is not None:
+                _mat_ms = round((_t10 - _t8) * 1000, 2)
+                if _mat_ms >= 0:
+                    local_summary.setdefault("derived_ms", {})["local_output_materialization_ms"] = _mat_ms
+
+            # ── Add semantic aliases from remote trace ──────────
+            _remote_stages = remote_trace_data.get("stages", {}) or {}
+            if isinstance(_remote_stages, dict):
+                _t3 = _remote_stages.get("t3_modal_entry")
+                if _t3 is not None:
+                    local_summary.setdefault("stages", {})["remote_method_entered"] = _t3
+            _restore_blk = data.get("_restore_timing", {}) or {}
+            _rs = _restore_blk.get("restore_start_unix_s")
+            _re = _restore_blk.get("restore_end_unix_s")
+            if _rs is not None:
+                local_summary.setdefault("stages", {})["app_restore_started"] = _rs
+            if _re is not None:
+                local_summary.setdefault("stages", {})["app_restore_completed"] = _re
+
+            # ── Snapshot stages AFTER all markers are set ──────────
+            _final_stages = dict(local_trace.fields())
+            local_summary["stages"].update(_final_stages)
+
+            # Extract compact timing payload from data, then embed
+            # the merged trace as the canonical trace record.
+            merged_payload = extract_remote_timing_payload(data)
+            merged_payload["trace"] = local_summary
+            if merged_payload:
+                result["timing_payload"] = merged_payload
+            return result
+
         except Exception as exc:
             result = {"status": "failed", "error": str(exc)}
             # Preserve any partial timing accumulated before the crash.
-            # Both holders are initialised to None at the top of this
-            # method — plain None checks replace NameError probing.
             if _last_remote_data is not None:
                 tp = extract_remote_timing_payload(_last_remote_data)
                 if tp:
