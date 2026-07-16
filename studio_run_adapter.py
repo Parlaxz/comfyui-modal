@@ -2175,6 +2175,27 @@ async def _schedule_and_start(
         timings["local_output_materialization_ms"] = _local_mat_ms
         timing_sources["local_output_materialization_ms"] = "derived"
 
+    # ── Profile-preparer derived metrics (all five fields) ────────────
+    # Numeric fields flow through merged_derived from LocalRemoteInvoker;
+    # the string dedup_status sits on the top-level trace dict (not stages).
+    for _pk, _pn in (
+        ("active_profile_to_gpu_submit_ms", "local_server_observed"),
+        ("active_profile_build_ms", "local_server_observed"),
+        ("active_profile_remote_call", "local_server_observed"),
+        ("active_profile_remote_ms", "local_server_observed"),
+    ):
+        _pv = merged_derived.get(_pk)
+        if _pv is not None:
+            timings[_pk] = _pv
+            timing_sources[_pk] = _pn
+    if timing_payload:
+        _trace = timing_payload.get("trace", {}) or {}
+        if isinstance(_trace, dict):
+            _ds = _trace.get("active_profile_dedup_status")
+            if _ds is not None and isinstance(_ds, str):
+                timings["active_profile_dedup_status"] = _ds
+                timing_sources["active_profile_dedup_status"] = "local_server_observed"
+
     # 4. Preserve compact raw trace structures (no base64)
     if timing_payload:
         for raw_key in ("trace", "wall_clock_trace", "_wall_clock_summary",
@@ -2566,8 +2587,13 @@ def _prepare_studio_run_context(
     # 5. Build profile-preparer closure
     _ws_captured = workspace
 
-    async def _studio_profile_preparer(resolved_workflow, cell):
-        """Prepare active-next warmup profile using the fully resolved cell workflow."""
+    async def _studio_profile_preparer(resolved_workflow, cell) -> dict:
+        """Prepare active-next warmup profile using the fully resolved cell workflow.
+
+        Returns the result dict from ``prepare_active_next_profile`` (which includes
+        dedup status, timing fields, and remote-call indicators).  On exception,
+        returns a non-fatal error result so the caller can still capture it.
+        """
         try:
             from experiment_runner import _workflow_sha256
             from modal_client import set_active_warmup_profile as _remote_setter
@@ -2596,15 +2622,25 @@ def _prepare_studio_run_context(
                     _prod_report.get("hash_schema_version", HASH_SCHEMA_VERSION))
                 _active_prod_opts.setdefault("production_plan_schema_version",
                     _prod_report.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION))
-            await prepare_active_next_profile(
+            result = await prepare_active_next_profile(
                 resolved_workflow,
                 _hash,
                 production_options=_active_prod_opts,
                 workspace=_ws_captured,
                 setter=_remote_setter,
             )
+            return result
         except Exception:
             _log.warning("Studio profile preparer failed (non-fatal)")
+            return {
+                "status": "error",
+                "active_profile_dedup_status": "error",
+                "profile_key": "",
+                "remote_call": 0,
+                "active_profile_remote_call": 0,
+                "active_profile_remote_ms": 0.0,
+                "changed": False,
+            }
 
     return {
         "status": "ok",
@@ -2770,12 +2806,25 @@ async def direct_studio_run_completion(
             "active_profile_write_start", "active_profile_write_end",
             "remote_submit", "first_remote_event",
             "result_received", "output_materialized",
+            "active_profile_to_gpu_submit_ms",
         ]
         for _mk in _required_markers:
             _mv = _merged_stages.get(_mk)
             if _mv is not None:
                 timings[_mk] = _mv
                 timing_sources[_mk] = "local_server_observed"
+
+        # Capture active_profile_dedup_status from the merged trace.
+        # It lives at the trace top level (as a string, not in stages).
+        # Fall back to stages for backward compat with older recordings.
+        _dedup_status = _merged_trace_dict.get("active_profile_dedup_status")
+        if _dedup_status is None:
+            _dedup_status = _merged_trace_dict.get("stages", {}).get("active_profile_dedup_status")
+        if _dedup_status is None:
+            _dedup_status = _merged_stages.get("active_profile_dedup_status")
+        if _dedup_status is not None and isinstance(_dedup_status, str):
+            timings["active_profile_dedup_status"] = _dedup_status
+            timing_sources["active_profile_dedup_status"] = "local_server_observed"
 
         # The Playground total is the complete client-press to materialized
         # output wall time, not the sum of overlapping remote child stages.
@@ -2809,6 +2858,14 @@ async def direct_studio_run_completion(
             _merged_trace = timing_payload.get("trace", {}) or {}
             _merged_deltas = _merged_trace.get("deltas_ms", {}) or {}
             _merged_derived = _merged_trace.get("derived_ms", {}) or {}
+
+        # Preparser numeric fields from merged_derived
+        for _pk in ("active_profile_build_ms", "active_profile_remote_call",
+                     "active_profile_remote_ms"):
+            _pv = _merged_derived.get(_pk)
+            if _pv is not None:
+                timings[_pk] = _pv
+                timing_sources[_pk] = "local_server_observed"
 
         # Canonical alias map — iterates module-level _CANONICAL_ALIAS_MAP
         # so both scheduler and direct-run paths derive timing identically.

@@ -86,6 +86,18 @@ def _normalize_stable_profile(warmup_profile: dict | None) -> dict:
         stable["_production_compiler_version"] = warmup_profile.get("compiler_version", COMPILER_SCHEMA_VERSION)
         stable["_production_hash_schema_version"] = warmup_profile.get("hash_schema_version", HASH_SCHEMA_VERSION)
         stable["_production_plan_schema_version"] = warmup_profile.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION)
+        # Production content hashes so two otherwise-identical production
+        # payloads with different hashed workflow content produce distinct
+        # dedup keys and trigger a setter call.
+        stable["_production_source_workflow_hash"] = str(
+            warmup_profile.get("source_workflow_hash", "")
+        )
+        stable["_production_compiled_workflow_hash"] = str(
+            warmup_profile.get("compiled_workflow_hash", "")
+        )
+        stable["_production_plan_hash"] = str(
+            warmup_profile.get("production_plan_hash", "")
+        )
     return stable
 
 
@@ -163,6 +175,12 @@ def _build_activation_payload(
         profile["compiler_version"] = production_options.get("compiler_version", COMPILER_SCHEMA_VERSION)
         profile["hash_schema_version"] = production_options.get("hash_schema_version", HASH_SCHEMA_VERSION)
         profile["production_plan_schema_version"] = production_options.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION)
+        # Production content hashes on the profile so the dedup key
+        # changes when the compiled or hashed workflow changes, even if
+        # the model stack / production option flags are identical.
+        profile["source_workflow_hash"] = production_options.get("source_workflow_hash", "")
+        profile["compiled_workflow_hash"] = production_options.get("compiled_workflow_hash", "")
+        profile["production_plan_hash"] = production_options.get("production_plan_hash", "")
         # Production identity fields carried on the payload for
         # the activation/adapter to use in production.profile diagnostics.
         # Legacy prefixed aliases (backward compat during migration)
@@ -233,25 +251,44 @@ async def prepare_active_next_profile(
         remote_call  : int — 1 if a remote setter call was made, else 0.
         payload_bytes: int — byte length of the serialised payload.
         changed      : bool — whether the remote reported a change.
+        active_profile_build_ms   : float — wall-clock ms to construct payload & compute key.
+        active_profile_dedup_status : str — final dedup/setter outcome (same semantics as
+                                    status but always set even on early returns).
+        active_profile_remote_call : int — 1 if a remote setter call was made, else 0.
+        active_profile_remote_ms   : float — wall-clock ms spent awaiting the setter, or 0.
     """
     # Global dedup state (must be declared before any use)
     global _last_written_stable_profile
 
-    # Default result
+    # Measure build time from entry
+    _build_start = time.time()
+
+    # Default result (includes new honest fields)
     result: dict = {
         "status": "skipped",
         "profile_key": "",
         "remote_call": 0,
         "payload_bytes": 0,
         "changed": False,
+        "active_profile_build_ms": 0.0,
+        "active_profile_dedup_status": "skipped",
+        "active_profile_remote_call": 0,
+        "active_profile_remote_ms": 0.0,
     }
 
     if os.environ.get("DISABLE_ACTIVE_NEXT_WRITE"):
+        result["active_profile_build_ms"] = round(
+            (time.time() - _build_start) * 1000, 2
+        )
         return result
 
     if not callable(setter) and setter is not None:
         # setter is not None and not callable — caller error
         result["status"] = "error"
+        result["active_profile_dedup_status"] = "error"
+        result["active_profile_build_ms"] = round(
+            (time.time() - _build_start) * 1000, 2
+        )
         return result
 
     # 1. Build activation payload
@@ -260,21 +297,19 @@ async def prepare_active_next_profile(
     payload_bytes = len(json.dumps(payload, separators=(",", ":")))
     result["payload_bytes"] = payload_bytes
 
-    # 2. Compute stable dedup key (pre-bundle)
+    # 2. Compute stable dedup key (model-stack only — no bundle_hash).
+    #    prompt_bundle is still extracted inside _build_activation_payload for
+    #    request-time/optimization use, but is NOT folded into the dedup key so
+    #    prompt-only changes (same model stack, different prompt text) produce
+    #    the same key and return unchanged without invoking the setter.
     warmup_profile = payload.get("warmup_profile", {})
     profile_key = _compute_stable_key(warmup_profile)
 
-    # Fold prompt bundle hash into key when present
-    prompt_bundle = payload.get("prompt_bundle")
-    if isinstance(prompt_bundle, dict):
-        bundle_hash = str(prompt_bundle.get("bundle_hash", ""))
-        if bundle_hash:
-            profile_key = hashlib.sha256(
-                (profile_key + ":" + bundle_hash).encode("utf-8")
-            ).hexdigest()
-
-    # Return the final (bundle-inclusive) key
     result["profile_key"] = profile_key[:16]
+
+    # Record build time (payload construction + key computation)
+    _build_ms = round((time.time() - _build_start) * 1000, 2)
+    result["active_profile_build_ms"] = _build_ms
 
     # 3. Workspace-scoped dedup
     ws_id = _ws_id(workspace)
@@ -299,26 +334,36 @@ async def prepare_active_next_profile(
     last_write_ts = _last_written_stable_profile.get(dedup_key, 0.0)
     if last_write_ts > 0.0 and (time.time() - last_write_ts) < refresh_after_s:
         result["status"] = "unchanged"
+        result["active_profile_dedup_status"] = "unchanged"
         return result
 
     # 5. No setter — dry run / test mode
     if setter is None:
         result["status"] = "skipped"
+        result["active_profile_dedup_status"] = "skipped"
         return result
 
     # 6. Write via setter
     result["remote_call"] = 1
+    result["active_profile_remote_call"] = 1
+    _remote_start = time.time()
     try:
         activation_result = await setter(payload, workspace=workspace or None)
+        _remote_ms = round((time.time() - _remote_start) * 1000, 2)
+        result["active_profile_remote_ms"] = _remote_ms
         write_status = activation_result.get("status", "written")
         result["status"] = write_status
+        result["active_profile_dedup_status"] = write_status
         result["changed"] = activation_result.get("changed", True)
 
         # Only advance dedup record on success
         if write_status not in ("error",):
             _last_written_stable_profile[dedup_key] = time.time()
     except Exception:
+        _remote_ms = round((time.time() - _remote_start) * 1000, 2)
+        result["active_profile_remote_ms"] = _remote_ms
         result["status"] = "error"
+        result["active_profile_dedup_status"] = "error"
         # Do NOT advance dedup record on error
 
     return result
