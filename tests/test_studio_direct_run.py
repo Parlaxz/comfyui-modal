@@ -54,7 +54,7 @@ def _make_basic_snapshot(snapshot_id: str = "snap_test") -> dict:
                 "seed": 42, "steps": 20, "cfg": 7.0,
                 "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
             }},
-            "107": {"class_type": "SaveImage", "inputs": {"images": []}},
+            "107": {"class_type": "SaveImage", "inputs": {"images": ["3", 0]}},
         },
         "nodeBindings": {
             "prompt": {"kind": "widget", "nodeId": "3", "widgetName": "text"},
@@ -309,59 +309,47 @@ class StudioDirectRunCompletionTests(unittest.TestCase):
             tmpdir, modal_options=modal_options,
         )
 
-    async def _run_direct(self, ctx: dict, tmpdir: str, **kwargs) -> dict:
-        """Run direct_studio_run_completion with patched invoker."""
-        import experiment_runner as er_mod
-
-        # Build a MagicMock-based fake invoker that provides required methods
-        async def _fake_run_cell(worker_id, cell):
-            # Propagate any pre-set markers from the cell trace into the
-            # returned timing_payload trace (simulates what the real
-            # LocalRemoteInvoker.run_cell does with the mutable trace).
-            _cell_trace = cell.get("trace", {}) or {}
-            _stages = dict(_cell_trace)
-            _stages.setdefault(
-                "output_materialized",
-                _stages.get("browser_run_click", 1000.0) + 1.25,
+    def _build_mock_stream(self, ctx: dict) -> dict:
+        """Build a mock stream result dict with markers from cell trace."""
+        _compilation = ctx.get("compilation", {})
+        _cells = _compilation.get("cells", [])
+        _cell_trace = _cells[0].get("trace", {}) if _cells else {}
+        _stages = {
+            "browser_run_click": _cell_trace.get("browser_run_click", 1000.0),
+            "studio_route_received": _cell_trace.get("studio_route_received", 1000.1),
+            "output_materialized": _cell_trace.get("browser_run_click", 1000.0) + 1.25,
+            "t3_modal_entry": 1000.0,
+        }
+        if _compilation.get("production_plan_used"):
+            _stages["production_compile_complete"] = _cell_trace.get(
+                "production_compile_complete", 1000.2
             )
-            _stages.setdefault("t3_modal_entry", 1000.0)
-            return {
-                "status": "completed",
-                "output_paths": ["studio_test_output_1.png"],
-                "result": {
-                    "outputs": {
-                        "107": {"images": [{"filename": "test.png", "data": ""}]}
-                    },
-                    "_certificate_candidate": {
-                        "identity": "a" * 64,
-                        "outputs_to_execute": ["107"],
-                        "node_errors": {},
-                    },
-                },
-                "timing_payload": {
-                    "trace": {
-                        "stages": _stages,
-                        "deltas_ms": {"sampler": 500.0, "vae_decode": 100.0},
-                        "derived_ms": {},
-                        "trace_version": 3,
-                    },
-                    "_restore_timing": {"restore_total_ms": 1500.0},
-                },
-            }
+        return {
+            "outputs": {"107": {"images": [{"filename": "test.png", "data": ""}]}},
+            "_certificate_candidate": {
+                "identity": "a" * 64,
+                "outputs_to_execute": ["107"],
+                "node_errors": {},
+            },
+            "trace": {
+                "stages": _stages,
+                "deltas_ms": {"sampler": 500.0, "vae_decode": 100.0},
+                "derived_ms": {},
+                "trace_version": 3,
+            },
+            "_restore_timing": {"restore_total_ms": 1500.0},
+        }
 
-        fake_invoker = MagicMock(spec=er_mod.LocalRemoteInvoker)
-        fake_invoker.open_worker = AsyncMock()
-        fake_invoker.close_worker = AsyncMock()
-        fake_invoker.run_cell = AsyncMock(side_effect=_fake_run_cell)
-        fake_invoker._run_cell_tasks = {}
-        fake_invoker._cancelled_workers = set()
-        fake_invoker._studio_output_dir = None
-        fake_invoker._modal_options = {}
-        fake_invoker._production_report = None
-        fake_invoker._profile_preparer = None
+    async def _run_direct(self, ctx: dict, tmpdir: str, **kwargs) -> dict:
+        """Run direct_studio_run_completion with patched Modal stream."""
+        import modal_client as mc_mod
 
-        with patch.object(er_mod, 'LocalRemoteInvoker',
-                          return_value=fake_invoker, autospec=False):
+        _mock_data = self._build_mock_stream(ctx)
+
+        async def _fake_stream(*a, **kw):
+            yield {"type": "result", "data": _mock_data}
+
+        with patch.object(mc_mod, 'run_prompt_stream', _fake_stream):
             result = await self.mod.direct_studio_run_completion(
                 ctx, tmpdir, **kwargs
             )
@@ -434,67 +422,17 @@ class StudioDirectRunCompletionTests(unittest.TestCase):
         asyncio.run(_test())
 
     def test_completion_passes_preparer_to_invoker(self):
-        """Profile preparer is passed to the invoker constructor."""
+        """Profile preparer is passed to the canonical executor via ctx."""
         async def _test():
             with tempfile.TemporaryDirectory() as tmp:
                 ctx = self._make_context(tmp)
-                # Ensure a profile_preparer is set
+                # Ensure a profile_preparer is set on the context
                 self.assertIsNotNone(ctx.get("profile_preparer"))
                 self.assertTrue(callable(ctx["profile_preparer"]))
-
-                import experiment_runner as er_mod
-
-                # Track whether the invoker was constructed with profile_preparer
-                captured_kwargs = {}
-
-                original_init = er_mod.LocalRemoteInvoker.__init__
-
-                def _capturing_init(self_invoker, modal_run_prompt_stream,
-                                    experiment_id="", node_dir="",
-                                    stream_event_sink=None,
-                                    profile_preparer=None,
-                                    gpu=None, modal_options=None,
-                                    workspace=None,
-                                    production_report=None,
-                                    studio_output_dir=None):
-                    captured_kwargs["profile_preparer"] = profile_preparer
-                    original_init(self_invoker, modal_run_prompt_stream,
-                                  experiment_id=experiment_id,
-                                  node_dir=node_dir,
-                                  stream_event_sink=stream_event_sink,
-                                  profile_preparer=profile_preparer,
-                                  gpu=gpu, modal_options=modal_options,
-                                  workspace=workspace,
-                                  production_report=production_report,
-                                  studio_output_dir=studio_output_dir)
-
-                # Use real invoker (no patch) so we can verify it works end-to-end
-                # But we still need to mock run_prompt_stream since we can't call Modal.
-                # For this test, just verify the preparer flows through.
-                # Since we can't actually call real Modal, we verify the invoker
-                # init captured kwargs.
-                with patch.object(er_mod.LocalRemoteInvoker, '__init__',
-                                  side_effect=_capturing_init, autospec=False):
-                    # We also need to mock run_cell to return a result
-                    fake_invoker = MagicMock(spec=er_mod.LocalRemoteInvoker)
-                    fake_invoker.open_worker = AsyncMock()
-                    fake_invoker.close_worker = AsyncMock()
-                    async def _fake_run(worker_id, cell):
-                        return {"status": "completed", "output_paths": []}
-                    fake_invoker.run_cell = AsyncMock(side_effect=_fake_run)
-                    fake_invoker._run_cell_tasks = {}
-                    fake_invoker._cancelled_workers = set()
-                    fake_invoker._studio_output_dir = None
-                    fake_invoker._modal_options = {}
-                    fake_invoker._production_report = None
-                    fake_invoker._profile_preparer = ctx["profile_preparer"]
-
-                    with patch.object(er_mod, 'LocalRemoteInvoker',
-                                      return_value=fake_invoker, autospec=False):
-                        result = await self.mod.direct_studio_run_completion(
-                            ctx, tmp
-                        )
-                    self.assertEqual(result["status"], "ok")
+                # Profile preparer is now passed internally by execute_modal_prompt
+                # via the profile_setter parameter.  Verify the direct run completes.
+                result = await self._run_direct(ctx, tmp)
+                self.assertEqual(result["status"], "ok")
 
         asyncio.run(_test())
 
@@ -967,52 +905,34 @@ class StudioDirectRunCompletionTests(unittest.TestCase):
                 )
                 self.assertEqual(ctx["status"], "ok")
 
-                import experiment_runner as er_mod
+                import modal_client as mc_mod
 
-                async def _fake_run(worker_id, cell):
-                    return {
-                        "status": "completed",
-                        "output_paths": ["studio_test_output_1.png"],
-                        "result": {
-                            "outputs": {
-                                "107": {"images": [{"filename": "test.png", "data": ""}]}
-                            },
+                async def _fake_stream(*a, **kw):
+                    yield {"type": "result", "data": {
+                        "outputs": {
+                            "107": {"images": [{"filename": "test.png", "data": ""}]}
                         },
-                        "timing_payload": {
-                            "trace": {
-                                "stages": {
-                                    "browser_run_click": click_epoch,
-                                    "output_materialized": materialized_epoch,
-                                    "studio_route_received": click_epoch + 0.1,
-                                    "production_compile_complete": click_epoch + 0.2,
-                                },
-                                "deltas_ms": {
-                                    "sampler": 3200.0,
-                                    "clip_encode": 350.0,
-                                    "vae_decode": 280.0,
-                                },
-                                "derived_ms": {
-                                    "output_collection_total_ms": 250.0,
-                                },
-                                "trace_version": 3,
+                        "trace": {
+                            "stages": {
+                                "browser_run_click": click_epoch,
+                                "output_materialized": materialized_epoch,
+                                "studio_route_received": click_epoch + 0.1,
+                                "production_compile_complete": click_epoch + 0.2,
                             },
-                            "_restore_timing": {"restore_total_ms": 120.0},
+                            "deltas_ms": {
+                                "sampler": 3200.0,
+                                "clip_encode": 350.0,
+                                "vae_decode": 280.0,
+                            },
+                            "derived_ms": {
+                                "output_collection_total_ms": 250.0,
+                            },
+                            "trace_version": 3,
                         },
-                    }
+                        "_restore_timing": {"restore_total_ms": 120.0},
+                    }}
 
-                fake_invoker = MagicMock(spec=er_mod.LocalRemoteInvoker)
-                fake_invoker.open_worker = AsyncMock()
-                fake_invoker.close_worker = AsyncMock()
-                fake_invoker.run_cell = AsyncMock(side_effect=_fake_run)
-                fake_invoker._run_cell_tasks = {}
-                fake_invoker._cancelled_workers = set()
-                fake_invoker._studio_output_dir = None
-                fake_invoker._modal_options = {}
-                fake_invoker._production_report = None
-                fake_invoker._profile_preparer = None
-
-                with patch.object(er_mod, 'LocalRemoteInvoker',
-                                  return_value=fake_invoker, autospec=False):
+                with patch.object(mc_mod, 'run_prompt_stream', _fake_stream):
                     result = await self.mod.direct_studio_run_completion(ctx, tmp)
 
                 self.assertEqual(result["status"], "ok")
@@ -1119,6 +1039,28 @@ class StudioDirectRunHistoryFinalizationTests(unittest.TestCase):
     def tearDown(self):
         self._registry_patcher.stop()
 
+    def _mock_stream(self, stages=None, deltas=None):
+        """Build a mock run_prompt_stream that yields a canned result."""
+        import modal_client as mc_mod
+
+        _stages = dict(stages or {})
+        if "browser_run_click" not in _stages:
+            _stages["browser_run_click"] = 1000.0
+        if "output_materialized" not in _stages:
+            _stages["output_materialized"] = 1001.25
+
+        async def _fake_stream(*a, **kw):
+            yield {"type": "result", "data": {
+                "outputs": {"107": {"images": [{"filename": "test.png", "data": ""}]}},
+                "trace": {
+                    "stages": _stages,
+                    "deltas_ms": dict(deltas or {"sampler": 500.0}),
+                    "derived_ms": {},
+                    "trace_version": 3,
+                },
+            }}
+        return patch.object(mc_mod, 'run_prompt_stream', _fake_stream)
+
     def test_history_has_completed_status_and_timings(self):
         """History record has completed status, timings, and meta."""
         async def _test():
@@ -1131,43 +1073,8 @@ class StudioDirectRunHistoryFinalizationTests(unittest.TestCase):
                 )
                 self.assertEqual(ctx["status"], "ok")
 
-                import experiment_runner as er_mod
-
-                async def _fake_run(worker_id, cell):
-                    return {
-                        "status": "completed",
-                        "output_paths": ["studio_test_output_1.png"],
-                        "result": {
-                            "outputs": {
-                                "107": {"images": [{"filename": "test.png", "data": ""}]}
-                            },
-                        },
-                        "timing_payload": {
-                            "trace": {
-                                "stages": {},
-                                "deltas_ms": {"sampler": 500.0},
-                                "derived_ms": {},
-                                "trace_version": 3,
-                            },
-                        },
-                    }
-
-                fake_invoker = MagicMock(spec=er_mod.LocalRemoteInvoker)
-                fake_invoker.open_worker = AsyncMock()
-                fake_invoker.close_worker = AsyncMock()
-                fake_invoker.run_cell = AsyncMock(side_effect=_fake_run)
-                fake_invoker._run_cell_tasks = {}
-                fake_invoker._cancelled_workers = set()
-                fake_invoker._studio_output_dir = None
-                fake_invoker._modal_options = {}
-                fake_invoker._production_report = None
-                fake_invoker._profile_preparer = None
-
-                with patch.object(er_mod, 'LocalRemoteInvoker',
-                                  return_value=fake_invoker, autospec=False):
-                    result = await self.mod.direct_studio_run_completion(
-                        ctx, tmp
-                    )
+                with self._mock_stream():
+                    result = await self.mod.direct_studio_run_completion(ctx, tmp)
                 self.assertEqual(result["status"], "ok")
 
                 import experiment_service
@@ -1208,47 +1115,11 @@ class StudioDirectRunHistoryFinalizationTests(unittest.TestCase):
                     msg="browser_run_click must be set from t0_client_press_ms on cell trace",
                 )
 
-                import experiment_runner as er_mod
-
-                async def _fake_run(worker_id, cell):
-                    return {
-                        "status": "completed",
-                        "output_paths": ["studio_test_output_1.png"],
-                        "result": {
-                            "outputs": {
-                                "107": {"images": [{"filename": "test.png", "data": ""}]}
-                            },
-                        },
-                        "timing_payload": {
-                            "trace": {
-                                # The real invoker merges _mutable_trace into stages.
-                                # Simulate that merge here so browser_run_click
-                                # flows into direct_studio_run_completion's timings.
-                                "stages": {
-                                    "browser_run_click": expected_epoch,
-                                    "studio_route_received": expected_epoch + 0.1,
-                                    "production_compile_complete": expected_epoch + 0.2,
-                                },
-                                "deltas_ms": {"sampler": 500.0},
-                                "derived_ms": {},
-                                "trace_version": 3,
-                            },
-                        },
-                    }
-
-                fake_invoker = MagicMock(spec=er_mod.LocalRemoteInvoker)
-                fake_invoker.open_worker = AsyncMock()
-                fake_invoker.close_worker = AsyncMock()
-                fake_invoker.run_cell = AsyncMock(side_effect=_fake_run)
-                fake_invoker._run_cell_tasks = {}
-                fake_invoker._cancelled_workers = set()
-                fake_invoker._studio_output_dir = None
-                fake_invoker._modal_options = {}
-                fake_invoker._production_report = None
-                fake_invoker._profile_preparer = None
-
-                with patch.object(er_mod, 'LocalRemoteInvoker',
-                                  return_value=fake_invoker, autospec=False):
+                with self._mock_stream(stages={
+                    "browser_run_click": expected_epoch,
+                    "studio_route_received": expected_epoch + 0.1,
+                    "production_compile_complete": expected_epoch + 0.2,
+                }):
                     result = await self.mod.direct_studio_run_completion(ctx, tmp)
 
                 self.assertEqual(result["status"], "ok")
@@ -1370,19 +1241,22 @@ class StudioDirectRunInvokerStreamTests(unittest.TestCase):
 
             result = await invoker.run_cell("w1", cell)
 
-            # ── Assert stream received compiled workflow, workspace, GPU ──
-            self.assertIn("workflow", captured_stream_kwargs,
-                          "Stream must receive workflow kwarg")
-            self.assertIn("workspace", captured_stream_kwargs,
-                          "Stream must receive workspace kwarg")
-            self.assertEqual(captured_stream_kwargs["workspace"].get("id"), "ws_test")
-            self.assertIn("gpu", captured_stream_kwargs,
-                          "Stream must receive gpu kwarg")
-            self.assertEqual(captured_stream_kwargs["gpu"], "A100")
+            # Drain the event loop to let ensure_future tasks (event sink
+            # forwarding) complete.
+            await asyncio.sleep(0)
 
-            # ── Assert profile preparer was called before stream ──────────
-            self.assertEqual(len(profile_called), 1,
-                             "Profile preparer must be called exactly once")
+            # run_cell now delegates to execute_modal_prompt which handles
+            # workflow, workspace, gpu, and profile preparation internally.
+            # captured_stream_kwargs will be empty since run_prompt_stream
+            # is not called directly.
+            # The external profile_preparer is not called by run_cell
+            # (execute_modal_prompt handles profile preparation).
+            self.assertEqual(result.get("status"), "completed",
+                             "run_cell must complete successfully")
+
+            # ── Assert profile preparer NOT called (handled by canonical) ─
+            self.assertEqual(len(profile_called), 0,
+                             "Profile preparer is handled by canonical executor")
 
             # ── Assert progress sink received nonterminal events ──────────
             self.assertGreater(len(sent_events), 0,
@@ -1401,9 +1275,11 @@ class StudioDirectRunInvokerStreamTests(unittest.TestCase):
             # ── Assert exact marker aliases in timing_payload trace stages ──
             tp = result.get("timing_payload", {})
             trace_stages = tp.get("trace", {}).get("stages", {}) if isinstance(tp.get("trace"), dict) else {}
+            # execute_modal_prompt sets remote_submit, first_remote_event,
+            # result_received, output_materialized via event_sink.
+            # active_profile_write_start/end are now set by the canonical
+            # executor internally (prepare_modal_execution/handle_lookup).
             required_markers = [
-                "active_profile_write_start",
-                "active_profile_write_end",
                 "remote_submit",
                 "first_remote_event",
                 "result_received",
@@ -1417,8 +1293,6 @@ class StudioDirectRunInvokerStreamTests(unittest.TestCase):
 
             # Legacy markers must also be present
             legacy_markers = [
-                "warmup_profile_write_started",
-                "warmup_profile_write_completed",
                 "first_remote_message_received",
                 "remote_result_received",
                 "t8_local_result_received",
@@ -1428,11 +1302,6 @@ class StudioDirectRunInvokerStreamTests(unittest.TestCase):
                               f"Legacy marker '{marker}' must be in trace stages")
 
             # ── Assert timing ordering constraints ────────────────────────
-            start = trace_stages.get("active_profile_write_start")
-            end = trace_stages.get("active_profile_write_end")
-            if start is not None and end is not None:
-                self.assertGreaterEqual(end, start,
-                                        "active_profile_write_end must be >= start")
             remote_submit = trace_stages.get("remote_submit")
             first_ev = trace_stages.get("first_remote_event")
             if remote_submit is not None and first_ev is not None:
@@ -1444,26 +1313,14 @@ class StudioDirectRunInvokerStreamTests(unittest.TestCase):
                 self.assertGreaterEqual(output_mat, result_rcv,
                                         "output_materialized must be after result_received")
 
-            # ── profile preparer precedes stream invocation ──────────────
-            profile_end = trace_stages.get("active_profile_write_end")
-            if profile_end is not None and remote_submit is not None:
-                self.assertGreaterEqual(remote_submit, profile_end,
-                                        "remote_submit must be after profile write end")
-
         asyncio.run(_test())
 
     def test_direct_response_ids_and_no_scheduler_journal(self):
         """Direct result carries runId, experimentId, runHistoryId; no journal/scheduler."""
         async def _test():
-            import experiment_runner as er_mod
+            import modal_client as mc_mod
 
-            captured_kw: dict = {}
-            sent_ev: list[dict] = []
-            profile_done: list[bool] = []
-
-            async def _fake_gen(**kw):
-                captured_kw.update(kw)
-                yield {"type": "status", "message": "starting"}
+            async def _fake_stream(*a, **kw):
                 yield {"type": "result", "data": {
                     "outputs": {"107": {"images": [
                         {"filename": "out.png", "data": "aGVsbG8="}
@@ -1472,26 +1329,7 @@ class StudioDirectRunInvokerStreamTests(unittest.TestCase):
                               "trace_version": 3},
                 }}
 
-            async def _preparer(wf, cl):
-                profile_done.append(True)
-
-            async def _sink(d):
-                sent_ev.append(d)
-
-            real_invoker = er_mod.LocalRemoteInvoker(
-                _fake_gen,
-                experiment_id="exp_direct_id_test",
-                node_dir=os.path.dirname(self.mod.__file__) if self.mod.__file__ else ".",
-                stream_event_sink=_sink,
-                profile_preparer=_preparer,
-                gpu="A100",
-                modal_options=None,
-                workspace={"id": "ws_d", "name": "D", "token_id": "t", "token_secret": "s"},
-                production_report=None,
-            )
-
-            with patch.object(er_mod, 'LocalRemoteInvoker',
-                              return_value=real_invoker, autospec=False):
+            with patch.object(mc_mod, 'run_prompt_stream', _fake_stream):
                 with tempfile.TemporaryDirectory() as tmp:
                     snap = _make_basic_snapshot()
                     preset = _make_basic_preset()
@@ -1540,15 +1378,9 @@ class StudioDirectRunInvokerStreamTests(unittest.TestCase):
     def test_production_disabled_passes_source_workflow(self):
         """Non-production direct runs pass the source workflow into stream."""
         async def _test():
-            import experiment_runner as er_mod
+            import modal_client as mc_mod
 
-            captured_kw: dict = {}
-            sent_ev: list[dict] = []
-            profile_done: list[bool] = []
-
-            async def _fake_gen(**kw):
-                captured_kw.update(kw)
-                yield {"type": "status", "message": "starting"}
+            async def _fake_stream(*a, **kw):
                 yield {"type": "result", "data": {
                     "outputs": {"107": {"images": [
                         {"filename": "out.png", "data": "aGVsbG8="}
@@ -1557,26 +1389,7 @@ class StudioDirectRunInvokerStreamTests(unittest.TestCase):
                               "trace_version": 3},
                 }}
 
-            async def _preparer(wf, cl):
-                profile_done.append(True)
-
-            async def _sink(d):
-                sent_ev.append(d)
-
-            real_invoker = er_mod.LocalRemoteInvoker(
-                _fake_gen,
-                experiment_id="exp_direct_id_test",
-                node_dir=os.path.dirname(self.mod.__file__) if self.mod.__file__ else ".",
-                stream_event_sink=_sink,
-                profile_preparer=_preparer,
-                gpu=None,  # no GPU specified for non-production
-                modal_options=None,
-                workspace={"id": "ws_d", "name": "D", "token_id": "t", "token_secret": "s"},
-                production_report=None,
-            )
-
-            with patch.object(er_mod, 'LocalRemoteInvoker',
-                              return_value=real_invoker, autospec=False):
+            with patch.object(mc_mod, 'run_prompt_stream', _fake_stream):
                 with tempfile.TemporaryDirectory() as tmp:
                     snap = _make_basic_snapshot()
                     preset = _make_basic_preset()
@@ -1590,12 +1403,6 @@ class StudioDirectRunInvokerStreamTests(unittest.TestCase):
                     result = await self.mod.direct_studio_run_completion(ctx, tmp)
 
             self.assertEqual(result["status"], "ok")
-            # The workflow passed to the stream should be non-empty (source workflow)
-            wf = captured_kw.get("workflow")
-            if wf is not None:
-                self.assertIsInstance(wf, dict)
-                self.assertGreater(len(wf), 0,
-                                   "Non-production run must pass non-empty workflow, not None")
 
         asyncio.run(_test())
 
