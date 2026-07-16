@@ -2191,6 +2191,10 @@ async def _execute_job(item: tuple, item_id: int):
     prompt_hash = ""
     prompt_summary: dict = {}
     model_stack: dict = {}
+    # Per-request result-route mode — initialized before the main try so all
+    # exception paths (CancelledError, execution failure, post-materialization)
+    # can safely use it without referencing the module-level default.
+    _result_route_mode = extra_data.get("result_route", _RESULT_ROUTE)
     try:
         _send(sid, "modal_status", {"prompt_id": prompt_id, "message": "Starting up", "phase": "startup"})
 
@@ -2201,7 +2205,6 @@ async def _execute_job(item: tuple, item_id: int):
         _log_generation_invocation_plan(prompt_id, invocation_plan)
 
         remote_started = time.time()
-        _result_route_mode = extra_data.get("result_route", _RESULT_ROUTE)
 
         # ── Prepare modal_options (runtime flags, scheduler_test) ──
         _mo = dict(extra_data.get("modal_options") or {})
@@ -2319,7 +2322,7 @@ async def _execute_job(item: tuple, item_id: int):
         )
         _send(sid, "execution_error", {"message": "cancelled", "prompt_id": prompt_id})
         _finish_job(task_key, prompt_id, outputs, success=False, meta={"error": "cancelled"})
-        if _RESULT_ROUTE == "direct":
+        if _result_route_mode == "direct":
             with _COMPLETED_RESULTS_LOCK:
                 _COMPLETED_RESULTS[prompt_id] = {
                     "status": "error",
@@ -2361,7 +2364,7 @@ async def _execute_job(item: tuple, item_id: int):
             "prompt_summary": prompt_summary,
             "workflow_hash": prompt_hash,
         })
-        if _RESULT_ROUTE == "direct":
+        if _result_route_mode == "direct":
             with _COMPLETED_RESULTS_LOCK:
                 _COMPLETED_RESULTS[prompt_id] = {
                     "status": "error",
@@ -2685,6 +2688,15 @@ async def _execute_job(item: tuple, item_id: int):
         traceback.print_exc()
         print(f"[comfyui-modal] Post-result processing failed: {_post_err}")
         _send(sid, "execution_error", {"message": str(_post_err), "prompt_id": prompt_id})
+        if _result_route_mode == "direct":
+            with _COMPLETED_RESULTS_LOCK:
+                _COMPLETED_RESULTS[prompt_id] = {
+                    "status": "error",
+                    "error": str(_post_err),
+                    "traceback": traceback.format_exc(),
+                    "completed_at": time.time(),
+                    "direct_route": True,
+                }
     finally:
         if not finalized and task_key != 0:
             try:
