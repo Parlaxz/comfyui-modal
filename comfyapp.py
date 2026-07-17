@@ -1373,8 +1373,8 @@ VOLUME_STALL_EXEC_MODEL_IO_MS = int(os.getenv("COMFYMODAL_VOLUME_STALL_EXEC_MODE
 # When 0, skip the Sage CUDA extension smoke test during restore.
 # Use the persistent volume cache if available, or SAGE_RUNTIME_MODE default.
 SAGE_RUNTIME_PROBE_ON_RESTORE = os.getenv("COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE", "1") == "1"
-PRELOAD_MODE_PATH = "/root/models/.preload_mode"
-RUNTIME_CONFIG_DIR = "/root/models/runtime_config"
+PRELOAD_MODE_PATH = "/root/comfymodal_runtime/.preload_mode"
+RUNTIME_CONFIG_DIR = "/root/comfymodal_runtime"
 RUNTIME_RETURN_MODE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "return_mode.txt")
 RUNTIME_STATE_SNAPSHOT_PATH = os.path.join(RUNTIME_CONFIG_DIR, ".runtime_state_snapshot.json")
 
@@ -1528,6 +1528,22 @@ def _current_custom_nodes_generation_id() -> str:
 
 
 def _log_remote_identity(event: str, *, cls_name: str = "", method_name: str = "", restore_session_id: str = "", request_seq: int = 0, snapshot_created: int = 0, restored_from_snapshot: int = 0, restored_instance_id: str = "") -> None:
+    _gen_rec = _read_models_generation_record()
+    _active_profile_token = ""
+    _active_profile_stable_key = ""
+    _active_profile_age = -1
+    try:
+        if os.path.isfile(ACTIVE_NEXT_PROFILE_PATH):
+            with open(ACTIVE_NEXT_PROFILE_PATH, "r") as _f:
+                _ap = json.load(_f)
+            if isinstance(_ap, dict):
+                _active_profile_token = _ap.get("profile_token", "")
+                _active_profile_stable_key = _ap.get("stable_restore_key", "") or ""
+                _ca = _ap.get("created_at", 0)
+                if _ca:
+                    _active_profile_age = round(time.time() - float(_ca), 1)
+    except Exception:
+        pass
     print(
         f"[comfyapp.identity] event={event} COMFYAPP_VERSION={COMFYAPP_VERSION} "
         f"APP_NAME={APP_NAME} class_name={cls_name or '?'} method_name={method_name or '?'} "
@@ -1542,6 +1558,13 @@ def _log_remote_identity(event: str, *, cls_name: str = "", method_name: str = "
         f"effective_RESTORE_BACKGROUND_UNET={_restore_background_unet_enabled()} "
         f"restored_instance_id={restored_instance_id} "
         f"CONTROL_BASELINE={CONTROL_BASELINE} "
+        f"models_volume_id={VOLUME_NAME} "
+        f"runtime_config_volume_id={RUNTIME_CONFIG_VOLUME_NAME} "
+        f"active_profile_storage=runtime_config "
+        f"models_volume_generation={(_gen_rec or {}).get('generation', '')[:12] or '-'} "
+        f"active_profile_stable_key={_active_profile_stable_key[:16] or '-'} "
+        f"active_profile_token={_active_profile_token[:16] or '-'} "
+        f"active_profile_age={_active_profile_age} "
     )
 
 
@@ -2110,11 +2133,13 @@ def _build_validation_certificate_identity(
         return ""
 
 
-def _write_validation_certificate(cert_hash, outputs_to_execute, node_errors, *, identity_components=None, vol=None, commit=False):
+def _write_validation_certificate(cert_hash, outputs_to_execute, node_errors, *, identity_components=None, runtime_config_volume=None, commit=False):
     """Atomically write a validation certificate.  Never raises.
 
-    When *commit* is True and *vol* is provided, the models volume is
-    committed synchronously after a successful write and retention cleanup.
+    When *commit* is True, *runtime_config_volume* must be provided;
+    it is committed synchronously after a successful write and retention
+    cleanup.  Only the runtime-config Volume is ever committed here.
+    Raises ``TypeError`` if *commit* is True but *runtime_config_volume* is None.
     """
     try:
         import json as _cert_json
@@ -2165,12 +2190,14 @@ def _write_validation_certificate(cert_hash, outputs_to_execute, node_errors, *,
         _cert_os.replace(tmp, _cert_path)
         _cert_write_ms = round((time.time() - _cert_write_start) * 1000, 1)
 
-        if commit and vol is not None:
+        if commit:
+            if runtime_config_volume is None:
+                raise TypeError("_write_validation_certificate requires a non-None runtime_config_volume when commit=True")
             # Retention cleanup BEFORE commit (so commit persists deletions too)
             _retained = _enforce_certificate_retention()
             _commit_start = time.time()
             try:
-                vol.commit()
+                runtime_config_volume.commit()
                 _commit_ms = round((time.time() - _commit_start) * 1000, 1)
                 print(
                     f"[cert.write] identity={cert_hash[:16]} status=committed "
@@ -2379,9 +2406,9 @@ def _enforce_certificate_retention(max_certs=128):
 BAKED_CUSTOM_NODE_DEPS_MANIFEST_PATH = "/opt/comfymodal/custom_node_deps_baked.json"
 
 # GÃ¶Ã‡GÃ¶Ã‡ PART 11: Known-good workflow profiles (for preload eligibility) GÃ¶Ã‡GÃ¶Ã‡
-KNOWN_GOOD_WORKFLOW_PROFILES_PATH = "/root/models/runtime_config/known_good_workflow_profiles.json"
-CURRENT_CUSTOM_NODE_DEPS_CACHE_PATH = "/root/models/runtime_config/current_custom_node_dependency_manifest_cache.json"
-PER_STACK_METRICS_PATH = "/root/models/runtime_config/per_stack_metrics.json"
+KNOWN_GOOD_WORKFLOW_PROFILES_PATH = os.path.join(RUNTIME_CONFIG_DIR, "known_good_workflow_profiles.json")
+CURRENT_CUSTOM_NODE_DEPS_CACHE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "current_custom_node_dependency_manifest_cache.json")
+PER_STACK_METRICS_PATH = os.path.join(RUNTIME_CONFIG_DIR, "per_stack_metrics.json")
 PER_STACK_METRICS_MAX_RECORDS = 20
 
 _WORKFLOW_IMAGE_SUFFIX_DIRS = {
@@ -2970,7 +2997,7 @@ def sync_custom_nodes_into_comfy(volume_root: str, comfy_custom_nodes_root: str,
           f"removed={len(removed)} blocked={len(blocked)} volume_dirs={len(volume_dirs)}")
     return result
 
-RUNTIME_METADATA_PATH = "/root/models/runtime_config/runtime_metadata.json"
+RUNTIME_METADATA_PATH = os.path.join(RUNTIME_CONFIG_DIR, "runtime_metadata.json")
 
 
 def requirements_file_hash(path: str) -> str | None:
@@ -3557,7 +3584,7 @@ def _write_deployment_dependency_validation_sentinel(
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(sentinel, f, indent=2, sort_keys=True)
         os.replace(tmp_path, sentinel_path)
-        _commit_volume_async(label="dep_validation_sentinel")
+        _commit_runtime_config_vol_async("dep_validation_sentinel", runtime_config_vol)
         print(
             f"[comfyapp] dep_validation_sentinel: written key={cache_key[:16]}... "
             f"source={source_root_indicator} nodes={sentinel['validated_node_count']}"
@@ -4354,45 +4381,50 @@ def _model_load_context(owner: str = "graph_loader", loader_type: str = "",
             delattr(_MODEL_LOAD_CONTEXT, "record_id")
 
 
-def _commit_volume_async(label: str = "") -> None:
-    """Schedule an asynchronous ``vol.commit()`` in a daemon thread.
+def _commit_runtime_config_vol_async(label: str, runtime_config_volume) -> None:
+    """Schedule an asynchronous commit on *runtime_config_volume*.
 
-    Uses a loopGÃ‡Ã¦based worker per label so no followGÃ‡Ã¦up depth cap can
+    Uses a loop-based worker per label so no follow-up depth cap can
     drop a dirty write:
 
     * If no commit is running for *label*, start one.
     * If a commit is already running, mark *label* dirty and return.
     * The running worker loops until no dirty marker remains.
+
+    Commits only the passed *runtime_config_volume*; never touches the models Volume.
     """
     import threading
+    if runtime_config_volume is None:
+        print(f"[comfyapp] _commit_runtime_config_vol_async: runtime_config_volume is None for label={label}, skipping")
+        return
     with _volume_commit_lock:
         if label and label in _volume_commit_inflight_labels:
             _volume_commit_dirty_labels.add(label)
             print(
-                f"[comfyapp] volume_commit_async_deferred "
+                f"[comfyapp] runtime_config_vol_commit_async_deferred "
                 f"label={label} reason=already_in_flight_marked_dirty"
             )
             return
         if label:
             _volume_commit_inflight_labels.add(label)
     if label:
-        print(f"[comfyapp] volume_commit_async_started label={label}")
-    t = threading.Thread(target=_commit_worker, args=(label,), daemon=True)
+        print(f"[comfyapp] runtime_config_vol_commit_async_started label={label}")
+    t = threading.Thread(target=_commit_runtime_config_worker, args=(label, runtime_config_volume), daemon=True)
     t.start()
 
 
-def _commit_worker(label: str) -> None:
-    """Loop: commit until no dirty marker remains for this label."""
+def _commit_runtime_config_worker(label: str, runtime_config_volume) -> None:
+    """Loop: commit *runtime_config_volume* until no dirty marker remains."""
     while True:
         try:
-            vol.commit()
-            print(f"[comfyapp] volume_commit_async_finished label={label}")
+            runtime_config_volume.commit()
+            print(f"[comfyapp] runtime_config_vol_commit_async_finished label={label}")
         except Exception as exc:
-            print(f"[comfyapp] volume_commit_async_failed label={label} error={exc}")
+            print(f"[comfyapp] runtime_config_vol_commit_async_failed label={label} error={exc}")
         with _volume_commit_lock:
             if label and label in _volume_commit_dirty_labels:
                 _volume_commit_dirty_labels.discard(label)
-                print(f"[comfyapp] volume_commit_async_followup_started label={label}")
+                print(f"[comfyapp] runtime_config_vol_commit_async_followup_started label={label}")
                 continue
             if label:
                 _volume_commit_inflight_labels.discard(label)
@@ -4400,14 +4432,14 @@ def _commit_worker(label: str) -> None:
 
 
 def save_known_good_workflow_profiles(profiles: dict) -> None:
-    """Persist known-good workflow profiles to the volume."""
+    """Persist known-good workflow profiles to the runtime config volume."""
     try:
         os.makedirs(os.path.dirname(KNOWN_GOOD_WORKFLOW_PROFILES_PATH), exist_ok=True)
         tmp = f"{KNOWN_GOOD_WORKFLOW_PROFILES_PATH}.tmp"
         with open(tmp, "w") as f:
             json.dump(profiles, f, indent=2, sort_keys=True)
         os.replace(tmp, KNOWN_GOOD_WORKFLOW_PROFILES_PATH)
-        _commit_volume_async(label="known_good_profiles")
+        _commit_runtime_config_vol_async("known_good_profiles", runtime_config_vol)
     except Exception as exc:
         print(f"[comfyapp] failed to save known-good profiles: {exc}")
 
@@ -4505,7 +4537,7 @@ def save_current_dependency_manifest_cache(cache: dict) -> None:
         with open(tmp, "w") as f:
             json.dump(cache, f, indent=2, sort_keys=True)
         os.replace(tmp, CURRENT_CUSTOM_NODE_DEPS_CACHE_PATH)
-        _commit_volume_async(label="dependency_manifest_cache")
+        _commit_runtime_config_vol_async("dependency_manifest_cache", runtime_config_vol)
     except Exception as exc:
         print(f"[comfyapp] failed to save dependency manifest cache: {exc}")
 
@@ -4694,7 +4726,7 @@ def save_runtime_metadata(data: dict) -> None:
         with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(payload)
         os.replace(tmp_path, RUNTIME_METADATA_PATH)
-        _commit_volume_async(label="runtime_metadata")
+        _commit_runtime_config_vol_async("runtime_metadata", runtime_config_vol)
     except Exception as exc:
         print(f"[comfyapp] failed to save runtime metadata: {exc}")
 
@@ -5022,12 +5054,15 @@ def _verify_model_file(path: str, expected_size: int | None = None, expected_sha
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.16.23"
+COMFYAPP_VERSION = "2.16.24"
 CONTROL_BASELINE = "v2.16.5_exact_plus_direct_memory_production"
 
 
 APP_NAME = "comfyui"
+# Model weights are read-only during generation; never store request/runtime state here.
 VOLUME_NAME = "comfyui-models"
+RUNTIME_CONFIG_VOLUME_NAME = "comfymodal-runtime-config"
+RUNTIME_CONFIG_PATH = "/root/comfymodal_runtime"
 CUSTOM_NODES_VOLUME_NAME = "comfyui-custom-nodes"
 # P2: dedicated prompt-encoding cache volume. NEVER written to the
 # models or custom-nodes volumes. The volume is mounted only by the
@@ -5820,11 +5855,11 @@ if not _INSIDE_MODAL_CONTAINER:
 COMFYUI_API_PORT = 8189
 MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
-LAST_MODEL_STACK_PATH = "/root/models/.last_model_stack.json"
-ACTIVE_NEXT_PROFILE_PATH = "/root/models/runtime_config/active_next_profile.json"
+LAST_MODEL_STACK_PATH = "/root/comfymodal_runtime/.last_model_stack.json"
+ACTIVE_NEXT_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "active_next_profile.json")
 ACTIVE_NEXT_PROFILE_TTL_S = int(os.getenv("COMFYMODAL_ACTIVE_NEXT_PROFILE_TTL_S", "3600"))
-LAST_WARMUP_WORKFLOW_PATH = "/root/models/.last_warmup_workflow.json"
-SAGE_RUNTIME_CACHE_PATH = "/root/models/.sage_runtime_cache.json"
+LAST_WARMUP_WORKFLOW_PATH = "/root/comfymodal_runtime/.last_warmup_workflow.json"
+SAGE_RUNTIME_CACHE_PATH = "/root/comfymodal_runtime/.sage_runtime_cache.json"
 
 SUPPORTED_GPUS = get_supported_gpus()
 
@@ -5898,7 +5933,7 @@ _image_base = (
     )
     .env(
         {
-            "TORCHINDUCTOR_CACHE_DIR": "/root/models/.inductor-cache",
+            "TORCHINDUCTOR_CACHE_DIR": "/root/comfymodal_runtime/.inductor-cache",
             "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
             "TRITON_CACHE_DIR": "/tmp/triton_cache",
             "TORCHINDUCTOR_EMULATE_PRECISION_CASTS": "1",
@@ -5998,13 +6033,33 @@ if not _INSIDE_MODAL_CONTAINER:
         print(f"[comfyapp] custom_node_copy_mode=per_node nodes={len(_syncable_node_names)} layers={_cn_copy_layer_count}")
 
     # GÃ¶Ã‡GÃ¶Ã‡ PART 4: Generate baked dependency manifest and copy into image GÃ¶Ã‡GÃ¶Ã‡
+
+    def _baked_manifest_serialized(data: dict) -> str:
+        """Deterministic JSON serialization matching the deployed file format."""
+        return json.dumps(data, indent=2, sort_keys=True)
+
     _BAKED_MANIFEST_DIR = os.path.join(_COMFYUI_MODAL_DIR, ".baked_custom_node_deps")
     os.makedirs(_BAKED_MANIFEST_DIR, exist_ok=True)
     _BAKED_MANIFEST_TEMP = os.path.join(_BAKED_MANIFEST_DIR, "custom_node_deps_baked.json")
+
+    def _maybe_write_baked_manifest(path: str, data: dict) -> None:
+        """Write JSON *data* to *path* only if content differs or file is missing.
+        Idempotent: skips the write when the existing file bytes are identical,
+        preventing unnecessary file-mtime changes that perturb ``modal deploy``."""
+        serialized = _baked_manifest_serialized(data)
+        try:
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as _f:
+                    if _f.read() == serialized:
+                        return  # content identical, skip write
+        except FileNotFoundError:
+            pass
+        with open(path, "w", encoding="utf-8") as _f:
+            _f.write(serialized)
+
     try:
         _baked_manifest = build_custom_node_dependency_manifest(_LOCAL_CUSTOM_NODES)
-        with open(_BAKED_MANIFEST_TEMP, "w", encoding="utf-8") as _f:
-            json.dump(_baked_manifest, _f, indent=2, sort_keys=True)
+        _maybe_write_baked_manifest(_BAKED_MANIFEST_TEMP, _baked_manifest)
         _baked_nodes = _baked_manifest.get("nodes", {})
         _baked_node_names = sorted(_baked_nodes.keys())
         _baked_node_count = len(_baked_node_names)
@@ -6032,8 +6087,10 @@ if not _INSIDE_MODAL_CONTAINER:
     except Exception as _bake_exc:
         print(f"[comfyapp] WARNING: baked manifest generation failed: {_bake_exc}")
         # Write empty manifest so the file exists in the image
-        with open(_BAKED_MANIFEST_TEMP, "w", encoding="utf-8") as _f:
-            json.dump({"schema_version": 1, "nodes": {}, "overall_dependency_hash": ""}, _f)
+        _maybe_write_baked_manifest(
+            _BAKED_MANIFEST_TEMP,
+            {"schema_version": 1, "nodes": {}, "overall_dependency_hash": ""},
+        )
 
     # GÃ¶Ã‡GÃ¶Ã‡ Dependency build-context diagnostics GÃ¶Ã‡GÃ¶Ã‡
     _baked_manifest_for_diag = locals().get("_baked_manifest", {})
@@ -6087,6 +6144,12 @@ vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 prompt_cache_vol = modal.Volume.from_name(
     PROMPT_CACHE_VOLUME_NAME, create_if_missing=True
 )
+# Runtime configuration and control state volume.  Never holds model
+# weights.  Always mounted alongside models/custom-nodes on GPU so
+# snapshot creation/restore see the same volume layout.
+runtime_config_vol = modal.Volume.from_name(
+    RUNTIME_CONFIG_VOLUME_NAME, create_if_missing=True
+)
 
 
 def _build_gpu_volumes() -> dict:
@@ -6097,10 +6160,16 @@ def _build_gpu_volumes() -> dict:
     matches the previous container mount setup exactly.  This
     also keeps the snapshot's volume metadata identical to the
     pre-feature state.
+
+    The runtime-config volume is always included so snapshot
+    creation/restore and GPU-side runtime persistence functions
+    can read/write configuration, active profile, validation
+    certificates, etc. without touching the models volume.
     """
     base = {
         MODELS_PATH: vol,
         CUSTOM_NODES_PATH: custom_nodes_vol,
+        RUNTIME_CONFIG_PATH: runtime_config_vol,
     }
     if os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1":
         base[PROMPT_CACHE_VOLUME_PATH] = prompt_cache_vol
@@ -6429,13 +6498,14 @@ def get_volume_status() -> dict:
     cpu=1,
     memory=512,
     timeout=30,
-    volumes={MODELS_PATH: vol},
+    volumes={RUNTIME_CONFIG_PATH: runtime_config_vol},
 )
 def set_preload_mode(mode: str) -> str:
     """Set the preload mode for the next cold restore.
 
-    Writes the mode to ``/root/models/.preload_mode`` on the volume so
+    Writes the mode to the runtime config volume so
     the lifecycle restore function reads it before CPU preload.
+    Only the runtime-config Volume is committed; never the models Volume.
     """
     import os
     mode = mode.strip().lower()
@@ -6443,10 +6513,10 @@ def set_preload_mode(mode: str) -> str:
              "off", "async_no_wait"}
     if mode not in valid and not mode.startswith("budgeted_"):
         return f"invalid mode: {mode}  valid={valid} or budgeted_<ms>"
-    os.makedirs("/root/models", exist_ok=True)
+    os.makedirs(RUNTIME_CONFIG_PATH, exist_ok=True)
     with open(PRELOAD_MODE_PATH, "w") as f:
         f.write(mode)
-    vol.commit()
+    runtime_config_vol.commit()
     print(f"[comfyapp] set_preload_mode: {mode}")
     return f"preload_mode={mode}"
 
@@ -6458,20 +6528,21 @@ def set_preload_mode(mode: str) -> str:
     cpu=1,
     memory=512,
     timeout=30,
-    volumes={MODELS_PATH: vol},
+    volumes={RUNTIME_CONFIG_PATH: runtime_config_vol},
 )
 def set_runtime_flag(name: str, value: str) -> str:
     """Set a runtime config value for the next cold restore.
 
-    Writes ``value`` to ``/root/models/runtime_config/{name}.txt`` which is read
+    Writes ``value`` to the runtime config volume which is read
     by ``_resolve_runtime_flag()`` (for bool flags) or inline readers during restore.
+    Only the runtime-config Volume is committed; never the models Volume.
     """
     import os
-    os.makedirs("/root/models/runtime_config", exist_ok=True)
-    path = os.path.join("/root/models/runtime_config", f"{name}.txt")
+    os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
+    path = os.path.join(RUNTIME_CONFIG_DIR, f"{name}.txt")
     with open(path, "w") as f:
         f.write(value.strip())
-    vol.commit()
+    runtime_config_vol.commit()
     print(f"[comfyapp] set_runtime_flag: {name}={value}")
     return f"runtime_flag {name}={value}"
 
@@ -6495,14 +6566,14 @@ def _clear_runtime_flag_internal(name: str) -> tuple[str, bool]:
     cpu=1,
     memory=512,
     timeout=30,
-    volumes={MODELS_PATH: vol},
+    volumes={RUNTIME_CONFIG_PATH: runtime_config_vol},
 )
 def clear_runtime_flag(name: str) -> str:
-    """Remove a single runtime config flag file from the volume."""
+    """Remove a single runtime config flag file from the runtime config volume."""
     import os
     os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
     msg, _ = _clear_runtime_flag_internal(name)
-    vol.commit()
+    runtime_config_vol.commit()
     print(f"[comfyapp] clear_runtime_flag: {name} -> {msg}")
     return f"clear_runtime_flag {name}: {msg}"
 
@@ -6514,10 +6585,10 @@ def clear_runtime_flag(name: str) -> str:
     cpu=1,
     memory=512,
     timeout=30,
-    volumes={MODELS_PATH: vol},
+    volumes={RUNTIME_CONFIG_PATH: runtime_config_vol},
 )
 def clear_runtime_flags(names: list[str]) -> list[str]:
-    """Remove multiple runtime config flag files from the volume."""
+    """Remove multiple runtime config flag files from the runtime config volume."""
     import os
     os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
     results = []
@@ -6528,7 +6599,7 @@ def clear_runtime_flags(names: list[str]) -> list[str]:
         if changed:
             any_change = True
     if any_change:
-        vol.commit()
+        runtime_config_vol.commit()
     print(f"[comfyapp] clear_runtime_flags: {names} -> {results}")
     return results
 
@@ -6540,7 +6611,7 @@ def clear_runtime_flags(names: list[str]) -> list[str]:
     cpu=1,
     memory=512,
     timeout=30,
-    volumes={MODELS_PATH: vol},
+    volumes={RUNTIME_CONFIG_PATH: runtime_config_vol},
 )
 def reset_runtime_defaults() -> dict:
     """Clear experiment/runtime flags that can override env defaults.
@@ -6559,6 +6630,8 @@ def reset_runtime_defaults() -> dict:
 
     Does NOT delete active_next_profile, known_good profiles, model files,
     custom node files, or dependency cache files.
+
+    Only commits the runtime-config Volume; never the models Volume.
     """
     import os
     os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
@@ -6589,7 +6662,7 @@ def reset_runtime_defaults() -> dict:
             absent.append(name)
 
     if any_change:
-        vol.commit()
+        runtime_config_vol.commit()
 
     result = {
         "status": "ok",
@@ -6633,11 +6706,11 @@ def upload_model_to_volume(file_data: bytes, folder: str, filename: str) -> dict
     cpu=2,
     memory=4096,
     timeout=3600,
-    volumes={MODELS_PATH: vol},
+    volumes={RUNTIME_CONFIG_PATH: runtime_config_vol},
 )
 def set_active_warmup_profile(payload: dict) -> dict:
     validate_active_warmup_profile_payload(payload)
-    return _write_active_warmup_profile_payload(payload)
+    return _write_active_warmup_profile_payload(payload, runtime_config_vol)
 
 
 def validate_active_warmup_profile_payload(payload: dict) -> None:
@@ -6690,7 +6763,15 @@ def validate_active_warmup_profile_payload(payload: dict) -> None:
             )
 
 
-def _write_active_warmup_profile_payload(payload: dict) -> dict:
+def _write_active_warmup_profile_payload(payload: dict, runtime_config_volume) -> dict:
+    """Write active warmup profile to *runtime_config_volume*.
+
+    The volume is committed synchronously after a successful write.
+    Only the runtime-config Volume is ever committed here; never the models Volume.
+    Raises ``TypeError`` if *runtime_config_volume* is ``None``.
+    """
+    if runtime_config_volume is None:
+        raise TypeError("_write_active_warmup_profile_payload requires a non-None runtime_config_volume")
     try:
         validate_active_warmup_profile_payload(payload)
         os.makedirs(RUNTIME_CONFIG_DIR, exist_ok=True)
@@ -6722,7 +6803,7 @@ def _write_active_warmup_profile_payload(payload: dict) -> dict:
             f.write(compact)
         os.replace(tmp_path, ACTIVE_NEXT_PROFILE_PATH)
         t1 = time.time()
-        vol.commit()
+        runtime_config_volume.commit()
         t2 = time.time()
         write_ms = round((t1 - t0) * 1000, 1)
         commit_ms = round((t2 - t1) * 1000, 1)
@@ -6890,15 +6971,19 @@ def delete_model_cpu(folder: str, filename: str) -> dict:
     cpu=1,
     memory=512,
     timeout=30,
-    volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
+    volumes={
+        MODELS_PATH: vol,
+        CUSTOM_NODES_PATH: custom_nodes_vol,
+        RUNTIME_CONFIG_PATH: runtime_config_vol,
+    },
 )
 def runtime_state_cpu() -> dict:
     """Check if the remote runtime state is stale relative to the volumes.
-    CPU-only GÃ‡Ã¶ no GPU cost."""
+    CPU-only Ã¢â¬Ã¢â¬ no GPU cost. Writes snapshot to and commits only the
+    runtime-config Volume."""
     import json
 
-    vol.reload()
-    custom_nodes_vol.reload()
+    runtime_config_vol.reload()
 
     current_models = model_volume_state(MODELS_PATH)
     current_nodes = custom_node_volume_state(CUSTOM_NODES_PATH)
@@ -6924,7 +7009,7 @@ def runtime_state_cpu() -> dict:
     }
     with open(RUNTIME_STATE_SNAPSHOT_PATH, "w") as f:
         json.dump(snapshot, f)
-    vol.commit()
+    runtime_config_vol.commit()
 
     return {
         "stale": bool(stale_reasons),
@@ -6932,6 +7017,86 @@ def runtime_state_cpu() -> dict:
         "models_changed": "models changed" in stale_reasons,
         "custom_nodes_changed": "custom nodes changed" in stale_reasons,
     }
+
+
+# ── Storage identity and diagnostics ─────────────────────────────────────
+# Called at startup/restore to log bounded volume identity info for
+# debugging cross-container state conflicts.
+
+
+def _log_storage_identity_diagnostics(label: str = "") -> None:
+    """Emit concise storage identity diagnostics.
+
+    Logs bounded identifiers for volumes, active profile, and generation
+    state.  Avoids full prompts/secrets in logs.  Reloads runtime_config_vol
+    before reading to ensure fresh state.
+    """
+    # Reload runtime config volume before reads
+    try:
+        runtime_config_vol.reload()
+    except Exception:
+        pass
+
+    _parts = []
+    _label = f" {label}" if label else ""
+
+    # Models volume identity: use object_id when available, else stable name
+    try:
+        _mid = getattr(vol, "object_id", None) or os.environ.get(
+            "MODAL_VOLUME_OBJECT_ID", ""
+        )
+        _parts.append(f"models_volume_id={_mid[:16] if _mid else VOLUME_NAME}")
+    except Exception:
+        _parts.append(f"models_volume_id={VOLUME_NAME}")
+
+    # Runtime config volume identity
+    try:
+        _rid = getattr(runtime_config_vol, "object_id", None) or os.environ.get(
+            "MODAL_RUNTIME_CONFIG_VOLUME_OBJECT_ID", ""
+        )
+        _parts.append(f"runtime_config_volume_id={_rid[:16] if _rid else RUNTIME_CONFIG_VOLUME_NAME}")
+    except Exception:
+        _parts.append(f"runtime_config_volume_id={RUNTIME_CONFIG_VOLUME_NAME}")
+
+    # Models generation
+    try:
+        _gen_rec = _read_models_generation_record()
+        _gen = (_gen_rec or {}).get("generation", "")
+        if _gen:
+            _parts.append(f"models_volume_generation={_gen[:12]}")
+    except Exception:
+        pass
+
+    # Active profile diagnostics — read stable_restore_key, not workflow_hash
+    _profile_path = ACTIVE_NEXT_PROFILE_PATH
+    try:
+        if os.path.isfile(_profile_path):
+            _st = os.stat(_profile_path)
+            _profile_age_s = round(
+                time.time() - _st.st_mtime, 1
+            )  # seconds
+            _parts.append(f"active_profile_age_s={_profile_age_s}")
+            # Read the full JSON payload (safe: only identity fields are logged)
+            import json as _json
+            with open(_profile_path, "r", encoding="utf-8") as _pf:
+                _prof = _json.load(_pf)
+            if isinstance(_prof, dict):
+                _tk = (_prof.get("profile_token") or "")[:12]
+                if _tk:
+                    _parts.append(f"active_profile_token={_tk}")
+                # stable_restore_key is the proper identity key for preload matching
+                _srk = (_prof.get("stable_restore_key") or "")[:16]
+                if _srk:
+                    _parts.append(f"active_profile_stable_key={_srk}")
+    except Exception:
+        pass
+
+    print(
+        f"[comfyapp.storage_diag{_label}] "
+        + " ".join(_parts)
+        if _parts
+        else f"[comfyapp.storage_diag{_label}] no_identity_data"
+    )
 
 
 # ── P2: Prompt-encoding cache (persistent LRU) ──────────────────────────
@@ -7300,6 +7465,41 @@ def lookup_clip_cache(bundle_hash: str, clip_fingerprint_key: str) -> dict:
         return {"status": "miss", "reason": "not_found"}
     except Exception as exc:
         return {"status": "miss", "reason": f"error:{exc}"[:120]}
+
+
+@app.function(
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
+    cpu=2,
+    memory=512,
+    timeout=120,
+    volumes={RUNTIME_CONFIG_PATH: runtime_config_vol},
+)
+def persist_validation_certificate(candidate: dict) -> dict:
+    """Persist a validation certificate to the runtime config volume.
+
+    Mounts and commits only the runtime-config Volume; never touches
+    the models Volume.  Called from the post-delivery dispatcher on
+    the local side via ``modal_client.persist_validation_certificate``.
+    """
+    try:
+        identity = candidate.get("identity", "")
+        outputs_to_execute = candidate.get("outputs_to_execute", [])
+        node_errors = candidate.get("node_errors", {})
+        identity_components = candidate.get("identity_components")
+        if not identity:
+            return {"status": "error", "error": "missing identity"}
+        return _write_validation_certificate(
+            identity,
+            outputs_to_execute,
+            node_errors,
+            identity_components=identity_components,
+            runtime_config_volume=runtime_config_vol,
+            commit=True,
+        )
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)[:200]}
 
 
 def _filter_preload_paths_by_size(file_paths: list) -> tuple[list, dict]:
@@ -8085,11 +8285,12 @@ class _ComfyAPIMixin:
                   f"in {(time.time()-_t0)*1000:.1f}ms")
 
     def _save_last_model_stack(self, stack: dict) -> None:
-        """Persist the workflow's model stack to the volume for the next restore.
+        """Persist the workflow's model stack to the runtime config volume for the next restore.
 
-        Writes the file synchronously but commits to volume in a background
+        Writes the file synchronously but commits to runtime config volume in a background
         thread to avoid blocking the response path with network I/O (~370ms).
         Skips write when the content is identical to the existing file.
+        Commits only the runtime-config Volume; never touches the models Volume.
         """
         import json
         try:
@@ -8104,7 +8305,7 @@ class _ComfyAPIMixin:
             with open(tmp_path, "w") as f:
                 f.write(stack_json)
             os.replace(tmp_path, LAST_MODEL_STACK_PATH)
-            _commit_volume_async(label="last_model_stack")
+            _commit_runtime_config_vol_async("last_model_stack", runtime_config_vol)
         except Exception as exc:
             print(f"[comfyapp] failed to save last model stack: {exc}")
 
@@ -8118,7 +8319,11 @@ class _ComfyAPIMixin:
             print(f"[comfyapp] failed to load last model stack: {exc}")
         return {}
 
-    def _write_active_next_profile(self, payload: dict) -> dict:
+    def _write_active_next_profile(self, payload: dict, runtime_config_volume) -> dict:
+        """Write active-next profile committing only *runtime_config_volume*.
+        Raises ``TypeError`` if *runtime_config_volume* is ``None``."""
+        if runtime_config_volume is None:
+            raise TypeError("_write_active_next_profile requires a non-None runtime_config_volume")
         try:
             os.makedirs(os.path.dirname(ACTIVE_NEXT_PROFILE_PATH), exist_ok=True)
             profile_token = payload.get("profile_token", "")
@@ -8148,14 +8353,16 @@ class _ComfyAPIMixin:
                 f.write(compact)
             os.replace(tmp_path, ACTIVE_NEXT_PROFILE_PATH)
             t1 = time.time()
-            vol.commit()
+            # Only commit the runtime-config Volume; never the models Volume.
+            runtime_config_volume.commit()
             t2 = time.time()
             write_ms = round((t1 - t0) * 1000, 1)
             commit_ms = round((t2 - t1) * 1000, 1)
             print(
                 f"[comfyapp] _write_active_next_profile written "
                 f"token={profile_token} payload_bytes={payload_bytes} "
-                f"write_ms={write_ms} commit_ms={commit_ms}"
+                f"write_ms={write_ms} commit_ms={commit_ms} "
+                f"volume=runtime_config_vol"
             )
             return {
                 "status": "written",
@@ -8258,7 +8465,7 @@ class _ComfyAPIMixin:
             return {"_diagnostic": {"status": "read_error", "source_path": ACTIVE_NEXT_PROFILE_PATH, "error": str(exc)}}
 
     def _save_last_warmup_workflow(self, workflow: dict) -> None:
-        """Persist a cheap warmup replay derived from a successful prompt."""
+        """Persist a cheap warmup replay to the runtime config volume."""
         try:
             os.makedirs(os.path.dirname(LAST_WARMUP_WORKFLOW_PATH), exist_ok=True)
             warmup = build_replay_warmup_workflow(workflow)
@@ -8272,7 +8479,7 @@ class _ComfyAPIMixin:
             with open(tmp_path, "w") as f:
                 f.write(warmup_json)
             os.replace(tmp_path, LAST_WARMUP_WORKFLOW_PATH)
-            _commit_volume_async(label="last_warmup_workflow")
+            _commit_runtime_config_vol_async("last_warmup_workflow", runtime_config_vol)
         except Exception as exc:
             print(f"[comfyapp] failed to save last warmup workflow: {exc}")
 
@@ -8385,7 +8592,22 @@ class _ComfyAPIMixin:
             self._validation_cache = _MemoizedValidationCache()
 
     def _sync_custom_nodes_from_volume(self):
-        custom_nodes_vol.reload()
+        # Transient-volume mount retry with exponential backoff.
+        # Modal volumes may not be immediately visible after snapshot
+        # restore; retry with the same backoff sequence used for the
+        # models volume in restore().
+        _cn_wait_seconds = [0.2, 0.5, 1.0, 2.0, 3.0]
+        _cn_mount_ready = False
+        for _attempt in range(len(_cn_wait_seconds)):
+            custom_nodes_vol.reload()
+            if os.path.isdir(CUSTOM_NODES_PATH):
+                _cn_mount_ready = True
+                break
+            if _attempt < len(_cn_wait_seconds) - 1:
+                time.sleep(_cn_wait_seconds[_attempt])
+        if not _cn_mount_ready:
+            print(f"[comfyapp] custom_nodes_volume_mount_failed path={CUSTOM_NODES_PATH}")
+
         comfy_custom_nodes = "/root/comfy/ComfyUI/custom_nodes"
         self._ensure_validation_cache()
 
@@ -10561,7 +10783,7 @@ class _ComfyAPIMixin:
 
                 # Use async commit to avoid hot-path volume churn
                 try:
-                    _commit_volume_async(label="per_stack_metrics")
+                    _commit_runtime_config_vol_async("per_stack_metrics", runtime_config_vol)
                     _diag["per_stack_metrics_commit_scheduled"] = 1
                 except Exception:
                     pass
@@ -12579,7 +12801,7 @@ class _ComfyAPIMixin:
             with open(tmp, "w") as f:
                 json.dump(data, f, indent=2, sort_keys=True)
             os.replace(tmp, SAGE_RUNTIME_CACHE_PATH)
-            _commit_volume_async(label="sage_runtime_cache")
+            _commit_runtime_config_vol_async("sage_runtime_cache", runtime_config_vol)
             print(f"[comfyapp] sage_runtime_cache saved mode={mode} gpu={gpu_name} sage_v={sage_version}")
         except Exception as exc:
             print(f"[comfyapp] sage_runtime_cache save error: {exc}")
@@ -14249,7 +14471,7 @@ class _ComfyAPIMixin:
                     _pending["outputs_to_execute"],
                     _pending["node_errors"],
                     identity_components=_pending.get("identity_components"),
-                    vol=vol,
+                    runtime_config_volume=runtime_config_vol,
                     commit=True,
                 )
                 self._validation_certificate_write_submitted = 1
@@ -15485,6 +15707,12 @@ class _ComfyAPIMixin:
         stage_started = time.time()
         vol.reload()
         self._log_profile("volume_reload", duration_ms=self._profile_ms(stage_started))
+
+        stage_started = time.time()
+        runtime_config_vol.reload()
+        self._log_profile("runtime_config_vol_reload", duration_ms=self._profile_ms(stage_started))
+
+        _log_storage_identity_diagnostics("startup")
 
         stage_started = time.time()
         _, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
@@ -17071,23 +17299,18 @@ class _ComfyAPIMixin:
         self._ensure_models_symlink()
         __stages["ensure_models_ms"] = self._profile_ms(_s)
 
-        # â”€â”€ Phase 1: Refresh custom-nodes Volume â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # Custom-nodes Volume must be reloaded first because the
-        # model-generation control record is stored there.
-        _wait_seconds = [0.2, 0.5, 1.0, 2.0, 3.0]
-        _s_vol_mount = time.time()
-        _s_cn_vol = time.time()
-        _cn_mount_ready = False
-        for _attempt in range(len(_wait_seconds)):
-            custom_nodes_vol.reload()
-            if os.path.isdir(CUSTOM_NODES_PATH):
-                _cn_mount_ready = True
-                break
-            if _attempt < len(_wait_seconds) - 1:
-                time.sleep(_wait_seconds[_attempt])
-        if not _cn_mount_ready:
-            print(f"[comfyapp] custom_nodes_volume_mount_failed path={CUSTOM_NODES_PATH}")
-        __stages["custom_nodes_volume_reload_ms"] = self._profile_ms(_s_cn_vol)
+        # â”€â”€ Phase 1: Sync custom-nodes from Volume â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Delegates to _sync_custom_nodes_from_volume, which handles
+        # volume reload, custom-node sync, and requirements install.
+        # This also refreshes the custom-nodes Volume so the
+        # model-generation control record (stored there) is readable.
+        _s_cn = time.time()
+        _cn_summary, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
+        _cn_created = _cn_summary.get("created", [])
+        __stages["custom_nodes_sync_ms"] = self._profile_ms(_s_cn)
+        __stages["custom_nodes_created"] = len(_cn_created)
+        if _cn_created:
+            print(f"[comfyapp] restore synced new custom nodes: {_cn_created}")
 
         # â”€â”€ Phase 2: Read model-generation record â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _s_gen_read = time.time()
@@ -17110,7 +17333,59 @@ class _ComfyAPIMixin:
         __stages["models_volume_reload_needed"] = 1 if _models_reload_needed else 0
         __stages["models_volume_reload_reason"] = _models_reload_reason
 
+        # â”€â”€ Reload runtime config volume before diagnostics/reads â”€â”€â”€â”€â”€â”€â”€â”€
+        _s_vol_mount = time.time()
+        try:
+            runtime_config_vol.reload()
+        except Exception as _rc_exc:
+            print(f"[comfyapp] runtime_config_vol.reload failed: {_rc_exc}")
+
+        # â”€â”€ Runtime config volume diagnostics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Use object_id when available, else stable volume name
+        __stages["models_volume_id"] = (
+            getattr(vol, "object_id", None)
+            or os.environ.get("MODAL_VOLUME_OBJECT_ID", "")
+            or VOLUME_NAME
+        )
+        __stages["runtime_config_volume_id"] = (
+            getattr(runtime_config_vol, "object_id", None)
+            or os.environ.get("MODAL_RUNTIME_CONFIG_VOLUME_OBJECT_ID", "")
+            or RUNTIME_CONFIG_VOLUME_NAME
+        )
+        __stages["active_profile_storage"] = "runtime_config"
+        __stages["models_volume_generation"] = (_models_gen or {}).get("generation", "")[:12] if _models_gen else "-"
+        # Derive stable identity from stored profile: use stable_restore_key,
+        # not profile_token or workflow_hash.
+        _ap_token = ""
+        _ap_stable_key = ""
+        _ap_age_s = -1
+        try:
+            if os.path.isfile(ACTIVE_NEXT_PROFILE_PATH):
+                with open(ACTIVE_NEXT_PROFILE_PATH, "r") as _f:
+                    _ap = json.load(_f)
+                if isinstance(_ap, dict):
+                    _ap_token = _ap.get("profile_token", "")[:16]
+                    _ap_stable_key = (_ap.get("stable_restore_key") or "")[:16]
+                    _ca = _ap.get("created_at", 0)
+                    if _ca:
+                        _ap_age_s = round(time.time() - float(_ca), 1)
+        except Exception:
+            pass
+        __stages["active_profile_stable_key"] = _ap_stable_key if _ap_stable_key else "-"
+        __stages["active_profile_token"] = _ap_token if _ap_token else "-"
+        __stages["active_profile_age_s"] = _ap_age_s
+        print(
+            f"[comfyapp.restore.volumes] models_volume_id={__stages['models_volume_id'][:16] if __stages.get('models_volume_id') else VOLUME_NAME} "
+            f"runtime_config_volume_id={__stages['runtime_config_volume_id'][:16] if __stages.get('runtime_config_volume_id') else RUNTIME_CONFIG_VOLUME_NAME} "
+            f"active_profile_storage=runtime_config "
+            f"models_volume_generation={(_models_gen or {}).get('generation', '')[:12] or '-'} "
+            f"active_profile_stable_key={_ap_stable_key or '-'} "
+            f"active_profile_token={_ap_token or '-'} "
+            f"active_profile_age_s={_ap_age_s}"
+        )
+
         # â”€â”€ Phase 4: Conditionally reload models Volume â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        _wait_seconds = [0.2, 0.5, 1.0, 2.0, 3.0]
         _s_models_vol = time.time()
         if _models_reload_needed:
             _models_mount_ready = False
@@ -17134,18 +17409,8 @@ class _ComfyAPIMixin:
         __stages["volume_mount_wait_ms"] = self._profile_ms(_s_vol_mount)
         __stages["models_volume_reload_skipped"] = 0 if _models_reload_needed else 1
 
-        # Reload custom nodes volume and sync any nodes added since the snapshot
-        # was taken.  The snapshot filesystem only contains custom_nodes symlinks
-        # from the time of snap=True; post-snapshot volume writes must be picked
-        # up explicitly here or the restored container won't see them.
-        _s2 = time.time()
-        _cn_summary, self._custom_nodes_state = self._sync_custom_nodes_from_volume()
-        _cn_created = _cn_summary.get("created", [])
-        __stages["custom_nodes_sync_ms"] = self._profile_ms(_s2)
-        __stages["custom_nodes_created"] = len(_cn_created)
-        if _cn_created:
-            print(f"[comfyapp] restore synced new custom nodes: {_cn_created}")
-
+        # Custom nodes volume was already reloaded and synced in Phase 1.
+        # Proceed with preload and warmup configuration.
         __stages["preload_mode"] = _resolve_preload_mode()
         __stages["preload_mode_source"] = "file" if os.path.isfile(PRELOAD_MODE_PATH) else "env_var"
         __stages["preload_env_raw"] = os.environ.get("COMFYMODAL_PRELOAD_MODE", "not_set")

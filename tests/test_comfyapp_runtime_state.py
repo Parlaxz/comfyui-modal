@@ -210,9 +210,10 @@ class ComfyAppRuntimeStateTests(unittest.TestCase):
                 "ComfyUI-CacheDiT": module.requirements_file_hash(str(first / "requirements.txt")),
             })
 
-    def test_runtime_metadata_path_uses_models_volume(self):
+    def test_runtime_metadata_path_uses_runtime_config_volume(self):
         module = load_module()
-        self.assertTrue(module.RUNTIME_METADATA_PATH.startswith(module.MODELS_PATH + "/"))
+        fwd = module.RUNTIME_METADATA_PATH.replace("\\", "/")
+        self.assertTrue(fwd.startswith("/root/comfymodal_runtime"), f"RUNTIME_METADATA_PATH={module.RUNTIME_METADATA_PATH!r}")
 
     def test_install_custom_node_requirements_rejects_missing_local_path_before_pip(self):
         module = load_module()
@@ -914,6 +915,109 @@ class ComfyAppRuntimeFlagTests(unittest.TestCase):
         content = preset_mod_path.read_text(encoding="utf-8")
         self.assertIn("PERSIST_PER_STACK_METRICS", content)
         self.assertIn("DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET", content)
+
+
+class RuntimeConfigVolumePathTests(unittest.TestCase):
+    """Verify all runtime/control paths live under /root/comfymodal_runtime,
+    not /root/models."""
+
+    _RUNTIME_PREFIX = "/root/comfymodal_runtime"
+
+    def setUp(self):
+        self.module = load_module()
+
+    def _check_prefix(self, path_value: str, name: str):
+        # Normalize to forward-slash form for cross-platform testing.
+        fwd = path_value.replace("\\", "/")
+        self.assertTrue(
+            fwd.startswith(self._RUNTIME_PREFIX),
+            f"{name}={path_value!r} does not start with {self._RUNTIME_PREFIX!r}",
+        )
+
+    def test_active_next_profile_path_outside_models(self):
+        self._check_prefix(self.module.ACTIVE_NEXT_PROFILE_PATH, "ACTIVE_NEXT_PROFILE_PATH")
+
+    def test_last_model_stack_path_outside_models(self):
+        self._check_prefix(self.module.LAST_MODEL_STACK_PATH, "LAST_MODEL_STACK_PATH")
+
+    def test_last_warmup_workflow_path_outside_models(self):
+        self._check_prefix(self.module.LAST_WARMUP_WORKFLOW_PATH, "LAST_WARMUP_WORKFLOW_PATH")
+
+    def test_sage_runtime_cache_path_outside_models(self):
+        self._check_prefix(self.module.SAGE_RUNTIME_CACHE_PATH, "SAGE_RUNTIME_CACHE_PATH")
+
+    def test_preload_mode_path_outside_models(self):
+        self._check_prefix(self.module.PRELOAD_MODE_PATH, "PRELOAD_MODE_PATH")
+
+    def test_known_good_profiles_path_outside_models(self):
+        self._check_prefix(self.module.KNOWN_GOOD_WORKFLOW_PROFILES_PATH, "KNOWN_GOOD_WORKFLOW_PROFILES_PATH")
+
+    def test_per_stack_metrics_path_outside_models(self):
+        self._check_prefix(self.module.PER_STACK_METRICS_PATH, "PER_STACK_METRICS_PATH")
+
+    def test_runtime_config_dir_outside_models(self):
+        self._check_prefix(self.module.RUNTIME_CONFIG_DIR, "RUNTIME_CONFIG_DIR")
+
+    def test_validation_cert_dir_outside_models(self):
+        self._check_prefix(self.module._VALIDATION_CERT_DIR, "_VALIDATION_CERT_DIR")
+
+    def test_build_gpu_volumes_includes_runtime_config(self):
+        vols = self.module._build_gpu_volumes()
+        self.assertIn(
+            self.module.RUNTIME_CONFIG_PATH,
+            vols,
+            f"runtime config path not in GPU volumes: {list(vols.keys())}",
+        )
+
+    def test_runtime_config_volume_name(self):
+        self.assertEqual(
+            self.module.RUNTIME_CONFIG_VOLUME_NAME,
+            "comfymodal-runtime-config",
+        )
+
+
+class RuntimeCommitHelperTests(unittest.TestCase):
+    """Verify renamed commit helper only commits runtime_config_vol."""
+
+    def setUp(self):
+        self.module = load_module()
+
+    def test_commit_helper_renamed(self):
+        self.assertTrue(
+            hasattr(self.module, "_commit_runtime_config_vol_async"),
+            "_commit_runtime_config_vol_async not found",
+        )
+
+    def test_save_known_good_uses_renamed_helper(self):
+        src = self.module.__file__
+        with open(src, "r", encoding="utf-8") as f:
+            source = f.read()
+        self.assertIn("_commit_runtime_config_vol_async", source)
+        self.assertNotIn("_commit_volume_async(label", source)
+
+    def test_save_last_model_stack_uses_renamed_helper(self):
+        # AST-level check inside _ComfyAPIMixin
+        import ast
+        with open(self.module.__file__, "r", encoding="utf-8-sig") as f:
+            tree = ast.parse(f.read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_save_last_model_stack":
+                source_seg = ast.unparse(node)
+                self.assertIn("_commit_runtime_config_vol_async", source_seg)
+                self.assertNotIn("_commit_volume_async", source_seg)
+                return
+        self.fail("_save_last_model_stack not found")
+
+    def test_save_last_warmup_workflow_uses_renamed_helper(self):
+        import ast
+        with open(self.module.__file__, "r", encoding="utf-8-sig") as f:
+            tree = ast.parse(f.read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_save_last_warmup_workflow":
+                source_seg = ast.unparse(node)
+                self.assertIn("_commit_runtime_config_vol_async", source_seg)
+                return
+        self.fail("_save_last_warmup_workflow not found")
 
 
 if __name__ == "__main__":

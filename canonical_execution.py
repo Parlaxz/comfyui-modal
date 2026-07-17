@@ -571,6 +571,14 @@ async def prepare_modal_execution(
                         _prod_meta[f"workspace_{_wk}"] = str(_wv)[:64]
             # Run surface — already a RunTrace property, include explicitly for consumers
             _prod_meta["run_surface"] = run_trace.run_surface
+            # Active profile preparation results (lane A) — always present
+            # for both production and non-production paths.
+            _prod_meta["local_active_profile_prepare_ms"] = _pn_result.get("local_active_profile_prepare_ms", 0.0)
+            _prod_meta["active_profile_publish_decision"] = _pn_result.get("active_profile_publish_decision", "")
+            _prod_meta["active_profile_stable_key"] = _pn_result.get("active_profile_stable_key", "")
+            _prod_meta["active_profile_token"] = _pn_result.get("active_profile_token", "")
+            _prod_meta["active_profile_remote_call"] = _pn_result.get("active_profile_remote_call", 0)
+            _prod_meta["active_profile_remote_ms"] = _pn_result.get("active_profile_remote_ms", 0.0)
             run_trace.set_meta(**_prod_meta)
 
         # 6. Pass caller modal_options through without reconstructing model-loading policy.
