@@ -380,6 +380,10 @@ export function createProgressTracker(api) {
       state.phase = phase;
       state.message = d.message || phase;
       if (d.prompt_id) state.promptId = d.prompt_id;
+      if (!state.startTime) {
+        state.startTime = Date.now();
+        _startTimer();
+      }
       _notify();
     } else if (phase === 'execution') {
       // Execution phase: advance to generating if idle/startup/queued
@@ -409,6 +413,10 @@ export function createProgressTracker(api) {
         state.phase = phase;
         state.message = d.message || phase;
         if (d.prompt_id) state.promptId = d.prompt_id;
+        if (!state.startTime) {
+          state.startTime = Date.now();
+          _startTimer();
+        }
         _notify();
       }
     }
@@ -884,6 +892,10 @@ export function createScopedTracker(api, identity) {
       state.phase = phase;
       state.message = d.message || phase;
       if (d.prompt_id) state.promptId = d.prompt_id;
+      if (!state.startTime) {
+        state.startTime = Date.now();
+        _startTimer();
+      }
       _notify();
     } else if (phase === 'execution') {
       if (state.stage === 'idle' || state.stage === 'startup' || state.stage === 'queued') {
@@ -909,6 +921,10 @@ export function createScopedTracker(api, identity) {
         state.phase = phase;
         state.message = d.message || phase;
         if (d.prompt_id) state.promptId = d.prompt_id;
+        if (!state.startTime) {
+          state.startTime = Date.now();
+          _startTimer();
+        }
         _notify();
       }
     }

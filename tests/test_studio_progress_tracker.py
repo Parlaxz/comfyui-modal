@@ -257,5 +257,56 @@ class ModalExecutionSamplerMappingTests(_ProgressSourceMixin, unittest.TestCase)
         )
 
 
+class StartupTimerInitializationTests(unittest.TestCase):
+    """Verify onModalStatus in both trackers starts timer on first startup phase.
+
+    Root cause: modal_status startup phases set stage='startup' but did not
+    initialize startTime. Subsequent execution_start is ignored by the re-entry
+    guard (stage==='startup'), so the timer only started at phase='execution',
+    losing all startup time. The fix adds startTime initialization at the first
+    matching startup status when no startTime exists.
+    """
+
+    def setUp(self):
+        self.source = PROGRESS_PATH.read_text(encoding="utf-8")
+
+    def test_global_tracker_onModalStatus_starts_timer_on_startup_phase(self):
+        """Global tracker onModalStatus must init startTime on startup phase."""
+        # Locate the global tracker's onModalStatus (first occurrence)
+        fn_start = self.source.index("  function onModalStatus(detail) {")
+        # Termination: the Wire up events section follows in the global tracker
+        fn_end = self.source.index("  // ── Wire up events", fn_start)
+        section = self.source[fn_start:fn_end]
+        self.assertIn(
+            "if (!state.startTime)",
+            section,
+            "Global tracker onModalStatus must guard startTime initialization",
+        )
+        self.assertIn(
+            "_startTimer();",
+            section,
+            "Global tracker onModalStatus must call _startTimer() on startup phase",
+        )
+
+    def test_scoped_tracker_onModalStatus_starts_timer_on_startup_phase(self):
+        """Scoped tracker onModalStatus must init startTime on startup phase."""
+        # Find the second onModalStatus (inside createScopedTracker)
+        first_fn = self.source.index("  function onModalStatus(detail) {")
+        fn_start = self.source.index("  function onModalStatus(detail) {", first_fn + 1)
+        # The scoped tracker's onModalStatus is followed by Experiment event handlers
+        fn_end = self.source.index("  // ── Experiment event handlers", fn_start)
+        section = self.source[fn_start:fn_end]
+        self.assertIn(
+            "if (!state.startTime)",
+            section,
+            "Scoped tracker onModalStatus must guard startTime initialization",
+        )
+        self.assertIn(
+            "_startTimer();",
+            section,
+            "Scoped tracker onModalStatus must call _startTimer() on startup phase",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
