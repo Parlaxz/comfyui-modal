@@ -1434,14 +1434,14 @@ def _run_deploy_background(workspace: dict, custom_nodes_fingerprint: str | None
                 deployed_at=_utc_now_iso(),
                 deployment_command=f'"{modal_cmd}" deploy "{_COMFYAPP_PATH}"',
             )
-            # Mark this deploy as a new generation that needs warmup.
-            # Launch automatic warmup in a background thread.
+            # Mark this deploy as a new generation that requires manual warmup.
+            # No automatic GPU work is submitted — user must call
+            # POST /comfymodal/deploy-warmup/run explicitly.
             try:
                 state = WarmupState(_warmup_state_path)
                 state.mark_deploy_started(
                     version, custom_nodes_fingerprint or "", time.time()
                 )
-                state._data["auto_warmup_pending"] = True
                 state._flush()
                 # Auto-record the deploy in run history.
                 REGISTRY.history().record_run(
@@ -1456,22 +1456,13 @@ def _run_deploy_background(workspace: dict, custom_nodes_fingerprint: str | None
                         "workspace_label": workspace.get("label", ""),
                     },
                 )
-                # Launch automatic warmup in a background thread
-                if _modal_available:
-                    def _auto_warmup():
-                        try:
-                            _run_auto_warmup(version, custom_nodes_fingerprint or "")
-                        except Exception as exc:
-                            print(f"[comfyui-modal] auto warmup failed: {exc}")
-                    t = threading.Thread(target=_auto_warmup, daemon=True)
-                    t.start()
             except Exception as exc:
                 print(f"[comfyui-modal] warmup state mark failed: {exc}")
             _deploy_status = {
                 "state": "deployed_unwarmed",
-                "message": f"Deployed {workspace['label']} v{version}, warming...",
+                "message": f"Deployed {workspace['label']} v{version}, manual warmup required",
             }
-            print(f"[comfyui-modal] Deploy succeeded ({workspace['label']} v{version}), warming...")
+            print(f"[comfyui-modal] Deploy succeeded ({workspace['label']} v{version}), warmup via /comfymodal/deploy-warmup/run")
             if _modal_available:
                 try:
                     clear_cache()
@@ -1563,74 +1554,6 @@ def _maybe_auto_deploy():
         _deploy_status["message"] = "Already deployed and current"
         _deploy_status["warning"] = False
         print("[comfyui-modal] deploy state already current - skipping deploy")
-
-def _run_auto_warmup(version: str, fingerprint: str) -> None:
-    """Run automatic warmup after deploy. Runs in background thread."""
-    global _deploy_status
-    try:
-        state = WarmupState(_warmup_state_path)
-        gen = state.deployment_generation()
-        if not gen:
-            print("[comfyui-modal] auto warmup: no deployment generation, skipping")
-            return
-
-        # Generate a consistent warmup run id for the full lifecycle
-        warmup_run_id = f"auto_{uuid.uuid4().hex[:8]}"
-
-        # Mark warmup as in-progress BEFORE any async work so that
-        # is_warming() is observable and double-warmup is prevented.
-        if state.is_warming():
-            print("[comfyui-modal] auto warmup: already warming, skipping")
-            return
-        state.mark_warmup_started(gen, warmup_run_id=warmup_run_id)
-
-        # Resolve a warmup workflow
-        wf = _load_latest_benchmark_workflow().get("payload", {}).get("prompt", {})
-        if not wf:
-            print("[comfyui-modal] auto warmup: no workflow available, skipping")
-            state.mark_warmup_failed(gen, "no warmup workflow available")
-            return
-
-        import asyncio
-
-        async def _do_warmup():
-            from modal_client import run_prompt_stream
-            had_result = False
-            try:
-                async for ev in run_prompt_stream(
-                    wf,
-                    input_images=None,
-                    modal_options={"comfymodal_warmup": True, "discard": True},
-                ):
-                    if ev.get("type") == "result":
-                        had_result = True
-                        break
-                    if ev.get("type") == "error":
-                        state.mark_warmup_failed(
-                            gen, ev.get("message", "warmup error"),
-                        )
-                        _deploy_status = {
-                            "state": "unwarmed",
-                            "message": f"Warmup failed: {ev.get('message', 'unknown error')}",
-                        }
-                        return
-            except Exception as exc:
-                state.mark_warmup_failed(
-                    gen, str(exc),
-                )
-                return
-            if had_result:
-                try:
-                    state.mark_warmed(gen, warmup_run_id=warmup_run_id)
-                    _deploy_status = {"state": "ready", "message": "Warmup complete"}
-                    print("[comfyui-modal] auto warmup succeeded")
-                except Exception as exc:
-                    print(f"[comfyui-modal] auto warmup mark failed: {exc}")
-
-        asyncio.run(_do_warmup())
-    except Exception as exc:
-        print(f"[comfyui-modal] auto warmup error: {exc}")
-
 
 try:
     from server import PromptServer
@@ -6502,10 +6425,6 @@ if _server:
         )
         warmup_run_id = f"warm_{uuid.uuid4().hex[:8]}"
         state.mark_warmed(gen, warmup_run_id=warmup_run_id)
-        # Clear auto-warmup pending flag if set
-        if state._data.get("auto_warmup_pending"):
-            state._data["auto_warmup_pending"] = False
-            state._flush()
         return web.json_response({"status": "ok", "state": state.snapshot()})
 
     @_server.routes.post("/comfymodal/deploy-warmup/invalidate")

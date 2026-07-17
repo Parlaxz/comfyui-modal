@@ -242,8 +242,9 @@ class WarmupProfileDedupTests(unittest.TestCase):
         self.assertIn("output_node_ids", profile,
                       "Production profile must carry output_node_ids")
 
-    def test_different_output_ids_different_key(self):
-        """Different output node IDs must produce different stable keys."""
+    def test_different_output_ids_same_key(self):
+        """Different output node IDs must produce the same restore key
+        (output IDs are excluded from restore identity)."""
         from warmup_profile import _normalize_stable_profile
         p1 = {
             "mode": "split", "unet": "a", "clip1": "b",
@@ -259,11 +260,12 @@ class WarmupProfileDedupTests(unittest.TestCase):
         p2["output_node_ids"] = ["10"]
         k1 = self._compute_key(p1)
         k2 = self._compute_key(p2)
-        self.assertNotEqual(k1, k2,
-                            "Different output_node_ids must produce different keys")
+        self.assertEqual(k1, k2,
+                         "Different output_node_ids must produce the same key")
 
-    def test_production_on_vs_off_different_key(self):
-        """Same model stack with production on/off must produce different keys."""
+    def test_production_on_vs_off_same_key(self):
+        """Same model stack with production on/off must produce the same restore key
+        (production status is excluded from restore identity)."""
         from warmup_profile import _normalize_stable_profile
         base = {
             "mode": "split", "unet": "a", "clip1": "b",
@@ -277,8 +279,8 @@ class WarmupProfileDedupTests(unittest.TestCase):
 
         k_on = self._compute_key(prod_on)
         k_off = self._compute_key(prod_off)
-        self.assertNotEqual(k_on, k_off,
-                            "Production ON vs OFF must produce different keys")
+        self.assertEqual(k_on, k_off,
+                         "Production ON vs OFF must produce the same restore key")
 
     def test_payload_has_production_enabled_true(self):
         """Payload must have production_enabled=True when production enabled."""
@@ -294,10 +296,10 @@ class WarmupProfileDedupTests(unittest.TestCase):
         self.assertTrue(profile.get("production_enabled"),
                         "warmup_profile must carry production_enabled=True for dedup")
 
-    def test_build_activation_payload_stable_key_differs_by_production_state(self):
+    def test_build_activation_payload_stable_key_same_across_production_state(self):
         """Two payloads with identical model stack but different production
-        state must produce different _compute_stable_key values, proving
-        the dedup key cannot suppress one with the other."""
+        state must produce the same _compute_stable_key value, because
+        production state is excluded from restore identity."""
         wf = {"3": {"class_type": "KSampler", "inputs": {}}}
         prod_on = self._build_payload(wf, "hash123", {
             "enabled": True, "output_node_ids": ["9"], "bypass_node_ids": [],
@@ -305,8 +307,8 @@ class WarmupProfileDedupTests(unittest.TestCase):
         prod_off = self._build_payload(wf, "hash123", None)
         k_on = self._compute_key(prod_on.get("warmup_profile", {}))
         k_off = self._compute_key(prod_off.get("warmup_profile", {}))
-        self.assertNotEqual(k_on, k_off,
-                            "Production ON vs OFF must produce different stable keys")
+        self.assertEqual(k_on, k_off,
+                         "Production ON vs OFF must produce the same restore key")
 
     def test_payload_no_production_enabled_when_off(self):
         """Payload must NOT have production_enabled when production disabled."""
@@ -361,10 +363,9 @@ class WarmupProfileDedupTests(unittest.TestCase):
         )
         self.assertTrue(payload.get("production_enabled"),
                         "Explicit enabled=True must set production_enabled")
-
-    def test_default_on_produces_different_key_than_off(self):
-        """The dedup key must differ when production defaults-on vs explicitly off,
-        proving the fix prevents cross-contamination."""
+    def test_default_on_produces_same_key_as_off(self):
+        """The dedup key must be the same when production defaults-on vs explicitly
+        off, because production state is excluded from restore identity."""
         from warmup_profile import _compute_stable_key
         wf = {"3": {"class_type": "KSampler", "inputs": {"seed": 7}}}
         default_on_opts = __import__("production_workflow", fromlist=["normalize_production_options"]).normalize_production_options({})
@@ -376,11 +377,12 @@ class WarmupProfileDedupTests(unittest.TestCase):
         p_off = _build_activation_payload(wf, "h", off_opts)
         k_on = _compute_stable_key(p_on.get("warmup_profile", {}))
         k_off = _compute_stable_key(p_off.get("warmup_profile", {}))
-        self.assertNotEqual(k_on, k_off,
-                            "Default-on vs off must produce different dedup keys")
+        self.assertEqual(k_on, k_off,
+                         "Default-on vs off must produce the same restore key")
 
-    def test_different_bypass_ids_different_key(self):
-        """Different bypass_node_ids must produce different keys."""
+    def test_different_bypass_ids_same_key(self):
+        """Different bypass_node_ids must produce the same restore key
+        (bypass IDs are excluded from restore identity)."""
         from warmup_profile import _normalize_stable_profile
         p1 = {
             "mode": "split", "unet": "a", "clip1": "b",
@@ -396,8 +398,8 @@ class WarmupProfileDedupTests(unittest.TestCase):
         p2["bypass_node_ids"] = ["8"]
         k1 = self._compute_key(p1)
         k2 = self._compute_key(p2)
-        self.assertNotEqual(k1, k2,
-                            "Different bypass_node_ids must produce different keys")
+        self.assertEqual(k1, k2,
+                         "Different bypass_node_ids must produce the same restore key")
 
 
 class ProductionBaselineResolveOverrideTests(unittest.TestCase):

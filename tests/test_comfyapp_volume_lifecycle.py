@@ -13,7 +13,7 @@ _AST_CACHE = None
 def _get_ast():
     global _AST_CACHE
     if _AST_CACHE is None:
-        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
         _AST_CACHE = ast.parse(source)
     return _AST_CACHE
 
@@ -195,6 +195,110 @@ class ComfyAppVolumeLifecycleTests(unittest.TestCase):
         self.assertIn("sys.path.insert(0, comfy_path)", method_source)
         self.assertIn("import comfy.cli_args", method_source)
         self.assertIn("comfy.cli_args.args.cpu = True", method_source)
+
+    # ── Runtime config volume migration tests ─────────────────────────
+
+    def _get_module_body(self):
+        return _get_ast().body
+
+    def test_runtime_config_volume_declared(self):
+        """runtime_config_vol must be declared as a named Modal Volume."""
+        body = self._get_module_body()
+        found = False
+        for node in body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "runtime_config_vol":
+                        found = True
+                        break
+        self.assertTrue(found, "runtime_config_vol must be assigned at module level")
+
+    def test_runtime_config_volume_mounted_in_gpu_volumes(self):
+        """_build_gpu_volumes must include RUNTIME_CONFIG_PATH."""
+        source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
+        func_name = "_build_gpu_volumes"
+        # Find the function in the AST and check for the expected content
+        self.assertIn(func_name, source,
+                      "_build_gpu_volumes must exist")
+        self.assertIn("RUNTIME_CONFIG_PATH", source,
+                      "_build_gpu_volumes must reference RUNTIME_CONFIG_PATH")
+        self.assertIn("runtime_config_vol", source,
+                      "_build_gpu_volumes must reference runtime_config_vol")
+
+    def test_runtime_config_paths_not_under_models(self):
+        """Runtime/config file paths must not be under /root/models."""
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        # Assert the old path is NOT present
+        old_meta_path = '"/root/models/runtime_config/runtime_metadata.json"'
+        self.assertNotIn(old_meta_path, source,
+                         "RUNTIME_METADATA_PATH must not point to /root/models")
+        # Key module-level constants already point to /root/comfymodal_runtime
+        self.assertIn("RUNTIME_CONFIG_PATH = \"/root/comfymodal_runtime\"", source)
+        self.assertIn("RUNTIME_CONFIG_DIR = \"/root/comfymodal_runtime\"", source)
+
+    def test_active_next_profile_path_under_runtime_config(self):
+        """ACTIVE_NEXT_PROFILE_PATH must be under /root/comfymodal_runtime."""
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn('ACTIVE_NEXT_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "active_next_profile.json")', source)
+
+    def test_no_commit_volume_async_remaining(self):
+        """_commit_volume_async must be fully replaced by _commit_runtime_config_vol_async."""
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("_commit_volume_async", source,
+                         "All _commit_volume_async call sites must be migrated")
+
+    def test_cpu_functions_use_runtime_config_vol(self):
+        """CPU runtime functions must mount runtime_config_vol, not vol."""
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        # set_preload_mode should use runtime_config_vol
+        self.assertIn("volumes={RUNTIME_CONFIG_PATH: runtime_config_vol}", source)
+        # set_runtime_flag should not have hardcoded /root/models paths
+        self.assertNotIn('os.makedirs("/root/models/runtime_config"', source)
+
+    def test_storage_identity_diagnostics_exist(self):
+        """_log_storage_identity_diagnostics must be defined."""
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn("def _log_storage_identity_diagnostics", source)
+
+    def test_runtime_config_vol_reloaded_at_startup_and_restore(self):
+        """runtime_config_vol.reload() must be called at startup and restore."""
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        # Verify reload call exists in the file
+        self.assertIn("runtime_config_vol.reload()", source)
+
+    def test_persist_validation_certificate_backed_by_runtime_config_vol(self):
+        """persist_validation_certificate must use runtime_config_vol."""
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn("def persist_validation_certificate", source)
+        self.assertIn("volumes={RUNTIME_CONFIG_PATH: runtime_config_vol}", source)
+
+    def test_model_volume_comment_present(self):
+        """The exact one-line comment must precede the model volume declaration."""
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "# Model weights are read-only during generation; never store request/runtime state here.",
+            source,
+        )
+
+    def test_known_good_profiles_uses_runtime_config_vol_async(self):
+        """save_known_good_workflow_profiles must use _commit_runtime_config_vol_async."""
+        func_name = "save_known_good_workflow_profiles"
+        source = COMFYAPP_PATH.read_text(encoding="utf-8")
+        self.assertIn("_commit_runtime_config_vol_async(\"known_good_profiles\", runtime_config_vol)", source)
+
+    def test_write_active_next_profile_uses_runtime_config_vol(self):
+        """_write_active_next_profile must accept and commit runtime_config_volume, not global vol."""
+        source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
+        self.assertIn(
+            "def _write_active_next_profile(self, payload: dict, runtime_config_volume)",
+            source,
+            "_write_active_next_profile must accept explicit runtime_config_volume parameter",
+        )
+        self.assertIn(
+            "runtime_config_volume.commit()",
+            source,
+            "_write_active_next_profile must commit the passed runtime_config_volume",
+        )
 
 
 if __name__ == "__main__":

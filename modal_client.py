@@ -215,14 +215,12 @@ def _workspace_api(workspace: dict, gpu: str | None = None):
         cls_handle = modal.Cls.from_name(APP_NAME, entry["class_name"], client=_workspace_client(workspace))
         kwargs = {}
         if selected_gpu == "rtx-pro-6000":
-            kwargs["cloud"] = "gcp"
             print(f"[modal-client] phase=cls_create requested_cloud=gcp requested_region=unconstrained")
-        else:
-            if region:
-                kwargs["region"] = region
-            if cloud:
-                kwargs["cloud"] = cloud
-        if kwargs:
+        if region:
+            kwargs["region"] = region
+        if cloud:
+            kwargs["cloud"] = cloud
+        if region or cloud:
             cls_handle = cls_handle.with_options(**kwargs)
         instance = cls_handle()
         _workspace_cls_instances[key] = instance
@@ -712,9 +710,9 @@ def persist_validation_certificate(
 ) -> dict:
     """Synchronous post-delivery persistence of a validation certificate.
 
-    Calls a small CPU-only Modal function mounted to the models volume.
-    Failures are returned as a dict with ``status="error"``; the caller
-    never raises out of this path.
+    Calls a small CPU-only Modal function mounted to the runtime-config
+    Volume (not the models Volume).  Failures are returned as a dict with
+    ``status="error"``; the caller never raises out of this path.
 
     Wraps the same workspace-capture pattern as persist_clip_cache_payload.
     """

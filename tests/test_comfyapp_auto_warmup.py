@@ -233,11 +233,15 @@ class SaveLoadActiveProfileTests(unittest.TestCase):
             "model_stack": {"unet": ["u.safetensors"], "clip": ["c.safetensors"], "vae": ["v.safetensors"], "checkpoint": [], "clip_type": "flux"},
             "warmup_profile": {"mode": "split", "unet": "u.safetensors", "clip1": "c.safetensors", "clip2": "c.safetensors", "vae": "v.safetensors", "clip_type": "flux"},
         }
-        inst._write_active_next_profile(payload)
+        class _MockVol:
+            def commit(self): pass
+        inst._write_active_next_profile(payload, _MockVol())
         self.assertEqual(inst._load_active_next_profile(now=1001.0)["profile_token"], "tok-1")
 
     def test_load_active_profile_returns_expired_diagnostic_when_expired(self):
         inst = self._make_instance()
+        class _MockVol2:
+            def commit(self): pass
         inst._write_active_next_profile({
             "profile_token": "tok-expired",
             "workflow_hash": "hash-old",
@@ -246,7 +250,7 @@ class SaveLoadActiveProfileTests(unittest.TestCase):
             "disable_warmup": False,
             "model_stack": {},
             "warmup_profile": {"mode": "checkpoint", "checkpoint": "old.safetensors"},
-        })
+        }, _MockVol2())
         result = inst._load_active_next_profile(now=1002.0)
         self.assertEqual(result.get("_diagnostic", {}).get("status"), "expired")
         self.assertIn("warmup_profile", result)
