@@ -205,19 +205,26 @@ def _workspace_api(workspace: dict, gpu: str | None = None):
         raise ValueError(f"Unsupported GPU: {selected_gpu}")
     region = _COMFYMODAL_COMPUTE_REGION
     cloud = _COMFYMODAL_COMPUTE_CLOUD
+    if selected_gpu == "rtx-pro-6000":
+        region = ""
+        cloud = "gcp"
     key = (workspace["id"], selected_gpu, region, cloud)
     instance = _workspace_cls_instances.get(key)
     if instance is None:
         _handle_cache_misses += 1
         cls_handle = modal.Cls.from_name(APP_NAME, entry["class_name"], client=_workspace_client(workspace))
-        instance = cls_handle()
-        if region or cloud:
-            kwargs = {}
+        kwargs = {}
+        if selected_gpu == "rtx-pro-6000":
+            kwargs["cloud"] = "gcp"
+            print(f"[modal-client] phase=cls_create requested_cloud=gcp requested_region=unconstrained")
+        else:
             if region:
                 kwargs["region"] = region
             if cloud:
                 kwargs["cloud"] = cloud
-            instance = instance.with_options(**kwargs)
+        if kwargs:
+            cls_handle = cls_handle.with_options(**kwargs)
+        instance = cls_handle()
         _workspace_cls_instances[key] = instance
     else:
         _handle_cache_hits += 1
