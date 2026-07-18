@@ -20,11 +20,16 @@ class _Executor:
 
     def __init__(self):
         self.executed = []
+        self.sync_called = False
 
     def reset(self):
         pass
 
     def execute(self, **kwargs):
+        self.sync_called = True
+        self.executed.append(kwargs)
+
+    async def execute_async(self, **kwargs):
         self.executed.append(kwargs)
 
 
@@ -87,6 +92,7 @@ def test_v2_runner_uses_prompt_executor_and_live_registry_without_legacy_wrapper
     assert result["outputs"]["107"]["images"][0]["node_id"] == "107"
     assert registered["req-1"]["authorized_node_ids"] == ["107"]
     assert executor.executed[0]["prompt_id"] == "req-1"
+    assert executor.sync_called is False
     assert cleaned == [("request", "req-1"), ("registry", "req-1")]
     assert "prompt_executor_start" in [event.name for event in trace.events]
     assert "output_collect_end" in [event.name for event in trace.events]

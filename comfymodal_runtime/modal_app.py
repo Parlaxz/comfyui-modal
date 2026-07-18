@@ -423,12 +423,19 @@ class ModalRuntimeEntrypoint:
         try:
             executor.reset()
             trace.emit("prompt_executor_start", phase="execution", metadata={"prompt_id": prompt_id})
-            executor.execute(
-                prompt=workflow,
-                prompt_id=prompt_id,
-                extra_data={"client_id": prompt_id},
-                execute_outputs=outputs_to_execute,
-            )
+            execute_async = getattr(executor, "execute_async", None)
+            execute_kwargs = {
+                "prompt": workflow,
+                "prompt_id": prompt_id,
+                "extra_data": {"client_id": prompt_id},
+                "execute_outputs": outputs_to_execute,
+            }
+            if callable(execute_async):
+                execute_result = execute_async(**execute_kwargs)
+                if inspect.isawaitable(execute_result):
+                    await execute_result
+            else:
+                executor.execute(**execute_kwargs)
             trace.emit(
                 "prompt_executor_end",
                 phase="execution",
