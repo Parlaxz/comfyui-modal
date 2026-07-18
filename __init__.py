@@ -106,6 +106,7 @@ from canonical_execution import (
     prepare_modal_execution,
 )
 from comfymodal_runtime.modal_transport import ModalTransport
+from comfymodal_runtime.restore_plan import RemoteRestorePlanPublisher
 from comfymodal_runtime.result_delivery import materialize_modal_result as _materialize_v2_result
 from comfymodal_runtime.trace import RuntimeTrace
 from comparison import (
@@ -749,18 +750,6 @@ def _materialize_experiment_output(
         "primary_thumbnail_asset_id": primary_thumbnail_asset_id,
         "output_count": seen,
     }
-
-
-def _get_v2_restore_publisher():
-    """Lazy singleton: delegates to the shared
-    ``comfymodal_runtime.restore_plan.get_default_restore_publisher()``
-    so normal v2 and Playground use the same publisher/coordinator.
-
-    Not initialized at import time — first call on the v2 execution path.
-    Concurrent requests share the same coordinator.
-    """
-    from comfymodal_runtime.restore_plan import get_default_restore_publisher as _shared
-    return _shared()
 
 
 _COMFYAPP_PATH = os.path.join(_NODE_DIR, "comfyapp.py")
@@ -2239,11 +2228,13 @@ async def _execute_job(item: tuple, item_id: int):
                 print(f"[comfyui-modal] v2 shadow plan built hash={_v2_plan.workflow_hash[:12]}")
 
         if _mode == "v2" and _v2_plan is not None:
-            _v2_publisher = _get_v2_restore_publisher()
+            _v2_transport = ModalTransport()
+            _v2_publisher = RemoteRestorePlanPublisher(_v2_transport, _request_workspace or None)
             result = await execute_plan(
                 _v2_plan,
+                transport=_v2_transport,
                 restore_publisher=_v2_publisher,
-                profile_setter=set_active_warmup_profile,
+                profile_setter=None,
                 gpu=extra_data.get("gpu"),
                 workspace=_request_workspace or None,
                 trace=_v2_trace,

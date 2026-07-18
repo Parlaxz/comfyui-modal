@@ -1739,11 +1739,11 @@ class TestDefaultExecutorDelegation(unittest.TestCase):
         self.assertIsNotNone(observed_kwargs.get("restore_publisher"),
                              "restore_publisher must be provided")
         self.assertIn("gpu", observed_kwargs)
-        # Must use a shared default restore publisher (RestorePlanPublisher instance)
+        # Production v2 must publish through the remote runtime-state method.
         pub = observed_kwargs.get("restore_publisher")
         self.assertIsNotNone(pub, "restore_publisher must be provided")
-        self.assertEqual(type(pub).__name__, "RestorePlanPublisher",
-                         "restore_publisher must be a RestorePlanPublisher")
+        self.assertEqual(type(pub).__name__, "RemoteRestorePlanPublisher",
+                         "v2 must use the remote RestorePlan publisher")
 
     def test_injected_transport_when_run_prompt_stream_fn_provided(self):
         """When run_prompt_stream_fn is supplied, a ModalTransport is

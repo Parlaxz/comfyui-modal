@@ -52,8 +52,12 @@ def _workflow_with_models(
 
 
 def _workflow_with_prompt(prompt: str = "a cat") -> dict:
-    """Build a minimal workflow with only a CLIPTextEncode."""
+    """Build a minimal workflow with a safely resolvable CLIP loader."""
     return {
+        "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {"clip_name": "clip_l.safetensors", "type": "flux"},
+        },
         "4": {
             "class_type": "CLIPTextEncode",
             "inputs": {"text": prompt, "clip": ["2", 0]},
@@ -166,6 +170,10 @@ class TestDerivePrefillKey(unittest.TestCase):
     def test_multiple_prompts_are_sorted_deterministically(self):
         model_key = ModelRestoreKey(unet_identity="u")
         wf = {
+            "2": {
+                "class_type": "CLIPLoader",
+                "inputs": {"clip_name": "clip_l.safetensors", "type": "flux"},
+            },
             "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "B", "clip": ["2", 0]}},
             "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "A", "clip": ["2", 0]}},
         }
@@ -177,7 +185,7 @@ class TestDerivePrefillKey(unittest.TestCase):
         prefill = derive_prefill_key(model_key, {})
         self.assertEqual(prefill.prompt_bundle_hash, "")
 
-    def test_sdxl_encode_is_included(self):
+    def test_unsupported_sdxl_encode_is_not_prefill_eligible(self):
         model_key = ModelRestoreKey(unet_identity="u")
         wf = {
             "4": {
@@ -186,7 +194,8 @@ class TestDerivePrefillKey(unittest.TestCase):
             },
         }
         prefill = derive_prefill_key(model_key, wf)
-        self.assertNotEqual(prefill.prompt_bundle_hash, "")
+        self.assertEqual(prefill.prompt_bundle_hash, "")
+        self.assertFalse(prefill.encode_options["eligible"])
 
     def test_stable_hash_differs_for_different_prompts(self):
         """Two PrefillKeys with different prompts but same model have different hashes."""

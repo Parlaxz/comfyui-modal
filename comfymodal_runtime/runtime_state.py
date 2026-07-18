@@ -143,6 +143,10 @@ class MountedStateVolume:
         self._write_count += 1
         self._write_bytes_total += len(data)
 
+    def reload(self) -> None:
+        """Hook for mounted filesystems; Modal-backed volumes override it."""
+        return None
+
     def read_bytes(self, path: str) -> bytes:
         final = self._resolve(path)
         self._read_count += 1
@@ -200,6 +204,26 @@ class MountedStateVolume:
     @property
     def write_bytes_total(self) -> int:
         return self._write_bytes_total
+
+
+class ModalMountedStateVolume(MountedStateVolume):
+    """Mounted runtime-state files backed by a real Modal Volume."""
+
+    def __init__(self, root: str, modal_volume: Any) -> None:
+        super().__init__(root)
+        self._modal_volume = modal_volume
+
+    def reload(self) -> None:
+        reload_fn = getattr(self._modal_volume, "reload", None)
+        if callable(reload_fn):
+            reload_fn()
+
+    def commit(self) -> None:
+        super().commit()
+        commit_fn = getattr(self._modal_volume, "commit", None)
+        if not callable(commit_fn):
+            raise RuntimeError("runtime-state Modal Volume does not expose commit()")
+        commit_fn()
 
 
 # ── Metrics ──────────────────────────────────────────────────────────────
@@ -282,6 +306,10 @@ class CommitCoordinator:
                 last_commit_ms=self._metrics.last_commit_ms,
             )
 
+    @property
+    def state_path(self) -> str:
+        return self._state_path
+
     # ── Internal helpers ───────────────────────────────────────────────
 
     def _temp_path(self) -> str:
@@ -327,6 +355,12 @@ class CommitCoordinator:
             # If a commit is in-flight, schedule a follow-up commit
             if self._in_flight:
                 self._needs_follow_up = True
+
+    def reload(self) -> None:
+        """Reload the authoritative backing volume before a state read."""
+        reload_fn = getattr(self._volume, "reload", None)
+        if callable(reload_fn):
+            reload_fn()
 
     def commit(self, generation: int) -> bool:
         """Commit *generation* if it matches the current dirty generation.
