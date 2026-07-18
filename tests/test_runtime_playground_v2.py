@@ -1044,6 +1044,66 @@ class HistoryAndOutputMetadataTests(unittest.TestCase):
 
         asyncio.run(_test())
 
+    def test_materialized_output_paths_persisted_in_history_meta(self):
+        """Materialized output paths from ``_default_save_history`` appear
+        in the saved history record's meta — not raw result filenames."""
+        import experiment_service as exp_svc
+
+        fake_history = FakeRunHistory()
+        fake_registry = MagicMock()
+        fake_registry.history.return_value = fake_history
+        original_registry = exp_svc.REGISTRY
+        exp_svc.REGISTRY = fake_registry
+        try:
+            plan = MagicMock(spec=[])
+            plan.request_metadata = {"studio_preset_id": "test"}
+            plan.prompt_bundle = {"prompt": "hello"}
+            plan.workflow_hash = "wf_abc"
+
+            # result carries a raw filename that should NOT appear in history
+            # when materialized_paths is provided.
+            result = {"outputs": {"107": {"images": [{"filename": "raw_internal.png"}]}}}
+
+            async def _test():
+                await self.mod._default_save_history(
+                    plan, result, "rh_materialized_test",
+                    materialized_paths=["studio_out.png"],
+                )
+
+            asyncio.run(_test())
+
+            # Inspect the history record — meta["output_paths"] must contain
+            # the materialized paths, not the raw result filenames.
+            run = fake_history.get_run("r_1")
+            self.assertIsNotNone(run, "History record should exist")
+            meta = run.get("meta", {})
+            self.assertIn("output_paths", meta,
+                          "History meta must contain output_paths")
+            self.assertEqual(
+                meta["output_paths"],
+                ["studio_out.png"],
+                "History meta output_paths must be the materialized paths, "
+                "not raw result filenames",
+            )
+            self.assertNotIn(
+                "raw_internal.png",
+                str(meta.get("output_paths", [])),
+                "Raw result filenames must NOT appear in history meta",
+            )
+
+            # Top-level output_path must be set — the frontend normalizer
+            # (studio-run-normalizer.js) resolves history images from
+            # run.output_path, not meta.output_paths.
+            self.assertIn("output_path", run,
+                          "History record must contain top-level output_path")
+            self.assertEqual(
+                run["output_path"],
+                "studio_out.png",
+                "Top-level output_path must be the first materialized basename",
+            )
+        finally:
+            exp_svc.REGISTRY = original_registry
+
 
 class AdapterCompatibilityTests(unittest.TestCase):
     """playground_adapter_direct_run returns compatible response shape."""
