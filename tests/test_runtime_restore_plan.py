@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from comfymodal_runtime.contracts import (
     ModelRestoreKey,
@@ -275,6 +276,52 @@ class TestRestorePlanPublisher(unittest.TestCase):
         self.assertEqual(gen, 0,
                          "Non-numeric generation should coerce to 0")
 
+    def test_modal_volume_publication_is_authoritative_and_synchronous(self):
+        import comfymodal_runtime.modal_app as modal_app
+
+        class FakeModalVolume:
+            def __init__(self):
+                self.reload_count = 0
+                self.commit_count = 0
+
+            def reload(self):
+                self.reload_count += 1
+
+            def commit(self):
+                self.commit_count += 1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            modal_volume = FakeModalVolume()
+            resources = {"runtime_state_volume": modal_volume}
+            plan = RestorePlan(generation=0, source_workflow_hash="wf-modal")
+            with patch.object(modal_app, "_MODAL_RESOURCES", resources), \
+                 patch.object(modal_app, "RUNTIME_STATE_PATH", tmp):
+                first = modal_app._publish_restore_plan_impl(plan)
+                second = modal_app._publish_restore_plan_impl(plan)
+                from comfymodal_runtime.runtime_bootstrap import RuntimeBootstrap
+                from comfymodal_runtime.runtime_executor import RuntimeExecutor
+                entrypoint = modal_app.ModalRuntimeEntrypoint(
+                    bootstrap=RuntimeBootstrap(
+                        restore_gpu_state=lambda: None,
+                        initialize_cuda=lambda: {"cuda_available": 1},
+                    ),
+                    executor=RuntimeExecutor(in_process_runner=lambda *_args: {"ok": True}),
+                )
+                restored = entrypoint.restore()
+
+            self.assertEqual(first["status"], "published")
+            self.assertEqual(first["generation"], 0)
+            self.assertEqual(second["status"], "unchanged")
+            self.assertEqual(second["generation"], 0)
+            self.assertEqual(modal_volume.commit_count, 1)
+            self.assertGreaterEqual(modal_volume.reload_count, 2)
+            self.assertEqual(first["models_volume_write_count"], 0)
+            self.assertEqual(first["models_volume_commit_count"], 0)
+            self.assertIsNotNone(entrypoint._restore_plan)
+            if entrypoint._restore_plan is not None:
+                self.assertEqual(str(entrypoint._restore_plan.generation), "0")
+            self.assertEqual(restored["status"], "restored")
+
 
 # ---------------------------------------------------------------------------
 # Legacy tests (migrated from test_runtime_contracts)
@@ -318,11 +365,18 @@ class TestDeriveModelKey(unittest.TestCase):
 class TestDerivePrefillKey(unittest.TestCase):
     def test_prompt_text_changes_prefill_not_model(self):
         model_key = ModelRestoreKey(unet_identity="u", clip_identity="c")
-        wf_a = {"6": {"class_type": "CLIPTextEncode", "inputs": {"text": "a dog"}}}
-        wf_b = {"6": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat"}}}
+        wf_a = {
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors", "type": "flux"}},
+            "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "a dog", "clip": ["2", 0]}},
+        }
+        wf_b = {
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors", "type": "flux"}},
+            "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat", "clip": ["2", 0]}},
+        }
         pa = derive_prefill_key(model_key, wf_a)
         pb = derive_prefill_key(model_key, wf_b)
         self.assertEqual(pa.model_key.stable_hash, pb.model_key.stable_hash)
+        self.assertTrue(pa.encode_options["eligible"])
         self.assertNotEqual(pa.stable_hash, pb.stable_hash)
 
 

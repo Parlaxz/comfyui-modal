@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import inspect
 import json
 import os
 import time
@@ -537,6 +538,8 @@ async def execute_plan(
     else:
         runtime_trace.emit("active_next_profile_end", phase="local", metadata={"status": "dry_run"})
 
+    active_transport = transport or ModalTransport()
+
     # ── Restore publication ──
     runtime_trace.emit("restore_publish_start", phase="local")
     if restore_publisher is not None:
@@ -548,17 +551,25 @@ async def execute_plan(
             model_key=model_key,
             prefill_key=prefill_key,
             model_spec=dict(plan.model_stack),
-            prefill_spec=dict(plan.prompt_bundle),
+            prefill_spec=dict(prefill_key.encode_options),
             source_workflow_hash=plan.source_workflow_hash,
         )
-        observed_generation = restore_publisher.publish(restore_plan)
+        publish_result = restore_publisher.publish(restore_plan)
+        if inspect.isawaitable(publish_result):
+            publish_result = await publish_result
+        if isinstance(publish_result, Mapping):
+            observed_generation = publish_result.get(
+                "generation", publish_result.get("observed_generation", "")
+            )
+            runtime_trace.set_metadata(restore_publish_result=dict(publish_result))
+        else:
+            observed_generation = publish_result
         runtime_trace.emit("restore_publish_end", phase="local", metadata={"generation": observed_generation})
     else:
         runtime_trace.emit("restore_publish_end", phase="local", metadata={"status": "not_configured"})
 
     # ── Modal submission ──
     runtime_trace.emit("modal_submit_start", phase="local")
-    active_transport = transport or ModalTransport()
     result: dict[str, Any] | None = None
     async for message in active_transport.run_plan_stream(
         plan,

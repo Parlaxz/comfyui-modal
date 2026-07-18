@@ -12,8 +12,10 @@ from typing import Any, AsyncIterator, Callable, Mapping
 
 from .contracts import ExecutionPlan, RestorePlan
 from .deployment_spec import build_deployment_identity
+from .restore_plan import RestorePlanPublisher
 from .runtime_bootstrap import BootstrapConfig, RuntimeBootstrap
 from .runtime_executor import ExecutionContext, RuntimeExecutor
+from .runtime_state import CommitCoordinator, ModalMountedStateVolume
 from .trace import RuntimeTrace
 
 
@@ -30,6 +32,7 @@ RUNTIME_STATE_VOLUME_NAME = os.environ.get("COMFYMODAL_RUNTIME_STATE_VOLUME", "c
 MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
 RUNTIME_STATE_PATH = "/root/comfymodal_runtime"
+V2_RESTORE_STATE_FILE = "v2_restore_plan.json"
 MIN_CONTAINERS = 0
 SCALEDOWN_WINDOW = 4
 V2_SOURCE_MODULES = (
@@ -136,6 +139,19 @@ class ModalRuntimeEntrypoint:
         self._legacy_api: Any | None = None
         self._runtime_configured = False
         self._restore_plan: RestorePlan | None = None
+        self._restore_publisher: RestorePlanPublisher | None = None
+
+    def _get_remote_restore_publisher(self) -> RestorePlanPublisher:
+        if self._restore_publisher is not None:
+            return self._restore_publisher
+        resources = globals().get("_MODAL_RESOURCES", {})
+        modal_volume = resources.get("runtime_state_volume")
+        if modal_volume is None:
+            raise RuntimeError("v2 runtime-state Modal Volume is not mounted")
+        volume = ModalMountedStateVolume(RUNTIME_STATE_PATH, modal_volume)
+        coordinator = CommitCoordinator(volume, state_path=V2_RESTORE_STATE_FILE)
+        self._restore_publisher = RestorePlanPublisher(coordinator)
+        return self._restore_publisher
 
     def _load_legacy_runtime(self) -> Any:
         if self._legacy_api is not None:
@@ -225,6 +241,22 @@ class ModalRuntimeEntrypoint:
     def restore(self) -> dict[str, Any]:
         self._configure_runtime()
         trace = RuntimeTrace(process="remote")
+        try:
+            self._restore_plan = self._get_remote_restore_publisher().read_current_plan()
+            trace.emit(
+                "restore_plan_read_end",
+                phase="restore",
+                metadata={
+                    "status": "found" if self._restore_plan else "absent",
+                    "generation": str(self._restore_plan.generation if self._restore_plan else ""),
+                },
+            )
+        except Exception as exc:
+            trace.emit(
+                "restore_plan_read_end",
+                phase="restore",
+                metadata={"status": "error", "error": str(exc)[:200]},
+            )
         state = self.bootstrap.restore(trace=trace)
         return {
             "backend": state.backend,
@@ -311,20 +343,11 @@ class ModalRuntimeEntrypoint:
             yield event
 
     async def publish_restore_plan(self, plan_payload: Mapping[str, Any]) -> dict[str, Any]:
-        """Accept a typed plan payload at the remote runtime boundary.
-
-        The mounted-volume publication coordinator is connected in the next
-        milestone; this endpoint still validates and retains the exact plan
-        consumed by the current container lifecycle.
-        """
         plan = RestorePlan.from_dict(plan_payload)
-        self._restore_plan = plan
-        return {
-            "status": "accepted",
-            "generation": plan.generation,
-            "canonical_hash": plan.canonical_hash,
-            "runtime_state_path": RUNTIME_STATE_PATH,
-        }
+        result = await asyncio.to_thread(_publish_restore_plan_impl, plan)
+        authoritative = self._get_remote_restore_publisher().read_current_plan()
+        self._restore_plan = authoritative or plan
+        return result
 
     async def run_checkpoint_stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[dict[str, Any]]:
         if self.checkpoint_runner is None:
@@ -371,6 +394,35 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
     )(remote_class)
 
 
+def _publish_restore_plan_impl(plan: RestorePlan) -> dict[str, Any]:
+    resources = globals().get("_MODAL_RESOURCES", {})
+    modal_volume = resources.get("runtime_state_volume")
+    if modal_volume is None:
+        raise RuntimeError("v2 runtime-state Modal Volume is not mounted")
+    volume = ModalMountedStateVolume(RUNTIME_STATE_PATH, modal_volume)
+    coordinator = CommitCoordinator(volume, state_path=V2_RESTORE_STATE_FILE)
+    publisher = RestorePlanPublisher(coordinator)
+    result = publisher.publish_with_metrics(plan)
+    authoritative = publisher.read_current_plan()
+    if authoritative is None:
+        raise RuntimeError("published RestorePlan could not be read back from runtime-state Volume")
+    result.update({
+        "status": "published" if result.get("changed") else "unchanged",
+        "generation": authoritative.generation,
+        "canonical_hash": authoritative.canonical_hash,
+        "runtime_state_volume": RUNTIME_STATE_VOLUME_NAME,
+        "state_path": V2_RESTORE_STATE_FILE,
+        "models_volume_write_count": 0,
+        "models_volume_commit_count": 0,
+    })
+    return result
+
+
+def publish_restore_plan_remote(plan_payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Publish before GPU class lookup so the next snap=False sees the plan."""
+    return _publish_restore_plan_impl(RestorePlan.from_dict(plan_payload))
+
+
 try:
     _MODAL_RESOURCES = build_modal_resources()
 except Exception:
@@ -387,3 +439,16 @@ ModalRuntimeEntrypointRemote = _register_remote_entrypoint(
     _MODAL_RESOURCES,
     _MODAL_RESOURCES["spec"],
 )
+if _modal is not None and _MODAL_RESOURCES.get("app") is not None:
+    publish_restore_plan_remote = _MODAL_RESOURCES["app"].function(
+        image=_MODAL_RESOURCES["image"],
+        cpu=2,
+        memory=4096,
+        timeout=300,
+        min_containers=MIN_CONTAINERS,
+        max_containers=1,
+        scaledown_window=SCALEDOWN_WINDOW,
+        volumes={
+            _MODAL_RESOURCES["spec"].runtime_state_path: _MODAL_RESOURCES["runtime_state_volume"],
+        },
+    )(publish_restore_plan_remote)

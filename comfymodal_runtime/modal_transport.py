@@ -156,8 +156,32 @@ class ModalTransport:
         if fn is not None:
             result = fn(dict(payload), workspace=workspace)
             return await result if inspect.isawaitable(result) else result
-        handle = self._v2_handle(workspace=workspace, gpu=None)
-        return await asyncio.to_thread(
-            handle.publish_restore_plan.remote,
-            dict(payload),
-        )
+        if self.v2_handle_factory is not None:
+            handle = self._v2_handle(workspace=workspace, gpu=None)
+            return await asyncio.to_thread(
+                handle.publish_restore_plan.remote,
+                dict(payload),
+            )
+        if _modal is None:
+            raise TransportError("Modal SDK is unavailable for the v2 transport")
+        if not workspace or not workspace.get("token_id") or not workspace.get("token_secret"):
+            raise TransportError("v2 transport requires an active Modal workspace with credentials")
+        app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow")
+        workspace_id = str(workspace.get("id", "default"))
+        key = HandleCacheKey(workspace_id, app_name, "publish_restore_plan_remote", "cpu")
+        function = self.handle_cache.get(key)
+        if function is None:
+            try:
+                client = _modal.Client.from_credentials(
+                    workspace["token_id"], workspace["token_secret"],
+                )
+                function = _modal.Function.from_name(
+                    app_name, "publish_restore_plan_remote", client=client,
+                )
+            except Exception as exc:
+                raise TransportError(f"v2 RestorePlan publisher lookup failed: {exc}") from exc
+            self.handle_cache.put(key, function)
+        try:
+            return await asyncio.to_thread(function.remote, dict(payload))
+        except Exception as exc:
+            raise TransportError(f"v2 RestorePlan publication failed: {exc}") from exc

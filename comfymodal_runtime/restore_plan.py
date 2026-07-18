@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Any
 
 from comfymodal_runtime.contracts import (
@@ -143,6 +144,75 @@ def _extract_prompt_texts(workflow: dict) -> list[str]:
     return texts
 
 
+def _infer_prompt_role(node: dict[str, Any]) -> str:
+    labels = [
+        node.get("title", ""),
+        node.get("name", ""),
+        (node.get("_meta") or {}).get("title", "") if isinstance(node.get("_meta"), dict) else "",
+    ]
+    label = " ".join(str(value or "") for value in labels).lower()
+    if "negative" in label:
+        return "negative"
+    if "positive" in label:
+        return "positive"
+    return ""
+
+
+def _extract_safe_prefill_bundle(workflow: dict) -> dict[str, Any]:
+    """Use the proven static resolver and build an exact identity bundle."""
+    try:
+        from optimizations import extract_safe_prompt_bundle
+    except Exception as exc:
+        return {"eligible": False, "reason": f"resolver_unavailable:{type(exc).__name__}", "encodes": []}
+
+    try:
+        resolved = extract_safe_prompt_bundle(workflow)
+    except Exception as exc:
+        return {"eligible": False, "reason": f"resolver_error:{type(exc).__name__}", "encodes": []}
+    if not isinstance(resolved, dict) or not resolved.get("eligible"):
+        return {
+            "eligible": False,
+            "reason": str((resolved or {}).get("reason", "not_eligible")),
+            "encodes": [],
+        }
+
+    canonical_encodes: list[dict[str, Any]] = []
+    for entry in resolved.get("encodes", []):
+        if not isinstance(entry, dict):
+            continue
+        node_id = str(entry.get("node_id", ""))
+        node = workflow.get(node_id, {}) if isinstance(workflow, dict) else {}
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        canonical_encodes.append({
+            "node_id": node_id,
+            "node_class": str(node.get("class_type", "")),
+            "prompt_input": "text",
+            "role": _infer_prompt_role(node),
+            "text": str(entry.get("text", "")),
+            "clip_connection": inputs.get("clip"),
+            "text_connection": inputs.get("text") if isinstance(inputs.get("text"), list) else None,
+            "loader_class": str(entry.get("loader_class", "")),
+            "filenames": list(entry.get("filenames", [])),
+            "clip_type": str(entry.get("clip_type", "")),
+            "text_source": list(entry.get("text_source", [])),
+            "adapter_chain": list(entry.get("adapter_chain", [])),
+        })
+    if not canonical_encodes:
+        return {"eligible": False, "reason": "no_safe_encodes", "encodes": []}
+
+    bundle = {
+        "schema_version": 1,
+        "eligible": True,
+        "encodes": canonical_encodes,
+    }
+    bundle["bundle_hash"] = stable_hash(bundle)
+    return bundle
+
+
 # ── Public derivation functions ──────────────────────────────────────────
 
 
@@ -171,13 +241,17 @@ def derive_prefill_key(
     identity but do **not** change the model identity.  The prompt bundle
     hash is derived deterministically from prompt text only.
     """
-    texts = _extract_prompt_texts(workflow)
-    bundle_hash = (
-        stable_hash({"prompts": sorted(texts)}) if texts else ""
-    )
+    bundle = _extract_safe_prefill_bundle(workflow)
+    bundle_hash = str(bundle.get("bundle_hash", "")) if bundle.get("eligible") else ""
     return PrefillKey(
         model_key=model_key,
         prompt_bundle_hash=bundle_hash,
+        encode_options={
+            "eligible": bool(bundle.get("eligible")),
+            "schema_version": bundle.get("schema_version", 1),
+            "reason": bundle.get("reason", "ok"),
+            "encodes": bundle.get("encodes", []),
+        },
     )
 
 
@@ -197,6 +271,7 @@ class RestorePlanPublisher:
 
     def __init__(self, coordinator: CommitCoordinator) -> None:
         self._coordinator = coordinator
+        self.last_publish: dict[str, Any] = {}
 
     @staticmethod
     def _safe_generation(value: int | str) -> int:
@@ -232,33 +307,31 @@ class RestorePlanPublisher:
         return stable_hash(identity)
 
     def publish(self, new_plan: RestorePlan) -> int:
-        """Publish *new_plan*.
+        """Publish *new_plan* and return its authoritative generation."""
+        return int(self.publish_with_metrics(new_plan)["generation"])
 
-        Returns the observed generation (as an ``int``).
-
-        * Loads the current authoritative plan from the volume.
-        * Compares **identity fields** (model_key, prefill_key, model_spec,
-          prefill_spec, source_workflow_hash, schema_version) — volatile
-          ``generation`` and ``created_at`` are **excluded** from the
-          comparison.  When the identity is unchanged, no write occurs.
-        * If the identity differs, assigns a **monotonic** generation:
-          when the incoming plan's generation is the default (``0``) or
-          behind the current authoritative generation, the generation is
-          advanced by one.  Explicit higher generations are preserved.
-        * Writes the new plan, commits once, and returns the assigned
-          generation.
-
-        Non-numeric generations are safely coerced to ``0``.
-        """
-        # 1. Reload authoritative state from the volume.
+    def publish_with_metrics(self, new_plan: RestorePlan) -> dict[str, Any]:
+        """Publish *new_plan* and return generation plus lifecycle timings."""
+        started = time.perf_counter()
         current_plan = self._load_current_plan()
+        reload_completed = time.perf_counter()
 
-        # 2. No-op when identity is unchanged (ignore volatile generation/created_at)
+        compare_started = time.perf_counter()
         if current_plan is not None:
             if self._identity_hash(current_plan) == self._identity_hash(new_plan):
-                return self._safe_generation(current_plan.generation)
+                result = {
+                    "changed": False,
+                    "generation": self._safe_generation(current_plan.generation),
+                    "reload_ms": round((reload_completed - started) * 1000.0, 3),
+                    "compare_ms": round((time.perf_counter() - compare_started) * 1000.0, 3),
+                    "write_ms": 0.0,
+                    "commit_ms": 0.0,
+                    "state_path": getattr(self._coordinator, "state_path", ""),
+                }
+                self.last_publish = result
+                return result
 
-        # 3. Compute monotonic generation
+        compare_completed = time.perf_counter()
         incoming_gen = self._safe_generation(new_plan.generation)
         if current_plan is not None:
             current_gen = self._safe_generation(current_plan.generation)
@@ -269,19 +342,38 @@ class RestorePlanPublisher:
         else:
             generation = incoming_gen
 
-        # 4. Write + commit once.
         plan_dict = new_plan.to_dict()
         plan_dict["generation"] = generation
+        write_started = time.perf_counter()
         self._coordinator.write_state(
             generation,
             {"restore_plan": plan_dict},
         )
+        write_completed = time.perf_counter()
+        commit_started = time.perf_counter()
         self._coordinator.commit(generation)
+        commit_completed = time.perf_counter()
+        result = {
+            "changed": True,
+            "generation": generation,
+            "reload_ms": round((reload_completed - started) * 1000.0, 3),
+            "compare_ms": round((compare_completed - compare_started) * 1000.0, 3),
+            "write_ms": round((write_completed - write_started) * 1000.0, 3),
+            "commit_ms": round((commit_completed - commit_started) * 1000.0, 3),
+            "state_path": getattr(self._coordinator, "state_path", ""),
+        }
+        self.last_publish = result
+        return result
 
-        return generation
+    def read_current_plan(self) -> RestorePlan | None:
+        """Reload and return the authoritative plan currently on the volume."""
+        return self._load_current_plan()
 
     def _load_current_plan(self) -> RestorePlan | None:
         """Load the current ``RestorePlan`` from authoritative state."""
+        reload_fn = getattr(self._coordinator, "reload", None)
+        if callable(reload_fn):
+            reload_fn()
         state = self._coordinator.read_state()
         if state is None:
             return None
@@ -289,3 +381,16 @@ class RestorePlanPublisher:
         if not plan_data:
             return None
         return RestorePlan.from_dict(plan_data)
+
+
+class RemoteRestorePlanPublisher:
+    """Async adapter that publishes through the v2 Modal transport."""
+
+    def __init__(self, transport: Any, workspace: dict[str, Any] | None = None) -> None:
+        self.transport = transport
+        self.workspace = workspace
+
+    async def publish(self, plan: RestorePlan) -> dict[str, Any]:
+        return await self.transport.publish_restore_plan(
+            plan.to_dict(), workspace=self.workspace,
+        )
