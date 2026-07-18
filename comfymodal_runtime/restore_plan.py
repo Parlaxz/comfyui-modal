@@ -255,6 +255,65 @@ def derive_prefill_key(
     )
 
 
+def build_restore_model_spec(workflow: dict, model_stack: dict | None = None) -> dict[str, Any]:
+    """Serialize the concrete loader requests needed by the remote preload.
+
+    ``ModelRestoreKey`` intentionally contains identities only.  The remote
+    runtime also needs the exact node arguments (weight dtype, CLIP type, and
+    dual-CLIP filenames) to invoke ComfyUI's real loader methods during
+    ``snap=False``.  Keep that small, deterministic request list alongside the
+    key rather than making the remote runtime re-parse a workflow it does not
+    receive.
+    """
+    loaders: dict[str, list[dict[str, Any]]] = {
+        "unet": [],
+        "clip": [],
+        "vae": [],
+    }
+    for node_id, node in (workflow or {}).items():
+        if not isinstance(node, dict):
+            continue
+        class_type = str(node.get("class_type", ""))
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        if class_type == "UNETLoader" and isinstance(inputs.get("unet_name"), str):
+            loaders["unet"].append({
+                "node_id": str(node_id),
+                "loader_class": class_type,
+                "unet_name": inputs["unet_name"],
+                "weight_dtype": str(inputs.get("weight_dtype", "default")),
+            })
+        elif class_type == "CLIPLoader" and isinstance(inputs.get("clip_name"), str):
+            loaders["clip"].append({
+                "node_id": str(node_id),
+                "loader_class": class_type,
+                "clip_name": inputs["clip_name"],
+                "type": str(inputs.get("type", "stable_diffusion")),
+                "device": str(inputs.get("device", "default")),
+            })
+        elif class_type == "DualCLIPLoader":
+            if isinstance(inputs.get("clip_name1"), str) and isinstance(inputs.get("clip_name2"), str):
+                loaders["clip"].append({
+                    "node_id": str(node_id),
+                    "loader_class": class_type,
+                    "clip_name1": inputs["clip_name1"],
+                    "clip_name2": inputs["clip_name2"],
+                    "type": str(inputs.get("type", "sdxl")),
+                    "device": str(inputs.get("device", "default")),
+                })
+        elif class_type == "VAELoader" and isinstance(inputs.get("vae_name"), str):
+            loaders["vae"].append({
+                "node_id": str(node_id),
+                "loader_class": class_type,
+                "vae_name": inputs["vae_name"],
+            })
+    return {
+        "model_stack": dict(model_stack or {}),
+        "loaders": loaders,
+    }
+
+
 # ── Publisher ────────────────────────────────────────────────────────────
 
 

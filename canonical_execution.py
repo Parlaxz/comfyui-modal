@@ -37,7 +37,11 @@ from workflow_metadata import (
 )
 from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, RestorePlan
 from comfymodal_runtime.modal_transport import ModalTransport
-from comfymodal_runtime.restore_plan import derive_model_key, derive_prefill_key
+from comfymodal_runtime.restore_plan import (
+    build_restore_model_spec,
+    derive_model_key,
+    derive_prefill_key,
+)
 from comfymodal_runtime.trace import RuntimeTrace, merge_runtime_traces
 
 # ---------------------------------------------------------------------------
@@ -550,7 +554,7 @@ async def execute_plan(
             generation=0,
             model_key=model_key,
             prefill_key=prefill_key,
-            model_spec=dict(plan.model_stack),
+            model_spec=build_restore_model_spec(workflow, dict(plan.model_stack)),
             prefill_spec=dict(prefill_key.encode_options),
             source_workflow_hash=plan.source_workflow_hash,
         )
