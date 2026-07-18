@@ -37,7 +37,7 @@ from workflow_metadata import (
 from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, RestorePlan
 from comfymodal_runtime.modal_transport import ModalTransport
 from comfymodal_runtime.restore_plan import derive_model_key, derive_prefill_key
-from comfymodal_runtime.trace import RuntimeTrace
+from comfymodal_runtime.trace import RuntimeTrace, merge_runtime_traces
 
 # ---------------------------------------------------------------------------
 # RunTrace — in-memory hierarchical span collector
@@ -578,18 +578,20 @@ async def execute_plan(
         raise RuntimeError("execution plan stream ended without result")
     runtime_trace.emit("remote_return_start", process="local", phase="transport")
 
-    # ── Merge local trace into remote result (preserve ALL remote fields) ──
-    remote_trace = result.get("trace")
-    if not isinstance(remote_trace, dict):
-        remote_trace = runtime_trace.to_legacy_timing(prompt_id=str(plan.request_metadata.get("prompt_id", "")))
-    # Overlay local events onto the remote trace
-    remote_trace["events"] = [event.to_dict() for event in runtime_trace.events]
-    # Merge local metadata safely — handle missing or malformed remote metadata
-    _remote_md = remote_trace.get("metadata")
-    if not isinstance(_remote_md, dict):
-        remote_trace["metadata"] = {}
-    remote_trace["metadata"].update(dict(runtime_trace._metadata))
-    # Backend: only set/overwrite when the result actually supplies one
+    # ── Merge local trace into remote result without dropping remote evidence ──
+    raw_remote_trace = result.get("trace")
+    if not isinstance(raw_remote_trace, dict):
+        raw_remote_trace = runtime_trace.to_legacy_timing(
+            prompt_id=str(plan.request_metadata.get("prompt_id", ""))
+        )
+    merged_trace = merge_runtime_traces(runtime_trace, raw_remote_trace)
+    remote_trace = dict(raw_remote_trace)
+    remote_trace["events"] = [event.to_dict() for event in merged_trace.events]
+    remote_trace["metadata"] = dict(merged_trace._metadata)
+    remote_trace.setdefault("trace_id", merged_trace.trace_id)
+    remote_trace.setdefault("request_id", merged_trace.request_id)
+    remote_trace.setdefault("container_session_id", merged_trace.container_session_id)
+    # Backend: only set/overwrite when the result actually supplies one.
     if "backend" in result:
         remote_trace["backend"] = result["backend"]
     result["trace"] = remote_trace

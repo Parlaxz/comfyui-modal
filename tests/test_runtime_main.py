@@ -6,8 +6,10 @@ import asyncio
 import os
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
+from typing import Any
 
 from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, ModelRestoreKey, PrefillKey
 from comfymodal_runtime.modal_transport import ModalTransport
@@ -162,6 +164,49 @@ class TestModalTransport(unittest.TestCase):
                 )
             ]
             self.assertEqual(messages[-1]["data"]["ok"], True)
+
+        asyncio.run(run())
+
+    def test_default_v2_transport_targets_registered_class(self):
+        observed: dict[str, Any] = {}
+
+        async def remote_stream(payload, **kwargs):
+            observed["payload"] = payload
+            observed["kwargs"] = kwargs
+            yield {"type": "result", "data": {"ok": True}}
+
+        def publish(payload):
+            observed["restore_plan"] = payload
+            return {"status": "published", "generation": 3}
+
+        handle = SimpleNamespace(
+            run_plan_stream=SimpleNamespace(remote_gen=SimpleNamespace(aio=remote_stream)),
+            publish_restore_plan=SimpleNamespace(remote=publish),
+        )
+
+        async def run():
+            plan = ExecutionPlan(
+                workflow={"1": {"class_type": "KSampler"}},
+                execution_options=ExecutionOptions(production_enabled=False),
+            )
+            transport = ModalTransport(
+                v2_handle_factory=lambda **kwargs: handle,
+            )
+            messages = [
+                message async for message in transport.run_plan_stream(
+                    plan,
+                    gpu="rtx-pro-6000",
+                    workspace={"id": "ws"},
+                    trace={"prompt_id": "req-1"},
+                )
+            ]
+            self.assertEqual(messages[-1]["data"], {"ok": True})
+            self.assertEqual(observed["payload"]["workflow"], plan.to_dict()["workflow"])
+            self.assertEqual(observed["kwargs"]["request_id"], "req-1")
+            published = await transport.publish_restore_plan(
+                {"generation": 3}, workspace={"id": "ws"},
+            )
+            self.assertEqual(published["generation"], 3)
 
         asyncio.run(run())
 
