@@ -98,6 +98,60 @@ class TestExecutePlan(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_remote_trace_events_and_derived_fields_survive_merge(self):
+        async def stream(**kwargs):
+            yield {
+                "type": "result",
+                "data": {
+                    "outputs": {},
+                    "trace": {
+                        "events": [
+                            {
+                                "name": "container_entry",
+                                "process": "remote",
+                                "phase": "restore",
+                                "wall_unix_ns": 1,
+                                "monotonic_ns": 1,
+                                "metadata": {},
+                            },
+                            {
+                                "name": "sampler_end",
+                                "process": "remote",
+                                "phase": "execution",
+                                "wall_unix_ns": 3,
+                                "monotonic_ns": 3,
+                                "metadata": {},
+                            },
+                        ],
+                        "metadata": {"remote_generation": "7"},
+                        "derived_ms": {"actual_graph_wait_ms": 12.5},
+                    },
+                },
+            }
+
+        async def run():
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="trace_merge",
+                validate=False,
+            )
+            local_trace = RuntimeTrace(request_id="trace_merge", process="local")
+            local_trace.emit("modal_submit_start")
+            result = await execute_plan(
+                plan,
+                transport=ModalTransport(prompt_stream_fn=stream),
+                trace=local_trace,
+            )
+            merged = result["trace"]
+            event_names = {event["name"] for event in merged["events"]}
+            self.assertIn("modal_submit_start", event_names)
+            self.assertIn("container_entry", event_names)
+            self.assertIn("sampler_end", event_names)
+            self.assertEqual(merged["metadata"]["remote_generation"], "7")
+            self.assertEqual(merged["derived_ms"]["actual_graph_wait_ms"], 12.5)
+
+        asyncio.run(run())
+
     def test_missing_profile_setter_is_safe_dry_run(self):
         """execute_plan with no profile_setter emits dry_run event and does not raise."""
         async def stream(**kwargs):
