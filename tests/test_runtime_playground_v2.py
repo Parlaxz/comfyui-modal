@@ -1559,7 +1559,8 @@ class TestHandleStudioRunAsyncDispatch(unittest.TestCase):
             self.assertEqual(result["direct_run"], True)
 
         try:
-            asyncio.run(_test())
+            with patch.dict(os.environ, {"COMFYMODAL_RUNTIME": "v2"}, clear=False):
+                asyncio.run(_test())
         finally:
             self.adapter.playground_adapter_direct_run = original
 

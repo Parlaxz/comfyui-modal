@@ -497,6 +497,7 @@ def _sync_materialize(
     result: dict[str, Any],
     experiment_id: str,
     studio_output_dir: str | os.PathLike | None = None,
+    require_output: bool = False,
 ) -> list[str]:
     """Synchronous materialization body — offloaded to thread by
     ``_default_materialize``.
@@ -521,6 +522,7 @@ def _sync_materialize(
         result,
         output_dir=out_dir,
         prompt_id=experiment_id,
+        require_output=require_output,
     )
     # Return URL-safe filenames (basenames), matching the shape from
     # the adapter response (output_paths).
@@ -532,6 +534,7 @@ async def _default_materialize(
     experiment_id: str,
     cell_key: str = "",
     studio_output_dir: str | os.PathLike | None = None,
+    require_output: bool = False,
 ) -> list[str]:
     """Save output images to disk and return URL-safe filenames.
 
@@ -548,7 +551,7 @@ async def _default_materialize(
     scheduler, leases, journals, or worker pool.
     """
     return await asyncio.to_thread(
-        _sync_materialize, result, experiment_id, studio_output_dir,
+        _sync_materialize, result, experiment_id, studio_output_dir, require_output,
     )
 
 
@@ -686,17 +689,36 @@ class PlaygroundService:
 
         # ── Stage 5: Materialize outputs ─────────────────────────────
         output_paths: list[str] = []
+        requires_output = bool(plan.execution_options.production_enabled)
+        has_remote_output = bool(
+            isinstance(result, dict)
+            and (
+                result.get("outputs")
+                or result.get("images")
+                or result.get("videos")
+                or result.get("primary_output")
+            )
+        )
+        if requires_output and not has_remote_output:
+            return {"status": "error", "message": "v2 execution returned no output"}
         try:
-            if isinstance(result, dict) and result.get("outputs"):
+            if has_remote_output:
                 output_paths = await _offload_or_await(
                     self._materialize,
                     result,
                     experiment_id=exp_id,
                     cell_key="playground",
                     studio_output_dir=studio_output_dir,
+                    require_output=requires_output,
                 )
-        except Exception:
+        except Exception as exc:
+            if requires_output:
+                _log.error("Playground output materialization failed: %s", exc)
+                return {"status": "error", "message": str(exc)[:500]}
             _log.warning("Playground output materialization failed (non-fatal)")
+
+        if requires_output and not output_paths:
+            return {"status": "error", "message": "v2 output materialization produced no files"}
 
         # ── Stage 6: Build timings ────────────────────────────────────
         timings: dict[str, Any] = {}

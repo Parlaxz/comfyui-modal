@@ -264,6 +264,10 @@ class ConversionFailedError(Exception):
     """
 
 
+class OutputMaterializationError(RuntimeError):
+    """Raised when a required v2 output cannot be materialized."""
+
+
 # ---------------------------------------------------------------------------
 # Parallel conversion runner (records totals)
 # ---------------------------------------------------------------------------
@@ -447,6 +451,7 @@ def materialize_modal_result(
     save_output_image_fn: Callable | None = None,
     converter_fn: Callable | None = None,
     output_format: str = "original",
+    require_output: bool = False,
 ) -> dict:
     """Materialise a Modal result dict to the local filesystem.
 
@@ -482,7 +487,7 @@ def materialize_modal_result(
         fallback_index: int = 0,
     ) -> None:
         nonlocal image_count, video_count, output_bytes_written
-        raw_bytes = base64.b64decode(entry["data"])
+        raw_bytes = base64.b64decode(entry["data"], validate=True)
         local_filename = entry.get("filename", f"output_{fallback_index}.bin")
         local_path = unique_path(output_dir, local_filename)
         local_filename = os.path.basename(local_path)
@@ -547,6 +552,11 @@ def materialize_modal_result(
         if stable_output_identity(node_id, output_key, vid, index) in handled_output_ids:
             continue
         _store_entry(node_id, output_key, vid, index)
+
+    if require_output and not written_files:
+        raise OutputMaterializationError(
+            f"required output missing for prompt {prompt_id or '<unknown>'}"
+        )
 
     # Build history outputs (alias b_images -> images for standard consumers)
     history_outputs: dict[str, dict] = {}
