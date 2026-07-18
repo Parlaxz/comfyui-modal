@@ -651,6 +651,9 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
         target_inputs=spec.target_inputs,
         max_inputs=spec.max_inputs,
     )(remote_class)
+    # Modal's worker importer resolves the serialized class by module/name;
+    # keep the dynamically-created class available under that exact name.
+    globals()["ModalRuntimeEntrypointV2"] = remote_class
     return resources["app"].cls(
         gpu=spec.gpu,
         cpu=spec.cpu,
