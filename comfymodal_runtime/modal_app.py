@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib
 import inspect
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Mapping
@@ -17,6 +19,12 @@ from .runtime_bootstrap import BootstrapConfig, RuntimeBootstrap
 from .runtime_executor import ExecutionContext, RuntimeExecutor
 from .runtime_state import CommitCoordinator, ModalMountedStateVolume
 from .model_preload import V2LoaderBridge
+from .output_delivery import (
+    Attempt,
+    build_default_chain,
+    run_strategy_chain,
+)
+from .result_delivery import ConversionFailedError, convert_output_items
 from .trace import RuntimeTrace
 
 
@@ -284,21 +292,9 @@ class ModalRuntimeEntrypoint:
         api = self._load_legacy_runtime()
         trace = context.trace or RuntimeTrace(request_id=context.request_id, process="remote")
         trace.emit("graph_execution_start", phase="execution")
-        legacy_trace = None
         try:
-            trace_factory = getattr(self._legacy_module, "Trace", None)
-            legacy_trace = trace_factory(prompt_id=context.request_id) if trace_factory else None
             with self._preload_bridge.request_scope():
-                result = api._execute_in_process(
-                    dict(plan.workflow),
-                    input_images=dict(plan.input_images),
-                    collect_outputs=True,
-                    trace=legacy_trace,
-                    modal_options=plan.execution_options.to_legacy_dict(),
-                    production_report=dict(plan.production_report),
-                )
-            if not isinstance(result, dict):
-                result = {"result": result}
+                result: dict[str, Any] = self._execute_v2_prompt_executor(plan, context, api, trace)
             trace.emit("graph_execution_end", phase="execution")
             trace.set_metadata(
                 restore_plan_generation=str(self._restore_plan.generation if self._restore_plan else ""),
@@ -306,13 +302,277 @@ class ModalRuntimeEntrypoint:
                 preload_diagnostics=self._preload_bridge.diagnostics(),
             )
             result["trace"] = trace.to_dict()
-            if legacy_trace is not None:
-                result["legacy_trace"] = legacy_trace.summary()
             result["restore_plan_generation"] = str(self._restore_plan.generation if self._restore_plan else "")
             return result
         except Exception as exc:
             trace.emit("graph_execution_end", phase="execution", metadata={"status": "error", "error": str(exc)[:200]})
             raise
+
+    def _execute_v2_prompt_executor(
+        self,
+        plan: ExecutionPlan,
+        context: ExecutionContext,
+        api: Any,
+        trace: RuntimeTrace,
+    ) -> dict[str, Any]:
+        """Run the live ComfyUI PromptExecutor without the legacy wrapper.
+
+        The v2 boundary owns request identity, validation, production
+        authorization, output collection, and result packaging. ComfyUI still
+        owns its actual PromptExecutor and node execution semantics.
+        """
+        if context.cancelled and context.cancelled():
+            raise RuntimeError("execution cancelled before PromptExecutor start")
+
+        workflow = dict(plan.workflow)
+        prompt_id = str(context.request_id or f"v2-{id(workflow):x}")
+        module = self._legacy_module
+        event_loop = getattr(api, "_event_loop", None)
+        executor = getattr(api, "_executor", None)
+        if event_loop is None or executor is None:
+            raise RuntimeError("v2 PromptExecutor runtime is not initialized")
+
+        wait_for_preload = getattr(api, "_wait_for_restore_preload_before_request", None)
+        if callable(wait_for_preload):
+            wait_for_preload(workflow)
+
+        materialize_inputs = getattr(module, "_materialize_input_images", None)
+        if plan.input_images and callable(materialize_inputs):
+            materialize_inputs(dict(plan.input_images))
+
+        preflight = getattr(api, "_preflight_before_prompt_execution", None)
+        if callable(preflight) and not getattr(api, "_preflight_already_ran", False):
+            preflight(workflow)
+
+        repair_missing_nodes = getattr(api, "_repair_missing_workflow_nodes", None)
+        if callable(repair_missing_nodes):
+            repair_summary = repair_missing_nodes(workflow)
+            if (
+                isinstance(repair_summary, Mapping)
+                and repair_summary.get("blocked_by_mode")
+                and repair_summary.get("missing_before")
+            ):
+                raise RuntimeError(
+                    "Workflow references missing custom node class(es): "
+                    f"{repair_summary['missing_before']}. Runtime repair is disabled."
+                )
+
+        import execution
+
+        trace.emit("prompt_validation_start", phase="execution", metadata={"prompt_id": prompt_id})
+        valid, error, outputs_to_execute, node_errors = event_loop.run_until_complete(
+            execution.validate_prompt(prompt_id, workflow, None)
+        )
+        trace.emit(
+            "prompt_validation_end",
+            phase="execution",
+            metadata={
+                "valid": bool(valid),
+                "output_count": len(outputs_to_execute or []),
+                "node_error_count": len(node_errors or {}),
+            },
+        )
+        if not valid:
+            detail = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+            raise RuntimeError(f"Workflow validation failed: {detail}")
+
+        legacy_options = plan.execution_options.to_legacy_dict()
+        production_report = dict(plan.production_report)
+        production = legacy_options.get("production", {})
+        production_enabled = bool(
+            (production.get("enabled") if isinstance(production, Mapping) else False)
+            or production_report.get("enabled")
+        )
+        authorized_node_ids: list[str] = []
+        if production_report:
+            for key in (
+                "direct_output_rewritten_node_ids",
+                "rgthree_comparer_rewritten_node_ids",
+            ):
+                authorized_node_ids.extend(str(value) for value in production_report.get(key, []) or [])
+        authorized_node_ids = list(dict.fromkeys(authorized_node_ids))
+        register_request = getattr(module, "_register_production_request", None)
+        cleanup_request = getattr(module, "_cleanup_production_request", None)
+        cleanup_registry = getattr(module, "_cleanup_production_registry", None)
+        pop_outputs = getattr(module, "_pop_production_outputs", None)
+        if production_enabled and not callable(pop_outputs):
+            raise RuntimeError("v2 production output registry is unavailable")
+
+        if production_enabled and callable(register_request):
+            register_request(
+                prompt_id,
+                {
+                    "enabled": True,
+                    "prompt_id": prompt_id,
+                    "output_format": legacy_options.get("output_format", "original"),
+                    "quality": legacy_options.get("quality", 75),
+                    "webp_lossless_compression": legacy_options.get(
+                        "webp_lossless_compression", "balanced"
+                    ),
+                    "return_comparison_a": legacy_options.get("return_comparison_a", False),
+                    "metadata_mode": production.get("metadata_mode", "none") if isinstance(production, Mapping) else "none",
+                    "authorized_node_ids": authorized_node_ids,
+                },
+            )
+
+        started = time.time()
+        try:
+            executor.reset()
+            trace.emit("prompt_executor_start", phase="execution", metadata={"prompt_id": prompt_id})
+            executor.execute(
+                prompt=workflow,
+                prompt_id=prompt_id,
+                extra_data={"client_id": prompt_id},
+                execute_outputs=outputs_to_execute,
+            )
+            trace.emit(
+                "prompt_executor_end",
+                phase="execution",
+                metadata={"elapsed_ms": round((time.time() - started) * 1000.0, 3)},
+            )
+            if context.cancelled and context.cancelled():
+                raise RuntimeError("execution cancelled after PromptExecutor completion")
+            if getattr(executor, "success", True) is False:
+                raise RuntimeError(self._executor_error_message(executor))
+
+            trace.emit("output_collect_start", phase="output")
+            registry = pop_outputs(prompt_id) if production_enabled and callable(pop_outputs) else {}
+            if not isinstance(registry, Mapping):
+                registry = {}
+            history_result = getattr(executor, "history_result", None)
+            history = {prompt_id: history_result} if isinstance(history_result, dict) else {}
+            output_dir = Path("/root/comfy/ComfyUI/output")
+            chain = build_default_chain(
+                registry=registry,
+                history=history,
+                materials_dir=str(output_dir) if output_dir.is_dir() else "",
+            )
+            attempts = run_strategy_chain(
+                chain,
+                prompt_id=prompt_id,
+                output_node_ids=tuple(plan.output_node_ids),
+                materials_dir=str(output_dir) if output_dir.is_dir() else "",
+                request_start_boundary=started,
+            )
+            selected_index = next(
+                (index for index, attempt in enumerate(attempts) if attempt.success),
+                None,
+            )
+            selected = attempts[selected_index] if selected_index is not None else None
+            if selected is None:
+                if production_enabled:
+                    raise RuntimeError("v2 production execution produced no materializable output")
+                selected = Attempt(strategy="none", success=False, error="no output")
+            output_format = str(legacy_options.get("output_format", "original") or "original")
+            if selected.success and selected.strategy != "direct_output_sink" and output_format != "original":
+                try:
+                    converted = convert_output_items(
+                        list(selected.items),
+                        output_format=output_format,
+                        quality=int(legacy_options.get("quality", 75) or 75),
+                        webp_lossless_compression=str(
+                            legacy_options.get("webp_lossless_compression", "balanced")
+                        ),
+                    )
+                except ConversionFailedError as exc:
+                    # The registry path is already encoded by the production
+                    # node. For history/filesystem compatibility, retain the
+                    # original bytes when a requested conversion cannot run.
+                    selected = Attempt(
+                        strategy=selected.strategy,
+                        success=selected.success,
+                        items=selected.items,
+                        total_items=selected.total_items,
+                        total_raw_bytes=selected.total_raw_bytes,
+                        total_base64_bytes=selected.total_base64_bytes,
+                        total_json_result_bytes=selected.total_json_result_bytes,
+                        total_conversion_time_ms=selected.total_conversion_time_ms,
+                        error=str(exc),
+                        metrics={**dict(selected.metrics), "conversion_fallback": True},
+                    )
+                else:
+                    selected = Attempt(
+                        strategy=selected.strategy,
+                        success=bool(converted.items),
+                        items=tuple(converted.items),
+                        total_items=len(converted.items),
+                        total_raw_bytes=converted.total_raw_bytes,
+                        total_base64_bytes=converted.total_base64_bytes,
+                        total_json_result_bytes=converted.total_json_result_bytes,
+                        total_conversion_time_ms=converted.total_conversion_time_ms,
+                        error="" if converted.items else "output conversion produced no items",
+                        metrics={**dict(selected.metrics), "converted": True},
+                    )
+                if selected_index is not None:
+                    attempts[selected_index] = selected
+            result = self._attempt_to_result(selected)
+            result["output_attempts"] = [
+                {
+                    "strategy": attempt.strategy,
+                    "success": attempt.success,
+                    "total_items": attempt.total_items,
+                    "total_raw_bytes": attempt.total_raw_bytes,
+                    "total_base64_bytes": attempt.total_base64_bytes,
+                    "error": attempt.error,
+                    "metrics": dict(attempt.metrics),
+                }
+                for attempt in attempts
+            ]
+            result["_registry_used"] = bool(attempts and attempts[0].success)
+            result["_registry_entries"] = attempts[0].total_items if attempts else 0
+            trace.emit(
+                "output_collect_end",
+                phase="output",
+                metadata={
+                    "strategy": selected.strategy,
+                    "items": selected.total_items,
+                    "raw_bytes": selected.total_raw_bytes,
+                },
+            )
+            return result
+        finally:
+            if production_enabled and callable(cleanup_request):
+                cleanup_request(prompt_id)
+            if production_enabled and callable(cleanup_registry):
+                cleanup_registry(prompt_id)
+
+    @staticmethod
+    def _executor_error_message(executor: Any) -> str:
+        messages = getattr(executor, "status_messages", [])
+        errors = [
+            payload.get("exception_message", str(payload))
+            for event, payload in messages
+            if event == "execution_error" and isinstance(payload, dict)
+        ]
+        return "; ".join(errors) or "ComfyUI PromptExecutor failed"
+
+    @staticmethod
+    def _attempt_to_result(attempt: Attempt) -> dict[str, Any]:
+        outputs: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        images: list[dict[str, Any]] = []
+        videos: list[dict[str, Any]] = []
+        for item in attempt.items:
+            output_key = item.output_key or ("gifs" if item.animated else "images")
+            data = item.base64_data or base64.b64encode(item.raw_bytes).decode("ascii")
+            entry = {
+                "filename": item.filename,
+                "data": data,
+                "node_id": item.node_id,
+                "output_key": output_key,
+                "comparison_side": item.comparison_side,
+                "mime_type": item.mime_type,
+                "file_ext": item.file_ext,
+                "width": item.width,
+                "height": item.height,
+                "output_index": item.output_index,
+                "format": item.format,
+            }
+            outputs.setdefault(item.node_id, {}).setdefault(output_key, []).append(entry)
+            if item.animated or output_key in {"gifs", "videos"}:
+                videos.append(entry)
+            else:
+                images.append(entry)
+        return {"images": images, "videos": videos, "outputs": outputs}
 
     async def run_plan_stream(
         self,

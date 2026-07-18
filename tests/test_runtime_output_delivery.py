@@ -117,6 +117,26 @@ class TestConversionMeta:
 # ---------------------------------------------------------------------------
 
 class TestDirectOutputSink:
+    def test_collects_live_flat_registry_shape(self):
+        registry = {
+            "107": [
+                _entry(
+                    "out.png",
+                    _png_bytes(0, 255, 0),
+                    node_id="107",
+                    output_key="b_images",
+                    comparison_side="b",
+                ),
+            ],
+        }
+        attempt = DirectOutputSink.from_registry(registry).collect(
+            prompt_id="p1", output_node_ids=("107",)
+        )
+        assert attempt.success
+        assert attempt.total_items == 1
+        assert attempt.items[0].output_key == "b_images"
+        assert attempt.items[0].comparison_side == "b"
+
     def test_collect_single_node_output(self):
         registry = {
             "107": {

@@ -197,7 +197,7 @@ class DirectOutputSink:
     @classmethod
     def from_registry(
         cls,
-        registry: Mapping[str, Mapping[str, list[Mapping[str, Any]]]],
+        registry: Mapping[str, Any],
     ) -> DirectOutputSink:
         return cls(registry=registry)
 
@@ -217,9 +217,13 @@ class DirectOutputSink:
         for node_id, node_registry in self._registry.items():
             if output_node_ids and node_id not in output_node_ids:
                 continue
-            if not isinstance(node_registry, dict):
+            if isinstance(node_registry, list):
+                grouped_entries = {"images": node_registry}
+            elif isinstance(node_registry, dict):
+                grouped_entries = node_registry
+            else:
                 continue
-            for output_key, entries in node_registry.items():
+            for output_key, entries in grouped_entries.items():
                 if not isinstance(entries, list):
                     continue
                 for idx, entry in enumerate(entries):
@@ -228,7 +232,7 @@ class DirectOutputSink:
                     item = _item_from_entry(
                         entry,
                         node_id=node_id,
-                        output_key=str(output_key),
+                        output_key=str(entry.get("output_key") or output_key),
                         fallback_index=idx,
                     )
                     items.append(item)
@@ -305,8 +309,19 @@ class HistoryOutputCollector:
                             candidate = os.path.join(materials_dir, filename)
                             if os.path.isfile(candidate):
                                 resolved_path = candidate
+                    entry_for_item = entry
+                    if resolved_path and not (
+                        entry.get("raw_bytes")
+                        or entry.get("bytes")
+                        or entry.get("data")
+                    ):
+                        try:
+                            entry_for_item = dict(entry)
+                            entry_for_item["raw_bytes"] = Path(resolved_path).read_bytes()
+                        except OSError:
+                            entry_for_item = entry
                     item = _item_from_entry(
-                        entry,
+                        entry_for_item,
                         node_id=node_id,
                         output_key=str(output_key),
                         fallback_index=idx,
