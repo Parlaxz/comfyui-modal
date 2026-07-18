@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import copy
 
-from comfymodal_runtime.contracts import ExecutionOptions
-
 
 def build_run_prompt_options(
     *,
@@ -34,17 +32,32 @@ def build_run_prompt_options(
         ``{"production": {"enabled": True, "output_node_ids": [...]},
             "actual_load": {"enabled": True, "mode": "unet_vae_only"}}``
     """
-    options = ExecutionOptions(
-        production_enabled=True,
-        production_output_node_ids=tuple(production_output_node_ids),
-        compatibility_flags={
-            "actual_load": {
-                "enabled": bool(enable_actual_load),
-                "mode": "unet_vae_only",
-            }
+    seen: set[str] = set()
+    normalized_ids: list[str] = []
+    for raw_id in production_output_node_ids:
+        sid = str(raw_id).strip()
+        if sid and sid not in seen:
+            seen.add(sid)
+            normalized_ids.append(sid)
+    # Sort numerically when all IDs are numeric, falling back to string sort
+    # (mirrors production_workflow._normalize_ids behavior).
+    def _sort_key(s: str):
+        try:
+            return (0, int(s))
+        except ValueError:
+            return (1, s)
+    normalized_ids.sort(key=_sort_key)
+
+    return {
+        "production": {
+            "enabled": True,
+            "output_node_ids": normalized_ids,
         },
-    )
-    return options.to_legacy_dict()
+        "actual_load": {
+            "enabled": bool(enable_actual_load),
+            "mode": "unet_vae_only",
+        },
+    }
 
 
 def ensure_run_prompt_options(
@@ -69,17 +82,10 @@ def ensure_run_prompt_options(
     - When ``production`` or ``actual_load`` already exist and are not
       opt-outs, builder defaults are merged underneath (caller sub-keys win).
     """
-    typed_existing = ExecutionOptions.from_legacy(modal_options, default_production=False)
-    typed_builder = ExecutionOptions.from_legacy(builder_result, default_production=True)
-    legacy_builder = typed_builder.to_legacy_dict()
-    legacy_existing = typed_existing.to_legacy_dict()
     result: dict = dict(modal_options) if modal_options else {}
 
     # ── Production ──────────────────────────────────────────────────────
-    builder_prod = {
-        "enabled": typed_builder.production_enabled,
-        "output_node_ids": list(typed_builder.production_output_node_ids),
-    }
+    builder_prod = builder_result.get("production", {})
     if "production" not in result:
         result["production"] = copy.deepcopy(builder_prod)
     elif result["production"].get("enabled") is False:
@@ -94,11 +100,7 @@ def ensure_run_prompt_options(
         result["production"] = merged_prod
 
     # ── Actual load ─────────────────────────────────────────────────────
-    builder_flags = typed_builder.compatibility_flags
-    builder_al = builder_flags.get("actual_load", {}) if hasattr(builder_flags, "get") else {}
-    if not builder_al:
-        builder_al = legacy_builder.get("actual_load", builder_result.get("actual_load", {}))
-    builder_al = dict(builder_al)
+    builder_al = builder_result.get("actual_load", {})
     if "actual_load" not in result:
         result["actual_load"] = copy.deepcopy(builder_al)
     elif result["actual_load"].get("enabled") is False:
@@ -112,6 +114,4 @@ def ensure_run_prompt_options(
                 merged_al[k] = v
         result["actual_load"] = merged_al
 
-    if legacy_existing.get("actual_load") and "actual_load" not in result:
-        result["actual_load"] = copy.deepcopy(legacy_existing["actual_load"])
     return result

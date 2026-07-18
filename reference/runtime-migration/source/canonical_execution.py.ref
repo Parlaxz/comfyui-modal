@@ -9,12 +9,11 @@ call, result collection, and canonical trace/counts).
 from __future__ import annotations
 
 import base64
-import copy
 import json
 import os
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import Any
 
 from api_prompt_validator import assert_valid_api_prompt_structure
@@ -22,7 +21,6 @@ from production_workflow import (
     COMPILER_SCHEMA_VERSION,
     HASH_SCHEMA_VERSION,
     PRODUCTION_PLAN_SCHEMA_VERSION,
-    compile_production_workflow,
     normalize_production_options,
 )
 # Note: modal_options are passed through without reconstructing model-loading policy.
@@ -34,10 +32,6 @@ from workflow_metadata import (
     stack_to_warmup_profile,
     summarize_prompt_fields,
 )
-from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, RestorePlan
-from comfymodal_runtime.modal_transport import ModalTransport
-from comfymodal_runtime.restore_plan import derive_model_key, derive_prefill_key
-from comfymodal_runtime.trace import RuntimeTrace
 
 # ---------------------------------------------------------------------------
 # RunTrace — in-memory hierarchical span collector
@@ -368,232 +362,6 @@ def _collect_input_images(workflow: dict, comfyui_root: str) -> dict[str, str]:
                         images[filename] = base64.b64encode(f.read()).decode()
                     break
     return images
-
-
-def build_execution_plan(
-    workflow: dict,
-    *,
-    prompt_id: str = "",
-    client_id: str = "",
-    input_images: dict[str, str] | None = None,
-    modal_options: dict | None = None,
-    production_options: dict | None = None,
-    production_report: dict | None = None,
-    gpu: str | None = None,
-    workspace: dict | None = None,
-    request_metadata: dict | None = None,
-    comfyui_root: str = "",
-    trace: RuntimeTrace | None = None,
-    validate: bool = True,
-) -> ExecutionPlan:
-    """Normalize, validate, compile, and freeze one dispatch plan."""
-    if trace:
-        trace.emit("plan_build_start", phase="local", metadata={"prompt_id": prompt_id})
-    source_workflow = copy.deepcopy(workflow or {})
-    source_hash = prompt_sha256(source_workflow)
-    if validate:
-        assert_valid_api_prompt_structure(source_workflow)
-        _validate_class_types(source_workflow, production_report)
-
-    dispatch_workflow = source_workflow
-    report = dict(production_report or {})
-    normalized_production = None
-    if report.get("enabled"):
-        dispatch_workflow = copy.deepcopy(workflow or {})
-    elif production_options and production_options.get("enabled"):
-        normalized_production = normalize_production_options(production_options)
-        compiled = compile_production_workflow(
-            source_workflow,
-            normalized_production,
-            allow_direct_output_rewrite=True,
-        )
-        dispatch_workflow = compiled.compiled_workflow
-        report = dict(compiled.report)
-    dispatch_hash = prompt_sha256(dispatch_workflow)
-    if report.get("enabled"):
-        compiled_hash = str(report.get("compiled_workflow_hash", ""))
-        if compiled_hash and compiled_hash != dispatch_hash:
-            raise AssertionError(
-                "execution plan compiled workflow hash mismatch: "
-                f"compiled={compiled_hash[:12]} dispatch={dispatch_hash[:12]}"
-            )
-
-    if input_images is None:
-        input_images = _collect_input_images(dispatch_workflow, comfyui_root) if comfyui_root else {}
-
-    model_stack = extract_model_stack(dispatch_workflow)
-    try:
-        from optimizations import extract_safe_prompt_bundle
-        bundle_result = extract_safe_prompt_bundle(dispatch_workflow)
-        prompt_bundle = bundle_result.get("bundle", {}) if bundle_result.get("eligible") else {}
-    except Exception:
-        prompt_bundle = summarize_prompt_fields(dispatch_workflow)
-
-    option_source = dict(modal_options or {})
-    if report.get("enabled"):
-        option_source["production"] = {
-            "enabled": True,
-            "output_node_ids": list(report.get("output_node_ids", [])),
-        }
-    options = ExecutionOptions.from_legacy(
-        option_source,
-        production_report=report,
-        default_production=bool(report.get("enabled")),
-    )
-    output_node_ids = tuple(str(v) for v in report.get("output_node_ids", options.production_output_node_ids))
-    metadata = dict(request_metadata or {})
-    metadata.update({
-        "prompt_id": prompt_id,
-        "client_id": client_id,
-        "selected_gpu": gpu or "",
-        "workspace_id": str((workspace or {}).get("id", "")),
-    })
-    plan = ExecutionPlan(
-        workflow=dispatch_workflow,
-        workflow_hash=dispatch_hash,
-        source_workflow_hash=str(report.get("source_workflow_hash", source_hash)),
-        production_report=report,
-        model_stack=model_stack,
-        prompt_bundle=prompt_bundle,
-        output_node_ids=output_node_ids,
-        input_images=input_images or {},
-        execution_options=options,
-        request_metadata=metadata,
-    )
-    if trace:
-        trace.emit("plan_build_end", phase="local", metadata={
-            "workflow_hash": plan.workflow_hash,
-            "source_workflow_hash": plan.source_workflow_hash,
-            "production_enabled": bool(report.get("enabled")),
-        })
-    return plan
-
-
-async def execute_plan(
-    plan: ExecutionPlan,
-    *,
-    transport: ModalTransport | None = None,
-    restore_publisher: Any | None = None,
-    profile_setter: Callable[..., Any] | None = None,
-    gpu: str | None = None,
-    workspace: dict | None = None,
-    trace: RuntimeTrace | None = None,
-    event_sink: Callable[[str, dict[str, Any]], None] | None = None,
-) -> dict[str, Any]:
-    """Publish one restore plan, submit one plan, and merge one trace.
-
-    When *profile_setter* is provided, calls ``prepare_active_next_profile``
-    before restore publication / Modal submission.  A missing setter is a
-    safe dry-run / no-remote path.
-    """
-    runtime_trace = trace or RuntimeTrace(
-        request_id=str(plan.request_metadata.get("prompt_id", "")),
-        process="local",
-    )
-
-    # ── Profile preparation (before restore publication / Modal submission) ──
-    runtime_trace.emit("active_next_profile_start", phase="local")
-    if profile_setter is not None:
-        _activation_wf = dict(plan.to_dict().get("workflow", {}))
-        _activation_hash = plan.source_workflow_hash or plan.workflow_hash
-        _prod_opts: dict | None = None
-        _pr = dict(plan.production_report) if isinstance(plan.production_report, Mapping) else {}
-        if _pr.get("enabled"):
-            _prod_opts = {
-                "enabled": True,
-                "output_node_ids": list(_pr.get("output_node_ids", [])),
-                "bypass_node_ids": list(_pr.get("bypass_node_ids", [])),
-                "source_workflow_hash": _pr.get("source_workflow_hash", ""),
-                "compiled_workflow_hash": _pr.get("compiled_workflow_hash", ""),
-                "production_plan_hash": _pr.get("production_plan_hash", ""),
-                "compiler_version": _pr.get("compiler_version", COMPILER_SCHEMA_VERSION),
-                "hash_schema_version": _pr.get("hash_schema_version", HASH_SCHEMA_VERSION),
-                "production_plan_schema_version": _pr.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION),
-            }
-            _activation_hash = _pr.get("source_workflow_hash", _activation_hash)
-        _pn_result = await prepare_active_next_profile(
-            _activation_wf,
-            _activation_hash,
-            production_options=_prod_opts,
-            workspace=workspace,
-            setter=profile_setter,
-        )
-        runtime_trace.set_metadata(
-            active_profile_publish_decision=_pn_result.get("active_profile_publish_decision", ""),
-            active_profile_stable_key=_pn_result.get("active_profile_stable_key", ""),
-            active_profile_token=_pn_result.get("active_profile_token", ""),
-            local_active_profile_prepare_ms=_pn_result.get("local_active_profile_prepare_ms", 0.0),
-            active_profile_remote_call=_pn_result.get("active_profile_remote_call", 0),
-            active_profile_remote_ms=_pn_result.get("active_profile_remote_ms", 0.0),
-            active_profile_prepare_count=1,
-            source_workflow_hash=plan.source_workflow_hash,
-            model_stack=dict(plan.model_stack),
-            prompt_summary=dict(plan.prompt_bundle),
-        )
-        runtime_trace.emit("active_next_profile_end", phase="local", metadata={
-            "decision": _pn_result.get("active_profile_publish_decision", ""),
-            "stable_key": _pn_result.get("active_profile_stable_key", "")[:16],
-        })
-    else:
-        runtime_trace.emit("active_next_profile_end", phase="local", metadata={"status": "dry_run"})
-
-    # ── Restore publication ──
-    runtime_trace.emit("restore_publish_start", phase="local")
-    if restore_publisher is not None:
-        workflow = plan.to_dict()["workflow"]
-        model_key = derive_model_key(workflow)
-        prefill_key = derive_prefill_key(model_key, workflow)
-        restore_plan = RestorePlan(
-            generation=0,
-            model_key=model_key,
-            prefill_key=prefill_key,
-            model_spec=dict(plan.model_stack),
-            prefill_spec=dict(plan.prompt_bundle),
-            source_workflow_hash=plan.source_workflow_hash,
-        )
-        observed_generation = restore_publisher.publish(restore_plan)
-        runtime_trace.emit("restore_publish_end", phase="local", metadata={"generation": observed_generation})
-    else:
-        runtime_trace.emit("restore_publish_end", phase="local", metadata={"status": "not_configured"})
-
-    # ── Modal submission ──
-    runtime_trace.emit("modal_submit_start", phase="local")
-    active_transport = transport or ModalTransport()
-    result: dict[str, Any] | None = None
-    async for message in active_transport.run_plan_stream(
-        plan,
-        gpu=gpu or str(plan.request_metadata.get("selected_gpu", "")) or None,
-        workspace=workspace,
-        trace=runtime_trace.to_legacy_timing(prompt_id=str(plan.request_metadata.get("prompt_id", ""))),
-    ):
-        message_type = message.get("type") if isinstance(message, dict) else ""
-        if event_sink is not None and message_type in {"progress", "status", "executing"}:
-            event_sink(message_type, message.get("data") or message.get("event") or message)
-        if message_type == "error":
-            raise RuntimeError(message.get("message", "Modal execution error"))
-        if message_type == "result":
-            result = message.get("data")
-            break
-    if not isinstance(result, dict):
-        raise RuntimeError("execution plan stream ended without result")
-    runtime_trace.emit("remote_return_start", process="local", phase="transport")
-
-    # ── Merge local trace into remote result (preserve ALL remote fields) ──
-    remote_trace = result.get("trace")
-    if not isinstance(remote_trace, dict):
-        remote_trace = runtime_trace.to_legacy_timing(prompt_id=str(plan.request_metadata.get("prompt_id", "")))
-    # Overlay local events onto the remote trace
-    remote_trace["events"] = [event.to_dict() for event in runtime_trace.events]
-    # Merge local metadata safely — handle missing or malformed remote metadata
-    _remote_md = remote_trace.get("metadata")
-    if not isinstance(_remote_md, dict):
-        remote_trace["metadata"] = {}
-    remote_trace["metadata"].update(dict(runtime_trace._metadata))
-    # Backend: only set/overwrite when the result actually supplies one
-    if "backend" in result:
-        remote_trace["backend"] = result["backend"]
-    result["trace"] = remote_trace
-    return result
 
 
 # ---------------------------------------------------------------------------

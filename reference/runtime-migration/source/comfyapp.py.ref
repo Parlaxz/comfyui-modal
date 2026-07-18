@@ -3947,46 +3947,6 @@ import threading as _threading
 _volume_commit_lock = _threading.Lock()
 _volume_commit_inflight_labels: set[str] = set()
 _volume_commit_dirty_labels: set[str] = set()
-_volume_telemetry = {
-    "runtime_state_write_count": 0,
-    "runtime_state_commit_count": 0,
-    "runtime_state_max_concurrent_commits": 0,
-    "runtime_state_commit_in_flight": 0,
-    "models_volume_write_count": 0,
-    "models_volume_commit_count": 0,
-}
-
-
-def _record_volume_write(kind: str, path: str = "") -> None:
-    with _volume_commit_lock:
-        _key = "runtime_state_write_count" if kind == "runtime_state" else "models_volume_write_count"
-        _volume_telemetry[_key] += 1
-        if path:
-            _volume_telemetry.setdefault(f"{kind}_last_write_path", path)
-
-
-def _commit_volume_with_telemetry(volume, kind: str, label: str = "") -> None:
-    with _volume_commit_lock:
-        _volume_telemetry["runtime_state_commit_in_flight"] += 1
-        _volume_telemetry["runtime_state_max_concurrent_commits"] = max(
-            _volume_telemetry["runtime_state_max_concurrent_commits"],
-            _volume_telemetry["runtime_state_commit_in_flight"],
-        )
-    try:
-        volume.commit()
-        with _volume_commit_lock:
-            _key = "runtime_state_commit_count" if kind == "runtime_state" else "models_volume_commit_count"
-            _volume_telemetry[_key] += 1
-    finally:
-        with _volume_commit_lock:
-            _volume_telemetry["runtime_state_commit_in_flight"] = max(
-                0, _volume_telemetry["runtime_state_commit_in_flight"] - 1
-            )
-
-
-def _volume_telemetry_snapshot() -> dict:
-    with _volume_commit_lock:
-        return dict(_volume_telemetry)
 
 # GÃ¶Ã‡GÃ¶Ã‡ Active model-read registry (module-global) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
 # Tracks every in-flight model-file read so any consumer (cached_load,
@@ -4457,7 +4417,7 @@ def _commit_runtime_config_worker(label: str, runtime_config_volume) -> None:
     """Loop: commit *runtime_config_volume* until no dirty marker remains."""
     while True:
         try:
-            _commit_volume_with_telemetry(runtime_config_volume, "runtime_state", label)
+            runtime_config_volume.commit()
             print(f"[comfyapp] runtime_config_vol_commit_async_finished label={label}")
         except Exception as exc:
             print(f"[comfyapp] runtime_config_vol_commit_async_failed label={label} error={exc}")
@@ -8345,7 +8305,6 @@ class _ComfyAPIMixin:
             with open(tmp_path, "w") as f:
                 f.write(stack_json)
             os.replace(tmp_path, LAST_MODEL_STACK_PATH)
-            _record_volume_write("runtime_state", LAST_MODEL_STACK_PATH)
             _commit_runtime_config_vol_async("last_model_stack", runtime_config_vol)
         except Exception as exc:
             print(f"[comfyapp] failed to save last model stack: {exc}")
@@ -8393,10 +8352,9 @@ class _ComfyAPIMixin:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(compact)
             os.replace(tmp_path, ACTIVE_NEXT_PROFILE_PATH)
-            _record_volume_write("runtime_state", ACTIVE_NEXT_PROFILE_PATH)
             t1 = time.time()
             # Only commit the runtime-config Volume; never the models Volume.
-            _commit_volume_with_telemetry(runtime_config_volume, "runtime_state", "active_next_profile")
+            runtime_config_volume.commit()
             t2 = time.time()
             write_ms = round((t1 - t0) * 1000, 1)
             commit_ms = round((t2 - t1) * 1000, 1)
