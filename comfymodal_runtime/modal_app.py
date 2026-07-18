@@ -153,7 +153,10 @@ class ModalRuntimeEntrypoint:
         self._lifecycle_trace: RuntimeTrace | None = None
 
     def _remember_lifecycle_trace(self, trace: RuntimeTrace) -> None:
-        self._lifecycle_trace = merge_runtime_traces(self._lifecycle_trace, trace)
+        if self._lifecycle_trace is None:
+            self._lifecycle_trace = trace
+        elif self._lifecycle_trace is not trace:
+            self._lifecycle_trace.extend(trace.events)
 
     def _get_remote_restore_publisher(self) -> RestorePlanPublisher:
         if self._restore_publisher is not None:
@@ -278,6 +281,8 @@ class ModalRuntimeEntrypoint:
                 metadata={"status": "error", "error": str(exc)[:200]},
             )
         state = self.bootstrap.restore(trace=trace)
+        self._remember_lifecycle_trace(trace)
+        trace = self._lifecycle_trace or trace
         if self._restore_plan is not None:
             preparation = self._preload_bridge.prepare(self._restore_plan, trace=trace)
             trace.set_metadata(
@@ -287,7 +292,6 @@ class ModalRuntimeEntrypoint:
             )
         else:
             self._preload_bridge.clear()
-        self._remember_lifecycle_trace(trace)
         return {
             "backend": state.backend,
             "cuda": dict(state.cuda),
