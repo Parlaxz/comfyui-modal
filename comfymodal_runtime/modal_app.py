@@ -10,7 +10,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Mapping
+from typing import Any, AsyncIterator, Callable, ContextManager, Mapping, cast
 
 from .contracts import ExecutionPlan, RestorePlan
 from .deployment_spec import build_deployment_identity
@@ -201,7 +201,12 @@ class ModalRuntimeEntrypoint:
             return api._sync_custom_nodes_from_volume()
 
         def start_backend() -> str:
-            api._start_in_process_backend()
+            snapshot_context = getattr(api, "_force_cpu_during_snapshot", None)
+            if callable(snapshot_context):
+                with cast(ContextManager[Any], snapshot_context()):
+                    api._start_in_process_backend()
+            else:
+                api._start_in_process_backend()
             return "in_process"
 
         def restore_gpu_state() -> Any:

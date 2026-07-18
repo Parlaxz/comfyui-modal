@@ -69,6 +69,20 @@ class TestBootstrap(unittest.TestCase):
         self.assertEqual(calls[4:], ["gpu", "cuda", "sage", "state", "models", "nodes"])
         self.assertEqual(bootstrap.state.backend, "in_process")
 
+    def test_backend_callback_controls_snapshot_cuda_policy(self):
+        observed: list[str | None] = []
+        model_path = Path(tempfile.gettempdir()) / "models"
+        model_path.mkdir(exist_ok=True)
+        bootstrap = RuntimeBootstrap(
+            BootstrapConfig(comfyui_root=tempfile.gettempdir(), models_path=str(model_path)),
+            start_backend=lambda: observed.append(os.environ.get("CUDA_VISIBLE_DEVICES")) or "in_process",
+        )
+
+        before = os.environ.get("CUDA_VISIBLE_DEVICES")
+        bootstrap.startup(snapshot=True)
+
+        self.assertEqual(observed, [before])
+
 
 class TestModelPreload(unittest.TestCase):
     def test_two_lanes_and_exact_prefill_are_measured(self):
