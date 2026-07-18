@@ -98,16 +98,7 @@ from run_prompt_options import (
 )
 import experiment_setup_adapter as _experiment_setup_adapter
 from warmup_profile import prepare_active_next_profile as prepare_active_next_profile
-from canonical_execution import (
-    RunTrace,
-    build_execution_plan,
-    execute_modal_prompt,
-    execute_plan,
-    prepare_modal_execution,
-)
-from comfymodal_runtime.modal_transport import ModalTransport
-from comfymodal_runtime.result_delivery import materialize_modal_result as _materialize_v2_result
-from comfymodal_runtime.trace import RuntimeTrace
+from canonical_execution import RunTrace, execute_modal_prompt, prepare_modal_execution
 from comparison import (
     create_profile,
     update_profile,
@@ -749,18 +740,6 @@ def _materialize_experiment_output(
         "primary_thumbnail_asset_id": primary_thumbnail_asset_id,
         "output_count": seen,
     }
-
-
-def _get_v2_restore_publisher():
-    """Lazy singleton: delegates to the shared
-    ``comfymodal_runtime.restore_plan.get_default_restore_publisher()``
-    so normal v2 and Playground use the same publisher/coordinator.
-
-    Not initialized at import time — first call on the v2 execution path.
-    Concurrent requests share the same coordinator.
-    """
-    from comfymodal_runtime.restore_plan import get_default_restore_publisher as _shared
-    return _shared()
 
 
 _COMFYAPP_PATH = os.path.join(_NODE_DIR, "comfyapp.py")
@@ -1652,11 +1631,6 @@ except ImportError:
 
 _COMFYUI_ROOT = os.path.dirname(os.path.dirname(_NODE_DIR))
 
-
-def _runtime_mode() -> str:
-    mode = os.environ.get("COMFYMODAL_RUNTIME", "legacy").strip().lower()
-    return mode if mode in {"legacy", "v2", "shadow"} else "legacy"
-
 _MODAL_TOML_PATH = os.path.expanduser("~/.modal.toml")
 _HF_TOKEN_PATH = os.path.join(os.path.dirname(__file__), ".hf_token")
 _CIVITAI_TOKEN_PATH = os.path.join(os.path.dirname(__file__), ".civitai_token")
@@ -2212,59 +2186,21 @@ async def _execute_job(item: tuple, item_id: int):
         # collection, profile preparation, run-prompt-options construction,
         # and the run_prompt_stream call with event forwarding.
         # This is the single canonical call — no second compile/hash path.
-        _mode = _runtime_mode()
-        _v2_plan = None
-        _v2_trace = None
-        if _mode in {"v2", "shadow"}:
-            _v2_trace = RuntimeTrace(request_id=prompt_id, process="local")
-            _v2_plan = build_execution_plan(
-                execution_workflow,
-                prompt_id=prompt_id,
-                client_id=sid,
-                modal_options=_mo if _mo else None,
-                production_options=production_options if production_options.get("enabled") else None,
-                production_report=extra_data.get("production_report") if isinstance(extra_data, dict) else None,
-                gpu=extra_data.get("gpu"),
-                workspace=_request_workspace or None,
-                comfyui_root=_COMFYUI_ROOT,
-                trace=_v2_trace,
-                validate=False,
-            )
-            _run_trace.set_meta(
-                v2_runtime_mode=_mode,
-                v2_plan_hash=_v2_plan.workflow_hash,
-                v2_source_workflow_hash=_v2_plan.source_workflow_hash,
-            )
-            if _mode == "shadow":
-                print(f"[comfyui-modal] v2 shadow plan built hash={_v2_plan.workflow_hash[:12]}")
-
-        if _mode == "v2" and _v2_plan is not None:
-            _v2_publisher = _get_v2_restore_publisher()
-            result = await execute_plan(
-                _v2_plan,
-                restore_publisher=_v2_publisher,
-                profile_setter=set_active_warmup_profile,
-                gpu=extra_data.get("gpu"),
-                workspace=_request_workspace or None,
-                trace=_v2_trace,
-                event_sink=_event_sink,
-            )
-        else:
-            result = await execute_modal_prompt(
-                execution_workflow,
-                prompt_id=prompt_id,
-                client_id=sid,
-                input_images=None,
-                modal_options=_mo if _mo else None,
-                production_options=production_options if production_options.get("enabled") else None,
-                gpu=extra_data.get("gpu"),
-                workspace=_request_workspace or None,
-                trace_payload={**trace.fields(), "prompt_id": prompt_id, "client_id": sid},
-                profile_setter=set_active_warmup_profile,
-                run_trace=_run_trace,
-                comfyui_root=_COMFYUI_ROOT,
-                event_sink=_event_sink,
-            )
+        result = await execute_modal_prompt(
+            execution_workflow,
+            prompt_id=prompt_id,
+            client_id=sid,
+            input_images=None,
+            modal_options=_mo if _mo else None,
+            production_options=production_options if production_options.get("enabled") else None,
+            gpu=extra_data.get("gpu"),
+            workspace=_request_workspace or None,
+            trace_payload={**trace.fields(), "prompt_id": prompt_id, "client_id": sid},
+            profile_setter=set_active_warmup_profile,
+            run_trace=_run_trace,
+            comfyui_root=_COMFYUI_ROOT,
+            event_sink=_event_sink,
+        )
         # ── Extract canonical metadata from run_trace ──
         _result_trace = result.get("trace", {}) if isinstance(result, dict) else {}
         _run_trace_summary = _result_trace.get("_run_trace", {}) if isinstance(_result_trace, dict) else {}
@@ -2274,12 +2210,6 @@ async def _execute_job(item: tuple, item_id: int):
                          _rt_meta.get("compiled_workflow_hash", ""))
             prompt_summary = _rt_meta.get("prompt_summary", {})
             model_stack = _rt_meta.get("model_stack", {})
-        elif _v2_plan is not None and _mode in {"v2", "shadow"}:
-            # v2 path fallback: extract from v2 plan metadata when the
-            # legacy _run_trace envelope is absent.
-            prompt_hash = _v2_plan.source_workflow_hash or _v2_plan.workflow_hash
-            prompt_summary = dict(_v2_plan.prompt_bundle)
-            model_stack = dict(_v2_plan.model_stack)
         # Log after canonical extraction
         print(f"[comfyui-modal] Running prompt {prompt_hash[:12] if prompt_hash else '?'}…")
 
@@ -2385,39 +2315,22 @@ async def _execute_job(item: tuple, item_id: int):
         trace.mark("client_comfy_notify_start", materialize_started)
         _mo = extra_data.get("modal_options") if isinstance(extra_data, dict) else None
         _settings = _load_modal_settings()
-        if _mode == "v2":
-            delivery = _materialize_v2_result(
-                result,
-                output_dir=output_dir,
-                prompt_id=prompt_id,
-                client_id=sid,
-                send_event=lambda event, payload: _send(sid, event, payload),
-                auto_save_local=bool((_mo or {}).get("auto_save_local", False)),
-                save_folder=(_mo or {}).get("save_folder") or _settings.get("save_folder", ""),
-                save_metadata_sidecar=bool((_mo or {}).get("save_metadata_sidecar", _settings.get("save_metadata_sidecar", True))),
-                workflow_hash=prompt_hash,
-                seed=str(prompt_summary.get("seed", "0")),
-                width=prompt_summary.get("width", 0),
-                height=prompt_summary.get("height", 0),
-                comfyui_root=_COMFYUI_ROOT,
-            )
-        else:
-            delivery = _materialize_modal_outputs(
-                result,
-                output_dir=output_dir,
-                prompt_id=prompt_id,
-                client_id=sid,
-                send_event=lambda event, payload: _send(sid, event, payload),
-                auto_save_local=bool((_mo or {}).get("auto_save_local", False)),
-                save_folder=(_mo or {}).get("save_folder") or _settings.get("save_folder", ""),
-                save_metadata_sidecar=bool((_mo or {}).get("save_metadata_sidecar", _settings.get("save_metadata_sidecar", True))),
-                workflow_hash=prompt_hash,
-                workflow_name="",
-                seed=str(prompt_summary.get("seed", "0")),
-                width=prompt_summary.get("width", 0),
-                height=prompt_summary.get("height", 0),
-                comfyui_root=_COMFYUI_ROOT,
-            )
+        delivery = _materialize_modal_outputs(
+            result,
+            output_dir=output_dir,
+            prompt_id=prompt_id,
+            client_id=sid,
+            send_event=lambda event, payload: _send(sid, event, payload),
+            auto_save_local=bool((_mo or {}).get("auto_save_local", False)),
+            save_folder=(_mo or {}).get("save_folder") or _settings.get("save_folder", ""),
+            save_metadata_sidecar=bool((_mo or {}).get("save_metadata_sidecar", _settings.get("save_metadata_sidecar", True))),
+            workflow_hash=prompt_hash,
+            workflow_name="",
+            seed=str(prompt_summary.get("seed", "0")),
+            width=prompt_summary.get("width", 0),
+            height=prompt_summary.get("height", 0),
+            comfyui_root=_COMFYUI_ROOT,
+        )
         outputs.clear()
         outputs.update(delivery.get("history_outputs", delivery["outputs"]))
         output_bytes_written = delivery["bytes_written"]
@@ -2473,38 +2386,18 @@ async def _execute_job(item: tuple, item_id: int):
 
         # Stash active-next preparer metrics into the merged trace.
         # Extract from the _run_trace spans and counts which were recorded
-        # by execute_modal_prompt / prepare_modal_execution.  When the
-        # legacy RunTrace envelope is absent (v2 path), fall back to
-        # metadata fields carried by the v2 RuntimeTrace.
+        # by execute_modal_prompt / prepare_modal_execution.
         _MERGED_DERIVED = _merged_trace.setdefault("derived_ms", {})
         _run_trace_summary = result.get("trace", {}).get("_run_trace", {}) if isinstance(result.get("trace"), dict) else {}
         _rt_counts = _run_trace_summary.get("counts", {}) if isinstance(_run_trace_summary, dict) else {}
         _rt_spans = _run_trace_summary.get("spans", {}) if isinstance(_run_trace_summary, dict) else {}
-        if not isinstance(_rt_counts, dict):
-            _rt_counts = {}
-        if not isinstance(_rt_spans, dict):
-            _rt_spans = {}
-        # v2 metadata fallback source — read once, safe when absent/non-dict
-        _v2_meta = result.get("trace", {}).get("metadata", {}) if isinstance(result.get("trace"), dict) else {}
-        if not isinstance(_v2_meta, dict):
-            _v2_meta = {}
-
         _profile_span = _rt_spans.get("prepare_active_next_profile", {}) if isinstance(_rt_spans, dict) else {}
         if _profile_span and isinstance(_profile_span, dict) and _profile_span.get("called"):
             _MERGED_DERIVED["active_profile_build_ms"] = _profile_span.get("duration_ms", 0)
         else:
-            # v2 fallback: read from trace metadata when positive
-            _v2_prepare_ms = _v2_meta.get("local_active_profile_prepare_ms", 0.0)
-            _MERGED_DERIVED["active_profile_build_ms"] = max(0.0, _v2_prepare_ms) if isinstance(_v2_prepare_ms, (int, float)) else 0.0
+            _MERGED_DERIVED["active_profile_build_ms"] = 0.0
         if "active_profile_prepare_count" in _rt_counts:
             _MERGED_DERIVED["active_profile_remote_call"] = _rt_counts.get("active_profile_prepare_count", 0)
-        else:
-            # v2 fallback: read active_profile_prepare_count from metadata
-            _v2_remote_call = _v2_meta.get("active_profile_prepare_count", 0)
-            if isinstance(_v2_remote_call, (int, float)):
-                _MERGED_DERIVED["active_profile_remote_call"] = int(_v2_remote_call) if _v2_remote_call else 0
-            else:
-                _MERGED_DERIVED["active_profile_remote_call"] = 1 if _v2_remote_call else 0
         _MERGED_DERIVED["active_profile_to_gpu_submit_ms"] = 0.0  # Not tracked in canonical executor
         _merged_trace["active_profile_dedup_status"] = ""  # Not tracked in canonical executor
 

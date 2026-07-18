@@ -50,7 +50,7 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 try:
     import nodes
@@ -1841,127 +1841,6 @@ def build_experiment_spec(
     return compilation
 
 
-# ── V2 Playground adapter ───────────────────────────────────────────────────
-# Thin compatibility adapter that bridges the existing adapter entrypoints
-# to the new PlaygroundService (comfymodal_runtime/playground_service.py).
-# The adapter preserves response shapes so callers see no difference.
-
-
-async def playground_adapter_direct_run(
-    preset_id: str,
-    feature_id: str,
-    controls: dict[str, Any],
-    node_dir: str | os.PathLike,
-    *,
-    modal_options: dict | None = None,
-    gpu: Any = None,
-    workspace: dict | None = None,
-    trace_ctx: dict | None = None,
-    event_sink: Callable[[str, dict[str, Any]], None] | None = None,
-    studio_output_dir: str | os.PathLike | None = None,
-) -> dict[str, Any]:
-    """Execute a direct single run via the PlaygroundService.
-
-    Returns a dict with the same shape as
-    ``direct_studio_run_completion``.
-
-    This is a **thin adapter** — the actual pipeline lives in
-    ``PlaygroundService.execute``.  Tests may call this adapter or
-    the service directly with injected fakes.
-
-    Bypasses: matrix compiler, scheduler, leases, journals, worker pool,
-    multi-cell machinery.
-
-    *event_sink* is forwarded so progress/status events reach the frontend.
-    """
-    from comfymodal_runtime.playground_service import (
-        _safe_event_sink,
-        create_playground_service,
-    )
-
-    service = create_playground_service()
-
-    # Try to wire the live profile setter when available
-    _profile_setter: Any = None
-    try:
-        from modal_client import set_active_warmup_profile as _live_setter
-        _profile_setter = _live_setter
-    except Exception:
-        pass
-
-    return await service.execute(
-        preset_id=preset_id,
-        feature_id=feature_id,
-        controls=controls,
-        node_dir=node_dir,
-        modal_options=modal_options,
-        gpu=gpu,
-        workspace=workspace,
-        trace_ctx=trace_ctx,
-        profile_setter=_profile_setter,
-        event_sink=event_sink or _safe_event_sink(),
-        studio_output_dir=studio_output_dir,
-    )
-
-
-def playground_adapter_sync_run(
-    preset_id: str,
-    feature_id: str,
-    controls: dict[str, Any],
-    node_dir: str | os.PathLike,
-    *,
-    modal_options: dict | None = None,
-    gpu: Any = None,
-    workspace: dict | None = None,
-    trace_ctx: dict | None = None,
-    timeout: float = 600.0,
-) -> dict[str, Any]:
-    """Sync wrapper for ``playground_adapter_direct_run``.
-
-    Spawns a new event loop when called from a running-loop context.
-    Matches the sync behaviour of ``handle_studio_run``.
-    """
-    import asyncio
-
-    async def _run() -> dict[str, Any]:
-        return await playground_adapter_direct_run(
-            preset_id, feature_id, controls, node_dir,
-            modal_options=modal_options,
-            gpu=gpu, workspace=workspace, trace_ctx=trace_ctx,
-        )
-
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop is not None and loop.is_running():
-        import threading
-        _result_holder: list[dict] = []
-
-        def _run_in_thread() -> None:
-            _inner_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(_inner_loop)
-            try:
-                r = _inner_loop.run_until_complete(_run())
-                _result_holder.append(r)
-            finally:
-                _inner_loop.close()
-
-        t = threading.Thread(target=_run_in_thread, daemon=True)
-        t.start()
-        t.join(timeout=timeout)
-        if not _result_holder:
-            return {"status": "error", "message": "Playground run timed out"}
-        return _result_holder[0]
-
-    try:
-        return asyncio.run(_run())
-    except Exception:
-        _log.exception("Playground adapter sync run failed for %s", preset_id)
-        return {"status": "error", "message": _STABLE_INTERNAL_ERROR}
-
-
 # ── Async scheduler helpers ────────────────────────────────────────────────
 
 
@@ -3235,24 +3114,13 @@ async def handle_studio_run_async(
 ) -> dict[str, Any]:
     """Async handler for a single Studio run.
 
-    When ``direct=True`` (default), dispatches immediately to the
-    PlaygroundService adapter **before** shared-context preparation,
-    avoiding duplicate preset loading, compilation, and history creation.
-
-    When ``direct=False``, uses the shared ``_prepare_studio_run_context``
-    + experiment scheduler path (legacy scheduler/runner flow).
+    Uses shared preparation then either executes the cell directly via
+    ``direct_studio_run_completion`` (``direct=True``, default) or
+    schedules via the experiment scheduler (``direct=False``).
 
     Returns a completed result dict on success in direct mode, or a
     submission response dict in scheduler (legacy) mode.
     """
-    if direct:
-        return await playground_adapter_direct_run(
-            preset_id, feature_id, controls, node_dir,
-            modal_options=modal_options, gpu=gpu,
-            workspace=workspace, trace_ctx=trace_ctx,
-        )
-
-    # ── Scheduler (legacy) path — shared context then scheduler ──
     ctx = _prepare_studio_run_context(
         preset_id, feature_id, controls, node_dir,
         trace_ctx=trace_ctx, modal_options=modal_options, workspace=workspace,
@@ -3260,7 +3128,13 @@ async def handle_studio_run_async(
     if ctx.get("status") != "ok":
         return ctx
 
-    return _handle_studio_run_scheduler(
+    if not direct:
+        return _handle_studio_run_scheduler(
+            ctx, node_dir,
+            gpu=gpu, modal_options=modal_options, workspace=workspace,
+        )
+
+    return await direct_studio_run_completion(
         ctx, node_dir,
         gpu=gpu, modal_options=modal_options, workspace=workspace,
     )

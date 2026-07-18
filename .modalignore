@@ -28,5 +28,7 @@ optimization_logs/
 .preset_blobs/
 MagicMock/
 docs/
+reference/
 web/node_modules/
+.runtime_state/
 
