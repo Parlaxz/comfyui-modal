@@ -14,11 +14,6 @@ from comfymodal_runtime.runtime_executor import ExecutionContext
 from comfymodal_runtime.trace import RuntimeTrace
 
 
-class _Loop:
-    def run_until_complete(self, awaitable):
-        return asyncio.run(awaitable)
-
-
 class _Executor:
     success = True
     history_result = {}
@@ -65,7 +60,7 @@ def test_v2_runner_uses_prompt_executor_and_live_registry_without_legacy_wrapper
         _pop_production_outputs=lambda _prompt_id: registry,
     )
     executor = _Executor()
-    api = SimpleNamespace(_event_loop=_Loop(), _executor=executor)
+    api = SimpleNamespace(_executor=executor)
     entrypoint = modal_app.ModalRuntimeEntrypoint()
     entrypoint._legacy_module = fake_module
 
@@ -86,7 +81,7 @@ def test_v2_runner_uses_prompt_executor_and_live_registry_without_legacy_wrapper
 
     fake_execution = SimpleNamespace(validate_prompt=_validate_prompt)
     with patch.dict("sys.modules", {"execution": fake_execution}):
-        result = entrypoint._execute_v2_prompt_executor(plan, context, api, trace)
+        result = asyncio.run(entrypoint._execute_v2_prompt_executor(plan, context, api, trace))
 
     assert result["images"][0]["data"]
     assert result["outputs"]["107"]["images"][0]["node_id"] == "107"
@@ -111,7 +106,7 @@ def test_v2_fallback_conversion_failure_keeps_original_materialized_bytes():
             },
         },
     }
-    api = SimpleNamespace(_event_loop=_Loop(), _executor=executor)
+    api = SimpleNamespace(_executor=executor)
     entrypoint = modal_app.ModalRuntimeEntrypoint()
     entrypoint._legacy_module = SimpleNamespace()
     plan = ExecutionPlan(
@@ -129,7 +124,7 @@ def test_v2_fallback_conversion_failure_keeps_original_materialized_bytes():
         "convert_output_items",
         side_effect=ConversionFailedError("converter unavailable"),
     ):
-        result = entrypoint._execute_v2_prompt_executor(plan, context, api, trace)
+        result = asyncio.run(entrypoint._execute_v2_prompt_executor(plan, context, api, trace))
 
     assert base64.b64decode(result["images"][0]["data"]) == original
     assert result["output_attempts"][1]["metrics"]["conversion_fallback"] is True
