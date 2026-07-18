@@ -196,6 +196,28 @@ class TestModalTransport(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_entrypoint_stream_merges_lifecycle_trace_into_result(self):
+        async def run():
+            lifecycle = RuntimeTrace(process="remote")
+            lifecycle.emit("snapshot_restore_end", phase="restore")
+            executor = RuntimeExecutor(
+                in_process_runner=lambda plan, ctx: {
+                    "trace": RuntimeTrace(process="remote").to_dict(),
+                    "ok": True,
+                }
+            )
+            entrypoint = ModalRuntimeEntrypoint(executor=executor)
+            entrypoint._lifecycle_trace = lifecycle
+            messages = [
+                message async for message in entrypoint.run_plan_stream(
+                    ExecutionPlan(workflow={"1": {}}).to_dict()
+                )
+            ]
+            names = {event["name"] for event in messages[-1]["data"]["trace"]["events"]}
+            self.assertIn("snapshot_restore_end", names)
+
+        asyncio.run(run())
+
     def test_default_v2_transport_targets_registered_class(self):
         observed: dict[str, Any] = {}
 

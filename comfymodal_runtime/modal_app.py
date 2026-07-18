@@ -25,7 +25,7 @@ from .output_delivery import (
     run_strategy_chain,
 )
 from .result_delivery import ConversionFailedError, convert_output_items
-from .trace import RuntimeTrace
+from .trace import RuntimeTrace, merge_runtime_traces
 
 
 try:
@@ -150,6 +150,10 @@ class ModalRuntimeEntrypoint:
         self._restore_plan: RestorePlan | None = None
         self._restore_publisher: RestorePlanPublisher | None = None
         self._preload_bridge = V2LoaderBridge()
+        self._lifecycle_trace: RuntimeTrace | None = None
+
+    def _remember_lifecycle_trace(self, trace: RuntimeTrace) -> None:
+        self._lifecycle_trace = merge_runtime_traces(self._lifecycle_trace, trace)
 
     def _get_remote_restore_publisher(self) -> RestorePlanPublisher:
         if self._restore_publisher is not None:
@@ -251,6 +255,7 @@ class ModalRuntimeEntrypoint:
         self._configure_runtime()
         trace = RuntimeTrace(process="remote")
         state = self.bootstrap.startup(snapshot=True, trace=trace)
+        self._remember_lifecycle_trace(trace)
         return {"backend": state.backend, "status": "ready", "trace": trace.to_dict()}
 
     def restore(self) -> dict[str, Any]:
@@ -282,6 +287,7 @@ class ModalRuntimeEntrypoint:
             )
         else:
             self._preload_bridge.clear()
+        self._remember_lifecycle_trace(trace)
         return {
             "backend": state.backend,
             "cuda": dict(state.cuda),
@@ -600,6 +606,13 @@ class ModalRuntimeEntrypoint:
         )
         yield {"type": "status", "phase": "plan_received", "request_id": request_id}
         async for event in self.executor.stream(plan, context=context):
+            if event.get("type") == "result" and isinstance(event.get("data"), dict):
+                data = dict(event["data"])
+                data["trace"] = merge_runtime_traces(
+                    self._lifecycle_trace,
+                    data.get("trace"),
+                ).to_dict()
+                event = {**event, "data": data}
             yield event
 
     async def run_prompt_stream(
