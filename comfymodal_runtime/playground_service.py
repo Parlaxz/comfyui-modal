@@ -388,6 +388,7 @@ async def _default_save_history(
     run_history_id: str,
     status: str = "completed",
     completed_at: str = "",
+    materialized_paths: list[str] | None = None,
 ) -> None:
     """Default history writer: records then updates via REGISTRY.
 
@@ -462,9 +463,10 @@ async def _default_save_history(
         meta["experiment_id"] = run_history_id
         meta["workflow_hash"] = plan.workflow_hash
 
-        # Extract output paths from result
-        output_paths: list[str] = []
-        if isinstance(result, dict):
+        # Extract output paths from result — prefer pre-materialized paths
+        # when available (passed by the PlaygroundService after materialization).
+        output_paths: list[str] = list(materialized_paths) if materialized_paths else []
+        if not output_paths and isinstance(result, dict):
             primary = result.get("primary_output") or result.get("_local_primary_output")
             if isinstance(primary, dict) and primary.get("path"):
                 output_paths = [primary["path"]]
@@ -479,6 +481,11 @@ async def _default_save_history(
         if output_paths:
             meta["output_paths"] = list(output_paths)
 
+        # Extract first output basename for top-level output_path — the
+        # frontend normalizer (studio-run-normalizer.js) resolves history
+        # images from run.output_path, not meta.output_paths.
+        top_level_output_path: str = output_paths[0] if output_paths else ""
+
         # Record a run in history, then update with timings/meta
         record = REGISTRY.history().record_run(
             kind="playground_run",
@@ -489,13 +496,15 @@ async def _default_save_history(
         )
         actual_run_id = record.get("run_id", run_history_id) if record else run_history_id
 
-        REGISTRY.history().update_run(
-            actual_run_id,
-            status=status,
-            completed_at=completed_at,
-            timings=timings if timings else None,
-            meta=meta,
-        )
+        update_kwargs: dict[str, Any] = {
+            "status": status,
+            "completed_at": completed_at,
+            "timings": timings if timings else None,
+            "meta": meta,
+        }
+        if top_level_output_path:
+            update_kwargs["output_path"] = top_level_output_path
+        REGISTRY.history().update_run(actual_run_id, **update_kwargs)
     except Exception:
         _log.warning("Failed to save history for run %s", run_history_id)
 
@@ -814,6 +823,7 @@ class PlaygroundService:
             await self._save_history(
                 plan, result, run_history_id,
                 status="completed", completed_at=completed_at,
+                materialized_paths=output_paths if output_paths else None,
             )
         except Exception:
             _log.warning("Playground history save failed (non-fatal)")
