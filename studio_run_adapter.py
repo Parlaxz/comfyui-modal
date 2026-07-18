@@ -2922,6 +2922,28 @@ async def direct_studio_run_completion(
             run_trace=_run_trace,
         )
 
+        # The direct path receives raw Modal output entries, including
+        # base64-encoded image data. Materialize them locally before
+        # publishing history/API paths; unlike the scheduler path, this
+        # path does not pass through LocalRemoteInvoker's materializer.
+        from local_artifacts import get_studio_outputs_dir
+        from comfymodal_runtime.result_delivery import materialize_modal_result
+
+        _studio_output_dir = get_studio_outputs_dir()
+        _studio_output_dir.mkdir(parents=True, exist_ok=True)
+        _materialized = materialize_modal_result(
+            result,
+            output_dir=str(_studio_output_dir),
+            prompt_id=exp_id,
+            require_output=True,
+        )
+        _materialized_paths = [
+            Path(path).name for path in _materialized.get("written_files", [])
+        ]
+        if _materialized_paths:
+            result["_local_materialized_output_paths"] = _materialized_paths
+            result["_local_primary_output"] = _materialized.get("primary_output")
+
         if _run_trace is not None:
             _run_trace.begin("post_processing")
 
@@ -3061,9 +3083,15 @@ async def direct_studio_run_completion(
         output_paths: list[str] = []
         if isinstance(result, dict):
             _primary = result.get("primary_output") or result.get("_local_primary_output")
-            if isinstance(_primary, dict) and _primary.get("path"):
-                output_paths = [_primary["path"]]
-            elif result.get("outputs"):
+            _materialized_paths = result.get("_local_materialized_output_paths")
+            if isinstance(_materialized_paths, list):
+                output_paths = [
+                    Path(path).name for path in _materialized_paths
+                    if isinstance(path, str) and path
+                ]
+            if not output_paths and isinstance(_primary, dict) and _primary.get("path"):
+                output_paths = [Path(_primary["path"]).name]
+            if not output_paths and result.get("outputs"):
                 for _nid, _nouts in result["outputs"].items():
                     if isinstance(_nouts, dict):
                         for _entries in _nouts.values():

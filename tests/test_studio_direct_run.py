@@ -360,7 +360,12 @@ class StudioDirectRunCompletionTests(unittest.TestCase):
         async def _test():
             with tempfile.TemporaryDirectory() as tmp:
                 ctx = self._make_context(tmp)
-                result = await self._run_direct(ctx, tmp)
+                studio_output_dir = Path(tmp) / "studio-output"
+                with patch(
+                    "local_artifacts.get_studio_outputs_dir",
+                    return_value=studio_output_dir,
+                ):
+                    result = await self._run_direct(ctx, tmp)
                 self.assertEqual(result["status"], "ok")
                 self.assertIn("output_paths", result)
                 self.assertIn("timings", result)
@@ -370,6 +375,8 @@ class StudioDirectRunCompletionTests(unittest.TestCase):
                 # Verify output paths exist
                 output_paths = result.get("output_paths", [])
                 self.assertGreater(len(output_paths), 0)
+                self.assertEqual(output_paths, ["test.png"])
+                self.assertTrue((studio_output_dir / "test.png").is_file())
 
         asyncio.run(_test())
 
