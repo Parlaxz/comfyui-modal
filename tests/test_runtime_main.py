@@ -142,6 +142,16 @@ class TestModalTransport(unittest.TestCase):
         self.assertEqual(resources["spec"].min_containers, 0)
         self.assertEqual(resources["spec"].scaledown_window, 4)
 
+    def test_v2_modal_class_is_registered_separately(self):
+        import comfymodal_runtime.modal_app as modal_app
+
+        if modal_app.ModalRuntimeEntrypointRemote is None:
+            self.skipTest("Modal/comfyapp deployment resources unavailable")
+        self.assertIsNotNone(modal_app.ModalRuntimeEntrypointRemote)
+        self.assertEqual(modal_app.APP_NAME, "stable-modal-comfy-v2-shadow")
+        self.assertIn("comfymodal_runtime", modal_app.V2_SOURCE_MODULES)
+        self.assertIn("comfyapp", modal_app.V2_SOURCE_MODULES)
+
     def test_entrypoint_stream_delegates_typed_plan(self):
         async def run():
             executor = RuntimeExecutor(in_process_runner=lambda plan, ctx: {"ok": True})
