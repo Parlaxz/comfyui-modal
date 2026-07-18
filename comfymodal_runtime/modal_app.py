@@ -16,6 +16,7 @@ from .restore_plan import RestorePlanPublisher
 from .runtime_bootstrap import BootstrapConfig, RuntimeBootstrap
 from .runtime_executor import ExecutionContext, RuntimeExecutor
 from .runtime_state import CommitCoordinator, ModalMountedStateVolume
+from .model_preload import V2LoaderBridge
 from .trace import RuntimeTrace
 
 
@@ -140,6 +141,7 @@ class ModalRuntimeEntrypoint:
         self._runtime_configured = False
         self._restore_plan: RestorePlan | None = None
         self._restore_publisher: RestorePlanPublisher | None = None
+        self._preload_bridge = V2LoaderBridge()
 
     def _get_remote_restore_publisher(self) -> RestorePlanPublisher:
         if self._restore_publisher is not None:
@@ -258,6 +260,15 @@ class ModalRuntimeEntrypoint:
                 metadata={"status": "error", "error": str(exc)[:200]},
             )
         state = self.bootstrap.restore(trace=trace)
+        if self._restore_plan is not None:
+            preparation = self._preload_bridge.prepare(self._restore_plan, trace=trace)
+            trace.set_metadata(
+                restore_plan_generation=str(self._restore_plan.generation),
+                preload_scheduled=bool(preparation),
+                preload_diagnostics=self._preload_bridge.diagnostics(),
+            )
+        else:
+            self._preload_bridge.clear()
         return {
             "backend": state.backend,
             "cuda": dict(state.cuda),
@@ -277,20 +288,22 @@ class ModalRuntimeEntrypoint:
         try:
             trace_factory = getattr(self._legacy_module, "Trace", None)
             legacy_trace = trace_factory(prompt_id=context.request_id) if trace_factory else None
-            result = api._execute_in_process(
-                dict(plan.workflow),
-                input_images=dict(plan.input_images),
-                collect_outputs=True,
-                trace=legacy_trace,
-                modal_options=plan.execution_options.to_legacy_dict(),
-                production_report=dict(plan.production_report),
-            )
+            with self._preload_bridge.request_scope():
+                result = api._execute_in_process(
+                    dict(plan.workflow),
+                    input_images=dict(plan.input_images),
+                    collect_outputs=True,
+                    trace=legacy_trace,
+                    modal_options=plan.execution_options.to_legacy_dict(),
+                    production_report=dict(plan.production_report),
+                )
             if not isinstance(result, dict):
                 result = {"result": result}
             trace.emit("graph_execution_end", phase="execution")
             trace.set_metadata(
                 restore_plan_generation=str(self._restore_plan.generation if self._restore_plan else ""),
                 execution_backend="in_process",
+                preload_diagnostics=self._preload_bridge.diagnostics(),
             )
             result["trace"] = trace.to_dict()
             if legacy_trace is not None:
