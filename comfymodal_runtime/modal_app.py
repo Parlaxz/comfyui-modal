@@ -290,7 +290,7 @@ class ModalRuntimeEntrypoint:
             "trace": trace.to_dict(),
         }
 
-    def _run_in_process(self, plan: ExecutionPlan, context: ExecutionContext) -> dict[str, Any]:
+    async def _run_in_process(self, plan: ExecutionPlan, context: ExecutionContext) -> dict[str, Any]:
         if context.cancelled and context.cancelled():
             raise RuntimeError("execution cancelled before PromptExecutor start")
         self._configure_runtime()
@@ -299,7 +299,7 @@ class ModalRuntimeEntrypoint:
         trace.emit("graph_execution_start", phase="execution")
         try:
             with self._preload_bridge.request_scope():
-                result: dict[str, Any] = self._execute_v2_prompt_executor(plan, context, api, trace)
+                result: dict[str, Any] = await self._execute_v2_prompt_executor(plan, context, api, trace)
             trace.emit("graph_execution_end", phase="execution")
             trace.set_metadata(
                 restore_plan_generation=str(self._restore_plan.generation if self._restore_plan else ""),
@@ -313,7 +313,7 @@ class ModalRuntimeEntrypoint:
             trace.emit("graph_execution_end", phase="execution", metadata={"status": "error", "error": str(exc)[:200]})
             raise
 
-    def _execute_v2_prompt_executor(
+    async def _execute_v2_prompt_executor(
         self,
         plan: ExecutionPlan,
         context: ExecutionContext,
@@ -332,9 +332,8 @@ class ModalRuntimeEntrypoint:
         workflow = _thaw(plan.workflow)
         prompt_id = str(context.request_id or f"v2-{id(workflow):x}")
         module = self._legacy_module
-        event_loop = getattr(api, "_event_loop", None)
         executor = getattr(api, "_executor", None)
-        if event_loop is None or executor is None:
+        if executor is None:
             raise RuntimeError("v2 PromptExecutor runtime is not initialized")
 
         wait_for_preload = getattr(api, "_wait_for_restore_preload_before_request", None)
@@ -365,8 +364,8 @@ class ModalRuntimeEntrypoint:
         import execution
 
         trace.emit("prompt_validation_start", phase="execution", metadata={"prompt_id": prompt_id})
-        valid, error, outputs_to_execute, node_errors = event_loop.run_until_complete(
-            execution.validate_prompt(prompt_id, workflow, None)
+        valid, error, outputs_to_execute, node_errors = await execution.validate_prompt(
+            prompt_id, workflow, None
         )
         trace.emit(
             "prompt_validation_end",
