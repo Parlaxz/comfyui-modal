@@ -128,9 +128,7 @@ class RuntimeBootstrap:
                 self.sync_custom_nodes()
             self._import_comfyui_path()
             if self.start_backend and not self._backend_started:
-                context = cpu_snapshot_environment() if snapshot else contextlib.nullcontext()
-                with context:
-                    backend = self.start_backend()
+                backend = self.start_backend()
                 self.state.backend = str(backend or "in_process")
                 self._backend_started = True
             if self.observe_generations:
