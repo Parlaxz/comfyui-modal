@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
 
-from .contracts import TraceEvent
+from .contracts import TraceEvent, stable_hash
 
 
 _LEGACY_STAGE_NAMES = {
@@ -179,14 +179,43 @@ class RuntimeTrace:
         return durations
 
 
-def merge_traces(*values: RuntimeTrace | Mapping[str, Any] | None) -> RuntimeTrace:
-    result = RuntimeTrace()
+def merge_runtime_traces(*values: RuntimeTrace | Mapping[str, Any] | None) -> RuntimeTrace:
+    """Merge local and remote traces without losing process evidence.
+
+    Mapping inputs are normalized through the legacy serializer first. Exact
+    duplicate events are removed, metadata is merged in input order (so a
+    later remote payload can supply authoritative derived fields), and the
+    resulting event list is sorted by wall time for display. Monotonic clocks
+    are never compared across processes.
+    """
+    result = RuntimeTrace(process="merged")
+    seen: set[str] = set()
     for value in values:
         if value is None:
             continue
         if isinstance(value, RuntimeTrace):
-            result.extend(value.events)
-            result.set_metadata(**value._metadata)
+            normalized = value
         elif isinstance(value, Mapping):
-            result.extend(RuntimeTrace.from_legacy(value).events)
+            normalized = RuntimeTrace.from_legacy(value)
+        else:
+            continue
+
+        if not result.request_id and normalized.request_id:
+            result.request_id = normalized.request_id
+        if not result.container_session_id and normalized.container_session_id:
+            result.container_session_id = normalized.container_session_id
+        result.set_metadata(**normalized._metadata)
+        for event in normalized.events:
+            identity = stable_hash(event.to_dict())
+            if identity in seen:
+                continue
+            seen.add(identity)
+            result._events.append(event)
+
+    result._events.sort(key=lambda event: (event.wall_unix_ns, event.monotonic_ns, event.name))
     return result
+
+
+def merge_traces(*values: RuntimeTrace | Mapping[str, Any] | None) -> RuntimeTrace:
+    """Compatibility alias for the unified trace merge implementation."""
+    return merge_runtime_traces(*values)

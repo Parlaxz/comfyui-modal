@@ -85,6 +85,7 @@ class ExecutionOptions:
     cancellation_options: Mapping[str, Any] = field(default_factory=dict)
     progress_options: Mapping[str, Any] = field(default_factory=dict)
     compatibility_flags: Mapping[str, Any] = field(default_factory=dict)
+    legacy_passthrough: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "production_output_node_ids", _normalized_ids(self.production_output_node_ids))
@@ -93,6 +94,7 @@ class ExecutionOptions:
             "cancellation_options",
             "progress_options",
             "compatibility_flags",
+            "legacy_passthrough",
         ):
             object.__setattr__(self, name, _freeze(getattr(self, name) or {}))
         object.__setattr__(self, "production_enabled", bool(self.production_enabled))
@@ -160,10 +162,39 @@ class ExecutionOptions:
             "progress",
             "compatibility_flags",
             "actual_load",
+            "legacy_passthrough",
         }
+        passthrough = source.get("legacy_passthrough", {})
+        passthrough = dict(passthrough) if isinstance(passthrough, Mapping) else {}
         for key in source:
             if key not in known:
                 _record_compatibility_key(str(key))
+                passthrough[str(key)] = source[key]
+
+        if isinstance(production, Mapping):
+            production_unknown = {
+                str(key): value
+                for key, value in production.items()
+                if key not in {"enabled", "output_node_ids"}
+            }
+            if production_unknown:
+                existing = passthrough.get("production", {})
+                merged = dict(existing) if isinstance(existing, Mapping) else {}
+                merged.update(production_unknown)
+                passthrough["production"] = merged
+
+        runtime_source = source.get("runtime")
+        if isinstance(runtime_source, Mapping):
+            runtime_unknown = {
+                str(key): value
+                for key, value in runtime_source.items()
+                if key not in {"requested_backend", "backend", "profiling_level"}
+            }
+            if runtime_unknown:
+                existing = passthrough.get("runtime", {})
+                merged = dict(existing) if isinstance(existing, Mapping) else {}
+                merged.update(runtime_unknown)
+                passthrough["runtime"] = merged
 
         return cls(
             production_enabled=production_enabled,
@@ -175,6 +206,7 @@ class ExecutionOptions:
             cancellation_options=cancellation,
             progress_options=progress,
             compatibility_flags=flags,
+            legacy_passthrough=passthrough,
         )
 
     @classmethod
@@ -194,10 +226,39 @@ class ExecutionOptions:
             "cancellation_options": _thaw(self.cancellation_options),
             "progress_options": _thaw(self.progress_options),
             "compatibility_flags": _thaw(self.compatibility_flags),
+            "legacy_passthrough": _thaw(self.legacy_passthrough),
         }
 
     def to_legacy_dict(self) -> dict[str, Any]:
-        result = self.to_dict()
+        passthrough = _thaw(self.legacy_passthrough)
+        result = dict(passthrough) if isinstance(passthrough, dict) else {}
+        result.pop("legacy_passthrough", None)
+
+        # Typed fields are applied after passthrough values so the canonical
+        # contract always wins over stale compatibility data.
+        result["production"] = {
+            **(
+                dict(result.get("production", {}))
+                if isinstance(result.get("production"), Mapping)
+                else {}
+            ),
+            "enabled": self.production_enabled,
+            "output_node_ids": list(self.production_output_node_ids),
+        }
+        result["output_conversion_options"] = _thaw(self.output_conversion_options)
+        result["result_route"] = self.result_route
+        result["profiling_level"] = self.profiling_level
+        result["requested_backend"] = self.requested_backend
+        result["cancellation_options"] = _thaw(self.cancellation_options)
+        result["progress_options"] = _thaw(self.progress_options)
+        result["compatibility_flags"] = _thaw(self.compatibility_flags)
+
+        runtime = result.get("runtime")
+        runtime = dict(runtime) if isinstance(runtime, Mapping) else {}
+        runtime["requested_backend"] = self.requested_backend
+        runtime["profiling_level"] = self.profiling_level
+        result["runtime"] = runtime
+
         conversion = _thaw(self.output_conversion_options)
         if isinstance(conversion, dict) and "format" in conversion:
             result["output_format"] = conversion["format"]

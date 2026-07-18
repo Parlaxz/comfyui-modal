@@ -1847,6 +1847,54 @@ def build_experiment_spec(
 # The adapter preserves response shapes so callers see no difference.
 
 
+def _playground_runtime_mode() -> str:
+    """Return the shared runtime switch used by Direct and Playground."""
+    mode = os.environ.get("COMFYMODAL_RUNTIME", "legacy").strip().lower()
+    return mode if mode in {"legacy", "v2", "shadow"} else "legacy"
+
+
+def _record_shadow_plan_comparison(
+    context: dict[str, Any],
+    feature_id: str,
+    controls: dict[str, Any],
+    modal_options: dict | None,
+) -> None:
+    """Build a v2 plan for comparison without publishing or executing it."""
+    try:
+        from comfymodal_runtime.playground_service import _default_build_execution_plan
+        from comfymodal_runtime.contracts import stable_hash
+
+        v2_plan, error = _default_build_execution_plan(
+            context["preset"],
+            context["snapshot"],
+            feature_id,
+            controls,
+            modal_options=modal_options,
+        )
+        legacy_workflow = {}
+        checkpoints = context.get("compilation", {}).get("checkpoints", [])
+        if checkpoints and isinstance(checkpoints[0], dict):
+            legacy_workflow = checkpoints[0].get("workflow", {}) or {}
+        comparison = {
+            "status": "error" if error else "compared",
+            "error": error or "",
+            "legacy_workflow_hash": stable_hash(legacy_workflow) if legacy_workflow else "",
+            "v2_workflow_hash": v2_plan.workflow_hash if v2_plan else "",
+            "v2_source_workflow_hash": v2_plan.source_workflow_hash if v2_plan else "",
+            "v2_model_stack": dict(v2_plan.model_stack) if v2_plan else {},
+            "v2_prefill_bundle": dict(v2_plan.prompt_bundle) if v2_plan else {},
+            "v2_output_node_ids": list(v2_plan.output_node_ids) if v2_plan else [],
+        }
+        context["shadow_plan_comparison"] = comparison
+        _log.info("Playground shadow plan comparison: %s", comparison)
+    except Exception as exc:
+        context["shadow_plan_comparison"] = {
+            "status": "error",
+            "error": str(exc)[:500],
+        }
+        _log.warning("Playground shadow plan comparison failed: %s", exc)
+
+
 async def playground_adapter_direct_run(
     preset_id: str,
     feature_id: str,
@@ -2759,6 +2807,9 @@ def _prepare_studio_run_context(
     return {
         "status": "ok",
         "preset": preset,
+        "snapshot": snapshot,
+        "controls": dict(controls),
+        "feature_id": feature_id,
         "compilation": compilation,
         "run_history_id": run_history_id,
         "exp_id": exp_id,
@@ -3245,12 +3296,35 @@ async def handle_studio_run_async(
     Returns a completed result dict on success in direct mode, or a
     submission response dict in scheduler (legacy) mode.
     """
-    if direct:
+    mode = _playground_runtime_mode()
+    if direct and mode == "v2":
         return await playground_adapter_direct_run(
             preset_id, feature_id, controls, node_dir,
             modal_options=modal_options, gpu=gpu,
             workspace=workspace, trace_ctx=trace_ctx,
         )
+
+    if direct:
+        # Legacy is the safe default. Shadow builds and compares the v2 plan,
+        # then executes exactly one legacy generation.
+        ctx = _prepare_studio_run_context(
+            preset_id, feature_id, controls, node_dir,
+            trace_ctx=trace_ctx, modal_options=modal_options, workspace=workspace,
+        )
+        if ctx.get("status") != "ok":
+            return ctx
+        if mode == "shadow":
+            _record_shadow_plan_comparison(ctx, feature_id, controls, modal_options)
+        result = await direct_studio_run_completion(
+            ctx,
+            node_dir,
+            gpu=gpu,
+            modal_options=modal_options,
+            workspace=workspace,
+        )
+        if mode == "shadow":
+            result["shadow_plan_comparison"] = ctx.get("shadow_plan_comparison", {})
+        return result
 
     # ── Scheduler (legacy) path — shared context then scheduler ──
     ctx = _prepare_studio_run_context(
