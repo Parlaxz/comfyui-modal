@@ -33,6 +33,21 @@ class TestBootstrap(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertTrue((root / "models").is_symlink())
 
+    @unittest.skipIf(os.name == "nt", "directory symlink requires elevated Windows privileges")
+    def test_existing_models_directory_is_replaced_by_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "comfy"
+            models = Path(tmp) / "models"
+            root.mkdir()
+            models.mkdir()
+            (root / "models").mkdir()
+            (root / "models" / "baked-stub").write_text("stub", encoding="utf-8")
+
+            ensure_models_symlink(str(models), str(root))
+
+            self.assertTrue((root / "models").is_symlink())
+            self.assertEqual((root / "models").resolve(), models.resolve())
+
     def test_lifecycle_order_and_no_startup_install(self):
         calls: list[str] = []
         model_path = Path(tempfile.gettempdir()) / "models"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -45,9 +46,12 @@ def ensure_models_symlink(models_path: str, comfyui_root: str) -> str:
         if destination.resolve() != source.resolve():
             destination.unlink()
     elif destination.exists():
-        if destination.resolve() != source.resolve():
-            raise RuntimeError(f"model path already exists: {destination}")
-        return str(destination)
+        if destination.resolve() == source.resolve():
+            return str(destination)
+        if destination.is_dir():
+            shutil.rmtree(destination)
+        else:
+            destination.unlink()
     if not destination.exists():
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.symlink_to(source, target_is_directory=True)
