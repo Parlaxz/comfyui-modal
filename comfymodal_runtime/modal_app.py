@@ -40,7 +40,7 @@ CUSTOM_NODES_VOLUME_NAME = os.environ.get("COMFYMODAL_CUSTOM_NODES_VOLUME", "com
 RUNTIME_STATE_VOLUME_NAME = os.environ.get("COMFYMODAL_RUNTIME_STATE_VOLUME", "comfymodal-runtime-config")
 MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
-RUNTIME_STATE_PATH = "/root/comfymodal_runtime"
+RUNTIME_STATE_PATH = "/root/comfymodal_runtime_state"
 V2_RESTORE_STATE_FILE = "v2_restore_plan.json"
 MIN_CONTAINERS = 0
 SCALEDOWN_WINDOW = 4
@@ -708,6 +708,10 @@ except Exception:
         "source_identity": None,
         "spec": ModalRuntimeSpec(),
     }
+# Modal CLI discovers the application through a module-level ``app`` object.
+# Keep the resource construction above as the single source of truth while
+# exposing the registered shadow app for ``modal deploy -m``.
+app = _MODAL_RESOURCES.get("app")
 ModalRuntimeEntrypointRemote = _register_remote_entrypoint(
     _MODAL_RESOURCES,
     _MODAL_RESOURCES["spec"],
