@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, ContextManager, Mapping, cast
 
-from .contracts import ExecutionPlan, RestorePlan
+from .contracts import ExecutionPlan, RestorePlan, _thaw
 from .deployment_spec import build_deployment_identity
 from .restore_plan import RestorePlanPublisher
 from .runtime_bootstrap import BootstrapConfig, RuntimeBootstrap
@@ -329,7 +329,7 @@ class ModalRuntimeEntrypoint:
         if context.cancelled and context.cancelled():
             raise RuntimeError("execution cancelled before PromptExecutor start")
 
-        workflow = dict(plan.workflow)
+        workflow = _thaw(plan.workflow)
         prompt_id = str(context.request_id or f"v2-{id(workflow):x}")
         module = self._legacy_module
         event_loop = getattr(api, "_event_loop", None)

@@ -34,6 +34,10 @@ class _Executor:
 
 
 async def _validate_prompt(_prompt_id, _workflow, _extra):
+    for node_spec in _workflow.values():
+        assert isinstance(node_spec, dict)
+        if "inputs" in node_spec:
+            assert isinstance(node_spec["inputs"], dict)
     return True, {}, ["107"], {}
 
 
