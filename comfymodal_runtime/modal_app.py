@@ -647,13 +647,15 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
     setattr(remote_class, "run_prompt_stream", _modal.method(is_generator=True)(remote_class.run_prompt_stream))
     setattr(remote_class, "publish_restore_plan", _modal.method()(remote_class.publish_restore_plan))
     setattr(remote_class, "run_checkpoint_stream", _modal.method(is_generator=True)(remote_class.run_checkpoint_stream))
+    # Export the raw class. Modal's worker importer resolves this module
+    # attribute and reapplies the serialized concurrency/class settings; the
+    # result of modal.concurrent() is a PartialFunction and cannot be used as
+    # the importer class object.
+    globals()["ModalRuntimeEntrypointV2"] = remote_class
     remote_class = _modal.concurrent(
         target_inputs=spec.target_inputs,
         max_inputs=spec.max_inputs,
     )(remote_class)
-    # Modal's worker importer resolves the serialized class by module/name;
-    # keep the dynamically-created class available under that exact name.
-    globals()["ModalRuntimeEntrypointV2"] = remote_class
     return resources["app"].cls(
         gpu=spec.gpu,
         cpu=spec.cpu,
