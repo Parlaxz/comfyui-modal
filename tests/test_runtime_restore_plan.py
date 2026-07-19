@@ -10,6 +10,7 @@ from comfymodal_runtime.contracts import (
     ModelRestoreKey,
     PrefillKey,
     RestorePlan,
+    TraceEvent,
 )
 from comfymodal_runtime.restore_plan import (
     _build_dual_clip_identity,
@@ -24,6 +25,7 @@ from comfymodal_runtime.runtime_state import (
     FakeVolume,
     MountedStateVolume,
 )
+from comfymodal_runtime.trace import RuntimeTrace, merge_runtime_traces
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +380,214 @@ class TestDerivePrefillKey(unittest.TestCase):
         self.assertEqual(pa.model_key.stable_hash, pb.model_key.stable_hash)
         self.assertTrue(pa.encode_options["eligible"])
         self.assertNotEqual(pa.stable_hash, pb.stable_hash)
+
+
+# ---------------------------------------------------------------------------
+# Publication measurement keys (no Modal required)
+# ---------------------------------------------------------------------------
+
+class TestPublicationMeasurementKeys(unittest.TestCase):
+    """Verify publish_with_metrics returns all granular measurements."""
+
+    def setUp(self):
+        self.volume = FakeVolume()
+        self.coord = CommitCoordinator(self.volume)
+        self.publisher = RestorePlanPublisher(self.coord)
+
+    def test_changed_publish_contains_all_measurement_keys(self):
+        plan = RestorePlan(generation=1, model_key=ModelRestoreKey(unet_identity="u1"))
+        result = self.publisher.publish_with_metrics(plan)
+        expected_keys = {
+            "changed", "generation",
+            "reload_ms", "compare_ms", "write_ms", "commit_ms",
+            "bytes_written", "state_path", "trace",
+        }
+        self.assertTrue(expected_keys.issubset(result.keys()),
+                        f"Missing keys: {expected_keys - result.keys()}")
+        self.assertTrue(result["changed"])
+        self.assertIsInstance(result["reload_ms"], float)
+        self.assertIsInstance(result["compare_ms"], float)
+        self.assertIsInstance(result["write_ms"], float)
+        self.assertIsInstance(result["commit_ms"], float)
+        self.assertIsInstance(result["bytes_written"], int)
+        self.assertGreater(result["bytes_written"], 0,
+                           "Changed plan must write bytes")
+
+    def test_unchanged_publish_all_measurement_keys(self):
+        plan = RestorePlan(generation=1, model_key=ModelRestoreKey(unet_identity="u1"))
+        self.publisher.publish_with_metrics(plan)
+        # Publish same plan again → no-op
+        result = self.publisher.publish_with_metrics(plan)
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["bytes_written"], 0)
+        self.assertEqual(result["write_ms"], 0.0)
+        self.assertEqual(result["commit_ms"], 0.0)
+        for key in ("reload_ms", "compare_ms"):
+            self.assertIsInstance(result[key], float)
+
+    def test_trace_present_and_structured(self):
+        plan = RestorePlan(generation=1, model_key=ModelRestoreKey(unet_identity="u1"))
+        result = self.publisher.publish_with_metrics(plan)
+        self.assertIn("trace", result)
+        trace = result["trace"]
+        # RuntimeTrace.to_dict() shape
+        self.assertIn("trace_id", trace)
+        self.assertIn("events", trace)
+        self.assertIn("metadata", trace)
+        self.assertGreater(len(trace["events"]), 0)
+
+    def test_changed_trace_contains_write_and_commit_events(self):
+        plan = RestorePlan(generation=1, model_key=ModelRestoreKey(unet_identity="u1"))
+        result = self.publisher.publish_with_metrics(plan)
+        event_names = [e["name"] for e in result["trace"]["events"]]
+        self.assertIn("publish_state_read", event_names)
+        self.assertIn("publish_compare", event_names)
+        self.assertIn("publish_write", event_names)
+        self.assertIn("publish_commit", event_names)
+        self.assertNotIn("publish_noop", event_names)
+
+    def test_unchanged_trace_has_noop_event(self):
+        plan = RestorePlan(generation=1, model_key=ModelRestoreKey(unet_identity="u1"))
+        self.publisher.publish_with_metrics(plan)
+        result = self.publisher.publish_with_metrics(plan)
+        event_names = [e["name"] for e in result["trace"]["events"]]
+        self.assertIn("publish_noop", event_names)
+        self.assertNotIn("publish_write", event_names)
+        self.assertNotIn("publish_commit", event_names)
+
+    def test_trace_has_measurement_values_in_metadata(self):
+        plan = RestorePlan(generation=1, model_key=ModelRestoreKey(unet_identity="u1"))
+        result = self.publisher.publish_with_metrics(plan)
+        for event in result["trace"]["events"]:
+            self.assertIsInstance(event["metadata"], dict)
+        write_event = next(
+            e for e in result["trace"]["events"]
+            if e["name"] == "publish_write"
+        )
+        self.assertIn("write_ms", write_event["metadata"])
+        self.assertIn("bytes_written", write_event["metadata"])
+        self.assertGreater(write_event["metadata"]["bytes_written"], 0)
+
+    def test_trace_mergeable_with_other_traces(self):
+        """The publication trace can be merged with another RuntimeTrace."""
+        plan = RestorePlan(generation=1, model_key=ModelRestoreKey(unet_identity="u1"))
+        pub_result = self.publisher.publish_with_metrics(plan)
+        pub_trace = RuntimeTrace(
+            process="publisher",
+            trace_id=pub_result["trace"]["trace_id"],
+        )
+        pub_trace.extend(
+            TraceEvent.from_dict(e) for e in pub_result["trace"]["events"]
+        )
+        exec_trace = RuntimeTrace(process="remote")
+        exec_trace.emit("graph_execution_start", phase="execution")
+        merged = merge_runtime_traces(pub_trace, exec_trace)
+        merged_names = {e.name for e in merged.events}
+        self.assertIn("publish_write", merged_names)
+        self.assertIn("graph_execution_start", merged_names)
+        # Exactly one of each — no duplicates
+        self.assertEqual(
+            sum(1 for e in merged.events if e.name == "publish_write"), 1,
+        )
+
+
+# ---------------------------------------------------------------------------
+# merge_runtime_traces behavior tests
+# ---------------------------------------------------------------------------
+
+class TestMergeRuntimeTraces(unittest.TestCase):
+    """Direct behavior tests for merge_runtime_traces."""
+
+    def test_remote_events_survive(self):
+        local = RuntimeTrace(process="local")
+        local.emit("local_step", phase="test")
+        remote = RuntimeTrace(process="remote")
+        remote.emit("remote_step", phase="test")
+        merged = merge_runtime_traces(local, remote)
+        names = {e.name for e in merged.events}
+        self.assertIn("local_step", names)
+        self.assertIn("remote_step", names)
+
+    def test_exact_duplicates_removed(self):
+        trace = RuntimeTrace(process="local")
+        trace.emit("event_a", phase="test")
+        trace.emit("event_b", phase="test")
+        # Merge trace with itself — duplicates must be removed
+        merged = merge_runtime_traces(trace, trace)
+        self.assertEqual(len(merged.events), 2,
+                         "Exact duplicates should be removed")
+
+    def test_distinct_events_survive_despite_partial_overlap(self):
+        t1 = RuntimeTrace(process="local")
+        t1.emit("common", phase="test")
+        t2 = RuntimeTrace(process="remote")
+        t2.emit("common", phase="test")
+        t2.emit("unique_to_remote", phase="test")
+        merged = merge_runtime_traces(t1, t2)
+        names = {e.name for e in merged.events}
+        self.assertIn("common", names)
+        self.assertIn("unique_to_remote", names)
+        # "common" events from different processes have different wall
+        # timestamps and process fields → they are NOT exact duplicates
+        # and must both survive.
+        self.assertEqual(len(merged.events), 3,
+                         "Different-process common events are distinct")
+
+    def test_cross_process_sorted_by_wall_time(self):
+        """Events from different processes are sorted solely by wall_unix_ns."""
+        local_trace = RuntimeTrace(process="local")
+        local_trace._events.append(TraceEvent(
+            name="later_local", process="local", phase="test",
+            wall_unix_ns=2000, monotonic_ns=0,
+        ))
+        remote_trace = RuntimeTrace(process="remote")
+        remote_trace._events.append(TraceEvent(
+            name="earlier_remote", process="remote", phase="test",
+            wall_unix_ns=1000, monotonic_ns=0,
+        ))
+        merged = merge_runtime_traces(local_trace, remote_trace)
+        wall_times = [e.wall_unix_ns for e in merged.events]
+        self.assertEqual(wall_times, sorted(wall_times),
+                         "Events must be sorted by wall time")
+        # The remote event (earlier) should come first
+        self.assertEqual(merged.events[0].name, "earlier_remote")
+        self.assertEqual(merged.events[1].name, "later_local")
+
+    def test_restore_and_execution_traces_coexist(self):
+        restore = RuntimeTrace(process="remote")
+        restore.emit("restore_start", phase="restore")
+        exec_trace = RuntimeTrace(process="remote")
+        exec_trace.emit("execution_done", phase="execution")
+        merged = merge_runtime_traces(restore, exec_trace)
+        phases = {e.phase for e in merged.events}
+        self.assertIn("restore", phases)
+        self.assertIn("execution", phases)
+        self.assertEqual(len(merged.events), 2)
+
+    def test_mapping_input_normalization(self):
+        """Mapping (dict) inputs are normalized through from_legacy."""
+        trace = RuntimeTrace(process="remote")
+        trace.emit("test_event", phase="test")
+        as_dict = trace.to_dict()
+        merged = merge_runtime_traces(as_dict)
+        self.assertEqual(len(merged.events), 1)
+        self.assertEqual(merged.events[0].name, "test_event")
+
+    def test_metadata_merged_in_order(self):
+        """Metadata from later traces overrides earlier keys."""
+        t1 = RuntimeTrace(process="local")
+        t1.set_metadata(phase="first", keep="me")
+        t2 = RuntimeTrace(process="remote")
+        t2.set_metadata(phase="second")
+        merged = merge_runtime_traces(t1, t2)
+        self.assertEqual(merged._metadata.get("keep"), "me")
+        self.assertEqual(merged._metadata.get("phase"), "second")
+
+    def test_event_count_correct_with_mixed_none(self):
+        t1 = RuntimeTrace(process="local")
+        t1.emit("a", phase="test")
+        merged = merge_runtime_traces(t1, None, t1)
+        self.assertEqual(len(merged.events), 1)
 
 
 if __name__ == "__main__":

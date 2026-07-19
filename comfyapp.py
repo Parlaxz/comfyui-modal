@@ -5263,6 +5263,8 @@ _COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = [
     "comfyui-modal/.last_custom_node_context_manifest.json",
     "comfyui-modal/.comfymodal_experiments/",
     "comfyui-modal/.comfymodal_experiments/*",
+    "comfyui-modal/.playwright-mcp/",
+    "comfyui-modal/.playwright-mcp/*",
     "comfyui-modal/.custom_node_requirements/",
     "comfyui-modal/.baked_custom_node_deps/",
     "comfyui-modal/*.md",
@@ -20254,6 +20256,16 @@ class _ComfyAPIMixin:
         server_trace = Trace(prompt_id=prompt_id_hint, t0=t0)
         server_trace.update(trace)
         server_trace.mark("t3_modal_entry")
+        # V1 parity: emit identity markers matching V2 deployment identity
+        _v1_entry_identity = _collect_platform_diagnostics(self.__class__.__name__)
+        print(f"[v1.diag] phase=remote_entry class={self.__class__.__name__} "
+              f"method=run_prompt_stream "
+              f"container_session_id={CONTAINER_SESSION_ID} "
+              f"task_id={_v1_entry_identity.get('task_id', '?')[:12]} "
+              f"region={_v1_entry_identity.get('region', '?')} "
+              f"cloud={_v1_entry_identity.get('cloud_provider', '?')} "
+              f"image_id={os.environ.get('MODAL_IMAGE_ID', '?')[:12]} "
+              f"request_seq={_container_request_count}")
         print(f"[predispatch] phase=modal_entry t={time.time()}")
 
         _prog_q = _qm.Queue()
@@ -20351,7 +20363,107 @@ class _ComfyAPIMixin:
                 yield {"type": "status", "message": "Reconnecting GPU", "phase": "gpu"}
             if _rt.get("warmup_preload_ms") or _rt.get("warmup_direct_total_ms"):
                 yield {"type": "status", "message": "Warming models", "phase": "warmup"}
-            yield {"type": "status", "message": "Starting execution", "phase": "execution"}
+
+            # ── V1 remote identity capture (authoritative Modal runtime values) ──
+            # Built inside the remote container where MODAL_* env vars and
+            # platform diagnostics are available. Attached to the first stream
+            # event so the client-side merge respects remote values as authoritative.
+            # Includes the additive common-schema identity keys so that the V1
+            # identity envelope carries the same fields as V2's resource metadata.
+            _v1_remote_task_id = _pd_stream_entry.get("task_id", "")
+            _v1_remote_image_id = os.environ.get("MODAL_IMAGE_ID", "")
+            _v1_remote_input_id = ""
+            try:
+                import modal as _modal_vi
+                if _modal_vi is not None:
+                    _inp_id = _modal_vi.current_input_id()
+                    if _inp_id:
+                        _v1_remote_input_id = str(_inp_id)
+            except Exception:
+                pass
+            # ── Look up GPU resource profile for common-schema keys ─────────
+            _v1_gpu_value = _pd_stream_entry.get("gpu_value", "")
+            _v1_class_name = self.__class__.__name__
+            _v1_resource_cpu = 4
+            _v1_resource_memory = 32768
+            _v1_target_inputs = 1
+            _v1_max_inputs = 1
+            try:
+                import gpu_catalog as _v1_gc
+                _v1_entry = _v1_gc.GPU_BY_VALUE.get(_v1_gpu_value, {})
+                _v1_profile_name = _v1_entry.get("profile", "")
+                if _v1_profile_name and _v1_profile_name in GPU_PROFILES:
+                    _v1_prof = GPU_PROFILES[_v1_profile_name]
+                    _v1_resource_cpu = _v1_prof.get("cpu", _v1_resource_cpu)
+                    _v1_resource_memory = _v1_prof.get("memory", _v1_resource_memory)
+                    _v1_target_inputs = _v1_prof.get("target_inputs", _v1_target_inputs)
+                    _v1_max_inputs = _v1_prof.get("max_inputs", _v1_max_inputs)
+            except Exception:
+                pass
+            # ── Workflow / options hash prefix from the incoming workflow ───
+            _v1_wf_hash = ""
+            _v1_effective_opts_hash = ""
+            try:
+                if isinstance(workflow, dict) and workflow:
+                    import hashlib as _v1_h
+                    import json as _v1_j
+                    _v1_wf_raw = _v1_j.dumps(workflow, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    _v1_wf_hash = _v1_h.sha256(_v1_wf_raw).hexdigest()
+            except Exception:
+                pass
+            try:
+                if isinstance(modal_options, dict) and modal_options:
+                    import hashlib as _v1_h
+                    import json as _v1_j
+                    _v1_opts_raw = _v1_j.dumps(modal_options, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    _v1_effective_opts_hash = _v1_h.sha256(_v1_opts_raw).hexdigest()
+            except Exception:
+                pass
+            _v1_remote_identity = {
+                # ── Common-schema app / class / method ──────────────
+                "app_name": APP_NAME,
+                "class_name": _v1_class_name,
+                "method_name": "run_prompt_stream",
+                # ── GPU / resource allocation ───────────────────────
+                "gpu": _v1_gpu_value,
+                "cpu": _v1_resource_cpu,
+                "memory_mb": _v1_resource_memory,
+                "target_inputs": _v1_target_inputs,
+                "max_inputs": _v1_max_inputs,
+                # ── Snapshot flags ──────────────────────────────────
+                "snapshot_enabled": "True",
+                "gpu_snapshot_enabled": str(
+                    os.environ.get("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1"
+                ),
+                # ── Volume names (from module-level constants) ──────
+                "models_volume": VOLUME_NAME,
+                "runtime_state_volume": RUNTIME_CONFIG_VOLUME_NAME,
+                "custom_nodes_volume": CUSTOM_NODES_VOLUME_NAME,
+                # ── Workflow / options identity ─────────────────────
+                "workflow_hash_prefix": _v1_wf_hash[:16] if _v1_wf_hash else "",
+                "effective_options_hash": _v1_effective_opts_hash if _v1_effective_opts_hash else "",
+                # ── Legacy V1 identity fields (preserved for compat) ─
+                "runtime_mode": "v1",
+                "container_session_id": CONTAINER_SESSION_ID,
+                "container_import_unix_s": CONTAINER_IMPORT_UNIX_S,
+                "restore_count": _container_restore_count,
+                "request_seq": _container_request_count,
+                "task_id": _v1_remote_task_id,
+                "image_id": _v1_remote_image_id,
+                "modal_input_id": _v1_remote_input_id,
+                "cloud_provider": _pd_stream_entry.get("cloud_provider", ""),
+                "region": _pd_stream_entry.get("region", ""),
+                "function_id": _pd_stream_entry.get("function_id", ""),
+                "environment": _pd_stream_entry.get("environment", ""),
+                "restore_session_id": _rt_identity.get("restore_session_id", ""),
+                "restored_instance_id": _rt_identity.get("restored_instance_id", ""),
+            }
+            yield {
+                "type": "status",
+                "message": "Starting execution",
+                "phase": "execution",
+                "v1_identity": _v1_remote_identity,
+            }
 
             # GÃ¶Ã‡GÃ¶Ã‡ Run execution in a background thread GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             # _execute_in_process is synchronous and blocking.  Running it
@@ -20363,7 +20475,15 @@ class _ComfyAPIMixin:
             def _exec() -> None:
                 try:
                     _t_exec_start = time.time()
+                    # V1 parity: output_collect_start marker (maps to V2 T7_OUTPUTS_COLLECTION_START)
+                    if isinstance(trace, dict):
+                        trace.setdefault("output_collect_start", time.time())
                     _r = self._execute_in_process(workflow, input_images or {}, trace=server_trace, modal_options=modal_options, production_report=production_report)
+                    if isinstance(trace, dict):
+                        trace.setdefault("output_collect_end", time.time())
+                    # V1 parity: return_packaging_start (maps to V2 T8C_RETURN_PACKAGING_START)
+                    if isinstance(trace, dict):
+                        trace["return_packaging_start"] = time.time()
                     # GÃ¶Ã‡GÃ¶Ã‡ Cache diagnostics for streaming path GÃ¶Ã‡GÃ¶Ã‡
                     try:
                         _r["_cache_diagnostics"] = {
@@ -20609,7 +20729,20 @@ class _ComfyAPIMixin:
                         actual_load_result="started" if _actual_load_info.get("enabled") else "",
                     )
                     print(f"[comfyapp] request_pipeline_summary {_summary}")
+                    # V1 parity: return_packaging_end (maps to V2 T8D_RETURN_PACKAGING_END)
+                    if isinstance(trace, dict):
+                        trace["return_packaging_end"] = time.time()
+                    # V1 parity: remote_return_start (maps to V2 T8E_REMOTE_RETURN_START)
+                    if isinstance(trace, dict):
+                        trace["remote_return_start"] = time.time()
+                    # Attach V1 deployment identity to result for downstream merge
+                    # Uses the same authoritative remote identity built for the
+                    # first-stream-event, extended with execution-phase fields.
+                    _r["v1_identity"] = dict(_v1_remote_identity)
                     _result.append(_r)
+                    # V1 parity: remote_return_end (maps to V2 T8F_REMOTE_RETURN_END)
+                    if isinstance(trace, dict):
+                        trace["remote_return_end"] = time.time()
                 except Exception as _exc:
                     _error.append(_exc)
                     import traceback as _tb

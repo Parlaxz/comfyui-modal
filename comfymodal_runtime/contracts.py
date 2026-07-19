@@ -11,6 +11,33 @@ from types import MappingProxyType
 from typing import Any
 
 
+METADATA_RUNTIME_MODE = "runtime_mode"
+METADATA_WORKFLOW_HASH_PREFIX = "workflow_hash_prefix"
+METADATA_APP_NAME = "app_name"
+METADATA_CLASS_NAME = "class_name"
+METADATA_METHOD_NAME = "method_name"
+METADATA_MODAL_INPUT_ID = "modal_input_id"
+METADATA_CONTAINER_TASK_ID = "container_task_id"
+METADATA_CONTAINER_SESSION_ID = "container_session_id"
+METADATA_IMAGE_ID = "image_id"
+METADATA_GPU = "gpu"
+METADATA_CLOUD = "cloud"
+METADATA_REGION = "region"
+METADATA_CPU = "cpu"
+METADATA_MEMORY_MB = "memory_mb"
+METADATA_SNAPSHOT_ENABLED = "snapshot_enabled"
+METADATA_GPU_SNAPSHOT_ENABLED = "gpu_snapshot_enabled"
+METADATA_RESTORE_PLAN_GENERATION = "restore_plan_generation"
+
+
+def diagnosis_metadata(**kwargs: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in kwargs.items():
+        if value is not None:
+            result[key] = value
+    return result
+
+
 _COMPATIBILITY_KEY_COUNTS: dict[str, int] = {}
 
 

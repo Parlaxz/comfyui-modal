@@ -77,11 +77,33 @@ class Attempt:
     total_conversion_time_ms: float = 0.0
     error: str = ""
     metrics: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    # ── Phase 6 timing / fallback observability ─────────────────────
+    strategy_start_ms: float = 0.0
+    strategy_end_ms: float = 0.0
+    strategy_duration_ms: float = 0.0
+    fallback_depth: int = 0
+    attempt_number: int = 0
+    total_base64_encoding_time_ms: float = 0.0
+    # ── Phase 6 result serialization size ────────────────────────────
+    serialized_result_bytes: int = 0
 
     @property
     def conversion_total_ms(self) -> float:
         """Compatibility alias for ``total_conversion_time_ms``."""
         return self.total_conversion_time_ms
+
+    @property
+    def timing(self) -> dict[str, float]:
+        """Return a flat dict of timing fields for serialization."""
+        return {
+            "strategy_start_ms": self.strategy_start_ms,
+            "strategy_end_ms": self.strategy_end_ms,
+            "strategy_duration_ms": self.strategy_duration_ms,
+            "fallback_depth": float(self.fallback_depth),
+            "attempt_number": float(self.attempt_number),
+            "total_base64_encoding_time_ms": self.total_base64_encoding_time_ms,
+            "total_conversion_time_ms": self.total_conversion_time_ms,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +125,15 @@ def _import_output_saver_helpers():
 def _hash_raw_bytes(raw: bytes) -> str:
     """SHA-256 hex digest of raw bytes."""
     return hashlib.sha256(raw).hexdigest()
+
+
+def _measure_json_bytes(payload: dict) -> int:
+    """Return the JSON UTF-8 byte length of *payload* (measurement only, no side effects).
+
+    Uses compact separators to match typical wire serialization without
+    duplicating or transmitting the payload.
+    """
+    return len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
 
 
 def _make_conversion_meta(
@@ -127,6 +158,14 @@ def _make_conversion_meta(
     )
 
 
+def _timed_b64_encode(data: bytes) -> tuple[str, float]:
+    """Base64-encode *data* and return (encoded_str, duration_ms)."""
+    t0 = time.monotonic()
+    encoded = base64.b64encode(data).decode("ascii")
+    duration_ms = (time.monotonic() - t0) * 1000.0
+    return encoded, duration_ms
+
+
 # ---------------------------------------------------------------------------
 # Strategy base
 # ---------------------------------------------------------------------------
@@ -138,14 +177,18 @@ def _item_from_entry(
     output_key: str,
     fallback_index: int = 0,
     path: str = "",
-) -> OutputItem:
-    """Build an OutputItem from a dictionary entry (registry or result dict)."""
+) -> tuple[OutputItem, float]:
+    """Build an OutputItem from a dictionary entry (registry or result dict).
+
+    Returns ``(item, base64_encoding_time_ms)``.
+    """
     raw = entry.get("raw_bytes") or entry.get("bytes") or b""
     if not raw and "data" in entry:
         raw = base64.b64decode(entry["data"])
     b64_data = entry.get("base64_data") or ""
+    b64_time_ms = 0.0
     if not b64_data and raw:
-        b64_data = base64.b64encode(raw).decode("ascii")
+        b64_data, b64_time_ms = _timed_b64_encode(raw)
     meta_raw = entry.get("conversion_meta")
     if meta_raw is not None and isinstance(meta_raw, ConversionMeta):
         conv_meta = meta_raw
@@ -159,22 +202,25 @@ def _item_from_entry(
         )
     else:
         conv_meta = None
-    return OutputItem(
-        node_id=str(node_id),
-        output_key=str(output_key),
-        filename=str(entry.get("filename", f"output_{fallback_index}.bin")),
-        path=path or str(entry.get("path", "")),
-        raw_bytes=raw,
-        base64_data=b64_data,
-        mime_type=str(entry.get("mime_type", "image/png")),
-        file_ext=str(entry.get("file_ext", ".png")),
-        width=int(entry.get("width", 0) or 0),
-        height=int(entry.get("height", 0) or 0),
-        output_index=int(entry.get("output_index", fallback_index)),
-        comparison_side=str(entry.get("comparison_side", "")),
-        format=str(entry.get("format", "")),
-        animated=bool(entry.get("animated", False)),
-        conversion_meta=conv_meta,
+    return (
+        OutputItem(
+            node_id=str(node_id),
+            output_key=str(output_key),
+            filename=str(entry.get("filename", f"output_{fallback_index}.bin")),
+            path=path or str(entry.get("path", "")),
+            raw_bytes=raw,
+            base64_data=b64_data,
+            mime_type=str(entry.get("mime_type", "image/png")),
+            file_ext=str(entry.get("file_ext", ".png")),
+            width=int(entry.get("width", 0) or 0),
+            height=int(entry.get("height", 0) or 0),
+            output_index=int(entry.get("output_index", fallback_index)),
+            comparison_side=str(entry.get("comparison_side", "")),
+            format=str(entry.get("format", "")),
+            animated=bool(entry.get("animated", False)),
+            conversion_meta=conv_meta,
+        ),
+        b64_time_ms,
     )
 
 
@@ -213,6 +259,7 @@ class DirectOutputSink:
         total_b64 = 0
         total_json = 0
         total_conv_ms = 0.0
+        total_b64_time_ms = 0.0
 
         for node_id, node_registry in self._registry.items():
             if output_node_ids and node_id not in output_node_ids:
@@ -229,7 +276,7 @@ class DirectOutputSink:
                 for idx, entry in enumerate(entries):
                     if not isinstance(entry, dict):
                         continue
-                    item = _item_from_entry(
+                    item, b64_time = _item_from_entry(
                         entry,
                         node_id=node_id,
                         output_key=str(entry.get("output_key") or output_key),
@@ -238,6 +285,7 @@ class DirectOutputSink:
                     items.append(item)
                     total_raw += len(item.raw_bytes)
                     total_b64 += len(item.base64_data)
+                    total_b64_time_ms += b64_time
                     if item.conversion_meta:
                         total_json += item.conversion_meta.json_result_bytes
                         total_conv_ms += item.conversion_meta.conversion_time_ms
@@ -251,6 +299,7 @@ class DirectOutputSink:
             total_base64_bytes=total_b64,
             total_json_result_bytes=total_json,
             total_conversion_time_ms=total_conv_ms,
+            total_base64_encoding_time_ms=total_b64_time_ms,
             metrics={
                 "source": "registry",
                 "prompt_id": prompt_id,
@@ -288,6 +337,7 @@ class HistoryOutputCollector:
         materials_dir: str = "",
     ) -> Attempt:
         items: list[OutputItem] = []
+        total_b64_time_ms = 0.0
         prompt_history = self._history.get(prompt_id, {})
         outputs = prompt_history.get("outputs", {}) if isinstance(prompt_history, dict) else {}
 
@@ -320,7 +370,7 @@ class HistoryOutputCollector:
                             entry_for_item["raw_bytes"] = Path(resolved_path).read_bytes()
                         except OSError:
                             entry_for_item = entry
-                    item = _item_from_entry(
+                    item, b64_time = _item_from_entry(
                         entry_for_item,
                         node_id=node_id,
                         output_key=str(output_key),
@@ -328,6 +378,7 @@ class HistoryOutputCollector:
                         path=resolved_path,
                     )
                     items.append(item)
+                    total_b64_time_ms += b64_time
 
         total_raw = sum(len(i.raw_bytes) for i in items)
         total_b64 = sum(len(i.base64_data) for i in items)
@@ -347,6 +398,7 @@ class HistoryOutputCollector:
             total_base64_bytes=total_b64,
             total_json_result_bytes=total_json,
             total_conversion_time_ms=total_conv_ms,
+            total_base64_encoding_time_ms=total_b64_time_ms,
             metrics={
                 "source": "history",
                 "prompt_id": prompt_id,
@@ -411,6 +463,7 @@ class RequestBoundFilesystemCollector:
             )
 
         scanned = 0
+        total_b64_time_ms = 0.0
         for fname in os.listdir(self._materials_dir):
             fpath = os.path.join(self._materials_dir, fname)
             if not os.path.isfile(fpath):
@@ -438,13 +491,15 @@ class RequestBoundFilesystemCollector:
                     derived_node_id = nid
                     break
             conv = _make_conversion_meta(raw, "original", self._mime_type_hint, ext, 0.0)
+            b64_data, b64_time = _timed_b64_encode(raw)
+            total_b64_time_ms += b64_time
             item = OutputItem(
                 node_id=derived_node_id,
                 output_key="images",
                 filename=fname,
                 path=fpath,
                 raw_bytes=raw,
-                base64_data=base64.b64encode(raw).decode("ascii"),
+                base64_data=b64_data,
                 mime_type=self._mime_type_hint,
                 file_ext=ext,
                 conversion_meta=conv,
@@ -466,6 +521,7 @@ class RequestBoundFilesystemCollector:
             total_base64_bytes=total_b64,
             total_json_result_bytes=total_json,
             total_conversion_time_ms=0.0,
+            total_base64_encoding_time_ms=total_b64_time_ms,
             metrics={
                 "source": "filesystem",
                 "prompt_id": prompt_id,
@@ -521,6 +577,7 @@ class SubprocessOutputCollector:
                 error="no constraint tokens (prompt_id or output_node_ids required)",
             )
 
+        total_b64_time_ms = 0.0
         for fname in os.listdir(self._output_dir):
             fpath = os.path.join(self._output_dir, fname)
             if not os.path.isfile(fpath):
@@ -547,13 +604,15 @@ class SubprocessOutputCollector:
                     break
 
             conv = _make_conversion_meta(raw, "original", mime, ext, 0.0)
+            b64_data, b64_time = _timed_b64_encode(raw)
+            total_b64_time_ms += b64_time
             item = OutputItem(
                 node_id=derived_node_id,
                 output_key=prompt_id if prompt_id else "subprocess",
                 filename=fname,
                 path=fpath,
                 raw_bytes=raw,
-                base64_data=base64.b64encode(raw).decode("ascii"),
+                base64_data=b64_data,
                 mime_type=mime,
                 file_ext=ext,
                 conversion_meta=conv,
@@ -572,6 +631,7 @@ class SubprocessOutputCollector:
             total_json_result_bytes=sum(
                 i.conversion_meta.json_result_bytes for i in items if i.conversion_meta
             ),
+            total_base64_encoding_time_ms=total_b64_time_ms,
             metrics={
                 "source": "subprocess_output_dir",
                 "prompt_id": prompt_id,
@@ -599,9 +659,17 @@ def run_strategy_chain(
     Strategies are called left-to-right. Each strategy's ``collect``
     method receives the ``prompt_id``, ``output_node_ids``, and
     strategy-specific extras.
+
+    Each returned ``Attempt`` includes per-strategy timing
+    (``strategy_start_ms``, ``strategy_end_ms``, ``strategy_duration_ms``),
+    ``attempt_number`` (position in chain), and ``fallback_depth`` (number of
+    earlier failed strategies before the first successful one).
     """
     results: list[Attempt] = []
-    for strat in strategies:
+    fallback_depth = 0
+    found_success = False
+    for attempt_number, strat in enumerate(strategies):
+        t0 = time.monotonic()
         try:
             if isinstance(strat, DirectOutputSink):
                 attempt = strat.collect(strategy_config, prompt_id=prompt_id, output_node_ids=output_node_ids)
@@ -619,8 +687,55 @@ def run_strategy_chain(
                 success=False,
                 error=f"{type(exc).__name__}: {exc}",
             )
+        t1 = time.monotonic()
+        elapsed_ms = (t1 - t0) * 1000.0
+        # fallback_depth counts failed strategies *before* this one
+        attempt = _replace_attempt_timing(attempt, t0, t1, elapsed_ms, attempt_number, fallback_depth)
         results.append(attempt)
+        # Update for next iteration: increment only for failures before first success
+        if not found_success and not attempt.success:
+            fallback_depth += 1
+        if attempt.success:
+            found_success = True
     return results
+
+
+def _replace_attempt_timing(
+    attempt: Attempt,
+    start_mono: float,
+    end_mono: float,
+    duration_ms: float,
+    attempt_number: int,
+    fallback_depth: int,
+) -> Attempt:
+    """Return a new ``Attempt`` with Phase 6 timing fields set."""
+    start_ms = start_mono * 1000.0
+    end_ms = end_mono * 1000.0
+    metrics = dict(attempt.metrics)
+    metrics["strategy_start_ms"] = start_ms
+    metrics["strategy_end_ms"] = end_ms
+    metrics["strategy_duration_ms"] = duration_ms
+    metrics["attempt_number"] = attempt_number
+    metrics["fallback_depth"] = fallback_depth
+    return Attempt(
+        strategy=attempt.strategy,
+        success=attempt.success,
+        items=attempt.items,
+        total_items=attempt.total_items,
+        total_raw_bytes=attempt.total_raw_bytes,
+        total_base64_bytes=attempt.total_base64_bytes,
+        total_json_result_bytes=attempt.total_json_result_bytes,
+        total_conversion_time_ms=attempt.total_conversion_time_ms,
+        error=attempt.error,
+        metrics=MappingProxyType(metrics),
+        strategy_start_ms=start_ms,
+        strategy_end_ms=end_ms,
+        strategy_duration_ms=duration_ms,
+        fallback_depth=fallback_depth,
+        attempt_number=attempt_number,
+        total_base64_encoding_time_ms=attempt.total_base64_encoding_time_ms,
+        serialized_result_bytes=attempt.serialized_result_bytes,
+    )
 
 
 # ---------------------------------------------------------------------------

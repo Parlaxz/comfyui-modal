@@ -23,6 +23,7 @@ from comfymodal_runtime.contracts import (
     stable_hash,
 )
 from comfymodal_runtime.runtime_state import CommitCoordinator
+from comfymodal_runtime.trace import RuntimeTrace
 
 
 # ── Default publisher singleton ────────────────────────────────────────
@@ -365,6 +366,58 @@ class RestorePlanPublisher:
         }
         return stable_hash(identity)
 
+    @staticmethod
+    def _build_publication_trace(metrics: dict[str, Any]) -> RuntimeTrace:
+        """Build a structured ``RuntimeTrace`` from publication measurement
+        keys recorded in *metrics*.
+
+        The trace conveys the same measurements as the flat dict but in a
+        structured event form that ``merge_runtime_traces`` can consume.
+        Event wall timestamps reflect when the trace is assembled — the
+        actual measured durations are carried in event metadata.
+        """
+        trace = RuntimeTrace(process="publisher")
+        trace.emit(
+            "publish_state_read",
+            phase="publish",
+            metadata={"reload_ms": metrics.get("reload_ms", 0.0)},
+        )
+        trace.emit(
+            "publish_compare",
+            phase="publish",
+            metadata={"compare_ms": metrics.get("compare_ms", 0.0)},
+        )
+        if metrics.get("changed"):
+            trace.emit(
+                "publish_write",
+                phase="publish",
+                metadata={
+                    "write_ms": metrics.get("write_ms", 0.0),
+                    "bytes_written": metrics.get("bytes_written", 0),
+                },
+            )
+            trace.emit(
+                "publish_commit",
+                phase="publish",
+                metadata={
+                    "commit_ms": metrics.get("commit_ms", 0.0),
+                },
+            )
+        else:
+            trace.emit(
+                "publish_noop",
+                phase="publish",
+                metadata={"reason": "unchanged_identity"},
+            )
+        trace.set_metadata(
+            generation=str(metrics.get("generation", "")),
+            changed=bool(metrics.get("changed")),
+            state_path=str(metrics.get("state_path", "")),
+            duration_source="event_metadata",
+            wall_timestamps_are="assembly_time",
+        )
+        return trace
+
     def publish(self, new_plan: RestorePlan) -> int:
         """Publish *new_plan* and return its authoritative generation."""
         return int(self.publish_with_metrics(new_plan)["generation"])
@@ -378,15 +431,19 @@ class RestorePlanPublisher:
         compare_started = time.perf_counter()
         if current_plan is not None:
             if self._identity_hash(current_plan) == self._identity_hash(new_plan):
+                reload_ms = round((reload_completed - started) * 1000.0, 3)
+                compare_ms = round((time.perf_counter() - compare_started) * 1000.0, 3)
                 result = {
                     "changed": False,
                     "generation": self._safe_generation(current_plan.generation),
-                    "reload_ms": round((reload_completed - started) * 1000.0, 3),
-                    "compare_ms": round((time.perf_counter() - compare_started) * 1000.0, 3),
+                    "reload_ms": reload_ms,
+                    "compare_ms": compare_ms,
                     "write_ms": 0.0,
                     "commit_ms": 0.0,
+                    "bytes_written": 0,
                     "state_path": getattr(self._coordinator, "state_path", ""),
                 }
+                result["trace"] = self._build_publication_trace(result).to_dict()
                 self.last_publish = result
                 return result
 
@@ -403,12 +460,14 @@ class RestorePlanPublisher:
 
         plan_dict = new_plan.to_dict()
         plan_dict["generation"] = generation
+        before_bytes = self._coordinator.metrics.total_write_bytes
         write_started = time.perf_counter()
         self._coordinator.write_state(
             generation,
             {"restore_plan": plan_dict},
         )
         write_completed = time.perf_counter()
+        after_bytes = self._coordinator.metrics.total_write_bytes
         commit_started = time.perf_counter()
         self._coordinator.commit(generation)
         commit_completed = time.perf_counter()
@@ -419,8 +478,10 @@ class RestorePlanPublisher:
             "compare_ms": round((compare_completed - compare_started) * 1000.0, 3),
             "write_ms": round((write_completed - write_started) * 1000.0, 3),
             "commit_ms": round((commit_completed - commit_started) * 1000.0, 3),
+            "bytes_written": after_bytes - before_bytes,
             "state_path": getattr(self._coordinator, "state_path", ""),
         }
+        result["trace"] = self._build_publication_trace(result).to_dict()
         self.last_publish = result
         return result
 

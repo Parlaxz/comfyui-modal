@@ -454,6 +454,9 @@ async def _default_save_history(
                 if rt is not None:
                     timings["restore_total_ms"] = rt
 
+                if isinstance(result.get("trace"), dict):
+                    timings["trace"] = copy.deepcopy(result["trace"])
+
         # Build meta — from plan request_metadata enriched with controls/ids
         meta: dict[str, Any] = {
             "playground_run": True,
@@ -799,6 +802,9 @@ class PlaygroundService:
                 timings["restore_total_ms"] = rt
                 timings["remote_restore_ms"] = rt
 
+            if isinstance(result.get("trace"), dict):
+                timings["trace"] = copy.deepcopy(result["trace"])
+
         timings["trace_available"] = bool(result)
         timings["timing_sources"] = {
             k: "local_server_observed"
@@ -838,6 +844,7 @@ class PlaygroundService:
             "output_paths": output_paths,
             "output_path": output_paths[0] if output_paths else "",
             "timings": timings,
+            "trace": copy.deepcopy(result.get("trace", {})) if isinstance(result, dict) else {},
             "meta": meta,
             "direct_run": True,
             "production_plan_used": meta["production_plan_used"],

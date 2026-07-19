@@ -499,7 +499,11 @@ async def execute_plan(
     # ── Profile preparation (before restore publication / Modal submission) ──
     runtime_trace.emit("active_next_profile_start", phase="local")
     if profile_setter is not None:
+        runtime_trace.emit("plan_serialization_start", phase="local",
+                           metadata={"purpose": "profile_activation"})
         _activation_wf = dict(plan.to_dict().get("workflow", {}))
+        runtime_trace.emit("plan_serialization_end", phase="local",
+                           metadata={"purpose": "profile_activation"})
         _activation_hash = plan.source_workflow_hash or plan.workflow_hash
         _prod_opts: dict | None = None
         _pr = dict(plan.production_report) if isinstance(plan.production_report, Mapping) else {}
@@ -547,7 +551,11 @@ async def execute_plan(
     # ── Restore publication ──
     runtime_trace.emit("restore_publish_start", phase="local")
     if restore_publisher is not None:
+        runtime_trace.emit("plan_serialization_start", phase="local",
+                           metadata={"purpose": "restore_publication"})
         workflow = plan.to_dict()["workflow"]
+        runtime_trace.emit("plan_serialization_end", phase="local",
+                           metadata={"purpose": "restore_publication"})
         model_key = derive_model_key(workflow)
         prefill_key = derive_prefill_key(model_key, workflow)
         restore_plan = RestorePlan(
@@ -574,12 +582,14 @@ async def execute_plan(
 
     # ── Modal submission ──
     runtime_trace.emit("modal_submit_start", phase="local")
+    runtime_trace.emit("gpu_invocation_submit", phase="local")
     result: dict[str, Any] | None = None
     async for message in active_transport.run_plan_stream(
         plan,
         gpu=gpu or str(plan.request_metadata.get("selected_gpu", "")) or None,
         workspace=workspace,
         trace=runtime_trace.to_legacy_timing(prompt_id=str(plan.request_metadata.get("prompt_id", ""))),
+        runtime_trace=runtime_trace,
     ):
         message_type = message.get("type") if isinstance(message, dict) else ""
         if event_sink is not None and message_type in {"progress", "status", "executing"}:
@@ -609,6 +619,20 @@ async def execute_plan(
     # Backend: only set/overwrite when the result actually supplies one.
     if "backend" in result:
         remote_trace["backend"] = result["backend"]
+    # V2 containers return the unified event form. Derive legacy-compatible
+    # stages/durations at the local merge boundary so Playground/history can
+    # expose truthful timing without inventing missing phases. Preserve any
+    # fields already supplied by a legacy-compatible remote runtime.
+    if "stages" not in remote_trace:
+        remote_trace["stages"] = dict(
+            merged_trace.to_legacy_timing(
+                prompt_id=str(plan.request_metadata.get("prompt_id", ""))
+            ).get("stages", {})
+        )
+    if "deltas_ms" not in remote_trace:
+        remote_trace["deltas_ms"] = merged_trace.durations_ms()
+    if "trace_version" not in remote_trace:
+        remote_trace["trace_version"] = "2.0.0"
     result["trace"] = remote_trace
     return result
 

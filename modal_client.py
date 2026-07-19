@@ -3,6 +3,7 @@ import functools
 import hashlib
 import json
 import os
+import time as _time
 from collections.abc import Callable
 
 import modal
@@ -127,6 +128,8 @@ _COMFYMODAL_COMPUTE_CLOUD = os.environ.get("COMFYMODAL_COMPUTE_CLOUD", "").strip
 # Client-side backpressure: only one in-flight prompt execution at a time
 _run_prompt_semaphore = asyncio.Semaphore(1)
 
+
+
 # Per-workspace caches — populated lazily on first use per workspace.
 # Key: workspace["id"] for clients, (workspace["id"], name) for function handles,
 # (workspace["id"], gpu_value, region, cloud) for Cls instances.
@@ -227,6 +230,50 @@ def _workspace_api(workspace: dict, gpu: str | None = None):
     else:
         _handle_cache_hits += 1
     return instance
+
+
+# ── V1 deployment identity capture ─────────────────────────────────────
+# Records the deployment/resource identity at submission time for V1/V2
+# parity comparison.  Mirrors the V2 DeploymentIdentity metadata without
+# importing V2 runtime contracts.
+
+_V1_DEPLOYMENT_METADATA: dict = {}
+
+
+def _capture_v1_deployment_identity(workspace: dict, gpu: str | None = None) -> dict:
+    """Capture V1 deployment identity from client-side workspace and configuration.
+
+    Only captures values available on the local/CLIENT side (app name, gpu,
+    workspace-configurable cloud/region overrides).  Authoritative Modal
+    runtime identity (task_id, image_id, container_session_id, cloud
+    provider, actual region) is captured by the REMOTE container and merged
+    into the first stream event downstream — client-side MODAL_* env vars
+    and locally generated UUIDs are NOT authoritative and are omitted here.
+
+    Returns a dict with identity metadata matching V2's diagnosis_metadata()
+    keys so comparison tooling can align V1 and V2 fields.
+    """
+    selected_gpu = _current_gpu if gpu is None else normalize_gpu_value(gpu)
+    entry = GPU_BY_VALUE.get(selected_gpu, {})
+    identity: dict = {
+        "runtime_mode": "v1",
+        "app_name": APP_NAME,
+        "class_name": entry.get("class_name", "ComfyModalProductionAPI"),
+        "method_name": "run_prompt_stream",
+        "gpu": selected_gpu,
+        "cloud": os.environ.get("COMFYMODAL_COMPUTE_CLOUD", "").strip() or "auto",
+        "region": os.environ.get("COMFYMODAL_COMPUTE_REGION", "").strip() or "auto",
+        "snapshot_enabled": True,  # V1 always has enable_memory_snapshot=True
+        "gpu_snapshot_enabled": os.environ.get("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1",
+    }
+    global _V1_DEPLOYMENT_METADATA
+    _V1_DEPLOYMENT_METADATA = dict(identity)
+    return identity
+
+
+def get_v1_deployment_identity() -> dict:
+    """Return the cached V1 deployment identity dict from the most recent capture."""
+    return dict(_V1_DEPLOYMENT_METADATA)
 
 
 # ── Existing public helpers (unchanged except set_gpu validation) ─────────
@@ -352,7 +399,6 @@ async def run_prompt_stream(
       {"type": "result", "data": {...}} — final result (last yield).
       {"type": "error", "message": "..."} — fatal error.
     """
-    import time as _t
     selected = _resolve_workspace(workspace)
     # Local dispatch invariant: verify compiled workflow matches report
     _precomputed_hash = (trace or {}).get("canonical_workflow_hash", "")
@@ -362,29 +408,51 @@ async def run_prompt_stream(
         workflow_hash=_precomputed_hash,
     )
     gen = None
+    # ── V1 parity identity capture ─────────────────────────────────────
+    _v1_identity = _capture_v1_deployment_identity(selected, gpu)
+    _v1_identity["workspace_name"] = selected.get("name", "?")
+    _v1_identity["workspace_id"] = selected.get("id", "?")[:12]
+    # Enable permissive identity if not already set
+    if trace is None:
+        trace = {}
+    _is_dict_trace = isinstance(trace, dict)
+
+    # ── Profile publication phase markers (V1 ↦ V2 publish_restore_plan) ──
+    if _is_dict_trace:
+        trace["profile_publish_start"] = _time.time()
+    print(f"[v1.diag] phase=profile_publish workspace={selected.get('name', '?')} "
+          f"gpu={gpu or 'default'} identity_keys={list(_v1_identity.keys())}")
+    # Profile publication happens implicitly via prepare_active_next_profile
+    # on the local side (in __init__.py / canonical_execution.py).  The local
+    # dispatch marker covers the same interval as V2's publish_restore_plan.
+    if _is_dict_trace:
+        trace["profile_publish_end"] = _time.time()
+
     # ── Local observation markers on the mutable trace dict ────────────
     # These are wall-clock observations from THIS side of the Modal
     # client — they do NOT observe internal platform restore boundaries.
-    _is_dict_trace = isinstance(trace, dict)
-
     if _is_dict_trace:
-        trace.setdefault("t2_local_dispatch", _t.time())
-        trace["modal_handle_lookup_started"] = _t.time()
+        trace.setdefault("t2_local_dispatch", _time.time())
+        trace["modal_handle_lookup_started"] = _time.time()
     print(f"[modal-client] phase=pre_gen workspace={selected.get('name', '?')} gpu={gpu or 'default'}")
     # Semaphore only serializes remote-generator creation, not iteration.
     # This prevents a caller that breaks early from blocking the next request.
     async with _run_prompt_semaphore:
         if _is_dict_trace:
-            trace["modal_handle_lookup_completed"] = _t.time()
-            trace["remote_generator_create_started"] = _t.time()
+            trace["modal_handle_lookup_completed"] = _time.time()
+            trace["remote_generator_create_started"] = _time.time()
+        # ── GPU submission marker (before generator creation) ──────────
+        if _is_dict_trace:
+            trace["gpu_submission_start"] = _time.time()
         gen = _workspace_api(selected, gpu).run_prompt_stream.remote_gen.aio(
             workflow, input_images or {}, trace or {}, modal_options or {}, production_report,
         )
         if _is_dict_trace:
-            trace["remote_generator_create_completed"] = _t.time()
+            trace["remote_generator_create_completed"] = _time.time()
+            trace["gpu_submission_end"] = _time.time()
     print(f"[modal-client] phase=post_gen gen_created=True")
     if _is_dict_trace:
-        _now_iter = _t.time()
+        _now_iter = _time.time()
         trace["remote_generator_iteration_started"] = _now_iter
         # remote_submit: same local-observation time as iteration start,
         # marking that the remote generator handoff is complete and the
@@ -393,14 +461,36 @@ async def run_prompt_stream(
         if "remote_submit" not in trace:
             trace["remote_submit"] = _now_iter
             trace.setdefault("t2_local_dispatch", _now_iter)
+        trace["v1_identity"] = dict(_v1_identity)
     _first_client_msg = True
     try:
+        # V1 parity: collect the full result body
+        _v1_result = None
         async for msg in gen:
             if _first_client_msg:
+                first_msg = msg
                 _first_client_msg = False
                 if _is_dict_trace:
-                    trace["first_remote_message_received"] = _t.time()
+                    _first_msg_rcv_time = _time.time()
+                    trace["first_remote_message_received"] = _first_msg_rcv_time
+                    # GPU submit-to-first-event: compute interval delta from
+                    # the existing gpu_submission_start marker (not an epoch
+                    # timestamp stored in an interval field).
+                    _gpu_sub_start = trace.get("gpu_submission_start", 0.0)
+                    if _gpu_sub_start > 0:
+                        _delta_s = _first_msg_rcv_time - _gpu_sub_start
+                        trace["gpu_submit_to_first_event_ms"] = round(_delta_s * 1000, 2)
+                        trace["gpu_submit_to_first_event_ns"] = int(round(_delta_s * 1_000_000_000))
+                # V1 parity: enrich first-stream-event with identity for correlation
+                if isinstance(first_msg, dict) and _is_dict_trace:
+                    # Merge v1 identity into the status/progress payload (never
+                    # overwrites existing identity fields from the remote side).
+                    _first_identity = first_msg.setdefault("v1_identity", {})
+                    for _ik, _iv in _v1_identity.items():
+                        _first_identity.setdefault(_ik, _iv)
                 print(f"[modal-client] phase=first_msg arrived=True")
+            if isinstance(msg, dict) and msg.get("type") == "result":
+                _v1_result = msg
             yield msg
     except TimeoutError:
         raise TimeoutError(
@@ -417,7 +507,6 @@ async def run_prompt_stream(
             ) from e
         raise
     finally:
-        # Ensure the remote generator is closed even if the caller breaks early
         if gen is not None:
             try:
                 await gen.aclose()

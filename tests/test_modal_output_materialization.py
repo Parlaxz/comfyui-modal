@@ -405,3 +405,265 @@ class ExperimentOutputMaterializationTests(unittest.TestCase):
             self.assertEqual(len(mat["assets"]), 0)
             self.assertIsNone(mat["primary_output"])
             self.assertEqual(mat["primary_asset_id"], "")
+
+
+class Phase6MaterializationTimingTests(unittest.TestCase):
+    """Focused tests for Phase 6 local materialization boundary timing.
+
+    Verifies that _materialize_modal_outputs and _materialize_experiment_output
+    return additive timing breakdowns without changing output payload shape.
+    """
+
+    def setUp(self):
+        self.module = _load_init_module()
+
+    # ── _materialize_modal_outputs timing keys ──────────────────────────
+
+    def test_materialize_modal_outputs_has_timing_key(self):
+        """materialization_timing is present in the return dict."""
+        result = {"outputs": {}, "images": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = self.module._materialize_modal_outputs(
+                result, output_dir=tmp, prompt_id="p1", client_id="c1",
+                send_event=lambda *_: None,
+            )
+            self.assertIn("materialization_timing", summary)
+            timing = summary["materialization_timing"]
+            self.assertIsInstance(timing, dict)
+
+    def test_materialize_modal_outputs_timing_has_required_keys(self):
+        """All required Phase 6 timing keys are present."""
+        result = {"outputs": {}, "images": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = self.module._materialize_modal_outputs(
+                result, output_dir=tmp, prompt_id="p1", client_id="c1",
+                send_event=lambda *_: None,
+            )
+            timing = summary["materialization_timing"]
+            required_keys = {
+                "total_wall_ms", "total_decode_time_ms", "total_write_time_ms",
+                "auto_save_time_ms", "item_count", "bytes_written",
+            }
+            for key in required_keys:
+                self.assertIn(key, timing, f"missing timing key: {key}")
+
+    def test_materialize_modal_outputs_timing_is_non_negative(self):
+        """All numeric timing values must be >= 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = self.module._materialize_modal_outputs(
+                {"outputs": {}, "images": []},
+                output_dir=tmp, prompt_id="p1", client_id="c1",
+                send_event=lambda *_: None,
+            )
+            timing = summary["materialization_timing"]
+            for key, value in timing.items():
+                if isinstance(value, (int, float)):
+                    self.assertGreaterEqual(
+                        value, 0,
+                        f"timing key {key} is negative: {value}",
+                    )
+
+    def test_materialize_modal_outputs_timing_additive(self):
+        """decode + write ≤ wall for materialization with real files."""
+        a_bytes = b"image-a-data"
+        from base64 import b64encode
+        entry = {
+            "filename": "img.png", "data": b64encode(a_bytes).decode("ascii"),
+            "node_id": "1", "output_key": "images", "comparison_side": "",
+            "mime_type": "image/png", "file_ext": ".png", "output_index": 0,
+            "format": "png", "width": 64, "height": 64,
+        }
+        result = {"outputs": {"1": {"images": [entry]}}, "images": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = self.module._materialize_modal_outputs(
+                result, output_dir=tmp, prompt_id="p1", client_id="c1",
+                send_event=lambda *_: None,
+            )
+            timing = summary["materialization_timing"]
+            decode_ms = timing["total_decode_time_ms"]
+            write_ms = timing["total_write_time_ms"]
+            wall_ms = timing["total_wall_ms"]
+            # decode + write should be ≤ wall (some overhead for dict operations)
+            self.assertLessEqual(
+                decode_ms + write_ms, wall_ms + 5.0,  # 5ms tolerance for overhead
+                f"decode({decode_ms}) + write({write_ms}) > wall({wall_ms})",
+            )
+
+    def test_materialize_modal_outputs_preserves_existing_keys(self):
+        """Adding materialization_timing does not remove existing return keys."""
+        result = {"outputs": {}, "images": []}
+        expected_keys = {
+            "outputs", "history_outputs", "materialized_outputs",
+            "primary_output", "written_files", "image_count",
+            "video_count", "bytes_written", "save_results", "save_warnings",
+            "materialization_timing",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = self.module._materialize_modal_outputs(
+                result, output_dir=tmp, prompt_id="p1", client_id="c1",
+                send_event=lambda *_: None,
+            )
+            self.assertEqual(set(summary.keys()), expected_keys)
+
+    def test_materialize_modal_outputs_timing_with_auto_save(self):
+        """auto_save_time_ms > 0 when auto_save_local is enabled."""
+        a_bytes = b"primary-image"
+        from base64 import b64encode
+        entry = {
+            "filename": "primary.png", "data": b64encode(a_bytes).decode("ascii"),
+            "node_id": "1", "output_key": "images", "comparison_side": "b",
+            "mime_type": "image/png", "file_ext": ".png", "output_index": 0,
+            "format": "png", "width": 64, "height": 64,
+        }
+        result = {"outputs": {"1": {"images": [entry]}}, "images": []}
+        save_calls = []
+        def _fake_save(image_bytes, **kwargs):
+            save_calls.append((image_bytes, kwargs))
+            return {"saved": True, "path": str(Path(kwargs["save_folder"]) / "out.png"),
+                    "metadata_path": "", "error": None}
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(self.module, "save_output_image", side_effect=_fake_save):
+                with patch.object(self.module, "_COMFYUI_ROOT", tmp):
+                    summary = self.module._materialize_modal_outputs(
+                        result, output_dir=tmp, prompt_id="p1", client_id="c1",
+                        send_event=lambda *_: None,
+                        auto_save_local=True, save_folder=tmp,
+                    )
+            timing = summary["materialization_timing"]
+            self.assertGreater(timing["auto_save_time_ms"], 0.0,
+                               "auto_save_time_ms should be > 0 when auto_save is on")
+
+    # ── _materialize_experiment_output timing keys ─────────────────────
+
+    def test_materialize_experiment_output_has_timing_key(self):
+        """materialization_timing is present in experiment output."""
+        result_data = {"outputs": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            mat = self.module._materialize_experiment_output(
+                result_data, str(Path(tmp) / "out"), cell_key="c1", attempt_id="a1",
+            )
+            self.assertIn("materialization_timing", mat)
+            timing = mat["materialization_timing"]
+            self.assertIsInstance(timing, dict)
+
+    def test_materialize_experiment_output_timing_has_required_keys(self):
+        """All required Phase 6 timing keys for experiment path."""
+        result_data = {"outputs": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            mat = self.module._materialize_experiment_output(
+                result_data, str(Path(tmp) / "out"), cell_key="c1", attempt_id="a1",
+            )
+            timing = mat["materialization_timing"]
+            required_keys = {
+                "total_wall_ms", "total_decode_time_ms", "total_write_time_ms",
+                "total_thumbnail_time_ms", "item_count",
+            }
+            for key in required_keys:
+                self.assertIn(key, timing, f"missing experiment timing key: {key}")
+
+    def test_materialize_experiment_output_timing_non_negative(self):
+        """Experiment timing values are non-negative."""
+        from tests.test_modal_output_materialization import _make_png_bytes, _exp_result_entry
+        png_data = _make_png_bytes(100, 150, 200)
+        result_data = {
+            "outputs": {"7": {"images": [_exp_result_entry("img.png", png_data, node_id="7")]}},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            mat = self.module._materialize_experiment_output(
+                result_data, str(Path(tmp) / "out"), cell_key="c1", attempt_id="a1",
+            )
+            timing = mat["materialization_timing"]
+            for key, value in timing.items():
+                if isinstance(value, (int, float)):
+                    self.assertGreaterEqual(
+                        value, 0,
+                        f"experiment timing key {key} is negative: {value}",
+                    )
+
+    def test_materialize_experiment_output_timing_additive(self):
+        """decode + write + thumbnail ≤ wall for experiment materialization."""
+        from tests.test_modal_output_materialization import _make_png_bytes, _exp_result_entry
+        png_data = _make_png_bytes(50, 100, 200)
+        result_data = {
+            "outputs": {"7": {"images": [_exp_result_entry("img.png", png_data, node_id="7")]}},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            mat = self.module._materialize_experiment_output(
+                result_data, str(Path(tmp) / "out"), cell_key="c1", attempt_id="a1",
+            )
+            timing = mat["materialization_timing"]
+            decode_ms = timing["total_decode_time_ms"]
+            write_ms = timing["total_write_time_ms"]
+            thumb_ms = timing["total_thumbnail_time_ms"]
+            wall_ms = timing["total_wall_ms"]
+            self.assertLessEqual(
+                decode_ms + write_ms + thumb_ms, wall_ms + 5.0,
+                f"decode({decode_ms}) + write({write_ms}) + thumb({thumb_ms}) > wall({wall_ms})",
+            )
+
+    def test_materialize_experiment_output_preserves_existing_keys(self):
+        """Adding materialization_timing does not remove existing keys in experiment output."""
+        result_data = {"outputs": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            mat = self.module._materialize_experiment_output(
+                result_data, str(Path(tmp) / "out"), cell_key="c1", attempt_id="a1",
+            )
+            expected_keys = {
+                "assets", "primary_output", "primary_asset_id",
+                "primary_thumbnail_asset_id", "output_count",
+                "materialization_timing",
+            }
+            self.assertEqual(set(mat.keys()), expected_keys)
+
+    # ── Output payload shape unchanged (regression checks) ─────────────
+
+    def test_materialize_modal_outputs_output_shape_unchanged(self):
+        """Primary output payload shape is preserved."""
+        a_bytes = b"image-a"
+        from base64 import b64encode
+        a_entry = {
+            "filename": "a.png", "data": b64encode(a_bytes).decode("ascii"),
+            "node_id": "1", "output_key": "images", "comparison_side": "b",
+            "mime_type": "image/png", "file_ext": ".png", "output_index": 0,
+            "format": "png", "width": 64, "height": 64,
+        }
+        result = {"outputs": {"1": {"images": [a_entry]}}, "images": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = self.module._materialize_modal_outputs(
+                result, output_dir=tmp, prompt_id="p1", client_id="c1",
+                send_event=lambda *_: None,
+            )
+            po = summary["primary_output"]
+            self.assertIsNotNone(po)
+            self.assertIn("filename", po)
+            self.assertIn("path", po)
+            self.assertIn("node_id", po)
+            self.assertIn("output_key", po)
+            self.assertIn("mime_type", po)
+            self.assertIn("byte_count", po)
+            # Verify path exists on disk
+            self.assertTrue(Path(po["path"]).exists())
+
+    def test_v4_event_trace_marks_emitted_no_crash(self):
+        """v4 event trace mark emission in materialization flow does not crash.
+
+        This tests that _get_local_event_trace can be called safely and
+        that mark/span operations on the trace do not raise even when
+        the trace was never initialized (returns None).
+        """
+        from profiler_trace_v4 import (
+            T9C_LOCAL_BASE64_DECODE_START, T9D_LOCAL_BASE64_DECODE_END,
+            T9E_LOCAL_FILE_WRITE_START, T9F_LOCAL_FILE_WRITE_END,
+            T10_LOCAL_MATERIALIZED, PHASE_LOCAL_MATERIALIZE,
+        )
+        # Simulate what _execute_job does
+        local_et = self.module._get_local_event_trace()
+        # No trace initialized — operations should be safe (no crash)
+        if local_et is not None:
+            local_et.mark(T9C_LOCAL_BASE64_DECODE_START, phase=PHASE_LOCAL_MATERIALIZE)
+            local_et.mark(T9E_LOCAL_FILE_WRITE_START, phase=PHASE_LOCAL_MATERIALIZE)
+            local_et.mark(T9D_LOCAL_BASE64_DECODE_END, phase=PHASE_LOCAL_MATERIALIZE)
+            local_et.mark(T9F_LOCAL_FILE_WRITE_END, phase=PHASE_LOCAL_MATERIALIZE)
+            local_et.mark(T10_LOCAL_MATERIALIZED, phase=PHASE_LOCAL_MATERIALIZE)
+        # If we reach here without AttributeError, the test passes
+        self.assertTrue(True)

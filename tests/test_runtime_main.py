@@ -83,6 +83,232 @@ class TestBootstrap(unittest.TestCase):
 
         self.assertEqual(observed, [before])
 
+    def test_install_requirements_callback_fires_after_nodes_in_startup(self):
+        calls: list[str] = []
+        model_path = Path(tempfile.gettempdir()) / "models"
+        model_path.mkdir(exist_ok=True)
+        bootstrap = RuntimeBootstrap(
+            BootstrapConfig(
+                comfyui_root=tempfile.gettempdir(),
+                models_path=str(model_path),
+                install_requirements_on_startup=True,
+            ),
+            reload_models=lambda: calls.append("models"),
+            reload_runtime_state=lambda: calls.append("state"),
+            sync_custom_nodes=lambda: calls.append("nodes"),
+            install_requirements=lambda: calls.append("install_reqs"),
+            start_backend=lambda: calls.append("backend") or "in_process",
+        )
+        trace = RuntimeTrace(request_id="r")
+        bootstrap.startup(trace=trace)
+        self.assertIn("install_reqs", calls)
+        self.assertEqual(calls[:4], ["models", "state", "nodes", "install_reqs"])
+        self.assertEqual(calls[4:], ["backend"])
+
+    def test_install_requirements_not_called_when_flag_off(self):
+        calls: list[str] = []
+        model_path = Path(tempfile.gettempdir()) / "models"
+        model_path.mkdir(exist_ok=True)
+        bootstrap = RuntimeBootstrap(
+            BootstrapConfig(
+                comfyui_root=tempfile.gettempdir(),
+                models_path=str(model_path),
+                install_requirements_on_startup=False,
+            ),
+            sync_custom_nodes=lambda: calls.append("nodes"),
+            install_requirements=lambda: calls.append("install_reqs"),
+            start_backend=lambda: calls.append("backend") or "in_process",
+        )
+        bootstrap.startup()
+        self.assertNotIn("install_reqs", calls)
+
+    def test_startup_emits_per_stage_trace_events(self):
+        model_path = Path(tempfile.gettempdir()) / "models"
+        model_path.mkdir(exist_ok=True)
+        trace = RuntimeTrace(request_id="test-startup-stages")
+        bootstrap = RuntimeBootstrap(
+            BootstrapConfig(comfyui_root=tempfile.gettempdir(), models_path=str(model_path)),
+            reload_models=lambda: None,
+            reload_runtime_state=lambda: None,
+            sync_custom_nodes=lambda: None,
+            start_backend=lambda: "in_process",
+        )
+        bootstrap.startup(trace=trace)
+        names = {e.name for e in trace.events}
+        for expected in (
+            "snapshot_restore_start",
+            "models_symlink_start",
+            "models_symlink_end",
+            "manager_offline_start",
+            "manager_offline_end",
+            "reload_models_start",
+            "reload_models_end",
+            "reload_runtime_state_start",
+            "reload_runtime_state_end",
+            "sync_custom_nodes_start",
+            "sync_custom_nodes_end",
+            "comfyui_path_setup_start",
+            "comfyui_path_setup_end",
+            "backend_startup_start",
+            "backend_startup_end",
+            "observe_generations_start",
+            "observe_generations_end",
+            "snapshot_restore_end",
+        ):
+            with self.subTest(event=expected):
+                self.assertIn(expected, names)
+
+    def test_startup_captures_identity_metadata(self):
+        model_path = Path(tempfile.gettempdir()) / "models"
+        model_path.mkdir(exist_ok=True)
+        trace = RuntimeTrace(request_id="test-identity")
+        bootstrap = RuntimeBootstrap(
+            BootstrapConfig(comfyui_root=tempfile.gettempdir(), models_path=str(model_path)),
+            start_backend=lambda: "in_process",
+        )
+        os.environ["MODAL_TASK_ID"] = "task-999"
+        os.environ["MODAL_IMAGE_ID"] = "img-abc"
+        os.environ["MODAL_CLOUD_PROVIDER"] = "aws"
+        os.environ["MODAL_REGION"] = "us-east-1"
+        try:
+            bootstrap.startup(trace=trace)
+            self.assertEqual(bootstrap.state.modal_task_id, "task-999")
+            self.assertEqual(bootstrap.state.modal_image_id, "img-abc")
+            self.assertEqual(bootstrap.state.modal_cloud_provider, "aws")
+            self.assertEqual(bootstrap.state.modal_region, "us-east-1")
+            # Verify metadata emitted in snapshot_restore_start
+            start_events = [e for e in trace.events if e.name == "snapshot_restore_start"]
+            self.assertGreaterEqual(len(start_events), 1)
+            meta = start_events[0].metadata
+            self.assertEqual(meta.get("modal_task_id"), "task-999")
+            self.assertEqual(meta.get("snapshot_enabled"), "True")
+        finally:
+            for key in ("MODAL_TASK_ID", "MODAL_IMAGE_ID", "MODAL_CLOUD_PROVIDER", "MODAL_REGION"):
+                os.environ.pop(key, None)
+
+    def test_restore_emits_per_stage_trace_events(self):
+        model_path = Path(tempfile.gettempdir()) / "models"
+        model_path.mkdir(exist_ok=True)
+        trace = RuntimeTrace(request_id="test-restore-stages")
+        bootstrap = RuntimeBootstrap(
+            BootstrapConfig(comfyui_root=tempfile.gettempdir(), models_path=str(model_path)),
+            restore_gpu_state=lambda: None,
+            initialize_cuda=lambda: {"device": "cuda:0", "cuda_available": "1"},
+            apply_sage_policy=lambda: True,
+            reload_runtime_state=lambda: None,
+            reload_models=lambda: None,
+            sync_custom_nodes=lambda: None,
+        )
+        bootstrap.restore(trace=trace)
+        names = {e.name for e in trace.events}
+        for expected in (
+            "snapshot_restore_start",
+            "restore_gpu_state_start",
+            "restore_gpu_state_end",
+            "cuda_init_start",
+            "cuda_init_end",
+            "sage_policy_start",
+            "sage_policy_end",
+            "reload_runtime_state_start",
+            "reload_runtime_state_end",
+            "reload_models_start",
+            "reload_models_end",
+            "sync_custom_nodes_start",
+            "sync_custom_nodes_end",
+            "observe_generations_start",
+            "observe_generations_end",
+            "snapshot_restore_end",
+        ):
+            with self.subTest(event=expected):
+                self.assertIn(expected, names)
+
+    def test_restore_captures_sage_policy_result(self):
+        model_path = Path(tempfile.gettempdir()) / "models"
+        model_path.mkdir(exist_ok=True)
+        trace = RuntimeTrace(request_id="test-sage")
+        bootstrap = RuntimeBootstrap(
+            BootstrapConfig(comfyui_root=tempfile.gettempdir(), models_path=str(model_path)),
+            restore_gpu_state=lambda: None,
+            initialize_cuda=lambda: {"device": "cuda:0"},
+            apply_sage_policy=lambda: True,
+            reload_runtime_state=lambda: None,
+            reload_models=lambda: None,
+            sync_custom_nodes=lambda: None,
+        )
+        bootstrap.restore(trace=trace)
+        self.assertEqual(bootstrap.state.sage_mode, "baked_cuda")
+        self.assertEqual(bootstrap.state.sage_reason, "patched")
+        # Verify metadata in sage_policy_end event
+        sage_ends = [e for e in trace.events if e.name == "sage_policy_end"]
+        self.assertGreaterEqual(len(sage_ends), 1)
+        self.assertEqual(sage_ends[0].metadata.get("sage_mode"), "baked_cuda")
+        self.assertEqual(sage_ends[0].metadata.get("sage_reason"), "patched")
+
+    def test_restore_captures_sage_policy_false_result(self):
+        model_path = Path(tempfile.gettempdir()) / "models"
+        model_path.mkdir(exist_ok=True)
+        bootstrap = RuntimeBootstrap(
+            BootstrapConfig(comfyui_root=tempfile.gettempdir(), models_path=str(model_path)),
+            restore_gpu_state=lambda: None,
+            initialize_cuda=lambda: {"device": "cuda:0"},
+            apply_sage_policy=lambda: False,
+            reload_runtime_state=lambda: None,
+            reload_models=lambda: None,
+            sync_custom_nodes=lambda: None,
+            observe_generations=lambda: {"runtime_state": "gen-5", "custom_nodes": "gen-3"},
+        )
+        state = bootstrap.restore()
+        self.assertEqual(state.sage_mode, "triton_fallback")
+        self.assertEqual(state.sage_reason, "not-patched-or-not-found")
+
+    def test_restore_captures_stage_durations_in_state(self):
+        model_path = Path(tempfile.gettempdir()) / "models"
+        model_path.mkdir(exist_ok=True)
+        trace = RuntimeTrace(request_id="test-durations")
+        bootstrap = RuntimeBootstrap(
+            BootstrapConfig(comfyui_root=tempfile.gettempdir(), models_path=str(model_path)),
+            restore_gpu_state=lambda: None,
+            initialize_cuda=lambda: {"device": "cuda:0"},
+            apply_sage_policy=lambda: True,
+            reload_runtime_state=lambda: None,
+            reload_models=lambda: None,
+            sync_custom_nodes=lambda: None,
+            observe_generations=lambda: {"runtime_state": "gen-5", "custom_nodes": "gen-3"},
+        )
+        state = bootstrap.restore(trace=trace)
+        self.assertIn("snapshot_restore", state.stage_durations)
+        self.assertIn("restore_gpu_state", state.stage_durations)
+        self.assertIn("cuda_init", state.stage_durations)
+        self.assertIn("sage_policy", state.stage_durations)
+        self.assertIn("reload_runtime_state", state.stage_durations)
+        self.assertIn("reload_models", state.stage_durations)
+        self.assertIn("sync_custom_nodes", state.stage_durations)
+        for name, duration_ms in state.stage_durations.items():
+            self.assertIsInstance(duration_ms, (int, float))
+            self.assertGreaterEqual(duration_ms, 0)
+
+    def test_startup_captures_stage_durations_in_state(self):
+        model_path = Path(tempfile.gettempdir()) / "models"
+        model_path.mkdir(exist_ok=True)
+        trace = RuntimeTrace(request_id="test-startup-durations")
+        bootstrap = RuntimeBootstrap(
+            BootstrapConfig(comfyui_root=tempfile.gettempdir(), models_path=str(model_path)),
+            reload_models=lambda: None,
+            reload_runtime_state=lambda: None,
+            sync_custom_nodes=lambda: None,
+            start_backend=lambda: "in_process",
+            observe_generations=lambda: {"runtime_state": "gen-5", "custom_nodes": "gen-3"},
+        )
+        state = bootstrap.startup(trace=trace)
+        self.assertIn("snapshot_restore", state.stage_durations)
+        self.assertIn("models_symlink", state.stage_durations)
+        self.assertIn("reload_models", state.stage_durations)
+        self.assertIn("backend_startup", state.stage_durations)
+        self.assertIn("observe_generations", state.stage_durations)
+        for name, duration_ms in state.stage_durations.items():
+            self.assertIsInstance(duration_ms, (int, float))
+            self.assertGreaterEqual(duration_ms, 0)
+
 
 class TestModelPreload(unittest.TestCase):
     def test_two_lanes_and_exact_prefill_are_measured(self):
@@ -260,6 +486,58 @@ class TestModalTransport(unittest.TestCase):
             self.assertEqual(published["generation"], 3)
 
         asyncio.run(run())
+
+    def test_resolve_v2_cloud_returns_empty_for_rtx_pro_6000_when_unset(self):
+        self.assertEqual(ModalTransport._resolve_v2_cloud("rtx-pro-6000"), "")
+
+    def test_resolve_v2_cloud_returns_empty_for_other_gpus(self):
+        self.assertEqual(ModalTransport._resolve_v2_cloud("a100-80gb"), "")
+
+    def test_resolve_v2_cloud_env_var_overrides_default(self):
+        os.environ["COMFYMODAL_V2_CLOUD"] = "aws"
+        try:
+            self.assertEqual(ModalTransport._resolve_v2_cloud("rtx-pro-6000"), "aws")
+            self.assertEqual(ModalTransport._resolve_v2_cloud("a100-80gb"), "aws")
+        finally:
+            os.environ.pop("COMFYMODAL_V2_CLOUD", None)
+
+    def test_resolve_v2_cloud_empty_env_returns_empty(self):
+        os.environ["COMFYMODAL_V2_CLOUD"] = ""
+        try:
+            self.assertEqual(ModalTransport._resolve_v2_cloud("rtx-pro-6000"), "")
+        finally:
+            os.environ.pop("COMFYMODAL_V2_CLOUD", None)
+
+    def test_v2_handle_cache_key_includes_cloud(self):
+        from comfymodal_runtime.modal_transport import HandleCacheKey
+        key = HandleCacheKey("ws", "app", "cls", "rtx-pro-6000", cloud="gcp")
+        self.assertEqual(key.cloud, "gcp")
+        key2 = HandleCacheKey("ws", "app", "cls", "rtx-pro-6000")
+        self.assertEqual(key2.cloud, "")
+
+    def test_configure_runtime_does_not_set_install_requirements_true(self):
+        """_configure_runtime must leave install_requirements_on_startup at its default (False).
+
+        V2 diagnosis containers must not install custom-node requirements at
+        startup.  The runtime may still install requirements through explicit
+        callback paths; this test only guards against the BootstrapConfig override.
+        """
+        source = Path("comfymodal_runtime/modal_app.py").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "install_requirements_on_startup=True",
+            source,
+            "_configure_runtime must not hard-code install_requirements_on_startup=True",
+        )
+        # Also confirm the BootstrapConfig default is False
+        from comfymodal_runtime.runtime_bootstrap import BootstrapConfig
+        self.assertFalse(BootstrapConfig().install_requirements_on_startup)
+
+    def test_stream_iteration_does_not_add_local_timeout(self):
+        """Stream instrumentation preserves the transport's existing iteration semantics."""
+        source = Path("comfymodal_runtime/modal_transport.py").read_text(encoding="utf-8")
+        self.assertNotIn("_STREAM_FIRST_EVENT_TIMEOUT", source)
+        self.assertNotIn("asyncio.wait_for", source)
+        self.assertNotIn("ait.aclose", source)
 
 
 if __name__ == "__main__":

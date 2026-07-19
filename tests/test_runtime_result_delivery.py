@@ -455,3 +455,88 @@ class TestMakeThumbnail:
             dst = os.path.join(tmp, "thumb.webp")
             result = make_thumbnail("/nonexistent.png", dst)
             assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Materialization decode/write timing
+# ---------------------------------------------------------------------------
+
+class TestPhase6MaterializationTiming:
+    """Focused tests for Phase 6 materialization timing observability."""
+
+    def test_summary_contains_timing_key(self):
+        """materialize_modal_result returns materialization_timing dict."""
+        result = {"outputs": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = materialize_modal_result(
+                result, output_dir=tmp, prompt_id="p1",
+            )
+            assert "materialization_timing" in summary
+            timing = summary["materialization_timing"]
+            assert "total_wall_ms" in timing
+            assert "total_decode_time_ms" in timing
+            assert "total_write_time_ms" in timing
+            assert "item_count" in timing
+            assert "bytes_written" in timing
+
+    def test_timing_zero_for_no_output(self):
+        """Empty output has zero timing values."""
+        result = {"outputs": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = materialize_modal_result(
+                result, output_dir=tmp, prompt_id="p1",
+            )
+            timing = summary["materialization_timing"]
+            assert timing["total_decode_time_ms"] == 0.0
+            assert timing["total_write_time_ms"] == 0.0
+            assert timing["item_count"] == 0
+            assert timing["bytes_written"] == 0
+            assert timing["total_wall_ms"] >= 0
+
+    def test_decode_write_time_positive_for_real_output(self):
+        """Real output produces non-negative decode and write times."""
+        a_bytes = _png_bytes(255, 0, 0)
+        a_entry = _remote_entry("out.png", a_bytes, node_id="7")
+        result = {"outputs": {"7": {"images": [a_entry]}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = materialize_modal_result(
+                result, output_dir=tmp, prompt_id="p1",
+            )
+            timing = summary["materialization_timing"]
+            assert timing["total_decode_time_ms"] >= 0
+            assert timing["total_write_time_ms"] >= 0
+            assert timing["item_count"] == 1
+            assert timing["bytes_written"] == len(a_bytes)
+            assert timing["total_wall_ms"] >= timing["total_decode_time_ms"] + timing["total_write_time_ms"] - 1.0
+
+    def test_multiple_outputs_accumulate_timing(self):
+        """Multiple outputs accumulate decode/write time correctly."""
+        a_bytes = _png_bytes(255, 0, 0)
+        b_bytes = _png_bytes(0, 255, 0)
+        a_entry = _remote_entry("a.png", a_bytes, node_id="7", output_key="images")
+        b_entry = _remote_entry("b.png", b_bytes, node_id="8", output_key="images")
+        result = {"outputs": {"7": {"images": [a_entry]}, "8": {"images": [b_entry]}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = materialize_modal_result(
+                result, output_dir=tmp, prompt_id="p1",
+            )
+            timing = summary["materialization_timing"]
+            assert timing["item_count"] == 2
+            assert timing["bytes_written"] == len(a_bytes) + len(b_bytes)
+            assert timing["total_decode_time_ms"] >= 0
+            assert timing["total_write_time_ms"] >= 0
+            # Total wall >= sum of decode + write (within rounding)
+            assert timing["total_wall_ms"] >= timing["total_decode_time_ms"] + timing["total_write_time_ms"] - 1.0
+
+    def test_timing_preserved_with_legacy_payload(self):
+        """Legacy payload adapter doesn't strip timing."""
+        a_bytes = _png_bytes(100, 100, 100)
+        entry = _remote_entry("img.png", a_bytes, node_id="7")
+        result = {"result": {"outputs": {"7": {"images": [entry]}}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = materialize_modal_result(
+                result, output_dir=tmp, prompt_id="p1",
+            )
+            timing = summary["materialization_timing"]
+            assert timing["total_decode_time_ms"] >= 0
+            assert timing["item_count"] == 1

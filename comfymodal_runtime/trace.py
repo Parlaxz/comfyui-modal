@@ -11,12 +11,19 @@ from typing import Any
 from .contracts import TraceEvent, stable_hash
 
 
+PROCESS_LOCAL = "local"
+PROCESS_PUBLISHER = "publisher"
+PROCESS_REMOTE_LIFECYCLE = "remote_lifecycle"
+PROCESS_REMOTE_METHOD = "remote_method"
+
+
 _LEGACY_STAGE_NAMES = {
     "local_request_received": "t1_local_recv",
     "plan_build_start": "t2_local_dispatch",
     "modal_submit_start": "t2c_modal_call_start",
     "container_entry": "t3_modal_entry",
     "graph_execution_start": "t3d_prompt_start",
+    "prompt_executor_start": "t3e_execution_start",
     "unet_prepare_start": "t4b_unet_load_start",
     "unet_prepare_end": "t4b_unet_load_end",
     "clip_prepare_start": "t4_clip_load_start",
@@ -212,7 +219,7 @@ def merge_runtime_traces(*values: RuntimeTrace | Mapping[str, Any] | None) -> Ru
             seen.add(identity)
             result._events.append(event)
 
-    result._events.sort(key=lambda event: (event.wall_unix_ns, event.monotonic_ns, event.name))
+    result._events.sort(key=lambda event: event.wall_unix_ns)
     return result
 
 

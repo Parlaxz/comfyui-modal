@@ -776,5 +776,109 @@ class TestStackExtractMsRegression(unittest.TestCase):
         )
 
 
+# =========================================================================
+# V1 regression: gpu_submit_to_first_event_ns is a delta, not epoch
+# =========================================================================
+
+
+class TestGpuSubmitToFirstEventRegression(unittest.TestCase):
+    """Verify ``gpu_submit_to_first_event_ns`` is a delta interval, not an epoch
+    timestamp stored in an interval field."""
+
+    def test_gpu_submit_to_first_event_ns_is_delta_not_epoch(self):
+        """gpu_submit_to_first_event_ns must be a duration delta (ns), not an epoch
+        timestamp. The old code stored ``_now_iter`` (a wall-clock epoch value) in
+        this field via ``setdefault`` near the iteration-start boundary."""
+        source = (REPO_ROOT / "modal_client.py").read_text(encoding="utf-8")
+        # Must not contain the old pattern that stored an epoch timestamp
+        self.assertNotIn(
+            'setdefault("gpu_submit_to_first_event_ns", _now_iter)',
+            source,
+            "gpu_submit_to_first_event_ns must not be set to an epoch timestamp "
+            "via setdefault near iteration start",
+        )
+        # Must still exist as a computed delta value
+        self.assertIn(
+            'trace["gpu_submit_to_first_event_ns"]',
+            source,
+            "gpu_submit_to_first_event_ns must be present as a computed interval",
+        )
+        # The ms variant must also be present
+        self.assertIn(
+            'trace["gpu_submit_to_first_event_ms"]',
+            source,
+            "gpu_submit_to_first_event_ms must be present as a computed interval",
+        )
+
+
+# =========================================================================
+# V2 execute_plan focused test: gpu_invocation_submit event
+# =========================================================================
+
+
+class TestExecutePlanGpuInvocation(unittest.TestCase):
+    """Focused test that ``execute_plan`` emits ``gpu_invocation_submit``."""
+
+    def setUp(self):
+        self.mod = _load_canonical()
+
+    def test_gpu_invocation_submit_event_emitted(self):
+        """execute_plan emits a gpu_invocation_submit RuntimeTrace event at the
+        submission boundary immediately before the transport call."""
+        from unittest.mock import MagicMock
+
+        async def _run():
+            trace = self.mod.RuntimeTrace(
+                request_id="test_gpu_invocation",
+            )
+
+            # Build a minimal ExecutionPlan
+            from comfymodal_runtime.contracts import ExecutionPlan, ExecutionOptions
+            plan = ExecutionPlan(
+                workflow={"3": {"class_type": "KSampler", "inputs": {"seed": 42}}},
+                workflow_hash="test_hash",
+                source_workflow_hash="test_src_hash",
+                execution_options=ExecutionOptions.from_legacy(
+                    {}, default_production=False,
+                ),
+                request_metadata={"prompt_id": "test_prompt"},
+            )
+
+            # Mock transport that yields a result immediately
+            async def _mock_stream(
+                plan, *, gpu=None, workspace=None,
+                trace=None, runtime_trace=None,
+            ):
+                yield {"type": "result", "data": {"outputs": {}}}
+
+            mock_transport = MagicMock()
+            mock_transport.run_plan_stream = _mock_stream
+
+            await self.mod.execute_plan(
+                plan,
+                transport=mock_transport,
+                trace=trace,
+            )
+
+            event_names = [e.name for e in trace.events]
+            self.assertIn(
+                "gpu_invocation_submit",
+                event_names,
+                "execute_plan must emit gpu_invocation_submit event",
+            )
+            # Verify ordering: gpu_invocation_submit must appear after
+            # modal_submit_start and before the first transport event
+            self.assertIn("modal_submit_start", event_names)
+            self.assertIn("remote_return_start", event_names)
+            submit_idx = event_names.index("gpu_invocation_submit")
+            modal_start_idx = event_names.index("modal_submit_start")
+            self.assertGreater(
+                submit_idx, modal_start_idx,
+                "gpu_invocation_submit must appear after modal_submit_start",
+            )
+
+        asyncio.run(_run())
+
+
 if __name__ == "__main__":
     unittest.main()
