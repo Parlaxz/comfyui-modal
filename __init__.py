@@ -333,15 +333,23 @@ def _materialize_modal_outputs(
     image_count = 0
     video_count = 0
     output_bytes_written = 0
+    # ── Phase 6 materialization timing ──
+    total_decode_time_ms: float = 0.0
+    total_write_time_ms: float = 0.0
+    _materialization_wall_start = time.perf_counter()
 
     def _store_entry(node_id: str, output_key: str, entry: dict, fallback_index: int = 0) -> None:
-        nonlocal image_count, video_count, output_bytes_written
-        raw_bytes = base64.b64decode(entry["data"])
+        nonlocal image_count, video_count, output_bytes_written, total_decode_time_ms, total_write_time_ms
+        _t0 = time.perf_counter()
+        raw_bytes = base64.b64decode(entry["data"], validate=True)
+        total_decode_time_ms += (time.perf_counter() - _t0) * 1000.0
         local_filename = entry.get("filename", f"output_{fallback_index}.bin")
         local_path = _unique_path(output_dir, local_filename)
         local_filename = os.path.basename(local_path)
+        _t1 = time.perf_counter()
         with open(local_path, "wb") as f:
             f.write(raw_bytes)
+        total_write_time_ms += (time.perf_counter() - _t1) * 1000.0
         written_files.append(local_path)
         output_bytes_written += len(raw_bytes)
         is_video = output_key == "gifs" or (entry.get("format", "") in {"gif", "mp4", "webm"})
@@ -474,7 +482,9 @@ def _materialize_modal_outputs(
             f"filename={primary_output['filename']} path={primary_output['path']} bytes={primary_output['byte_count']}"
         )
 
+    _auto_save_time_ms: float = 0.0
     if auto_save_local and primary_output and primary_output.get("path"):
+        _auto_save_start = time.perf_counter()
         try:
             with open(primary_output["path"], "rb") as f:
                 image_bytes = f.read()
@@ -514,6 +524,9 @@ def _materialize_modal_outputs(
                 save_warnings.append(save_result["error"])
         except OSError as exc:
             save_warnings.append(str(exc))
+        _auto_save_time_ms = (time.perf_counter() - _auto_save_start) * 1000.0
+
+    _materialization_wall_ms = (time.perf_counter() - _materialization_wall_start) * 1000.0
 
     return {
         "outputs": native_outputs,
@@ -526,6 +539,15 @@ def _materialize_modal_outputs(
         "bytes_written": output_bytes_written,
         "save_results": save_results,
         "save_warnings": save_warnings,
+        # ── Phase 6 materialization timing ──
+        "materialization_timing": {
+            "total_wall_ms": _materialization_wall_ms,
+            "total_decode_time_ms": total_decode_time_ms,
+            "total_write_time_ms": total_write_time_ms,
+            "auto_save_time_ms": _auto_save_time_ms,
+            "item_count": image_count + video_count,
+            "bytes_written": output_bytes_written,
+        },
     }
 
 
@@ -575,12 +597,19 @@ def _materialize_experiment_output(
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
     seen = 0
+    # ── Phase 6 materialization timing ──
+    _total_decode_time_ms: float = 0.0
+    _total_write_time_ms: float = 0.0
+    _total_thumbnail_time_ms: float = 0.0
+    _experiment_wall_start = time.perf_counter()
     # Collect all entries indexed by their stable identity for primary selection
     per_node_outputs: dict[str, dict[str, list[dict]]] = {}
 
     def _write_and_index(entry: dict, node_id: str, output_key: str, fallback_index: int) -> str:
-        nonlocal seen
-        raw_bytes = base64.b64decode(entry["data"])
+        nonlocal seen, _total_decode_time_ms, _total_write_time_ms, _total_thumbnail_time_ms
+        _t0 = time.perf_counter()
+        raw_bytes = base64.b64decode(entry["data"], validate=True)
+        _total_decode_time_ms += (time.perf_counter() - _t0) * 1000.0
         content_hash = hashlib.sha256(raw_bytes).hexdigest()
         # Goal 1: globally unique UUID-based asset ID (NOT content-hash-derived)
         asset_id = str(uuid.uuid4())
@@ -592,7 +621,9 @@ def _materialize_experiment_output(
             counter += 1
             stem = local_path.stem
             local_path = output_dir_path / f"{stem}_{counter}{local_path.suffix}"
+        _tw0 = time.perf_counter()
         local_path.write_bytes(raw_bytes)
+        _total_write_time_ms += (time.perf_counter() - _tw0) * 1000.0
         mime_type = entry.get("mime_type", "image/png")
         comp_side = entry.get("comparison_side", "")
         entry_width = entry.get("width", 0) or 0
@@ -618,7 +649,9 @@ def _materialize_experiment_output(
         # B4: generate WebP thumbnail and register as separate first-class asset
         thumb_stem = f"{local_path.stem}_thumb"
         thumb_path = output_dir_path / f"{thumb_stem}.webp"
+        _tt0 = time.perf_counter()
         thumb_ok = bool(_make_thumbnail(str(local_path), str(thumb_path)))
+        _total_thumbnail_time_ms += (time.perf_counter() - _tt0) * 1000.0
         if thumb_ok and thumb_path.exists():
             thumb_bytes = thumb_path.read_bytes()
             # B4: recompute SHA-256 on ACTUAL thumbnail bytes (not original hash)
@@ -743,12 +776,22 @@ def _materialize_experiment_output(
                         "primary_thumbnail_asset_id": primary_thumbnail_asset_id,
                     }
 
+    _experiment_wall_ms = (time.perf_counter() - _experiment_wall_start) * 1000.0
+
     return {
         "assets": assets,
         "primary_output": primary_output,
         "primary_asset_id": primary_asset_id,
         "primary_thumbnail_asset_id": primary_thumbnail_asset_id,
         "output_count": seen,
+        # ── Phase 6 materialization timing ──
+        "materialization_timing": {
+            "total_wall_ms": _experiment_wall_ms,
+            "total_decode_time_ms": _total_decode_time_ms,
+            "total_write_time_ms": _total_write_time_ms,
+            "total_thumbnail_time_ms": _total_thumbnail_time_ms,
+            "item_count": seen,
+        },
     }
 
 
@@ -2182,7 +2225,12 @@ async def _execute_job(item: tuple, item_id: int):
             print(f"[predispatch] phase=before_gpu_spawn t={time.time()}")
 
         # ── Event sink: forward progress/status events to frontend ──
+        _first_remote_event_seen = True
         def _event_sink(event_type: str, payload: dict) -> None:
+            nonlocal _first_remote_event_seen
+            if _first_remote_event_seen:
+                _first_remote_event_seen = False
+                trace.mark("client_first_remote_log_seen")
             if event_type == "progress" and isinstance(payload, dict):
                 _evt = payload.get("event", "executing")
                 _data = dict(payload)
@@ -2206,6 +2254,22 @@ async def _execute_job(item: tuple, item_id: int):
         _v2_trace = None
         if _mode in {"v2", "shadow"}:
             _v2_trace = RuntimeTrace(request_id=prompt_id, process="local")
+            # ── Phase 0: deployment/invocation identity ──
+            _v2_gpu = extra_data.get("gpu") or get_gpu() or ""
+            _v2_app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow").strip() or "stable-modal-comfy-v2-shadow"
+            _v2_class_name = os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2").strip() or "ModalRuntimeEntrypointV2"
+            _v2_method_name = "run_plan_stream"
+            _v2_trace.set_metadata(
+                runtime_mode=_mode,
+                app_name=_v2_app_name,
+                class_name=_v2_class_name,
+                method_name=_v2_method_name,
+                gpu=_v2_gpu,
+                cloud=os.environ.get("COMFYMODAL_COMPUTE_CLOUD", "").strip(),
+                region=os.environ.get("COMFYMODAL_COMPUTE_REGION", "").strip(),
+                image_id=os.environ.get("MODAL_IMAGE_ID", "").strip(),
+                container_task_id=os.environ.get("MODAL_TASK_ID", "").strip(),
+            )
             _v2_plan = build_execution_plan(
                 execution_workflow,
                 prompt_id=prompt_id,
@@ -2213,11 +2277,16 @@ async def _execute_job(item: tuple, item_id: int):
                 modal_options=_mo if _mo else None,
                 production_options=production_options if production_options.get("enabled") else None,
                 production_report=extra_data.get("production_report") if isinstance(extra_data, dict) else None,
-                gpu=extra_data.get("gpu"),
+                gpu=_v2_gpu,
                 workspace=_request_workspace or None,
                 comfyui_root=_COMFYUI_ROOT,
                 trace=_v2_trace,
                 validate=False,
+            )
+            _v2_trace.set_metadata(
+                workflow_hash_prefix=_v2_plan.workflow_hash[:12],
+                container_session_id="",  # placeholder; populated from remote
+                workspace_id=_v2_plan.request_metadata.get("workspace_id", ""),
             )
             _run_trace.set_meta(
                 v2_runtime_mode=_mode,
@@ -2369,11 +2438,20 @@ async def _execute_job(item: tuple, item_id: int):
 
         output_dir = os.path.join(_COMFYUI_ROOT, "output")
         os.makedirs(output_dir, exist_ok=True)
+        # ── Phase 6: local materialization boundary ──
         trace.mark("t9e_local_materialize_start")
         materialize_started = time.time()
-        trace.mark("client_result_decode_start", materialize_started)
-        trace.mark("client_file_write_start", materialize_started)
-        trace.mark("client_comfy_notify_start", materialize_started)
+        # v4 event trace: materialization phase start
+        _local_et = _get_local_event_trace()
+        if _local_et is not None:
+            from profiler_trace_v4 import (
+                T9C_LOCAL_BASE64_DECODE_START, T9E_LOCAL_FILE_WRITE_START,
+                T10_LOCAL_MATERIALIZED, PHASE_LOCAL_MATERIALIZE,
+            )
+            _local_et.mark(T9C_LOCAL_BASE64_DECODE_START, phase=PHASE_LOCAL_MATERIALIZE)
+            _local_et.mark(T9E_LOCAL_FILE_WRITE_START, phase=PHASE_LOCAL_MATERIALIZE)
+        trace.mark("client_result_decode_start")
+        trace.mark("client_file_write_start")
         _mo = extra_data.get("modal_options") if isinstance(extra_data, dict) else None
         _settings = _load_modal_settings()
         if _mode == "v2":
@@ -2409,12 +2487,23 @@ async def _execute_job(item: tuple, item_id: int):
                 height=prompt_summary.get("height", 0),
                 comfyui_root=_COMFYUI_ROOT,
             )
+        # v4 event trace: materialization phase end
+        if _local_et is not None:
+            from profiler_trace_v4 import (
+                T9D_LOCAL_BASE64_DECODE_END, T9F_LOCAL_FILE_WRITE_END,
+                T10_LOCAL_MATERIALIZED, PHASE_LOCAL_MATERIALIZE,
+            )
+            _local_et.mark(T9D_LOCAL_BASE64_DECODE_END, phase=PHASE_LOCAL_MATERIALIZE)
+            _local_et.mark(T9F_LOCAL_FILE_WRITE_END, phase=PHASE_LOCAL_MATERIALIZE)
+            _local_et.mark(T10_LOCAL_MATERIALIZED, phase=PHASE_LOCAL_MATERIALIZE)
         outputs.clear()
         outputs.update(delivery.get("history_outputs", delivery["outputs"]))
         output_bytes_written = delivery["bytes_written"]
         output_image_count = delivery["image_count"]
         output_video_count = delivery["video_count"]
         materialize_ms = round((time.time() - materialize_started) * 1000, 1)
+        # Phase 6: store per-operation timing breakdown from delivery
+        _mat_timing = delivery.get("materialization_timing") or {}
         trace.mark("client_result_decode_done")
         trace.mark("client_file_write_done")
         trace.mark("client_comfy_notify_done")
@@ -2498,6 +2587,37 @@ async def _execute_job(item: tuple, item_id: int):
                 _MERGED_DERIVED["active_profile_remote_call"] = 1 if _v2_remote_call else 0
         _MERGED_DERIVED["active_profile_to_gpu_submit_ms"] = 0.0  # Not tracked in canonical executor
         _merged_trace["active_profile_dedup_status"] = ""  # Not tracked in canonical executor
+        # ── Phase 6 materialization timing ──
+        if _mat_timing:
+            _MERGED_DERIVED["materialize_wall_ms"] = _mat_timing.get("total_wall_ms", 0.0)
+            _MERGED_DERIVED["materialize_decode_ms"] = _mat_timing.get("total_decode_time_ms", 0.0)
+            _MERGED_DERIVED["materialize_write_ms"] = _mat_timing.get("total_write_time_ms", 0.0)
+            _MERGED_DERIVED["materialize_item_count"] = _mat_timing.get("item_count", 0)
+            _MERGED_DERIVED["materialize_bytes"] = _mat_timing.get("bytes_written", 0)
+            # auto-save time present in local path (_materialize_modal_outputs)
+            _auto_ms = _mat_timing.get("auto_save_time_ms", 0.0)
+            if _auto_ms:
+                _MERGED_DERIVED["materialize_auto_save_ms"] = _auto_ms
+            # thumbnail time present in experiment path
+            _thumb_ms = _mat_timing.get("total_thumbnail_time_ms", 0.0)
+            if _thumb_ms:
+                _MERGED_DERIVED["materialize_thumbnail_ms"] = _thumb_ms
+
+        # ── Hoist identity metadata from RuntimeTrace into merged legacy trace ──
+        # The RuntimeTrace metadata (container_task_id, image_id, gpu, etc.)
+        # is present in _v2_meta (read from result["trace"]["metadata"]) but
+        # never reaches the top-level merged trace unless explicitly hoisted.
+        # This ensures diagnosis_collector extract_section14_run can find
+        # top-level identity keys in V2 benchmark artifacts.
+        _IDENTITY_HOIST_KEYS = (
+            "container_task_id", "container_session_id", "image_id",
+            "gpu", "cloud", "region", "modal_input_id",
+            "workspace_id", "app_name", "class_name", "method_name",
+        )
+        if isinstance(_v2_meta, dict):
+            for _hk in _IDENTITY_HOIST_KEYS:
+                if _hk in _v2_meta and _hk not in _merged_trace:
+                    _merged_trace[_hk] = _v2_meta[_hk]
 
         result["trace"] = _merged_trace
         if os.environ.get("COMFYMODAL_TRACE_DEBUG_LOG"):

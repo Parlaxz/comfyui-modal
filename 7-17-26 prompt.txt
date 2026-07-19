@@ -1,0 +1,1061 @@
+# Complete the Real V2 Runtime Vertical Slice and Correct Commit `e1e4749e`
+
+use Subagent driven implementation and programming
+
+Continue from commit:
+
+```text
+e1e4749e3330184fdd1d49c1edf0b212a1025479
+```
+
+Do not restart the migration, redesign the architecture, or produce another broad audit. The previous commit created useful contracts and tests, but it did not migrate the actual remote runtime. Your task now is to turn that scaffolding into one functioning end-to-end v2 execution path.
+
+The immediate objective is:
+
+```text
+Direct or Playground request
+→ build one ExecutionPlan
+→ publish one RestorePlan to the actual Modal runtime-state Volume
+→ real snap=False restore reads that plan
+→ real UNET/CLIP preload starts
+→ real loader nodes consume the prepared results
+→ real in-process PromptExecutor runs
+→ real production output is captured
+→ result is materialized locally
+→ one merged trace proves every step
+```
+
+Do not attempt another repository-wide abstraction pass. Implement this vertical slice completely, test it after every behavior-bearing step, and only then continue removing legacy layers.
+
+---
+
+# What went wrong in the previous commit
+
+Treat the following findings as confirmed. Do not ask Explorer to rediscover them.
+
+## 1. V2 is still a wrapper over the legacy remote runtime
+
+`comfymodal_runtime.modal_transport.ModalTransport` falls back to:
+
+```python
+from modal_client import run_prompt_stream
+```
+
+It converts the typed plan back into legacy dictionaries and invokes the old `comfyapp.py` runtime.
+
+The new `modal_app.py` is not a functioning Modal deployment:
+
+* No complete production image.
+* No real custom-node source inclusion.
+* No class mounts.
+* No GPU class registration.
+* No `@app.cls`.
+* No `@modal.method`.
+* No real executor runner.
+* No real preload integration.
+
+Fix this by wiring a real shadow v2 Modal class and invoking it directly.
+
+## 2. Restore state is duplicated and the new state is local-only
+
+`execute_plan()` currently:
+
+1. Calls the legacy `prepare_active_next_profile()`.
+2. Publishes a new `RestorePlan`.
+3. Writes that new plan into local `.runtime_state/`.
+4. Sends the request through the old remote runtime, which reads the legacy active profile.
+
+The new RestorePlan is therefore not consumed remotely.
+
+Fix this by:
+
+* Publishing the RestorePlan through an actual Modal remote method.
+* Writing it to the actual runtime-state Modal Volume.
+* Committing that Volume synchronously before GPU submission.
+* Reading the exact same plan during the real v2 `snap=False` restore.
+* Removing the duplicate legacy profile call from the v2 path once parity is proven.
+
+## 3. Typed options discard live runtime and output settings
+
+The typed options parser currently drops unknown fields instead of preserving them.
+
+The live legacy runtime uses fields including:
+
+* `quality`
+* `webp_lossless_compression`
+* `return_comparison_a`
+* `runtime.cold_unet_early_load`
+* Loader/preload settings.
+* Additional production/output flags.
+
+Until every field is explicitly typed, preserve all unknown legacy keys in a passthrough mapping.
+
+V2 must not silently change:
+
+* Output format.
+* Output quality.
+* Image Comparer A/B behavior.
+* Compression.
+* Runtime preload settings.
+* Cancellation/progress behavior.
+
+## 4. Trace merging destroys remote events
+
+Current v2 code replaces:
+
+```python
+remote_trace["events"]
+```
+
+with local events.
+
+Fix it so local and remote events are:
+
+* Normalized.
+* Combined.
+* Deduplicated.
+* Sorted by wall time for display.
+* Kept identifiable by process.
+* Never overwritten.
+
+## 5. The new output collector does not match the live registry
+
+The live production registry returns:
+
+```text
+node_id → list[entry]
+```
+
+The new `DirectOutputSink` tests use:
+
+```text
+node_id → output_key → list[entry]
+```
+
+Adapt the new output strategy to the real registry contract. Do not change the live registry merely to satisfy the new abstraction unless there is a strong demonstrated reason.
+
+Missing output must be a hard execution failure for production runs. Do not report success and continue after materialization or collection fails.
+
+## 6. Playground was partially cut over without the runtime switch
+
+The default direct Playground path now enters `PlaygroundService` regardless of `COMFYMODAL_RUNTIME`, while Direct ComfyUI defaults to legacy.
+
+Gate Playground with the same runtime switch as Direct:
+
+```text
+legacy → existing path
+v2 → new execution service
+shadow → build/compare plans without a second paid generation
+```
+
+Direct and Playground must call the exact same `execute_plan()` implementation.
+
+## 7. The preload coordinator is disconnected
+
+`ModelPreloadCoordinator` currently uses injected dummy callbacks and is not connected to:
+
+* The real `snap=False` restore.
+* Actual UNET loading code.
+* Actual CLIP loading code.
+* Actual CLIP prefill.
+* Actual ComfyUI loader nodes.
+* The real graph demand boundaries.
+
+Port the proven legacy loader code into it and connect the complete lifecycle.
+
+## 8. Deployment and runtime state are still legacy
+
+The new deployment and state modules are mostly standalone test objects.
+
+They do not yet replace:
+
+* Real image construction.
+* Real source inclusion.
+* Real Modal deployment.
+* Real Volume mounting.
+* Real source identity.
+* Legacy label-keyed runtime-config commits.
+* Deployment mutation behavior.
+* Deployment validation state.
+
+For this pass, implement only enough deployment wiring to deploy and run the shadow v2 runtime correctly. Do not attempt unrelated deployment UI cleanup until the vertical slice works.
+
+---
+
+# Required working discipline
+
+1. Begin by recording:
+
+```bash
+git rev-parse HEAD
+git status --short
+git diff --stat
+git log -8 --oneline
+```
+
+2. Do not reset, clean, stash, overwrite, or discard existing work.
+3. Do not create another giant all-in-one commit.
+4. Make one focused commit per milestone below.
+5. After each behavior-bearing commit:
+
+   * Run focused tests.
+   * Run relevant existing tests.
+   * Deploy the shadow runtime when remote code changes.
+   * Run one real smoke generation when possible.
+6. Do not claim performance parity without real cold Modal runs.
+7. Do not claim UI parity without real Playwright execution.
+8. Do not add more placeholder or callback-only production classes.
+9. Do not create additional architecture modules unless required by a real implementation.
+10. Do not expand the reference archive.
+11. Replace the readable reference source copies with one compressed archive after confirming their hashes and `PORT_MAP.md`.
+12. Preserve:
+
+* `min_containers=0`
+* `scaledown_window=4`
+
+13. Never add warm containers, keep-warm pings, automatic warmups, or scheduled generations.
+14. Do not automatically migrate, move, or delete user files during deployment.
+
+---
+
+# Subagent usage
+
+The main agent must personally own all runtime-critical work.
+
+## Do not use Explorer broadly
+
+The previous migration already produced a symbol map. Do not repeat repository exploration.
+
+Use one targeted verifier only when a named legacy function’s complete dependency set is unclear.
+
+The verifier prompt must be:
+
+> Inspect only the named legacy symbol and its direct helpers. Return the exact code ranges, globals, imports, and tests required to move it. Do not propose architecture and do not inspect unrelated files.
+
+## Main agent must implement
+
+The main agent personally implements:
+
+* Real v2 Modal class.
+* Modal image/source/mount wiring.
+* Real restore-plan publication.
+* Real `snap=False` consumption.
+* Actual UNET/CLIP preload.
+* Loader interception.
+* In-process PromptExecutor integration.
+* Direct production output integration.
+* Direct/Playground canonical execution.
+* Trace merge.
+* Cutover switch.
+
+## Test subagent
+
+A test-focused subagent may inspect the exact current diff and add only missing focused tests.
+
+It must not invent large fake-based suites for code that is not connected to production.
+
+## Reviewer
+
+After each milestone, use one reviewer on the exact diff.
+
+Ask only:
+
+* Is this code live?
+* Does it still route through legacy unexpectedly?
+* Did any option or output behavior disappear?
+* Is any state local when it should be remote?
+* Is any Modal lifecycle hook incorrectly decorated or mounted?
+* Is any trace data overwritten?
+* Is any normal generation writing the models Volume?
+
+---
+
+# Milestone 1: Make the existing v2 wrapper safe
+
+Complete this before wiring the new remote runtime.
+
+## 1.1 Preserve all legacy options
+
+Add to `ExecutionOptions`:
+
+```python
+legacy_passthrough: Mapping[str, Any]
+```
+
+Requirements:
+
+* Every unknown top-level legacy option is preserved.
+* Unknown nested runtime fields are preserved.
+* Explicitly typed fields override passthrough values when serialized.
+* `to_legacy_dict()` reconstructs a behaviorally equivalent legacy dictionary.
+* Add round-trip tests using actual option payloads from current Direct, Playground, and benchmark presets.
+
+Test these fields explicitly:
+
+```text
+quality
+webp_lossless_compression
+return_comparison_a
+runtime.cold_unet_early_load
+runtime.restore_preload
+actual_load
+output_format
+production
+profiling fields
+```
+
+## 1.2 Fix trace merging
+
+Implement:
+
+```python
+merge_runtime_traces(local_trace, remote_trace)
+```
+
+Requirements:
+
+* Preserve all remote events.
+* Preserve all local events.
+* Preserve remote derived fields and metadata.
+* Merge metadata without erasing remote values.
+* Deduplicate only exact duplicate events.
+* Sort display events by wall-clock time.
+* Retain process identity.
+* Never use cross-process monotonic subtraction.
+
+Add a test where remote restore, UNET, sampler, VAE, and output events remain after local merge.
+
+## 1.3 Gate Playground consistently
+
+Update direct Playground dispatch:
+
+```text
+legacy → old direct completion
+v2 → PlaygroundService using execute_plan
+shadow → build v2 plan, execute legacy only
+```
+
+Do not run two paid generations in shadow mode.
+
+## 1.4 Make output/materialization failure fatal
+
+For direct production and Playground runs:
+
+* No collected output → error.
+* Conversion failed → error.
+* Local materialization failed → error.
+* History write may be warning-only only after the image is successfully materialized and returned.
+* Never return `status=completed` with zero outputs.
+
+Commit this milestone separately.
+
+---
+
+# Milestone 2: Build a real deployable v2 Modal runtime
+
+Do not create a second simplified image that lacks production dependencies.
+
+Use the existing working `comfyapp.py` image, Volume, secret, GPU, and source configuration as the reference.
+
+## 2.1 Real Modal application
+
+In `comfymodal_runtime/modal_app.py`, define a real app/class.
+
+It must include:
+
+* The actual ComfyUI base image and dependency layers.
+* Existing custom-node installation/source inclusion.
+* Models Volume mounted at the actual path.
+* Runtime-state Volume mounted at the actual path.
+* Required secrets.
+* GPU selection using existing GPU catalog rules.
+* CPU memory snapshots.
+* `min_containers=0`.
+* `scaledown_window=4`.
+* Actual `@app.cls`.
+* Actual `@modal.enter(snap=True)`.
+* Actual `@modal.enter(snap=False)`.
+* Actual `@modal.method` prompt stream.
+* Actual restore-plan publication method.
+* Actual checkpoint compatibility method if required.
+
+Do not copy all CPU admin methods into the new class. Only include runtime-critical methods.
+
+## 2.2 Deterministic source manifest
+
+Connect `deployment_spec.py` to actual Modal source inclusion.
+
+Tests must prove:
+
+* Required v2 runtime files are included.
+* Required shared pure modules are included.
+* Custom-node Python changes alter identity.
+* Custom-node JavaScript changes alter identity.
+* Requirements changes alter identity.
+* `reference/` does not alter identity.
+* Logs and generated state do not alter identity.
+* A no-op manifest is stable.
+
+## 2.3 Shadow app
+
+Deploy under a separate app identity such as:
+
+```text
+stable-modal-comfy-v2-shadow
+```
+
+Do not replace the legacy app yet.
+
+Commit this milestone separately and perform an import/deploy smoke test.
+
+---
+
+# Milestone 3: Publish and consume one real RestorePlan
+
+## 3.1 Remote publication method
+
+Add a remote method to the v2 Modal runtime:
+
+```python
+publish_restore_plan(plan_payload) -> RestorePublishResult
+```
+
+It must:
+
+1. Reload the actual runtime-state Modal Volume.
+2. Read the current authoritative plan.
+3. Compare canonical identity.
+4. Perform no write when unchanged.
+5. Atomically replace the state file when changed.
+6. Commit the actual Modal Volume once.
+7. Return:
+
+   * Changed or unchanged.
+   * Assigned generation.
+   * Reload time.
+   * Compare time.
+   * Write time.
+   * Commit time.
+   * State path.
+   * Runtime Volume identity.
+
+Do not use local `.runtime_state/` as the production authority.
+
+A local filesystem implementation may remain only as a unit-test backend.
+
+## 3.2 Correct prefill identity
+
+Do not hash a sorted list of prompt strings.
+
+Prefill identity must preserve:
+
+* Node ID.
+* Node class.
+* Prompt input field.
+* Positive/negative role where derivable.
+* CLIP/model identity.
+* Encode options.
+* Text value.
+* Connection identity when text is not a static literal.
+
+Use the existing safe exact-prefill bundle extraction rather than rescanning only `CLIPTextEncode` text fields.
+
+If the prompt is not safely statically resolvable:
+
+```text
+prefill eligible = false
+```
+
+Do not create an unsafe key.
+
+## 3.3 Remove duplicate v2 publication
+
+Once v2 remote publication works:
+
+* V2 must not call `prepare_active_next_profile`.
+* Legacy keeps using it.
+* Shadow may compare the old and new derived identities locally, but it executes and publishes only the legacy state.
+
+## 3.4 Actual restore consumption
+
+The v2 `snap=False` hook must:
+
+1. Reload the runtime-state Volume.
+2. Read the exact RestorePlan.
+3. Record its generation.
+4. Validate schema.
+5. Use its model and prefill specs.
+6. Expose the generation in every result trace.
+
+Add tests for:
+
+* Unchanged plan: zero write/commit.
+* Prompt-only change: prefill changes, model key remains.
+* UNET change: model key changes.
+* CLIP change.
+* VAE change.
+* Concurrent publication: one commit at a time.
+* Remote container sees the published generation.
+
+Commit this milestone separately.
+
+---
+
+# Milestone 4: Connect the real preload algorithm
+
+The objective is not to add a scheduler. It is to move and simplify the actual working loader path.
+
+## 4.1 Port actual UNET preparation
+
+From legacy `comfyapp.py`, move the minimum required production code for:
+
+* Resolving the UNET model path.
+* Reading/loading the UNET.
+* Constructing the object expected by the actual loader node.
+* Recording load timing.
+* Publishing the prepared result/future.
+* Handling errors.
+* Safe cleanup.
+
+Do not port disabled experimental modes.
+
+The v2 restore hook must call:
+
+```python
+preload.prepare_unet(...)
+```
+
+during `snap=False`.
+
+## 4.2 Port actual CLIP preparation
+
+Move:
+
+* CLIP path resolution.
+* CLIP object load.
+* Model-aware in-memory cache.
+* Safe exact prefill.
+* Correct CLIP type handling.
+* Dual-CLIP handling.
+* Required fingerprints.
+
+Do not port persistent serialized conditioning caches yet.
+
+## 4.3 Connect real loader interception
+
+The graph’s actual loader nodes must consume the prepared objects or futures.
+
+Required proof:
+
+```text
+restore UNET start
+restore UNET finish or still running
+graph UNET demand
+graph wait
+prepared object consumed
+```
+
+The loader must safely fall back to ordinary loading when:
+
+* The key does not match.
+* Preparation failed.
+* The requested model differs.
+* The plan is absent.
+* Safe mode is active.
+
+## 4.4 Production policies
+
+Support only:
+
+```text
+production
+safe
+profile
+```
+
+* `production`: two-lane UNET + CLIP preparation.
+* `safe`: ordinary graph loading.
+* `profile`: production plus deep metrics.
+
+Do not expose the old experimental mode matrix in the new production code.
+
+## 4.5 Correct overlap metrics
+
+Measure:
+
+```text
+preload_start
+preload_finish
+graph_demand
+graph_wait_start
+graph_wait_end
+future_consumed
+```
+
+Report:
+
+```text
+work_completed_before_demand_ms
+actual_graph_wait_ms
+unused_speculation
+preload_failed
+```
+
+Do not label concurrent work duration as useful overlap.
+
+Commit this milestone separately.
+
+---
+
+# Milestone 5: Connect real in-process execution
+
+Move the real production behavior from `_execute_in_process` into the new executor.
+
+It must preserve:
+
+* PromptExecutor lifecycle.
+* Prompt server integration.
+* Input images.
+* Progress events.
+* Cancellation.
+* Production output authorization.
+* Production node 107 behavior.
+* Image Comparer output.
+* Request cleanup.
+* Exception formatting.
+* Output metadata.
+* Current custom-node execution.
+
+Do not create a generic callback executor with no configured runner.
+
+The v2 Modal class must construct the real runner.
+
+Keep subprocess compatibility outside the primary v2 path:
+
+* Explicitly requested only.
+* No sticky process-global fallback.
+* Visible in trace.
+* Tested separately.
+
+Commit separately.
+
+---
+
+# Milestone 6: Connect real output delivery
+
+Adapt `output_delivery.py` to the real live output contracts.
+
+## Direct registry
+
+Support the actual registry shape:
+
+```text
+prompt_id
+  → node_id
+      → list[entry]
+```
+
+After popping a prompt:
+
+```text
+node_id → list[entry]
+```
+
+Do not require an invented `output_key` nesting.
+
+## Strategy order
+
+Use:
+
+```text
+direct production registry
+→ executor history
+→ request-bounded filesystem
+→ subprocess collector when subprocess backend was selected
+```
+
+Requirements:
+
+* No unrestricted “most recent file” fallback.
+* Every strategy attempt recorded.
+* Correct comparer A/B metadata.
+* Correct primary B output.
+* Correct MIME and extension.
+* Correct PNG/WebP/JPEG conversion.
+* Raw bytes hashed before base64.
+* Correct raw/base64/JSON byte counts.
+* Partial parallel conversion failure safely retries or fails.
+* Missing output is fatal.
+
+Integrate this collector into the real v2 remote executor, not only tests.
+
+Commit separately.
+
+---
+
+# Milestone 7: Route one real Direct and Playground vertical slice
+
+## Direct
+
+When `COMFYMODAL_RUNTIME=v2`:
+
+```text
+build ExecutionPlan
+→ publish RestorePlan through v2 remote publisher
+→ invoke v2 Modal class run_plan_stream
+→ merge trace
+→ materialize result
+→ return
+```
+
+There must be no call to:
+
+* Legacy `prepare_active_next_profile`.
+* Legacy `modal_client.run_prompt_stream`.
+* Legacy remote `comfyapp.py` prompt execution.
+
+Compatibility adapters may remain only at the route boundary.
+
+## Playground
+
+Use the exact same:
+
+```python
+execute_plan(plan)
+```
+
+Do not recompile, rehash, or reinterpret the workflow in PlaygroundService.
+
+`PlaygroundService` should own only:
+
+* Preset/snapshot loading.
+* Applying controls.
+* Calling the plan builder.
+* Calling `execute_plan`.
+* Recording Playground history.
+
+Do not import private helpers from `studio_run_adapter` back into the new service. Move the required pure helpers or expose a small public preset resolver.
+
+## Shadow
+
+Shadow mode:
+
+* Builds both legacy and v2 plans.
+* Compares hashes, model keys, prefill eligibility, outputs requested, and options.
+* Executes only legacy.
+* Does not publish v2 remote state.
+* Does not generate twice.
+
+Commit separately.
+
+---
+
+# Milestone 8: Real validation
+
+## Local tests
+
+Run the focused migration tests plus relevant existing suites.
+
+Do not report a pass while 17 known tests are failing without classifying each failure.
+
+For every failure:
+
+* Pre-existing and irrelevant.
+* Pre-existing but blocks parity.
+* Newly introduced.
+* Fixed.
+
+## Modal smoke
+
+Deploy the shadow v2 app.
+
+Run one actual workflow through it and prove:
+
+* CPU snapshot created.
+* `snap=False` ran.
+* RestorePlan generation observed.
+* UNET preload started.
+* CLIP preload started.
+* Loader consumed prepared object.
+* Sampling completed.
+* Node 107 output captured.
+* Output returned.
+* Local materialization succeeded.
+* Models Volume write count is zero.
+* Models Volume commit count is zero.
+* Runtime-state commits do not overlap.
+
+## Playwright
+
+Install or use the repository’s required Playwright dependency. Do not simply record that it is missing.
+
+Run:
+
+1. Direct cold generation.
+2. Playground cold generation.
+3. Same model, changed prompt.
+4. Image Comparer.
+5. WebP or JPEG output.
+
+Capture browser-visible and backend timings.
+
+## Performance comparison
+
+Interleave:
+
+```text
+legacy
+v2
+legacy
+v2
+legacy
+v2
+```
+
+Use identical:
+
+* Workflow.
+* Model stack.
+* Prompt where applicable.
+* Seed.
+* GPU.
+* Output settings.
+* Production settings.
+
+Report:
+
+* Median.
+* p90.
+* Maximum.
+* Scheduling gap.
+* Restore.
+* UNET graph wait.
+* CLIP graph wait.
+* Sampling.
+* Output.
+* Total.
+* Paired delta.
+
+Do not make v2 default unless:
+
+* Outputs are correct.
+* Direct and Playground share the same service.
+* No remote events are missing.
+* No options are lost.
+* V2 does not regress median by more than 0.5 seconds without a justified tradeoff.
+* The target is at or below approximately 19 seconds, aiming for 17–18 seconds.
+
+---
+
+# Milestone 9: Cleanup only after vertical parity
+
+Once the v2 vertical path works:
+
+1. Remove the local-only production RestorePlan publisher.
+2. Remove v2 calls into legacy warmup profile.
+3. Remove v2 calls into legacy Modal transport.
+4. Remove dead callback-only facades.
+5. Remove duplicate Playground compilation.
+6. Remove old trace merge adapters no longer used.
+7. Replace readable `.ref` source copies with:
+
+   * One compressed archive.
+   * `PORT_MAP.md`
+   * File hashes.
+8. Update `DELETION_CANDIDATES.md` with actual evidence.
+9. Do not delete the legacy runtime until stabilization is complete.
+
+---
+
+# Acceptance criteria
+
+The task is complete only when all are true:
+
+1. A real v2 Modal app is deployed.
+2. V2 does not call legacy `modal_client.run_prompt_stream`.
+3. V2 does not call legacy `prepare_active_next_profile`.
+4. RestorePlan is stored in the actual runtime-state Modal Volume.
+5. `snap=False` reads the same RestorePlan generation.
+6. Actual UNET loading starts during restore.
+7. Actual graph UNETLoader consumes the prepared result.
+8. Actual CLIP loading/prefill is connected.
+9. Direct and Playground call the same `execute_plan`.
+10. Unknown legacy options survive typed round-trip.
+11. Remote and local trace events are both preserved.
+12. Production output registry shape matches the live runtime.
+13. Image Comparer behavior is preserved.
+14. Missing output is a failure.
+15. No normal generation writes or commits the models Volume.
+16. Runtime-state commits have maximum concurrency one.
+17. `min_containers=0`.
+18. `scaledown_window=4`.
+19. No automatic post-deploy generation.
+20. No automatic file migration during deployment.
+21. Real Modal smoke succeeds.
+22. Real Playwright Direct and Playground runs succeed.
+23. Paired cold timing results are recorded.
+24. The migration log lists every milestone commit and its validation.
+25. The final response states honestly which legacy compatibility pieces remain.
+
+Do not title the final result “complete” unless these acceptance criteria are actually met.
+
+---
+
+# Progress log — 2026-07-17 continuation
+
+## Starting state recorded
+
+```text
+HEAD: f5b522faa05a7174848da549a4738c5f28b81308
+git status --short: ?? "7-17-26 prompt.txt"
+git diff --stat: clean tracked tree (the progress log is untracked)
+```
+
+Recent commits from the migration are:
+
+```text
+f5b522f Publish and consume v2 restore plans
+a2f3c73 Route v2 execution through Modal
+88a2dd1 Wire v2 Modal shadow runtime
+eaa5e76 Harden v2 runtime compatibility
+e1e4749 Complete typed runtime migration
+```
+
+## Completed before this continuation
+
+* Milestone 1 wrapper hardening is implemented and tested: passthrough options, trace merging, Playground gating, and fatal production output failures.
+* Milestone 2 shadow Modal app wiring is implemented: working `comfyapp.image`, source modules, Modal class registration, lifecycle hooks, Volumes, GPU/CPU settings, `min_containers=0`, and `scaledown_window=4`.
+* Milestone 3 RestorePlan plumbing is implemented: remote CPU publication, synchronous runtime-state Volume commits, authoritative readback, generation propagation, safe prefill identity, and no v2 legacy profile publication.
+* Focused validation previously passed: 177 tests for wrapper hardening, 69 passed/1 skipped for shadow Modal wiring, 40 passed/1 skipped for transport/trace behavior, and 199 passed/2 skipped for the RestorePlan slice. The final mode-routing fix was validated by the latest selected suite and the tracked tree was committed as `f5b522f`.
+
+## Current confirmed gap
+
+`comfymodal_runtime/model_preload.py` is still a generic coordinator whose callbacks are not connected to the real ComfyUI UNET/CLIP loaders. `ModalRuntimeEntrypoint.restore()` reads the authoritative RestorePlan, but `_run_in_process()` still delegates graph execution to legacy `api._execute_in_process()`. The next behavior-bearing milestone is therefore the real v2 preload/loader bridge, not another abstraction pass.
+
+## Current implementation target
+
+Implement and test, in the main agent:
+
+1. Restore-time preparation using the actual ComfyUI UNET and CLIP loading code.
+2. A v2-owned prepared-result cache/future consumed by real loader nodes, with ordinary-loader fallback on mismatch/error/absent plan.
+3. Exact-prefilled CLIP/prefill consumption only when the RestorePlan marks the bundle safe.
+4. Restore/preload/demand/wait/consumption events and truthful overlap metrics.
+5. Focused tests proving the callbacks are live and the loader bridge consumes the prepared results.
+
+No remote Modal or Playwright smoke claim has been made yet; credentials/tooling remain required for those acceptance gates.
+
+## Milestone 4 progress — committed
+
+Commit:
+
+```text
+8f1fdf1 Connect v2 restore preload to ComfyUI loaders
+```
+
+Implemented:
+
+* `RestorePlan` publication now carries deterministic concrete UNET/CLIP loader arguments, including weight dtype, CLIP type, device, and dual-CLIP names.
+* `ModalRuntimeEntrypoint.restore()` starts the preload bridge from the authoritative plan after the real restore lifecycle.
+* `V2LoaderBridge` wraps the live ComfyUI `UNETLoader`, `CLIPLoader`, `DualCLIPLoader`, and `CLIPTextEncode` methods.
+* Restore preparation invokes the original ComfyUI loader implementations in parallel and graph demand consumes the prepared objects/futures.
+* Exact safe prefill results are consumed by graph `CLIPTextEncode` calls; mismatches, missing plans, and failed futures fall back to the original methods.
+* Restore, graph demand, wait, consumption, and fallback trace events are recorded with truthful graph wait/finished-before-demand metrics.
+* The restore worker pool is lazy-created after the `snap=True` boundary; prefill waits never hold the cache lock.
+* Added `tests/test_v2_preload_bridge.py` covering live loader consumption, safe fallback, trace events, and snapshot-safe pool creation.
+
+Validation after the milestone:
+
+```text
+tests/test_v2_preload_bridge.py + restore suites: 61 passed, 1 warning
+preload + runtime_main + restore suites: 71 passed, 1 skipped, 1 warning
+canonical/playground/contracts suites: 102 passed
+compileall: passed
+reviewer: no remaining preload milestone blockers
+```
+
+The Modal constructor deprecation warning remains non-blocking. Real remote Modal and Playwright execution are still not verified.
+
+## Milestone 5/6 progress — committed
+
+Commit:
+
+```text
+dd1b6b0 Run v2 plans through PromptExecutor
+```
+
+Implemented:
+
+* V2 no longer calls `api._execute_in_process`; it calls the live ComfyUI `PromptExecutor` directly with the typed workflow and request identity.
+* V2 preserves PromptExecutor reset/execute/success/status/history lifecycle behavior, preflight guards, missing-node repair policy, input-image materialization, and cancellation checks at the request boundaries.
+* Production requests register authorized direct-output nodes using the typed passthrough options and production report.
+* The actual flat production registry shape (`node_id -> list[entry]`) is consumed directly; nested test-compatible registry shapes remain supported.
+* History output descriptors can load their request-bounded files before materialization.
+* Output strategy attempts are returned in the remote result; missing production output is fatal.
+* Image Comparer A/B metadata and output keys are preserved.
+* Non-registry fallback outputs honor requested conversion settings and retain original bytes if conversion fails.
+* Added focused PromptExecutor/output tests, including the no-legacy-wrapper path and conversion-fallback behavior.
+
+Validation:
+
+```text
+PromptExecutor/output/canonical/Playground suites: 138 passed, 1 skipped, 1 warning
+compileall: passed
+reviewer: zero blockers after parity fixes
+```
+
+The remote execution path is now real locally, but remote Modal smoke, cold restore evidence, and Playwright Direct/Playground evidence remain outstanding.
+
+## Current gate status — 2026-07-17
+
+```text
+HEAD: dd1b6b0 Run v2 plans through PromptExecutor
+tracked worktree: clean
+progress log: intentionally untracked and updated
+Modal SDK: available
+Modal credentials: available (workspace testing3)
+```
+
+The remote Modal smoke gate can now be attempted. It has not yet been claimed as passed. Playwright tooling/UI validation remains outstanding.
+
+## Remote deploy/smoke attempt
+
+* `modal deploy -m comfymodal_runtime.modal_app` initially exposed and fixed the missing module-level `app` entrypoint.
+* The next deploy completed successfully in Modal workspace `testing3`; deployment URL: `https://modal.com/apps/testing3/main/deployed/stable-modal-comfy-v2-shadow`.
+* A real remote smoke script was launched with the captured workflow and actual `z_image_turbo_bf16.safetensors` / `qwen_3_4b.safetensors` stack, but the local client produced no buffered output while waiting for the cold GPU container and was user-aborted. This is not smoke evidence; the result remains unverified.
+* Remote logs then showed the root cause: `cannot mount volume on non-empty path: "/root/comfymodal_runtime"`. The source package and runtime-state Volume shared that path. The fix is to mount runtime state at `/root/comfymodal_runtime_state`; redeploy and smoke validation are still pending.
+* After that mount fix, the remote worker reached the class importer but failed with `module 'comfymodal_runtime.modal_app' has no attribute 'ModalRuntimeEntrypointV2'`. The dynamic Modal class is now exported under that module attribute; redeploy and smoke validation remain pending.
+
+## Milestone 10 progress — direct Studio output materialization
+
+Commit:
+
+```text
+3f2d673 Materialize direct Studio outputs locally
+```
+
+The direct Studio path was returning Modal output filenames without decoding
+the base64 payloads into `<data-root>/outputs/studio`, so completed Playground
+runs displayed a 404 when the browser fetched the recorded output path.
+
+Implemented:
+
+* `studio_run_adapter.direct_studio_run_completion()` now calls the existing
+  `materialize_modal_result()` with `require_output=True`.
+* Returned history/API output paths are the materialized safe basenames,
+  including all written outputs rather than an absolute primary path.
+* Added a focused test proving the output file is written and the returned
+  path is `test.png`.
+
+Validation:
+
+```text
+tests/test_studio_direct_run.py + tests/test_runtime_output_delivery.py: 68 passed
+Playwright Studio run: completed, run_id=r_f96ef6c4f6b7
+output_path=production_042d94cc_107_b_0.png
+GET /comfymodal/studio/outputs/production_042d94cc_107_b_0.png: HTTP 200, image/png, 2,892,165 bytes
+Browser image natural size: 1088x1920
+```
+
+The prior remote Modal smoke and prior Playwright results remain valid; the
+remaining acceptance gap is the required repeated interleaved cold timing
+comparison and explicit WebP/JPEG coverage.

@@ -11,7 +11,7 @@ from threading import RLock
 from collections.abc import Mapping
 from typing import Any, Callable, Iterator
 
-from .contracts import ModelRestoreKey, PrefillKey
+from .contracts import ModelRestoreKey, PrefillKey, stable_hash
 from .trace import RuntimeTrace
 
 
@@ -158,22 +158,53 @@ class ModelPreloadCoordinator:
             return self._pool
 
     def _submit(self, name: str, callback: Callable[[], Any], preparation: RestorePreparation, trace: RuntimeTrace | None) -> Future[Any]:
+        if trace:
+            trace.emit(
+                "preload_submitted",
+                phase="restore",
+                metadata={"lane": name},
+            )
+
         def run() -> Any:
             started = time.time()
             setattr(preparation.diagnostics, f"{name}_started_at", started)
             if trace:
                 trace.emit(f"{name}_prepare_start", phase="restore")
+                trace.emit(
+                    "preload_worker_started",
+                    phase="restore",
+                    metadata={"lane": name},
+                )
             try:
                 result = callback()
-                setattr(preparation.diagnostics, f"{name}_completed_at", time.time())
+                completed = time.time()
+                setattr(preparation.diagnostics, f"{name}_completed_at", completed)
                 if trace:
                     trace.emit(f"{name}_prepare_end", phase="restore")
+                    trace.emit(
+                        "preload_worker_finished",
+                        phase="restore",
+                        metadata={
+                            "lane": name,
+                            "worker_duration_ms": round((completed - started) * 1000, 3),
+                        },
+                    )
                 return result
             except Exception as exc:
+                completed = time.time()
                 setattr(preparation.diagnostics, f"{name}_error", str(exc))
-                setattr(preparation.diagnostics, f"{name}_completed_at", time.time())
+                setattr(preparation.diagnostics, f"{name}_completed_at", completed)
                 if trace:
                     trace.emit(f"{name}_prepare_end", phase="restore", metadata={"error": str(exc)[:200]})
+                    trace.emit(
+                        "preload_worker_failed",
+                        phase="restore",
+                        metadata={
+                            "lane": name,
+                            "error_category": type(exc).__name__,
+                            "worker_duration_ms": round((completed - started) * 1000, 3),
+                        },
+                    )
                 raise
         return self._ensure_pool().submit(run)
 
@@ -483,25 +514,125 @@ class V2LoaderBridge:
         key = self._model_key
         preparation = self._preparation
         unet_name = kwargs.get("unet_name", args[0] if args else "")
-        if key is None or preparation is None or str(unet_name) != key.unet_identity:
+
+        # --- Missing spec check ---
+        if key is None or preparation is None:
+            if self._trace:
+                self._trace.emit(
+                    "request_spec_missing",
+                    phase="execution",
+                    metadata={
+                        "lane": "UNET",
+                        "loader_class": "UNETLoader",
+                        "hashed_requested_identity": stable_hash(str(unet_name)),
+                        "terminal_outcome": "fallback_missing_spec",
+                    },
+                )
+                self._trace.emit("original_loader_fallback", phase="execution", metadata={
+                    "lane": "UNET", "reason": "missing_spec",
+                })
             return _LOADER_MISS
+
+        # --- Identity mismatch check ---
+        if str(unet_name) != key.unet_identity:
+            if self._trace:
+                self._trace.emit(
+                    "identity_mismatch",
+                    phase="execution",
+                    metadata={
+                        "lane": "UNET",
+                        "loader_class": "UNETLoader",
+                        "hashed_planned_identity": stable_hash(key.unet_identity),
+                        "hashed_requested_identity": stable_hash(str(unet_name)),
+                        "terminal_outcome": "fallback_identity_mismatch",
+                    },
+                )
+                self._trace.emit("original_loader_fallback", phase="execution", metadata={
+                    "lane": "UNET", "reason": "identity_mismatch",
+                })
+            return _LOADER_MISS
+
+        # --- Graph demand and wait ---
         if self._trace:
-            self._trace.emit("graph_unet_demand", phase="execution", metadata={"unet_name": str(unet_name)})
+            self._trace.emit("graph_unet_demand", phase="execution", metadata={
+                "unet_name": str(unet_name),
+                "lane": "UNET",
+                "loader_class": "UNETLoader",
+            })
+            self._trace.emit("graph_model_demand", phase="execution", metadata={
+                "lane": "UNET",
+                "loader_class": "UNETLoader",
+            })
             self._trace.emit("graph_unet_wait_start", phase="execution")
+            self._trace.emit("graph_wait_started", phase="execution", metadata={"lane": "UNET"})
         try:
             result = self.coordinator.wait_unet(preparation)
         except Exception as exc:
             if self._trace:
                 self._trace.emit("graph_unet_wait_end", phase="execution", metadata={"status": "error"})
-                self._trace.emit("graph_unet_consumed", phase="execution", metadata={"status": "fallback", "error": str(exc)[:200]})
+                self._trace.emit("graph_unet_consumed", phase="execution", metadata={
+                    "status": "fallback", "error": str(exc)[:200],
+                })
+                self._trace.emit("graph_wait_finished", phase="execution", metadata={
+                    "lane": "UNET", "status": "error",
+                })
+                self._trace.emit(
+                    "future_failed",
+                    phase="execution",
+                    metadata={
+                        "lane": "UNET",
+                        "loader_class": "UNETLoader",
+                        "error_category": type(exc).__name__,
+                        "terminal_outcome": "fallback_future_error",
+                    },
+                )
+                self._trace.emit("original_loader_fallback", phase="execution", metadata={
+                    "lane": "UNET", "reason": "future_error",
+                })
             return _LOADER_MISS
         if result is None:
             if self._trace:
                 self._trace.emit("graph_unet_wait_end", phase="execution", metadata={"status": "unavailable"})
+                self._trace.emit("graph_wait_finished", phase="execution", metadata={
+                    "lane": "UNET", "status": "unavailable",
+                })
+                self._trace.emit(
+                    "future_unavailable",
+                    phase="execution",
+                    metadata={
+                        "lane": "UNET",
+                        "loader_class": "UNETLoader",
+                        "terminal_outcome": "fallback_unavailable",
+                    },
+                )
+                self._trace.emit("original_loader_fallback", phase="execution", metadata={
+                    "lane": "UNET", "reason": "result_none",
+                })
             return _LOADER_MISS
         if self._trace:
             self._trace.emit("graph_unet_wait_end", phase="execution", metadata={"status": "ok"})
             self._trace.emit("graph_unet_consumed", phase="execution", metadata={"status": "prepared"})
+            self._trace.emit("graph_wait_finished", phase="execution", metadata={
+                "lane": "UNET", "status": "ok",
+            })
+            completed_before = getattr(
+                preparation.diagnostics, "unet_work_completed_before_demand_ms", 0.0
+            )
+            graph_wait_ms = getattr(
+                preparation.diagnostics, "unet_actual_graph_wait_ms", 0.0
+            )
+            self._trace.emit(
+                "prepared_result_consumed",
+                phase="execution",
+                metadata={
+                    "lane": "UNET",
+                    "loader_class": "UNETLoader",
+                    "hashed_planned_identity": stable_hash(key.unet_identity),
+                    "terminal_outcome": "prepared",
+                    "completed_before_demand_ms": round(completed_before, 3),
+                    "graph_wait_duration_ms": round(graph_wait_ms, 3),
+                },
+            )
         return (result,)
 
     def _consume_clip(self, class_name: str, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Any:
@@ -513,38 +644,179 @@ class V2LoaderBridge:
             identity = f"{clip_a}||{clip_b}"
         else:
             identity = str(kwargs.get("clip_name", args[0] if args else ""))
-        if key is None or preparation is None or identity != key.clip_identity:
+
+        # --- Missing spec check ---
+        if key is None or preparation is None:
+            if self._trace:
+                self._trace.emit(
+                    "request_spec_missing",
+                    phase="execution",
+                    metadata={
+                        "lane": "CLIP",
+                        "loader_class": class_name,
+                        "hashed_requested_identity": stable_hash(identity),
+                        "terminal_outcome": "fallback_missing_spec",
+                    },
+                )
+                self._trace.emit("original_loader_fallback", phase="execution", metadata={
+                    "lane": "CLIP", "reason": "missing_spec",
+                })
             return _LOADER_MISS
+
+        # --- Identity mismatch check ---
+        if identity != key.clip_identity:
+            if self._trace:
+                self._trace.emit(
+                    "identity_mismatch",
+                    phase="execution",
+                    metadata={
+                        "lane": "CLIP",
+                        "loader_class": class_name,
+                        "hashed_planned_identity": stable_hash(key.clip_identity),
+                        "hashed_requested_identity": stable_hash(identity),
+                        "terminal_outcome": "fallback_identity_mismatch",
+                    },
+                )
+                self._trace.emit("original_loader_fallback", phase="execution", metadata={
+                    "lane": "CLIP", "reason": "identity_mismatch",
+                })
+            return _LOADER_MISS
+
+        # --- Graph demand and wait ---
         if self._trace:
             self._trace.emit("graph_clip_demand", phase="execution", metadata={"clip_identity": identity})
+            self._trace.emit("graph_model_demand", phase="execution", metadata={
+                "lane": "CLIP",
+                "loader_class": class_name,
+            })
             self._trace.emit("graph_clip_wait_start", phase="execution")
+            self._trace.emit("graph_wait_started", phase="execution", metadata={"lane": "CLIP"})
         try:
             result = self.coordinator.wait_clip(preparation)
         except Exception as exc:
             if self._trace:
                 self._trace.emit("graph_clip_wait_end", phase="execution", metadata={"status": "error"})
-                self._trace.emit("graph_clip_consumed", phase="execution", metadata={"status": "fallback", "error": str(exc)[:200]})
+                self._trace.emit("graph_clip_consumed", phase="execution", metadata={
+                    "status": "fallback", "error": str(exc)[:200],
+                })
+                self._trace.emit("graph_wait_finished", phase="execution", metadata={
+                    "lane": "CLIP", "status": "error",
+                })
+                self._trace.emit(
+                    "future_failed",
+                    phase="execution",
+                    metadata={
+                        "lane": "CLIP",
+                        "loader_class": class_name,
+                        "error_category": type(exc).__name__,
+                        "terminal_outcome": "fallback_future_error",
+                    },
+                )
+                self._trace.emit("original_loader_fallback", phase="execution", metadata={
+                    "lane": "CLIP", "reason": "future_error",
+                })
             return _LOADER_MISS
         if result is None:
             if self._trace:
                 self._trace.emit("graph_clip_wait_end", phase="execution", metadata={"status": "unavailable"})
+                self._trace.emit("graph_wait_finished", phase="execution", metadata={
+                    "lane": "CLIP", "status": "unavailable",
+                })
+                self._trace.emit(
+                    "future_unavailable",
+                    phase="execution",
+                    metadata={
+                        "lane": "CLIP",
+                        "loader_class": class_name,
+                        "terminal_outcome": "fallback_unavailable",
+                    },
+                )
+                self._trace.emit("original_loader_fallback", phase="execution", metadata={
+                    "lane": "CLIP", "reason": "result_none",
+                })
             return _LOADER_MISS
         if self._trace:
             self._trace.emit("graph_clip_wait_end", phase="execution", metadata={"status": "ok"})
             self._trace.emit("graph_clip_consumed", phase="execution", metadata={"status": "prepared"})
+            self._trace.emit("graph_wait_finished", phase="execution", metadata={
+                "lane": "CLIP", "status": "ok",
+            })
+            completed_before = getattr(
+                preparation.diagnostics, "clip_work_completed_before_demand_ms", 0.0
+            )
+            graph_wait_ms = getattr(
+                preparation.diagnostics, "clip_actual_graph_wait_ms", 0.0
+            )
+            self._trace.emit(
+                "prepared_result_consumed",
+                phase="execution",
+                metadata={
+                    "lane": "CLIP",
+                    "loader_class": class_name,
+                    "hashed_planned_identity": stable_hash(key.clip_identity),
+                    "terminal_outcome": "prepared",
+                    "completed_before_demand_ms": round(completed_before, 3),
+                    "graph_wait_duration_ms": round(graph_wait_ms, 3),
+                },
+            )
         return (result,)
 
     def _consume_prefill(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Any:
         preparation = self._preparation
-        if preparation is None or self._prefill_key is None or not self._prefill_key.prompt_bundle_hash:
-            return _LOADER_MISS
+        # Extract clip/text early so hashed_requested_identity is available
+        # for every terminal event without changing preload behavior.
         clip = kwargs.get("clip", args[0] if args else None)
         text = str(kwargs.get("text", args[1] if len(args) > 1 else ""))
-        if clip is None or not text:
+
+        # --- Missing spec check ---
+        if preparation is None or self._prefill_key is None or not self._prefill_key.prompt_bundle_hash:
+            if self._trace:
+                self._trace.emit(
+                    "request_spec_missing",
+                    phase="execution",
+                    metadata={
+                        "lane": "prefill",
+                        "loader_class": "CLIPTextEncode",
+                        "hashed_requested_identity": stable_hash(text) if text else "",
+                        "terminal_outcome": "fallback_missing_spec",
+                    },
+                )
+                self._trace.emit("original_loader_fallback", phase="execution", metadata={
+                    "lane": "prefill", "reason": "missing_spec",
+                })
             return _LOADER_MISS
+
+        if clip is None or not text:
+            if self._trace:
+                self._trace.emit(
+                    "request_spec_missing",
+                    phase="execution",
+                    metadata={
+                        "lane": "prefill",
+                        "loader_class": "CLIPTextEncode",
+                        "hashed_requested_identity": stable_hash(text) if text else "",
+                        "terminal_outcome": "fallback_missing_spec",
+                        "reason": "clip_or_text_missing",
+                    },
+                )
+                self._trace.emit("original_loader_fallback", phase="execution", metadata={
+                    "lane": "prefill", "reason": "clip_or_text_missing",
+                })
+            return _LOADER_MISS
+
+        # --- Graph demand and wait ---
         if self._trace:
-            self._trace.emit("graph_prefill_demand", phase="execution", metadata={"text_length": len(text)})
+            self._trace.emit("graph_prefill_demand", phase="execution", metadata={
+                "text_length": len(text),
+                "lane": "prefill",
+                "loader_class": "CLIPTextEncode",
+            })
+            self._trace.emit("graph_model_demand", phase="execution", metadata={
+                "lane": "prefill",
+                "loader_class": "CLIPTextEncode",
+            })
             self._trace.emit("graph_prefill_wait_start", phase="execution")
+            self._trace.emit("graph_wait_started", phase="execution", metadata={"lane": "prefill"})
         try:
             cache_key = (id(clip), text)
             with self._prefill_lock:
@@ -561,15 +833,71 @@ class V2LoaderBridge:
         except Exception as exc:
             if self._trace:
                 self._trace.emit("graph_prefill_wait_end", phase="execution", metadata={"status": "error"})
-                self._trace.emit("graph_prefill_consumed", phase="execution", metadata={"status": "fallback", "error": str(exc)[:200]})
+                self._trace.emit("graph_prefill_consumed", phase="execution", metadata={
+                    "status": "fallback", "error": str(exc)[:200],
+                })
+                self._trace.emit("graph_wait_finished", phase="execution", metadata={
+                    "lane": "prefill", "status": "error",
+                })
+                self._trace.emit(
+                    "future_failed",
+                    phase="execution",
+                    metadata={
+                        "lane": "prefill",
+                        "loader_class": "CLIPTextEncode",
+                        "hashed_requested_identity": stable_hash(text),
+                        "error_category": type(exc).__name__,
+                        "terminal_outcome": "fallback_future_error",
+                    },
+                )
+                self._trace.emit("original_loader_fallback", phase="execution", metadata={
+                    "lane": "prefill", "reason": "future_error",
+                })
             return _LOADER_MISS
         if result is _LOADER_MISS:
             if self._trace:
                 self._trace.emit("graph_prefill_wait_end", phase="execution", metadata={"status": "unavailable"})
+                self._trace.emit("graph_wait_finished", phase="execution", metadata={
+                    "lane": "prefill", "status": "unavailable",
+                })
+                self._trace.emit(
+                    "future_unavailable",
+                    phase="execution",
+                    metadata={
+                        "lane": "prefill",
+                        "loader_class": "CLIPTextEncode",
+                        "hashed_requested_identity": stable_hash(text),
+                        "terminal_outcome": "fallback_unavailable",
+                    },
+                )
+                self._trace.emit("original_loader_fallback", phase="execution", metadata={
+                    "lane": "prefill", "reason": "future_unavailable",
+                })
             return _LOADER_MISS
         if self._trace:
             self._trace.emit("graph_prefill_wait_end", phase="execution", metadata={"status": "ok"})
             self._trace.emit("graph_prefill_consumed", phase="execution", metadata={"status": "prepared"})
+            self._trace.emit("graph_wait_finished", phase="execution", metadata={
+                "lane": "prefill", "status": "ok",
+            })
+            completed_before = getattr(
+                preparation.diagnostics, "prefill_work_completed_before_demand_ms", None
+            )
+            graph_wait_ms = getattr(
+                preparation.diagnostics, "prefill_actual_graph_wait_ms", None
+            )
+            self._trace.emit(
+                "prepared_result_consumed",
+                phase="execution",
+                metadata={
+                    "lane": "prefill",
+                    "loader_class": "CLIPTextEncode",
+                    "hashed_requested_identity": stable_hash(text),
+                    "terminal_outcome": "prepared",
+                    "completed_before_demand_ms": round(completed_before, 3) if completed_before is not None else None,
+                    "graph_wait_duration_ms": round(graph_wait_ms, 3) if graph_wait_ms is not None else None,
+                },
+            )
         return result
 
     def _invoke_original(self, class_name: str, kwargs: Mapping[str, Any]) -> Any:

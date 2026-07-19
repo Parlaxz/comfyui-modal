@@ -24,6 +24,8 @@ from comfymodal_runtime.output_delivery import (
     build_default_chain,
     _make_conversion_meta,
     _hash_raw_bytes,
+    _measure_json_bytes,
+    _replace_attempt_timing,
 )
 from comfymodal_runtime.contracts import OutputStrategy
 
@@ -529,3 +531,260 @@ class TestOutputItemConversion:
                 [OutputItem(node_id="9", output_key="images", raw_bytes=raw)],
                 converter_fn=bad_converter,
             )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Per-strategy timing / fallback depth / base64 encoding time
+# ---------------------------------------------------------------------------
+
+class TestPhase6OutputTiming:
+    """Focused tests for Phase 6 additive observability fields."""
+
+    def test_attempt_has_timing_fields(self):
+        """All Attempt instances have the new timing fields with defaults."""
+        attempt = Attempt(strategy="test", success=True)
+        assert hasattr(attempt, "strategy_start_ms")
+        assert hasattr(attempt, "strategy_end_ms")
+        assert hasattr(attempt, "strategy_duration_ms")
+        assert hasattr(attempt, "fallback_depth")
+        assert hasattr(attempt, "attempt_number")
+        assert hasattr(attempt, "total_base64_encoding_time_ms")
+        assert attempt.strategy_start_ms == 0.0
+        assert attempt.strategy_duration_ms == 0.0
+        assert attempt.fallback_depth == 0
+        assert attempt.attempt_number == 0
+
+    def test_attempt_timing_property(self):
+        """The ``timing`` property returns a flat dict of timing values."""
+        attempt = Attempt(
+            strategy="test", success=True,
+            strategy_start_ms=100.0, strategy_end_ms=250.0,
+            strategy_duration_ms=150.0, fallback_depth=1, attempt_number=2,
+            total_base64_encoding_time_ms=5.5, total_conversion_time_ms=20.0,
+        )
+        t = attempt.timing
+        assert t["strategy_start_ms"] == 100.0
+        assert t["strategy_end_ms"] == 250.0
+        assert t["strategy_duration_ms"] == 150.0
+        assert t["fallback_depth"] == 1.0
+        assert t["attempt_number"] == 2.0
+        assert t["total_base64_encoding_time_ms"] == 5.5
+        assert t["total_conversion_time_ms"] == 20.0
+
+    def test_run_strategy_chain_sets_attempt_number_and_fallback_depth(self):
+        """Chain runner assigns attempt_number and fallback_depth to each attempt."""
+        registry = {
+            "107": {"images": [_entry("out.png", b"data", node_id="107")]},
+        }
+        results = run_strategy_chain(
+            [
+                DirectOutputSink(registry={}),        # 0: fails (empty)
+                HistoryOutputCollector(history={}),    # 1: fails (empty)
+                DirectOutputSink(registry=registry),   # 2: succeeds
+            ],
+            prompt_id="p1", output_node_ids=("107",),
+        )
+        assert len(results) == 3
+        # First: attempt 0, fallback_depth=0 (first failure increments)
+        assert results[0].attempt_number == 0
+        assert results[0].fallback_depth == 0
+        # Second: attempt 1, fallback_depth=1 (one prior failure)
+        assert results[1].attempt_number == 1
+        assert results[1].fallback_depth == 1
+        # Third: attempt 2, fallback_depth=2 (two prior failures, but it succeeded)
+        assert results[2].attempt_number == 2
+        assert results[2].fallback_depth == 2
+        assert results[2].success
+
+    def test_fallback_depth_stops_incrementing_after_success(self):
+        """fallback_depth does not increase for failures after the first success."""
+        reg = {"107": {"images": [_entry("out.png", b"data", node_id="107")]}}
+        results = run_strategy_chain(
+            [
+                DirectOutputSink(registry={}),    # 0: fails
+                DirectOutputSink(registry=reg),   # 1: succeeds
+                DirectOutputSink(registry={}),    # 2: fails, but depth should stay
+            ],
+            prompt_id="p1", output_node_ids=("107",),
+        )
+        assert results[0].fallback_depth == 0
+        assert results[1].fallback_depth == 1
+        # After success, fallback_depth is no longer incremented
+        assert results[2].fallback_depth == 1
+
+    def test_all_failures_show_full_fallback_depth(self):
+        """When all strategies fail, fallback_depth equals number of prior failures."""
+        results = run_strategy_chain(
+            [
+                DirectOutputSink(registry={}),
+                DirectOutputSink(registry={}),
+            ],
+            prompt_id="p1", output_node_ids=(),
+        )
+        assert results[0].fallback_depth == 0
+        assert results[1].fallback_depth == 1
+        assert not results[0].success
+        assert not results[1].success
+
+    def test_strategy_timing_monotonic_increasing(self):
+        """Timestamps across strategies are monotonically increasing."""
+        registry = {
+            "107": {"images": [_entry("out.png", b"x", node_id="107")]},
+        }
+        results = run_strategy_chain(
+            [
+                DirectOutputSink(registry={}),
+                DirectOutputSink(registry=registry),
+            ],
+            prompt_id="p1", output_node_ids=("107",),
+        )
+        assert results[0].strategy_end_ms <= results[1].strategy_start_ms
+        assert results[0].strategy_duration_ms >= 0
+        assert results[1].strategy_duration_ms >= 0
+
+    def test_strategy_duration_reasonable(self):
+        """Strategy duration should be non-negative and within bounds."""
+        registry = {
+            "107": {"images": [_entry("out.png", b"x" * 100000, node_id="107")]},  # larger payload
+        }
+        results = run_strategy_chain(
+            [DirectOutputSink(registry=registry)],
+            prompt_id="p1", output_node_ids=("107",),
+        )
+        assert results[0].strategy_duration_ms >= 0
+        assert results[0].strategy_duration_ms < 60000  # under 60s
+
+    def test_base64_encoding_time_tracked_in_attempt(self):
+        """Base64 encoding time is accumulated in the Attempt."""
+        registry = {
+            "107": {"images": [_entry("out.png", b"x" * 10000, node_id="107")]},
+        }
+        sink = DirectOutputSink(registry=registry)
+        attempt = sink.collect(prompt_id="p1", output_node_ids=("107",))
+        # Base64 encoding should have taken a measurable time
+        assert attempt.total_base64_encoding_time_ms >= 0
+
+    def test_base64_encoding_time_zero_for_no_items(self):
+        """Empty strategy has zero base64 encoding time."""
+        sink = DirectOutputSink(registry={})
+        attempt = sink.collect(prompt_id="p1", output_node_ids=())
+        assert attempt.total_base64_encoding_time_ms == 0.0
+
+    def test_wall_duration_reflects_fallback_depth(self):
+        """end - start roughly equals the duration (allow tiny rounding)."""
+        registry = {
+            "107": {"images": [_entry("out.png", b"data", node_id="107")]},
+        }
+        results = run_strategy_chain(
+            [DirectOutputSink(registry=registry)],
+            prompt_id="p1", output_node_ids=("107",),
+        )
+        a = results[0]
+        expected = round(a.strategy_duration_ms, 3)
+        computed = round(a.strategy_end_ms - a.strategy_start_ms, 3)
+        assert abs(expected - computed) < 1.0  # within 1ms tolerance
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Result serialization size
+# ---------------------------------------------------------------------------
+
+class TestPhase6SerializedResultBytes:
+    """Focused tests for Phase 6 result serialization size measurement."""
+
+    def test_serialized_result_bytes_field_present(self):
+        """Attempt has ``serialized_result_bytes`` field defaulting to 0."""
+        attempt = Attempt(strategy="test", success=True)
+        assert hasattr(attempt, "serialized_result_bytes")
+        assert attempt.serialized_result_bytes == 0
+
+    def test_serialized_result_bytes_non_negative(self):
+        """Setting serialized_result_bytes to a non-negative value works."""
+        attempt = Attempt(strategy="test", success=True, serialized_result_bytes=1024)
+        assert attempt.serialized_result_bytes == 1024
+
+    def test_serialized_result_bytes_zero_for_empty(self):
+        """An empty Attempt still has ``serialized_result_bytes`` set to 0."""
+        attempt = Attempt()
+        assert attempt.serialized_result_bytes == 0
+
+    def test_legacy_payload_shape_preserved(self):
+        """All prior Attempt fields are unaffected by the new field."""
+        attempt = Attempt(
+            strategy="test",
+            success=True,
+            total_items=3,
+            total_raw_bytes=300,
+            total_base64_bytes=400,
+            total_json_result_bytes=500,
+            total_conversion_time_ms=10.0,
+            strategy_start_ms=1000.0,
+            strategy_end_ms=2000.0,
+            strategy_duration_ms=1000.0,
+            fallback_depth=1,
+            attempt_number=2,
+            total_base64_encoding_time_ms=5.0,
+            serialized_result_bytes=2048,
+        )
+        assert attempt.strategy == "test"
+        assert attempt.success is True
+        assert attempt.total_items == 3
+        assert attempt.total_raw_bytes == 300
+        assert attempt.total_base64_bytes == 400
+        assert attempt.total_json_result_bytes == 500
+        assert attempt.total_conversion_time_ms == 10.0
+        assert attempt.strategy_start_ms == 1000.0
+        assert attempt.strategy_end_ms == 2000.0
+        assert attempt.strategy_duration_ms == 1000.0
+        assert attempt.fallback_depth == 1
+        assert attempt.attempt_number == 2
+        assert attempt.total_base64_encoding_time_ms == 5.0
+        assert attempt.serialized_result_bytes == 2048
+
+    def test_legacy_timing_property_unchanged(self):
+        """The ``timing`` property does not include ``serialized_result_bytes``."""
+        attempt = Attempt(
+            strategy="test",
+            success=True,
+            strategy_start_ms=100.0,
+            strategy_end_ms=200.0,
+            strategy_duration_ms=100.0,
+            fallback_depth=1,
+            attempt_number=0,
+            total_base64_encoding_time_ms=0.0,
+            total_conversion_time_ms=0.0,
+            serialized_result_bytes=512,
+        )
+        t = attempt.timing
+        assert "serialized_result_bytes" not in t
+        assert t["strategy_start_ms"] == 100.0
+        assert t["strategy_end_ms"] == 200.0
+
+    def test_replace_attempt_timing_preserves_serialized_result_bytes(self):
+        """``_replace_attempt_timing`` preserves an existing ``serialized_result_bytes``."""
+        original = Attempt(
+            strategy="direct_output_sink",
+            success=True,
+            serialized_result_bytes=4096,
+        )
+        replaced = _replace_attempt_timing(original, 1.0, 2.0, 1000.0, 0, 0)
+        assert replaced.serialized_result_bytes == 4096
+        assert replaced.strategy_duration_ms == 1000.0
+        assert replaced.attempt_number == 0
+
+    def test_measure_json_bytes_helper(self):
+        """``_measure_json_bytes`` returns the JSON UTF-8 byte length."""
+        payload = {"a": 1, "b": "hello"}
+        expected = len(b'{"a":1,"b":"hello"}')
+        assert _measure_json_bytes(payload) == expected
+
+    def test_measure_json_bytes_empty_dict(self):
+        """``_measure_json_bytes`` on ``{}`` returns 2 bytes (the two braces)."""
+        assert _measure_json_bytes({}) == 2
+
+    def test_measure_json_bytes_nested(self):
+        """Nested payload size is computed correctly."""
+        payload = {"images": [{"data": "abcd", "filename": "out.png"}]}
+        size = _measure_json_bytes(payload)
+        assert size > 0
+        assert isinstance(size, int)

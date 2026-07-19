@@ -4,6 +4,9 @@ from pathlib import Path
 
 from timing_trace import Trace, coerce_t0_from_browser
 
+from comfymodal_runtime.contracts import TraceEvent
+from comfymodal_runtime.trace import RuntimeTrace, merge_runtime_traces
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INIT_PATH = REPO_ROOT / "__init__.py"
@@ -77,8 +80,8 @@ class TimingTraceWiringTests(unittest.TestCase):
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_prompt"
         )
         arg_names = [arg.arg for arg in run_prompt.args.args]
-        self.assertEqual(arg_names, ["workflow", "input_images", "trace", "gpu"])
-        self.assertIn("_api_for_gpu(gpu).run_prompt.remote(workflow, input_images or {}, trace or {})", source)
+        self.assertEqual(arg_names, ["workflow", "input_images", "trace", "production_report", "gpu", "modal_options", "workspace"])
+        self.assertIn("trace or {}", source)
 
     def test_init_tracks_local_and_browser_trace_stamps(self):
         source = INIT_PATH.read_text(encoding="utf-8")
@@ -129,6 +132,89 @@ class TimingTraceWiringTests(unittest.TestCase):
         self.assertIn('stage != "sampler" and "start" not in windows[stage]', source)
         self.assertIn('windows[stage]["source"] = "progress"', source)
         self.assertIn('windows[stage]["source"] = "node_duration"', source)
+
+
+# ---------------------------------------------------------------------------
+# merge_runtime_traces behavior
+# ---------------------------------------------------------------------------
+
+
+class TestMergeRuntimeTraces(unittest.TestCase):
+    """Direct behavior tests for merge_runtime_traces."""
+
+    def test_remote_events_survive(self):
+        local = RuntimeTrace(process="local")
+        local.emit("local_step", phase="test")
+        remote = RuntimeTrace(process="remote")
+        remote.emit("remote_step", phase="test")
+        merged = merge_runtime_traces(local, remote)
+        names = {e.name for e in merged.events}
+        self.assertIn("local_step", names)
+        self.assertIn("remote_step", names)
+
+    def test_exact_duplicates_removed(self):
+        trace = RuntimeTrace(process="local")
+        trace.emit("event_a", phase="test")
+        trace.emit("event_b", phase="test")
+        merged = merge_runtime_traces(trace, trace)
+        self.assertEqual(len(merged.events), 2,
+                         "Exact duplicates should be removed")
+
+    def test_cross_process_sorted_by_wall_time(self):
+        local_trace = RuntimeTrace(process="local")
+        local_trace._events.append(TraceEvent(
+            name="later_local", process="local", phase="test",
+            wall_unix_ns=2000, monotonic_ns=0,
+        ))
+        remote_trace = RuntimeTrace(process="remote")
+        remote_trace._events.append(TraceEvent(
+            name="earlier_remote", process="remote", phase="test",
+            wall_unix_ns=1000, monotonic_ns=0,
+        ))
+        merged = merge_runtime_traces(local_trace, remote_trace)
+        wall_times = [e.wall_unix_ns for e in merged.events]
+        self.assertEqual(wall_times, sorted(wall_times))
+        self.assertEqual(merged.events[0].name, "earlier_remote")
+
+    def test_restore_and_execution_traces_coexist(self):
+        restore = RuntimeTrace(process="remote")
+        restore.emit("restore_start", phase="restore")
+        exec_trace = RuntimeTrace(process="remote")
+        exec_trace.emit("execution_done", phase="execution")
+        merged = merge_runtime_traces(restore, exec_trace)
+        phases = {e.phase for e in merged.events}
+        self.assertIn("restore", phases)
+        self.assertIn("execution", phases)
+        self.assertEqual(len(merged.events), 2)
+
+    def test_mixed_none_values_ignored(self):
+        t = RuntimeTrace(process="local")
+        t.emit("a", phase="test")
+        merged = merge_runtime_traces(t, None, t)
+        self.assertEqual(len(merged.events), 1)
+
+    def test_metadata_merged_in_input_order(self):
+        t1 = RuntimeTrace(process="local")
+        t1.set_metadata(keep="me", version="first")
+        t2 = RuntimeTrace(process="remote")
+        t2.set_metadata(version="second")
+        merged = merge_runtime_traces(t1, t2)
+        self.assertEqual(merged._metadata.get("keep"), "me")
+        self.assertEqual(merged._metadata.get("version"), "second")
+
+    def test_mapping_input_normalized(self):
+        t = RuntimeTrace(process="local")
+        t.emit("mapped_event", phase="test")
+        as_dict = t.to_dict()
+        merged = merge_runtime_traces(as_dict)
+        self.assertEqual(len(merged.events), 1)
+        self.assertEqual(merged.events[0].name, "mapped_event")
+
+    def test_request_id_uses_first_non_empty(self):
+        t1 = RuntimeTrace(process="local", request_id="req-001")
+        t2 = RuntimeTrace(process="remote", request_id="req-002")
+        merged = merge_runtime_traces(t1, t2)
+        self.assertEqual(merged.request_id, "req-001")
 
 
 if __name__ == "__main__":

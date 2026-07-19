@@ -930,6 +930,8 @@ class HistoryAndOutputMetadataTests(unittest.TestCase):
             self.assertIn("trace_available", timings)
             self.assertTrue(timings["trace_available"])
             self.assertIn("end_to_end_total_ms", timings)
+            self.assertIn("trace", timings)
+            self.assertIn("trace", result)
 
         asyncio.run(_test())
 

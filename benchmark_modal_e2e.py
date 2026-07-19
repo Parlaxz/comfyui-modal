@@ -42,6 +42,7 @@ COMFYUI_LAUNCHER = OUTER_ROOT / "run_nvidia_gpu.bat"
 
 _STALE_T0_THRESHOLD_S = 60
 _MIN_POLL_INTERVAL = 0.05
+_UNSET = object()  # sentinel to detect explicitly-provided CLI args
 
 
 def _resolve_benchmark_runs_dir() -> Path:
@@ -233,7 +234,7 @@ def build_effective_config(preset_name: str | None, cli_args: dict, set_override
             if section in p:
                 _deep_merge(config.setdefault(section, {}), copy.deepcopy(p[section]))
 
-    # 3. Apply CLI explicit args (non-default)
+    # 3. Apply CLI explicit args (only when caller provides them)
     overrides = []
     for key, cli_key in [("runs", "runs"), ("mode", "mode"), ("profile_level", "profile_level"),
                           ("sleep_between_runs", "sleep_between_runs"),
@@ -241,9 +242,14 @@ def build_effective_config(preset_name: str | None, cli_args: dict, set_override
                           ("strict_inter_run_sleep", "strict_inter_run_sleep"),
                           ("poll_interval", "poll_interval"), ("write_analysis_pack", "write_analysis_pack"),
                           ("print_cost_warning", "print_cost_warning"),
-                          ("include_local_materialization", "include_local_materialization")]:
-        av = cli_args.get(cli_key)
-        if av is not None and av != build_parser().get_default(cli_key):
+                          ("include_local_materialization", "include_local_materialization"),
+                          ("no_deploy", "no_deploy"),
+                          ("same_seed", "same_seed"), ("same_workflow", "same_workflow"),
+                          ("same_active_profile", "same_active_profile"),
+                          ("result_mode", "result_mode"), ("output_format", "output_format"),
+                          ("return_mode", "return_mode"), ("poll_timeout", "poll_timeout")]:
+        if cli_key in cli_args:  # caller included it => explicit user value
+            av = cli_args[cli_key]
             config["benchmark"][key] = av
             overrides.append(f"cli.{cli_key}={av}")
     config["config_sources"]["cli_overrides"] = overrides
@@ -444,6 +450,20 @@ def _safe_float(val, default=None) -> float | None:
         return default
 
 
+def _fmt_opt(val: float | int | None, fmt: str = ".0f", fallback: str = "N/A") -> str:
+    """Format an optional numeric value for user-facing display text.
+
+    Returns ``f"{val:{fmt}}"`` when *val* is not None, otherwise *fallback*.
+    Does **not** mask None in JSON/structured data — only used for display.
+    """
+    if val is None:
+        return fallback
+    try:
+        return f"{val:{fmt}}"
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _median(values: list[float]) -> float:
     return statistics.median(values) if values else 0.0
 
@@ -508,6 +528,27 @@ def fresh_benchmark_payload(workflow_dict: dict, t_start: float, include_local_m
         payload = {"prompt": raw}
     payload.pop("client_id", None)
     payload.pop("extra_data", None)
+
+    # Capture _production_trace metadata BEFORE stripping modal_options,
+    # so we can reconstruct production output_node_ids for the V1 bridge.
+    production_output_ids = None
+    if isinstance(workflow_dict, dict):
+        pt = workflow_dict.get("_production_trace")
+        if isinstance(pt, dict):
+            ids = pt.get("production_output_ids")
+            if isinstance(ids, list) and len(ids) > 0:
+                production_output_ids = ids
+
+    # Also preserve any explicit production options already in modal_options
+    # as fallback if _production_trace is absent.
+    existing_production = None
+    if production_output_ids is None and isinstance(workflow_dict, dict):
+        existing_mo = workflow_dict.get("modal_options")
+        if isinstance(existing_mo, dict):
+            ep = existing_mo.get("production")
+            if isinstance(ep, dict) and isinstance(ep.get("output_node_ids"), list) and len(ep["output_node_ids"]) > 0:
+                existing_production = ep
+
     payload.pop("modal_options", None)
     payload["result_route"] = "direct"
     trace_event = {
@@ -519,6 +560,18 @@ def fresh_benchmark_payload(workflow_dict: dict, t_start: float, include_local_m
     if include_local_materialization:
         trace_event["t0a_local_node_start"] = t_start
     payload["trace"] = trace_event
+
+    # Reconstruct modal_options.production so the V1 bridge sees output_node_ids.
+    if production_output_ids is not None:
+        payload.setdefault("modal_options", {})
+        payload["modal_options"]["production"] = {
+            "enabled": True,
+            "output_node_ids": list(production_output_ids),
+        }
+    elif existing_production is not None:
+        payload.setdefault("modal_options", {})
+        payload["modal_options"]["production"] = dict(existing_production)
+
     return payload
 
 
@@ -1995,47 +2048,51 @@ def cmd_benchmark(args: argparse.Namespace, effective_config: dict | None = None
         pass
 
     if not comfy_ok:
-        print(f"  ComfyUI is not running at {LOCAL_BASE_URL}.\n")
-        print("  Choose an option:\n    1 - Deploy + run ComfyUI (redeploy_modal_and_run_comfyui.bat)\n    2 - Run ComfyUI only (run_nvidia_gpu.bat)\n    3 - Exit\n")
+        if no_deploy:
+            print(f"ERROR: ComfyUI is not running at {LOCAL_BASE_URL} "
+                  "and --no-deploy is set. Aborting.", flush=True)
+            return 1
+        print(f"  ComfyUI is not running at {LOCAL_BASE_URL}.\n", flush=True)
+        print("  Choose an option:\n    1 - Deploy + run ComfyUI (redeploy_modal_and_run_comfyui.bat)\n    2 - Run ComfyUI only (run_nvidia_gpu.bat)\n    3 - Exit\n", flush=True)
         choice = input("  Enter 1, 2, or 3: ").strip()
         if choice == "1":
             if not REDEPLOY_BATCH.exists():
-                print(f"  ERROR: {REDEPLOY_BATCH} not found.")
+                print(f"  ERROR: {REDEPLOY_BATCH} not found.", flush=True)
                 return 1
-            print(f"  Running: {REDEPLOY_BATCH.name} ...")
+            print(f"  Running: {REDEPLOY_BATCH.name} ...", flush=True)
             subprocess.Popen([str(REDEPLOY_BATCH)], cwd=str(OUTER_ROOT), shell=True)
         elif choice == "2":
             if not COMFYUI_LAUNCHER.exists():
-                print(f"  ERROR: {COMFYUI_LAUNCHER} not found.")
+                print(f"  ERROR: {COMFYUI_LAUNCHER} not found.", flush=True)
                 return 1
-            print(f"  Running: {COMFYUI_LAUNCHER.name} ...")
+            print(f"  Running: {COMFYUI_LAUNCHER.name} ...", flush=True)
             subprocess.Popen([str(COMFYUI_LAUNCHER)], cwd=str(OUTER_ROOT), shell=True)
         else:
-            print("  Exiting.")
+            print("  Exiting.", flush=True)
             return 0
-        print("  Waiting for ComfyUI to become available...")
+        print("  Waiting for ComfyUI to become available...", flush=True)
         for attempt in range(4):
             time.sleep(30)
             try:
                 _json_request(f"{LOCAL_BASE_URL}/comfymodal/health?mode=deploy", timeout=5)
                 comfy_ok = True
-                print(f"  ComfyUI is ready (attempt {attempt + 1}/4).")
+                print(f"  ComfyUI is ready (attempt {attempt + 1}/4).", flush=True)
                 break
             except Exception:
-                print(f"  Waiting... (attempt {attempt + 1}/4, 30s each)")
+                print(f"  Waiting... (attempt {attempt + 1}/4, 30s each)", flush=True)
         if not comfy_ok:
-            print("  ERROR: ComfyUI did not start within ~2 minutes.")
+            print("  ERROR: ComfyUI did not start within ~2 minutes.", flush=True)
             return 1
 
     if print_cost_warning:
-        print("  WARNING: This benchmark will trigger Modal GPU inference.")
-        print(f"  Estimated runs: {num_runs}")
-        print("  Each run may incur GPU compute costs on Modal.")
-        print("  Press Ctrl+C within 5s to abort...\n")
+        print("\n  WARNING: This benchmark will trigger Modal GPU inference.", flush=True)
+        print(f"  Estimated runs: {num_runs}", flush=True)
+        print("  Each run may incur GPU compute costs on Modal.", flush=True)
+        print("  Press Ctrl+C within 5s to abort...\n", flush=True)
         try:
             time.sleep(5)
         except KeyboardInterrupt:
-            print("Aborted.")
+            print("Aborted.", flush=True)
             return 1
 
     if dry_run:
@@ -2403,9 +2460,9 @@ def cmd_benchmark(args: argparse.Namespace, effective_config: dict | None = None
                   "warnings": [stale_t0_warn] if stale_t0_warn else [], "degradation_flags": df}
         run_details.append(detail)
 
-        print(f"    {label} (confidence: {conf})  wall={local_wall_ms:.0f}ms  "
-              f"submit2entry={cp.get('submit2entry_ms', '?'):>8}ms  "
-              f"sampler={run_record.get('sampler_ms', '?'):>8}ms  "
+        print(f"    {label} (confidence: {conf})  wall={_fmt_opt(local_wall_ms)}ms  "
+              f"submit2entry={_fmt_opt(cp.get('submit2entry_ms'), '8.0f', '?'):>8}ms  "
+              f"sampler={_fmt_opt(run_record.get('sampler_ms'), '8.0f', '?'):>8}ms  "
               f"poll={poll_count}")
         if stale_t0:
             print("    Warning: stale t0 detected")
@@ -2755,12 +2812,26 @@ def main() -> int:
         print(f"ERROR: unknown preset {args.preset!r}. Use --list-presets to see available presets.")
         return 1
 
-    # Build effective config
-    cli_dict = {k: getattr(args, k, None) for k in ("runs", "mode", "profile_level",
-                "sleep_between_runs", "min_gap_between_runs", "strict_inter_run_sleep",
-                "poll_interval", "write_analysis_pack", "print_cost_warning",
-                "include_local_materialization")}
-    effective_config = build_effective_config(args.preset if args.preset else None, cli_dict, args.set_overrides)
+    # Build explicit CLI values dict — only keys where the user's value differs from
+    # the parser default.  This prevents preset defaults from silently overwriting
+    # explicitly-provided CLI values while still applying preset defaults for omitted keys.
+    _base_parser = build_parser()
+    _ALL_PRESET_KEYS = ("runs", "mode", "profile_level", "sleep_between_runs",
+                        "min_gap_between_runs", "strict_inter_run_sleep",
+                        "poll_interval", "write_analysis_pack", "print_cost_warning",
+                        "include_local_materialization", "no_deploy",
+                        "poll_timeout", "result_mode", "output_format", "return_mode",
+                        "same_seed", "same_workflow", "same_active_profile")
+    explicit_cli = {}
+    explicit_cli_keys = set()
+    for k in _ALL_PRESET_KEYS:
+        default = _base_parser.get_default(k)
+        val = getattr(args, k, default)
+        if val != default:
+            explicit_cli[k] = val
+            explicit_cli_keys.add(k)
+
+    effective_config = build_effective_config(args.preset if args.preset else None, explicit_cli, args.set_overrides)
 
     if args.print_effective_config or args.dry_run_preset:
         print(f"\nEffective config ({effective_config['preset']}):\n")
@@ -2771,7 +2842,8 @@ def main() -> int:
         if args.print_effective_config:
             return 0
 
-    # Override CLI args from effective config
+    # Apply preset/default values to args ONLY for keys the user did not explicitly provide.
+    # This keeps explicit CLI values intact while letting preset defaults flow through.
     bm = effective_config["benchmark"]
     for cli_key, cfg_key in [("runs", "runs"), ("mode", "mode"), ("profile_level", "profile_level"),
                               ("sleep_between_runs", "sleep_between_runs"),
@@ -2781,7 +2853,7 @@ def main() -> int:
                               ("include_local_materialization", "include_local_materialization"),
                               ("write_analysis_pack", "write_analysis_pack"),
                               ("print_cost_warning", "print_cost_warning")]:
-        if cfg_key in bm:
+        if cli_key not in explicit_cli_keys and cfg_key in bm:
             setattr(args, cli_key, bm[cfg_key])
 
     if not args.workflow:

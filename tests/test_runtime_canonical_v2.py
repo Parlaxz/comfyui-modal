@@ -152,6 +152,62 @@ class TestExecutePlan(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_event_trace_derives_stages_and_durations_without_fabrication(self):
+        """V2 event traces gain only timing fields backed by real events."""
+        async def stream(**kwargs):
+            yield {
+                "type": "result",
+                "data": {
+                    "outputs": {},
+                    "trace": {
+                        "events": [
+                            {
+                                "name": "container_entry",
+                                "process": "remote",
+                                "phase": "restore",
+                                "wall_unix_ns": 1_000_000_000,
+                                "monotonic_ns": 1_000_000_000,
+                                "metadata": {},
+                            },
+                            {
+                                "name": "sampler_start",
+                                "process": "remote",
+                                "phase": "execution",
+                                "wall_unix_ns": 2_000_000_000,
+                                "monotonic_ns": 2_000_000_000,
+                                "metadata": {},
+                            },
+                            {
+                                "name": "sampler_end",
+                                "process": "remote",
+                                "phase": "execution",
+                                "wall_unix_ns": 3_000_000_000,
+                                "monotonic_ns": 2_003_000_000,
+                                "metadata": {},
+                            },
+                        ],
+                        "metadata": {},
+                    },
+                },
+            }
+
+        async def run():
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="event_timing",
+                validate=False,
+            )
+            result = await execute_plan(
+                plan,
+                transport=ModalTransport(prompt_stream_fn=stream),
+            )
+            trace = result["trace"]
+            self.assertEqual(trace["stages"]["t3_modal_entry"], 1.0)
+            self.assertAlmostEqual(trace["deltas_ms"]["sampler"], 3.0)
+            self.assertNotIn("vae_decode", trace["deltas_ms"])
+
+        asyncio.run(run())
+
     def test_missing_profile_setter_is_safe_dry_run(self):
         """execute_plan with no profile_setter emits dry_run event and does not raise."""
         async def stream(**kwargs):

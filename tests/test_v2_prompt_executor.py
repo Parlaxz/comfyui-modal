@@ -10,7 +10,7 @@ from unittest.mock import patch
 from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan
 import comfymodal_runtime.modal_app as modal_app
 from comfymodal_runtime.result_delivery import ConversionFailedError
-from comfymodal_runtime.runtime_executor import ExecutionContext
+from comfymodal_runtime.runtime_executor import ExecutionContext, RuntimeExecutor
 from comfymodal_runtime.trace import RuntimeTrace
 
 
@@ -58,19 +58,28 @@ def test_v2_runner_uses_prompt_executor_and_live_registry_without_legacy_wrapper
     }
     registered = {}
     cleaned = []
+    materialized_inputs = []
     fake_module = SimpleNamespace(
+        _materialize_input_images=lambda inputs: materialized_inputs.append(inputs),
         _register_production_request=lambda prompt_id, data: registered.update({prompt_id: data}),
         _cleanup_production_request=lambda prompt_id: cleaned.append(("request", prompt_id)),
         _cleanup_production_registry=lambda prompt_id: cleaned.append(("registry", prompt_id)),
         _pop_production_outputs=lambda _prompt_id: registry,
     )
     executor = _Executor()
-    api = SimpleNamespace(_executor=executor)
+    api = SimpleNamespace(
+        _executor=executor,
+        _wait_for_restore_preload_before_request=lambda wf: None,
+        _preflight_before_prompt_execution=lambda wf: None,
+        _preflight_already_ran=False,
+        _repair_missing_workflow_nodes=lambda wf: {"missing_before": [], "missing_after": [], "blocked_by_mode": False},
+    )
     entrypoint = modal_app.ModalRuntimeEntrypoint()
     entrypoint._legacy_module = fake_module
 
     plan = ExecutionPlan(
         workflow={"107": {"class_type": "SaveImage", "inputs": {}}},
+        input_images={"0.png": "dGVzdA=="},  # non-empty to exercise materialization span
         execution_options=ExecutionOptions(
             production_enabled=True,
             production_output_node_ids=("107",),
@@ -94,8 +103,44 @@ def test_v2_runner_uses_prompt_executor_and_live_registry_without_legacy_wrapper
     assert executor.executed[0]["prompt_id"] == "req-1"
     assert executor.sync_called is False
     assert cleaned == [("request", "req-1"), ("registry", "req-1")]
-    assert "prompt_executor_start" in [event.name for event in trace.events]
-    assert "output_collect_end" in [event.name for event in trace.events]
+
+    # Verify all Phase 5 execution span events are present
+    event_names = [event.name for event in trace.events]
+    expected_spans = [
+        "legacy_preload_check_start",
+        "legacy_preload_check_end",
+        "input_materialization_start",
+        "input_materialization_end",
+        "preflight_start",
+        "preflight_end",
+        "missing_node_repair_start",
+        "missing_node_repair_end",
+        "prompt_validation_start",
+        "prompt_validation_end",
+        "production_registry_setup_start",
+        "production_registry_setup_end",
+        "executor_reset_start",
+        "executor_reset_end",
+        "prompt_executor_start",
+        "prompt_executor_end",
+        "output_collect_start",
+        "output_collect_end",
+        "production_cleanup_start",
+        "production_cleanup_end",
+    ]
+    for span in expected_spans:
+        assert span in event_names, f"Missing span event: {span}"
+
+    # Verify no two consecutive events have the same name (start/end pair count)
+    for span_base in ["legacy_preload_check", "input_materialization", "preflight",
+                       "missing_node_repair", "prompt_validation",
+                       "production_registry_setup", "executor_reset",
+                       "prompt_executor", "output_collect", "production_cleanup"]:
+        start_count = event_names.count(f"{span_base}_start")
+        end_count = event_names.count(f"{span_base}_end")
+        assert start_count == end_count, (
+            f"Mismatched start/end for {span_base}: {start_count} starts, {end_count} ends"
+        )
 
 
 def test_v2_fallback_conversion_failure_keeps_original_materialized_bytes():
@@ -134,3 +179,41 @@ def test_v2_fallback_conversion_failure_keeps_original_materialized_bytes():
 
     assert base64.b64decode(result["images"][0]["data"]) == original
     assert result["output_attempts"][1]["metrics"]["conversion_fallback"] is True
+
+    # Verify non-production spans are present, production spans are absent
+    event_names = [event.name for event in trace.events]
+    assert "legacy_preload_check_start" not in event_names  # no _wait_for_restore_preload_before_request on api
+    assert "prompt_validation_start" in event_names
+    assert "prompt_validation_end" in event_names
+    assert "executor_reset_start" in event_names
+    assert "executor_reset_end" in event_names
+    assert "prompt_executor_start" in event_names
+    assert "prompt_executor_end" in event_names
+    assert "output_collect_start" in event_names
+    assert "output_collect_end" in event_names
+    assert "production_registry_setup_start" not in event_names  # production_enabled=False
+    assert "production_cleanup_start" not in event_names  # production_enabled=False
+
+
+def test_first_stream_event_contains_trace_id():
+    """First stream event from run_plan_stream carries correlation identifiers."""
+    executor = RuntimeExecutor(in_process_runner=lambda plan, ctx: {"ok": True})
+    entrypoint = modal_app.ModalRuntimeEntrypoint(executor=executor)
+
+    async def run():
+        messages = [
+            message async for message in entrypoint.run_plan_stream(
+                ExecutionPlan(workflow={"1": {}}).to_dict(),
+                request_id="req-trace-id",
+            )
+        ]
+        first = messages[0]
+        assert first["type"] == "status"
+        assert first["phase"] == "plan_received"
+        assert first["request_id"] == "req-trace-id"
+        assert isinstance(first.get("trace_id"), str)
+        assert len(first["trace_id"]) > 0
+        return messages
+
+    messages = asyncio.run(run())
+    assert messages[-1]["data"]["ok"] is True

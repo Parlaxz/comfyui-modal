@@ -24,6 +24,7 @@ from .output_delivery import (
     OutputItem,
     _item_from_entry,
     _make_conversion_meta,
+    _measure_json_bytes,
 )
 
 
@@ -473,6 +474,10 @@ def materialize_modal_result(
     image_count = 0
     video_count = 0
     output_bytes_written = 0
+    # ── Phase 6 materialization timing ──────────────────────────────
+    total_decode_time_ms: float = 0.0
+    total_write_time_ms: float = 0.0
+    materialization_wall_start = time.monotonic()
 
     if send_event is None:
         send_event = lambda _event, _payload: None
@@ -486,12 +491,16 @@ def materialize_modal_result(
         entry: dict,
         fallback_index: int = 0,
     ) -> None:
-        nonlocal image_count, video_count, output_bytes_written
+        nonlocal image_count, video_count, output_bytes_written, total_decode_time_ms, total_write_time_ms
+        t0 = time.monotonic()
         raw_bytes = base64.b64decode(entry["data"], validate=True)
+        total_decode_time_ms += (time.monotonic() - t0) * 1000.0
         local_filename = entry.get("filename", f"output_{fallback_index}.bin")
         local_path = unique_path(output_dir, local_filename)
         local_filename = os.path.basename(local_path)
+        t1 = time.monotonic()
         Path(local_path).write_bytes(raw_bytes)
+        total_write_time_ms += (time.monotonic() - t1) * 1000.0
         written_files.append(local_path)
         output_bytes_written += len(raw_bytes)
 
@@ -635,6 +644,8 @@ def materialize_modal_result(
         except OSError as exc:
             save_warnings.append(str(exc))
 
+    materialization_wall_ms = (time.monotonic() - materialization_wall_start) * 1000.0
+
     return {
         "outputs": native_outputs,
         "history_outputs": history_outputs,
@@ -646,6 +657,14 @@ def materialize_modal_result(
         "bytes_written": output_bytes_written,
         "save_results": save_results,
         "save_warnings": save_warnings,
+        # ── Phase 6 materialization timing ──────────────────────
+        "materialization_timing": {
+            "total_wall_ms": materialization_wall_ms,
+            "total_decode_time_ms": total_decode_time_ms,
+            "total_write_time_ms": total_write_time_ms,
+            "item_count": image_count + video_count,
+            "bytes_written": output_bytes_written,
+        },
     }
 
 
