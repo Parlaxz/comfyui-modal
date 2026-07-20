@@ -1,5 +1,9 @@
 import unittest
 
+import os
+import copy
+import json
+
 from production_workflow import (
     normalize_production_options,
     build_production_topology_hash,
@@ -8,6 +12,9 @@ from production_workflow import (
     _reset_cache,
     _cache_size,
     _compute_source_workflow_hash,
+    _apply_res4lyf_dummy_sampler_transform,
+    _build_normalized_id_map,
+    _is_connection,
     COMPILER_SCHEMA_VERSION,
 )
 
@@ -1740,3 +1747,406 @@ class CanonicalOptionsKeyJoinTests(unittest.TestCase):
             allow_direct_output_rewrite=False,
         )
         self.assertEqual(h1, h2)
+
+
+# ---------------------------------------------------------------------------
+# RES4LYF dummy sampler init disable transform tests
+# ---------------------------------------------------------------------------
+
+_RES4LYF_SAMPLER_CLASS = "ClownsharKSampler_Beta"
+_RES4LYF_OPTIONS_CLASS = "ClownOptions_ExtraOptions_Beta"
+
+WORKFLOW_CLOWNSHARK = {
+    "5": {"class_type": _RES4LYF_SAMPLER_CLASS, "inputs": {
+        "model": ("4", 0), "positive": ("6", 0), "negative": ("7", 0),
+        "latent_image": ("8", 0),
+        "seed": 42, "steps": 20, "cfg": 5.5, "denoise": 1.0,
+        "sampler_name": "res_2m", "scheduler": "beta57",
+        "eta": 0.5, "steps_to_run": -1,
+        "noise_type_init": "fixed", "sampler_mode": "standard",
+        "bongmath": True,
+    }},
+    "4": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux-model.safetensors"}},
+    "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat", "clip": ("10", 0)}},
+    "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ("10", 0)}},
+    "8": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024}},
+    "9": {"class_type": "VAEDecode", "inputs": {"samples": ("5", 0), "vae": ("11", 0)}},
+    "10": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors"}},
+    "11": {"class_type": "VAELoader", "inputs": {"vae_name": "vae.safetensors"}},
+    "12": {"class_type": "PreviewImage", "inputs": {"images": ("9", 0)}},
+}
+
+WORKFLOW_CLOWNSHARK_WITH_OPTIONS = {
+    "5": {"class_type": _RES4LYF_SAMPLER_CLASS, "inputs": {
+        "model": ("4", 0), "positive": ("6", 0), "negative": ("7", 0),
+        "latent_image": ("8", 0),
+        "seed": 42, "steps": 20, "cfg": 5.5, "denoise": 1.0,
+        "sampler_name": "res_2m", "scheduler": "beta57",
+        "eta": 0.5, "steps_to_run": -1,
+        "noise_type_init": "fixed", "sampler_mode": "standard",
+        "bongmath": True,
+        "options": ("20", 0),
+    }},
+    "4": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux-model.safetensors"}},
+    "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat", "clip": ("10", 0)}},
+    "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ("10", 0)}},
+    "8": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024}},
+    "9": {"class_type": "VAEDecode", "inputs": {"samples": ("5", 0), "vae": ("11", 0)}},
+    "10": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors"}},
+    "11": {"class_type": "VAELoader", "inputs": {"vae_name": "vae.safetensors"}},
+    "12": {"class_type": "PreviewImage", "inputs": {"images": ("9", 0)}},
+    "20": {"class_type": "ClownOptions_DetailBoost_Beta", "inputs": {
+        "detail_boost": 0.15, "options": {},
+    }},
+}
+
+WORKFLOW_CACHEDIT = {
+    "5": {"class_type": _RES4LYF_SAMPLER_CLASS, "inputs": {
+        "model": ("30", 0), "positive": ("6", 0), "negative": ("7", 0),
+        "latent_image": ("8", 0),
+        "seed": 42, "steps": 20, "cfg": 5.5, "denoise": 1.0,
+        "sampler_name": "res_2m", "scheduler": "beta57",
+        "eta": 0.5, "steps_to_run": -1,
+        "noise_type_init": "fixed", "sampler_mode": "standard",
+        "bongmath": True,
+    }},
+    "4": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux-model.safetensors"}},
+    "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat", "clip": ("10", 0)}},
+    "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ("10", 0)}},
+    "8": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024}},
+    "9": {"class_type": "VAEDecode", "inputs": {"samples": ("5", 0), "vae": ("11", 0)}},
+    "10": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors"}},
+    "11": {"class_type": "VAELoader", "inputs": {"vae_name": "vae.safetensors"}},
+    "12": {"class_type": "PreviewImage", "inputs": {"images": ("9", 0)}},
+    # CacheDiT-specific node — feeds into sampler to remain reachable
+    "30": {"class_type": "CacheDiT", "inputs": {
+        "model": ("4", 0), "positive": ("6", 0), "negative": ("7", 0),
+    }},
+}
+
+
+class Res4lyfDummySamplerInitTests(unittest.TestCase):
+    """Focused tests for the RES4LYF dummy sampler init disable transform."""
+
+    def setUp(self):
+        _reset_cache()
+
+    def _prod(self, output_ids=None):
+        return {
+            "schema_version": COMPILER_SCHEMA_VERSION,
+            "output_node_ids": output_ids or ["12"],
+            "bypass_node_ids": [],
+            "disable_sampler_previews": True,
+            "quiet_execution_logs": True,
+            "progress_min_interval_ms": 500,
+            "strict_output_collection": True,
+            "direct_output_sink": True,
+            "metadata_mode": "none",
+        }
+
+    # ── No existing options ────────────────────────────────────────────
+
+    def test_injects_options_node_when_no_existing_options(self):
+        """Sampler with no ``options`` connection gets an injected
+        ``ClownOptions_ExtraOptions_Beta`` node."""
+        prod = self._prod()
+        compiled, report = compile_production_workflow(
+            WORKFLOW_CLOWNSHARK, prod, allow_direct_output_rewrite=False,
+        )
+
+        self.assertEqual(
+            report["res4lyf_dummy_sampler_disabled_count"], 1,
+            "Expected 1 sampler to be patched",
+        )
+        self.assertIn(
+            "5", report["res4lyf_dummy_sampler_disabled_node_ids"],
+        )
+
+        # Injected node should be in compiled with correct class_type
+        injected_id = report["res4lyf_options_injected_node_ids"][0]
+        self.assertIn(injected_id, compiled)
+        self.assertEqual(
+            compiled[injected_id]["class_type"], _RES4LYF_OPTIONS_CLASS,
+        )
+        self.assertEqual(
+            compiled[injected_id]["inputs"]["extra_options"],
+            "disable_dummy_sampler_init",
+        )
+
+        # Sampler options must be a list (ComfyUI JSON convention), not a tuple
+        self.assertEqual(
+            compiled["5"]["inputs"]["options"],
+            [injected_id, 0],
+        )
+        # Must survive JSON roundtrip as a valid connection
+        roundtripped = json.loads(json.dumps(compiled))
+        ct = roundtripped["5"]["class_type"]
+        self.assertEqual(ct, _RES4LYF_SAMPLER_CLASS,
+                         "JSON roundtrip must preserve sampler class_type")
+        rt_options = roundtripped["5"]["inputs"]["options"]
+        self.assertIsInstance(rt_options, list,
+                              "JSON-roundtripped options must be a list")
+        self.assertEqual(rt_options, [injected_id, 0],
+                         "JSON roundtrip must preserve injected edge")
+
+    # ── Existing options chain ─────────────────────────────────────────
+
+    def test_chains_existing_options_through_injected_node(self):
+        """Sampler with existing ``options`` connection chains it through."""
+        prod = self._prod()
+        compiled, report = compile_production_workflow(
+            WORKFLOW_CLOWNSHARK_WITH_OPTIONS, prod,
+            allow_direct_output_rewrite=False,
+        )
+
+        self.assertEqual(report["res4lyf_dummy_sampler_disabled_count"], 1)
+
+        injected_id = report["res4lyf_options_injected_node_ids"][0]
+        self.assertIn(injected_id, compiled)
+
+        # Injected node should have the existing options chained
+        self.assertEqual(
+            compiled[injected_id]["inputs"]["options"],
+            ("20", 0),
+            "Existing options connection should be chained through injected node",
+        )
+
+        # Sampler options must be a list (ComfyUI JSON/API convention)
+        self.assertEqual(
+            compiled["5"]["inputs"]["options"],
+            [injected_id, 0],
+        )
+
+        # The original detail-boost node should be preserved
+        self.assertEqual(
+            compiled["20"]["class_type"], "ClownOptions_DetailBoost_Beta",
+        )
+
+    # ── Env off (gate disabled) ────────────────────────────────────────
+
+    def test_env_off_skips_transform(self):
+        """When env ``COMFYMODAL_DISABLE_RES4LYF_DUMMY_SAMPLER_INIT=0``,
+        no injection occurs."""
+        old_val = os.environ.get("COMFYMODAL_DISABLE_RES4LYF_DUMMY_SAMPLER_INIT")
+        try:
+            os.environ["COMFYMODAL_DISABLE_RES4LYF_DUMMY_SAMPLER_INIT"] = "0"
+            prod = self._prod()
+            compiled, report = compile_production_workflow(
+                WORKFLOW_CLOWNSHARK, prod,
+                allow_direct_output_rewrite=False,
+            )
+            self.assertEqual(report["res4lyf_dummy_sampler_disabled_count"], 0)
+            self.assertEqual(report["res4lyf_options_injected_count"], 0)
+            # Sampler options should remain absent/unmodified
+            self.assertNotIn("options", compiled["5"].get("inputs", {}))
+        finally:
+            if old_val is None:
+                del os.environ["COMFYMODAL_DISABLE_RES4LYF_DUMMY_SAMPLER_INIT"]
+            else:
+                os.environ["COMFYMODAL_DISABLE_RES4LYF_DUMMY_SAMPLER_INIT"] = old_val
+
+    # ── Source immutability ────────────────────────────────────────────
+
+    def test_source_workflow_not_mutated(self):
+        """Source workflow dict must not be modified by compilation."""
+        source = copy.deepcopy(WORKFLOW_CLOWNSHARK)
+        source_repr = repr(source)
+        prod = self._prod()
+        compile_production_workflow(
+            source, prod, allow_direct_output_rewrite=False,
+        )
+        self.assertEqual(
+            repr(source), source_repr,
+            "Source workflow should not be mutated",
+        )
+        # Specifically, no extra nodes should appear in source
+        self.assertEqual(
+            len(source), len(WORKFLOW_CLOWNSHARK),
+            "Source should not gain new nodes",
+        )
+        # Sampler options input should remain unchanged in source
+        self.assertNotIn(
+            "options", source.get("5", {}).get("inputs", {}),
+        )
+
+    # ── CacheDiT retained ──────────────────────────────────────────────
+
+    def test_cachedit_preserved(self):
+        """CacheDiT nodes must remain untouched after transform."""
+        prod = self._prod(output_ids=["12"])
+        compiled, report = compile_production_workflow(
+            WORKFLOW_CACHEDIT, prod,
+            allow_direct_output_rewrite=False,
+        )
+        # CacheDiT node should be in compiled
+        self.assertIn("30", compiled)
+        self.assertEqual(compiled["30"]["class_type"], "CacheDiT")
+        # Its inputs must be untouched (only model feeds into sampler)
+        self.assertEqual(
+            compiled["30"]["inputs"],
+            {"model": ("4", 0), "positive": ("6", 0), "negative": ("7", 0)},
+        )
+        # Sampler receives model from CacheDiT
+        self.assertEqual(compiled["5"]["inputs"]["model"], ("30", 0))
+        # ClownsharK sampler should be patched
+        self.assertEqual(report["res4lyf_dummy_sampler_disabled_count"], 1)
+        self.assertIn("5", report["res4lyf_dummy_sampler_disabled_node_ids"])
+
+    # ── Idempotence ────────────────────────────────────────────────────
+
+    def test_idempotent_no_double_injection(self):
+        """Running the transform twice on the same compiled workflow must
+        not inject a second options node."""
+        prod = self._prod()
+        compiled, report = compile_production_workflow(
+            WORKFLOW_CLOWNSHARK, prod,
+            allow_direct_output_rewrite=False,
+        )
+        first_disabled = list(report["res4lyf_dummy_sampler_disabled_node_ids"])
+        first_injected = list(report["res4lyf_options_injected_node_ids"])
+
+        # Run a second compilation — must produce same result
+        _reset_cache()
+        compiled2, report2 = compile_production_workflow(
+            WORKFLOW_CLOWNSHARK, prod,
+            allow_direct_output_rewrite=False,
+        )
+        self.assertEqual(
+            report2["res4lyf_dummy_sampler_disabled_node_ids"],
+            first_disabled,
+            "Second compilation must not produce different disabled IDs",
+        )
+        self.assertEqual(
+            report2["res4lyf_options_injected_node_ids"],
+            first_injected,
+            "Second compilation must not produce different injected IDs",
+        )
+        self.assertEqual(
+            report2["res4lyf_dummy_sampler_disabled_count"], 1,
+        )
+
+        # Also verify direct idempotence: calling the raw transform twice
+        # on the same compiled must not double-inject.
+        from production_workflow import _build_normalized_id_map
+        nid_map = _build_normalized_id_map(compiled)
+        disabled2, injected2 = _apply_res4lyf_dummy_sampler_transform(
+            compiled, nid_map,
+        )
+        self.assertEqual(
+            len(disabled2), 0,
+            "Second raw transform pass must find 0 new nodes to patch",
+        )
+        self.assertEqual(
+            len(injected2), 0,
+            "Second raw transform pass must inject 0 new nodes",
+        )
+
+    # ── Deterministic IDs ──────────────────────────────────────────────
+
+    def test_deterministic_injected_ids(self):
+        """Same source workflow always produces the same injected node IDs."""
+        prod = self._prod()
+        _reset_cache()
+        _, r1 = compile_production_workflow(
+            WORKFLOW_CLOWNSHARK, prod,
+            allow_direct_output_rewrite=False,
+        )
+        _reset_cache()
+        _, r2 = compile_production_workflow(
+            WORKFLOW_CLOWNSHARK, prod,
+            allow_direct_output_rewrite=False,
+        )
+        self.assertEqual(
+            r1["res4lyf_options_injected_node_ids"],
+            r2["res4lyf_options_injected_node_ids"],
+        )
+
+    # ── Non-numeric sampler ID fallback ────────────────────────────────
+
+    def test_deterministic_non_numeric_sampler_id_fallback(self):
+        """Non-numeric sampler ID must produce a deterministic injected ID
+        using hashlib.md5 (not Python's randomized ``hash()``)."""
+        # A compiled-like dict with a non-numeric sampler ID
+        compiled = {
+            "node_x": {
+                "class_type": _RES4LYF_SAMPLER_CLASS,
+                "inputs": {},
+            },
+        }
+        nid_map = _build_normalized_id_map(compiled)
+
+        # First call
+        disabled_1, injected_1 = _apply_res4lyf_dummy_sampler_transform(
+            compiled, nid_map,
+        )
+        self.assertEqual(len(disabled_1), 1)
+        self.assertEqual(len(injected_1), 1)
+        first_id = injected_1[0]
+
+        # Second call with a fresh copy — must produce the SAME injected ID
+        compiled2 = {
+            "node_x": {
+                "class_type": _RES4LYF_SAMPLER_CLASS,
+                "inputs": {},
+            },
+        }
+        nid_map2 = _build_normalized_id_map(compiled2)
+        disabled_2, injected_2 = _apply_res4lyf_dummy_sampler_transform(
+            compiled2, nid_map2,
+        )
+        self.assertEqual(
+            injected_1, injected_2,
+            "Non-numeric sampler ID fallback must be deterministic "
+            "(hashlib.md5, not Python's randomized hash())",
+        )
+
+        # The injected ID must be a plausible numeric string (not NaN, not empty)
+        self.assertTrue(first_id.isdigit(), f"Injected ID must be numeric, got {first_id!r}")
+        self.assertGreater(len(first_id), 0)
+
+    def test_numeric_sampler_id_still_uses_offset(self):
+        """Numeric sampler IDs must use the offset-based scheme,
+        not the hashlib fallback."""
+        compiled = {
+            "42": {
+                "class_type": _RES4LYF_SAMPLER_CLASS,
+                "inputs": {},
+            },
+        }
+        nid_map = _build_normalized_id_map(compiled)
+        disabled, injected = _apply_res4lyf_dummy_sampler_transform(
+            compiled, nid_map,
+        )
+        self.assertEqual(injected[0], "100042",
+                         "Numeric sampler ID 42 must produce injected ID 100042")
+
+    # ── JSON roundtrip (list, not tuple) ───────────────────────────────
+
+    def test_injected_edge_is_list_and_survives_json_roundtrip(self):
+        """The injected ``options`` connection must be a two-element list
+        (ComfyUI JSON convention), not a Python tuple, and must still be
+        recognized by ``_is_connection`` after ``json.dumps/json.loads``."""
+        prod = self._prod()
+        compiled, report = compile_production_workflow(
+            WORKFLOW_CLOWNSHARK, prod,
+            allow_direct_output_rewrite=False,
+        )
+        injected_id = report["res4lyf_options_injected_node_ids"][0]
+
+        # The in-memory compiled dict must use a list
+        raw_options = compiled["5"]["inputs"]["options"]
+        self.assertIsInstance(raw_options, list,
+                              "In-memory options connection must be a list")
+        self.assertEqual(raw_options, [injected_id, 0])
+
+        # _is_connection must accept it natively
+        self.assertTrue(_is_connection(raw_options))
+
+        # After JSON roundtrip _is_connection still recognizes it
+        roundtripped = json.loads(json.dumps(compiled))
+        rt_options = roundtripped["5"]["inputs"]["options"]
+        self.assertIsInstance(rt_options, list)
+        self.assertEqual(rt_options, [injected_id, 0])
+        self.assertTrue(_is_connection(rt_options),
+                        "_is_connection must recognize the edge after "
+                        "JSON roundtrip")

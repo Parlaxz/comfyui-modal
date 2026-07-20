@@ -19,6 +19,9 @@ const _modalNodeRuntime = {
   installed: false,
   listenerRemovers: [],
   fetchApiPatch: null,
+  originalQueuePrompt: null,
+  queuePromptPatch: null,
+  pendingQueueCapture: null,
 };
 
 function log(...args) {
@@ -71,7 +74,13 @@ function _disposeModalNodeRuntime() {
   if (_originalFetchApi && api?.fetchApi === _modalNodeRuntime.fetchApiPatch) {
     api.fetchApi = _originalFetchApi;
   }
+  if (_modalNodeRuntime.originalQueuePrompt && app?.queuePrompt === _modalNodeRuntime.queuePromptPatch) {
+    app.queuePrompt = _modalNodeRuntime.originalQueuePrompt;
+  }
   _modalNodeRuntime.fetchApiPatch = null;
+  _modalNodeRuntime.originalQueuePrompt = null;
+  _modalNodeRuntime.queuePromptPatch = null;
+  _modalNodeRuntime.pendingQueueCapture = null;
   _modalNodeRuntime.installed = false;
 }
 
@@ -505,6 +514,24 @@ function _captureT0() {
   };
 }
 
+// ── Queue-prompt timestamp capture ──────────────────────────────────────
+// Stores a timestamp when app.queuePrompt is invoked (user presses
+// Generate).  The patched fetchApi consumes this capture so the request
+// body carries the true queue-invocation time, not the later fetch time
+// which may be delayed by graphToPrompt serialization.
+function _captureQueuePromptTimestamps() {
+  return { queue_prompt_start_ms: Date.now() };
+}
+
+function _consumeQueueCapture() {
+  const cap = _modalNodeRuntime.pendingQueueCapture;
+  _modalNodeRuntime.pendingQueueCapture = null;
+  if (!cap) return null;
+  // 60s generous validity window — well beyond the suspected ~10s delay
+  if (Date.now() - cap.queue_prompt_start_ms > 60000) return null; // stale
+  return cap;
+}
+
 function _logTrace(trace, suffix = "") {
   if (!trace || !trace.deltas_ms) return;
   const d = trace.deltas_ms;
@@ -628,6 +655,19 @@ app.registerExtension({
 
     // ── End Progress Bar ────────────────────────────────────────────────
 
+    // ── Queue Prompt Pre-fetch Timing Fix ────────────────────────────────
+    // Wrap app.queuePrompt idempotently to capture the true invocation
+    // timestamp before graphToPrompt serialization.  The patched fetchApi
+    // consumes this capture so the request body carries the press time.
+    if (!_modalNodeRuntime.originalQueuePrompt) {
+      _modalNodeRuntime.originalQueuePrompt = app.queuePrompt;
+      _modalNodeRuntime.queuePromptPatch = function (...args) {
+        _modalNodeRuntime.pendingQueueCapture = _captureQueuePromptTimestamps();
+        return _modalNodeRuntime.originalQueuePrompt.apply(this, args);
+      };
+      app.queuePrompt = _modalNodeRuntime.queuePromptPatch;
+    }
+
     _originalFetchApi = api.fetchApi.bind(api);
     const patchedFetchApi = async function (route, options = {}) {
       const isPromptPost =
@@ -639,13 +679,12 @@ app.registerExtension({
         if (!enabled) {
           return _originalFetchApi(route, options);
         }
-        // ── t0: browser pressed Generate.  Inject both into the
-        // body so the local server can re-stamp t1/t2 and the Modal
-        // server can re-stamp t3..t9.
-        const t0 = _captureT0();
-        log(
-          `Intercepted /prompt POST -> routing to Modal GPU (t0_perf_ms=${t0.t0_perf_ms.toFixed(1)})`
-        );
+        // ── Queue-prompt pre-fetch timing capture ──────────────────────
+        // Consume a pending queue capture (set by wrapped queuePrompt) so
+        // the timestamps reflect the true invocation time, not the fetch
+        // time which may be delayed by graphToPrompt serialization.
+        const queueCapture = _consumeQueueCapture();
+        const fetchT0 = _captureT0();
         const body = options.body;
         let parsed;
         try {
@@ -654,9 +693,28 @@ app.registerExtension({
           parsed = null;
         }
         if (parsed && typeof parsed === "object") {
-          parsed.t0_perf_ms = t0.t0_perf_ms;
-          parsed.t0_perf_now_ms = t0.t0_perf_now_ms;
-          parsed.t0_client_press_ms = t0.t0_client_press_ms;
+          // ── Timing diagnostics ────────────────────────────────────────
+          // True queue invocation time (user pressed Generate)
+          if (queueCapture) {
+            parsed.queue_prompt_start_ms = queueCapture.queue_prompt_start_ms;
+            parsed.t0_client_press_ms = queueCapture.queue_prompt_start_ms;
+          } else {
+            parsed.t0_client_press_ms = fetchT0.t0_client_press_ms;
+          }
+          // Fetch invocation time (when the HTTP request is being built)
+          parsed.prompt_fetch_start_ms = fetchT0.t0_client_press_ms;
+          // Difference between queue prompt invocation and fetch start
+          if (queueCapture) {
+            parsed.queue_to_prompt_fetch_ms = fetchT0.t0_client_press_ms - queueCapture.queue_prompt_start_ms;
+          }
+          // Serialized prompt payload size (approximate byte count)
+          parsed.serialized_prompt_bytes = typeof body === "string" ? body.length : 0;
+          // Always set monotonic timing fields
+          parsed.t0_perf_ms = fetchT0.t0_perf_ms;
+          parsed.t0_perf_now_ms = fetchT0.t0_perf_now_ms;
+          // Concise timing diagnostic
+          const q2f = parsed.queue_to_prompt_fetch_ms != null ? `${parsed.queue_to_prompt_fetch_ms}ms` : "-";
+          log(`Prompt: q→f=${q2f} body=${parsed.serialized_prompt_bytes}b t0=${fetchT0.t0_perf_ms.toFixed(0)}`);
           const baseOptions = { ..._getOutputOptions() };
           delete baseOptions.production;  // ensure clean start
           const productionEnabled = _getProductionEnabled();

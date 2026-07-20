@@ -30,6 +30,7 @@ class HandleCacheKey:
     target: str
     gpu: str
     cloud: str = ""
+    environment: str = ""
 
 
 class HandleCache:
@@ -78,6 +79,22 @@ class ModalTransport:
             return explicit
         return ""
 
+    @staticmethod
+    def _resolve_environment() -> str:
+        """Resolve the Modal environment name.
+
+        ``COMFYMODAL_V2_ENVIRONMENT`` takes precedence over
+        ``MODAL_ENVIRONMENT``.  Returns ``""`` when neither is set so callers
+        can pass ``None`` to SDK lookups, which uses the default environment.
+        """
+        env = os.environ.get("COMFYMODAL_V2_ENVIRONMENT", "")
+        if env:
+            return env.strip()
+        env = os.environ.get("MODAL_ENVIRONMENT", "")
+        if env:
+            return env.strip()
+        return ""
+
     def _v2_handle(
         self,
         *,
@@ -90,7 +107,8 @@ class ModalTransport:
         class_name = os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2")
         workspace_id = str((workspace or {}).get("id", "default"))
         cloud = self._resolve_v2_cloud(selected_gpu)
-        key = HandleCacheKey(workspace_id, app_name, class_name, selected_gpu, cloud=cloud)
+        environment = self._resolve_environment()
+        key = HandleCacheKey(workspace_id, app_name, class_name, selected_gpu, cloud=cloud, environment=environment)
         cached = self.handle_cache.get(key)
         if cached is not None:
             if runtime_trace is not None:
@@ -128,7 +146,10 @@ class ModalTransport:
             if runtime_trace is not None:
                 runtime_trace.emit("client_resolution_end", phase="local")
                 runtime_trace.emit("class_lookup_start", phase="local", metadata=_handle_identity)
-            cls_handle = _modal.Cls.from_name(app_name, class_name, client=client)
+            cls_handle = _modal.Cls.from_name(
+                app_name, class_name, client=client,
+                environment_name=environment or None,
+            )
             if runtime_trace is not None:
                 runtime_trace.emit("class_lookup_end", phase="local")
             if cloud:
@@ -281,7 +302,8 @@ class ModalTransport:
             raise TransportError("v2 transport requires an active Modal workspace with credentials")
         app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow")
         workspace_id = str(workspace.get("id", "default"))
-        key = HandleCacheKey(workspace_id, app_name, "publish_restore_plan_remote", "cpu")
+        environment = self._resolve_environment()
+        key = HandleCacheKey(workspace_id, app_name, "publish_restore_plan_remote", "cpu", environment=environment)
         function = self.handle_cache.get(key)
         if function is None:
             if runtime_trace is not None:
@@ -294,6 +316,7 @@ class ModalTransport:
                     )
                     return _modal.Function.from_name(
                         app_name, "publish_restore_plan_remote", client=c,
+                        environment_name=environment or None,
                     )
                 function = await asyncio.to_thread(_do_lookup)
             except Exception as exc:

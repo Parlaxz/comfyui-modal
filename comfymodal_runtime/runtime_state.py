@@ -18,6 +18,7 @@ The coordinator never touches a models volume.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
@@ -217,6 +218,27 @@ class ModalMountedStateVolume(MountedStateVolume):
         reload_fn = getattr(self._modal_volume, "reload", None)
         if callable(reload_fn):
             reload_fn()
+
+    async def reload_async(self) -> None:
+        """Async reload — tries ``self._modal_volume.reload.aio()`` first,
+        falls back to ``asyncio.to_thread(self.reload)`` for fakes/older
+        APIs that only expose a synchronous ``reload()``.
+
+        Modal's ``Volume.reload`` exposes an ``.aio()`` coroutine method
+        that should be preferred in async contexts to avoid the "synchronous
+        reload in async context" warning.  When the attribute check fails
+        (e.g. ``FakeVolume`` or an older API surface), the fallback runs
+        ``self.reload()`` in a thread via ``asyncio.to_thread()``.
+        """
+        modal_volume = self._modal_volume
+        reload_fn = getattr(modal_volume, "reload", None)
+        if reload_fn is not None:
+            aio_method = getattr(reload_fn, "aio", None)
+            if callable(aio_method):
+                await aio_method()
+                return
+        # Fallback: synchronous reload in a thread.
+        await asyncio.to_thread(self.reload)
 
     def commit(self) -> None:
         super().commit()

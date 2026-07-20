@@ -13,6 +13,7 @@ import copy
 import inspect
 import json
 import os
+import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -35,7 +36,12 @@ from workflow_metadata import (
     stack_to_warmup_profile,
     summarize_prompt_fields,
 )
-from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, RestorePlan
+from comfymodal_runtime.contracts import (
+    ExecutionOptions,
+    ExecutionPlan,
+    RestorePlan,
+    stable_hash,
+)
 from comfymodal_runtime.modal_transport import ModalTransport
 from comfymodal_runtime.restore_plan import (
     build_restore_model_spec,
@@ -43,6 +49,50 @@ from comfymodal_runtime.restore_plan import (
     derive_prefill_key,
 )
 from comfymodal_runtime.trace import RuntimeTrace, merge_runtime_traces
+
+# ---------------------------------------------------------------------------
+# Restore-plan publish cache (process-safe, skips remote calls when
+# the canonical identity is unchanged for the same workspace/app/env)
+# ---------------------------------------------------------------------------
+
+_RESTORE_PUBLISH_CACHE: dict[str, str] = {}
+"""``{cache_key: identity_hash}`` — set of published plan identities.
+
+Cache-key format: ``{workspace_id}:{app_name}:{environment}:{identity_hash}``
+Cleared only by module reload; survives across calls within the same process.
+Thread-safe via ``_RESTORE_PUBLISH_CACHE_LOCK``.
+"""
+
+_RESTORE_PUBLISH_CACHE_LOCK = threading.Lock()
+"""Guard for all ``_RESTORE_PUBLISH_CACHE`` access."""
+
+_APP_NAME_DEFAULT = "stable-modal-comfy-v2-shadow"
+"""Fallback Modal app name when ``COMFYMODAL_V2_APP_NAME`` is unset."""
+
+
+def _restore_plan_identity_hash(plan: RestorePlan) -> str:
+    """Deterministic hash of identity fields, excluding volatile
+    ``generation`` and ``created_at``.
+
+    Mirrors ``RestorePlanPublisher._identity_hash`` so the local cache
+    is consistent with the publisher's own no-op detection.
+    """
+    identity = {
+        "schema_version": plan.schema_version,
+        "model_key": plan.model_key.to_dict(),
+        "prefill_key": plan.prefill_key.to_dict(),
+        "model_spec": dict(plan.model_spec),
+        "prefill_spec": dict(plan.prefill_spec),
+        "source_workflow_hash": plan.source_workflow_hash,
+    }
+    return stable_hash(identity)
+
+
+def _reset_restore_publish_cache() -> None:
+    """Clear the restore-plan publish cache (test / teardown only)."""
+    with _RESTORE_PUBLISH_CACHE_LOCK:
+        _RESTORE_PUBLISH_CACHE.clear()
+
 
 # ---------------------------------------------------------------------------
 # RunTrace — in-memory hierarchical span collector
@@ -566,16 +616,43 @@ async def execute_plan(
             prefill_spec=dict(prefill_key.encode_options),
             source_workflow_hash=plan.source_workflow_hash,
         )
-        publish_result = restore_publisher.publish(restore_plan)
-        if inspect.isawaitable(publish_result):
-            publish_result = await publish_result
-        if isinstance(publish_result, Mapping):
-            observed_generation = publish_result.get(
-                "generation", publish_result.get("observed_generation", "")
+
+        # ── Local process-safe cache: skip remote call when identity
+        #    is unchanged for the same workspace/app/environment ──
+        plan_identity = _restore_plan_identity_hash(restore_plan)
+        ws_id = str((workspace or {}).get("id", ""))
+        app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", _APP_NAME_DEFAULT)
+        env = (
+            os.environ.get("COMFYMODAL_V2_ENVIRONMENT", "")
+            or os.environ.get("MODAL_ENVIRONMENT", "")
+        )
+        cache_key = f"{ws_id}:{app_name}:{env}:{plan_identity}"
+
+        with _RESTORE_PUBLISH_CACHE_LOCK:
+            cached_identity = _RESTORE_PUBLISH_CACHE.get(cache_key)
+
+        if cached_identity is not None:
+            # Identity unchanged — skip the remote publish call entirely
+            runtime_trace.emit(
+                "restore_publish_cache_skip", phase="local",
+                metadata={"cache_key_prefix": cache_key[:64], "identity": plan_identity[:16]},
             )
-            runtime_trace.set_metadata(restore_publish_result=dict(publish_result))
+            observed_generation = 0
         else:
-            observed_generation = publish_result
+            publish_result = restore_publisher.publish(restore_plan)
+            if inspect.isawaitable(publish_result):
+                publish_result = await publish_result
+            if isinstance(publish_result, Mapping):
+                observed_generation = publish_result.get(
+                    "generation", publish_result.get("observed_generation", "")
+                )
+                runtime_trace.set_metadata(restore_publish_result=dict(publish_result))
+            else:
+                observed_generation = publish_result
+            # On success, populate the cache so future identical calls skip
+            with _RESTORE_PUBLISH_CACHE_LOCK:
+                _RESTORE_PUBLISH_CACHE[cache_key] = plan_identity
+
         runtime_trace.emit("restore_publish_end", phase="local", metadata={"generation": observed_generation})
     else:
         runtime_trace.emit("restore_publish_end", phase="local", metadata={"status": "not_configured"})
@@ -623,12 +700,16 @@ async def execute_plan(
     # stages/durations at the local merge boundary so Playground/history can
     # expose truthful timing without inventing missing phases. Preserve any
     # fields already supplied by a legacy-compatible remote runtime.
-    if "stages" not in remote_trace:
-        remote_trace["stages"] = dict(
-            merged_trace.to_legacy_timing(
-                prompt_id=str(plan.request_metadata.get("prompt_id", ""))
-            ).get("stages", {})
-        )
+    _legacy_stages = dict(
+        merged_trace.to_legacy_timing(
+            prompt_id=str(plan.request_metadata.get("prompt_id", ""))
+        ).get("stages", {})
+    )
+    if "stages" in remote_trace and remote_trace["stages"]:
+        # Merge: legacy fills gaps, existing remote stages win for exact keys.
+        for _k, _v in remote_trace["stages"].items():
+            _legacy_stages[_k] = _v
+    remote_trace["stages"] = _legacy_stages
     if "deltas_ms" not in remote_trace:
         remote_trace["deltas_ms"] = merged_trace.durations_ms()
     if "trace_version" not in remote_trace:

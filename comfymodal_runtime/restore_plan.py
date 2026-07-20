@@ -156,7 +156,10 @@ def _infer_prompt_role(node: dict[str, Any]) -> str:
         return "negative"
     if "positive" in label:
         return "positive"
-    return ""
+    # Unlabeled CLIPTextEncode nodes default to "positive" so they are
+    # eligible when lane mode is "critical" (the default).  Explicit
+    # positive/negative inference above is preserved.
+    return "positive"
 
 
 def _extract_safe_prefill_bundle(workflow: dict) -> dict[str, Any]:

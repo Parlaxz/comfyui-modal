@@ -10,10 +10,13 @@ All tests import pure helpers via importlib or use unittest.mock.
 No Modal or GPU dependency.
 """
 
+import copy
 import importlib
 import json
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -709,6 +712,577 @@ class TestPerRunFormattingSafe(unittest.TestCase):
         self.assertIn("?ms", line)
         self.assertNotIn("None", line)
         self.assertIn("sampler=", line)
+
+
+# ============================================================================
+# Error response from result poll — immediate termination
+# ============================================================================
+
+
+class TestResultPollErrorResponse(unittest.TestCase):
+    """When result route returns status='error', polling must stop immediately
+    instead of waiting for poll_timeout (default 600s).
+
+    The server-provided error must be recorded in the run result with a clear
+    failure phase/reason, and the error payload must be preserved as an artifact.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mod()
+
+    def setUp(self):
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="bm_e2e_test_"))
+        self._wf_path = self._tmpdir / "test_workflow.json"
+        # Minimal workflow that passes validation in cmd_benchmark
+        wf = {"prompt": {"3": {"class_type": "KSampler", "inputs": {"steps": 20}}}}
+        self._wf_path.write_text(json.dumps(wf), encoding="utf-8")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _make_args(self, **overrides):
+        """Minimal argparse.Namespace for cmd_benchmark.
+
+        Unlike the no-deploy health-failure tests, this uses dry_run=False
+        and a valid workflow path so the benchmark loop actually runs.
+        """
+        base = dict(
+            runs=1, mode="cold", profile_level="summary",
+            sleep_between_runs=10, min_gap_between_runs=10,
+            strict_inter_run_sleep=False, poll_interval=0.25,
+            poll_timeout=600, result_mode="poll",
+            output_format="original", return_mode="full_base64",
+            same_seed=False, same_workflow=False, same_active_profile=False,
+            include_local_materialization=False,
+            write_analysis_pack=False, analysis_pack_include_timelines=False,
+            analysis_pack_include_wall_traces=False,
+            no_deploy=True, dry_run=False, print_cost_warning=False,
+            workflow=str(self._wf_path),
+        )
+        base.update(overrides)
+        return mock.MagicMock(**base, spec=[])
+
+    @staticmethod
+    def _mock_side_effect():
+        """Return a side_effect function that returns error on result poll.
+
+        Returns:
+            A callable suitable as ``mock.Mock(side_effect=...)`` that
+            distinguishes health checks, prompt submit, and result polling
+            by URL and HTTP method.
+        """
+        def side_effect(url, method="GET", payload=None, timeout=300):
+            url_str = url if isinstance(url, str) else str(url)
+            if "health" in url_str:
+                return {"status": "ok"}
+            if method == "POST":
+                return {"prompt_id": "test-prompt-error", "number": 1}
+            if "result" in url_str:
+                return {"status": "error", "error": "modal crashed during inference"}
+            return {}
+        return side_effect
+
+    # ── Tests ──────────────────────────────────────────────────────────────
+
+    @mock.patch("benchmark_modal_e2e._resolve_benchmark_runs_dir")
+    @mock.patch("benchmark_modal_e2e._json_request")
+    def test_error_response_terminates_poll_immediately(self, mock_req, mock_runs_dir):
+        """Error response terminates polling after one response, does not wait 600s."""
+        mock_req.side_effect = self._mock_side_effect()
+        mock_runs_dir.return_value = self._tmpdir
+
+        args = self._make_args()
+
+        start = time.time()
+        rc = self.mod.cmd_benchmark(args)
+        elapsed = time.time() - start
+
+        # Must NOT wait 600s poll_timeout — polling breaks on first error response.
+        # With mocked calls and runs=1 the entire benchmark should finish in < 5s.
+        self.assertLess(
+            elapsed, 30,
+            f"Polling blocked for {elapsed:.1f}s waiting for error response, "
+            "but should have terminated immediately",
+        )
+
+        # Error artifact must be preserved so the user can inspect it.
+        error_artifacts = list(self._tmpdir.rglob("run_0_error_result.json"))
+        self.assertEqual(
+            len(error_artifacts), 1,
+            "Error artifact run_0_error_result.json must exist",
+        )
+        err_data = json.loads(error_artifacts[0].read_text("utf-8"))
+        self.assertEqual(err_data.get("status"), "error")
+        self.assertEqual(
+            err_data.get("error"), "modal crashed during inference",
+            "Server-provided error message must be preserved in artifact",
+        )
+
+    @mock.patch("benchmark_modal_e2e._resolve_benchmark_runs_dir")
+    @mock.patch("benchmark_modal_e2e._json_request")
+    def test_error_response_prints_error_and_does_not_pretend_success(self, mock_req, mock_runs_dir):
+        """Error response must print the server error and not mark the run as successful."""
+        mock_req.side_effect = self._mock_side_effect()
+        mock_runs_dir.return_value = self._tmpdir
+
+        args = self._make_args()
+
+        with mock.patch("builtins.print") as mock_print:
+            rc = self.mod.cmd_benchmark(args)
+            # Flatten all print call args
+            all_prints = " ".join(
+                str(a) for call_args in mock_print.call_args_list
+                for a in call_args[0]
+            )
+
+        self.assertIn(
+            "SERVER ERROR",
+            all_prints,
+            "Must print SERVER ERROR message",
+        )
+        self.assertIn(
+            "modal crashed during inference",
+            all_prints,
+            "Must include the server-provided error message in output",
+        )
+
+
+# ============================================================================
+# Browser timing refresh — stale queue_prompt_start_ms overwritten per run
+# ============================================================================
+
+
+class TestBrowserTimingRefresh(unittest.TestCase):
+    """The per-run payload must strip stale top-level browser timing fields
+    (queue_prompt_start_ms etc.) inherited from the workflow file and set
+    fresh per-run values.  Otherwise coerce_t0_from_browser prefers the
+    stale epoch-ms value over the benchmark's fresh trace.t0_client_press
+    (epoch s), causing every run to flag stale t0.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mod()
+
+    def setUp(self):
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="bm_e2e_bt_"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _make_workflow_with_stale_browser_timing(self) -> Path:
+        """Create a workflow JSON that mimics latest_benchmark_workflow.json
+        with stale browser timing fields at the top level."""
+        wf = {
+            "prompt": {"3": {"class_type": "KSampler", "inputs": {"steps": 20}}},
+            "queue_prompt_start_ms": 1784496125117,   # stale future epoch ms
+            "prompt_fetch_start_ms": 1784496125140,
+            "queue_to_prompt_fetch_ms": 23,
+            "serialized_prompt_bytes": 170701,
+            "t0_client_press_ms": 1784496125117,
+        }
+        path = self._tmpdir / "stale_workflow.json"
+        path.write_text(json.dumps(wf), encoding="utf-8")
+        return path
+
+    def _make_args(self, workflow_path: str, **overrides):
+        base = dict(
+            runs=1, mode="cold", profile_level="summary",
+            sleep_between_runs=10, min_gap_between_runs=10,
+            strict_inter_run_sleep=False, poll_interval=0.25,
+            poll_timeout=600, result_mode="poll",
+            output_format="original", return_mode="full_base64",
+            same_seed=False, same_workflow=False, same_active_profile=False,
+            include_local_materialization=False,
+            write_analysis_pack=False, analysis_pack_include_timelines=False,
+            analysis_pack_include_wall_traces=False,
+            no_deploy=True, dry_run=False, print_cost_warning=False,
+            workflow=workflow_path,
+        )
+        base.update(overrides)
+        return mock.MagicMock(**base, spec=[])
+
+    # ── Tests ──────────────────────────────────────────────────────────────
+
+    @mock.patch("benchmark_modal_e2e._resolve_benchmark_runs_dir")
+    @mock.patch("benchmark_modal_e2e._json_request")
+    def test_stale_browser_timing_overwritten_per_run(self, mock_req, mock_runs_dir):
+        """Workflow with stale queue_prompt_start_ms → fresh per-run values
+        are sent in the POST, not the stale capture."""
+        captured_payloads: list[dict] = []
+
+        def side_effect(url, method="GET", payload=None, timeout=300):
+            url_str = url if isinstance(url, str) else str(url)
+            if "health" in url_str:
+                return {"status": "ok"}
+            if method == "POST":
+                captured_payloads.append(copy.deepcopy(payload))
+                return {"prompt_id": "bt-test-prompt", "number": 1}
+            if "result" in url_str:
+                # Return just enough structure to avoid a crash in the
+                # normal success path (identity extraction, etc.).
+                return {"status": "ok", "result": {"wall_clock_trace": {},
+                                                     "trace": {}}}
+            return {}
+
+        mock_req.side_effect = side_effect
+        mock_runs_dir.return_value = self._tmpdir
+
+        wf_path = self._make_workflow_with_stale_browser_timing()
+        args = self._make_args(str(wf_path))
+
+        self.mod.cmd_benchmark(args)
+
+        self.assertGreater(len(captured_payloads), 0,
+                           "At least one POST must have been made")
+
+        posted = captured_payloads[0]
+
+        # 1. Stale queue_prompt_start_ms must be overwritten
+        stale_value = 1784496125117
+        self.assertNotEqual(
+            posted.get("queue_prompt_start_ms"), stale_value,
+            "Stale queue_prompt_start_ms must be overwritten with a fresh value",
+        )
+        # Fresh value should be a positive int close to current epoch ms
+        now_ms = int(time.time() * 1000)
+        self.assertIsInstance(posted.get("queue_prompt_start_ms"), int)
+        self.assertGreater(posted["queue_prompt_start_ms"], 0)
+        # Must be within 60s of now (any longer indicates stale reuse)
+        self.assertLess(abs(posted["queue_prompt_start_ms"] - now_ms), 60000)
+
+        # 2. prompt_fetch_start_ms must be set (positive int close to now)
+        self.assertIn("prompt_fetch_start_ms", posted)
+        self.assertIsInstance(posted["prompt_fetch_start_ms"], int)
+        self.assertGreater(posted["prompt_fetch_start_ms"], 0)
+        self.assertLess(abs(posted["prompt_fetch_start_ms"] - now_ms), 60000)
+
+        # 3. queue_to_prompt_fetch_ms must be nonnegative (delta)
+        self.assertIn("queue_to_prompt_fetch_ms", posted)
+        self.assertIsInstance(posted["queue_to_prompt_fetch_ms"], (int, float))
+        self.assertGreaterEqual(posted["queue_to_prompt_fetch_ms"], 0)
+
+        # 4. serialized_prompt_bytes must be set and > 0
+        self.assertIn("serialized_prompt_bytes", posted)
+        self.assertIsInstance(posted["serialized_prompt_bytes"], int)
+        self.assertGreater(posted["serialized_prompt_bytes"], 0)
+
+        # 5. Stale prompt_fetch_start_ms / queue_to_prompt_fetch_ms / t0_client_press_ms
+        #    must NOT survive (they were popped before fresh values were set).
+        self.assertNotEqual(posted.get("prompt_fetch_start_ms"), 1784496125140)
+        self.assertNotEqual(posted.get("queue_to_prompt_fetch_ms"), 23)
+        self.assertNotIn("t0_client_press_ms", posted,
+                         "t0_client_press_ms is stripped by _strip_trace_fields")
+
+    @mock.patch("benchmark_modal_e2e._resolve_benchmark_runs_dir")
+    @mock.patch("benchmark_modal_e2e._json_request")
+    def test_fresh_browser_timing_fields_are_present(self, mock_req, mock_runs_dir):
+        """Even when the workflow has NO browser timing, fresh fields are added."""
+        captured_payloads: list[dict] = []
+
+        def side_effect(url, method="GET", payload=None, timeout=300):
+            url_str = url if isinstance(url, str) else str(url)
+            if "health" in url_str:
+                return {"status": "ok"}
+            if method == "POST":
+                captured_payloads.append(copy.deepcopy(payload))
+                return {"prompt_id": "bt-test-prompt", "number": 1}
+            if "result" in url_str:
+                return {"status": "ok", "result": {"wall_clock_trace": {},
+                                                     "trace": {}}}
+            return {}
+
+        mock_req.side_effect = side_effect
+        mock_runs_dir.return_value = self._tmpdir
+
+        # Clean workflow — no stale browser timing at all
+        clean_wf = {"prompt": {"3": {"class_type": "KSampler",
+                                      "inputs": {"steps": 20}}}}
+        wf_path = self._tmpdir / "clean_workflow.json"
+        wf_path.write_text(json.dumps(clean_wf), encoding="utf-8")
+        args = self._make_args(str(wf_path))
+
+        self.mod.cmd_benchmark(args)
+
+        self.assertGreater(len(captured_payloads), 0)
+        posted = captured_payloads[0]
+
+        self.assertIn("queue_prompt_start_ms", posted)
+        self.assertIn("prompt_fetch_start_ms", posted)
+        self.assertIn("queue_to_prompt_fetch_ms", posted)
+        self.assertIn("serialized_prompt_bytes", posted)
+        self.assertGreater(posted["serialized_prompt_bytes"], 0)
+
+
+# ============================================================================
+# Summary metric robustness — numeric strings, sentinels, None → no crash
+# ============================================================================
+
+
+class TestSummaryColdMetricsRobust(unittest.TestCase):
+    """Summary metric aggregation must handle numeric strings, sentinel
+    nonnumeric strings (e.g. "N/A", "unknown"), and None without crashing.
+    statistics.median crashes on str/int mixed types — _safe_float must
+    be applied to every value in the list comprehension."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mod()
+
+    def test_median_with_safe_float_handles_numeric_string(self):
+        """Numeric string '5000' → float via _safe_float → median works."""
+        mod = self.mod
+        runs = [
+            {"cold_warm_label": "cold", "actual_load_saved_ms": "5000"},
+            {"cold_warm_label": "cold", "actual_load_saved_ms": "3000"},
+        ]
+        cold = [r for r in runs if r.get("cold_warm_label", "").startswith("cold")]
+        vals = [mod._safe_float(r.get("actual_load_saved_ms"), 0.0) for r in cold]
+        result = mod._median(vals)
+        self.assertIsInstance(result, float)
+        self.assertEqual(result, 4000.0)
+
+    def test_median_with_safe_float_handles_nonnumeric_sentinel(self):
+        """Nonnumeric sentinel 'N/A' → 0.0 via _safe_float → no crash."""
+        mod = self.mod
+        runs = [
+            {"cold_warm_label": "cold", "actual_load_saved_ms": "5000"},
+            {"cold_warm_label": "cold", "actual_load_saved_ms": "N/A"},
+        ]
+        cold = [r for r in runs if r.get("cold_warm_label", "").startswith("cold")]
+        vals = [mod._safe_float(r.get("actual_load_saved_ms"), 0.0) for r in cold]
+        result = mod._median(vals)
+        self.assertIsInstance(result, float)
+        # 5000.0 and 0.0 → median 2500.0
+        self.assertEqual(result, 2500.0)
+
+    def test_median_with_safe_float_handles_none(self):
+        """None value → 0.0 via _safe_float → no crash."""
+        mod = self.mod
+        runs = [
+            {"cold_warm_label": "cold", "actual_load_saved_ms": None},
+            {"cold_warm_label": "cold", "actual_load_saved_ms": 2000},
+        ]
+        cold = [r for r in runs if r.get("cold_warm_label", "").startswith("cold")]
+        vals = [mod._safe_float(r.get("actual_load_saved_ms"), 0.0) for r in cold]
+        result = mod._median(vals)
+        self.assertIsInstance(result, float)
+        self.assertEqual(result, 1000.0)
+
+    def test_median_with_safe_float_handles_missing_key(self):
+        """Missing dict key → 0.0 via _safe_float → no crash."""
+        mod = self.mod
+        runs = [
+            {"cold_warm_label": "cold"},  # no actual_load_saved_ms key
+            {"cold_warm_label": "cold", "actual_load_saved_ms": 4000},
+        ]
+        cold = [r for r in runs if r.get("cold_warm_label", "").startswith("cold")]
+        vals = [mod._safe_float(r.get("actual_load_saved_ms"), 0.0) for r in cold]
+        result = mod._median(vals)
+        self.assertIsInstance(result, float)
+        self.assertEqual(result, 2000.0)
+
+    def test_cold_summary_does_not_crash_on_mixed_values(self):
+        """The _cold_runs summary block (all metrics) must not crash when
+        actual_load_saved_ms contains a numeric string."""
+        mod = self.mod
+        _cold_runs = [
+            {"cold_warm_label": "cold_restore",
+             "local_button_to_materialized_ms": 10000,
+             "known_nonoverlap_ms": 5000,
+             "submit2entry_ms": 3000,
+             "restore_total_ms": 2000,
+             "pre_sampler_ms": 1000,
+             "unet_node_wait_ms": 800,
+             "unet_load_ms": 750,
+             "exec_model_load_io_ms": 600,
+             "actual_load_saved_ms": "5000",   # numeric string
+             "actual_load_remaining_wait_ms": "N/A",  # nonnumeric sentinel
+             "sampler_ms": 7000,
+             "post_sampler_ms": 500},
+        ]
+        summary = {}
+        # Simulate the exact computation from cmd_benchmark
+        summary["median_cold_actual_load_saved_ms"] = mod._median(
+            [mod._safe_float(r.get("actual_load_saved_ms"), 0.0) for r in _cold_runs])
+        summary["median_cold_actual_load_remaining_wait_ms"] = mod._median(
+            [mod._safe_float(r.get("actual_load_remaining_wait_ms"), 0.0) for r in _cold_runs])
+        summary["median_cold_local_wall_ms"] = mod._median(
+            [mod._safe_float(r.get("local_button_to_materialized_ms"), 0.0) for r in _cold_runs])
+        summary["median_cold_sampler_ms"] = mod._median(
+            [mod._safe_float(r.get("sampler_ms"), 0.0) for r in _cold_runs])
+        # All medians must be numeric — no TypeError from string value
+        self.assertIsInstance(summary["median_cold_actual_load_saved_ms"], float)
+        self.assertIsInstance(summary["median_cold_actual_load_remaining_wait_ms"], float)
+        self.assertIsInstance(summary["median_cold_local_wall_ms"], float)
+        self.assertIsInstance(summary["median_cold_sampler_ms"], float)
+        # actual_load_saved_ms = "5000" → 5000.0
+        self.assertEqual(summary["median_cold_actual_load_saved_ms"], 5000.0)
+        # actual_load_remaining_wait_ms = "N/A" → 0.0
+        self.assertEqual(summary["median_cold_actual_load_remaining_wait_ms"], 0.0)
+
+
+# ============================================================================
+# V2 cold/warm identity extraction and classification
+# ============================================================================
+
+
+class TestV2IdentityExtraction(unittest.TestCase):
+    """extract_run_identity must prefer container_task_id over
+    container_session_id, and per-run restore_session_id from
+    _restore_timing over lifecycle-event fallbacks."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mod()
+
+    # ── container_task_id extraction ───────────────────────────────────
+
+    def test_extract_container_task_id_from_wall_trace(self):
+        """container_task_id in wall_trace is the authoritative source."""
+        result_data = {"wall_clock_trace": {"container_task_id": "task-001"}}
+        wall = result_data["wall_clock_trace"]
+        tid = self.mod.extract_run_identity(result_data, wall, {}, {})
+        self.assertEqual(tid.get("container_task_id"), "task-001")
+        self.assertIn("container_task_id_from_wall_trace",
+                      tid.get("identity_source_notes", []))
+
+    def test_extract_container_task_id_from_timing_trace(self):
+        """Falls back to timing_trace when wall_trace lacks the field."""
+        result_data = {"trace": {"container_task_id": "task-002"}}
+        wall = result_data.get("wall_clock_trace", {})
+        timing = result_data["trace"]
+        tid = self.mod.extract_run_identity(result_data, wall, timing, {})
+        self.assertEqual(tid.get("container_task_id"), "task-002")
+        self.assertIn("container_task_id_from_timing_trace",
+                      tid.get("identity_source_notes", []))
+
+    def test_extract_container_task_id_from_restore_timing(self):
+        """Falls back to _restore_timing when wall/timing traces lack it."""
+        result_data = {"_restore_timing": {"container_task_id": "task-003"}}
+        tid = self.mod.extract_run_identity(result_data, {}, {}, result_data["_restore_timing"])
+        self.assertEqual(tid.get("container_task_id"), "task-003")
+        self.assertIn("container_task_id_from_restore_timing",
+                      tid.get("identity_source_notes", []))
+
+    def test_extract_no_container_task_id_v1_fallback(self):
+        """No container_task_id anywhere → empty string (V1 compat)."""
+        tid = self.mod.extract_run_identity({"trace": {}}, {}, {}, {})
+        self.assertEqual(tid.get("container_task_id"), "")
+
+    # ── restore_session_id priority ───────────────────────────────────
+
+    def test_restore_session_id_prefers_restore_timing(self):
+        """Per-run _restore_timing.restore_session_id beats wall_trace."""
+        result_data = {
+            "_restore_timing": {"restore_session_id": "per-run-rsid"},
+        }
+        wall = {"restore_session_id": "wall-lifecycle-rsid"}
+        tid = self.mod.extract_run_identity(result_data, wall, {}, result_data["_restore_timing"])
+        self.assertEqual(tid.get("restore_session_id"), "per-run-rsid",
+                         "_restore_timing restore_session_id must be preferred")
+
+    def test_restore_session_id_falls_back_to_wall(self):
+        """No _restore_timing → wall_trace restore_session_id is used."""
+        wall = {"restore_session_id": "wall-rsid"}
+        tid = self.mod.extract_run_identity({"trace": {}}, wall, {}, {})
+        self.assertEqual(tid.get("restore_session_id"), "wall-rsid")
+
+
+class TestV2Classification(unittest.TestCase):
+    """classify_run must use container_task_id (MODAL_TASK_ID) for
+    same-container detection when available, not the shared V2
+    container_session_id snapshot."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mod()
+
+    # ── Different task IDs → same_container=False ──────────────────────
+
+    def test_different_task_id_not_same_container(self):
+        """Different container_task_id → same_container=False even when
+        container_session_id matches (V2 snapshot scenario)."""
+        prev = {"container_task_id": "task-a", "container_session_id": "shared-v2",
+                "restore_session_id": "rsid-1", "request_seq": 1, "restore_count": 1,
+                "has_restore_total": True}
+        curr = {"container_task_id": "task-b", "container_session_id": "shared-v2",
+                "restore_session_id": "rsid-2", "request_seq": 1, "restore_count": 1,
+                "has_restore_total": True}
+        _, _, _, _, same_container, _ = self.mod.classify_run(curr, prev, 5000, 4000)
+        self.assertFalse(same_container,
+                         "Different task IDs must NOT be same_container "
+                         "even when container_session_id matches")
+
+    # ── Same task ID → same_container=True ─────────────────────────
+
+    def test_same_task_id_is_same_container(self):
+        """Same container_task_id → same_container=True (warm same container)."""
+        prev = {"container_task_id": "task-a", "container_session_id": "shared-v2",
+                "restore_session_id": "rsid-1", "request_seq": 2, "restore_count": 2,
+                "has_restore_total": True}
+        curr = {"container_task_id": "task-a", "container_session_id": "shared-v2",
+                "restore_session_id": "rsid-1", "request_seq": 3, "restore_count": 2,
+                "has_restore_total": True}
+        _, _, _, _, same_container, _ = self.mod.classify_run(curr, prev, 5, 3)
+        self.assertTrue(same_container,
+                        "Same task ID must be same_container")
+
+    # ── Same task ID + same restore → warm classification ─────────────
+
+    def test_same_task_id_same_restore_is_warm(self):
+        """Same task ID + same restore_session_id + request_seq>1 → warm."""
+        prev = {"container_task_id": "task-a", "container_session_id": "shared-v2",
+                "restore_session_id": "rsid-1", "request_seq": 2, "restore_count": 2,
+                "has_restore_total": True}
+        curr = {"container_task_id": "task-a", "container_session_id": "shared-v2",
+                "restore_session_id": "rsid-1", "request_seq": 3, "restore_count": 2,
+                "has_restore_total": True}
+        label, conf, reasons, _, _, _ = self.mod.classify_run(curr, prev, 5, 3)
+        self.assertTrue(label.startswith("warm"),
+                        f"Same task + same restore must be warm, got {label}")
+        self.assertIn("same_restore_session", ";".join(reasons))
+
+    # ── Different restore → cold even with same task ID ───────────────
+    # (same container but new deployment / new restore session)
+
+    def test_different_restore_is_cold(self):
+        """Different restore_session_id → cold, even if task_id matches."""
+        prev = {"container_task_id": "task-a", "container_session_id": "shared-v2",
+                "restore_session_id": "rsid-1", "request_seq": 2, "restore_count": 2,
+                "has_restore_total": True}
+        curr = {"container_task_id": "task-a", "container_session_id": "shared-v2",
+                "restore_session_id": "rsid-2", "request_seq": 1, "restore_count": 1,
+                "has_restore_total": True}
+        label, conf, reasons, _, _, _ = self.mod.classify_run(curr, prev, 8000, 6000)
+        # rsid different, rc=1 → cold_restore
+        self.assertTrue(label.startswith("cold"),
+                        f"Different restore_session_id must be cold, got {label}")
+
+    # ── No container_task_id → container_session_id fallback (V1 compat) ──
+
+    def test_v1_fallback_same_csid_same_container(self):
+        """No container_task_id → same_container uses container_session_id."""
+        prev = {"container_session_id": "v1-session", "restore_session_id": "rsid-1",
+                "request_seq": 1, "restore_count": 1, "has_restore_total": True}
+        curr = {"container_session_id": "v1-session", "restore_session_id": "rsid-1",
+                "request_seq": 2, "restore_count": 2, "has_restore_total": True}
+        _, _, _, _, same_container, _ = self.mod.classify_run(curr, prev, 5, 3)
+        self.assertTrue(same_container,
+                        "V1 fallback: same container_session_id → same_container=True")
+
+    def test_v1_fallback_diff_csid_not_same_container(self):
+        """No container_task_id → different container_session_id → not same."""
+        prev = {"container_session_id": "v1-session-a", "restore_session_id": "rsid-1",
+                "request_seq": 1, "restore_count": 1, "has_restore_total": True}
+        curr = {"container_session_id": "v1-session-b", "restore_session_id": "rsid-2",
+                "request_seq": 1, "restore_count": 1, "has_restore_total": True}
+        _, _, _, _, same_container, _ = self.mod.classify_run(curr, prev, 8000, 6000)
+        self.assertFalse(same_container,
+                         "V1 fallback: different container_session_id → same_container=False")
 
 
 if __name__ == "__main__":

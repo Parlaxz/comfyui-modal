@@ -5914,7 +5914,12 @@ GPU_PROFILES = {
 SAGEATTENTION_GIT_REF = "v2.2.0"
 SAGEATTENTION_SITE_PACKAGES = "/usr/local/lib/python3.11/site-packages"
 
-
+try:
+    _V2_RUNTIME_REVISION = hashlib.sha256(
+        (Path(__file__).resolve().parent / "comfymodal_runtime" / "modal_app.py").read_bytes()
+    ).hexdigest()[:16]
+except Exception:
+    _V2_RUNTIME_REVISION = "0000000000000000"
 
 _image_base = (
     modal.Image.from_registry(
@@ -6011,6 +6016,7 @@ _image_base = (
                         "COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY": "0",
             "COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "0",
             "COMFYMODAL_RESTORE_BACKGROUND_UNET": "0",
+            "COMFYMODAL_V2_RUNTIME_REVISION": _V2_RUNTIME_REVISION,
         }
     )
 )
@@ -9740,7 +9746,7 @@ class _ComfyAPIMixin:
                                 f"[preload] state=slow_running cancelable=0 action=wait_for_existing_future "
                                 f"session={_preload_session_id}"
                             )
-                            for _f, (_fname, _cache_key, _path) in list(fut_to_item.items()):
+                            for _f, (_fname, _cache_key, _path, _role) in list(fut_to_item.items()):
                                 try:
                                     _consume_preload_future(_f, _fname, _cache_key)
                                 except Exception as exc:
@@ -9770,9 +9776,9 @@ class _ComfyAPIMixin:
                     else:
                         pool.shutdown(wait=True)
             else:
-                # All files already cached GÃ‡Ã¶ just report them
-                for path in file_paths:
-                    filename = os.path.basename(path)
+                # All files already cached — just report them
+                for _item in _normalized_items:
+                    filename = os.path.basename(_item["path"])
                     cached.append(filename)
 
             _total_ms = self._profile_ms(_total_start)
@@ -9786,10 +9792,10 @@ class _ComfyAPIMixin:
                     _slowest_fn = _fn
             if _total_ms > 5000 and _slowest_fn:
                 _slowest_size_gb = 0.0
-                for p in file_paths:
-                    if os.path.basename(p) == _slowest_fn:
+                for _item in _normalized_items:
+                    if os.path.basename(_item["path"]) == _slowest_fn:
                         try:
-                            _slowest_size_gb = os.path.getsize(p) / (1024**3)
+                            _slowest_size_gb = os.path.getsize(_item["path"]) / (1024**3)
                         except OSError:
                             pass
                         break

@@ -6,6 +6,7 @@ No Modal, Torch, ComfyUI server, filesystem, or GPU dependencies.
 import copy
 import hashlib
 import json
+import os
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -492,6 +493,10 @@ def compile_production_workflow(
             for oid in cached_rgthree:
                 if oid in compiled:
                     _try_rewrite_rgthree_comparer(oid, compiled, nid_map, rgthree_rewritten_ids)
+        # ── RES4LYF dummy sampler init disable ────────────────────────
+        res4lyf_disabled_ids, res4lyf_injected_ids = _apply_res4lyf_dummy_sampler_transform(
+            compiled, nid_map,
+        )
         removed_ids = [nid for nid in nid_map if nid not in cached_kept_set]
         duplicate_analysis = {}
         _selected_output_classes = {}
@@ -540,6 +545,8 @@ def compile_production_workflow(
             "bypass_node_ids": list(bypass_ids),
             "direct_output_rewritten_node_ids": rewritten_ids,
             "rgthree_comparer_rewritten_node_ids": rgthree_rewritten_ids,
+            "res4lyf_dummy_sampler_disabled_node_ids": res4lyf_disabled_ids,
+            "res4lyf_options_injected_node_ids": res4lyf_injected_ids,
             "topology_hash": topology_hash,
             "production_plan_hash": production_plan_hash,
             "source_workflow_hash": source_workflow_hash,
@@ -552,6 +559,8 @@ def compile_production_workflow(
             "selected_output_classes": _selected_output_classes,
             "direct_output_rewritten_count": len(rewritten_ids),
             "rgthree_comparer_rewritten_count": len(rgthree_rewritten_ids),
+            "res4lyf_dummy_sampler_disabled_count": len(res4lyf_disabled_ids),
+            "res4lyf_options_injected_count": len(res4lyf_injected_ids),
             "direct_output_rewrite_allowed": allow_direct_output_rewrite,
         }
         compiled_wf = dict(compiled)
@@ -588,6 +597,11 @@ def compile_production_workflow(
         if metadata_mode != "full":
             for oid in output_ids:
                 _try_rewrite_rgthree_comparer(oid, compiled, nid_map, rgthree_rewritten_ids)
+
+    # ── RES4LYF dummy sampler init disable ────────────────────────────
+    res4lyf_disabled_ids, res4lyf_injected_ids = _apply_res4lyf_dummy_sampler_transform(
+        compiled, nid_map,
+    )
 
     removed_ids = [nid for nid in nid_map if nid not in reachable]
     compiled_workflow_hash = _compute_compiled_workflow_hash(compiled)
@@ -653,6 +667,8 @@ def compile_production_workflow(
         "bypass_node_ids": list(bypass_ids),
         "direct_output_rewritten_node_ids": rewritten_ids,
         "rgthree_comparer_rewritten_node_ids": rgthree_rewritten_ids,
+        "res4lyf_dummy_sampler_disabled_node_ids": res4lyf_disabled_ids,
+        "res4lyf_options_injected_node_ids": res4lyf_injected_ids,
         "topology_hash": topology_hash,
         "production_plan_hash": production_plan_hash,
         "source_workflow_hash": source_workflow_hash,
@@ -665,6 +681,8 @@ def compile_production_workflow(
         "selected_output_classes": _selected_output_classes,
         "direct_output_rewritten_count": len(rewritten_ids),
         "rgthree_comparer_rewritten_count": len(rgthree_rewritten_ids),
+        "res4lyf_dummy_sampler_disabled_count": len(res4lyf_disabled_ids),
+        "res4lyf_options_injected_count": len(res4lyf_injected_ids),
         "direct_output_rewrite_allowed": allow_direct_output_rewrite,
     }
     compiled_wf = dict(compiled)
@@ -892,3 +910,121 @@ def _try_rewrite_rgthree_comparer(oid, compiled, nid_map, rewritten_ids):
     }
     rewritten_ids.append(oid)
     return True
+
+
+# ---------------------------------------------------------------------------
+# RES4LYF dummy sampler init disable transform
+# ---------------------------------------------------------------------------
+
+_RES4LYF_SAMPLER_CLASS = "ClownsharKSampler_Beta"
+_RES4LYF_OPTIONS_CLASS = "ClownOptions_ExtraOptions_Beta"
+_RES4LYF_ENV_VAR = "COMFYMODAL_DISABLE_RES4LYF_DUMMY_SAMPLER_INIT"
+_RES4LYF_ID_OFFSET = 100000
+
+
+def _apply_res4lyf_dummy_sampler_transform(compiled, nid_map):
+    """Inject ``ClownOptions_ExtraOptions_Beta`` nodes with
+    ``extra_options: "disable_dummy_sampler_init"`` into compiled workflow.
+
+    For each ``ClownsharKSampler_Beta`` node in *compiled*, this transform:
+
+    1. Creates a ``ClownOptions_ExtraOptions_Beta`` node whose ``extra_options``
+       input is set to ``"disable_dummy_sampler_init"``.
+    2. If the sampler already has an ``options`` connection from another node,
+       that existing connection is chained through the injected node's
+       ``options`` input so existing options are preserved.
+    3. The injected node's OPTIONS output is connected to the sampler's
+       ``options`` input, ensuring the dummy sampler init guard is in place.
+
+    The transform is gated by ``COMFYMODAL_DISABLE_RES4LYF_DUMMY_SAMPLER_INIT``
+    (default ``1``). Set the env var to ``0`` to skip the transform entirely.
+
+    Idempotence
+    -----------
+    If the sampler's ``options`` input already connects to a
+    ``ClownOptions_ExtraOptions_Beta`` whose ``extra_options`` contains the
+    string ``"disable_dummy_sampler_init"``, the node is left untouched.
+
+    Deterministic IDs
+    -----------------
+    Injected node IDs are computed as ``str(_RES4LYF_ID_OFFSET + int(nid))``,
+    with collision-safe bumping.  The same source workflow always yields the
+    same injected IDs.
+
+    Parameters
+    ----------
+    compiled : OrderedDict
+        Compiled (mutable) workflow being built by ``compile_production_workflow``.
+    nid_map : OrderedDict
+        Normalised ID → original key map.
+
+    Returns
+    -------
+    tuple[list[str], list[str]]
+        ``(disabled_sampler_ids, injected_options_ids)`` — lists of node IDs
+        that were patched and the corresponding injected options nodes.
+    """
+    env_val = os.environ.get(_RES4LYF_ENV_VAR, "1")
+    if env_val == "0":
+        return [], []
+
+    disabled_ids = []
+    injected_ids = []
+
+    for sampler_id in list(compiled.keys()):
+        node = compiled[sampler_id]
+        if node.get("class_type") != _RES4LYF_SAMPLER_CLASS:
+            continue
+
+        inputs = node.get("inputs", {})
+        current_options = inputs.get("options") if isinstance(inputs, dict) else None
+
+        # ── Idempotence: already patched? ──────────────────────────────
+        if _is_connection(current_options):
+            conn_id = str(current_options[0]).strip()
+            if conn_id in compiled:
+                conn_node = compiled[conn_id]
+                if conn_node.get("class_type") == _RES4LYF_OPTIONS_CLASS:
+                    conn_extra = conn_node.get("inputs", {}).get("extra_options", "")
+                    if "disable_dummy_sampler_init" in str(conn_extra):
+                        continue  # already patched
+
+        # ── Deterministic injected node ID ─────────────────────────────
+        try:
+            base = int(sampler_id)
+        except (ValueError, TypeError):
+            # Deterministic fallback for non-numeric IDs (shouldn't occur in
+            # practice).  Uses hashlib.md5 instead of Python's randomized
+            # hash() so the same sampler_id always yields the same base.
+            base = int(hashlib.md5(sampler_id.encode("utf-8")).hexdigest()[:8], 16) % 1000000
+
+        injected_id = str(base + _RES4LYF_ID_OFFSET)
+
+        # Collision safety: bump until unique
+        while injected_id in compiled or injected_id in disabled_ids:
+            base += 1
+            injected_id = str(base + _RES4LYF_ID_OFFSET)
+
+        # ── Build injected node ────────────────────────────────────────
+        injected_inputs = {"extra_options": "disable_dummy_sampler_init"}
+
+        # Chain existing options connection through injected node
+        if _is_connection(current_options):
+            injected_inputs["options"] = current_options
+
+        compiled[injected_id] = {
+            "class_type": _RES4LYF_OPTIONS_CLASS,
+            "inputs": injected_inputs,
+        }
+
+        # Connect injected OPTIONS output (slot 0) to sampler options input.
+        # Must be a two-element list (ComfyUI JSON/API convention), NOT a
+        # tuple — RES4LYF's OptionsManager calls .items() on the resolved
+        # options dict, and a tuple would propagate as-is in the native
+        # compiled dict and fail with ``'tuple' object has no attribute 'items'``.
+        inputs["options"] = [injected_id, 0]
+
+        disabled_ids.append(sampler_id)
+        injected_ids.append(injected_id)
+
+    return disabled_ids, injected_ids
