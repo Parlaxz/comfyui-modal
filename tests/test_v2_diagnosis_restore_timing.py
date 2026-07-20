@@ -11,6 +11,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan
 from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
 from comfymodal_runtime.runtime_executor import ExecutionContext
@@ -26,6 +28,21 @@ _MS_HOOK.start()
 # Similarly patch configure_manager_offline to avoid env var side effects
 _CM_HOOK = patch("comfymodal_runtime.runtime_bootstrap.configure_manager_offline", return_value={})
 _CM_HOOK.start()
+
+
+@pytest.fixture(autouse=True)
+def _reset_module_level_counters():
+    """Reset module-level counters before each test to prevent cross-test leakage.
+
+    Production semantics are preserved at module scope — this fixture only
+    ensures each test sees a fresh baseline so assertions like
+    ``restore_count == 1`` are not affected by earlier tests.
+    """
+    import comfymodal_runtime.modal_app as _ma
+    _ma._v2_container_restore_count = 0
+    _ma._LATEST_LIFECYCLE_TIMING = None
+    # Also reset the restore_count on any cached entrypoint instances
+    yield
 
 
 # ═══════════════════════════════════════════════════════════════════════════

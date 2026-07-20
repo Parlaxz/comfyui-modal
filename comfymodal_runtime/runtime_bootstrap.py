@@ -2,16 +2,28 @@
 
 from __future__ import annotations
 
+import configparser
 import contextlib
+import logging
 import os
 import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .trace import RuntimeTrace
+
+_log = logging.getLogger(__name__)
+
+# Three known ComfyUI-Manager config.ini locations (relative to comfyui_root).
+_MANAGER_CONFIG_PATHS: tuple[str, ...] = (
+    "user/__manager/config.ini",
+    "user/default/__manager/config.ini",
+    "user/default/ComfyUI-Manager/config.ini",
+)
 
 
 @dataclass(frozen=True)
@@ -68,7 +80,55 @@ def ensure_models_symlink(models_path: str, comfyui_root: str) -> str:
     return str(destination)
 
 
-def configure_manager_offline(environ: dict[str, str] | None = None) -> dict[str, str]:
+def _write_manager_config_ini(path: Path) -> None:
+    """Write ``[default] network_mode = offline`` preserving all existing sections.
+
+    Uses ``ConfigParser(strict=False)`` to tolerate duplicate sections, and an
+    atomic temp-file + ``os.replace`` to avoid partial writes.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = configparser.ConfigParser(strict=False)
+    # Read the existing file (if any) into the parser.
+    parser.read([str(path)], encoding="utf-8")
+    if not parser.has_section("default"):
+        parser.add_section("default")
+    parser.set("default", "network_mode", "offline")
+
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".config_tmp_", suffix=".ini", text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            parser.write(fh)
+        os.replace(tmp_name, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def configure_manager_offline(
+    comfyui_root: str,
+    environ: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Set environment hints *and* write ``config.ini`` files so ComfyUI-Manager
+    stays offline even when it reads config before checking environment variables.
+
+    Parameters
+    ----------
+    comfyui_root:
+        Absolute path to the ComfyUI root directory (e.g. ``/root/comfy/ComfyUI``).
+    environ:
+        Optional environment mapping (defaults to ``os.environ``).  Keys are set
+        via ``setdefault`` so caller pre-sets are honoured.
+
+    Returns
+    -------
+    Dict of the environment changes applied (always ``{"COMFYUI_MANAGER_MODE": "offline",
+    "COMFYUI_MANAGER_NETWORK_MODE": "offline"}``).
+    """
     target = environ if environ is not None else os.environ
     changes = {
         "COMFYUI_MANAGER_MODE": "offline",
@@ -76,6 +136,16 @@ def configure_manager_offline(environ: dict[str, str] | None = None) -> dict[str
     }
     for key, value in changes.items():
         target.setdefault(key, value)
+
+    written: list[str] = []
+    root = Path(comfyui_root)
+    for rel_path in _MANAGER_CONFIG_PATHS:
+        cfg = root / rel_path
+        _write_manager_config_ini(cfg)
+        written.append(str(cfg))
+
+    _log.info("Manager offline config applied to %s", "; ".join(written))
+    print("[v2.manager] network_mode=offline configs=%d" % len(written), flush=True)
     return changes
 
 
@@ -153,7 +223,7 @@ class RuntimeBootstrap:
             if trace:
                 trace.emit("manager_offline_start", phase="startup")
             if self.config.manager_offline:
-                configure_manager_offline()
+                configure_manager_offline(self.config.comfyui_root)
             if trace:
                 trace.emit("manager_offline_end", phase="startup")
 

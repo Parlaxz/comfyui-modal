@@ -16,6 +16,7 @@ from comfymodal_runtime.restore_plan import (
     _build_dual_clip_identity,
     _extract_model_references,
     _extract_prompt_texts,
+    _infer_prompt_role,
     derive_model_key,
     derive_prefill_key,
     RestorePlanPublisher,
@@ -380,6 +381,147 @@ class TestDerivePrefillKey(unittest.TestCase):
         self.assertEqual(pa.model_key.stable_hash, pb.model_key.stable_hash)
         self.assertTrue(pa.encode_options["eligible"])
         self.assertNotEqual(pa.stable_hash, pb.stable_hash)
+
+
+# ---------------------------------------------------------------------------
+# _infer_prompt_role — default positive for unlabeled, explicit
+# positive/negative preserved
+# ---------------------------------------------------------------------------
+
+class TestInferPromptRole(unittest.TestCase):
+    """Verify _infer_prompt_role returns correct role strings.
+
+    Unlabeled CLIPTextEncode nodes (no "positive" or "negative" in title)
+    must default to "positive" so they are eligible when lane mode is
+    "critical" (the default).  Explicit "positive" or "negative" in the
+    title must still be respected.
+    """
+
+    def test_explicit_positive_in_title(self):
+        node = {"title": "positive", "class_type": "CLIPTextEncode"}
+        self.assertEqual(_infer_prompt_role(node), "positive")
+
+    def test_explicit_positive_in_meta(self):
+        node = {"class_type": "CLIPTextEncode", "_meta": {"title": "positive"}}
+        self.assertEqual(_infer_prompt_role(node), "positive")
+
+    def test_explicit_negative_in_title(self):
+        node = {"title": "negative", "class_type": "CLIPTextEncode"}
+        self.assertEqual(_infer_prompt_role(node), "negative")
+
+    def test_explicit_negative_in_meta(self):
+        node = {"class_type": "CLIPTextEncode", "_meta": {"title": "negative"}}
+        self.assertEqual(_infer_prompt_role(node), "negative")
+
+    def test_negative_takes_precedence_over_positive(self):
+        """When both words appear, "negative" wins (conservative default)."""
+        node = {"title": "negative positive", "class_type": "CLIPTextEncode"}
+        self.assertEqual(_infer_prompt_role(node), "negative")
+
+    def test_unlabeled_defaults_positive(self):
+        """A CLIPTextEncode without positive/negative in title defaults to positive."""
+        node = {"class_type": "CLIPTextEncode", "title": "CLIP Text Encode"}
+        self.assertEqual(_infer_prompt_role(node), "positive")
+
+    def test_unlabeled_no_title_defaults_positive(self):
+        """A CLIPTextEncode with no title at all defaults to positive."""
+        node = {"class_type": "CLIPTextEncode"}
+        self.assertEqual(_infer_prompt_role(node), "positive")
+
+    def test_unlabeled_empty_title_defaults_positive(self):
+        """A CLIPTextEncode with empty title defaults to positive."""
+        node = {"class_type": "CLIPTextEncode", "title": ""}
+        self.assertEqual(_infer_prompt_role(node), "positive")
+
+    def test_unlabeled_via_name_defaults_positive(self):
+        """A node with a name (not title) but no positive/negative defaults positive."""
+        node = {"class_type": "CLIPTextEncode", "name": "EncodePrompt"}
+        self.assertEqual(_infer_prompt_role(node), "positive")
+
+    def test_unlabeled_via_name_negative_explicit(self):
+        """'negative' in name is still respected."""
+        node = {"class_type": "CLIPTextEncode", "name": "NegativePrompt"}
+        self.assertEqual(_infer_prompt_role(node), "negative")
+
+
+class TestPrefillBundleRoleIntegration(unittest.TestCase):
+    """Verify that the derived prefill bundle retains exact text/clip
+    identity and correct role for unlabeled CLIPTextEncode entries."""
+
+    def test_unlabeled_encode_gets_positive_role_in_bundle(self):
+        """An unlabeled CLIPTextEncode must get role='positive' in the bundle."""
+        workflow = {
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors", "type": "flux"}},
+            "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "a dog", "clip": ["2", 0]}},
+        }
+        model_key = derive_model_key(workflow)
+        prefill_key = derive_prefill_key(model_key, workflow)
+        self.assertTrue(prefill_key.encode_options["eligible"])
+        encodes = prefill_key.encode_options["encodes"]
+        self.assertEqual(len(encodes), 1)
+        entry = encodes[0]
+        self.assertEqual(entry["role"], "positive",
+                         "Unlabeled CLIPTextEncode must default to positive role")
+        self.assertEqual(entry["text"], "a dog",
+                         "Text identity must be preserved")
+        self.assertEqual(entry["clip_connection"], ("2", 0),
+                         "CLIP connection must be preserved")
+        self.assertEqual(entry["node_class"], "CLIPTextEncode")
+        self.assertEqual(entry["node_id"], "6")
+
+    def test_negative_title_encode_gets_negative_role_in_bundle(self):
+        """A CLIPTextEncode with 'negative' in title gets role='negative'."""
+        workflow = {
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors", "type": "flux"}},
+            "7": {"class_type": "CLIPTextEncode", "title": "negative",
+                  "inputs": {"text": "bad stuff", "clip": ["2", 0]}},
+        }
+        model_key = derive_model_key(workflow)
+        prefill_key = derive_prefill_key(model_key, workflow)
+        self.assertTrue(prefill_key.encode_options["eligible"])
+        encodes = prefill_key.encode_options["encodes"]
+        self.assertEqual(len(encodes), 1)
+        entry = encodes[0]
+        self.assertEqual(entry["role"], "negative",
+                         "Explicit 'negative' title must yield negative role")
+        self.assertEqual(entry["text"], "bad stuff")
+
+    def test_positive_title_encode_gets_positive_role_in_bundle(self):
+        """A CLIPTextEncode with 'positive' in title gets role='positive'."""
+        workflow = {
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors", "type": "flux"}},
+            "8": {"class_type": "CLIPTextEncode", "title": "positive",
+                  "inputs": {"text": "good stuff", "clip": ["2", 0]}},
+        }
+        model_key = derive_model_key(workflow)
+        prefill_key = derive_prefill_key(model_key, workflow)
+        self.assertTrue(prefill_key.encode_options["eligible"])
+        encodes = prefill_key.encode_options["encodes"]
+        self.assertEqual(len(encodes), 1)
+        entry = encodes[0]
+        self.assertEqual(entry["role"], "positive",
+                         "Explicit 'positive' title must yield positive role")
+        self.assertEqual(entry["text"], "good stuff")
+
+    def test_mixed_positive_and_unlabeled_produces_two_entries(self):
+        """Both a positive-titled and an unlabeled encode are included with correct roles."""
+        workflow = {
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors", "type": "flux"}},
+            "6": {"class_type": "CLIPTextEncode",
+                  "inputs": {"text": "a dog", "clip": ["2", 0]}},
+            "7": {"class_type": "CLIPTextEncode", "title": "negative",
+                  "inputs": {"text": "a cat", "clip": ["2", 0]}},
+        }
+        model_key = derive_model_key(workflow)
+        prefill_key = derive_prefill_key(model_key, workflow)
+        self.assertTrue(prefill_key.encode_options["eligible"])
+        encodes = prefill_key.encode_options["encodes"]
+        self.assertEqual(len(encodes), 2)
+        roles = {e["node_id"]: e["role"] for e in encodes}
+        self.assertEqual(roles["6"], "positive",
+                         "Unlabeled node_id=6 must default to positive")
+        self.assertEqual(roles["7"], "negative",
+                         "Negative-titled node_id=7 must be negative")
 
 
 # ---------------------------------------------------------------------------

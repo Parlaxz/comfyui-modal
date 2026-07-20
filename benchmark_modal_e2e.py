@@ -596,7 +596,24 @@ def extract_run_identity(result_data: dict, wall_trace: dict, timing_trace: dict
 
     trace_id = wall_trace.get("trace_id") or _get("trace.restore.restore_session_id") or _get("_wall_clock_summary.trace_id")
     prompt_id = timing_trace.get("prompt_id") or result_data.get("prompt_id")
-    restore_session_id = wall_trace.get("restore_session_id") or timing_trace.get("restore_session_id") or _get("trace.restore.restore_session_id") or restore_timing.get("restore_session_id")
+    # Per-run restore_session_id from _restore_timing is authoritative in V2;
+    # avoid stale lifecycle event fallbacks when the per-run source is present.
+    restore_session_id = (restore_timing.get("restore_session_id")
+                         or wall_trace.get("restore_session_id")
+                         or timing_trace.get("restore_session_id")
+                         or _get("trace.restore.restore_session_id")
+                         or "")
+    # container_task_id (MODAL_TASK_ID) is the authoritative per-container
+    # identifier in V2.  V2's _V2_CONTAINER_SESSION_ID is snapshotted at
+    # module import and identical across fresh containers — never authoritative.
+    # Prefer wall_trace (outermost capture), then timing_trace, then nested
+    # metadata, then _restore_timing, then fall back to container_session_id.
+    container_task_id = (wall_trace.get("container_task_id")
+                        or timing_trace.get("container_task_id")
+                        or _get("trace.metadata.container_task_id",
+                                "wall_clock_trace.container_task_id")
+                        or restore_timing.get("container_task_id")
+                        or "")
     container_session_id = wall_trace.get("container_session_id") or timing_trace.get("container_session_id") or _get("trace.restore.container_session_id") or restore_timing.get("container_session_id")
     snapshot_import_session_id = _get("trace.restore.snapshot_import_session_id") or restore_timing.get("snapshot_import_session_id") or wall_trace.get("snapshot_import_session_id")
     restore_count_raw = wall_trace.get("restore_count") or timing_trace.get("restore_count") or _get("trace.restore.restore_count") or restore_timing.get("restore_count")
@@ -612,10 +629,17 @@ def extract_run_identity(result_data: dict, wall_trace: dict, timing_trace: dict
         notes.append("restore_session_id_from_nested_restore")
     if not timing_trace.get("request_sequence_id") and wall_trace.get("request_seq"):
         notes.append("request_seq_from_wall_trace")
+    if wall_trace.get("container_task_id"):
+        notes.append("container_task_id_from_wall_trace")
+    elif timing_trace.get("container_task_id"):
+        notes.append("container_task_id_from_timing_trace")
+    elif restore_timing.get("container_task_id"):
+        notes.append("container_task_id_from_restore_timing")
     return {
         "trace_id": trace_id or "",
         "request_id": prompt_id or "",
         "restore_session_id": restore_session_id or "",
+        "container_task_id": container_task_id or "",
         "container_session_id": container_session_id or "",
         "snapshot_import_session_id": snapshot_import_session_id or "",
         "restore_count": restore_count,
@@ -637,13 +661,23 @@ def classify_run(identity: dict, prev_identity: dict | None, submit2entry_ms: fl
     rcount = identity.get("restore_count", 0)
     rsid = identity.get("restore_session_id", "")
     csid = identity.get("container_session_id", "")
+    ctid = identity.get("container_task_id", "") or ""
     has_restore = identity.get("has_restore_total", False)
     rseq_missing = rseq == 0 and bool(rsid)
     same_restore = False
     same_container = False
     if prev_identity:
         same_restore = bool(rsid) and rsid == prev_identity.get("restore_session_id")
-        same_container = bool(csid) and csid == prev_identity.get("container_session_id")
+        # container_task_id (MODAL_TASK_ID) is authoritative in V2.
+        # V2's _V2_CONTAINER_SESSION_ID is snapshotted at module import
+        # and identical across fresh containers, so container_session_id
+        # must NOT be authoritative when container_task_id is available.
+        # When task ID is unavailable, fall back to container_session_id.
+        prev_ctid = prev_identity.get("container_task_id", "") or ""
+        if bool(ctid) and bool(prev_ctid):
+            same_container = ctid == prev_ctid
+        else:
+            same_container = bool(csid) and csid == prev_identity.get("container_session_id")
 
     if identity.get("failure_phase"):
         return ("failed", "high", ["explicit_failure"], False, False, False)
@@ -848,16 +882,16 @@ def write_summary_md(runs: list[dict], summary: dict, path: Path) -> None:
                    f"- cold_unet_early_load_enabled: {summary.get('cold_unet_early_load_enabled', False)}",
                    f"- cold_unet_early_load_mode: {summary.get('cold_unet_early_load_mode', 'N/A')}",
                    f"- cold_runs: {summary.get('cold_count', 0)}",
-                   f"- median_cold_local_wall_ms: {_median([r.get('local_button_to_materialized_ms') or 0 for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
-                   f"- median_cold_known_nonoverlap_ms: {_median([r.get('known_nonoverlap_ms') or 0 for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
-                   f"- median_cold_submit2entry_ms: {_median([r.get('submit2entry_ms') or 0 for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
-                   f"- median_cold_restore_ms: {_median([r.get('restore_total_ms') or 0 for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
-                   f"- median_cold_pre_sampler_ms: {_median([r.get('pre_sampler_ms') or 0 for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
-                   f"- median_cold_unet_wait_ms: {_median([r.get('unet_node_wait_ms') or 0 for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
-                   f"- median_cold_exec_model_load_io_ms: {_median([r.get('exec_model_load_io_ms') or 0 for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
-                   f"- median_cold_actual_load_saved_ms: {_median([r.get('actual_load_saved_ms') or 0 for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
-                   f"- median_cold_actual_load_remaining_wait_ms: {_median([r.get('actual_load_remaining_wait_ms') or 0 for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
-                   f"- median_cold_unet_overlap_ms: {_median([r.get('cold_unet_overlap_ms') or 0 for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
+                   f"- median_cold_local_wall_ms: {_median([_safe_float(r.get('local_button_to_materialized_ms'), 0.0) for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
+                   f"- median_cold_known_nonoverlap_ms: {_median([_safe_float(r.get('known_nonoverlap_ms'), 0.0) for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
+                   f"- median_cold_submit2entry_ms: {_median([_safe_float(r.get('submit2entry_ms'), 0.0) for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
+                   f"- median_cold_restore_ms: {_median([_safe_float(r.get('restore_total_ms'), 0.0) for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
+                   f"- median_cold_pre_sampler_ms: {_median([_safe_float(r.get('pre_sampler_ms'), 0.0) for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
+                   f"- median_cold_unet_wait_ms: {_median([_safe_float(r.get('unet_node_wait_ms'), 0.0) for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
+                   f"- median_cold_exec_model_load_io_ms: {_median([_safe_float(r.get('exec_model_load_io_ms'), 0.0) for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
+                   f"- median_cold_actual_load_saved_ms: {_median([_safe_float(r.get('actual_load_saved_ms'), 0.0) for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
+                   f"- median_cold_actual_load_remaining_wait_ms: {_median([_safe_float(r.get('actual_load_remaining_wait_ms'), 0.0) for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
+                   f"- median_cold_unet_overlap_ms: {_median([_safe_float(r.get('cold_unet_overlap_ms'), 0.0) for r in runs if (r.get('cold_warm_label','') or '').startswith('cold')]) if any((r.get('cold_warm_label','') or '').startswith('cold') for r in runs) else 'N/A'}",
                    f"- duplicate_unet_read_detected_count: {summary.get('duplicate_unet_read_detected_count', 0)}",
                    f"- cold_unet_volume_stall_count: {summary.get('cold_unet_volume_stall_count', 0)}",
                    f"- degraded_cold_run_count: {summary.get('degraded_cold_run_count', 0)}",
@@ -2102,9 +2136,16 @@ def cmd_benchmark(args: argparse.Namespace, effective_config: dict | None = None
     workflow = args.workflow
     workflow_dict = json.loads(Path(workflow).read_text("utf-8"))
     if isinstance(workflow_dict, dict):
-        payload_raw = workflow_dict.get("payload") or workflow_dict.get("prompt") or workflow_dict
+        outer_workflow = workflow_dict
+        payload_raw = outer_workflow.get("payload") or outer_workflow.get("prompt") or outer_workflow
         if isinstance(payload_raw, dict):
-            workflow_dict = payload_raw
+            if "prompt" in payload_raw:
+                workflow_dict = payload_raw
+            else:
+                workflow_dict = {"prompt": payload_raw}
+                for key in ("modal_options", "_production_trace"):
+                    if key in outer_workflow:
+                        workflow_dict[key] = outer_workflow[key]
     workflow_hash = _json_hash(workflow_dict)
     print(f"  Workflow loaded. Hash: {workflow_hash[:16]}\n")
 
@@ -2138,6 +2179,23 @@ def cmd_benchmark(args: argparse.Namespace, effective_config: dict | None = None
             payload["modal_options"]["benchmark_effective_config"] = effective_config
             payload["modal_options"]["runtime"] = effective_config.get("runtime", {})
             payload["modal_options"]["preset"] = effective_config.get("preset", "")
+
+        # ── Refresh browser timing diagnostics per run ──────────────────
+        # The workflow file (latest_benchmark_workflow.json) may contain
+        # stale top-level browser timing fields (queue_prompt_start_ms epoch
+        # ms, prompt_fetch_start_ms, etc.) from a previous capture.
+        # The server's coerce_t0_from_browser prefers these over the
+        # benchmark's trace.t0_client_press (epoch s), causing every run
+        # to be flagged as stale t0.  Strip stale values and set fresh
+        # per-run measurements so the server sees the correct baseline.
+        for _k in ("queue_prompt_start_ms", "prompt_fetch_start_ms",
+                   "queue_to_prompt_fetch_ms", "serialized_prompt_bytes"):
+            payload.pop(_k, None)
+        payload["queue_prompt_start_ms"] = int(t_start * 1000)
+        _fetch_ms = int(time.time() * 1000)
+        payload["prompt_fetch_start_ms"] = _fetch_ms
+        payload["queue_to_prompt_fetch_ms"] = max(0, _fetch_ms - int(t_start * 1000))
+        payload["serialized_prompt_bytes"] = len(json.dumps(payload, default=str))
 
         record_harness_ts(ht, "benchmark_submit_start")
         submit_ok = False
@@ -2190,6 +2248,10 @@ def cmd_benchmark(args: argparse.Namespace, effective_config: dict | None = None
                     result = rr
                     poll_success += 1
                     break
+                if rr.get("status") == "error":
+                    result = rr
+                    poll_error += 1
+                    break
             except Exception:
                 poll_error += 1
                 pass
@@ -2207,6 +2269,24 @@ def cmd_benchmark(args: argparse.Namespace, effective_config: dict | None = None
             rr = {"run_index": run_idx, "cold_warm_label": "failed", "failure_phase": "poll",
                   "failure_reason": "timeout", "local_button_to_materialized_ms": local_wall_ms}
             runs.append(rr)
+            if strict_gap and run_idx < num_runs - 1:
+                record_harness_ts(ht, "benchmark_sleep_start")
+                time.sleep(sleep_between)
+                record_harness_ts(ht, "benchmark_sleep_end")
+            continue
+
+        if result.get("status") == "error":
+            error_msg = result.get("error") or result.get("message") or "unknown server error"
+            print(f"    SERVER ERROR: {error_msg}", flush=True)
+            rr = {"run_index": run_idx, "cold_warm_label": "failed", "failure_phase": "poll",
+                  "failure_reason": f"server_error: {error_msg}",
+                  "local_button_to_materialized_ms": local_wall_ms}
+            runs.append(rr)
+            try:
+                (raw_dir / f"run_{run_idx}_error_result.json").write_text(
+                    json.dumps(result, default=str, indent=2), encoding="utf-8")
+            except Exception:
+                pass
             if strict_gap and run_idx < num_runs - 1:
                 record_harness_ts(ht, "benchmark_sleep_start")
                 time.sleep(sleep_between)
@@ -2305,6 +2385,7 @@ def cmd_benchmark(args: argparse.Namespace, effective_config: dict | None = None
             "request_id": identity.get("request_id", ""),
             "workflow_hash": workflow_hash,
             "benchmark_run_id": f"{benchmark_session_id}_run_{run_idx}",
+            "container_task_id": identity.get("container_task_id", ""),
             "container_session_id": identity.get("container_session_id", ""),
             "snapshot_import_session_id": identity.get("snapshot_import_session_id", ""),
             "restore_session_id": identity.get("restore_session_id", ""),
@@ -2653,18 +2734,18 @@ def cmd_benchmark(args: argparse.Namespace, effective_config: dict | None = None
     summary["comparison_valid"] = _preset_assertions_passed and not any(r.get("cold_warm_label", "").startswith("warm") for r in runs)
     summary["comparison_valid_reason"] = "" if summary["comparison_valid"] else "warm_run_in_cold_preset" if summary.get("warm_count", 0) > 0 else "preset_assertions_failed"
     if _cold_runs:
-        summary["median_cold_local_wall_ms"] = _median([r.get("local_button_to_materialized_ms") or 0 for r in _cold_runs])
-        summary["median_cold_known_nonoverlap_ms"] = _median([r.get("known_nonoverlap_ms") or 0 for r in _cold_runs])
-        summary["median_cold_submit2entry_ms"] = _median([r.get("submit2entry_ms") or 0 for r in _cold_runs])
-        summary["median_cold_restore_ms"] = _median([r.get("restore_total_ms") or 0 for r in _cold_runs])
-        summary["median_cold_pre_sampler_ms"] = _median([r.get("pre_sampler_ms") or 0 for r in _cold_runs])
-        summary["median_cold_unet_wait_ms"] = _median([r.get("unet_node_wait_ms") or r.get("unet_load_ms") or 0 for r in _cold_runs])
-        summary["median_cold_unet_load_ms"] = _median([r.get("unet_load_ms") or 0 for r in _cold_runs])
-        summary["median_cold_exec_model_load_io_ms"] = _median([r.get("exec_model_load_io_ms") or 0 for r in _cold_runs])
-        summary["median_cold_actual_load_saved_ms"] = _median([r.get("actual_load_saved_ms") or 0 for r in _cold_runs])
-        summary["median_cold_actual_load_remaining_wait_ms"] = _median([r.get("actual_load_remaining_wait_ms") or 0 for r in _cold_runs])
-        summary["median_cold_sampler_ms"] = _median([r.get("sampler_ms") or 0 for r in _cold_runs])
-        summary["median_cold_post_sampler_ms"] = _median([r.get("post_sampler_ms") or 0 for r in _cold_runs])
+        summary["median_cold_local_wall_ms"] = _median([_safe_float(r.get("local_button_to_materialized_ms"), 0.0) for r in _cold_runs])
+        summary["median_cold_known_nonoverlap_ms"] = _median([_safe_float(r.get("known_nonoverlap_ms"), 0.0) for r in _cold_runs])
+        summary["median_cold_submit2entry_ms"] = _median([_safe_float(r.get("submit2entry_ms"), 0.0) for r in _cold_runs])
+        summary["median_cold_restore_ms"] = _median([_safe_float(r.get("restore_total_ms"), 0.0) for r in _cold_runs])
+        summary["median_cold_pre_sampler_ms"] = _median([_safe_float(r.get("pre_sampler_ms"), 0.0) for r in _cold_runs])
+        summary["median_cold_unet_wait_ms"] = _median([_safe_float(r.get("unet_node_wait_ms")) or _safe_float(r.get("unet_load_ms"), 0.0) for r in _cold_runs])
+        summary["median_cold_unet_load_ms"] = _median([_safe_float(r.get("unet_load_ms"), 0.0) for r in _cold_runs])
+        summary["median_cold_exec_model_load_io_ms"] = _median([_safe_float(r.get("exec_model_load_io_ms"), 0.0) for r in _cold_runs])
+        summary["median_cold_actual_load_saved_ms"] = _median([_safe_float(r.get("actual_load_saved_ms"), 0.0) for r in _cold_runs])
+        summary["median_cold_actual_load_remaining_wait_ms"] = _median([_safe_float(r.get("actual_load_remaining_wait_ms"), 0.0) for r in _cold_runs])
+        summary["median_cold_sampler_ms"] = _median([_safe_float(r.get("sampler_ms"), 0.0) for r in _cold_runs])
+        summary["median_cold_post_sampler_ms"] = _median([_safe_float(r.get("post_sampler_ms"), 0.0) for r in _cold_runs])
 
     # Write output files
     write_runs_csv(runs, out_dir / "runs.csv")

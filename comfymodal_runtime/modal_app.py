@@ -16,13 +16,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, ContextManager, Mapping, cast
 
-from .contracts import ExecutionPlan, RestorePlan, _thaw, stable_hash
+from .contracts import DeploymentIdentity, ExecutionPlan, RestorePlan, _thaw, stable_hash
 from .deployment_spec import build_deployment_identity
 from .restore_plan import RestorePlanPublisher
 from .runtime_bootstrap import BootstrapConfig, RuntimeBootstrap
 from .runtime_executor import ExecutionContext, RuntimeExecutor
 from .runtime_state import CommitCoordinator, ModalMountedStateVolume
-from .model_preload import V2LoaderBridge
+from .model_preload import V2LoaderBridge, RestorePreparation
 from .output_delivery import (
     Attempt,
     _measure_json_bytes,
@@ -31,6 +31,20 @@ from .output_delivery import (
 )
 from .result_delivery import ConversionFailedError, convert_output_items
 from .trace import RuntimeTrace, merge_runtime_traces
+
+_V2_STAGE_MAP: tuple[tuple[str, str, str], ...] = (
+    ("unet_load",      "t4b_unet_load_start",      "t4b_unet_load_end"),
+    ("clip_load",      "t4_clip_load_start",       "t4_clip_load_end"),
+    ("vae_load",       "t4c_vae_load_start",       "t4c_vae_load_end"),
+    ("clip_encode",    "t5_text_encode_start",     "t5_text_encode_end"),
+    ("sampler",        "t6_sampler_start",          "t6_sampler_end"),
+    ("vae_decode",     "t7_vae_decode_start",       "t7_vae_decode_end"),
+    ("cachedit",       "t8_cachedit_start",         "t8_cachedit_end"),
+    ("noise_inject",   "t8_noise_inject_start",     "t8_noise_inject_end"),
+    ("model_sampling", "t4d_model_sampling_start",  "t4d_model_sampling_end"),
+    ("model_patch",    "t4e_model_patch_start",     "t4e_model_patch_end"),
+    ("sampler_setup",  "t8_sampler_setup_start",    "t8_sampler_setup_end"),
+)
 
 
 try:
@@ -68,6 +82,293 @@ V2_SOURCE_MODULES = (
     "run_prompt_options",
     "comfymodal_runtime",
 )
+
+# ── V2 validation certificate (V1-parity persistent validation cache) ──
+# Enabled by default.  Set COMFYMODAL_V2_VALIDATION_CERT=0 to disable.
+# Certificates are stored on the runtime-state Volume keyed by a stable
+# identity that includes workflow struct hash and deployment identity.
+_V2_VALIDATION_CERT_ENABLED: bool = (
+    os.environ.get("COMFYMODAL_V2_VALIDATION_CERT", "1") == "1"
+)
+_V2_CERT_SCHEMA_VERSION: int = 2
+_V2_CERT_FILENAME_PREFIX: str = "v2_cert_"
+
+# Pre-computed deployment identity hash for certificate identity.
+# Populated at module level once during import.
+_V2_DEPLOYMENT_COMBINED_HASH: str = ""
+
+
+def _get_preflight_context(api: Any, module: Any) -> tuple[str, str]:
+    """Extract cheap request-time preflight context from the loaded legacy API.
+
+    Calls the authoritative helpers ``api._resolve_requirements_repair_mode()``
+    and ``module._current_custom_nodes_generation_id()``.  Returns
+    ``(repair_mode, custom_nodes_generation)``.  Either may be empty when
+    the helpers are absent or raise — optimisation fails closed.
+    """
+    repair_mode = ""
+    custom_nodes_gen = ""
+    try:
+        repair_mode = str(api._resolve_requirements_repair_mode() or "")
+    except Exception:
+        pass
+    try:
+        custom_nodes_gen = str(module._current_custom_nodes_generation_id() or "")
+    except Exception:
+        pass
+    return repair_mode, custom_nodes_gen
+
+
+def _compute_v2_cert_identity(
+    workflow_hash: str,
+    deployment_identity: DeploymentIdentity | None = None,
+    repair_mode: str = "",
+    custom_nodes_generation: str = "",
+) -> tuple[str, dict[str, str]]:
+    """Build a deterministic certificate identity from *workflow_hash*,
+    the deployment's combined hash, and mutable preflight context.
+
+    Returns ``(identity_hex, components_dict)``.  Identity is a SHA-256 hex
+    string.  When *deployment_identity* is absent or empty, only the
+    workflow_hash is used (deployment combined hash is empty — less
+    discrimination but still safe).
+    """
+    import hashlib
+    dep_hash = ""
+    if deployment_identity is not None:
+        dep_hash = deployment_identity.combined_hash
+    h = hashlib.sha256()
+    h.update(f"cert_schema={_V2_CERT_SCHEMA_VERSION}\n".encode())
+    h.update(f"workflow_hash={workflow_hash}\n".encode())
+    h.update(f"deployment_hash={dep_hash}\n".encode())
+    h.update(f"repair_mode={repair_mode}\n".encode())
+    h.update(f"custom_nodes_generation={custom_nodes_generation}\n".encode())
+    identity = h.hexdigest()
+    components = {
+        "schema_version": str(_V2_CERT_SCHEMA_VERSION),
+        "workflow_hash": workflow_hash,
+        "deployment_hash": dep_hash,
+        "repair_mode": repair_mode,
+        "custom_nodes_generation": custom_nodes_generation,
+    }
+    return identity, components
+
+
+def _v2_cert_filename(cert_identity: str) -> str:
+    """Return the on-volume filename for a certificate identity."""
+    return f"{_V2_CERT_FILENAME_PREFIX}{cert_identity}.json"
+
+
+def _write_v2_validation_certificate(
+    cert_identity: str,
+    outputs_to_execute: list[str],
+    node_errors: dict[str, Any],
+    *,
+    components: dict[str, str] | None = None,
+    preflight_ok: bool = False,
+) -> bool:
+    """Write a validation certificate to the runtime-state volume.
+
+    When *preflight_ok* is True the certificate attests that deterministic
+    preflight completed successfully for this identity.  Schema v2+ requires
+    preflight_ok to be True for the certificate to be eligible as a preflight
+    skip.
+
+    Never raises.  Returns True on success, False on any error.
+    The certificate is written atomically and committed immediately.
+    """
+    try:
+        import json as _json
+        resources = globals().get("_MODAL_RESOURCES", {})
+        modal_volume = resources.get("runtime_state_volume")
+        if modal_volume is None:
+            return False
+        from .runtime_state import ModalMountedStateVolume
+        volume = ModalMountedStateVolume(RUNTIME_STATE_PATH, modal_volume)
+        filename = _v2_cert_filename(cert_identity)
+        payload = {
+            "schema_version": _V2_CERT_SCHEMA_VERSION,
+            "identity": cert_identity,
+            "created_at": time.time(),
+            "outputs_to_execute": outputs_to_execute,
+            "node_errors": dict(node_errors or {}),
+            "preflight_ok": bool(preflight_ok),
+        }
+        if components:
+            payload["identity_components"] = dict(components)
+        encoded = _json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        volume.write_bytes(filename, encoded)
+        volume.commit()
+        print(
+            f"[v2.cert] write identity={cert_identity[:16]} status=committed",
+            flush=True,
+        )
+        return True
+    except Exception as exc:
+        print(
+            f"[v2.cert] write identity={cert_identity[:16]} status=error error={str(exc)[:120]}",
+            flush=True,
+        )
+        return False
+
+
+def _read_and_validate_cert_payload(
+    volume: Any,
+    cert_identity: str,
+    *,
+    expected_components: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    """Read and validate a certificate payload from an already-reloaded *volume*.
+
+    Shared helper used by both sync (``_read_v2_validation_certificate``) and
+    async (``_read_v2_validation_certificate_async``) read paths.  Never raises.
+    Returns ``{"outputs_to_execute": [...], "node_errors": {...}}`` on hit, or
+    ``None`` on miss/mismatch/error.
+    """
+    try:
+        import json as _json
+        filename = _v2_cert_filename(cert_identity)
+        if not volume.exists(filename):
+            return None
+        raw = volume.read_bytes(filename)
+        if not raw:
+            return None
+        payload = _json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            return None
+
+        # Schema version must match
+        if payload.get("schema_version") != _V2_CERT_SCHEMA_VERSION:
+            return None
+
+        # Schema v2+: preflight_ok must be True for the cert to be eligible
+        # as a preflight-skip token.  Old v1 payloads (no preflight_ok key)
+        # fail this check naturally.
+        if payload.get("preflight_ok") is not True:
+            return None
+
+        # Identity must match the requested cert_hash
+        stored_identity = payload.get("identity", "")
+        if stored_identity and stored_identity != cert_identity:
+            return None
+
+        # Verify identity components if provided
+        if expected_components and isinstance(expected_components, dict):
+            stored_components = payload.get("identity_components", {})
+            if not isinstance(stored_components, dict):
+                return None
+            for key, expected_val in expected_components.items():
+                stored_val = stored_components.get(key)
+                if stored_val is None or str(stored_val) != str(expected_val):
+                    print(
+                        f"[v2.cert] hit=0 identity={cert_identity[:16]} "
+                        f"reason={key}_changed "
+                        f"stored={str(stored_val)[:32]!r} "
+                        f"expected={str(expected_val)[:32]!r}",
+                        flush=True,
+                    )
+                    return None
+
+        # outputs_to_execute must be a non-empty list
+        outputs = payload.get("outputs_to_execute")
+        if not isinstance(outputs, list) or len(outputs) == 0:
+            return None
+
+        # Verify output IDs are unique strings
+        seen: set[str] = set()
+        for oid in outputs:
+            if not isinstance(oid, str) or oid in seen:
+                return None
+            seen.add(oid)
+
+        # node_errors must be dict of dicts
+        errors = payload.get("node_errors", {})
+        if not isinstance(errors, dict):
+            errors = {}
+
+        print(
+            f"[v2.cert] hit=1 identity={cert_identity[:16]} "
+            f"outputs={len(outputs)} errors={len(errors)}",
+            flush=True,
+        )
+        return {"outputs_to_execute": outputs, "node_errors": errors}
+    except Exception as exc:
+        print(
+            f"[v2.cert] read identity={cert_identity[:16]} "
+            f"status=error error={str(exc)[:120]}",
+            flush=True,
+        )
+        return None
+
+
+def _read_v2_validation_certificate(
+    cert_identity: str,
+    *,
+    expected_components: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    """Read and validate a certificate from the runtime-state volume.
+
+    Synchronous variant — creates a ``ModalMountedStateVolume``, calls
+    ``volume.reload()`` synchronously, then delegates to
+    ``_read_and_validate_cert_payload()``.
+
+    Never raises.  Returns the cached ``(outputs_to_execute, node_errors)``
+    dict on hit, or None on miss/mismatch/error.
+
+    When *expected_components* is provided, each stored identity component
+    is verified against its expected value.  A mismatch logs the changed
+    component and returns None.
+    """
+    try:
+        resources = globals().get("_MODAL_RESOURCES", {})
+        modal_volume = resources.get("runtime_state_volume")
+        if modal_volume is None:
+            return None
+        from .runtime_state import ModalMountedStateVolume
+        volume = ModalMountedStateVolume(RUNTIME_STATE_PATH, modal_volume)
+        volume.reload()
+        return _read_and_validate_cert_payload(
+            volume, cert_identity, expected_components=expected_components,
+        )
+    except Exception as exc:
+        print(
+            f"[v2.cert] read identity={cert_identity[:16]} "
+            f"status=error error={str(exc)[:120]}",
+            flush=True,
+        )
+        return None
+
+
+async def _read_v2_validation_certificate_async(
+    cert_identity: str,
+    *,
+    expected_components: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    """Async variant — uses ``volume.reload_async()`` to avoid Modal's
+    "synchronous reload in async context" warning, then delegates to
+    ``_read_and_validate_cert_payload()``.
+
+    Prefer this over the sync variant when calling from an async context
+    (e.g. ``_execute_v2_prompt_executor``).
+    """
+    try:
+        resources = globals().get("_MODAL_RESOURCES", {})
+        modal_volume = resources.get("runtime_state_volume")
+        if modal_volume is None:
+            return None
+        from .runtime_state import ModalMountedStateVolume
+        volume = ModalMountedStateVolume(RUNTIME_STATE_PATH, modal_volume)
+        await volume.reload_async()
+        return _read_and_validate_cert_payload(
+            volume, cert_identity, expected_components=expected_components,
+        )
+    except Exception as exc:
+        print(
+            f"[v2.cert] read identity={cert_identity[:16]} "
+            f"status=error error={str(exc)[:120]}",
+            flush=True,
+        )
+        return None
 
 
 def _capture_remote_identity() -> dict[str, Any]:
@@ -256,6 +557,53 @@ class ModalRuntimeEntrypoint:
         self._restore_publisher = RestorePlanPublisher(coordinator)
         return self._restore_publisher
 
+    def _join_legacy_background_threads(self, api: Any, *, join_timeout: float = 30.0) -> int:
+        """Join remaining alive threads in the legacy API's ``_actual_load_futures``.
+
+        Returns the number of threads joined.  Uses a bounded per-thread
+        timeout.  If the graph already consumed the future (thread is dead),
+        the join returns immediately.  Never raises — errors are swallowed so
+        existing error behaviour is preserved.
+        """
+        joined = 0
+        if api is None:
+            return 0
+        try:
+            futures = getattr(api, "_actual_load_futures", None)
+            if not isinstance(futures, dict):
+                return 0
+            for key, thread in list(futures.items()):
+                if thread is not None and getattr(thread, "is_alive", lambda: False)():
+                    try:
+                        thread.join(timeout=join_timeout)
+                        joined += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return joined
+
+    @staticmethod
+    def _check_unet_deferral_eligible(api: Any, plan: Any) -> bool:
+        """Return True when the optimized V2 UNET-deferral handoff is eligible.
+
+        Checks that the plan has a UNET identity and the legacy API exposes
+        the two helper methods needed by the handoff.  Never raises.
+        """
+        try:
+            if plan is None:
+                return False
+            model_key = getattr(plan, "model_key", None)
+            if model_key is None or not getattr(model_key, "unet_identity", ""):
+                return False
+            if not callable(getattr(api, '_patch_unet_loader_cache', None)):
+                return False
+            if not callable(getattr(api, '_start_production_restore_unet', None)):
+                return False
+            return True
+        except Exception:
+            return False
+
     def _load_legacy_runtime(self) -> Any:
         if self._legacy_api is not None:
             return self._legacy_api
@@ -350,9 +698,9 @@ class ModalRuntimeEntrypoint:
         identity = _capture_remote_identity()
         self._configure_runtime()
         trace = RuntimeTrace(process="remote")
-        trace.container_session_id = self.container_session_id
+        trace.container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
         trace.set_metadata(**identity)
-        trace.set_metadata(container_session_id=self.container_session_id)
+        trace.set_metadata(container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID)
         startup_session_id = uuid.uuid4().hex
         trace.emit(
             "remote_method_entry",
@@ -364,7 +712,7 @@ class ModalRuntimeEntrypoint:
                 "snapshot": "True",
                 "lifecycle_session_id": startup_session_id,
                 "lifecycle_count": "1",
-                "container_session_id": self.container_session_id,
+                "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
                 **identity,
                 **_resource_identity(),
             },
@@ -434,9 +782,9 @@ class ModalRuntimeEntrypoint:
         identity = _capture_remote_identity()
         self._configure_runtime()
         trace = RuntimeTrace(process="remote")
-        trace.container_session_id = self.container_session_id
+        trace.container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
         trace.set_metadata(**identity)
-        trace.set_metadata(container_session_id=self.container_session_id)
+        trace.set_metadata(container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID)
         _v2_container_restore_count += 1
         self._restore_count = _v2_container_restore_count
         restore_session_id = uuid.uuid4().hex
@@ -450,7 +798,7 @@ class ModalRuntimeEntrypoint:
                 "snapshot": "False",
                 "restore_session_id": restore_session_id,
                 "restore_count": str(self._restore_count),
-                "container_session_id": self.container_session_id,
+                "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
                 **identity,
                 **_resource_identity(),
             },
@@ -501,15 +849,66 @@ class ModalRuntimeEntrypoint:
             trace.emit("preload_submission_start", phase="restore", metadata={
                 "restore_plan_generation": str(self._restore_plan.generation),
             })
-            preparation = self._preload_bridge.prepare(self._restore_plan, trace=trace)
+            preparation: RestorePreparation | None = None
+            # ── Bounded V2 latency: check if we can defer UNET+VAE to
+            #    original graph loaders and prepare only CLIP through the
+            #    V2 bridge.  On any failure (missing helper, exception,
+            #    non-submitted background future) we fail closed to the
+            #    existing full V2 preload path. ──
+            _optimized_ok = False
+            _unet_deferred_meta: dict[str, Any] = {}
+            _defer_api = self._load_legacy_runtime() if self._restore_plan else None
+            if self._check_unet_deferral_eligible(_defer_api, self._restore_plan):
+                try:
+                    _defer_api._patch_unet_loader_cache()
+                    # Prepare only CLIP through V2; UNET and VAE are
+                    # deferred to the original (patched) graph loaders.
+                    preparation = self._preload_bridge.prepare(
+                        self._restore_plan, trace=trace,
+                        prepare_unet=False, prepare_vae=False,
+                    )
+                    self._preload_bridge.close_workers()
+                    # Start exactly one V1-style background UNET future.
+                    unet_name = self._restore_plan.model_key.unet_identity
+                    weight_dtype = "default"
+                    try:
+                        unet_specs = self._restore_plan.model_spec.get("loaders", {}).get("unet", [])
+                        if unet_specs and isinstance(unet_specs, list) and len(unet_specs) > 0:
+                            weight_dtype = str(unet_specs[0].get("weight_dtype", "default"))
+                    except Exception:
+                        pass
+                    _defer_result = _defer_api._start_production_restore_unet(
+                        {"unet": unet_name, "weight_dtype": weight_dtype},
+                        restore_start=time.time(),
+                        restore_stages={},
+                    )
+                    if _defer_result.get("submitted"):
+                        _optimized_ok = True
+                        _unet_deferred_meta = {
+                            "decision": str(_defer_result.get("decision", "unknown")),
+                            "submitted": True,
+                            "unet_identity": unet_name,
+                        }
+                except Exception:
+                    pass
+            if not _optimized_ok:
+                # Fail closed: clear any partially-prepared bridge state
+                # and use the full V2 preload path.
+                self._preload_bridge.clear()
+                preparation = self._preload_bridge.prepare(self._restore_plan, trace=trace)
+                self._preload_bridge.close_workers()
+            # Shared tail: trace metadata common to both paths.
             trace.emit("preload_submission_end", phase="restore", metadata={
                 "preload_scheduled": str(bool(preparation)),
+                "unet_deferred": _optimized_ok,
             })
             trace.set_metadata(
                 restore_plan_generation=str(self._restore_plan.generation),
                 preload_scheduled=bool(preparation),
                 preload_diagnostics=self._preload_bridge.diagnostics(),
             )
+            if _optimized_ok:
+                trace.emit("unet_deferred", phase="restore", metadata=_unet_deferred_meta)
         else:
             self._preload_bridge.clear()
         trace.emit(
@@ -570,10 +969,23 @@ class ModalRuntimeEntrypoint:
         _cid = self.container_session_id or _V2_CONTAINER_SESSION_ID
         trace.container_session_id = _cid
         trace.emit("graph_execution_start", phase="execution")
+        # ── Execution-phase CLIP exact-prefill single-flight ────────
+        # Schedule prefill immediately after graph start so it runs
+        # concurrently with execution setup.  The callback waits for both
+        # UNET and CLIP preparation futures before encoding, preventing
+        # GPU model-load/encode overlap.  Idempotent and thread-safe.
+        self._preload_bridge.schedule_execution_prefill(trace=trace)
         try:
             with self._preload_bridge.request_scope():
                 result: dict[str, Any] = await self._execute_v2_prompt_executor(plan, context, api, trace)
             trace.emit("graph_execution_end", phase="execution")
+            # Drain late worker events (read/cpu/gpu/ready) from bridge
+            # preparation into the execution trace so they are not lost.
+            self._preload_bridge.drain_worker_events(trace)
+            self._preload_bridge.close_workers()
+            # Ensure any remaining legacy API background loader threads
+            # for this request are terminal before result delivery.
+            self._join_legacy_background_threads(api)
             trace.set_metadata(
                 restore_plan_generation=str(self._restore_plan.generation if self._restore_plan else ""),
                 execution_backend="in_process",
@@ -581,6 +993,8 @@ class ModalRuntimeEntrypoint:
                 container_session_id=_cid,
             )
             result["trace"] = trace.to_dict()
+            if "_stage_timings" in result:
+                result["trace"]["stages"] = result.pop("_stage_timings")
             result["container_session_id"] = _cid
             result["restore_plan_generation"] = str(self._restore_plan.generation if self._restore_plan else "")
             _rt = self._restore_timing or _LATEST_LIFECYCLE_TIMING
@@ -589,6 +1003,8 @@ class ModalRuntimeEntrypoint:
             return result
         except Exception as exc:
             trace.emit("graph_execution_end", phase="execution", metadata={"status": "error", "error": str(exc)[:200]})
+            self._preload_bridge.close_workers()
+            self._join_legacy_background_threads(api)
             raise
 
     async def _execute_v2_prompt_executor(
@@ -608,6 +1024,28 @@ class ModalRuntimeEntrypoint:
             raise RuntimeError("execution cancelled before PromptExecutor start")
 
         workflow = _thaw(plan.workflow)
+        _res4lyf_reported = int(plan.production_report.get("res4lyf_options_injected_count", 0) or 0)
+        _res4lyf_injected_ids = [
+            str(node_id)
+            for node_id, node in workflow.items()
+            if isinstance(node, Mapping)
+            and node.get("class_type") == "ClownOptions_ExtraOptions_Beta"
+            and "disable_dummy_sampler_init" in str((node.get("inputs") or {}).get("extra_options", ""))
+        ]
+        print(
+            f"[v2.exec] res4lyf_dummy_init_disabled={int(bool(_res4lyf_injected_ids))} "
+            f"reported_injected={_res4lyf_reported} actual_injected={len(_res4lyf_injected_ids)}",
+            flush=True,
+        )
+        trace.emit(
+            "res4lyf_dummy_init_transform",
+            phase="execution",
+            metadata={
+                "reported_injected": _res4lyf_reported,
+                "actual_injected": len(_res4lyf_injected_ids),
+                "disabled": bool(_res4lyf_injected_ids),
+            },
+        )
         prompt_id = str(context.request_id or f"v2-{id(workflow):x}")
         module = self._legacy_module
         executor = getattr(api, "_executor", None)
@@ -626,13 +1064,102 @@ class ModalRuntimeEntrypoint:
             materialize_inputs(dict(plan.input_images))
             trace.emit("input_materialization_end", phase="execution")
 
-        preflight = getattr(api, "_preflight_before_prompt_execution", None)
-        if callable(preflight) and not getattr(api, "_preflight_already_ran", False):
-            trace.emit("preflight_start", phase="execution")
-            preflight(workflow)
-            trace.emit("preflight_end", phase="execution")
+        # ── Preflight context and certificate-gated preflight fast path ──
+        # Phase 2: resolve the exact certificate before expensive preflight.
+        # On exact identity/component hit + preflight_ok, skip preflight.
+        # Missing-node repair always runs outside the certified skip.
+        _v2_cert_hit = False
+        _v2_cert_preflight_skip = False
+        _v2_preflight_ran = False
+        _v2_cert_identity = ""
+        _v2_cert_components: dict[str, str] = {}
+        _v2_schedule_cert_write = False
+        _v2_dep_identity: DeploymentIdentity | None = globals().get("_MODAL_RESOURCES", {}).get("source_identity")
+        _v2_repair_mode: str = ""
+        _v2_custom_nodes_gen: str = ""
+
+        # Pre-initialize outputs_to_execute/node_errors so they are always
+        # defined before the execution/output section regardless of cert path.
+        outputs_to_execute: list[str] = []
+        node_errors: dict[str, Any] = {}
+
+        # Obtain preflight context from the loaded legacy API
+        _preflight_fn = getattr(api, "_preflight_before_prompt_execution", None)
+        if callable(_preflight_fn) and not getattr(api, "_preflight_already_ran", False):
+            _v2_repair_mode, _v2_custom_nodes_gen = _get_preflight_context(api, module)
+
+            # Try cert lookup before preflight — only eligible when the
+            # deployment identity, repair mode, and custom-nodes generation
+            # are all complete and recognised.
+            if _V2_VALIDATION_CERT_ENABLED:
+                _cert_wf_hash = plan.workflow_hash or plan.source_workflow_hash or ""
+                if _cert_wf_hash:
+                    _v2_dep_hash = _v2_dep_identity.combined_hash if _v2_dep_identity else ""
+
+                    # Cert read eligibility: nonempty deployment combined
+                    # hash, recognised repair mode, and nonempty custom-nodes
+                    # generation.  Incomplete context means preflight+validate
+                    # must run and no certificate will be written.
+                    _cert_eligible = (
+                        bool(_v2_dep_hash)
+                        and _v2_repair_mode in ("off", "fail_fast", "dev")
+                        and bool(_v2_custom_nodes_gen)
+                    )
+                    if _cert_eligible:
+                        _v2_cert_identity, _v2_cert_components = _compute_v2_cert_identity(
+                            _cert_wf_hash,
+                            deployment_identity=_v2_dep_identity,
+                            repair_mode=_v2_repair_mode,
+                            custom_nodes_generation=_v2_custom_nodes_gen,
+                        )
+                        trace.emit(
+                            "certificate_reload_start",
+                            phase="execution",
+                            metadata={"cert_identity": _v2_cert_identity[:16]},
+                        )
+                        _cert_result = await _read_v2_validation_certificate_async(
+                            _v2_cert_identity,
+                            expected_components=_v2_cert_components,
+                        )
+                        trace.emit(
+                            "certificate_read_outcome",
+                            phase="execution",
+                            metadata={
+                                "cert_identity": _v2_cert_identity[:16],
+                                "hit": _cert_result is not None,
+                                "preflight_skip": _cert_result is not None,
+                            },
+                        )
+                        if _cert_result is not None:
+                            outputs_to_execute = _cert_result["outputs_to_execute"]
+                            node_errors = _cert_result.get("node_errors", {})
+                            _v2_cert_hit = True
+                            _v2_cert_preflight_skip = True
+                            print(
+                                f"[v2.cert] hit=1 preflight_skip=1 identity={_v2_cert_identity[:16]} "
+                                f"outputs={len(outputs_to_execute)}",
+                                flush=True,
+                            )
+
+        # ── Preflight (skip on exact certificate hit) ──────────────────
+        if callable(_preflight_fn) and not getattr(api, "_preflight_already_ran", False):
+            if _v2_cert_preflight_skip:
+                trace.emit(
+                    "preflight_certificate_skip",
+                    phase="execution",
+                    metadata={
+                        "cert_identity": _v2_cert_identity[:16] if _v2_cert_identity else "",
+                        "cert_hit": True,
+                    },
+                )
+            else:
+                _v2_preflight_ran = True
+                trace.emit("preflight_start", phase="execution")
+                _preflight_fn(workflow)
+                trace.emit("preflight_end", phase="execution")
 
         repair_missing_nodes = getattr(api, "_repair_missing_workflow_nodes", None)
+        repair_summary: Any = None
         if callable(repair_missing_nodes):
             trace.emit("missing_node_repair_start", phase="execution")
             repair_summary = repair_missing_nodes(workflow)
@@ -655,12 +1182,82 @@ class ModalRuntimeEntrypoint:
                     f"{repair_summary['missing_before']}. Runtime repair is disabled."
                 )
 
+            # Oracle Gate 2: if a cert skip occurred but the repair reports
+            # nodes that were missing before repair, the cached validation
+            # result may be stale because repair changed node availability.
+            # Invalidate the cached cert result and fall through to full
+            # preflight+validate below.
+            if (
+                _v2_cert_preflight_skip
+                and isinstance(repair_summary, Mapping)
+                and repair_summary.get("missing_before")
+            ):
+                print(
+                    f"[v2.cert] invalidating cached result after missing-node repair "
+                    f"missing_before={repair_summary['missing_before']}",
+                    flush=True,
+                )
+                _v2_cert_hit = False
+                _v2_cert_preflight_skip = False
+                outputs_to_execute = []
+                node_errors = {}
+                # Re-run preflight now since the inline preflight block
+                # already executed (and skipped).  Validate will also run
+                # because _v2_cert_preflight_skip is now False.
+                _v2_preflight_ran = True
+                if callable(_preflight_fn):
+                    trace.emit("preflight_start", phase="execution")
+                    _preflight_fn(workflow)
+                    trace.emit("preflight_end", phase="execution")
+
         import execution
 
-        trace.emit("prompt_validation_start", phase="execution", metadata={"prompt_id": prompt_id})
-        valid, error, outputs_to_execute, node_errors = await execution.validate_prompt(
-            prompt_id, workflow, None
+        # ── Prompt validation ─────────────────────────────────────────
+        # When preflight was skipped via certificate hit, outputs_to_execute
+        # and node_errors are already populated from the stored certificate.
+        # When preflight ran, we run validate_prompt and schedule a new cert
+        # write (with preflight_ok=True) after successful execution.
+        valid: bool = False
+        error: dict[str, Any] | str = {}
+        if not _v2_cert_preflight_skip:
+            outputs_to_execute = []
+            node_errors = {}
+        trace.emit(
+            "prompt_validation_start",
+            phase="execution",
+            metadata={
+                "prompt_id": prompt_id,
+                "cert_hit": _v2_cert_hit,
+                "preflight_skip": _v2_cert_preflight_skip,
+            },
         )
+        if not _v2_cert_preflight_skip:
+            valid, error, outputs_to_execute, node_errors = await execution.validate_prompt(
+                prompt_id, workflow, None
+            )
+            # Schedule certificate write only when the same eligibility
+            # conditions that would allow a read are met — incomplete or
+            # unknown context never produces a certificate.
+            _cert_write_eligible = (
+                bool(_v2_dep_identity.combined_hash if _v2_dep_identity else "")
+                and _v2_repair_mode in ("off", "fail_fast", "dev")
+                and bool(_v2_custom_nodes_gen)
+            )
+            if valid and outputs_to_execute and _cert_write_eligible:
+                if not _v2_cert_identity:
+                    _cert_wf_hash = plan.workflow_hash or plan.source_workflow_hash or ""
+                    if _cert_wf_hash and _V2_VALIDATION_CERT_ENABLED:
+                        _v2_cert_identity, _v2_cert_components = _compute_v2_cert_identity(
+                            _cert_wf_hash,
+                            deployment_identity=_v2_dep_identity,
+                            repair_mode=_v2_repair_mode,
+                            custom_nodes_generation=_v2_custom_nodes_gen,
+                        )
+                if _v2_cert_identity:
+                    _v2_schedule_cert_write = True
+        else:
+            valid = True
+            error = {}
         trace.emit(
             "prompt_validation_end",
             phase="execution",
@@ -668,6 +1265,10 @@ class ModalRuntimeEntrypoint:
                 "valid": bool(valid),
                 "output_count": len(outputs_to_execute or []),
                 "node_error_count": len(node_errors or {}),
+                "cert_hit": _v2_cert_hit,
+                "preflight_skip": _v2_cert_preflight_skip,
+                "preflight_ran": _v2_preflight_ran,
+                "cert_identity": _v2_cert_identity[:16] if _v2_cert_identity else "",
             },
         )
         if not valid:
@@ -719,6 +1320,10 @@ class ModalRuntimeEntrypoint:
             )
             trace.emit("production_registry_setup_end", phase="execution")
 
+        _begin_profile = getattr(api, "_begin_prompt_profile", None)
+        if callable(_begin_profile):
+            _begin_profile(workflow, prompt_id, outputs_to_execute)
+
         started = time.time()
         try:
             trace.emit("executor_reset_start", phase="execution")
@@ -732,12 +1337,25 @@ class ModalRuntimeEntrypoint:
                 "extra_data": {"client_id": prompt_id},
                 "execute_outputs": outputs_to_execute,
             }
-            if callable(execute_async):
-                execute_result = execute_async(**execute_kwargs)
-                if inspect.isawaitable(execute_result):
-                    await execute_result
-            else:
-                executor.execute(**execute_kwargs)
+            # ── Sampler lease ────────────────────────────────────
+            # Acquire the mutation lane so no model GPU commits can
+            # overlap with sampling, and no pending commit starts after
+            # the sampler begins.  Release immediately after execution.
+            _lane = getattr(self._preload_bridge.coordinator, "mutation_lane", None)
+            if _lane is not None:
+                trace.emit("sampler_lane_wait_start", phase="execution")
+                _lane.acquire("sampler")
+                trace.emit("sampler_lane_wait_end", phase="execution")
+            try:
+                if callable(execute_async):
+                    execute_result = execute_async(**execute_kwargs)
+                    if inspect.isawaitable(execute_result):
+                        await execute_result
+                else:
+                    executor.execute(**execute_kwargs)
+            finally:
+                if _lane is not None:
+                    _lane.release("sampler")
             trace.emit(
                 "prompt_executor_end",
                 phase="execution",
@@ -755,6 +1373,11 @@ class ModalRuntimeEntrypoint:
             history_result = getattr(executor, "history_result", None)
             history = {prompt_id: history_result} if isinstance(history_result, dict) else {}
             output_dir = Path("/root/comfy/ComfyUI/output")
+            trace.emit(
+                "output_chain_start",
+                phase="output",
+                metadata={"prompt_id": prompt_id},
+            )
             chain = build_default_chain(
                 registry=registry,
                 history=history,
@@ -767,6 +1390,15 @@ class ModalRuntimeEntrypoint:
                 materials_dir=str(output_dir) if output_dir.is_dir() else "",
                 request_start_boundary=started,
             )
+            trace.emit(
+                "output_chain_end",
+                phase="output",
+                metadata={
+                    "prompt_id": prompt_id,
+                    "attempts": len(attempts),
+                    "successful": sum(1 for a in attempts if a.success),
+                },
+            )
             selected_index = next(
                 (index for index, attempt in enumerate(attempts) if attempt.success),
                 None,
@@ -778,6 +1410,14 @@ class ModalRuntimeEntrypoint:
                 selected = Attempt(strategy="none", success=False, error="no output")
             output_format = str(legacy_options.get("output_format", "original") or "original")
             if selected.success and selected.strategy != "direct_output_sink" and output_format != "original":
+                trace.emit(
+                    "output_conversion_start",
+                    phase="output",
+                    metadata={
+                        "format": output_format,
+                        "items": len(selected.items),
+                    },
+                )
                 try:
                     converted = convert_output_items(
                         list(selected.items),
@@ -818,6 +1458,20 @@ class ModalRuntimeEntrypoint:
                     )
                 if selected_index is not None:
                     attempts[selected_index] = selected
+                _conv_ok = selected.success and selected.strategy != "direct_output_sink" and output_format != "original"
+                trace.emit(
+                    "output_conversion_end",
+                    phase="output",
+                    metadata={
+                        "format": output_format,
+                        "success": _conv_ok,
+                        "error": selected.error if not _conv_ok else "",
+                        "conversion_time_ms": round(getattr(selected, "total_conversion_time_ms", 0), 3),
+                        "fallback": bool(
+                            selected.metrics.get("conversion_fallback")
+                        ) if hasattr(selected, "metrics") and isinstance(selected.metrics, Mapping) else False,
+                    },
+                )
             result = self._attempt_to_result(selected)
             result["output_attempts"] = [
                 {
@@ -854,6 +1508,34 @@ class ModalRuntimeEntrypoint:
                     "serialized_result_bytes": payload_bytes,
                 },
             )
+
+            _stage_windows = getattr(api, "_stage_windows", None)
+            if _stage_windows:
+                _stages: dict[str, float] = {}
+                for _stage, _sk, _ek in _V2_STAGE_MAP:
+                    _fields = _stage_windows.get(_stage, {})
+                    _s = _fields.get("start")
+                    _e = _fields.get("end")
+                    if _s is not None:
+                        _stages[_sk] = _s
+                    if _e is not None:
+                        _stages[_ek] = _e
+                if _stages:
+                    result["_stage_timings"] = _stages
+
+            # ── Write validation certificate after successful execution ──
+            # Schema v2 certs include preflight_ok=True to attest that
+            # deterministic preflight completed successfully for this identity.
+            # Only write when preflight actually ran (not on cert skip).
+            if _v2_schedule_cert_write and _v2_preflight_ran:
+                _write_v2_validation_certificate(
+                    _v2_cert_identity,
+                    outputs_to_execute,
+                    node_errors,
+                    components=_v2_cert_components,
+                    preflight_ok=True,
+                )
+
             return result
         finally:
             if production_enabled:
@@ -912,18 +1594,23 @@ class ModalRuntimeEntrypoint:
     ) -> AsyncIterator[dict[str, Any]]:
         identity = _capture_remote_identity()
         plan = ExecutionPlan.from_dict(plan_payload)
+        print(
+            f"[runtime] RUNNING V2 app={APP_NAME} "
+            f"class=ModalRuntimeEntrypointV2 method=run_plan_stream "
+            f"request_id={request_id} workflow_hash={plan.workflow_hash[:16]}",
+            flush=True,
+        )
         context = ExecutionContext(
             request_id=request_id,
             cancelled=cancelled,
             trace=RuntimeTrace(request_id=request_id, process="remote"),
         )
         if context.trace is not None:
+            _auth_cid = self.container_session_id or _V2_CONTAINER_SESSION_ID
+            context.trace.container_session_id = _auth_cid
             context.trace.set_metadata(**identity)
-            # ── Additive common-schema identity keys ──────────────────
-            # workflow_hash_prefix: first 16 hex chars for stable short-id.
             _wf_hash_prefix = plan.workflow_hash[:16] if plan.workflow_hash else ""
             _src_wf_hash_prefix = plan.source_workflow_hash[:16] if plan.source_workflow_hash else ""
-            # effective_options_hash: stable hash of execution options.
             try:
                 _opts_dict = plan.execution_options.to_dict() if hasattr(plan, "execution_options") and plan.execution_options else {}
                 _opts_hash = stable_hash(_opts_dict) if _opts_dict else ""
@@ -933,11 +1620,9 @@ class ModalRuntimeEntrypoint:
                 "remote_method_entry",
                 phase="method",
                 metadata={
-                    # ── App / class / method ──────────────────────
                     "app_name": APP_NAME,
                     "class_name": CLASS_NAME,
                     "method_name": "run_plan_stream",
-                    # ── Workflow identity ─────────────────────────
                     "workflow_hash": plan.workflow_hash,
                     "workflow_hash_prefix": _wf_hash_prefix,
                     "source_workflow_hash": plan.source_workflow_hash,
@@ -946,6 +1631,14 @@ class ModalRuntimeEntrypoint:
                     # ── Remote-observed identity ──────────────────
                     **identity,
                     **_resource_identity(),
+                },
+            )
+            context.trace.emit(
+                "container_entry",
+                phase="execution",
+                metadata={
+                    "container_session_id": _auth_cid,
+                    "workflow_hash": plan.workflow_hash,
                 },
             )
         yield {
@@ -957,16 +1650,23 @@ class ModalRuntimeEntrypoint:
         async for event in self.executor.stream(plan, context=context):
             if event.get("type") == "result" and isinstance(event.get("data"), dict):
                 data = dict(event["data"])
+                _exec_trace = data.get("trace", {})
+                _exec_stages = _exec_trace.get("stages") if isinstance(_exec_trace, Mapping) else None
                 merged = merge_runtime_traces(
                     self._lifecycle_trace,
-                    data.get("trace"),
+                    _exec_trace,
                 )
-                # Use stable module-level identity — never overwrite a non-empty
-                # authoritative container_session_id with an empty placeholder.
                 _authoritative_cid = self.container_session_id or _V2_CONTAINER_SESSION_ID
                 if _authoritative_cid:
                     merged.container_session_id = _authoritative_cid
+                # Merge legacy stages from events with node-stage windows.
+                # Node-stage windows win for exact keys; legacy stages fill
+                # gaps (e.g. container_entry -> t3_modal_entry).
+                _legacy_stages = merged.to_legacy_timing().get("stages", {})
+                if _exec_stages:
+                    _legacy_stages.update(_exec_stages)
                 data["trace"] = merged.to_dict()
+                data["trace"]["stages"] = _legacy_stages
                 _rt = self._restore_timing or _LATEST_LIFECYCLE_TIMING
                 if _rt is not None and "_restore_timing" not in data:
                     data["_restore_timing"] = dict(_rt)

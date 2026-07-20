@@ -180,13 +180,17 @@ class ComfyAppPreloadStateMachineTests(unittest.TestCase):
 
     def test_dict_preload_entries_outlier_branch_no_crash(self):
         """Dict entries in file_paths must not crash the outlier detection at
-        line ~9687 where raw ``file_paths`` is iterated with ``os.path.basename``
+        line ~9789 where raw ``file_paths`` is iterated with ``os.path.basename``
         and ``os.path.getsize``.
 
         We patch ``_load_model_state_explicit_cpu`` and use
         ``read_strategy="normal"`` so the test does not depend on the
         ``comfy.model_management`` module (which imports ``comfy_aimdo``
         and may not be available in the test environment).
+
+        A small sleep in the patched loader ensures the per-file timing
+        (``_loader_ms``) is > 0.0, so ``_slowest_fn`` is populated and the
+        outlier code at line ~9787 is genuinely reached.
         """
         module = load_module()
         mixin = module._ComfyAPIMixin()
@@ -198,11 +202,9 @@ class ComfyAppPreloadStateMachineTests(unittest.TestCase):
         mixin._original_model_loader = loader
 
         def _patched_explicit_cpu(path, original_loader):
-            # Call the original_loader directly to exercise the real
-            # cache-population flow without comfy.model_management.
+            # Small sleep so _loader_ms > 0.0 → _slowest_fn is set
+            time.sleep(0.002)
             sd, meta = original_loader(path, return_metadata=True)
-            # Return the same (state_dict, metadata, diagnostics) shape
-            # that _load_model_state_explicit_cpu would produce.
             return (sd, meta, {})
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -220,6 +222,67 @@ class ComfyAppPreloadStateMachineTests(unittest.TestCase):
                 )
 
         self.assertEqual(result["status"], "ok")
+
+    def test_dict_preload_entries_abort_tuple_unpack_no_crash(self):
+        """Dict entries in file_paths must not crash the abort-then-adopt
+        tuple unpack at line ~9743 where ``fut_to_item`` values are 4-tuples
+        ``(filename, cache_key, path, role)`` but the unpack was written for
+        3 items.
+
+        Trigger conditions:
+        - ``PRELOAD_OUTLIER_ABORT_SECONDS`` patched to 0.001 (1ms)
+        - ``clip_only`` preload mode with a single dict entry
+        - A slow loader that keeps the future running past the abort deadline
+        - The future is not cancellable (thread is executing), forcing the
+          ``_running_threads_not_killable > 0`` branch
+
+        Before the fix this crashes with ``ValueError: too many values to unpack``.
+        After the fix the 4-tuple is properly unpacked and the preload completes
+        with ``slow_completed`` status.
+        """
+        module = load_module()
+        mixin = module._ComfyAPIMixin()
+        mixin._model_cpu_cache = {}
+
+        _load_event = threading.Event()
+
+        def slow_loader(_path, return_metadata=True):
+            _load_event.wait(timeout=2.0)
+            return ({"ok": True}, {"meta": 1}) if return_metadata else {"ok": True}
+
+        mixin._original_model_loader = slow_loader
+
+        def _patched_explicit_cpu(path, original_loader):
+            sd, meta = original_loader(path, return_metadata=True)
+            return (sd, meta, {})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "slow-clip.safetensors"
+            path.write_bytes(b"x")
+            with (
+                patch.object(module, "_resolve_preload_mode", return_value="clip_only"),
+                patch.object(module, "PRELOAD_OUTLIER_ABORT_SECONDS", 0.001),
+                patch.object(mixin, "_load_model_state_explicit_cpu",
+                             side_effect=_patched_explicit_cpu),
+            ):
+                # The abort deadline (1ms) is much shorter than the loader
+                # sleep (which waits for _load_event), so abort fires while
+                # the future is still running.  The future cannot be
+                # cancelled → _running_threads_not_killable > 0 →
+                # abort-then-adopt path → tuple unpack at line ~9743.
+                result = mixin._preload_models_to_cpu(
+                    [{"path": str(path), "role": "clip"}],
+                    read_strategy="normal",
+                )
+            # Release the loader so the test thread can join cleanly
+            _load_event.set()
+
+        # The abort-then-adopt path produces "slow_completed" (not "aborted")
+        # because it adopts the running future's result.
+        self.assertEqual(
+            result["status"], "slow_completed",
+            "abort-then-adopt must produce slow_completed status, not aborted",
+        )
 
 
     # ── 7. Direct-warmup boundary test ──

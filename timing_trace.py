@@ -510,30 +510,38 @@ class Trace:
         return msg
 
 
-_TRACE_KEYS_FROM_BROWSER = ("t0_client_press",)
+_TRACE_KEYS_FROM_BROWSER = ("t0_client_press", "queue_prompt_start_ms")
 
 
 def coerce_t0_from_browser(payload: dict | None) -> float | None:
     """Extract a t0 timestamp from a request body if present.
 
-    The browser may send either:
+    The browser may send any of the following (checked in priority order):
 
-    * ``t0_client_press`` (epoch seconds, float) — preferred
-    * ``t0_client_press_ms`` (epoch milliseconds) — fallback
-    * ``t0_perf_ms`` (performance.now() relative to navigation start) —
-      converted using ``Date.now() - performance.now()``
+    * ``queue_prompt_start_ms`` (epoch milliseconds from ``Date.now()`` at
+      queue capture) — **preferred** because it is the earliest reliable
+      browser timestamp.
+    * ``t0_client_press`` (epoch seconds, float) — legacy fallback.
+    * ``t0_client_press_ms`` (epoch milliseconds) — legacy fallback.
+    * ``t0_perf_ms`` + ``t0_perf_now_ms`` (``performance.now()`` relative
+      to ``Date.now()``) — last-resort conversion.
     """
     if not isinstance(payload, dict):
         return None
+    # Preferred: queue_prompt_start_ms (epoch ms from browser Date.now())
+    raw = payload.get("queue_prompt_start_ms")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return float(raw) / 1000.0
     raw = payload.get("t0_client_press")
-    if isinstance(raw, (int, float)):
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
         return float(raw)
     raw = payload.get("t0_client_press_ms")
-    if isinstance(raw, (int, float)):
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
         return float(raw) / 1000.0
     raw = payload.get("t0_perf_ms")
     raw_now = payload.get("t0_perf_now_ms")
-    if isinstance(raw, (int, float)) and isinstance(raw_now, (int, float)):
+    if (isinstance(raw, (int, float)) and not isinstance(raw, bool)
+            and isinstance(raw_now, (int, float)) and not isinstance(raw_now, bool)):
         epoch_ms_at_perf = raw_now - float(raw)
         return epoch_ms_at_perf / 1000.0
     return None

@@ -515,6 +515,63 @@ class TestModalTransport(unittest.TestCase):
         key2 = HandleCacheKey("ws", "app", "cls", "rtx-pro-6000")
         self.assertEqual(key2.cloud, "")
 
+    def test_resolve_environment_returns_empty_when_unset(self):
+        """Both env vars absent -> empty string."""
+        for var in ("COMFYMODAL_V2_ENVIRONMENT", "MODAL_ENVIRONMENT"):
+            os.environ.pop(var, None)
+        try:
+            self.assertEqual(ModalTransport._resolve_environment(), "")
+        finally:
+            for var in ("COMFYMODAL_V2_ENVIRONMENT", "MODAL_ENVIRONMENT"):
+                os.environ.pop(var, None)
+
+    def test_resolve_environment_prefers_v2_var(self):
+        """COMFYMODAL_V2_ENVIRONMENT wins over MODAL_ENVIRONMENT."""
+        os.environ["COMFYMODAL_V2_ENVIRONMENT"] = "v2-staging"
+        os.environ["MODAL_ENVIRONMENT"] = "shared-prod"
+        try:
+            self.assertEqual(ModalTransport._resolve_environment(), "v2-staging")
+        finally:
+            os.environ.pop("COMFYMODAL_V2_ENVIRONMENT", None)
+            os.environ.pop("MODAL_ENVIRONMENT", None)
+
+    def test_resolve_environment_falls_back_to_modal_environment(self):
+        """Only MODAL_ENVIRONMENT set -> that value."""
+        os.environ.pop("COMFYMODAL_V2_ENVIRONMENT", None)
+        os.environ["MODAL_ENVIRONMENT"] = "shared-prod"
+        try:
+            self.assertEqual(ModalTransport._resolve_environment(), "shared-prod")
+        finally:
+            os.environ.pop("COMFYMODAL_V2_ENVIRONMENT", None)
+            os.environ.pop("MODAL_ENVIRONMENT", None)
+
+    def test_v2_handle_cache_key_includes_environment(self):
+        """HandleCacheKey.environment is set and included in equality."""
+        from comfymodal_runtime.modal_transport import HandleCacheKey
+        key_a = HandleCacheKey("ws", "app", "cls", "gpu", environment="staging")
+        key_b = HandleCacheKey("ws", "app", "cls", "gpu", environment="prod")
+        key_default = HandleCacheKey("ws", "app", "cls", "gpu")
+        self.assertEqual(key_a.environment, "staging")
+        self.assertEqual(key_b.environment, "prod")
+        self.assertEqual(key_default.environment, "")
+        self.assertNotEqual(key_a, key_b)
+        self.assertNotEqual(key_a, key_default)
+
+    def test_v2_handle_cache_isolation_by_environment(self):
+        """Handles for different environment values must not collide in cache."""
+        transport = ModalTransport()
+        # Directly populate the cache with two different environment keys
+        from comfymodal_runtime.modal_transport import HandleCacheKey
+        k1 = HandleCacheKey("ws", "app", "Cls", "gpu", environment="staging")
+        k2 = HandleCacheKey("ws", "app", "Cls", "gpu", environment="prod")
+        transport.handle_cache.put(k1, "handle-staging")
+        transport.handle_cache.put(k2, "handle-prod")
+        self.assertEqual(transport.handle_cache.get(k1), "handle-staging")
+        self.assertEqual(transport.handle_cache.get(k2), "handle-prod")
+        self.assertIsNone(transport.handle_cache.get(
+            HandleCacheKey("ws", "app", "Cls", "gpu")
+        ))
+
     def test_configure_runtime_does_not_set_install_requirements_true(self):
         """_configure_runtime must leave install_requirements_on_startup at its default (False).
 

@@ -2603,21 +2603,46 @@ async def _execute_job(item: tuple, item_id: int):
             if _thumb_ms:
                 _MERGED_DERIVED["materialize_thumbnail_ms"] = _thumb_ms
 
-        # ── Hoist identity metadata from RuntimeTrace into merged legacy trace ──
-        # The RuntimeTrace metadata (container_task_id, image_id, gpu, etc.)
-        # is present in _v2_meta (read from result["trace"]["metadata"]) but
-        # never reaches the top-level merged trace unless explicitly hoisted.
-        # This ensures diagnosis_collector extract_section14_run can find
-        # top-level identity keys in V2 benchmark artifacts.
+        # ── Preserve V2 trace fields lost by trace.summary() and hoist identity ──
+        # trace.summary() produces a legacy timing dict without events, metadata,
+        # trace_id, request_id, or container_session_id.  These are essential
+        # for diagnosis_collector, benchmark consumers, and restore-timing
+        # lifecycle analysis.
+        _remote_events = _remote_full.get("events")
+        if isinstance(_remote_events, list):
+            _merged_trace["events"] = list(_remote_events)
+        _remote_md = _remote_full.get("metadata")
+        if isinstance(_remote_md, dict):
+            _merged_trace["metadata"] = dict(_remote_md)
+        for _key in ("trace_id", "request_id"):
+            _val = _remote_full.get(_key)
+            if _val:
+                _merged_trace[_key] = _val
+        _csid = _remote_full.get("container_session_id")
+        if _csid:
+            _merged_trace["container_session_id"] = _csid
+        _restore_timing_rt = result.get("_restore_timing")
+        if _restore_timing_rt:
+            _merged_trace["_restore_timing"] = _restore_timing_rt
+
+        # Hoist identity fields from authoritative remote (top-level preferred,
+        # then remote metadata), skipping when already set above.  Nonempty
+        # remote values take precedence over empty local placeholders so that
+        # diagnosis_collector extract_section14_run finds real container/GPU
+        # identity in V2 benchmark artifacts.
         _IDENTITY_HOIST_KEYS = (
             "container_task_id", "container_session_id", "image_id",
             "gpu", "cloud", "region", "modal_input_id",
             "workspace_id", "app_name", "class_name", "method_name",
         )
-        if isinstance(_v2_meta, dict):
-            for _hk in _IDENTITY_HOIST_KEYS:
-                if _hk in _v2_meta and _hk not in _merged_trace:
-                    _merged_trace[_hk] = _v2_meta[_hk]
+        for _hk in _IDENTITY_HOIST_KEYS:
+            if _hk in _merged_trace:
+                continue
+            _remote_val = _remote_full.get(_hk)
+            if not _remote_val and isinstance(_v2_meta, dict):
+                _remote_val = _v2_meta.get(_hk)
+            if _remote_val:
+                _merged_trace[_hk] = _remote_val
 
         result["trace"] = _merged_trace
         if os.environ.get("COMFYMODAL_TRACE_DEBUG_LOG"):
@@ -3412,9 +3437,10 @@ if _server:
         _request_workspace = _active_workspace()
         if _request_workspace is None:
             _request_workspace = {}
-        # Prefer request-level trace (body["trace"]["t0_client_press"]) over top-level
+        # Top-level body checked FIRST so a valid queue_prompt_start_ms wins
+        # over a legacy body["trace"]["t0_client_press"].
         request_trace = body.get("trace", {})
-        browser_t0 = coerce_t0_from_browser(request_trace) or coerce_t0_from_browser(body)
+        browser_t0 = coerce_t0_from_browser(body) or coerce_t0_from_browser(request_trace)
         trace = Trace(prompt_id=prompt_id, t0=browser_t0 or _route_entry_ts)
         if browser_t0 is not None:
             trace.mark("t0_client_press", browser_t0)
@@ -3431,6 +3457,24 @@ if _server:
         trace.mark("t1d_json_parse_end", _json_parse_done_ts)
         trace.mark("t1_local_recv", time.time())
         local_et.mark(T1A_LOCAL_PAYLOAD_PARSE_START, phase=PHASE_LOCAL_BRIDGE)
+
+        # ── Browser timing diagnostics (carried through trace._t but not via
+        # mark() — durations/byte counts are stored directly as values) ──
+        def _coerce_numeric(v):
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return float(v)
+            return None
+        _browser_fields = {}
+        for _bf in ("queue_prompt_start_ms", "prompt_fetch_start_ms",
+                     "queue_to_prompt_fetch_ms", "serialized_prompt_bytes"):
+            _bv = _coerce_numeric(body.get(_bf))
+            if _bv is not None:
+                _browser_fields[_bf] = _bv
+        if _browser_fields:
+            # Use public update() API so fields() carries them; never via
+            # mark() since queue_to_prompt_fetch_ms (duration) and
+            # serialized_prompt_bytes (byte count) are not epoch timestamps.
+            trace.update(_browser_fields)
 
         # ── Preflight validation ──
         local_et.mark(T1C_LOCAL_PREFLIGHT_START, phase=PHASE_LOCAL_BRIDGE)
