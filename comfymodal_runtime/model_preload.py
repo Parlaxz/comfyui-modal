@@ -79,14 +79,32 @@ Reset to ``None`` after the callback completes."""
 
 _SENTINEL_READ = "_comfy_modal_read_wrapper"
 _SENTINEL_GPU = "_comfy_modal_gpu_wrapper"
+_SENTINEL_SD = "_comfy_modal_sd_wrapper"
+_SENTINEL_SUBFN = "_comfy_modal_subfn_wrapper"
 
 _read_wrapper_installed: bool = False
 _gpu_wrapper_installed: bool = False
+_sd_wrapper_installed: bool = False
+_subfn_wrappers_installed: bool = False
 _wrappers_lock = RLock()
 
 # Reentrancy guards — per-thread via ContextVar default=0.
 _torch_file_depth: ContextVar[int] = ContextVar("_torch_file_depth", default=0)
 _gpu_depth: ContextVar[int] = ContextVar("_gpu_depth", default=0)
+_sd_depth: ContextVar[int] = ContextVar("_sd_depth", default=0)
+
+# Residual tracking — list of child duration_ms collected during an SD outer call.
+_child_durations: ContextVar[list[float] | None] = ContextVar("_child_durations", default=None)
+
+# Submission correlation counter
+_SUBMISSION_COUNTER: int = 0
+_SUBMISSION_COUNTER_LOCK = RLock()
+
+def _next_submission_id() -> str:
+    global _SUBMISSION_COUNTER
+    with _SUBMISSION_COUNTER_LOCK:
+        _SUBMISSION_COUNTER += 1
+        return f"s{_SUBMISSION_COUNTER:04d}"
 
 
 def _get_live_module(mod_name: str) -> Any | None:
@@ -261,6 +279,215 @@ def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
             )
 
     return result
+
+
+# ── UNET post-read subfunction wrappers (Section B) ─────────────────
+# Installed idempotently on the live sys.modules; skip absent modules
+# without breaking loading.  Only active when _ACTIVE_LANE_TRACE is UNET.
+
+_UNET_DECOMPOSE_TARGETS: dict[str, tuple[str, str, str]] = {
+    # NOTE: load_diffusion_model_state_dict is handled by a dedicated
+    # wrapper (_make_sd_state_dict_wrapper) so it is intentionally absent.
+    "convert_old_quants": ("comfy.utils", "convert_old_quants", "utils"),
+    "state_dict_prefix_replace": ("comfy.utils", "state_dict_prefix_replace", "utils"),
+    "calculate_parameters": ("comfy.utils", "calculate_parameters", "utils"),
+    "weight_dtype": ("comfy.utils", "weight_dtype", "utils"),
+    "model_config_from_unet": ("comfy.model_detection", "model_config_from_unet", "model_detection"),
+    "unet_dtype": ("comfy.model_management", "unet_dtype", "model_management"),
+    "unet_manual_cast": ("comfy.model_management", "unet_manual_cast", "model_management"),
+}
+"""Maps short name -> (module_name, function_name, diagnostic_category)."""
+
+
+def _install_unet_decompose_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
+    """Install UNET post-read decomposition wrappers idempotently.
+
+    Global flag ``_subfn_wrappers_installed`` avoids duplicate trace
+    events.  Each wrapper is installed on its live ``sys.modules`` entry
+    using a sentinel for idempotence.  If a module or symbol is absent
+    the entry is recorded as ``"unavailable"`` and loading continues.
+    Returns ``{short_name: status}``.
+    """
+    global _subfn_wrappers_installed
+    if _subfn_wrappers_installed:
+        return {}
+    result: dict[str, str] = {}
+    for short_name, (mod_name, func_name, category) in _UNET_DECOMPOSE_TARGETS.items():
+        mod = _get_live_module(mod_name)
+        if mod is None:
+            result[short_name] = "unavailable"
+            continue
+        original = getattr(mod, func_name, None)
+        if not callable(original):
+            result[short_name] = "unavailable"
+            continue
+        if getattr(original, _SENTINEL_SUBFN, False):
+            result[short_name] = "already_installed"
+            continue
+        wrapper = _make_unet_subfn_wrapper(short_name, original, category)
+        setattr(wrapper, _SENTINEL_SUBFN, True)
+        setattr(mod, func_name, wrapper)
+        result[short_name] = "installed"
+    if trace:
+        for name, status in result.items():
+            trace.emit("unet_decompose_install", phase="restore", metadata={
+                "function": name, "status": status,
+            })
+    _subfn_wrappers_installed = True
+    return result
+
+
+def _make_unet_subfn_wrapper(
+    short_name: str,
+    original: Callable[..., Any],
+    category: str,
+) -> Callable[..., Any]:
+    """Wrap a UNET post-read subfunction to emit start/end events.
+
+    Only active when ``_ACTIVE_LANE_TRACE`` is set AND the current lane
+    is ``UNET``.  Reentrancy-safe via a per-function ContextVar depth
+    counter.  Records duration into ``_child_durations`` for residual
+    computation by the outer SD state dict wrapper.
+    """
+    _UNET_SUBFN_DEPTH: ContextVar[int] = ContextVar(f"_sd_depth_{short_name}", default=0)
+
+    @functools.wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        before = _UNET_SUBFN_DEPTH.get()
+        _UNET_SUBFN_DEPTH.set(before + 1)
+        lane = _ACTIVE_LANE_TRACE.get()
+        _outer = (before == 0)
+        emit = (_outer and lane is not None and lane._lane == "UNET")
+        _fn_start_ns = time.monotonic_ns() if emit else 0
+        if emit:
+            lane._trace.emit(f"unet_{short_name}_start", phase="restore", metadata={
+                "category": category,
+            })
+        try:
+            return original(*args, **kwargs)
+        finally:
+            after = _UNET_SUBFN_DEPTH.get()
+            _UNET_SUBFN_DEPTH.set(after - 1)
+            if emit and _outer:
+                _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
+                lane._trace.emit(f"unet_{short_name}_end", phase="restore", metadata={
+                    "category": category,
+                    "duration_ms": _dur_ms,
+                })
+                # Record for outer SD residual computation
+                _children = _child_durations.get()
+                if _children is not None:
+                    _children.append(_dur_ms)
+    return wrapper
+
+
+_SD_WRAPPER_INSTANCE: Any = None
+"""Holds the ``sd.load_diffusion_model_state_dict`` wrapper to capture
+both the full span and the residual computation."""
+
+
+def _make_sd_state_dict_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``comfy.sd.load_diffusion_model_state_dict`` with UNET-lane guard.
+
+    Emits:
+    - ``unet_load_diffusion_model_state_dict_start/end`` span
+    - ``unet_post_read_uninstrumented_residual`` with whole/child/residual ms.
+
+    Reentrancy-safe via ``_sd_depth``.  Child durations are accumulated
+    in a thread-local list via ``_child_durations``, populated by the
+    sub-function wrappers in ``_make_unet_subfn_wrapper``.
+    """
+    global _SD_WRAPPER_INSTANCE
+
+    @functools.wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        before = _sd_depth.get()
+        _sd_depth.set(before + 1)
+        lane = _ACTIVE_LANE_TRACE.get()
+        emit = (before == 0 and lane is not None and lane._lane == "UNET")
+        _sd_start_ns = time.monotonic_ns() if emit else 0
+        # Set up child duration tracking for this outer invocation.
+        _prior_children = _child_durations.get()
+        if emit:
+            _child_durations.set([])
+            lane._trace.emit("unet_load_diffusion_model_state_dict_start", phase="restore")
+        try:
+            return original(*args, **kwargs)
+        finally:
+            after = _sd_depth.get()
+            _sd_depth.set(after - 1)
+            if emit:  # before was 0, so we are the outermost invocation
+                _children = _child_durations.get() or []
+                _child_total = round(sum(_children), 3)
+                _whole_ms = round((time.monotonic_ns() - _sd_start_ns) / 1_000_000, 3)
+                _residual_ms = round(max(0.0, _whole_ms - _child_total), 3)
+                # Restore prior before emitting (children list snapshot taken)
+                _child_durations.set(_prior_children)
+                lane._trace.emit("unet_load_diffusion_model_state_dict_end", phase="restore", metadata={
+                    "duration_ms": _whole_ms,
+                    "measured_child_total_ms": _child_total,
+                    "measured_child_count": len(_children),
+                    "measured_children": _children,
+                    "residual_ms": _residual_ms,
+                    "classification": "residual_not_causal_owner",
+                })
+
+    setattr(wrapper, _SENTINEL_SD, True)
+    _SD_WRAPPER_INSTANCE = wrapper
+    return wrapper
+
+
+def _install_sd_state_dict_wrapper(trace: RuntimeTrace | None = None) -> str:
+    """Install the ``load_diffusion_model_state_dict`` wrapper on
+    ``comfy.sd`` (live module in sys.modules).  Idempotent via sentinel."""
+    global _sd_wrapper_installed
+    if _sd_wrapper_installed:
+        return "already_installed"
+    mod = _get_live_module("comfy.sd")
+    if mod is None:
+        return "unavailable"
+    original = getattr(mod, "load_diffusion_model_state_dict", None)
+    if not callable(original):
+        return "unavailable"
+    if getattr(original, _SENTINEL_SD, False):
+        _sd_wrapper_installed = True
+        return "already_installed"
+    with _wrappers_lock:
+        if _sd_wrapper_installed:
+            return "already_installed"
+        if getattr(mod.load_diffusion_model_state_dict, _SENTINEL_SD, False):
+            _sd_wrapper_installed = True
+            return "already_installed"
+        mod.load_diffusion_model_state_dict = _make_sd_state_dict_wrapper(
+            mod.load_diffusion_model_state_dict
+        )
+        _sd_wrapper_installed = True
+    if trace:
+        trace.emit("unet_sd_wrapper_install", phase="restore", metadata={"status": "installed"})
+    return "installed"
+
+
+_UNET_DECOMPOSE_ENSURE_LOCK = RLock()
+_unet_decompose_ensure_done: bool = False
+
+def _ensure_unet_decompose_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
+    """Install both the SD state dict wrapper and all subfunction wrappers.
+
+    Returns combined ``{short_name: status}`` dict.  Global lock ensures
+    exactly one full install attempt across all worker threads.
+    """
+    global _unet_decompose_ensure_done
+    if _unet_decompose_ensure_done:
+        return {}
+    with _UNET_DECOMPOSE_ENSURE_LOCK:
+        if _unet_decompose_ensure_done:
+            return {}
+        result: dict[str, str] = {}
+        result["load_diffusion_model_state_dict"] = _install_sd_state_dict_wrapper(trace=trace)
+        subfn_result = _install_unet_decompose_wrappers(trace=trace)
+        result.update(subfn_result)
+        _unet_decompose_ensure_done = True
+        return result
 
 
 # ── Phase 1-2: state machine and mutation lane ──────────────────────
@@ -607,6 +834,56 @@ class ModelPreloadCoordinator:
             preparation.diagnostics.unused_speculation = bool(exact_prefill and self.prefill_loader is None)
         return preparation
 
+    def extend(
+        self,
+        preparation: RestorePreparation,
+        *,
+        prepare_unet: bool = True,
+        prepare_vae: bool = True,
+        trace: RuntimeTrace | None = None,
+    ) -> RestorePreparation:
+        """Submit only missing lanes on an existing preparation.
+
+        Never resubmits a lane whose future is already present.  The
+        existing preparation (model_key, prefill_key, diagnostics, and
+        any completed futures) is kept intact.  The thread pool is
+        recreated on demand if it was previously closed via ``close()``.
+        """
+        if preparation is None:
+            raise RuntimeError("cannot extend a None preparation")
+        self._active = preparation
+        submitted: list[str] = []
+
+        if prepare_unet and preparation.unet_future is None and self.unet_loader is not None:
+            preparation.unet_future = self._submit(
+                "unet", lambda: self.unet_loader(preparation.model_key),
+                preparation, trace,
+                expected_read_count=1,
+            )
+            submitted.append("unet")
+        if prepare_vae and preparation.vae_future is None and self.vae_loader is not None:
+            if preparation.model_key.vae_identity:
+                preparation.vae_future = self._submit(
+                    "vae", lambda: self.vae_loader(preparation.model_key),
+                    preparation, trace,
+                    expected_read_count=1,
+                )
+                submitted.append("vae")
+
+        if trace and submitted:
+            trace.emit(
+                "preload_extension_submitted",
+                phase="restore",
+                metadata={"submitted_lanes": submitted},
+            )
+        elif trace and not submitted:
+            trace.emit(
+                "preload_extension_skipped",
+                phase="restore",
+                metadata={"reason": "all_requested_lanes_already_present"},
+            )
+        return preparation
+
     def wait_unet(
         self,
         preparation: RestorePreparation | None = None,
@@ -702,12 +979,16 @@ class ModelPreloadCoordinator:
         phase: str = "restore",
         diag_name: str | None = None,
         expected_read_count: int = 1,
+        submission_id: str = "",
     ) -> Future[Any]:
         # Normalise diagnostic attribute namespace so execution-preﬁll work
         # uses the static *preﬁll_started_at/completed_at/error* ﬁelds.
         effective_diag = diag_name or name
         if effective_diag == "execution_prefill":
             effective_diag = "prefill"
+
+        # Generate submission identity used in both pre- and post-pool events.
+        sid = submission_id or _next_submission_id()
 
         # Build canonical lane trace (additive — existing events unchanged).
         canonical_lane = _LANE_TO_CANONICAL.get(name, name.upper())
@@ -716,7 +997,10 @@ class ModelPreloadCoordinator:
             trace.emit(
                 "preload_submitted",
                 phase=phase,
-                metadata={"lane": name},
+                metadata={
+                    "lane": name,
+                    "submission_id": sid,
+                },
             )
             lane_trace = ModelLaneTrace(
                 trace, canonical_lane, phase=phase,
@@ -724,8 +1008,12 @@ class ModelPreloadCoordinator:
             )
             lane_trace.submitted()
 
+        # Capture monotonic clock just before pool handoff for queue delay.
+        _submit_started_ns = time.monotonic_ns()
+
         def run() -> Any:
             started = time.time()
+            _queue_wait_ms = round((time.monotonic_ns() - _submit_started_ns) / 1_000_000, 3)
             setattr(preparation.diagnostics, f"{effective_diag}_started_at", started)
             # ── Activate per-worker lane context ────────────────
             ctx_token = None
@@ -737,12 +1025,20 @@ class ModelPreloadCoordinator:
                     trace.emit(
                         "preload_worker_started",
                         phase=phase,
-                        metadata={"lane": name},
+                        metadata={
+                            "lane": name,
+                            "submission_id": sid,
+                            "queue_wait_ms": _queue_wait_ms,
+                        },
                     )
                 # Install core dispatch wrappers (idempotent per-component,
                 # resolves live sys.modules so partial comfy imports cannot
                 # block the read wrapper).
                 _ensure_core_wrappers(trace=trace)
+                # Install UNET post-read decomposition wrappers (Section B).
+                # Only active when _ACTIVE_LANE_TRACE is UNET; absent
+                # symbols are skipped without breaking loading.
+                _ensure_unet_decompose_wrappers(trace=trace)
 
                 result = callback()
                 completed = time.time()
@@ -1272,13 +1568,58 @@ class V2LoaderBridge:
         The coordinator recreates a pool on the next _submit call."""
         prep = self._preparation
         if prep is not None:
+            _cw_start_ns = time.monotonic_ns()
+            _present = 0
+            _done = 0
+            _failed = 0
             for future in (prep.unet_future, prep.clip_future, prep.vae_future):
                 if future is not None:
+                    _present += 1
+                    if future.done():
+                        _done += 1
+                        if future.exception() is not None:
+                            _failed += 1
                     try:
                         future.result()
                     except Exception:
-                        pass
+                        _failed += 1
+            _cw_wait_ms = round((time.monotonic_ns() - _cw_start_ns) / 1_000_000, 3)
+            if self._trace:
+                self._trace.emit("close_workers_start", phase="restore", metadata={
+                    "present": _present,
+                    "done_before_wait": _done,
+                    "failed": _failed,
+                })
+                self._trace.emit("close_workers_end", phase="restore", metadata={
+                    "wait_ms": _cw_wait_ms,
+                    "present": _present,
+                    "done_final": _present,
+                })
         self.coordinator.close()
+
+    def extend_preparation(
+        self,
+        *,
+        prepare_unet: bool = True,
+        prepare_vae: bool = True,
+        trace: RuntimeTrace | None = None,
+    ) -> RestorePreparation | None:
+        """Extend the current preparation with missing lanes (no clear+re-prepare).
+
+        Delegates to ``ModelPreloadCoordinator.extend()`` which never
+        resubmits a lane whose future is already present.  The existing
+        ``clip_future`` (submitted during a prior clip-only prepare) is
+        preserved, and the thread pool is recreated on demand if it was
+        closed.  Returns None when no preparation exists.
+        """
+        if self._preparation is None or self._model_key is None:
+            return None
+        return self.coordinator.extend(
+            self._preparation,
+            prepare_unet=prepare_unet,
+            prepare_vae=prepare_vae,
+            trace=trace,
+        )
 
     def clear(self) -> None:
         """Disable consumption when a restore has no authoritative plan."""
@@ -1653,6 +1994,7 @@ class V2LoaderBridge:
                 ff_meta: dict[str, Any] = {
                     "lane": lane,
                     "error_category": type(exc).__name__,
+                    "hashed_planned_identity": stable_hash(planned_identity or ""),
                     "terminal_outcome": "fallback_future_error",
                 }
                 if not skip_loader_class:
@@ -1675,6 +2017,7 @@ class V2LoaderBridge:
                 })
                 fu_meta: dict[str, Any] = {
                     "lane": lane,
+                    "hashed_planned_identity": stable_hash(planned_identity or ""),
                     "terminal_outcome": "fallback_unavailable",
                 }
                 if not skip_loader_class:
@@ -1881,5 +2224,36 @@ class V2LoaderBridge:
         method = self._original_methods.get(f"{class_name}.{method_name}")
         node_class = self._node_classes.get(class_name)
         if not callable(method) or node_class is None:
+            if self._trace:
+                self._trace.emit("loader_invoke_error", phase="restore", metadata={
+                    "lane": class_name,
+                    "error": "original_unavailable",
+                })
             raise RuntimeError(f"original ComfyUI loader is unavailable: {class_name}.{method_name}")
-        return method(node_class(), **dict(kwargs))
+        _invoke_lane = class_name
+        _start_ns = time.monotonic_ns()
+        if self._trace:
+            self._trace.emit("loader_invoke_start", phase="restore", metadata={
+                "lane": _invoke_lane,
+                "loader_class": class_name,
+            })
+        try:
+            result = method(node_class(), **dict(kwargs))
+            _dur_ms = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+            if self._trace:
+                self._trace.emit("loader_invoke_end", phase="restore", metadata={
+                    "lane": _invoke_lane,
+                    "loader_class": class_name,
+                    "duration_ms": _dur_ms,
+                })
+            return result
+        except Exception as exc:
+            _dur_ms = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+            if self._trace:
+                self._trace.emit("loader_invoke_error", phase="restore", metadata={
+                    "lane": _invoke_lane,
+                    "loader_class": class_name,
+                    "duration_ms": _dur_ms,
+                    "error": str(exc)[:200],
+                })
+            raise

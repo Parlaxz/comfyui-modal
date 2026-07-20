@@ -9992,6 +9992,12 @@ class _ComfyAPIMixin:
             self._production_unet_barrier_event = _threading.Event()
         if not hasattr(self, "_production_unet_encode_barrier_event"):
             self._production_unet_encode_barrier_event = _threading.Event()
+        # P1: per-key UNET done-events dict, consumed by the V2 deferral
+        # handoff and by legacy restore (which resets to {} at each
+        # call).  Idempotent init so V2's cold-start deferral path does
+        # not crash with AttributeError.
+        if not hasattr(self, "_rbg_unet_done_events"):
+            self._rbg_unet_done_events: dict[str, object] = {}
 
     def _set_actual_load_future_meta(self, key: tuple, **fields) -> dict:
         if not _restore_background_code_enabled():
