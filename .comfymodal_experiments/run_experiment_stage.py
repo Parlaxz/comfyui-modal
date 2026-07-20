@@ -19,8 +19,8 @@ BASE_DIR = Path(__file__).resolve().parent
 PRESETS_PATH = BASE_DIR / "comfymodal_experiment_presets.json"
 STATE_PATH = BASE_DIR / "comfymodal_experiment_state.json"
 DEPLOY_BATCH = Path(
-    r"C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install"
-    r"\redeploy_modal_and_run_comfyui.bat"
+    r"C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI"
+    r"\custom_nodes\comfyui-modal\deploy_and_benchmark_v2_shadow.bat"
 )
 
 

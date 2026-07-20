@@ -185,6 +185,17 @@ class RuntimeTrace:
                     durations[key] = round((event.monotonic_ns - start) / 1_000_000, 2)
         return durations
 
+    def export_phase_durations(self) -> dict[str, float]:
+        """Explicit span durations from paired ``_start``/``_end`` events.
+
+        Only phases where both a ``_start`` and ``_end`` event exist in this
+        trace are included.  Durations are computed from the monotonic clock
+        delta of the paired events — no subtraction-based ownership inference
+        across spans, and overlapping spans are reported independently (the
+        map is not a partition of wall time).
+        """
+        return self.durations_ms()
+
 
 def merge_runtime_traces(*values: RuntimeTrace | Mapping[str, Any] | None) -> RuntimeTrace:
     """Merge local and remote traces without losing process evidence.

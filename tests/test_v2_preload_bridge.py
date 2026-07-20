@@ -34,6 +34,11 @@ def _fake_nodes(calls: list[tuple]) -> SimpleNamespace:
             calls.append(("dual_clip", clip_name1, clip_name2, type, device))
             return (_FakeClip(),)
 
+    class VAELoader:
+        def load_vae(self, vae_name):
+            calls.append(("vae", vae_name))
+            return (f"vae:{vae_name}",)
+
     class CLIPTextEncode:
         def encode(self, clip, text):
             calls.append(("prefill", id(clip), text))
@@ -44,6 +49,7 @@ def _fake_nodes(calls: list[tuple]) -> SimpleNamespace:
             "UNETLoader": UNETLoader,
             "CLIPLoader": CLIPLoader,
             "DualCLIPLoader": DualCLIPLoader,
+            "VAELoader": VAELoader,
             "CLIPTextEncode": CLIPTextEncode,
         }
     )
@@ -334,6 +340,12 @@ class V2PreloadBridgeTests(unittest.TestCase):
         self.assertEqual(len(failed_events), 1)
         self.assertEqual(failed_events[0].metadata.get("terminal_outcome"), "fallback_future_error")
         self.assertEqual(failed_events[0].metadata.get("error_category"), "RuntimeError")
+        self.assertIn("hashed_planned_identity", failed_events[0].metadata,
+                      "future_failed must carry hashed_planned_identity")
+        self.assertNotEqual(
+            failed_events[0].metadata["hashed_planned_identity"], "",
+            "hashed_planned_identity must be non-empty",
+        )
 
     def test_every_graph_demand_has_exactly_one_terminal_outcome(self):
         """Every graph loader demand must end in exactly one terminal outcome.
@@ -617,6 +629,55 @@ class V2PreloadBridgeTests(unittest.TestCase):
             ]
             self.assertEqual(len(bad_for_lane), 0,
                              f"unexpected fallback event '{bad}' for UNET/CLIP")
+
+    def test_no_duplicate_clip_loader_for_identity_match(self):
+        """CLIP original loader called exactly once when planned identity matches."""
+        calls: list[tuple] = []
+        nodes = _fake_nodes(calls)
+        bridge = V2LoaderBridge()
+        bridge.install(nodes)
+        trace = RuntimeTrace(request_id="phase0-clip-nodup", process="remote")
+        workflow = {
+            "1": {
+                "class_type": "CLIPLoader",
+                "inputs": {"clip_name": "clip.safetensors", "type": "flux"},
+            },
+        }
+        bridge.prepare(self._plan(workflow, prefill=False), trace=trace)
+        with bridge.request_scope():
+            result = nodes.NODE_CLASS_MAPPINGS["CLIPLoader"]().load_clip(
+                "clip.safetensors", "flux"
+            )
+
+        self.assertIsInstance(result[0], _FakeClip)
+        clip_calls = [c for c in calls if c[0] == "clip"]
+        self.assertEqual(len(clip_calls), 1,
+                         "CLIP original loader must be called exactly once on identity match")
+        self.assertEqual(clip_calls[0][1], "clip.safetensors",
+                         "CLIP call must use the correct identity")
+
+        event_names = [e.name for e in trace.events]
+        self.assertIn("graph_clip_demand", event_names)
+        self.assertIn("graph_clip_consumed", event_names)
+        self.assertIn("prepared_result_consumed", event_names)
+
+        # Verify terminal outcome metadata
+        terminal = [
+            e for e in trace.events
+            if e.name == "prepared_result_consumed" and e.metadata.get("lane") == "CLIP"
+        ]
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0].metadata.get("terminal_outcome"), "prepared")
+        self.assertIn("hashed_planned_identity", terminal[0].metadata)
+
+        # No fallback events for CLIP
+        for bad in ("identity_mismatch", "request_spec_missing", "original_loader_fallback"):
+            bad_for_clip = [
+                e for e in trace.events
+                if e.name == bad and e.metadata.get("lane") == "CLIP"
+            ]
+            self.assertEqual(len(bad_for_clip), 0,
+                             f"unexpected fallback event '{bad}' for CLIP on identity match")
 
     # ── Phase 0 gate-1: Core dispatch wrapper tests ───────────────────
 
@@ -1200,10 +1261,12 @@ class V2PreloadBridgeTests(unittest.TestCase):
                          "restore prefix must not be duplicated")
 
         # No duplicates of non-diagnostic events.
-        # ``core_wrapper_install`` is a diagnostic event that legitimately
-        # fires once per install attempt (bridge.install + worker fallback).
+        # ``core_wrapper_install`` and ``unet_decompose_install`` are
+        # diagnostic events that legitimately fire once per install
+        # attempt (bridge.install + worker fallback).
+        _DIAG_EVENTS = frozenset({"core_wrapper_install", "unet_decompose_install"})
         from collections import Counter
-        event_names_no_diag = [n for n in exec_names if n != "core_wrapper_install"]
+        event_names_no_diag = [n for n in exec_names if n not in _DIAG_EVENTS]
         name_counts = Counter(event_names_no_diag)
         dupes = {n: c for n, c in name_counts.items() if c > 1}
         self.assertEqual(len(dupes), 0,
@@ -1258,9 +1321,11 @@ class V2PreloadBridgeTests(unittest.TestCase):
         all_names = [e.name for e in restore_trace.events] + [e.name for e in exec_trace.events]
         self.assertIn("failed", all_names, "failed must be in restore or exec trace")
         self.assertNotIn("ready", all_names, "ready must NOT appear on failure")
-        # No duplicates across merged names (core_wrapper_install can appear twice)
+        # No duplicates across merged names (core_wrapper_install and
+        # unet_decompose_install can appear once per install attempt).
+        _DIAG_EVENTS = frozenset({"core_wrapper_install", "unet_decompose_install"})
         from collections import Counter
-        non_diag = [n for n in all_names if n != "core_wrapper_install"]
+        non_diag = [n for n in all_names if n not in _DIAG_EVENTS]
         dupes = {n: c for n, c in Counter(non_diag).items() if c > 1}
         self.assertEqual(len(dupes), 0, f"no duplicates: {dupes}")
 
@@ -1579,6 +1644,17 @@ class V2PreloadBridgeTests(unittest.TestCase):
                        "must emit future_unavailable when UNET future absent")
         self.assertIn("original_loader_fallback", event_names,
                        "must emit original_loader_fallback when UNET falls through")
+        # Verify hashed_planned_identity in future_unavailable
+        unavailable_events = [e for e in trace.events if e.name == "future_unavailable"]
+        self.assertGreaterEqual(len(unavailable_events), 1)
+        for ev in unavailable_events:
+            if ev.metadata.get("lane") == "UNET":
+                self.assertIn("hashed_planned_identity", ev.metadata,
+                              "future_unavailable must carry hashed_planned_identity")
+                self.assertNotEqual(
+                    ev.metadata["hashed_planned_identity"], "",
+                    "hashed_planned_identity must be non-empty",
+                )
 
     def test_vae_skipped_falls_through_to_original(self):
         """When ``prepare_vae=False``, VAE consumption falls through to original loader."""
@@ -1796,6 +1872,281 @@ class V2PreloadBridgeTests(unittest.TestCase):
                 SimpleNamespace(), object()
             )
         )
+
+    # ── Extension: extend existing preparation instead of clear+reprepare ──
+
+    def test_extension_preserves_clip_and_adds_unet(self):
+        """Extending after clip-only prepare preserves clip, adds UNET, no duplicate CLIP call."""
+        calls: list[tuple] = []
+        nodes = _fake_nodes(calls)
+        bridge = V2LoaderBridge()
+        bridge.install(nodes)
+        trace = RuntimeTrace(request_id="ext-preserve", process="remote")
+        workflow = {
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "unet.safetensors", "weight_dtype": "default"}},
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors", "type": "flux"}},
+        }
+
+        # Step 1: clip-only prepare
+        plan = self._plan(workflow, prefill=False)
+        prep = bridge.prepare(plan, trace=trace, prepare_unet=False, prepare_vae=False)
+        self.assertIsNotNone(prep)
+        self.assertIsNone(prep.unet_future, "UNET future must be None in clip-only prepare")
+        self.assertIsNotNone(prep.clip_future, "CLIP future must exist")
+        bridge.close_workers()
+
+        clip_calls_before = [c for c in calls if c[0] == "clip"]
+        self.assertEqual(len(clip_calls_before), 1, "CLIP loaded once in clip-only prepare")
+
+        # Step 2: extend with UNET only
+        extended = bridge.extend_preparation(prepare_unet=True, prepare_vae=False, trace=trace)
+        self.assertIsNotNone(extended)
+        self.assertIs(extended, prep, "extend must return the same preparation object")
+        bridge.close_workers()
+
+        clip_calls_after = [c for c in calls if c[0] == "clip"]
+        unet_calls = [c for c in calls if c[0] == "unet"]
+        self.assertEqual(len(clip_calls_after), 1,
+                         "CLIP must NOT be loaded again during extension")
+        self.assertEqual(len(unet_calls), 1,
+                         "UNET loaded once during extension")
+
+        # Step 3: graph consumption uses prepared objects
+        with bridge.request_scope():
+            unet_result = nodes.NODE_CLASS_MAPPINGS["UNETLoader"]().load_unet(
+                "unet.safetensors", "default"
+            )
+            clip_result = nodes.NODE_CLASS_MAPPINGS["CLIPLoader"]().load_clip(
+                "clip.safetensors", "flux"
+            )
+
+        self.assertEqual(unet_result, ("prepared-unet:unet.safetensors:default",))
+        self.assertIsInstance(clip_result[0], _FakeClip,
+                              "graph must return originally prepared CLIP object")
+
+        # No fallback events for UNET or CLIP
+        for bad in ("identity_mismatch", "request_spec_missing", "original_loader_fallback"):
+            bad_for_lane = [
+                e for e in trace.events
+                if e.name == bad and e.metadata.get("lane") in ("UNET", "CLIP")
+            ]
+            self.assertEqual(len(bad_for_lane), 0,
+                             f"unexpected fallback event '{bad}' for UNET/CLIP")
+
+        # Verify trace has extension events
+        event_names = [e.name for e in trace.events]
+        self.assertIn("preload_extension_submitted", event_names,
+                      "trace must contain preload_extension_submitted")
+
+    def test_extension_adds_vae_when_identity_present(self):
+        """Extension submits VAE when model_key.vae_identity is non-empty."""
+        from comfymodal_runtime.contracts import ModelRestoreKey, PrefillKey, RestorePlan
+        from comfymodal_runtime.restore_plan import build_restore_model_spec
+
+        calls: list[tuple] = []
+        nodes = _fake_nodes(calls)
+        bridge = V2LoaderBridge()
+        bridge.install(nodes)
+        trace = RuntimeTrace(request_id="ext-vae", process="remote")
+        workflow = {
+            "1": {"class_type": "VAELoader", "inputs": {"vae_name": "vae.safetensors"}},
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors", "type": "flux"}},
+        }
+        model_key = ModelRestoreKey(
+            unet_identity="unet.safetensors",
+            clip_identity="clip.safetensors",
+            vae_identity="vae.safetensors",
+        )
+        plan = RestorePlan(
+            generation=1,
+            model_key=model_key,
+            prefill_key=PrefillKey(model_key=model_key),
+            model_spec=build_restore_model_spec(workflow, {"unet": []}),
+        )
+
+        # Step 1: clip-only prepare
+        prep = bridge.prepare(plan, trace=trace, prepare_unet=False, prepare_clip=True, prepare_vae=False)
+        bridge.close_workers()
+        self.assertIsNotNone(prep.clip_future)
+
+        # Step 2: extend with VAE only
+        bridge.extend_preparation(prepare_unet=False, prepare_vae=True, trace=trace)
+        bridge.close_workers()
+
+        self.assertIsNotNone(prep.vae_future, "VAE future must be created during extension")
+        vae_calls = [c for c in calls if c[0] == "vae"]
+        self.assertEqual(len(vae_calls), 1, "VAE loaded once during extension")
+
+        # CLIP still called only once
+        clip_calls = [c for c in calls if c[0] == "clip"]
+        self.assertEqual(len(clip_calls), 1, "CLIP must NOT be reloaded during VAE extension")
+
+    def test_extension_idempotent_no_duplicate(self):
+        """Calling extend twice does not duplicate futures or original loader calls."""
+        calls: list[tuple] = []
+        nodes = _fake_nodes(calls)
+        bridge = V2LoaderBridge()
+        bridge.install(nodes)
+        trace = RuntimeTrace(request_id="ext-idem", process="remote")
+        workflow = {
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "unet.safetensors", "weight_dtype": "default"}},
+        }
+        plan = self._plan(workflow, prefill=False)
+
+        bridge.prepare(plan, trace=trace, prepare_unet=False, prepare_vae=False)
+        bridge.close_workers()
+
+        # First extend
+        bridge.extend_preparation(prepare_unet=True, trace=trace)
+        bridge.close_workers()
+        unet_after_first = len([c for c in calls if c[0] == "unet"])
+        self.assertEqual(unet_after_first, 1, "UNET loaded once after first extend")
+
+        # Second extend — should be no-op (future already present)
+        bridge.extend_preparation(prepare_unet=True, prepare_vae=True, trace=trace)
+        bridge.close_workers()
+        unet_after_second = len([c for c in calls if c[0] == "unet"])
+        self.assertEqual(unet_after_second, 1,
+                         "UNET must NOT be loaded again during second extend (idempotent)")
+        self.assertIn("preload_extension_skipped", [e.name for e in trace.events],
+                      "idempotent extend must emit preload_extension_skipped")
+
+    def test_extension_none_preparation_returns_none(self):
+        """extend_preparation returns None when no preparation exists."""
+        bridge = V2LoaderBridge()
+        result = bridge.extend_preparation(prepare_unet=True, trace=None)
+        self.assertIsNone(result, "extend_preparation must return None with no preparation")
+
+    # ── SD state-dict wrapper and residual ──────────────────────────
+
+    def _with_fake_sd_module(self):
+        """Temporarily install a fake ``comfy.sd`` module in sys.modules
+        whose ``load_diffusion_model_state_dict`` calls known subfunction
+        wrappers (calculate_parameters, weight_dtype) so child wrapper
+        events and residual are exercised."""
+        import sys, types
+        mod = types.ModuleType("comfy.sd")
+        def fake_load_state_dict(ckpt, filter_prefix=None):
+            # Exercise the installed child wrappers
+            utils = sys.modules.get("comfy.utils")
+            if utils is not None:
+                if callable(getattr(utils, "calculate_parameters", None)):
+                    utils.calculate_parameters(ckpt)
+                if callable(getattr(utils, "weight_dtype", None)):
+                    utils.weight_dtype(ckpt, "fp16")
+            return {"model": "fake"}
+        mod.load_diffusion_model_state_dict = fake_load_state_dict
+        prev = sys.modules.get("comfy.sd")
+        sys.modules["comfy.sd"] = mod
+        return mod, prev
+
+    def _cleanup_fake_modules(self, prev_modules: dict):
+        import sys
+        for name, prev in prev_modules.items():
+            if prev is not None:
+                sys.modules[name] = prev
+            else:
+                sys.modules.pop(name, None)
+
+    def _reset_decompose_globals(self):
+        import comfymodal_runtime.model_preload as mp
+        mp._unet_decompose_ensure_done = False
+        mp._sd_wrapper_installed = False
+        mp._subfn_wrappers_installed = False
+
+    def test_unet_sd_wrapper_one_outer_span(self):
+        """SD state-dict wrapper emits exactly one outer start/end pair, no duplicate from decompose targets."""
+        from comfymodal_runtime.model_preload import (
+            _ensure_unet_decompose_wrappers, _ACTIVE_LANE_TRACE, ModelLaneTrace,
+        )
+        self._reset_decompose_globals()
+        fake_sd, prev_sd = self._with_fake_sd_module()
+        trace = RuntimeTrace(request_id="sd-outer", process="remote")
+        lane = ModelLaneTrace(trace, "UNET")
+        try:
+            install_result = _ensure_unet_decompose_wrappers(trace=trace)
+            self.assertIn("load_diffusion_model_state_dict", install_result,
+                          "SD wrapper must be in install result")
+        finally:
+            self._cleanup_fake_modules({"comfy.sd": prev_sd})
+
+        event_names = [e.name for e in trace.events]
+        sd_installs = [e for e in trace.events if e.name == "unet_sd_wrapper_install"]
+        self.assertGreaterEqual(len(sd_installs), 1,
+                                "must emit unet_sd_wrapper_install")
+
+    def test_unet_sd_residual_arithmetic(self):
+        """Child subfunction durations are tracked and residual = whole - child_total.
+        Each wrapped child emits exactly one start AND one end, and the residual
+        event shows measured_child_count and measured_children matching invoked
+        child wrappers (nonzero count from calculate_parameters + weight_dtype)."""
+        import sys, types
+        from comfymodal_runtime.model_preload import (
+            _ensure_unet_decompose_wrappers, _ACTIVE_LANE_TRACE, ModelLaneTrace,
+        )
+        self._reset_decompose_globals()
+        fake_sd, prev_sd = self._with_fake_sd_module()
+
+        # Register fake modules for subfunction wrappers
+        prev_utils = sys.modules.get("comfy.utils")
+        utils_mod = types.ModuleType("comfy.utils")
+        utils_mod.calculate_parameters = lambda sd: 12345
+        utils_mod.weight_dtype = lambda sd, dtype: sd
+        sys.modules["comfy.utils"] = utils_mod
+
+        trace = RuntimeTrace(request_id="sd-residual", process="remote")
+        lane = ModelLaneTrace(trace, "UNET")
+        _ensure_unet_decompose_wrappers(trace=trace)
+
+        token = _ACTIVE_LANE_TRACE.set(lane)
+        try:
+            fake_sd.load_diffusion_model_state_dict({"test": "data"})
+        finally:
+            _ACTIVE_LANE_TRACE.reset(token)
+
+        self._cleanup_fake_modules({"comfy.sd": prev_sd, "comfy.utils": prev_utils})
+
+        # ── Each child wrapper emits one start AND one end ───────────
+        for child_name in ("calculate_parameters", "weight_dtype"):
+            starts = [e for e in trace.events if e.name == f"unet_{child_name}_start"]
+            ends = [e for e in trace.events if e.name == f"unet_{child_name}_end"]
+            self.assertEqual(
+                len(starts), 1,
+                f"{child_name} must emit exactly one start, got {len(starts)}",
+            )
+            self.assertEqual(
+                len(ends), 1,
+                f"{child_name} must emit exactly one end, got {len(ends)}",
+            )
+            # End event must carry duration_ms
+            self.assertIn("duration_ms", ends[0].metadata,
+                          f"{child_name} end must carry duration_ms")
+            self.assertGreaterEqual(ends[0].metadata["duration_ms"], 0,
+                                    f"{child_name} duration_ms must be >= 0")
+
+        # ── Outer SD event has residual ──────────────────────────────
+        end_events = [e for e in trace.events if e.name == "unet_load_diffusion_model_state_dict_end"]
+        self.assertEqual(len(end_events), 1)
+        meta = end_events[0].metadata
+        self.assertGreaterEqual(meta["measured_child_total_ms"], 0)
+        self.assertAlmostEqual(
+            meta["duration_ms"],
+            meta["measured_child_total_ms"] + meta["residual_ms"],
+            delta=0.02,
+            msg="duration_ms ≈ child_total + residual (within clock precision)",
+        )
+        self.assertGreaterEqual(meta["measured_child_count"], 2,
+                                "measured_child_count must be >= 2 (calculate_parameters + weight_dtype)")
+        # measured_children list must contain entries for invoked wrappers
+        self.assertIsInstance(meta.get("measured_children"), (list, tuple),
+                              "measured_children must be list or tuple after freeze")
+        self.assertGreaterEqual(len(meta["measured_children"]), 2,
+                                "measured_children list must have entries for both invoked wrappers")
+        # Each child entry is a non-negative duration
+        for child_dur in meta["measured_children"]:
+            self.assertGreaterEqual(child_dur, 0)
+
+    # ── Phase 0 gate-4: Pregraph ordering ───────────────────────────
 
 
 if __name__ == "__main__":

@@ -774,6 +774,7 @@ class ModalRuntimeEntrypoint:
             "status": "ready",
             "trace": trace.to_dict(),
             "_restore_timing": _restore_timing,
+            "phase_durations_ms": trace.export_phase_durations(),
         }
 
     def restore(self) -> dict[str, Any]:
@@ -809,6 +810,7 @@ class ModalRuntimeEntrypoint:
             metadata=_resource_identity(),
         )
         trace.emit("remote_lifecycle_start", phase="restore", metadata={"snapshot": "False"})
+        trace.emit("restore_plan_read_start", phase="restore")
         try:
             self._restore_plan = self._get_remote_restore_publisher().read_current_plan()
             trace.emit(
@@ -859,6 +861,9 @@ class ModalRuntimeEntrypoint:
             _unet_deferred_meta: dict[str, Any] = {}
             _defer_api = self._load_legacy_runtime() if self._restore_plan else None
             if self._check_unet_deferral_eligible(_defer_api, self._restore_plan):
+                trace.emit("defer_trial_start", phase="restore", metadata={
+                    "unet_identity_hash": stable_hash(self._restore_plan.model_key.unet_identity) if self._restore_plan else "",
+                })
                 try:
                     _defer_api._patch_unet_loader_cache()
                     # Prepare only CLIP through V2; UNET and VAE are
@@ -889,14 +894,53 @@ class ModalRuntimeEntrypoint:
                             "submitted": True,
                             "unet_identity": unet_name,
                         }
-                except Exception:
-                    pass
+                        trace.emit("defer_trial_result", phase="restore", metadata={
+                            "submitted": True,
+                            "decision": str(_defer_result.get("decision", "unknown"))[:120],
+                        })
+                    else:
+                        trace.emit("defer_trial_result", phase="restore", metadata={
+                            "submitted": False,
+                            "reason": "not_submitted",
+                        })
+                except Exception as _defer_exc:
+                    trace.emit("defer_trial_result", phase="restore", metadata={
+                        "submitted": False,
+                        "reason": str(_defer_exc)[:200],
+                    })
             if not _optimized_ok:
-                # Fail closed: clear any partially-prepared bridge state
-                # and use the full V2 preload path.
-                self._preload_bridge.clear()
-                preparation = self._preload_bridge.prepare(self._restore_plan, trace=trace)
-                self._preload_bridge.close_workers()
+                # Check whether an existing clip-only preparation can be
+                # extended with UNET+VAE rather than cleared+reprepared.
+                _existing = self._preload_bridge._preparation
+                _can_extend = False
+                if _existing is not None and _existing.clip_future is not None:
+                    try:
+                        _existing.clip_future.result()  # non-blocking; already waited
+                        _can_extend = True
+                    except Exception:
+                        _can_extend = False
+                if _can_extend:
+                    preparation = self._preload_bridge.extend_preparation(
+                        prepare_unet=True, prepare_vae=True, trace=trace,
+                    )
+                    self._preload_bridge.close_workers()
+                    trace.emit(
+                        "preload_fallback_mode", phase="restore",
+                        metadata={"mode": "extended_existing_preparation"},
+                    )
+                else:
+                    # Fail closed: clear any partially-prepared bridge state
+                    # and use the full V2 preload path.
+                    _reason = "no_useful_existing_preparation"
+                    if _existing is not None and _existing.clip_future is not None:
+                        _reason = "clip_future_failed"
+                    self._preload_bridge.clear()
+                    preparation = self._preload_bridge.prepare(self._restore_plan, trace=trace)
+                    self._preload_bridge.close_workers()
+                    trace.emit(
+                        "preload_fallback_mode", phase="restore",
+                        metadata={"mode": "full_reprepare", "reason": _reason},
+                    )
             # Shared tail: trace metadata common to both paths.
             trace.emit("preload_submission_end", phase="restore", metadata={
                 "preload_scheduled": str(bool(preparation)),
@@ -957,6 +1001,7 @@ class ModalRuntimeEntrypoint:
             "status": "restored",
             "_restore_timing": _restore_timing,
             "trace": trace.to_dict(),
+            "phase_durations_ms": trace.export_phase_durations(),
         }
 
     async def _run_in_process(self, plan: ExecutionPlan, context: ExecutionContext) -> dict[str, Any]:
@@ -1000,6 +1045,7 @@ class ModalRuntimeEntrypoint:
             _rt = self._restore_timing or _LATEST_LIFECYCLE_TIMING
             if _rt is not None:
                 result["_restore_timing"] = dict(_rt)
+            result["phase_durations_ms"] = trace.export_phase_durations()
             return result
         except Exception as exc:
             trace.emit("graph_execution_end", phase="execution", metadata={"status": "error", "error": str(exc)[:200]})
@@ -1128,6 +1174,14 @@ class ModalRuntimeEntrypoint:
                                 "cert_identity": _v2_cert_identity[:16],
                                 "hit": _cert_result is not None,
                                 "preflight_skip": _cert_result is not None,
+                            },
+                        )
+                        trace.emit(
+                            "certificate_reload_end",
+                            phase="execution",
+                            metadata={
+                                "cert_identity": _v2_cert_identity[:16],
+                                "hit": _cert_result is not None,
                             },
                         )
                         if _cert_result is not None:
@@ -1275,60 +1329,77 @@ class ModalRuntimeEntrypoint:
             detail = error.get("message", str(error)) if isinstance(error, dict) else str(error)
             raise RuntimeError(f"Workflow validation failed: {detail}")
 
-        legacy_options = plan.execution_options.to_legacy_dict()
-        production_report = dict(plan.production_report)
-        production = legacy_options.get("production", {})
-        production_enabled = bool(
-            (production.get("enabled") if isinstance(production, Mapping) else False)
-            or production_report.get("enabled")
-        )
-        authorized_node_ids: list[str] = []
-        if production_report:
-            for key in (
-                "direct_output_rewritten_node_ids",
-                "rgthree_comparer_rewritten_node_ids",
-            ):
-                authorized_node_ids.extend(str(value) for value in production_report.get(key, []) or [])
-        authorized_node_ids = list(dict.fromkeys(authorized_node_ids))
-        register_request = getattr(module, "_register_production_request", None)
-        cleanup_request = getattr(module, "_cleanup_production_request", None)
-        cleanup_registry = getattr(module, "_cleanup_production_registry", None)
-        pop_outputs = getattr(module, "_pop_production_outputs", None)
-        if production_enabled and not callable(pop_outputs):
-            raise RuntimeError("v2 production output registry is unavailable")
-
-        if production_enabled and callable(register_request):
-            trace.emit(
-                "production_registry_setup_start",
-                phase="execution",
-                metadata={"production_enabled": True, "authorized_node_count": len(authorized_node_ids)},
+        # ── Pregraph setup: V2-owned work between prompt validation and
+        # PromptExecutor call (production registry, _begin_profile, etc.).
+        trace.emit("pregraph_setup_start", phase="execution", metadata={
+            "prompt_id": prompt_id,
+        })
+        _pregraph_error: str | None = None
+        try:
+            legacy_options = plan.execution_options.to_legacy_dict()
+            production_report = dict(plan.production_report)
+            production = legacy_options.get("production", {})
+            production_enabled = bool(
+                (production.get("enabled") if isinstance(production, Mapping) else False)
+                or production_report.get("enabled")
             )
-            register_request(
-                prompt_id,
-                {
-                    "enabled": True,
-                    "prompt_id": prompt_id,
-                    "output_format": legacy_options.get("output_format", "original"),
-                    "quality": legacy_options.get("quality", 75),
-                    "webp_lossless_compression": legacy_options.get(
-                        "webp_lossless_compression", "balanced"
-                    ),
-                    "return_comparison_a": legacy_options.get("return_comparison_a", False),
-                    "metadata_mode": production.get("metadata_mode", "none") if isinstance(production, Mapping) else "none",
-                    "authorized_node_ids": authorized_node_ids,
-                },
-            )
-            trace.emit("production_registry_setup_end", phase="execution")
+            authorized_node_ids: list[str] = []
+            if production_report:
+                for key in (
+                    "direct_output_rewritten_node_ids",
+                    "rgthree_comparer_rewritten_node_ids",
+                ):
+                    authorized_node_ids.extend(str(value) for value in production_report.get(key, []) or [])
+            authorized_node_ids = list(dict.fromkeys(authorized_node_ids))
+            register_request = getattr(module, "_register_production_request", None)
+            cleanup_request = getattr(module, "_cleanup_production_request", None)
+            cleanup_registry = getattr(module, "_cleanup_production_registry", None)
+            pop_outputs = getattr(module, "_pop_production_outputs", None)
+            if production_enabled and not callable(pop_outputs):
+                raise RuntimeError("v2 production output registry is unavailable")
 
-        _begin_profile = getattr(api, "_begin_prompt_profile", None)
-        if callable(_begin_profile):
-            _begin_profile(workflow, prompt_id, outputs_to_execute)
+            if production_enabled and callable(register_request):
+                trace.emit(
+                    "production_registry_setup_start",
+                    phase="execution",
+                    metadata={"production_enabled": True, "authorized_node_count": len(authorized_node_ids)},
+                )
+                register_request(
+                    prompt_id,
+                    {
+                        "enabled": True,
+                        "prompt_id": prompt_id,
+                        "output_format": legacy_options.get("output_format", "original"),
+                        "quality": legacy_options.get("quality", 75),
+                        "webp_lossless_compression": legacy_options.get(
+                            "webp_lossless_compression", "balanced"
+                        ),
+                        "return_comparison_a": legacy_options.get("return_comparison_a", False),
+                        "metadata_mode": production.get("metadata_mode", "none") if isinstance(production, Mapping) else "none",
+                        "authorized_node_ids": authorized_node_ids,
+                    },
+                )
+                trace.emit("production_registry_setup_end", phase="execution")
+
+            _begin_profile = getattr(api, "_begin_prompt_profile", None)
+            if callable(_begin_profile):
+                _begin_profile(workflow, prompt_id, outputs_to_execute)
+        except Exception as _pg_exc:
+            _pregraph_error = str(_pg_exc)[:200]
 
         started = time.time()
         try:
             trace.emit("executor_reset_start", phase="execution")
             executor.reset()
             trace.emit("executor_reset_end", phase="execution")
+            # End pregraph span here — before prompt_executor_start, after
+            # all V2-owned setup including executor.reset().
+            trace.emit("pregraph_setup_end", phase="execution", metadata={
+                "status": "error" if _pregraph_error else "ok",
+                "error": _pregraph_error or "",
+            })
+            if _pregraph_error:
+                raise RuntimeError(_pregraph_error)
             trace.emit("prompt_executor_start", phase="execution", metadata={"prompt_id": prompt_id})
             execute_async = getattr(executor, "execute_async", None)
             execute_kwargs = {
@@ -1346,6 +1417,47 @@ class ModalRuntimeEntrypoint:
                 trace.emit("sampler_lane_wait_start", phase="execution")
                 _lane.acquire("sampler")
                 trace.emit("sampler_lane_wait_end", phase="execution")
+            # ── PromptExecutor internal milestone interception ──
+            # Request-local: wraps executor.add_message (3-arg shape) to
+            # capture execution_start and execution_cached timestamps,
+            # and executor.server.send_sync to capture the first executing
+            # node.  Both are restored in the finally block.
+            _orig_add_message = getattr(executor, "add_message", None)
+            _server = getattr(executor, "server", None)
+            _orig_send_sync = getattr(_server, "send_sync", None) if _server is not None else None
+            _milestones: dict[str, float] = {}
+            _milestone_wrapper_ok = False
+            _send_sync_wrapper_ok = False
+
+            if callable(_orig_add_message) and not getattr(_orig_add_message, "_comfy_modal_milestone", False):
+                def _milestone_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    event = args[0] if args else kwargs.get("event", "")
+                    if event in ("execution_start", "execution_cached"):
+                        _milestones.setdefault(event, time.monotonic_ns())
+                    return _orig_add_message(*args, **kwargs)
+                setattr(_milestone_wrapper, "_comfy_modal_milestone", True)
+                executor.add_message = _milestone_wrapper
+                _milestone_wrapper_ok = True
+
+            if callable(_orig_send_sync) and not getattr(_orig_send_sync, "_comfy_modal_send_sync", False):
+                def _send_sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    event = args[0] if args else kwargs.get("event", "")
+                    if event == "executing":
+                        _milestones.setdefault(event, time.monotonic_ns())
+                    return _orig_send_sync(*args, **kwargs)
+                setattr(_send_sync_wrapper, "_comfy_modal_send_sync", True)
+                _server.send_sync = _send_sync_wrapper
+                _send_sync_wrapper_ok = True
+
+            if not _milestone_wrapper_ok and not _send_sync_wrapper_ok:
+                trace.emit("prompt_executor_internal_milestones_unavailable", phase="execution",
+                           metadata={"reason": "add_message_and_send_sync_unavailable"})
+            elif not _milestone_wrapper_ok:
+                trace.emit("prompt_executor_internal_milestones_unavailable", phase="execution",
+                           metadata={"reason": "add_message_unavailable"})
+
+            # Capture monotonic timestamp immediately before executor call.
+            _execute_call_ns = time.monotonic_ns()
             try:
                 if callable(execute_async):
                     execute_result = execute_async(**execute_kwargs)
@@ -1354,8 +1466,27 @@ class ModalRuntimeEntrypoint:
                 else:
                     executor.execute(**execute_kwargs)
             finally:
+                # Restore original add_message
+                if _milestone_wrapper_ok and _orig_add_message is not None:
+                    executor.add_message = _orig_add_message
+                # Restore original send_sync
+                if _send_sync_wrapper_ok and _orig_send_sync is not None and _server is not None:
+                    _server.send_sync = _orig_send_sync
                 if _lane is not None:
                     _lane.release("sampler")
+            # ── Emit derived milestone intervals (monotonic ns deltas) ────
+            if _milestones:
+                _exec_st_ns = _milestones.get("execution_start")
+                _cached_ns = _milestones.get("execution_cached")
+                _first_ns = _milestones.get("executing")
+                _exec_st_val = round((_exec_st_ns - _execute_call_ns) / 1_000_000, 3) if _exec_st_ns else None
+                _exec_to_cache = round((_cached_ns - _exec_st_ns) / 1_000_000, 3) if _exec_st_ns and _cached_ns else None
+                _cache_to_node = round((_first_ns - _cached_ns) / 1_000_000, 3) if _cached_ns and _first_ns else None
+                trace.emit("prompt_executor_milestones", phase="execution", metadata={
+                    "executor_call_to_execution_start_ms": _exec_st_val,
+                    "execution_start_to_cached_ms": _exec_to_cache,
+                    "cached_to_first_node_ms": _cache_to_node,
+                })
             trace.emit(
                 "prompt_executor_end",
                 phase="execution",
@@ -1667,6 +1798,7 @@ class ModalRuntimeEntrypoint:
                     _legacy_stages.update(_exec_stages)
                 data["trace"] = merged.to_dict()
                 data["trace"]["stages"] = _legacy_stages
+                data["phase_durations_ms"] = merged.export_phase_durations()
                 _rt = self._restore_timing or _LATEST_LIFECYCLE_TIMING
                 if _rt is not None and "_restore_timing" not in data:
                     data["_restore_timing"] = dict(_rt)
