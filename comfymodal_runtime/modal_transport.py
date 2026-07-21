@@ -183,6 +183,7 @@ class ModalTransport:
         _origin_from_meta: dict[str, Any] = {}
         _modal_input_id = ""
         _modal_input_created_at: Any = None
+        _modal_input_id_emitted = False
         _generator_start_wall_ns = 0
         _generator_start_mono_ns = 0
         _generator_end_wall_ns = 0
@@ -253,6 +254,7 @@ class ModalTransport:
                 _generator_end_mono_ns = time.monotonic_ns()
                 _modal_input_id = str(getattr(stream, "input_id", "") or "")
                 _modal_input_created_at = getattr(stream, "input_created_at", None)
+                _modal_input_id_emitted = False
                 if runtime_trace is not None:
                     runtime_trace.emit("modal_generator_created", phase="local", metadata={
                         "wall_ns": _generator_end_wall_ns,
@@ -262,16 +264,31 @@ class ModalTransport:
                         "modal_input_created_at": _modal_input_created_at,
                     })
                     runtime_trace.emit("modal_generator_create_end", phase="local")
+                    # Emit modal_input_id_observed at creation boundary when
+                    # input_id is already exposed by the SDK immediately after
+                    # .remote_gen.aio().
+                    if _modal_input_id:
+                        runtime_trace.emit("modal_input_id_observed", phase="local", metadata={
+                            "modal_input_id": _modal_input_id,
+                        })
+                        _modal_input_id_emitted = True
             if hasattr(stream, "__aiter__"):
                 iterator = stream.__aiter__()
                 _submission_wall_ns = time.time_ns()
                 _submission_mono_ns = time.monotonic_ns()
                 if runtime_trace is not None and fn is None:
-                    runtime_trace.emit("modal_submission_attempt", phase="local", metadata={
-                        "wall_ns": _submission_wall_ns,
-                        "mono_ns": _submission_mono_ns,
-                        "request_id": request_id if fn is None else "",
-                    })
+                    # Use emit_at so the event wall/monotonic timestamps match
+                    # the captured boundary — no normal emit() between capture
+                    # and __anext__.
+                    runtime_trace.emit_at(
+                        "modal_submission_attempt",
+                        wall_unix_ns=_submission_wall_ns,
+                        monotonic_ns=_submission_mono_ns,
+                        phase="local",
+                        metadata={
+                            "request_id": request_id if fn is None else "",
+                        },
+                    )
                 try:
                     first_event = await iterator.__anext__()
                 except StopAsyncIteration:
@@ -296,7 +313,10 @@ class ModalTransport:
                         "wall_ns": _first_event_wall_ns,
                         "mono_ns": _first_event_mono_ns,
                     })
-                    if fn is None and _modal_input_id:
+                    # Emit modal_input_id_observed after first iteration when
+                    # it was not available at creation time.  The flag prevents
+                    # a duplicate observation event.
+                    if fn is None and _modal_input_id and not _modal_input_id_emitted:
                         runtime_trace.emit("modal_input_id_observed", phase="local", metadata={
                             "modal_input_id": _modal_input_id,
                         })

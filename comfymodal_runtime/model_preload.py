@@ -115,12 +115,21 @@ _SENTINEL_SD = "_comfy_modal_sd_wrapper"
 _SENTINEL_SUBFN = "_comfy_modal_subfn_wrapper"
 _SENTINEL_DEEP_ST = "_comfy_modal_deep_st_wrapper"
 _SENTINEL_DEEP_TL = "_comfy_modal_deep_tl_wrapper"
+_SENTINEL_CLIP = "_comfy_modal_clip_wrapper"
+_SENTINEL_CLIP_SUBFN = "_comfy_modal_clip_subfn_wrapper"
+_SENTINEL_UNET_SUBFN = "_comfy_modal_unet_subfn_wrapper"
+_SENTINEL_SHARED_COQ = "_comfy_modal_shared_convert_old_quants"
+_SENTINEL_MODEL_PATCHER = "_comfy_modal_model_patcher_wrapper"
+_SENTINEL_MODEL_TO = "_comfy_modal_model_to_wrapper"
+_SENTINEL_CLIP_CONSTRUCTOR = "_comfy_modal_clip_constructor_wrapper"
 
 _read_wrapper_installed: bool = False
 _gpu_wrapper_installed: bool = False
 _sd_wrapper_installed: bool = False
 _subfn_wrappers_installed: bool = False
 _deep_diag_wrappers_installed: bool = False
+_clip_wrapper_installed: bool = False
+_clip_constructor_wrapper_installed: bool = False
 _wrappers_lock = RLock()
 
 # Reentrancy guards — per-thread via ContextVar default=0.
@@ -129,6 +138,9 @@ _gpu_depth: ContextVar[int] = ContextVar("_gpu_depth", default=0)
 _sd_depth: ContextVar[int] = ContextVar("_sd_depth", default=0)
 _deep_st_depth: ContextVar[int] = ContextVar("_deep_st_depth", default=0)
 _deep_tl_depth: ContextVar[int] = ContextVar("_deep_tl_depth", default=0)
+_clip_depth: ContextVar[int] = ContextVar("_clip_depth", default=0)
+_clip_subfn_depth: ContextVar[int] = ContextVar("_clip_subfn_depth", default=0)
+_clip_constructor_depth: ContextVar[int] = ContextVar("_clip_constructor_depth", default=0)
 
 # ── Deep-diagnostic target path (thread-local) ──────────────────────
 # Set by the background UNET worker before the load body; used by the
@@ -139,6 +151,18 @@ _DEEP_TARGET_PATH: ContextVar[str] = ContextVar("_deep_target_path", default="")
 
 # Residual tracking — list of child duration_ms collected during an SD outer call.
 _child_durations: ContextVar[list[float] | None] = ContextVar("_child_durations", default=None)
+
+# CLIP CPU prepare child durations.
+_clip_cpu_prepare_children: ContextVar[list[tuple[str, float]] | None] = ContextVar("_clip_cpu_prepare_children", default=None)
+
+# GPU request-local invocation count (ContextVar for per-thread safety).
+_gpu_request_call_count_var: ContextVar[int] = ContextVar("_gpu_request_call_count", default=0)
+
+# UNET subfn nesting depth — tracks cross-function nesting for non-overlapping measured children.
+_unet_subfn_nesting_depth: ContextVar[int] = ContextVar("_unet_subfn_nesting_depth", default=0)
+
+# Accumulator for "not_observed" GPU wrapper calls (no lane/request scope).
+_not_observed_gpu_calls: int = 0
 
 # Submission correlation counter
 _SUBMISSION_COUNTER: int = 0
@@ -207,7 +231,8 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
     Reentrancy-safe.  Emits ``gpu_lane_wait_start/end`` using the real
     ``_MUTATION_LANE`` (non-zero when contention exists) so Phase-2
     wait durations are truthful.  ``gpu_commit_start/end`` bracket the
-    actual call.
+    actual call with full metadata (restore IDs, model identity,
+    caller classification, wall/thread CPU durations).
     """
 
     @functools.wraps(original)
@@ -218,36 +243,71 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
         _graph_start_ns = 0
         _graph_thread_start_ns = None
         _caller = "not_observed"
+        _wrapper_status = "installed"
+        _lane_start_ns = 0
+        _lane_thread_start_ns = None
+        _model_identity_hash = ""
         if before == 0:
+            count = _gpu_request_call_count_var.get()
+            _gpu_request_call_count_var.set(count + 1)
             lane = _ACTIVE_LANE_TRACE.get()
             request_trace = _ACTIVE_REQUEST_TRACE.get()
             _graph_start_ns = time.monotonic_ns()
             _graph_thread_start_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
-            _caller = "background_unet_preparation" if lane is not None and lane._lane == "UNET" else "graph_model_loading"
-            if lane is None and request_trace is not None:
+            if lane is not None and lane._lane == "UNET":
+                _caller = "background_unet_preparation"
+            elif lane is not None and lane._lane == "CLIP":
+                _caller = "restore_clip_preparation"
+            elif lane is not None and lane._lane == "VAE":
+                _caller = "restore_vae_preparation"
+            elif lane is None and request_trace is not None:
                 try:
                     import inspect as _inspect
                     _frames = " ".join(frame.function.lower() for frame in _inspect.stack(context=0)[:12])
                     if "sampler" in _frames:
                         _caller = "sampler_setup"
+                    else:
+                        _caller = "graph_model_loading"
                 except Exception:
-                    pass
+                    _caller = "graph_model_loading"
+                _model_identity_hash = stable_hash([type(model).__module__ + "." + type(model).__qualname__ for model in models])[:16]
                 request_trace.emit("graph_gpu_load_start", phase="execution", metadata={
-                    "model_identity_hash": stable_hash([type(model).__module__ + "." + type(model).__qualname__ for model in models])[:16],
+                    "model_identity_hash": _model_identity_hash,
                     "memory_required": memory_required,
                     "force_patch_weights": force_patch_weights,
                     "force_full_load": force_full_load,
                     "caller_classification": _caller,
+                    "gpu_wrapper_status": _wrapper_status,
+                    "gpu_request_invocation_count": _gpu_request_call_count_var.get(),
+                    "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+                    "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
                 })
+            elif lane is None and request_trace is None:
+                # Installed wrapper called outside any lane/request scope
+                _caller = "not_observed"
+                global _not_observed_gpu_calls
+                _not_observed_gpu_calls += 1
             if lane is not None:
                 lane._on_gpu_commit_about_to_start()
-                # Acquire mutation lane (real wait when contended).
-                # _get_mutation_lane is a lazy getter so there is no
-                # circular-dependency issue with the MutationLane class.
                 _get_mutation_lane().acquire(lane._lane if lane else None)
                 lane.gpu_lane_wait_start()
                 lane.gpu_lane_wait_end()
-                lane.gpu_commit_start()
+                # Compute metadata for lane-owned commit events
+                _lane_start_ns = time.monotonic_ns()
+                _lane_thread_start_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
+                _model_identity_hash = stable_hash([type(model).__module__ + "." + type(model).__qualname__ for model in models])[:16]
+                lane.gpu_commit_start(
+                    request_id=str(request_trace.request_id) if request_trace is not None else "",
+                    restore_session_id=_LATEST_RESTORE_SESSION_ID,
+                    restored_instance_id=_LATEST_RESTORED_INSTANCE_ID,
+                    model_identity_hash=_model_identity_hash,
+                    memory_required=memory_required,
+                    force_patch_weights=force_patch_weights,
+                    force_full_load=force_full_load,
+                    caller_classification=_caller,
+                    gpu_wrapper_status=_wrapper_status,
+                    gpu_request_invocation_count=_gpu_request_call_count_var.get(),
+                )
         try:
             return original(models, memory_required=memory_required,
                             force_patch_weights=force_patch_weights,
@@ -260,7 +320,22 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 lane = _ACTIVE_LANE_TRACE.get()
                 request_trace = _ACTIVE_REQUEST_TRACE.get()
                 if lane is not None:
-                    lane.gpu_commit_end()
+                    _lane_end_ns = time.monotonic_ns()
+                    _lane_thread_end_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
+                    lane.gpu_commit_end(
+                        host_wall_duration_ms=round((_lane_end_ns - _lane_start_ns) / 1_000_000, 3),
+                        thread_cpu_duration_ms=round((_lane_thread_end_ns - _lane_thread_start_ns) / 1_000_000, 3) if _lane_thread_end_ns is not None and _lane_thread_start_ns is not None else None,
+                        request_id=str(request_trace.request_id) if request_trace is not None else "",
+                        restore_session_id=_LATEST_RESTORE_SESSION_ID,
+                        restored_instance_id=_LATEST_RESTORED_INSTANCE_ID,
+                        model_identity_hash=_model_identity_hash,
+                        memory_required=memory_required,
+                        force_patch_weights=force_patch_weights,
+                        force_full_load=force_full_load,
+                        caller_classification=_caller,
+                        gpu_wrapper_status=_wrapper_status,
+                        gpu_request_invocation_count=_gpu_request_call_count_var.get(),
+                    )
                     _get_mutation_lane().release(lane._lane if lane else None)
                 elif request_trace is not None:
                     _thread_end_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
@@ -268,8 +343,16 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                         "host_wall_duration_ms": round((time.monotonic_ns() - _graph_start_ns) / 1_000_000, 3),
                         "thread_cpu_duration_ms": round((_thread_end_ns - _graph_thread_start_ns) / 1_000_000, 3) if _thread_end_ns is not None and _graph_thread_start_ns is not None else None,
                         "caller_classification": _caller,
+                        "gpu_wrapper_status": _wrapper_status,
+                        "gpu_request_invocation_count": _gpu_request_call_count_var.get(),
+                        "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
+                        "restore_session_id": _LATEST_RESTORE_SESSION_ID,
+                        "model_identity_hash": _model_identity_hash,
+                        "memory_required": memory_required,
+                        "force_patch_weights": force_patch_weights,
+                        "force_full_load": force_full_load,
                     })
-    wrapper._comfy_modal_gpu_wrapper = True  # sentinel for idempotence
+    wrapper._comfy_modal_gpu_wrapper = True
     return wrapper
 
 
@@ -281,6 +364,55 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
 #   3. The active lane trace is UNET
 # These are globally installed but filtered by thread-local path, so
 # unrelated file activity is never logged.
+
+
+class _SafeOpenProxy:
+    """Delegating proxy for safetensors.safe_open that wraps get_tensor
+    for aggregate diagnostics without mutating the native C-extension object.
+    _orig_gt(k) is called exactly once per requested tensor key.
+    """
+    def __init__(self, wrapped, orig_gt, count_agg, bytes_agg):
+        object.__setattr__(self, "_wrapped", wrapped)
+        object.__setattr__(self, "_orig_gt", orig_gt)
+        object.__setattr__(self, "_count_agg", count_agg)
+        object.__setattr__(self, "_bytes_agg", bytes_agg)
+
+    def __getattr__(self, name):
+        if name == "get_tensor":
+            return lambda k: self._proxy_get_tensor(k)
+        return getattr(self._wrapped, name)
+
+    def _proxy_get_tensor(self, k):
+        lane2 = _ACTIVE_LANE_TRACE.get()
+        _start_ns = 0
+        if lane2 is not None and lane2._lane == "UNET" and _DIAGNOSTIC_FLAG:
+            _start_ns = time.monotonic_ns()
+        tensor = self._orig_gt(k)
+        if lane2 is not None and lane2._lane == "UNET" and _DIAGNOSTIC_FLAG and _start_ns:
+            self._count_agg[0] += 1
+            try:
+                self._bytes_agg[0] += tensor.numel() * tensor.element_size()
+            except Exception:
+                pass
+        return tensor
+
+    def __enter__(self):
+        try:
+            return self._wrapped.__enter__()
+        except AttributeError:
+            return self
+
+    def __exit__(self, *exc):
+        lane2 = _ACTIVE_LANE_TRACE.get()
+        if lane2 is not None:
+            lane2._trace.emit("unet_tensor_materialize_aggregated", phase="restore", metadata={
+                "tensor_count": self._count_agg[0],
+                "total_bytes": self._bytes_agg[0],
+            })
+        return self._wrapped.__exit__(*exc) if hasattr(self._wrapped, "__exit__") else None
+
+    def keys(self):
+        return self._wrapped.keys()
 
 
 def _make_safetensors_open_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -332,50 +464,6 @@ def _make_safetensors_open_wrapper(original: Callable[..., Any]) -> Callable[...
                     _tensor_bytes_agg = [0]
                     _orig_get_tensor = _result.get_tensor
 
-                    class _SafeOpenProxy:
-                        """Delegating wrapper that preserves the full safe_open
-                        interface (keys, get_tensor, metadata, context manager)
-                        while wrapping get_tensor for aggregate diagnostics."""
-                        def __init__(self, wrapped, orig_gt, count_agg, bytes_agg):
-                            object.__setattr__(self, "_wrapped", wrapped)
-                            object.__setattr__(self, "_orig_gt", orig_gt)
-                            object.__setattr__(self, "_count_agg", count_agg)
-                            object.__setattr__(self, "_bytes_agg", bytes_agg)
-
-                        def __getattr__(self, name):
-                            if name == "get_tensor":
-                                return lambda k: self._proxy_get_tensor(k)
-                            return getattr(self._wrapped, name)
-
-                        def _proxy_get_tensor(self, k):
-                            lane2 = _ACTIVE_LANE_TRACE.get()
-                            _start_ns = 0
-                            if lane2 is not None and lane2._lane == "UNET" and _DIAGNOSTIC_FLAG:
-                                _start_ns = time.monotonic_ns()
-                            tensor = self._orig_gt(k)
-                            if lane2 is not None and lane2._lane == "UNET" and _DIAGNOSTIC_FLAG and _start_ns:
-                                self._count_agg[0] += 1
-                                try:
-                                    self._bytes_agg[0] += tensor.numel() * tensor.element_size()
-                                except Exception:
-                                    pass
-                            return tensor
-
-                        def __enter__(self):
-                            return self
-
-                        def __exit__(self, *exc):
-                            lane2 = _ACTIVE_LANE_TRACE.get()
-                            if lane2 is not None:
-                                lane2._trace.emit("unet_tensor_materialize_aggregated", phase="restore", metadata={
-                                    "tensor_count": self._count_agg[0],
-                                    "total_bytes": self._bytes_agg[0],
-                                })
-                            return self._wrapped.__exit__(*exc) if hasattr(self._wrapped, "__exit__") else None
-
-                        def keys(self):
-                            return self._wrapped.keys()
-
                     _result = _SafeOpenProxy(_result, _orig_get_tensor,
                                              _tensor_count_agg, _tensor_bytes_agg)
                 else:
@@ -419,6 +507,415 @@ def _make_torch_load_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 lane._trace.emit("unet_load_torch_file_end", phase="restore")
     wrapper._comfy_modal_deep_tl_wrapper = True
     return wrapper
+
+
+def _make_clip_load_wrapper(original):
+    import functools as _ft
+    @_ft.wraps(original)
+    def wrapper(*args, **kwargs):
+        before = _clip_depth.get()
+        _clip_depth.set(before + 1)
+        lane = _ACTIVE_LANE_TRACE.get()
+        emit = (before == 0 and lane is not None and lane._lane == "CLIP")
+        _outer_start_ns = time.monotonic_ns() if emit else 0
+        _prior_children = _clip_cpu_prepare_children.get()
+        _result = None
+        if emit:
+            _clip_cpu_prepare_children.set([])
+            lane._trace.emit("clip_cpu_prepare_start", phase="restore")
+        try:
+            _result = original(*args, **kwargs)
+            return _result
+        finally:
+            after = _clip_depth.get()
+            _clip_depth.set(after - 1)
+            if emit:
+                _outer_dur_ms = round((time.monotonic_ns() - _outer_start_ns) / 1_000_000, 3)
+                _children = _clip_cpu_prepare_children.get() or []
+                _children_total = round(sum(c[1] for c in _children), 3)
+                _residual = round(max(0.0, _outer_dur_ms - _children_total), 3)
+                # ── Cache publication observation ────────────────
+                if _result is not None:
+                    _patcher = getattr(_result, "patcher", None)
+                    if _patcher is not None:
+                        _cpi = getattr(_patcher, "cached_patcher_init", None)
+                        if _cpi is not None:
+                            lane._trace.emit("clip_cache_publish", phase="restore", metadata={
+                                "cache_type": "cached_patcher_init",
+                                "clip_cpu_prepare_total_ms": _outer_dur_ms,
+                            })
+                _clip_cpu_prepare_children.set(_prior_children)
+                lane._trace.emit("clip_cpu_prepare_end", phase="restore", metadata={
+                    "clip_cpu_prepare_total_ms": _outer_dur_ms,
+                    "children": [(name, dur) for name, dur in _children],
+                    "clip_cpu_prepare_measured_children_ms": _children_total,
+                    "clip_cpu_prepare_residual_ms": _residual,
+                })
+    wrapper._comfy_modal_clip_wrapper = True
+    return wrapper
+
+
+def _make_clip_subfn_wrapper(short_name, original, category):
+    import functools as _ft
+    @_ft.wraps(original)
+    def wrapper(*args, **kwargs):
+        lane = _ACTIVE_LANE_TRACE.get()
+        emit = (lane is not None and lane._lane == "CLIP")
+        _fn_start_ns = time.monotonic_ns() if emit else 0
+        if emit:
+            lane._trace.emit("clip_" + short_name + "_start", phase="restore", metadata={"category": category})
+        _before_depth = _clip_subfn_depth.get()
+        _clip_subfn_depth.set(_before_depth + 1)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            _after_depth = _clip_subfn_depth.get()
+            _clip_subfn_depth.set(_after_depth - 1)
+            if emit:
+                _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
+                lane._trace.emit("clip_" + short_name + "_end", phase="restore", metadata={
+                    "category": category, "duration_ms": _dur_ms})
+                # Only direct children (depth=0 before call) contribute to measured sum
+                if _before_depth == 0:
+                    _children = _clip_cpu_prepare_children.get()
+                    if _children is not None:
+                        _children.append((short_name, _dur_ms))
+    setattr(wrapper, _SENTINEL_CLIP_SUBFN, True)
+    return wrapper
+
+
+def _make_clip_constructor_wrapper(original):
+    """Wrap ``comfy.sd.CLIP.__init__`` to emit ``clip_constructor_start/end``.
+
+    Only active when ``_ACTIVE_LANE_TRACE`` is set AND the current lane
+    is ``CLIP``.  Reentrancy-safe via ``_clip_constructor_depth``.
+    Emitted spans are NOT recorded into ``_clip_cpu_prepare_children`` —
+    they are nested inside ``load_text_encoder_state_dicts`` which is the
+    direct measured owner.
+    """
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(self, *args: Any, **kwargs: Any) -> None:
+        before = _clip_constructor_depth.get()
+        _clip_constructor_depth.set(before + 1)
+        lane = _ACTIVE_LANE_TRACE.get()
+        emit = (before == 0 and lane is not None and lane._lane == "CLIP")
+        _fn_start_ns = time.monotonic_ns() if emit else 0
+        if emit:
+            lane._trace.emit("clip_constructor_start", phase="restore")
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            after = _clip_constructor_depth.get()
+            _clip_constructor_depth.set(after - 1)
+            if emit:
+                _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
+                lane._trace.emit("clip_constructor_end", phase="restore", metadata={
+                    "duration_ms": _dur_ms,
+                })
+                # NOT recorded into _clip_cpu_prepare_children — nested inside
+                # load_text_encoder_state_dicts which is the direct measured owner.
+    setattr(wrapper, _SENTINEL_CLIP_CONSTRUCTOR, True)
+    return wrapper
+
+
+# ── Shared convert_old_quants wrapper ───────────────────────────────
+# Lane-aware wrapper installed once for comfy.utils.convert_old_quants.
+# Emits either clip_convert_old_quants_* or unet_convert_old_quants_*
+# depending on the active lane.  Children are recorded into the
+# appropriate per-lane list for residual/non-overlap computation.
+
+_shared_convert_old_quants_installed: bool = False
+
+
+def _make_convert_old_quants_wrapper(original):
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        lane = _ACTIVE_LANE_TRACE.get()
+        if lane is None:
+            return original(*args, **kwargs)
+        _fn_start_ns = time.monotonic_ns()
+        if lane._lane == "CLIP":
+            lane._trace.emit("clip_convert_old_quants_start", phase="restore", metadata={"category": "utils"})
+        elif lane._lane == "UNET":
+            lane._trace.emit("unet_convert_old_quants_start", phase="restore", metadata={"category": "utils"})
+        try:
+            return original(*args, **kwargs)
+        finally:
+            _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
+            if lane._lane == "CLIP":
+                lane._trace.emit("clip_convert_old_quants_end", phase="restore", metadata={
+                    "category": "utils", "duration_ms": _dur_ms})
+                _children = _clip_cpu_prepare_children.get()
+                if _children is not None:
+                    _children.append(("convert_old_quants", _dur_ms))
+            elif lane._lane == "UNET":
+                lane._trace.emit("unet_convert_old_quants_end", phase="restore", metadata={
+                    "category": "utils", "duration_ms": _dur_ms})
+                _children = _child_durations.get()
+                if _children is not None:
+                    _children.append(_dur_ms)
+    setattr(wrapper, _SENTINEL_SHARED_COQ, True)
+    return wrapper
+
+
+def _install_shared_convert_old_quants_wrapper() -> str:
+    """Install lane-aware wrapper on comfy.utils.convert_old_quants once."""
+    global _shared_convert_old_quants_installed
+    if _shared_convert_old_quants_installed:
+        return "already_installed"
+    mod = _get_live_module("comfy.utils")
+    if mod is None:
+        return "unavailable"
+    original = getattr(mod, "convert_old_quants", None)
+    if not callable(original):
+        return "unavailable"
+    if getattr(original, _SENTINEL_SHARED_COQ, False):
+        _shared_convert_old_quants_installed = True
+        return "already_installed"
+    with _wrappers_lock:
+        if _shared_convert_old_quants_installed:
+            return "already_installed"
+        if getattr(mod.convert_old_quants, _SENTINEL_SHARED_COQ, False):
+            _shared_convert_old_quants_installed = True
+            return "already_installed"
+        mod.convert_old_quants = _make_convert_old_quants_wrapper(mod.convert_old_quants)
+        _shared_convert_old_quants_installed = True
+    return "installed"
+
+
+# ── UNET model construction wrappers ────────────────────────────────
+# Wrap ModelPatcher/CoreModelPatcher constructors and model.to() so
+# model-construction children are captured in measured_direct_children_ms.
+
+
+def _make_model_patcher_constructor_wrapper(original):
+    """Wrap ``model_patcher.ModelPatcher().__init__`` (or subclass) with lane guard.
+
+    Extends the existing UNET-only instrumentation to also emit named
+    ``clip_model_patcher_constructor_start/end`` events when the active
+    lane is CLIP.  CLIP-lane spans are NOT recorded into
+    ``_clip_cpu_prepare_children`` — they are nested inside
+    ``load_text_encoder_state_dicts`` which is the direct measured owner.
+    UNET-lane spans are recorded into ``_child_durations`` as before.
+    """
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(self, *args: Any, **kwargs: Any) -> None:
+        lane = _ACTIVE_LANE_TRACE.get()
+        emit_unet = (lane is not None and lane._lane == "UNET")
+        emit_clip = (lane is not None and lane._lane == "CLIP")
+        _fn_start_ns = time.monotonic_ns() if (emit_unet or emit_clip) else 0
+        if emit_unet:
+            lane._trace.emit("unet_model_patcher_constructor_start", phase="restore")
+        elif emit_clip:
+            lane._trace.emit("clip_model_patcher_constructor_start", phase="restore")
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            if emit_unet:
+                _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
+                lane._trace.emit("unet_model_patcher_constructor_end", phase="restore", metadata={
+                    "duration_ms": _dur_ms})
+                _children = _child_durations.get()
+                if _children is not None:
+                    _children.append(_dur_ms)
+            elif emit_clip:
+                _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
+                lane._trace.emit("clip_model_patcher_constructor_end", phase="restore", metadata={
+                    "duration_ms": _dur_ms})
+                # NOT recorded into _clip_cpu_prepare_children — nested inside
+                # load_text_encoder_state_dicts which is the direct measured owner.
+    setattr(wrapper, _SENTINEL_MODEL_PATCHER, True)
+    return wrapper
+
+
+def _make_model_to_wrapper(original):
+    """Wrap ``model.to(...)`` with UNET-lane guard for direct ownership measurement."""
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(self, *args: Any, **kwargs: Any) -> Any:
+        lane = _ACTIVE_LANE_TRACE.get()
+        emit = (lane is not None and lane._lane == "UNET")
+        _fn_start_ns = time.monotonic_ns() if emit else 0
+        if emit:
+            lane._trace.emit("unet_model_to_start", phase="restore")
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            if emit:
+                _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
+                lane._trace.emit("unet_model_to_end", phase="restore", metadata={
+                    "duration_ms": _dur_ms})
+                _children = _child_durations.get()
+                if _children is not None:
+                    _children.append(_dur_ms)
+    setattr(wrapper, _SENTINEL_MODEL_TO, True)
+    return wrapper
+
+
+# ── Model patcher wrapper installer ─────────────────────────────────
+
+_model_patcher_wrappers_installed: bool = False
+
+
+def _install_model_patcher_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
+    """Install constructor and model.to wrappers on live comfy.model_patcher module.
+
+    Targets ModelPatcher and CoreModelPatcher constructors plus model.to().
+    Idempotent via per-sentinel flags.
+    """
+    global _model_patcher_wrappers_installed
+    if _model_patcher_wrappers_installed:
+        return {}
+    result: dict[str, str] = {}
+    mp_mod = _get_live_module("comfy.model_patcher")
+    if mp_mod is None:
+        return {"model_patcher_wrappers": "unavailable"}
+
+    # Wrap ModelPatcher.__init__
+    _ModelPatcher_cls = getattr(mp_mod, "ModelPatcher", None)
+    if _ModelPatcher_cls is not None:
+        _orig_init = getattr(_ModelPatcher_cls, "__init__", None)
+        if callable(_orig_init) and not getattr(_orig_init, _SENTINEL_MODEL_PATCHER, False):
+            setattr(_ModelPatcher_cls, "__init__", _make_model_patcher_constructor_wrapper(_orig_init))
+            result["ModelPatcher.__init__"] = "installed"
+        else:
+            result["ModelPatcher.__init__"] = "already_installed" if _orig_init else "unavailable"
+    else:
+        result["ModelPatcher.__init__"] = "unavailable"
+
+    # Wrap CoreModelPatcher.__init__
+    _CoreMP_cls = getattr(mp_mod, "CoreModelPatcher", None)
+    if _CoreMP_cls is not None:
+        _orig_init = getattr(_CoreMP_cls, "__init__", None)
+        if callable(_orig_init) and not getattr(_orig_init, _SENTINEL_MODEL_PATCHER, False):
+            setattr(_CoreMP_cls, "__init__", _make_model_patcher_constructor_wrapper(_orig_init))
+            result["CoreModelPatcher.__init__"] = "installed"
+        else:
+            result["CoreModelPatcher.__init__"] = "already_installed" if _orig_init else "unavailable"
+
+    # Wrap model.to() — installed on torch.nn.Module so it catches any model.to() call.
+    _torch_mod = _get_live_module("torch")
+    if _torch_mod is not None:
+        _nn_mod = getattr(_torch_mod, "nn", None)
+        if _nn_mod is not None:
+            _Module_cls = getattr(_nn_mod, "Module", None)
+            if _Module_cls is not None:
+                _orig_to = getattr(_Module_cls, "to", None)
+                if callable(_orig_to) and not getattr(_orig_to, _SENTINEL_MODEL_TO, False):
+                    setattr(_Module_cls, "to", _make_model_to_wrapper(_orig_to))
+                    result["nn.Module.to"] = "installed"
+                else:
+                    result["nn.Module.to"] = "already_installed" if _orig_to else "unavailable"
+
+    if trace:
+        for comp, status in result.items():
+            trace.emit("model_patcher_wrapper_install", phase="restore",
+                       metadata={"component": comp, "status": status})
+    _model_patcher_wrappers_installed = True
+    return result
+
+
+def _install_clip_constructor_wrapper(sd_mod, trace=None):
+    """Install CLIP.__init__ wrapper on live comfy.sd.CLIP class.
+
+    Idempotent via sentinel.  Emits ``clip_constructor_start/end``
+    named events that are NOT recorded into ``_clip_cpu_prepare_children``.
+    """
+    global _clip_constructor_wrapper_installed
+    if _clip_constructor_wrapper_installed:
+        return "already_installed"
+    CLIP_cls = getattr(sd_mod, "CLIP", None)
+    if CLIP_cls is None:
+        return "unavailable"
+    _orig_init = getattr(CLIP_cls, "__init__", None)
+    if not callable(_orig_init):
+        return "unavailable"
+    if getattr(_orig_init, _SENTINEL_CLIP_CONSTRUCTOR, False):
+        _clip_constructor_wrapper_installed = True
+        return "already_installed"
+    with _wrappers_lock:
+        if _clip_constructor_wrapper_installed:
+            return "already_installed"
+        _check_init = getattr(CLIP_cls, "__init__", None)
+        if getattr(_check_init, _SENTINEL_CLIP_CONSTRUCTOR, False):
+            _clip_constructor_wrapper_installed = True
+            return "already_installed"
+        setattr(CLIP_cls, "__init__", _make_clip_constructor_wrapper(_check_init))
+        _clip_constructor_wrapper_installed = True
+    if trace:
+        trace.emit("clip_constructor_wrapper_install", phase="restore",
+                   metadata={"status": "installed"})
+    return "installed"
+
+
+def _install_clip_wrapper(trace=None):
+    global _clip_wrapper_installed
+    if _clip_wrapper_installed:
+        return "already_installed"
+    sd_mod = _get_live_module("comfy.sd")
+    if sd_mod is None:
+        return "unavailable"
+    original_fn = getattr(sd_mod, "load_clip", None)
+    if not callable(original_fn):
+        return "unavailable"
+    if getattr(original_fn, _SENTINEL_CLIP, False):
+        _clip_wrapper_installed = True
+        return "already_installed"
+    from threading import RLock as _RLock
+    _cw_lock = _RLock()
+    with _cw_lock:
+        if _clip_wrapper_installed:
+            return "already_installed"
+        if getattr(sd_mod.load_clip, _SENTINEL_CLIP, False):
+            _clip_wrapper_installed = True
+            return "already_installed"
+        sd_mod.load_clip = _make_clip_load_wrapper(sd_mod.load_clip)
+        _clip_wrapper_installed = True
+        _install_clip_subfn_wrappers(sd_mod)
+        _install_clip_constructor_wrapper(sd_mod, trace=trace)
+    if trace:
+        trace.emit("clip_wrapper_install", phase="restore", metadata={"status": "installed"})
+    return "installed"
+
+
+_CLIP_DECOMPOSE_TARGETS = {
+    "detect_te_model": ("comfy.sd", "detect_te_model", "sd"),
+    "load_text_encoder_state_dicts": ("comfy.sd", "load_text_encoder_state_dicts", "sd"),
+    "clip_text_transformers_convert": ("comfy.utils", "clip_text_transformers_convert", "utils"),
+    # NOTE: convert_old_quants is installed via the shared lane-aware
+    # _install_shared_convert_old_quants_wrapper so both CLIP and UNET
+    # attribution remain active on the same live function.
+}
+
+
+def _install_clip_subfn_wrappers(sd_mod):
+    result = {}
+    # Install shared lane-aware convert_old_quants wrapper first.
+    result["convert_old_quants"] = _install_shared_convert_old_quants_wrapper()
+    for short_name, (mod_name, func_name, category) in _CLIP_DECOMPOSE_TARGETS.items():
+        mod = _get_live_module(mod_name) if mod_name != "comfy.sd" else sd_mod
+        if mod is None:
+            result[short_name] = "unavailable"
+            continue
+        original = getattr(mod, func_name, None)
+        if not callable(original):
+            result[short_name] = "unavailable"
+            continue
+        if getattr(original, _SENTINEL_CLIP_SUBFN, False):
+            result[short_name] = "already_installed"
+            continue
+        wrapper = _make_clip_subfn_wrapper(short_name, original, category)
+        setattr(wrapper, _SENTINEL_CLIP_SUBFN, True)
+        setattr(mod, func_name, wrapper)
+        result[short_name] = "installed"
+    return result
 
 
 def _install_deep_diag_wrappers(*, safe_open_fn: Any = None, torch_load_fn: Any = None,
@@ -567,6 +1064,10 @@ def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
         )
         result.update(_deep_install_result)
 
+    # Install CLIP wrapper.
+    _clip_result = _install_clip_wrapper(trace=trace)
+    result["comfy.sd.load_clip"] = _clip_result
+
     # Emit diagnostic events when a trace is available.
     if trace is not None:
         for component, status in result.items():
@@ -589,13 +1090,20 @@ def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
 _UNET_DECOMPOSE_TARGETS: dict[str, tuple[str, str, str]] = {
     # NOTE: load_diffusion_model_state_dict is handled by a dedicated
     # wrapper (_make_sd_state_dict_wrapper) so it is intentionally absent.
-    "convert_old_quants": ("comfy.utils", "convert_old_quants", "utils"),
+    # NOTE: convert_old_quants is installed via the shared lane-aware
+    # _install_shared_convert_old_quants_wrapper so both CLIP and UNET
+    # attribution remain active on the same live function.
     "state_dict_prefix_replace": ("comfy.utils", "state_dict_prefix_replace", "utils"),
     "calculate_parameters": ("comfy.utils", "calculate_parameters", "utils"),
     "weight_dtype": ("comfy.utils", "weight_dtype", "utils"),
     "model_config_from_unet": ("comfy.model_detection", "model_config_from_unet", "model_detection"),
     "unet_dtype": ("comfy.model_management", "unet_dtype", "model_management"),
     "unet_manual_cast": ("comfy.model_management", "unet_manual_cast", "model_management"),
+    "unet_prefix_from_state_dict": ("comfy.model_detection", "unet_prefix_from_state_dict", "model_detection"),
+    "convert_diffusers_mmdit": ("comfy.model_detection", "convert_diffusers_mmdit", "model_detection"),
+    "model_config_from_diffusers_unet": ("comfy.model_detection", "model_config_from_diffusers_unet", "model_detection"),
+    "unet_to_diffusers": ("comfy.utils", "unet_to_diffusers", "utils"),
+    "unet_offload_device": ("comfy.model_management", "unet_offload_device", "model_management"),
 }
 """Maps short name -> (module_name, function_name, diagnostic_category)."""
 
@@ -613,6 +1121,10 @@ def _install_unet_decompose_wrappers(trace: RuntimeTrace | None = None) -> dict[
     if _subfn_wrappers_installed:
         return {}
     result: dict[str, str] = {}
+    # Install shared lane-aware convert_old_quants wrapper first.
+    result["convert_old_quants"] = _install_shared_convert_old_quants_wrapper()
+    # Install model patcher construction wrappers.
+    result.update(_install_model_patcher_wrappers(trace=trace))
     for short_name, (mod_name, func_name, category) in _UNET_DECOMPOSE_TARGETS.items():
         mod = _get_live_module(mod_name)
         if mod is None:
@@ -622,11 +1134,11 @@ def _install_unet_decompose_wrappers(trace: RuntimeTrace | None = None) -> dict[
         if not callable(original):
             result[short_name] = "unavailable"
             continue
-        if getattr(original, _SENTINEL_SUBFN, False):
+        if getattr(original, _SENTINEL_UNET_SUBFN, False):
             result[short_name] = "already_installed"
             continue
         wrapper = _make_unet_subfn_wrapper(short_name, original, category)
-        setattr(wrapper, _SENTINEL_SUBFN, True)
+        setattr(wrapper, _SENTINEL_UNET_SUBFN, True)
         setattr(mod, func_name, wrapper)
         result[short_name] = "installed"
     if trace:
@@ -659,6 +1171,8 @@ def _make_unet_subfn_wrapper(
         lane = _ACTIVE_LANE_TRACE.get()
         _outer = (before == 0)
         emit = (_outer and lane is not None and lane._lane == "UNET")
+        _nest_before = _unet_subfn_nesting_depth.get()
+        _unet_subfn_nesting_depth.set(_nest_before + 1)
         _fn_start_ns = time.monotonic_ns() if emit else 0
         if emit:
             lane._trace.emit(f"unet_{short_name}_start", phase="restore", metadata={
@@ -672,16 +1186,18 @@ def _make_unet_subfn_wrapper(
         finally:
             after = _UNET_SUBFN_DEPTH.get()
             _UNET_SUBFN_DEPTH.set(after - 1)
+            _unet_subfn_nesting_depth.set(_nest_before)
             if emit and _outer:
                 _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
                 lane._trace.emit(f"unet_{short_name}_end", phase="restore", metadata={
                     "category": category,
                     "duration_ms": _dur_ms,
                 })
-                # Record for outer SD residual computation
-                _children = _child_durations.get()
-                if _children is not None:
-                    _children.append(_dur_ms)
+                # Record for outer SD residual computation (only direct children)
+                if _nest_before == 0:
+                    _children = _child_durations.get()
+                    if _children is not None:
+                        _children.append(_dur_ms)
     return wrapper
 
 
@@ -694,15 +1210,18 @@ def _instrument_unet_model_config(model_config: Any, lane: "ModelLaneTrace") -> 
     def wrapped_get_model(*args: Any, **kwargs: Any) -> Any:
         started_ns = time.monotonic_ns()
         lane._trace.emit("unet_model_config_get_model_start", phase="restore")
+        _nest_before = _unet_subfn_nesting_depth.get()
+        _unet_subfn_nesting_depth.set(_nest_before + 1)
         try:
             model = get_model(*args, **kwargs)
             _instrument_unet_model_weights(model, lane)
             return model
         finally:
+            _unet_subfn_nesting_depth.set(_nest_before)
             duration_ms = round((time.monotonic_ns() - started_ns) / 1_000_000, 3)
             lane._trace.emit("unet_model_config_get_model_end", phase="restore", metadata={"duration_ms": duration_ms})
             children = _child_durations.get()
-            if children is not None:
+            if _nest_before == 0 and children is not None:
                 children.append(duration_ms)
 
     setattr(wrapped_get_model, _SENTINEL_SUBFN, True)
@@ -721,13 +1240,16 @@ def _instrument_unet_model_weights(model: Any, lane: "ModelLaneTrace") -> None:
     def wrapped_load_weights(*args: Any, **kwargs: Any) -> Any:
         started_ns = time.monotonic_ns()
         lane._trace.emit("unet_load_model_weights_start", phase="restore")
+        _nest_before = _unet_subfn_nesting_depth.get()
+        _unet_subfn_nesting_depth.set(_nest_before + 1)
         try:
             return load_weights(*args, **kwargs)
         finally:
+            _unet_subfn_nesting_depth.set(_nest_before)
             duration_ms = round((time.monotonic_ns() - started_ns) / 1_000_000, 3)
             lane._trace.emit("unet_load_model_weights_end", phase="restore", metadata={"duration_ms": duration_ms})
             children = _child_durations.get()
-            if children is not None:
+            if _nest_before == 0 and children is not None:
                 children.append(duration_ms)
 
     setattr(wrapped_load_weights, _SENTINEL_SUBFN, True)
@@ -781,10 +1303,13 @@ def _make_sd_state_dict_wrapper(original: Callable[..., Any]) -> Callable[..., A
                 _child_durations.set(_prior_children)
                 lane._trace.emit("unet_load_diffusion_model_state_dict_end", phase="restore", metadata={
                     "duration_ms": _whole_ms,
+                    "model_construction_total_ms": _whole_ms,
                     "measured_child_total_ms": _child_total,
+                    "measured_direct_children_ms": _child_total,
                     "measured_child_count": len(_children),
                     "measured_children": _children,
                     "residual_ms": _residual_ms,
+                    "model_construction_residual_ms": _residual_ms,
                     "classification": "residual_not_causal_owner",
                 })
 
@@ -1294,11 +1819,53 @@ def set_model_load_identity(restored_instance_id: str, restore_session_id: str) 
 
 @contextmanager
 def request_execution_trace_scope(trace: RuntimeTrace) -> Iterator[None]:
+    _gpu_request_call_count_var.set(0)
     token = _ACTIVE_REQUEST_TRACE.set(trace)
     try:
         yield
     finally:
         _ACTIVE_REQUEST_TRACE.reset(token)
+
+
+def reset_gpu_call_count() -> None:
+    _gpu_request_call_count_var.set(0)
+
+
+def gpu_wrapper_is_installed() -> bool:
+    return _gpu_wrapper_installed
+
+
+def gpu_call_count() -> int:
+    return _gpu_request_call_count_var.get()
+
+
+def gpu_not_observed_summary() -> dict[str, Any]:
+    """Return request-scope GPU wrapper diagnostic summary.
+
+    When a request makes zero ``load_models_gpu`` calls, this accessor
+    reports ``caller_classification="not_observed"`` (wrapper installed)
+    or ``"wrapper_unavailable"`` (wrapper not installed), together with
+    the request ID, wrapper status, and invocation count.
+
+    Preserves the installed/unavailable distinction and request-local
+    invocation count.  No side effects on lane/request events.
+    """
+    wrapper_installed = _gpu_wrapper_installed
+    request_id = get_active_request_id()
+    cnt = _gpu_request_call_count_var.get()
+    if wrapper_installed:
+        return {
+            "caller_classification": "not_observed" if cnt == 0 else "observed",
+            "request_id": request_id,
+            "wrapper_status": "installed",
+            "count": cnt,
+        }
+    return {
+        "caller_classification": "wrapper_unavailable",
+        "request_id": request_id,
+        "wrapper_status": "unavailable",
+        "count": 0,
+    }
 
 
 def get_active_request_id() -> str:
@@ -1403,6 +1970,92 @@ def _capture_proc_tid_io_snapshot() -> dict[str, int] | None:
         return result
     except Exception:
         return None
+
+
+def classify_active_read_dims(
+    *,
+    deep_diag: bool,
+    before_tid: int | None = None,
+    after_tid: int | None = None,
+    has_thread_cpu: bool = False,
+    has_process_cpu: bool = False,
+    has_rusage: bool = False,
+    has_io: bool = False,
+    os_supports_thread_cpu: bool = True,
+    os_supports_process_cpu: bool = True,
+    os_supports_rusage: bool = True,
+    os_supports_io: bool = True,
+) -> dict[str, str]:
+    """Classify per-dimension active-read counter statuses using native thread IDs.
+
+    Status vocabulary:
+      ``available`` — data captured and valid for this dimension.
+      ``unsupported`` — deep_diag is disabled; this OS class is not instrumented.
+      ``unavailable`` — deep_diag enabled but the OS does not support this
+          counter (e.g. ``resource.RUSAGE_THREAD`` on non-Linux).
+      ``thread_changed`` — thread-bounded dimension whose before/after
+          measurement spans different native threads; delta would be meaningless.
+      ``not_observed_in_this_thread`` — deep_diag + same thread, the OS
+          supports this counter, but no before-snapshot was captured for
+          this dimension in this thread.
+
+    Returns a dict keyed by dimension name with string status values.
+    """
+    _same_tid: bool = (before_tid is not None and after_tid is not None
+                       and before_tid == after_tid)
+
+    # ── Dimension definitions with per-dimension metadata ───────────
+    _DIMS: list[tuple[str, bool]] = [
+        ("thread_cpu", True),       # thread-bounded
+        ("process_cpu", False),     # process-wide (not thread-bounded)
+        ("io_deltas", True),        # thread-bounded (/proc/self/task/*/io)
+        ("page_faults", True),      # thread-bounded (RUSAGE_THREAD minflt/majflt)
+        ("block_input", True),      # thread-bounded (RUSAGE_THREAD inblock/oublock)
+        ("context_switches", True), # thread-bounded (RUSAGE_THREAD nvcsw/nivcsw)
+    ]
+    # ── Per-dimension data-captured flag mapping ────────────────────
+    _HAS_MAP: dict[str, bool] = {
+        "thread_cpu": has_thread_cpu,
+        "process_cpu": has_process_cpu,
+        "io_deltas": has_io,
+        "page_faults": has_rusage,
+        "block_input": has_rusage,
+        "context_switches": has_rusage,
+    }
+    # ── Per-dimension OS-support flag mapping ───────────────────────
+    _OS_SUPPORTS_MAP: dict[str, bool] = {
+        "thread_cpu": os_supports_thread_cpu,
+        "process_cpu": os_supports_process_cpu,
+        "io_deltas": os_supports_io,
+        "page_faults": os_supports_rusage,
+        "block_input": os_supports_rusage,
+        "context_switches": os_supports_rusage,
+    }
+
+    result: dict[str, str] = {}
+    if not deep_diag:
+        for dim, _ in _DIMS:
+            result[dim] = "unsupported"
+        return result
+
+    for dim, thread_bounded in _DIMS:
+        has_data = _HAS_MAP[dim]
+        os_supports = _OS_SUPPORTS_MAP[dim]
+        if thread_bounded and not _same_tid:
+            # Thread changed — cannot compute meaningful delta for bounded dims
+            result[dim] = "thread_changed"
+        elif not has_data:
+            # Capability-vs-observation distinction:
+            #   os_supports=True  but has_data=False → supported counter not
+            #     observed in this thread → not_observed_in_this_thread
+            #   os_supports=False (OS cannot provide this counter) → unavailable
+            if not os_supports:
+                result[dim] = "unavailable"
+            else:
+                result[dim] = "not_observed_in_this_thread"
+        else:
+            result[dim] = "available"
+    return result
 
 
 def _compute_rusage_deltas(before: dict[str, Any] | None, after: dict[str, Any] | None) -> dict[str, Any] | None:

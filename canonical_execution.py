@@ -507,6 +507,13 @@ def build_execution_plan(
     )
     output_node_ids = tuple(str(v) for v in report.get("output_node_ids", options.production_output_node_ids))
     metadata = dict(request_metadata or {})
+    # Propagate request_origin_info from trace when request_metadata lacks it.
+    # Use Mapping check because frozen dataclasses wrap nested dicts as
+    # mappingproxy; isinstance(x, dict) fails for mappingproxy values.
+    if trace is not None:
+        _trace_origin = trace._metadata.get("request_origin_info", {})
+        if isinstance(_trace_origin, Mapping) and _trace_origin:
+            metadata.setdefault("request_origin_info", dict(_trace_origin))
     metadata.update({
         "prompt_id": prompt_id,
         "client_id": client_id,
@@ -555,6 +562,17 @@ async def execute_plan(
         request_id=str(plan.request_metadata.get("prompt_id", "")),
         process="local",
     )
+
+    # Propagate request_origin_info from plan metadata into runtime_trace when
+    # the trace metadata does not already carry it.  Preserve existing values
+    # (never overwrite with plan defaults).
+    # Use Mapping check because frozen dataclasses wrap nested dicts as
+    # mappingproxy.
+    _plan_origin = plan.request_metadata.get("request_origin_info", {})
+    if isinstance(_plan_origin, Mapping) and _plan_origin:
+        _existing_origin = runtime_trace._metadata.get("request_origin_info", {})
+        if not isinstance(_existing_origin, Mapping) or not _existing_origin:
+            runtime_trace.set_metadata(request_origin_info=dict(_plan_origin))
 
     # ── Profile preparation (before restore publication / Modal submission) ──
     runtime_trace.emit("active_profile_prepare_start", phase="local")
@@ -731,7 +749,7 @@ async def execute_plan(
     if "trace_version" not in remote_trace:
         remote_trace["trace_version"] = "2.0.0"
     _origin = runtime_trace._metadata.get("request_origin_info", {})
-    if not isinstance(_origin, dict):
+    if not isinstance(_origin, Mapping):
         _origin = {}
     _transport_meta = runtime_trace._metadata
     if not _transport_meta.get("modal_input_id"):
@@ -754,11 +772,53 @@ async def execute_plan(
         "generator_create_ms": _transport_meta.get("generator_create_ms"),
     }
     _t1_to_submission_ms = _transport_meta.get("local_receive_to_actual_submission_ms")
-    _measured_total = sum(float(value) for value in _local_stages.values() if isinstance(value, (int, float)))
-    _local_residual_ms = (
-        round(float(_t1_to_submission_ms) - _measured_total, 3)
-        if isinstance(_t1_to_submission_ms, (int, float)) else None
-    )
+    if isinstance(_t1_to_submission_ms, (int, float)):
+        # Use non-overlapping transport intervals when available to avoid
+        # summing overlapping stage spans (route/plan/profile/restore/
+        # handle/payload/generator-create all overlap).
+        _gen_create = _transport_meta.get("local_receive_to_generator_create_ms")
+        _gen_ms = _transport_meta.get("generator_create_ms")
+        _gen_to_first = _transport_meta.get("generator_create_to_first_iteration_ms")
+        if all(isinstance(v, (int, float)) for v in (_gen_create, _gen_ms, _gen_to_first)):
+            _reconciled_total = float(_gen_create) + float(_gen_ms) + float(_gen_to_first)
+            _local_residual_ms = round(float(_t1_to_submission_ms) - _reconciled_total, 3)
+        else:
+            # Fallback: sum only a demonstrably disjoint set using
+            # local_receive_to_enqueue_ms as the pre-worker prefix, queue_wait,
+            # and sequential plan/profile/restore/handle/payload spans.
+            # All must be known; otherwise return None rather than hiding
+            # a missing major span.
+            _enqueue_prefix = _origin.get("local_receive_to_enqueue_ms")
+            _queue_wait = _origin.get("queue_wait_before_worker_ms")
+            if isinstance(_enqueue_prefix, (int, float)) and isinstance(_queue_wait, (int, float)):
+                _disjoint_total = float(_enqueue_prefix) + float(_queue_wait)
+                _all_known = True
+                for _sk in ("plan_build_ms", "active_profile_ms",
+                            "restore_plan_build_ms", "restore_publish_ms",
+                            "handle_lookup_ms", "payload_serialize_ms"):
+                    _sv = _local_stages.get(_sk)
+                    if isinstance(_sv, (int, float)):
+                        _disjoint_total += float(_sv)
+                    else:
+                        _all_known = False
+                        break
+                if _all_known:
+                    # generator_create_ms and generator_create_to_first_iteration_ms
+                    # from transport metadata (sequential after payload serialization).
+                    # Both must be present to avoid hiding a potentially major span.
+                    _gen_ms_val = _transport_meta.get("generator_create_ms")
+                    _gen_to_first_val = _transport_meta.get("generator_create_to_first_iteration_ms")
+                    if isinstance(_gen_ms_val, (int, float)) and isinstance(_gen_to_first_val, (int, float)):
+                        _disjoint_total += float(_gen_ms_val) + float(_gen_to_first_val)
+                        _local_residual_ms = round(float(_t1_to_submission_ms) - _disjoint_total, 3)
+                    else:
+                        _local_residual_ms = None
+                else:
+                    _local_residual_ms = None
+            else:
+                _local_residual_ms = None
+    else:
+        _local_residual_ms = None
     _t0_ms = _origin.get("ui_run_triggered_wall_unix_ms")
     _t1_wall_ns = _origin.get("local_receive_wall_ns")
     _t0_to_t1_ms = (
@@ -768,6 +828,7 @@ async def execute_plan(
     _local_summary = {
         "t0_to_t1_ms": _t0_to_t1_ms,
         "t1_to_queue_enqueue_ms": _origin.get("local_receive_to_enqueue_ms"),
+        "local_receive_to_enqueue_ms": _origin.get("local_receive_to_enqueue_ms"),
         **_local_stages,
         "local_residual_ms": _local_residual_ms,
         "local_receive_to_generator_create_ms": _transport_meta.get("local_receive_to_generator_create_ms"),
@@ -785,6 +846,7 @@ async def execute_plan(
         f"modal_submission_attempt_unix_ns={_transport_meta.get('modal_submission_attempt_wall_ns')} "
         f"modal_first_event_received_unix_ns={_transport_meta.get('modal_first_event_received_wall_ns')} "
         f"t0_to_t1_ms={_t0_to_t1_ms} t1_to_queue_enqueue_ms={_origin.get('local_receive_to_enqueue_ms')} "
+        f"local_receive_to_enqueue_ms={_origin.get('local_receive_to_enqueue_ms')} "
         f"queue_wait_before_worker_ms={_origin.get('queue_wait_before_worker_ms')} "
         f"plan_build_ms={_local_stages['plan_build_ms']} active_profile_ms={_local_stages['active_profile_ms']} "
         f"restore_publish_ms={_local_stages['restore_publish_ms']} handle_lookup_ms={_local_stages['handle_lookup_ms']} "
