@@ -3312,6 +3312,22 @@ async def handle_studio_run_async(
     workspace: dict | None = None,
     direct: bool = True,
 ) -> dict[str, Any]:
+    # T1: local endpoint received — first executable line before any work
+    import time as _handle_time
+    _t1_wall_ns = int(_handle_time.time() * 1_000_000_000)
+    _t1_mono_ns = _handle_time.monotonic_ns()
+    # Extract request origin from incoming payload
+    _request_origin_info = dict(trace_ctx.get("request_origin", {})) if isinstance(trace_ctx, dict) else {}
+    if not _request_origin_info.get("request_id"):
+        # Fallback: generate a local request ID when no UI origin provided
+        _request_origin_info["request_id"] = str(uuid.uuid4())
+        _request_origin_info["trigger_source"] = "local_adapter"
+    _request_origin_info["local_receive_wall_ns"] = _t1_wall_ns
+    _request_origin_info["local_receive_mono_ns"] = _t1_mono_ns
+    # Propagate origin info into the trace_ctx that flows downstream
+    if isinstance(trace_ctx, dict):
+        trace_ctx["request_origin_info"] = _request_origin_info
+
     """Async handler for a single Studio run.
 
     When ``direct=True`` (default), dispatches immediately to the

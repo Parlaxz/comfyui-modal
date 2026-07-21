@@ -553,6 +553,7 @@ class TraceEvent:
     monotonic_ns: int = field(default_factory=time.perf_counter_ns)
     request_id: str = ""
     container_session_id: str = ""
+    trace_id: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -570,6 +571,7 @@ class TraceEvent:
         phase: str = "",
         request_id: str = "",
         container_session_id: str = "",
+        trace_id: str = "",
         metadata: Mapping[str, Any] | None = None,
     ) -> "TraceEvent":
         return cls(
@@ -578,6 +580,7 @@ class TraceEvent:
             phase=phase,
             request_id=request_id,
             container_session_id=container_session_id,
+            trace_id=trace_id,
             metadata=metadata or {},
         )
 
@@ -592,6 +595,7 @@ class TraceEvent:
             monotonic_ns=int(source.get("monotonic_ns", source.get("mono_ns", 0))),
             request_id=str(source.get("request_id", "")),
             container_session_id=str(source.get("container_session_id", source.get("container_session", ""))),
+            trace_id=str(source.get("trace_id", "")),
             metadata=source.get("metadata", {}),
         )
 
@@ -604,5 +608,6 @@ class TraceEvent:
             "monotonic_ns": self.monotonic_ns,
             "request_id": self.request_id,
             "container_session_id": self.container_session_id,
+            "trace_id": self.trace_id,
             "metadata": _thaw(self.metadata),
         }

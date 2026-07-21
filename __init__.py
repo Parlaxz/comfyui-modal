@@ -3389,6 +3389,10 @@ if _server:
 
     @_server.routes.post("/comfymodal/prompt")
     async def modal_prompt(request: web.Request) -> web.Response:
+        # T1: local endpoint received (before body read, validation, dispatch)
+        _t1_prompt_wall_ns = int(time.time() * 1_000_000_000)
+        _t1_prompt_mono_ns = time.monotonic_ns()
+
         global _queue_worker_started, _queue_worker_task, _item_counter
 
         # ── v4 local event trace ──
@@ -3421,6 +3425,24 @@ if _server:
         if body_bytes > 10 * 1024 * 1024:
             print(f"[comfyui-modal] WARN large body: {body_bytes} bytes")
         local_et.mark(T1J_JSON_PARSE_END, phase=PHASE_LOCAL_BRIDGE)
+
+        # ── Request-origin extraction (T0/T1 from legacy/benchmark path) ──
+        _prompt_request_origin: dict[str, Any] = {}
+        request_trace_from_body = body.get("trace", {})
+        if isinstance(request_trace_from_body, dict):
+            _existing_req_id = request_trace_from_body.get("request_id", "")
+            if _existing_req_id:
+                _prompt_request_origin["request_id"] = str(_existing_req_id)
+                _prompt_request_origin["trigger_source"] = str(request_trace_from_body.get("trigger_source", "legacy_prompt"))
+                _existing_t0 = request_trace_from_body.get("ui_run_triggered_wall_unix_ms", None)
+                if _existing_t0 is not None:
+                    _prompt_request_origin["ui_run_triggered_wall_unix_ms"] = int(_existing_t0)
+        if not _prompt_request_origin.get("request_id"):
+            _prompt_request_origin["request_id"] = str(uuid.uuid4())
+            _prompt_request_origin["trigger_source"] = "legacy_prompt_fallback"
+            # No browser T0 — T1 becomes the first known boundary
+        _prompt_request_origin["local_receive_wall_ns"] = _t1_prompt_wall_ns
+        _prompt_request_origin["local_receive_mono_ns"] = _t1_prompt_mono_ns
 
         # ── Extract payload fields and inject detailed trace stages ──
         workflow = body.get("prompt", body)
@@ -3578,11 +3600,13 @@ if _server:
             ack_ready = asyncio.Event()
 
             _queue_execution_workflow = copy.deepcopy(execution_workflow)
+            _trace_with_origin = {**trace.fields(), "prompt_id": prompt_id}
+            _trace_with_origin["request_origin_info"] = _prompt_request_origin
             extra_data = {
                 "client_id": client_id,
                 "create_time": int(time.time() * 1000),
                 "gpu": selected_gpu,
-                "trace": {**trace.fields(), "prompt_id": prompt_id},
+                "trace": _trace_with_origin,
                 "_client_trace": _client_trace_dict,
                 "modal_options": modal_options,
                 "scheduler_test": scheduler_test,

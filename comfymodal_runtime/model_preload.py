@@ -3,6 +3,7 @@
 Controls:
   COMFYMODAL_V2_PREFILL_LANES — critical|all|none (default critical)
   COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET — legacy barrier (default off)
+  COMFYMODAL_V2_DEEP_MODEL_DIAG=1 — enable deep /proc, faults, open/mmap/safetensors
 """
 
 from __future__ import annotations
@@ -10,7 +11,9 @@ from __future__ import annotations
 import enum
 import functools
 import os
+import platform
 import time
+import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -63,6 +66,24 @@ _LANE_TO_CANONICAL: dict[str, str] = {
 }
 """Maps internal ``_submit`` lane names to canonical identifiers."""
 
+# ── V2 restore correlation identity ──────────────────────────────────
+_LATEST_RESTORED_INSTANCE_ID: str = ""
+"""Module-level latest restored_instance_id.  Set by restore() after
+snapshot restoration; read by background worker and graph-entry paths."""
+
+_LATEST_RESTORE_RETURN_MARKER: dict[str, Any] | None = None
+"""Set immediately before ``restore()`` returns with wall/monotonic time,
+both restore IDs, MODAL_TASK_ID, and PID.  Read by ``run_plan_stream`` method
+entry for method-entry-gap computation."""
+
+_DIAGNOSTIC_FLAG: bool = (
+    os.environ.get("COMFYMODAL_V2_DEEP_MODEL_DIAG", "0") == "1"
+)
+"""Controls deep diagnostics (proc/pagefault/open/mmap/safetensors detail).
+``False`` by default — when disabled, only lightweight identity, restore
+total, CLIP read/ready, background submitted/ready, graph demand/wait,
+and method gaps are reported."""
+
 # ── Per-worker lane context (set around worker callback) ─────────────
 
 _ACTIVE_LANE_TRACE: ContextVar["ModelLaneTrace | None"] = ContextVar(
@@ -70,6 +91,13 @@ _ACTIVE_LANE_TRACE: ContextVar["ModelLaneTrace | None"] = ContextVar(
 )
 """Set to the active ``ModelLaneTrace`` while a worker callback runs.
 Reset to ``None`` after the callback completes."""
+
+# ── Background UNET diagnostics store ────────────────────────────────
+# Thread-safe mapping from canonical key -> completed RuntimeTrace events
+# list for background UNET worker.  Written by the worker thread, read
+# (and drained) by the graph cache patcher.
+_BG_UNET_DIAG_STORE: dict[str, list] = {}
+_BG_UNET_DIAG_LOCK = RLock()
 
 # ── ComfyUI core dispatch wrappers (installed once globally) ─────────
 # Wrappers target the *live* module objects already loaded by ComfyUI's
@@ -81,17 +109,29 @@ _SENTINEL_READ = "_comfy_modal_read_wrapper"
 _SENTINEL_GPU = "_comfy_modal_gpu_wrapper"
 _SENTINEL_SD = "_comfy_modal_sd_wrapper"
 _SENTINEL_SUBFN = "_comfy_modal_subfn_wrapper"
+_SENTINEL_DEEP_ST = "_comfy_modal_deep_st_wrapper"
+_SENTINEL_DEEP_TL = "_comfy_modal_deep_tl_wrapper"
 
 _read_wrapper_installed: bool = False
 _gpu_wrapper_installed: bool = False
 _sd_wrapper_installed: bool = False
 _subfn_wrappers_installed: bool = False
+_deep_diag_wrappers_installed: bool = False
 _wrappers_lock = RLock()
 
 # Reentrancy guards — per-thread via ContextVar default=0.
 _torch_file_depth: ContextVar[int] = ContextVar("_torch_file_depth", default=0)
 _gpu_depth: ContextVar[int] = ContextVar("_gpu_depth", default=0)
 _sd_depth: ContextVar[int] = ContextVar("_sd_depth", default=0)
+_deep_st_depth: ContextVar[int] = ContextVar("_deep_st_depth", default=0)
+_deep_tl_depth: ContextVar[int] = ContextVar("_deep_tl_depth", default=0)
+
+# ── Deep-diagnostic target path (thread-local) ──────────────────────
+# Set by the background UNET worker before the load body; used by the
+# deep diag wrappers to filter: only emit stage events when the current
+# thread's *target_path* matches the file being accessed AND deep diag
+# is enabled.  Avoids logging unrelated model loads.
+_DEEP_TARGET_PATH: ContextVar[str] = ContextVar("_deep_target_path", default="")
 
 # Residual tracking — list of child duration_ms collected during an SD outer call.
 _child_durations: ContextVar[list[float] | None] = ContextVar("_child_durations", default=None)
@@ -131,6 +171,12 @@ def _make_torch_file_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
             lane = _ACTIVE_LANE_TRACE.get()
             if lane is not None:
                 lane.read_start()
+                if lane._lane == "UNET" and _DIAGNOSTIC_FLAG:
+                    lane._trace.emit(
+                        "unet_load_torch_file_start",
+                        phase=lane._phase,
+                        metadata={"lane": lane._lane, "path_hash": stable_hash(str(ckpt))[:16]},
+                    )
         try:
             return original(ckpt, safe_load=safe_load, device=device, return_metadata=return_metadata)
         finally:
@@ -141,6 +187,12 @@ def _make_torch_file_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 if lane is not None:
                     lane.read_end()
                     lane._on_read_completed()
+                    if lane._lane == "UNET" and _DIAGNOSTIC_FLAG:
+                        lane._trace.emit(
+                            "unet_load_torch_file_end",
+                            phase=lane._phase,
+                            metadata={"lane": lane._lane, "path_hash": stable_hash(str(ckpt))[:16]},
+                        )
     wrapper._comfy_modal_read_wrapper = True  # sentinel for idempotence
     return wrapper
 
@@ -185,6 +237,202 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                     _get_mutation_lane().release(lane._lane if lane else None)
     wrapper._comfy_modal_gpu_wrapper = True  # sentinel for idempotence
     return wrapper
+
+
+# ── Deep-diagnostic safetensors/torch.load decomposition wrappers ───
+# Only active when:
+#   1. _DIAGNOSTIC_FLAG is True
+#   2. The calling thread's _DEEP_TARGET_PATH is non-empty AND matches
+#      the file being accessed (avoid logging unrelated model loads)
+#   3. The active lane trace is UNET
+# These are globally installed but filtered by thread-local path, so
+# unrelated file activity is never logged.
+
+
+def _make_safetensors_open_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``safetensors.safe_open`` to emit open/parse/materialize stages.
+
+    Uses a reentrancy guard and thread-local path filtering.  Emits:
+    - ``unet_safetensors_open_start/end`` for the ``safe_open()`` call itself
+    - ``unet_safetensors_parse_start/end`` for the ``f.keys()`` header parse
+    - ``unet_tensor_materialize_start/end`` around ``f.get_tensor()`` calls
+    When the safetensors library does not expose separable boundaries, emits
+    ``unet_safetensors_load_combined_start/end`` with ``stage_split_available=false``.
+    """
+
+    @functools.wraps(original)
+    def wrapper(file, framework="pt", device="cpu", **kwargs):
+        before = _deep_st_depth.get()
+        _deep_st_depth.set(before + 1)
+        lane = _ACTIVE_LANE_TRACE.get()
+        target_path = _DEEP_TARGET_PATH.get()
+        _outer = (before == 0)
+        _eligible = (_outer and _DIAGNOSTIC_FLAG and lane is not None
+                     and lane._lane == "UNET" and target_path
+                     and (isinstance(file, str) and target_path in file))
+        _result = None
+        if _eligible:
+            lane._trace.emit("unet_safetensors_open_start", phase="restore",
+                             metadata={"path": str(file)[-80:]})
+        try:
+            _result = original(file, framework=framework, device=device, **kwargs)
+            if _eligible and _outer:
+                lane._trace.emit("unet_safetensors_open_end", phase="restore")
+                # Check if the safetensors object has separable keys()
+                _stage_split = (_result is not None
+                                and callable(getattr(_result, "keys", None))
+                                and callable(getattr(_result, "get_tensor", None)))
+                if _stage_split:
+                    lane._trace.emit("unet_safetensors_parse_start", phase="restore")
+                    try:
+                        _keys = list(_result.keys())
+                        lane._trace.emit("unet_safetensors_parse_end", phase="restore",
+                                         metadata={"tensor_count": len(_keys),
+                                                   "stage_split_available": True})
+                    except Exception:
+                        lane._trace.emit("unet_safetensors_parse_end", phase="restore",
+                                         metadata={"stage_split_available": False})
+                    # Return a delegating proxy instead of mutating the native
+                    # safe_open object (C-extension — attributes are read-only).
+                    _tensor_count_agg = [0]
+                    _tensor_bytes_agg = [0]
+                    _orig_get_tensor = _result.get_tensor
+
+                    class _SafeOpenProxy:
+                        """Delegating wrapper that preserves the full safe_open
+                        interface (keys, get_tensor, metadata, context manager)
+                        while wrapping get_tensor for aggregate diagnostics."""
+                        def __init__(self, wrapped, orig_gt, count_agg, bytes_agg):
+                            object.__setattr__(self, "_wrapped", wrapped)
+                            object.__setattr__(self, "_orig_gt", orig_gt)
+                            object.__setattr__(self, "_count_agg", count_agg)
+                            object.__setattr__(self, "_bytes_agg", bytes_agg)
+
+                        def __getattr__(self, name):
+                            if name == "get_tensor":
+                                return lambda k: self._proxy_get_tensor(k)
+                            return getattr(self._wrapped, name)
+
+                        def _proxy_get_tensor(self, k):
+                            lane2 = _ACTIVE_LANE_TRACE.get()
+                            _start_ns = 0
+                            if lane2 is not None and lane2._lane == "UNET" and _DIAGNOSTIC_FLAG:
+                                _start_ns = time.monotonic_ns()
+                            try:
+                                return self._orig_gt(k)
+                            finally:
+                                if lane2 is not None and lane2._lane == "UNET" and _DIAGNOSTIC_FLAG and _start_ns:
+                                    self._count_agg[0] += 1
+                                    try:
+                                        _t = self._orig_gt(k)
+                                        self._bytes_agg[0] += _t.numel() if hasattr(_t, "numel") else 0
+                                    except Exception:
+                                        pass
+
+                        def __enter__(self):
+                            return self
+
+                        def __exit__(self, *exc):
+                            return self._wrapped.__exit__(*exc) if hasattr(self._wrapped, "__exit__") else None
+
+                        def keys(self):
+                            return self._wrapped.keys()
+
+                    _result = _SafeOpenProxy(_result, _orig_get_tensor,
+                                             _tensor_count_agg, _tensor_bytes_agg)
+                    lane._trace.emit("unet_tensor_materialize_aggregated", phase="restore",
+                                     metadata={"tensor_count": _tensor_count_agg[0],
+                                               "total_bytes": _tensor_bytes_agg[0]})
+                else:
+                    lane._trace.emit("unet_safetensors_load_combined_start", phase="restore",
+                                     metadata={"stage_split_available": False})
+                    lane._trace.emit("unet_safetensors_load_combined_end", phase="restore")
+            return _result
+        finally:
+            after = _deep_st_depth.get()
+            _deep_st_depth.set(after - 1)
+    wrapper._comfy_modal_deep_st_wrapper = True
+    return wrapper
+
+
+def _make_torch_load_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``torch.load`` to emit combined load event for non-safetensors files.
+
+    Thread-local path filtering.  Emits ``unet_load_torch_file_start/end``.
+    """
+
+    @functools.wraps(original)
+    def wrapper(f, map_location=None, weights_only=True, **kwargs):
+        before = _deep_tl_depth.get()
+        _deep_tl_depth.set(before + 1)
+        lane = _ACTIVE_LANE_TRACE.get()
+        target_path = _DEEP_TARGET_PATH.get()
+        _outer = (before == 0)
+        _file_str = str(getattr(f, "name", f)) if not isinstance(f, str) else str(f)
+        _eligible = (_outer and _DIAGNOSTIC_FLAG and lane is not None
+                     and lane._lane == "UNET" and target_path
+                     and target_path in _file_str)
+        if _eligible:
+            lane._trace.emit("unet_load_torch_file_start", phase="restore",
+                             metadata={"path": _file_str[-80:]})
+        try:
+            return original(f, map_location=map_location, weights_only=weights_only, **kwargs)
+        finally:
+            after = _deep_tl_depth.get()
+            _deep_tl_depth.set(after - 1)
+            if _eligible and _outer:
+                lane._trace.emit("unet_load_torch_file_end", phase="restore")
+    wrapper._comfy_modal_deep_tl_wrapper = True
+    return wrapper
+
+
+def _install_deep_diag_wrappers(*, safe_open_fn: Any = None, torch_load_fn: Any = None,
+                                 trace: RuntimeTrace | None = None) -> dict[str, str]:
+    """Install deep diagnostic wrappers on safetensors.safe_open and torch.load.
+
+    Idempotent via sentinel flags.  Installs the wrapper onto the *live module
+    object in sys.modules* so the wrapper intercepts real callers.  Thread-local
+    ``_DEEP_TARGET_PATH`` + ``_ACTIVE_LANE_TRACE`` filtering ensures unrelated
+    file activity is never logged.
+
+    Returns ``{component: status}`` dict.  Only meaningful when
+    ``_DIAGNOSTIC_FLAG`` is True at install time, but the wrappers themselves
+    check the flag and path filter at call time.
+    """
+    global _deep_diag_wrappers_installed
+    if _deep_diag_wrappers_installed:
+        return {}
+    result: dict[str, str] = {}
+    if safe_open_fn is not None and callable(safe_open_fn):
+        if not getattr(safe_open_fn, _SENTINEL_DEEP_ST, False):
+            _wrapped = _make_safetensors_open_wrapper(safe_open_fn)
+            # Install onto the live safetensors module in sys.modules
+            _st_mod = _get_live_module("safetensors")
+            if _st_mod is not None:
+                setattr(_st_mod, "safe_open", _wrapped)
+                result["safetensors.safe_open"] = "installed"
+            else:
+                result["safetensors.safe_open"] = "unavailable"
+        else:
+            result["safetensors.safe_open"] = "already_installed"
+    if torch_load_fn is not None and callable(torch_load_fn):
+        if not getattr(torch_load_fn, _SENTINEL_DEEP_TL, False):
+            _wrapped = _make_torch_load_wrapper(torch_load_fn)
+            # Install onto the live torch module in sys.modules
+            _torch_mod = _get_live_module("torch")
+            if _torch_mod is not None:
+                setattr(_torch_mod, "load", _wrapped)
+                result["torch.load"] = "installed"
+            else:
+                result["torch.load"] = "unavailable"
+        else:
+            result["torch.load"] = "already_installed"
+    if trace:
+        for comp, status in result.items():
+            trace.emit("deep_diag_wrapper_install", phase="restore",
+                       metadata={"component": comp, "status": status})
+    _deep_diag_wrappers_installed = True
+    return result
 
 
 # ── Independent per-component installation ──────────────────────────
@@ -250,6 +498,11 @@ def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
     optional-dependency import failures in ``comfy.memory_management``
     cannot block the read wrapper.
 
+    Also installs deep-diagnostic wrappers (``safetensors.safe_open``,
+    ``torch.load``) when COMFYMODAL_V2_DEEP_MODEL_DIAG=1.  These wrappers
+    are globally installed but filtered at call time by thread-local
+    ``_DEEP_TARGET_PATH`` so unrelated file activity is never logged.
+
     Returns a ``{component: status}`` dict suitable for trace diagnostics.
     """
     result: dict[str, str] = {}
@@ -265,6 +518,19 @@ def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
         result["load_models_gpu"] = _install_gpu_wrapper(mm_module=mm_mod, trace=trace)
     else:
         result["load_models_gpu"] = "unavailable"
+
+    # ── Install deep diag wrappers (idempotent, path-filtered) ────
+    if _DIAGNOSTIC_FLAG:
+        import safetensors as _st
+        import torch as _torch
+        _st_mod = _get_live_module("safetensors")
+        _st_open_fn = getattr(_st_mod, "safe_open", None) if _st_mod else None
+        _deep_install_result = _install_deep_diag_wrappers(
+            safe_open_fn=_st_open_fn,
+            torch_load_fn=getattr(_torch, "load", None),
+            trace=trace,
+        )
+        result.update(_deep_install_result)
 
     # Emit diagnostic events when a trace is available.
     if trace is not None:
@@ -605,6 +871,13 @@ class ModelLaneTrace:
         Single CLIP is 1; DualCLIP is 2.  When the observed read count
         differs from expected, ``cpu_prepare_start`` carries
         ``status="read_count_mismatch"``.
+
+    **UNET-specific stages** (only emitted when ``_lane == "UNET"`` and
+    ``_DIAGNOSTIC_FLAG`` is enabled):
+        unet_file_stat_start/end, unet_file_open_start/end,
+        unet_mmap_create_start/end, unet_load_torch_file_start/end,
+        unet_safetensors_open_start/end, unet_safetensors_parse_start/end,
+        unet_tensor_materialize_start/end or unet_safetensors_load_combined_start/end.
     """
 
     def __init__(
@@ -623,6 +896,13 @@ class ModelLaneTrace:
         self._cpu_prepare_started: bool = False
         self._cpu_prepare_ended: bool = False
         self._gpu_commit_started: bool = False
+        # ── Worker queue/publication tracking ────────────────────
+        self._submitted_at_ns: int = 0
+        self._worker_started_at_ns: int = 0
+        self._worker_ended_at_ns: int = 0
+        self._cache_publish_started: bool = False
+        self._cache_publish_completed: bool = False
+        self._done_event_set: bool = False
 
     # ── Internal lifecycle hooks (called by wrappers) ────────────────
 
@@ -653,7 +933,22 @@ class ModelLaneTrace:
     # ── Producer-side lifecycle ──────────────────────────────────────
 
     def submitted(self, **metadata: Any) -> None:
+        self._submitted_at_ns = time.monotonic_ns()
         self._trace.emit("submitted", phase=self._phase, metadata={"lane": self._lane, **metadata})
+
+    def worker_start(self, **metadata: Any) -> None:
+        self._worker_started_at_ns = time.monotonic_ns()
+        self._trace.emit("background_unet_worker_start", phase=self._phase,
+                         metadata={"lane": self._lane, **metadata})
+
+    def worker_end(self, **metadata: Any) -> None:
+        self._worker_ended_at_ns = time.monotonic_ns()
+        self._trace.emit("background_unet_worker_end", phase=self._phase,
+                         metadata={"lane": self._lane, **metadata})
+
+    def worker_failed(self, **metadata: Any) -> None:
+        self._trace.emit("background_unet_worker_failed", phase=self._phase,
+                         metadata={"lane": self._lane, **metadata})
 
     def read_start(self, **metadata: Any) -> None:
         self._trace.emit("read_start", phase=self._phase, metadata={"lane": self._lane, **metadata})
@@ -670,24 +965,91 @@ class ModelLaneTrace:
     def gpu_lane_wait_start(self, **metadata: Any) -> None:
         self._trace.emit("gpu_lane_wait_start", phase=self._phase, metadata={
             "lane": self._lane, "status": "unlocked", **metadata})
+        # Also emit UNET-specific name
+        if self._lane == "UNET":
+            self._trace.emit("unet_gpu_lane_wait_start", phase=self._phase, metadata={
+                "lane": self._lane, **metadata})
 
     def gpu_lane_wait_end(self, **metadata: Any) -> None:
         self._trace.emit("gpu_lane_wait_end", phase=self._phase, metadata={
             "lane": self._lane, "status": "unlocked", **metadata})
+        if self._lane == "UNET":
+            self._trace.emit("unet_gpu_lane_wait_end", phase=self._phase, metadata={
+                "lane": self._lane, **metadata})
 
     def gpu_commit_start(self, **metadata: Any) -> None:
         self._trace.emit("gpu_commit_start", phase=self._phase, metadata={"lane": self._lane, **metadata})
+        if self._lane == "UNET":
+            self._trace.emit("unet_gpu_commit_start", phase=self._phase, metadata={
+                "lane": self._lane, **metadata})
 
     def gpu_commit_end(self, **metadata: Any) -> None:
         self._trace.emit("gpu_commit_end", phase=self._phase, metadata={"lane": self._lane, **metadata})
+        if self._lane == "UNET":
+            self._trace.emit("unet_gpu_commit_end", phase=self._phase, metadata={
+                "lane": self._lane, **metadata})
+
+    def cache_publish_start(self, **metadata: Any) -> None:
+        self._cache_publish_started = True
+        self._trace.emit("unet_cache_publish_start", phase=self._phase,
+                         metadata={"lane": self._lane, **metadata})
+
+    def cache_object_store(self, **metadata: Any) -> None:
+        self._trace.emit("unet_cache_object_store", phase=self._phase,
+                         metadata={"lane": self._lane, **metadata})
+
+    def cache_metadata_store(self, **metadata: Any) -> None:
+        self._trace.emit("unet_cache_metadata_store", phase=self._phase,
+                         metadata={"lane": self._lane, **metadata})
+
+    def done_event_set(self, **metadata: Any) -> None:
+        self._done_event_set = True
+        self._trace.emit("unet_done_event_set", phase=self._phase,
+                         metadata={"lane": self._lane, **metadata})
+
+    def cache_publish_end(self, **metadata: Any) -> None:
+        self._cache_publish_completed = True
+        self._trace.emit("unet_cache_publish_end", phase=self._phase,
+                         metadata={"lane": self._lane, **metadata})
 
     def ready(self, **metadata: Any) -> None:
         self._close_cpu_prepare(status="ok")
-        self._trace.emit("ready", phase=self._phase, metadata={"lane": self._lane, **metadata})
+        # Only set ready after cache publication is complete
+        self._trace.emit("ready", phase=self._phase, metadata={
+            "lane": self._lane,
+            "cache_publish_completed": self._cache_publish_completed,
+            "done_event_set": self._done_event_set,
+            **metadata,
+        })
 
     def failed(self, **metadata: Any) -> None:
         self._close_cpu_prepare(status="error")
         self._trace.emit("failed", phase=self._phase, metadata={"lane": self._lane, **metadata})
+
+    # ── UNET-specific file/safetensors stage methods ────────────────
+    # Only meaningful for UNET lane with deep diag enabled.  These
+    # mirror the deep diagnostic wrappers above.
+
+    def unet_file_stat(self, **metadata: Any) -> None:
+        self._trace.emit("unet_file_stat_start", phase=self._phase, metadata={"lane": self._lane, **metadata})
+        self._trace.emit("unet_file_stat_end", phase=self._phase, metadata={"lane": self._lane})
+
+    def unet_file_open(self, **metadata: Any) -> None:
+        # INTENTIONALLY UNCALLED — the live safetensors/torch.load
+        # implementations do not expose a separable Python-callable
+        # file-open boundary.  This method exists only for forward
+        # compatibility and the bg_unet_io summary correctly reports
+        # it as None/absent.
+        self._trace.emit("unet_file_open_start", phase=self._phase, metadata={"lane": self._lane, **metadata})
+        self._trace.emit("unet_file_open_end", phase=self._phase, metadata={"lane": self._lane})
+
+    def unet_mmap_create(self, **metadata: Any) -> None:
+        self._trace.emit("unet_mmap_create_start", phase=self._phase, metadata={"lane": self._lane, **metadata})
+        self._trace.emit("unet_mmap_create_end", phase=self._phase, metadata={"lane": self._lane})
+
+    def unet_load_torch_file(self, **metadata: Any) -> None:
+        self._trace.emit("unet_load_torch_file_start", phase=self._phase, metadata={"lane": self._lane, **metadata})
+        self._trace.emit("unet_load_torch_file_end", phase=self._phase, metadata={"lane": self._lane})
 
     # ── Consumer-side (graph demand) lifecycle ───────────────────────
 
@@ -699,6 +1061,630 @@ class ModelLaneTrace:
 
     def graph_wait_end(self, **metadata: Any) -> None:
         self._trace.emit("graph_wait_end", phase="execution", metadata={"lane": self._lane, **metadata})
+
+
+# ── External (legacy background UNET) lane scope ─────────────────────
+
+@contextmanager
+def external_model_lane_scope(
+    trace: RuntimeTrace,
+    *,
+    lane: str = "UNET",
+    phase: str = "restore",
+    expected_read_count: int = 1,
+) -> Iterator[ModelLaneTrace]:
+    """Context manager for legacy background UNET thread lane tracing.
+
+    Creates a dedicated ``ModelLaneTrace``, sets ``_ACTIVE_LANE_TRACE``,
+    and ensures terminal ``ready()`` or ``failed()`` is emitted exactly
+    once.  The *trace* must be a **dedicated** RuntimeTrace (not shared
+    with the request/restore trace) — this manager never appends to a
+    shared cross-thread list.
+
+    On success the lane's events are stored into the module-level
+    ``_BG_UNET_DIAG_STORE`` keyed by ``(lane, diagnostic_id)`` for
+    later draining by the graph cache patcher.
+
+    Usage::
+
+        bg_trace = RuntimeTrace(process="remote_background_unet", ...)
+        with external_model_lane_scope(bg_trace, lane="UNET", ...) as lane_trace:
+            lane_trace.submitted()
+            # ... worker body ...
+    """
+    lane_trace = ModelLaneTrace(trace, lane, phase=phase, expected_read_count=expected_read_count)
+    # Emit background_unet_submitted immediately when scope opens
+    _canonical_key_str = str(trace._metadata.get("canonical_key", "")) if hasattr(trace, "_metadata") else ""
+    _diag_id_val = str(trace._metadata.get("diagnostic_id", "")) if hasattr(trace, "_metadata") else ""
+    _resolved_path_val = str(trace._metadata.get("resolved_path", "")) if hasattr(trace, "_metadata") else ""
+    lane_trace.submitted(canonical_key=_canonical_key_str, diagnostic_id=_diag_id_val)
+    trace.emit("background_unet_submitted", phase=phase, metadata={
+        "lane": lane, "canonical_key": _canonical_key_str, "diagnostic_id": _diag_id_val,
+        "expected_read_count": expected_read_count,
+    })
+    # Set path filtering for deep diag wrappers
+    _deep_path_token = None
+    if _DIAGNOSTIC_FLAG:
+        if _resolved_path_val:
+            _deep_path_token = _DEEP_TARGET_PATH.set(_resolved_path_val)
+    # NOTE: active-read before/after deltas are NOT sampled here.
+    # Active-read delta computation is owned entirely by the exact
+    # comfyapp _register_active_model_read / _complete_active_model_read
+    # interval.  The background worker scope only owns its own
+    # deep-diagnostic file-stat / safetensors boundaries.
+
+    # Emit unet_file_stat from actual os.stat of the resolved path
+    if _DIAGNOSTIC_FLAG and _resolved_path_val:
+        try:
+            _st = os.stat(_resolved_path_val)
+            lane_trace.unet_file_stat(
+                path_hash=_resolved_path_val[-48:],
+                size=_st.st_size,
+                st_dev=_st.st_dev,
+                st_ino=_st.st_ino,
+            )
+        except OSError:
+            lane_trace.unet_file_stat(path_hash=_resolved_path_val[-48:], size=None)
+
+    # Install core dispatch + deep diag wrappers idempotently in the
+    # real background worker thread so safetensors/torch.load boundaries
+    # are instrumented under COMFYMODAL_V2_DEEP_MODEL_DIAG=1.
+    _ensure_core_wrappers(trace=trace)
+
+    token = _ACTIVE_LANE_TRACE.set(lane_trace)
+    lane_trace.worker_start(canonical_key=_canonical_key_str)
+    try:
+        yield lane_trace
+        lane_trace.worker_end()
+        # ready() is called AFTER cache publication completes — the
+        # caller is responsible for calling cache_publish_start(),
+        # cache_object_store(), cache_metadata_store(), done_event_set(),
+        # cache_publish_end() before this scope exits.
+        lane_trace.ready()
+    except BaseException as exc:
+        lane_trace.worker_end()
+        lane_trace.worker_failed(error_category=type(exc).__name__)
+        lane_trace.failed(error_category=type(exc).__name__)
+        raise
+    finally:
+        _ACTIVE_LANE_TRACE.reset(token)
+        if _deep_path_token is not None:
+            _DEEP_TARGET_PATH.reset(_deep_path_token)
+
+        # ── Emit bg_unet summaries from the worker's actual trace ──
+        _emit_bg_unet_io_summary(trace, canonical_key=_canonical_key_str, force=True)
+        _emit_bg_unet_stages_summary(trace, canonical_key=_canonical_key_str,
+                                      weight_dtype=trace._metadata.get("weight_dtype", "") if hasattr(trace, "_metadata") else "",
+                                      force=True)
+
+        # Store completed events into the diagnostic store for later
+        # draining by graph cache consumer.  Use a composite key that
+        # includes diagnostic_id from the trace metadata when available.
+        _store_key = f"{lane}:{_diag_id_val}" if _diag_id_val else lane
+        with _BG_UNET_DIAG_LOCK:
+            # Append (do not overwrite) to avoid losing previously stored events
+            _existing = _BG_UNET_DIAG_STORE.setdefault(_store_key, [])
+            _existing.extend(trace.events)
+
+
+# ── Restore-return marker helpers ────────────────────────────────────
+
+
+def set_restore_return_marker(
+    restored_instance_id: str,
+    restore_session_id: str,
+    legacy_container_session_id: str,
+    modal_task_id: str = "",
+    pid: int = 0,
+) -> None:
+    """Set ``_LATEST_RESTORE_RETURN_MARKER`` immediately before restore return."""
+    global _LATEST_RESTORE_RETURN_MARKER
+    _LATEST_RESTORE_RETURN_MARKER = {
+        "wall_unix_ns": int(time.time() * 1_000_000_000),
+        "monotonic_ns": time.monotonic_ns(),
+        "restored_instance_id": restored_instance_id,
+        "restore_session_id": restore_session_id,
+        "legacy_container_session_id": legacy_container_session_id,
+        "modal_task_id": modal_task_id,
+        "pid": pid,
+    }
+
+
+# ── Deep diagnostic helpers (guarded by COMFYMODAL_V2_DEEP_MODEL_DIAG) ──
+
+
+def _capture_tid() -> int:
+    """Return native thread ID (cross-platform)."""
+    try:
+        import threading
+        return threading.get_native_id()
+    except Exception:
+        return 0
+
+
+def _capture_host_info() -> dict[str, Any]:
+    """Capture hostname, pid, and Linux boot_id when available."""
+    info: dict[str, Any] = {
+        "pid": os.getpid(),
+        "native_tid": _capture_tid(),
+        "hostname": platform.node(),
+    }
+    if _DIAGNOSTIC_FLAG and platform.system() == "Linux":
+        try:
+            with open("/proc/sys/kernel/random/boot_id") as _f:
+                info["boot_id"] = _f.read().strip()
+        except Exception:
+            pass
+    return info
+
+
+def _capture_rusage_thread_delta() -> dict[str, Any] | None:
+    """Return RUSAGE_THREAD values.  Only on Linux with deep diag enabled."""
+    if not _DIAGNOSTIC_FLAG:
+        return None
+    if platform.system() != "Linux":
+        return None
+    try:
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_THREAD)
+        return {
+            "utime_ms": round(ru.ru_utime * 1000, 3),
+            "stime_ms": round(ru.ru_stime * 1000, 3),
+            "minflt": ru.ru_minflt,
+            "majflt": ru.ru_majflt,
+            "inblock": ru.ru_inblock,
+            "oublock": ru.ru_oublock,
+            "nvcsw": ru.ru_nvcsw,
+            "nivcsw": ru.ru_nivcsw,
+        }
+    except Exception:
+        return None
+
+
+def _capture_rusage_thread_snapshot() -> dict[str, Any] | None:
+    """Return a raw RUSAGE_THREAD snapshot for before/after delta computation.
+    Only on Linux with deep diag enabled.  Returns flat dict of ints.
+    The caller must compute deltas externally."""
+    if not _DIAGNOSTIC_FLAG:
+        return None
+    if platform.system() != "Linux":
+        return None
+    try:
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_THREAD)
+        return {
+            "utime_us": round(ru.ru_utime * 1_000_000),
+            "stime_us": round(ru.ru_stime * 1_000_000),
+            "minflt": ru.ru_minflt,
+            "majflt": ru.ru_majflt,
+            "inblock": ru.ru_inblock,
+            "oublock": ru.ru_oublock,
+            "nvcsw": ru.ru_nvcsw,
+            "nivcsw": ru.ru_nivcsw,
+        }
+    except Exception:
+        return None
+
+
+def _capture_proc_tid_io_snapshot() -> dict[str, int] | None:
+    """Read /proc/self/task/<tid>/io for delta-capable counters.
+    Only on Linux with deep diag enabled.  Returns dict of raw ints.
+    The caller must compute deltas externally."""
+    if not _DIAGNOSTIC_FLAG or platform.system() != "Linux":
+        return None
+    try:
+        tid = _capture_tid()
+        with open(f"/proc/self/task/{tid}/io") as _f:
+            lines = _f.readlines()
+        result: dict[str, int] = {}
+        for line in lines:
+            for prefix in ("rchar", "wchar", "syscr", "syscw",
+                           "read_bytes", "write_bytes", "cancelled_write_bytes"):
+                if line.startswith(prefix + ":"):
+                    parts = line.strip().split(":")
+                    if len(parts) == 2:
+                        result[prefix] = int(parts[1].strip())
+        return result
+    except Exception:
+        return None
+
+
+def _compute_rusage_deltas(before: dict[str, Any] | None, after: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Compute rusage deltas (after - before). Both must share the same keys."""
+    if not before or not after:
+        return None
+    result = {}
+    for key in before:
+        if key in after and isinstance(before[key], (int, float)) and isinstance(after[key], (int, float)):
+            result[key] = max(0, after[key] - before[key])
+    return result
+
+
+def _compute_io_deltas(before: dict[str, int] | None, after: dict[str, int] | None) -> dict[str, int] | None:
+    """Compute /proc/self/task/<tid>/io deltas (after - before)."""
+    if not before or not after:
+        return None
+    result = {}
+    for key in before:
+        if key in after and isinstance(before[key], int) and isinstance(after[key], int):
+            result[key] = max(0, after[key] - before[key])
+    return result
+
+
+def _capture_proc_tid_io() -> dict[str, Any] | None:
+    """Read /proc/self/task/<tid>/io for delta-capable counters.
+    Only on Linux with deep diag enabled.  Returns raw values (not deltas)."""
+    if not _DIAGNOSTIC_FLAG or platform.system() != "Linux":
+        return None
+    try:
+        tid = _capture_tid()
+        with open(f"/proc/self/task/{tid}/io") as _f:
+            lines = _f.readlines()
+        result: dict[str, int] = {}
+        for line in lines:
+            for prefix in ("rchar", "wchar", "syscr", "syscw",
+                           "read_bytes", "write_bytes", "cancelled_write_bytes"):
+                if line.startswith(prefix + ":"):
+                    parts = line.strip().split(":")
+                    if len(parts) == 2:
+                        result[prefix] = int(parts[1].strip())
+        return result
+    except Exception:
+        return None
+
+
+def _capture_file_identity(path: str) -> dict[str, Any]:
+    """Capture stat info for the file at *path*: st_dev, st_ino, size, mtime."""
+    result: dict[str, Any] = {"path_hash": stable_hash(path or "")}
+    if not path:
+        return result
+    try:
+        st = os.stat(path)
+        result["st_dev"] = st.st_dev
+        result["st_ino"] = st.st_ino
+        result["size"] = st.st_size
+        result["st_mtime"] = round(st.st_mtime, 3)
+        if _DIAGNOSTIC_FLAG and platform.system() == "Linux":
+            try:
+                # Attempt mount/filesystem identity via stat
+                result["st_dev_major"] = os.major(st.st_dev)
+                result["st_dev_minor"] = os.minor(st.st_dev)
+            except Exception:
+                pass
+    except OSError:
+        pass
+    return result
+
+
+# ── Background UNET diagnostic helpers ─────────────────────────────
+
+
+def _make_bg_unet_diag_context(
+    *,
+    canonical_key: str,
+    diagnostic_id: str,
+    restored_instance_id: str,
+    restore_session_id: str,
+    modal_task_id: str = "",
+) -> dict[str, Any]:
+    """Return a metadata dict shared across all background UNET diagnostic events."""
+    return {
+        "canonical_key": canonical_key,
+        "diagnostic_id": diagnostic_id,
+        "restored_instance_id": restored_instance_id,
+        "restore_session_id": restore_session_id,
+        "modal_task_id": modal_task_id,
+        "pid": os.getpid(),
+        "native_tid": _capture_tid(),
+        "hostname": platform.node(),
+    }
+
+
+# ── Summary emission helpers (one-line compact summaries) ──────────
+
+
+def _collect_restore_events_for_summary(
+    trace: RuntimeTrace,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Scan trace events for restore-breakdown and CLIP-stage timestamps.
+
+    Returns ``(breakdown_dict, clip_stages_dict)``.  Missing stages are
+    reported as ``None``; absent lanes as ``"absent"``.
+    """
+    breakdown: dict[str, Any] = {}
+    clip: dict[str, Any] = {}
+    # Iterate events and capture timestamps
+    for evt in trace.events:
+        if evt.name == "v2_bootstrap_restore_start":
+            breakdown["bootstrap_start_ns"] = evt.monotonic_ns
+        elif evt.name == "v2_bootstrap_restore_end":
+            breakdown["bootstrap_end_ns"] = evt.monotonic_ns
+        elif evt.name == "v2_unet_cache_patch_start":
+            breakdown["unet_cache_patch_start_ns"] = evt.monotonic_ns
+        elif evt.name == "v2_unet_cache_patch_end":
+            breakdown["unet_cache_patch_end_ns"] = evt.monotonic_ns
+        elif evt.name == "v2_clip_prepare_submit_start":
+            breakdown["clip_prepare_submit_start_ns"] = evt.monotonic_ns
+        elif evt.name == "v2_clip_prepare_submit_end":
+            breakdown["clip_prepare_submit_end_ns"] = evt.monotonic_ns
+        elif evt.name == "v2_clip_worker_wait_start":
+            breakdown["clip_worker_wait_start_ns"] = evt.monotonic_ns
+            clip["worker_wait_start_ns"] = evt.monotonic_ns
+        elif evt.name == "v2_clip_worker_wait_end":
+            breakdown["clip_worker_wait_end_ns"] = evt.monotonic_ns
+            clip["worker_wait_end_ns"] = evt.monotonic_ns
+        elif evt.name == "v2_clip_ready":
+            clip["ready_ns"] = evt.monotonic_ns
+        elif evt.name == "v2_unet_spec_extract_start":
+            breakdown["unet_spec_extract_start_ns"] = evt.monotonic_ns
+        elif evt.name == "v2_unet_spec_extract_end":
+            breakdown["unet_spec_extract_end_ns"] = evt.monotonic_ns
+        elif evt.name == "v2_background_unet_submit_start":
+            breakdown["bg_unet_submit_start_ns"] = evt.monotonic_ns
+        elif evt.name == "v2_background_unet_submit_end":
+            breakdown["bg_unet_submit_end_ns"] = evt.monotonic_ns
+        elif evt.name == "v2_restore_finalize_start":
+            breakdown["restore_finalize_start_ns"] = evt.monotonic_ns
+        elif evt.name == "v2_restore_finalize_end":
+            breakdown["restore_finalize_end_ns"] = evt.monotonic_ns
+
+    # Convert to ms where pairs exist
+    result_breakdown: dict[str, Any] = {}
+    _PAIRS = [
+        ("bootstrap_ms", "bootstrap_start_ns", "bootstrap_end_ns"),
+        ("unet_cache_patch_ms", "unet_cache_patch_start_ns", "unet_cache_patch_end_ns"),
+        ("clip_prepare_submit_ms", "clip_prepare_submit_start_ns", "clip_prepare_submit_end_ns"),
+        ("clip_worker_wait_ms", "clip_worker_wait_start_ns", "clip_worker_wait_end_ns"),
+        ("unet_spec_extract_ms", "unet_spec_extract_start_ns", "unet_spec_extract_end_ns"),
+        ("bg_unet_submit_ms", "bg_unet_submit_start_ns", "bg_unet_submit_end_ns"),
+        ("restore_finalize_ms", "restore_finalize_start_ns", "restore_finalize_end_ns"),
+    ]
+    for key, start_key, end_key in _PAIRS:
+        s = breakdown.get(start_key)
+        e = breakdown.get(end_key)
+        result_breakdown[key] = round((e - s) / 1_000_000, 3) if (s and e) else None
+
+    # CLIP stages
+    result_clip: dict[str, Any] = {
+        "read_to_ready_ms": None,
+        "cpu_prepare_ms": None,
+        "gpu_wait_ms": None,
+        "gpu_commit_ms": None,
+        "read_end_to_ready_ms": None,
+        "worker_total_ms": None,
+    }
+    for evt in trace.events:
+        _meta = evt.metadata if hasattr(evt, "metadata") else {}
+        if evt.name == "read_start" and _meta.get("lane") == "CLIP":
+            clip["read_start_ns"] = evt.monotonic_ns
+        elif evt.name == "read_end" and _meta.get("lane") == "CLIP":
+            clip["read_end_ns"] = evt.monotonic_ns
+        elif evt.name == "cpu_prepare_start" and _meta.get("lane") == "CLIP":
+            clip["cpu_prepare_start_ns"] = evt.monotonic_ns
+        elif evt.name == "cpu_prepare_end" and _meta.get("lane") == "CLIP":
+            clip["cpu_prepare_end_ns"] = evt.monotonic_ns
+        elif evt.name == "gpu_lane_wait_start" and _meta.get("lane") == "CLIP":
+            clip["gpu_wait_start_ns"] = evt.monotonic_ns
+        elif evt.name == "gpu_lane_wait_end" and _meta.get("lane") == "CLIP":
+            clip["gpu_wait_end_ns"] = evt.monotonic_ns
+        elif evt.name == "gpu_commit_start" and _meta.get("lane") == "CLIP":
+            clip["gpu_commit_start_ns"] = evt.monotonic_ns
+        elif evt.name == "gpu_commit_end" and _meta.get("lane") == "CLIP":
+            clip["gpu_commit_end_ns"] = evt.monotonic_ns
+
+    rs = clip.get("read_start_ns")
+    re = clip.get("read_end_ns")
+    cps = clip.get("cpu_prepare_start_ns")
+    cpe = clip.get("cpu_prepare_end_ns")
+    gws = clip.get("gpu_wait_start_ns")
+    gwe = clip.get("gpu_wait_end_ns")
+    gcs = clip.get("gpu_commit_start_ns")
+    gce = clip.get("gpu_commit_end_ns")
+    rdy = clip.get("ready_ns")
+    wws = clip.get("worker_wait_start_ns")
+    wwe = clip.get("worker_wait_end_ns")
+
+    if rs and rdy:
+        result_clip["read_to_ready_ms"] = round((rdy - rs) / 1_000_000, 3)
+    if cps and cpe:
+        result_clip["cpu_prepare_ms"] = round((cpe - cps) / 1_000_000, 3)
+    if gws and gwe:
+        result_clip["gpu_wait_ms"] = round((gwe - gws) / 1_000_000, 3)
+    if gcs and gce:
+        result_clip["gpu_commit_ms"] = round((gce - gcs) / 1_000_000, 3)
+    if re and rdy:
+        result_clip["read_end_to_ready_ms"] = round((rdy - re) / 1_000_000, 3)
+    if wws and wwe:
+        result_clip["worker_total_ms"] = round((wwe - wws) / 1_000_000, 3)
+
+    return result_breakdown, result_clip
+
+
+# ── Background UNET IO/stages summary emission ──────────────────────
+
+
+def _emit_bg_unet_io_summary(trace: RuntimeTrace, *, canonical_key: str = "",
+                               target_path: str = "", force: bool = False) -> None:
+    """Emit a compact [v2.bg_unet_io] line from trace events.
+
+    Summarises file stat, open, mmap, safetensors parse, tensor materialization
+    durations.  Missing stages → None.  Only emits when deep diag produced
+    events or *force* is True.
+
+    NOTE: file_open and mmap_create are always None/absent because the real
+    safetensors/torch.load implementations do not expose separable Python-callable
+    boundaries for these stages.  They are listed only for forward compatibility
+    — do not emit synthetic values.
+    """
+    if not force and not _DIAGNOSTIC_FLAG:
+        return
+    stages: dict[str, Any] = {"file_stat_ms": None, "file_open_ms": None,
+                               "mmap_create_ms": None, "safetensors_open_ms": None,
+                               "safetensors_parse_ms": None,
+                               "tensor_materialization_ms": None,
+                               "safetensors_combined_ms": None,
+                               "load_torch_file_ms": None, "stage_split_available": None}
+    events = trace.events
+    for i, evt in enumerate(events):
+        _meta = evt.metadata if hasattr(evt, "metadata") else {}
+        # unet_file_stat_start -> unet_file_stat_end
+        if evt.name == "unet_file_stat_start":
+            for j in range(i + 1, min(i + 20, len(events))):
+                if events[j].name == "unet_file_stat_end":
+                    stages["file_stat_ms"] = round((events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    break
+        elif evt.name == "unet_file_open_start":
+            for j in range(i + 1, min(i + 20, len(events))):
+                if events[j].name == "unet_file_open_end":
+                    stages["file_open_ms"] = round((events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    break
+        elif evt.name == "unet_mmap_create_start":
+            for j in range(i + 1, min(i + 20, len(events))):
+                if events[j].name == "unet_mmap_create_end":
+                    stages["mmap_create_ms"] = round((events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    break
+        elif evt.name == "unet_safetensors_open_start":
+            for j in range(i + 1, min(i + 80, len(events))):
+                if events[j].name == "unet_safetensors_open_end":
+                    stages["safetensors_open_ms"] = round((events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    break
+        elif evt.name == "unet_safetensors_parse_start":
+            for j in range(i + 1, min(i + 40, len(events))):
+                if events[j].name == "unet_safetensors_parse_end":
+                    stages["safetensors_parse_ms"] = round((events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    stages["stage_split_available"] = _meta.get("stage_split_available", False)
+                    break
+        elif evt.name == "unet_tensor_materialize_start":
+            for j in range(i + 1, min(i + 200, len(events))):
+                if events[j].name == "unet_tensor_materialize_end":
+                    _prev = stages.get("tensor_materialization_ms", 0) or 0
+                    stages["tensor_materialization_ms"] = round(
+                        _prev + (events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    break
+        elif evt.name == "unet_safetensors_load_combined_start":
+            for j in range(i + 1, min(i + 200, len(events))):
+                if events[j].name == "unet_safetensors_load_combined_end":
+                    stages["safetensors_combined_ms"] = round(
+                        (events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    stages["stage_split_available"] = False
+                    break
+        elif evt.name == "unet_load_torch_file_start":
+            for j in range(i + 1, min(i + 200, len(events))):
+                if events[j].name == "unet_load_torch_file_end":
+                    stages["load_torch_file_ms"] = round(
+                        (events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    break
+    print(
+        f"[v2.bg_unet_io] "
+        f"file_stat_ms={stages['file_stat_ms']} "
+        f"file_open_ms={stages['file_open_ms']} "
+        f"mmap_create_ms={stages['mmap_create_ms']} "
+        f"safetensors_open_ms={stages['safetensors_open_ms']} "
+        f"safetensors_parse_ms={stages['safetensors_parse_ms']} "
+        f"tensor_materialization_ms={stages['tensor_materialization_ms']} "
+        f"safetensors_combined_ms={stages['safetensors_combined_ms']} "
+        f"load_torch_file_ms={stages['load_torch_file_ms']} "
+        f"stage_split_available={stages['stage_split_available']} "
+        f"canonical_key={canonical_key[-32:] if canonical_key else ''}",
+        flush=True,
+    )
+
+
+def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = "",
+                                   weight_dtype: str = "", force: bool = False) -> None:
+    """Emit compact [v2.bg_unet_stages] line from trace events.
+
+    Summarises worker queue, model construction subfunction durations, GPU commit,
+    and cache publication.  Missing stages → None.
+    """
+    if not force and not _DIAGNOSTIC_FLAG:
+        return
+    stages: dict[str, Any] = {
+        "submission_to_worker_start_ms": None,
+        "worker_wall_ms": None, "worker_thread_cpu_ms": None,
+        "model_construction_total_ms": None,
+        "measured_children_ms": None,
+        "unattributed_residual_ms": None,
+        "gpu_lane_wait_ms": None, "gpu_commit_ms": None,
+        "cache_publish_ms": None,
+        "background_gpu_transfer_present": False,
+        "weight_dtype": weight_dtype,
+    }
+    events = trace.events
+    _submitted_ns = 0
+    _worker_start_ns = 0
+    _worker_end_ns = 0
+    _gpu_wait_start = 0
+    _gpu_wait_end = 0
+    _gpu_commit_start = 0
+    _gpu_commit_end = 0
+    _cache_pub_start = 0
+    _cache_pub_end = 0
+    _sd_total = 0.0
+    _children_total = 0.0
+
+    for i, evt in enumerate(events):
+        if evt.name == "background_unet_submitted":
+            _submitted_ns = evt.monotonic_ns
+        elif evt.name == "background_unet_worker_start":
+            _worker_start_ns = evt.monotonic_ns
+        elif evt.name == "background_unet_worker_end":
+            _worker_end_ns = evt.monotonic_ns
+        elif evt.name == "unet_gpu_lane_wait_start":
+            _gpu_wait_start = evt.monotonic_ns
+        elif evt.name == "unet_gpu_lane_wait_end":
+            _gpu_wait_end = evt.monotonic_ns
+        elif evt.name == "unet_gpu_commit_start":
+            _gpu_commit_start = evt.monotonic_ns
+        elif evt.name == "unet_gpu_commit_end":
+            _gpu_commit_end = evt.monotonic_ns
+        elif evt.name == "unet_cache_publish_start":
+            _cache_pub_start = evt.monotonic_ns
+        elif evt.name == "unet_cache_publish_end":
+            _cache_pub_end = evt.monotonic_ns
+        elif evt.name == "unet_load_diffusion_model_state_dict_start":
+            _sd_start = evt.monotonic_ns
+            for j in range(i + 1, min(i + 300, len(events))):
+                if events[j].name == "unet_load_diffusion_model_state_dict_end":
+                    _sd_total = events[j].metadata.get("duration_ms", 0) if hasattr(events[j], "metadata") else 0
+                    _children_total = events[j].metadata.get("measured_child_total_ms", 0) if hasattr(events[j], "metadata") else 0
+                    break
+
+    if _submitted_ns and _worker_start_ns:
+        stages["submission_to_worker_start_ms"] = round((_worker_start_ns - _submitted_ns) / 1_000_000, 3)
+    if _worker_start_ns and _worker_end_ns:
+        stages["worker_wall_ms"] = round((_worker_end_ns - _worker_start_ns) / 1_000_000, 3)
+    if _gpu_wait_start and _gpu_wait_end:
+        stages["gpu_lane_wait_ms"] = round((_gpu_wait_end - _gpu_wait_start) / 1_000_000, 3)
+        stages["background_gpu_transfer_present"] = True
+    if _gpu_commit_start and _gpu_commit_end:
+        stages["gpu_commit_ms"] = round((_gpu_commit_end - _gpu_commit_start) / 1_000_000, 3)
+        stages["background_gpu_transfer_present"] = True
+    if _cache_pub_start and _cache_pub_end:
+        stages["cache_publish_ms"] = round((_cache_pub_end - _cache_pub_start) / 1_000_000, 3)
+
+    stages["model_construction_total_ms"] = round(_sd_total, 3) if _sd_total else None
+    stages["measured_children_ms"] = round(_children_total, 3) if _children_total else None
+    if _sd_total and _children_total:
+        stages["unattributed_residual_ms"] = round(max(0.0, _sd_total - _children_total), 3)
+    elif _sd_total:
+        stages["unattributed_residual_ms"] = None  # no children measured → residual classification N/A
+
+    print(
+        f"[v2.bg_unet_stages] "
+        f"submission_to_worker_start_ms={stages['submission_to_worker_start_ms']} "
+        f"worker_wall_ms={stages['worker_wall_ms']} "
+        f"model_construction_total_ms={stages['model_construction_total_ms']} "
+        f"measured_children_ms={stages['measured_children_ms']} "
+        f"unattributed_residual_ms={stages['unattributed_residual_ms']} "
+        f"gpu_lane_wait_ms={stages['gpu_lane_wait_ms']} "
+        f"gpu_commit_ms={stages['gpu_commit_ms']} "
+        f"cache_publish_ms={stages['cache_publish_ms']} "
+        f"background_gpu_transfer_present={stages['background_gpu_transfer_present']} "
+        f"weight_dtype={stages['weight_dtype']} "
+        f"canonical_key={canonical_key[-32:] if canonical_key else ''}",
+        flush=True,
+    )
 
 
 @dataclass
@@ -1265,6 +2251,13 @@ class V2LoaderBridge:
                 trace.emit("preload_schedule_end", phase="restore", metadata={"status": "no_model_key"})
             return None
         self.install(self._nodes, trace=trace)
+        # NOTE: when prepare_unet is False (V2 CLIP-only fast path), UNET is
+        # owned entirely by the production background cache published during
+        # restore.  The V2LoaderBridge intentionally does NOT prepare UNET
+        # here; a bridge miss at graph time is expected and non-fatal — the
+        # original (patched) loader handles it via _start_production_restore_unet
+        # and _cached_unet_load.  See modal_app.py restore() for the fast-path
+        # handoff that sets prepare_unet=False.
         prepare_unet = self._resolve_lane_override(
             prepare_unet,
             bool(self._model_key.unet_identity and self._request_list("unet")),

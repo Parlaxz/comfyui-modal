@@ -444,12 +444,24 @@ async def run_prompt_stream(
         # ── GPU submission marker (before generator creation) ──────────
         if _is_dict_trace:
             trace["gpu_submission_start"] = _time.time()
+        # T2: immediately before the actual Modal remote call (legacy path)
+        _t2_wall = int(_time.time() * 1_000_000_000)
+        _t2_mono = _time.monotonic_ns()
+        print(f"[v1.diag] comfy_modal_dispatch_start legacy_path request_id={trace.get('request_id','')[:16]}", flush=True)
         gen = _workspace_api(selected, gpu).run_prompt_stream.remote_gen.aio(
             workflow, input_images or {}, trace or {}, modal_options or {}, production_report,
         )
+        # T3: after the generator object is successfully created
+        _t3_wall = int(_time.time() * 1_000_000_000)
+        _t3_mono = _time.monotonic_ns()
+        print(f"[v1.diag] modal_call_created legacy_path request_id={trace.get('request_id','')[:16]}", flush=True)
         if _is_dict_trace:
             trace["remote_generator_create_completed"] = _time.time()
             trace["gpu_submission_end"] = _time.time()
+            trace["comfy_modal_dispatch_start_wall_ns"] = _t2_wall
+            trace["modal_call_created_wall_ns"] = _t3_wall
+            trace["t2_wall_ns"] = _t2_wall
+            trace["t3_wall_ns"] = _t3_wall
     print(f"[modal-client] phase=post_gen gen_created=True")
     if _is_dict_trace:
         _now_iter = _time.time()

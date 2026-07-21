@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 import uuid
+import os
+import threading
 from contextlib import contextmanager
 from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
@@ -75,13 +77,99 @@ class RuntimeTrace:
         phase: str = "",
         metadata: Mapping[str, Any] | None = None,
     ) -> TraceEvent:
+        event_metadata = dict(metadata or {})
+        event_metadata.setdefault("trace_id", self.trace_id)
+        event_metadata.setdefault("pid", os.getpid())
+        try:
+            event_metadata.setdefault("thread_native_id", threading.get_native_id())
+        except Exception:
+            pass
+        for key in (
+            "restored_instance_id",
+            "restore_session_id",
+            "legacy_container_session_id",
+            "container_task_id",
+            "modal_input_id",
+            "image_id",
+            "cloud",
+            "region",
+            "app_name",
+            "class_name",
+            "method_name",
+            "workflow_hash_prefix",
+            "restore_plan_generation",
+            "lane",
+            "canonical_key_hash",
+            "diagnostic_id",
+        ):
+            if key in self._metadata:
+                event_metadata.setdefault(key, self._metadata[key])
+        if "canonical_key_hash" not in event_metadata and "canonical_key" in event_metadata:
+            event_metadata["canonical_key_hash"] = stable_hash(str(event_metadata["canonical_key"]))[:16]
         event = TraceEvent.now(
             name,
             process=process or self.process,
             phase=phase,
             request_id=self.request_id,
             container_session_id=self.container_session_id,
-            metadata=metadata or {},
+            trace_id=self.trace_id,
+            metadata=event_metadata,
+        )
+        self._events.append(event)
+        return event
+
+    def emit_at(
+        self,
+        name: str,
+        *,
+        wall_unix_ns: int,
+        monotonic_ns: int = 0,
+        process: str | None = None,
+        phase: str = "",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> TraceEvent:
+        """Append an event whose timestamp was captured at another boundary."""
+        event_metadata = dict(metadata or {})
+        event_metadata.setdefault("trace_id", self.trace_id)
+        event_metadata.setdefault("pid", os.getpid())
+        try:
+            event_metadata.setdefault("thread_native_id", threading.get_native_id())
+        except Exception:
+            pass
+        for key in (
+            "restored_instance_id",
+            "restore_session_id",
+            "legacy_container_session_id",
+            "container_task_id",
+            "modal_input_id",
+            "image_id",
+            "cloud",
+            "region",
+            "app_name",
+            "class_name",
+            "method_name",
+            "workflow_hash_prefix",
+            "restore_plan_generation",
+            "lane",
+            "canonical_key_hash",
+            "diagnostic_id",
+        ):
+            if key in self._metadata:
+                event_metadata.setdefault(key, self._metadata[key])
+        if "canonical_key_hash" not in event_metadata and "canonical_key" in event_metadata:
+            event_metadata["canonical_key_hash"] = stable_hash(str(event_metadata["canonical_key"]))[:16]
+        event_metadata.setdefault("clock_scope", "cross_process")
+        event_metadata.setdefault("clock_precision", "wall_clock")
+        event = TraceEvent(
+            name=name,
+            process=process or self.process,
+            phase=phase,
+            wall_unix_ns=int(wall_unix_ns),
+            monotonic_ns=int(monotonic_ns),
+            request_id=self.request_id,
+            container_session_id=self.container_session_id,
+            trace_id=self.trace_id,
+            metadata=event_metadata,
         )
         self._events.append(event)
         return event
