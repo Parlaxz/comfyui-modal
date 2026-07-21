@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Mapping
 
@@ -213,6 +214,13 @@ class ModalTransport:
                     runtime_trace.emit("plan_serialize_for_transport_start", phase="local")
                 request_id = str((trace or {}).get("prompt_id", ""))
                 plan_dict = plan.to_dict()
+                # Embed request-origin info into the plan dict so it reaches
+                # the remote run_plan_stream without an extra argument.
+                _origin_from_meta = {}
+                if isinstance(trace, dict):
+                    _trace_meta = trace.get("metadata", {}) or {}
+                    if isinstance(_trace_meta, dict):
+                        _origin_from_meta = dict(_trace_meta.get("request_origin_info", {}))
                 if runtime_trace is not None:
                     plan_serialize_meta = {
                         "plan_dict_bytes": len(str(plan_dict)),
@@ -220,12 +228,49 @@ class ModalTransport:
                     }
                     runtime_trace.emit("plan_serialize_for_transport_end", phase="local",
                                        metadata=plan_serialize_meta)
-                    runtime_trace.emit("remote_generator_create_start", phase="local")
+                # T2: immediately before the actual Modal remote call
+                _t2_wall_ns = int(time.time() * 1_000_000_000)
+                _t2_mono_ns = time.monotonic_ns()
+                # Add T2/T3 wall timestamps to origin info so they reach remote
+                _origin_from_meta["modal_dispatch_wall_ns"] = _t2_wall_ns
+                _origin_from_meta["modal_dispatch_mono_ns"] = _t2_mono_ns
+                if _origin_from_meta:
+                    plan_dict["__request_origin_info__"] = _origin_from_meta
+                if runtime_trace is not None:
+                    runtime_trace.emit("comfy_modal_dispatch_start", phase="local",
+                                       metadata={
+                                           "wall_ns": _t2_wall_ns,
+                                           "mono_ns": _t2_mono_ns,
+                                           "request_id": request_id,
+                                           "app_name": os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow"),
+                                           "class_name": os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2"),
+                                           "method_name": "run_plan_stream",
+                                           "payload_bytes": len(str(plan_dict)),
+                                           "workflow_hash": plan.workflow_hash,
+                                       })
                 stream = handle.run_plan_stream.remote_gen.aio(
                     plan_dict, request_id=request_id,
                 )
+                # T3: after the generator object is successfully created
+                _t3_wall_ns = int(time.time() * 1_000_000_000)
+                _t3_mono_ns = time.monotonic_ns()
+                _origin_from_meta["modal_call_created_wall_ns"] = _t3_wall_ns
+                _origin_from_meta["modal_call_created_mono_ns"] = _t3_mono_ns
+                if _origin_from_meta:
+                    plan_dict["__request_origin_info__"] = _origin_from_meta
                 if runtime_trace is not None:
-                    runtime_trace.emit("remote_generator_create_end", phase="local")
+                    runtime_trace.emit("modal_call_created", phase="local",
+                                       metadata={
+                                           "wall_ns": _t3_wall_ns,
+                                           "mono_ns": _t3_mono_ns,
+                                           "request_id": request_id,
+                                           "modal_input_id": str(getattr(stream, "input_id", "")),
+                                       })
+                    runtime_trace.emit("remote_generator_create_end", phase="local",
+                                       metadata={"t2_wall_ns": _t2_wall_ns,
+                                                 "t2_mono_ns": _t2_mono_ns,
+                                                 "t3_wall_ns": _t3_wall_ns,
+                                                 "t3_mono_ns": _t3_mono_ns})
             if hasattr(stream, "__aiter__"):
                 ait = stream.__aiter__()
                 if runtime_trace is not None:

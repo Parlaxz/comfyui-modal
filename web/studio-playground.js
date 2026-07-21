@@ -1840,6 +1840,19 @@ function _handleDirectRunResult(result, state, context, actions, controls) {
 }
 
 async function doRunSubmit(state, context, actions) {
+  // T0: request identity origin (literal first line, before any workflow prep)
+  const requestId = crypto.randomUUID();
+  const ui_run_triggered_wall_unix_ms = Date.now();
+  const ui_run_triggered_perf_ms = performance.now();
+  const browser_time_origin_ms = performance.timeOrigin;
+  const requestOriginInfo = {
+    request_id: requestId,
+    trigger_source: "playground_run",
+    ui_run_triggered_wall_unix_ms: ui_run_triggered_wall_unix_ms,
+    ui_run_triggered_perf_ms: ui_run_triggered_perf_ms,
+    browser_time_origin_ms: browser_time_origin_ms,
+  };
+
   const apiBase = (context && context.apiBase) || "/comfymodal";
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
   const selectedId = state.playground && state.playground.selectedBackendId;
@@ -1883,6 +1896,7 @@ async function doRunSubmit(state, context, actions) {
     presetId: preset.id || selectedId,
     featureId: currentFeatureId,
     controls: controls,
+    request_origin: requestOriginInfo,
     metadata: {
       source: "studio_playground",
     },
@@ -1890,6 +1904,7 @@ async function doRunSubmit(state, context, actions) {
       t0_perf_ms: t0_perf_ms,
       t0_perf_now_ms: t0_now,
       t0_client_press_ms: t0_now,
+      request_id: requestId,
     },
   });
 

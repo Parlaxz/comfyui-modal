@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Any, Callable
 
 import modal
 
@@ -4081,7 +4082,10 @@ def _release_fuse_large_read_slot_locked(canonical_key: str, entry: dict) -> Non
 def _register_active_model_read(canonical_key: str, owner: str, path: str = "",
                                  future=None, event=None, loader_type: str = "",
                                  phase: str = "", caller_hint: str = "",
-                                 priority: int | None = None) -> str:
+                                 priority: int | None = None,
+                                 active_read_id: str = "",
+                                 restored_instance_id: str = "",
+                                 restore_session_id: str = "") -> str:
     """Register a model-file read before starting the actual loader call.
 
     If a running entry already exists for *canonical_key*, returns
@@ -4090,11 +4094,41 @@ def _register_active_model_read(canonical_key: str, owner: str, path: str = "",
 
     The caller **must** later call ``_complete_active_model_read()``
     or ``_fail_active_model_read()``.
+
+    *active_read_id* — correlation identity for the active read span.
+    *restored_instance_id* / *restore_session_id* — V2 restore correlation
+    identity forwarded to the entry for cross-referencing with lifecycle trace.
     """
     global _FUSE_LARGE_READS_IN_PROGRESS
     classification = _classify_fuse_read(path, loader_type=loader_type, caller_hint=caller_hint)
     active_read_priority = priority if priority is not None else _active_read_priority(owner, loader_type, path, phase)
     is_large = int(classification.get("active_read_is_large", 0)) == 1
+    _arid = active_read_id or uuid.uuid4().hex[:16]
+    _now_ns = time.perf_counter_ns()
+    _wall_ns = int(time.time() * 1_000_000_000)
+    _native_tid = 0
+    try:
+        _native_tid = threading.get_native_id()
+    except Exception:
+        pass
+    # ── Read correlation identity from model load context when not passed ──
+    if not restored_instance_id:
+        restored_instance_id = str(getattr(_MODEL_LOAD_CONTEXT, "restored_instance_id", ""))
+    if not restore_session_id:
+        restore_session_id = str(getattr(_MODEL_LOAD_CONTEXT, "restore_session_id", ""))
+    # ── Capture deep diagnostics before-snapshot ─────────────────────────
+    _before_rusage = None
+    _before_io = None
+    _deep_diag_here = (os.environ.get("COMFYMODAL_V2_DEEP_MODEL_DIAG", "0") == "1")
+    if _deep_diag_here:
+        try:
+            from comfymodal_runtime.model_preload import (
+                _capture_rusage_thread_snapshot, _capture_proc_tid_io_snapshot,
+            )
+            _before_rusage = _capture_rusage_thread_snapshot()
+            _before_io = _capture_proc_tid_io_snapshot()
+        except Exception:
+            pass
     with _ACTIVE_MODEL_READS_LOCK:
         existing = _ACTIVE_MODEL_READS.get(canonical_key)
         if existing and existing["status"] in ("queued", "running"):
@@ -4102,11 +4136,54 @@ def _register_active_model_read(canonical_key: str, owner: str, path: str = "",
                   f"owner_existing={existing['owner']} owner_new={owner} "
                   f"active_read_attached_existing_future=1 active_read_duplicate_prevented=1")
             return "duplicate"
+        # File identity for stat/mount info
+        _file_identity: dict[str, Any] = {}
+        if path:
+            try:
+                _st = os.stat(path)
+                _file_identity = {
+                    "path_hash": str(hash(path)),
+                    "size": _st.st_size,
+                    "st_dev": _st.st_dev,
+                    "st_ino": _st.st_ino,
+                }
+            except OSError:
+                _file_identity = {"path_hash": str(hash(path))}
+        else:
+            _file_identity = {"path_hash": str(hash(canonical_key))}
         entry = {
             "canonical_key": canonical_key,
             "owner": owner,
             "path": path,
             "start_time": time.time(),
+            "start_wall_unix_ns": _wall_ns,
+            "start_monotonic_ns": _now_ns,
+            "start_thread_time_ns": time.thread_time_ns() if hasattr(time, 'thread_time_ns') else 0,
+            "start_process_time_ns": time.process_time_ns() if hasattr(time, 'process_time_ns') else 0,
+            "native_tid": _native_tid,
+            "active_read_id": _arid,
+            "restored_instance_id": restored_instance_id,
+            "restore_session_id": restore_session_id,
+            # ── Deep diag before-snapshot ──────────────────────
+            "before_rusage": dict(_before_rusage) if _before_rusage else None,
+            "before_io": dict(_before_io) if _before_io else None,
+            "after_rusage": None,
+            "after_io": None,
+            # ── Computed delta fields (populated in _complete_active_model_read) ──
+            "active_read_wall_ms": None,
+            "active_read_thread_cpu_ms": None,
+            "active_read_process_cpu_ms": None,
+            "active_read_read_bytes_delta": None,
+            "active_read_rchar_delta": None,
+            "active_read_major_faults_delta": None,
+            "active_read_minor_faults_delta": None,
+            "active_read_inblock_delta": None,
+            "active_read_voluntary_context_switches_delta": None,
+            "active_read_involuntary_context_switches_delta": None,
+            "active_read_file_size": _file_identity.get("size"),
+            "active_read_st_dev": _file_identity.get("st_dev"),
+            "active_read_st_ino": _file_identity.get("st_ino"),
+            "active_read_path_hash": _file_identity.get("path_hash"),
             "status": "queued" if (FUSE_READ_GOVERNOR_ENABLED and is_large) else "running",
             "future": future,
             "event": event or _threading.Event(),
@@ -4183,6 +4260,18 @@ def _register_active_model_read(canonical_key: str, owner: str, path: str = "",
         _log_fields = dict(entry)
     print(
         f"[active_read] registered owner={owner} key={canonical_key[:80]} "
+        f"active_read_id={_log_fields.get('active_read_id', '')} "
+        f"restored_instance_id={_log_fields.get('restored_instance_id', '')} "
+        f"restore_session_id={_log_fields.get('restore_session_id', '')} "
+        f"start_wall_unix_ns={_log_fields.get('start_wall_unix_ns', '')} "
+        f"start_monotonic_ns={_log_fields.get('start_monotonic_ns', '')} "
+        f"start_thread_time_ns={_log_fields.get('start_thread_time_ns', '')} "
+        f"start_process_time_ns={_log_fields.get('start_process_time_ns', '')} "
+        f"native_tid={_log_fields.get('native_tid', '')} "
+        f"active_read_path_hash={_log_fields.get('active_read_path_hash', '')} "
+        f"active_read_file_size={_log_fields.get('active_read_file_size', '')} "
+        f"active_read_st_dev={_log_fields.get('active_read_st_dev', '')} "
+        f"active_read_st_ino={_log_fields.get('active_read_st_ino', '')} "
         f"active_read_governor_enabled={_log_fields.get('active_read_governor_enabled', 0)} "
         f"active_read_priority={_log_fields.get('active_read_priority', 0)} "
         f"active_read_size_bytes={_log_fields.get('active_read_size_bytes', -1)} "
@@ -4216,7 +4305,35 @@ def _attach_active_model_read_future(canonical_key: str, future) -> None:
 
 
 def _complete_active_model_read(canonical_key: str) -> None:
-    """Mark a read completed and signal any waiters."""
+    """Mark a read completed and signal any waiters.
+
+    Records wall/monotonic/thread/process time deltas at completion for
+    diagnostic summarization.  The entry's ``active_read_id`` and correlation
+    identity are preserved for cross-referencing with V2 lifecycle trace.
+    """
+    _complete_now_ns = time.perf_counter_ns()
+    _complete_wall_ns = int(time.time() * 1_000_000_000)
+    _complete_thread_time_ns = time.thread_time_ns() if hasattr(time, 'thread_time_ns') else 0
+    _complete_process_time_ns = time.process_time_ns() if hasattr(time, 'process_time_ns') else 0
+    _complete_tid = 0
+    try:
+        _complete_tid = threading.get_native_id()
+    except Exception:
+        pass
+    # ── Capture deep diagnostics after-snapshot ──────────────────────────
+    _deep_diag_here = (os.environ.get("COMFYMODAL_V2_DEEP_MODEL_DIAG", "0") == "1")
+    _after_rusage = None
+    _after_io = None
+    if _deep_diag_here:
+        try:
+            from comfymodal_runtime.model_preload import (
+                _capture_rusage_thread_snapshot, _capture_proc_tid_io_snapshot,
+                _compute_rusage_deltas, _compute_io_deltas,
+            )
+            _after_rusage = _capture_rusage_thread_snapshot()
+            _after_io = _capture_proc_tid_io_snapshot()
+        except Exception:
+            pass
     with _ACTIVE_MODEL_READS_LOCK:
         entry = _ACTIVE_MODEL_READS.get(canonical_key)
         if entry is None:
@@ -4225,11 +4342,68 @@ def _complete_active_model_read(canonical_key: str) -> None:
         entry["status"] = "completed"
         entry["result_available"] = True
         entry["completed_at"] = time.time()
+        entry["complete_wall_unix_ns"] = _complete_wall_ns
+        entry["complete_monotonic_ns"] = _complete_now_ns
+        entry["complete_thread_time_ns"] = _complete_thread_time_ns
+        entry["complete_process_time_ns"] = _complete_process_time_ns
+        entry["complete_native_tid"] = _complete_tid
+        entry["after_rusage"] = dict(_after_rusage) if _after_rusage else None
+        entry["after_io"] = dict(_after_io) if _after_io else None
+        # ── Compute delta fields ──────────────────────────────────
+        _start_wall = entry.get("start_wall_unix_ns", 0)
+        _start_mono = entry.get("start_monotonic_ns", 0)
+        if _start_mono and _complete_now_ns:
+            entry["active_read_wall_ms"] = round((_complete_now_ns - _start_mono) / 1_000_000, 3)
+        _start_tt = entry.get("start_thread_time_ns", 0)
+        if _start_tt and _complete_thread_time_ns:
+            entry["active_read_thread_cpu_ms"] = round((_complete_thread_time_ns - _start_tt) / 1_000_000, 3)
+        _start_pt = entry.get("start_process_time_ns", 0)
+        if _start_pt and _complete_process_time_ns:
+            entry["active_read_process_cpu_ms"] = round((_complete_process_time_ns - _start_pt) / 1_000_000, 3)
+        # RUSAGE and IO deltas (Linux deep diag only)
+        _before_r = entry.get("before_rusage")
+        _before_i = entry.get("before_io")
+        if _before_r and _after_rusage:
+            _ru_deltas = _compute_rusage_deltas(_before_r, _after_rusage)
+            if _ru_deltas:
+                entry["active_read_major_faults_delta"] = _ru_deltas.get("majflt")
+                entry["active_read_minor_faults_delta"] = _ru_deltas.get("minflt")
+                entry["active_read_inblock_delta"] = _ru_deltas.get("inblock")
+                entry["active_read_voluntary_context_switches_delta"] = _ru_deltas.get("nvcsw")
+                entry["active_read_involuntary_context_switches_delta"] = _ru_deltas.get("nivcsw")
+        if _before_i and _after_io:
+            _io_deltas = _compute_io_deltas(_before_i, _after_io)
+            if _io_deltas:
+                entry["active_read_read_bytes_delta"] = _io_deltas.get("read_bytes")
+                entry["active_read_rchar_delta"] = _io_deltas.get("rchar")
+        # Summarize active read raw counters
+        _arid = entry.get("active_read_id", "")
+        _rid = entry.get("restored_instance_id", "")
+        _awall = entry.get("active_read_wall_ms", "?")
+        _acpu = entry.get("active_read_thread_cpu_ms", "?")
+        _amaj = entry.get("active_read_major_faults_delta", "?")
+        _amin = entry.get("active_read_minor_faults_delta", "?")
+        _arbytes = entry.get("active_read_read_bytes_delta", "?")
         ev = entry.get("event")
         _ACTIVE_MODEL_READS.pop(canonical_key, None)
     if ev is not None:
         ev.set()
-    print(f"[active_read] completed owner={entry['owner']} key={canonical_key[:80]}")
+    print(f"[active_read] completed owner={entry['owner']} key={canonical_key[:80]} "
+          f"active_read_id={_arid[:16]} restored_instance_id={_rid[:16]} "
+          f"restore_session_id={entry.get('restore_session_id', '')} "
+          f"complete_wall_unix_ns={entry.get('complete_wall_unix_ns', '')} "
+          f"complete_monotonic_ns={entry.get('complete_monotonic_ns', '')} "
+          f"complete_thread_time_ns={entry.get('complete_thread_time_ns', '')} "
+          f"complete_process_time_ns={entry.get('complete_process_time_ns', '')} "
+          f"complete_native_tid={entry.get('complete_native_tid', '')} "
+          f"wall_ms={_awall} thread_cpu_ms={_acpu} "
+          f"process_cpu_ms={entry.get('active_read_process_cpu_ms', '?')} "
+          f"majf={_amaj} minf={_amin} inblock={entry.get('active_read_inblock_delta', '?')} "
+          f"nvcsw={entry.get('active_read_voluntary_context_switches_delta', '?')} "
+          f"nivcsw={entry.get('active_read_involuntary_context_switches_delta', '?')} "
+          f"read_bytes={_arbytes} rchar={entry.get('active_read_rchar_delta', '?')} "
+          f"path_hash={entry.get('active_read_path_hash', '')} file_size={entry.get('active_read_file_size', '')} "
+          f"st_dev={entry.get('active_read_st_dev', '')} st_ino={entry.get('active_read_st_ino', '')}")
 
 
 def _fail_active_model_read(canonical_key: str, error: str = "") -> None:
@@ -4378,24 +4552,35 @@ _MODEL_LOAD_CONTEXT = _threading.local()
 @contextlib.contextmanager
 def _model_load_context(owner: str = "graph_loader", loader_type: str = "",
                          actual_key=None, canonical_path: str = "",
-                         record_id: str = ""):
+                         record_id: str = "",
+                         restored_instance_id: str = "",
+                         restore_session_id: str = ""):
     """Context manager that sets thread-local model-load attribution.
 
     Within the ``with`` block, any call to ``cached_load()`` (the patched
     ``load_torch_file``) will use the given *owner* and *loader_type*
     for active-read registration instead of the default ``graph_loader``.
+
+    *restored_instance_id* and *restore_session_id* are forwarded to
+    active-read registration so diagnostic records carry the V2 restore
+    correlation identity.  These propagate through the cached loader into
+    ``_register_active_model_read()``.
     """
     prev_owner = getattr(_MODEL_LOAD_CONTEXT, "owner", None)
     prev_loader = getattr(_MODEL_LOAD_CONTEXT, "loader_type", None)
     prev_actual_key = getattr(_MODEL_LOAD_CONTEXT, "actual_key", None)
     prev_path = getattr(_MODEL_LOAD_CONTEXT, "canonical_path", None)
     prev_rid = getattr(_MODEL_LOAD_CONTEXT, "record_id", None)
+    prev_ar_rid = getattr(_MODEL_LOAD_CONTEXT, "restored_instance_id", None)
+    prev_ar_rsid = getattr(_MODEL_LOAD_CONTEXT, "restore_session_id", None)
 
     _MODEL_LOAD_CONTEXT.owner = owner
     _MODEL_LOAD_CONTEXT.loader_type = loader_type
     _MODEL_LOAD_CONTEXT.actual_key = actual_key
     _MODEL_LOAD_CONTEXT.canonical_path = canonical_path
     _MODEL_LOAD_CONTEXT.record_id = record_id
+    _MODEL_LOAD_CONTEXT.restored_instance_id = restored_instance_id
+    _MODEL_LOAD_CONTEXT.restore_session_id = restore_session_id
     try:
         yield
     finally:
@@ -4419,6 +4604,20 @@ def _model_load_context(owner: str = "graph_loader", loader_type: str = "",
             _MODEL_LOAD_CONTEXT.record_id = prev_rid
         else:
             delattr(_MODEL_LOAD_CONTEXT, "record_id")
+        if prev_ar_rid is not None:
+            _MODEL_LOAD_CONTEXT.restored_instance_id = prev_ar_rid
+        else:
+            try:
+                delattr(_MODEL_LOAD_CONTEXT, "restored_instance_id")
+            except AttributeError:
+                pass
+        if prev_ar_rsid is not None:
+            _MODEL_LOAD_CONTEXT.restore_session_id = prev_ar_rsid
+        else:
+            try:
+                delattr(_MODEL_LOAD_CONTEXT, "restore_session_id")
+            except AttributeError:
+                pass
 
 
 def _commit_runtime_config_vol_async(label: str, runtime_config_volume) -> None:
@@ -10327,13 +10526,29 @@ class _ComfyAPIMixin:
         *,
         restore_start: float,
         restore_stages: dict,
+        diagnostic_scope_factory: Callable | None = None,
+        diagnostic_context: Any = None,
+        diagnostic_sink: Callable | None = None,
     ) -> dict:
         """Start the exact selected UNET load in the existing future registry.
 
         Called only when production stable path is active.  Must run after
         CLIP preload has completed and before request actual-load.
+
+        ``diagnostic_scope_factory`` — optional ``Callable[[], ContextManager]``
+        that wraps the worker load body.  When provided, the worker body runs
+        inside the factory's context, enabling legacy UNET lane tracing without
+        redesigning the thread lifecycle.  Default ``None`` preserves all
+        existing callers.
+
+        ``diagnostic_context`` — opaque value forwarded to factory for worker
+        identification (e.g. canonical key, restored_instance_id).
+
+        ``diagnostic_sink`` — optional ``Callable[[str, list], None]`` invoked
+        after the worker completes with the canonical key and completed diagnostics
+        events.  Only called when diagnostics are active.
         """
-        result: dict = {"decision": "production_disabled", "submitted": False, "key": ""}
+        result: dict = {"decision": "production_disabled", "submitted": False, "key": "", "canonical_key": "", "diagnostic_id": ""}
         if not profile:
             result["reason"] = "no_profile"
             return result
@@ -10354,8 +10569,26 @@ class _ComfyAPIMixin:
             return result
         _weight_dtype = profile.get("weight_dtype", "default")
         key = self._unet_cache_key(_resolved, _weight_dtype)
+        _canonical_key_str = str(key)
+        _diagnostic_id = uuid.uuid4().hex[:16]
 
-        result["key"] = str(key)
+        result["key"] = _canonical_key_str
+        result["canonical_key"] = _canonical_key_str
+        result["diagnostic_id"] = _diagnostic_id
+
+        # ── Populate mutable diagnostic context (if provided) so the
+        #    factory/worker thread reads live values, not stale empties ──
+        if isinstance(diagnostic_context, dict):
+            diagnostic_context["canonical_key"] = _canonical_key_str
+            diagnostic_context["diagnostic_id"] = _diagnostic_id
+            diagnostic_context["resolved_path"] = str(_resolved)
+
+        # ── Extract correlation identity from diagnostic context ──
+        _ctx_restored_id = ""
+        _ctx_restore_sid = ""
+        if isinstance(diagnostic_context, dict):
+            _ctx_restored_id = str(diagnostic_context.get("restored_instance_id", ""))
+            _ctx_restore_sid = str(diagnostic_context.get("restore_session_id", ""))
 
         # Ensure actual-load registries are initialized
         self._init_actual_load_registry()
@@ -10398,11 +10631,11 @@ class _ComfyAPIMixin:
         self._record_critical_path(
             "production_unet_submit",
             canonical_digest=str(key)[-32:],
-            extra={"submit_ms": _submit_ms, "key": str(key)},
+            extra={"submit_ms": _submit_ms, "key": _canonical_key_str},
         )
         _submit_unix_ns = time.time()
         _future_submit_at_ns = time.perf_counter_ns()
-        _production_unet_diag_key = str(key)
+        _production_unet_diag_key = _canonical_key_str
 
         def _production_unet_worker():
             import nodes as _prod_nodes
@@ -10416,98 +10649,148 @@ class _ComfyAPIMixin:
             except Exception:
                 pass
             try:
-                _node_lookup_start_ns = time.perf_counter_ns()
-                _cls = _prod_nodes.NODE_CLASS_MAPPINGS.get("UNETLoader")
-                if _cls is None:
-                    raise RuntimeError("UNETLoader not found in NODE_CLASS_MAPPINGS")
-                _node = _cls()
-                _node_lookup_end_ns = time.perf_counter_ns()
-                try:
-                    self._record_critical_path_restore(
-                        "production_unet_node_create",
-                        canonical_digest=_production_unet_diag_key,
-                        extra={
-                            "node_lookup_ms": round((_node_lookup_end_ns - _node_lookup_start_ns) / 1_000_000.0, 3),
-                            "node_lookup_to_create_ms": round((_node_lookup_end_ns - _thread_start_ns) / 1_000_000.0, 3),
-                        },
-                    )
-                except Exception:
-                    pass
-                _orig_loader_enter_ns = time.perf_counter_ns()
-                try:
-                    self._record_critical_path_restore(
-                        "production_unet_original_loader_enter",
-                        canonical_digest=_production_unet_diag_key,
-                        extra={"enter_unix_s": time.time()},
-                    )
-                except Exception:
-                    pass
-                with _model_load_context(
-                    owner="restore_background_unet",
-                    loader_type="UNET",
-                    actual_key=key,
-                    canonical_path=_resolved,
-                ):
+                # ── Optional diagnostic scope wrapping the load body ──
+                _scope_ctx = (
+                    diagnostic_scope_factory()
+                    if diagnostic_scope_factory is not None
+                    else contextlib.nullcontext()
+                )
+                with _scope_ctx:
+                    _node_lookup_start_ns = time.perf_counter_ns()
+                    _cls = _prod_nodes.NODE_CLASS_MAPPINGS.get("UNETLoader")
+                    if _cls is None:
+                        raise RuntimeError("UNETLoader not found in NODE_CLASS_MAPPINGS")
+                    _node = _cls()
+                    _node_lookup_end_ns = time.perf_counter_ns()
                     try:
                         self._record_critical_path_restore(
-                            "production_unet_model_load_context_enter",
+                            "production_unet_node_create",
                             canonical_digest=_production_unet_diag_key,
+                            extra={
+                                "node_lookup_ms": round((_node_lookup_end_ns - _node_lookup_start_ns) / 1_000_000.0, 3),
+                                "node_lookup_to_create_ms": round((_node_lookup_end_ns - _thread_start_ns) / 1_000_000.0, 3),
+                            },
                         )
                     except Exception:
                         pass
-                    _loaded = _orig_unet(_node, _unet_name, _weight_dtype)
+                    _orig_loader_enter_ns = time.perf_counter_ns()
                     try:
                         self._record_critical_path_restore(
-                            "production_unet_model_load_context_body_end",
+                            "production_unet_original_loader_enter",
                             canonical_digest=_production_unet_diag_key,
+                            extra={"enter_unix_s": time.time()},
                         )
                     except Exception:
                         pass
-                _orig_loader_exit_ns = time.perf_counter_ns()
-                try:
-                    self._record_critical_path_restore(
-                        "production_unet_original_loader_exit",
-                        canonical_digest=_production_unet_diag_key,
-                        extra={
-                            "original_loader_total_ms": round((_orig_loader_exit_ns - _orig_loader_enter_ns) / 1_000_000.0, 3),
-                        },
-                    )
-                except Exception:
-                    pass
-                # UNETLoader.load_unet returns (model,) — extract the model
-                if not isinstance(_loaded, tuple) or not _loaded or _loaded[0] is None:
-                    raise RuntimeError("Production restore UNET loader returned an invalid result")
-                _validate_start_ns = time.perf_counter_ns()
-                _unet_object = _loaded[0]
-                _uc = getattr(self, "_unet_object_cache", {})
-                _uc[key] = _unet_object
-                self._unet_object_cache = _uc
-                _meta = getattr(self, "_actual_load_future_meta", {})
-                _meta[key] = {
-                    "source": "restore_background_unet",
-                    "production_stable": True,
-                    "strict_no_fallback": True,
-                    "status": "completed",
-                    "selected_unet": _unet_name,
-                    "canonical_key": key,
-                    "resolved_path": _resolved,
-                    "profile_token": profile.get("_profile_token", ""),
-                    "workflow_hash": profile.get("_workflow_hash", ""),
-                }
-                self._actual_load_future_meta = _meta
-                _validate_end_ns = time.perf_counter_ns()
-                try:
-                    self._record_critical_path_restore(
-                        "production_unet_object_cache_publish",
-                        canonical_digest=_production_unet_diag_key,
-                        extra={
-                            "result_publish_ms": round((_validate_end_ns - _validate_start_ns) / 1_000_000.0, 3),
-                        },
-                    )
-                except Exception:
-                    pass
+                    with _model_load_context(
+                        owner="restore_background_unet",
+                        loader_type="UNET",
+                        actual_key=key,
+                        canonical_path=_resolved,
+                        restored_instance_id=_ctx_restored_id,
+                        restore_session_id=_ctx_restore_sid,
+                    ):
+                        try:
+                            self._record_critical_path_restore(
+                                "production_unet_model_load_context_enter",
+                                canonical_digest=_production_unet_diag_key,
+                            )
+                        except Exception:
+                            pass
+                        _loaded = _orig_unet(_node, _unet_name, _weight_dtype)
+                        try:
+                            self._record_critical_path_restore(
+                                "production_unet_model_load_context_body_end",
+                                canonical_digest=_production_unet_diag_key,
+                            )
+                        except Exception:
+                            pass
+                    _orig_loader_exit_ns = time.perf_counter_ns()
+                    try:
+                        self._record_critical_path_restore(
+                            "production_unet_original_loader_exit",
+                            canonical_digest=_production_unet_diag_key,
+                            extra={
+                                "original_loader_total_ms": round((_orig_loader_exit_ns - _orig_loader_enter_ns) / 1_000_000.0, 3),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    # UNETLoader.load_unet returns (model,) — extract the model
+                    if not isinstance(_loaded, tuple) or not _loaded or _loaded[0] is None:
+                        raise RuntimeError("Production restore UNET loader returned an invalid result")
+                    # ── Cache publication start ─────────────────
+                    _validate_start_ns = time.perf_counter_ns()
+                    _unet_object = _loaded[0]
+                    # Emit cache_publish_start through lane trace if active
+                    _pub_lane = None
+                    try:
+                        from comfymodal_runtime.model_preload import _ACTIVE_LANE_TRACE as _alt
+                        _pub_lane = _alt.get()
+                        if _pub_lane is not None:
+                            _pub_lane.cache_publish_start(canonical_key=str(key)[-32:])
+                    except Exception:
+                        pass
+                    # Store object in cache
+                    _uc = getattr(self, "_unet_object_cache", {})
+                    _uc[key] = _unet_object
+                    self._unet_object_cache = _uc
+                    if _pub_lane is not None:
+                        try:
+                            _pub_lane.cache_object_store(canonical_key=str(key)[-32:],
+                                                          object_type="ModelPatcher",
+                                                          object_id=str(id(_unet_object))[-16:])
+                        except Exception:
+                            pass
+                    # Store metadata (preserve submitted_at_unix_s from previous entry)
+                    _meta = getattr(self, "_actual_load_future_meta", {})
+                    _prev_meta = _meta.get(key, {})
+                    _submitted_at = _prev_meta.get("submitted_at_unix_s") if isinstance(_prev_meta, dict) else None
+                    _meta[key] = {
+                        "source": "restore_background_unet",
+                        "production_stable": True,
+                        "strict_no_fallback": True,
+                        "status": "completed",
+                        "selected_unet": _unet_name,
+                        "canonical_key": key,
+                        "resolved_path": _resolved,
+                        "profile_token": profile.get("_profile_token", ""),
+                        "workflow_hash": profile.get("_workflow_hash", ""),
+                        "diagnostic_id": _diagnostic_id,
+                        "submitted_at_unix_s": _submitted_at or 0,
+                        "cache_published_at_unix_s": time.time(),
+                    }
+                    self._actual_load_future_meta = _meta
+                    if _pub_lane is not None:
+                        try:
+                            _pub_lane.cache_metadata_store(canonical_key=str(key)[-32:],
+                                                            metadata_status="completed")
+                        except Exception:
+                            pass
+                    # Done event + publish end — must occur INSIDE the diagnostic
+                    # scope so they are recorded before ready() emits.
+                    if _pub_lane is not None:
+                        try:
+                            _pub_lane.done_event_set(canonical_key=str(key)[-32:])
+                            _pub_lane.cache_publish_end(canonical_key=str(key)[-32:])
+                        except Exception:
+                            pass
+                    _validate_end_ns = time.perf_counter_ns()
+                    try:
+                        self._record_critical_path_restore(
+                            "production_unet_object_cache_publish",
+                            canonical_digest=_production_unet_diag_key,
+                            extra={
+                                "result_publish_ms": round((_validate_end_ns - _validate_start_ns) / 1_000_000.0, 3),
+                            },
+                        )
+                    except Exception:
+                        pass
             except Exception as _exc:
                 _meta = getattr(self, "_actual_load_future_meta", {})
+                _prev_meta_f = _meta.get(key, {})
+                _submitted_at_f = _prev_meta_f.get("submitted_at_unix_s") if isinstance(_prev_meta_f, dict) else None
+                _prev_diag = _prev_meta_f.get("diagnostic_id", "") if isinstance(_prev_meta_f, dict) else ""
                 _meta[key] = {
                     "source": "restore_background_unet",
                     "production_stable": True,
@@ -10518,6 +10801,8 @@ class _ComfyAPIMixin:
                     "resolved_path": _resolved,
                     "profile_token": profile.get("_profile_token", ""),
                     "workflow_hash": profile.get("_workflow_hash", ""),
+                    "diagnostic_id": _diagnostic_id,
+                    "submitted_at_unix_s": _submitted_at_f or 0,
                 }
                 self._actual_load_future_meta = _meta
                 _errs = getattr(self, "_actual_load_future_errors", {})
@@ -10525,6 +10810,11 @@ class _ComfyAPIMixin:
                 self._actual_load_future_errors = _errs
                 print(f"[production.unet] worker_failed key={key} err={_exc}")
             finally:
+                # ── Production done-event signaling (NOT lane trace) ──
+                # Lane trace done_event_set/cache_publish_end are emitted
+                # INSIDE the diagnostic scope above so they are recorded
+                # before ready().  Only the production-level done-event
+                # (used by graph cache waiters) is set here.
                 _ev_map = getattr(self, "_rbg_unet_done_events", None)
                 if _ev_map is not None and key in _ev_map:
                     _ev_map[key].set()
@@ -10551,6 +10841,7 @@ class _ComfyAPIMixin:
             "production_stable": True,
             "strict_no_fallback": True,
             "status": "submitted",
+            "diagnostic_id": _diagnostic_id,
             "submitted_at_unix_s": time.time(),
             "selected_unet": _unet_name,
             "canonical_key": key,
@@ -10562,8 +10853,41 @@ class _ComfyAPIMixin:
 
         result["decision"] = "started"
         result["submitted"] = True
-        result["key"] = str(key)
+        result["key"] = _canonical_key_str
+        result["canonical_key"] = _canonical_key_str
+        result["diagnostic_id"] = _diagnostic_id
         return result
+
+    def _get_production_restore_unet_diagnostics(self, canonical_key: str = "",
+                                                  diagnostic_id: str = "",
+                                                  lane: str = "UNET") -> list:
+        """Return stored background UNET diagnostics matching the given identifiers.
+
+        The module-level ``_BG_UNET_DIAG_STORE`` uses a composite key of the
+        form ``f"{lane}:{diagnostic_id}"`` (or just ``lane`` when diagnostic_id
+        is empty), so this method reconstructs that key to perform the lookup.
+        *canonical_key* is accepted for caller convenience but is NOT part of
+        the store key — the store uses (lane, diagnostic_id).  Returns [] when
+        nothing is found.  Thread-safe, non-destructive read.
+
+        NOTE: the global drain in ``_run_in_process`` / ``run_plan_stream``
+        pops ALL entries from the store after execution completes, so this
+        accessor is meaningful only when called before that final drain.
+        """
+        try:
+            from comfymodal_runtime.model_preload import _BG_UNET_DIAG_STORE, _BG_UNET_DIAG_LOCK
+            _store_key = f"{lane}:{diagnostic_id}" if diagnostic_id else lane
+            with _BG_UNET_DIAG_LOCK:
+                return list(_BG_UNET_DIAG_STORE.get(_store_key, []))
+        except Exception:
+            return []
+
+    # NOTE: _pop_production_restore_unet_diagnostics is intentionally absent.
+    # The global drain in _run_in_process / run_plan_stream pops ALL entries
+    # from _BG_UNET_DIAG_STORE after execution.  A narrow per-key pop would
+    # risk losing events if called before that drain, and is fully replaced by
+    # the bulk drain.  Use _get_production_restore_unet_diagnostics() for
+    # non-destructive reads.
 
     def _finalize_actual_load_records(self) -> None:
         """Compute derived fields (critical_path_saved_ms, remaining_wait_ms, etc.)
@@ -16425,7 +16749,34 @@ class _ComfyAPIMixin:
         def _cached_unet_load(self_node, **kwargs):
             _loader_entry_t0 = time.time()
             unet_name = kwargs.get("unet_name", "")
-            # Critical-path recorder: graph UNET loader entry
+            # ── V2 graph UNET demand instrumentation ───────────────
+            _v2_bridge = None
+            _v2_trace = None
+            try:
+                from comfymodal_runtime.model_preload import current_v2_loader_bridge
+                _v2_bridge = current_v2_loader_bridge()
+                if _v2_bridge is not None:
+                    _v2_trace = getattr(_v2_bridge, "_trace", None)
+            except Exception:
+                pass
+            # Fallback: when the bridge is absent (background UNET cache
+            # consumption outside request scope), use the execution trace
+            # stashed on the API instance by _run_in_process.
+            if _v2_trace is None:
+                try:
+                    _v2_trace = getattr(_api, '_v2_graph_trace', None)
+                except Exception:
+                    pass
+            _demand_ns = time.monotonic_ns()
+            if _v2_trace is not None:
+                try:
+                    _v2_trace.emit("graph_unet_demand", phase="execution", metadata={
+                        "unet_name": str(unet_name)[:32],
+                        "lane": "UNET",
+                    })
+                except Exception:
+                    pass
+            # Critical-path recorder: graph UNET loader entry (legacy)
             try:
                 _api._record_critical_path(
                     "graph_unet_loader_enter",
@@ -16446,6 +16797,19 @@ class _ComfyAPIMixin:
             key = _api._unet_cache_key(path, weight_dtype)
             _graph_entry_s = time.time()
             _al_key_str = str(key)
+            _canonical_key_str = str(key)
+            if _v2_trace is not None:
+                try:
+                    _v2_trace.emit("graph_unet_key_resolved", phase="execution", metadata={
+                        "canonical_key": _canonical_key_str,
+                        "canonical_hash": _canonical_key_str[-32:],
+                        "path_hash": str(hash(path)) if path else "",
+                    })
+                    # lookup_start begins the actual cache inspection;
+                    # lookup_end is emitted on hit/miss/fallback.
+                    _v2_trace.emit("graph_unet_cache_lookup_start", phase="execution")
+                except Exception:
+                    pass
             for _rec in getattr(_api, "_wall_actual_load_per_model", []):
                 if _rec.get("canonical_key") == _al_key_str and _rec.get("graph_requested_model_unix_s") is None:
                     _rec["graph_requested_model_unix_s"] = _graph_entry_s
@@ -16461,11 +16825,12 @@ class _ComfyAPIMixin:
             _future_exists_before = key in _futures
             _future_source_before = "actual_load"
             _future_status_before = ""
+            _future_meta: dict[str, Any] = {}
             _object_cache_exists_before = key in _cache
+            _future_meta = dict(getattr(_api, '_actual_load_future_meta', {}).get(key, {}))
+            _future_source_before = _future_meta.get("source", "actual_load") if _future_exists_before else "actual_load"
+            _future_status_before = _future_meta.get("status", "") if _future_exists_before else ""
             if _restore_background_code_enabled():
-                _future_meta = dict(getattr(_api, '_actual_load_future_meta', {}).get(key, {}))
-                _future_source_before = _future_meta.get("source", "actual_load") if _future_exists_before else "actual_load"
-                _future_status_before = _future_meta.get("status", "") if _future_exists_before else ""
                 _rt_restore = getattr(_api, "_last_restore_timing", None)
                 if isinstance(_rt_restore, dict):
                     _rt_restore["restore_background_unet_future_source_at_graph_unet"] = (
@@ -16511,7 +16876,32 @@ class _ComfyAPIMixin:
                 _diag["unet_object_cache_size_after"] = len(_cache)
                 _diag["unet_object_cache_keys_after"] = str(list(_cache.keys())) if _cache else "empty"
                 _diag["unet_cpu_cache_size_after"] = len(_cpu_cache)
+                # ── V2 cache hit instrumentation ─────────────────
+                # _v2_trace is resolved at function entry (bridge or API fallback).
+                if _v2_trace is not None:
+                    try:
+                        _hit_diag_id = _future_meta.get("diagnostic_id", "") if isinstance(_future_meta, dict) else ""
+                        _hit_pub_ts = _future_meta.get("cache_published_at_unix_s", 0) if isinstance(_future_meta, dict) else 0
+                        _hit_completed_before = max(0.0, (_graph_entry_s - _hit_pub_ts) * 1000) if _hit_pub_ts and _graph_entry_s else None
+                        _v2_trace.emit("graph_unet_cache_lookup_end", phase="execution",
+                                        metadata={"status": "hit", "hit_source": "object_cache"})
+                        _v2_trace.emit("graph_unet_cache_hit", phase="execution", metadata={
+                            "canonical_key": str(key),
+                            "diagnostic_id": _hit_diag_id,
+                            "hit_source": "object_cache",
+                            "publication_timestamp_unix_s": _hit_pub_ts,
+                            "demand_timestamp_unix_s": _graph_entry_s,
+                            "completed_before_demand_ms": round(_hit_completed_before, 3) if _hit_completed_before is not None else None,
+                        })
+                    except Exception:
+                        pass
                 print(f"[unet_loader_cache] cache_hit path={unet_name}")
+                # ── Compact summary ─────────────────────────────
+                print(
+                    f"[v2.bg_unet_cache] graph_demand=1 cache_hit=1 hit_source=object_cache "
+                    f"canonical_key={str(key)[:32]}",
+                    flush=True,
+                )
                 _api._unet_load_diagnostics = _diag
                 return (_cache[key],)
             _diag["unet_object_cache_miss"] = "1"
@@ -16559,6 +16949,12 @@ class _ComfyAPIMixin:
             # Check in-flight actual-load future
             _f_graph_wait_start_s = time.time()
             if _future_exists_before:
+                # ── V2 cache wait start ─────────────────────────
+                if _v2_trace is not None:
+                    _v2_trace.emit("graph_unet_wait_start", phase="execution", metadata={
+                        "canonical_key": str(key),
+                        "future_source": _future_source_before,
+                    })
                 _f_wait_t0 = time.time()
                 # Critical-path recorder: graph UNET future wait start
                 try:
@@ -16573,9 +16969,13 @@ class _ComfyAPIMixin:
                     )
                 except Exception:
                     pass
+                _actual_wait_ms = 0.0
+                _wait_successful = False
                 if _api._consume_actual_load_future(key):
                     _f_wait_s = time.time()
                     _f_wait_ms = round((_f_wait_s - _f_wait_t0) * 1000, 1)
+                    _actual_wait_ms = _f_wait_ms
+                    _wait_successful = True
                     # Critical-path recorder: graph UNET future wait end
                     try:
                         _api._record_critical_path(
@@ -16589,6 +16989,40 @@ class _ComfyAPIMixin:
                     except Exception:
                         pass
                     if key in _cache:
+                        # ── V2 cache hit (future) ───────────────
+                        _f_diag_id = _future_meta.get("diagnostic_id", "") if isinstance(_future_meta, dict) else ""
+                        _f_pub_ts = _future_meta.get("cache_published_at_unix_s", 0) if isinstance(_future_meta, dict) else 0
+                        _f_demand_ts = _graph_entry_s
+                        _completed_before_demand = max(0.0, (_f_demand_ts - _f_pub_ts) * 1000) if _f_pub_ts and _f_demand_ts else None
+                        if _v2_trace is not None:
+                            _v2_trace.emit("graph_unet_wait_end", phase="execution", metadata={
+                                "canonical_key": str(key),
+                                "wait_ms": round(_f_wait_ms, 3),
+                                "status": "hit",
+                                "diagnostic_id": _f_diag_id,
+                            })
+                            _v2_trace.emit("graph_unet_cache_hit", phase="execution", metadata={
+                                "canonical_key": str(key),
+                                "hit_source": "future",
+                                "future_source": _future_source_before,
+                                "wait_ms": round(_f_wait_ms, 3),
+                                "diagnostic_id": _f_diag_id,
+                                "publication_timestamp_unix_s": _f_pub_ts,
+                                "demand_timestamp_unix_s": _f_demand_ts,
+                                "completed_before_demand_ms": round(_completed_before_demand, 3) if _completed_before_demand is not None else None,
+                            })
+                # If wait_start was emitted but consume failed, close the span
+                # with truthful status so no unmatched wait_start remains.
+                if not _wait_successful and _v2_trace is not None:
+                    try:
+                        _v2_trace.emit("graph_unet_wait_end", phase="execution", metadata={
+                            "canonical_key": str(key),
+                            "wait_ms": 0.0,
+                            "status": "unavailable",
+                            "reason": "future_consume_failed",
+                        })
+                    except Exception:
+                        pass
                         print(f"[loader_future] returned_future_result loader=UNET key={key} wait_ms={_f_wait_ms}")
                         _api._unet_cache_hits = getattr(_api, '_unet_cache_hits', 0) + 1
                         _diag["unet_loaded_from"] = "restore_background_unet_future" if (
@@ -16617,11 +17051,35 @@ class _ComfyAPIMixin:
                             )
                         except Exception:
                             pass
+                        # ── Compact cache summary ───────────────
+                        print(
+                            f"[v2.bg_unet_cache] graph_demand=1 cache_hit=1 hit_source=future "
+                            f"wait_ms={_f_wait_ms} "
+                            f"canonical_key={str(key)[:32]}",
+                            flush=True,
+                        )
                         return (_cache[key],)
                 if _restore_background_code_enabled() and _future_source_before == "restore_background_unet" and isinstance(getattr(_api, "_last_restore_timing", None), dict):
                     _api._last_restore_timing["restore_background_unet_fallback_used"] = 1
                     print(f"[loader_future] failed_future_fallback key={key} source=restore_background_unet")
             _api._unet_cache_misses = getattr(_api, '_unet_cache_misses', 0) + 1
+            # ── V2 cache miss / fallback ─────────────────────────
+            _cache_lookup_miss = True
+            if _v2_trace is not None:
+                try:
+                    _v2_trace.emit("graph_unet_cache_lookup_end", phase="execution",
+                                    metadata={"status": "miss"})
+                    _v2_trace.emit("graph_unet_cache_miss", phase="execution", metadata={
+                        "canonical_key": str(key),
+                        "future_exists": _future_exists_before,
+                        "object_cache_exists": _object_cache_exists_before,
+                    })
+                    _v2_trace.emit("graph_unet_fallback", phase="execution", metadata={
+                        "canonical_key": str(key),
+                        "reason": "cache_miss",
+                    })
+                except Exception:
+                    pass
             t0 = time.time()
             result = orig_load(self_node, **kwargs)
             d_ms = round((time.time() - t0) * 1000, 1)

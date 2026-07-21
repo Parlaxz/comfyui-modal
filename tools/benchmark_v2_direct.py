@@ -136,9 +136,25 @@ async def _run_one(
     transport: ModalTransport,
     output_dir: Path,
 ) -> dict[str, Any]:
-    prompt_id = f"v2-benchmark-{index}-{uuid.uuid4().hex[:12]}"
+    # T0: benchmark iteration origin (literal first line)
+    _req_id = f"v2-benchmark-{index}-{uuid.uuid4().hex[:12]}"
+    _t0_wall_ms = int(time.time() * 1000)
+    _t0_perf = time.perf_counter()
+    # T1: local receive (this runner is itself the local receiver)
+    _t1_wall_ns = int(time.time() * 1_000_000_000)
+    _t1_mono_ns = time.monotonic_ns()
+    request_origin_info = {
+        "request_id": _req_id,
+        "trigger_source": "benchmark",
+        "ui_run_triggered_wall_unix_ms": _t0_wall_ms,
+        "benchmark_run_index": index,
+        "local_receive_wall_ns": _t1_wall_ns,
+        "local_receive_mono_ns": _t1_mono_ns,
+    }
+    prompt_id = _req_id  # request_id == prompt_id
     production_options = normalize_production_options(modal_options)
     runtime_trace = RuntimeTrace(request_id=prompt_id, process="local")
+    runtime_trace.set_metadata(request_origin_info=request_origin_info)
     plan = build_execution_plan(
         workflow,
         prompt_id=prompt_id,
@@ -147,7 +163,8 @@ async def _run_one(
         production_options=production_options if production_options.get("enabled") else None,
         gpu=GPU,
         workspace=workspace,
-        request_metadata={"benchmark_run_index": index, "benchmark_app": APP_NAME},
+        request_metadata={"benchmark_run_index": index, "benchmark_app": APP_NAME,
+                          "__request_origin_info__": request_origin_info},
         trace=runtime_trace,
         validate=False,
     )

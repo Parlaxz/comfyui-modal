@@ -8,6 +8,7 @@ chcp 65001 >nul
 set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-shadow"
 set "COMFYMODAL_V2_CLASS_NAME=ModalRuntimeEntrypointV2"
 set "COMFYMODAL_V2_GPU=rtx-pro-6000"
+set "COMFYMODAL_V2_DEEP_MODEL_DIAG=1"
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
 
@@ -69,10 +70,10 @@ if errorlevel 1 (
 del "%TEMP%\_v2_deploy.txt" 2>nul
 echo === Deploy verified OK ===
 
-:: Run three V2 direct benchmark trials
-echo === Running V2 direct benchmarks (3 trials, 60s gap) ===
-set "V2_BENCHMARK_RUNS=3"
-set "V2_BENCHMARK_GAP_SECONDS=60"
+:: Run exactly one V2 direct cold benchmark trial
+echo === Running V2 direct benchmark (1 cold trial) ===
+set "V2_BENCHMARK_RUNS=1"
+set "V2_BENCHMARK_GAP_SECONDS=0"
 python tools\benchmark_v2_direct.py
 set "BENCHMARK_EXIT=%errorlevel%"
 if %BENCHMARK_EXIT% neq 0 (

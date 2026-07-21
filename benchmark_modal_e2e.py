@@ -2166,12 +2166,23 @@ def cmd_benchmark(args: argparse.Namespace, effective_config: dict | None = None
     prev_remote_done_ts: float | None = None
 
     for run_idx in range(num_runs):
+        # T0: request identity origin for each benchmark iteration
+        _run_request_id = uuid.uuid4().hex
+        _run_t0_wall_ms = int(time.time() * 1000)
+
         print(f"  --- Run {run_idx + 1}/{num_runs} ---")
         ht = {}
         record_harness_ts(ht, "benchmark_run_start")
 
         t_start = time.time()
         payload = fresh_benchmark_payload(workflow_dict, t_start, include_local_materialization, benchmark_session_id, run_idx)
+        # Inject request_origin into the payload trace so the server sees it
+        payload.setdefault("trace", {})
+        if isinstance(payload.get("trace"), dict):
+            payload["trace"]["request_id"] = _run_request_id
+            payload["trace"]["trigger_source"] = "benchmark"
+            payload["trace"]["ui_run_triggered_wall_unix_ms"] = _run_t0_wall_ms
+            payload["trace"]["benchmark_run_index"] = run_idx
         # Inject effective config into modal_options so remote applies request-level options
         if effective_config:
             if "modal_options" not in payload or not isinstance(payload.get("modal_options"), dict):
