@@ -4405,6 +4405,58 @@ def _complete_active_model_read(canonical_key: str) -> None:
             _counter_status = "unavailable"
         else:
             _counter_status = "available"
+        # ── Per-dimension classifier via model_preload ────────────────
+        # Guard optional resource import separately so Windows (no resource
+        # module) still gets truthful classification for supported dims.
+        _os_supports_rusage = False
+        try:
+            import resource as _resource
+            _os_supports_rusage = bool(hasattr(_resource, 'getrusage') and hasattr(_resource, 'RUSAGE_THREAD'))
+        except ImportError:
+            pass
+        _os_supports_io = os.path.exists("/proc/self/io") if os.name == 'posix' else False
+        _dim_statuses: dict[str, str] = {}
+        try:
+            from comfymodal_runtime.model_preload import classify_active_read_dims
+            _dim_statuses = classify_active_read_dims(
+                deep_diag=_deep_diag_here,
+                before_tid=entry.get("native_tid"),
+                after_tid=_complete_tid,
+                has_thread_cpu=entry.get("start_thread_time_ns") is not None,
+                has_process_cpu=entry.get("start_process_time_ns") is not None,
+                has_rusage=entry.get("before_rusage") is not None,
+                has_io=entry.get("before_io") is not None,
+                os_supports_thread_cpu=hasattr(time, 'thread_time_ns'),
+                os_supports_process_cpu=hasattr(time, 'process_time_ns'),
+                os_supports_rusage=_os_supports_rusage,
+                os_supports_io=_os_supports_io,
+            )
+        except Exception:
+            # Classifier import or call failed — truthful per-dimension fallback.
+            # Do NOT copy the broad _counter_status to every dimension; instead
+            # emit what we can observe from captured state.
+            _DIM_ALL = ("thread_cpu", "process_cpu", "io_deltas",
+                        "page_faults", "block_input", "context_switches")
+            _THREAD_BOUNDED = frozenset({"thread_cpu", "io_deltas", "page_faults",
+                                          "block_input", "context_switches"})
+            if not _deep_diag_here:
+                for _d in _DIM_ALL:
+                    _dim_statuses[_d] = "unsupported"
+            elif not _same_native_thread:
+                for _d in _DIM_ALL:
+                    _dim_statuses[_d] = "thread_changed" if _d in _THREAD_BOUNDED else "unavailable"
+            else:
+                for _d in _DIM_ALL:
+                    _dim_statuses[_d] = "unavailable"
+        # Compute aggregate: mixed when dimensions disagree, otherwise the
+        # single status value.  Always derived from _dim_statuses (either
+        # classifier output or truthful fallback above).
+        _unique_statuses = {v for v in _dim_statuses.values()}
+        if len(_unique_statuses) == 1:
+            _aggregate_status = _unique_statuses.pop()
+        else:
+            _aggregate_status = "mixed"
+        # Legacy counter_status kept for parsers that depend on it.
         ev = entry.get("event")
         _ACTIVE_MODEL_READS.pop(canonical_key, None)
     if ev is not None:
@@ -4434,7 +4486,14 @@ def _complete_active_model_read(canonical_key: str) -> None:
         f"rchar={entry.get('active_read_rchar_delta') if entry.get('active_read_rchar_delta') is not None else 'not_observed_in_this_thread'} "
         f"minor_faults={entry.get('active_read_minor_faults_delta')} major_faults={entry.get('active_read_major_faults_delta')} "
         f"context_switches={entry.get('active_read_voluntary_context_switches_delta')}/{entry.get('active_read_involuntary_context_switches_delta')} "
-        f"counter_status={_counter_status} native_thread_id={entry.get('native_tid')}"
+        f"counter_status={_aggregate_status} legacy_counter_status={_counter_status} "
+        f"thread_cpu_status={_dim_statuses.get('thread_cpu', _counter_status)} "
+        f"process_cpu_status={_dim_statuses.get('process_cpu', _counter_status)} "
+        f"io_status={_dim_statuses.get('io_deltas', _counter_status)} "
+        f"page_fault_status={_dim_statuses.get('page_faults', _counter_status)} "
+        f"block_input_status={_dim_statuses.get('block_input', _counter_status)} "
+        f"context_switch_status={_dim_statuses.get('context_switches', _counter_status)} "
+        f"native_thread_id={entry.get('native_tid')}"
     )
 
 
@@ -9649,8 +9708,14 @@ class _ComfyAPIMixin:
                 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
                 def _load_one(path: str, filename: str, cache_key: str, role: str = "unknown") -> tuple[str, str, object, object | None, float, int, dict]:
+                    # Map role to restore-specific owner label.
+                    _role_owner = {
+                        "clip": "restore_clip_loader",
+                        "unet": "restore_background_unet",
+                        "vae": "restore_vae_loader",
+                    }.get(role, "restore_preload")
                     started = time.time()
-                    # â”€â”€ Signal worker started from actual loader context â”€â”€
+                    # ── Signal worker started from actual loader context ──
                     _worker_started_ns = time.perf_counter_ns()
                     if worker_timing_holder is not None:
                         worker_timing_holder.setdefault(
@@ -9663,7 +9728,7 @@ class _ComfyAPIMixin:
                     if worker_started_event is not None:
                         worker_started_event.set()
                     _t_before_register = time.time()
-                    _reg_status = _register_active_model_read(cache_key, owner="restore_preload", path=path, phase="restore")
+                    _reg_status = _register_active_model_read(cache_key, owner=_role_owner, path=path, phase="restore")
                     _active_register_ms = round((time.time() - _t_before_register) * 1000, 1)
                     _attached_existing = 1 if _reg_status == "duplicate" else 0
                     if _reg_status == "duplicate":
@@ -9686,7 +9751,7 @@ class _ComfyAPIMixin:
                                 }
                                 print(f"[preload_model_read_duplicate_adopted] file={filename} key={cache_key[:80]} wait_ms={_wr.get('wait_ms', 0)}")
                                 return filename, cache_key, _cached_state, _cached_meta, _dup_ms, _dup_diag["file_size_bytes"], _dup_diag
-                        _reg_status = _register_active_model_read(cache_key, owner="restore_preload", path=path, phase="restore")
+                        _reg_status = _register_active_model_read(cache_key, owner=_role_owner, path=path, phase="restore")
                     _concurrent_at_start = _count_active_model_reads()
                     _eff_safetensors_mode = os.environ.get("COMFYMODAL_SAFETENSORS_READ_MODE", "normal").strip().lower()
                     # Resolve read-bytes eligibility
@@ -11938,7 +12003,7 @@ class _ComfyAPIMixin:
         # BEFORE starting thread, so the graph loader finds this inflight read.
         import threading as _cl_thr
         _read_event = _cl_thr.Event()
-        _register_active_model_read(_graph_key, owner="cold_unet_early", path=unet_real, event=_read_event)
+        _register_active_model_read(_graph_key, owner="restore_background_unet", path=unet_real, event=_read_event)
 
         result["submit_ts"] = time.time()
         self._init_actual_load_registry()
@@ -11965,7 +12030,7 @@ class _ComfyAPIMixin:
             try:
                 import nodes as _cl_nodes
                 _orig_fn = self._original_loaders.get("UNETLoader.load_unet")
-                with _model_load_context(owner="cold_unet_early", loader_type="UNET", actual_key=k, canonical_path=_un_path, record_id=str(_rec_idx_)):
+                with _model_load_context(owner="restore_background_unet", loader_type="UNET", actual_key=k, canonical_path=_un_path, record_id=str(_rec_idx_)):
                     if _orig_fn:
                         obj = _orig_fn(_cl_nodes.NODE_CLASS_MAPPINGS["UNETLoader"](), unet_name=un, weight_dtype="default")
                     else:

@@ -1375,3 +1375,87 @@ def api_with_executor(executor) -> SimpleNamespace:
         _preflight_already_ran=False,
         _repair_missing_workflow_nodes=lambda wf: {"missing_before": [], "missing_after": [], "blocked_by_mode": False},
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. GPU not-observed classification propagation
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestGpuNotObservedInRestoreTiming:
+    """gpu_not_observed_summary propagates through restore timing.
+
+    The summary function is consumed by the caller (modal_app or diagnosis
+    collector) which reads the request-scope wrapper state.  These tests
+    verify the contract without calling modal_app.py.
+    """
+
+    def test_not_observed_under_request_scope_zero_calls(self):
+        """Under request scope with zero GPU calls, classification is 'not_observed'."""
+        from comfymodal_runtime.model_preload import (
+            gpu_not_observed_summary,
+            request_execution_trace_scope,
+            _gpu_wrapper_installed,
+            _gpu_request_call_count_var,
+        )
+
+        saved_installed = _gpu_wrapper_installed
+        saved_count = _gpu_request_call_count_var.get()
+        try:
+            # Simulate wrapper installed but zero GPU calls
+            import comfymodal_runtime.model_preload as mp
+            mp._gpu_wrapper_installed = True
+            mp._gpu_request_call_count_var.set(0)
+
+            trace = RuntimeTrace(request_id="gpu-no-call-rt", process="remote")
+            with request_execution_trace_scope(trace):
+                summary = gpu_not_observed_summary()
+
+            assert summary["caller_classification"] == "not_observed"
+            assert summary["wrapper_status"] == "installed"
+            assert summary["count"] == 0
+            assert summary["request_id"] == "gpu-no-call-rt"
+        finally:
+            mp._gpu_wrapper_installed = saved_installed
+            mp._gpu_request_call_count_var.set(saved_count)
+
+    def test_wrapper_unavailable_when_not_installed(self):
+        """When wrapper is not installed, classification is 'wrapper_unavailable'."""
+        from comfymodal_runtime.model_preload import (
+            gpu_not_observed_summary,
+            _gpu_wrapper_installed,
+        )
+
+        saved = _gpu_wrapper_installed
+        try:
+            import comfymodal_runtime.model_preload as mp
+            mp._gpu_wrapper_installed = False
+
+            summary = gpu_not_observed_summary()
+
+            assert summary["caller_classification"] == "wrapper_unavailable"
+            assert summary["wrapper_status"] == "unavailable"
+            assert summary["count"] == 0
+        finally:
+            mp._gpu_wrapper_installed = saved
+
+    def test_summary_never_returns_numeric_zero_as_classification(self):
+        """caller_classification is always a string, never None or 0."""
+        from comfymodal_runtime.model_preload import request_execution_trace_scope
+        import comfymodal_runtime.model_preload as mp
+        saved = mp._gpu_wrapper_installed
+        try:
+            mp._gpu_wrapper_installed = True
+            trace = RuntimeTrace(request_id="gpu-str-cls", process="remote")
+            with request_execution_trace_scope(trace):
+                summary = mp.gpu_not_observed_summary()
+            assert isinstance(summary["caller_classification"], str)
+            assert summary["caller_classification"] != "0"
+            assert summary["caller_classification"] != ""
+
+            mp._gpu_wrapper_installed = False
+            summary2 = mp.gpu_not_observed_summary()
+            assert isinstance(summary2["caller_classification"], str)
+            assert summary2["caller_classification"] != "0"
+        finally:
+            mp._gpu_wrapper_installed = saved

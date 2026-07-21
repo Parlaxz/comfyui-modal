@@ -43,6 +43,7 @@ from comfymodal_runtime.model_preload import (
     _make_clip_constructor_wrapper,
     _child_durations,
     _unet_subfn_nesting_depth,
+    _clip_subfn_depth,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -78,12 +79,19 @@ class TestClipLoadWrapperFactory:
 
     def test_clip_wrapper_emits_cpu_prepare_events_with_reconciliation(self):
         """When lane=CLIP, the wrapper emits clip_cpu_prepare_start/end with
-        total = sum(children) + residual."""
+        post_read_total = sum(children) + residual (signed).
+        clip_cpu_prepare_start is triggered by _on_read_completed
+        (not at wrapper entry), so test must simulate it."""
         trace = RuntimeTrace(request_id="clip-factory", process="remote")
         lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=1)
 
         # Use a child that adds a real-wall-clock child so total ≈ children_total
         def fake_original(*args, **kwargs):
+            # Simulate a load_torch_file call: read_start, work, read_end, _on_read_completed
+            lane.read_start()
+            time.sleep(0.030)
+            lane.read_end()
+            lane._on_read_completed()
             children = _clip_cpu_prepare_children.get()
             if children is not None:
                 # Simulate subfn that takes real time
@@ -105,19 +113,171 @@ class TestClipLoadWrapperFactory:
             _ACTIVE_LANE_TRACE.reset(token)
 
         events = list(trace.events)
+        # clip_cpu_prepare_start must be present (emitted by _on_read_completed)
+        start_events = [e for e in events if e.name == "clip_cpu_prepare_start"]
+        assert len(start_events) == 1, (
+            f"Expected 1 clip_cpu_prepare_start, got {len(start_events)}"
+        )
+        assert start_events[0].metadata.get("expected_read_count") == 1
+        assert start_events[0].metadata.get("actual_read_count") == 1
+
         end_events = [e for e in events if e.name == "clip_cpu_prepare_end"]
         assert len(end_events) == 1
         meta = end_events[0].metadata
-        total = meta["clip_cpu_prepare_total_ms"]
+        post_read_total = meta["clip_cpu_prepare_total_ms"]
+        file_read_total = meta.get("clip_file_read_total_ms")
         measured = meta["clip_cpu_prepare_measured_children_ms"]
         residual = meta["clip_cpu_prepare_residual_ms"]
-        assert isinstance(total, (int, float)) and total >= 0
+        status = meta.get("status")
+        assert isinstance(post_read_total, (int, float)) and post_read_total >= 0
         assert isinstance(measured, (int, float)) and measured >= 0
-        assert isinstance(residual, (int, float)) and residual >= 0
-        # total ≈ measured + residual (within rounding + sleep overhead)
-        assert abs(total - (measured + residual)) < 5.0, (
-            f"total={total} != measured={measured} + residual={residual}"
+        # file_read_total should reflect the read interval if monotonic clock ticked
+        if file_read_total is not None:
+            assert isinstance(file_read_total, (int, float)) and file_read_total >= 0
+        # post_read_total ≈ measured + residual (signed, within rounding + sleep overhead)
+        assert abs(post_read_total - (measured + residual)) < 5.0, (
+            f"post_read_total={post_read_total} != measured={measured} + residual={residual}"
         )
+        assert status == "ok", f"Expected status=ok, got {status}"
+
+        # clip_load_call_start/end must also be present
+        call_start = [e for e in events if e.name == "clip_load_call_start"]
+        assert len(call_start) == 1
+        call_end = [e for e in events if e.name == "clip_load_call_end"]
+        assert len(call_end) == 1
+        assert "clip_load_call_total_ms" in call_end[0].metadata
+        assert "clip_file_read_total_ms" in call_end[0].metadata
+        assert "clip_post_read_cpu_total_ms" in call_end[0].metadata
+
+    def test_clip_wrapper_dual_read_triggers_post_read_boundary(self):
+        """When expected_read_count=2, clip_cpu_prepare_start fires after
+        the second read (simulated by calling read_start/read_end/_on_read_completed twice)."""
+        trace = RuntimeTrace(request_id="clip-dual", process="remote")
+        lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=2)
+
+        def fake_original(*args, **kwargs):
+            # Simulate two load_torch_file calls
+            lane.read_start()
+            time.sleep(0.030)
+            lane.read_end()
+            lane._on_read_completed()
+            time.sleep(0.010)
+            lane.read_start()
+            time.sleep(0.030)
+            lane.read_end()
+            lane._on_read_completed()
+            time.sleep(0.005)
+            return SimpleNamespace(patcher=SimpleNamespace())
+
+        wrapper = _make_clip_load_wrapper(fake_original)
+        token = _ACTIVE_LANE_TRACE.set(lane)
+        try:
+            wrapper(["ckpt1", "ckpt2"])
+        finally:
+            _ACTIVE_LANE_TRACE.reset(token)
+
+        events = list(trace.events)
+        # clip_cpu_prepare_start must fire after second read
+        start_events = [e for e in events if e.name == "clip_cpu_prepare_start"]
+        assert len(start_events) == 1
+        assert start_events[0].metadata.get("actual_read_count") == 2
+
+        # clip_load_call_end should have file_read_total_ms and post_read_cpu_total_ms
+        call_end = [e for e in events if e.name == "clip_load_call_end"]
+        assert len(call_end) == 1
+        call_meta = call_end[0].metadata
+        assert "clip_file_read_total_ms" in call_meta, (
+            f"Missing clip_file_read_total_ms in clip_load_call_end: {list(call_meta.keys())}"
+        )
+        # For dual CLIP, file read total should reflect sum of intervals
+        frt = call_meta["clip_file_read_total_ms"]
+        if frt is not None:
+            assert isinstance(frt, (int, float)) and frt >= 0
+
+        # cpu_prepare_start (generic) should also fire
+        generic_start = [e for e in events if e.name == "cpu_prepare_start"]
+        assert len(generic_start) == 1
+
+    def test_clip_wrapper_exceeded_reads(self):
+        """When more reads occur than expected count, only one clip_cpu_prepare_start
+        fires (on the first trigger), and subsequent reads do not re-trigger."""
+        trace = RuntimeTrace(request_id="clip-overread", process="remote")
+        # expected=1 but 3 reads occur
+        lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=1)
+
+        def fake_original(*args, **kwargs):
+            lane._on_read_completed()  # actual=1 >= 1, trigger fires
+            lane._on_read_completed()  # actual=2, _cpu_prepare_started=True, no-op
+            lane._on_read_completed()  # actual=3, _cpu_prepare_started=True, no-op
+            return SimpleNamespace(patcher=SimpleNamespace())
+
+        wrapper = _make_clip_load_wrapper(fake_original)
+        token = _ACTIVE_LANE_TRACE.set(lane)
+        try:
+            wrapper(["ckpt"])
+        finally:
+            _ACTIVE_LANE_TRACE.reset(token)
+
+        events = list(trace.events)
+        # clip_cpu_prepare_start fires exactly once
+        start_events = [e for e in events if e.name == "clip_cpu_prepare_start"]
+        assert len(start_events) == 1
+
+        # Generic cpu_prepare_start fires once (no status metadata since
+        # actual=expected=1 at trigger time)
+        generic_start = [e for e in events if e.name == "cpu_prepare_start"]
+        assert len(generic_start) == 1
+
+        # clip_cpu_prepare_end carries read_count_mismatch status because
+        # actual=3 > expected=1
+        end_events = [e for e in events if e.name == "clip_cpu_prepare_end"]
+        assert len(end_events) == 1
+        assert end_events[0].metadata.get("status") == "read_count_mismatch", (
+            f"Expected read_count_mismatch status, got {end_events[0].metadata.get('status')}"
+        )
+
+        # clip_load_call_end also carries mismatch status
+        call_end = [e for e in events if e.name == "clip_load_call_end"]
+        assert len(call_end) == 1
+        assert call_end[0].metadata.get("status") == "read_count_mismatch"
+
+    def test_clip_wrapper_emits_load_call_events(self):
+        """When lane=CLIP, the wrapper emits clip_load_call_start/end
+        with total duration metadata."""
+        trace = RuntimeTrace(request_id="clip-load-call", process="remote")
+        lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=1)
+
+        def fake_original(*args, **kwargs):
+            lane._on_read_completed()
+            return SimpleNamespace(patcher=SimpleNamespace())
+
+        wrapper = _make_clip_load_wrapper(fake_original)
+        token = _ACTIVE_LANE_TRACE.set(lane)
+        try:
+            wrapper(["ckpt"])
+        finally:
+            _ACTIVE_LANE_TRACE.reset(token)
+
+        events = list(trace.events)
+        start_events = [e for e in events if e.name == "clip_load_call_start"]
+        assert len(start_events) == 1, (
+            f"Expected 1 clip_load_call_start, got {len(start_events)}"
+        )
+        end_events = [e for e in events if e.name == "clip_load_call_end"]
+        assert len(end_events) == 1, (
+            f"Expected 1 clip_load_call_end, got {len(end_events)}"
+        )
+        meta = end_events[0].metadata
+        assert "clip_load_call_total_ms" in meta, (
+            f"clip_load_call_end missing total_ms, metadata keys: {list(meta.keys())}"
+        )
+        assert "clip_file_read_total_ms" in meta, (
+            f"clip_load_call_end missing file_read_total_ms"
+        )
+        assert "clip_post_read_cpu_total_ms" in meta, (
+            f"clip_load_call_end missing post_read_cpu_total_ms"
+        )
+        assert meta.get("status") == "ok"
 
     def test_clip_wrapper_produces_no_events_without_lane(self):
         """When no lane trace is active, no events are emitted."""
@@ -172,6 +332,157 @@ class TestClipLoadWrapperFactory:
         name, dur = children[0]
         assert name == "detect_te_model"
         assert isinstance(dur, float) and dur >= 0
+
+    def test_clip_named_fields_from_trace_events(self):
+        """Named CLIP compact fields are derived from trace event metadata
+        (not from _clip_cpu_prepare_children).  Absent events → None."""
+        trace = RuntimeTrace(request_id="clip-named", process="remote")
+        lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=1)
+
+        def fake_original(*args, **kwargs):
+            lane.read_start()
+            time.sleep(0.030)
+            lane.read_end()
+            lane._on_read_completed()
+            # Emit subfn _end events with duration_ms metadata
+            lane._trace.emit("clip_detect_te_model_end", phase="restore", metadata={"duration_ms": 15.0})
+            lane._trace.emit("clip_load_text_encoder_state_dicts_end", phase="restore", metadata={"duration_ms": 25.0})
+            lane._trace.emit("clip_text_transformers_convert_end", phase="restore", metadata={"duration_ms": 5.0})
+            lane._trace.emit("clip_convert_old_quants_end", phase="restore", metadata={"duration_ms": 3.0})
+            lane._trace.emit("clip_constructor_end", phase="restore", metadata={"duration_ms": 8.0})
+            lane._trace.emit("clip_model_patcher_constructor_end", phase="restore", metadata={"duration_ms": 4.0})
+            return SimpleNamespace(patcher=SimpleNamespace())
+
+        wrapper = _make_clip_load_wrapper(fake_original)
+        token = _ACTIVE_LANE_TRACE.set(lane)
+        try:
+            wrapper(["ckpt"])
+        finally:
+            _ACTIVE_LANE_TRACE.reset(token)
+
+        events = list(trace.events)
+
+        # Verify named fields in clip_load_call_end
+        call_end = [e for e in events if e.name == "clip_load_call_end"]
+        assert len(call_end) == 1
+        call_meta = call_end[0].metadata
+        assert "clip_file_read_total_ms" in call_meta
+        frt = call_meta["clip_file_read_total_ms"]
+        if frt is not None:
+            assert isinstance(frt, (int, float)) and frt >= 0
+
+        # clip_cpu_prepare_end metadata includes measured children
+        end_events = [e for e in events if e.name == "clip_cpu_prepare_end"]
+        assert len(end_events) == 1
+        meta = end_events[0].metadata
+        assert "clip_cpu_prepare_total_ms" in meta
+        assert "clip_file_read_total_ms" in meta
+        frt2 = meta["clip_file_read_total_ms"]
+        if frt2 is not None:
+            assert isinstance(frt2, (int, float)) and frt2 >= 0
+        # measured_children_ms should reflect only children recorded in
+        # _clip_cpu_prepare_children (none in this test since no subfn wrappers)
+        assert meta["clip_cpu_prepare_measured_children_ms"] == 0.0
+
+        # The compact summary is printed via _emit_clip_cpu_children_summary.
+        # Verify trace events show the expected durations.
+        detect_end = [e for e in events if e.name == "clip_detect_te_model_end"]
+        assert len(detect_end) == 1
+        assert detect_end[0].metadata.get("duration_ms") == 15.0
+        lte_end = [e for e in events if e.name == "clip_load_text_encoder_state_dicts_end"]
+        assert len(lte_end) == 1
+        assert lte_end[0].metadata.get("duration_ms") == 25.0
+        conv_end = [e for e in events if e.name == "clip_text_transformers_convert_end"]
+        assert len(conv_end) == 1
+        assert conv_end[0].metadata.get("duration_ms") == 5.0
+        coq_end = [e for e in events if e.name == "clip_convert_old_quants_end"]
+        assert len(coq_end) == 1
+        assert coq_end[0].metadata.get("duration_ms") == 3.0
+        cc_end = [e for e in events if e.name == "clip_constructor_end"]
+        assert len(cc_end) == 1
+        assert cc_end[0].metadata.get("duration_ms") == 8.0
+        mpc_end = [e for e in events if e.name == "clip_model_patcher_constructor_end"]
+        assert len(mpc_end) == 1
+        assert mpc_end[0].metadata.get("duration_ms") == 4.0
+
+    def test_clip_named_fields_absent_when_no_trace_events(self):
+        """When no subfn _end events are emitted, all named compact fields
+        remain None (not zero or children_total)."""
+        trace = RuntimeTrace(request_id="clip-named-none", process="remote")
+        lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=1)
+
+        def fake_original(*args, **kwargs):
+            lane.read_start()
+            time.sleep(0.030)
+            lane.read_end()
+            lane._on_read_completed()
+            # No subfn trace events — named fields should stay None
+            return SimpleNamespace(patcher=SimpleNamespace())
+
+        wrapper = _make_clip_load_wrapper(fake_original)
+        token = _ACTIVE_LANE_TRACE.set(lane)
+        try:
+            wrapper(["ckpt"])
+        finally:
+            _ACTIVE_LANE_TRACE.reset(token)
+
+        events = list(trace.events)
+        # clip_cpu_prepare_end metadata does not include named fields
+        # (they are in the compact print summary, not the trace metadata).
+        # The file_read_total should be populated from read intervals if
+        # the monotonic clock ticked.
+        end_events = [e for e in events if e.name == "clip_cpu_prepare_end"]
+        assert len(end_events) == 1
+        meta = end_events[0].metadata
+        frt = meta.get("clip_file_read_total_ms")
+        if frt is not None:
+            assert isinstance(frt, (int, float)) and frt >= 0
+        assert meta["clip_cpu_prepare_measured_children_ms"] == 0.0
+        # No children were recorded (no subfn wrappers)
+        assert len(meta.get("children", [])) == 0
+        assert "clip_cpu_prepare_total_ms" in meta
+        assert "clip_cpu_prepare_residual_ms" in meta
+
+    def test_clip_double_prefixed_conversion_event_aggregated(self):
+        """The live double-prefixed name clip_clip_text_transformers_convert_end
+        is properly aggregated into state_dict_conversion_ms alongside the
+        existing single-prefix clip_text_transformers_convert_end name."""
+        import io
+        import contextlib
+
+        trace = RuntimeTrace(request_id="clip-double-prefix", process="remote")
+        lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=1)
+
+        def fake_original(*args, **kwargs):
+            lane.read_start()
+            time.sleep(0.010)
+            lane.read_end()
+            lane._on_read_completed()
+            # Emit the live double-prefixed event name
+            lane._trace.emit("clip_clip_text_transformers_convert_end", phase="restore",
+                             metadata={"duration_ms": 5.0})
+            # Emit convert_old_quants (always single-prefix)
+            lane._trace.emit("clip_convert_old_quants_end", phase="restore",
+                             metadata={"duration_ms": 3.0})
+            return SimpleNamespace(patcher=SimpleNamespace())
+
+        wrapper = _make_clip_load_wrapper(fake_original)
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            token = _ACTIVE_LANE_TRACE.set(lane)
+            try:
+                wrapper(["ckpt"])
+            finally:
+                _ACTIVE_LANE_TRACE.reset(token)
+        output = f.getvalue()
+        # Both events should be summed into state_dict_conversion_ms=8.0
+        assert "state_dict_conversion_ms=8.0" in output, (
+            f"Expected state_dict_conversion_ms=8.0 in summary, got:\n{output}"
+        )
+        # The live double-prefixed name must appear in the trace events
+        assert "clip_clip_text_transformers_convert_end" in output or any(
+            e.name == "clip_clip_text_transformers_convert_end" for e in trace.events
+        ), "Double-prefixed clip_clip_text_transformers_convert_end not found"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -579,7 +890,8 @@ class TestUnetSdStateDictWrapperFactory:
             if children is not None:
                 _t = time.monotonic()
                 time.sleep(_TEST_CHILD_DUR)
-                children.append(round((time.monotonic() - _t) * 1000, 3))
+                _d = round((time.monotonic() - _t) * 1000, 3)
+                children.append(("test_child", _d))
             return {"model": "fake"}
 
         wrapper = _make_sd_state_dict_wrapper(fake_original)
@@ -605,6 +917,18 @@ class TestUnetSdStateDictWrapperFactory:
         )
         assert "duration_ms" in meta  # legacy compatibility
         assert "measured_child_total_ms" in meta  # legacy compatibility
+        # measured_children is legacy numeric-only; measured_named_children has (name, dur) pairs
+        legacy_durs = meta.get("measured_children", [])
+        assert all(isinstance(d, (int, float)) for d in legacy_durs), (
+            f"Legacy measured_children must be numeric, got {legacy_durs}"
+        )
+        named = meta.get("measured_named_children", [])
+        assert all(isinstance(c, tuple) and len(c) == 2 for c in named), (
+            f"measured_named_children must be (name, dur) tuples, got {named}"
+        )
+        if legacy_durs:
+            assert len(legacy_durs) == len(named)
+            assert abs(sum(legacy_durs) - sum(d for _, d in named)) < 0.001
 
     def test_sd_wrapper_no_events_for_non_unet_lane(self):
         """When lane is not UNET, no SD events are emitted."""
@@ -648,8 +972,9 @@ class TestUnetSdStateDictWrapperFactory:
 
         children = _child_durations.get() or []
         assert len(children) >= 1
-        dur = children[0]
-        assert isinstance(dur, float) and dur >= 0
+        name, dur = children[0]
+        assert isinstance(name, str)
+        assert isinstance(dur, (int, float)) and dur >= 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -866,6 +1191,21 @@ class TestUnetDirectChildrenWrappers:
             f"Expected 3 measured direct children (constructor, to, load_weights), "
             f"got {child_count}: {meta.get('measured_children', [])}"
         )
+        # Children should be named tuples (via measured_named_children)
+        children_list = meta.get("measured_named_children", [])
+        child_names = [c[0] for c in children_list]
+        assert "model_patcher_constructor" in child_names, (
+            f"Expected model_patcher_constructor in {child_names}"
+        )
+        assert "model_to" in child_names, (
+            f"Expected model_to in {child_names}"
+        )
+        assert "load_model_weights" in child_names, (
+            f"Expected load_model_weights in {child_names}"
+        )
+        # Residual should be signed (not max-clamped)
+        assert "residual_ms" in meta
+        assert "status" in meta
 
     def test_shared_convert_old_quants_emits_both_lanes(self):
         """The shared convert_old_quants wrapper emits lane-prefixed events
@@ -909,6 +1249,61 @@ class TestUnetDirectChildrenWrappers:
 
         # Verify shared sentinel
         assert getattr(coq_wrapper, "_comfy_modal_shared_convert_old_quants", False)
+
+    def test_convert_old_quants_nesting_depth_participation_clip(self):
+        """The shared convert_old_quants wrapper respects CLIP subfn nesting depth
+        and does not append as direct child when called inside another subfn."""
+        trace = RuntimeTrace(request_id="coq-clip-nest", process="remote")
+        lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=1)
+
+        def fake_coq(x):
+            return x * 2
+
+        coq_wrapper = _make_convert_old_quants_wrapper(fake_coq)
+
+        # Simulate load_text_encoder_state_dicts wrapper which increments _clip_subfn_depth
+        _clip_cpu_prepare_children.set([])
+        import comfymodal_runtime.model_preload as mp
+        _clip_subfn_depth.set(1)  # simulate being inside a subfn wrapper
+        token = _ACTIVE_LANE_TRACE.set(lane)
+        try:
+            result = coq_wrapper(21)
+            assert result == 42
+        finally:
+            _ACTIVE_LANE_TRACE.reset(token)
+            _clip_subfn_depth.set(0)
+
+        # convert_old_quants should NOT be in measured children when nested
+        children = _clip_cpu_prepare_children.get() or []
+        assert len(children) == 0, (
+            f"Expected no children when nested, got: {children}"
+        )
+
+    def test_convert_old_quants_nesting_depth_participation_unet(self):
+        """The shared convert_old_quants wrapper respects UNET nesting depth
+        and does not append as direct child when called inside another wrapper."""
+        trace = RuntimeTrace(request_id="coq-unet-nest", process="remote")
+        lane = ModelLaneTrace(trace, "UNET", "restore", expected_read_count=1)
+
+        def fake_coq(x):
+            return x * 2
+
+        coq_wrapper = _make_convert_old_quants_wrapper(fake_coq)
+
+        _child_durations.set([])
+        _unet_subfn_nesting_depth.set(1)  # simulate being inside a subfn wrapper
+        token = _ACTIVE_LANE_TRACE.set(lane)
+        try:
+            result = coq_wrapper(42)
+            assert result == 84
+        finally:
+            _ACTIVE_LANE_TRACE.reset(token)
+            _unet_subfn_nesting_depth.set(0)
+
+        children = _child_durations.get() or []
+        assert len(children) == 0, (
+            f"Expected no children when nested, got: {children}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1348,6 +1743,8 @@ class TestClipConstructorAndCache:
         lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=1)
 
         def fake_original(*args, **kwargs):
+            # Simulate _on_read_completed to trigger clip_cpu_prepare_start
+            lane._on_read_completed()
             patcher = SimpleNamespace()
             patcher.cached_patcher_init = ("factory_fn", ("args",))
             clip = SimpleNamespace(patcher=patcher)
@@ -1449,6 +1846,8 @@ class TestClipConstructorAndCache:
             return clip
 
         def fake_load_clip(*args, **kwargs):
+            # Simulate _on_read_completed to trigger clip_cpu_prepare_start
+            lane._on_read_completed()
             clip = load_text_encoder_state_dicts_fake(*args, **kwargs)
             return clip
 
@@ -1489,10 +1888,604 @@ class TestClipConstructorAndCache:
             f"clip_model_patcher_constructor should not be a measured child: {child_names}"
         )
 
-        # total ≈ measured + residual
+        # post_read_total ≈ measured + residual (signed)
         total = meta["clip_cpu_prepare_total_ms"]
         measured = meta["clip_cpu_prepare_measured_children_ms"]
         residual = meta["clip_cpu_prepare_residual_ms"]
         assert abs(total - (measured + residual)) < 10.0, (
             f"total={total} != measured={measured} + residual={residual}"
         )
+        # verify file_read_total_ms is separate
+        assert "clip_file_read_total_ms" in meta
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 13. [v2.clip_cpu_children] compact summary emission
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestClipCpuChildrenSummary:
+    """_emit_clip_cpu_children_summary prints a compact [v2.clip_cpu_children] line."""
+
+    def test_emit_clip_cpu_children_summary(self):
+        """Summary line contains stable named fields plus children dict."""
+        import io
+        import contextlib
+        from comfymodal_runtime.model_preload import _emit_clip_cpu_children_summary
+
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            _emit_clip_cpu_children_summary(
+                post_read_total_ms=150.5,
+                file_read_total_ms=50.0,
+                children=[("detect_te_model", 50.2), ("load_text_encoder_state_dicts", 80.1)],
+                load_text_encoder_state_dicts_ms=80.1,
+                detect_te_model_ms=50.2,
+                state_dict_conversion_ms=5.0,
+                clip_constructor_ms=10.0,
+                model_patcher_ms=3.0,
+                cache_publish_ms=2.0,
+                measured_children_ms=130.3,
+                residual_ms=20.2,
+                status="ok",
+            )
+        output = f.getvalue()
+        assert "[v2.clip_cpu_children]" in output
+        assert "post_read_total_ms=150.5" in output
+        assert "file_read_total_ms=50.0" in output
+        assert "detect_te_model" in output
+        assert "load_text_encoder_state_dicts" in output
+        assert "measured_children_ms=130.3" in output
+        assert "residual_ms=20.2" in output
+        assert "status=ok" in output
+        assert "load_text_encoder_state_dicts_ms=80.1" in output
+        assert "detect_te_model_ms=50.2" in output
+        assert "state_dict_conversion_ms=5.0" in output
+        assert "clip_constructor_ms=10.0" in output
+        assert "model_patcher_ms=3.0" in output
+        assert "cache_publish_ms=2.0" in output
+        assert "children={" in output
+
+    def test_emit_clip_cpu_children_summary_empty_children(self):
+        """Empty children list produces empty dict."""
+        import io
+        import contextlib
+        from comfymodal_runtime.model_preload import _emit_clip_cpu_children_summary
+
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            _emit_clip_cpu_children_summary(
+                post_read_total_ms=50.0,
+                file_read_total_ms=10.0,
+                children=[],
+                measured_children_ms=0.0,
+                residual_ms=50.0,
+                status="ok",
+            )
+        output = f.getvalue()
+        assert "[v2.clip_cpu_children]" in output
+        assert "children={}" in output, f"Expected empty children dict, got: {output}"
+        assert "post_read_total_ms=50.0" in output
+        assert "file_read_total_ms=10.0" in output
+
+    def test_clip_wrapper_invokes_summary(self):
+        """The CLIP load wrapper invokes _emit_clip_cpu_children_summary
+        automatically when lane=CLIP.  Capture stdout to verify."""
+        import io
+        import contextlib
+
+        trace = RuntimeTrace(request_id="clip-summary-invoke", process="remote")
+        lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=1)
+
+        def fake_original(*args, **kwargs):
+            lane._on_read_completed()
+            # Add real time so post_read_total covers the child duration
+            time.sleep(0.02)
+            children = _clip_cpu_prepare_children.get()
+            if children is not None:
+                # Record actual elapsed time as child, like real subfn wrapper
+                _t0 = time.monotonic()
+                time.sleep(0.01)
+                _dur_ms = round((time.monotonic() - _t0) * 1000, 3)
+                children.append(("detect_te_model", _dur_ms))
+            return SimpleNamespace(patcher=SimpleNamespace())
+
+        wrapper = _make_clip_load_wrapper(fake_original)
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            token = _ACTIVE_LANE_TRACE.set(lane)
+            try:
+                wrapper(["ckpt"])
+            finally:
+                _ACTIVE_LANE_TRACE.reset(token)
+        output = f.getvalue()
+        assert "[v2.clip_cpu_children]" in output, (
+            f"Expected [v2.clip_cpu_children] in output, got: {output}"
+        )
+        assert "post_read_total_ms" in output, (
+            f"Expected post_read_total_ms in output, got: {output}"
+        )
+        assert "file_read_total_ms" in output, (
+            f"Expected file_read_total_ms in output, got: {output}"
+        )
+        assert "status=ok" in output, (
+            f"Expected status=ok in output, got: {output}"
+        )
+        assert "detect_te_model" in output
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 14. UNET named direct children with >1ms threshold
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestUnetNamedChildrenSummary:
+    """_emit_bg_unet_stages_summary includes named children with >1ms threshold."""
+
+    def test_named_children_appear_in_output(self):
+        """Named UNET children >1ms appear individually in the summary."""
+        import io
+        import contextlib
+        from comfymodal_runtime.model_preload import _emit_bg_unet_stages_summary
+
+        trace = RuntimeTrace(request_id="unet-named", process="remote_background_unet")
+        # Emit events with known durations
+        trace.emit("background_unet_submitted", phase="restore")
+        trace.emit("background_unet_worker_start", phase="restore")
+        trace.emit("unet_load_diffusion_model_state_dict_start", phase="restore")
+        trace.emit("unet_load_diffusion_model_state_dict_end", phase="restore", metadata={
+            "duration_ms": 200.0, "measured_child_total_ms": 150.0})
+        trace.emit("unet_model_config_get_model_end", phase="restore", metadata={"duration_ms": 50.0})
+        trace.emit("unet_load_model_weights_end", phase="restore", metadata={"duration_ms": 30.0})
+        trace.emit("unet_convert_old_quants_end", phase="restore", metadata={"duration_ms": 2.5})
+        trace.emit("unet_model_patcher_constructor_end", phase="restore", metadata={"duration_ms": 0.5})
+        trace.emit("unet_model_to_end", phase="restore", metadata={"duration_ms": 0.3})
+        trace.emit("unet_state_dict_prefix_replace_end", phase="restore", metadata={"duration_ms": 1.5})
+
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            _emit_bg_unet_stages_summary(trace, force=True)
+        output = f.getvalue()
+        assert "[v2.bg_unet_stages]" in output
+        # Children >1ms should appear individually
+        assert "model_config_get_model=50.0" in output
+        assert "load_model_weights=30.0" in output
+        assert "convert_old_quants=2.5" in output
+        assert "state_dict_prefix_replace=1.5" in output
+        # Children <=1ms should NOT appear individually but counted in fast_children
+        assert "fast_children_le_1ms" in output
+
+    def test_no_crash_on_empty_trace(self):
+        """Empty trace does not crash _emit_bg_unet_stages_summary."""
+        import io
+        import contextlib
+        from comfymodal_runtime.model_preload import _emit_bg_unet_stages_summary
+
+        trace = RuntimeTrace(process="remote_background_unet")
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            _emit_bg_unet_stages_summary(trace, force=True)
+        output = f.getvalue()
+        assert "[v2.bg_unet_stages]" in output
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 15. MutationLane documentation accuracy
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestMutationLaneDocs:
+    """MutationLane docs accurately describe FIFO behavior (no preemption)."""
+
+    def test_docstring_reflects_fifo_no_preemption(self):
+        """Docstring and comments must not claim priority preemption."""
+        from comfymodal_runtime.model_preload import MutationLane
+
+        doc = MutationLane.__doc__ or ""
+        # Must not claim preemption
+        assert "does NOT preempt" in doc or "FIFO" in doc, (
+            f"Docstring should describe FIFO, got:\n{doc}"
+        )
+
+    def test_acquire_docstring_no_preemption_claim(self):
+        """acquire() docstring does not claim priority preemption."""
+        from comfymodal_runtime.model_preload import MutationLane
+
+        acquire_doc = MutationLane.acquire.__doc__ or ""
+        assert "plain FIFO" in acquire_doc, (
+            f"acquire docstring should say FIFO, got:\n{acquire_doc}"
+        )
+
+    def test_priority_dict_feature_gate_comment(self):
+        """_MUTEX_PRIORITY comment says it's not used for preemption."""
+        import inspect
+        from comfymodal_runtime.model_preload import MutationLane
+
+        source = inspect.getsource(MutationLane)
+        assert "# NOTE: _MUTEX_PRIORITY is defined for documentation / forward" in source, (
+            "Missing feature-gate comment explaining _MUTEX_PRIORITY is not used"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 16. GPU installed-no-call vs unavailable classification
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestGpuNotObservedClassification:
+    """gpu_not_observed_summary distinguishes installed+no-call vs unavailable."""
+
+    def test_gpu_installed_no_call_is_not_observed(self):
+        """Installed wrapper + zero calls → not_observed."""
+        import comfymodal_runtime.model_preload as mp
+        saved = mp._gpu_wrapper_installed
+        try:
+            mp._gpu_wrapper_installed = True
+            trace = RuntimeTrace(request_id="gpu-no-call-cls", process="remote")
+            with request_execution_trace_scope(trace):
+                summary = mp.gpu_not_observed_summary()
+            assert summary["caller_classification"] == "not_observed"
+            assert summary["wrapper_status"] == "installed"
+            assert summary["count"] == 0
+        finally:
+            mp._gpu_wrapper_installed = saved
+
+    def test_gpu_installed_with_call_is_observed(self):
+        """Installed wrapper + calls → observed.
+
+        NOTE: request_execution_trace_scope resets the call count to 0 on entry,
+        so we set the count inside the scope.
+        """
+        import comfymodal_runtime.model_preload as mp
+        saved_installed = mp._gpu_wrapper_installed
+        saved_count = mp._gpu_request_call_count_var.get()
+        try:
+            mp._gpu_wrapper_installed = True
+            trace = RuntimeTrace(request_id="gpu-call-cls", process="remote")
+            with request_execution_trace_scope(trace):
+                # Count is reset to 0 by scope entry; set it inside scope
+                mp._gpu_request_call_count_var.set(3)
+                summary = mp.gpu_not_observed_summary()
+            assert summary["caller_classification"] == "observed"
+            assert summary["wrapper_status"] == "installed"
+            assert summary["count"] == 3
+        finally:
+            mp._gpu_wrapper_installed = saved_installed
+            mp._gpu_request_call_count_var.set(saved_count)
+
+    def test_gpu_unavailable_is_wrapper_unavailable(self):
+        """Wrapper not installed → wrapper_unavailable."""
+        import comfymodal_runtime.model_preload as mp
+        saved = mp._gpu_wrapper_installed
+        try:
+            mp._gpu_wrapper_installed = False
+            summary = mp.gpu_not_observed_summary()
+            assert summary["caller_classification"] == "wrapper_unavailable"
+            assert summary["wrapper_status"] == "unavailable"
+            assert summary["count"] == 0
+        finally:
+            mp._gpu_wrapper_installed = saved
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 17. Safetensors proxy get_tensor exactly once
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestSafetensorsGetTensorOnce:
+    """_SafeOpenProxy does not read materialize or duplicate get_tensor calls.
+
+    The proxy calls _orig_gt(k) exactly once per proxy.get_tensor(k) call.
+    """
+
+    def test_get_tensor_called_exactly_once_per_call(self):
+        """Each proxy.get_tensor(k) call triggers _orig_gt(k) exactly once."""
+        call_log: list[str] = []
+
+        class FakeSafeOpen:
+            def keys(self):
+                return ["a"]
+            def get_tensor(self, k):
+                call_log.append(k)
+                return SimpleNamespace(numel=lambda: 10, element_size=lambda: 2)
+
+        proxy = _SafeOpenProxy(FakeSafeOpen(), FakeSafeOpen().get_tensor, [0], [0])
+        t1 = proxy.get_tensor("a")
+        t2 = proxy.get_tensor("a")
+
+        assert len(call_log) == 2, (
+            f"Expected 2 _orig_gt calls (one per proxy call), got {len(call_log)}"
+        )
+
+    def test_proxy_no_extra_materialization(self):
+        """Proxy does not materialize tensors or call keys() on get_tensor."""
+        get_tensor_called = [False]
+
+        class FakeSafeOpen:
+            def keys(self):
+                return ["a"]
+            def get_tensor(self, k):
+                get_tensor_called[0] = True
+                return SimpleNamespace(numel=lambda: 10, element_size=lambda: 2)
+
+        proxy = _SafeOpenProxy(FakeSafeOpen(), FakeSafeOpen().get_tensor, [0], [0])
+
+        # Just get_tensor should not trigger keys() (proxy delegates to _orig_gt)
+        _ = proxy.get_tensor("a")
+        assert get_tensor_called[0], "get_tensor should be called"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 18. ModelLaneTrace _on_read_completed CLIP-specific behavior
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestOnReadCompletedClipBehavior:
+    """ModelLaneTrace._on_read_completed emits clip_cpu_prepare_start for CLIP lane."""
+
+    def test_clip_lane_emits_clip_cpu_prepare_start(self):
+        """CLIP lane _on_read_completed emits clip_cpu_prepare_start after final read."""
+        trace = RuntimeTrace(request_id="on-read-clip", process="remote")
+        lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=1)
+
+        lane._on_read_completed()  # single read
+
+        events = list(trace.events)
+        clip_start = [e for e in events if e.name == "clip_cpu_prepare_start"]
+        assert len(clip_start) == 1, (
+            f"Expected clip_cpu_prepare_start for CLIP lane, events: {[e.name for e in events]}"
+        )
+        meta = clip_start[0].metadata
+        assert meta["expected_read_count"] == 1
+        assert meta["actual_read_count"] == 1
+
+    def test_non_clip_lane_does_not_emit_clip_cpu_prepare_start(self):
+        """UNET lane _on_read_completed does NOT emit clip_cpu_prepare_start."""
+        trace = RuntimeTrace(request_id="on-read-unet", process="remote")
+        lane = ModelLaneTrace(trace, "UNET", "restore", expected_read_count=1)
+
+        lane._on_read_completed()
+
+        events = list(trace.events)
+        clip_start = [e for e in events if e.name == "clip_cpu_prepare_start"]
+        assert len(clip_start) == 0, (
+            f"UNET lane should not emit clip_cpu_prepare_start"
+        )
+
+    def test_dual_clip_two_reads(self):
+        """Two _on_read_completed calls for DualCLIP (expected=2)
+        fire clip_cpu_prepare_start on the second call."""
+        trace = RuntimeTrace(request_id="dual-clip-onread", process="remote")
+        lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=2)
+
+        lane._on_read_completed()  # first read
+        lane._on_read_completed()  # second read -> trigger
+
+        events = list(trace.events)
+        clip_start = [e for e in events if e.name == "clip_cpu_prepare_start"]
+        assert len(clip_start) == 1, (
+            f"Expected 1 clip_cpu_prepare_start after 2 reads, got {len(clip_start)}"
+        )
+        assert clip_start[0].metadata.get("actual_read_count") == 2
+
+    def test_mismatch_still_emits_clip_cpu_prepare_start(self):
+        """When read count exceeds expected, clip_cpu_prepare_start still fires."""
+        trace = RuntimeTrace(request_id="mismatch-onread", process="remote")
+        lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=1)
+
+        lane._on_read_completed()  # matches expected -> fires
+        lane._on_read_completed()  # exceeds -> no second fire
+
+        events = list(trace.events)
+        clip_start = [e for e in events if e.name == "clip_cpu_prepare_start"]
+        assert len(clip_start) == 1, "Only one clip_cpu_prepare_start regardless of mismatch"
+        assert clip_start[0].metadata.get("actual_read_count") == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 19. Corrected semantics: signed residual, overlap error, boundary tracking
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestCorrectedSemantics:
+    """Verifies signed residual, overlap_error status, under-read boundary
+    absence, file_read_total separation, and named CLIP/UNET fields."""
+
+    def test_clip_overlap_error_signed_residual(self):
+        """When children total exceeds post-read total, residual is negative
+        and status includes overlap_error."""
+        trace = RuntimeTrace(request_id="clip-overlap", process="remote")
+        lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=1)
+
+        def fake_original(*args, **kwargs):
+            lane._on_read_completed()
+            children = _clip_cpu_prepare_children.get()
+            if children is not None:
+                # Children exceed post-read total (synthetic: large children)
+                children.append(("load_text_encoder_state_dicts", 999.0))
+            return SimpleNamespace(patcher=SimpleNamespace())
+
+        wrapper = _make_clip_load_wrapper(fake_original)
+        token = _ACTIVE_LANE_TRACE.set(lane)
+        try:
+            wrapper(["ckpt"])
+        finally:
+            _ACTIVE_LANE_TRACE.reset(token)
+
+        events = list(trace.events)
+        end_events = [e for e in events if e.name == "clip_cpu_prepare_end"]
+        assert len(end_events) == 1
+        meta = end_events[0].metadata
+        residual = meta["clip_cpu_prepare_residual_ms"]
+        status = meta.get("status", "")
+        assert residual < 0, f"Expected negative residual for overlap, got {residual}"
+        assert "overlap_error" in status, (
+            f"Expected overlap_error in status, got {status!r}"
+        )
+
+        # clip_load_call_end also carries overlap_error status
+        call_end = [e for e in events if e.name == "clip_load_call_end"]
+        assert len(call_end) == 1
+        assert "overlap_error" in call_end[0].metadata.get("status", "")
+
+    def test_clip_post_read_none_when_no_read_boundary(self):
+        """When _on_read_completed is never called (no reads), post_read_total_ms
+        should be None/absent and file_read_total_ms should be None."""
+        trace = RuntimeTrace(request_id="clip-noread", process="remote")
+        lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=1)
+
+        def fake_original(*args, **kwargs):
+            # No _on_read_completed called — boundary never set
+            return SimpleNamespace(patcher=SimpleNamespace())
+
+        wrapper = _make_clip_load_wrapper(fake_original)
+        token = _ACTIVE_LANE_TRACE.set(lane)
+        try:
+            wrapper(["ckpt"])
+        finally:
+            _ACTIVE_LANE_TRACE.reset(token)
+
+        events = list(trace.events)
+        end_events = [e for e in events if e.name == "clip_cpu_prepare_end"]
+        assert len(end_events) == 1
+        meta = end_events[0].metadata
+        # post_read_total should be None (not a fake zero)
+        assert meta["clip_cpu_prepare_total_ms"] is None, (
+            f"Expected None post_read_total when no read boundary, got {meta['clip_cpu_prepare_total_ms']}"
+        )
+
+        call_end = [e for e in events if e.name == "clip_load_call_end"]
+        assert len(call_end) == 1
+        call_meta = call_end[0].metadata
+        assert call_meta.get("clip_file_read_total_ms") is None
+        assert call_meta.get("clip_post_read_cpu_total_ms") is None
+        # clip_load_call_total_ms should still be present (outer total)
+        assert "clip_load_call_total_ms" in call_meta
+
+    def test_clip_file_read_total_less_than_load_call_total(self):
+        """file_read_total + post_read_total ≤ clip_load_call_total."""
+        trace = RuntimeTrace(request_id="clip-read-sum", process="remote")
+        lane = ModelLaneTrace(trace, "CLIP", "restore", expected_read_count=1)
+
+        def fake_original(*args, **kwargs):
+            # Simulate a load_torch_file call so file_read_total is measured
+            lane.read_start()
+            time.sleep(0.030)
+            lane.read_end()
+            lane._on_read_completed()
+            time.sleep(0.010)  # post-read work
+            return SimpleNamespace(patcher=SimpleNamespace())
+
+        wrapper = _make_clip_load_wrapper(fake_original)
+        token = _ACTIVE_LANE_TRACE.set(lane)
+        try:
+            wrapper(["ckpt"])
+        finally:
+            _ACTIVE_LANE_TRACE.reset(token)
+
+        events = list(trace.events)
+        call_end = [e for e in events if e.name == "clip_load_call_end"]
+        assert len(call_end) == 1
+        meta = call_end[0].metadata
+        outer = meta["clip_load_call_total_ms"]
+        file_read = meta["clip_file_read_total_ms"]
+        post_read = meta["clip_post_read_cpu_total_ms"]
+        assert isinstance(outer, (int, float)) and outer >= 0
+        # file_read_total may be None on low-res timer systems
+        if file_read is not None:
+            assert isinstance(file_read, (int, float)) and file_read >= 0
+        assert isinstance(post_read, (int, float)) and post_read >= 0
+        # outer ≥ file_read + post_read (when file_read is measured)
+        if file_read is not None:
+            assert abs(outer - (file_read + post_read)) < 5.0, (
+                f"outer={outer} != file_read={file_read} + post_read={post_read}"
+            )
+
+    def test_unet_signed_residual_overlap_error(self):
+        """UNET SD wrapper produces signed residual and overlap_error status
+        when children exceed total."""
+        trace = RuntimeTrace(request_id="unet-overlap", process="remote")
+        lane = ModelLaneTrace(trace, "UNET", "restore", expected_read_count=1)
+
+        def fake_original(*args, **kwargs):
+            children = _child_durations.get()
+            if children is not None:
+                children.append(("load_model_weights", 999.0))
+            return {"model": "fake"}
+
+        wrapper = _make_sd_state_dict_wrapper(fake_original)
+        _child_durations.set([])
+        token = _ACTIVE_LANE_TRACE.set(lane)
+        try:
+            wrapper("config", {})
+        finally:
+            _ACTIVE_LANE_TRACE.reset(token)
+
+        events = list(trace.events)
+        end_events = [e for e in events if e.name == "unet_load_diffusion_model_state_dict_end"]
+        assert len(end_events) == 1
+        meta = end_events[0].metadata
+        residual = meta["model_construction_residual_ms"]
+        assert residual < 0, f"Expected negative residual, got {residual}"
+        assert meta.get("status") == "overlap_error", (
+            f"Expected overlap_error, got {meta.get('status')}"
+        )
+
+    def test_clip_cpu_children_summary_named_fields_absent_when_unavailable(self):
+        """Named fields in [v2.clip_cpu_children] show None when unavailable."""
+        import io
+        import contextlib
+        from comfymodal_runtime.model_preload import _emit_clip_cpu_children_summary
+
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            _emit_clip_cpu_children_summary(
+                post_read_total_ms=100.0,
+                file_read_total_ms=30.0,
+                children=[],
+                load_text_encoder_state_dicts_ms=None,
+                detect_te_model_ms=None,
+                state_dict_conversion_ms=None,
+                clip_constructor_ms=None,
+                model_patcher_ms=None,
+                cache_publish_ms=None,
+                measured_children_ms=0.0,
+                residual_ms=100.0,
+                status="ok",
+            )
+        output = f.getvalue()
+        assert "load_text_encoder_state_dicts_ms=None" in output
+        assert "detect_te_model_ms=None" in output
+        assert "state_dict_conversion_ms=None" in output
+        assert "clip_constructor_ms=None" in output
+        assert "model_patcher_ms=None" in output
+        assert "cache_publish_ms=None" in output
+        # No invented zeroes
+        assert "load_text_encoder_state_dicts_ms=0" not in output
+
+    def test_unet_named_children_aggregation(self):
+        """UNET _emit_bg_unet_stages_summary aggregates duplicate named events
+        instead of overwriting."""
+        import io
+        import contextlib
+        from comfymodal_runtime.model_preload import _emit_bg_unet_stages_summary
+
+        trace = RuntimeTrace(request_id="unet-agg", process="remote_background_unet")
+        trace.emit("background_unet_submitted", phase="restore")
+        trace.emit("background_unet_worker_start", phase="restore")
+        trace.emit("unet_load_diffusion_model_state_dict_end", phase="restore", metadata={
+            "duration_ms": 300.0, "measured_child_total_ms": 250.0})
+        # Duplicate named event
+        trace.emit("unet_load_model_weights_end", phase="restore", metadata={"duration_ms": 20.0})
+        trace.emit("unet_load_model_weights_end", phase="restore", metadata={"duration_ms": 15.0})
+        trace.emit("unet_model_config_get_model_end", phase="restore", metadata={"duration_ms": 50.0})
+
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            _emit_bg_unet_stages_summary(trace, force=True)
+        output = f.getvalue()
+        # load_model_weights should be aggregated: 20 + 15 = 35
+        assert "load_model_weights=35.0" in output, (
+            f"Expected load_model_weights=35.0 in output, got: {output}"
+        )
+        assert "model_config_get_model=50.0" in output

@@ -581,7 +581,8 @@ def test_exception_restores_add_message():
 
 
 def test_exception_releases_mutation_lane():
-    """When execute raises, the sampler mutation lane is released."""
+    """When execute raises and lane was acquired for a sampler node,
+    the sampler mutation lane is released in the outer finally."""
     import threading
     _lane_released = [False]
 
@@ -589,6 +590,11 @@ def test_exception_releases_mutation_lane():
         def __init__(self):
             self._locked = threading.Lock()
             self._locked.acquire()
+            self._owner = None
+
+        @property
+        def owner(self) -> str | None:
+            return self._owner
 
         def acquire(self, _owner: str) -> None:
             pass
@@ -601,6 +607,8 @@ def test_exception_releases_mutation_lane():
                 pass
 
     executor = _FakeExecutor(use_async=True, raise_on_execute=True)
+    executor.add_message = lambda e, *a, **kw: None
+    executor.server = SimpleNamespace(send_sync=lambda *a, **kw: None)
 
     api = _build_fake_api(executor)
     entrypoint = modal_app.ModalRuntimeEntrypoint()
@@ -610,6 +618,17 @@ def test_exception_releases_mutation_lane():
     plan = _build_minimal_plan()
     trace = RuntimeTrace(request_id="test-exc-lane", process="remote")
     context = ExecutionContext(request_id="test-exc-lane", trace=trace)
+
+    original_execute = executor.execute_async
+
+    async def _wrapped_execute(**kwargs):
+        # Simulate send_sync with a KSampler node to trigger lane acquisition
+        executor.add_message("execution_start")
+        executor.add_message("execution_cached")
+        executor.server.send_sync("executing", {"node": "1"})
+        await original_execute(**kwargs)
+
+    executor.execute_async = _wrapped_execute  # type: ignore[assignment]
 
     fake_execution = SimpleNamespace(
         validate_prompt=_async_validate,
@@ -1015,7 +1034,8 @@ def test_milestones_first_model_loader_clip_sampler():
     assert isinstance(ps.get("first_loader_node_monotonic_ns"), int)
     assert isinstance(ps.get("first_clip_encode_node_monotonic_ns"), int)
     assert isinstance(ps.get("first_sampler_node_monotonic_ns"), int)
-    assert isinstance(ps.get("first_sampler_stage_monotonic_ns"), int)
+    # first_sampler_stage_monotonic_ns is None since no actual stage event fired
+    assert ps.get("first_sampler_stage_monotonic_ns") is None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1140,8 +1160,6 @@ def test_setup_intervals_non_overlapping():
         "executor_reset_start",
         "executor_reset_end",
         "pregraph_setup_end",
-        "sampler_lane_wait_start",
-        "sampler_lane_wait_end",
         "prompt_executor_invoke_start",
         "prompt_executor_invoke_end",
     ]
@@ -1217,14 +1235,16 @@ def test_monotonic_ns_captures_in_milestones():
     assert ms.get("first_loader_node_id") == "10"
     assert ms.get("first_clip_encode_node_id") == "5"
     assert ms.get("first_sampler_node_id") == "6"
-    # first_sampler_stage_event should be 'executing' since sampler was classified via executing event
-    assert ms.get("first_sampler_stage_event") == "executing"
+    # first_sampler_stage_event is NOT set from the executing event
+    # (only from actual sampler_start/sampling_start events)
+    assert ms.get("first_sampler_stage_event") in ("", None)
+    # first_sampler_stage_monotonic_ns is None since no sampler stage event fired
+    assert ms.get("first_sampler_stage_monotonic_ns") is None
     # Raw monotonic-ns fields present in milestones metadata
     assert isinstance(ms.get("first_executing_node_monotonic_ns"), int)
     assert isinstance(ms.get("first_loader_node_monotonic_ns"), int)
     assert isinstance(ms.get("first_clip_encode_node_monotonic_ns"), int)
     assert isinstance(ms.get("first_sampler_node_monotonic_ns"), int)
-    assert isinstance(ms.get("first_sampler_stage_monotonic_ns"), int)
     # Same-event timestamps must be equal (loaded via a single _event_ns)
     assert ms["first_loader_node_monotonic_ns"] == ms["first_executing_node_monotonic_ns"]
 
@@ -1233,7 +1253,8 @@ def test_monotonic_ns_captures_in_milestones():
     assert ps.get("first_loader_node_id") == "10"
     assert ps.get("first_clip_encode_node_id") == "5"
     assert ps.get("first_sampler_node_id") == "6"
-    assert ps.get("first_sampler_stage_event") == "executing"
+    # first_sampler_stage_event is absent/empty since no actual stage event fired
+    assert ps.get("first_sampler_stage_event") in ("", None)
     # first_loader_node_class should be propagated
     assert ps.get("first_loader_node_class") == "CheckpointLoaderSimple"
     # Raw monotonic-ns fields in pre_sampler_stages metadata
@@ -1241,7 +1262,8 @@ def test_monotonic_ns_captures_in_milestones():
     assert isinstance(ps.get("first_loader_node_monotonic_ns"), int)
     assert isinstance(ps.get("first_clip_encode_node_monotonic_ns"), int)
     assert isinstance(ps.get("first_sampler_node_monotonic_ns"), int)
-    assert isinstance(ps.get("first_sampler_stage_monotonic_ns"), int)
+    # first_sampler_stage_monotonic_ns is None since no actual stage event fired
+    assert ps.get("first_sampler_stage_monotonic_ns") is None
 
 
 def test_monotonic_ns_first_sampler_stage_event_from_sampler_stage():
@@ -1273,7 +1295,7 @@ def test_monotonic_ns_first_sampler_stage_event_from_sampler_stage():
     async def _wrapped_execute(**kwargs):
         executor.add_message("execution_start")
         executor.add_message("execution_cached")
-        executor.server.send_sync("executing", {"node": "5"})  # not sampler
+        executor.server.send_sync("executing", {"node": "1"})  # KSampler from _build_minimal_plan
         executor.server.send_sync("sampling_start", {})  # sampler stage event
         await original_execute(**kwargs)
 
@@ -1564,20 +1586,32 @@ def test_node_to_node_intervals_loader_first_then_clip_then_sampler():
     ps = [e for e in trace.events if e.name == "pre_sampler_stages"][0].metadata
     ms = [e for e in trace.events if e.name == "prompt_executor_milestones"][0].metadata
 
-    # All three node-to-node intervals should be present in both events
-    for source, label in [(ms, "milestones"), (ps, "pre_sampler_stages")]:
-        first_node_to_clip = source.get("first_node_to_clip_ms")
-        clip_to_sampler = source.get("clip_to_sampler_node_ms")
-        sampler_to_stage = source.get("sampler_node_to_sampler_start_ms")
+    # Verify milestones has standard node-to-node intervals
+    first_node_to_clip_ms = ms.get("first_node_to_clip_ms")
+    clip_to_sampler_ms = ms.get("clip_to_sampler_node_ms")
+    assert first_node_to_clip_ms is not None, "first_node_to_clip_ms absent from milestones"
+    assert clip_to_sampler_ms is not None, "clip_to_sampler_node_ms absent from milestones"
+    assert first_node_to_clip_ms >= 0
+    assert clip_to_sampler_ms >= 0
+    # sampler_node_to_sampler_start_ms is None because the stage timestamp
+    # is no longer set from the executing event in milestones.
+    assert ms.get("sampler_node_to_sampler_start_ms") is None
 
-        assert first_node_to_clip is not None, f"first_node_to_clip_ms absent from {label}"
-        assert clip_to_sampler is not None, f"clip_to_sampler_node_ms absent from {label}"
-        assert sampler_to_stage is not None, f"sampler_node_to_sampler_start_ms absent from {label}"
-
-        # All intervals must be non-negative
-        assert first_node_to_clip >= 0, f"first_node_to_clip_ms={first_node_to_clip} negative in {label}"
-        assert clip_to_sampler >= 0, f"clip_to_sampler_node_ms={clip_to_sampler} negative in {label}"
-        assert sampler_to_stage >= 0, f"sampler_node_to_sampler_start_ms={sampler_to_stage} negative in {label}"
+    # Verify pre_sampler_stages has the new decomposed intervals
+    first_node_to_clip_ps = ps.get("first_node_to_clip_ms")
+    clip_to_sampler_ps = ps.get("clip_to_sampler_node_ms")
+    assert first_node_to_clip_ps is not None, "first_node_to_clip_ms absent from pre_sampler_stages"
+    assert clip_to_sampler_ps is not None, "clip_to_sampler_node_ms absent from pre_sampler_stages"
+    assert first_node_to_clip_ps >= 0
+    assert clip_to_sampler_ps >= 0
+    # sampler_node_to_sampler_start_ms is absent (decomposed into the two new intervals)
+    assert ps.get("sampler_node_to_sampler_start_ms") is None
+    # The new sampler_node_to_lane_acquired_ms should be present (0.0 or small)
+    node_to_lane = ps.get("sampler_node_to_lane_acquired_ms")
+    assert node_to_lane is not None, "sampler_node_to_lane_acquired_ms absent from pre_sampler_stages"
+    assert node_to_lane >= 0
+    # lane_acquired_to_actual_stage_ms is None since no sampler stage event fired
+    assert ps.get("lane_acquired_to_actual_stage_ms") is None
 
     # Verify ordering: first_node_to_clip <= clip_to_sampler + sampler_to_stage (approximate)
     # Since first_executing_node is the loader (node 10), first_node_to_clip goes from loader→clip
@@ -1637,13 +1671,311 @@ def test_sampler_as_first_node_gives_zero_intervals():
     assert ps.get("first_node_to_clip_ms") is None
     assert ps.get("clip_to_sampler_node_ms") is None
 
-    # sampler_node_to_sampler_start_ms may be 0.0 or small (same event)
-    sampler_to_stage = ps.get("sampler_node_to_sampler_start_ms")
-    # 0.0 is valid for the same executing sampler-stage event
-    assert sampler_to_stage is not None, "sampler_node_to_sampler_start_ms should exist when sampler is first"
-    assert sampler_to_stage >= 0, f"sampler_node_to_sampler_start_ms={sampler_to_stage} must be >= 0"
+    # sampler_node_to_sampler_start_ms is None because first_sampler_stage_ns
+    # is no longer set from the executing event (only from actual
+    # sampler_start/sampling_start/sampler_stage_start/progress events).
+    assert ps.get("sampler_node_to_sampler_start_ms") is None
 
     # first_sampler_node_id = "6"
     assert ps.get("first_sampler_node_id") == "6"
     assert ms.get("first_sampler_node_id") == "6"
-    assert ms.get("first_sampler_stage_event") == "executing"
+    # first_sampler_stage_event is absent/empty since no actual stage event fired
+    assert ms.get("first_sampler_stage_event") in ("", None)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# overlapping_intervals field (Fix 1)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def test_overlapping_intervals_present_on_overlap_error():
+    """When measured_children_ms > pre_sampler_total_ms, overlapping_intervals
+    lists the contributing interval names.  It must be a list of strings."""
+    executor = _FakeExecutor(use_async=True)
+    _add_msgs: list[str] = []
+    _send_syncs: list[tuple] = []
+
+    def _add_msg(event: str, *a, **kw):
+        _add_msgs.append(event)
+
+    def _send_sync(event: str, data: dict | None = None, *a, **kw):
+        _send_syncs.append((event, data))
+
+    executor.add_message = _add_msg
+    executor.server = SimpleNamespace(send_sync=_send_sync)
+
+    api = _build_fake_api(executor)
+    entrypoint = modal_app.ModalRuntimeEntrypoint()
+    entrypoint._legacy_module = SimpleNamespace()
+
+    plan = _build_minimal_plan()
+    trace = RuntimeTrace(request_id="test-overlap-list", process="remote")
+    context = ExecutionContext(request_id="test-overlap-list", trace=trace)
+
+    original_execute = executor.execute_async
+
+    async def _wrapped_execute(**kwargs):
+        executor.add_message("execution_start")
+        executor.add_message("execution_cached")
+        executor.server.send_sync("executing", {"node": "6"})  # KSampler
+        executor.server.send_sync("executing", {"node": "1"})
+        executor.server.send_sync("sampler_start", {})
+        await original_execute(**kwargs)
+
+    executor.execute_async = _wrapped_execute  # type: ignore[assignment]
+
+    fake_execution = SimpleNamespace(validate_prompt=_async_validate_107)
+    with patch.dict("sys.modules", {"execution": fake_execution}):
+        asyncio.run(
+            entrypoint._execute_v2_prompt_executor(plan, context, api, trace)
+        )
+
+    ps = [e for e in trace.events if e.name == "pre_sampler_stages"][0].metadata
+
+    # overlapping_intervals must always be present in metadata
+    assert "overlapping_intervals" in ps, (
+        "overlapping_intervals must be present in pre_sampler_stages metadata"
+    )
+    oi = ps["overlapping_intervals"]
+    assert isinstance(oi, (list, tuple)), "overlapping_intervals must be a list or tuple"
+    # When no overlap error, the list contains all contributed names
+    # (non-overlap path populates all present intervals)
+    assert len(oi) > 0, "should contain at least the non-None interval names"
+    # Verify known interval names are present
+    assert "invoke_to_execution_start_ms" in oi
+    assert "execution_start_to_cached_ms" in oi
+    assert "cached_to_first_node_ms" in oi
+    # sampler_stage event was captured, so lane_acquired_to_actual_stage_ms
+    # should be present if lane was acquired
+    # (lane acquired because first executing node is KSampler)
+
+
+def test_overlapping_intervals_list_format():
+    """overlapping_intervals is always present and contains strings."""
+    executor = _FakeExecutor(use_async=True)
+    api = _build_fake_api(executor)
+    entrypoint = modal_app.ModalRuntimeEntrypoint()
+    entrypoint._legacy_module = SimpleNamespace()
+
+    plan = _build_minimal_plan()
+    trace = RuntimeTrace(request_id="test-overlap-format", process="remote")
+    context = ExecutionContext(request_id="test-overlap-format", trace=trace)
+
+    fake_execution = SimpleNamespace(validate_prompt=_async_validate)
+    with patch.dict("sys.modules", {"execution": fake_execution}):
+        asyncio.run(
+            entrypoint._execute_v2_prompt_executor(plan, context, api, trace)
+        )
+
+    ps = [e for e in trace.events if e.name == "pre_sampler_stages"][0].metadata
+    assert "overlapping_intervals" in ps
+    oi = ps["overlapping_intervals"]
+    assert isinstance(oi, (list, tuple)), f"Expected list/tuple, got {type(oi)}: {oi}"
+    # All entries should be strings
+    for name in oi:
+        assert isinstance(name, str), f"Expected string, got {type(name)}: {name}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# GPU observation classification (Fix 2)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def test_gpu_observation_classification_present_in_result():
+    """gpu_observation_classification metadata is set on the result
+    from _run_in_process with the four expected boolean keys.
+    This exercises the full classification path including the
+    _execute_v2_prompt_executor + gpu_not_observed_summary + trace scan."""
+    executor = _FakeExecutor(use_async=True)
+    _add_msgs: list[str] = []
+
+    def _add_msg(event: str, *a, **kw):
+        _add_msgs.append(event)
+
+    executor.add_message = _add_msg
+    executor.server = SimpleNamespace(send_sync=lambda *a, **kw: None)
+
+    api = _build_fake_api(executor)
+    entrypoint = modal_app.ModalRuntimeEntrypoint()
+    entrypoint._legacy_module = SimpleNamespace()
+
+    # Mock _configure_runtime and _load_legacy_runtime so _run_in_process
+    # can proceed without real Modal/ComfyUI dependencies.
+    entrypoint._configure_runtime = lambda: None  # type: ignore[method-assign]
+    entrypoint._load_legacy_runtime = lambda: api  # type: ignore[method-assign]
+    # Mock preload_bridge methods needed by _run_in_process
+    entrypoint._preload_bridge.schedule_execution_prefill = lambda **kw: None
+    from contextlib import nullcontext
+    entrypoint._preload_bridge.request_scope = lambda: nullcontext()
+    entrypoint._preload_bridge.drain_worker_events = lambda _trace: None
+    entrypoint._preload_bridge.close_workers = lambda: None
+    # Mock the legacy background threads
+    entrypoint._join_legacy_background_threads = lambda _api, **kw: 0  # type: ignore[method-assign]
+
+    plan = _build_minimal_plan()
+    trace = RuntimeTrace(request_id="test-gpu-class", process="remote")
+    context = ExecutionContext(request_id="test-gpu-class", trace=trace)
+
+    original_execute = executor.execute_async
+
+    async def _wrapped_execute(**kwargs):
+        executor.add_message("execution_start")
+        executor.add_message("execution_cached")
+        executor.server.send_sync("executing", {"node": "1"})
+        await original_execute(**kwargs)
+
+    executor.execute_async = _wrapped_execute  # type: ignore[assignment]
+
+    fake_execution = SimpleNamespace(validate_prompt=_async_validate_107)
+    with patch.dict("sys.modules", {"execution": fake_execution}):
+        result = asyncio.run(
+            entrypoint._run_in_process(plan, context)
+        )
+
+    # The classification is set on the execution trace inside result
+    exec_trace = result.get("trace", {})
+    if isinstance(exec_trace, dict):
+        trace_meta = exec_trace.get("metadata", {})
+    else:
+        trace_meta = getattr(exec_trace, "_metadata", {})
+
+    gpu_class = trace_meta.get("gpu_observation_classification", None)
+    assert gpu_class is not None, (
+        "gpu_observation_classification must be set in result trace metadata"
+    )
+    assert isinstance(gpu_class, dict)
+    # All four expected keys
+    for key in ("wrapper_installed", "wrapper_calls_observed",
+                "graph_gpu_load_observed", "sampler_setup_observed"):
+        assert key in gpu_class, f"Expected key {key} in gpu_observation_classification"
+        assert isinstance(gpu_class[key], bool), (
+            f"{key} must be bool, got {type(gpu_class[key])}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# progress gating on first_sampler_node (Fix 3)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def test_progress_before_sampler_node_ignored():
+    """progress fired before any sampler node is executing must NOT set
+    first_sampler_stage_ns / first_sampler_stage_event.  The wrapper
+    only accepts progress after a sampler node has been observed."""
+    executor = _FakeExecutor(use_async=True)
+    _add_msgs: list[str] = []
+    _send_syncs: list[tuple] = []
+
+    def _add_msg(event: str, *a, **kw):
+        _add_msgs.append(event)
+
+    def _send_sync(event: str, data: dict | None = None, *a, **kw):
+        _send_syncs.append((event, data))
+
+    executor.add_message = _add_msg
+    executor.server = SimpleNamespace(send_sync=_send_sync)
+
+    api = _build_fake_api(executor)
+    entrypoint = modal_app.ModalRuntimeEntrypoint()
+    entrypoint._legacy_module = SimpleNamespace()
+
+    plan = ExecutionPlan(
+        workflow={
+            "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "cat"}},
+            "6": {"class_type": "KSampler", "inputs": {}},
+        },
+        execution_options=ExecutionOptions(production_enabled=False),
+    )
+    trace = RuntimeTrace(request_id="test-progress-gate", process="remote")
+    context = ExecutionContext(request_id="test-progress-gate", trace=trace)
+
+    original_execute = executor.execute_async
+
+    async def _wrapped_execute(**kwargs):
+        executor.add_message("execution_start")
+        executor.add_message("execution_cached")
+        # progress fires BEFORE any sampler node executing — should be ignored
+        executor.server.send_sync("progress", {"node": "5"})
+        # now CLIP encode executes
+        executor.server.send_sync("executing", {"node": "5"})
+        await original_execute(**kwargs)
+
+    executor.execute_async = _wrapped_execute  # type: ignore[assignment]
+
+    fake_execution = SimpleNamespace(validate_prompt=_async_validate_107)
+    with patch.dict("sys.modules", {"execution": fake_execution}):
+        asyncio.run(
+            entrypoint._execute_v2_prompt_executor(plan, context, api, trace)
+        )
+
+    ps = [e for e in trace.events if e.name == "pre_sampler_stages"][0].metadata
+    # first_sampler_stage_event should be empty/absent — progress was
+    # ignored because no sampler node was observed yet
+    assert ps.get("first_sampler_stage_event") in ("", None), (
+        f"progress before sampler node must be ignored, "
+        f"got first_sampler_stage_event={ps.get('first_sampler_stage_event')!r}"
+    )
+    assert ps.get("first_sampler_stage_monotonic_ns") is None, (
+        "progress before sampler node must not set first_sampler_stage_monotonic_ns"
+    )
+
+
+def test_progress_after_sampler_node_accepted():
+    """progress fired AFTER sampler node executing is valid and sets
+    first_sampler_stage_event='progress'."""
+    executor = _FakeExecutor(use_async=True)
+    _add_msgs: list[str] = []
+    _send_syncs: list[tuple] = []
+
+    def _add_msg(event: str, *a, **kw):
+        _add_msgs.append(event)
+
+    def _send_sync(event: str, data: dict | None = None, *a, **kw):
+        _send_syncs.append((event, data))
+
+    executor.add_message = _add_msg
+    executor.server = SimpleNamespace(send_sync=_send_sync)
+
+    api = _build_fake_api(executor)
+    entrypoint = modal_app.ModalRuntimeEntrypoint()
+    entrypoint._legacy_module = SimpleNamespace()
+
+    plan = ExecutionPlan(
+        workflow={
+            "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "cat"}},
+            "6": {"class_type": "KSampler", "inputs": {}},
+        },
+        execution_options=ExecutionOptions(production_enabled=False),
+    )
+    trace = RuntimeTrace(request_id="test-progress-accept", process="remote")
+    context = ExecutionContext(request_id="test-progress-accept", trace=trace)
+
+    original_execute = executor.execute_async
+
+    async def _wrapped_execute(**kwargs):
+        executor.add_message("execution_start")
+        executor.add_message("execution_cached")
+        # CLIP encode executes first
+        executor.server.send_sync("executing", {"node": "5"})
+        # Sampler executes
+        executor.server.send_sync("executing", {"node": "6"})
+        # progress fires AFTER sampler node — should be accepted
+        executor.server.send_sync("progress", {})
+        await original_execute(**kwargs)
+
+    executor.execute_async = _wrapped_execute  # type: ignore[assignment]
+
+    fake_execution = SimpleNamespace(validate_prompt=_async_validate_107)
+    with patch.dict("sys.modules", {"execution": fake_execution}):
+        asyncio.run(
+            entrypoint._execute_v2_prompt_executor(plan, context, api, trace)
+        )
+
+    ps = [e for e in trace.events if e.name == "pre_sampler_stages"][0].metadata
+    assert ps.get("first_sampler_stage_event") == "progress", (
+        f"progress after sampler node must be accepted, "
+        f"got first_sampler_stage_event={ps.get('first_sampler_stage_event')!r}"
+    )
+    assert ps.get("first_sampler_stage_monotonic_ns") is not None, (
+        "first_sampler_stage_monotonic_ns must be set when progress is accepted"
+    )

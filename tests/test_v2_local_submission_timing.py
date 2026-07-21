@@ -385,6 +385,13 @@ class TestExecutePlanLocalTiming(unittest.TestCase):
             "payload_serialize_ms",
             "generator_create_ms",
             "local_residual_ms",
+            "clock_reconciliation_residual_ms",
+            "route_unattributed_ms",
+            "worker_unattributed_ms",
+            "reconciliation_status",
+            "missing_stages",
+            "overlap_error",
+            "stage_attribution_residual_ms",
             "local_receive_to_generator_create_ms",
             "generator_create_to_first_iteration_ms",
             "first_iteration_to_first_remote_event_ms",
@@ -1235,6 +1242,461 @@ class TestResidualReconciliation(unittest.TestCase):
             self.assertIn("local_residual_ms", lt)
             self.assertIsNotNone(lt["local_residual_ms"])
             self.assertIsInstance(lt["local_residual_ms"], (int, float))
+
+        asyncio.run(run())
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Clock reconciliation residual
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestClockReconciliationResidual(unittest.TestCase):
+    """clock_reconciliation_residual_ms equals local_residual_ms (same
+    formula: authoritative submission minus aggregate adjacent transport
+    intervals).  local_residual_ms is a compatibility alias."""
+
+    def test_clock_reconciliation_equals_local_residual(self):
+        """clock_reconciliation equals local_residual when transport intervals present."""
+        async def stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            trace = RuntimeTrace(request_id="clock-rec-test", process="local")
+            origin = _make_origin("clock-rec-test", t0_wall_ms=100_000)
+            trace.set_metadata(request_origin_info=origin)
+            trace.set_metadata(
+                local_receive_to_generator_create_ms=10.0,
+                generator_create_ms=2.0,
+                generator_create_to_first_iteration_ms=1.0,
+                local_receive_to_actual_submission_ms=15.0,
+            )
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="clock-rec-test",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=stream)
+            result = await execute_plan(plan, transport=transport, trace=trace)
+            lt = result.get("local_timing", {})
+            self.assertIn("clock_reconciliation_residual_ms", lt)
+            self.assertIn("local_residual_ms", lt)
+            if lt["local_residual_ms"] is not None:
+                self.assertAlmostEqual(
+                    lt["clock_reconciliation_residual_ms"],
+                    lt["local_residual_ms"],
+                    places=3,
+                )
+                # 15.0 - (10.0 + 2.0 + 1.0) = 2.0
+                self.assertAlmostEqual(lt["clock_reconciliation_residual_ms"], 2.0, places=2)
+
+        asyncio.run(run())
+
+    def test_clock_reconciliation_none_when_submission_unavailable(self):
+        """clock_reconciliation_residual_ms is None when submission or
+        transport intervals are missing."""
+        async def stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            trace = RuntimeTrace(request_id="clock-rec-none", process="local")
+            origin = {
+                "request_id": "clock-rec-none",
+                "trigger_source": "test",
+                "local_receive_wall_ns": int(time.time() * 1_000_000_000),
+                "local_receive_mono_ns": time.monotonic_ns(),
+            }
+            trace.set_metadata(request_origin_info=origin)
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="clock-rec-none",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=stream)
+            result = await execute_plan(plan, transport=transport, trace=trace)
+            lt = result.get("local_timing", {})
+            self.assertIn("clock_reconciliation_residual_ms", lt)
+            self.assertIn("local_residual_ms", lt)
+            # clock_reconciliation_residual_ms is alias of local_residual_ms
+            self.assertEqual(
+                lt["clock_reconciliation_residual_ms"],
+                lt["local_residual_ms"],
+            )
+
+        asyncio.run(run())
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Stage attribution residual
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestStageAttributionResidual(unittest.TestCase):
+    """stage_attribution_residual_ms dict with route/worker attribution."""
+
+    def test_stage_attribution_present(self):
+        """stage_attribution_residual_ms exists in local_timing."""
+        async def stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            trace = RuntimeTrace(request_id="stage-attr-test", process="local")
+            origin = _make_origin("stage-attr-test")
+            trace.set_metadata(request_origin_info=origin)
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="stage-attr-test",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=stream)
+            result = await execute_plan(plan, transport=transport, trace=trace)
+            lt = result.get("local_timing", {})
+            self.assertIn("stage_attribution_residual_ms", lt)
+            sar = lt["stage_attribution_residual_ms"]
+            self.assertIsInstance(sar, dict)
+            self.assertIn("route_unattributed_ms", sar)
+            self.assertIn("worker_unattributed_ms", sar)
+            self.assertIn("reconciliation_status", sar)
+            self.assertIn("overlap_error", sar)
+
+        asyncio.run(run())
+
+    def test_route_attribution_computes_residual(self):
+        """route_unattributed_ms = local_receive_to_enqueue_ms minus leaf sum."""
+        async def stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            trace = RuntimeTrace(request_id="route-attr", process="local")
+            origin = _make_origin("route-attr")
+            # leaf stages sum to 4.9 (1.5 + 0.8 + 2.1 + 0.3 + 0.2)
+            origin["local_body_read_ms"] = 1.5
+            origin["local_json_parse_ms"] = 0.8
+            origin["local_preflight_ms"] = 2.1
+            origin["local_queue_lock_wait_ms"] = 0.3
+            origin["local_queue_enqueue_ms"] = 0.2
+            origin["local_receive_to_enqueue_ms"] = 5.0
+            trace.set_metadata(request_origin_info=origin)
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="route-attr",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=stream)
+            result = await execute_plan(plan, transport=transport, trace=trace)
+            lt = result.get("local_timing", {})
+            sar = lt.get("stage_attribution_residual_ms", {})
+            # 5.0 - (1.5 + 0.8 + 2.1 + 0.3 + 0.2) = 5.0 - 4.9 = 0.1
+            self.assertAlmostEqual(sar.get("route_unattributed_ms"), 0.1, places=3)
+
+        asyncio.run(run())
+
+    def test_route_overlap_error_when_leaf_sum_exceeds_parent(self):
+        """overlap_error is set when leaves sum > local_receive_to_enqueue_ms."""
+        async def stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            trace = RuntimeTrace(request_id="route-overlap", process="local")
+            origin = _make_origin("route-overlap")
+            origin["local_body_read_ms"] = 3.0
+            origin["local_json_parse_ms"] = 2.0
+            origin["local_preflight_ms"] = 2.0
+            origin["local_queue_lock_wait_ms"] = 1.0
+            origin["local_queue_enqueue_ms"] = 1.0
+            origin["local_receive_to_enqueue_ms"] = 5.0  # leaves sum to 9.0 > 5.0
+            trace.set_metadata(request_origin_info=origin)
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="route-overlap",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=stream)
+            result = await execute_plan(plan, transport=transport, trace=trace)
+            lt = result.get("local_timing", {})
+            sar = lt.get("stage_attribution_residual_ms", {})
+            self.assertLess(sar.get("route_unattributed_ms", 0), 0)
+            self.assertEqual(sar.get("overlap_error"), "route")
+
+        asyncio.run(run())
+
+    def test_worker_attribution_computed_when_all_known(self):
+        """worker_unattributed_ms computed from worker span minus leaf stages."""
+        async def stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            trace = RuntimeTrace(request_id="worker-attr", process="local")
+            origin = _make_origin("worker-attr")
+            origin["local_receive_to_enqueue_ms"] = 5.0
+            origin["queue_wait_before_worker_ms"] = 45.0
+            trace.set_metadata(request_origin_info=origin)
+            _wall = time.time()
+            _mono = time.monotonic_ns()
+            for _name in ("plan_build_start", "plan_build_end",
+                           "active_profile_prepare_start", "active_profile_prepare_end",
+                           "restore_plan_build_start", "restore_plan_build_end",
+                           "restore_plan_publish_start", "restore_plan_publish_end",
+                           "modal_handle_lookup_start", "modal_handle_lookup_end",
+                           "modal_payload_serialize_start", "modal_payload_serialize_end"):
+                trace.emit(_name, phase="local", metadata={"wall": _wall, "mono": _mono})
+                _wall += 0.001
+                _mono += 1_000_000
+            trace.set_metadata(
+                local_receive_to_actual_submission_ms=80.0,
+                generator_create_ms=5.0,
+                generator_create_to_first_iteration_ms=2.0,
+            )
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="worker-attr",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=stream)
+            result = await execute_plan(plan, transport=transport, trace=trace)
+            lt = result.get("local_timing", {})
+            sar = lt.get("stage_attribution_residual_ms", {})
+            self.assertIsNotNone(sar.get("worker_unattributed_ms"))
+
+        asyncio.run(run())
+
+    def test_incomplete_when_route_parent_absent(self):
+        """reconciliation_status=incomplete when local_receive_to_enqueue_ms is missing."""
+        async def stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            trace = RuntimeTrace(request_id="incomplete-test", process="local")
+            origin = {
+                "request_id": "incomplete-test",
+                "trigger_source": "test",
+                "local_receive_wall_ns": int(time.time() * 1_000_000_000),
+                "local_receive_mono_ns": time.monotonic_ns(),
+            }
+            trace.set_metadata(request_origin_info=origin)
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="incomplete-test",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=stream)
+            result = await execute_plan(plan, transport=transport, trace=trace)
+            lt = result.get("local_timing", {})
+            sar = lt.get("stage_attribution_residual_ms", {})
+            self.assertIsNone(sar.get("route_unattributed_ms"))
+            self.assertEqual(sar.get("reconciliation_status"), "incomplete")
+            self.assertIn("missing_stages", sar)
+
+        asyncio.run(run())
+
+    def test_incomplete_when_worker_missing(self):
+        """reconciliation_status=incomplete when worker stages are missing."""
+        async def stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            trace = RuntimeTrace(request_id="worker-missing", process="local")
+            origin = _make_origin("worker-missing")
+            trace.set_metadata(request_origin_info=origin)
+            # No transport meta, no trace events → worker leaves all missing
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="worker-missing",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=stream)
+            result = await execute_plan(plan, transport=transport, trace=trace)
+            lt = result.get("local_timing", {})
+            sar = lt.get("stage_attribution_residual_ms", {})
+            self.assertEqual(sar.get("reconciliation_status"), "incomplete")
+            self.assertIn("missing_stages", sar)
+
+        asyncio.run(run())
+
+    def test_worker_does_not_include_first_remote_event(self):
+        """first_iteration_to_first_remote_event_ms is never in worker leaf sum."""
+        async def stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            trace = RuntimeTrace(request_id="worker-no-first-event", process="local")
+            origin = _make_origin("worker-no-first-event")
+            trace.set_metadata(request_origin_info=origin)
+            # Emit non-auto-emitted leaf events so all stages are present
+            _wall = time.time()
+            _mono = time.monotonic_ns()
+            for _name in ("plan_build_start", "plan_build_end",
+                           "modal_handle_lookup_start", "modal_handle_lookup_end",
+                           "modal_payload_serialize_start", "modal_payload_serialize_end"):
+                trace.emit(_name, phase="local", metadata={"wall": _wall, "mono": _mono})
+                _wall += 0.001
+                _mono += 1_000_000
+            trace.set_metadata(
+                local_receive_to_actual_submission_ms=80.0,
+                generator_create_ms=5.0,
+                generator_create_to_first_iteration_ms=2.0,
+                first_iteration_to_first_remote_event_ms=999.0,  # large value we DON'T want in worker
+            )
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="worker-no-first-event",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=stream)
+            result = await execute_plan(plan, transport=transport, trace=trace)
+            lt = result.get("local_timing", {})
+            sar = lt.get("stage_attribution_residual_ms", {})
+            # first_iteration_to_first_remote_event_ms should NOT affect worker_unattributed.
+            # It stays in local_timing for diagnostics but is never in the leaf sum.
+            self.assertIn("first_iteration_to_first_remote_event_ms", lt)
+            self.assertIsNotNone(sar.get("worker_unattributed_ms"))
+            # The 999 value would cause a positive residual if it were included,
+            # but since it's excluded, worker_unattributed should be < 999.
+            self.assertLess(sar["worker_unattributed_ms"], 999.0)
+
+        asyncio.run(run())
+
+    def test_leaf_gap_detected_as_incomplete(self):
+        """When one leaf stage is missing (intentional gap not auto-emitted by
+        execute_plan), worker_unattributed is None and missing_stages names it.
+        Uses modal_payload_serialize which is NOT auto-emitted by execute_plan."""
+        async def stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            trace = RuntimeTrace(request_id="leaf-gap", process="local")
+            origin = _make_origin("leaf-gap")
+            trace.set_metadata(request_origin_info=origin)
+            # Emit all stages EXCEPT modal_payload_serialize_start/end to create a gap.
+            # modal_payload_serialize is NOT auto-emitted by execute_plan.
+            _wall = time.time()
+            _mono = time.monotonic_ns()
+            for _name in ("plan_build_start", "plan_build_end",
+                           "restore_plan_build_start", "restore_plan_build_end",
+                           "restore_plan_publish_start", "restore_plan_publish_end",
+                           "modal_handle_lookup_start", "modal_handle_lookup_end"):
+                trace.emit(_name, phase="local", metadata={"wall": _wall, "mono": _mono})
+                _wall += 0.001
+                _mono += 1_000_000
+            trace.set_metadata(
+                local_receive_to_actual_submission_ms=80.0,
+                generator_create_ms=5.0,
+                generator_create_to_first_iteration_ms=2.0,
+            )
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="leaf-gap",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=stream)
+            result = await execute_plan(plan, transport=transport, trace=trace)
+            sar = result.get("local_timing", {}).get("stage_attribution_residual_ms", {})
+            self.assertIsNone(sar.get("worker_unattributed_ms"))
+            self.assertEqual(sar.get("reconciliation_status"), "incomplete")
+            self.assertIn("missing_stages", sar)
+            self.assertIn("payload_serialize_ms", sar["missing_stages"])
+
+        asyncio.run(run())
+
+    def test_negative_worker_overlap_detected(self):
+        """When leaf sum exceeds worker span, worker_unattributed is negative and
+        overlap_error is set."""
+        async def stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            trace = RuntimeTrace(request_id="neg-overlap", process="local")
+            origin = _make_origin("neg-overlap")
+            # Large queue_wait so leaves exceed worker span
+            origin["queue_wait_before_worker_ms"] = 60.0
+            trace.set_metadata(request_origin_info=origin)
+            # Emit non-auto-emitted stage events so all leaves are known
+            _wall = time.time()
+            _mono = time.monotonic_ns()
+            for _name in ("plan_build_start", "plan_build_end",
+                           "modal_handle_lookup_start", "modal_handle_lookup_end",
+                           "modal_payload_serialize_start", "modal_payload_serialize_end"):
+                trace.emit(_name, phase="local", metadata={"wall": _wall, "mono": _mono})
+                _wall += 0.001
+                _mono += 1_000_000
+            # Worker span = 10 - 5 = 5, queue_wait alone = 60 → leaves sum > span
+            trace.set_metadata(
+                local_receive_to_actual_submission_ms=10.0,
+                generator_create_ms=1.0,
+                generator_create_to_first_iteration_ms=1.0,
+            )
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="neg-overlap",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=stream)
+            result = await execute_plan(plan, transport=transport, trace=trace)
+            sar = result.get("local_timing", {}).get("stage_attribution_residual_ms", {})
+            self.assertIsNotNone(sar.get("worker_unattributed_ms"))
+            self.assertLess(sar["worker_unattributed_ms"], 0)
+            self.assertIn("overlap_error", sar)
+            self.assertIn("worker", sar.get("overlap_error", ""))
+
+        asyncio.run(run())
+
+    def test_negative_worker_span_sets_overlap_error(self):
+        """When worker authoritative span is negative (submission < enqueue),
+        overlap_error is set for worker, not merely incomplete."""
+        async def stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            trace = RuntimeTrace(request_id="neg-span", process="local")
+            origin = _make_origin("neg-span")
+            origin["local_receive_to_enqueue_ms"] = 100.0
+            trace.set_metadata(request_origin_info=origin)
+            trace.set_metadata(
+                local_receive_to_actual_submission_ms=50.0,  # < enqueue=100
+                generator_create_ms=1.0,
+                generator_create_to_first_iteration_ms=1.0,
+            )
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="neg-span",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=stream)
+            result = await execute_plan(plan, transport=transport, trace=trace)
+            sar = result.get("local_timing", {}).get("stage_attribution_residual_ms", {})
+            self.assertIsNone(sar.get("worker_unattributed_ms"))
+            self.assertEqual(sar.get("reconciliation_status"), "overlap_error")
+            self.assertIn("worker", sar.get("overlap_error", ""))
+
+        asyncio.run(run())
+
+    def test_clock_alias_equals_local_residual(self):
+        """clock_reconciliation_residual_ms is always the alias of local_residual_ms."""
+        async def stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            trace = RuntimeTrace(request_id="clock-alias", process="local")
+            origin = _make_origin("clock-alias")
+            trace.set_metadata(request_origin_info=origin)
+            trace.set_metadata(
+                local_receive_to_actual_submission_ms=50.0,
+                local_receive_to_generator_create_ms=30.0,
+                generator_create_ms=5.0,
+                generator_create_to_first_iteration_ms=3.0,
+            )
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="clock-alias",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=stream)
+            result = await execute_plan(plan, transport=transport, trace=trace)
+            lt = result.get("local_timing", {})
+            self.assertIn("clock_reconciliation_residual_ms", lt)
+            self.assertIn("local_residual_ms", lt)
+            # Must be identical
+            self.assertEqual(lt["clock_reconciliation_residual_ms"], lt["local_residual_ms"])
 
         asyncio.run(run())
 
