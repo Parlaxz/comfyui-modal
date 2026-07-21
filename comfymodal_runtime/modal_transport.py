@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -178,6 +179,14 @@ class ModalTransport:
         runtime_trace: RuntimeTrace | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         fn = self.prompt_stream_fn
+        request_id = str((trace or {}).get("prompt_id", ""))
+        _origin_from_meta: dict[str, Any] = {}
+        _modal_input_id = ""
+        _modal_input_created_at: Any = None
+        _generator_start_wall_ns = 0
+        _generator_start_mono_ns = 0
+        _generator_end_wall_ns = 0
+        _generator_end_mono_ns = 0
         try:
             if fn is not None:
                 # V1-compatible stream path — measure plan serialization
@@ -206,85 +215,111 @@ class ModalTransport:
                     workspace=workspace,
                 )
             else:
+                if runtime_trace is not None:
+                    runtime_trace.emit("modal_handle_lookup_start", phase="local")
                 handle = self._v2_handle(
                     workspace=workspace, gpu=gpu, runtime_trace=runtime_trace,
                 )
-                # ── Plan serialization for V2 remote stream ──
                 if runtime_trace is not None:
-                    runtime_trace.emit("plan_serialize_for_transport_start", phase="local")
-                request_id = str((trace or {}).get("prompt_id", ""))
+                    runtime_trace.emit("modal_handle_lookup_end", phase="local")
+                    runtime_trace.emit("modal_payload_serialize_start", phase="local")
                 plan_dict = plan.to_dict()
-                # Embed request-origin info into the plan dict so it reaches
-                # the remote run_plan_stream without an extra argument.
-                _origin_from_meta = {}
                 if isinstance(trace, dict):
                     _trace_meta = trace.get("metadata", {}) or {}
                     if isinstance(_trace_meta, dict):
                         _origin_from_meta = dict(_trace_meta.get("request_origin_info", {}))
-                if runtime_trace is not None:
-                    plan_serialize_meta = {
-                        "plan_dict_bytes": len(str(plan_dict)),
-                        "workflow_hash": plan.workflow_hash,
-                    }
-                    runtime_trace.emit("plan_serialize_for_transport_end", phase="local",
-                                       metadata=plan_serialize_meta)
-                # T2: immediately before the actual Modal remote call
-                _t2_wall_ns = int(time.time() * 1_000_000_000)
-                _t2_mono_ns = time.monotonic_ns()
-                # Add T2/T3 wall timestamps to origin info so they reach remote
-                _origin_from_meta["modal_dispatch_wall_ns"] = _t2_wall_ns
-                _origin_from_meta["modal_dispatch_mono_ns"] = _t2_mono_ns
+                request_id = str(_origin_from_meta.get("request_id") or request_id)
                 if _origin_from_meta:
                     plan_dict["__request_origin_info__"] = _origin_from_meta
+                _payload_bytes = len(json.dumps(plan_dict, separators=(",", ":"), default=str).encode("utf-8"))
                 if runtime_trace is not None:
-                    runtime_trace.emit("comfy_modal_dispatch_start", phase="local",
-                                       metadata={
-                                           "wall_ns": _t2_wall_ns,
-                                           "mono_ns": _t2_mono_ns,
-                                           "request_id": request_id,
-                                           "app_name": os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow"),
-                                           "class_name": os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2"),
-                                           "method_name": "run_plan_stream",
-                                           "payload_bytes": len(str(plan_dict)),
-                                           "workflow_hash": plan.workflow_hash,
-                                       })
+                    runtime_trace.emit("modal_payload_serialize_end", phase="local", metadata={
+                        "plan_dict_bytes": _payload_bytes,
+                        "workflow_hash": plan.workflow_hash,
+                    })
+                _generator_start_wall_ns = time.time_ns()
+                _generator_start_mono_ns = time.monotonic_ns()
+                if runtime_trace is not None:
+                    runtime_trace.emit("modal_generator_create_start", phase="local", metadata={
+                        "wall_ns": _generator_start_wall_ns,
+                        "mono_ns": _generator_start_mono_ns,
+                        "request_id": request_id,
+                        "payload_bytes": _payload_bytes,
+                    })
                 stream = handle.run_plan_stream.remote_gen.aio(
                     plan_dict, request_id=request_id,
                 )
-                # T3: after the generator object is successfully created
-                _t3_wall_ns = int(time.time() * 1_000_000_000)
-                _t3_mono_ns = time.monotonic_ns()
-                _origin_from_meta["modal_call_created_wall_ns"] = _t3_wall_ns
-                _origin_from_meta["modal_call_created_mono_ns"] = _t3_mono_ns
-                if _origin_from_meta:
-                    plan_dict["__request_origin_info__"] = _origin_from_meta
+                _generator_end_wall_ns = time.time_ns()
+                _generator_end_mono_ns = time.monotonic_ns()
+                _modal_input_id = str(getattr(stream, "input_id", "") or "")
+                _modal_input_created_at = getattr(stream, "input_created_at", None)
                 if runtime_trace is not None:
-                    runtime_trace.emit("modal_call_created", phase="local",
-                                       metadata={
-                                           "wall_ns": _t3_wall_ns,
-                                           "mono_ns": _t3_mono_ns,
-                                           "request_id": request_id,
-                                           "modal_input_id": str(getattr(stream, "input_id", "")),
-                                       })
-                    runtime_trace.emit("remote_generator_create_end", phase="local",
-                                       metadata={"t2_wall_ns": _t2_wall_ns,
-                                                 "t2_mono_ns": _t2_mono_ns,
-                                                 "t3_wall_ns": _t3_wall_ns,
-                                                 "t3_mono_ns": _t3_mono_ns})
+                    runtime_trace.emit("modal_generator_created", phase="local", metadata={
+                        "wall_ns": _generator_end_wall_ns,
+                        "mono_ns": _generator_end_mono_ns,
+                        "request_id": request_id,
+                        "modal_input_id": _modal_input_id,
+                        "modal_input_created_at": _modal_input_created_at,
+                    })
+                    runtime_trace.emit("modal_generator_create_end", phase="local")
             if hasattr(stream, "__aiter__"):
-                ait = stream.__aiter__()
+                iterator = stream.__aiter__()
+                _submission_wall_ns = time.time_ns()
+                _submission_mono_ns = time.monotonic_ns()
+                if runtime_trace is not None and fn is None:
+                    runtime_trace.emit("modal_submission_attempt", phase="local", metadata={
+                        "wall_ns": _submission_wall_ns,
+                        "mono_ns": _submission_mono_ns,
+                        "request_id": request_id if fn is None else "",
+                    })
+                try:
+                    first_event = await iterator.__anext__()
+                except StopAsyncIteration:
+                    return
+                _first_event_wall_ns = time.time_ns()
+                _first_event_mono_ns = time.monotonic_ns()
+                if fn is None:
+                    _modal_input_id = str(
+                        getattr(stream, "input_id", "")
+                        or getattr(iterator, "input_id", "")
+                        or _modal_input_id
+                    )
+                    _modal_input_created_at = (
+                        getattr(stream, "input_created_at", None)
+                        or getattr(iterator, "input_created_at", None)
+                        or _modal_input_created_at
+                    )
                 if runtime_trace is not None:
-                    runtime_trace.emit("first_generator_iteration_start", phase="local")
-                _first_event = True
-                async for event in ait:
-                    if _first_event:
-                        _first_event = False
-                        if runtime_trace is not None:
-                            runtime_trace.emit("first_event_received", phase="local",
-                                               metadata={
-                                                   "event_type": event.get("type", ""),
-                                               })
-                    if runtime_trace is not None and event.get("type") == "result":
+                    runtime_trace.emit("modal_first_event_received", phase="local", metadata={
+                        "event_type": first_event.get("type", "") if isinstance(first_event, dict) else "",
+                        "modal_input_id": _modal_input_id if fn is None else "",
+                        "wall_ns": _first_event_wall_ns,
+                        "mono_ns": _first_event_mono_ns,
+                    })
+                    if fn is None and _modal_input_id:
+                        runtime_trace.emit("modal_input_id_observed", phase="local", metadata={
+                            "modal_input_id": _modal_input_id,
+                        })
+                    if fn is None:
+                        _t1_mono = _origin_from_meta.get("local_receive_mono_ns")
+                        runtime_trace.set_metadata(
+                            modal_generator_created_wall_ns=_generator_end_wall_ns,
+                            modal_generator_created_mono_ns=_generator_end_mono_ns,
+                            modal_submission_attempt_wall_ns=_submission_wall_ns,
+                            modal_submission_attempt_mono_ns=_submission_mono_ns,
+                            modal_first_event_received_wall_ns=_first_event_wall_ns,
+                            modal_first_event_received_mono_ns=_first_event_mono_ns,
+                            modal_input_id=_modal_input_id,
+                            modal_input_created_at=_modal_input_created_at,
+                            local_receive_to_generator_create_ms=(round((_generator_start_mono_ns - _t1_mono) / 1_000_000, 3) if isinstance(_t1_mono, int) else None),
+                            generator_create_ms=round((_generator_end_mono_ns - _generator_start_mono_ns) / 1_000_000, 3),
+                            generator_create_to_first_iteration_ms=round((_submission_mono_ns - _generator_end_mono_ns) / 1_000_000, 3),
+                            first_iteration_to_first_remote_event_ms=round((_first_event_mono_ns - _submission_mono_ns) / 1_000_000, 3),
+                            local_receive_to_actual_submission_ms=(round((_submission_mono_ns - _t1_mono) / 1_000_000, 3) if isinstance(_t1_mono, int) else None),
+                        )
+                yield first_event
+                async for event in iterator:
+                    if runtime_trace is not None and isinstance(event, dict) and event.get("type") == "result":
                         runtime_trace.emit("final_result_received", phase="local")
                     yield event
             else:
