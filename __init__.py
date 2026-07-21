@@ -3704,8 +3704,12 @@ if _server:
                 heapq.heappush(pq.queue, item)
                 pq.server.queue_updated()
 
-        await _queue.put((item, item_id))
+        # put_nowait on unbounded Queue never blocks — no yield point.
+        # Both ComfyUI heap push and queue insertion are truthfully
+        # captured in local_queue_enqueue_ms.
+        _queue.put_nowait((item, item_id))
         _enqueue_end_mono_ns = time.monotonic_ns()
+
         _prompt_request_origin["local_queue_enqueue_ms"] = round(
             (_enqueue_end_mono_ns - _enqueue_start_mono_ns) / 1_000_000, 3
         )

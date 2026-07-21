@@ -593,6 +593,9 @@ class TestRestorePublisherWiring(unittest.TestCase):
     def setUp(self):
         _reset_restore_publish_cache()
 
+    def tearDown(self):
+        _reset_restore_publish_cache()
+
     def test_restore_publisher_called_when_provided(self):
         """When restore_publisher is provided, it is called with a RestorePlan."""
         async def stream(**kwargs):
@@ -626,9 +629,13 @@ class TestRestorePublisherWiring(unittest.TestCase):
             trace = RuntimeTrace(request_id="no_pub", process="local")
             transport = ModalTransport(prompt_stream_fn=stream)
             await execute_plan(plan, transport=transport, trace=trace)
-            ev_meta = {e.name: dict(e.metadata) for e in trace.events}
-            restore_end = ev_meta.get("restore_publish_end", {})
-            self.assertEqual(restore_end.get("status"), "not_configured")
+            found_events = [e for e in trace.events if e.name == "restore_plan_publish_end"]
+            self.assertEqual(len(found_events), 1,
+                             "Must have exactly one restore_plan_publish_end event")
+            md = found_events[0].metadata
+            status = md.get("status") if hasattr(md, "get") else md.get("status")
+            self.assertEqual(status, "not_configured",
+                             f"status should be 'not_configured'. metadata={md} type={type(md)}")
         asyncio.run(run())
 
     def test_publisher_generation_returned_in_event(self):
@@ -637,6 +644,7 @@ class TestRestorePublisherWiring(unittest.TestCase):
             yield {"type": "result", "data": {"images": [], "outputs": {}}}
 
         async def run():
+            _reset_restore_publish_cache()
             plan = build_execution_plan(
                 {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
                 prompt_id="gen_test",
@@ -646,9 +654,13 @@ class TestRestorePublisherWiring(unittest.TestCase):
             transport = ModalTransport(prompt_stream_fn=stream)
             trace = RuntimeTrace(request_id="gen_test", process="local")
             await execute_plan(plan, transport=transport, restore_publisher=publisher, trace=trace)
-            ev_meta = {e.name: dict(e.metadata) for e in trace.events}
-            restore_end = ev_meta.get("restore_publish_end", {})
-            self.assertEqual(restore_end.get("generation"), 1)
+            found_events = [e for e in trace.events if e.name == "restore_plan_publish_end"]
+            self.assertEqual(len(found_events), 1,
+                             "Must have exactly one restore_plan_publish_end event")
+            md = found_events[0].metadata
+            generation = md.get("generation") if hasattr(md, "get") else None
+            self.assertEqual(generation, 1,
+                             f"generation should be 1. metadata={md} type={type(md)}")
         asyncio.run(run())
 
 

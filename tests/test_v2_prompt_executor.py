@@ -123,7 +123,8 @@ def test_v2_runner_uses_prompt_executor_and_live_registry_without_legacy_wrapper
         "production_registry_setup_end",
         "executor_reset_start",
         "executor_reset_end",
-        "prompt_executor_start",
+        "prompt_executor_invoke_start",
+        "prompt_executor_invoke_end",
         "prompt_executor_end",
         "output_collect_start",
         "output_collect_end",
@@ -137,7 +138,8 @@ def test_v2_runner_uses_prompt_executor_and_live_registry_without_legacy_wrapper
     for span_base in ["legacy_preload_check", "input_materialization", "preflight",
                        "missing_node_repair", "prompt_validation",
                        "production_registry_setup", "executor_reset",
-                       "prompt_executor", "output_collect", "production_cleanup"]:
+                       "output_collect", "production_cleanup",
+                       "prompt_executor_invoke"]:
         start_count = event_names.count(f"{span_base}_start")
         end_count = event_names.count(f"{span_base}_end")
         assert start_count == end_count, (
@@ -189,7 +191,8 @@ def test_v2_fallback_conversion_failure_keeps_original_materialized_bytes():
     assert "prompt_validation_end" in event_names
     assert "executor_reset_start" in event_names
     assert "executor_reset_end" in event_names
-    assert "prompt_executor_start" in event_names
+    assert "prompt_executor_invoke_start" in event_names
+    assert "prompt_executor_invoke_end" in event_names
     assert "prompt_executor_end" in event_names
     assert "output_collect_start" in event_names
     assert "output_collect_end" in event_names

@@ -1221,9 +1221,13 @@ class ModalRuntimeEntrypoint:
     async def _run_in_process(self, plan: ExecutionPlan, context: ExecutionContext) -> dict[str, Any]:
         if context.cancelled and context.cancelled():
             raise RuntimeError("execution cancelled before PromptExecutor start")
-        self._configure_runtime()
-        api = self._load_legacy_runtime()
         trace = context.trace or RuntimeTrace(request_id=context.request_id, process="remote")
+        trace.emit("runtime_config_start", phase="execution")
+        self._configure_runtime()
+        trace.emit("runtime_config_end", phase="execution")
+        trace.emit("legacy_runtime_load_start", phase="execution")
+        api = self._load_legacy_runtime()
+        trace.emit("legacy_runtime_load_end", phase="execution")
         # Attach stable container identity to execution trace
         _cid = self.container_session_id or _V2_CONTAINER_SESSION_ID
         trace.container_session_id = _cid
@@ -1319,6 +1323,32 @@ class ModalRuntimeEntrypoint:
             except Exception:
                 pass
             raise
+
+    @staticmethod
+    def _interval_from_trace(trace: Any, start_name: str, end_name: str) -> float | None:
+        """Compute ms interval from the first start_name event to the first
+        end_name event in the trace.  Returns None if either event is missing
+        or end is before start (wrapping).  Does not raise."""
+        start_ns: int | None = None
+        end_ns: int | None = None
+        for ev in trace.events:
+            if ev.name == start_name and start_ns is None:
+                start_ns = ev.monotonic_ns
+            if ev.name == end_name and end_ns is None:
+                end_ns = ev.monotonic_ns
+            if start_ns is not None and end_ns is not None:
+                break
+        if start_ns is not None and end_ns is not None and end_ns >= start_ns:
+            return round((end_ns - start_ns) / 1_000_000, 3)
+        return None
+
+    @staticmethod
+    def _fmt_or_absent(v: float | int | None) -> str:
+        """Format a numeric interval for the one-line summary.
+        Returns ``str(v)`` for numeric values (including ``0.0``), ``"absent"`` for None."""
+        if v is None:
+            return "absent"
+        return str(v)
 
     async def _execute_v2_prompt_executor(
         self,
@@ -1659,7 +1689,7 @@ class ModalRuntimeEntrypoint:
             trace.emit("executor_reset_start", phase="execution")
             executor.reset()
             trace.emit("executor_reset_end", phase="execution")
-            # End pregraph span here — before prompt_executor_start, after
+            # End pregraph span here — before prompt_executor_invoke_start, after
             # all V2-owned setup including executor.reset().
             trace.emit("pregraph_setup_end", phase="execution", metadata={
                 "status": "error" if _pregraph_error else "ok",
@@ -1667,7 +1697,6 @@ class ModalRuntimeEntrypoint:
             })
             if _pregraph_error:
                 raise RuntimeError(_pregraph_error)
-            trace.emit("prompt_executor_start", phase="execution", metadata={"prompt_id": prompt_id})
             execute_async = getattr(executor, "execute_async", None)
             execute_kwargs = {
                 "prompt": workflow,
@@ -1675,6 +1704,23 @@ class ModalRuntimeEntrypoint:
                 "extra_data": {"client_id": prompt_id},
                 "execute_outputs": outputs_to_execute,
             }
+            # ── Build node-ID → class_type map ──────────────────
+            _node_class_map: dict[str, str] = {}
+            if isinstance(workflow, dict):
+                for _nid, _node in workflow.items():
+                    if isinstance(_node, dict):
+                        _ct = _node.get("class_type", "")
+                        if _ct:
+                            _node_class_map[str(_nid)] = str(_ct)
+            _first_node_id = str(outputs_to_execute[0]) if outputs_to_execute else ""
+            _first_class_type = _node_class_map.get(_first_node_id, "")
+            _has_clip_loader = any(ct.startswith("CLIP") for ct in _node_class_map.values())
+            _has_text_encode = any("TextEncode" in ct or "CLIPTextEncode" in ct for ct in _node_class_map.values())
+            _has_sampler = any("Sampler" in ct or "KSampler" in ct for ct in _node_class_map.values())
+            _sampler_node_ids = [
+                nid for nid, ct in _node_class_map.items()
+                if "Sampler" in ct or "KSampler" in ct
+            ]
             # ── Sampler lease ────────────────────────────────────
             # Acquire the mutation lane so no model GPU commits can
             # overlap with sampling, and no pending commit starts after
@@ -1685,19 +1731,25 @@ class ModalRuntimeEntrypoint:
                 _lane.acquire("sampler")
                 trace.emit("sampler_lane_wait_end", phase="execution")
             # ── PromptExecutor internal milestone interception ──
-            # Request-local: wraps executor.add_message (3-arg shape) to
-            # capture execution_start and execution_cached timestamps,
-            # and executor.server.send_sync to capture the first executing
-            # node.  Both are restored in the finally block.
+            # Request-local: wraps executor.add_message (3-arg shape:
+            # event, data: dict, broadcast: bool) to capture
+            # execution_start and execution_cached timestamps (first
+            # occurrences only via setdefault).  Wraps
+            # executor.server.send_sync (3-arg shape: event, data: dict,
+            # client_id) to capture the first executing node and to
+            # classify first model-loader, CLIP/text-encode, and
+            # sampler-related nodes.  Both wrappers are restored in
+            # the finally block and always delegate with original args.
             _orig_add_message = getattr(executor, "add_message", None)
             _server = getattr(executor, "server", None)
             _orig_send_sync = getattr(_server, "send_sync", None) if _server is not None else None
-            _milestones: dict[str, float] = {}
+            _milestones: dict[str, Any] = {}
             _milestone_wrapper_ok = False
             _send_sync_wrapper_ok = False
 
             if callable(_orig_add_message) and not getattr(_orig_add_message, "_comfy_modal_milestone", False):
                 def _milestone_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    # Real shape: add_message(event, data: dict, broadcast: bool)
                     event = args[0] if args else kwargs.get("event", "")
                     if event in ("execution_start", "execution_cached"):
                         _milestones.setdefault(event, time.monotonic_ns())
@@ -1708,9 +1760,52 @@ class ModalRuntimeEntrypoint:
 
             if callable(_orig_send_sync) and not getattr(_orig_send_sync, "_comfy_modal_send_sync", False):
                 def _send_sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    # Real shape: send_sync(event, data: dict, client_id)
                     event = args[0] if args else kwargs.get("event", "")
                     if event == "executing":
-                        _milestones.setdefault(event, time.monotonic_ns())
+                        _event_ns = time.monotonic_ns()
+                        _milestones.setdefault(event, _event_ns)
+                        _data = args[1] if len(args) > 1 else kwargs.get("data", {})
+                        if isinstance(_data, dict):
+                            _node = _data.get("node")
+                            if _node:
+                                _node_str = str(_node)
+                                _class_node = _node_class_map.get(str(_node), "")
+                                # First executing node
+                                if "first_executing_node" not in _milestones:
+                                    _milestones["first_executing_node"] = _node_str
+                                    _milestones["first_executing_node_class"] = _class_node
+                                    _milestones["first_executing_node_ns"] = _event_ns
+                                # First model-loader node: *Loader, Checkpoint, UNETLoader,
+                                # VAELoader, CLIPLoader/DualCLIPLoader/LoraLoader; exclude CLIPTextEncode
+                                _class_lower = _class_node.lower()
+                                if ("first_loader_node" not in _milestones
+                                        and "textencode" not in _class_lower
+                                        and (_class_lower.endswith("loader")
+                                             or "checkpointloader" in _class_lower
+                                             or "model_loader" in _class_lower)):
+                                    _milestones["first_loader_node"] = _node_str
+                                    _milestones["first_loader_node_class"] = _class_node
+                                    _milestones["first_loader_node_ns"] = _event_ns
+                                # First CLIP/text-encode node
+                                if ("first_clip_encode_node" not in _milestones
+                                        and ("CLIPTextEncode" in _class_node or "TextEncode" in _class_node
+                                             or "CLIP" in _class_node)):
+                                    _milestones["first_clip_encode_node"] = _node_str
+                                    _milestones["first_clip_encode_node_class"] = _class_node
+                                    _milestones["first_clip_encode_node_ns"] = _event_ns
+                                # First sampler-related node
+                                if ("first_sampler_node" not in _milestones
+                                        and ("Sampler" in _class_node or "KSampler" in _class_node)):
+                                    _milestones["first_sampler_node"] = _node_str
+                                    _milestones["first_sampler_node_class"] = _class_node
+                                    _milestones["first_sampler_node_ns"] = _event_ns
+                                    _milestones["first_sampler_stage_ns"] = _event_ns
+                                    _milestones["first_sampler_stage_event"] = "executing"
+                    elif event in ("sampler_start", "sampling_start", "sampler_stage_start", "progress"):
+                        if "first_sampler_stage_ns" not in _milestones:
+                            _milestones["first_sampler_stage_ns"] = time.monotonic_ns()
+                            _milestones["first_sampler_stage_event"] = event
                     return _orig_send_sync(*args, **kwargs)
                 setattr(_send_sync_wrapper, "_comfy_modal_send_sync", True)
                 _server.send_sync = _send_sync_wrapper
@@ -1722,16 +1817,26 @@ class ModalRuntimeEntrypoint:
             elif not _milestone_wrapper_ok:
                 trace.emit("prompt_executor_internal_milestones_unavailable", phase="execution",
                            metadata={"reason": "add_message_unavailable"})
+            elif not _send_sync_wrapper_ok:
+                trace.emit("prompt_executor_internal_milestones_unavailable", phase="execution",
+                           metadata={"reason": "send_sync_unavailable"})
 
             # T5: immediately before prompt executor invocation
             _t5_wall_ns = int(time.time() * 1_000_000_000)
             _t5_mono_ns = time.monotonic_ns()
             _execute_call_ns = _t5_mono_ns  # preserve for milestone calculations
-            trace.emit("prompt_executor_start", phase="execution", metadata={
+            trace.emit("prompt_executor_invoke_start", phase="execution", metadata={
                 "prompt_id": prompt_id,
                 "request_id": str(context.trace.request_id if context.trace else ""),
                 "t5_wall_ns": _t5_wall_ns,
                 "t5_mono_ns": _t5_mono_ns,
+                "first_node_id": _first_node_id,
+                "first_class_type": _first_class_type,
+                "has_clip_loader": _has_clip_loader,
+                "has_text_encode": _has_text_encode,
+                "has_sampler": _has_sampler,
+                "sampler_node_count": len(_sampler_node_ids),
+                "total_nodes": len(_node_class_map),
             })
             try:
                 if callable(execute_async):
@@ -1741,27 +1846,285 @@ class ModalRuntimeEntrypoint:
                 else:
                     executor.execute(**execute_kwargs)
             finally:
-                # Restore original add_message
-                if _milestone_wrapper_ok and _orig_add_message is not None:
-                    executor.add_message = _orig_add_message
-                # Restore original send_sync
-                if _send_sync_wrapper_ok and _orig_send_sync is not None and _server is not None:
-                    _server.send_sync = _orig_send_sync
-                if _lane is not None:
-                    _lane.release("sampler")
-            # ── Emit derived milestone intervals (monotonic ns deltas) ────
+                try:
+                    # Restore original add_message
+                    if _milestone_wrapper_ok and _orig_add_message is not None:
+                        executor.add_message = _orig_add_message
+                    # Restore original send_sync
+                    if _send_sync_wrapper_ok and _orig_send_sync is not None and _server is not None:
+                        _server.send_sync = _orig_send_sync
+                    if _lane is not None:
+                        _lane.release("sampler")
+                finally:
+                    # Always emit invoke_end — even if restore/release raises
+                    _invoke_elapsed_ms = round((time.monotonic_ns() - _execute_call_ns) / 1_000_000, 3)
+                    trace.emit("prompt_executor_invoke_end", phase="execution", metadata={
+                        "invoke_elapsed_ms": _invoke_elapsed_ms,
+                    })
+
+            # ── Compute derived milestone intervals ──────────────────────
+            _exec_st_ns = _milestones.get("execution_start") if _milestones else None
+            _cached_ns = _milestones.get("execution_cached") if _milestones else None
+            _first_ns = _milestones.get("executing") if _milestones else None
+            _first_exec_node_id = _milestones.get("first_executing_node", "") if _milestones else ""
+            _first_exec_node_class = _milestones.get("first_executing_node_class", "") if _milestones else ""
+            _first_loader_node_id = _milestones.get("first_loader_node", "") if _milestones else ""
+            _first_clip_encode_node_id = _milestones.get("first_clip_encode_node", "") if _milestones else ""
+            _first_sampler_node_id = _milestones.get("first_sampler_node", "") if _milestones else ""
+            # Extract monotonic_ns timestamps for node classifications (A)
+            _first_exec_node_ns = _milestones.get("first_executing_node_ns") if _milestones else None
+            _first_loader_node_ns = _milestones.get("first_loader_node_ns") if _milestones else None
+            _first_clip_ns = _milestones.get("first_clip_encode_node_ns") if _milestones else None
+            _first_sampler_ns = _milestones.get("first_sampler_node_ns") if _milestones else None
+            _first_sampler_stage_ns = _milestones.get("first_sampler_stage_ns") if _milestones else None
+            _first_sampler_stage_event = _milestones.get("first_sampler_stage_event", "") if _milestones else ""
+            _exec_st_val = round((_exec_st_ns - _execute_call_ns) / 1_000_000, 3) if _exec_st_ns else None
+            _exec_to_cache = round((_cached_ns - _exec_st_ns) / 1_000_000, 3) if _exec_st_ns and _cached_ns else None
+            _cache_to_node = round((_first_ns - _cached_ns) / 1_000_000, 3) if _cached_ns and _first_ns else None
+            _call_to_cached = round((_cached_ns - _execute_call_ns) / 1_000_000, 3) if _cached_ns else None
+            _call_to_first_node = round((_first_ns - _execute_call_ns) / 1_000_000, 3) if _first_ns else None
+            # ── Node-to-node sub-intervals (B) ──
+            _first_node_to_clip_ms: float | None = None
+            _clip_to_sampler_node_ms: float | None = None
+            _sampler_node_to_sampler_start_ms: float | None = None
+            if _first_exec_node_ns is not None and _first_clip_ns is not None:
+                _first_node_to_clip_ms = round((_first_clip_ns - _first_exec_node_ns) / 1_000_000, 3)
+            if _first_clip_ns is not None and _first_sampler_ns is not None:
+                _clip_to_sampler_node_ms = round((_first_sampler_ns - _first_clip_ns) / 1_000_000, 3)
+            if _first_sampler_ns is not None and _first_sampler_stage_ns is not None:
+                _sampler_node_to_sampler_start_ms = round((_first_sampler_stage_ns - _first_sampler_ns) / 1_000_000, 3)
             if _milestones:
-                _exec_st_ns = _milestones.get("execution_start")
-                _cached_ns = _milestones.get("execution_cached")
-                _first_ns = _milestones.get("executing")
-                _exec_st_val = round((_exec_st_ns - _execute_call_ns) / 1_000_000, 3) if _exec_st_ns else None
-                _exec_to_cache = round((_cached_ns - _exec_st_ns) / 1_000_000, 3) if _exec_st_ns and _cached_ns else None
-                _cache_to_node = round((_first_ns - _cached_ns) / 1_000_000, 3) if _cached_ns and _first_ns else None
                 trace.emit("prompt_executor_milestones", phase="execution", metadata={
                     "executor_call_to_execution_start_ms": _exec_st_val,
                     "execution_start_to_cached_ms": _exec_to_cache,
                     "cached_to_first_node_ms": _cache_to_node,
+                    "executor_call_to_cached_ms": _call_to_cached,
+                    "executor_call_to_first_node_ms": _call_to_first_node,
+                    "first_executing_node_id": _first_exec_node_id,
+                    "first_executing_node_class": _first_exec_node_class,
+                    # Loader/CLIP/sampler node classification (B)
+                    "first_loader_node_id": _first_loader_node_id,
+                    "first_clip_encode_node_id": _first_clip_encode_node_id,
+                    "first_sampler_node_id": _first_sampler_node_id,
+                    "first_sampler_stage_event": _first_sampler_stage_event,
+                    # Node-to-node intervals (B)
+                    "first_node_to_clip_ms": _first_node_to_clip_ms,
+                    "clip_to_sampler_node_ms": _clip_to_sampler_node_ms,
+                    "sampler_node_to_sampler_start_ms": _sampler_node_to_sampler_start_ms,
+                    # Raw monotonic-ns timestamps
+                    "first_executing_node_monotonic_ns": _first_exec_node_ns,
+                    "first_loader_node_monotonic_ns": _first_loader_node_ns,
+                    "first_clip_encode_node_monotonic_ns": _first_clip_ns,
+                    "first_sampler_node_monotonic_ns": _first_sampler_ns,
+                    "first_sampler_stage_monotonic_ns": _first_sampler_stage_ns,
                 })
+
+            # ── Classify sampler stage from first executing node ──
+            _sampler_stage_status: str = "awaiting_classification"
+            if _first_exec_node_class:
+                if "Sampler" in _first_exec_node_class or "KSampler" in _first_exec_node_class:
+                    _sampler_stage_status = "sampler_active"
+                elif "CLIPTextEncode" in _first_exec_node_class or "TextEncode" in _first_exec_node_class:
+                    _sampler_stage_status = "text_encoding"
+                elif "CLIP" in _first_exec_node_class:
+                    _sampler_stage_status = "clip_loading"
+                elif "VAE" in _first_exec_node_class:
+                    _sampler_stage_status = "vae_loading"
+                elif "UNET" in _first_exec_node_class or "UNet" in _first_exec_node_class:
+                    _sampler_stage_status = "unet_loading"
+                elif "Load" in _first_exec_node_class:
+                    _sampler_stage_status = f"loading:{_first_exec_node_class}"
+                else:
+                    _sampler_stage_status = f"other:{_first_exec_node_class}"
+
+            # ── Compute setup intervals from existing trace events ───────
+            _cert_ms = self._interval_from_trace(trace, "certificate_reload_start", "certificate_reload_end")
+            _preflight_ms = self._interval_from_trace(trace, "preflight_start", "preflight_end")
+            _validation_ms = self._interval_from_trace(trace, "prompt_validation_start", "prompt_validation_end")
+            _pregraph_ms = self._interval_from_trace(trace, "pregraph_setup_start", "pregraph_setup_end")
+            _exec_reset_ms = self._interval_from_trace(trace, "executor_reset_start", "executor_reset_end")
+            _sampler_lane_ms = self._interval_from_trace(trace, "sampler_lane_wait_start", "sampler_lane_wait_end")
+            _graph_setup_ms = self._interval_from_trace(trace, "graph_execution_start", "prompt_executor_invoke_start")
+            _met_start_ms = self._interval_from_trace(trace, "remote_method_entry", "graph_execution_start")
+            # Additional setup interval fields (C)
+            _runtime_config_ms = self._interval_from_trace(trace, "runtime_config_start", "runtime_config_end")
+            _method_entry_to_runtime_ms = self._interval_from_trace(trace, "remote_method_entry", "runtime_config_end")
+            _legacy_runtime_ms = self._interval_from_trace(trace, "legacy_runtime_load_start", "legacy_runtime_load_end")
+            _preload_check_ms = self._interval_from_trace(trace, "legacy_preload_check_start", "legacy_preload_check_end")
+            _repair_ms = self._interval_from_trace(trace, "missing_node_repair_start", "missing_node_repair_end")
+            _production_registry_ms = self._interval_from_trace(trace, "production_registry_setup_start", "production_registry_setup_end")
+            # Residual before invoke: gap between pregraph_setup_end (or last measured) and invoke_start
+            _pregraph_end_event_ns: int | None = None
+            for ev in reversed(trace.events):
+                if ev.name == "pregraph_setup_end":
+                    _pregraph_end_event_ns = ev.monotonic_ns
+                    break
+            if _pregraph_end_event_ns and _execute_call_ns > _pregraph_end_event_ns:
+                _residual_before_invoke = round((_execute_call_ns - _pregraph_end_event_ns) / 1_000_000, 3)
+            else:
+                _residual_before_invoke = None
+
+            # ── Measured children sum (leaf-level, no double-counting) (C) ──
+            # pregraph_setup_ms includes executor_reset_ms; use pregraph_without_reset in leaf sum.
+            _pregraph_without_reset_ms = (_pregraph_ms - _exec_reset_ms) if _pregraph_ms is not None and _exec_reset_ms is not None else None
+            _leaf_setup = [
+                _cert_ms, _preflight_ms, _repair_ms, _validation_ms,
+                _pregraph_without_reset_ms, _exec_reset_ms, _sampler_lane_ms,
+                _residual_before_invoke,
+            ]
+            _leaf_setup_ms = sum(v for v in _leaf_setup if v is not None)
+            _leaf_milestone = [
+                _exec_st_val, _exec_to_cache, _cache_to_node,
+                _first_node_to_clip_ms, _clip_to_sampler_node_ms, _sampler_node_to_sampler_start_ms,
+            ]
+            _leaf_milestone_ms = sum(v for v in _leaf_milestone if v is not None)
+            _total_children_val = _leaf_setup_ms + _leaf_milestone_ms
+            _measured_children_ms = round(_total_children_val, 3) if _total_children_val > 0 else None
+
+            # ── pre_sampler_total_ms from remote_method_entry to first_sampler_stage_ns (C) ──
+            _remote_method_entry_ns = None
+            for ev in trace.events:
+                if ev.name == "remote_method_entry":
+                    _remote_method_entry_ns = ev.monotonic_ns
+                    break
+            if _remote_method_entry_ns is not None and _first_sampler_stage_ns is not None:
+                _pre_sampler_total_ms = round((_first_sampler_stage_ns - _remote_method_entry_ns) / 1_000_000, 3)
+            else:
+                _pre_sampler_total_ms = None
+            if _pre_sampler_total_ms is not None:
+                _residual_ms = max(_pre_sampler_total_ms - (_measured_children_ms or 0.0), 0.0)
+            else:
+                _residual_ms = None
+
+            # ── Gather identity metadata for pre_sampler_stages event and print (D) ──
+            _ps_prompt_id = prompt_id
+            _ps_identity = _capture_remote_identity()
+            _ps_modal_input_id = _ps_identity.get("modal_input_id", "absent")
+            _ps_modal_task_id = _ps_identity.get("container_task_id", "absent")
+            _ps_host_info = _capture_host_info()
+            _ps_pid = _ps_host_info.get("pid", os.getpid())
+            _ps_hostname = _ps_host_info.get("hostname", "absent")
+            _ps_boot_id = _ps_host_info.get("boot_id", "absent")
+            _ps_restored_id_actual = getattr(self, "_restored_instance_id", "")
+            _ps_restore_session = (self._restore_timing or {}).get("restore_session_id", "") or "absent"
+            _ps_restored_instance_id = _ps_restored_id_actual or "absent"
+            _ps_cid = self.container_session_id or _V2_CONTAINER_SESSION_ID or "absent"
+
+            # Always emit pre_sampler_stages — even when milestones absent (C/D)
+            trace.emit("pre_sampler_stages", phase="execution", metadata={
+                # Setup intervals from trace events
+                "method_entry_to_graph_start_ms": _met_start_ms,
+                "graph_setup_ms": _graph_setup_ms,
+                "certificate_ms": _cert_ms,
+                "preflight_ms": _preflight_ms,
+                "validation_ms": _validation_ms,
+                "runtime_configuration_ms": _runtime_config_ms,
+                "method_entry_to_runtime_configuration_ms": _method_entry_to_runtime_ms,
+                "legacy_runtime_resolution_ms": _legacy_runtime_ms,
+                "preload_check_ms": _preload_check_ms,
+                "missing_node_repair_ms": _repair_ms,
+                "production_registry_setup_ms": _production_registry_ms,
+                "production_registry_profile_setup_ms": _production_registry_ms,
+                "pregraph_setup_ms": _pregraph_ms,
+                "executor_reset_ms": _exec_reset_ms,
+                "sampler_lane_wait_ms": _sampler_lane_ms,
+                "residual_before_invoke_ms": _residual_before_invoke,
+                # Internal milestone intervals (from wrapper captures)
+                "invoke_to_execution_start_ms": _exec_st_val,
+                "execution_start_to_cached_ms": _exec_to_cache,
+                "cached_to_first_node_ms": _cache_to_node,
+                "first_node_to_clip_ms": _first_node_to_clip_ms,
+                "clip_to_sampler_node_ms": _clip_to_sampler_node_ms,
+                "sampler_node_to_sampler_start_ms": _sampler_node_to_sampler_start_ms,
+                # Totals and reconciliation (C)
+                "pre_sampler_total_ms": _pre_sampler_total_ms,
+                "measured_children_ms": _measured_children_ms,
+                "residual_ms": _residual_ms,
+                # Node classification (B)
+                "total_nodes": len(_node_class_map),
+                "first_output_node_id": _first_node_id,
+                "first_output_class_type": _first_class_type,
+                "first_executing_node_id": _first_exec_node_id,
+                "first_executing_node_class": _first_exec_node_class,
+                "first_loader_node_id": _first_loader_node_id,
+                "first_loader_node_class": _milestones.get("first_loader_node_class", "") if _milestones else "",
+                "first_clip_encode_node_id": _first_clip_encode_node_id,
+                "first_clip_encode_node_class": _milestones.get("first_clip_encode_node_class", "") if _milestones else "",
+                "first_sampler_node_id": _first_sampler_node_id,
+                "first_sampler_node_class": _milestones.get("first_sampler_node_class", "") if _milestones else "",
+                "first_sampler_stage_event": _first_sampler_stage_event,
+                # Raw monotonic-ns timestamps
+                "first_executing_node_monotonic_ns": _first_exec_node_ns,
+                "first_loader_node_monotonic_ns": _first_loader_node_ns,
+                "first_clip_encode_node_monotonic_ns": _first_clip_ns,
+                "first_sampler_node_monotonic_ns": _first_sampler_ns,
+                "first_sampler_stage_monotonic_ns": _first_sampler_stage_ns,
+                "sampler_stage_status": _sampler_stage_status,
+                "has_clip_loader": _has_clip_loader,
+                "has_text_encode": _has_text_encode,
+                "has_sampler": _has_sampler,
+                "sampler_node_ids": ",".join(_sampler_node_ids) if _sampler_node_ids else "",
+                "sampler_node_count": len(_sampler_node_ids),
+                # Wrapper availability
+                "add_message_available": _milestone_wrapper_ok,
+                "send_sync_available": _send_sync_wrapper_ok,
+                # Identity metadata (D)
+                "request_id": _ps_prompt_id,
+                "modal_input_id": _ps_modal_input_id,
+                "modal_task_id": _ps_modal_task_id,
+                "container_task_id": _ps_modal_task_id,
+                "pid": _ps_pid,
+                "boot_id": _ps_boot_id,
+                "hostname": _ps_hostname,
+                "restored_instance_id": _ps_restored_instance_id,
+                "restore_session_id": _ps_restore_session,
+                "container_session_id": _ps_cid,
+            })
+            # ── One-line [v2.pre_sampler_stages] summary (always emitted) ───
+            print(
+                f"[v2.pre_sampler_stages] "
+                f"request_id={_ps_prompt_id} "
+                f"restored_instance_id={_ps_restored_instance_id} "
+                f"restore_session_id={_ps_restore_session} "
+                f"container_session_id={_ps_cid} "
+                f"modal_input_id={_ps_modal_input_id} "
+                f"modal_task_id={_ps_modal_task_id} "
+                f"pid={_ps_pid} "
+                f"boot_id={_ps_boot_id} "
+                f"hostname={_ps_hostname} "
+                f"total_nodes={len(_node_class_map)} "
+                f"first_output_node={_first_node_id}:{_first_class_type} "
+                f"first_executing_node={_first_exec_node_id}:{_first_exec_node_class} "
+                f"sampler_stage_status={_sampler_stage_status} "
+                f"method_entry_to_graph_start_ms={self._fmt_or_absent(_met_start_ms)} "
+                f"graph_setup_ms={self._fmt_or_absent(_graph_setup_ms)} "
+                f"certificate_ms={self._fmt_or_absent(_cert_ms)} "
+                f"preflight_ms={self._fmt_or_absent(_preflight_ms)} "
+                f"validation_ms={self._fmt_or_absent(_validation_ms)} "
+                f"missing_node_repair_ms={self._fmt_or_absent(_repair_ms)} "
+                f"production_registry_setup_ms={self._fmt_or_absent(_production_registry_ms)} "
+                f"production_registry_profile_setup_ms={self._fmt_or_absent(_production_registry_ms)} "
+                f"pregraph_setup_ms={self._fmt_or_absent(_pregraph_ms)} "
+                f"executor_reset_ms={self._fmt_or_absent(_exec_reset_ms)} "
+                f"sampler_lane_wait_ms={self._fmt_or_absent(_sampler_lane_ms)} "
+                f"residual_before_invoke_ms={self._fmt_or_absent(_residual_before_invoke)} "
+                f"method_entry_to_runtime_configuration_ms={self._fmt_or_absent(_method_entry_to_runtime_ms)} "
+                f"call_to_exec_start_ms={self._fmt_or_absent(_exec_st_val)} "
+                f"exec_start_to_cached_ms={self._fmt_or_absent(_exec_to_cache)} "
+                f"cached_to_first_executing_ms={self._fmt_or_absent(_cache_to_node)} "
+                f"call_to_cached_ms={self._fmt_or_absent(_call_to_cached)} "
+                f"call_to_first_node_ms={self._fmt_or_absent(_call_to_first_node)} "
+                f"first_node_to_clip_ms={self._fmt_or_absent(_first_node_to_clip_ms)} "
+                f"clip_to_sampler_node_ms={self._fmt_or_absent(_clip_to_sampler_node_ms)} "
+                f"sampler_node_to_sampler_start_ms={self._fmt_or_absent(_sampler_node_to_sampler_start_ms)} "
+                f"pre_sampler_total_ms={self._fmt_or_absent(_pre_sampler_total_ms)} "
+                f"residual_ms={self._fmt_or_absent(_residual_ms)} "
+                f"add_message={_milestone_wrapper_ok} "
+                f"send_sync={_send_sync_wrapper_ok} "
+                f"has_sampler={_has_sampler} "
+                f"sampler_count={len(_sampler_node_ids)}",
+                flush=True,
+            )
             trace.emit(
                 "prompt_executor_end",
                 phase="execution",
@@ -2183,10 +2546,12 @@ class ModalRuntimeEntrypoint:
             except Exception:
                 _opts_hash = ""
 
-            # ── Emit trace-setup span ──────────────────────────────
+            # ── Emit trace-setup span (remote_method_entry at original first-line time) ──
             context.trace.emit("run_plan_trace_setup_start", phase="method")
-            context.trace.emit(
+            context.trace.emit_at(
                 "remote_method_entry",
+                wall_unix_ns=_method_first_line_wall_ns,
+                monotonic_ns=_method_first_line_ns,
                 phase="method",
                 metadata={
                     "app_name": APP_NAME,
@@ -2304,7 +2669,7 @@ class ModalRuntimeEntrypoint:
                 _t1_wall_ns = _request_origin_info.get("local_receive_wall_ns", None)
                 _t2_wall_ns = _request_origin_info.get("modal_submission_attempt_wall_ns", None)
                 _t3_wall_ns = _request_origin_info.get("modal_generator_created_wall_ns", None)
-                # Extract authoritative T5 from remote V2 prompt_executor_start event.
+                # Extract authoritative T5 from remote V2 prompt_executor_invoke_start event.
                 # Filter for process=remote to ignore legacy/duplicate traces.
                 # Iterate until a remote event with non-empty t5_wall_ns is found;
                 # do NOT break on the first remote event missing the raw timestamp.
@@ -2313,7 +2678,7 @@ class ModalRuntimeEntrypoint:
                     _exec_events = _exec_trace.get("events", [])
                     if isinstance(_exec_events, list):
                         for _evt in _exec_events:
-                            if isinstance(_evt, dict) and _evt.get("name") == "prompt_executor_start":
+                            if isinstance(_evt, dict) and _evt.get("name") == "prompt_executor_invoke_start":
                                 _evt_proc = _evt.get("process", "") or ""
                                 if _evt_proc == "remote":
                                     _evt_meta = _evt.get("metadata", {}) or {}
@@ -2361,7 +2726,7 @@ class ModalRuntimeEntrypoint:
                     _exec_events = _exec_trace.get("events", [])
                     if isinstance(_exec_events, list):
                         for _evt in _exec_events:
-                            if isinstance(_evt, dict) and _evt.get("name") == "prompt_executor_start":
+                            if isinstance(_evt, dict) and _evt.get("name") == "prompt_executor_invoke_start":
                                 _evt_proc = _evt.get("process", "") or ""
                                 if _evt_proc == "remote":
                                     _evt_meta = _evt.get("metadata", {}) or {}
@@ -2391,7 +2756,7 @@ class ModalRuntimeEntrypoint:
                     "modal_submission_attempt_wall_unix_ns": _t2_wall_ns,
                     "modal_generator_created_wall_unix_ns": _t3_wall_ns,
                     "t4_modal_method_entry_wall_unix_ns": _t4_wall,
-                    "t5_prompt_executor_start_wall_unix_ns": _t5_wall_ns,
+                    "t5_prompt_executor_invoke_start_wall_unix_ns": _t5_wall_ns,
                 }
                 data["intervals_ms"] = {
                     "run_trigger_to_local_receive_ms": _t0_t1_ms,
@@ -2431,7 +2796,7 @@ class ModalRuntimeEntrypoint:
                     f"modal_submission_attempt_unix_ns={_t2_wall_ns or 0} "
                     f"modal_generator_created_unix_ns={_t3_wall_ns or 0} "
                     f"modal_method_entry_unix_ns={_t4_wall} "
-                    f"prompt_executor_start_unix_ns={_t5_wall_ns or 0} "
+                    f"prompt_executor_invoke_start_unix_ns={_t5_wall_ns or 0} "
                     f"trigger_to_dispatch_ms={_trig_to_dispatch} "
                     f"dispatch_to_modal_entry_ms={_dispatch_to_entry} "
                     f"modal_entry_to_executor_ms={_entry_to_exec} "

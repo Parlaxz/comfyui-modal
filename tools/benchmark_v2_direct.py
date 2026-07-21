@@ -115,6 +115,10 @@ def _timing(result: dict[str, Any], wall_ms: float) -> dict[str, Any]:
         if local_submit is not None and remote_entry is not None
         else None
     )
+    # Forward local_timing from result (copied/safe block)
+    _local_timing = result.get("local_timing", {}) if isinstance(result, dict) else {}
+    if not isinstance(_local_timing, dict):
+        _local_timing = {}
     return {
         "wall_ms": round(wall_ms, 1),
         "submit2entry_ms": deltas.get("modal_submit_to_entry_ms", submit2entry_ms),
@@ -124,6 +128,7 @@ def _timing(result: dict[str, Any], wall_ms: float) -> dict[str, Any]:
         "sampler_ms": derived.get("sampler_ms", sampler_ms),
         "vae_decode_ms": derived.get("vae_decode_ms", deltas.get("vae_decode_ms", vae_decode_ms)),
         "output_collection_ms": deltas.get("output_collection_total_ms", output_collection_ms),
+        "local_timing": _local_timing,
     }
 
 
