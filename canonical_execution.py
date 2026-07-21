@@ -425,6 +425,16 @@ def _collect_input_images(workflow: dict, comfyui_root: str) -> dict[str, str]:
     return images
 
 
+def _event_span_ms(trace: RuntimeTrace, start_name: str, end_name: str) -> float | None:
+    start_ns: int | None = None
+    for event in trace.events:
+        if event.name == start_name:
+            start_ns = event.monotonic_ns
+        elif event.name == end_name and start_ns is not None:
+            return round((event.monotonic_ns - start_ns) / 1_000_000, 3)
+    return None
+
+
 def build_execution_plan(
     workflow: dict,
     *,
@@ -547,6 +557,7 @@ async def execute_plan(
     )
 
     # ── Profile preparation (before restore publication / Modal submission) ──
+    runtime_trace.emit("active_profile_prepare_start", phase="local")
     runtime_trace.emit("active_next_profile_start", phase="local")
     if profile_setter is not None:
         runtime_trace.emit("plan_serialization_start", phase="local",
@@ -595,11 +606,12 @@ async def execute_plan(
         })
     else:
         runtime_trace.emit("active_next_profile_end", phase="local", metadata={"status": "dry_run"})
+    runtime_trace.emit("active_profile_prepare_end", phase="local")
 
     active_transport = transport or ModalTransport()
 
     # ── Restore publication ──
-    runtime_trace.emit("restore_publish_start", phase="local")
+    runtime_trace.emit("restore_plan_build_start", phase="local")
     if restore_publisher is not None:
         runtime_trace.emit("plan_serialization_start", phase="local",
                            metadata={"purpose": "restore_publication"})
@@ -616,6 +628,8 @@ async def execute_plan(
             prefill_spec=dict(prefill_key.encode_options),
             source_workflow_hash=plan.source_workflow_hash,
         )
+        runtime_trace.emit("restore_plan_build_end", phase="local")
+        runtime_trace.emit("restore_plan_publish_start", phase="local")
 
         # ── Local process-safe cache: skip remote call when identity
         #    is unchanged for the same workspace/app/environment ──
@@ -653,9 +667,11 @@ async def execute_plan(
             with _RESTORE_PUBLISH_CACHE_LOCK:
                 _RESTORE_PUBLISH_CACHE[cache_key] = plan_identity
 
-        runtime_trace.emit("restore_publish_end", phase="local", metadata={"generation": observed_generation})
+        runtime_trace.emit("restore_plan_publish_end", phase="local", metadata={"generation": observed_generation})
     else:
-        runtime_trace.emit("restore_publish_end", phase="local", metadata={"status": "not_configured"})
+        runtime_trace.emit("restore_plan_build_end", phase="local", metadata={"status": "not_configured"})
+        runtime_trace.emit("restore_plan_publish_start", phase="local", metadata={"status": "not_configured"})
+        runtime_trace.emit("restore_plan_publish_end", phase="local", metadata={"status": "not_configured"})
 
     # ── Modal submission ──
     runtime_trace.emit("modal_submit_start", phase="local")
@@ -714,6 +730,68 @@ async def execute_plan(
         remote_trace["deltas_ms"] = merged_trace.durations_ms()
     if "trace_version" not in remote_trace:
         remote_trace["trace_version"] = "2.0.0"
+    _origin = runtime_trace._metadata.get("request_origin_info", {})
+    if not isinstance(_origin, dict):
+        _origin = {}
+    _transport_meta = runtime_trace._metadata
+    if not _transport_meta.get("modal_input_id"):
+        _remote_metadata = raw_remote_trace.get("metadata", {}) if isinstance(raw_remote_trace, dict) else {}
+        if isinstance(_remote_metadata, dict) and _remote_metadata.get("modal_input_id"):
+            _transport_meta["modal_input_id"] = _remote_metadata["modal_input_id"]
+    _local_stages = {
+        "local_body_read_ms": _origin.get("local_body_read_ms"),
+        "local_json_parse_ms": _origin.get("local_json_parse_ms"),
+        "local_preflight_ms": _origin.get("local_preflight_ms"),
+        "local_queue_lock_wait_ms": _origin.get("local_queue_lock_wait_ms"),
+        "local_queue_enqueue_ms": _origin.get("local_queue_enqueue_ms"),
+        "queue_wait_before_worker_ms": _origin.get("queue_wait_before_worker_ms"),
+        "plan_build_ms": _event_span_ms(runtime_trace, "plan_build_start", "plan_build_end"),
+        "active_profile_ms": _event_span_ms(runtime_trace, "active_profile_prepare_start", "active_profile_prepare_end"),
+        "restore_plan_build_ms": _event_span_ms(runtime_trace, "restore_plan_build_start", "restore_plan_build_end"),
+        "restore_publish_ms": _event_span_ms(runtime_trace, "restore_plan_publish_start", "restore_plan_publish_end"),
+        "handle_lookup_ms": _event_span_ms(runtime_trace, "modal_handle_lookup_start", "modal_handle_lookup_end"),
+        "payload_serialize_ms": _event_span_ms(runtime_trace, "modal_payload_serialize_start", "modal_payload_serialize_end"),
+        "generator_create_ms": _transport_meta.get("generator_create_ms"),
+    }
+    _t1_to_submission_ms = _transport_meta.get("local_receive_to_actual_submission_ms")
+    _measured_total = sum(float(value) for value in _local_stages.values() if isinstance(value, (int, float)))
+    _local_residual_ms = (
+        round(float(_t1_to_submission_ms) - _measured_total, 3)
+        if isinstance(_t1_to_submission_ms, (int, float)) else None
+    )
+    _t0_ms = _origin.get("ui_run_triggered_wall_unix_ms")
+    _t1_wall_ns = _origin.get("local_receive_wall_ns")
+    _t0_to_t1_ms = (
+        round((_t1_wall_ns - int(_t0_ms) * 1_000_000) / 1_000_000, 3)
+        if isinstance(_t0_ms, (int, float)) and isinstance(_t1_wall_ns, int) else None
+    )
+    _local_summary = {
+        "t0_to_t1_ms": _t0_to_t1_ms,
+        "t1_to_queue_enqueue_ms": _origin.get("local_receive_to_enqueue_ms"),
+        **_local_stages,
+        "local_residual_ms": _local_residual_ms,
+        "local_receive_to_generator_create_ms": _transport_meta.get("local_receive_to_generator_create_ms"),
+        "generator_create_to_first_iteration_ms": _transport_meta.get("generator_create_to_first_iteration_ms"),
+        "first_iteration_to_first_remote_event_ms": _transport_meta.get("first_iteration_to_first_remote_event_ms"),
+        "local_receive_to_actual_submission_ms": _t1_to_submission_ms,
+    }
+    result["local_timing"] = _local_summary
+    print(
+        f"[v2.request_origin] request_id={runtime_trace.request_id} "
+        f"trigger_source={_origin.get('trigger_source', 'unknown')} "
+        f"local_prompt_enqueued_unix_ns={_origin.get('local_prompt_enqueued_wall_ns')} "
+        f"local_prompt_ack_ready_unix_ns={_origin.get('local_prompt_ack_ready_wall_ns')} "
+        f"modal_generator_created_unix_ns={_transport_meta.get('modal_generator_created_wall_ns')} "
+        f"modal_submission_attempt_unix_ns={_transport_meta.get('modal_submission_attempt_wall_ns')} "
+        f"modal_first_event_received_unix_ns={_transport_meta.get('modal_first_event_received_wall_ns')} "
+        f"t0_to_t1_ms={_t0_to_t1_ms} t1_to_queue_enqueue_ms={_origin.get('local_receive_to_enqueue_ms')} "
+        f"queue_wait_before_worker_ms={_origin.get('queue_wait_before_worker_ms')} "
+        f"plan_build_ms={_local_stages['plan_build_ms']} active_profile_ms={_local_stages['active_profile_ms']} "
+        f"restore_publish_ms={_local_stages['restore_publish_ms']} handle_lookup_ms={_local_stages['handle_lookup_ms']} "
+        f"payload_serialize_ms={_local_stages['payload_serialize_ms']} local_residual_ms={_local_residual_ms} "
+        f"modal_input_id={_transport_meta.get('modal_input_id', '')}",
+        flush=True,
+    )
     result["trace"] = remote_trace
     return result
 

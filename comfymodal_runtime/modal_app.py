@@ -25,8 +25,10 @@ from .runtime_state import CommitCoordinator, ModalMountedStateVolume
 from .model_preload import (
     V2LoaderBridge,
     RestorePreparation,
-    _LATEST_RESTORE_RETURN_MARKER as _MP_LATEST_RESTORE_RETURN_MARKER,
     _collect_restore_events_for_summary,
+    get_restore_return_marker,
+    request_execution_trace_scope,
+    set_model_load_identity,
     set_restore_return_marker,
     _capture_host_info,
     _DIAGNOSTIC_FLAG as _MP_DIAGNOSTIC_FLAG,
@@ -834,6 +836,7 @@ class ModalRuntimeEntrypoint:
         restored_instance_id = uuid.uuid4().hex
         self._restored_instance_id = restored_instance_id
         _LATEST_RESTORED_INSTANCE_ID = restored_instance_id
+        set_model_load_identity(restored_instance_id, restore_session_id)
         # Legacy identity: rename old container_session_id internally
         legacy_container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
         trace.set_metadata(
@@ -1138,6 +1141,20 @@ class ModalRuntimeEntrypoint:
         self._restore_timing = _restore_timing
         _LATEST_LIFECYCLE_TIMING = _restore_timing
 
+        trace.emit("v2_restore_finalize_end", phase="restore")
+        _restore_result = {
+            "backend": state.backend,
+            "cuda": dict(state.cuda),
+            "runtime_generation": state.runtime_generation,
+            "status": "restored",
+            "_restore_timing": _restore_timing,
+            "restored_instance_id": restored_instance_id,
+            "restore_session_id": restore_session_id,
+            "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            "trace": trace.to_dict(),
+            "phase_durations_ms": trace.export_phase_durations(),
+        }
+
         # ── Emit compact restore-breakdown summary ──────────────────
         _brk, _clip = _collect_restore_events_for_summary(trace)
         print(
@@ -1153,25 +1170,17 @@ class ModalRuntimeEntrypoint:
         )
         print(
             f"[v2.clip_stages] "
+            f"worker_queue_ms={_clip.get('worker_queue_ms')} "
+            f"load_torch_file_ms={_clip.get('load_torch_file_ms')} "
             f"read_to_ready_ms={_clip.get('read_to_ready_ms')} "
-            f"cpu_prepare_ms={_clip.get('cpu_prepare_ms')} "
+            f"post_read_cpu_prepare_ms={_clip.get('post_read_cpu_prepare_ms')} "
             f"gpu_wait_ms={_clip.get('gpu_wait_ms')} "
             f"gpu_commit_ms={_clip.get('gpu_commit_ms')} "
             f"read_end_to_ready_ms={_clip.get('read_end_to_ready_ms')} "
-            f"worker_total_ms={_clip.get('worker_total_ms')}",
+            f"worker_total_ms={_clip.get('worker_total_ms')} "
+            f"worker_close_wait_ms={_clip.get('worker_close_wait_ms')} "
+            f"restore_finalization_ms={_clip.get('restore_finalization_ms')}",
             flush=True,
-        )
-
-        trace.emit("v2_restore_finalize_end", phase="restore")
-
-        # ── v2 restore return marker ────────────────────────────────
-        trace.emit("v2_restore_return", phase="restore")
-        set_restore_return_marker(
-            restored_instance_id=restored_instance_id,
-            restore_session_id=restore_session_id,
-            legacy_container_session_id=legacy_container_session_id,
-            modal_task_id=identity.get("container_task_id", ""),
-            pid=os.getpid(),
         )
 
         # ── Emit restoration identity line ──────────────────────────
@@ -1198,18 +1207,16 @@ class ModalRuntimeEntrypoint:
             f"status=restored"
         )
 
-        return {
-            "backend": state.backend,
-            "cuda": dict(state.cuda),
-            "runtime_generation": state.runtime_generation,
-            "status": "restored",
-            "_restore_timing": _restore_timing,
-            "restored_instance_id": restored_instance_id,
-            "restore_session_id": restore_session_id,
-            "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
-            "trace": trace.to_dict(),
-            "phase_durations_ms": trace.export_phase_durations(),
-        }
+        trace.emit("v2_restore_return", phase="restore")
+        _restore_result["trace"] = trace.to_dict()
+        set_restore_return_marker(
+            restored_instance_id=restored_instance_id,
+            restore_session_id=restore_session_id,
+            legacy_container_session_id=legacy_container_session_id,
+            modal_task_id=identity.get("container_task_id", ""),
+            pid=os.getpid(),
+        )
+        return _restore_result
 
     async def _run_in_process(self, plan: ExecutionPlan, context: ExecutionContext) -> dict[str, Any]:
         if context.cancelled and context.cancelled():
@@ -1235,8 +1242,9 @@ class ModalRuntimeEntrypoint:
         # GPU model-load/encode overlap.  Idempotent and thread-safe.
         self._preload_bridge.schedule_execution_prefill(trace=trace)
         try:
-            with self._preload_bridge.request_scope():
-                result: dict[str, Any] = await self._execute_v2_prompt_executor(plan, context, api, trace)
+            with request_execution_trace_scope(trace):
+                with self._preload_bridge.request_scope():
+                    result: dict[str, Any] = await self._execute_v2_prompt_executor(plan, context, api, trace)
             trace.emit("graph_execution_end", phase="execution")
             # Drain late worker events (read/cpu/gpu/ready) from bridge
             # preparation into the execution trace so they are not lost.
@@ -1264,6 +1272,25 @@ class ModalRuntimeEntrypoint:
                 preload_diagnostics=self._preload_bridge.diagnostics(),
                 container_session_id=_cid,
             )
+            _gpu_locations: list[str] = []
+            for _gpu_event in trace.events:
+                if _gpu_event.name == "graph_gpu_load_start":
+                    _classification = str(_gpu_event.metadata.get("caller_classification", "graph_model_loading"))
+                    if _classification not in _gpu_locations:
+                        _gpu_locations.append(_classification)
+                elif _gpu_event.name == "gpu_commit_start":
+                    _lane_name = str(_gpu_event.metadata.get("lane", ""))
+                    _lane_location = {
+                        "UNET": "background_unet_preparation",
+                        "CLIP": "restore_clip_preparation",
+                        "VAE": "restore_vae_preparation",
+                    }.get(_lane_name)
+                    if _lane_location and _lane_location not in _gpu_locations:
+                        _gpu_locations.append(_lane_location)
+            if not _gpu_locations:
+                _gpu_locations = ["not_observed"]
+            trace.set_metadata(gpu_loading_observed=_gpu_locations)
+            result["gpu_loading_observed"] = _gpu_locations
             result["trace"] = trace.to_dict()
             if "_stage_timings" in result:
                 result["trace"]["stages"] = result.pop("_stage_timings")
@@ -1975,7 +2002,8 @@ class ModalRuntimeEntrypoint:
         _method_first_line_ns = time.monotonic_ns()
         _method_first_line_wall_ns = int(time.time() * 1_000_000_000)
         _method_first_line_pid = os.getpid()
-        _method_restore_marker = _MP_LATEST_RESTORE_RETURN_MARKER
+        _method_restore_marker = get_restore_return_marker()
+        _entry_host = _capture_host_info()
 
         identity = _capture_remote_identity()
         _identity_capture_end_ns = time.monotonic_ns()
@@ -1993,18 +2021,33 @@ class ModalRuntimeEntrypoint:
         # ── Compute method entry gap before any trace output ─────────
         _method_entry_gap_results: dict[str, Any] = {}
         try:
-            # Only compare when marker comes from same process+task
+            # Durations are valid only when all process identities match.
             _marker_restored_id = (_method_restore_marker or {}).get("restored_instance_id", "")
+            _marker_restore_session_id = (_method_restore_marker or {}).get("restore_session_id", "")
             _marker_task_id = (_method_restore_marker or {}).get("modal_task_id", "")
             _marker_pid = (_method_restore_marker or {}).get("pid", 0)
+            _marker_boot_id = (_method_restore_marker or {}).get("boot_id", "")
+            _marker_hostname = (_method_restore_marker or {}).get("hostname", "")
             _current_rid = self._restored_instance_id if hasattr(self, "_restored_instance_id") else ""
+            _current_restore_session_id = (self._restore_timing or {}).get("restore_session_id", "")
             _current_task_id = identity.get("container_task_id", "")
-            _same_process = bool(
-                _current_rid
-                and _current_rid == _marker_restored_id
-                and _current_task_id == _marker_task_id
-                and _method_first_line_pid == _marker_pid
+            _current_host = _entry_host
+            _identity_matches = {
+                "restored_instance_id": bool(_current_rid and _current_rid == _marker_restored_id),
+                "restore_session_id": bool(_current_restore_session_id and _current_restore_session_id == _marker_restore_session_id),
+                "modal_task_id": bool(_current_task_id and _current_task_id == _marker_task_id),
+                "pid": bool(_method_first_line_pid == _marker_pid),
+                "boot_id": bool(_marker_boot_id and _marker_boot_id == _current_host.get("boot_id", "")),
+                "hostname": bool(_marker_hostname and _marker_hostname == _current_host.get("hostname", "")),
+            }
+            _same_process = all(
+                _identity_matches[key]
+                for key in ("restored_instance_id", "modal_task_id", "pid", "boot_id")
             )
+            _method_entry_gap_results["identity_matches"] = _identity_matches
+            _method_entry_gap_results["identity_mismatch_reasons"] = [
+                key for key, matched in _identity_matches.items() if not matched
+            ]
             if _same_process and _method_restore_marker is not None:
                 _restore_return_ns = _method_restore_marker.get("monotonic_ns", 0)
                 if _restore_return_ns and _method_first_line_ns >= _restore_return_ns:
@@ -2016,9 +2059,10 @@ class ModalRuntimeEntrypoint:
             else:
                 _method_entry_gap_results["same_process"] = False
                 _method_entry_gap_results["cross_process_duration_unavailable"] = True
-        except Exception:
+        except Exception as exc:
             _method_entry_gap_results["same_process"] = False
             _method_entry_gap_results["cross_process_duration_unavailable"] = True
+            _method_entry_gap_results["identity_mismatch_reasons"] = [f"identity_check_error:{type(exc).__name__}"]
 
         # ── Continue with normal setup ──────────────────────────────
         # Use a local event buffer until trace exists
@@ -2026,7 +2070,7 @@ class ModalRuntimeEntrypoint:
             {"name": "run_plan_method_first_line", "phase": "method",
              "wall_unix_ns": _method_first_line_wall_ns,
              "monotonic_ns": _method_first_line_ns,
-             "metadata": {"pid": _method_first_line_pid}}
+             "metadata": {"pid": _method_first_line_pid, **_entry_host}}
         ]
 
         context = ExecutionContext(
@@ -2041,6 +2085,7 @@ class ModalRuntimeEntrypoint:
             restore_session_id=(self._restore_timing or {}).get("restore_session_id", ""),
             legacy_container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
             request_origin_info=_request_origin_info,
+            **_entry_host,
             **_resource_identity(),
         )
 
@@ -2066,8 +2111,10 @@ class ModalRuntimeEntrypoint:
 
         # Now merge pre-trace events into the real trace
         for _pt_event in _pre_trace_events:
-            context.trace.emit(
+            context.trace.emit_at(
                 _pt_event["name"],
+                wall_unix_ns=_pt_event["wall_unix_ns"],
+                monotonic_ns=_pt_event["monotonic_ns"],
                 phase=_pt_event["phase"],
                 metadata={**_pt_event.get("metadata", {}),
                           "deferred": True},
@@ -2110,7 +2157,8 @@ class ModalRuntimeEntrypoint:
             f"[v2.method_entry_gap] "
             f"restore_to_method_ms={_method_entry_gap_results.get('restore_return_to_method_first_line_ms')} "
             f"first_line_to_running_log_ms={_first_line_to_now_ms} "
-            f"same_process={_method_entry_gap_results.get('same_process')}",
+            f"same_process={_method_entry_gap_results.get('same_process')} "
+            f"identity_mismatch_reasons={','.join(_method_entry_gap_results.get('identity_mismatch_reasons', [])) or 'none'}",
             flush=True,
         )
 
@@ -2254,8 +2302,8 @@ class ModalRuntimeEntrypoint:
                 else:
                     _t0_wall_ns = None
                 _t1_wall_ns = _request_origin_info.get("local_receive_wall_ns", None)
-                _t2_wall_ns = _request_origin_info.get("modal_dispatch_wall_ns", None)
-                _t3_wall_ns = _request_origin_info.get("modal_call_created_wall_ns", None)
+                _t2_wall_ns = _request_origin_info.get("modal_submission_attempt_wall_ns", None)
+                _t3_wall_ns = _request_origin_info.get("modal_generator_created_wall_ns", None)
                 # Extract authoritative T5 from remote V2 prompt_executor_start event.
                 # Filter for process=remote to ignore legacy/duplicate traces.
                 # Iterate until a remote event with non-empty t5_wall_ns is found;
@@ -2283,7 +2331,7 @@ class ModalRuntimeEntrypoint:
                 _t1_t2_ms = None
                 _t1_t2_scope = None
                 _t1_mono = _request_origin_info.get("local_receive_mono_ns", None)
-                _t2_mono = _request_origin_info.get("modal_dispatch_mono_ns", None)
+                _t2_mono = _request_origin_info.get("modal_submission_attempt_mono_ns", None)
                 if _t1_mono and _t2_mono:
                     _t1_t2_ms = round((_t2_mono - _t1_mono) / 1_000_000, 3)
                     _t1_t2_scope = "mono_same_process"
@@ -2293,8 +2341,8 @@ class ModalRuntimeEntrypoint:
                 # T2(server)→T3(server): same-process → mono
                 _t2_t3_ms = None
                 _t2_t3_scope = None
-                if _t2_mono and _request_origin_info.get("modal_call_created_mono_ns"):
-                    _t2_t3_ms = round((_request_origin_info["modal_call_created_mono_ns"] - _t2_mono) / 1_000_000, 3)
+                if _t2_mono and _request_origin_info.get("modal_generator_created_mono_ns"):
+                    _t2_t3_ms = round((_request_origin_info["modal_generator_created_mono_ns"] - _t2_mono) / 1_000_000, 3)
                     _t2_t3_scope = "mono_same_process"
                 elif _t2_wall_ns and _t3_wall_ns:
                     _t2_t3_ms = round((_t3_wall_ns - _t2_wall_ns) / 1_000_000, 3)
@@ -2340,27 +2388,27 @@ class ModalRuntimeEntrypoint:
                 data["raw_timestamps"] = {
                     "t0_ui_trigger_wall_unix_ns": _t0_wall_ns,
                     "t1_local_receive_wall_unix_ns": _t1_wall_ns,
-                    "t2_modal_dispatch_wall_unix_ns": _t2_wall_ns,
-                    "t3_modal_call_created_wall_unix_ns": _t3_wall_ns,
+                    "modal_submission_attempt_wall_unix_ns": _t2_wall_ns,
+                    "modal_generator_created_wall_unix_ns": _t3_wall_ns,
                     "t4_modal_method_entry_wall_unix_ns": _t4_wall,
                     "t5_prompt_executor_start_wall_unix_ns": _t5_wall_ns,
                 }
                 data["intervals_ms"] = {
                     "run_trigger_to_local_receive_ms": _t0_t1_ms,
-                    "local_receive_to_modal_dispatch_ms": _t1_t2_ms,
-                    "modal_dispatch_setup_ms": _t2_t3_ms,
-                    "modal_dispatch_to_method_entry_ms": _t2_t4_ms,
-                    "modal_call_created_to_entry_ms": _t3_t4_ms,
+                    "local_receive_to_actual_submission_ms": _t1_t2_ms,
+                    "generator_create_ms": _t2_t3_ms,
+                    "actual_submission_to_method_entry_ms": _t2_t4_ms,
+                    "generator_created_to_entry_ms": _t3_t4_ms,
                     "method_entry_to_prompt_executor_ms": _t4_t5_ms,
                     "run_trigger_to_modal_entry_ms": _t0_t4_ms,
                     "run_trigger_to_prompt_executor_ms": _t0_t5_ms,
                 }
                 data["clock_scopes"] = {
                     "run_trigger_to_local_receive": _t0_t1_scope,
-                    "local_receive_to_modal_dispatch": _t1_t2_scope,
-                    "modal_dispatch_setup": _t2_t3_scope,
-                    "modal_dispatch_to_method_entry": _t2_t4_scope,
-                    "modal_call_created_to_entry": _t3_t4_scope,
+                    "local_receive_to_actual_submission": _t1_t2_scope,
+                    "generator_create": _t2_t3_scope,
+                    "actual_submission_to_method_entry": _t2_t4_scope,
+                    "generator_created_to_entry": _t3_t4_scope,
                     "method_entry_to_prompt_executor": _t4_t5_scope,
                     "run_trigger_to_modal_entry": _t0_t4_scope,
                     "run_trigger_to_prompt_executor": _t0_t5_scope,
@@ -2371,17 +2419,17 @@ class ModalRuntimeEntrypoint:
 
                 # ── Exact one-line [v2.request_origin] summary ──────
                 _trig_to_dispatch = _t0_t1_ms  # same as run_trigger_to_local_receive
-                _dispatch_to_entry = _t2_t4_ms   # same as modal_dispatch_to_method_entry
+                _dispatch_to_entry = _t2_t4_ms
                 _entry_to_exec = _t4_t5_ms       # same as method_entry_to_prompt_executor
                 _trig_to_exec = _t0_t5_ms        # same as run_trigger_to_prompt_executor
                 print(
-                    f"[v2.request_origin] "
+                    f"[v2.remote_request_origin] "
                     f"request_id={_t4_request} "
                     f"trigger_source={_trig_src} "
                     f"ui_trigger_unix_ms={_t0_wall or 0} "
                     f"local_receive_unix_ns={_t1_wall_ns or 0} "
-                    f"modal_dispatch_unix_ns={_t2_wall_ns or 0} "
-                    f"modal_call_created_unix_ns={_t3_wall_ns or 0} "
+                    f"modal_submission_attempt_unix_ns={_t2_wall_ns or 0} "
+                    f"modal_generator_created_unix_ns={_t3_wall_ns or 0} "
                     f"modal_method_entry_unix_ns={_t4_wall} "
                     f"prompt_executor_start_unix_ns={_t5_wall_ns or 0} "
                     f"trigger_to_dispatch_ms={_trig_to_dispatch} "

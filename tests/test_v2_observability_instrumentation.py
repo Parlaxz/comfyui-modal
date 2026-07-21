@@ -212,7 +212,7 @@ class TestSummaryCollector(unittest.TestCase):
         trace.emit("v2_clip_worker_wait_end", phase="restore")
         trace.emit("v2_clip_ready", phase="restore")
         brk, clip = _collect_restore_events_for_summary(trace)
-        self.assertIsNotNone(clip.get("worker_total_ms"))
+        self.assertIsNotNone(clip.get("worker_close_wait_ms"))
 
 
 class TestDeepDiagnosticHelpers(unittest.TestCase):
@@ -758,13 +758,14 @@ class TestRestoreEventsVocabulary(unittest.TestCase):
 
 
 class TestRestoreReturnInRunPlanStream(unittest.TestCase):
-    """Verify run_plan_stream reads _MP_LATEST_RESTORE_RETURN_MARKER."""
+    """Verify run_plan_stream reads the restore marker through its accessor."""
 
     def test_run_plan_stream_uses_restore_marker(self):
         import inspect
         from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
         source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
-        self.assertIn("_MP_LATEST_RESTORE_RETURN_MARKER", source)
+        self.assertIn("get_restore_return_marker()", source)
+        self.assertNotIn("_LATEST_RESTORE_RETURN_MARKER", source)
 
 
 class TestCompactSummaries(unittest.TestCase):
@@ -903,32 +904,37 @@ class TestT4Placement(unittest.TestCase):
 
 
 class TestT2T3Placement(unittest.TestCase):
-    """Exact T2 comfy_modal_dispatch_start / T3 modal_call_created order."""
+    """Lazy generator creation and actual first-iteration submission order."""
 
-    def test_comfy_modal_dispatch_start_exists(self):
-        """comfy_modal_dispatch_start event emitted exactly at T2."""
+    def test_modal_generator_events_exist(self):
         import inspect
         from comfymodal_runtime.modal_transport import ModalTransport
         source = inspect.getsource(ModalTransport.run_plan_stream)
-        self.assertIn("comfy_modal_dispatch_start", source)
+        self.assertIn("modal_generator_create_start", source)
+        self.assertIn("modal_generator_created", source)
 
-    def test_modal_call_created_exists(self):
-        """modal_call_created event emitted exactly at T3."""
+    def test_submission_and_first_event_exist(self):
         import inspect
         from comfymodal_runtime.modal_transport import ModalTransport
         source = inspect.getsource(ModalTransport.run_plan_stream)
-        self.assertIn("modal_call_created", source)
+        self.assertIn("modal_submission_attempt", source)
+        self.assertIn("modal_first_event_received", source)
 
-    def test_ordering_dispatch_before_call(self):
-        """comfy_modal_dispatch_start before remote_gen.aio before modal_call_created."""
+    def test_lazy_generator_and_iteration_order(self):
         import inspect
         from comfymodal_runtime.modal_transport import ModalTransport
         source = inspect.getsource(ModalTransport.run_plan_stream)
-        dsp_idx = source.find("comfy_modal_dispatch_start")
+        create_start_idx = source.find("modal_generator_create_start")
         gen_idx = source.find("remote_gen.aio")
-        call_idx = source.find("modal_call_created")
-        self.assertLess(dsp_idx, gen_idx, "dispatch before remote_gen.aio")
-        self.assertLess(gen_idx, call_idx, "remote_gen.aio before call_created")
+        created_idx = source.find("modal_generator_created")
+        submit_idx = source.find("modal_submission_attempt")
+        iterate_idx = source.find("await iterator.__anext__()")
+        first_event_idx = source.find("modal_first_event_received")
+        self.assertLess(create_start_idx, gen_idx)
+        self.assertLess(gen_idx, created_idx)
+        self.assertLess(created_idx, submit_idx)
+        self.assertLess(submit_idx, iterate_idx)
+        self.assertLess(iterate_idx, first_event_idx)
 
     def test_exact_events_in_modal_client(self):
         """comfy_modal_dispatch_start and modal_call_created in legacy path."""
@@ -957,27 +963,27 @@ class TestEightIntervals(unittest.TestCase):
             "raw_timestamps": {
                 "t0_ui_trigger_wall_unix_ns": now - 10_000_000_000,
                 "t1_local_receive_wall_unix_ns": now - 9_000_000_000,
-                "t2_modal_dispatch_wall_unix_ns": now - 8_500_000_000,
-                "t3_modal_call_created_wall_unix_ns": now - 8_490_000_000,
+                "modal_submission_attempt_wall_unix_ns": now - 8_500_000_000,
+                "modal_generator_created_wall_unix_ns": now - 8_490_000_000,
                 "t4_modal_method_entry_wall_unix_ns": now - 1_000_000_000,
                 "t5_prompt_executor_start_wall_unix_ns": now,
             },
             "intervals_ms": {
                 "run_trigger_to_local_receive_ms": 1000.0,
-                "local_receive_to_modal_dispatch_ms": 500.0,
-                "modal_dispatch_setup_ms": 10.0,
-                "modal_dispatch_to_method_entry_ms": 7500.0,
-                "modal_call_created_to_entry_ms": 7490.0,
+                "local_receive_to_actual_submission_ms": 500.0,
+                "generator_create_ms": 10.0,
+                "actual_submission_to_method_entry_ms": 7500.0,
+                "generator_created_to_entry_ms": 7490.0,
                 "method_entry_to_prompt_executor_ms": 1000.0,
                 "run_trigger_to_modal_entry_ms": 9000.0,
                 "run_trigger_to_prompt_executor_ms": 10000.0,
             },
             "clock_scopes": {
                 "run_trigger_to_local_receive": "wall_cross_process",
-                "local_receive_to_modal_dispatch": "mono_same_process",
-                "modal_dispatch_setup": "mono_same_process",
-                "modal_dispatch_to_method_entry": "wall_cross_process",
-                "modal_call_created_to_entry": "wall_cross_process",
+                "local_receive_to_actual_submission": "mono_same_process",
+                "generator_create": "mono_same_process",
+                "actual_submission_to_method_entry": "wall_cross_process",
+                "generator_created_to_entry": "wall_cross_process",
                 "method_entry_to_prompt_executor": "mono_same_process",
                 "run_trigger_to_modal_entry": "wall_cross_process",
                 "run_trigger_to_prompt_executor": "wall_cross_process",
@@ -990,10 +996,10 @@ class TestEightIntervals(unittest.TestCase):
         intervals = data["intervals_ms"]
         expected = [
             "run_trigger_to_local_receive_ms",
-            "local_receive_to_modal_dispatch_ms",
-            "modal_dispatch_setup_ms",
-            "modal_dispatch_to_method_entry_ms",
-            "modal_call_created_to_entry_ms",
+            "local_receive_to_actual_submission_ms",
+            "generator_create_ms",
+            "actual_submission_to_method_entry_ms",
+            "generator_created_to_entry_ms",
             "method_entry_to_prompt_executor_ms",
             "run_trigger_to_modal_entry_ms",
             "run_trigger_to_prompt_executor_ms",
@@ -1038,32 +1044,35 @@ class TestExactSummaryFields(unittest.TestCase):
     REQUIRED_FIELDS = [
         "request_id",
         "trigger_source",
-        "ui_trigger_unix_ms",
-        "local_receive_unix_ns",
-        "modal_dispatch_unix_ns",
-        "modal_call_created_unix_ns",
-        "modal_method_entry_unix_ns",
-        "prompt_executor_start_unix_ns",
-        "trigger_to_dispatch_ms",
-        "dispatch_to_modal_entry_ms",
-        "modal_entry_to_executor_ms",
-        "trigger_to_executor_ms",
+        "local_prompt_enqueued_unix_ns",
+        "local_prompt_ack_ready_unix_ns",
+        "modal_generator_created_unix_ns",
+        "modal_submission_attempt_unix_ns",
+        "modal_first_event_received_unix_ns",
+        "t0_to_t1_ms",
+        "t1_to_queue_enqueue_ms",
+        "queue_wait_before_worker_ms",
+        "plan_build_ms",
+        "active_profile_ms",
+        "restore_publish_ms",
+        "handle_lookup_ms",
+        "payload_serialize_ms",
+        "local_residual_ms",
         "modal_input_id",
-        "modal_task_id",
     ]
 
     def test_summary_prefix_in_source(self):
         """[v2.request_origin] prefix is emitted in run_plan_stream."""
         import inspect
-        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
-        source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        from canonical_execution import execute_plan
+        source = inspect.getsource(execute_plan)
         self.assertIn("[v2.request_origin]", source)
 
     def test_all_required_fields_in_source(self):
         """Every required summary field name appears in the summary print."""
         import inspect
-        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
-        source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        from canonical_execution import execute_plan
+        source = inspect.getsource(execute_plan)
         for field in self.REQUIRED_FIELDS:
             self.assertIn(f"{field}=", source, f"Missing summary field: {field}")
 
@@ -1071,8 +1080,8 @@ class TestExactSummaryFields(unittest.TestCase):
         """None of the required fields use shortened names."""
         forbidden_short = ["trig_to_dispatch", "disp_to_entry", "entry_to_exec"]
         import inspect
-        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
-        source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        from canonical_execution import execute_plan
+        source = inspect.getsource(execute_plan)
         for short in forbidden_short:
             self.assertNotIn(f"{short}=", source, f"Shortened name forbidden: {short}")
 
@@ -1149,10 +1158,10 @@ class TestClockScopeCorrectness(unittest.TestCase):
         data = {
             "clock_scopes": {
                 "run_trigger_to_local_receive": "wall_cross_process",
-                "local_receive_to_modal_dispatch": "mono_same_process",
-                "modal_dispatch_setup": "mono_same_process",
-                "modal_dispatch_to_method_entry": "wall_cross_process",
-                "modal_call_created_to_entry": "wall_cross_process",
+                "local_receive_to_actual_submission": "mono_same_process",
+                "generator_create": "mono_same_process",
+                "actual_submission_to_method_entry": "wall_cross_process",
+                "generator_created_to_entry": "wall_cross_process",
                 "method_entry_to_prompt_executor": "mono_same_process",
                 "run_trigger_to_modal_entry": "wall_cross_process",
                 "run_trigger_to_prompt_executor": "wall_cross_process",
@@ -1175,8 +1184,8 @@ class TestResultDataTimestamps(unittest.TestCase):
         import inspect
         from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
         source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
-        for t_key in ("t0_ui_trigger", "t1_local_receive", "t2_modal_dispatch",
-                       "t3_modal_call_created", "t4_modal_method_entry",
+        for t_key in ("t0_ui_trigger", "t1_local_receive", "modal_submission_attempt",
+                       "modal_generator_created", "t4_modal_method_entry",
                        "t5_prompt_executor_start"):
             self.assertIn(t_key, source, f"Missing raw timestamp key: {t_key}")
 
@@ -1185,9 +1194,9 @@ class TestResultDataTimestamps(unittest.TestCase):
         import inspect
         from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
         source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
-        for iv_key in ("run_trigger_to_local_receive_ms", "local_receive_to_modal_dispatch_ms",
-                       "modal_dispatch_setup_ms", "modal_dispatch_to_method_entry_ms",
-                       "modal_call_created_to_entry_ms", "method_entry_to_prompt_executor_ms",
+        for iv_key in ("run_trigger_to_local_receive_ms", "local_receive_to_actual_submission_ms",
+                       "generator_create_ms", "actual_submission_to_method_entry_ms",
+                       "generator_created_to_entry_ms", "method_entry_to_prompt_executor_ms",
                        "run_trigger_to_modal_entry_ms", "run_trigger_to_prompt_executor_ms"):
             self.assertIn(iv_key, source, f"Missing interval: {iv_key}")
 

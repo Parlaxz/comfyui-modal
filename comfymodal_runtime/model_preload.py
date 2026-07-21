@@ -68,6 +68,7 @@ _LANE_TO_CANONICAL: dict[str, str] = {
 
 # ── V2 restore correlation identity ──────────────────────────────────
 _LATEST_RESTORED_INSTANCE_ID: str = ""
+_LATEST_RESTORE_SESSION_ID: str = ""
 """Module-level latest restored_instance_id.  Set by restore() after
 snapshot restoration; read by background worker and graph-entry paths."""
 
@@ -88,6 +89,9 @@ and method gaps are reported."""
 
 _ACTIVE_LANE_TRACE: ContextVar["ModelLaneTrace | None"] = ContextVar(
     "comfymodal_active_lane_trace", default=None
+)
+_ACTIVE_REQUEST_TRACE: ContextVar["RuntimeTrace | None"] = ContextVar(
+    "comfymodal_active_request_trace", default=None
 )
 """Set to the active ``ModelLaneTrace`` while a worker callback runs.
 Reset to ``None`` after the callback completes."""
@@ -211,8 +215,30 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 minimum_memory_required=None, force_full_load=False):
         before = _gpu_depth.get()
         _gpu_depth.set(before + 1)
+        _graph_start_ns = 0
+        _graph_thread_start_ns = None
+        _caller = "not_observed"
         if before == 0:
             lane = _ACTIVE_LANE_TRACE.get()
+            request_trace = _ACTIVE_REQUEST_TRACE.get()
+            _graph_start_ns = time.monotonic_ns()
+            _graph_thread_start_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
+            _caller = "background_unet_preparation" if lane is not None and lane._lane == "UNET" else "graph_model_loading"
+            if lane is None and request_trace is not None:
+                try:
+                    import inspect as _inspect
+                    _frames = " ".join(frame.function.lower() for frame in _inspect.stack(context=0)[:12])
+                    if "sampler" in _frames:
+                        _caller = "sampler_setup"
+                except Exception:
+                    pass
+                request_trace.emit("graph_gpu_load_start", phase="execution", metadata={
+                    "model_identity_hash": stable_hash([type(model).__module__ + "." + type(model).__qualname__ for model in models])[:16],
+                    "memory_required": memory_required,
+                    "force_patch_weights": force_patch_weights,
+                    "force_full_load": force_full_load,
+                    "caller_classification": _caller,
+                })
             if lane is not None:
                 lane._on_gpu_commit_about_to_start()
                 # Acquire mutation lane (real wait when contended).
@@ -232,9 +258,17 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
             _gpu_depth.set(after - 1)
             if before == 0:
                 lane = _ACTIVE_LANE_TRACE.get()
+                request_trace = _ACTIVE_REQUEST_TRACE.get()
                 if lane is not None:
                     lane.gpu_commit_end()
                     _get_mutation_lane().release(lane._lane if lane else None)
+                elif request_trace is not None:
+                    _thread_end_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
+                    request_trace.emit("graph_gpu_load_end", phase="execution", metadata={
+                        "host_wall_duration_ms": round((time.monotonic_ns() - _graph_start_ns) / 1_000_000, 3),
+                        "thread_cpu_duration_ms": round((_thread_end_ns - _graph_thread_start_ns) / 1_000_000, 3) if _thread_end_ns is not None and _graph_thread_start_ns is not None else None,
+                        "caller_classification": _caller,
+                    })
     wrapper._comfy_modal_gpu_wrapper = True  # sentinel for idempotence
     return wrapper
 
@@ -318,21 +352,25 @@ def _make_safetensors_open_wrapper(original: Callable[..., Any]) -> Callable[...
                             _start_ns = 0
                             if lane2 is not None and lane2._lane == "UNET" and _DIAGNOSTIC_FLAG:
                                 _start_ns = time.monotonic_ns()
-                            try:
-                                return self._orig_gt(k)
-                            finally:
-                                if lane2 is not None and lane2._lane == "UNET" and _DIAGNOSTIC_FLAG and _start_ns:
-                                    self._count_agg[0] += 1
-                                    try:
-                                        _t = self._orig_gt(k)
-                                        self._bytes_agg[0] += _t.numel() if hasattr(_t, "numel") else 0
-                                    except Exception:
-                                        pass
+                            tensor = self._orig_gt(k)
+                            if lane2 is not None and lane2._lane == "UNET" and _DIAGNOSTIC_FLAG and _start_ns:
+                                self._count_agg[0] += 1
+                                try:
+                                    self._bytes_agg[0] += tensor.numel() * tensor.element_size()
+                                except Exception:
+                                    pass
+                            return tensor
 
                         def __enter__(self):
                             return self
 
                         def __exit__(self, *exc):
+                            lane2 = _ACTIVE_LANE_TRACE.get()
+                            if lane2 is not None:
+                                lane2._trace.emit("unet_tensor_materialize_aggregated", phase="restore", metadata={
+                                    "tensor_count": self._count_agg[0],
+                                    "total_bytes": self._bytes_agg[0],
+                                })
                             return self._wrapped.__exit__(*exc) if hasattr(self._wrapped, "__exit__") else None
 
                         def keys(self):
@@ -340,9 +378,6 @@ def _make_safetensors_open_wrapper(original: Callable[..., Any]) -> Callable[...
 
                     _result = _SafeOpenProxy(_result, _orig_get_tensor,
                                              _tensor_count_agg, _tensor_bytes_agg)
-                    lane._trace.emit("unet_tensor_materialize_aggregated", phase="restore",
-                                     metadata={"tensor_count": _tensor_count_agg[0],
-                                               "total_bytes": _tensor_bytes_agg[0]})
                 else:
                     lane._trace.emit("unet_safetensors_load_combined_start", phase="restore",
                                      metadata={"stage_split_available": False})
@@ -630,7 +665,10 @@ def _make_unet_subfn_wrapper(
                 "category": category,
             })
         try:
-            return original(*args, **kwargs)
+            result = original(*args, **kwargs)
+            if emit and short_name == "model_config_from_unet" and result is not None:
+                _instrument_unet_model_config(result, lane)
+            return result
         finally:
             after = _UNET_SUBFN_DEPTH.get()
             _UNET_SUBFN_DEPTH.set(after - 1)
@@ -645,6 +683,58 @@ def _make_unet_subfn_wrapper(
                 if _children is not None:
                     _children.append(_dur_ms)
     return wrapper
+
+
+def _instrument_unet_model_config(model_config: Any, lane: "ModelLaneTrace") -> None:
+    get_model = getattr(model_config, "get_model", None)
+    if not callable(get_model) or getattr(get_model, _SENTINEL_SUBFN, False):
+        return
+
+    @functools.wraps(get_model)
+    def wrapped_get_model(*args: Any, **kwargs: Any) -> Any:
+        started_ns = time.monotonic_ns()
+        lane._trace.emit("unet_model_config_get_model_start", phase="restore")
+        try:
+            model = get_model(*args, **kwargs)
+            _instrument_unet_model_weights(model, lane)
+            return model
+        finally:
+            duration_ms = round((time.monotonic_ns() - started_ns) / 1_000_000, 3)
+            lane._trace.emit("unet_model_config_get_model_end", phase="restore", metadata={"duration_ms": duration_ms})
+            children = _child_durations.get()
+            if children is not None:
+                children.append(duration_ms)
+
+    setattr(wrapped_get_model, _SENTINEL_SUBFN, True)
+    try:
+        model_config.get_model = wrapped_get_model
+    except Exception:
+        lane._trace.emit("unet_model_config_get_model_unavailable", phase="restore")
+
+
+def _instrument_unet_model_weights(model: Any, lane: "ModelLaneTrace") -> None:
+    load_weights = getattr(model, "load_model_weights", None)
+    if not callable(load_weights) or getattr(load_weights, _SENTINEL_SUBFN, False):
+        return
+
+    @functools.wraps(load_weights)
+    def wrapped_load_weights(*args: Any, **kwargs: Any) -> Any:
+        started_ns = time.monotonic_ns()
+        lane._trace.emit("unet_load_model_weights_start", phase="restore")
+        try:
+            return load_weights(*args, **kwargs)
+        finally:
+            duration_ms = round((time.monotonic_ns() - started_ns) / 1_000_000, 3)
+            lane._trace.emit("unet_load_model_weights_end", phase="restore", metadata={"duration_ms": duration_ms})
+            children = _child_durations.get()
+            if children is not None:
+                children.append(duration_ms)
+
+    setattr(wrapped_load_weights, _SENTINEL_SUBFN, True)
+    try:
+        model.load_model_weights = wrapped_load_weights
+    except Exception:
+        lane._trace.emit("unet_load_model_weights_unavailable", phase="restore")
 
 
 _SD_WRAPPER_INSTANCE: Any = None
@@ -1180,6 +1270,7 @@ def set_restore_return_marker(
     """Set ``_LATEST_RESTORE_RETURN_MARKER`` immediately before restore return."""
     global _LATEST_RESTORE_RETURN_MARKER
     _LATEST_RESTORE_RETURN_MARKER = {
+        **_capture_host_info(),
         "wall_unix_ns": int(time.time() * 1_000_000_000),
         "monotonic_ns": time.monotonic_ns(),
         "restored_instance_id": restored_instance_id,
@@ -1188,6 +1279,31 @@ def set_restore_return_marker(
         "modal_task_id": modal_task_id,
         "pid": pid,
     }
+
+
+def get_restore_return_marker() -> dict[str, Any] | None:
+    marker = _LATEST_RESTORE_RETURN_MARKER
+    return dict(marker) if marker else None
+
+
+def set_model_load_identity(restored_instance_id: str, restore_session_id: str) -> None:
+    global _LATEST_RESTORED_INSTANCE_ID, _LATEST_RESTORE_SESSION_ID
+    _LATEST_RESTORED_INSTANCE_ID = restored_instance_id
+    _LATEST_RESTORE_SESSION_ID = restore_session_id
+
+
+@contextmanager
+def request_execution_trace_scope(trace: RuntimeTrace) -> Iterator[None]:
+    token = _ACTIVE_REQUEST_TRACE.set(trace)
+    try:
+        yield
+    finally:
+        _ACTIVE_REQUEST_TRACE.reset(token)
+
+
+def get_active_request_id() -> str:
+    trace = _ACTIVE_REQUEST_TRACE.get()
+    return str(trace.request_id) if trace is not None else ""
 
 
 # ── Deep diagnostic helpers (guarded by COMFYMODAL_V2_DEEP_MODEL_DIAG) ──
@@ -1209,7 +1325,7 @@ def _capture_host_info() -> dict[str, Any]:
         "native_tid": _capture_tid(),
         "hostname": platform.node(),
     }
-    if _DIAGNOSTIC_FLAG and platform.system() == "Linux":
+    if platform.system() == "Linux":
         try:
             with open("/proc/sys/kernel/random/boot_id") as _f:
                 info["boot_id"] = _f.read().strip()
@@ -1446,12 +1562,16 @@ def _collect_restore_events_for_summary(
 
     # CLIP stages
     result_clip: dict[str, Any] = {
+        "worker_queue_ms": None,
+        "load_torch_file_ms": None,
         "read_to_ready_ms": None,
-        "cpu_prepare_ms": None,
+        "post_read_cpu_prepare_ms": None,
         "gpu_wait_ms": None,
         "gpu_commit_ms": None,
         "read_end_to_ready_ms": None,
         "worker_total_ms": None,
+        "worker_close_wait_ms": result_breakdown.get("clip_worker_wait_ms"),
+        "restore_finalization_ms": result_breakdown.get("restore_finalize_ms"),
     }
     for evt in trace.events:
         _meta = evt.metadata if hasattr(evt, "metadata") else {}
@@ -1471,6 +1591,14 @@ def _collect_restore_events_for_summary(
             clip["gpu_commit_start_ns"] = evt.monotonic_ns
         elif evt.name == "gpu_commit_end" and _meta.get("lane") == "CLIP":
             clip["gpu_commit_end_ns"] = evt.monotonic_ns
+        elif evt.name == "submitted" and _meta.get("lane") == "CLIP":
+            clip["submitted_ns"] = evt.monotonic_ns
+        elif evt.name == "preload_worker_started" and _meta.get("lane") == "clip":
+            clip["worker_start_ns"] = evt.monotonic_ns
+        elif evt.name == "clip_prepare_start":
+            clip["worker_body_start_ns"] = evt.monotonic_ns
+        elif evt.name == "clip_prepare_end":
+            clip["worker_body_end_ns"] = evt.monotonic_ns
 
     rs = clip.get("read_start_ns")
     re = clip.get("read_end_ns")
@@ -1487,7 +1615,7 @@ def _collect_restore_events_for_summary(
     if rs and rdy:
         result_clip["read_to_ready_ms"] = round((rdy - rs) / 1_000_000, 3)
     if cps and cpe:
-        result_clip["cpu_prepare_ms"] = round((cpe - cps) / 1_000_000, 3)
+        result_clip["post_read_cpu_prepare_ms"] = round((cpe - cps) / 1_000_000, 3)
     if gws and gwe:
         result_clip["gpu_wait_ms"] = round((gwe - gws) / 1_000_000, 3)
     if gcs and gce:
@@ -1495,7 +1623,13 @@ def _collect_restore_events_for_summary(
     if re and rdy:
         result_clip["read_end_to_ready_ms"] = round((rdy - re) / 1_000_000, 3)
     if wws and wwe:
-        result_clip["worker_total_ms"] = round((wwe - wws) / 1_000_000, 3)
+        result_clip["worker_close_wait_ms"] = round((wwe - wws) / 1_000_000, 3)
+    if rs and re:
+        result_clip["load_torch_file_ms"] = round((re - rs) / 1_000_000, 3)
+    if clip.get("submitted_ns") and clip.get("worker_start_ns"):
+        result_clip["worker_queue_ms"] = round((clip["worker_start_ns"] - clip["submitted_ns"]) / 1_000_000, 3)
+    if clip.get("worker_body_start_ns") and clip.get("worker_body_end_ns"):
+        result_clip["worker_total_ms"] = round((clip["worker_body_end_ns"] - clip["worker_body_start_ns"]) / 1_000_000, 3)
 
     return result_breakdown, result_clip
 
@@ -1603,8 +1737,10 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
         "submission_to_worker_start_ms": None,
         "worker_wall_ms": None, "worker_thread_cpu_ms": None,
         "model_construction_total_ms": None,
-        "measured_children_ms": None,
-        "unattributed_residual_ms": None,
+        "measured_direct_children_ms": None,
+        "model_construction_residual_ms": None,
+        "model_config_get_model_ms": None,
+        "load_model_weights_ms": None,
         "gpu_lane_wait_ms": None, "gpu_commit_ms": None,
         "cache_publish_ms": None,
         "background_gpu_transfer_present": False,
@@ -1649,6 +1785,10 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
                     _sd_total = events[j].metadata.get("duration_ms", 0) if hasattr(events[j], "metadata") else 0
                     _children_total = events[j].metadata.get("measured_child_total_ms", 0) if hasattr(events[j], "metadata") else 0
                     break
+        elif evt.name == "unet_model_config_get_model_end":
+            stages["model_config_get_model_ms"] = evt.metadata.get("duration_ms")
+        elif evt.name == "unet_load_model_weights_end":
+            stages["load_model_weights_ms"] = evt.metadata.get("duration_ms")
 
     if _submitted_ns and _worker_start_ns:
         stages["submission_to_worker_start_ms"] = round((_worker_start_ns - _submitted_ns) / 1_000_000, 3)
@@ -1664,19 +1804,18 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
         stages["cache_publish_ms"] = round((_cache_pub_end - _cache_pub_start) / 1_000_000, 3)
 
     stages["model_construction_total_ms"] = round(_sd_total, 3) if _sd_total else None
-    stages["measured_children_ms"] = round(_children_total, 3) if _children_total else None
-    if _sd_total and _children_total:
-        stages["unattributed_residual_ms"] = round(max(0.0, _sd_total - _children_total), 3)
-    elif _sd_total:
-        stages["unattributed_residual_ms"] = None  # no children measured → residual classification N/A
+    stages["measured_direct_children_ms"] = round(_children_total, 3) if _children_total else None
+    stages["model_construction_residual_ms"] = round(max(0.0, _sd_total - _children_total), 3) if _sd_total else None
 
     print(
         f"[v2.bg_unet_stages] "
         f"submission_to_worker_start_ms={stages['submission_to_worker_start_ms']} "
         f"worker_wall_ms={stages['worker_wall_ms']} "
         f"model_construction_total_ms={stages['model_construction_total_ms']} "
-        f"measured_children_ms={stages['measured_children_ms']} "
-        f"unattributed_residual_ms={stages['unattributed_residual_ms']} "
+        f"measured_direct_children_ms={stages['measured_direct_children_ms']} "
+        f"model_construction_residual_ms={stages['model_construction_residual_ms']} "
+        f"model_config_get_model_ms={stages['model_config_get_model_ms']} "
+        f"load_model_weights_ms={stages['load_model_weights_ms']} "
         f"gpu_lane_wait_ms={stages['gpu_lane_wait_ms']} "
         f"gpu_commit_ms={stages['gpu_commit_ms']} "
         f"cache_publish_ms={stages['cache_publish_ms']} "

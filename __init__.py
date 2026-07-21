@@ -66,9 +66,10 @@ from profiler_trace_v4 import (
     T1M_TRACE_STRIP_START, T1N_TRACE_STRIP_END,
     T1O_PROMPT_EXTRACT_START, T1P_PROMPT_EXTRACT_END,
     T1Q_STACK_EXTRACT_START, T1R_STACK_EXTRACT_END,
-    T2_LOCAL_MODAL_SUBMIT_START, T2A_MODAL_CALL_CONSTRUCTED,
+    T2A_MODAL_CALL_CONSTRUCTED,
     T2B_MODAL_CALL_STREAM_OPEN, T2C_FIRST_REMOTE_EVENT_RECEIVED,
     T2D_LOCAL_PROMPT_ACK_RETURNED,
+    LOCAL_PROMPT_ENQUEUED, LOCAL_PROMPT_ACK_READY,
     T9_LOCAL_REMOTE_RESULT_RECEIVED,
     T9A_LOCAL_RESULT_DESERIALIZE_START, T9B_LOCAL_RESULT_DESERIALIZE_END,
     T9C_LOCAL_BASE64_DECODE_START, T9D_LOCAL_BASE64_DECODE_END,
@@ -1947,6 +1948,20 @@ async def _process_queue():
     while True:
         item, item_id = await _queue.get()
         try:
+            _extra = item[3]
+            _origin = (_extra.get("trace", {}) or {}).get("request_origin_info", {})
+            _worker_wall_ns = time.time_ns()
+            _worker_mono_ns = time.monotonic_ns()
+            _origin["queue_worker_start_wall_ns"] = _worker_wall_ns
+            _origin["queue_worker_start_mono_ns"] = _worker_mono_ns
+            _enqueued_mono_ns = _origin.get("local_prompt_enqueued_mono_ns")
+            if isinstance(_enqueued_mono_ns, int):
+                _origin["queue_wait_before_worker_ms"] = round(
+                    (_worker_mono_ns - _enqueued_mono_ns) / 1_000_000, 3
+                )
+        except Exception:
+            pass
+        try:
             await _execute_job(item, item_id)
         except asyncio.CancelledError:
             raise
@@ -2259,6 +2274,7 @@ async def _execute_job(item: tuple, item_id: int):
             _v2_app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow").strip() or "stable-modal-comfy-v2-shadow"
             _v2_class_name = os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2").strip() or "ModalRuntimeEntrypointV2"
             _v2_method_name = "run_plan_stream"
+            _origin_info = trace_payload.get("request_origin_info", {}) if isinstance(trace_payload, dict) else {}
             _v2_trace.set_metadata(
                 runtime_mode=_mode,
                 app_name=_v2_app_name,
@@ -2269,6 +2285,7 @@ async def _execute_job(item: tuple, item_id: int):
                 region=os.environ.get("COMFYMODAL_COMPUTE_REGION", "").strip(),
                 image_id=os.environ.get("MODAL_IMAGE_ID", "").strip(),
                 container_task_id=os.environ.get("MODAL_TASK_ID", "").strip(),
+                request_origin_info=dict(_origin_info) if isinstance(_origin_info, dict) else {},
             )
             _v2_plan = build_execution_plan(
                 execution_workflow,
@@ -3376,7 +3393,7 @@ if _server:
         dominant = max(phases, key=phases.get) if phases else "unknown"
         dominant_ms = phases.get(dominant, 0)
         total = t2 - t1 if (t1 is not None and t2 is not None) else 0
-        total_ms = round(total * 1000, 2) if isinstance(total, float) else local_ts.get("local_recv_to_dispatch_ms", 0)
+        total_ms = round(total * 1000, 2) if isinstance(total, float) else local_ts.get("local_receive_to_ack_ms", 0)
         if total_ms > 60000:
             degradation_flags.append("local_predispatch_stall_severe")
             print(f"[local_predispatch_stall] SEVERE request_id={request_id} total_ms={total_ms} dominant={dominant}={dominant_ms} body_read={body_read} json_parse={json_parse} stack_extract={stack_extract} active_next={active_next} lock_wait={lock_wait}")
@@ -3385,7 +3402,7 @@ if _server:
             print(f"[local_predispatch_stall] CRITICAL request_id={request_id} total_ms={total_ms} dominant={dominant}={dominant_ms} body_read={body_read} json_parse={json_parse} stack_extract={stack_extract} active_next={active_next} lock_wait={lock_wait}")
         elif total_ms > 5000:
             print(f"[local_predispatch_stall] request_id={request_id} total_ms={total_ms} dominant={dominant}={dominant_ms} body_read={body_read} json_parse={json_parse} stack_extract={stack_extract} active_next={active_next} lock_wait={lock_wait}")
-        return {"local_recv_to_dispatch_ms": total_ms, "dominant_phase": dominant, "dominant_ms": dominant_ms, "body_read_ms": body_read, "json_parse_ms": json_parse, "stack_extract_ms": stack_extract, "active_next_write_ms": active_next, "lock_wait_total_ms": lock_wait}
+        return {"local_receive_to_ack_ms": total_ms, "dominant_phase": dominant, "dominant_ms": dominant_ms, "body_read_ms": body_read, "json_parse_ms": json_parse, "stack_extract_ms": stack_extract, "active_next_write_ms": active_next, "lock_wait_total_ms": lock_wait}
 
     @_server.routes.post("/comfymodal/prompt")
     async def modal_prompt(request: web.Request) -> web.Response:
@@ -3406,22 +3423,27 @@ if _server:
         content_length = request.content_length
         if content_length is not None and content_length > 50 * 1024 * 1024:  # 50 MB max
             return web.json_response({"status": "error", "error": "Request body too large"}, status=413)
+        _body_read_start_mono_ns = time.monotonic_ns()
         try:
-            body = await asyncio.wait_for(request.json(), timeout=_BODY_READ_TIMEOUT_S)
+            _raw_body = await asyncio.wait_for(request.read(), timeout=_BODY_READ_TIMEOUT_S)
         except asyncio.TimeoutError:
             print(f"[comfyui-modal] BODY READ TIMEOUT after {_BODY_READ_TIMEOUT_S}s")
             return web.json_response({"status": "error", "error": "Request body read timed out"}, status=408)
+        _body_read_end_mono_ns = time.monotonic_ns()
         local_et.mark(T1H_BODY_READ_END, phase=PHASE_LOCAL_BRIDGE)
         _body_read_done_ts = time.time()
 
         local_et.mark(T1I_JSON_PARSE_START, phase=PHASE_LOCAL_BRIDGE)
+        _json_parse_start_mono_ns = time.monotonic_ns()
+        body = json.loads(_raw_body.decode(request.charset or "utf-8"))
+        _json_parse_end_mono_ns = time.monotonic_ns()
         _json_parse_done_ts = time.time()
         body_read_ms = round((_body_read_done_ts - _route_entry_ts) * 1000, 3)
         if body_read_ms > _JSON_PARSE_WARN_MS:
             print(f"[comfyui-modal] WARN slow body read: {body_read_ms}ms content_length={content_length or '?'}")
         if body_read_ms > _JSON_PARSE_FAIL_S * 1000:
             return web.json_response({"status": "error", "error": f"JSON read/parse took {body_read_ms}ms, exceeding limit"}, status=413)
-        body_bytes = content_length if content_length else len(json.dumps(body).encode('utf-8'))
+        body_bytes = content_length if content_length else len(_raw_body)
         if body_bytes > 10 * 1024 * 1024:
             print(f"[comfyui-modal] WARN large body: {body_bytes} bytes")
         local_et.mark(T1J_JSON_PARSE_END, phase=PHASE_LOCAL_BRIDGE)
@@ -3443,6 +3465,12 @@ if _server:
             # No browser T0 — T1 becomes the first known boundary
         _prompt_request_origin["local_receive_wall_ns"] = _t1_prompt_wall_ns
         _prompt_request_origin["local_receive_mono_ns"] = _t1_prompt_mono_ns
+        _prompt_request_origin["local_body_read_ms"] = round(
+            (_body_read_end_mono_ns - _body_read_start_mono_ns) / 1_000_000, 3
+        )
+        _prompt_request_origin["local_json_parse_ms"] = round(
+            (_json_parse_end_mono_ns - _json_parse_start_mono_ns) / 1_000_000, 3
+        )
 
         # ── Extract payload fields and inject detailed trace stages ──
         workflow = body.get("prompt", body)
@@ -3501,7 +3529,9 @@ if _server:
         # ── Preflight validation ──
         local_et.mark(T1C_LOCAL_PREFLIGHT_START, phase=PHASE_LOCAL_BRIDGE)
         _preflight_start_ts = time.perf_counter()
+        _preflight_start_mono_ns = time.monotonic_ns()
         validation_errors = validate_api_prompt_structure(workflow)
+        _preflight_end_mono_ns = time.monotonic_ns()
         _preflight_end_ts = time.perf_counter()
         preflight_ms = round((_preflight_end_ts - _preflight_start_ts) * 1000, 3)
         local_et.mark(T1D_LOCAL_PREFLIGHT_END, phase=PHASE_LOCAL_BRIDGE)
@@ -3572,9 +3602,13 @@ if _server:
         scheduler_test = body.get("comfymodal_scheduler_test")
 
         # ── Lock + enqueue ──
-        local_et.mark(T2_LOCAL_MODAL_SUBMIT_START, phase=PHASE_LOCAL_BRIDGE)
-
         _lock_trace = await _timed_async_lock_acquire(_counter_lock, "counter_lock", prompt_id)
+        _prompt_request_origin["local_preflight_ms"] = round(
+            (_preflight_end_mono_ns - _preflight_start_mono_ns) / 1_000_000, 3
+        )
+        _prompt_request_origin["local_queue_lock_wait_ms"] = round(
+            float(_lock_trace.get("wait_ms", 0) or 0), 3
+        )
         if not _lock_trace.get("acquired"):
             raise web.HTTPTooManyRequests(text=json.dumps({"status": "error", "error": "server busy, try again"}))
         try:
@@ -3592,7 +3626,6 @@ if _server:
                 "stages": {
                     T0_CLIENT_PRESS: local_et.events[0].get("wall_unix_ns") if local_et.events else 0,
                     T1_LOCAL_BRIDGE_RECEIVED: local_et.events[1].get("wall_unix_ns") if len(local_et.events) > 1 else 0,
-                    T2_LOCAL_MODAL_SUBMIT_START: time.time_ns(),
                 },
             }
 
@@ -3663,6 +3696,7 @@ if _server:
             if _lock_trace.get("acquired"):
                 _counter_lock.release()
 
+        _enqueue_start_mono_ns = time.monotonic_ns()
         pq = _pq()
         if pq:
             with pq.mutex:
@@ -3671,6 +3705,16 @@ if _server:
                 pq.server.queue_updated()
 
         await _queue.put((item, item_id))
+        _enqueue_end_mono_ns = time.monotonic_ns()
+        _prompt_request_origin["local_queue_enqueue_ms"] = round(
+            (_enqueue_end_mono_ns - _enqueue_start_mono_ns) / 1_000_000, 3
+        )
+        _prompt_request_origin["local_prompt_enqueued_wall_ns"] = time.time_ns()
+        _prompt_request_origin["local_prompt_enqueued_mono_ns"] = _enqueue_end_mono_ns
+        _prompt_request_origin["local_receive_to_enqueue_ms"] = round(
+            (_enqueue_end_mono_ns - _t1_prompt_mono_ns) / 1_000_000, 3
+        )
+        local_et.mark(LOCAL_PROMPT_ENQUEUED, phase=PHASE_LOCAL_BRIDGE)
 
         if _queue_worker_task is None or _queue_worker_task.done():
             _queue_worker_task = asyncio.create_task(_process_queue())
@@ -3680,15 +3724,23 @@ if _server:
         # ── Signal acknowledgment: prompt is enqueued and response is ready ──
         asyncio.get_running_loop().call_soon(ack_ready.set)
 
-        _dispatch_ts = time.time()
-        local_recv_to_dispatch_ms = round((_dispatch_ts - _route_entry_ts) * 1000, 3)
+        _ack_ready_wall_ns = time.time_ns()
+        _ack_ready_mono_ns = time.monotonic_ns()
+        _prompt_request_origin["local_prompt_ack_ready_wall_ns"] = _ack_ready_wall_ns
+        _prompt_request_origin["local_prompt_ack_ready_mono_ns"] = _ack_ready_mono_ns
+        _prompt_request_origin["local_receive_to_ack_ms"] = round(
+            (_ack_ready_mono_ns - _t1_prompt_mono_ns) / 1_000_000, 3
+        )
+        local_et.mark(LOCAL_PROMPT_ACK_READY, phase=PHASE_LOCAL_BRIDGE)
+        _ack_ready_ts = _ack_ready_wall_ns / 1_000_000_000
+        local_receive_to_ack_ms = _prompt_request_origin["local_receive_to_ack_ms"]
 
         # ── Stall detector ──
-        local_ts = {"t1_local_recv": _route_entry_ts, "t2_local_dispatch": _dispatch_ts,
+        local_ts = {"t1_local_recv": _route_entry_ts, "t2_local_dispatch": _ack_ready_ts,
                     "body_read_ms": body_read_ms, "json_parse_ms": body_read_ms, "preflight_ms": preflight_ms,
                     "stack_extract_ms": 0,  # deferred to canonical executor
                     "active_next_write_ms": 0,
-                    "lock_wait_total_ms": _lock_trace.get("wait_ms", 0), "local_recv_to_dispatch_ms": local_recv_to_dispatch_ms}
+                    "lock_wait_total_ms": _lock_trace.get("wait_ms", 0), "local_receive_to_ack_ms": local_receive_to_ack_ms}
         degradation_flags = []
         _detect_local_predispatch_stall(local_ts, prompt_id, degradation_flags)
 

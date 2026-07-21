@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import modal
+from comfymodal_runtime.contracts import stable_hash
 
 # Gö─Gö─ Optimizations module (Phase 1-7 wiring) Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─
 # Imported lazily with a guarded fallback so a missing/import-error in
@@ -4085,7 +4086,8 @@ def _register_active_model_read(canonical_key: str, owner: str, path: str = "",
                                  priority: int | None = None,
                                  active_read_id: str = "",
                                  restored_instance_id: str = "",
-                                 restore_session_id: str = "") -> str:
+                                 restore_session_id: str = "",
+                                 request_id: str = "") -> str:
     """Register a model-file read before starting the actual loader call.
 
     If a running entry already exists for *canonical_key*, returns
@@ -4116,6 +4118,14 @@ def _register_active_model_read(canonical_key: str, owner: str, path: str = "",
         restored_instance_id = str(getattr(_MODEL_LOAD_CONTEXT, "restored_instance_id", ""))
     if not restore_session_id:
         restore_session_id = str(getattr(_MODEL_LOAD_CONTEXT, "restore_session_id", ""))
+    if not restored_instance_id or not restore_session_id:
+        try:
+            from comfymodal_runtime import model_preload as _model_preload
+            restored_instance_id = restored_instance_id or str(_model_preload._LATEST_RESTORED_INSTANCE_ID)
+            restore_session_id = restore_session_id or str(_model_preload._LATEST_RESTORE_SESSION_ID)
+            request_id = request_id or _model_preload.get_active_request_id()
+        except Exception:
+            pass
     # ── Capture deep diagnostics before-snapshot ─────────────────────────
     _before_rusage = None
     _before_io = None
@@ -4142,15 +4152,15 @@ def _register_active_model_read(canonical_key: str, owner: str, path: str = "",
             try:
                 _st = os.stat(path)
                 _file_identity = {
-                    "path_hash": str(hash(path)),
+                    "path_hash": stable_hash(path)[:16],
                     "size": _st.st_size,
                     "st_dev": _st.st_dev,
                     "st_ino": _st.st_ino,
                 }
             except OSError:
-                _file_identity = {"path_hash": str(hash(path))}
+                _file_identity = {"path_hash": stable_hash(path)[:16]}
         else:
-            _file_identity = {"path_hash": str(hash(canonical_key))}
+            _file_identity = {"path_hash": stable_hash(canonical_key)[:16]}
         entry = {
             "canonical_key": canonical_key,
             "owner": owner,
@@ -4158,12 +4168,13 @@ def _register_active_model_read(canonical_key: str, owner: str, path: str = "",
             "start_time": time.time(),
             "start_wall_unix_ns": _wall_ns,
             "start_monotonic_ns": _now_ns,
-            "start_thread_time_ns": time.thread_time_ns() if hasattr(time, 'thread_time_ns') else 0,
-            "start_process_time_ns": time.process_time_ns() if hasattr(time, 'process_time_ns') else 0,
+            "start_thread_time_ns": time.thread_time_ns() if hasattr(time, 'thread_time_ns') else None,
+            "start_process_time_ns": time.process_time_ns() if hasattr(time, 'process_time_ns') else None,
             "native_tid": _native_tid,
             "active_read_id": _arid,
             "restored_instance_id": restored_instance_id,
             "restore_session_id": restore_session_id,
+            "request_id": request_id,
             # ── Deep diag before-snapshot ──────────────────────
             "before_rusage": dict(_before_rusage) if _before_rusage else None,
             "before_io": dict(_before_io) if _before_io else None,
@@ -4263,6 +4274,7 @@ def _register_active_model_read(canonical_key: str, owner: str, path: str = "",
         f"active_read_id={_log_fields.get('active_read_id', '')} "
         f"restored_instance_id={_log_fields.get('restored_instance_id', '')} "
         f"restore_session_id={_log_fields.get('restore_session_id', '')} "
+        f"request_id={_log_fields.get('request_id', '')} "
         f"start_wall_unix_ns={_log_fields.get('start_wall_unix_ns', '')} "
         f"start_monotonic_ns={_log_fields.get('start_monotonic_ns', '')} "
         f"start_thread_time_ns={_log_fields.get('start_thread_time_ns', '')} "
@@ -4313,8 +4325,8 @@ def _complete_active_model_read(canonical_key: str) -> None:
     """
     _complete_now_ns = time.perf_counter_ns()
     _complete_wall_ns = int(time.time() * 1_000_000_000)
-    _complete_thread_time_ns = time.thread_time_ns() if hasattr(time, 'thread_time_ns') else 0
-    _complete_process_time_ns = time.process_time_ns() if hasattr(time, 'process_time_ns') else 0
+    _complete_thread_time_ns = time.thread_time_ns() if hasattr(time, 'thread_time_ns') else None
+    _complete_process_time_ns = time.process_time_ns() if hasattr(time, 'process_time_ns') else None
     _complete_tid = 0
     try:
         _complete_tid = threading.get_native_id()
@@ -4354,16 +4366,17 @@ def _complete_active_model_read(canonical_key: str) -> None:
         _start_mono = entry.get("start_monotonic_ns", 0)
         if _start_mono and _complete_now_ns:
             entry["active_read_wall_ms"] = round((_complete_now_ns - _start_mono) / 1_000_000, 3)
-        _start_tt = entry.get("start_thread_time_ns", 0)
-        if _start_tt and _complete_thread_time_ns:
+        _start_tt = entry.get("start_thread_time_ns")
+        _same_native_thread = bool(entry.get("native_tid") and entry.get("native_tid") == _complete_tid)
+        if _same_native_thread and _start_tt is not None and _complete_thread_time_ns is not None:
             entry["active_read_thread_cpu_ms"] = round((_complete_thread_time_ns - _start_tt) / 1_000_000, 3)
-        _start_pt = entry.get("start_process_time_ns", 0)
-        if _start_pt and _complete_process_time_ns:
+        _start_pt = entry.get("start_process_time_ns")
+        if _start_pt is not None and _complete_process_time_ns is not None:
             entry["active_read_process_cpu_ms"] = round((_complete_process_time_ns - _start_pt) / 1_000_000, 3)
         # RUSAGE and IO deltas (Linux deep diag only)
         _before_r = entry.get("before_rusage")
         _before_i = entry.get("before_io")
-        if _before_r and _after_rusage:
+        if _same_native_thread and _before_r and _after_rusage:
             _ru_deltas = _compute_rusage_deltas(_before_r, _after_rusage)
             if _ru_deltas:
                 entry["active_read_major_faults_delta"] = _ru_deltas.get("majflt")
@@ -4371,7 +4384,7 @@ def _complete_active_model_read(canonical_key: str) -> None:
                 entry["active_read_inblock_delta"] = _ru_deltas.get("inblock")
                 entry["active_read_voluntary_context_switches_delta"] = _ru_deltas.get("nvcsw")
                 entry["active_read_involuntary_context_switches_delta"] = _ru_deltas.get("nivcsw")
-        if _before_i and _after_io:
+        if _same_native_thread and _before_i and _after_io:
             _io_deltas = _compute_io_deltas(_before_i, _after_io)
             if _io_deltas:
                 entry["active_read_read_bytes_delta"] = _io_deltas.get("read_bytes")
@@ -4383,7 +4396,15 @@ def _complete_active_model_read(canonical_key: str) -> None:
         _acpu = entry.get("active_read_thread_cpu_ms", "?")
         _amaj = entry.get("active_read_major_faults_delta", "?")
         _amin = entry.get("active_read_minor_faults_delta", "?")
-        _arbytes = entry.get("active_read_read_bytes_delta", "?")
+        _arbytes = entry.get("active_read_read_bytes_delta")
+        if not _same_native_thread:
+            _counter_status = "thread_changed"
+        elif not _deep_diag_here:
+            _counter_status = "unsupported"
+        elif _before_r is None and _before_i is None:
+            _counter_status = "unavailable"
+        else:
+            _counter_status = "available"
         ev = entry.get("event")
         _ACTIVE_MODEL_READS.pop(canonical_key, None)
     if ev is not None:
@@ -4404,6 +4425,17 @@ def _complete_active_model_read(canonical_key: str) -> None:
           f"read_bytes={_arbytes} rchar={entry.get('active_read_rchar_delta', '?')} "
           f"path_hash={entry.get('active_read_path_hash', '')} file_size={entry.get('active_read_file_size', '')} "
           f"st_dev={entry.get('active_read_st_dev', '')} st_ino={entry.get('active_read_st_ino', '')}")
+    print(
+        f"[v2.active_read_diag] active_read_id={_arid} owner={entry.get('owner', '')} "
+        f"request_id={entry.get('request_id', '')} restore_session_id={entry.get('restore_session_id', '')} "
+        f"path_hash={entry.get('active_read_path_hash', '')} wall_ms={_awall} "
+        f"thread_cpu_ms={entry.get('active_read_thread_cpu_ms')} process_cpu_ms={entry.get('active_read_process_cpu_ms')} "
+        f"read_bytes={_arbytes if _arbytes is not None else 'not_observed_in_this_thread'} "
+        f"rchar={entry.get('active_read_rchar_delta') if entry.get('active_read_rchar_delta') is not None else 'not_observed_in_this_thread'} "
+        f"minor_faults={entry.get('active_read_minor_faults_delta')} major_faults={entry.get('active_read_major_faults_delta')} "
+        f"context_switches={entry.get('active_read_voluntary_context_switches_delta')}/{entry.get('active_read_involuntary_context_switches_delta')} "
+        f"counter_status={_counter_status} native_thread_id={entry.get('native_tid')}"
+    )
 
 
 def _fail_active_model_read(canonical_key: str, error: str = "") -> None:
@@ -16803,7 +16835,7 @@ class _ComfyAPIMixin:
                     _v2_trace.emit("graph_unet_key_resolved", phase="execution", metadata={
                         "canonical_key": _canonical_key_str,
                         "canonical_hash": _canonical_key_str[-32:],
-                        "path_hash": str(hash(path)) if path else "",
+                        "path_hash": stable_hash(path)[:16] if path else "",
                     })
                     # lookup_start begins the actual cache inspection;
                     # lookup_end is emitted on hit/miss/fallback.
