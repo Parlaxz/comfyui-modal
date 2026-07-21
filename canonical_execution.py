@@ -825,12 +825,145 @@ async def execute_plan(
         round((_t1_wall_ns - int(_t0_ms) * 1_000_000) / 1_000_000, 3)
         if isinstance(_t0_ms, (int, float)) and isinstance(_t1_wall_ns, int) else None
     )
+
+    # ── Clock reconciliation residual ──
+    # True residual of the monotonic pipeline: authoritative
+    # local_receive_to_actual_submission_ms minus the aggregate adjacent
+    # non-overlapping transport intervals
+    # (local_receive_to_generator_create_ms + generator_create_ms +
+    #  generator_create_to_first_iteration_ms) when available; falls back
+    # to the disjoint leaf-set calculation (see _local_residual_ms above).
+    # local_residual_ms is a compatibility alias with exactly the same
+    # value and definition.
+    _clock_reconciliation_residual_ms = _local_residual_ms
+
+    # ── Stage attribution residual (non-overlapping leaf stages) ──
+    _stage_attribution_residual_ms: dict[str, Any] = {}
+    _missing_stages: list[str] = []
+    # Route leaf: local_receive_to_enqueue_ms minus sum of sequential handler
+    # stages (body_read, json_parse, preflight, lock_wait, enqueue).  The route
+    # total is NOT re-used as a leaf — its children are the leaves.
+    _route_total = _origin.get("local_receive_to_enqueue_ms")
+    _route_leaf_keys = ("local_body_read_ms", "local_json_parse_ms", "local_preflight_ms",
+                        "local_queue_lock_wait_ms", "local_queue_enqueue_ms")
+    _route_vals = [_origin.get(k) for k in _route_leaf_keys]
+    if isinstance(_route_total, (int, float)):
+        if all(isinstance(v, (int, float)) for v in _route_vals):
+            _route_leaf_sum = sum(float(v) for v in _route_vals)
+            _route_residual = round(float(_route_total) - _route_leaf_sum, 3)
+            _stage_attribution_residual_ms["route_unattributed_ms"] = _route_residual
+            if _route_residual < 0:
+                _stage_attribution_residual_ms["overlap_error"] = "route"
+        else:
+            _stage_attribution_residual_ms["route_unattributed_ms"] = None
+            for _rk, _rv in zip(_route_leaf_keys, _route_vals):
+                if not isinstance(_rv, (int, float)):
+                    _missing_stages.append(_rk)
+    else:
+        _stage_attribution_residual_ms["route_unattributed_ms"] = None
+
+    # Worker leaf (pre-submission, never first_iteration_to_first_remote_event):
+    # Authoritative worker total = local_receive_to_actual_submission_ms
+    # minus local_receive_to_enqueue_ms.
+    # Leaves are ONLY individual sequential stages (queue_wait, plan_build,
+    # active_profile, restore_plan_build, restore_publish, handle_lookup,
+    # payload_serialize, generator_create, generator_create_to_first_iteration).
+    # No aggregate transport intervals — the aggregate path was removed because
+    # it can hide an uninstrumented plan/profile/restore/serialization gap.
+    # If any leaf or boundary is absent, worker_unattributed_ms is None and
+    # missing_stages lists each missing name (never silently substitute zero).
+    _queue_wait = _origin.get("queue_wait_before_worker_ms")
+    _enqueue_prefix = _origin.get("local_receive_to_enqueue_ms")
+    if isinstance(_t1_to_submission_ms, (int, float)) and isinstance(_enqueue_prefix, (int, float)):
+        _worker_span = float(_t1_to_submission_ms) - float(_enqueue_prefix)
+        if _worker_span < 0:
+            # Negative authoritative span: submission before enqueue.
+            # Do NOT build leaves — overlap_error is the primary signal.
+            _stage_attribution_residual_ms["worker_unattributed_ms"] = None
+            _existing_err = _stage_attribution_residual_ms.get("overlap_error", "")
+            _stage_attribution_residual_ms["overlap_error"] = (
+                (_existing_err + " worker") if _existing_err else "worker"
+            )
+        else:
+            # Build leaf sequence: every stage must be numeric.
+            _worker_leaf_vals: list[float] = []
+            _all_worker_known = True
+            if isinstance(_queue_wait, (int, float)):
+                _worker_leaf_vals.append(float(_queue_wait))
+            else:
+                _all_worker_known = False
+                _missing_stages.append("queue_wait_before_worker_ms")
+            for _wk in ("plan_build_ms", "active_profile_ms", "restore_plan_build_ms",
+                        "restore_publish_ms", "handle_lookup_ms", "payload_serialize_ms"):
+                _wv = _local_stages.get(_wk)
+                if isinstance(_wv, (int, float)):
+                    _worker_leaf_vals.append(float(_wv))
+                else:
+                    _all_worker_known = False
+                    _missing_stages.append(_wk)
+            for _wk in ("generator_create_ms", "generator_create_to_first_iteration_ms"):
+                _wv = _transport_meta.get(_wk)
+                if isinstance(_wv, (int, float)):
+                    _worker_leaf_vals.append(float(_wv))
+                else:
+                    _all_worker_known = False
+                    _missing_stages.append(_wk)
+            if _all_worker_known:
+                _worker_leaf_sum = sum(_worker_leaf_vals)
+                _worker_residual = round(_worker_span - _worker_leaf_sum, 3)
+                _stage_attribution_residual_ms["worker_unattributed_ms"] = _worker_residual
+                if _worker_residual < 0:
+                    _existing_err = _stage_attribution_residual_ms.get("overlap_error", "")
+                    _stage_attribution_residual_ms["overlap_error"] = (
+                        (_existing_err + " worker") if _existing_err else "worker"
+                    )
+            else:
+                _stage_attribution_residual_ms["worker_unattributed_ms"] = None
+    else:
+        _stage_attribution_residual_ms["worker_unattributed_ms"] = None
+        if _enqueue_prefix is None:
+            _missing_stages.append("local_receive_to_enqueue_ms")
+        if _t1_to_submission_ms is None:
+            _missing_stages.append("local_receive_to_actual_submission_ms")
+
+    # Structured reconciliation status: incomplete when any required boundary
+    # or leaf stage is absent; overlap_error when leaves exceed authoritative.
+    if _missing_stages:
+        # Preserve first-seen order (no set() which loses insertion order).
+        _seen = set()
+        _ordered = []
+        for _m in _missing_stages:
+            if _m not in _seen:
+                _seen.add(_m)
+                _ordered.append(_m)
+        _stage_attribution_residual_ms["missing_stages"] = _ordered
+        _reconciliation_status = "incomplete"
+    elif _stage_attribution_residual_ms.get("overlap_error", ""):
+        _reconciliation_status = "overlap_error"
+    elif (_stage_attribution_residual_ms.get("route_unattributed_ms") is None
+          or _stage_attribution_residual_ms.get("worker_unattributed_ms") is None):
+        _reconciliation_status = "incomplete"
+    else:
+        _reconciliation_status = "complete"
+    _stage_attribution_residual_ms["reconciliation_status"] = _reconciliation_status
+    _stage_attribution_residual_ms.setdefault("overlap_error", "")
+
+    # Flatten key stage-attribution fields directly under local_timing
+    # (benchmark consumers read these top-level keys). Nested dict kept for compat.
+    _sar = _stage_attribution_residual_ms
     _local_summary = {
         "t0_to_t1_ms": _t0_to_t1_ms,
         "t1_to_queue_enqueue_ms": _origin.get("local_receive_to_enqueue_ms"),
         "local_receive_to_enqueue_ms": _origin.get("local_receive_to_enqueue_ms"),
         **_local_stages,
         "local_residual_ms": _local_residual_ms,
+        "clock_reconciliation_residual_ms": _clock_reconciliation_residual_ms,
+        "route_unattributed_ms": _sar.get("route_unattributed_ms"),
+        "worker_unattributed_ms": _sar.get("worker_unattributed_ms"),
+        "reconciliation_status": _sar.get("reconciliation_status", ""),
+        "missing_stages": list(_sar.get("missing_stages", [])),
+        "overlap_error": _sar.get("overlap_error", ""),
+        "stage_attribution_residual_ms": dict(_sar),
         "local_receive_to_generator_create_ms": _transport_meta.get("local_receive_to_generator_create_ms"),
         "generator_create_to_first_iteration_ms": _transport_meta.get("generator_create_to_first_iteration_ms"),
         "first_iteration_to_first_remote_event_ms": _transport_meta.get("first_iteration_to_first_remote_event_ms"),
@@ -851,6 +984,12 @@ async def execute_plan(
         f"plan_build_ms={_local_stages['plan_build_ms']} active_profile_ms={_local_stages['active_profile_ms']} "
         f"restore_publish_ms={_local_stages['restore_publish_ms']} handle_lookup_ms={_local_stages['handle_lookup_ms']} "
         f"payload_serialize_ms={_local_stages['payload_serialize_ms']} local_residual_ms={_local_residual_ms} "
+        f"clock_reconciliation_residual_ms={_clock_reconciliation_residual_ms} "
+        f"route_unattributed_ms={_stage_attribution_residual_ms.get('route_unattributed_ms')} "
+        f"worker_unattributed_ms={_stage_attribution_residual_ms.get('worker_unattributed_ms')} "
+        f"reconciliation_status={_stage_attribution_residual_ms.get('reconciliation_status', '')} "
+        f"missing_stages={','.join(_stage_attribution_residual_ms.get('missing_stages', []))} "
+        f"overlap_error={_stage_attribution_residual_ms.get('overlap_error', '')} "
         f"modal_input_id={_transport_meta.get('modal_input_id', '')}",
         flush=True,
     )

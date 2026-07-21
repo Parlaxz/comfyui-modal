@@ -27,6 +27,7 @@ from .model_preload import (
     RestorePreparation,
     _collect_restore_events_for_summary,
     get_restore_return_marker,
+    gpu_not_observed_summary,
     request_execution_trace_scope,
     set_model_load_identity,
     set_restore_return_marker,
@@ -1249,6 +1250,27 @@ class ModalRuntimeEntrypoint:
             with request_execution_trace_scope(trace):
                 with self._preload_bridge.request_scope():
                     result: dict[str, Any] = await self._execute_v2_prompt_executor(plan, context, api, trace)
+                _gpu_summary = gpu_not_observed_summary()
+                trace.set_metadata(gpu_observation_summary=_gpu_summary)
+                # ── Build GPU observation classification from helper + trace events ──
+                _gpu_wrapper_installed = _gpu_summary.get("wrapper_status") == "installed"
+                _gpu_wrapper_calls = _gpu_summary.get("count", 0)
+                _gpu_graph_load_obs = any(e.name == "graph_gpu_load_start" for e in trace.events)
+                _gpu_sampler_setup_obs = (
+                    any(e.name in ("sampler_lane_wait_start", "sampler_lane_wait_end") for e in trace.events)
+                    or any(
+                        e.name == "graph_gpu_load_start"
+                        and e.metadata.get("caller_classification") == "sampler_setup"
+                        for e in trace.events
+                    )
+                )
+                _gpu_obs_classification = {
+                    "wrapper_installed": _gpu_wrapper_installed,
+                    "wrapper_calls_observed": _gpu_wrapper_calls > 0,
+                    "graph_gpu_load_observed": _gpu_graph_load_obs,
+                    "sampler_setup_observed": _gpu_sampler_setup_obs,
+                }
+                trace.set_metadata(gpu_observation_classification=_gpu_obs_classification)
             trace.emit("graph_execution_end", phase="execution")
             # Drain late worker events (read/cpu/gpu/ready) from bridge
             # preparation into the execution trace so they are not lost.
@@ -1307,6 +1329,31 @@ class ModalRuntimeEntrypoint:
             return result
         except Exception as exc:
             trace.emit("graph_execution_end", phase="execution", metadata={"status": "error", "error": str(exc)[:200]})
+            # Capture GPU observation summary/classification on exception path too.
+            # Safe after request_execution_trace_scope exit — reads from module-level state.
+            try:
+                _gpu_summary = gpu_not_observed_summary()
+                trace.set_metadata(gpu_observation_summary=_gpu_summary)
+                _gpu_wrapper_installed = _gpu_summary.get("wrapper_status") == "installed"
+                _gpu_wrapper_calls = _gpu_summary.get("count", 0)
+                _gpu_graph_load_obs = any(e.name == "graph_gpu_load_start" for e in trace.events)
+                _gpu_sampler_setup_obs = (
+                    any(e.name in ("sampler_lane_wait_start", "sampler_lane_wait_end") for e in trace.events)
+                    or any(
+                        e.name == "graph_gpu_load_start"
+                        and e.metadata.get("caller_classification") == "sampler_setup"
+                        for e in trace.events
+                    )
+                )
+                _gpu_obs_classification = {
+                    "wrapper_installed": _gpu_wrapper_installed,
+                    "wrapper_calls_observed": _gpu_wrapper_calls > 0,
+                    "graph_gpu_load_observed": _gpu_graph_load_obs,
+                    "sampler_setup_observed": _gpu_sampler_setup_obs,
+                }
+                trace.set_metadata(gpu_observation_classification=_gpu_obs_classification)
+            except Exception:
+                pass
             # Ensure any remaining legacy API background loader threads
             # are terminal before draining diagnostics (same ordering as
             # success path: join first, then drain).
@@ -1684,6 +1731,8 @@ class ModalRuntimeEntrypoint:
         except Exception as _pg_exc:
             _pregraph_error = str(_pg_exc)[:200]
 
+        _lane = getattr(self._preload_bridge.coordinator, "mutation_lane", None)
+        _lane_acquired = [False]
         started = time.time()
         try:
             trace.emit("executor_reset_start", phase="execution")
@@ -1721,15 +1770,6 @@ class ModalRuntimeEntrypoint:
                 nid for nid, ct in _node_class_map.items()
                 if "Sampler" in ct or "KSampler" in ct
             ]
-            # ── Sampler lease ────────────────────────────────────
-            # Acquire the mutation lane so no model GPU commits can
-            # overlap with sampling, and no pending commit starts after
-            # the sampler begins.  Release immediately after execution.
-            _lane = getattr(self._preload_bridge.coordinator, "mutation_lane", None)
-            if _lane is not None:
-                trace.emit("sampler_lane_wait_start", phase="execution")
-                _lane.acquire("sampler")
-                trace.emit("sampler_lane_wait_end", phase="execution")
             # ── PromptExecutor internal milestone interception ──
             # Request-local: wraps executor.add_message (3-arg shape:
             # event, data: dict, broadcast: bool) to capture
@@ -1800,9 +1840,28 @@ class ModalRuntimeEntrypoint:
                                     _milestones["first_sampler_node"] = _node_str
                                     _milestones["first_sampler_node_class"] = _class_node
                                     _milestones["first_sampler_node_ns"] = _event_ns
-                                    _milestones["first_sampler_stage_ns"] = _event_ns
-                                    _milestones["first_sampler_stage_event"] = "executing"
-                    elif event in ("sampler_start", "sampling_start", "sampler_stage_start", "progress"):
+                                    # Acquire mutation lane: blocks until previous
+                                    # GPU commit finishes, preventing overlap
+                                    # between model GPU commits and sampling.
+                                    if _lane is not None and not _lane_acquired[0]:
+                                        _blocking_owner = _lane.owner or ""
+                                        _lane_wait_start_ns = time.monotonic_ns()
+                                        trace.emit("sampler_lane_wait_start", phase="execution", metadata={
+                                            "sampler_node_id": _node_str,
+                                            "sampler_node_class": _class_node,
+                                            "blocking_owner": _blocking_owner,
+                                        })
+                                        _lane.acquire("sampler")
+                                        _milestones["_lane_acquired_mono_ns"] = time.monotonic_ns()
+                                        _lane_wait_ms = round((_milestones["_lane_acquired_mono_ns"] - _lane_wait_start_ns) / 1_000_000, 3)
+                                        trace.emit("sampler_lane_wait_end", phase="execution", metadata={
+                                            "sampler_node_id": _node_str,
+                                            "sampler_node_class": _class_node,
+                                            "wait_ms": _lane_wait_ms,
+                                            "blocking_owner": _blocking_owner,
+                                        })
+                                        _lane_acquired[0] = True
+                    elif event in ("sampler_start", "sampling_start", "sampler_stage_start", "progress") and "first_sampler_node" in _milestones:
                         if "first_sampler_stage_ns" not in _milestones:
                             _milestones["first_sampler_stage_ns"] = time.monotonic_ns()
                             _milestones["first_sampler_stage_event"] = event
@@ -1853,8 +1912,6 @@ class ModalRuntimeEntrypoint:
                     # Restore original send_sync
                     if _send_sync_wrapper_ok and _orig_send_sync is not None and _server is not None:
                         _server.send_sync = _orig_send_sync
-                    if _lane is not None:
-                        _lane.release("sampler")
                 finally:
                     # Always emit invoke_end — even if restore/release raises
                     _invoke_elapsed_ms = round((time.monotonic_ns() - _execute_call_ns) / 1_000_000, 3)
@@ -1964,22 +2021,58 @@ class ModalRuntimeEntrypoint:
             else:
                 _residual_before_invoke = None
 
-            # ── Measured children sum (leaf-level, no double-counting) (C) ──
-            # pregraph_setup_ms includes executor_reset_ms; use pregraph_without_reset in leaf sum.
+            # ── Measured children sum (leaf-level, non-overlapping) (C) ──
+            # pregraph_setup_ms includes executor_reset_ms; decompose into
+            # pregraph_without_reset + exec_reset (non-overlapping leaves).
             _pregraph_without_reset_ms = (_pregraph_ms - _exec_reset_ms) if _pregraph_ms is not None and _exec_reset_ms is not None else None
             _leaf_setup = [
                 _cert_ms, _preflight_ms, _repair_ms, _validation_ms,
-                _pregraph_without_reset_ms, _exec_reset_ms, _sampler_lane_ms,
-                _residual_before_invoke,
+                _pregraph_without_reset_ms, _exec_reset_ms,
             ]
+            # Include sampler_lane_wait_ms only when lane was acquired
+            # (avoids including lane wait in both sampler_lane and residual).
+            if _lane_acquired[0]:
+                _leaf_setup.append(_sampler_lane_ms)
             _leaf_setup_ms = sum(v for v in _leaf_setup if v is not None)
+            # Sampler node → lane acquired → actual stage decompose
+            # the single sampler_node_to_sampler_start_ms into two
+            # non-overlapping sub-intervals for the leaf sum.
+            _lane_acquired_ns = _milestones.get("_lane_acquired_mono_ns") if _milestones else None
+            _sampler_node_to_lane_acquired_ms: float | None = None
+            _lane_acquired_to_actual_stage_ms: float | None = None
+            if _first_sampler_ns is not None and _lane_acquired_ns is not None:
+                _sampler_node_to_lane_acquired_ms = round((_lane_acquired_ns - _first_sampler_ns) / 1_000_000, 3)
+            if _lane_acquired_ns is not None and _first_sampler_stage_ns is not None:
+                _lane_acquired_to_actual_stage_ms = round((_first_sampler_stage_ns - _lane_acquired_ns) / 1_000_000, 3)
             _leaf_milestone = [
                 _exec_st_val, _exec_to_cache, _cache_to_node,
-                _first_node_to_clip_ms, _clip_to_sampler_node_ms, _sampler_node_to_sampler_start_ms,
+                _first_node_to_clip_ms, _clip_to_sampler_node_ms,
+                _sampler_node_to_lane_acquired_ms, _lane_acquired_to_actual_stage_ms,
             ]
             _leaf_milestone_ms = sum(v for v in _leaf_milestone if v is not None)
             _total_children_val = _leaf_setup_ms + _leaf_milestone_ms
             _measured_children_ms = round(_total_children_val, 3) if _total_children_val > 0 else None
+
+            # ── Build named interval map for overlap diagnostics ──
+            _overlap_interval_map: dict[str, float | None] = {
+                "certificate_ms": _cert_ms,
+                "preflight_ms": _preflight_ms,
+                "repair_ms": _repair_ms,
+                "validation_ms": _validation_ms,
+                "pregraph_without_reset_ms": _pregraph_without_reset_ms,
+                "executor_reset_ms": _exec_reset_ms,
+                "sampler_lane_wait_ms": _sampler_lane_ms if _lane_acquired[0] else None,
+                "invoke_to_execution_start_ms": _exec_st_val,
+                "execution_start_to_cached_ms": _exec_to_cache,
+                "cached_to_first_node_ms": _cache_to_node,
+                "first_node_to_clip_ms": _first_node_to_clip_ms,
+                "clip_to_sampler_node_ms": _clip_to_sampler_node_ms,
+                "sampler_node_to_lane_acquired_ms": _sampler_node_to_lane_acquired_ms,
+                "lane_acquired_to_actual_stage_ms": _lane_acquired_to_actual_stage_ms,
+            }
+            _overlapping_intervals: list[str] = [
+                name for name, val in _overlap_interval_map.items() if val is not None
+            ]
 
             # ── pre_sampler_total_ms from remote_method_entry to first_sampler_stage_ns (C) ──
             _remote_method_entry_ns = None
@@ -1992,8 +2085,14 @@ class ModalRuntimeEntrypoint:
             else:
                 _pre_sampler_total_ms = None
             if _pre_sampler_total_ms is not None:
-                _residual_ms = max(_pre_sampler_total_ms - (_measured_children_ms or 0.0), 0.0)
+                if _measured_children_ms is not None and _measured_children_ms > _pre_sampler_total_ms:
+                    _reconciliation_status = "overlap_error"
+                    _residual_ms = round(_pre_sampler_total_ms - _measured_children_ms, 3)
+                else:
+                    _reconciliation_status = "ok"
+                    _residual_ms = round(_pre_sampler_total_ms - (_measured_children_ms or 0.0), 3)
             else:
+                _reconciliation_status = "absent_total"
                 _residual_ms = None
 
             # ── Gather identity metadata for pre_sampler_stages event and print (D) ──
@@ -2035,11 +2134,16 @@ class ModalRuntimeEntrypoint:
                 "cached_to_first_node_ms": _cache_to_node,
                 "first_node_to_clip_ms": _first_node_to_clip_ms,
                 "clip_to_sampler_node_ms": _clip_to_sampler_node_ms,
+                "sampler_node_to_lane_acquired_ms": _sampler_node_to_lane_acquired_ms,
+                "lane_acquired_to_actual_stage_ms": _lane_acquired_to_actual_stage_ms,
                 "sampler_node_to_sampler_start_ms": _sampler_node_to_sampler_start_ms,
                 # Totals and reconciliation (C)
                 "pre_sampler_total_ms": _pre_sampler_total_ms,
                 "measured_children_ms": _measured_children_ms,
                 "residual_ms": _residual_ms,
+                "reconciliation_status": _reconciliation_status,
+                "overlapping_intervals": _overlapping_intervals,
+                "lane_acquired": _lane_acquired[0],
                 # Node classification (B)
                 "total_nodes": len(_node_class_map),
                 "first_output_node_id": _first_node_id,
@@ -2117,12 +2221,17 @@ class ModalRuntimeEntrypoint:
                 f"first_node_to_clip_ms={self._fmt_or_absent(_first_node_to_clip_ms)} "
                 f"clip_to_sampler_node_ms={self._fmt_or_absent(_clip_to_sampler_node_ms)} "
                 f"sampler_node_to_sampler_start_ms={self._fmt_or_absent(_sampler_node_to_sampler_start_ms)} "
+                f"sampler_node_to_lane_acquired_ms={self._fmt_or_absent(_sampler_node_to_lane_acquired_ms)} "
+                f"lane_acquired_to_actual_stage_ms={self._fmt_or_absent(_lane_acquired_to_actual_stage_ms)} "
                 f"pre_sampler_total_ms={self._fmt_or_absent(_pre_sampler_total_ms)} "
+                f"measured_children_ms={self._fmt_or_absent(_measured_children_ms)} "
                 f"residual_ms={self._fmt_or_absent(_residual_ms)} "
+                f"reconciliation_status={_reconciliation_status} "
                 f"add_message={_milestone_wrapper_ok} "
                 f"send_sync={_send_sync_wrapper_ok} "
                 f"has_sampler={_has_sampler} "
-                f"sampler_count={len(_sampler_node_ids)}",
+                f"sampler_count={len(_sampler_node_ids)} "
+                f"lane_acquired={_lane_acquired[0]}",
                 flush=True,
             )
             trace.emit(
@@ -2307,6 +2416,11 @@ class ModalRuntimeEntrypoint:
 
             return result
         finally:
+            # Release sampler lane if acquired during execution.
+            # Must happen before production cleanup to ensure GPU
+            # commit lane is free before any post-execution work.
+            if _lane is not None and _lane_acquired[0]:
+                _lane.release("sampler")
             if production_enabled:
                 trace.emit("production_cleanup_start", phase="output")
             if production_enabled and callable(cleanup_request):
@@ -2791,12 +2905,12 @@ class ModalRuntimeEntrypoint:
                     f"[v2.remote_request_origin] "
                     f"request_id={_t4_request} "
                     f"trigger_source={_trig_src} "
-                    f"ui_trigger_unix_ms={_t0_wall or 0} "
-                    f"local_receive_unix_ns={_t1_wall_ns or 0} "
-                    f"modal_submission_attempt_unix_ns={_t2_wall_ns or 0} "
-                    f"modal_generator_created_unix_ns={_t3_wall_ns or 0} "
+                    f"ui_trigger_unix_ms={self._fmt_or_absent(_t0_wall)} "
+                    f"local_receive_unix_ns={self._fmt_or_absent(_t1_wall_ns)} "
+                    f"modal_submission_attempt_unix_ns={self._fmt_or_absent(_t2_wall_ns)} "
+                    f"modal_generator_created_unix_ns={self._fmt_or_absent(_t3_wall_ns)} "
                     f"modal_method_entry_unix_ns={_t4_wall} "
-                    f"prompt_executor_invoke_start_unix_ns={_t5_wall_ns or 0} "
+                    f"prompt_executor_invoke_start_unix_ns={self._fmt_or_absent(_t5_wall_ns)} "
                     f"trigger_to_dispatch_ms={_trig_to_dispatch} "
                     f"dispatch_to_modal_entry_ms={_dispatch_to_entry} "
                     f"modal_entry_to_executor_ms={_entry_to_exec} "

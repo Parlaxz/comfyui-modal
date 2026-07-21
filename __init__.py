@@ -3344,65 +3344,181 @@ if _server:
             "previous_request_age_s": round(prev_age, 3) if prev_age is not None else None,
         }
 
-    def _clear_request_state(prompt_id: str):
-        global _PREVIOUS_REQUEST_ID, _PREVIOUS_REQUEST_FINISHED_AT
-        with _ACTIVE_REQUEST_IDS_LOCK:
-            _ACTIVE_REQUEST_IDS.pop(prompt_id, None)
-            _PREVIOUS_REQUEST_ID = prompt_id
-            _PREVIOUS_REQUEST_FINISHED_AT = time.time()
+def _clear_request_state(prompt_id: str):
+    global _PREVIOUS_REQUEST_ID, _PREVIOUS_REQUEST_FINISHED_AT
+    with _ACTIVE_REQUEST_IDS_LOCK:
+        _ACTIVE_REQUEST_IDS.pop(prompt_id, None)
+        _PREVIOUS_REQUEST_ID = prompt_id
+        _PREVIOUS_REQUEST_FINISHED_AT = time.time()
 
-    async def _timed_async_lock_acquire(lock: asyncio.Lock, lock_name: str, request_id: str, timeout_s: float | None = None) -> dict:
-        wait_start = time.perf_counter()
-        acquired = False
-        timed_out = False
-        try:
-            if timeout_s is not None:
-                try:
-                    await asyncio.wait_for(lock.acquire(), timeout=timeout_s)
-                    acquired = True
-                except asyncio.TimeoutError:
-                    timed_out = True
-            else:
-                await lock.acquire()
+
+def _derive_active_read_owner(
+    role: str = "",
+    *,
+    explicit_owner: str = "",
+    loader_type: str = "",
+) -> str:
+    """Derive canonical active-read owner name.
+
+    Restore preload roles map to canonical restore names:
+
+      clip → restore_clip_loader
+      unet → restore_background_unet
+      vae  → restore_vae_loader
+
+    For generic prompt reads, uses the explicit owner or the current
+    ``_ACTIVE_LANE_TRACE`` lane owner (from ``comfymodal_runtime.model_preload``)
+    when available, without inventing synthetic request IDs.
+
+    Returns the resolved owner string; falls back to ``explicit_owner``
+    when role is empty and no lane context resolves.
+    """
+    _ROLE_MAP: dict[str, str] = {
+        "clip": "restore_clip_loader",
+        "unet": "restore_background_unet",
+        "vae": "restore_vae_loader",
+    }
+    if role in _ROLE_MAP:
+        return _ROLE_MAP[role]
+    if explicit_owner:
+        return explicit_owner
+    # Attempt lane-context derivation from model_preload
+    try:
+        from comfymodal_runtime.model_preload import _ACTIVE_LANE_TRACE
+        _lane = _ACTIVE_LANE_TRACE.get()
+        if _lane is not None and hasattr(_lane, "lane") and _lane.lane:
+            _derived = f"lane_{_lane.lane.lower()}"
+            if hasattr(_lane, "owner") and _lane.owner:
+                _derived = str(_lane.owner)
+            return _derived
+    except Exception:
+        pass
+    # Fall back to loader_type when available
+    if loader_type:
+        return loader_type
+    return explicit_owner
+
+
+def _classify_active_read_dimensions(entry: dict) -> dict[str, str]:
+    """Classify per-dimension counter status for an active-read entry.
+
+    Uses lazy import of ``classify_active_read_dims`` from
+    ``comfymodal_runtime.model_preload`` to avoid import cycles.
+
+    Returns a dict with per-dimension string statuses:
+
+      thread_cpu_status, process_cpu_status, io_status, page_fault_status,
+      block_input_status, context_switch_status
+
+    Plus an aggregate ``counter_status`` that is ``"mixed"`` when
+    dimensions disagree, ``"available"`` when all are available, etc.
+
+    Per-dimension statuses are always the specific string from the underlying
+    classifier (e.g. ``"thread_changed"``, ``"not_observed_in_this_thread"``,
+    ``"unsupported"``) and never fall back to a broad ``"available"``.
+    """
+    from comfymodal_runtime.model_preload import classify_active_read_dims
+
+    _before_tid: int | None = entry.get("native_tid")
+    _after_tid: int | None = entry.get("complete_native_tid")
+    _deep_diag: bool = os.environ.get("COMFYMODAL_V2_DEEP_MODEL_DIAG", "0") == "1"
+    _has_thread_cpu: bool = entry.get("start_thread_time_ns") is not None
+    _has_process_cpu: bool = entry.get("start_process_time_ns") is not None
+    _has_rusage: bool = entry.get("before_rusage") is not None
+    _has_io: bool = entry.get("before_io") is not None
+
+    raw = classify_active_read_dims(
+        deep_diag=_deep_diag,
+        before_tid=_before_tid,
+        after_tid=_after_tid,
+        has_thread_cpu=_has_thread_cpu,
+        has_process_cpu=_has_process_cpu,
+        has_rusage=_has_rusage,
+        has_io=_has_io,
+    )
+    # Map internal dim names to the exposed status keys.
+    # Each dimension carries its specific status string, NOT a broad "available".
+    _DIM_KEY_MAP: dict[str, str] = {
+        "thread_cpu": "thread_cpu_status",
+        "process_cpu": "process_cpu_status",
+        "io_deltas": "io_status",
+        "page_faults": "page_fault_status",
+        "block_input": "block_input_status",
+        "context_switches": "context_switch_status",
+    }
+    result: dict[str, str] = {}
+    for internal, exposed in _DIM_KEY_MAP.items():
+        result[exposed] = raw.get(internal, "unavailable")
+
+    # Aggregate counter_status: mixed when dimensions disagree.
+    known_statuses = [v for v in result.values() if v not in ("unavailable",)]
+    if not known_statuses:
+        result["counter_status"] = "unavailable"
+    elif all(v == "available" for v in known_statuses):
+        result["counter_status"] = "available"
+    elif all(v == known_statuses[0] for v in known_statuses):
+        result["counter_status"] = known_statuses[0]
+    else:
+        result["counter_status"] = "mixed"
+
+    return result
+
+
+async def _timed_async_lock_acquire(lock: asyncio.Lock, lock_name: str, request_id: str, timeout_s: float | None = None) -> dict:
+    wait_start = time.perf_counter()
+    acquired = False
+    timed_out = False
+    try:
+        if timeout_s is not None:
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=timeout_s)
                 acquired = True
-        except Exception:
-            acquired = False
-        wait_end = time.perf_counter()
-        wait_ms = round((wait_end - wait_start) * 1000, 3)
-        result = {"lock_name": lock_name, "wait_start": wait_start, "wait_end": wait_end, "wait_ms": wait_ms, "acquired": acquired, "timed_out": timed_out}
-        if wait_ms > _LOCK_WAIT_DEGRADE_S * 1000:
-            with _ACTIVE_REQUEST_IDS_LOCK:
-                active = dict(_ACTIVE_REQUEST_IDS)
-            print(f"[local_lock_wait] CRITICAL request_id={request_id} lock={lock_name} wait_ms={wait_ms} active_requests={len(active)} active_ids={list(active.keys())[-5:]}")
-        elif wait_ms > _LOCK_WAIT_CRITICAL_MS:
-            print(f"[local_lock_wait] CRITICAL request_id={request_id} lock={lock_name} wait_ms={wait_ms}")
-        elif wait_ms > _LOCK_WAIT_WARN_MS:
-            print(f"[local_lock_wait] WARN request_id={request_id} lock={lock_name} wait_ms={wait_ms}")
-        return result
+            except asyncio.TimeoutError:
+                timed_out = True
+        else:
+            await lock.acquire()
+            acquired = True
+    except Exception:
+        acquired = False
+    wait_end = time.perf_counter()
+    wait_ms = round((wait_end - wait_start) * 1000, 3)
+    result = {"lock_name": lock_name, "wait_start": wait_start, "wait_end": wait_end, "wait_ms": wait_ms, "acquired": acquired, "timed_out": timed_out}
+    if wait_ms > _LOCK_WAIT_DEGRADE_S * 1000:
+        with _ACTIVE_REQUEST_IDS_LOCK:
+            active = dict(_ACTIVE_REQUEST_IDS)
+        print(f"[local_lock_wait] CRITICAL request_id={request_id} lock={lock_name} wait_ms={wait_ms} active_requests={len(active)} active_ids={list(active.keys())[-5:]}")
+    elif wait_ms > _LOCK_WAIT_CRITICAL_MS:
+        print(f"[local_lock_wait] CRITICAL request_id={request_id} lock={lock_name} wait_ms={wait_ms}")
+    elif wait_ms > _LOCK_WAIT_WARN_MS:
+        print(f"[local_lock_wait] WARN request_id={request_id} lock={lock_name} wait_ms={wait_ms}")
+    return result
 
-    def _detect_local_predispatch_stall(local_ts: dict, request_id: str, degradation_flags: list) -> dict:
-        t1 = local_ts.get("t1_local_recv")
-        t2 = local_ts.get("t2_local_dispatch")
-        body_read = local_ts.get("body_read_ms", 0) or 0
-        json_parse = local_ts.get("json_parse_ms", 0) or 0
-        preflight = local_ts.get("preflight_ms", 0) or 0
-        stack_extract = local_ts.get("stack_extract_ms", 0) or 0
-        active_next = local_ts.get("active_next_write_ms", 0) or 0
-        lock_wait = local_ts.get("lock_wait_total_ms", 0) or 0
-        phases = {"body_read": body_read, "json_parse": json_parse, "preflight": preflight, "stack_extract": stack_extract, "active_next_write": active_next, "lock_wait_total": lock_wait}
-        dominant = max(phases, key=phases.get) if phases else "unknown"
-        dominant_ms = phases.get(dominant, 0)
-        total = t2 - t1 if (t1 is not None and t2 is not None) else 0
-        total_ms = round(total * 1000, 2) if isinstance(total, float) else local_ts.get("local_receive_to_ack_ms", 0)
-        if total_ms > 60000:
-            degradation_flags.append("local_predispatch_stall_severe")
-            print(f"[local_predispatch_stall] SEVERE request_id={request_id} total_ms={total_ms} dominant={dominant}={dominant_ms} body_read={body_read} json_parse={json_parse} stack_extract={stack_extract} active_next={active_next} lock_wait={lock_wait}")
-        elif total_ms > 30000:
-            degradation_flags.append("local_predispatch_stall")
-            print(f"[local_predispatch_stall] CRITICAL request_id={request_id} total_ms={total_ms} dominant={dominant}={dominant_ms} body_read={body_read} json_parse={json_parse} stack_extract={stack_extract} active_next={active_next} lock_wait={lock_wait}")
-        elif total_ms > 5000:
-            print(f"[local_predispatch_stall] request_id={request_id} total_ms={total_ms} dominant={dominant}={dominant_ms} body_read={body_read} json_parse={json_parse} stack_extract={stack_extract} active_next={active_next} lock_wait={lock_wait}")
-        return {"local_receive_to_ack_ms": total_ms, "dominant_phase": dominant, "dominant_ms": dominant_ms, "body_read_ms": body_read, "json_parse_ms": json_parse, "stack_extract_ms": stack_extract, "active_next_write_ms": active_next, "lock_wait_total_ms": lock_wait}
+
+def _detect_local_predispatch_stall(local_ts: dict, request_id: str, degradation_flags: list) -> dict:
+    t1 = local_ts.get("t1_local_recv")
+    t2 = local_ts.get("t2_local_dispatch")
+    body_read = local_ts.get("body_read_ms", 0) or 0
+    json_parse = local_ts.get("json_parse_ms", 0) or 0
+    preflight = local_ts.get("preflight_ms", 0) or 0
+    stack_extract = local_ts.get("stack_extract_ms", 0) or 0
+    active_next = local_ts.get("active_next_write_ms", 0) or 0
+    lock_wait = local_ts.get("lock_wait_total_ms", 0) or 0
+    phases = {"body_read": body_read, "json_parse": json_parse, "preflight": preflight, "stack_extract": stack_extract, "active_next_write": active_next, "lock_wait_total": lock_wait}
+    dominant = max(phases, key=phases.get) if phases else "unknown"
+    dominant_ms = phases.get(dominant, 0)
+    total = t2 - t1 if (t1 is not None and t2 is not None) else 0
+    total_ms = round(total * 1000, 2) if isinstance(total, float) else local_ts.get("local_receive_to_ack_ms", 0)
+    if total_ms > 60000:
+        degradation_flags.append("local_predispatch_stall_severe")
+        print(f"[local_predispatch_stall] SEVERE request_id={request_id} total_ms={total_ms} dominant={dominant}={dominant_ms} body_read={body_read} json_parse={json_parse} stack_extract={stack_extract} active_next={active_next} lock_wait={lock_wait}")
+    elif total_ms > 30000:
+        degradation_flags.append("local_predispatch_stall")
+        print(f"[local_predispatch_stall] CRITICAL request_id={request_id} total_ms={total_ms} dominant={dominant}={dominant_ms} body_read={body_read} json_parse={json_parse} stack_extract={stack_extract} active_next={active_next} lock_wait={lock_wait}")
+    elif total_ms > 5000:
+        print(f"[local_predispatch_stall] request_id={request_id} total_ms={total_ms} dominant={dominant}={dominant_ms} body_read={body_read} json_parse={json_parse} stack_extract={stack_extract} active_next={active_next} lock_wait={lock_wait}")
+    return {"local_receive_to_ack_ms": total_ms, "dominant_phase": dominant, "dominant_ms": dominant_ms, "body_read_ms": body_read, "json_parse_ms": json_parse, "stack_extract_ms": stack_extract, "active_next_write_ms": active_next, "lock_wait_total_ms": lock_wait}
+
+if _server:
 
     @_server.routes.post("/comfymodal/prompt")
     async def modal_prompt(request: web.Request) -> web.Response:

@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import inspect
 import os
+import sys
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from comfymodal_runtime.contracts import TraceEvent
@@ -1696,6 +1698,131 @@ class TestT5Selection(unittest.TestCase):
                     t5_mono = candidate
                     break
         self.assertEqual(t5_mono, 9_876_543_210)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Active-read dimensional status classification (root __init__.py)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestActiveReadDimClassification(unittest.TestCase):
+    """_classify_active_read_dimensions returns truthful per-dimension statuses."""
+
+    @staticmethod
+    def _load_module():
+        """Load root __init__.py via importlib to access _classify_active_read_dimensions."""
+        import importlib.util
+        _init_path = Path(__file__).resolve().parents[1] / "__init__.py"
+        _mod_name = "_active_read_dim_test_mod"
+        if _mod_name in sys.modules:
+            del sys.modules[_mod_name]
+        spec = importlib.util.spec_from_file_location(_mod_name, str(_init_path))
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _classify(self, entry: dict) -> dict[str, str]:
+        mod = self._load_module()
+        return mod._classify_active_read_dimensions(entry)
+
+    def test_all_available_when_deep_diag_and_same_thread(self):
+        """thread_cpu_status=available when deep diag enabled and native_tid matches."""
+        entry = {
+            "native_tid": 1234,
+            "complete_native_tid": 1234,
+            "start_thread_time_ns": 1_000_000,
+            "start_process_time_ns": 2_000_000,
+            "before_rusage": {"utime_us": 100},
+            "before_io": {"read_bytes": 1000},
+        }
+        with patch.dict(os.environ, {"COMFYMODAL_V2_DEEP_MODEL_DIAG": "1"}):
+            result = self._classify(entry)
+        self.assertEqual(result.get("thread_cpu_status"), "available")
+        self.assertEqual(result.get("process_cpu_status"), "available")
+        self.assertEqual(result.get("io_status"), "available")
+        self.assertEqual(result.get("page_fault_status"), "available")
+        self.assertEqual(result.get("block_input_status"), "available")
+        self.assertEqual(result.get("context_switch_status"), "available")
+        self.assertEqual(result.get("counter_status"), "available")
+
+    def test_thread_changed_when_tid_mismatch(self):
+        """thread-bounded dims are thread_changed when native_tid differs."""
+        entry = {
+            "native_tid": 1234,
+            "complete_native_tid": 5678,
+            "start_thread_time_ns": 1_000_000,
+            "start_process_time_ns": 2_000_000,
+            "before_rusage": {"utime_us": 100},
+            "before_io": {"read_bytes": 1000},
+        }
+        with patch.dict(os.environ, {"COMFYMODAL_V2_DEEP_MODEL_DIAG": "1"}):
+            result = self._classify(entry)
+        self.assertEqual(result.get("thread_cpu_status"), "thread_changed")
+        self.assertEqual(result.get("io_status"), "thread_changed")
+        self.assertEqual(result.get("page_fault_status"), "thread_changed")
+        self.assertEqual(result.get("block_input_status"), "thread_changed")
+        self.assertEqual(result.get("context_switch_status"), "thread_changed")
+        # process_cpu is NOT thread-bounded, so available when data exists
+        self.assertEqual(result.get("process_cpu_status"), "available")
+
+    def test_unsupported_when_deep_diag_disabled(self):
+        """All dims are unsupported when deep_diag is disabled."""
+        entry = {
+            "native_tid": 1234,
+            "complete_native_tid": 1234,
+            "start_thread_time_ns": 1_000_000,
+            "start_process_time_ns": 2_000_000,
+            "before_rusage": {"utime_us": 100},
+            "before_io": {"read_bytes": 1000},
+        }
+        with patch.dict(os.environ, {"COMFYMODAL_V2_DEEP_MODEL_DIAG": "0"}):
+            result = self._classify(entry)
+        for status_key in ("thread_cpu_status", "process_cpu_status", "io_status",
+                           "page_fault_status", "block_input_status", "context_switch_status"):
+            self.assertEqual(result.get(status_key), "unsupported",
+                             f"{status_key} should be unsupported")
+
+    def test_not_observed_when_same_thread_but_no_data(self):
+        """not_observed_in_this_thread when same thread but no before-snapshot captured."""
+        entry = {
+            "native_tid": 1234,
+            "complete_native_tid": 1234,
+            "start_thread_time_ns": 1_000_000,
+            "start_process_time_ns": 2_000_000,
+            "before_rusage": None,
+            "before_io": None,
+        }
+        with patch.dict(os.environ, {"COMFYMODAL_V2_DEEP_MODEL_DIAG": "1"}):
+            result = self._classify(entry)
+        # page_fault, block_input, context_switch map to rusage — no snapshot
+        self.assertEqual(result.get("page_fault_status"), "not_observed_in_this_thread")
+        self.assertEqual(result.get("block_input_status"), "not_observed_in_this_thread")
+        self.assertEqual(result.get("context_switch_status"), "not_observed_in_this_thread")
+        # io_status maps to io — no snapshot
+        self.assertEqual(result.get("io_status"), "not_observed_in_this_thread")
+
+    def test_empty_entry_does_not_crash(self):
+        """Empty entry defaults to safe statuses without raising."""
+        result = self._classify({})
+        self.assertIsInstance(result, dict)
+        self.assertIn("thread_cpu_status", result)
+        self.assertIn("counter_status", result)
+
+    def test_counter_status_mixed(self):
+        """counter_status=mixed when dimensions disagree."""
+        entry = {
+            "native_tid": 1234,
+            "complete_native_tid": 1234,
+            "start_thread_time_ns": 1_000_000,
+            "start_process_time_ns": 2_000_000,
+            "before_rusage": {"utime_us": 100},
+            "before_io": None,
+        }
+        with patch.dict(os.environ, {"COMFYMODAL_V2_DEEP_MODEL_DIAG": "1"}):
+            result = self._classify(entry)
+        # thread_cpu available, io not_observed → mixed
+        self.assertEqual(result.get("counter_status"), "mixed")
 
 
 if __name__ == "__main__":
