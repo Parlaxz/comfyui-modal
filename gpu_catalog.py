@@ -1,6 +1,93 @@
 import os
 
 DEFAULT_GPU = "rtx-pro-6000"
+# V2 canonical primary GPU name (Modal-cased), used when COMFYMODAL_V2_GPU
+# is absent or explicitly empty.  Preserves legacy DEFAULT_GPU for backward
+# compat in non-V2 code paths.
+V2_DEFAULT_GPU: str = "RTX-PRO-6000"
+
+# ── Canonical GPU name mapping (lowercase-normalized → Modal canonical) ──
+# All keys and values must match Modal's accepted GPU strings exactly.
+GPU_CANONICAL_MAP: dict[str, str] = {
+    "rtx-pro-6000": "RTX-PRO-6000",
+    "rtx pro 6000": "RTX-PRO-6000",
+    "a100-80gb": "A100-80GB",
+    "a100 80gb": "A100-80GB",
+    "a100_80gb": "A100-80GB",
+    "a100-40gb": "A100-40GB",
+    "a100 40gb": "A100-40GB",
+    "a100_40gb": "A100-40GB",
+    "a100": "A100",
+    "t4": "T4",
+    "l4": "L4",
+    "a10g": "A10",
+    "a10": "A10",
+    "l40s": "L40S",
+    "l40": "L40S",
+    "h100": "H100",
+    "h200": "H200",
+    "b200": "B200",
+}
+
+# ── Default ordered GPU request ─────────────────────────────────────────
+# Primary from COMFYMODAL_V2_GPU, fallbacks from COMFYMODAL_V2_GPU_FALLBACKS.
+# Deduped preserving order.  Empty/absent fallbacks = no fallback.
+DEFAULT_GPU_FALLBACKS: tuple[str, ...] = ("A100-80GB", "A100-40GB")
+
+
+def _normalize_gpu_name(raw: str) -> str:
+    """Normalize a GPU name to lower-case with hyphens, then look up canonical."""
+    cleaned = raw.strip().lower().replace("_", "-").replace(" ", "-")
+    return GPU_CANONICAL_MAP.get(cleaned, cleaned)
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    """Remove duplicates while preserving first-seen order."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def parse_gpu_request() -> tuple[str, ...]:
+    """Parse the ordered GPU request from environment variables.
+
+    Returns an immutable deduplicated tuple of Modal-canonical GPU names.
+    Never appends GPUs beyond those explicitly configured or defaulted.
+
+    Semantics
+    ---------
+    * ``COMFYMODAL_V2_GPU`` absent → ``V2_DEFAULT_GPU`` as primary.
+    * ``COMFYMODAL_V2_GPU`` explicitly empty or whitespace-only
+      → ``V2_DEFAULT_GPU`` as primary (not legacy ``DEFAULT_GPU``).
+    * ``COMFYMODAL_V2_GPU_FALLBACKS`` absent → use ``DEFAULT_GPU_FALLBACKS``.
+    * ``COMFYMODAL_V2_GPU_FALLBACKS`` explicitly empty or whitespace-only
+      → disable all fallbacks (empty tuple).
+    """
+    primary_raw = os.environ.get("COMFYMODAL_V2_GPU", V2_DEFAULT_GPU).strip()
+    primary = _normalize_gpu_name(primary_raw) if primary_raw else V2_DEFAULT_GPU
+
+    fallbacks_raw = os.environ.get("COMFYMODAL_V2_GPU_FALLBACKS")
+    if fallbacks_raw is None:
+        # Absent → use defaults
+        fallback_list = list(DEFAULT_GPU_FALLBACKS)
+    elif fallbacks_raw.strip():
+        # Non-empty explicit value → parse comma-separated list
+        fallback_list = [
+            _normalize_gpu_name(fb.strip())
+            for fb in fallbacks_raw.split(",")
+            if fb.strip()
+        ]
+    else:
+        # Explicitly empty or whitespace-only → disable all fallbacks
+        fallback_list = []
+
+    # Build ordered list: primary first, then fallbacks, dedupe preserving order
+    ordered = [primary] + fallback_list
+    return tuple(_dedupe_preserve_order(ordered))
 
 GPU_CATALOG = [
     {"value": "rtx-pro-6000", "label": "RTX PRO 6000", "modal_gpu": "rtx-pro-6000", "class_name": "ComfyAPI_RTX_PRO_6000", "profile": "high_mem"},

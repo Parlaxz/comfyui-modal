@@ -1375,6 +1375,55 @@ VOLUME_STALL_EXEC_MODEL_IO_MS = int(os.getenv("COMFYMODAL_VOLUME_STALL_EXEC_MODE
 # When 0, skip the Sage CUDA extension smoke test during restore.
 # Use the persistent volume cache if available, or SAGE_RUNTIME_MODE default.
 SAGE_RUNTIME_PROBE_ON_RESTORE = os.getenv("COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE", "1") == "1"
+
+# ── Cross-GPU: runtime compute capability ───────────────────────────
+# Used to prevent Blackwell-only compiled artifacts from being placed in
+# a process-global cache shared with A100.  GPU architecture must be
+# checked at runtime, not at build time.
+_COMPUTE_CAPABILITY_CACHE: tuple[int, int] | None = None
+_COMPUTE_CAPABILITY_LOCK = threading.Lock()
+
+
+def _get_runtime_compute_capability() -> tuple[int, int] | None:
+    """Return the actual runtime compute capability as (major, minor).
+
+    Uses torch.cuda.get_device_capability() when CUDA is available.
+    Returns None if CUDA is unavailable or the device cannot be queried.
+    This value is used for hardware-dependent cache keys only when the
+    cached object is genuinely GPU-architecture dependent (e.g. compiled
+    CUDA kernels).  CPU state dicts remain hardware-neutral and should
+    NOT include this in their cache key.
+    """
+    global _COMPUTE_CAPABILITY_CACHE
+    if _COMPUTE_CAPABILITY_CACHE is not None:
+        return _COMPUTE_CAPABILITY_CACHE
+    with _COMPUTE_CAPABILITY_LOCK:
+        if _COMPUTE_CAPABILITY_CACHE is not None:
+            return _COMPUTE_CAPABILITY_CACHE
+        try:
+            import torch
+            if torch.cuda.is_available():
+                _cap = torch.cuda.get_device_capability()
+                _COMPUTE_CAPABILITY_CACHE = (int(_cap[0]), int(_cap[1]))
+                return _COMPUTE_CAPABILITY_CACHE
+        except Exception:
+            pass
+        _COMPUTE_CAPABILITY_CACHE = (-1, -1)
+        return None
+
+
+def _make_hardware_dependent_cache_key(base_key: str) -> str:
+    """Extend a cache key with runtime compute capability when the cached
+    object is GPU-architecture dependent.
+
+    Returns the original *base_key* unchanged when compute capability
+    cannot be determined (e.g. CPU-only runtime), ensuring CPU state
+    dicts remain hardware-neutral.
+    """
+    _cap = _get_runtime_compute_capability()
+    if _cap is None or _cap[0] < 0:
+        return base_key
+    return f"{base_key}_cc{_cap[0]}{_cap[1]}"
 PRELOAD_MODE_PATH = "/root/comfymodal_runtime/.preload_mode"
 RUNTIME_CONFIG_DIR = "/root/comfymodal_runtime"
 RUNTIME_RETURN_MODE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "return_mode.txt")
@@ -1805,6 +1854,23 @@ def _log_cold_start_waterfall(s, label=""):
     if crit_total > 0:
         print(f"[waterfall] SUM    known_nonoverlap_total           {_fmt(crit_total)}  --", flush=True)
 DEPENDENCY_VALIDATION_CACHE_SCHEMA_VERSION = 1
+DEPENDENCY_MANIFEST_SCHEMA_VERSION = 1
+"""Schema version for the immutable dependency manifest persisted on
+runtime-config volume during deployment/snapshot initialization.
+
+The manifest is keyed by deployment combined hash, custom-node source
+fingerprint, custom-node generation, repair mode, and schema version.
+On request, the persisted manifest is loaded once for a cheap identity
+comparison.  Exact match skips full fingerprint/validation.  Missing,
+corrupt, schema-mismatch, or identity-mismatch fails closed and triggers
+a single valid replacement write.
+"""
+
+DEPENDENCY_MANIFEST_DIR = os.path.join(
+    RUNTIME_CONFIG_DIR, "dependency_manifest"
+)
+DEPENDENCY_MANIFEST_FILENAME = "immutable_manifest.json"
+
 # Platform pre-restore outlier threshold (ms).  Gaps exceeding this are flagged.
 _PLATFORM_OUTLIER_THRESHOLD_MS = int(os.getenv("COMFYMODAL_PLATFORM_OUTLIER_THRESHOLD_MS", "10000"))
 DEPLOYMENT_DEPENDENCY_VALIDATION_CACHE_DIR = os.path.join(
@@ -1821,6 +1887,252 @@ _dependency_validation_memory_cache_key: str = ""
 # Stored as dict with keys: baked_hash, repair_mode, source_root_indicator,
 # volume_state_hash, result
 _dep_validation_pre_key: dict | None = None
+
+
+def _build_immutable_dependency_manifest_identity(
+    combined_hash: str,
+    custom_node_fingerprint: dict | None,
+    custom_node_generation: str,
+    repair_mode: str,
+) -> str:
+    """Build a deterministic identity string for the immutable dependency manifest.
+
+    Includes:
+    - manifest schema version
+    - deployment combined hash (from DeploymentIdentity)
+    - custom-node source fingerprint hash (overall_dependency_hash)
+    - custom-node generation token
+    - repair mode
+    """
+    import hashlib
+    _h = hashlib.sha256()
+    _h.update(f"manifest_schema={DEPENDENCY_MANIFEST_SCHEMA_VERSION}\n".encode())
+    _h.update(f"combined_hash={combined_hash}\n".encode())
+    _cn_hash = ""
+    if custom_node_fingerprint and isinstance(custom_node_fingerprint, dict):
+        _cn_hash = custom_node_fingerprint.get("overall_dependency_hash", "")
+    _h.update(f"custom_node_fingerprint={_cn_hash}\n".encode())
+    _h.update(f"custom_node_generation={custom_node_generation}\n".encode())
+    _h.update(f"repair_mode={repair_mode}\n".encode())
+    return _h.hexdigest()
+
+
+def _resolve_deployment_combined_hash() -> str:
+    """Build a deterministic combined hash representing deployment identity.
+
+    Combines:
+    - COMFYAPP_VERSION
+    - runtime revision (``_V2_RUNTIME_REVISION``)
+    - baked dependency overall hash
+    - custom-nodes generation
+
+    Returns empty string when any required identity component is unavailable,
+    signalling that a reusable dependency manifest cannot be created.
+    """
+    _baked = load_baked_custom_node_dependency_manifest()
+    _baked_hash = _baked.get("overall_dependency_hash", "") if _baked else ""
+    if not _baked_hash:
+        return ""
+    _cn_gen_rec = _read_custom_nodes_generation_record()
+    _cn_gen = _cn_gen_rec.get("generation", "") if _cn_gen_rec else ""
+    if not _cn_gen:
+        return ""
+    import hashlib
+    _h = hashlib.sha256()
+    _h.update(f"comfyapp_version={COMFYAPP_VERSION}\n".encode())
+    _h.update(f"runtime_revision={_V2_RUNTIME_REVISION}\n".encode())
+    _h.update(f"baked_hash={_baked_hash}\n".encode())
+    _h.update(f"custom_nodes_generation={_cn_gen}\n".encode())
+    return _h.hexdigest()
+
+
+def _build_and_persist_dependency_manifest(
+    combined_hash: str,
+    custom_node_fingerprint: dict | None,
+    custom_node_generation: str,
+    repair_mode: str,
+    *,
+    volume: Any = None,
+    commit: bool = False,
+) -> dict:
+    """Build an immutable dependency manifest and persist it atomically.
+
+    The manifest is keyed by _build_immutable_dependency_manifest_identity.
+    Persisted to DEPENDENCY_MANIFEST_DIR on the runtime-config volume.
+
+    When *commit* is True and *volume* is provided, the volume is committed
+    after write.
+
+    Returns the manifest dict (never raises; returns error dict on failure).
+    """
+    _t0 = time.time()
+    _identity = _build_immutable_dependency_manifest_identity(
+        combined_hash=combined_hash,
+        custom_node_fingerprint=custom_node_fingerprint,
+        custom_node_generation=custom_node_generation,
+        repair_mode=repair_mode,
+    )
+    _manifest = {
+        "schema_version": DEPENDENCY_MANIFEST_SCHEMA_VERSION,
+        "identity": _identity,
+        "created_at_unix": time.time(),
+        "combined_hash": combined_hash,
+        "custom_node_fingerprint": dict(custom_node_fingerprint) if custom_node_fingerprint else {},
+        "custom_node_generation": custom_node_generation,
+        "repair_mode": repair_mode,
+        "source": "snapshot_manifest",
+    }
+    try:
+        os.makedirs(DEPENDENCY_MANIFEST_DIR, exist_ok=True)
+        _tmp = os.path.join(DEPENDENCY_MANIFEST_DIR, f".{DEPENDENCY_MANIFEST_FILENAME}.tmp.{os.getpid()}")
+        _final = os.path.join(DEPENDENCY_MANIFEST_DIR, DEPENDENCY_MANIFEST_FILENAME)
+        with open(_tmp, "w", encoding="utf-8") as _f:
+            json.dump(_manifest, _f, sort_keys=True, separators=(",", ":"))
+            _f.flush()
+            os.fsync(_f.fileno())
+        os.replace(_tmp, _final)
+        if commit and volume is not None:
+            try:
+                volume.commit()
+            except Exception as _ce:
+                print(f"[dep_manifest] commit failed: {_ce}", flush=True)
+        _elapsed_ms = round((time.time() - _t0) * 1000, 1)
+        print(
+            f"[dep_manifest] persisted identity={_identity[:16]}... "
+            f"combined_hash={combined_hash[:16]}... "
+            f"elapsed_ms={_elapsed_ms}",
+            flush=True,
+        )
+        return _manifest
+    except Exception as _exc:
+        print(f"[dep_manifest] persist failed: {_exc}", flush=True)
+        return {"identity": "", "error": str(_exc)[:200]}
+
+
+def _load_dependency_manifest() -> dict | None:
+    """Load the persisted immutable dependency manifest.
+
+    Returns the manifest dict on success, or None if missing/corrupt.
+    Never raises.
+    """
+    _load_start = time.time()
+    _path = os.path.join(DEPENDENCY_MANIFEST_DIR, DEPENDENCY_MANIFEST_FILENAME)
+    if not os.path.isfile(_path):
+        return None
+    try:
+        with open(_path, "r", encoding="utf-8") as _f:
+            _data = json.load(_f)
+        if not isinstance(_data, dict):
+            return None
+        if _data.get("schema_version") != DEPENDENCY_MANIFEST_SCHEMA_VERSION:
+            print(f"[dep_manifest] schema_version mismatch: {_data.get('schema_version')}", flush=True)
+            return None
+        if not _data.get("identity"):
+            print("[dep_manifest] missing identity", flush=True)
+            return None
+        _load_ms = round((time.time() - _load_start) * 1000, 1)
+        print(f"[dep_manifest] loaded identity={_data['identity'][:16]}... load_ms={_load_ms}", flush=True)
+        return _data
+    except (json.JSONDecodeError, OSError) as _exc:
+        print(f"[dep_manifest] corrupt: {_exc}", flush=True)
+        return None
+
+
+def _check_dependency_manifest_identity(
+    manifest: dict | None,
+    combined_hash: str,
+    custom_node_fingerprint: dict | None,
+    custom_node_generation: str,
+    repair_mode: str,
+) -> dict:
+    """Cheap-compare the persisted manifest identity against current values.
+
+    Returns a dict with:
+      identity_match: bool
+      manifest_load_ms: float
+      cheap_check_ms: float
+      computed_identity: str
+
+    When identity_match is False, a refresh is needed (caller should run
+    full validation then _build_and_persist_dependency_manifest).
+    """
+    _t0 = time.time()
+    if manifest is None:
+        return {
+            "identity_match": False,
+            "manifest_load_ms": 0.0,
+            "cheap_check_ms": round((time.time() - _t0) * 1000, 1),
+            "computed_identity": "",
+            "reason": "manifest_missing",
+        }
+    _manifest_load_ms = 0.0
+    _chk_t0 = time.time()
+    _expected = _build_immutable_dependency_manifest_identity(
+        combined_hash=combined_hash,
+        custom_node_fingerprint=custom_node_fingerprint,
+        custom_node_generation=custom_node_generation,
+        repair_mode=repair_mode,
+    )
+    _stored = manifest.get("identity", "")
+    _match = bool(_stored and _expected and _stored == _expected)
+    _reason = ""
+    if not _match:
+        if not _stored:
+            _reason = "stored_identity_empty"
+        elif not _expected:
+            _reason = "computed_identity_empty"
+        else:
+            _reason = "identity_mismatch"
+    return {
+        "identity_match": _match,
+        "manifest_load_ms": _manifest_load_ms,
+        "cheap_check_ms": round((time.time() - _chk_t0) * 1000, 1),
+        "computed_identity": _expected,
+        "stored_identity": _stored,
+        "reason": _reason,
+    }
+
+
+# ── [v2.dependency_validation] diagnostic emitter ────────────────────
+
+
+def _emit_dependency_validation_v2(
+    *,
+    source: str = "",
+    identity_match: bool = False,
+    manifest_load_ms: float = 0.0,
+    cheap_check_ms: float = 0.0,
+    fingerprint_ms: float = 0.0,
+    full_validation_ms: float = 0.0,
+    total_ms: float = 0.0,
+    refresh_performed: bool = False,
+    reason: str = "",
+) -> None:
+    """Emit a single [v2.dependency_validation] diagnostic line.
+
+    source: snapshot_manifest|persistent_manifest|request_rebuild
+    identity_match: True when persisted manifest identity matches expected
+    manifest_load_ms: time to load the persisted manifest from volume
+    cheap_check_ms: time for the cheap identity comparison
+    fingerprint_ms: time for dependency fingerprint computation
+    full_validation_ms: time for full validate_custom_node_dependencies_prepared
+    total_ms: total elapsed (manifest_load + cheap_check + fingerprint + validation)
+    refresh_performed: True if a write/replacement was performed
+    reason: short string explaining the outcome
+    """
+    print(
+        f"[v2.dependency_validation] "
+        f"source={source} "
+        f"identity_match={int(identity_match)} "
+        f"manifest_load_ms={manifest_load_ms} "
+        f"cheap_check_ms={cheap_check_ms} "
+        f"fingerprint_ms={fingerprint_ms} "
+        f"full_validation_ms={full_validation_ms} "
+        f"total_ms={total_ms} "
+        f"refresh_performed={int(refresh_performed)} "
+        f"reason={reason}",
+        flush=True,
+    )
 
 # GÃ¶Ã‡GÃ¶Ã‡ Per-audit round 7: persistent validation certificate GÃ¶Ã‡GÃ¶Ã‡
 # Persistent validation certificate that caches a successful
@@ -8606,36 +8918,103 @@ class _ComfyAPIMixin:
             print(f"[comfyapp] FAILURE SUMMARY: {summary}")
             raise
 
-        # 2. Dependency validation for production modes (cached)
+        # 2. Dependency validation for production modes
+        #    2a. Persistent-manifest fast path (cheap identity check)
+        #    2b. Fall back to existing validation + manifest refresh
         dep_prepared = True
         dep_reason = ""
         if _repair_mode in ("off", "fail_fast"):
-            dep_check = _run_dependency_validation_with_cache(repair_mode=_repair_mode)
-            dep_prepared = dep_check.get("prepared", False)
-            dep_reason = dep_check.get("dependency_validation_reason", dep_check.get("reason", ""))
-            if not dep_prepared:
-                baked_hash = dep_check.get("baked_hash", "?") or "?"
-                current_hash = dep_check.get("current_hash", "?") or "?"
-                changed_nodes = dep_check.get("changed_nodes", [])
-                summary = FailureSummary(phase="dependency_preflight")
-                summary.fatal_error = "custom node dependencies not prepared"
-                summary.modal_invoked = True
-                summary.recommendation = (
-                    "Rebuild/deploy Modal image after syncing "
-                    "custom-node requirements."
+            _dep_t0 = time.time()
+            # Resolve current identity components (shared by both paths)
+            _combined_hash_pre = _resolve_deployment_combined_hash()
+            _baked_mft_pre = load_baked_custom_node_dependency_manifest()
+            _cn_fp_pre = _baked_mft_pre if _baked_mft_pre else None
+            _cn_gen_rec_pre = _read_custom_nodes_generation_record()
+            _cn_gen_pre = _cn_gen_rec_pre.get("generation", "") if _cn_gen_rec_pre else ""
+
+            # 2a. Persistent manifest identity check
+            _manifest_snapshot = _load_dependency_manifest()
+            _manifest_load_ms = round((time.time() - _dep_t0) * 1000, 2)
+            _chk_t0 = time.time()
+            _identity_check = _check_dependency_manifest_identity(
+                _manifest_snapshot,
+                _combined_hash_pre,
+                _cn_fp_pre,
+                _cn_gen_pre,
+                _repair_mode,
+            )
+            _cheap_check_ms = round((time.time() - _chk_t0) * 1000, 2)
+
+            if _identity_check.get("identity_match"):
+                # Fast path: exact identity match skips fingerprint/validation
+                dep_prepared = True
+                dep_reason = "manifest_identity_match"
+                _v2_total = round((time.time() - _dep_t0) * 1000, 2)
+                _emit_dependency_validation_v2(
+                    source="persistent_manifest",
+                    identity_match=True,
+                    manifest_load_ms=_manifest_load_ms,
+                    cheap_check_ms=_cheap_check_ms,
+                    fingerprint_ms=0.0,
+                    full_validation_ms=0.0,
+                    total_ms=_v2_total,
+                    refresh_performed=False,
+                    reason="manifest_identity_match",
                 )
-                print(f"[comfyapp] FAILURE SUMMARY: {summary}")
-                raise RuntimeError(
-                    "Custom node dependencies are not prepared for this image. "
-                    "Runtime pip install is disabled in "
-                    f"{_repair_mode} mode. "
-                    f"Rebuild/deploy the Modal image after syncing "
-                    f"custom-node requirements. "
-                    f"reason={dep_reason} "
-                    f"baked_hash={baked_hash} "
-                    f"current_hash={current_hash} "
-                    f"changed_nodes={changed_nodes}"
+            else:
+                # 2b. Manifest miss: run full existing validation
+                dep_check = _run_dependency_validation_with_cache(repair_mode=_repair_mode)
+                dep_prepared = dep_check.get("prepared", False)
+                dep_reason = dep_check.get("dependency_validation_reason", dep_check.get("reason", ""))
+                _fingerprint_ms = dep_check.get("dependency_fingerprint_ms", 0.0)
+                _full_val_ms = dep_check.get("dependency_full_validation_ms", 0.0)
+                _v2_total = round((time.time() - _dep_t0) * 1000, 2)
+                _refresh_performed = False
+                if dep_prepared and _combined_hash_pre:
+                    _build_and_persist_dependency_manifest(
+                        combined_hash=_combined_hash_pre,
+                        custom_node_fingerprint=_cn_fp_pre,
+                        custom_node_generation=_cn_gen_pre,
+                        repair_mode=_repair_mode,
+                        volume=runtime_config_vol,
+                        commit=True,
+                    )
+                    _refresh_performed = True
+                _emit_dependency_validation_v2(
+                    source="request_rebuild",
+                    identity_match=False,
+                    manifest_load_ms=_manifest_load_ms,
+                    cheap_check_ms=_cheap_check_ms,
+                    fingerprint_ms=_fingerprint_ms,
+                    full_validation_ms=_full_val_ms,
+                    total_ms=_v2_total,
+                    refresh_performed=_refresh_performed,
+                    reason=_identity_check.get("reason", "manifest_mismatch"),
                 )
+
+                if not dep_prepared:
+                    baked_hash = dep_check.get("baked_hash", "?") or "?"
+                    current_hash = dep_check.get("current_hash", "?") or "?"
+                    changed_nodes = dep_check.get("changed_nodes", [])
+                    summary = FailureSummary(phase="dependency_preflight")
+                    summary.fatal_error = "custom node dependencies not prepared"
+                    summary.modal_invoked = True
+                    summary.recommendation = (
+                        "Rebuild/deploy Modal image after syncing "
+                        "custom-node requirements."
+                    )
+                    print(f"[comfyapp] FAILURE SUMMARY: {summary}")
+                    raise RuntimeError(
+                        "Custom node dependencies are not prepared for this image. "
+                        "Runtime pip install is disabled in "
+                        f"{_repair_mode} mode. "
+                        f"Rebuild/deploy the Modal image after syncing "
+                        f"custom-node requirements. "
+                        f"reason={dep_reason} "
+                        f"baked_hash={baked_hash} "
+                        f"current_hash={current_hash} "
+                        f"changed_nodes={changed_nodes}"
+                    )
 
         result = {
             "valid_prompt": valid_prompt,
@@ -14887,13 +15266,112 @@ class _ComfyAPIMixin:
         try:
             self._executor.reset()
             stage_started = time.time()
+
+            # ── Pre-sampler instrumentation ────────────────────────────
+            # Capture exact node IDs and class types for the critical path
+            # from execution start through CLIP loading to sampler start.
+            _pre_sampler_info: dict[str, Any] = {
+                "exec_start_node_id": "",
+                "exec_start_class_type": "",
+                "cached_to_first_executing_node_id": "",
+                "cached_to_first_executing_class_type": "",
+                "first_node_to_clip_node_id": "",
+                "first_node_to_clip_class_type": "",
+                "clip_to_sampler_node_id": "",
+                "clip_to_sampler_class_type": "",
+                "sampler_start_node_id": "",
+                "sampler_start_class_type": "",
+                "cache_hit": False,
+                "exec_start_to_cached_ms": 0.0,
+                "cached_to_first_executing_ms": 0.0,
+                "first_node_to_clip_ms": 0.0,
+                "clip_to_sampler_ms": 0.0,
+                "sampler_start_ms": 0.0,
+                "background_future_exists": False,
+                "background_future_done": False,
+                "future_wait_ms": 0.0,
+                "model_cache_hit": False,
+                "node_execution_ms": 0.0,
+                "unattributed_ms": 0.0,
+            }
+            _exec_t0 = time.time()
+            _pre_sampler_info["exec_start_node_id"] = str(outputs_to_execute[0]) if outputs_to_execute else ""
+            # Extract first node class type from workflow
+            if outputs_to_execute and isinstance(workflow, dict):
+                _first_out_id = str(outputs_to_execute[0])
+                _first_node = workflow.get(_first_out_id, {})
+                _pre_sampler_info["exec_start_class_type"] = str(_first_node.get("class_type", ""))
             if trace is not None:
-                trace.mark("t3e_execution_start", t=stage_started)
+                trace.mark("t3e_execution_start", t=_exec_t0)
+
+            # ── Check background UNET future before execution ──────────
+            try:
+                from comfymodal_runtime.model_preload import _LATEST_RESTORED_INSTANCE_ID
+                _has_bg_unet = bool(getattr(self, "_background_unet_future", None))
+                if _has_bg_unet:
+                    _bf = self._background_unet_future
+                    _pre_sampler_info["background_future_exists"] = True
+                    _pre_sampler_info["background_future_done"] = _bf.done() if hasattr(_bf, "done") else False
+                    if _bf.done() and hasattr(_bf, "result"):
+                        # Completed future returns cached object directly
+                        try:
+                            _bf.result(timeout=0)
+                            _pre_sampler_info["future_wait_ms"] = 0.0
+                            _pre_sampler_info["model_cache_hit"] = True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
             self._executor.execute(
                 prompt=workflow,
                 prompt_id=prompt_id,
                 extra_data={"client_id": prompt_id},
                 execute_outputs=outputs_to_execute,
+            )
+            _exec_t1 = time.time()
+            _pre_sampler_info["node_execution_ms"] = round((_exec_t1 - _exec_t0) * 1000, 3)
+
+            # ── Post-execution: record pre-sampler diagnostic ───────────
+            if trace is not None:
+                trace.mark("t3f_execution_end", t=_exec_t1)
+            # Identify sampler start node from the executor's last executed node
+            try:
+                _exec_history = getattr(self._executor, "execution_history_trace", None) or getattr(self._executor, "history", None)
+                if _exec_history and isinstance(_exec_history, dict):
+                    _exec_keys = list(_exec_history.keys())
+                    if len(_exec_keys) >= 2:
+                        _clip_node_id = _exec_keys[0] if len(_exec_keys) > 0 else ""
+                        _sampler_node_id = _exec_keys[-1] if len(_exec_keys) > 0 else ""
+                        if isinstance(workflow, dict):
+                            _clip_n = workflow.get(_clip_node_id, {})
+                            _sampler_n = workflow.get(_sampler_node_id, {})
+                            _pre_sampler_info["first_node_to_clip_node_id"] = _clip_node_id
+                            _pre_sampler_info["first_node_to_clip_class_type"] = str(_clip_n.get("class_type", ""))
+                            _pre_sampler_info["clip_to_sampler_node_id"] = _sampler_node_id
+                            _pre_sampler_info["clip_to_sampler_class_type"] = str(_sampler_n.get("class_type", ""))
+            except Exception:
+                pass
+            _pre_sampler_total = sum(v for k, v in _pre_sampler_info.items() if k.endswith("_ms") and isinstance(v, (int, float)))
+            if _pre_sampler_info["node_execution_ms"] and _pre_sampler_info["node_execution_ms"] > _pre_sampler_total:
+                _pre_sampler_info["unattributed_ms"] = round(
+                    _pre_sampler_info["node_execution_ms"] - _pre_sampler_total, 3
+                )
+            _diag_nid = _pre_sampler_info.get("exec_start_node_id", "")[:16]
+            _diag_ct = _pre_sampler_info.get("exec_start_class_type", "")[:32]
+            print(
+                f"[v2.pre_sampler] "
+                f"node_id={_diag_nid} class_type={_diag_ct} "
+                f"cache_hit={int(_pre_sampler_info['cache_hit'])} "
+                f"bg_future_exists={int(_pre_sampler_info['background_future_exists'])} "
+                f"bg_future_done={int(_pre_sampler_info['background_future_done'])} "
+                f"future_wait_ms={_pre_sampler_info['future_wait_ms']} "
+                f"model_cache_hit={int(_pre_sampler_info['model_cache_hit'])} "
+                f"exec_to_cached_ms={_pre_sampler_info['exec_start_to_cached_ms']} "
+                f"cached_to_exec_ms={_pre_sampler_info['cached_to_first_executing_ms']} "
+                f"node_exec_ms={_pre_sampler_info['node_execution_ms']} "
+                f"unattributed_ms={_pre_sampler_info['unattributed_ms']}",
+                flush=True,
             )
         except BaseException:
             _try_failed = True
@@ -16279,6 +16757,31 @@ class _ComfyAPIMixin:
         stage_started = time.time()
         self._record_runtime_state()
         self._log_profile("runtime_state_record", duration_ms=self._profile_ms(stage_started))
+
+        # ── Build and persist immutable dependency manifest ───────────
+        # Only creates a reusable manifest when all identity components
+        # are available (baked hash, custom-nodes generation, etc.).
+        # When identity cannot be established, we skip silently so the
+        # request-time fast path degrades to existing validation.
+        _manifest_build_t0 = time.time()
+        _deploy_combined = _resolve_deployment_combined_hash()
+        if _deploy_combined:
+            _baked_mft = load_baked_custom_node_dependency_manifest()
+            _cn_gen_rec = _read_custom_nodes_generation_record()
+            _cn_gen_str = _cn_gen_rec.get("generation", "") if _cn_gen_rec else ""
+            _repair_mode_str = REQUIREMENTS_REPAIR_MODE.strip().lower()
+            _build_and_persist_dependency_manifest(
+                combined_hash=_deploy_combined,
+                custom_node_fingerprint=_baked_mft if _baked_mft else None,
+                custom_node_generation=_cn_gen_str,
+                repair_mode=_repair_mode_str,
+                volume=runtime_config_vol,
+                commit=True,
+            )
+            _manifest_ms = round((time.time() - _manifest_build_t0) * 1000, 1)
+            print(f"[dep_manifest] startup build/persist done in {_manifest_ms}ms")
+        else:
+            print("[dep_manifest] startup: identity not resolvable, skipping manifest build")
 
         _need_backend = True
         if _snap_mode == "none":
