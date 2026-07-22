@@ -1550,6 +1550,7 @@ async def execute_plan(
     _transport_entry_to_handle_lookup_ms = _ld(runtime_trace,
                                                 "transport_entry",
                                                 "modal_handle_lookup_start")
+    _transport_entry_ms = _transport_entry_to_handle_lookup_ms
     _payload_ready_to_gen_create_ms = _ld(runtime_trace,
                                            "modal_payload_serialize_end",
                                            "modal_generator_create_start")
@@ -1597,6 +1598,7 @@ async def execute_plan(
                 _worker_start_to_plan_build_ms = _INVALID_NEG_STR
             else:
                 _worker_start_to_plan_build_ms = round(_delta / 1_000_000, 3)
+    _worker_queue_ms = _worker_start_to_plan_build_ms
 
     # ── Total span ──
     # local_receive_to_actual_submission_ms = submission - local_receive
@@ -1759,12 +1761,14 @@ async def execute_plan(
         "request_id": _origin.get("request_id") or runtime_trace.request_id,
         "local_receive_to_worker_start_ms": _local_receive_to_worker_start_ms,
         "worker_start_to_plan_build_ms": _worker_start_to_plan_build_ms,
+        "worker_queue_ms": _worker_queue_ms,
         "plan_build_ms": _plan_build_ms,
         "active_profile_ms": _active_profile_ms,
         "restore_plan_build_ms": _restore_plan_build_ms,
         "restore_publish_ms": _restore_publish_ms,
         "restore_publish_to_transport_entry_ms": _restore_pub_to_transport_entry_ms,
         "transport_entry_to_handle_lookup_ms": _transport_entry_to_handle_lookup_ms,
+        "transport_entry_ms": _transport_entry_ms,
         "handle_lookup_ms": _handle_lookup_ms,
         "payload_materialization_ms": _payload_materialization_prep_ms,
         "payload_size_measurement_ms": _payload_size_measurement_ms,
@@ -1833,12 +1837,14 @@ async def execute_plan(
         f"request_id={_breakdown['request_id']} "
         f"local_receive_to_worker_start_ms={_fmt_bd(_breakdown['local_receive_to_worker_start_ms'])} "
         f"worker_start_to_plan_build_ms={_fmt_bd(_breakdown['worker_start_to_plan_build_ms'])} "
+        f"worker_queue_ms={_fmt_bd(_breakdown['worker_queue_ms'])} "
         f"plan_build_ms={_fmt_bd(_breakdown['plan_build_ms'])} "
         f"active_profile_ms={_fmt_bd(_breakdown['active_profile_ms'])} "
         f"restore_plan_build_ms={_fmt_bd(_breakdown['restore_plan_build_ms'])} "
         f"restore_publish_ms={_fmt_bd(_breakdown['restore_publish_ms'])} "
         f"restore_publish_to_transport_entry_ms={_fmt_bd(_breakdown['restore_publish_to_transport_entry_ms'])} "
         f"transport_entry_to_handle_lookup_ms={_fmt_bd(_breakdown['transport_entry_to_handle_lookup_ms'])} "
+        f"transport_entry_ms={_fmt_bd(_breakdown['transport_entry_ms'])} "
         f"handle_lookup_ms={_fmt_bd(_breakdown['handle_lookup_ms'])} "
         f"payload_materialization_ms={_fmt_bd(_breakdown['payload_materialization_ms'])} "
         f"payload_size_measurement_ms={_fmt_bd(_breakdown['payload_size_measurement_ms'])} "

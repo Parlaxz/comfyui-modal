@@ -32,7 +32,7 @@ GPU_CANONICAL_MAP: dict[str, str] = {
 # ── Default ordered GPU request ─────────────────────────────────────────
 # Primary from COMFYMODAL_V2_GPU, fallbacks from COMFYMODAL_V2_GPU_FALLBACKS.
 # Deduped preserving order.  Empty/absent fallbacks = no fallback.
-DEFAULT_GPU_FALLBACKS: tuple[str, ...] = ("A100-80GB", "A100-40GB")
+DEFAULT_GPU_FALLBACKS: tuple[str, ...] = ()
 
 
 def _normalize_gpu_name(raw: str) -> str:
@@ -63,7 +63,7 @@ def parse_gpu_request() -> tuple[str, ...]:
     * ``COMFYMODAL_V2_GPU`` absent → ``V2_DEFAULT_GPU`` as primary.
     * ``COMFYMODAL_V2_GPU`` explicitly empty or whitespace-only
       → ``V2_DEFAULT_GPU`` as primary (not legacy ``DEFAULT_GPU``).
-    * ``COMFYMODAL_V2_GPU_FALLBACKS`` absent → use ``DEFAULT_GPU_FALLBACKS``.
+    * ``COMFYMODAL_V2_GPU_FALLBACKS`` absent → no fallbacks (empty tuple).
     * ``COMFYMODAL_V2_GPU_FALLBACKS`` explicitly empty or whitespace-only
       → disable all fallbacks (empty tuple).
     """

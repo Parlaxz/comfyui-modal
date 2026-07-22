@@ -233,6 +233,61 @@ MODEL_FUTURE_HIT = "model_future_hit"
 MODEL_ORIGINAL_VOLUME_LOAD_START = "model_original_volume_load_start"
 MODEL_ORIGINAL_VOLUME_LOAD_END = "model_original_volume_load_end"
 
+# ── Pre-sampler critical path operations ─────────────────────────────
+# Canonical list of operations tracked by the pre-sampler cache/orchestration
+# component.  Each tracks its own cumulative timing and count.
+PRE_SAMPLER_OPERATIONS = [
+    "cache_key_build",
+    "cache_lookup",
+    "input_resolution",
+    "model_patch",
+    "conditioning",
+    "future_wait",
+    "lock_wait",
+    "node_execution",
+    "unattributed",
+]
+PRE_SAMPLER_OPERATION_SET = frozenset(PRE_SAMPLER_OPERATIONS)
+
+
+def pre_sampler_span_metadata(
+    operation: str,
+    duration_ms: float = 0.0,
+    node_id: str = "",
+    class_type: str = "",
+    start_node_id: str = "",
+    start_node_class_type: str = "",
+    end_node_id: str = "",
+    end_node_class_type: str = "",
+    cache_hit: bool = False,
+    reused: bool = False,
+    skipped: bool = False,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Build metadata dict for a pre-sampler operation span event.
+
+    The returned dict is suitable for passing as ``**metadata`` to
+    ``mark_event``, ``SpanContext``, or ``EventTrace.span_start`` /
+    ``span_end``.
+    """
+    meta: dict[str, Any] = {
+        "operation": operation if operation in PRE_SAMPLER_OPERATION_SET else "unattributed",
+        "duration_ms": duration_ms,
+        "node_id": node_id,
+        "class_type": class_type,
+        "start_node_id": start_node_id,
+        "start_node_class_type": start_node_class_type,
+        "end_node_id": end_node_id,
+        "end_node_class_type": end_node_class_type,
+        "cache_hit": cache_hit,
+        "reused": reused,
+        "skipped": skipped,
+    }
+    if extra:
+        meta.update(extra)
+    return meta
+
+
 # ── Phase categories ───────────────────────────────────────────────────────
 PHASE_LOCAL_PRE = "local_pre"
 PHASE_LOCAL_BRIDGE = "local_bridge"
@@ -343,11 +398,15 @@ class SpanContext:
         with SpanContext(trace, "sampler", process="modal_remote", phase="sampler") as ctx:
             run_sampler()
         # ctx.duration_ns is set on exit
+
+    When *metadata* is provided it is passed as ``**metadata`` to both the
+    ``_start`` and ``_end`` mark_event calls.  For pre-sampler operations use
+    ``pre_sampler_span_metadata()`` to build the dict.
     """
 
     __slots__ = (
         "_trace", "_name", "_process", "_phase",
-        "_trace_id", "_request_seq", "_profile_level",
+        "_trace_id", "_request_seq", "_profile_level", "_metadata",
         "_start_wall", "_start_mono", "duration_ns", "duration_ms",
     )
 
@@ -360,6 +419,7 @@ class SpanContext:
         trace_id: str = "",
         request_seq: int = 0,
         profile_level: str = "summary",
+        metadata: dict[str, Any] | None = None,
     ):
         self._trace = trace
         self._name = name
@@ -368,6 +428,7 @@ class SpanContext:
         self._trace_id = trace_id
         self._request_seq = request_seq
         self._profile_level = profile_level
+        self._metadata = metadata or {}
         self._start_wall = 0
         self._start_mono = 0
         self.duration_ns = 0
@@ -385,6 +446,7 @@ class SpanContext:
                 trace_id=self._trace_id,
                 request_seq=self._request_seq,
                 profile_level=self._profile_level,
+                **self._metadata,
             )
         return self
 
@@ -393,6 +455,8 @@ class SpanContext:
             end_mono = time.perf_counter_ns()
             self.duration_ns = end_mono - self._start_mono
             self.duration_ms = round(self.duration_ns / 1_000_000, 3)
+            meta = dict(self._metadata)
+            meta.update(duration_ns=self.duration_ns, duration_ms=self.duration_ms)
             mark_event(
                 self._trace,
                 name=f"{self._name}_end",
@@ -401,9 +465,48 @@ class SpanContext:
                 trace_id=self._trace_id,
                 request_seq=self._request_seq,
                 profile_level=self._profile_level,
-                duration_ns=self.duration_ns,
-                duration_ms=self.duration_ms,
+                **meta,
             )
+
+
+class PreSamplerSpan(SpanContext):
+    """Convenience context manager for pre-sampler operation tracing.
+
+    Wraps ``SpanContext`` with canonical pre-sampler operation metadata.
+
+    Usage::
+
+        with PreSamplerSpan(trace, "cache_key_build") as ctx:
+            key = build_key(plan)
+        print(ctx.duration_ms)
+    """
+
+    __slots__ = ()
+
+    def __init__(
+        self,
+        trace: list[dict],
+        operation: str,
+        process: str = "",
+        phase: str = "pre_sampler",
+        trace_id: str = "",
+        request_seq: int = 0,
+        profile_level: str = "summary",
+        **operation_meta: Any,
+    ):
+        if operation not in PRE_SAMPLER_OPERATION_SET:
+            operation = "unattributed"
+        meta = pre_sampler_span_metadata(operation=operation, **operation_meta)
+        super().__init__(
+            trace=trace,
+            name=operation,
+            process=process,
+            phase=phase,
+            trace_id=trace_id,
+            request_seq=request_seq,
+            profile_level=profile_level,
+            metadata=meta,
+        )
 
 
 # ── Trace container ────────────────────────────────────────────────────────
@@ -509,6 +612,18 @@ def derive_spans(events: list[dict]) -> list[dict]:
                 dur_ns = ev.get("wall_unix_ns", 0) - start_ev.get("wall_unix_ns", 0)
                 dur_mono = ev.get("mono_ns", 0) - start_ev.get("mono_ns", 0)
                 same_proc = start_ev.get("process") == ev.get("process")
+                merged_meta: dict[str, Any] = {}
+                start_meta = start_ev.get("metadata") or {}
+                end_meta = ev.get("metadata") or {}
+                # Build merged metadata preserving the end event's duration_ms
+                # (excluded from pre-sampler merge so it is redundant but kept
+                # for backward compatibility).
+                merged_meta = dict(start_meta) if isinstance(start_meta, dict) else {}
+                if isinstance(end_meta, dict):
+                    merged_meta.update(
+                        {k: v for k, v in end_meta.items()
+                         if k not in ("duration_ns",)}
+                    )
                 spans.append({
                     "name": base,
                     "start_event": start_ev.get("name"),
@@ -518,8 +633,10 @@ def derive_spans(events: list[dict]) -> list[dict]:
                     "duration_wall_ns": dur_ns,
                     "duration_wall_ms": round(dur_ns / 1_000_000, 3),
                     "duration_mono_ms": round(dur_mono / 1_000_000, 3) if same_proc else None,
+                    "duration_ms": merged_meta.get("duration_ms", round(dur_mono / 1_000_000, 3) if same_proc else round(dur_ns / 1_000_000, 3)),
                     "process": ev.get("process", ""),
                     "same_process": same_proc,
+                    "metadata": merged_meta if merged_meta else None,
                 })
     return spans
 

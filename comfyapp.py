@@ -195,6 +195,8 @@ from production_workflow import (
     build_production_topology_hash,
 )
 
+# ── Immutable dependency manifest (pure logic extracted for testability) ──
+import comfymodal_runtime.dependency_manifest as _dep_mft
 
 # GÃ¶Ã‡GÃ¶Ã‡ Inline output-converter constants & helpers (self-contained for Modal) GÃ¶Ã‡GÃ¶Ã‡
 _OUTPUT_FORMATS = ("original", "webp_lossless", "webp_lossy", "jpeg")
@@ -1992,10 +1994,8 @@ def _build_and_persist_dependency_manifest(
             os.fsync(_f.fileno())
         os.replace(_tmp, _final)
         if commit and volume is not None:
-            try:
-                volume.commit()
-            except Exception as _ce:
-                print(f"[dep_manifest] commit failed: {_ce}", flush=True)
+            if not _dep_mft.commit_volume_sync(volume):
+                return {"identity": "", "error": "volume commit failed", "source": "snapshot_manifest"}
         _elapsed_ms = round((time.time() - _t0) * 1000, 1)
         print(
             f"[dep_manifest] persisted identity={_identity[:16]}... "
@@ -8971,7 +8971,7 @@ class _ComfyAPIMixin:
                 _v2_total = round((time.time() - _dep_t0) * 1000, 2)
                 _refresh_performed = False
                 if dep_prepared and _combined_hash_pre:
-                    _build_and_persist_dependency_manifest(
+                    _new_mft = _build_and_persist_dependency_manifest(
                         combined_hash=_combined_hash_pre,
                         custom_node_fingerprint=_cn_fp_pre,
                         custom_node_generation=_cn_gen_pre,
@@ -8979,7 +8979,14 @@ class _ComfyAPIMixin:
                         volume=runtime_config_vol,
                         commit=True,
                     )
-                    _refresh_performed = True
+                    if _new_mft.get("identity"):
+                        _refresh_performed = True
+                    elif _repair_mode in ("off", "fail_fast"):
+                        raise RuntimeError(
+                            "Immutable dependency manifest refresh failed: "
+                            "write or commit did not produce a valid identity. "
+                            f"repair_mode={_repair_mode}"
+                        )
                 _emit_dependency_validation_v2(
                     source="request_rebuild",
                     identity_match=False,
@@ -16754,34 +16761,112 @@ class _ComfyAPIMixin:
             raise
         self._log_profile("requirements_install", duration_ms=self._profile_ms(stage_started), installed=len(install_summary.get("installed", [])), skipped=len(install_summary.get("skipped", [])))
 
+        # ── Fail closed in production modes when requirements not prepared ──
+        # _install_custom_node_requirements raises in fail_fast but returns
+        # prepared=False silently in off mode.  Catch that here before
+        # persisting any manifest.
+        if not install_summary.get("prepared"):
+            _off_mode = (install_summary.get("mode") or REQUIREMENTS_REPAIR_MODE or "").strip().lower()
+            if _off_mode in ("off", "fail_fast"):
+                raise RuntimeError(
+                    "Cannot build immutable dependency manifest: "
+                    "custom node requirements are not prepared "
+                    f"(repair_mode={_off_mode})."
+                )
+
         stage_started = time.time()
         self._record_runtime_state()
         self._log_profile("runtime_state_record", duration_ms=self._profile_ms(stage_started))
 
         # ── Build and persist immutable dependency manifest ───────────
-        # Only creates a reusable manifest when all identity components
-        # are available (baked hash, custom-nodes generation, etc.).
-        # When identity cannot be established, we skip silently so the
-        # request-time fast path degrades to existing validation.
-        _manifest_build_t0 = time.time()
-        _deploy_combined = _resolve_deployment_combined_hash()
-        if _deploy_combined:
-            _baked_mft = load_baked_custom_node_dependency_manifest()
-            _cn_gen_rec = _read_custom_nodes_generation_record()
-            _cn_gen_str = _cn_gen_rec.get("generation", "") if _cn_gen_rec else ""
-            _repair_mode_str = REQUIREMENTS_REPAIR_MODE.strip().lower()
-            _build_and_persist_dependency_manifest(
-                combined_hash=_deploy_combined,
-                custom_node_fingerprint=_baked_mft if _baked_mft else None,
-                custom_node_generation=_cn_gen_str,
-                repair_mode=_repair_mode_str,
-                volume=runtime_config_vol,
-                commit=True,
+        # The manifest is created during every valid startup.  If identity
+        # components (baked hash, custom-nodes generation) are unavailable
+        # in production mode, we fail closed — no silent skip.
+        _mft_t0 = time.time()
+        _repair_mode_s = REQUIREMENTS_REPAIR_MODE.strip().lower()
+        _baked_mft_su = load_baked_custom_node_dependency_manifest()
+        _baked_mft_ok = bool(_baked_mft_su and _baked_mft_su.get("overall_dependency_hash"))
+
+        # Ensure generation record exists for the synced tree.
+        _cn_gen_rec_su = _read_custom_nodes_generation_record()
+        if _cn_gen_rec_su is None:
+            _cn_gen_rec_su = _write_custom_nodes_generation_record_no_commit(
+                reason="startup_init_generation_record"
             )
-            _manifest_ms = round((time.time() - _manifest_build_t0) * 1000, 1)
-            print(f"[dep_manifest] startup build/persist done in {_manifest_ms}ms")
-        else:
-            print("[dep_manifest] startup: identity not resolvable, skipping manifest build")
+            # Commit the generation record so the manifest persists it atomically.
+            # The manifest write below will be in a separate commit cycle.
+            custom_nodes_vol.commit()
+            print(
+                f"[dep_manifest] initialized generation="
+                f"{_cn_gen_rec_su['generation'][:12]} reason=startup_init_generation_record"
+            )
+        _cn_gen_str_su = _cn_gen_rec_su.get("generation", "")
+
+        # In production modes, missing baked hash must fail closed.
+        if not _baked_mft_ok and _repair_mode_s in ("off", "fail_fast"):
+            print(
+                "[dep_manifest] FATAL: baked dependency manifest missing "
+                f"repair_mode={_repair_mode_s}",
+                flush=True,
+            )
+            raise RuntimeError(
+                "Cannot build immutable dependency manifest: baked manifest "
+                f"is missing or incomplete (repair_mode={_repair_mode_s})."
+            )
+
+        # Build the combined hash using available identity components.
+        # Unlike the caller above, we do NOT silently return empty —
+        # if identity is genuinely unavailable (no baked hash to combine with
+        # generation), the manifest will have an empty combined_hash and will
+        # be rebuilt on the first request.  We still persist for consistency.
+        _deploy_combined_su = _resolve_deployment_combined_hash()
+
+        # Build and persist the manifest.  Uses the already-loaded baked
+        # manifest fingerprint (no additional custom-node traversal).
+        _manifest_su = _build_and_persist_dependency_manifest(
+            combined_hash=_deploy_combined_su,
+            custom_node_fingerprint=_baked_mft_su if _baked_mft_su else None,
+            custom_node_generation=_cn_gen_str_su,
+            repair_mode=_repair_mode_s,
+            volume=runtime_config_vol,
+            commit=True,
+        )
+        _manifest_su_ms = round((time.time() - _mft_t0) * 1000, 1)
+        _mft_identity = _manifest_su.get("identity", "")
+        _mft_ident_match = bool(_mft_identity)
+
+        # In production modes, absent identity must fail closed.
+        if not _mft_ident_match and _repair_mode_s in ("off", "fail_fast"):
+            print(
+                "[dep_manifest] FATAL: startup manifest has no identity — "
+                "volume commit likely failed or identity components unavailable",
+                flush=True,
+            )
+            raise RuntimeError(
+                "Immutable dependency manifest creation failed: "
+                "no valid identity (volume commit failure or "
+                "missing identity components). "
+                f"repair_mode={_repair_mode_s}"
+            )
+
+        # Emit the startup diagnostic with source=snapshot_manifest.
+        # refresh_performed is 1 only when the identity is valid/durable.
+        _dep_mft.emit_validation_diagnostic(
+            source="snapshot_manifest",
+            identity_match=_mft_ident_match,
+            manifest_load_ms=0.0,
+            cheap_check_ms=0.0,
+            fingerprint_ms=0.0,
+            full_validation_ms=0.0,
+            total_ms=_manifest_su_ms,
+            refresh_performed=_mft_ident_match,
+            reason="startup_manifest_created",
+        )
+        print(
+            f"[dep_manifest] startup build/persist done in {_manifest_su_ms}ms "
+            f"identity={_mft_identity[:16] if _mft_identity else '<empty>'} "
+            f"combined_hash={_deploy_combined_su[:16] if _deploy_combined_su else '<empty>'}"
+        )
 
         _need_backend = True
         if _snap_mode == "none":
