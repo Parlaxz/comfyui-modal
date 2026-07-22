@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Mapping
@@ -42,21 +43,29 @@ class HandleCacheKey:
     gpu: tuple[str, ...]
     cloud: str = ""
     environment: str = ""
+    factory_identity: Any = None
 
 
 class HandleCache:
     def __init__(self) -> None:
         self._values: dict[HandleCacheKey, Any] = {}
+        self._lock = threading.Lock()
 
     def get(self, key: HandleCacheKey) -> Any:
-        return self._values.get(key)
+        with self._lock:
+            return self._values.get(key)
 
     def put(self, key: HandleCacheKey, value: Any) -> Any:
-        self._values[key] = value
+        with self._lock:
+            self._values[key] = value
         return value
 
     def clear(self) -> None:
-        self._values.clear()
+        with self._lock:
+            self._values.clear()
+
+
+_SHARED_HANDLE_CACHE = HandleCache()
 
 
 class ModalTransport:
@@ -69,12 +78,13 @@ class ModalTransport:
         checkpoint_stream_fn: Callable[..., Any] | None = None,
         restore_plan_fn: Callable[..., Any] | None = None,
         v2_handle_factory: Callable[..., Any] | None = None,
+        handle_cache: HandleCache | None = None,
     ) -> None:
         self.prompt_stream_fn = prompt_stream_fn
         self.checkpoint_stream_fn = checkpoint_stream_fn
         self.restore_plan_fn = restore_plan_fn
         self.v2_handle_factory = v2_handle_factory
-        self.handle_cache = HandleCache()
+        self.handle_cache = handle_cache or _SHARED_HANDLE_CACHE
 
     @staticmethod
     def _resolve_v2_cloud(gpu: str) -> str:
@@ -146,7 +156,15 @@ class ModalTransport:
         workspace_id = str((workspace or {}).get("id", "default"))
         cloud = self._resolve_v2_cloud(selected_gpu_str)
         environment = self._resolve_environment()
-        key = HandleCacheKey(workspace_id, app_name, class_name, selected_gpu_str_tuple, cloud=cloud, environment=environment)
+        key = HandleCacheKey(
+            workspace_id,
+            app_name,
+            class_name,
+            selected_gpu_str_tuple,
+            cloud=cloud,
+            environment=environment,
+            factory_identity=self.v2_handle_factory,
+        )
         cached = self.handle_cache.get(key)
         if cached is not None:
             if runtime_trace is not None:

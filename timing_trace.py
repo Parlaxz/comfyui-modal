@@ -80,12 +80,13 @@ class Trace:
     compute the deltas between any two marked stages.
     """
 
-    __slots__ = ("_t", "_t0", "prompt_id")
+    __slots__ = ("_t", "_t0", "prompt_id", "_pre_sampler")
 
     def __init__(self, prompt_id: str = "", t0: float | None = None):
         self.prompt_id = prompt_id
         self._t0 = t0 if t0 is not None else time.time()
         self._t: dict[str, float] = {}
+        self._pre_sampler: dict[str, Any] | None = None
 
     def mark(self, name: str, t: float | None = None) -> float:
         """Record a named timestamp.  Returns the absolute time used."""
@@ -123,6 +124,126 @@ class Trace:
             for k, v in other.items():
                 if isinstance(k, str) and isinstance(v, (int, float)):
                     self._t[k] = float(v)
+
+    def store_pre_sampler_data(self, data: dict[str, Any] | None = None) -> None:
+        """Store pre-sampler critical-path operation data for later summary.
+
+        Accepts operation timings, counts, hits, dominant spans, and node
+        attribution.  The data dict is stored directly — no deep-copy of
+        model objects occurs.  Only numeric timings and metadata strings
+        are retained.
+
+        Parameters (all optional, typical keys):
+            cache_key_build_ms, cache_lookup_ms, input_resolution_ms,
+            model_patch_ms, conditioning_ms, future_wait_ms, lock_wait_ms,
+            node_execution_ms, unattributed_ms,
+            total_measured_ms, total_wall_ms, residual_ms,
+            operation_counts (dict),
+            operation_hits (dict),
+            dominant_spans (list[dict]),
+            node_class_map (dict).
+        """
+        if data is None:
+            return
+        # Strip out anything that looks like a model object — only keep
+        # numeric timings, strings, dicts of strings/numbers, and lists
+        # of such dicts.
+        safe: dict[str, Any] = {}
+        for k, v in data.items():
+            if isinstance(v, (int, float, str, bool)):
+                safe[k] = v
+            elif isinstance(v, dict):
+                safe[k] = {
+                    sk: sv for sk, sv in v.items()
+                    if isinstance(sv, (int, float, str, bool, type(None)))
+                }
+            elif isinstance(v, (list, tuple)):
+                cleaned: list[dict[str, Any]] = []
+                for item in v:
+                    if isinstance(item, dict):
+                        cleaned.append(
+                            {ik: iv for ik, iv in item.items()
+                             if isinstance(iv, (int, float, str, bool, type(None)))}
+                        )
+                    elif isinstance(item, (int, float, str, bool)):
+                        cleaned.append({"value": item})
+                safe[k] = cleaned
+            # Silently drop anything else (model objects, callables, etc.)
+        self._pre_sampler = safe
+
+    def pre_sampler_summary(self) -> dict[str, Any]:
+        """Return a pre-sampler critical-path summary dict.
+
+        Returns an empty dict when no pre-sampler data has been stored.
+        The returned dict has at minimum ``"present"`` set to ``True`` when
+        data exists, along with all required operation timing fields and
+        measured/residual reconciliation.
+        """
+        if self._pre_sampler is None:
+            return {"pre_sampler_critical_path_ms": {}, "present": False}
+
+        data = self._pre_sampler
+
+        # Required operation timing fields
+        op_fields = {
+            "cache_key_build_ms",
+            "cache_lookup_ms",
+            "input_resolution_ms",
+            "model_patch_ms",
+            "conditioning_ms",
+            "future_wait_ms",
+            "lock_wait_ms",
+            "node_execution_ms",
+            "unattributed_ms",
+        }
+        critical = {}
+        for field in op_fields:
+            critical[field] = round(float(data.get(field, 0.0) or 0.0), 3)
+
+        # Measured / residual reconciliation
+        measured = sum(
+            v for k, v in critical.items()
+            if k in op_fields and k != "unattributed_ms" and v is not None
+        )
+        residual = data.get("residual_ms")
+        total_wall = data.get("total_wall_ms")
+        if residual is None and total_wall is not None and measured > 0:
+            unattrib = critical.get("unattributed_ms", 0.0) or 0.0
+            known = measured + unattrib
+            residual = max(0.0, total_wall - known)
+
+        critical["total_measured_ms"] = round(measured, 3)
+        if total_wall is not None:
+            critical["total_wall_ms"] = round(float(total_wall), 3)
+        if residual is not None:
+            critical["residual_ms"] = round(float(residual), 3)
+
+        result: dict[str, Any] = {
+            "pre_sampler_critical_path_ms": critical,
+            "present": True,
+        }
+
+        # Operation counts
+        counts = data.get("operation_counts")
+        if isinstance(counts, dict) and counts:
+            result["pre_sampler_operation_counts"] = dict(counts)
+
+        # Operation hits
+        hits = data.get("operation_hits")
+        if isinstance(hits, dict) and hits:
+            result["pre_sampler_operation_hits"] = dict(hits)
+
+        # Dominant spans with start/end node attribution
+        spans = data.get("dominant_spans")
+        if isinstance(spans, list):
+            result["pre_sampler_dominant_spans"] = list(spans)
+
+        # Node class map
+        ncm = data.get("node_class_map")
+        if isinstance(ncm, dict):
+            result["pre_sampler_node_map"] = dict(ncm)
+
+        return result
 
     def summary(self) -> dict[str, Any]:
         # NOTE: _trace_dbg.log write removed per Phase 10 — no hot-path debug file I/O.
@@ -371,6 +492,14 @@ class Trace:
         if _opt_missing:
             _reason_parts.append(f"optional_missing={_opt_missing}")
         out["timing_quality_reason"] = "; ".join(_reason_parts)
+
+        # Pre-sampler critical path summary (additive, preserves existing keys)
+        ps = self.pre_sampler_summary()
+        if ps.get("present"):
+            for _ps_key, _ps_val in ps.items():
+                if _ps_key == "present":
+                    continue
+                out[_ps_key] = _ps_val
 
         print(f"[timing_trace] summary: trace_version={out.get('trace_version')} "
               f"quality={out.get('timing_quality')} "
@@ -678,13 +807,117 @@ class TraceV4(Trace):
         return list(self._v4_events)
 
     def v4_summary(self) -> dict[str, Any]:
-        return {
+        out = {
             "trace_version": "4.0.0",
             "prompt_id": self.prompt_id,
             "events": list(self._v4_events),
             "event_count": len(self._v4_events),
             "process": self.process,
         }
+        ps = self.pre_sampler_summary()
+        if ps.get("present"):
+            out["pre_sampler_critical_path_ms"] = ps.get("pre_sampler_critical_path_ms", {})
+            for key in ("pre_sampler_operation_counts", "pre_sampler_operation_hits",
+                        "pre_sampler_dominant_spans", "pre_sampler_node_map"):
+                val = ps.get(key)
+                if val:
+                    out[key] = val
+        return out
+
+    def pre_sampler_summary(self) -> dict[str, Any]:
+        """Return pre-sampler critical-path summary, scanning v4 events too.
+
+        Inherits ``store_pre_sampler_data()`` data from ``Trace``.  When no
+        explicit data has been stored, attempts to derive what it can from
+        ``_v4_events`` that carry pre-sampler operation metadata.
+        """
+        # Check for explicitly stored data first
+        if self._pre_sampler is not None:
+            return super().pre_sampler_summary()
+
+        # Attempt derivation from v4 events
+        op_spans: dict[str, float] = {}
+        op_counts: dict[str, int] = {}
+        op_hits: dict[str, int] = {}
+        dominant: list[dict] = []
+        node_map: dict[str, str] = {}
+
+        starts: dict[str, dict] = {}
+        for ev in self._v4_events:
+            name = ev.get("name", "")
+            meta = ev.get("metadata") or {}
+            if not isinstance(meta, dict):
+                meta = {}
+            op = meta.get("operation", "")
+            if not op:
+                continue
+
+            if name.endswith("_start"):
+                starts[op] = ev
+            elif name.endswith("_end") and op in starts:
+                start_ev = starts.pop(op, None)
+                if start_ev is not None:
+                    dur_ns = ev.get("mono_ns", 0) - start_ev.get("mono_ns", 0)
+                    dur_ms = max(0.0, dur_ns / 1_000_000)
+                    op_spans[op] = op_spans.get(op, 0.0) + dur_ms
+                    op_counts[op] = op_counts.get(op, 0) + 1
+                    if meta.get("cache_hit"):
+                        op_hits[op] = op_hits.get(op, 0) + 1
+                    # Collect node attribution
+                    span: dict[str, Any] = {
+                        "operation": op,
+                        "duration_ms": round(dur_ms, 3),
+                    }
+                    for attr in ("node_id", "class_type",
+                                 "start_node_id", "start_node_class_type",
+                                 "end_node_id", "end_node_class_type",
+                                 "cache_hit", "reused", "skipped"):
+                        val = meta.get(attr)
+                        if val is not None and val != "":
+                            span[attr] = val
+                    if span.get("start_node_id") or span.get("node_id"):
+                        dominant.append(span)
+                    # Build node map
+                    for nid_attr in ("start_node_id", "end_node_id", "node_id"):
+                        nid = meta.get(nid_attr, "")
+                        ct = meta.get("start_node_class_type" if nid_attr == "start_node_id"
+                                      else "end_node_class_type" if nid_attr == "end_node_id"
+                                      else "class_type", "")
+                        if nid and ct:
+                            node_map[nid] = ct
+
+        # If no v4 event data, return empty
+        if not op_spans:
+            return {"pre_sampler_critical_path_ms": {}, "present": False}
+
+        required = {"cache_key_build_ms", "cache_lookup_ms", "input_resolution_ms",
+                     "model_patch_ms", "conditioning_ms", "future_wait_ms",
+                     "lock_wait_ms", "node_execution_ms", "unattributed_ms"}
+        critical: dict[str, float] = {}
+        for op in ("cache_key_build", "cache_lookup", "input_resolution",
+                    "model_patch", "conditioning", "future_wait",
+                    "lock_wait", "node_execution", "unattributed"):
+            critical[f"{op}_ms"] = round(op_spans.get(op, 0.0), 3)
+
+        measured = sum(v for k, v in critical.items() if k in required and k != "unattributed_ms")
+        residual = critical.get("unattributed_ms", 0.0)
+        critical["total_measured_ms"] = round(measured, 3)
+        if residual > 0:
+            critical["residual_ms"] = round(residual, 3)
+
+        out: dict[str, Any] = {
+            "pre_sampler_critical_path_ms": critical,
+            "present": True,
+        }
+        if op_counts:
+            out["pre_sampler_operation_counts"] = dict(op_counts)
+        if op_hits:
+            out["pre_sampler_operation_hits"] = dict(op_hits)
+        if dominant:
+            out["pre_sampler_dominant_spans"] = dominant
+        if node_map:
+            out["pre_sampler_node_map"] = node_map
+        return out
 
 
 # ---------------------------------------------------------------------------

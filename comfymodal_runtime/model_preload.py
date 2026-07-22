@@ -220,9 +220,11 @@ def _make_torch_file_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
         _slow_read_state: _SlowReadBeforeState | None = None
         _slow_ru_before: dict[str, Any] | None = None
         _slow_io_before: dict[str, int] | None = None
+        _read_outer_ns: int = 0
         if before == 0:
             lane = _ACTIVE_LANE_TRACE.get()
             if lane is not None:
+                _read_outer_ns = time.monotonic_ns()
                 lane.read_start()
                 if lane._lane == "CLIP":
                     _slow_read_state = _capture_slow_read_before()
@@ -242,7 +244,8 @@ def _make_torch_file_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 lane = _ACTIVE_LANE_TRACE.get()
                 if lane is not None:
                     lane.read_end()
-                    lane._on_read_completed()
+                    _read_dur_ms = round((time.monotonic_ns() - _read_outer_ns) / 1_000_000, 3) if _read_outer_ns else 0.0
+                    lane._on_read_completed(read_duration_ms=_read_dur_ms)
                     if lane._lane == "CLIP" and _slow_read_state is not None:
                         _after_mono = time.monotonic_ns()
                         _after_tt = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
@@ -608,21 +611,11 @@ def _make_clip_load_wrapper(original):
                                 "clip_cpu_prepare_total_ms": _outer_dur_ms,
                             })
                 _clip_cpu_prepare_children.set(_prior_children)
-                # Compute clip_file_read_total_ms from read start/end intervals
-                _clip_read_total = None
-                try:
-                    for ev in lane._trace.events:
-                        if ev.name == "read_start" and ev.metadata.get("lane") == "CLIP":
-                            _rs = ev.monotonic_ns
-                        elif ev.name == "read_end" and ev.metadata.get("lane") == "CLIP":
-                            _re = ev.monotonic_ns
-                            _val = max(0, (_re - _rs) / 1_000_000)
-                            _clip_read_total = (_clip_read_total or 0) + _val
-                except Exception:
-                    pass
-                _clip_file_read = round(_clip_read_total, 3) if _clip_read_total else None
-                _clip_post_read_cpu = (round(max(0.0, _outer_dur_ms - _clip_read_total), 3)
-                                       if _clip_read_total else None)
+                # clip_file_read_total_ms from per-lane read-duration accumulator.
+                _clip_read_raw = lane._clip_read_total_ms
+                _clip_file_read = round(_clip_read_raw, 3) if _clip_read_raw else None
+                _clip_post_read_cpu = (round(max(0.0, _outer_dur_ms - _clip_read_raw), 3)
+                                       if _clip_read_raw else None)
                 lane._trace.emit("clip_load_call_end", phase="restore", metadata={
                     "lane": lane._lane,
                     "clip_load_call_total_ms": _outer_dur_ms,
@@ -1676,12 +1669,30 @@ class ModelLaneTrace:
         self._cache_publish_started: bool = False
         self._cache_publish_completed: bool = False
         self._done_event_set: bool = False
+        # Accumulated CLIP file-read wall time (ms).  Updated by
+        # _on_read_completed(read_duration_ms=...) so _make_clip_load_wrapper
+        # can avoid an O(n) event scan.  Only meaningful for CLIP lane.
+        self._clip_read_total_ms: float = 0.0
+        self._clip_read_started_ns: int = 0
+        self._clip_pending_read_duration_ms: float | None = None
 
     # ── Internal lifecycle hooks (called by wrappers) ────────────────
 
-    def _on_read_completed(self) -> None:
-        """Called by the ``load_torch_file`` wrapper after each read_end."""
+    def _on_read_completed(self, read_duration_ms: float | None = None) -> None:
+        """Called by the ``load_torch_file`` wrapper after each read_end.
+
+        *read_duration_ms* — wall-time of the outer read_start..read_end
+        interval.  When provided for CLIP lane, accumulated into
+        ``_clip_read_total_ms`` so ``_make_clip_load_wrapper`` can avoid
+        an O(n) event scan.
+        """
         self._actual_read_count += 1
+        if self._lane == "CLIP":
+            if read_duration_ms is None:
+                read_duration_ms = self._clip_pending_read_duration_ms
+            self._clip_pending_read_duration_ms = None
+            if read_duration_ms is not None:
+                self._clip_read_total_ms += read_duration_ms
         if self._actual_read_count >= self.expected_read_count and not self._cpu_prepare_started:
             self._cpu_prepare_started = True
             if self.expected_read_count > 0 and self._actual_read_count != self.expected_read_count:
@@ -1738,9 +1749,17 @@ class ModelLaneTrace:
                          metadata={"lane": self._lane, **metadata})
 
     def read_start(self, **metadata: Any) -> None:
+        if self._lane == "CLIP":
+            self._clip_read_started_ns = time.monotonic_ns()
         self._trace.emit("read_start", phase=self._phase, metadata={"lane": self._lane, **metadata})
 
     def read_end(self, **metadata: Any) -> None:
+        if self._lane == "CLIP" and self._clip_read_started_ns:
+            ended_ns = time.monotonic_ns()
+            self._clip_pending_read_duration_ms = max(
+                0.0, (ended_ns - self._clip_read_started_ns) / 1_000_000
+            )
+            self._clip_read_started_ns = 0
         self._trace.emit("read_end", phase=self._phase, metadata={"lane": self._lane, **metadata})
 
     def cpu_prepare_start(self, **metadata: Any) -> None:
@@ -3698,6 +3717,7 @@ class ModelPreloadCoordinator:
         _submit_started_ns = time.monotonic_ns()
 
         def run() -> Any:
+            nonlocal callback
             started = time.time()
             _queue_wait_ms = round((time.monotonic_ns() - _submit_started_ns) / 1_000_000, 3)
             setattr(preparation.diagnostics, f"{effective_diag}_started_at", started)
@@ -3720,13 +3740,21 @@ class ModelPreloadCoordinator:
                 # Install core dispatch wrappers (idempotent per-component,
                 # resolves live sys.modules so partial comfy imports cannot
                 # block the read wrapper).
-                _ensure_core_wrappers(trace=trace)
+                # Skip for execution prefill — wrappers already installed
+                # during restore (model-loading lanes).
+                if effective_diag != 'prefill':
+                    _ensure_core_wrappers(trace=trace)
                 # Install UNET post-read decomposition wrappers (Section B).
                 # Only active when _ACTIVE_LANE_TRACE is UNET; absent
                 # symbols are skipped without breaking loading.
-                _ensure_unet_decompose_wrappers(trace=trace)
+                # UNET-only — execution prefill does not need these.
+                if effective_diag == 'unet':
+                    _ensure_unet_decompose_wrappers(trace=trace)
 
-                result = callback()
+                try:
+                    result = callback()
+                finally:
+                    callback = None
                 completed = time.time()
                 setattr(preparation.diagnostics, f"{effective_diag}_completed_at", completed)
                 if trace:

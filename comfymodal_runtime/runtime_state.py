@@ -19,6 +19,7 @@ The coordinator never touches a models volume.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import threading
@@ -235,10 +236,13 @@ class ModalMountedStateVolume(MountedStateVolume):
         if reload_fn is not None:
             aio_method = getattr(reload_fn, "aio", None)
             if callable(aio_method):
-                await aio_method()
+                # Call the async API exactly once and await the returned awaitable.
+                result = aio_method()
+                await result  # type: ignore[call-overload]
                 return
         # Fallback: synchronous reload in a thread.
         await asyncio.to_thread(self.reload)
+
 
     def commit(self) -> None:
         super().commit()
@@ -258,18 +262,31 @@ class ModalMountedStateVolume(MountedStateVolume):
         Does NOT call ``super().commit()`` (which performs a synchronous
         fsync) — Modal's commit handles durability.  The coordinator's
         ``commit_async`` caller tracks the single commit via metrics.
+
+        The callable is invoked exactly once — its return value is always
+        awaited, never discarded.  When the synchronous fallback returns
+        an awaitable (unusual but possible), that object is awaited rather
+        than invoking the operation a second time.
         """
         commit_fn = getattr(self._modal_volume, "commit", None)
         if not callable(commit_fn):
             raise RuntimeError("runtime-state Modal Volume does not expose commit()")
         aio_method = getattr(commit_fn, "aio", None)
         if callable(aio_method):
-            await aio_method()  # type: ignore[call-overload]
+            # Call the async API exactly once and await the returned awaitable.
+            result = aio_method()
+            await result  # type: ignore[call-overload]
         elif asyncio.iscoroutinefunction(commit_fn):
-            await commit_fn()  # type: ignore[call-overload]
+            # Genuinely async callable — call once, await the coroutine.
+            coro = commit_fn()
+            await coro  # type: ignore[call-overload]
         else:
-            # Synchronous commit in a thread — never blocking Modal commit
-            await asyncio.to_thread(commit_fn)
+            # Synchronous commit in a thread — never blocking Modal commit.
+            # If the thread returns an awaitable, await it rather than
+            # invoking the operation again.
+            result = await asyncio.to_thread(commit_fn)
+            if inspect.isawaitable(result):
+                await result  # type: ignore[call-overload]
 
 
 # ── Metrics ──────────────────────────────────────────────────────────────
@@ -413,7 +430,8 @@ class CommitCoordinator:
         falls back to ``asyncio.to_thread(self.reload)`` for older APIs."""
         reload_fn = getattr(self._volume, "reload_async", None)
         if callable(reload_fn):
-            await reload_fn()  # type: ignore[call-overload]
+            result = reload_fn()
+            await result  # type: ignore[call-overload]
         else:
             await asyncio.to_thread(self.reload)
 
@@ -490,11 +508,16 @@ class CommitCoordinator:
             self._volume.read_bytes(self._state_path)
             commit_fn = getattr(self._volume, "commit_async", None)
             if callable(commit_fn):
-                await commit_fn()  # type: ignore[call-overload]
+                # Invoke volume.commit_async() exactly once and await
+                # its returned awaitable.
+                result = commit_fn()
+                await result  # type: ignore[call-overload]
             else:
                 # No async commit method — use thread fallback to avoid
                 # blocking the event loop with a synchronous Modal commit.
-                await asyncio.to_thread(self._volume.commit)
+                result = await asyncio.to_thread(self._volume.commit)
+                if inspect.isawaitable(result):
+                    await result  # type: ignore[call-overload]
             with self._lock:
                 self._committed_gen = generation
                 self._metrics.commit_count += 1

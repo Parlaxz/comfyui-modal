@@ -8,6 +8,7 @@ import importlib
 import inspect
 import os
 import platform
+import posixpath
 import time
 import uuid
 from types import MappingProxyType
@@ -468,10 +469,10 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
 
 
 def _parse_memory_mb() -> int:
-    """Parse COMFYMODAL_V2_MEMORY_MB, default 16384, positive int required."""
-    raw = os.environ.get("COMFYMODAL_V2_MEMORY_MB", "16384").strip()
+    """Parse COMFYMODAL_V2_MEMORY_MB, default 24576, positive int required."""
+    raw = os.environ.get("COMFYMODAL_V2_MEMORY_MB", "24576").strip()
     if not raw:
-        return 16384
+        return 24576
     try:
         val = int(raw)
     except (ValueError, TypeError):
@@ -579,11 +580,74 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
 # â”€â”€ Host memory reporting (cgroup v2 + process rss) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
-def _read_cgroup_v2_memory(path: str) -> int | None:
-    """Read a cgroup v2 memory stat file. Returns None on any error."""
+def _unescape_mountinfo_field(value: str) -> str:
+    return (
+        value.replace(r"\040", " ")
+        .replace(r"\011", "\t")
+        .replace(r"\012", "\n")
+        .replace(r"\134", "\\")
+    )
+
+
+def _resolve_cgroup_v2_base(
+    mountinfo_path: str = "/proc/self/mountinfo",
+    cgroup_path: str = "/proc/self/cgroup",
+) -> str | None:
+    """Resolve the process cgroup v2 directory from procfs metadata."""
+    mount_point: str | None = None
+    try:
+        with open(mountinfo_path) as f:
+            for line in f:
+                parts = line.split()
+                separator = next(
+                    (index for index, part in enumerate(parts) if part == "-"),
+                    None,
+                )
+                if (
+                    separator is not None
+                    and separator >= 5
+                    and separator + 1 < len(parts)
+                    and parts[separator + 1] == "cgroup2"
+                ):
+                    candidate = _unescape_mountinfo_field(parts[4])
+                    if candidate.startswith("/"):
+                        mount_point = candidate
+                        break
+    except Exception:
+        return None
+    if not mount_point:
+        return None
+
+    cgroup_rel: str | None = None
+    try:
+        with open(cgroup_path) as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith("0::"):
+                    cgroup_rel = stripped[3:]
+                    break
+    except Exception:
+        return None
+    if cgroup_rel is None:
+        return None
+    if not cgroup_rel or cgroup_rel == "/":
+        return mount_point
+    if not cgroup_rel.startswith("/"):
+        return None
+    components = [component for component in cgroup_rel.split("/") if component]
+    if any(component in {".", ".."} for component in components):
+        return None
+    return posixpath.join(mount_point, *components)
+
+
+def _read_cgroup_v2_memory(path: str) -> int | str | None:
+    """Read a cgroup v2 memory stat file, preserving an unlimited ``max``."""
     try:
         with open(path) as f:
-            return int(f.read().strip())
+            raw = f.read().strip()
+            if raw == "max":
+                return raw
+            return int(raw)
     except Exception:
         return None
 
@@ -591,40 +655,75 @@ def _read_cgroup_v2_memory(path: str) -> int | None:
 def _report_host_memory(stage: str) -> dict[str, Any]:
     """Low-overhead host memory snapshot.
 
-    Emits ``[v2.host_memory]`` with cgroup v2 memory.current/peak/max and
-    process RSS/max RSS from ``/proc/self/status``.  Missing counters are
-    absent; malformed values are safely absent.  Never raises.
+    Emits ``[v2.host_memory]`` with cgroup v2 memory raw bytes, MiB
+    conversions, OOM counters, and process RSS.  Resolves cgroup v2
+    paths through ``/proc/self/mountinfo`` and ``/proc/self/cgroup``.
+    Unavailable counters use ``"absent"``.  Never raises.
     """
-    info: dict[str, Any] = {"stage": stage}
+    info: dict[str, Any] = {
+        "stage": stage,
+        "memory.current": "absent",
+        "memory.peak": "absent",
+        "memory.max": "absent",
+        "memory.events": "absent",
+        "current_mib": "absent",
+        "peak_mib": "absent",
+        "limit_mib": "absent",
+        "process_rss_mib": "absent",
+        "process_maxrss_mib": "absent",
+        "oom_count": "absent",
+        "oom_kill_count": "absent",
+    }
     try:
-        # Cgroup v2 memory stats (Linux only)
         if platform.system() == "Linux":
-            mem_current = _read_cgroup_v2_memory(
-                "/sys/fs/cgroup/memory.current"
-            )
-            if mem_current is not None:
+            cgroup_base = _resolve_cgroup_v2_base()
+            # memory.current
+            if cgroup_base:
+                mem_current = _read_cgroup_v2_memory(posixpath.join(cgroup_base, "memory.current"))
+            else:
+                mem_current = None
+            if isinstance(mem_current, int) and mem_current >= 0:
+                info["memory.current"] = mem_current
                 info["current_mib"] = round(mem_current / (1024 * 1024), 1)
-            mem_peak = _read_cgroup_v2_memory(
-                "/sys/fs/cgroup/memory.peak"
-            )
-            if mem_peak is not None:
+            # memory.peak
+            if cgroup_base:
+                mem_peak = _read_cgroup_v2_memory(posixpath.join(cgroup_base, "memory.peak"))
+            else:
+                mem_peak = None
+            if isinstance(mem_peak, int) and mem_peak >= 0:
+                info["memory.peak"] = mem_peak
                 info["peak_mib"] = round(mem_peak / (1024 * 1024), 1)
-            mem_max = _read_cgroup_v2_memory(
-                "/sys/fs/cgroup/memory.max"
-            )
-            if mem_max is not None and mem_max > 0:
-                info["limit_mib"] = round(mem_max / (1024 * 1024), 1) if mem_max < 2**60 else None
-            # Memory events (oom)
-            try:
-                with open("/sys/fs/cgroup/memory.events") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith("oom "):
-                            info["oom_count"] = int(line.split()[1])
-                        elif line.startswith("oom_kill "):
-                            info["oom_kill_count"] = int(line.split()[1])
-            except Exception:
-                pass
+            # memory.max (limit)
+            if cgroup_base:
+                mem_max = _read_cgroup_v2_memory(posixpath.join(cgroup_base, "memory.max"))
+            else:
+                mem_max = None
+            if isinstance(mem_max, (int, str)):
+                info["memory.max"] = mem_max
+                if isinstance(mem_max, int) and 0 <= mem_max < 2**60:
+                    info["limit_mib"] = round(mem_max / (1024 * 1024), 1)
+            else:
+                mem_max = None
+            # memory.events (OOM)
+            if cgroup_base:
+                try:
+                    events_path = posixpath.join(cgroup_base, "memory.events")
+                    events: dict[str, int] = {}
+                    with open(events_path) as f:
+                        for line in f:
+                            line = line.strip()
+                            if " " in line:
+                                key, val_str = line.split(" ", 1)
+                                try:
+                                    events[key] = int(val_str)
+                                except ValueError:
+                                    pass
+                    if events:
+                        info["memory.events"] = events
+                        info["oom_count"] = events.get("oom", "absent")
+                        info["oom_kill_count"] = events.get("oom_kill", "absent")
+                except Exception:
+                    pass
         # Process RSS from /proc/self/status
         if platform.system() == "Linux":
             try:
@@ -633,14 +732,10 @@ def _report_host_memory(stage: str) -> dict[str, Any]:
                         if line.startswith("VmRSS:"):
                             parts = line.split()
                             if len(parts) >= 2:
-                                info["process_rss_mib"] = round(
-                                    int(parts[1]) / 1024, 1
-                                )
+                                info["process_rss_mib"] = round(int(parts[1]) / 1024, 1)
             except Exception:
                 pass
-        # Host-memory process_maxrss_mib: actual maximum RSS from resource
-        # usage (rusage.ru_maxrss), NOT VmPeak (virtual-memory peak).
-        # This is the reliable cross-platform source for peak RSS.
+        # Host-memory process_maxrss_mib from rusage (cross-platform)
         try:
             import resource as _resource
             _maxrss_kb = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
@@ -648,14 +743,12 @@ def _report_host_memory(stage: str) -> dict[str, Any]:
                 info["process_maxrss_mib"] = round(_maxrss_kb / 1024, 1)
         except Exception:
             pass
-        # Status
         info["status"] = "ok"
     except Exception:
         info["status"] = "error"
-    # One-line summary (printf-safe, absent sentinel)
-    _fmt = {k: v for k, v in info.items() if v is not None}
+    # One-line summary: include all keys, use "absent" sentinel for None
     _line = " ".join(
-        f"{k}={v}" for k, v in sorted(_fmt.items())
+        f"{k}={v}" for k, v in sorted(info.items())
     )
     print(f"[v2.host_memory] {_line}", flush=True)
     return info
@@ -1874,7 +1967,7 @@ class ModalRuntimeEntrypoint:
             else:
                 _v2_preflight_ran = True
                 trace.emit("preflight_start", phase="execution")
-                _preflight_fn(workflow)
+                await asyncio.to_thread(_preflight_fn, workflow)
                 trace.emit("preflight_end", phase="execution")
 
         repair_missing_nodes = getattr(api, "_repair_missing_workflow_nodes", None)
@@ -1926,7 +2019,7 @@ class ModalRuntimeEntrypoint:
                 _v2_preflight_ran = True
                 if callable(_preflight_fn):
                     trace.emit("preflight_start", phase="execution")
-                    _preflight_fn(workflow)
+                    await asyncio.to_thread(_preflight_fn, workflow)
                     trace.emit("preflight_end", phase="execution")
 
         import execution
