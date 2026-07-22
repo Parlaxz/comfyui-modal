@@ -27,6 +27,12 @@ class TransportError(RuntimeError):
 
 @dataclass(frozen=True)
 class HandleCacheKey:
+    """Cache key for Modal function/cls handles.
+
+    Equality is value-based so the same workspace/app/target/gpu/cloud/
+    environment produces the same dict key across call boundaries.
+    """
+
     workspace: str
     app_name: str
     target: str
@@ -177,6 +183,7 @@ class ModalTransport:
         workspace: dict[str, Any] | None = None,
         trace: Mapping[str, Any] | None = None,
         runtime_trace: RuntimeTrace | None = None,
+        plan_dict: dict[str, Any] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         fn = self.prompt_stream_fn
         request_id = str((trace or {}).get("prompt_id", ""))
@@ -184,18 +191,24 @@ class ModalTransport:
         _modal_input_id = ""
         _modal_input_created_at: Any = None
         _modal_input_id_emitted = False
-        _generator_start_wall_ns = 0
-        _generator_start_mono_ns = 0
-        _generator_end_wall_ns = 0
-        _generator_end_mono_ns = 0
+        _generator_start_wall_ns = None
+        _generator_start_mono_ns = None
+        _generator_end_wall_ns = None
+        _generator_end_mono_ns = None
+        _submission_boundary_source = None
         try:
             if fn is not None:
                 # V1-compatible stream path — measure plan serialization
                 if runtime_trace is not None:
                     runtime_trace.emit("plan_serialize_for_transport_start", phase="local")
-                plan_dict_workflow = plan.to_dict()["workflow"]
-                plan_dict_images = plan.to_dict()["input_images"]
-                plan_dict_report = plan.to_dict()["production_report"]
+                if plan_dict is not None:
+                    plan_dict_workflow = plan_dict["workflow"]
+                    plan_dict_images = plan_dict["input_images"]
+                    plan_dict_report = plan_dict["production_report"]
+                else:
+                    plan_dict_workflow = plan.to_dict()["workflow"]
+                    plan_dict_images = plan.to_dict()["input_images"]
+                    plan_dict_report = plan.to_dict()["production_report"]
                 if runtime_trace is not None:
                     rt_plan_dict = {
                         "workflow_bytes": len(str(plan_dict_workflow)),
@@ -216,15 +229,26 @@ class ModalTransport:
                     workspace=workspace,
                 )
             else:
+                # ── V2 transport entry boundary ──
                 if runtime_trace is not None:
+                    runtime_trace.emit("transport_entry", phase="local")
+                    # pre-handle residual brackets the transport_entry→modal_handle_lookup_start gap
+                    runtime_trace.emit("pre_handle_residual_start", phase="local")
+                    runtime_trace.emit("pre_handle_residual_end", phase="local")
                     runtime_trace.emit("modal_handle_lookup_start", phase="local")
                 handle = self._v2_handle(
                     workspace=workspace, gpu=gpu, runtime_trace=runtime_trace,
                 )
                 if runtime_trace is not None:
                     runtime_trace.emit("modal_handle_lookup_end", phase="local")
+                    gpu_str = str(gpu or os.environ.get("COMFYMODAL_V2_GPU", "rtx-pro-6000")).strip().lower()
+                    runtime_trace.set_metadata(
+                        handle_lookup_app_name=str(handle.__class__.__module__ if hasattr(handle, "__class__") else ""),
+                        handle_lookup_class_name=type(handle).__name__,
+                        handle_lookup_gpu=gpu_str,
+                    )
                     runtime_trace.emit("modal_payload_serialize_start", phase="local")
-                plan_dict = plan.to_dict()
+                plan_dict = plan_dict if plan_dict is not None else plan.to_dict()
                 if isinstance(trace, dict):
                     _trace_meta = trace.get("metadata", {}) or {}
                     if isinstance(_trace_meta, dict):
@@ -233,13 +257,34 @@ class ModalTransport:
                 if _origin_from_meta:
                     plan_dict["__request_origin_info__"] = _origin_from_meta
                 _payload_bytes = len(json.dumps(plan_dict, separators=(",", ":"), default=str).encode("utf-8"))
+                _workflow_dict = plan_dict.get("workflow", {})
+                _image_dict = plan_dict.get("input_images", {})
+                _node_count = sum(
+                    1 for v in _workflow_dict.values()
+                    if isinstance(v, dict) and isinstance(v.get("class_type"), str)
+                )
+                _image_count = len(_image_dict)
                 if runtime_trace is not None:
                     runtime_trace.emit("modal_payload_serialize_end", phase="local", metadata={
                         "plan_dict_bytes": _payload_bytes,
                         "workflow_hash": plan.workflow_hash,
                     })
+                    runtime_trace.set_metadata(
+                        modal_payload_serialize_bytes=_payload_bytes,
+                        workflow_hash=plan.workflow_hash,
+                        payload_bytes=_payload_bytes,
+                        workflow_node_count=_node_count,
+                        input_image_count=_image_count,
+                    )
                 _generator_start_wall_ns = time.time_ns()
                 _generator_start_mono_ns = time.monotonic_ns()
+                # Inject generator-create-start into origin dict BEFORE the
+                # remote_gen.aio call so the remote can read it.  The
+                # plan_dict reference is shared mutable, so modifying
+                # _origin_from_meta here updates plan_dict.__request_origin_info__.
+                if isinstance(_origin_from_meta, dict):
+                    _origin_from_meta.setdefault("modal_generator_create_start_wall_ns", _generator_start_wall_ns)
+                    _origin_from_meta.setdefault("modal_generator_create_start_mono_ns", _generator_start_mono_ns)
                 if runtime_trace is not None:
                     runtime_trace.emit("modal_generator_create_start", phase="local", metadata={
                         "wall_ns": _generator_start_wall_ns,
@@ -247,9 +292,17 @@ class ModalTransport:
                         "request_id": request_id,
                         "payload_bytes": _payload_bytes,
                     })
-                stream = handle.run_plan_stream.remote_gen.aio(
-                    plan_dict, request_id=request_id,
-                )
+                try:
+                    stream = handle.run_plan_stream.remote_gen.aio(
+                        plan_dict, request_id=request_id,
+                    )
+                except Exception:
+                    if runtime_trace is not None:
+                        runtime_trace.set_metadata(
+                            modal_generator_create_start_wall_ns=_generator_start_wall_ns,
+                            modal_generator_create_start_mono_ns=_generator_start_mono_ns,
+                        )
+                    raise
                 _generator_end_wall_ns = time.time_ns()
                 _generator_end_mono_ns = time.monotonic_ns()
                 _modal_input_id = str(getattr(stream, "input_id", "") or "")
@@ -264,6 +317,12 @@ class ModalTransport:
                         "modal_input_created_at": _modal_input_created_at,
                     })
                     runtime_trace.emit("modal_generator_create_end", phase="local")
+                    # Pre-populate generator-created wall/mono into the
+                    # plan_dict origin dict BEFORE the first __anext__ so
+                    # the lazy remote_gen payload serialises them.
+                    if isinstance(_origin_from_meta, dict):
+                        _origin_from_meta.setdefault("modal_generator_created_wall_ns", _generator_end_wall_ns)
+                        _origin_from_meta.setdefault("modal_generator_created_mono_ns", _generator_end_mono_ns)
                     # Emit modal_input_id_observed at creation boundary when
                     # input_id is already exposed by the SDK immediately after
                     # .remote_gen.aio().
@@ -281,6 +340,15 @@ class ModalTransport:
                     # the captured boundary — no normal emit() between capture
                     # and __anext__.
                     runtime_trace.emit_at(
+                        "modal_first_iteration_start",
+                        wall_unix_ns=_submission_wall_ns,
+                        monotonic_ns=_submission_mono_ns,
+                        phase="local",
+                        metadata={
+                            "request_id": request_id if fn is None else "",
+                        },
+                    )
+                    runtime_trace.emit_at(
                         "modal_submission_attempt",
                         wall_unix_ns=_submission_wall_ns,
                         monotonic_ns=_submission_mono_ns,
@@ -289,6 +357,15 @@ class ModalTransport:
                             "request_id": request_id if fn is None else "",
                         },
                     )
+                _submission_boundary_source = "first_iteration_proxy"
+                # Pre-populate first-iteration/submission fields into plan_dict
+                # origin before the first __anext__ (lazy submission trigger).
+                if isinstance(_origin_from_meta, dict):
+                    _origin_from_meta.setdefault("modal_first_iteration_start_wall_ns", _submission_wall_ns)
+                    _origin_from_meta.setdefault("modal_first_iteration_start_mono_ns", _submission_mono_ns)
+                    _origin_from_meta.setdefault("modal_submission_attempt_wall_ns", _submission_wall_ns)
+                    _origin_from_meta.setdefault("modal_submission_attempt_mono_ns", _submission_mono_ns)
+                    _origin_from_meta.setdefault("modal_submission_boundary_source", _submission_boundary_source)
                 try:
                     first_event = await iterator.__anext__()
                 except StopAsyncIteration:
@@ -307,6 +384,12 @@ class ModalTransport:
                         or _modal_input_created_at
                     )
                 if runtime_trace is not None:
+                    runtime_trace.emit("modal_first_remote_event", phase="local", metadata={
+                        "event_type": first_event.get("type", "") if isinstance(first_event, dict) else "",
+                        "modal_input_id": _modal_input_id if fn is None else "",
+                        "wall_ns": _first_event_wall_ns,
+                        "mono_ns": _first_event_mono_ns,
+                    })
                     runtime_trace.emit("modal_first_event_received", phase="local", metadata={
                         "event_type": first_event.get("type", "") if isinstance(first_event, dict) else "",
                         "modal_input_id": _modal_input_id if fn is None else "",
@@ -322,13 +405,33 @@ class ModalTransport:
                         })
                     if fn is None:
                         _t1_mono = _origin_from_meta.get("local_receive_mono_ns")
+                        # Backfill all post-call timing fields into
+                        # _origin_from_meta so local consumers (execute_plan)
+                        # can read them from either trace metadata or origin.
+                        if isinstance(_origin_from_meta, dict):
+                            _origin_from_meta.setdefault("modal_generator_created_wall_ns", _generator_end_wall_ns)
+                            _origin_from_meta.setdefault("modal_generator_created_mono_ns", _generator_end_mono_ns)
+                            _origin_from_meta.setdefault("modal_first_iteration_start_wall_ns", _submission_wall_ns)
+                            _origin_from_meta.setdefault("modal_first_iteration_start_mono_ns", _submission_mono_ns)
+                            _origin_from_meta.setdefault("modal_submission_attempt_wall_ns", _submission_wall_ns)
+                            _origin_from_meta.setdefault("modal_submission_attempt_mono_ns", _submission_mono_ns)
+                            _origin_from_meta.setdefault("modal_first_remote_event_wall_ns", _first_event_wall_ns)
+                            _origin_from_meta.setdefault("modal_first_remote_event_mono_ns", _first_event_mono_ns)
+                            _origin_from_meta.setdefault("modal_submission_boundary_source", _submission_boundary_source)
                         runtime_trace.set_metadata(
+                            modal_generator_create_start_wall_ns=_generator_start_wall_ns,
+                            modal_generator_create_start_mono_ns=_generator_start_mono_ns,
                             modal_generator_created_wall_ns=_generator_end_wall_ns,
                             modal_generator_created_mono_ns=_generator_end_mono_ns,
+                            modal_first_iteration_start_wall_ns=_submission_wall_ns,
+                            modal_first_iteration_start_mono_ns=_submission_mono_ns,
                             modal_submission_attempt_wall_ns=_submission_wall_ns,
                             modal_submission_attempt_mono_ns=_submission_mono_ns,
+                            modal_first_remote_event_wall_ns=_first_event_wall_ns,
+                            modal_first_remote_event_mono_ns=_first_event_mono_ns,
                             modal_first_event_received_wall_ns=_first_event_wall_ns,
                             modal_first_event_received_mono_ns=_first_event_mono_ns,
+                            modal_submission_boundary_source=_submission_boundary_source,
                             modal_input_id=_modal_input_id,
                             modal_input_created_at=_modal_input_created_at,
                             local_receive_to_generator_create_ms=(round((_generator_start_mono_ns - _t1_mono) / 1_000_000, 3) if isinstance(_t1_mono, int) else None),

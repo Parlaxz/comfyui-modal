@@ -2287,6 +2287,11 @@ async def _execute_job(item: tuple, item_id: int):
                 container_task_id=os.environ.get("MODAL_TASK_ID", "").strip(),
                 request_origin_info=dict(_origin_info) if isinstance(_origin_info, dict) else {},
             )
+            # Emit worker_start at the true dequeue boundary
+            _ws_wall = _origin_info.get("queue_worker_start_wall_ns") if isinstance(_origin_info, dict) else None
+            _ws_mono = _origin_info.get("queue_worker_start_mono_ns") if isinstance(_origin_info, dict) else None
+            if _ws_wall is not None and _ws_mono is not None:
+                _v2_trace.emit_at("worker_start", wall_unix_ns=_ws_wall, monotonic_ns=_ws_mono, phase="local")
             _v2_plan = build_execution_plan(
                 execution_workflow,
                 prompt_id=prompt_id,

@@ -28,6 +28,15 @@ _last_stable_profile_cache: dict[tuple[str, str, str], dict] = {}
 _last_cache_app_identity: str = ""
 _last_cache_ws_id: str = ""
 
+
+def _reset_last_stable_profile_cache() -> None:
+    """Clear the process-local stable profile cache (test / teardown only)."""
+    global _last_stable_profile_cache, _last_cache_app_identity, _last_cache_ws_id
+    _last_stable_profile_cache.clear()
+    _last_cache_app_identity = ""
+    _last_cache_ws_id = ""
+
+
 # Default TTL (1 hour, matching __init__._ACTIVE_NEXT_PROFILE_TTL_S).
 _ACTIVE_NEXT_PROFILE_TTL_S = int(os.environ.get(
     "COMFYMODAL_ACTIVE_NEXT_PROFILE_TTL_S", "3600",

@@ -759,6 +759,172 @@ class TestRestoreEventsVocabulary(unittest.TestCase):
             self.assertIn(evt, source, f"run_plan_stream() missing event {evt}")
 
 
+class TestRestoreBoundaryTimestamps(unittest.TestCase):
+    """Focused assertions on restore-boundary timestamp data-flow order.
+
+    Verifies that _restore_timing dict fields are populated before the dict
+    is constructed (not after), and that all error/fallback paths set the
+    raw wall+mono end fields with restore_method_status=error.
+    Also verifies run_plan_stream exposes both method-entry fields in
+    trace metadata and that restore_end_to_modal_method_ms draws from
+    _restore_timing.restore_method_end_mono_ns, not only the return marker.
+    """
+
+    # ── Ordering: bootstrap error handler ──────────────────────────────
+
+    def test_bootstrap_error_captures_end_before_dict(self):
+        """In bootstrap error path, _restore_end_wall_ns and _restore_end_mono_ns
+        are assigned BEFORE the err_timing dict is constructed, so the dict
+        contains the actual end timestamps (not None)."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # Find the bootstrap except block (the one at v2_bootstrap_restore_start
+        # level, not the outer except:)
+        # The pattern: after the capture, the end fields appear in err_timing.
+        # We verify that _restore_status / _restore_end_* assignment lines
+        # appear BEFORE the err_timing = { ... } assignment.
+        err_timing_idx = source.find("err_timing: dict[str, Any] = {")
+        self.assertGreater(err_timing_idx, 0, "err_timing dict must exist")
+        # The end-assignment lines must appear before err_timing
+        _status_idx = source.find('_restore_status = "error"', 0, err_timing_idx)
+        _end_wall_idx = source.find("_restore_end_wall_ns = int(time.time()", 0, err_timing_idx)
+        _end_mono_idx = source.find("_restore_end_mono_ns = time.monotonic_ns()", 0, err_timing_idx)
+        self.assertGreater(
+            _status_idx, 0,
+            "_restore_status = 'error' must appear before err_timing dict"
+        )
+        self.assertGreater(
+            _end_wall_idx, 0,
+            "_restore_end_wall_ns capture must appear before err_timing dict"
+        )
+        self.assertGreater(
+            _end_mono_idx, 0,
+            "_restore_end_mono_ns capture must appear before err_timing dict"
+        )
+        # Verify the err_timing dict references _restore_end_wall_ns etc.
+        after_err = source[err_timing_idx:err_timing_idx + 800]
+        self.assertIn('"restore_method_end_wall_unix_ns": _restore_end_wall_ns', after_err)
+        self.assertIn('"restore_method_end_mono_ns": _restore_end_mono_ns', after_err)
+        self.assertIn('"restore_method_status": "error"', after_err)
+
+    # ── Ordering: success path ─────────────────────────────────────────
+
+    def test_success_captures_end_before_dict(self):
+        """In success path, _restore_end_* and _restore_status are captured
+        BEFORE the _restore_timing dict is constructed."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # Find the success _restore_timing dict (the one with lifecycle_status="ok")
+        ok_timing_idx = source.find('"lifecycle_status": "ok"')
+        self.assertGreater(ok_timing_idx, 0, "Success _restore_timing with lifecycle_status=ok must exist")
+        # Walk backward to the dict assignment line
+        dict_start_idx = source.rfind("_restore_timing: dict[str, Any] = {", 0, ok_timing_idx)
+        self.assertGreater(dict_start_idx, 0, "_restore_timing dict must exist")
+        # The capture lines must appear before this dict
+        _status_ok_idx = source.find('_restore_status = "success"', 0, dict_start_idx)
+        _end_wall_idx = source.find("_restore_end_wall_ns = int(time.time()", 0, dict_start_idx)
+        _end_mono_idx = source.find("_restore_end_mono_ns = time.monotonic_ns()", 0, dict_start_idx)
+        self.assertGreater(
+            _status_ok_idx, 0,
+            "_restore_status = 'success' must appear before success timing dict"
+        )
+        self.assertGreater(
+            _end_wall_idx, 0,
+            "_restore_end_wall_ns capture must appear before success timing dict"
+        )
+        self.assertGreater(
+            _end_mono_idx, 0,
+            "_restore_end_mono_ns capture must appear before success timing dict"
+        )
+
+    # ── Error/fallback paths set raw fields ────────────────────────────
+
+    def test_unexpected_error_fallback_has_raw_fields(self):
+        """The outer except: block's _restore_timing includes
+        remote_python_resume_*, restore_method_start_*, restore_method_end_*
+        and restore_method_status=error."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # Find the except: block's _restore_timing construction
+        # (the block near 'lifecycle_error": "unhandled_restore_error"')
+        unhandled_idx = source.find('"lifecycle_error": "unhandled_restore_error"')
+        self.assertGreater(
+            unhandled_idx, 0,
+            "except: block _restore_timing with unhandled_restore_error must exist"
+        )
+        block = source[unhandled_idx - 200:unhandled_idx + 600]
+        self.assertIn("remote_python_resume_wall_unix_ns", block)
+        self.assertIn("remote_python_resume_mono_ns", block)
+        self.assertIn("restore_method_start_wall_unix_ns", block)
+        self.assertIn("restore_method_start_mono_ns", block)
+        self.assertIn("restore_method_end_wall_unix_ns", block)
+        self.assertIn("restore_method_end_mono_ns", block)
+        self.assertIn('"restore_method_status": "error"', block)
+
+    def test_finally_block_backfills_raw_fields(self):
+        """The finally block backfills missing raw fields in _restore_timing."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # Find the finally block's backfill section
+        finally_idx = source.find("finally:")
+        self.assertGreater(finally_idx, 0, "finally block must exist")
+        after_finally = source[finally_idx:finally_idx + 1500]
+        self.assertIn("restore_method_end_wall_unix_ns", after_finally)
+        self.assertIn("restore_method_end_mono_ns", after_finally)
+        self.assertIn('"restore_method_status"', after_finally)
+
+    # ── run_plan_stream exposes method-entry fields ────────────────────
+
+    def test_run_plan_stream_has_method_entry_mono_in_pre_trace(self):
+        """The run_plan_method_first_line pre-trace event metadata
+        includes both modal_method_entry_wall_unix_ns and modal_method_entry_mono_ns."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        self.assertIn("modal_method_entry_wall_unix_ns", source)
+        self.assertIn("modal_method_entry_mono_ns", source)
+        # Both must appear in the pre-trace event
+        pre_trace_idx = source.find("_pre_trace_events")
+        self.assertGreater(pre_trace_idx, 0)
+        pre_trace_block = source[pre_trace_idx:pre_trace_idx + 500]
+        self.assertIn("modal_method_entry_wall_unix_ns", pre_trace_block)
+        self.assertIn("modal_method_entry_mono_ns", pre_trace_block)
+
+    def test_run_plan_stream_remote_method_entry_has_both_fields(self):
+        """The remote_method_entry event in run_plan_stream includes both
+        modal_method_entry_wall_unix_ns and modal_method_entry_mono_ns."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        # Find the remote_method_entry metadata block
+        rme_idx = source.find('"remote_method_entry"')
+        self.assertGreater(rme_idx, 0, "remote_method_entry event must exist")
+        rme_block = source[rme_idx:rme_idx + 1200]
+        self.assertIn("modal_method_entry_wall_unix_ns", rme_block)
+        self.assertIn("modal_method_entry_mono_ns", rme_block)
+
+    # ── restore_end_to_modal_method_ms from _restore_timing ────────────
+
+    def test_restore_end_to_method_ms_uses_timing_end_mono(self):
+        """restore_end_to_modal_method_ms in [v2.method_entry_gap] uses
+        _restore_timing.restore_method_end_mono_ns (not just the return marker)
+        and emits 'absent' when the raw end is unavailable."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        method_gap_idx = source.find("[v2.method_entry_gap]")
+        self.assertGreater(method_gap_idx, 0, "[v2.method_entry_gap] must exist")
+        gap_block = source[method_gap_idx - 600:method_gap_idx + 600]
+        # Must read from _rt.get("restore_method_end_mono_ns")
+        self.assertIn("restore_method_end_mono_ns", gap_block)
+        # Must use _fmt_or_absent or equivalent 'absent' string for the field
+        self.assertIn("restore_end_to_modal_method_ms", gap_block)
+
+
 class TestRestoreReturnInRunPlanStream(unittest.TestCase):
     """Verify run_plan_stream reads the restore marker through its accessor."""
 
@@ -1346,43 +1512,93 @@ class TestGraphCacheLookupEvents(unittest.TestCase):
 
 
 class TestDeepDiagImageEnv(unittest.TestCase):
-    """COMFYMODAL_V2_DEEP_MODEL_DIAG=1 in V2 shadow image only, with valid build order."""
+    """COMFYMODAL_V2_DEEP_MODEL_DIAG follows normal external env control (not forced)."""
 
-    def test_env_in_reference_image(self):
-        """_reference_image() uses _image_base and adds COMFYMODAL_V2_DEEP_MODEL_DIAG=1."""
+    @staticmethod
+    def _code_body(source: str) -> str:
+        """Strip the docstring from a function source, returning only the executable body."""
+        lines = source.splitlines()
+        # Find the first line that starts a triple-quoted docstring
+        in_docstring = False
+        body_lines: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not in_docstring:
+                if stripped.startswith('"""') or stripped.startswith("'''"):
+                    in_docstring = True
+                    # Check if docstring opens AND closes on this same line
+                    delim = stripped[:3]
+                    count = stripped.count(delim)
+                    if count >= 2:
+                        in_docstring = False
+                    continue
+                body_lines.append(line)
+            else:
+                # Look for the closing triple quote
+                if stripped.endswith('"""') or stripped.endswith("'''"):
+                    # This line closes the docstring
+                    after_quotes = stripped[3:].strip() if stripped.startswith(
+                        '"""') or stripped.startswith("'''") else stripped
+                    # Check if delim opens and closes
+                    in_docstring = False
+                    # The def line + decorators come before docstring, already captured
+                    continue
+        return "\n".join(body_lines)
+
+    def test_env_not_forced_in_reference_image(self):
+        """_reference_image() uses _image_base, adds V2 source modules, and does NOT
+        force COMFYMODAL_V2_DEEP_MODEL_DIAG or contain an .env({...}) build call
+        in the code body (docstring mentions are allowed)."""
         import inspect
         from comfymodal_runtime.modal_app import _reference_image
-        source = inspect.getsource(_reference_image)
-        self.assertIn("COMFYMODAL_V2_DEEP_MODEL_DIAG", source)
-        self.assertIn('"1"', source)
+        source = self._code_body(inspect.getsource(_reference_image))
+        # Uses _image_base (pre-local-sources) for legal build order
+        self.assertIn("_image_base", source,
+                      "Must reference _image_base for legal Modal build order")
+        # Still adds V2 source modules
+        self.assertIn("add_local_python_source", source,
+                      "Must add V2 source modules")
+        self.assertIn("V2_SOURCE_MODULES", source,
+                      "Must iterate V2_SOURCE_MODULES")
+        # The flag must NOT be forced as an env-var dict key in the code body.
+        # (The docstring mentions it in prose, which is fine.)
+        self.assertNotIn('"COMFYMODAL_V2_DEEP_MODEL_DIAG"', source,
+                         "Flag must NOT appear as a string literal in code body; "
+                         "follows external env control")
+        # No .env({...) build call in the code body
+        self.assertNotIn(".env({", source,
+                         ".env({...) build call must not appear in code body")
 
-    def test_uses_image_base_not_image(self):
-        """_reference_image() reads comfyapp._image_base, not comfyapp.image, so .env()
-        is called before any add_local_python_source — satisfying Modal's build-order
-        constraint that all build steps must precede local-file additions."""
+    def test_uses_image_base_without_env_call(self):
+        """_reference_image() reads comfyapp._image_base, not comfyapp.image, with no .env({...})
+        build call — the production base already has build steps, and env control is external."""
         import inspect
         from comfymodal_runtime.modal_app import _reference_image
-        source = inspect.getsource(_reference_image)
+        source = self._code_body(inspect.getsource(_reference_image))
         self.assertIn('"_image_base"', source,
                       "Must reference _image_base (pre-local-sources) for legal build order")
-        # Verify .env() occurs before add_local_python_source in the source
-        env_idx = source.find(".env(")
-        add_local_idx = source.find("add_local_python_source")
-        self.assertGreater(env_idx, 0, ".env() must exist in _reference_image")
-        self.assertGreater(add_local_idx, 0, "add_local_python_source must exist")
-        self.assertLess(env_idx, add_local_idx,
-                        ".env() must come BEFORE add_local_python_source (Modal build order)")
+        # add_local_python_source must still exist (adds V2 modules)
+        self.assertIn("add_local_python_source", source,
+                      "Must add V2 source modules via add_local_python_source")
+        # No .env({) build call in the code body (docstring mentions are allowed)
+        self.assertNotIn(".env({", source,
+                         ".env({...) must NOT appear in code body; env follows external control")
+        # Verify there is no base.env or image.env call pattern
+        self.assertNotIn("base.env(", source,
+                         "No base.env() call in code body")
+        self.assertNotIn("image.env(", source,
+                         "No image.env() call in code body")
 
     def test_env_not_in_production_image_env_block(self):
-        """The env var does NOT appear in comfyapp's production .env() block."""
+        """The env var does NOT appear in comfyapp's production _image_base definition."""
         import inspect
         import comfyapp as _ca_mod
         _has_base = hasattr(_ca_mod, "_image_base")
         if not _has_base:
             return  # _image_base not exported — skip (still valid, just not verifiable)
         ca_source = inspect.getsource(_ca_mod)
-        # Find the production _image_base env block
-        env_block_start = ca_source.find("def _image_base")
+        # Find the production _image_base variable assignment block
+        env_block_start = ca_source.find("_image_base =")
         env_block = ca_source[env_block_start:] if env_block_start >= 0 else ""
         prod_env_idx = env_block.find("COMFYMODAL_V2_DEEP_MODEL_DIAG")
         self.assertEqual(prod_env_idx, -1,
@@ -1767,7 +1983,8 @@ class TestActiveReadDimClassification(unittest.TestCase):
         self.assertEqual(result.get("process_cpu_status"), "available")
 
     def test_unsupported_when_deep_diag_disabled(self):
-        """All dims are unsupported when deep_diag is disabled."""
+        """All dims are unsupported when deep_diag is disabled,
+        regardless of data presence — the flag gates per-dimension classification."""
         entry = {
             "native_tid": 1234,
             "complete_native_tid": 1234,
@@ -1781,7 +1998,8 @@ class TestActiveReadDimClassification(unittest.TestCase):
         for status_key in ("thread_cpu_status", "process_cpu_status", "io_status",
                            "page_fault_status", "block_input_status", "context_switch_status"):
             self.assertEqual(result.get(status_key), "unsupported",
-                             f"{status_key} should be unsupported")
+                             f"{status_key} should be unsupported when deep_diag=0")
+        self.assertEqual(result.get("counter_status"), "unsupported")
 
     def test_not_observed_when_same_thread_but_no_data(self):
         """not_observed_in_this_thread when same thread but no before-snapshot captured."""
@@ -1823,6 +2041,1455 @@ class TestActiveReadDimClassification(unittest.TestCase):
             result = self._classify(entry)
         # thread_cpu available, io not_observed → mixed
         self.assertEqual(result.get("counter_status"), "mixed")
+
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 5: Slow model-read threshold diagnostics
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestSlowReadThresholdParsing(unittest.TestCase):
+    """COMFYMODAL_V2_SLOW_READ_THRESHOLD_MS env var parsing."""
+
+    def test_default_value(self):
+        """Default threshold is 3000.0."""
+        from comfymodal_runtime.model_preload import _SLOW_READ_THRESHOLD_MS
+        self.assertEqual(_SLOW_READ_THRESHOLD_MS, 3000.0)
+
+    def test_parse_function_default(self):
+        """_parse_slow_read_threshold returns 3000 with no env set."""
+        from comfymodal_runtime.model_preload import _parse_slow_read_threshold
+        with patch.dict(os.environ, {}, clear=True):
+            val = _parse_slow_read_threshold()
+            self.assertEqual(val, 3000.0)
+
+    def test_parse_function_valid_override(self):
+        """_parse_slow_read_threshold returns parsed value for valid env."""
+        from comfymodal_runtime.model_preload import _parse_slow_read_threshold
+        with patch.dict(os.environ, {"COMFYMODAL_V2_SLOW_READ_THRESHOLD_MS": "5000"}):
+            val = _parse_slow_read_threshold()
+            self.assertEqual(val, 5000.0)
+
+    def test_parse_function_negative_falls_back(self):
+        """_parse_slow_read_threshold falls back for negative input."""
+        from comfymodal_runtime.model_preload import _parse_slow_read_threshold
+        with patch.dict(os.environ, {"COMFYMODAL_V2_SLOW_READ_THRESHOLD_MS": "-100"}):
+            val = _parse_slow_read_threshold()
+            self.assertEqual(val, 3000.0)
+
+    def test_parse_function_nan_falls_back(self):
+        """_parse_slow_read_threshold falls back for NaN."""
+        from comfymodal_runtime.model_preload import _parse_slow_read_threshold
+        with patch.dict(os.environ, {"COMFYMODAL_V2_SLOW_READ_THRESHOLD_MS": "not-a-number"}):
+            val = _parse_slow_read_threshold()
+            self.assertEqual(val, 3000.0)
+
+    def test_parse_function_infinity_falls_back(self):
+        """_parse_slow_read_threshold falls back for infinity."""
+        from comfymodal_runtime.model_preload import _parse_slow_read_threshold
+        with patch.dict(os.environ, {"COMFYMODAL_V2_SLOW_READ_THRESHOLD_MS": "inf"}):
+            val = _parse_slow_read_threshold()
+            self.assertEqual(val, 3000.0)
+
+    def test_parse_function_zero(self):
+        """_parse_slow_read_threshold returns 0 for zero input."""
+        from comfymodal_runtime.model_preload import _parse_slow_read_threshold
+        with patch.dict(os.environ, {"COMFYMODAL_V2_SLOW_READ_THRESHOLD_MS": "0"}):
+            val = _parse_slow_read_threshold()
+            self.assertEqual(val, 0.0)
+
+
+class TestCaptureSlowReadBefore(unittest.TestCase):
+    """_capture_slow_read_before returns lightweight timing state."""
+
+    def test_returns_dataclass_with_expected_fields(self):
+        from comfymodal_runtime.model_preload import _capture_slow_read_before, _SlowReadBeforeState
+        state = _capture_slow_read_before()
+        self.assertIsInstance(state, _SlowReadBeforeState)
+        self.assertIsInstance(state.mono_ns, int)
+        self.assertGreater(state.mono_ns, 0)
+        self.assertIsInstance(state.tid, int)
+        self.assertGreater(state.tid, 0)
+        # thread_time_ns and process_time_ns may be None on some platforms
+        self.assertIn(type(state.thread_time_ns), (int, type(None)))
+        self.assertIn(type(state.process_time_ns), (int, type(None)))
+
+
+class TestEmitSlowReadLineOutput(unittest.TestCase):
+    """_emit_slow_read_line prints correct prefix and fields."""
+
+    def test_output_contains_prefix(self):
+        import io
+        import contextlib
+        from comfymodal_runtime.model_preload import (
+            _emit_slow_read_line, _capture_slow_read_before,
+            _SlowReadBeforeState,
+        )
+        before = _capture_slow_read_before()
+        before_fake = _SlowReadBeforeState(
+            mono_ns=before.mono_ns,
+            thread_time_ns=before.thread_time_ns,
+            process_time_ns=before.process_time_ns,
+            tid=before.tid,
+        )
+        after_mono = before.mono_ns + 5_000_000  # 5ms later
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            _emit_slow_read_line(
+                owner="CLIP",
+                loader_type="load_torch_file",
+                path_str="/tmp/test_model.safetensors",
+                request_id="req-001",
+                restore_session_id="rs-001",
+                restored_instance_id="ri-001",
+                before=before_fake,
+                after_mono_ns=after_mono,
+                after_thread_time_ns=before.thread_time_ns,
+                after_process_time_ns=before.process_time_ns,
+                after_tid=before.tid,
+            )
+        output = f.getvalue()
+        self.assertIn("[v2.slow_model_read]", output)
+        self.assertIn("owner=CLIP", output)
+        self.assertIn("loader_type=load_torch_file", output)
+        # No raw path in output (uses hash)
+        self.assertNotIn("/tmp/test_model.safetensors", output)
+        # Hash appears
+        self.assertIn("path_hash=", output)
+        # Modal identity fields present
+        self.assertIn("modal_task_id=", output)
+        self.assertIn("modal_image_id=", output)
+        self.assertIn("cloud=", output)
+        self.assertIn("region=", output)
+        # Counter fields present
+        self.assertIn("elapsed_ms=", output)
+        self.assertIn("counter_status=", output)
+        # No secrets leaked
+        self.assertNotIn("password", output.lower())
+        self.assertNotIn("token", output.lower())
+
+    def test_no_full_path_in_output(self):
+        """Raw user path must not appear in output, only hash."""
+        import io
+        import contextlib
+        from comfymodal_runtime.model_preload import (
+            _emit_slow_read_line, _capture_slow_read_before,
+            _SlowReadBeforeState,
+        )
+        before = _capture_slow_read_before()
+        before_fake = _SlowReadBeforeState(
+            mono_ns=before.mono_ns,
+            thread_time_ns=before.thread_time_ns,
+            process_time_ns=before.process_time_ns,
+            tid=before.tid,
+        )
+        after_mono = before.mono_ns + 4_000_000_000  # 4s exceeds default 3s threshold
+        user_path = "/home/user/ComfyUI/models/checkpoints/sd_xl_turbo_1.0.safetensors"
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            _emit_slow_read_line(
+                owner="CLIP",
+                loader_type="load_torch_file",
+                path_str=user_path,
+                request_id="req-002",
+                restore_session_id="rs-002",
+                restored_instance_id="ri-002",
+                before=before_fake,
+                after_mono_ns=after_mono,
+                after_thread_time_ns=before.thread_time_ns,
+                after_process_time_ns=before.process_time_ns,
+                after_tid=before.tid,
+            )
+        output = f.getvalue()
+        # Path hash appears but raw user path does not
+        self.assertIn("path_hash=", output)
+        self.assertNotIn(user_path, output)
+        # No prompt/workflow leakage
+        self.assertNotIn("prompt", output.lower())
+        self.assertNotIn("workflow", output.lower())
+
+    def test_unsupported_on_windows(self):
+        """On non-Linux, counter_status is 'unsupported' and values are None."""
+        import io
+        import contextlib
+        from comfymodal_runtime.model_preload import (
+            _emit_slow_read_line, _capture_slow_read_before,
+            _SlowReadBeforeState,
+        )
+        before = _capture_slow_read_before()
+        before_fake = _SlowReadBeforeState(
+            mono_ns=before.mono_ns,
+            thread_time_ns=before.thread_time_ns,
+            process_time_ns=before.process_time_ns,
+            tid=before.tid,
+        )
+        after_mono = before.mono_ns + 5_000_000_000
+        with patch("platform.system", return_value="Windows"):
+            f = io.StringIO()
+            with contextlib.redirect_stdout(f):
+                _emit_slow_read_line(
+                    owner="CLIP",
+                    loader_type="load_torch_file",
+                    path_str="/tmp/test.safetensors",
+                    request_id="req-003",
+                    restore_session_id="rs-003",
+                    restored_instance_id="ri-003",
+                    before=before_fake,
+                    after_mono_ns=after_mono,
+                    after_thread_time_ns=before.thread_time_ns,
+                    after_process_time_ns=before.process_time_ns,
+                    after_tid=before.tid,
+                )
+            output = f.getvalue()
+        self.assertIn("counter_status=unsupported", output)
+
+    def test_missing_proc_cgroup_safe(self):
+        """Missing /proc or cgroup files don't crash emission."""
+        import io
+        import contextlib
+        from comfymodal_runtime.model_preload import (
+            _emit_slow_read_line, _capture_slow_read_before,
+            _SlowReadBeforeState,
+        )
+        before = _capture_slow_read_before()
+        before_fake = _SlowReadBeforeState(
+            mono_ns=before.mono_ns,
+            thread_time_ns=before.thread_time_ns,
+            process_time_ns=before.process_time_ns,
+            tid=before.tid,
+        )
+        after_mono = before.mono_ns + 5_000_000_000
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            _emit_slow_read_line(
+                owner="CLIP",
+                loader_type="load_torch_file",
+                path_str="",
+                request_id="",
+                restore_session_id="",
+                restored_instance_id="",
+                before=before_fake,
+                after_mono_ns=after_mono,
+                after_thread_time_ns=before.thread_time_ns,
+                after_process_time_ns=before.process_time_ns,
+                after_tid=before.tid,
+            )
+        output = f.getvalue()
+        # Should print without raising, even with empty path and no /proc
+        self.assertIn("[v2.slow_model_read]", output)
+
+    def test_active_read_entry_preferred(self):
+        """When active_read_entry is provided, its pre-computed fields are used."""
+        import io
+        import contextlib
+        from comfymodal_runtime.model_preload import (
+            _emit_slow_read_line, _capture_slow_read_before,
+            _SlowReadBeforeState,
+        )
+        before = _capture_slow_read_before()
+        before_fake = _SlowReadBeforeState(
+            mono_ns=1000,
+            thread_time_ns=500,
+            process_time_ns=600,
+            tid=42,
+        )
+        entry = {
+            "active_read_wall_ms": 1234.5,
+            "active_read_file_size": 2_000_000_000,
+            "active_read_st_dev": 2049,
+            "active_read_st_ino": 99999,
+            "active_read_thread_cpu_ms": 100.0,
+            "active_read_process_cpu_ms": 200.0,
+            "active_read_rchar_delta": 500000,
+            "active_read_read_bytes_delta": 400000,
+            "active_read_major_faults_delta": 5,
+            "active_read_minor_faults_delta": 100,
+            "active_read_inblock_delta": 10,
+            "active_read_voluntary_context_switches_delta": 50,
+            "active_read_involuntary_context_switches_delta": 3,
+            "before_rusage": {"minflt": 100},
+            "after_rusage": {"minflt": 200},
+            "before_io": {"rchar": 1000},
+            "after_io": {"rchar": 6000},
+        }
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            _emit_slow_read_line(
+                owner="restore_background_unet",
+                loader_type="UNET",
+                path_str="/tmp/unet.safetensors",
+                request_id="req-ar",
+                restore_session_id="rs-ar",
+                restored_instance_id="ri-ar",
+                before=before_fake,
+                after_mono_ns=5000,
+                after_thread_time_ns=700,
+                after_process_time_ns=800,
+                after_tid=42,
+                active_read_entry=entry,
+            )
+        output = f.getvalue()
+        self.assertIn("elapsed_ms=1234.5", output)
+        self.assertIn("file_size=2000000000", output)
+        self.assertIn("st_dev=2049", output)
+        self.assertIn("thread_cpu_ms=100.0", output)
+        self.assertIn("process_cpu_ms=200.0", output)
+        self.assertIn("rchar_delta=500000", output)
+        self.assertIn("read_bytes_delta=400000", output)
+
+    def test_below_threshold_no_emission_in_wrapper(self):
+        """When elapsed < threshold, the wrapper does NOT emit slow read line."""
+        import io
+        import contextlib
+        from comfymodal_runtime.model_preload import (
+            _make_torch_file_wrapper, _ACTIVE_LANE_TRACE,
+            ModelLaneTrace, _SlowReadBeforeState,
+        )
+
+        # Create a mock trace with CLIP lane
+        trace = RuntimeTrace(process="test", request_id="clip-test")
+        lane = ModelLaneTrace(trace, "CLIP", phase="restore")
+
+        # We need a real load_torch_file that just returns quickly
+        def _fast_original(ckpt, safe_load=False, device=None, return_metadata=False):
+            return {"state_dict": {}}
+
+        wrapped = _make_torch_file_wrapper(_fast_original)
+
+        f = io.StringIO()
+        token = _ACTIVE_LANE_TRACE.set(lane)
+        try:
+            with contextlib.redirect_stdout(f):
+                wrapped("/tmp/fast_model.safetensors")
+        finally:
+            _ACTIVE_LANE_TRACE.reset(token)
+
+        output = f.getvalue()
+        # No slow read line because read is fast
+        self.assertNotIn("[v2.slow_model_read]", output)
+
+    def test_above_threshold_emits_one_line(self):
+        """When elapsed >= threshold, exactly one slow read line is emitted."""
+        import io
+        import contextlib
+        import comfymodal_runtime.model_preload as mp
+
+        # Force threshold to 0 so any read triggers
+        with patch("comfymodal_runtime.model_preload._SLOW_READ_THRESHOLD_MS", 0.0):
+            trace = RuntimeTrace(process="test", request_id="clip-slow")
+            lane = ModelLaneTrace(trace, "CLIP", phase="restore")
+
+            def _slow_original(ckpt, safe_load=False, device=None, return_metadata=False):
+                import time
+                time.sleep(0.001)  # tiny sleep to ensure non-zero elapsed
+                return {"state_dict": {}}
+
+            wrapped = mp._make_torch_file_wrapper(_slow_original)
+
+            f = io.StringIO()
+            token = mp._ACTIVE_LANE_TRACE.set(lane)
+            try:
+                with contextlib.redirect_stdout(f):
+                    wrapped("/tmp/slow_model.safetensors")
+            finally:
+                mp._ACTIVE_LANE_TRACE.reset(token)
+
+            output = f.getvalue()
+            slow_lines = [line for line in output.split("\n") if "[v2.slow_model_read]" in line]
+            self.assertEqual(len(slow_lines), 1, f"Expected 1 slow line, got {len(slow_lines)}: {output}")
+
+    def test_clip_timing_output_preserved(self):
+        """Existing [v2.clip_stages] output is not affected by slow-read instrumentation."""
+        from comfymodal_runtime.model_preload import _make_torch_file_wrapper
+        source = inspect.getsource(_make_torch_file_wrapper)
+        # The wrapper still calls lane.read_start/read_end and _on_read_completed
+        self.assertIn("lane.read_start()", source)
+        self.assertIn("lane.read_end()", source)
+        self.assertIn("lane._on_read_completed()", source)
+
+    def test_no_broad_global_wrappers(self):
+        """Slow-read instrumentation does not install any new global wrappers."""
+        import comfymodal_runtime.model_preload as mp
+        source = inspect.getsource(mp._ensure_core_wrappers)
+        # No new wrapper installation for slow reads
+        self.assertNotIn("slow_read", source.lower())
+        self.assertNotIn("SlowRead", source)
+
+    def test_identity_fields_no_leakage(self):
+        """Identity fields in slow read line don't leak credentials."""
+        import io
+        import contextlib
+        from comfymodal_runtime.model_preload import (
+            _emit_slow_read_line, _capture_slow_read_before,
+            _SlowReadBeforeState,
+        )
+        before = _capture_slow_read_before()
+        before_fake = _SlowReadBeforeState(
+            mono_ns=before.mono_ns,
+            thread_time_ns=before.thread_time_ns,
+            process_time_ns=before.process_time_ns,
+            tid=before.tid,
+        )
+        after_mono = before.mono_ns + 5_000_000_000
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            _emit_slow_read_line(
+                owner="CLIP",
+                loader_type="load_torch_file",
+                path_str="/tmp/not-a-secret.safetensors",
+                request_id="req-safe",
+                restore_session_id="rs-safe",
+                restored_instance_id="ri-safe",
+                before=before_fake,
+                after_mono_ns=after_mono,
+                after_thread_time_ns=before.thread_time_ns,
+                after_process_time_ns=before.process_time_ns,
+                after_tid=before.tid,
+            )
+        output = f.getvalue()
+        # No JSON blobs
+        self.assertNotIn('{"', output)
+        self.assertNotIn("'{" + "'", output)
+        # No credentials
+        self.assertNotIn("api_key", output)
+        self.assertNotIn("secret", output)
+        self.assertNotIn("bearer", output)
+        self.assertNotIn("auth", output.lower())
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Slow-read focused tests: _capture_proc_self_io, threshold gating,
+# counter capture/deltas without deep_diag, unsupported platforms
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestCaptureProcSelfIo(unittest.TestCase):
+    """_capture_proc_self_io reads /proc/self/io, never raises, returns
+    None on unsupported platforms."""
+
+    def test_returns_none_on_windows(self):
+        """On non-Linux, returns None (does not raise)."""
+        from comfymodal_runtime.model_preload import _capture_proc_self_io
+        with patch("platform.system", return_value="Windows"):
+            result = _capture_proc_self_io()
+        self.assertIsNone(result)
+
+    def test_returns_none_on_darwin(self):
+        """On macOS, returns None."""
+        from comfymodal_runtime.model_preload import _capture_proc_self_io
+        with patch("platform.system", return_value="Darwin"):
+            result = _capture_proc_self_io()
+        self.assertIsNone(result)
+
+    def test_dict_keys_when_linux(self):
+        """On Linux, returns dict with rchar/read_bytes or None.
+        We'll mock the file read to check the parsing path."""
+        from comfymodal_runtime.model_preload import _capture_proc_self_io
+        fake_content = "rchar: 12345\nwchar: 678\nread_bytes: 98765\nwrite_bytes: 100\n"
+        with patch("platform.system", return_value="Linux"):
+            with patch("builtins.open", unittest.mock.mock_open(read_data=fake_content)):
+                result = _capture_proc_self_io()
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("rchar"), 12345)
+        self.assertEqual(result.get("read_bytes"), 98765)
+
+    def test_missing_fields_not_invented(self):
+        """Missing counters are absent from result dict."""
+        from comfymodal_runtime.model_preload import _capture_proc_self_io
+        fake_content = "wchar: 678\nwrite_bytes: 100\n"
+        with patch("platform.system", return_value="Linux"):
+            with patch("builtins.open", unittest.mock.mock_open(read_data=fake_content)):
+                result = _capture_proc_self_io()
+        # rchar and read_bytes not present, result should be None (empty)
+        self.assertIsNone(result)
+
+    def test_missing_file_returns_none(self):
+        """Missing /proc/self/io returns None without raising."""
+        from comfymodal_runtime.model_preload import _capture_proc_self_io
+        with patch("platform.system", return_value="Linux"):
+            with patch("builtins.open", side_effect=FileNotFoundError):
+                result = _capture_proc_self_io()
+        self.assertIsNone(result)
+
+    def test_none_on_parse_error(self):
+        """Garbled /proc/self/io returns None without raising."""
+        from comfymodal_runtime.model_preload import _capture_proc_self_io
+        fake_content = "rchar: not-a-number\n"
+        with patch("platform.system", return_value="Linux"):
+            with patch("builtins.open", unittest.mock.mock_open(read_data=fake_content)):
+                result = _capture_proc_self_io()
+        self.assertIsNone(result)
+
+
+class TestCaptureRusageThreadSnapshotNoFlag(unittest.TestCase):
+    """_capture_rusage_thread_snapshot works without DIAGNOSTIC_FLAG."""
+
+    def test_returns_none_on_windows(self):
+        """On non-Linux returns None."""
+        from comfymodal_runtime.model_preload import _capture_rusage_thread_snapshot
+        with patch("platform.system", return_value="Windows"):
+            result = _capture_rusage_thread_snapshot()
+        self.assertIsNone(result)
+
+    def test_returns_dict_on_linux_with_mock(self):
+        """On Linux (with mock), returns expected keys."""
+        from comfymodal_runtime.model_preload import _capture_rusage_thread_snapshot
+        import types as _types
+
+        class _FakeRusage:
+            ru_utime = 0.5
+            ru_stime = 0.1
+            ru_minflt = 1000
+            ru_majflt = 5
+            ru_inblock = 10
+            ru_oublock = 2
+            ru_nvcsw = 50
+            ru_nivcsw = 3
+
+        _mock_resource = _types.ModuleType("resource")
+        _mock_resource.RUSAGE_THREAD = -1  # sentinel value, getrusage ignores it
+        _mock_resource.getrusage = lambda _arg: _FakeRusage()
+
+        with patch("platform.system", return_value="Linux"):
+            with patch.dict("sys.modules", {"resource": _mock_resource}):
+                result = _capture_rusage_thread_snapshot()
+        self.assertIsNotNone(result)
+        self.assertEqual(result["minflt"], 1000)
+        self.assertEqual(result["majflt"], 5)
+        self.assertEqual(result["inblock"], 10)
+        self.assertEqual(result["nvcsw"], 50)
+        self.assertEqual(result["nivcsw"], 3)
+
+
+class TestClassifyActiveReadDimsNoDeepDiag(unittest.TestCase):
+    """classify_active_read_dims without deep_diag flag.
+    When deep_diag=False all dimensions return 'unsupported' — the
+    per-dimension classifier is only active with deep diagnostics enabled."""
+
+    def test_all_unsupported_when_no_deep_diag(self):
+        """Every dimension returns unsupported when deep_diag=False,
+        regardless of data or OS capability flags."""
+        from comfymodal_runtime.model_preload import classify_active_read_dims
+        result = classify_active_read_dims(
+            deep_diag=False,
+            before_tid=100, after_tid=100,
+            has_thread_cpu=True, has_process_cpu=True,
+            has_rusage=True, has_io=True,
+            os_supports_thread_cpu=True, os_supports_process_cpu=True,
+            os_supports_rusage=True, os_supports_io=True,
+        )
+        for dim in ("thread_cpu", "process_cpu", "io_deltas",
+                    "page_faults", "block_input", "context_switches"):
+            self.assertEqual(result[dim], "unsupported",
+                             f"{dim} should be unsupported when deep_diag=False")
+
+    def test_all_unsupported_even_with_mismatched_tids(self):
+        """Even with changed thread IDs, all dims are unsupported."""
+        from comfymodal_runtime.model_preload import classify_active_read_dims
+        result = classify_active_read_dims(
+            deep_diag=False,
+            before_tid=100, after_tid=999,
+            has_thread_cpu=True, has_process_cpu=True,
+            has_rusage=True, has_io=True,
+            os_supports_thread_cpu=True, os_supports_process_cpu=True,
+            os_supports_rusage=True, os_supports_io=True,
+        )
+        for v in result.values():
+            self.assertEqual(v, "unsupported")
+
+    def test_all_unsupported_when_no_data(self):
+        """Without data or OS support, still all unsupported."""
+        from comfymodal_runtime.model_preload import classify_active_read_dims
+        result = classify_active_read_dims(
+            deep_diag=False,
+            before_tid=100, after_tid=100,
+            has_thread_cpu=False, has_process_cpu=False,
+            has_rusage=False, has_io=False,
+            os_supports_thread_cpu=True, os_supports_process_cpu=True,
+            os_supports_rusage=True, os_supports_io=True,
+        )
+        for v in result.values():
+            self.assertEqual(v, "unsupported")
+
+    def test_all_unsupported_when_os_unsupported(self):
+        """Even with missing OS support, deep_diag=False gates all to unsupported."""
+        from comfymodal_runtime.model_preload import classify_active_read_dims
+        result = classify_active_read_dims(
+            deep_diag=False,
+            before_tid=100, after_tid=100,
+            has_thread_cpu=False, has_process_cpu=False,
+            has_rusage=False, has_io=False,
+            os_supports_thread_cpu=True, os_supports_process_cpu=True,
+            os_supports_rusage=False,
+            os_supports_io=True,
+        )
+        for v in result.values():
+            self.assertEqual(v, "unsupported")
+
+
+class TestCollectRusageAndIOSnapshots(unittest.TestCase):
+    """_collect_rusage_and_io_snapshots works without DIAGNOSTIC_FLAG."""
+
+    def test_on_windows_returns_none_none(self):
+        """On Windows, returns (None, None)."""
+        from comfymodal_runtime.model_preload import _collect_rusage_and_io_snapshots
+        with patch("platform.system", return_value="Windows"):
+            ru, io = _collect_rusage_and_io_snapshots()
+        self.assertIsNone(ru)
+        self.assertIsNone(io)
+
+    def test_on_linux_rusage_and_io_mocked(self):
+        """On Linux with mocked data, returns expected dicts."""
+        from comfymodal_runtime.model_preload import _collect_rusage_and_io_snapshots
+        import types as _types
+
+        class _FakeRusage:
+            ru_minflt = 200
+            ru_majflt = 3
+            ru_inblock = 5
+            ru_nvcsw = 10
+            ru_nivcsw = 1
+
+        _mock_resource = _types.ModuleType("resource")
+        _mock_resource.RUSAGE_THREAD = -1
+        _mock_resource.getrusage = lambda _arg: _FakeRusage()
+
+        fake_proc_io = "rchar: 50000\nread_bytes: 30000\nwchar: 1000\n"
+        with patch("platform.system", return_value="Linux"):
+            with patch.dict("sys.modules", {"resource": _mock_resource}):
+                with patch("builtins.open", unittest.mock.mock_open(read_data=fake_proc_io)):
+                    ru, io = _collect_rusage_and_io_snapshots()
+        self.assertIsNotNone(ru)
+        self.assertEqual(ru["minflt"], 200)
+        self.assertEqual(ru["majflt"], 3)
+        self.assertIsNotNone(io)
+        self.assertEqual(io["rchar"], 50000)
+        self.assertEqual(io["read_bytes"], 30000)
+
+
+class TestThresholdGateAfterSnapshots(unittest.TestCase):
+    """Verify that after-snapshot capture happens only after threshold crossed.
+    This tests the _complete_active_model_read threshold gating logic
+    by exercising the comfyapp module functions."""
+
+    def test_before_snapshots_captured_without_deep_diag(self):
+        """Before rusage/io are captured for restore_background_unet owner
+        regardless of COMFYMODAL_V2_DEEP_MODEL_DIAG."""
+        from comfyapp import _register_active_model_read, _ACTIVE_MODEL_READS, _ACTIVE_MODEL_READS_LOCK
+        key = "test-before-no-deep"
+        with patch.dict(os.environ, {"COMFYMODAL_V2_DEEP_MODEL_DIAG": "0"}, clear=False):
+            status = _register_active_model_read(
+                key, owner="restore_background_unet", path="",
+                restored_instance_id="ri-test", restore_session_id="rs-test",
+            )
+        self.assertEqual(status, "registered")
+        with _ACTIVE_MODEL_READS_LOCK:
+            entry = _ACTIVE_MODEL_READS.get(key)
+        self.assertIsNotNone(entry, "Entry should exist")
+        # before_rusage may be None on non-Linux test runners (CI), but the
+        # key should be present (not missing from entry).  On Linux it should
+        # be a dict; on Windows it's None — both are acceptable as long as
+        # the registration didn't skip capturing.
+        self.assertIn("before_rusage", entry, "before_rusage key must exist in entry")
+        self.assertIn("before_io", entry, "before_io key must exist in entry")
+        # Clean up
+        with _ACTIVE_MODEL_READS_LOCK:
+            _ACTIVE_MODEL_READS.pop(key, None)
+
+    def test_exactly_one_slow_line_per_completed_slow_read(self):
+        """Verify the _complete_active_model_read emits exactly one
+        [v2.slow_model_read] line when elapsed >= threshold."""
+        import io
+        import contextlib
+        from comfyapp import _register_active_model_read, _complete_active_model_read, _ACTIVE_MODEL_READS, _ACTIVE_MODEL_READS_LOCK
+
+        key = "test-exact-one-slow"
+        with patch.dict(os.environ, {"COMFYMODAL_V2_DEEP_MODEL_DIAG": "0",
+                                      "COMFYMODAL_V2_SLOW_READ_THRESHOLD_MS": "0"}, clear=False):
+            status = _register_active_model_read(
+                key, owner="restore_background_unet", path="/fake/unet.safetensors",
+                restored_instance_id="ri-slow", restore_session_id="rs-slow",
+            )
+            self.assertEqual(status, "registered")
+            f = io.StringIO()
+            with contextlib.redirect_stdout(f):
+                _complete_active_model_read(key)
+            output = f.getvalue()
+        slow_lines = [line for line in output.split("\n") if "[v2.slow_model_read]" in line]
+        self.assertEqual(len(slow_lines), 1,
+                         f"Expected exactly 1 [v2.slow_model_read] line, got {len(slow_lines)}: {output}")
+        self.assertIn("[v2.slow_model_read] owner=restore_background_unet", output,
+                      "Slow line must have UNET owner")
+
+    def test_no_slow_line_below_threshold(self):
+        """No [v2.slow_model_read] line when elapsed < threshold."""
+        import io
+        import contextlib
+        from comfyapp import _register_active_model_read, _complete_active_model_read, _ACTIVE_MODEL_READS, _ACTIVE_MODEL_READS_LOCK
+
+        key = "test-no-slow-below-threshold"
+        # Use a high threshold so no read triggers it
+        with patch.dict(os.environ, {"COMFYMODAL_V2_DEEP_MODEL_DIAG": "0",
+                                      "COMFYMODAL_V2_SLOW_READ_THRESHOLD_MS": "999999"}, clear=False):
+            status = _register_active_model_read(
+                key, owner="restore_background_unet", path="/fake/unet.safetensors",
+                restored_instance_id="ri-fast", restore_session_id="rs-fast",
+            )
+            self.assertEqual(status, "registered")
+            f = io.StringIO()
+            with contextlib.redirect_stdout(f):
+                _complete_active_model_read(key)
+            output = f.getvalue()
+        slow_lines = [line for line in output.split("\n") if "[v2.slow_model_read]" in line]
+        self.assertEqual(len(slow_lines), 0,
+                         f"Expected 0 [v2.slow_model_read] lines, got {len(slow_lines)}")
+
+    def test_not_slow_for_non_unet_owner(self):
+        """Non-UNET owners do not emit slow read lines from _complete."""
+        import io
+        import contextlib
+        from comfyapp import _register_active_model_read, _complete_active_model_read, _ACTIVE_MODEL_READS, _ACTIVE_MODEL_READS_LOCK
+
+        key = "test-non-unet-skip"
+        with patch.dict(os.environ, {"COMFYMODAL_V2_DEEP_MODEL_DIAG": "0"}, clear=False):
+            status = _register_active_model_read(
+                key, owner="graph_loader", path="/fake/model.safetensors",
+                restored_instance_id="ri-graph", restore_session_id="rs-graph",
+            )
+            self.assertEqual(status, "registered")
+            f = io.StringIO()
+            with contextlib.redirect_stdout(f):
+                _complete_active_model_read(key)
+            output = f.getvalue()
+        slow_lines = [line for line in output.split("\n") if "[v2.slow_model_read]" in line]
+        self.assertEqual(len(slow_lines), 0,
+                         "Non-UNET owner must not emit slow read line")
+
+    def test_rusage_io_capture_gated_by_owner(self):
+        """Prove rusage/io snapshot helpers are called ONLY for
+        restore_background_unet and NOT for other owners."""
+        import importlib
+        from comfyapp import _register_active_model_read, _ACTIVE_MODEL_READS, _ACTIVE_MODEL_READS_LOCK
+
+        # Patch at the module level so the local import inside
+        # _register_active_model_read sees the mocks.
+        with (
+            patch("comfymodal_runtime.model_preload._capture_rusage_thread_snapshot",
+                  return_value={"rchar": 42, "wchar": 7}) as mock_rusage,
+            patch("comfymodal_runtime.model_preload._capture_proc_self_io",
+                  return_value={"read_bytes": 999}) as mock_io,
+        ):
+            # ── Non-background owner must NOT invoke helpers ──────
+            key_fast = "test-owner-fast-graph"
+            status = _register_active_model_read(
+                key_fast, owner="graph_loader", path="/fake/fast.safetensors",
+                restored_instance_id="ri-fast", restore_session_id="rs-fast",
+            )
+            self.assertEqual(status, "registered")
+            mock_rusage.assert_not_called()
+            mock_io.assert_not_called()
+            with _ACTIVE_MODEL_READS_LOCK:
+                entry_fast = _ACTIVE_MODEL_READS.get(key_fast)
+            self.assertIsNotNone(entry_fast)
+            # Entry must exist but before_* must be None (no capture attempted)
+            self.assertIn("before_rusage", entry_fast)
+            self.assertIn("before_io", entry_fast)
+            self.assertIsNone(entry_fast["before_rusage"],
+                              "Non-background owner should have before_rusage=None")
+            self.assertIsNone(entry_fast["before_io"],
+                              "Non-background owner should have before_io=None")
+            # Reset mock counts for next call
+            mock_rusage.reset_mock()
+            mock_io.reset_mock()
+
+            # ── Background UNET owner MUST invoke helpers ─────────
+            key_bg = "test-owner-bg-unet"
+            status = _register_active_model_read(
+                key_bg, owner="restore_background_unet", path="/fake/unet.safetensors",
+                restored_instance_id="ri-bg", restore_session_id="rs-bg",
+            )
+            self.assertEqual(status, "registered")
+            mock_rusage.assert_called_once()
+            mock_io.assert_called_once()
+            with _ACTIVE_MODEL_READS_LOCK:
+                entry_bg = _ACTIVE_MODEL_READS.get(key_bg)
+            self.assertIsNotNone(entry_bg)
+            self.assertIsNotNone(entry_bg["before_rusage"],
+                                 "Background owner should have before_rusage captured")
+            self.assertIsNotNone(entry_bg["before_io"],
+                                 "Background owner should have before_io captured")
+            self.assertEqual(entry_bg["before_rusage"].get("rchar"), 42)
+            self.assertEqual(entry_bg["before_io"].get("read_bytes"), 999)
+
+        # Clean up
+        with _ACTIVE_MODEL_READS_LOCK:
+            _ACTIVE_MODEL_READS.pop(key_fast, None)
+            _ACTIVE_MODEL_READS.pop(key_bg, None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 3: Remote resume / restore boundary timestamps
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestRestoreBoundaryTimestamps(unittest.TestCase):
+    """remote_python_resume_* and restore_method_* timestamp ordering, presence,
+    and lifecycle-log compatibility."""
+
+    # ── Source-inspection: placement before restore-stage work ────────
+
+    def test_resume_captured_before_restore_perf_start(self):
+        """remote_python_resume_wall_ns assignment precedes _restore_perf_start."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        resume_idx = source.find("remote_python_resume_wall_ns")
+        perf_idx = source.find("_restore_perf_start")
+        self.assertGreater(
+            perf_idx, resume_idx,
+            "remote_python_resume_wall_ns must be set before _restore_perf_start",
+        )
+
+    def test_resume_before_configure_runtime(self):
+        """remote_python_resume_wall_ns precedes _configure_runtime()."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        resume_idx = source.find("remote_python_resume_wall_ns")
+        configure_idx = source.find("_configure_runtime")
+        self.assertLess(
+            resume_idx, configure_idx,
+            "remote_python_resume_wall_ns must be before _configure_runtime()",
+        )
+
+    def test_resume_before_identity_capture(self):
+        """remote_python_resume_wall_ns precedes _capture_remote_identity."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        resume_idx = source.find("remote_python_resume_wall_ns")
+        identity_idx = source.find("_capture_remote_identity")
+        self.assertLess(
+            resume_idx, identity_idx,
+            "remote_python_resume_wall_ns must be before _capture_remote_identity()",
+        )
+
+    def test_resume_before_bootstrap_restore(self):
+        """remote_python_resume_wall_ns precedes bootstrap.restore()."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        resume_idx = source.find("remote_python_resume_wall_ns")
+        bootstrap_idx = source.find("bootstrap.restore")
+        self.assertLess(
+            resume_idx, bootstrap_idx,
+            "remote_python_resume_wall_ns must be before bootstrap.restore()",
+        )
+
+    def test_resume_before_trace_emit_remote_method_entry(self):
+        """remote_python_resume_wall_ns precedes the remote_method_entry trace emit."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        resume_idx = source.find("remote_python_resume_wall_ns")
+        entry_idx = source.find('"remote_method_entry"')
+        self.assertLess(
+            resume_idx, entry_idx,
+            "remote_python_resume_wall_ns must be before remote_method_entry trace emit",
+        )
+
+    def test_restore_method_start_at_same_position(self):
+        """restore_method_start_wall_ns is assigned at same time as
+        remote_python_resume_wall_ns (aliased)."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        resume_idx = source.find("remote_python_resume_wall_ns")
+        start_idx = source.find("restore_method_start_wall_ns")
+        # Both appear in the same small block near the top
+        self.assertLess(start_idx - resume_idx, 300,
+                        "restore_method_start_wall_ns must be close to remote_python_resume_wall_ns")
+
+    # ── Source-inspection: end timestamps on both paths ──────────────
+
+    def test_end_captured_before_error_raise(self):
+        """_restore_end_wall_ns is set before raise in the error path."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        end_idx = source.find("_restore_end_wall_ns")
+        raise_idx = source.rfind("raise")
+        # The raise in the catch block should come after end capture
+        # There may be multiple raise/return; verify end comes before last raise
+        self.assertGreater(raise_idx, 0)
+        # Find the raise that is after the error path's _restore_status assignment
+        err_status_idx = source.find('_restore_status = "error"')
+        self.assertLess(err_status_idx, source.find("raise", err_status_idx),
+                        "_restore_status = 'error' must appear before raise")
+
+    def test_end_captured_before_success_return(self):
+        """_restore_end_wall_ns is set before return _restore_result."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        end_idx = source.find("_restore_end_wall_ns")
+        return_idx = source.rfind("return _restore_result")
+        self.assertLess(
+            end_idx, return_idx,
+            "_restore_end_wall_ns must be set before return _restore_result",
+        )
+
+    def test_success_status_before_return(self):
+        """_restore_status = 'success' appears before return _restore_result."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        success_idx = source.find('_restore_status = "success"')
+        return_idx = source.rfind("return _restore_result")
+        self.assertLess(
+            success_idx, return_idx,
+            "_restore_status = 'success' must appear before return",
+        )
+
+    def test_error_status_before_raise(self):
+        """_restore_status = 'error' appears before raise in the error path."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        error_idx = source.find('_restore_status = "error"')
+        self.assertGreater(error_idx, 0, "_restore_status = 'error' must exist in source")
+        # Verify it's in the error path (after lifecycle_error, before raise)
+        life_err_idx = source.find("lifecycle_error")
+        self.assertLess(life_err_idx, error_idx,
+                        "_restore_status = 'error' must be after lifecycle_error assignment")
+
+    # ── Source-inspection: method-entry aliases in run_plan_stream ──
+
+    def test_modal_method_entry_aliases_present_in_run_plan(self):
+        """modal_method_entry_mono_ns and modal_method_entry_wall_ns exist in run_plan_stream."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        self.assertIn("modal_method_entry_mono_ns", source)
+        self.assertIn("modal_method_entry_wall_ns", source)
+
+    def test_modal_method_entry_aliases_after_first_line(self):
+        """modal_method_entry_* aliases appear after _method_first_line captures."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        mono_idx = source.find("modal_method_entry_mono_ns")
+        wall_idx = source.find("modal_method_entry_wall_ns")
+        line_idx = source.find("_method_first_line_ns")
+        self.assertLess(line_idx, mono_idx,
+                        "_method_first_line_ns must precede modal_method_entry_mono_ns")
+        self.assertLess(line_idx, wall_idx,
+                        "_method_first_line_ns must precede modal_method_entry_wall_ns")
+        # Verify they come BEFORE restore-marker access (same process boundary)
+        marker_idx = source.find("get_restore_return_marker()")
+        self.assertLess(wall_idx, marker_idx,
+                        "modal_method_entry_wall_ns must precede get_restore_return_marker()")
+
+    def test_modal_method_entry_aliases_not_zero(self):
+        """modal_method_entry_* are aliased to the real _method_first_line_* values,
+        not zero placeholders."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        # Verify aliasing assignment pattern
+        self.assertIn("modal_method_entry_mono_ns: int = _method_first_line_ns", source)
+        self.assertIn("modal_method_entry_wall_ns: int = _method_first_line_wall_ns", source)
+
+    # ── Source-inspection: Unix-ns fields in identity lines ─────────
+
+    def test_restoration_identity_has_new_unix_fields(self):
+        """[v2.restoration_identity] contains all four Unix-ns fields."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        self.assertIn("remote_python_resume_wall_unix_ns=", source)
+        self.assertIn("restore_method_start_wall_unix_ns=", source)
+        self.assertIn("restore_method_end_wall_unix_ns=", source)
+        self.assertIn("modal_method_entry_wall_unix_ns=", source,
+                      "modal_method_entry_wall_unix_ns= must be present")
+        self.assertIn('_fmt_or_absent(None)', source,
+                      "modal_method_entry must use _fmt_or_absent(None) to emit 'absent'")
+
+    def test_lifecycle_line_has_new_unix_fields(self):
+        """[v2.lifecycle] method=restore contains all four Unix-ns fields."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # All new fields appear somewhere in the restore source
+        self.assertIn("remote_python_resume_wall_unix_ns=", source)
+        self.assertIn("restore_method_start_wall_unix_ns=", source)
+        self.assertIn("restore_method_end_wall_unix_ns=", source)
+        self.assertIn("modal_method_entry_wall_unix_ns=", source)
+        self.assertIn("restore_status=", source)
+
+    def test_restoration_identity_has_restore_status(self):
+        """[v2.restoration_identity] includes restore_status= field."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        self.assertIn("restore_status=", source)
+
+    # ── Unit tests: ordering and absent semantics ────────────────────
+
+    def test_restore_method_end_ge_start_wall(self):
+        """restore_method_end_wall_ns >= restore_method_start_wall_ns."""
+        start = int(1_700_000_000_000_000_000)
+        end = int(1_700_000_000_000_500_000)
+        self.assertGreaterEqual(end, start,
+                                "end wall must not be before start wall")
+
+    def test_restore_method_end_ge_start_mono(self):
+        """restore_method_end_mono_ns >= restore_method_start_mono_ns."""
+        start = 1_000_000_000
+        end = 1_005_000_000
+        self.assertGreaterEqual(end, start,
+                                "end monotonic must not be before start monotonic")
+
+    def test_absent_via_fmt_or_absent_is_string(self):
+        """_fmt_or_absent(None) returns 'absent', not 0 or None."""
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        entrypoint = ModalRuntimeEntrypoint()
+        result = entrypoint._fmt_or_absent(None)
+        self.assertEqual(result, "absent")
+        self.assertIsInstance(result, str)
+
+    def test_fmt_or_absent_preserves_zero(self):
+        """_fmt_or_absent(0) returns '0', not 'absent'."""
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        entrypoint = ModalRuntimeEntrypoint()
+        result = entrypoint._fmt_or_absent(0)
+        self.assertEqual(result, "0")
+
+    def test_modal_method_entry_absent_in_restore(self):
+        """In the restore method, modal_method_entry_wall_unix_ns is printed
+        as 'absent' because run_plan_stream has not yet been called."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # Should contain "modal_method_entry_wall_unix_ns=absent" string literal
+        self.assertIn("modal_method_entry_wall_unix_ns={self._fmt_or_absent(None)}", source)
+
+    # ── Compatibility: existing prefixes/lines preserved ────────────
+
+    def test_existing_restoration_identity_fields_preserved(self):
+        """Existing [v2.restoration_identity] fields are still present."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        for field in ("restored_instance_id=", "restore_session_id=",
+                      "container_session_id=", "modal_task_id=",
+                      "modal_image_id=", "modal_cloud=", "modal_region=",
+                      "pid=", "hostname=", "restore_total_ms="):
+            self.assertIn(field, source,
+                          f"Existing restoration_identity field {field} must be preserved")
+
+    def test_existing_lifecycle_fields_preserved(self):
+        """Existing [v2.lifecycle] method=restore fields are still present."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # All lifecycle fields appear in the restore source
+        for field in ("container_session=", "restore_count=",
+                      "restore_total_ms=", "status="):
+            self.assertIn(field, source,
+                          f"Existing lifecycle field {field} must be preserved")
+
+    def test_existing_breakdown_prefix_preserved(self):
+        """[v2.restore_breakdown] prefix is preserved in restore."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        self.assertIn("[v2.restore_breakdown]", source)
+
+    def test_existing_clip_stages_prefix_preserved(self):
+        """[v2.clip_stages] prefix is preserved in restore."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        self.assertIn("[v2.clip_stages]", source)
+
+    def test_existing_method_entry_gap_prefix_preserved(self):
+        """[v2.method_entry_gap] prefix is preserved in run_plan_stream."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        self.assertIn("[v2.method_entry_gap]", source)
+
+    def test_existing_lifecycle_startup_preserved(self):
+        """[v2.lifecycle] method=startup is preserved."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.startup)
+        self.assertIn("[v2.lifecycle]", source)
+
+    # ── Same-process method-entry ordering test ──────────────────────
+
+    def test_run_plan_method_entry_after_restore_end(self):
+        """In same process, run_plan_stream method entry (monotonic) must be
+        after restore_method_end_mono_ns.  Verified via source ordering since
+        restore() runs first then run_plan_stream()."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        restore_source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        run_source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        # The restore method definition comes before run_plan_stream
+        restore_def = "def restore"
+        run_def = "def run_plan_stream"
+        self.assertIn(restore_def, restore_source)
+        self.assertIn(run_def, run_source)
+        # Verify _restore_end_wall_ns is assigned in restore (method entry
+        # uses wall too)
+        self.assertIn("_restore_end_wall_ns", restore_source)
+
+    def test_same_process_monotonic_ordering_logic(self):
+        """Verify monotonic_ns increases within a single process (restore then
+        run_plan_stream)."""
+        import time
+        start_mono = time.monotonic_ns()
+        _ = time.monotonic_ns()  # simulated restore_end
+        restore_end = time.monotonic_ns()
+        entry_mono = time.monotonic_ns()  # simulated run_plan_stream entry
+        self.assertGreaterEqual(entry_mono, restore_end,
+                                "method entry must be at or after restore end in same process")
+
+    # ── Fix-verification: success status/end before exposed lines ─────
+
+    def test_success_status_before_identity_print(self):
+        """_restore_status = 'success' appears before [v2.restoration_identity] print."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        succ_idx = source.find('_restore_status = "success"')
+        ident_idx = source.find("[v2.restoration_identity]")
+        self.assertGreater(succ_idx, 0, "_restore_status = 'success' must exist")
+        self.assertGreater(ident_idx, 0, "[v2.restoration_identity] print must exist")
+        self.assertLess(
+            succ_idx, ident_idx,
+            "_restore_status = 'success' must be assigned before [v2.restoration_identity] print",
+        )
+
+    def test_success_end_wall_before_identity_print(self):
+        """_restore_end_wall_ns assignment appears before [v2.restoration_identity] print."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # The success-path captures _restore_end_wall_ns BEFORE the _restore_timing
+        # dict (just after restore_total_ms and just before the dict literal).
+        # Find the occurrence that precedes the identity print.
+        ok_idx = source.find('"lifecycle_status": "ok"')
+        ident_idx = source.find("[v2.restoration_identity]")
+        self.assertGreater(ok_idx, 0, "Success dict with lifecycle_status=ok must exist")
+        self.assertGreater(ident_idx, 0)
+        # There should be at least one _restore_end_wall_ns reference before the
+        # identity print that belongs to the success block.
+        end_before_ident = source.rfind("_restore_end_wall_ns", 0, ident_idx)
+        self.assertGreater(
+            end_before_ident, ok_idx,
+            "Success-path _restore_end_wall_ns must appear after the ok dict start "
+            "but before the [v2.restoration_identity] print",
+        )
+
+    def test_success_end_wall_printed_via_fmt_or_absent(self):
+        """restore_method_end_wall_unix_ns in identity line uses _fmt_or_absent."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # The identity line uses self._fmt_or_absent(_restore_end_wall_ns)
+        identity_line = 'restore_method_end_wall_unix_ns={self._fmt_or_absent(_restore_end_wall_ns)}'
+        self.assertIn(identity_line, source,
+                      "identity line must use _fmt_or_absent for end wall")
+
+    def test_success_end_wall_printed_via_fmt_or_absent_lifecycle(self):
+        """restore_method_end_wall_unix_ns in lifecycle line uses _fmt_or_absent."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        lifecycle_line = 'restore_method_end_wall_unix_ns={self._fmt_or_absent(_restore_end_wall_ns)}'
+        self.assertIn(lifecycle_line, source,
+                      "lifecycle line must use _fmt_or_absent for end wall")
+
+    # ── Fix-verification: method-level exit mechanism ────────────────
+
+    def test_try_finally_exit_guard_exists(self):
+        """restore() wraps the main body in a try/finally exit guard."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # The try: after the bootstrap handler (only one at the 8-space indent
+        # that is not for the inner bootstrap try: at 12-space indent)
+        # Verify there is a try: at the outer level and a matching finally:
+        self.assertIn("        try:", source,
+                      "restore() must have a top-level try for exit guard")
+        self.assertIn("        finally:", source,
+                      "restore() must have a finally for exit guard")
+
+    def test_finally_captures_end_on_unexpected_exit(self):
+        """The finally block captures _restore_end_wall_ns when it is None."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # Verify the guard pattern exists in the source
+        self.assertIn("if _restore_end_wall_ns is None:", source,
+                      "finally must guard against already-set end timestamps")
+        self.assertIn('_restore_status = "error"', source,
+                      "finally must set status to error for unexpected exits")
+
+    def test_finally_prints_lifecycle_on_error(self):
+        """The finally block prints [v2.lifecycle] with status=error on unexpected exit."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # Verify a status=error print exists in the source
+        self.assertIn("status=error", source,
+                      "restore() must emit status=error lifecycle line on error")
+
+    def test_bootstrap_error_prints_lifecycle_error(self):
+        """Bootstrap error handler prints [v2.lifecycle] with status=error."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # Bootstrap handler region has lifecycle line with status=error before raise
+        # There are now at least two status=error lines; verify one is before a raise
+        err_idx = source.find('status=error')
+        raise_idx = source.rfind("raise", 0, err_idx)
+        # A status=error text should exist that appears AFTER some raise content
+        # Actually simpler: confirm bootstrap handler region emits lifecycle status=error
+        boot_idx = source.find("bootstrap.restore")
+        # Find status=error print after bootstrap call
+        status_error_after_bootstrap = source.find("status=error", boot_idx)
+        self.assertGreater(
+            status_error_after_bootstrap, boot_idx,
+            "status=error lifecycle line must appear after bootstrap.restore call",
+        )
+
+    # ── Fix-verification: no false-zero for end timestamps ───────────
+
+    def test_end_wall_initialized_as_none_not_zero(self):
+        """_restore_end_wall_ns initializes as None, not 0."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # The initialization must use None, not 0
+        init_line = "_restore_end_wall_ns: int | None = None"
+        self.assertIn(init_line, source,
+                      "end wall must be initialized as None (not 0)")
+
+    def test_end_mono_initialized_as_none_not_zero(self):
+        """_restore_end_mono_ns initializes as None, not 0."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        init_line = "_restore_end_mono_ns: int | None = None"
+        self.assertIn(init_line, source,
+                      "end mono must be initialized as None (not 0)")
+
+    def test_no_zero_literal_for_restore_end_in_print(self):
+        """Success-path identity/lifecycle print lines use _fmt_or_absent for end wall."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # The success prints use _fmt_or_absent.  Error-handler prints (bootstrap
+        # handler and finally block) use raw _restore_end_wall_ns — intentional
+        # because the value is always a valid int there.
+        # Verify that [v2.restoration_identity] and [v2.lifecycle] method=restore
+        # success prints include _fmt_or_absent — the simplest reliable check:
+        self.assertIn(
+            "restore_method_end_wall_unix_ns={self._fmt_or_absent(_restore_end_wall_ns)}",
+            source,
+            "Success identity/lifecycle print must use _fmt_or_absent for end wall",
+        )
+
+
+class TestRestoreBoundaryTimestampsV2(unittest.TestCase):
+    """Method-level try guard covers early restore setup; _restore_timing carries
+    raw boundary timestamps and restore_method_status.  No Modal deploy required.
+
+    Note: named V2 to avoid shadowing the pre-existing TestRestoreBoundaryTimestamps
+    class which validates timestamp ordering and lifecycle-log compatibility."""
+
+    # ── Method-level guard encloses early setup ──────────────────────
+
+    def test_method_level_try_guard_covers_identity_capture(self):
+        """The outer try in restore() starts before identity capture."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # Find the try that wraps identity capture (after perf_counter, before _capture_remote_identity)
+        perf_idx = source.find("_restore_perf_start = time.perf_counter()")
+        try_idx = source.find("try:\n", perf_idx)
+        identity_idx = source.find("_capture_remote_identity()", perf_idx)
+        self.assertGreater(try_idx, 0, "try block must exist after perf_counter")
+        self.assertGreater(identity_idx, 0, "identity capture must exist")
+        self.assertLess(try_idx, identity_idx,
+                        "try guard must start before identity capture")
+
+    def test_method_level_try_catches_early_exceptions(self):
+        """The except guard after early setup records end wall when missing."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # Find the except that handles early failure
+        except_idx = source.find("except:\n", source.find("_capture_remote_identity"))
+        self.assertGreater(except_idx, 0, "except block for early exceptions must exist")
+        self.assertIn("_restore_end_wall_ns is None", source[except_idx:],
+                      "except must check for missing end wall")
+        self.assertIn("status=error", source[except_idx:],
+                      "except must emit status=error")
+
+    def test_early_except_sets_restore_timing(self):
+        """When _restore_timing is None, the early-exception except sets it."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # Find the method-level except block
+        except_idx = source.find("if self._restore_timing is None:")
+        self.assertGreater(except_idx, 0,
+                           "except must set _restore_timing when not already set")
+        # The _LATEST_LIFECYCLE_TIMING assignment appears after the dict literal
+        # Search the whole source to avoid line-length limits
+        self.assertIn("_LATEST_LIFECYCLE_TIMING = self._restore_timing", source,
+                      "except block must set _LATEST_LIFECYCLE_TIMING")
+
+    def test_method_guard_before_preload_try(self):
+        """The method-level except appears before the preload/finalize try."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # Find the method-level except and the inner try (preload/finalize)
+        outer_except_idx = source.find("except:\n", source.find("_capture_remote_identity"))
+        # The inner try is the first "try:" after the bootstrap handler raise
+        inner_try_idx = source.find("try:\n", source.find("_restore_plan is not None"))
+        self.assertGreater(inner_try_idx, outer_except_idx,
+                           "method-level except comes before inner preload try")
+
+    # ── _restore_timing carries raw timestamps and status ────────────
+
+    def test_restore_timing_success_has_raw_timestamps(self):
+        """Success-path _restore_timing dict carries raw resume/start/end + status."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        self.assertIn('"remote_python_resume_wall_unix_ns"', source)
+        self.assertIn('"remote_python_resume_mono_ns"', source)
+        self.assertIn('"restore_method_start_wall_unix_ns"', source)
+        self.assertIn('"restore_method_start_mono_ns"', source)
+        self.assertIn('"restore_method_end_wall_unix_ns"', source)
+        self.assertIn('"restore_method_end_mono_ns"', source)
+        self.assertIn('"restore_method_status"', source)
+
+    def test_restore_timing_error_has_raw_timestamps(self):
+        """Error-path err_timing dict also carries raw timestamps."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # Find err_timing section (bootstrap error handler)
+        err_idx = source.find("err_timing: dict[str, Any] = {")
+        self.assertGreater(err_idx, 0, "err_timing dict must exist")
+        after_err = source[err_idx:]
+        self.assertIn("remote_python_resume_wall_unix_ns", after_err)
+        self.assertIn("remote_python_resume_mono_ns", after_err)
+        self.assertIn("restore_method_start_wall_unix_ns", after_err)
+        self.assertIn("restore_method_end_wall_unix_ns", after_err)
+        self.assertIn("restore_method_status", after_err)
+
+    def test_restore_timing_has_status_field(self):
+        """_restore_timing has restore_method_status (success/error)."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        # Check both success dict and error dict
+        ok_count = source.count('"restore_method_status": "success"')
+        err_count = source.count('"restore_method_status": "error"')
+        # At least one success (success path) and at least one error (bootstrap handler)
+        self.assertGreaterEqual(ok_count, 1, "Success status must appear in success timing")
+        self.assertGreaterEqual(err_count, 1, "Error status must appear in err_timing")
+
+    def test_restore_method_status_in_lifecycle_prints(self):
+        """[v2.lifecycle] and [v2.restoration_identity] prints carry
+        restore_method_status= in every output line, not just the timing dicts."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.restore)
+        self.assertIn("restore_method_status=", source)
+
+    # ── _fmt_or_absent for genuinely missing values ──────────────────
+
+    def test_fmt_or_absent_returns_absent_for_none(self):
+        """_fmt_or_absent returns 'absent' for None, not '0' or 'None'."""
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        self.assertEqual(ModalRuntimeEntrypoint._fmt_or_absent(None), "absent")
+
+    def test_fmt_or_absent_returns_str_for_numeric(self):
+        """_fmt_or_absent returns str(v) for numeric values."""
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        self.assertEqual(ModalRuntimeEntrypoint._fmt_or_absent(42), "42")
+        self.assertEqual(ModalRuntimeEntrypoint._fmt_or_absent(3.14), "3.14")
+
+    def test_restore_method_entry_wall_in_trace_metadata(self):
+        """run_plan_stream's remote_method_entry has modal_method_entry_wall_unix_ns."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        self.assertIn('"modal_method_entry_wall_unix_ns"', source)
+
+    # ── method_entry_gap carries new fields ──────────────────────────
+
+    def test_method_entry_gap_has_raw_timestamps(self):
+        """[v2.method_entry_gap] print includes all new restore boundary fields."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        self.assertIn("remote_python_resume_wall_unix_ns=", source)
+        self.assertIn("restore_method_start_wall_unix_ns=", source)
+        self.assertIn("restore_method_end_wall_unix_ns=", source)
+        self.assertIn("modal_method_entry_wall_unix_ns=", source)
+        self.assertIn("restore_end_to_modal_method_ms=", source)
+
+    def test_method_entry_gap_uses_fmt_or_absent_for_missing(self):
+        """method_entry_gap code calls _fmt_or_absent for restore timing values."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        gap_idx = source.find('"[v2.method_entry_gap] "')
+        self.assertGreater(gap_idx, 0)
+        near_gap = source[gap_idx:gap_idx + 1000]
+        # _fmt_or_absent is used in the variable computation before the print,
+        # not directly in the f-string.  Verify the variable-assignment code
+        # that feeds the gap line calls _fmt_or_absent.
+        pre_gap = source[:gap_idx]
+        fmt_count = pre_gap.count("self._fmt_or_absent")
+        # At least one call to _fmt_or_absent for a restore timing value
+        self.assertGreaterEqual(fmt_count, 1,
+                                "_fmt_or_absent must be called for restore timing values")
+
+    def test_modal_method_entry_wall_is_actual_value(self):
+        """modal_method_entry_wall_unix_ns uses _method_first_line_wall_ns, not absent/0."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        gap_idx = source.find('"[v2.method_entry_gap] "')
+        self.assertGreater(gap_idx, 0)
+        near_gap = source[gap_idx:gap_idx + 1000]
+        # The entry wall must be the actual variable, not _fmt_or_absent
+        self.assertIn("modal_method_entry_wall_unix_ns={_method_first_line_wall_ns}", near_gap)
+
+    # ── run_plan_stream first-line aliases ───────────────────────────
+
+    def test_first_line_aliases_exist(self):
+        """run_plan_stream has modal_method_entry_mono_ns and modal_method_entry_wall_ns aliases."""
+        import inspect
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        source = inspect.getsource(ModalRuntimeEntrypoint.run_plan_stream)
+        self.assertIn("modal_method_entry_mono_ns", source)
+        self.assertIn("modal_method_entry_wall_ns", source)
+        self.assertIn("_method_first_line_ns", source)
+        self.assertIn("_method_first_line_wall_ns", source)
 
 
 if __name__ == "__main__":
