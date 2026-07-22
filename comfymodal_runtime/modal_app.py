@@ -1,4 +1,4 @@
-"""Deployable v2 Modal application and its runtime entrypoint."""
+﻿"""Deployable v2 Modal application and its runtime entrypoint."""
 
 from __future__ import annotations
 
@@ -94,7 +94,7 @@ _v2_container_restore_count: int = 0
 # All local Python modules that comfyapp.py imports at the top level
 # and that must be available in the remote V2 shadow container.
 # External ComfyUI modules (nodes, server, folder_paths, torch, ...)
-# are provided by the base runtime image — do not list them here.
+# are provided by the base runtime image â€” do not list them here.
 V2_SOURCE_MODULES = (
     "api_prompt_validator",
     "canonical_execution",
@@ -111,7 +111,7 @@ V2_SOURCE_MODULES = (
     "wall_clock_trace_v3",
 )
 
-# ── V2 validation certificate (V1-parity persistent validation cache) ──
+# â”€â”€ V2 validation certificate (V1-parity persistent validation cache) â”€â”€
 # Enabled by default.  Set COMFYMODAL_V2_VALIDATION_CERT=0 to disable.
 # Certificates are stored on the runtime-state Volume keyed by a stable
 # identity that includes workflow struct hash and deployment identity.
@@ -132,7 +132,7 @@ def _get_preflight_context(api: Any, module: Any) -> tuple[str, str]:
     Calls the authoritative helpers ``api._resolve_requirements_repair_mode()``
     and ``module._current_custom_nodes_generation_id()``.  Returns
     ``(repair_mode, custom_nodes_generation)``.  Either may be empty when
-    the helpers are absent or raise — optimisation fails closed.
+    the helpers are absent or raise â€” optimisation fails closed.
     """
     repair_mode = ""
     custom_nodes_gen = ""
@@ -158,7 +158,7 @@ def _compute_v2_cert_identity(
 
     Returns ``(identity_hex, components_dict)``.  Identity is a SHA-256 hex
     string.  When *deployment_identity* is absent or empty, only the
-    workflow_hash is used (deployment combined hash is empty — less
+    workflow_hash is used (deployment combined hash is empty â€” less
     discrimination but still safe).
     """
     import hashlib
@@ -336,7 +336,7 @@ def _read_v2_validation_certificate(
 ) -> dict[str, Any] | None:
     """Read and validate a certificate from the runtime-state volume.
 
-    Synchronous variant — creates a ``ModalMountedStateVolume``, calls
+    Synchronous variant â€” creates a ``ModalMountedStateVolume``, calls
     ``volume.reload()`` synchronously, then delegates to
     ``_read_and_validate_cert_payload()``.
 
@@ -372,7 +372,7 @@ async def _read_v2_validation_certificate_async(
     *,
     expected_components: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
-    """Async variant — uses ``volume.reload_async()`` to avoid Modal's
+    """Async variant â€” uses ``volume.reload_async()`` to avoid Modal's
     "synchronous reload in async context" warning, then delegates to
     ``_read_and_validate_cert_payload()``.
 
@@ -403,7 +403,7 @@ def _capture_remote_identity() -> dict[str, Any]:
     """Capture Modal identity and environment metadata at remote entry.
 
     Gathers ``modal.current_input_id()`` (safe fallback on failure), Modal
-    runtime env vars, and current runtime mode.  Never raises — all access
+    runtime env vars, and current runtime mode.  Never raises â€” all access
     is wrapped in try/except.
     """
     identity: dict[str, Any] = {}
@@ -434,25 +434,25 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
 
     Returns the additive common-schema identity keys used across V1 and V2
     remote resource metadata.  All values are remote-observed or null/empty
-    — never client-generated IDs or raw workflow/image/credential data.
+    â€” never client-generated IDs or raw workflow/image/credential data.
     """
     actual = spec or _MODAL_RESOURCES.get("spec", ModalRuntimeSpec())
     return {
-        # ── App / class identity (from remote-observed values) ────────
+        # â”€â”€ App / class identity (from remote-observed values) â”€â”€â”€â”€â”€â”€â”€â”€
         "app_name": actual.app_name,
         "class_name": CLASS_NAME,
-        # ── Resource allocation ───────────────────────────────────────
+        # â”€â”€ Resource allocation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "gpu": actual.gpu,
         "cpu": actual.cpu,
         "memory_mb": actual.memory,
         "target_inputs": actual.target_inputs,
         "max_inputs": actual.max_inputs,
-        # ── Snapshot flags ────────────────────────────────────────────
+        # â”€â”€ Snapshot flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "snapshot_enabled": str(actual.enable_memory_snapshot),
         "gpu_snapshot_enabled": str(
             os.environ.get("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1"
         ),
-        # ── Volume names and mount paths ──────────────────────────────
+        # â”€â”€ Volume names and mount paths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "models_volume": actual.models_volume_name,
         "runtime_state_volume": actual.runtime_state_volume_name,
         "custom_nodes_volume": actual.custom_nodes_volume_name,
@@ -497,15 +497,16 @@ def _reference_image() -> Any:
     Modal requires that all build steps (``.pip_install``, ``.run_commands``,
     ``.env()``, ``.add_local_dir``) precede any ``.add_local_python_source()``
     calls.  The production base (``_image_base``) already satisfies this, so
-    we start from it, inject the V2-only environment variable, then add the
-    V2 source modules — preserving Modal's ordering constraint and keeping
-    deep diagnostics off the legacy production image.
+    we start from it, then add the V2 source modules â€” preserving Modal's
+    ordering constraint and keeping diagnostics off the legacy production image.
+    The ``COMFYMODAL_V2_DEEP_MODEL_DIAG`` flag is NOT forced here; it follows
+    normal externally-controlled environment variable behavior.
     """
     try:
         legacy = importlib.import_module("comfyapp")
-        # Use _image_base (pre-local-sources) so .env() is legal here.
-        # comfyapp.image already has add_local_python_source applied and
-        # cannot be further modified with build-step commands.
+        # Use _image_base (pre-local-sources).  comfyapp.image already has
+        # add_local_python_source applied and cannot be further modified with
+        # build-step commands.
         base = getattr(legacy, "_image_base", None)
         if base is None:
             # Fallback: attempt the fully-built image (risks build-order
@@ -513,7 +514,7 @@ def _reference_image() -> Any:
             base = getattr(legacy, "image", None)
             if base is None:
                 raise RuntimeError("comfyapp._image_base and .image are unavailable")
-        image = base.env({"COMFYMODAL_V2_DEEP_MODEL_DIAG": "1"})
+        image = base
         for module_name in V2_SOURCE_MODULES:
             image = image.add_local_python_source(module_name)
         return image
@@ -606,7 +607,7 @@ class ModalRuntimeEntrypoint:
 
         Returns the number of threads joined.  Uses a bounded per-thread
         timeout.  If the graph already consumed the future (thread is dead),
-        the join returns immediately.  Never raises — errors are swallowed so
+        the join returns immediately.  Never raises â€” errors are swallowed so
         existing error behaviour is preserved.
         """
         joined = 0
@@ -823,401 +824,563 @@ class ModalRuntimeEntrypoint:
 
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count
+        # â”€â”€ Remote resume / restore method boundary timestamps â”€â”€â”€â”€â”€â”€â”€â”€
+        remote_python_resume_wall_ns: int = int(time.time() * 1_000_000_000)
+        remote_python_resume_mono_ns: int = time.monotonic_ns()
+        restore_method_start_wall_ns: int = remote_python_resume_wall_ns
+        restore_method_start_mono_ns: int = remote_python_resume_mono_ns
+        _restore_status: str = "unknown"
+        _restore_end_wall_ns: int | None = None
+        _restore_end_mono_ns: int | None = None
         _restore_perf_start = time.perf_counter()
-        identity = _capture_remote_identity()
-        self._configure_runtime()
-        trace = RuntimeTrace(process="remote")
-        trace.container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
-        trace.set_metadata(**identity)
-        trace.set_metadata(container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID)
-        _v2_container_restore_count += 1
-        self._restore_count = _v2_container_restore_count
-        restore_session_id = uuid.uuid4().hex
-        # ── V2 restore correlation identity ──────────────────────────
-        restored_instance_id = uuid.uuid4().hex
-        self._restored_instance_id = restored_instance_id
-        _LATEST_RESTORED_INSTANCE_ID = restored_instance_id
-        set_model_load_identity(restored_instance_id, restore_session_id)
-        # Legacy identity: rename old container_session_id internally
-        legacy_container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
-        trace.set_metadata(
-            trace_id=trace.trace_id,
-            restored_instance_id=restored_instance_id,
-            restore_session_id=restore_session_id,
-            legacy_container_session_id=legacy_container_session_id,
-            **_resource_identity(),
-        )
-        trace.emit(
-            "remote_method_entry",
-            phase="lifecycle",
-            metadata={
-                "app_name": APP_NAME,
-                "class_name": CLASS_NAME,
-                "method_name": "restore",
-                "snapshot": "False",
-                "restore_session_id": restore_session_id,
-                "restored_instance_id": restored_instance_id,
-                "legacy_container_session_id": legacy_container_session_id,
-                "restore_count": str(self._restore_count),
-                "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
-                **identity,
-                **_resource_identity(),
-            },
-        )
-        trace.emit(
-            "gpu_invocation_submit",
-            phase="restore",
-            metadata=_resource_identity(),
-        )
-        trace.emit("remote_lifecycle_start", phase="restore", metadata={"snapshot": "False"})
-        trace.emit("restore_plan_read_start", phase="restore")
         try:
-            self._restore_plan = self._get_remote_restore_publisher().read_current_plan()
+            identity = _capture_remote_identity()
+            self._configure_runtime()
+            trace = RuntimeTrace(process="remote")
+            trace.container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
+            trace.set_metadata(**identity)
+            trace.set_metadata(container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID)
+            _v2_container_restore_count += 1
+            self._restore_count = _v2_container_restore_count
+            restore_session_id = uuid.uuid4().hex
+            # â”€â”€ V2 restore correlation identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            restored_instance_id = uuid.uuid4().hex
+            self._restored_instance_id = restored_instance_id
+            _LATEST_RESTORED_INSTANCE_ID = restored_instance_id
+            set_model_load_identity(restored_instance_id, restore_session_id)
+            # Legacy identity: rename old container_session_id internally
+            legacy_container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
+            trace.set_metadata(
+                trace_id=trace.trace_id,
+                restored_instance_id=restored_instance_id,
+                restore_session_id=restore_session_id,
+                legacy_container_session_id=legacy_container_session_id,
+                **_resource_identity(),
+            )
             trace.emit(
-                "restore_plan_read_end",
-                phase="restore",
+                "remote_method_entry",
+                phase="lifecycle",
                 metadata={
-                    "status": "found" if self._restore_plan else "absent",
-                    "generation": str(self._restore_plan.generation if self._restore_plan else ""),
+                    "app_name": APP_NAME,
+                    "class_name": CLASS_NAME,
+                    "method_name": "restore",
+                    "snapshot": "False",
+                    "restore_session_id": restore_session_id,
+                    "restored_instance_id": restored_instance_id,
+                    "legacy_container_session_id": legacy_container_session_id,
+                    "restore_count": str(self._restore_count),
+                    "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
+                    **identity,
+                    **_resource_identity(),
                 },
             )
-        except Exception as exc:
             trace.emit(
-                "restore_plan_read_end",
+                "gpu_invocation_submit",
                 phase="restore",
-                metadata={"status": "error", "error": str(exc)[:200]},
+                metadata=_resource_identity(),
             )
-        _lifecycle_error: str | None = None
+            trace.emit("remote_lifecycle_start", phase="restore", metadata={"snapshot": "False"})
+            trace.emit("restore_plan_read_start", phase="restore")
+            try:
+                self._restore_plan = self._get_remote_restore_publisher().read_current_plan()
+                trace.emit(
+                    "restore_plan_read_end",
+                    phase="restore",
+                    metadata={
+                        "status": "found" if self._restore_plan else "absent",
+                        "generation": str(self._restore_plan.generation if self._restore_plan else ""),
+                    },
+                )
+            except Exception as exc:
+                trace.emit(
+                    "restore_plan_read_end",
+                    phase="restore",
+                    metadata={"status": "error", "error": str(exc)[:200]},
+                )
+            _lifecycle_error: str | None = None
+            try:
+                trace.emit("v2_bootstrap_restore_start", phase="restore")
+                state = self.bootstrap.restore(trace=trace)
+                trace.emit("v2_bootstrap_restore_end", phase="restore")
+            except Exception as exc:
+                _lifecycle_error = str(exc)[:200]
+                trace.emit("v2_bootstrap_restore_end", phase="restore", metadata={"status": "error", "error": _lifecycle_error})
+                trace.emit("remote_lifecycle_end", phase="restore", metadata={"status": "error", "error": _lifecycle_error})
+                self._remember_lifecycle_trace(trace)
+                restore_total_ms = round((time.perf_counter() - _restore_perf_start) * 1000.0, 3)
+                # Capture end timestamps BEFORE constructing err_timing
+                _restore_status = "error"
+                _restore_end_wall_ns = int(time.time() * 1_000_000_000)
+                _restore_end_mono_ns = time.monotonic_ns()
+                err_timing: dict[str, Any] = {
+                    "restore_total_ms": restore_total_ms,
+                    "restore_session_id": restore_session_id,
+                    "restored_instance_id": restored_instance_id,
+                    "container_session_id": self.container_session_id,
+                    "restore_count": self._restore_count,
+                    "lifecycle_status": "error",
+                    "lifecycle_error": _lifecycle_error,
+                    "lifecycle_method": "restore",
+                    "remote_python_resume_wall_unix_ns": remote_python_resume_wall_ns,
+                    "remote_python_resume_mono_ns": remote_python_resume_mono_ns,
+                    "restore_method_start_wall_unix_ns": restore_method_start_wall_ns,
+                    "restore_method_start_mono_ns": restore_method_start_mono_ns,
+                    "restore_method_end_wall_unix_ns": _restore_end_wall_ns,
+                    "restore_method_end_mono_ns": _restore_end_mono_ns,
+                    "restore_method_status": "error",
+                }
+                self._restore_timing = err_timing
+                _LATEST_LIFECYCLE_TIMING = err_timing
+                print(
+                    f"[v2.lifecycle] method=restore snap=False "
+                    f"container_session={_V2_CONTAINER_SESSION_ID} "
+                    f"restore_count={self._restore_count} "
+                    f"restore_total_ms={restore_total_ms} "
+                    f"remote_python_resume_wall_unix_ns={remote_python_resume_wall_ns} "
+                    f"restore_method_start_wall_unix_ns={restore_method_start_wall_ns} "
+                    f"restore_method_end_wall_unix_ns={_restore_end_wall_ns} "
+                    f"modal_method_entry_wall_unix_ns={self._fmt_or_absent(None)} "
+                    f"restore_status={_restore_status} "
+                    f"restore_method_status={_restore_status} "
+                    f"status=error",
+                    flush=True,
+                )
+                raise
+        except:
+            # Method-level guard: captures end timestamps for exceptions that
+            # escape before the preload/finalize try block (e.g. identity
+            # capture, configuration, trace setup, plan read, bootstrap).
+            # The bootstrap error handler already sets _restore_end_wall_ns
+            # etc., so this except only fires for truly early failures.
+            if _restore_end_wall_ns is None:
+                _restore_end_wall_ns = int(time.time() * 1_000_000_000)
+                _restore_end_mono_ns = time.monotonic_ns()
+                if _restore_status not in ("success", "error"):
+                    _restore_status = "error"
+                print(
+                    f"[v2.lifecycle] method=restore snap=False "
+                    f"container_session={_V2_CONTAINER_SESSION_ID} "
+                    f"restore_count={getattr(self, '_restore_count', 0)} "
+                    f"restore_total_ms={round((time.perf_counter() - _restore_perf_start) * 1000.0, 3)} "
+                    f"remote_python_resume_wall_unix_ns={remote_python_resume_wall_ns} "
+                    f"restore_method_start_wall_unix_ns={restore_method_start_wall_ns} "
+                    f"restore_method_end_wall_unix_ns={_restore_end_wall_ns} "
+                    f"modal_method_entry_wall_unix_ns={self._fmt_or_absent(None)} "
+                    f"restore_status={_restore_status} "
+                    f"restore_method_status={_restore_status} "
+                    f"status=error",
+                    flush=True,
+                )
+                if self._restore_timing is None:
+                    self._restore_timing = {
+                        "restore_total_ms": round((time.perf_counter() - _restore_perf_start) * 1000.0, 3),
+                        "restore_session_id": "",
+                        "restored_instance_id": "",
+                        "container_session_id": getattr(self, "container_session_id", ""),
+                        "restore_count": getattr(self, "_restore_count", 0),
+                        "lifecycle_status": "error",
+                        "lifecycle_error": "unhandled_restore_error",
+                        "lifecycle_method": "restore",
+                        "remote_python_resume_wall_unix_ns": remote_python_resume_wall_ns,
+                        "remote_python_resume_mono_ns": remote_python_resume_mono_ns,
+                        "restore_method_start_wall_unix_ns": restore_method_start_wall_ns,
+                        "restore_method_start_mono_ns": restore_method_start_mono_ns,
+                        "restore_method_end_wall_unix_ns": _restore_end_wall_ns,
+                        "restore_method_end_mono_ns": _restore_end_mono_ns,
+                        "restore_method_status": "error",
+                    }
+                    _LATEST_LIFECYCLE_TIMING = self._restore_timing
+                elif self._restore_timing is not None:
+                    # Bootstrap error path may have set _restore_timing without raw end fields;
+                    # backfill them now from the captured _restore_end_* locals.
+                    _rt = self._restore_timing
+                    if _rt.get("restore_method_end_wall_unix_ns") is None:
+                        _rt["restore_method_end_wall_unix_ns"] = _restore_end_wall_ns
+                    if _rt.get("restore_method_end_mono_ns") is None:
+                        _rt["restore_method_end_mono_ns"] = _restore_end_mono_ns
+                    if _rt.get("restore_method_status") is None:
+                        _rt["restore_method_status"] = "error"
+                    if _rt.get("remote_python_resume_wall_unix_ns") is None:
+                        _rt["remote_python_resume_wall_unix_ns"] = remote_python_resume_wall_ns
+                    if _rt.get("remote_python_resume_mono_ns") is None:
+                        _rt["remote_python_resume_mono_ns"] = remote_python_resume_mono_ns
+                    if _rt.get("restore_method_start_wall_unix_ns") is None:
+                        _rt["restore_method_start_wall_unix_ns"] = restore_method_start_wall_ns
+                    if _rt.get("restore_method_start_mono_ns") is None:
+                        _rt["restore_method_start_mono_ns"] = restore_method_start_mono_ns
+                    _LATEST_LIFECYCLE_TIMING = _rt
+            raise
         try:
-            trace.emit("v2_bootstrap_restore_start", phase="restore")
-            state = self.bootstrap.restore(trace=trace)
-            trace.emit("v2_bootstrap_restore_end", phase="restore")
-        except Exception as exc:
-            _lifecycle_error = str(exc)[:200]
-            trace.emit("v2_bootstrap_restore_end", phase="restore", metadata={"status": "error", "error": _lifecycle_error})
-            trace.emit("remote_lifecycle_end", phase="restore", metadata={"status": "error", "error": _lifecycle_error})
+            if self._restore_plan is not None:
+                trace.emit("preload_submission_start", phase="restore", metadata={
+                    "restore_plan_generation": str(self._restore_plan.generation),
+                })
+                preparation: RestorePreparation | None = None
+                # â”€â”€ Bounded V2 latency: check if we can defer UNET+VAE to
+                #    original graph loaders and prepare only CLIP through the
+                #    V2 bridge.  On any failure (missing helper, exception,
+                #    non-submitted background future) we fail closed to the
+                #    existing full V2 preload path. â”€â”€
+                _optimized_ok = False
+                _unet_deferred_meta: dict[str, Any] = {}
+                _defer_api = self._load_legacy_runtime() if self._restore_plan else None
+                if self._check_unet_deferral_eligible(_defer_api, self._restore_plan):
+                    trace.emit("defer_trial_start", phase="restore", metadata={
+                        "unet_identity_hash": stable_hash(self._restore_plan.model_key.unet_identity) if self._restore_plan else "",
+                    })
+                    try:
+                        # â”€â”€ v2 UNET cache patch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                        trace.emit("v2_unet_cache_patch_start", phase="restore")
+                        _defer_api._patch_unet_loader_cache()
+                        trace.emit("v2_unet_cache_patch_end", phase="restore")
+
+                        # â”€â”€ v2 CLIP prepare submit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                        trace.emit("v2_clip_prepare_submit_start", phase="restore")
+                        # Prepare only CLIP through V2; UNET and VAE are
+                        # deferred to the original (patched) graph loaders.
+                        preparation = self._preload_bridge.prepare(
+                            self._restore_plan, trace=trace,
+                            prepare_unet=False, prepare_vae=False,
+                        )
+                        trace.emit("v2_clip_prepare_submit_end", phase="restore")
+
+                        # â”€â”€ v2 CLIP worker wait â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                        trace.emit("v2_clip_worker_wait_start", phase="restore")
+                        self._preload_bridge.close_workers()
+                        trace.emit("v2_clip_worker_wait_end", phase="restore")
+                        trace.emit("v2_clip_ready", phase="restore")
+
+                        # â”€â”€ v2 UNET spec extract â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                        trace.emit("v2_unet_spec_extract_start", phase="restore")
+                        unet_name = self._restore_plan.model_key.unet_identity
+                        weight_dtype = "default"
+                        try:
+                            unet_specs = self._restore_plan.model_spec.get("loaders", {}).get("unet", [])
+                            if unet_specs and isinstance(unet_specs, list) and len(unet_specs) > 0:
+                                weight_dtype = str(unet_specs[0].get("weight_dtype", "default"))
+                        except Exception:
+                            pass
+                        trace.emit("v2_unet_spec_extract_end", phase="restore",
+                                   metadata={"unet_name": unet_name, "weight_dtype": weight_dtype})
+
+                        # â”€â”€ v2 background UNET submit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                        trace.emit("v2_background_unet_submit_start", phase="restore")
+
+                        # Build diagnostic scope factory for the background worker.
+                        # Use a shared mutable dict so _start_production_restore_unet
+                        # populates canonical_key, diagnostic_id, resolved_path before
+                        # the worker thread starts, and the factory reads the live values.
+                        _bg_diag_ctx: dict[str, Any] = {
+                            "canonical_key": "",
+                            "diagnostic_id": "",
+                            "resolved_path": "",
+                            "restored_instance_id": restored_instance_id,
+                            "restore_session_id": restore_session_id,
+                            "weight_dtype": weight_dtype,
+                            "submitted_at_unix": time.time(),
+                        }
+                        _bg_unet_trace_ref = None
+                        try:
+                            from comfymodal_runtime.model_preload import external_model_lane_scope
+                            _factory_tid = trace.trace_id
+
+                            def _bg_unet_diag_scope_factory():
+                                """Create external_model_lane_scope for the bg UNET worker.
+                                Reads live values from the shared mutable _bg_diag_ctx
+                                dict, which _start_production_restore_unet populated."""
+                                _ck = str(_bg_diag_ctx.get("canonical_key", ""))
+                                _did = str(_bg_diag_ctx.get("diagnostic_id", ""))
+                                _rp = str(_bg_diag_ctx.get("resolved_path", ""))
+                                _bt = RuntimeTrace(
+                                    process="remote_background_unet",
+                                    trace_id=_factory_tid,
+                                )
+                                _bt.set_metadata(
+                                    restored_instance_id=str(_bg_diag_ctx.get("restored_instance_id", "")),
+                                    restore_session_id=str(_bg_diag_ctx.get("restore_session_id", "")),
+                                    canonical_key=_ck,
+                                    diagnostic_id=_did,
+                                    resolved_path=_rp,
+                                    weight_dtype=str(_bg_diag_ctx.get("weight_dtype", "")),
+                                )
+                                return external_model_lane_scope(
+                                    _bt, lane="UNET", phase="restore", expected_read_count=1,
+                                )
+
+                            _defer_result = _defer_api._start_production_restore_unet(
+                                {"unet": unet_name, "weight_dtype": weight_dtype},
+                                restore_start=time.time(),
+                                restore_stages={},
+                                diagnostic_scope_factory=_bg_unet_diag_scope_factory,
+                                diagnostic_context=_bg_diag_ctx,
+                                diagnostic_sink=None,
+                            )
+                            # Update shared context with values returned by the method
+                            _defer_key = str(_defer_result.get("canonical_key", ""))
+                            _defer_did = str(_defer_result.get("diagnostic_id", ""))
+                            if _defer_key:
+                                _bg_diag_ctx["canonical_key"] = _defer_key
+                            if _defer_did:
+                                _bg_diag_ctx["diagnostic_id"] = _defer_did
+                            _bg_unet_trace_ref = None
+                        except Exception:
+                            _defer_result = _defer_api._start_production_restore_unet(
+                                {"unet": unet_name, "weight_dtype": weight_dtype},
+                                restore_start=time.time(),
+                                restore_stages={},
+                            )
+
+                        trace.emit("v2_background_unet_submit_end", phase="restore",
+                                   metadata={"submitted": _defer_result.get("submitted", False),
+                                             "canonical_key": _defer_result.get("canonical_key", ""),
+                                             "diagnostic_id": _defer_result.get("diagnostic_id", "")})
+
+                        # NOTE: bg_unet IO/stages summaries are NOT emitted here.
+                        # They are emitted inside external_model_lane_scope's finally
+                        # block after the worker completes (model_preload.py).
+                        if _defer_result.get("submitted"):
+                            _optimized_ok = True
+                            _unet_deferred_meta = {
+                                "decision": str(_defer_result.get("decision", "unknown")),
+                                "submitted": True,
+                                "unet_identity": unet_name,
+                            }
+                            trace.emit("defer_trial_result", phase="restore", metadata={
+                                "submitted": True,
+                                "decision": str(_defer_result.get("decision", "unknown"))[:120],
+                            })
+                        else:
+                            trace.emit("defer_trial_result", phase="restore", metadata={
+                                "submitted": False,
+                                "reason": "not_submitted",
+                            })
+                    except Exception as _defer_exc:
+                        trace.emit("defer_trial_result", phase="restore", metadata={
+                            "submitted": False,
+                            "reason": str(_defer_exc)[:200],
+                        })
+                if not _optimized_ok:
+                    # Check whether an existing clip-only preparation can be
+                    # extended with UNET+VAE rather than cleared+reprepared.
+                    _existing = self._preload_bridge._preparation
+                    _can_extend = False
+                    if _existing is not None and _existing.clip_future is not None:
+                        try:
+                            _existing.clip_future.result()  # non-blocking; already waited
+                            _can_extend = True
+                        except Exception:
+                            _can_extend = False
+                    if _can_extend:
+                        preparation = self._preload_bridge.extend_preparation(
+                            prepare_unet=True, prepare_vae=True, trace=trace,
+                        )
+                        self._preload_bridge.close_workers()
+                        trace.emit(
+                            "preload_fallback_mode", phase="restore",
+                            metadata={"mode": "extended_existing_preparation"},
+                        )
+                    else:
+                        # Fail closed: clear any partially-prepared bridge state
+                        # and use the full V2 preload path.
+                        _reason = "no_useful_existing_preparation"
+                        if _existing is not None and _existing.clip_future is not None:
+                            _reason = "clip_future_failed"
+                        self._preload_bridge.clear()
+                        preparation = self._preload_bridge.prepare(self._restore_plan, trace=trace)
+                        self._preload_bridge.close_workers()
+                        trace.emit(
+                            "preload_fallback_mode", phase="restore",
+                            metadata={"mode": "full_reprepare", "reason": _reason},
+                        )
+                # Shared tail: trace metadata common to both paths.
+                trace.emit("preload_submission_end", phase="restore", metadata={
+                    "preload_scheduled": str(bool(preparation)),
+                    "unet_deferred": _optimized_ok,
+                })
+                trace.set_metadata(
+                    restore_plan_generation=str(self._restore_plan.generation),
+                    preload_scheduled=bool(preparation),
+                    preload_diagnostics=self._preload_bridge.diagnostics(),
+                )
+                if _optimized_ok:
+                    trace.emit("unet_deferred", phase="restore", metadata=_unet_deferred_meta)
+            else:
+                self._preload_bridge.clear()
+            trace.emit(
+                "restore_completion_evidence",
+                phase="restore",
+                metadata={
+                    "preload_submitted": str(self._restore_plan is not None),
+                    "restore_plan_generation": str(
+                        self._restore_plan.generation if self._restore_plan else ""
+                    ),
+                },
+            )
+            # â”€â”€ v2 restore finalize â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            trace.emit("v2_restore_finalize_start", phase="restore")
+
+            trace.emit("remote_lifecycle_end", phase="restore", metadata={"status": "restored"})
             self._remember_lifecycle_trace(trace)
+            trace = self._lifecycle_trace or trace
+
             restore_total_ms = round((time.perf_counter() - _restore_perf_start) * 1000.0, 3)
-            err_timing: dict[str, Any] = {
+            # Capture end timestamps BEFORE constructing _restore_timing
+            _restore_status = "success"
+            _restore_end_wall_ns = int(time.time() * 1_000_000_000)
+            _restore_end_mono_ns = time.monotonic_ns()
+            _restore_timing: dict[str, Any] = {
                 "restore_total_ms": restore_total_ms,
                 "restore_session_id": restore_session_id,
                 "restored_instance_id": restored_instance_id,
+                "legacy_container_session_id": legacy_container_session_id,
                 "container_session_id": self.container_session_id,
                 "restore_count": self._restore_count,
-                "lifecycle_status": "error",
-                "lifecycle_error": _lifecycle_error,
+                "lifecycle_status": "ok",
                 "lifecycle_method": "restore",
+                "remote_python_resume_wall_unix_ns": remote_python_resume_wall_ns,
+                "remote_python_resume_mono_ns": remote_python_resume_mono_ns,
+                "restore_method_start_wall_unix_ns": restore_method_start_wall_ns,
+                "restore_method_start_mono_ns": restore_method_start_mono_ns,
+                "restore_method_end_wall_unix_ns": _restore_end_wall_ns,
+                "restore_method_end_mono_ns": _restore_end_mono_ns,
+                "restore_method_status": "success",
             }
-            self._restore_timing = err_timing
-            _LATEST_LIFECYCLE_TIMING = err_timing
-            raise
-        if self._restore_plan is not None:
-            trace.emit("preload_submission_start", phase="restore", metadata={
-                "restore_plan_generation": str(self._restore_plan.generation),
-            })
-            preparation: RestorePreparation | None = None
-            # ── Bounded V2 latency: check if we can defer UNET+VAE to
-            #    original graph loaders and prepare only CLIP through the
-            #    V2 bridge.  On any failure (missing helper, exception,
-            #    non-submitted background future) we fail closed to the
-            #    existing full V2 preload path. ──
-            _optimized_ok = False
-            _unet_deferred_meta: dict[str, Any] = {}
-            _defer_api = self._load_legacy_runtime() if self._restore_plan else None
-            if self._check_unet_deferral_eligible(_defer_api, self._restore_plan):
-                trace.emit("defer_trial_start", phase="restore", metadata={
-                    "unet_identity_hash": stable_hash(self._restore_plan.model_key.unet_identity) if self._restore_plan else "",
-                })
-                try:
-                    # ── v2 UNET cache patch ────────────────────────
-                    trace.emit("v2_unet_cache_patch_start", phase="restore")
-                    _defer_api._patch_unet_loader_cache()
-                    trace.emit("v2_unet_cache_patch_end", phase="restore")
+            # Include available stage timings from bootstrap state (only when present)
+            if state.stage_durations:
+                for _stage, _dur_ms in state.stage_durations.items():
+                    if _dur_ms is not None and _dur_ms > 0:
+                        _restore_timing[f"{_stage}_ms"] = round(float(_dur_ms), 3)
+            self._restore_timing = _restore_timing
+            _LATEST_LIFECYCLE_TIMING = _restore_timing
 
-                    # ── v2 CLIP prepare submit ─────────────────────
-                    trace.emit("v2_clip_prepare_submit_start", phase="restore")
-                    # Prepare only CLIP through V2; UNET and VAE are
-                    # deferred to the original (patched) graph loaders.
-                    preparation = self._preload_bridge.prepare(
-                        self._restore_plan, trace=trace,
-                        prepare_unet=False, prepare_vae=False,
-                    )
-                    trace.emit("v2_clip_prepare_submit_end", phase="restore")
+            trace.emit("v2_restore_finalize_end", phase="restore")
+            _restore_result = {
+                "backend": state.backend,
+                "cuda": dict(state.cuda),
+                "runtime_generation": state.runtime_generation,
+                "status": "restored",
+                "_restore_timing": _restore_timing,
+                "restored_instance_id": restored_instance_id,
+                "restore_session_id": restore_session_id,
+                "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
+                "trace": trace.to_dict(),
+                "phase_durations_ms": trace.export_phase_durations(),
+            }
 
-                    # ── v2 CLIP worker wait ────────────────────────
-                    trace.emit("v2_clip_worker_wait_start", phase="restore")
-                    self._preload_bridge.close_workers()
-                    trace.emit("v2_clip_worker_wait_end", phase="restore")
-                    trace.emit("v2_clip_ready", phase="restore")
-
-                    # ── v2 UNET spec extract ───────────────────────
-                    trace.emit("v2_unet_spec_extract_start", phase="restore")
-                    unet_name = self._restore_plan.model_key.unet_identity
-                    weight_dtype = "default"
-                    try:
-                        unet_specs = self._restore_plan.model_spec.get("loaders", {}).get("unet", [])
-                        if unet_specs and isinstance(unet_specs, list) and len(unet_specs) > 0:
-                            weight_dtype = str(unet_specs[0].get("weight_dtype", "default"))
-                    except Exception:
-                        pass
-                    trace.emit("v2_unet_spec_extract_end", phase="restore",
-                               metadata={"unet_name": unet_name, "weight_dtype": weight_dtype})
-
-                    # ── v2 background UNET submit ──────────────────
-                    trace.emit("v2_background_unet_submit_start", phase="restore")
-
-                    # Build diagnostic scope factory for the background worker.
-                    # Use a shared mutable dict so _start_production_restore_unet
-                    # populates canonical_key, diagnostic_id, resolved_path before
-                    # the worker thread starts, and the factory reads the live values.
-                    _bg_diag_ctx: dict[str, Any] = {
-                        "canonical_key": "",
-                        "diagnostic_id": "",
-                        "resolved_path": "",
-                        "restored_instance_id": restored_instance_id,
-                        "restore_session_id": restore_session_id,
-                        "weight_dtype": weight_dtype,
-                        "submitted_at_unix": time.time(),
-                    }
-                    _bg_unet_trace_ref = None
-                    try:
-                        from comfymodal_runtime.model_preload import external_model_lane_scope
-                        _factory_tid = trace.trace_id
-
-                        def _bg_unet_diag_scope_factory():
-                            """Create external_model_lane_scope for the bg UNET worker.
-                            Reads live values from the shared mutable _bg_diag_ctx
-                            dict, which _start_production_restore_unet populated."""
-                            _ck = str(_bg_diag_ctx.get("canonical_key", ""))
-                            _did = str(_bg_diag_ctx.get("diagnostic_id", ""))
-                            _rp = str(_bg_diag_ctx.get("resolved_path", ""))
-                            _bt = RuntimeTrace(
-                                process="remote_background_unet",
-                                trace_id=_factory_tid,
-                            )
-                            _bt.set_metadata(
-                                restored_instance_id=str(_bg_diag_ctx.get("restored_instance_id", "")),
-                                restore_session_id=str(_bg_diag_ctx.get("restore_session_id", "")),
-                                canonical_key=_ck,
-                                diagnostic_id=_did,
-                                resolved_path=_rp,
-                                weight_dtype=str(_bg_diag_ctx.get("weight_dtype", "")),
-                            )
-                            return external_model_lane_scope(
-                                _bt, lane="UNET", phase="restore", expected_read_count=1,
-                            )
-
-                        _defer_result = _defer_api._start_production_restore_unet(
-                            {"unet": unet_name, "weight_dtype": weight_dtype},
-                            restore_start=time.time(),
-                            restore_stages={},
-                            diagnostic_scope_factory=_bg_unet_diag_scope_factory,
-                            diagnostic_context=_bg_diag_ctx,
-                            diagnostic_sink=None,
-                        )
-                        # Update shared context with values returned by the method
-                        _defer_key = str(_defer_result.get("canonical_key", ""))
-                        _defer_did = str(_defer_result.get("diagnostic_id", ""))
-                        if _defer_key:
-                            _bg_diag_ctx["canonical_key"] = _defer_key
-                        if _defer_did:
-                            _bg_diag_ctx["diagnostic_id"] = _defer_did
-                        _bg_unet_trace_ref = None
-                    except Exception:
-                        _defer_result = _defer_api._start_production_restore_unet(
-                            {"unet": unet_name, "weight_dtype": weight_dtype},
-                            restore_start=time.time(),
-                            restore_stages={},
-                        )
-
-                    trace.emit("v2_background_unet_submit_end", phase="restore",
-                               metadata={"submitted": _defer_result.get("submitted", False),
-                                         "canonical_key": _defer_result.get("canonical_key", ""),
-                                         "diagnostic_id": _defer_result.get("diagnostic_id", "")})
-
-                    # NOTE: bg_unet IO/stages summaries are NOT emitted here.
-                    # They are emitted inside external_model_lane_scope's finally
-                    # block after the worker completes (model_preload.py).
-                    if _defer_result.get("submitted"):
-                        _optimized_ok = True
-                        _unet_deferred_meta = {
-                            "decision": str(_defer_result.get("decision", "unknown")),
-                            "submitted": True,
-                            "unet_identity": unet_name,
-                        }
-                        trace.emit("defer_trial_result", phase="restore", metadata={
-                            "submitted": True,
-                            "decision": str(_defer_result.get("decision", "unknown"))[:120],
-                        })
-                    else:
-                        trace.emit("defer_trial_result", phase="restore", metadata={
-                            "submitted": False,
-                            "reason": "not_submitted",
-                        })
-                except Exception as _defer_exc:
-                    trace.emit("defer_trial_result", phase="restore", metadata={
-                        "submitted": False,
-                        "reason": str(_defer_exc)[:200],
-                    })
-            if not _optimized_ok:
-                # Check whether an existing clip-only preparation can be
-                # extended with UNET+VAE rather than cleared+reprepared.
-                _existing = self._preload_bridge._preparation
-                _can_extend = False
-                if _existing is not None and _existing.clip_future is not None:
-                    try:
-                        _existing.clip_future.result()  # non-blocking; already waited
-                        _can_extend = True
-                    except Exception:
-                        _can_extend = False
-                if _can_extend:
-                    preparation = self._preload_bridge.extend_preparation(
-                        prepare_unet=True, prepare_vae=True, trace=trace,
-                    )
-                    self._preload_bridge.close_workers()
-                    trace.emit(
-                        "preload_fallback_mode", phase="restore",
-                        metadata={"mode": "extended_existing_preparation"},
-                    )
-                else:
-                    # Fail closed: clear any partially-prepared bridge state
-                    # and use the full V2 preload path.
-                    _reason = "no_useful_existing_preparation"
-                    if _existing is not None and _existing.clip_future is not None:
-                        _reason = "clip_future_failed"
-                    self._preload_bridge.clear()
-                    preparation = self._preload_bridge.prepare(self._restore_plan, trace=trace)
-                    self._preload_bridge.close_workers()
-                    trace.emit(
-                        "preload_fallback_mode", phase="restore",
-                        metadata={"mode": "full_reprepare", "reason": _reason},
-                    )
-            # Shared tail: trace metadata common to both paths.
-            trace.emit("preload_submission_end", phase="restore", metadata={
-                "preload_scheduled": str(bool(preparation)),
-                "unet_deferred": _optimized_ok,
-            })
-            trace.set_metadata(
-                restore_plan_generation=str(self._restore_plan.generation),
-                preload_scheduled=bool(preparation),
-                preload_diagnostics=self._preload_bridge.diagnostics(),
+            # â”€â”€ Emit compact restore-breakdown summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            _brk, _clip = _collect_restore_events_for_summary(trace)
+            print(
+                f"[v2.restore_breakdown] "
+                f"bootstrap_ms={_brk.get('bootstrap_ms')} "
+                f"unet_cache_patch_ms={_brk.get('unet_cache_patch_ms')} "
+                f"clip_prepare_submit_ms={_brk.get('clip_prepare_submit_ms')} "
+                f"clip_worker_wait_ms={_brk.get('clip_worker_wait_ms')} "
+                f"unet_spec_extract_ms={_brk.get('unet_spec_extract_ms')} "
+                f"bg_unet_submit_ms={_brk.get('bg_unet_submit_ms')} "
+                f"restore_finalize_ms={_brk.get('restore_finalize_ms')}",
+                flush=True,
             )
-            if _optimized_ok:
-                trace.emit("unet_deferred", phase="restore", metadata=_unet_deferred_meta)
-        else:
-            self._preload_bridge.clear()
-        trace.emit(
-            "restore_completion_evidence",
-            phase="restore",
-            metadata={
-                "preload_submitted": str(self._restore_plan is not None),
-                "restore_plan_generation": str(
-                    self._restore_plan.generation if self._restore_plan else ""
-                ),
-            },
-        )
-        # ── v2 restore finalize ──────────────────────────────────────
-        trace.emit("v2_restore_finalize_start", phase="restore")
+            print(
+                f"[v2.clip_stages] "
+                f"worker_queue_ms={_clip.get('worker_queue_ms')} "
+                f"load_torch_file_ms={_clip.get('load_torch_file_ms')} "
+                f"read_to_ready_ms={_clip.get('read_to_ready_ms')} "
+                f"post_read_cpu_prepare_ms={_clip.get('post_read_cpu_prepare_ms')} "
+                f"gpu_wait_ms={_clip.get('gpu_wait_ms')} "
+                f"gpu_commit_ms={_clip.get('gpu_commit_ms')} "
+                f"read_end_to_ready_ms={_clip.get('read_end_to_ready_ms')} "
+                f"worker_total_ms={_clip.get('worker_total_ms')} "
+                f"worker_close_wait_ms={_clip.get('worker_close_wait_ms')} "
+                f"restore_finalization_ms={_clip.get('restore_finalization_ms')}",
+                flush=True,
+            )
 
-        trace.emit("remote_lifecycle_end", phase="restore", metadata={"status": "restored"})
-        self._remember_lifecycle_trace(trace)
-        trace = self._lifecycle_trace or trace
+            # â”€â”€ Emit restoration identity line â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            print(
+                f"[v2.restoration_identity] "
+                f"restored_instance_id={restored_instance_id} "
+                f"restore_session_id={restore_session_id} "
+                f"container_session_id={self.container_session_id or _V2_CONTAINER_SESSION_ID} "
+                f"modal_task_id={identity.get('container_task_id', '')} "
+                f"modal_image_id={identity.get('image_id', '')} "
+                f"modal_cloud={identity.get('cloud', '')} "
+                f"modal_region={identity.get('region', '')} "
+                f"pid={os.getpid()} "
+                f"hostname={_capture_host_info().get('hostname', '')} "
+                f"restore_total_ms={restore_total_ms} "
+                f"remote_python_resume_wall_unix_ns={remote_python_resume_wall_ns} "
+                f"restore_method_start_wall_unix_ns={restore_method_start_wall_ns} "
+                f"restore_method_end_wall_unix_ns={self._fmt_or_absent(_restore_end_wall_ns)} "
+                f"modal_method_entry_wall_unix_ns={self._fmt_or_absent(None)} "
+                f"restore_status={_restore_status} "
+                f"restore_method_status={_restore_status} ",
+                flush=True,
+            )
 
-        restore_total_ms = round((time.perf_counter() - _restore_perf_start) * 1000.0, 3)
-        _restore_timing: dict[str, Any] = {
-            "restore_total_ms": restore_total_ms,
-            "restore_session_id": restore_session_id,
-            "restored_instance_id": restored_instance_id,
-            "legacy_container_session_id": legacy_container_session_id,
-            "container_session_id": self.container_session_id,
-            "restore_count": self._restore_count,
-            "lifecycle_status": "ok",
-            "lifecycle_method": "restore",
-        }
-        # Include available stage timings from bootstrap state (only when present)
-        if state.stage_durations:
-            for _stage, _dur_ms in state.stage_durations.items():
-                if _dur_ms is not None and _dur_ms > 0:
-                    _restore_timing[f"{_stage}_ms"] = round(float(_dur_ms), 3)
-        self._restore_timing = _restore_timing
-        _LATEST_LIFECYCLE_TIMING = _restore_timing
+            print(
+                f"[v2.lifecycle] method=restore snap=False "
+                f"container_session={_V2_CONTAINER_SESSION_ID} "
+                f"restore_count={self._restore_count} "
+                f"restore_total_ms={restore_total_ms} "
+                f"remote_python_resume_wall_unix_ns={remote_python_resume_wall_ns} "
+                f"restore_method_start_wall_unix_ns={restore_method_start_wall_ns} "
+                f"restore_method_end_wall_unix_ns={self._fmt_or_absent(_restore_end_wall_ns)} "
+                f"modal_method_entry_wall_unix_ns={self._fmt_or_absent(None)} "
+                f"restore_status={_restore_status} "
+                f"restore_method_status={_restore_status} "
+                f"status=restored"
+            )
 
-        trace.emit("v2_restore_finalize_end", phase="restore")
-        _restore_result = {
-            "backend": state.backend,
-            "cuda": dict(state.cuda),
-            "runtime_generation": state.runtime_generation,
-            "status": "restored",
-            "_restore_timing": _restore_timing,
-            "restored_instance_id": restored_instance_id,
-            "restore_session_id": restore_session_id,
-            "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
-            "trace": trace.to_dict(),
-            "phase_durations_ms": trace.export_phase_durations(),
-        }
-
-        # ── Emit compact restore-breakdown summary ──────────────────
-        _brk, _clip = _collect_restore_events_for_summary(trace)
-        print(
-            f"[v2.restore_breakdown] "
-            f"bootstrap_ms={_brk.get('bootstrap_ms')} "
-            f"unet_cache_patch_ms={_brk.get('unet_cache_patch_ms')} "
-            f"clip_prepare_submit_ms={_brk.get('clip_prepare_submit_ms')} "
-            f"clip_worker_wait_ms={_brk.get('clip_worker_wait_ms')} "
-            f"unet_spec_extract_ms={_brk.get('unet_spec_extract_ms')} "
-            f"bg_unet_submit_ms={_brk.get('bg_unet_submit_ms')} "
-            f"restore_finalize_ms={_brk.get('restore_finalize_ms')}",
-            flush=True,
-        )
-        print(
-            f"[v2.clip_stages] "
-            f"worker_queue_ms={_clip.get('worker_queue_ms')} "
-            f"load_torch_file_ms={_clip.get('load_torch_file_ms')} "
-            f"read_to_ready_ms={_clip.get('read_to_ready_ms')} "
-            f"post_read_cpu_prepare_ms={_clip.get('post_read_cpu_prepare_ms')} "
-            f"gpu_wait_ms={_clip.get('gpu_wait_ms')} "
-            f"gpu_commit_ms={_clip.get('gpu_commit_ms')} "
-            f"read_end_to_ready_ms={_clip.get('read_end_to_ready_ms')} "
-            f"worker_total_ms={_clip.get('worker_total_ms')} "
-            f"worker_close_wait_ms={_clip.get('worker_close_wait_ms')} "
-            f"restore_finalization_ms={_clip.get('restore_finalization_ms')}",
-            flush=True,
-        )
-
-        # ── Emit restoration identity line ──────────────────────────
-        print(
-            f"[v2.restoration_identity] "
-            f"restored_instance_id={restored_instance_id} "
-            f"restore_session_id={restore_session_id} "
-            f"container_session_id={self.container_session_id or _V2_CONTAINER_SESSION_ID} "
-            f"modal_task_id={identity.get('container_task_id', '')} "
-            f"modal_image_id={identity.get('image_id', '')} "
-            f"modal_cloud={identity.get('cloud', '')} "
-            f"modal_region={identity.get('region', '')} "
-            f"pid={os.getpid()} "
-            f"hostname={_capture_host_info().get('hostname', '')} "
-            f"restore_total_ms={restore_total_ms} ",
-            flush=True,
-        )
-
-        print(
-            f"[v2.lifecycle] method=restore snap=False "
-            f"container_session={_V2_CONTAINER_SESSION_ID} "
-            f"restore_count={self._restore_count} "
-            f"restore_total_ms={restore_total_ms} "
-            f"status=restored"
-        )
-
-        trace.emit("v2_restore_return", phase="restore")
-        _restore_result["trace"] = trace.to_dict()
-        set_restore_return_marker(
-            restored_instance_id=restored_instance_id,
-            restore_session_id=restore_session_id,
-            legacy_container_session_id=legacy_container_session_id,
-            modal_task_id=identity.get("container_task_id", ""),
-            pid=os.getpid(),
-        )
-        return _restore_result
+            trace.emit("v2_restore_return", phase="restore")
+            _restore_result["trace"] = trace.to_dict()
+            set_restore_return_marker(
+                restored_instance_id=restored_instance_id,
+                restore_session_id=restore_session_id,
+                legacy_container_session_id=legacy_container_session_id,
+                modal_task_id=identity.get("container_task_id", ""),
+                pid=os.getpid(),
+            )
+            return _restore_result
+        finally:
+            if _restore_end_wall_ns is None:
+                _restore_end_wall_ns = int(time.time() * 1_000_000_000)
+                _restore_end_mono_ns = time.monotonic_ns()
+                if _restore_status not in ("success", "error"):
+                    _restore_status = "error"
+                print(
+                    f"[v2.lifecycle] method=restore snap=False "
+                    f"container_session={_V2_CONTAINER_SESSION_ID} "
+                    f"restore_count={getattr(self, '_restore_count', 0)} "
+                    f"restore_total_ms={round((time.perf_counter() - _restore_perf_start) * 1000.0, 3)} "
+                    f"remote_python_resume_wall_unix_ns={remote_python_resume_wall_ns} "
+                    f"restore_method_start_wall_unix_ns={restore_method_start_wall_ns} "
+                    f"restore_method_end_wall_unix_ns={_restore_end_wall_ns} "
+                    f"modal_method_entry_wall_unix_ns={self._fmt_or_absent(None)} "
+                    f"restore_status={_restore_status} "
+                    f"restore_method_status={_restore_status} "
+                    f"status=error",
+                    flush=True,
+                )
+                # Backfill _restore_timing with raw fields when this finally
+                # path catches an error that escaped the success/error handlers
+                # above (e.g. preload/finalize unexpected exception).
+                if self._restore_timing is not None:
+                    _rt = self._restore_timing
+                    if _rt.get("restore_method_end_wall_unix_ns") is None:
+                        _rt["restore_method_end_wall_unix_ns"] = _restore_end_wall_ns
+                    if _rt.get("restore_method_end_mono_ns") is None:
+                        _rt["restore_method_end_mono_ns"] = _restore_end_mono_ns
+                    if _rt.get("restore_method_status") is None:
+                        _rt["restore_method_status"] = "error"
+                    if _rt.get("remote_python_resume_wall_unix_ns") is None:
+                        _rt["remote_python_resume_wall_unix_ns"] = remote_python_resume_wall_ns
+                    if _rt.get("remote_python_resume_mono_ns") is None:
+                        _rt["remote_python_resume_mono_ns"] = remote_python_resume_mono_ns
+                    if _rt.get("restore_method_start_wall_unix_ns") is None:
+                        _rt["restore_method_start_wall_unix_ns"] = restore_method_start_wall_ns
+                    if _rt.get("restore_method_start_mono_ns") is None:
+                        _rt["restore_method_start_mono_ns"] = restore_method_start_mono_ns
+                    _LATEST_LIFECYCLE_TIMING = _rt
 
     async def _run_in_process(self, plan: ExecutionPlan, context: ExecutionContext) -> dict[str, Any]:
         if context.cancelled and context.cancelled():
@@ -1240,7 +1403,7 @@ class ModalRuntimeEntrypoint:
             api._v2_graph_trace = trace
         except Exception:
             pass
-        # ── Execution-phase CLIP exact-prefill single-flight ────────
+        # â”€â”€ Execution-phase CLIP exact-prefill single-flight â”€â”€â”€â”€â”€â”€â”€â”€
         # Schedule prefill immediately after graph start so it runs
         # concurrently with execution setup.  The callback waits for both
         # UNET and CLIP preparation futures before encoding, preventing
@@ -1252,7 +1415,7 @@ class ModalRuntimeEntrypoint:
                     result: dict[str, Any] = await self._execute_v2_prompt_executor(plan, context, api, trace)
                 _gpu_summary = gpu_not_observed_summary()
                 trace.set_metadata(gpu_observation_summary=_gpu_summary)
-                # ── Build GPU observation classification from helper + trace events ──
+                # â”€â”€ Build GPU observation classification from helper + trace events â”€â”€
                 _gpu_wrapper_installed = _gpu_summary.get("wrapper_status") == "installed"
                 _gpu_wrapper_calls = _gpu_summary.get("count", 0)
                 _gpu_graph_load_obs = any(e.name == "graph_gpu_load_start" for e in trace.events)
@@ -1330,7 +1493,7 @@ class ModalRuntimeEntrypoint:
         except Exception as exc:
             trace.emit("graph_execution_end", phase="execution", metadata={"status": "error", "error": str(exc)[:200]})
             # Capture GPU observation summary/classification on exception path too.
-            # Safe after request_execution_trace_scope exit — reads from module-level state.
+            # Safe after request_execution_trace_scope exit â€” reads from module-level state.
             try:
                 _gpu_summary = gpu_not_observed_summary()
                 trace.set_metadata(gpu_observation_summary=_gpu_summary)
@@ -1454,7 +1617,7 @@ class ModalRuntimeEntrypoint:
             materialize_inputs(dict(plan.input_images))
             trace.emit("input_materialization_end", phase="execution")
 
-        # ── Preflight context and certificate-gated preflight fast path ──
+        # â”€â”€ Preflight context and certificate-gated preflight fast path â”€â”€
         # Phase 2: resolve the exact certificate before expensive preflight.
         # On exact identity/component hit + preflight_ok, skip preflight.
         # Missing-node repair always runs outside the certified skip.
@@ -1478,7 +1641,7 @@ class ModalRuntimeEntrypoint:
         if callable(_preflight_fn) and not getattr(api, "_preflight_already_ran", False):
             _v2_repair_mode, _v2_custom_nodes_gen = _get_preflight_context(api, module)
 
-            # Try cert lookup before preflight — only eligible when the
+            # Try cert lookup before preflight â€” only eligible when the
             # deployment identity, repair mode, and custom-nodes generation
             # are all complete and recognised.
             if _V2_VALIDATION_CERT_ENABLED:
@@ -1539,7 +1702,7 @@ class ModalRuntimeEntrypoint:
                                 flush=True,
                             )
 
-        # ── Preflight (skip on exact certificate hit) ──────────────────
+        # â”€â”€ Preflight (skip on exact certificate hit) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if callable(_preflight_fn) and not getattr(api, "_preflight_already_ran", False):
             if _v2_cert_preflight_skip:
                 trace.emit(
@@ -1610,7 +1773,7 @@ class ModalRuntimeEntrypoint:
 
         import execution
 
-        # ── Prompt validation ─────────────────────────────────────────
+        # â”€â”€ Prompt validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # When preflight was skipped via certificate hit, outputs_to_execute
         # and node_errors are already populated from the stored certificate.
         # When preflight ran, we run validate_prompt and schedule a new cert
@@ -1634,7 +1797,7 @@ class ModalRuntimeEntrypoint:
                 prompt_id, workflow, None
             )
             # Schedule certificate write only when the same eligibility
-            # conditions that would allow a read are met — incomplete or
+            # conditions that would allow a read are met â€” incomplete or
             # unknown context never produces a certificate.
             _cert_write_eligible = (
                 bool(_v2_dep_identity.combined_hash if _v2_dep_identity else "")
@@ -1673,7 +1836,7 @@ class ModalRuntimeEntrypoint:
             detail = error.get("message", str(error)) if isinstance(error, dict) else str(error)
             raise RuntimeError(f"Workflow validation failed: {detail}")
 
-        # ── Pregraph setup: V2-owned work between prompt validation and
+        # â”€â”€ Pregraph setup: V2-owned work between prompt validation and
         # PromptExecutor call (production registry, _begin_profile, etc.).
         trace.emit("pregraph_setup_start", phase="execution", metadata={
             "prompt_id": prompt_id,
@@ -1738,7 +1901,7 @@ class ModalRuntimeEntrypoint:
             trace.emit("executor_reset_start", phase="execution")
             executor.reset()
             trace.emit("executor_reset_end", phase="execution")
-            # End pregraph span here — before prompt_executor_invoke_start, after
+            # End pregraph span here â€” before prompt_executor_invoke_start, after
             # all V2-owned setup including executor.reset().
             trace.emit("pregraph_setup_end", phase="execution", metadata={
                 "status": "error" if _pregraph_error else "ok",
@@ -1753,7 +1916,7 @@ class ModalRuntimeEntrypoint:
                 "extra_data": {"client_id": prompt_id},
                 "execute_outputs": outputs_to_execute,
             }
-            # ── Build node-ID → class_type map ──────────────────
+            # â”€â”€ Build node-ID â†’ class_type map â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             _node_class_map: dict[str, str] = {}
             if isinstance(workflow, dict):
                 for _nid, _node in workflow.items():
@@ -1770,7 +1933,7 @@ class ModalRuntimeEntrypoint:
                 nid for nid, ct in _node_class_map.items()
                 if "Sampler" in ct or "KSampler" in ct
             ]
-            # ── PromptExecutor internal milestone interception ──
+            # â”€â”€ PromptExecutor internal milestone interception â”€â”€
             # Request-local: wraps executor.add_message (3-arg shape:
             # event, data: dict, broadcast: bool) to capture
             # execution_start and execution_cached timestamps (first
@@ -1913,13 +2076,13 @@ class ModalRuntimeEntrypoint:
                     if _send_sync_wrapper_ok and _orig_send_sync is not None and _server is not None:
                         _server.send_sync = _orig_send_sync
                 finally:
-                    # Always emit invoke_end — even if restore/release raises
+                    # Always emit invoke_end â€” even if restore/release raises
                     _invoke_elapsed_ms = round((time.monotonic_ns() - _execute_call_ns) / 1_000_000, 3)
                     trace.emit("prompt_executor_invoke_end", phase="execution", metadata={
                         "invoke_elapsed_ms": _invoke_elapsed_ms,
                     })
 
-            # ── Compute derived milestone intervals ──────────────────────
+            # â”€â”€ Compute derived milestone intervals â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             _exec_st_ns = _milestones.get("execution_start") if _milestones else None
             _cached_ns = _milestones.get("execution_cached") if _milestones else None
             _first_ns = _milestones.get("executing") if _milestones else None
@@ -1940,7 +2103,7 @@ class ModalRuntimeEntrypoint:
             _cache_to_node = round((_first_ns - _cached_ns) / 1_000_000, 3) if _cached_ns and _first_ns else None
             _call_to_cached = round((_cached_ns - _execute_call_ns) / 1_000_000, 3) if _cached_ns else None
             _call_to_first_node = round((_first_ns - _execute_call_ns) / 1_000_000, 3) if _first_ns else None
-            # ── Node-to-node sub-intervals (B) ──
+            # â”€â”€ Node-to-node sub-intervals (B) â”€â”€
             _first_node_to_clip_ms: float | None = None
             _clip_to_sampler_node_ms: float | None = None
             _sampler_node_to_sampler_start_ms: float | None = None
@@ -1976,7 +2139,7 @@ class ModalRuntimeEntrypoint:
                     "first_sampler_stage_monotonic_ns": _first_sampler_stage_ns,
                 })
 
-            # ── Classify sampler stage from first executing node ──
+            # â”€â”€ Classify sampler stage from first executing node â”€â”€
             _sampler_stage_status: str = "awaiting_classification"
             if _first_exec_node_class:
                 if "Sampler" in _first_exec_node_class or "KSampler" in _first_exec_node_class:
@@ -1994,7 +2157,7 @@ class ModalRuntimeEntrypoint:
                 else:
                     _sampler_stage_status = f"other:{_first_exec_node_class}"
 
-            # ── Compute setup intervals from existing trace events ───────
+            # â”€â”€ Compute setup intervals from existing trace events â”€â”€â”€â”€â”€â”€â”€
             _cert_ms = self._interval_from_trace(trace, "certificate_reload_start", "certificate_reload_end")
             _preflight_ms = self._interval_from_trace(trace, "preflight_start", "preflight_end")
             _validation_ms = self._interval_from_trace(trace, "prompt_validation_start", "prompt_validation_end")
@@ -2021,7 +2184,7 @@ class ModalRuntimeEntrypoint:
             else:
                 _residual_before_invoke = None
 
-            # ── Measured children sum (leaf-level, non-overlapping) (C) ──
+            # â”€â”€ Measured children sum (leaf-level, non-overlapping) (C) â”€â”€
             # pregraph_setup_ms includes executor_reset_ms; decompose into
             # pregraph_without_reset + exec_reset (non-overlapping leaves).
             _pregraph_without_reset_ms = (_pregraph_ms - _exec_reset_ms) if _pregraph_ms is not None and _exec_reset_ms is not None else None
@@ -2034,7 +2197,7 @@ class ModalRuntimeEntrypoint:
             if _lane_acquired[0]:
                 _leaf_setup.append(_sampler_lane_ms)
             _leaf_setup_ms = sum(v for v in _leaf_setup if v is not None)
-            # Sampler node → lane acquired → actual stage decompose
+            # Sampler node â†’ lane acquired â†’ actual stage decompose
             # the single sampler_node_to_sampler_start_ms into two
             # non-overlapping sub-intervals for the leaf sum.
             _lane_acquired_ns = _milestones.get("_lane_acquired_mono_ns") if _milestones else None
@@ -2053,7 +2216,7 @@ class ModalRuntimeEntrypoint:
             _total_children_val = _leaf_setup_ms + _leaf_milestone_ms
             _measured_children_ms = round(_total_children_val, 3) if _total_children_val > 0 else None
 
-            # ── Build named interval map for overlap diagnostics ──
+            # â”€â”€ Build named interval map for overlap diagnostics â”€â”€
             _overlap_interval_map: dict[str, float | None] = {
                 "certificate_ms": _cert_ms,
                 "preflight_ms": _preflight_ms,
@@ -2074,7 +2237,7 @@ class ModalRuntimeEntrypoint:
                 name for name, val in _overlap_interval_map.items() if val is not None
             ]
 
-            # ── pre_sampler_total_ms from remote_method_entry to first_sampler_stage_ns (C) ──
+            # â”€â”€ pre_sampler_total_ms from remote_method_entry to first_sampler_stage_ns (C) â”€â”€
             _remote_method_entry_ns = None
             for ev in trace.events:
                 if ev.name == "remote_method_entry":
@@ -2095,7 +2258,7 @@ class ModalRuntimeEntrypoint:
                 _reconciliation_status = "absent_total"
                 _residual_ms = None
 
-            # ── Gather identity metadata for pre_sampler_stages event and print (D) ──
+            # â”€â”€ Gather identity metadata for pre_sampler_stages event and print (D) â”€â”€
             _ps_prompt_id = prompt_id
             _ps_identity = _capture_remote_identity()
             _ps_modal_input_id = _ps_identity.get("modal_input_id", "absent")
@@ -2109,7 +2272,7 @@ class ModalRuntimeEntrypoint:
             _ps_restored_instance_id = _ps_restored_id_actual or "absent"
             _ps_cid = self.container_session_id or _V2_CONTAINER_SESSION_ID or "absent"
 
-            # Always emit pre_sampler_stages — even when milestones absent (C/D)
+            # Always emit pre_sampler_stages â€” even when milestones absent (C/D)
             trace.emit("pre_sampler_stages", phase="execution", metadata={
                 # Setup intervals from trace events
                 "method_entry_to_graph_start_ms": _met_start_ms,
@@ -2184,7 +2347,7 @@ class ModalRuntimeEntrypoint:
                 "restore_session_id": _ps_restore_session,
                 "container_session_id": _ps_cid,
             })
-            # ── One-line [v2.pre_sampler_stages] summary (always emitted) ───
+            # â”€â”€ One-line [v2.pre_sampler_stages] summary (always emitted) â”€â”€â”€
             print(
                 f"[v2.pre_sampler_stages] "
                 f"request_id={_ps_prompt_id} "
@@ -2366,7 +2529,7 @@ class ModalRuntimeEntrypoint:
             result["_registry_used"] = bool(attempts and attempts[0].success)
             result["_registry_entries"] = attempts[0].total_items if attempts else 0
 
-            # ── Phase 6: measure serialized result payload size ────────
+            # â”€â”€ Phase 6: measure serialized result payload size â”€â”€â”€â”€â”€â”€â”€â”€
             payload_bytes = _measure_json_bytes(result)
             selected = dataclasses.replace(
                 selected,
@@ -2401,7 +2564,7 @@ class ModalRuntimeEntrypoint:
                 if _stages:
                     result["_stage_timings"] = _stages
 
-            # ── Write validation certificate after successful execution ──
+            # â”€â”€ Write validation certificate after successful execution â”€â”€
             # Schema v2 certs include preflight_ok=True to attest that
             # deterministic preflight completed successfully for this identity.
             # Only write when preflight actually ran (not on cert skip).
@@ -2475,17 +2638,20 @@ class ModalRuntimeEntrypoint:
         request_id: str = "",
         cancelled: Callable[[], bool] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        # ── TRUE METHOD FIRST LINE (before any identity or trace exists) ──
+        # â”€â”€ TRUE METHOD FIRST LINE (before any identity or trace exists) â”€â”€
         _method_first_line_ns = time.monotonic_ns()
         _method_first_line_wall_ns = int(time.time() * 1_000_000_000)
         _method_first_line_pid = os.getpid()
+        # Consistent field-name aliases for method-entry timestamps
+        modal_method_entry_mono_ns: int = _method_first_line_ns
+        modal_method_entry_wall_ns: int = _method_first_line_wall_ns
         _method_restore_marker = get_restore_return_marker()
         _entry_host = _capture_host_info()
 
         identity = _capture_remote_identity()
         _identity_capture_end_ns = time.monotonic_ns()
 
-        # ── Extract request origin info before deserialization ─────
+        # â”€â”€ Extract request origin info before deserialization â”€â”€â”€â”€â”€
         _request_origin_info: dict[str, Any] = {}
         _safe_payload = dict(plan_payload) if isinstance(plan_payload, Mapping) else plan_payload
         if isinstance(_safe_payload, dict):
@@ -2495,7 +2661,7 @@ class ModalRuntimeEntrypoint:
         plan = ExecutionPlan.from_dict(_safe_payload if isinstance(_safe_payload, dict) else plan_payload)
         _deserialize_end_ns = time.monotonic_ns()
 
-        # ── Compute method entry gap before any trace output ─────────
+        # â”€â”€ Compute method entry gap before any trace output â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _method_entry_gap_results: dict[str, Any] = {}
         try:
             # Durations are valid only when all process identities match.
@@ -2541,13 +2707,15 @@ class ModalRuntimeEntrypoint:
             _method_entry_gap_results["cross_process_duration_unavailable"] = True
             _method_entry_gap_results["identity_mismatch_reasons"] = [f"identity_check_error:{type(exc).__name__}"]
 
-        # ── Continue with normal setup ──────────────────────────────
+        # â”€â”€ Continue with normal setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Use a local event buffer until trace exists
         _pre_trace_events: list[dict[str, Any]] = [
             {"name": "run_plan_method_first_line", "phase": "method",
              "wall_unix_ns": _method_first_line_wall_ns,
              "monotonic_ns": _method_first_line_ns,
-             "metadata": {"pid": _method_first_line_pid, **_entry_host}}
+             "metadata": {"pid": _method_first_line_pid, **_entry_host,
+                          "modal_method_entry_wall_unix_ns": _method_first_line_wall_ns,
+                          "modal_method_entry_mono_ns": _method_first_line_ns}}
         ]
 
         context = ExecutionContext(
@@ -2597,7 +2765,7 @@ class ModalRuntimeEntrypoint:
                           "deferred": True},
             )
 
-        # ── Emit identity capture/deserialize/trace-setup spans ─────
+        # â”€â”€ Emit identity capture/deserialize/trace-setup spans â”€â”€â”€â”€â”€
         context.trace.emit(
             "run_plan_identity_capture_start",
             phase="method",
@@ -2619,7 +2787,7 @@ class ModalRuntimeEntrypoint:
             },
         )
 
-        # ── Emit method entry gap summary ───────────────────────────
+        # â”€â”€ Emit method entry gap summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _first_line_to_now_ms = round((time.monotonic_ns() - _method_first_line_ns) / 1_000_000, 3)
         context.trace.emit(
             "run_plan_method_entry_gap",
@@ -2630,16 +2798,40 @@ class ModalRuntimeEntrypoint:
             },
         )
 
+        # â”€â”€ Compute restore_end_to_modal_method_ms from raw restore-method-end
+        #    monotonic timestamp in _restore_timing (not the return marker).
+        #    Same-process identity check required; emit "absent" when unavailable.
+        _restore_end_to_modal_ms: str = "absent"
+        _restore_end_wall_from_timing: str = "absent"
+        _restore_start_wall_from_timing: str = "absent"
+        _resume_wall_from_timing: str = "absent"
+        _rt = self._restore_timing or {}
+        if _rt:
+            _resume_wall_from_timing = self._fmt_or_absent(_rt.get("remote_python_resume_wall_unix_ns"))
+            _restore_start_wall_from_timing = self._fmt_or_absent(_rt.get("restore_method_start_wall_unix_ns"))
+            _restore_end_wall_from_timing = self._fmt_or_absent(_rt.get("restore_method_end_wall_unix_ns"))
+            _rt_end_mono = _rt.get("restore_method_end_mono_ns")
+            # Same-process: restored_instance_id, modal_task_id, pid, boot_id must all match
+            _same_process = _method_entry_gap_results.get("same_process", False)
+            if _same_process and _rt_end_mono is not None and _method_first_line_ns >= _rt_end_mono:
+                _restore_end_to_modal_ms = str(round(
+                    (_method_first_line_ns - _rt_end_mono) / 1_000_000, 3
+                ))
         print(
             f"[v2.method_entry_gap] "
             f"restore_to_method_ms={_method_entry_gap_results.get('restore_return_to_method_first_line_ms')} "
             f"first_line_to_running_log_ms={_first_line_to_now_ms} "
             f"same_process={_method_entry_gap_results.get('same_process')} "
-            f"identity_mismatch_reasons={','.join(_method_entry_gap_results.get('identity_mismatch_reasons', [])) or 'none'}",
+            f"identity_mismatch_reasons={','.join(_method_entry_gap_results.get('identity_mismatch_reasons', [])) or 'none'} "
+            f"remote_python_resume_wall_unix_ns={_resume_wall_from_timing} "
+            f"restore_method_start_wall_unix_ns={_restore_start_wall_from_timing} "
+            f"restore_method_end_wall_unix_ns={_restore_end_wall_from_timing} "
+            f"modal_method_entry_wall_unix_ns={_method_first_line_wall_ns} "
+            f"restore_end_to_modal_method_ms={_restore_end_to_modal_ms}",
             flush=True,
         )
 
-        # ── Normal trace setup ──────────────────────────────────────
+        # â”€â”€ Normal trace setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if context.trace is not None:
             _auth_cid = self.container_session_id or _V2_CONTAINER_SESSION_ID
             context.trace.container_session_id = _auth_cid
@@ -2660,7 +2852,7 @@ class ModalRuntimeEntrypoint:
             except Exception:
                 _opts_hash = ""
 
-            # ── Emit trace-setup span (remote_method_entry at original first-line time) ──
+            # â”€â”€ Emit trace-setup span (remote_method_entry at original first-line time) â”€â”€
             context.trace.emit("run_plan_trace_setup_start", phase="method")
             context.trace.emit_at(
                 "remote_method_entry",
@@ -2676,14 +2868,17 @@ class ModalRuntimeEntrypoint:
                     "source_workflow_hash": plan.source_workflow_hash,
                     "source_workflow_hash_prefix": _src_wf_hash_prefix,
                     "effective_options_hash": _opts_hash,
-                    # ── Correlation identity ──────────────────────
+                    # â”€â”€ Correlation identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     "restored_instance_id": getattr(self, "_restored_instance_id", ""),
                     "restore_session_id": (self._restore_timing or {}).get("restore_session_id", ""),
                     "legacy_container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
-                    # ── Request origin identity ───────────────────
+                    # â”€â”€ Method-entry timestamps for downstream consumers â”€â”€â”€â”€â”€
+                    "modal_method_entry_wall_unix_ns": _method_first_line_wall_ns,
+                    "modal_method_entry_mono_ns": _method_first_line_ns,
+                    # â”€â”€ Request origin identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     "request_id": _t4_request_id,
                     "trigger_source": _request_origin_info.get("trigger_source", ""),
-                    # ── Remote-observed identity ──────────────────
+                    # â”€â”€ Remote-observed identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     **identity,
                     **_resource_identity(),
                 },
@@ -2698,7 +2893,7 @@ class ModalRuntimeEntrypoint:
             )
             context.trace.emit("run_plan_trace_setup_end", phase="method")
 
-        # ── First status yield ──────────────────────────────────────
+        # â”€â”€ First status yield â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         context.trace.emit("run_plan_first_status_yield", phase="method")
         yield {
             "type": "status",
@@ -2712,7 +2907,7 @@ class ModalRuntimeEntrypoint:
                 _exec_trace = data.get("trace", {})
                 _exec_stages = _exec_trace.get("stages") if isinstance(_exec_trace, Mapping) else None
 
-                # ── Drain available background UNET diagnostics ────
+                # â”€â”€ Drain available background UNET diagnostics â”€â”€â”€â”€
                 _bg_trace_events: list[dict[str, Any]] = []
                 try:
                     from comfymodal_runtime.model_preload import _BG_UNET_DIAG_STORE, _BG_UNET_DIAG_LOCK
@@ -2732,7 +2927,7 @@ class ModalRuntimeEntrypoint:
                 # Merge background UNET diagnostic events into the result trace
                 if _bg_trace_events:
                     merged.extend(_bg_trace_events)
-                # ── Event identity enrichment ────────────────────────
+                # â”€â”€ Event identity enrichment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 # Backfill missing request_id, restore IDs, task/input/pid/tid
                 # on lifecycle and background events now that the authoritative
                 # request_id is known.  Updates BOTH event.request_id (top-level
@@ -2770,19 +2965,27 @@ class ModalRuntimeEntrypoint:
                 _rt = self._restore_timing or _LATEST_LIFECYCLE_TIMING
                 if _rt is not None and "_restore_timing" not in data:
                     data["_restore_timing"] = dict(_rt)
-                # ── Request-origin summary (T0–T5) ──────────────────
+                # â”€â”€ Request-origin summary (T0â€“T5) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 # Gather raw wall timestamps from origin info + local captures
                 _t4_wall = _method_first_line_wall_ns
                 _t4_request = _t4_request_id
                 _trig_src = _request_origin_info.get("trigger_source", "unknown")
                 _t0_wall = _request_origin_info.get("ui_run_triggered_wall_unix_ms", None)
                 if _t0_wall is not None:
-                    _t0_wall_ns = int(_t0_wall * 1_000_000)  # convert ms→ns
+                    _t0_wall_ns = int(_t0_wall * 1_000_000)  # convert msâ†’ns
                 else:
                     _t0_wall_ns = None
                 _t1_wall_ns = _request_origin_info.get("local_receive_wall_ns", None)
                 _t2_wall_ns = _request_origin_info.get("modal_submission_attempt_wall_ns", None)
                 _t3_wall_ns = _request_origin_info.get("modal_generator_created_wall_ns", None)
+                # V2 remote request origin: generator create start (before
+                # remote_gen.aio), first iteration start (before __anext__),
+                # and first remote event (after __anext__).
+                # Only generator_create_start is sent in the plan payload;
+                # the others are captured too late and render "absent".
+                _gen_create_start_wall_ns = _request_origin_info.get("modal_generator_create_start_wall_ns", None)
+                _first_iter_start_wall_ns = _request_origin_info.get("modal_first_iteration_start_wall_ns", None)
+                _first_remote_event_wall_ns = _request_origin_info.get("modal_first_remote_event_wall_ns", None)
                 # Extract authoritative T5 from remote V2 prompt_executor_invoke_start event.
                 # Filter for process=remote to ignore legacy/duplicate traces.
                 # Iterate until a remote event with non-empty t5_wall_ns is found;
@@ -2803,10 +3006,10 @@ class ModalRuntimeEntrypoint:
 
                 # Compute all eight intervals with clock-scope metadata.
                 # Cross-process intervals MUST use wall; same-process may use mono.
-                # T0(browser)→T1(server): cross-process → wall
+                # T0(browser)â†’T1(server): cross-process â†’ wall
                 _t0_t1_ms = round((_t1_wall_ns - _t0_wall_ns) / 1_000_000, 3) if _t0_wall_ns and _t1_wall_ns else None
                 _t0_t1_scope = "wall_cross_process" if _t0_wall_ns and _t1_wall_ns else None
-                # T1(server)→T2(server): same-process → mono preferred
+                # T1(server)â†’T2(server): same-process â†’ mono preferred
                 _t1_t2_ms = None
                 _t1_t2_scope = None
                 _t1_mono = _request_origin_info.get("local_receive_mono_ns", None)
@@ -2817,7 +3020,7 @@ class ModalRuntimeEntrypoint:
                 elif _t1_wall_ns and _t2_wall_ns:
                     _t1_t2_ms = round((_t2_wall_ns - _t1_wall_ns) / 1_000_000, 3)
                     _t1_t2_scope = "wall_fallback"
-                # T2(server)→T3(server): same-process → mono
+                # T2(server)â†’T3(server): same-process â†’ mono
                 _t2_t3_ms = None
                 _t2_t3_scope = None
                 if _t2_mono and _request_origin_info.get("modal_generator_created_mono_ns"):
@@ -2826,13 +3029,13 @@ class ModalRuntimeEntrypoint:
                 elif _t2_wall_ns and _t3_wall_ns:
                     _t2_t3_ms = round((_t3_wall_ns - _t2_wall_ns) / 1_000_000, 3)
                     _t2_t3_scope = "wall_fallback"
-                # T2(server)→T4(remote): cross-process → wall
+                # T2(server)â†’T4(remote): cross-process â†’ wall
                 _t2_t4_ms = round((_t4_wall - _t2_wall_ns) / 1_000_000, 3) if _t2_wall_ns and _t4_wall else None
                 _t2_t4_scope = "wall_cross_process" if _t2_wall_ns and _t4_wall else None
-                # T3(server)→T4(remote): cross-process → wall
+                # T3(server)â†’T4(remote): cross-process â†’ wall
                 _t3_t4_ms = round((_t4_wall - _t3_wall_ns) / 1_000_000, 3) if _t3_wall_ns and _t4_wall else None
                 _t3_t4_scope = "wall_cross_process" if _t3_wall_ns and _t4_wall else None
-                # T4(remote)→T5(remote): same-process → mono
+                # T4(remote)â†’T5(remote): same-process â†’ mono
                 _t4_t5_ms = None
                 _t4_t5_scope = None
                 _t5_mono_from_trace = None
@@ -2854,10 +3057,10 @@ class ModalRuntimeEntrypoint:
                 elif _t4_wall and _t5_wall_ns:
                     _t4_t5_ms = round((_t5_wall_ns - _t4_wall) / 1_000_000, 3)
                     _t4_t5_scope = "wall_fallback"
-                # T0(browser)→T4(remote): cross-process → wall
+                # T0(browser)â†’T4(remote): cross-process â†’ wall
                 _t0_t4_ms = round((_t4_wall - _t0_wall_ns) / 1_000_000, 3) if _t0_wall_ns and _t4_wall else None
                 _t0_t4_scope = "wall_cross_process" if _t0_wall_ns and _t4_wall else None
-                # T0(browser)→T5(remote): cross-process → wall
+                # T0(browser)â†’T5(remote): cross-process â†’ wall
                 _t0_t5_ms = round((_t5_wall_ns - _t0_wall_ns) / 1_000_000, 3) if _t0_wall_ns and _t5_wall_ns else None
                 _t0_t5_scope = "wall_cross_process" if _t0_wall_ns and _t5_wall_ns else None
 
@@ -2867,8 +3070,11 @@ class ModalRuntimeEntrypoint:
                 data["raw_timestamps"] = {
                     "t0_ui_trigger_wall_unix_ns": _t0_wall_ns,
                     "t1_local_receive_wall_unix_ns": _t1_wall_ns,
+                    "modal_generator_create_start_wall_unix_ns": _gen_create_start_wall_ns,
                     "modal_submission_attempt_wall_unix_ns": _t2_wall_ns,
                     "modal_generator_created_wall_unix_ns": _t3_wall_ns,
+                    "modal_first_iteration_start_wall_unix_ns": _first_iter_start_wall_ns,
+                    "modal_first_remote_event_wall_unix_ns": _first_remote_event_wall_ns,
                     "t4_modal_method_entry_wall_unix_ns": _t4_wall,
                     "t5_prompt_executor_invoke_start_wall_unix_ns": _t5_wall_ns,
                 }
@@ -2896,19 +3102,22 @@ class ModalRuntimeEntrypoint:
                 _modal_input_id = identity.get("modal_input_id", "")
                 _modal_task_id = identity.get("container_task_id", "")
 
-                # ── Exact one-line [v2.request_origin] summary ──────
+                # â”€â”€ Exact one-line [v2.request_origin] summary â”€â”€â”€â”€â”€â”€
                 _trig_to_dispatch = _t0_t1_ms  # same as run_trigger_to_local_receive
                 _dispatch_to_entry = _t2_t4_ms
                 _entry_to_exec = _t4_t5_ms       # same as method_entry_to_prompt_executor
                 _trig_to_exec = _t0_t5_ms        # same as run_trigger_to_prompt_executor
                 print(
-                    f"[v2.remote_request_origin] "
+                    f"[v2.remote_request_origin.remote] "
                     f"request_id={_t4_request} "
                     f"trigger_source={_trig_src} "
                     f"ui_trigger_unix_ms={self._fmt_or_absent(_t0_wall)} "
                     f"local_receive_unix_ns={self._fmt_or_absent(_t1_wall_ns)} "
+                    f"modal_generator_create_start_unix_ns={self._fmt_or_absent(_gen_create_start_wall_ns)} "
                     f"modal_submission_attempt_unix_ns={self._fmt_or_absent(_t2_wall_ns)} "
                     f"modal_generator_created_unix_ns={self._fmt_or_absent(_t3_wall_ns)} "
+                    f"modal_first_iteration_start_unix_ns={self._fmt_or_absent(_first_iter_start_wall_ns)} "
+                    f"modal_first_remote_event_unix_ns={self._fmt_or_absent(_first_remote_event_wall_ns)} "
                     f"modal_method_entry_unix_ns={_t4_wall} "
                     f"prompt_executor_invoke_start_unix_ns={self._fmt_or_absent(_t5_wall_ns)} "
                     f"trigger_to_dispatch_ms={_trig_to_dispatch} "
@@ -3069,7 +3278,7 @@ def _publish_restore_plan_impl(plan: RestorePlan) -> dict[str, Any]:
     readback_ms = round((time.perf_counter() - readback_started) * 1000.0, 3)
     if authoritative is None:
         raise RuntimeError("published RestorePlan could not be read back from runtime-state Volume")
-    # ── Add publish_readback event to publication trace ────────────
+    # â”€â”€ Add publish_readback event to publication trace â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     pub_trace = result.get("trace", {})
     if isinstance(pub_trace, dict) and "events" in pub_trace:
         pub_trace["events"].append({
@@ -3101,7 +3310,7 @@ def publish_restore_plan_remote(plan_payload: Mapping[str, Any]) -> dict[str, An
     return result
 
 
-# ── ModalRuntimeEntrypointV2: decorated class exported BEFORE resource
+# â”€â”€ ModalRuntimeEntrypointV2: decorated class exported BEFORE resource
 #    construction so Modal's finalized function registry (enter/method)
 #    is always populated.  Resource-independent: only depends on _modal
 #    being importable.  When _modal is unavailable, export a plain

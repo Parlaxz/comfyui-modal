@@ -95,6 +95,49 @@ def _reset_restore_publish_cache() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Profile preparation cache — skip prepare_active_next_profile when the
+# plan identity (source_workflow_hash + production_plan_hash + workspace +
+# app/environment) is unchanged for the same process.
+# ---------------------------------------------------------------------------
+
+_PROFILE_PREP_CACHE: dict[str, dict] = {}
+"""``{cache_key: profile_result}`` — cached prepared profile results.
+
+Cache-key format: ``stable_hash({source_workflow_hash, production_plan_hash,
+workspace_id, app_name, environment})``.
+Cleared only by module reload; survives across calls within the same process.
+Thread-safe via ``_PROFILE_PREP_CACHE_LOCK``.
+"""
+
+_PROFILE_PREP_CACHE_LOCK = threading.Lock()
+"""Guard for all ``_PROFILE_PREP_CACHE`` access."""
+
+
+def _profile_prep_cache_key(
+    source_workflow_hash: str,
+    production_plan_hash: str,
+    workspace_id: str,
+    app_name: str,
+    environment: str,
+) -> str:
+    """Deterministic cache key for profile preparation results."""
+    identity = {
+        "s": source_workflow_hash,
+        "p": production_plan_hash,
+        "w": workspace_id,
+        "a": app_name,
+        "e": environment,
+    }
+    return stable_hash(identity)
+
+
+def _reset_profile_prep_cache() -> None:
+    """Clear the profile prep cache (test / teardown only)."""
+    with _PROFILE_PREP_CACHE_LOCK:
+        _PROFILE_PREP_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
 # RunTrace — in-memory hierarchical span collector
 # ---------------------------------------------------------------------------
 
@@ -435,6 +478,44 @@ def _event_span_ms(trace: RuntimeTrace, start_name: str, end_name: str) -> float
     return None
 
 
+def _strict_event_span_ms(trace: RuntimeTrace, start_name: str, end_name: str) -> float | str | None:
+    """Like _event_span_ms but returns _INVALID_NEG_STR for negative durations.
+    Returns None when missing, _INVALID_NEG_STR when start > end, float otherwise."""
+    start_ns: int | None = None
+    for event in trace.events:
+        if event.name == start_name:
+            start_ns = event.monotonic_ns
+        elif event.name == end_name and start_ns is not None:
+            delta = event.monotonic_ns - start_ns
+            if delta < 0:
+                return "invalid_negative"
+            return round(delta / 1_000_000, 3)
+    return None
+
+
+def _event_mono_ns(trace: RuntimeTrace, name: str) -> int | None:
+    """Return the monotonic_ns of the first event with *name*, or None."""
+    for event in trace.events:
+        if event.name == name:
+            return event.monotonic_ns
+    return None
+
+
+def _derived_mono_delta_ms(trace: RuntimeTrace, start_name: str, end_name: str) -> float | str | None:
+    """Compute ``end_name - start_name`` in ms using monotonic timestamps.
+    Returns ``None`` when either event is missing, ``"invalid_negative"`` when
+    the delta is negative, otherwise the non-negative float ms.
+    Uses start, end ordering (first arg = start, second arg = end)."""
+    start_ns = _event_mono_ns(trace, start_name)
+    end_ns = _event_mono_ns(trace, end_name)
+    if start_ns is None or end_ns is None:
+        return None
+    delta = end_ns - start_ns
+    if delta < 0:
+        return "invalid_negative"
+    return round(delta / 1_000_000, 3)
+
+
 def build_execution_plan(
     workflow: dict,
     *,
@@ -574,54 +655,112 @@ async def execute_plan(
         if not isinstance(_existing_origin, Mapping) or not _existing_origin:
             runtime_trace.set_metadata(request_origin_info=dict(_plan_origin))
 
+    # ── Entry timestamp for the execute_plan boundary ──
+    runtime_trace.emit("execute_plan_entry", phase="local")
+
+    # ── Single canonical payload — materialize the frozen plan exactly once ──
+    # Reused for active-profile workflow, restore publication, and final Modal
+    # payload.  ExecutionPlan is immutable; the thawed dict is a safe copy.
+    _canonical_dict: dict = plan.to_dict()
+    _canonical_workflow: dict = _canonical_dict["workflow"]
+
     # ── Profile preparation (before restore publication / Modal submission) ──
     runtime_trace.emit("active_profile_prepare_start", phase="local")
     runtime_trace.emit("active_next_profile_start", phase="local")
     if profile_setter is not None:
-        runtime_trace.emit("plan_serialization_start", phase="local",
-                           metadata={"purpose": "profile_activation"})
-        _activation_wf = dict(plan.to_dict().get("workflow", {}))
-        runtime_trace.emit("plan_serialization_end", phase="local",
-                           metadata={"purpose": "profile_activation"})
-        _activation_hash = plan.source_workflow_hash or plan.workflow_hash
-        _prod_opts: dict | None = None
+        # ── Profile prep cache identity keys ──
+        _profile_ws_id = str((workspace or {}).get("id", ""))
+        _profile_app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", _APP_NAME_DEFAULT)
+        _profile_env = (
+            os.environ.get("COMFYMODAL_V2_ENVIRONMENT", "")
+            or os.environ.get("MODAL_ENVIRONMENT", "")
+        )
+        _profile_src_hash = plan.source_workflow_hash or plan.workflow_hash
         _pr = dict(plan.production_report) if isinstance(plan.production_report, Mapping) else {}
-        if _pr.get("enabled"):
-            _prod_opts = {
-                "enabled": True,
-                "output_node_ids": list(_pr.get("output_node_ids", [])),
-                "bypass_node_ids": list(_pr.get("bypass_node_ids", [])),
-                "source_workflow_hash": _pr.get("source_workflow_hash", ""),
-                "compiled_workflow_hash": _pr.get("compiled_workflow_hash", ""),
-                "production_plan_hash": _pr.get("production_plan_hash", ""),
-                "compiler_version": _pr.get("compiler_version", COMPILER_SCHEMA_VERSION),
-                "hash_schema_version": _pr.get("hash_schema_version", HASH_SCHEMA_VERSION),
-                "production_plan_schema_version": _pr.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION),
-            }
-            _activation_hash = _pr.get("source_workflow_hash", _activation_hash)
-        _pn_result = await prepare_active_next_profile(
-            _activation_wf,
-            _activation_hash,
-            production_options=_prod_opts,
-            workspace=workspace,
-            setter=profile_setter,
+        _profile_prod_hash = str(_pr.get("production_plan_hash", ""))
+
+        _profile_cache_key = _profile_prep_cache_key(
+            _profile_src_hash, _profile_prod_hash,
+            _profile_ws_id, _profile_app_name, _profile_env,
         )
-        runtime_trace.set_metadata(
-            active_profile_publish_decision=_pn_result.get("active_profile_publish_decision", ""),
-            active_profile_stable_key=_pn_result.get("active_profile_stable_key", ""),
-            active_profile_token=_pn_result.get("active_profile_token", ""),
-            local_active_profile_prepare_ms=_pn_result.get("local_active_profile_prepare_ms", 0.0),
-            active_profile_remote_call=_pn_result.get("active_profile_remote_call", 0),
-            active_profile_remote_ms=_pn_result.get("active_profile_remote_ms", 0.0),
-            active_profile_prepare_count=1,
-            source_workflow_hash=plan.source_workflow_hash,
-            model_stack=dict(plan.model_stack),
-            prompt_summary=dict(plan.prompt_bundle),
-        )
-        runtime_trace.emit("active_next_profile_end", phase="local", metadata={
-            "decision": _pn_result.get("active_profile_publish_decision", ""),
-            "stable_key": _pn_result.get("active_profile_stable_key", "")[:16],
-        })
+
+        with _PROFILE_PREP_CACHE_LOCK:
+            _cached_result = _PROFILE_PREP_CACHE.get(_profile_cache_key)
+
+        if _cached_result is not None:
+            # Identity unchanged — reuse cached result, no remote calls
+            _pn_result = dict(_cached_result)
+            runtime_trace.emit(
+                "profile_prep_cache_hit", phase="local",
+                metadata={"cache_key_prefix": _profile_cache_key[:16]},
+            )
+            runtime_trace.set_metadata(
+                active_profile_publish_decision=_pn_result.get("active_profile_publish_decision", "cached_unchanged"),
+                active_profile_stable_key=_pn_result.get("active_profile_stable_key", ""),
+                active_profile_token=_pn_result.get("active_profile_token", ""),
+                local_active_profile_prepare_ms=0.0,
+                active_profile_remote_call=0,
+                active_profile_remote_ms=0.0,
+                active_profile_prepare_count=0,
+                profile_prep_cache_hit=True,
+                source_workflow_hash=plan.source_workflow_hash,
+                model_stack=dict(plan.model_stack),
+                prompt_summary=dict(plan.prompt_bundle),
+            )
+            runtime_trace.emit("active_next_profile_end", phase="local", metadata={
+                "decision": "profile_prep_cache_hit",
+                "stable_key": _pn_result.get("active_profile_stable_key", "")[:16],
+            })
+        else:
+            runtime_trace.emit("plan_serialization_start", phase="local",
+                               metadata={"purpose": "profile_activation"})
+            _activation_wf = _canonical_workflow  # reuse canonical payload
+            runtime_trace.emit("plan_serialization_end", phase="local",
+                               metadata={"purpose": "profile_activation",
+                                         "reused_canonical": True})
+            _activation_hash = _profile_src_hash
+            _prod_opts: dict | None = None
+            if _pr.get("enabled"):
+                _prod_opts = {
+                    "enabled": True,
+                    "output_node_ids": list(_pr.get("output_node_ids", [])),
+                    "bypass_node_ids": list(_pr.get("bypass_node_ids", [])),
+                    "source_workflow_hash": _pr.get("source_workflow_hash", ""),
+                    "compiled_workflow_hash": _pr.get("compiled_workflow_hash", ""),
+                    "production_plan_hash": _pr.get("production_plan_hash", ""),
+                    "compiler_version": _pr.get("compiler_version", COMPILER_SCHEMA_VERSION),
+                    "hash_schema_version": _pr.get("hash_schema_version", HASH_SCHEMA_VERSION),
+                    "production_plan_schema_version": _pr.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION),
+                }
+                _activation_hash = _pr.get("source_workflow_hash", _activation_hash)
+            _pn_result = await prepare_active_next_profile(
+                _activation_wf,
+                _activation_hash,
+                production_options=_prod_opts,
+                workspace=workspace,
+                setter=profile_setter,
+            )
+            runtime_trace.set_metadata(
+                active_profile_publish_decision=_pn_result.get("active_profile_publish_decision", ""),
+                active_profile_stable_key=_pn_result.get("active_profile_stable_key", ""),
+                active_profile_token=_pn_result.get("active_profile_token", ""),
+                local_active_profile_prepare_ms=_pn_result.get("local_active_profile_prepare_ms", 0.0),
+                active_profile_remote_call=_pn_result.get("active_profile_remote_call", 0),
+                active_profile_remote_ms=_pn_result.get("active_profile_remote_ms", 0.0),
+                active_profile_prepare_count=1,
+                profile_prep_cache_hit=False,
+                source_workflow_hash=plan.source_workflow_hash,
+                model_stack=dict(plan.model_stack),
+                prompt_summary=dict(plan.prompt_bundle),
+            )
+            runtime_trace.emit("active_next_profile_end", phase="local", metadata={
+                "decision": _pn_result.get("active_profile_publish_decision", ""),
+                "stable_key": _pn_result.get("active_profile_stable_key", "")[:16],
+            })
+            # On success, populate the cache so future identical calls skip
+            if _pn_result.get("status") not in ("error",):
+                with _PROFILE_PREP_CACHE_LOCK:
+                    _PROFILE_PREP_CACHE[_profile_cache_key] = dict(_pn_result)
     else:
         runtime_trace.emit("active_next_profile_end", phase="local", metadata={"status": "dry_run"})
     runtime_trace.emit("active_profile_prepare_end", phase="local")
@@ -633,9 +772,10 @@ async def execute_plan(
     if restore_publisher is not None:
         runtime_trace.emit("plan_serialization_start", phase="local",
                            metadata={"purpose": "restore_publication"})
-        workflow = plan.to_dict()["workflow"]
+        workflow = _canonical_workflow  # reuse canonical payload
         runtime_trace.emit("plan_serialization_end", phase="local",
-                           metadata={"purpose": "restore_publication"})
+                           metadata={"purpose": "restore_publication",
+                                     "reused_canonical": True})
         model_key = derive_model_key(workflow)
         prefill_key = derive_prefill_key(model_key, workflow)
         restore_plan = RestorePlan(
@@ -669,8 +809,10 @@ async def execute_plan(
                 "restore_publish_cache_skip", phase="local",
                 metadata={"cache_key_prefix": cache_key[:64], "identity": plan_identity[:16]},
             )
+            runtime_trace.set_metadata(restore_publish_cache_skipped=True)
             observed_generation = 0
         else:
+            runtime_trace.set_metadata(restore_publish_cache_skipped=False)
             publish_result = restore_publisher.publish(restore_plan)
             if inspect.isawaitable(publish_result):
                 publish_result = await publish_result
@@ -701,6 +843,7 @@ async def execute_plan(
         workspace=workspace,
         trace=runtime_trace.to_legacy_timing(prompt_id=str(plan.request_metadata.get("prompt_id", ""))),
         runtime_trace=runtime_trace,
+        plan_dict=_canonical_dict,
     ):
         message_type = message.get("type") if isinstance(message, dict) else ""
         if event_sink is not None and message_type in {"progress", "status", "executing"}:
@@ -752,10 +895,17 @@ async def execute_plan(
     if not isinstance(_origin, Mapping):
         _origin = {}
     _transport_meta = runtime_trace._metadata
+    # Unconditionally extract remote metadata before the modal_input_id check
+    # so _remote_metadata is always defined for timestamp fallback lookups.
+    _remote_metadata: dict[str, Any] = {}
+    if isinstance(raw_remote_trace, dict):
+        _remote_metadata = raw_remote_trace.get("metadata", {})
+        if not isinstance(_remote_metadata, dict):
+            _remote_metadata = {}
     if not _transport_meta.get("modal_input_id"):
-        _remote_metadata = raw_remote_trace.get("metadata", {}) if isinstance(raw_remote_trace, dict) else {}
-        if isinstance(_remote_metadata, dict) and _remote_metadata.get("modal_input_id"):
+        if _remote_metadata.get("modal_input_id"):
             _transport_meta["modal_input_id"] = _remote_metadata["modal_input_id"]
+
     _local_stages = {
         "local_body_read_ms": _origin.get("local_body_read_ms"),
         "local_json_parse_ms": _origin.get("local_json_parse_ms"),
@@ -825,6 +975,212 @@ async def execute_plan(
         round((_t1_wall_ns - int(_t0_ms) * 1_000_000) / 1_000_000, 3)
         if isinstance(_t0_ms, (int, float)) and isinstance(_t1_wall_ns, int) else None
     )
+
+    # ── V2 remote request origin intervals (Requirement 1) ──────────
+    # All new timestamps come from _origin (local) and _transport_meta (remote).
+    # Missing endpoints emit "absent" (not None/0).
+    # Negative ordering emits "invalid_negative" (not clamp).
+    _ABSENT = "absent"
+    _INVALID_NEG = "invalid_negative"
+
+    def _interval_ms(start: Any, end: Any, *, scale_start: float = 1.0, scale_end: float = 1.0) -> Any:
+        """Compute (end - start) / 1_000_000 in ms.
+        Returns _ABSENT when either is missing, _INVALID_NEG when negative.
+        *scale_start/scale_end* convert to nanoseconds before subtraction."""
+        if start is None or end is None:
+            return _ABSENT
+        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            return _ABSENT
+        _start_ns = int(start * scale_start)
+        _end_ns = int(end * scale_end)
+        _delta_ns = _end_ns - _start_ns
+        if _delta_ns < 0:
+            return _INVALID_NEG
+        return round(_delta_ns / 1_000_000, 3)
+
+    # Raw timestamps: transport metadata first, then origin/request_origin_info,
+    # then merged/raw remote trace data (tolerant multi-tier fallback).
+    # Explicit is not None per tier — preserves valid zero raw timestamps.
+    _local_modal_gen_create_start_ns = _transport_meta.get("modal_generator_create_start_wall_ns")
+    if _local_modal_gen_create_start_ns is None:
+        _local_modal_gen_create_start_ns = _origin.get("modal_generator_create_start_wall_ns")
+    _local_modal_gen_created_ns = _transport_meta.get("modal_generator_created_wall_ns")
+    if _local_modal_gen_created_ns is None:
+        _local_modal_gen_created_ns = _origin.get("modal_generator_created_wall_ns")
+    _local_modal_first_iter_start_ns = _transport_meta.get("modal_first_iteration_start_wall_ns")
+    if _local_modal_first_iter_start_ns is None:
+        _local_modal_first_iter_start_ns = _origin.get("modal_first_iteration_start_wall_ns")
+    _local_modal_submission_attempt_ns = _transport_meta.get("modal_submission_attempt_wall_ns")
+    if _local_modal_submission_attempt_ns is None:
+        _local_modal_submission_attempt_ns = _origin.get("modal_submission_attempt_wall_ns")
+    _local_modal_first_remote_event_ns = _transport_meta.get("modal_first_remote_event_wall_ns")
+    if _local_modal_first_remote_event_ns is None:
+        _local_modal_first_remote_event_ns = _origin.get("modal_first_remote_event_wall_ns")
+    # Third-tier fallback: try from merged/raw remote trace metadata (aliases)
+    if _local_modal_gen_create_start_ns is None:
+        _local_modal_gen_create_start_ns = _remote_metadata.get("modal_generator_create_start_wall_ns")
+    if _local_modal_gen_created_ns is None:
+        _local_modal_gen_created_ns = _remote_metadata.get("modal_generator_created_wall_ns")
+    if _local_modal_first_iter_start_ns is None:
+        _local_modal_first_iter_start_ns = _remote_metadata.get("modal_first_iteration_start_wall_ns")
+    if _local_modal_submission_attempt_ns is None:
+        _local_modal_submission_attempt_ns = _remote_metadata.get("modal_submission_attempt_wall_ns")
+    if _local_modal_first_remote_event_ns is None:
+        _local_modal_first_remote_event_ns = _remote_metadata.get("modal_first_remote_event_wall_ns")
+
+    # Raw timestamps from remote transport metadata (wall_unix_ns)
+    _remote_python_resume_ns = _transport_meta.get("remote_python_resume_wall_ns")
+    _remote_restore_method_start_ns = _transport_meta.get("restore_method_start_wall_ns")
+    _remote_restore_method_end_ns = _transport_meta.get("restore_method_end_wall_ns")
+    _remote_modal_method_entry_ns = _transport_meta.get("modal_method_entry_wall_ns")
+    _remote_prompt_executor_invoke_start_ns = _transport_meta.get("prompt_executor_invoke_start_wall_ns")
+
+    # Also try from _origin for remote timestamps that may be forwarded
+    # as part of the local origin info (tolerate either location).
+    if _remote_python_resume_ns is None:
+        _remote_python_resume_ns = _origin.get("remote_python_resume_wall_ns")
+    if _remote_restore_method_start_ns is None:
+        _remote_restore_method_start_ns = _origin.get("restore_method_start_wall_ns")
+    if _remote_restore_method_end_ns is None:
+        _remote_restore_method_end_ns = _origin.get("restore_method_end_wall_ns")
+    if _remote_modal_method_entry_ns is None:
+        _remote_modal_method_entry_ns = _origin.get("modal_method_entry_wall_ns")
+    if _remote_prompt_executor_invoke_start_ns is None:
+        _remote_prompt_executor_invoke_start_ns = _origin.get("prompt_executor_invoke_start_wall_ns")
+
+    # ── Fourth-tier fallback: raw_timestamps alias keys from result data ──
+    _raw_ts: dict[str, Any] = {}
+    if isinstance(result, dict):
+        _raw_ts = result.get("raw_timestamps", {})
+        if not isinstance(_raw_ts, dict):
+            _raw_ts = {}
+    if _raw_ts:
+        if _t0_ms is None and _raw_ts.get("t0_ui_trigger_wall_unix_ns") is not None:
+            _t0_ms = _raw_ts["t0_ui_trigger_wall_unix_ns"] / 1_000_000.0
+        if _t1_wall_ns is None and _raw_ts.get("t1_local_receive_wall_unix_ns") is not None:
+            _t1_wall_ns = _raw_ts["t1_local_receive_wall_unix_ns"]
+        if _local_modal_submission_attempt_ns is None and _raw_ts.get("modal_submission_attempt_wall_unix_ns") is not None:
+            _local_modal_submission_attempt_ns = _raw_ts["modal_submission_attempt_wall_unix_ns"]
+        if _local_modal_gen_created_ns is None and _raw_ts.get("modal_generator_created_wall_unix_ns") is not None:
+            _local_modal_gen_created_ns = _raw_ts["modal_generator_created_wall_unix_ns"]
+        if _remote_modal_method_entry_ns is None and _raw_ts.get("t4_modal_method_entry_wall_unix_ns") is not None:
+            _remote_modal_method_entry_ns = _raw_ts["t4_modal_method_entry_wall_unix_ns"]
+        if _remote_prompt_executor_invoke_start_ns is None and _raw_ts.get("t5_prompt_executor_invoke_start_wall_unix_ns") is not None:
+            _remote_prompt_executor_invoke_start_ns = _raw_ts["t5_prompt_executor_invoke_start_wall_unix_ns"]
+
+    # ── Fifth-tier fallback: merged trace event metadata ──
+    # Inspect merged trace events for modal_method_entry / remote_method_entry
+    # and prompt_executor_invoke_start by name, using their wall_unix_ns.
+    if _remote_modal_method_entry_ns is None or _remote_prompt_executor_invoke_start_ns is None:
+        for _evt in merged_trace.events:
+            if _remote_modal_method_entry_ns is None and _evt.name in ("modal_method_entry", "remote_method_entry"):
+                _remote_modal_method_entry_ns = _evt.wall_unix_ns
+            if _remote_prompt_executor_invoke_start_ns is None and _evt.name == "prompt_executor_invoke_start":
+                _remote_prompt_executor_invoke_start_ns = _evt.wall_unix_ns
+            if _remote_modal_method_entry_ns is not None and _remote_prompt_executor_invoke_start_ns is not None:
+                break
+
+    # Compute intervals
+    _trigger_to_local_receive_ms = _interval_ms(_t0_ms, _t1_wall_ns,
+                                                  scale_start=1_000_000, scale_end=1.0)
+
+    _local_receive_to_gen_create_start_ms = _interval_ms(
+        _t1_wall_ns, _local_modal_gen_create_start_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    _generator_create_ms = _interval_ms(
+        _local_modal_gen_create_start_ns, _local_modal_gen_created_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    _gen_created_to_first_iter_ms = _interval_ms(
+        _local_modal_gen_created_ns, _local_modal_first_iter_start_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    _first_iter_to_first_remote_event_ms = _interval_ms(
+        _local_modal_first_iter_start_ns, _local_modal_first_remote_event_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    _remote_python_resume_to_restore_start_ms = _interval_ms(
+        _remote_python_resume_ns, _remote_restore_method_start_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    _restore_method_ms = _interval_ms(
+        _remote_restore_method_start_ns, _remote_restore_method_end_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    _restore_end_to_modal_method_entry_ms = _interval_ms(
+        _remote_restore_method_end_ns, _remote_modal_method_entry_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    _modal_method_entry_to_executor_ms = _interval_ms(
+        _remote_modal_method_entry_ns, _remote_prompt_executor_invoke_start_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    # ── submission_to_remote_python_resume_ms ──────────────────────
+    # Cross-process interval: local modal_submission_attempt wall_ns →
+    # remote python resume wall_ns.  Wall clock across processes.
+    _submission_to_remote_python_resume_ms = _interval_ms(
+        _local_modal_submission_attempt_ns, _remote_python_resume_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    # ── unexplained_pre_remote_ms ──────────────────────────────────
+    # = first_iteration_to_first_remote_event_ms minus only intervals
+    #   whose raw endpoints are fully within that same window and whose
+    #   spans are pairwise non-overlapping.
+    # Remote intervals outside the window are ignored (not subtracted,
+    #   not marked invalid).  Missing window endpoints → absent.
+    # Negative ordering → invalid_negative.
+    _unexplained_pre_remote_ms: Any = _ABSENT
+    _win_start_raw = _local_modal_first_iter_start_ns
+    _win_end_raw = _local_modal_first_remote_event_ns
+    if (
+        isinstance(_win_start_raw, (int, float))
+        and isinstance(_win_end_raw, (int, float))
+        and _win_start_raw <= _win_end_raw
+    ):
+        _win_start = int(_win_start_raw)
+        _win_end = int(_win_end_raw)
+        # Candidate remote intervals with raw endpoint pairs
+        _candidates: list[tuple[int, int, str]] = []
+        _remote_groups = [
+            ("python_resume→restore_start", _remote_python_resume_ns, _remote_restore_method_start_ns),
+            ("restore_method", _remote_restore_method_start_ns, _remote_restore_method_end_ns),
+            ("restore_end→method_entry", _remote_restore_method_end_ns, _remote_modal_method_entry_ns),
+            ("method_entry→executor", _remote_modal_method_entry_ns, _remote_prompt_executor_invoke_start_ns),
+        ]
+        for _name, _s, _e in _remote_groups:
+            if isinstance(_s, (int, float)) and isinstance(_e, (int, float)):
+                _si = int(_s)
+                _ei = int(_e)
+                if _si > _ei:
+                    _unexplained_pre_remote_ms = _INVALID_NEG
+                    break
+                if _win_start <= _si <= _win_end and _win_start <= _ei <= _win_end:
+                    _candidates.append((_si, _ei, _name))
+                # else: outside window — ignore for subtraction
+        else:
+            # Only proceed when no ordering violation was found
+            if _candidates:
+                # Greedy non-overlapping selection sorted by start time
+                _candidates.sort(key=lambda x: x[0])
+                _selected: list[tuple[int, int]] = []
+                _last_end = _win_start
+                for _si, _ei, _name in _candidates:
+                    if _si >= _last_end:
+                        _selected.append((_si, _ei))
+                        _last_end = _ei
+                _contained_total_ns = sum(e - s for s, e in _selected)
+                _window_ns = _win_end - _win_start
+                _residual_ns = _window_ns - _contained_total_ns
+                if _residual_ns < 0:
+                    _unexplained_pre_remote_ms = _INVALID_NEG
+                else:
+                    _unexplained_pre_remote_ms = round(_residual_ns / 1_000_000, 3)
+            else:
+                _unexplained_pre_remote_ms = _ABSENT
+    elif isinstance(_win_start_raw, (int, float)) and isinstance(_win_end_raw, (int, float)):
+        # Negative ordering within window endpoints
+        _unexplained_pre_remote_ms = _INVALID_NEG
 
     # ── Clock reconciliation residual ──
     # True residual of the monotonic pipeline: authoritative
@@ -968,8 +1324,25 @@ async def execute_plan(
         "generator_create_to_first_iteration_ms": _transport_meta.get("generator_create_to_first_iteration_ms"),
         "first_iteration_to_first_remote_event_ms": _transport_meta.get("first_iteration_to_first_remote_event_ms"),
         "local_receive_to_actual_submission_ms": _t1_to_submission_ms,
+        # V2 remote request origin intervals
+        "trigger_to_local_receive_ms": _trigger_to_local_receive_ms,
+        "local_receive_to_generator_create_start_ms": _local_receive_to_gen_create_start_ms,
+        "generator_create_ms": _generator_create_ms,
+        "generator_created_to_first_iteration_ms": _gen_created_to_first_iter_ms,
+        "first_iteration_to_first_remote_event_ms": _first_iter_to_first_remote_event_ms,
+        "remote_python_resume_to_restore_start_ms": _remote_python_resume_to_restore_start_ms,
+        "restore_method_ms": _restore_method_ms,
+        "restore_end_to_modal_method_entry_ms": _restore_end_to_modal_method_entry_ms,
+        "modal_method_entry_to_executor_ms": _modal_method_entry_to_executor_ms,
+        "submission_to_remote_python_resume_ms": _submission_to_remote_python_resume_ms,
+        "unexplained_pre_remote_ms": _unexplained_pre_remote_ms,
     }
     result["local_timing"] = _local_summary
+    def _fmt_opt(v: Any) -> str:
+        """Format a numeric value for the one-line summary.
+        Returns ``str(v)`` for numeric values (including 0.0), ``"absent"`` for None."""
+        return "absent" if v is None else str(v)
+
     print(
         f"[v2.request_origin] request_id={runtime_trace.request_id} "
         f"trigger_source={_origin.get('trigger_source', 'unknown')} "
@@ -990,7 +1363,404 @@ async def execute_plan(
         f"reconciliation_status={_stage_attribution_residual_ms.get('reconciliation_status', '')} "
         f"missing_stages={','.join(_stage_attribution_residual_ms.get('missing_stages', []))} "
         f"overlap_error={_stage_attribution_residual_ms.get('overlap_error', '')} "
-        f"modal_input_id={_transport_meta.get('modal_input_id', '')}",
+        f"modal_input_id={_transport_meta.get('modal_input_id', '')} "
+        # V2 remote request origin intervals
+        f"trigger_to_local_receive_ms={_trigger_to_local_receive_ms} "
+        f"local_receive_to_generator_create_start_ms={_local_receive_to_gen_create_start_ms} "
+        f"generator_create_ms={_generator_create_ms} "
+        f"generator_created_to_first_iteration_ms={_gen_created_to_first_iter_ms} "
+        f"first_iteration_to_first_remote_event_ms={_first_iter_to_first_remote_event_ms} "
+        f"remote_python_resume_to_restore_start_ms={_remote_python_resume_to_restore_start_ms} "
+        f"restore_method_ms={_restore_method_ms} "
+        f"restore_end_to_modal_method_entry_ms={_restore_end_to_modal_method_entry_ms} "
+        f"modal_method_entry_to_executor_ms={_modal_method_entry_to_executor_ms} "
+        f"submission_to_remote_python_resume_ms={_submission_to_remote_python_resume_ms} "
+        f"unexplained_pre_remote_ms={_unexplained_pre_remote_ms}",
+        flush=True,
+    )
+    # ── New exact [v2.remote_request_origin] summary ─────────────
+    # Preserves [v2.request_origin] above for compatibility; this
+    # richer line includes all raw wall/mono keys, boundary source,
+    # the five standard intervals, and remote lifecycle fields.
+    # Uses _fmt_opt (local formatter) — None → "absent", preserves
+    # numeric zero and negative semantics.
+    _remote_req_id = _origin.get("request_id") or runtime_trace.request_id
+    _remote_trig_src = _origin.get("trigger_source", "unknown")
+    _remote_t0_wall = _origin.get("ui_run_triggered_wall_unix_ms")
+    _remote_t1_wall_ns = _origin.get("local_receive_wall_ns")
+    _remote_t1_mono_ns = _origin.get("local_receive_mono_ns")
+    print(
+        f"[v2.remote_request_origin] "
+        f"request_id={_remote_req_id} "
+        f"trigger_source={_remote_trig_src} "
+        f"ui_trigger_unix_ms={_fmt_opt(_remote_t0_wall)} "
+        f"local_receive_wall_unix_ns={_fmt_opt(_remote_t1_wall_ns)} "
+        f"local_receive_mono_ns={_fmt_opt(_remote_t1_mono_ns)} "
+        f"modal_generator_create_start_wall_unix_ns={_fmt_opt(_local_modal_gen_create_start_ns)} "
+        f"modal_generator_create_start_mono_ns={_fmt_opt(_transport_meta.get('modal_generator_create_start_mono_ns'))} "
+        f"modal_generator_created_wall_unix_ns={_fmt_opt(_local_modal_gen_created_ns)} "
+        f"modal_generator_created_mono_ns={_fmt_opt(_transport_meta.get('modal_generator_created_mono_ns'))} "
+        f"modal_first_iteration_start_wall_unix_ns={_fmt_opt(_local_modal_first_iter_start_ns)} "
+        f"modal_first_iteration_start_mono_ns={_fmt_opt(_transport_meta.get('modal_first_iteration_start_mono_ns'))} "
+        f"modal_submission_attempt_wall_unix_ns={_fmt_opt(_local_modal_submission_attempt_ns)} "
+        f"modal_submission_attempt_mono_ns={_fmt_opt(_transport_meta.get('modal_submission_attempt_mono_ns'))} "
+        f"modal_first_remote_event_wall_unix_ns={_fmt_opt(_local_modal_first_remote_event_ns)} "
+        f"modal_first_remote_event_mono_ns={_fmt_opt(_transport_meta.get('modal_first_remote_event_mono_ns'))} "
+        f"modal_submission_boundary_source={_fmt_opt(_transport_meta.get('modal_submission_boundary_source'))} "
+        f"remote_python_resume_wall_unix_ns={_fmt_opt(_remote_python_resume_ns)} "
+        f"restore_method_start_wall_unix_ns={_fmt_opt(_remote_restore_method_start_ns)} "
+        f"restore_method_end_wall_unix_ns={_fmt_opt(_remote_restore_method_end_ns)} "
+        f"modal_method_entry_wall_unix_ns={_fmt_opt(_remote_modal_method_entry_ns)} "
+        f"prompt_executor_invoke_start_wall_unix_ns={_fmt_opt(_remote_prompt_executor_invoke_start_ns)} "
+        f"trigger_to_local_receive_ms={_trigger_to_local_receive_ms} "
+        f"local_receive_to_generator_create_start_ms={_local_receive_to_gen_create_start_ms} "
+        f"generator_create_ms={_generator_create_ms} "
+        f"generator_created_to_first_iteration_ms={_gen_created_to_first_iter_ms} "
+        f"first_iteration_to_first_remote_event_ms={_first_iter_to_first_remote_event_ms} "
+        f"remote_python_resume_to_restore_start_ms={_remote_python_resume_to_restore_start_ms} "
+        f"restore_method_ms={_restore_method_ms} "
+        f"restore_end_to_modal_method_entry_ms={_restore_end_to_modal_method_entry_ms} "
+        f"modal_method_entry_to_executor_ms={_modal_method_entry_to_executor_ms} "
+        f"submission_to_remote_python_resume_ms={_submission_to_remote_python_resume_ms} "
+        f"unexplained_pre_remote_ms={_unexplained_pre_remote_ms} "
+        f"modal_input_id={_fmt_opt(_transport_meta.get('modal_input_id', ''))}",
+        flush=True,
+    )
+    # ═══════════════════════════════════════════════════════════════════
+    # [v2.local_submission_breakdown] — detailed pre-submission attribution
+    # ═══════════════════════════════════════════════════════════════════
+    # All durations are monotonic (perf_counter_ns).  Missing events render
+    # as "absent" (literal string), negative deltas as "invalid_negative".
+    # This line covers only local pre-submission instrumentation — no remote
+    # or scheduling time (those appear in [v2.remote_request_origin]).
+    # Reconciliation: measured_children + residual = total (non-overlapping).
+    # Total span: local_receive_mono_ns → modal_submission_attempt.
+    # ═══════════════════════════════════════════════════════════════════
+    _ld = _derived_mono_delta_ms  # shorthand: _ld(trace, start_name, end_name)
+    _ABSENT_STR = "absent"
+    _INVALID_NEG_STR = "invalid_negative"
+
+    # ── Helper: value or absent ──
+    def _val_or_absent(v: Any) -> Any:
+        return _ABSENT_STR if v is None else v
+
+    # ── Raw monotonic reference timestamps ──
+    _ref_mono_local_receive = _origin.get("local_receive_mono_ns")
+    _ref_mono_worker_start = _event_mono_ns(runtime_trace, "worker_start")
+    _ref_mono_exec_entry = _event_mono_ns(runtime_trace, "execute_plan_entry")
+    _ref_mono_submission = _event_mono_ns(runtime_trace, "modal_submission_attempt")
+
+    # ── One-stage durations (direct span events, strict — invalid_negative on neg) ──
+    _plan_build_ms = _strict_event_span_ms(runtime_trace, "plan_build_start", "plan_build_end")
+    _active_profile_ms = _strict_event_span_ms(runtime_trace,
+                                                "active_profile_prepare_start",
+                                                "active_profile_prepare_end")
+    _restore_plan_build_ms = _strict_event_span_ms(runtime_trace,
+                                                    "restore_plan_build_start",
+                                                    "restore_plan_build_end")
+    _restore_publish_ms = _strict_event_span_ms(runtime_trace,
+                                                 "restore_plan_publish_start",
+                                                 "restore_plan_publish_end")
+    _handle_lookup_ms = _strict_event_span_ms(runtime_trace,
+                                               "modal_handle_lookup_start",
+                                               "modal_handle_lookup_end")
+    _payload_serialize_ms = _strict_event_span_ms(runtime_trace,
+                                                   "modal_payload_serialize_start",
+                                                   "modal_payload_serialize_end")
+
+    # ── Derived gap durations (start→end, non-overlapping) ──
+    _post_restore_pub_to_transport_ms = _ld(runtime_trace,
+                                             "restore_plan_publish_end",
+                                             "transport_entry")
+    _transport_entry_to_handle_lookup_ms = _ld(runtime_trace,
+                                                "transport_entry",
+                                                "modal_handle_lookup_start")
+    _payload_ready_to_gen_create_ms = _ld(runtime_trace,
+                                           "modal_payload_serialize_end",
+                                           "modal_generator_create_start")
+    _generator_create_ms = _ld(runtime_trace,
+                                "modal_generator_create_start",
+                                "modal_generator_created")
+    _gen_created_to_first_iter_ms = _ld(runtime_trace,
+                                         "modal_generator_created",
+                                         "modal_first_iteration_start")
+
+    # ── Boundary-anchored durations ──
+    # local_receive_to_worker_start_ms = worker_start - local_receive
+    _local_receive_to_worker_start_ms: Any = _ABSENT_STR
+    if isinstance(_ref_mono_local_receive, int) and isinstance(_ref_mono_worker_start, int):
+        _delta = _ref_mono_worker_start - _ref_mono_local_receive
+        if _delta < 0:
+            _local_receive_to_worker_start_ms = _INVALID_NEG_STR
+        else:
+            _local_receive_to_worker_start_ms = round(_delta / 1_000_000, 3)
+
+    # worker_start_to_execute_plan_entry_ms =
+    #   (execute_plan_entry - worker_start) - plan_build_ms
+    # This is the residual in the worker_start→execute_plan_entry region
+    # after excluding the plan_build sub-interval.
+    _worker_start_to_exec_entry_ms: Any = _ABSENT_STR
+    if isinstance(_ref_mono_worker_start, int) and isinstance(_ref_mono_exec_entry, int):
+        _total = _ref_mono_exec_entry - _ref_mono_worker_start
+        if _total < 0:
+            _worker_start_to_exec_entry_ms = _INVALID_NEG_STR
+        elif isinstance(_plan_build_ms, (int, float)):
+            _residual = _total / 1_000_000 - float(_plan_build_ms)
+            if _residual < 0:
+                _worker_start_to_exec_entry_ms = _INVALID_NEG_STR
+            else:
+                _worker_start_to_exec_entry_ms = round(_residual, 3)
+        else:
+            # plan_build_ms absent → entire total becomes this residual
+            _worker_start_to_exec_entry_ms = round(_total / 1_000_000, 3)
+
+    # ── Total span ──
+    # local_receive_to_actual_submission_ms = submission - local_receive
+    _total_ms: Any = _ABSENT_STR
+    if isinstance(_ref_mono_local_receive, int) and isinstance(_ref_mono_submission, int):
+        _delta = _ref_mono_submission - _ref_mono_local_receive
+        if _delta < 0:
+            _total_ms = _INVALID_NEG_STR
+        else:
+            _total_ms = round(_delta / 1_000_000, 3)
+
+    # ── Measured children: sum of all valid sequential non-overlapping stages ──
+    _child_keys = [
+        ("local_receive_to_worker_start_ms", _local_receive_to_worker_start_ms),
+        ("worker_start_to_execute_plan_entry_ms", _worker_start_to_exec_entry_ms),
+        ("plan_build_ms", _plan_build_ms),
+        ("active_profile_ms", _active_profile_ms),
+        ("restore_plan_build_ms", _restore_plan_build_ms),
+        ("restore_publish_ms", _restore_publish_ms),
+        ("post_restore_publish_to_transport_ms", _post_restore_pub_to_transport_ms),
+        ("transport_entry_to_handle_lookup_ms", _transport_entry_to_handle_lookup_ms),
+        ("handle_lookup_ms", _handle_lookup_ms),
+        ("payload_serialize_ms", _payload_serialize_ms),
+        ("payload_ready_to_generator_create_ms", _payload_ready_to_gen_create_ms),
+        ("generator_create_ms", _generator_create_ms),
+        ("generator_created_to_first_iteration_ms", _gen_created_to_first_iter_ms),
+    ]
+    _measured_children_ms: Any = _ABSENT_STR
+    _all_numeric = True
+    _child_sum = 0.0
+    _missing_child_names: list[str] = []
+    for _ck, _cv in _child_keys:
+        if isinstance(_cv, (int, float)):
+            _child_sum += float(_cv)
+        else:
+            _all_numeric = False
+            if _cv not in (_ABSENT_STR, _INVALID_NEG_STR):
+                _missing_child_names.append(_ck)
+    if _all_numeric:
+        _measured_children_ms = round(_child_sum, 3)
+    else:
+        _measured_children_ms = _ABSENT_STR
+
+    # ── Residual from unrounded child sum for deterministic reconcile ──
+    _residual_ms: Any = _ABSENT_STR
+    if isinstance(_total_ms, (int, float)) and _all_numeric:
+        # unrounded: residual = total - child_sum (not measured_children which is rounded)
+        _residual_val = _total_ms - _child_sum
+        _residual_ms = round(_residual_val, 3)
+
+    # ── Reconciliation status ──
+    _reconciliation_status: str = "complete"
+    if not isinstance(_total_ms, (int, float)):
+        _reconciliation_status = "incomplete"
+    elif not isinstance(_measured_children_ms, (int, float)):
+        _reconciliation_status = "incomplete"
+    elif isinstance(_residual_ms, (int, float)) and _residual_ms < -0.001:
+        _reconciliation_status = "overlap"
+    # Any direct strict stage with INVALID_NEG → overlap
+    for _ck, _cv in _child_keys:
+        if _cv == _INVALID_NEG_STR:
+            _reconciliation_status = "overlap"
+            break
+
+    # ── Metadata booleans from actual branches ──
+    # Active profile
+    _performed_remote_setter_call: Any = None
+    _used_existing_stable_profile: Any = None
+    _rebuilt_profile_locally: Any = None
+    _ap_decision = _transport_meta.get("active_profile_publish_decision", "")
+    _remote_call_count = _transport_meta.get("active_profile_remote_call", 0)
+    if _ap_decision:
+        _performed_remote_setter_call = bool(_remote_call_count)
+        # Use exact decision values from warmup_profile rather than substring guess
+        _used_existing_stable_profile = _ap_decision in ("stable_key_exists", "stable_found", "stable_key_found")
+        _rebuilt_profile_locally = _ap_decision in ("rebuilt", "rebuilt_locally", "rebuilt_profile")
+    _remote_call_performed = bool(_remote_call_count) if _ap_decision else None
+
+    # Restore publication
+    _hit_restore_publish_cache: Any = None
+    _performed_remote_publish: Any = None
+    _rpc_skipped = _transport_meta.get("restore_publish_cache_skipped")
+    if isinstance(_rpc_skipped, bool):
+        _hit_restore_publish_cache = bool(_rpc_skipped)
+        _performed_remote_publish = not bool(_rpc_skipped)
+
+    # Handle lookup — check trace events for specific boundaries
+    _has_cache_hit_event = any(e.name == "handle_cache_hit" for e in runtime_trace.events)
+    _has_cache_miss_event = any(e.name == "handle_cache_miss" for e in runtime_trace.events)
+    _has_client_resolution = any(e.name == "client_resolution_start" for e in runtime_trace.events)
+    _has_class_lookup = any(e.name == "class_lookup_start" for e in runtime_trace.events)
+    _has_instance_construction = any(e.name == "instance_construction_start" for e in runtime_trace.events)
+    _has_factory_resolve = any(e.name == "handle_factory_resolve" for e in runtime_trace.events)
+
+    if _has_cache_hit_event:
+        _hit_handle_cache = True
+    elif _has_cache_miss_event:
+        _hit_handle_cache = False
+    else:
+        _hit_handle_cache = None
+
+    if _has_client_resolution:
+        _created_modal_client = True
+    elif _has_factory_resolve:
+        _created_modal_client = False
+    elif _has_cache_hit_event:
+        _created_modal_client = False
+    else:
+        _created_modal_client = None
+
+    if _has_class_lookup:
+        _performed_cls_from_name = True
+    elif _has_factory_resolve:
+        _performed_cls_from_name = False
+    elif _has_cache_hit_event:
+        _performed_cls_from_name = False
+    else:
+        _performed_cls_from_name = None
+
+    if _has_instance_construction:
+        _constructed_class_instance = True
+    elif _has_factory_resolve:
+        _constructed_class_instance = False
+    elif _has_cache_hit_event:
+        _constructed_class_instance = False
+    else:
+        _constructed_class_instance = None
+
+    # Workflow / payload metadata
+    _workflow_node_count: Any = None
+    _workflow_node_count_val = _transport_meta.get("workflow_node_count")
+    if _workflow_node_count_val is not None:
+        _workflow_node_count = _workflow_node_count_val
+    _input_image_count = _transport_meta.get("input_image_count", 0)
+    _payload_bytes = _transport_meta.get("payload_bytes") or _transport_meta.get("modal_payload_serialize_bytes")
+
+    _breakdown = {
+        # ── Required fields ──────────────────────────────────────────
+        "request_id": _origin.get("request_id") or runtime_trace.request_id,
+        "local_receive_to_worker_start_ms": _local_receive_to_worker_start_ms,
+        "worker_start_to_execute_plan_entry_ms": _worker_start_to_exec_entry_ms,
+        "plan_build_ms": _plan_build_ms,
+        "active_profile_ms": _active_profile_ms,
+        "restore_plan_build_ms": _restore_plan_build_ms,
+        "restore_publish_ms": _restore_publish_ms,
+        "post_restore_publish_to_transport_ms": _post_restore_pub_to_transport_ms,
+        "transport_entry_to_handle_lookup_ms": _transport_entry_to_handle_lookup_ms,
+        "handle_lookup_ms": _handle_lookup_ms,
+        "payload_serialize_ms": _payload_serialize_ms,
+        "payload_ready_to_generator_create_ms": _payload_ready_to_gen_create_ms,
+        "generator_create_ms": _generator_create_ms,
+        "generator_created_to_first_iteration_ms": _gen_created_to_first_iter_ms,
+        "local_receive_to_actual_submission_ms": _total_ms,
+        "measured_children_ms": _measured_children_ms,
+        "residual_ms": _residual_ms,
+        "reconciliation_status": _reconciliation_status,
+
+        # ── Raw monotonic reference points (metadata, not required) ──
+        "local_receive_mono_ns": _ref_mono_local_receive,
+        "worker_start_mono_ns": _ref_mono_worker_start,
+        "execute_plan_entry_mono_ns": _ref_mono_exec_entry,
+        "transport_entry_mono_ns": _event_mono_ns(runtime_trace, "transport_entry"),
+        "modal_submission_attempt_mono_ns": _ref_mono_submission,
+
+        # ── Active profile metadata ──
+        "active_profile_publish_decision": _ap_decision,
+        "active_profile_stable_key": _transport_meta.get("active_profile_stable_key", ""),
+        "active_profile_token": _transport_meta.get("active_profile_token", ""),
+        "local_active_profile_prepare_ms": _transport_meta.get("local_active_profile_prepare_ms"),
+        "active_profile_remote_call": _remote_call_count,
+        "active_profile_remote_ms": _transport_meta.get("active_profile_remote_ms"),
+        "performed_remote_setter_call": _performed_remote_setter_call,
+        "used_existing_stable_profile": _used_existing_stable_profile,
+        "rebuilt_profile_locally": _rebuilt_profile_locally,
+        "remote_call_performed": _remote_call_performed,
+
+        # ── Restore publication metadata ──
+        "restore_publish_generation": _transport_meta.get("restore_publish_result", {}).get("generation")
+        if isinstance(_transport_meta.get("restore_publish_result"), dict) else None,
+        "restore_publish_cache_skipped": _rpc_skipped,
+        "hit_restore_publish_cache": _hit_restore_publish_cache,
+        "performed_remote_publish": _performed_remote_publish,
+
+        # ── Handle lookup metadata ──
+        "handle_lookup_app_name": _transport_meta.get("handle_lookup_app_name", ""),
+        "handle_lookup_class_name": _transport_meta.get("handle_lookup_class_name", ""),
+        "handle_lookup_gpu": _transport_meta.get("handle_lookup_gpu", ""),
+        "hit_handle_cache": _hit_handle_cache,
+        "created_modal_client": _created_modal_client,
+        "performed_cls_from_name": _performed_cls_from_name,
+        "constructed_class_instance": _constructed_class_instance,
+
+        # ── Payload / workflow / images metadata ──
+        "payload_bytes": _payload_bytes,
+        "payload_serialized_bytes": _transport_meta.get("modal_payload_serialize_bytes"),
+        "workflow_hash": _transport_meta.get("workflow_hash", ""),
+        "input_image_count": _input_image_count,
+        "workflow_node_count": _workflow_node_count,
+
+        # ── Cache / remote call metadata ──
+        "handle_cache_action": _transport_meta.get("handle_cache_action", ""),
+        "active_profile_remote_call_count": _remote_call_count,
+    }
+    _fmt_bd = _fmt_opt
+    print(
+        f"[v2.local_submission_breakdown] "
+        f"request_id={_breakdown['request_id']} "
+        f"local_receive_to_worker_start_ms={_fmt_bd(_breakdown['local_receive_to_worker_start_ms'])} "
+        f"worker_start_to_execute_plan_entry_ms={_fmt_bd(_breakdown['worker_start_to_execute_plan_entry_ms'])} "
+        f"plan_build_ms={_fmt_bd(_breakdown['plan_build_ms'])} "
+        f"active_profile_ms={_fmt_bd(_breakdown['active_profile_ms'])} "
+        f"restore_plan_build_ms={_fmt_bd(_breakdown['restore_plan_build_ms'])} "
+        f"restore_publish_ms={_fmt_bd(_breakdown['restore_publish_ms'])} "
+        f"post_restore_publish_to_transport_ms={_fmt_bd(_breakdown['post_restore_publish_to_transport_ms'])} "
+        f"transport_entry_to_handle_lookup_ms={_fmt_bd(_breakdown['transport_entry_to_handle_lookup_ms'])} "
+        f"handle_lookup_ms={_fmt_bd(_breakdown['handle_lookup_ms'])} "
+        f"payload_serialize_ms={_fmt_bd(_breakdown['payload_serialize_ms'])} "
+        f"payload_ready_to_generator_create_ms={_fmt_bd(_breakdown['payload_ready_to_generator_create_ms'])} "
+        f"generator_create_ms={_fmt_bd(_breakdown['generator_create_ms'])} "
+        f"generator_created_to_first_iteration_ms={_fmt_bd(_breakdown['generator_created_to_first_iteration_ms'])} "
+        f"local_receive_to_actual_submission_ms={_fmt_bd(_breakdown['local_receive_to_actual_submission_ms'])} "
+        f"measured_children_ms={_fmt_bd(_breakdown['measured_children_ms'])} "
+        f"residual_ms={_fmt_bd(_breakdown['residual_ms'])} "
+        f"reconciliation_status={_breakdown['reconciliation_status']} "
+        # Metadata (non-required, informative)
+        f"active_profile_publish_decision={_breakdown['active_profile_publish_decision']} "
+        f"active_profile_stable_key_prefix={str(_breakdown['active_profile_stable_key'])[:16]} "
+        f"active_profile_token_prefix={str(_breakdown['active_profile_token'])[:8]} "
+        f"local_active_profile_prepare_ms={_fmt_bd(_breakdown['local_active_profile_prepare_ms'])} "
+        f"remote_call_performed={_fmt_bd(_breakdown['remote_call_performed'])} "
+        f"active_profile_remote_call={_breakdown['active_profile_remote_call']} "
+        f"active_profile_remote_ms={_fmt_bd(_breakdown['active_profile_remote_ms'])} "
+        f"performed_remote_setter_call={_fmt_bd(_breakdown['performed_remote_setter_call'])} "
+        f"used_existing_stable_profile={_fmt_bd(_breakdown['used_existing_stable_profile'])} "
+        f"rebuilt_profile_locally={_fmt_bd(_breakdown['rebuilt_profile_locally'])} "
+        f"hit_restore_publish_cache={_fmt_bd(_breakdown['hit_restore_publish_cache'])} "
+        f"performed_remote_publish={_fmt_bd(_breakdown['performed_remote_publish'])} "
+        f"hit_handle_cache={_fmt_bd(_breakdown['hit_handle_cache'])} "
+        f"created_modal_client={_fmt_bd(_breakdown['created_modal_client'])} "
+        f"performed_cls_from_name={_fmt_bd(_breakdown['performed_cls_from_name'])} "
+        f"constructed_class_instance={_fmt_bd(_breakdown['constructed_class_instance'])} "
+        f"payload_bytes={_fmt_bd(_breakdown['payload_bytes'])} "
+        f"payload_serialized_bytes={_fmt_bd(_breakdown['payload_serialized_bytes'])} "
+        f"workflow_hash_prefix={_breakdown['workflow_hash'][:12]} "
+        f"input_image_count={_breakdown['input_image_count']} "
+        f"workflow_node_count={_fmt_bd(_breakdown['workflow_node_count'])} "
+        f"handle_cache_action={_breakdown['handle_cache_action']} "
+        f"active_profile_remote_call_count={_breakdown['active_profile_remote_call_count']}",
         flush=True,
     )
     result["trace"] = remote_trace

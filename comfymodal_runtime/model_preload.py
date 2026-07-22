@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import enum
 import functools
+import math
 import os
 import platform
 import time
@@ -85,6 +86,27 @@ _DIAGNOSTIC_FLAG: bool = (
 total, CLIP read/ready, background submitted/ready, graph demand/wait,
 and method gaps are reported."""
 
+# ── Slow model-read threshold ─────────────────────────────────────────
+# When a CLIP load_torch_file or background-UNET active read exceeds this
+# wall-time threshold (ms), a detailed ``[v2.slow_model_read]`` diagnostic
+# line is emitted with counter deltas, /proc/meminfo, and cgroup stats.
+# Invalid/negative/non-finite values fall back safely to 3000.
+
+
+def _parse_slow_read_threshold() -> float:
+    """Parse COMFYMODAL_V2_SLOW_READ_THRESHOLD_MS with safe fallback to 3000."""
+    try:
+        _val = os.environ.get("COMFYMODAL_V2_SLOW_READ_THRESHOLD_MS", "3000")
+        _parsed = float(_val)
+        if _parsed >= 0 and math.isfinite(_parsed):
+            return _parsed
+    except Exception:
+        pass
+    return 3000.0
+
+
+_SLOW_READ_THRESHOLD_MS: float = _parse_slow_read_threshold()
+
 # ── Per-worker lane context (set around worker callback) ─────────────
 
 _ACTIVE_LANE_TRACE: ContextVar["ModelLaneTrace | None"] = ContextVar(
@@ -149,8 +171,8 @@ _clip_constructor_depth: ContextVar[int] = ContextVar("_clip_constructor_depth",
 # is enabled.  Avoids logging unrelated model loads.
 _DEEP_TARGET_PATH: ContextVar[str] = ContextVar("_deep_target_path", default="")
 
-# Residual tracking — list of (name, duration_ms) tuples collected during an SD outer call.
-_child_durations: ContextVar[list[tuple[str, float]] | None] = ContextVar("_child_durations", default=None)
+# Residual tracking — list of child duration_ms collected during an SD outer call.
+_child_durations: ContextVar[list[float] | None] = ContextVar("_child_durations", default=None)
 
 # CLIP CPU prepare child durations.
 _clip_cpu_prepare_children: ContextVar[list[tuple[str, float]] | None] = ContextVar("_clip_cpu_prepare_children", default=None)
@@ -195,10 +217,16 @@ def _make_torch_file_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
     def wrapper(ckpt, safe_load=False, device=None, return_metadata=False):
         before = _torch_file_depth.get()
         _torch_file_depth.set(before + 1)
+        _slow_read_state: _SlowReadBeforeState | None = None
+        _slow_ru_before: dict[str, Any] | None = None
+        _slow_io_before: dict[str, int] | None = None
         if before == 0:
             lane = _ACTIVE_LANE_TRACE.get()
             if lane is not None:
                 lane.read_start()
+                if lane._lane == "CLIP":
+                    _slow_read_state = _capture_slow_read_before()
+                    _slow_ru_before, _slow_io_before = _collect_rusage_and_io_snapshots()
                 if lane._lane == "UNET" and _DIAGNOSTIC_FLAG:
                     lane._trace.emit(
                         "unet_load_torch_file_start",
@@ -215,6 +243,32 @@ def _make_torch_file_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 if lane is not None:
                     lane.read_end()
                     lane._on_read_completed()
+                    if lane._lane == "CLIP" and _slow_read_state is not None:
+                        _after_mono = time.monotonic_ns()
+                        _after_tt = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
+                        _after_pt = time.process_time_ns() if hasattr(time, "process_time_ns") else None
+                        _after_tid = _capture_tid()
+                        _elapsed = round((_after_mono - _slow_read_state.mono_ns) / 1_000_000, 3)
+                        if _elapsed >= _SLOW_READ_THRESHOLD_MS:
+                            _slow_ru_after, _slow_io_after = _collect_rusage_and_io_snapshots()
+                            _request_trace = _ACTIVE_REQUEST_TRACE.get()
+                            _emit_slow_read_line(
+                                owner="CLIP",
+                                loader_type="load_torch_file",
+                                path_str=str(ckpt) if ckpt else "",
+                                request_id=str(_request_trace.request_id) if _request_trace is not None else "",
+                                restore_session_id=_LATEST_RESTORE_SESSION_ID,
+                                restored_instance_id=_LATEST_RESTORED_INSTANCE_ID,
+                                before=_slow_read_state,
+                                after_mono_ns=_after_mono,
+                                after_thread_time_ns=_after_tt,
+                                after_process_time_ns=_after_pt,
+                                after_tid=_after_tid,
+                                before_rusage=_slow_ru_before,
+                                after_rusage=_slow_ru_after,
+                                before_io=_slow_io_before,
+                                after_io=_slow_io_after,
+                            )
                     if lane._lane == "UNET" and _DIAGNOSTIC_FLAG:
                         lane._trace.emit(
                             "unet_load_torch_file_end",
@@ -517,14 +571,12 @@ def _make_clip_load_wrapper(original):
         _clip_depth.set(before + 1)
         lane = _ACTIVE_LANE_TRACE.get()
         emit = (before == 0 and lane is not None and lane._lane == "CLIP")
-        _entry_ns = time.monotonic_ns() if emit else 0
+        _outer_start_ns = time.monotonic_ns() if emit else 0
         _prior_children = _clip_cpu_prepare_children.get()
         _result = None
-        _pre_event_count = 0
         if emit:
-            lane._trace.emit("clip_load_call_start", phase="restore", metadata={"lane": lane._lane})
             _clip_cpu_prepare_children.set([])
-            _pre_event_count = len(lane._trace.events)
+            lane._trace.emit("clip_cpu_prepare_start", phase="restore")
         try:
             _result = original(*args, **kwargs)
             return _result
@@ -532,106 +584,27 @@ def _make_clip_load_wrapper(original):
             after = _clip_depth.get()
             _clip_depth.set(after - 1)
             if emit:
-                _exit_ns = time.monotonic_ns()
-                _outer_dur_ms = round((_exit_ns - _entry_ns) / 1_000_000, 3)
-                # ── Post-read boundary from lane state ────────────
-                _boundary_ns = lane._post_read_boundary_ns if lane is not None else 0
-                _boundary_occurred = (_boundary_ns > 0)
-                if _boundary_occurred:
-                    _post_read_total_ms = round((_exit_ns - _boundary_ns) / 1_000_000, 3)
-                    _file_read_total_ms = round(lane._read_interval_sum_ns / 1_000_000, 3) if lane._read_interval_sum_ns > 0 else None
-                else:
-                    _post_read_total_ms = None
-                    _file_read_total_ms = None
-                # ── Children and residual (signed!) ─────────────
+                _outer_dur_ms = round((time.monotonic_ns() - _outer_start_ns) / 1_000_000, 3)
                 _children = _clip_cpu_prepare_children.get() or []
                 _children_total = round(sum(c[1] for c in _children), 3)
-                # Signed residual: post_read_total - measured direct children.
-                # If no boundary occurred, residual is None too.
-                _residual_ms = None
-                if _post_read_total_ms is not None:
-                    _residual_ms = round(_post_read_total_ms - _children_total, 3)
-                # ── Status: mismatch + signed overlap ────────────
-                _status = "ok"
-                if lane is not None:
-                    if lane.expected_read_count > 0 and lane._actual_read_count != lane.expected_read_count:
-                        _status = "read_count_mismatch"
-                if _residual_ms is not None and _residual_ms < 0 and abs(_residual_ms) > 0.01:
-                    if _status == "ok":
-                        _status = "overlap_error"
-                    else:
-                        _status = _status + "|overlap_error"
+                _residual = round(max(0.0, _outer_dur_ms - _children_total), 3)
                 # ── Cache publication observation ────────────────
                 if _result is not None:
                     _patcher = getattr(_result, "patcher", None)
                     if _patcher is not None:
                         _cpi = getattr(_patcher, "cached_patcher_init", None)
-                        if _cpi is not None and lane is not None:
+                        if _cpi is not None:
                             lane._trace.emit("clip_cache_publish", phase="restore", metadata={
-                                "lane": lane._lane,
                                 "cache_type": "cached_patcher_init",
-                                "clip_cpu_prepare_total_ms": _post_read_total_ms,
-                                "duration_ms": None,
+                                "clip_cpu_prepare_total_ms": _outer_dur_ms,
                             })
-                # ── Derive named durations from trace event metadata ───
-                _detect_te_ms = None
-                _lte_ms = None
-                _conv_ms = None
-                _clip_constr_ms = None
-                _model_pat_ms = None
-                _cache_pub_event_ms = None
-                if lane is not None:
-                    for _evt in list(lane._trace.events)[_pre_event_count:]:
-                        _meta = getattr(_evt, 'metadata', {}) or {}
-                        _m_dur = _meta.get('duration_ms')
-                        if _evt.name == "clip_detect_te_model_end" and _m_dur is not None:
-                            _detect_te_ms = (_detect_te_ms or 0) + _m_dur
-                        elif _evt.name == "clip_load_text_encoder_state_dicts_end" and _m_dur is not None:
-                            _lte_ms = (_lte_ms or 0) + _m_dur
-                        elif _evt.name in ("clip_text_transformers_convert_end", "clip_clip_text_transformers_convert_end", "clip_convert_old_quants_end") and _m_dur is not None:
-                            _conv_ms = (_conv_ms or 0) + _m_dur
-                        elif _evt.name == "clip_constructor_end" and _m_dur is not None:
-                            _clip_constr_ms = (_clip_constr_ms or 0) + _m_dur
-                        elif _evt.name == "clip_model_patcher_constructor_end" and _m_dur is not None:
-                            _model_pat_ms = (_model_pat_ms or 0) + _m_dur
-                        elif _evt.name == "clip_cache_publish" and _m_dur is not None:
-                            _cache_pub_event_ms = (_cache_pub_event_ms or 0) + _m_dur
-                _state_dict_conv_ms = _conv_ms
-                # ── Emit clip_cpu_prepare_end ─────────────────────
+                _clip_cpu_prepare_children.set(_prior_children)
                 lane._trace.emit("clip_cpu_prepare_end", phase="restore", metadata={
-                    "lane": lane._lane,
-                    "clip_cpu_prepare_total_ms": _post_read_total_ms,
-                    "clip_file_read_total_ms": _file_read_total_ms,
+                    "clip_cpu_prepare_total_ms": _outer_dur_ms,
                     "children": [(name, dur) for name, dur in _children],
                     "clip_cpu_prepare_measured_children_ms": _children_total,
-                    "clip_cpu_prepare_residual_ms": _residual_ms,
-                    "status": _status,
+                    "clip_cpu_prepare_residual_ms": _residual,
                 })
-                # ── Emit clip_load_call_end with totals ──────────
-                lane._trace.emit("clip_load_call_end", phase="restore", metadata={
-                    "lane": lane._lane,
-                    "clip_load_call_total_ms": _outer_dur_ms,
-                    "clip_file_read_total_ms": _file_read_total_ms,
-                    "clip_post_read_cpu_total_ms": _post_read_total_ms,
-                    "status": _status,
-                })
-                # ── Restore prior children list ───────────────────
-                _clip_cpu_prepare_children.set(_prior_children)
-                # ── Compact [v2.clip_cpu_children] summary ───────
-                _emit_clip_cpu_children_summary(
-                    post_read_total_ms=_post_read_total_ms,
-                    file_read_total_ms=_file_read_total_ms,
-                    children=_children,
-                    load_text_encoder_state_dicts_ms=_lte_ms,
-                    detect_te_model_ms=_detect_te_ms,
-                    state_dict_conversion_ms=_state_dict_conv_ms,
-                    clip_constructor_ms=_clip_constr_ms,
-                    model_patcher_ms=_model_pat_ms,
-                    cache_publish_ms=_cache_pub_event_ms,
-                    measured_children_ms=_children_total,
-                    residual_ms=_residual_ms,
-                    status=_status,
-                )
     wrapper._comfy_modal_clip_wrapper = True
     return wrapper
 
@@ -644,7 +617,7 @@ def _make_clip_subfn_wrapper(short_name, original, category):
         emit = (lane is not None and lane._lane == "CLIP")
         _fn_start_ns = time.monotonic_ns() if emit else 0
         if emit:
-            lane._trace.emit("clip_" + short_name + "_start", phase="restore", metadata={"lane": lane._lane, "category": category})
+            lane._trace.emit("clip_" + short_name + "_start", phase="restore", metadata={"category": category})
         _before_depth = _clip_subfn_depth.get()
         _clip_subfn_depth.set(_before_depth + 1)
         try:
@@ -655,7 +628,7 @@ def _make_clip_subfn_wrapper(short_name, original, category):
             if emit:
                 _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
                 lane._trace.emit("clip_" + short_name + "_end", phase="restore", metadata={
-                    "lane": lane._lane, "category": category, "duration_ms": _dur_ms})
+                    "category": category, "duration_ms": _dur_ms})
                 # Only direct children (depth=0 before call) contribute to measured sum
                 if _before_depth == 0:
                     _children = _clip_cpu_prepare_children.get()
@@ -684,7 +657,7 @@ def _make_clip_constructor_wrapper(original):
         emit = (before == 0 and lane is not None and lane._lane == "CLIP")
         _fn_start_ns = time.monotonic_ns() if emit else 0
         if emit:
-            lane._trace.emit("clip_constructor_start", phase="restore", metadata={"lane": lane._lane})
+            lane._trace.emit("clip_constructor_start", phase="restore")
         try:
             return original(self, *args, **kwargs)
         finally:
@@ -693,7 +666,6 @@ def _make_clip_constructor_wrapper(original):
             if emit:
                 _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
                 lane._trace.emit("clip_constructor_end", phase="restore", metadata={
-                    "lane": lane._lane,
                     "duration_ms": _dur_ms,
                 })
                 # NOT recorded into _clip_cpu_prepare_children — nested inside
@@ -720,36 +692,26 @@ def _make_convert_old_quants_wrapper(original):
         if lane is None:
             return original(*args, **kwargs)
         _fn_start_ns = time.monotonic_ns()
-        # Capture nesting depth BEFORE incrementing for both lane types
-        _clip_nest_before = _clip_subfn_depth.get()
-        _unet_nest_before = _unet_subfn_nesting_depth.get()
         if lane._lane == "CLIP":
-            _clip_subfn_depth.set(_clip_nest_before + 1)
-            lane._trace.emit("clip_convert_old_quants_start", phase="restore", metadata={"lane": lane._lane, "category": "utils"})
+            lane._trace.emit("clip_convert_old_quants_start", phase="restore", metadata={"category": "utils"})
         elif lane._lane == "UNET":
-            _unet_subfn_nesting_depth.set(_unet_nest_before + 1)
             lane._trace.emit("unet_convert_old_quants_start", phase="restore", metadata={"category": "utils"})
         try:
             return original(*args, **kwargs)
         finally:
             _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
             if lane._lane == "CLIP":
-                _clip_subfn_depth.set(_clip_nest_before)
                 lane._trace.emit("clip_convert_old_quants_end", phase="restore", metadata={
-                    "lane": lane._lane, "category": "utils", "duration_ms": _dur_ms})
-                # Only direct children (no enclosing CLIP subfn) contribute
-                if _clip_nest_before == 0:
-                    _children = _clip_cpu_prepare_children.get()
-                    if _children is not None:
-                        _children.append(("convert_old_quants", _dur_ms))
+                    "category": "utils", "duration_ms": _dur_ms})
+                _children = _clip_cpu_prepare_children.get()
+                if _children is not None:
+                    _children.append(("convert_old_quants", _dur_ms))
             elif lane._lane == "UNET":
-                _unet_subfn_nesting_depth.set(_unet_nest_before)
                 lane._trace.emit("unet_convert_old_quants_end", phase="restore", metadata={
                     "category": "utils", "duration_ms": _dur_ms})
-                if _unet_nest_before == 0:
-                    _children = _child_durations.get()
-                    if _children is not None:
-                        _children.append(("convert_old_quants", _dur_ms))
+                _children = _child_durations.get()
+                if _children is not None:
+                    _children.append(_dur_ms)
     setattr(wrapper, _SENTINEL_SHARED_COQ, True)
     return wrapper
 
@@ -802,28 +764,23 @@ def _make_model_patcher_constructor_wrapper(original):
         emit_unet = (lane is not None and lane._lane == "UNET")
         emit_clip = (lane is not None and lane._lane == "CLIP")
         _fn_start_ns = time.monotonic_ns() if (emit_unet or emit_clip) else 0
-        _unet_nest_before = _unet_subfn_nesting_depth.get()
         if emit_unet:
-            _unet_subfn_nesting_depth.set(_unet_nest_before + 1)
             lane._trace.emit("unet_model_patcher_constructor_start", phase="restore")
         elif emit_clip:
-            lane._trace.emit("clip_model_patcher_constructor_start", phase="restore", metadata={"lane": lane._lane})
+            lane._trace.emit("clip_model_patcher_constructor_start", phase="restore")
         try:
             return original(self, *args, **kwargs)
         finally:
             if emit_unet:
-                _unet_subfn_nesting_depth.set(_unet_nest_before)
                 _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
                 lane._trace.emit("unet_model_patcher_constructor_end", phase="restore", metadata={
                     "duration_ms": _dur_ms})
-                if _unet_nest_before == 0:
-                    _children = _child_durations.get()
-                    if _children is not None:
-                        _children.append(("model_patcher_constructor", _dur_ms))
+                _children = _child_durations.get()
+                if _children is not None:
+                    _children.append(_dur_ms)
             elif emit_clip:
                 _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
                 lane._trace.emit("clip_model_patcher_constructor_end", phase="restore", metadata={
-                    "lane": lane._lane,
                     "duration_ms": _dur_ms})
                 # NOT recorded into _clip_cpu_prepare_children — nested inside
                 # load_text_encoder_state_dicts which is the direct measured owner.
@@ -840,22 +797,18 @@ def _make_model_to_wrapper(original):
         lane = _ACTIVE_LANE_TRACE.get()
         emit = (lane is not None and lane._lane == "UNET")
         _fn_start_ns = time.monotonic_ns() if emit else 0
-        _unet_nest_before = _unet_subfn_nesting_depth.get()
         if emit:
-            _unet_subfn_nesting_depth.set(_unet_nest_before + 1)
             lane._trace.emit("unet_model_to_start", phase="restore")
         try:
             return original(self, *args, **kwargs)
         finally:
             if emit:
-                _unet_subfn_nesting_depth.set(_unet_nest_before)
                 _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
                 lane._trace.emit("unet_model_to_end", phase="restore", metadata={
                     "duration_ms": _dur_ms})
-                if _unet_nest_before == 0:
-                    _children = _child_durations.get()
-                    if _children is not None:
-                        _children.append(("model_to", _dur_ms))
+                _children = _child_durations.get()
+                if _children is not None:
+                    _children.append(_dur_ms)
     setattr(wrapper, _SENTINEL_MODEL_TO, True)
     return wrapper
 
@@ -1298,7 +1251,7 @@ def _make_unet_subfn_wrapper(
                 if _nest_before == 0:
                     _children = _child_durations.get()
                     if _children is not None:
-                        _children.append((short_name, _dur_ms))
+                        _children.append(_dur_ms)
     return wrapper
 
 
@@ -1323,7 +1276,7 @@ def _instrument_unet_model_config(model_config: Any, lane: "ModelLaneTrace") -> 
             lane._trace.emit("unet_model_config_get_model_end", phase="restore", metadata={"duration_ms": duration_ms})
             children = _child_durations.get()
             if _nest_before == 0 and children is not None:
-                children.append(("model_config_get_model", duration_ms))
+                children.append(duration_ms)
 
     setattr(wrapped_get_model, _SENTINEL_SUBFN, True)
     try:
@@ -1351,7 +1304,7 @@ def _instrument_unet_model_weights(model: Any, lane: "ModelLaneTrace") -> None:
             lane._trace.emit("unet_load_model_weights_end", phase="restore", metadata={"duration_ms": duration_ms})
             children = _child_durations.get()
             if _nest_before == 0 and children is not None:
-                children.append(("load_model_weights", duration_ms))
+                children.append(duration_ms)
 
     setattr(wrapped_load_weights, _SENTINEL_SUBFN, True)
     try:
@@ -1397,19 +1350,9 @@ def _make_sd_state_dict_wrapper(original: Callable[..., Any]) -> Callable[..., A
             _sd_depth.set(after - 1)
             if emit:  # before was 0, so we are the outermost invocation
                 _children = _child_durations.get() or []
-                # Aggregate duplicate named events
-                _aggregated: dict[str, float] = {}
-                for _cname, _cdur in _children:
-                    _aggregated[_cname] = _aggregated.get(_cname, 0.0) + _cdur
-                _child_named = list(_aggregated.items())
-                _child_total = round(sum(c[1] for c in _child_named), 3)
+                _child_total = round(sum(_children), 3)
                 _whole_ms = round((time.monotonic_ns() - _sd_start_ns) / 1_000_000, 3)
-                # Signed residual (not max-clamped)
-                _residual_ms = round(_whole_ms - _child_total, 3)
-                # Status: overlap_error when residual is negative beyond rounding tolerance
-                _status = "ok"
-                if _residual_ms < -0.01:
-                    _status = "overlap_error"
+                _residual_ms = round(max(0.0, _whole_ms - _child_total), 3)
                 # Restore prior before emitting (children list snapshot taken)
                 _child_durations.set(_prior_children)
                 lane._trace.emit("unet_load_diffusion_model_state_dict_end", phase="restore", metadata={
@@ -1417,12 +1360,10 @@ def _make_sd_state_dict_wrapper(original: Callable[..., Any]) -> Callable[..., A
                     "model_construction_total_ms": _whole_ms,
                     "measured_child_total_ms": _child_total,
                     "measured_direct_children_ms": _child_total,
-                    "measured_child_count": len(_child_named),
-                    "measured_children": [c[1] for c in _child_named],  # legacy numeric-only durations
-                    "measured_named_children": _child_named,  # (name, duration) pairs
+                    "measured_child_count": len(_children),
+                    "measured_children": _children,
                     "residual_ms": _residual_ms,
                     "model_construction_residual_ms": _residual_ms,
-                    "status": _status,
                     "classification": "residual_not_causal_owner",
                 })
 
@@ -1519,24 +1460,15 @@ def _get_mutation_lane() -> "MutationLane":
 class MutationLane:
     """Coordinator-owned deterministic serialization of GPU/cache mutation.
 
-    Only one caller may hold the lane at a time.  The lane is a plain
-    mutex (FIFO blocking, no preemption).  The priority dict is defined
-    for forward compatibility but NOT used for preemption — ``acquire``
-    blocks unconditionally until the current owner releases, regardless
-    of the caller's priority.  The ``owner`` property is informational
-    (not used for priority scheduling).
-
+    Only one caller may hold the lane at a time.  Priority order:
+    ``UNET → CLIP → prefill → VAE → sampler``.  Acquire blocks until
+    the lane is free; release hands ownership to the next waiter.
     Exception-safe via context manager.
     """
 
     _MUTEX_PRIORITY: dict[str, int] = {
         "UNET": 0, "CLIP": 1, "prefill": 2, "VAE": 3, "sampler": 4,
     }
-    # NOTE: _MUTEX_PRIORITY is defined for documentation / forward
-    # compatibility but NOT used in acquire().  The lane is a plain
-    # FIFO mutex — higher-priority waiters do NOT preempt the current
-    # owner.  Do not add preemption logic without reviewing the thread-
-    # safety and deadlock implications across UNET/CLIP/prefill workers.
 
     def __init__(self) -> None:
         self._lock = RLock()
@@ -1544,16 +1476,14 @@ class MutationLane:
         self._cond = Condition(self._lock)
 
     def acquire(self, owner: str | None, timeout: float | None = None) -> bool:
-        """Block until the lane is acquired for *owner*.
-
-        NOTE: This is a plain FIFO mutex.  ``_MUTEX_PRIORITY`` is defined
-        for forward compatibility only — higher-priority callers do NOT
-        preempt the current owner.  Blocking is unconditional FIFO.
-        """
+        """Block until the lane is acquired for *owner*."""
         if owner is None:
             return True  # no tracking for anonymous callers
         with self._cond:
             while self._owner is not None:
+                # Priority: higher-priority waiters can preempt when current
+                # owner releases. For now, simple FIFO with priority ordering
+                # on acquire.
                 if timeout is not None:
                     remaining = timeout
                 self._cond.wait(timeout=timeout)
@@ -1635,10 +1565,6 @@ class ModelLaneTrace:
         self._cpu_prepare_started: bool = False
         self._cpu_prepare_ended: bool = False
         self._gpu_commit_started: bool = False
-        # ── Post-read boundary tracking (final expected read completion) ─
-        self._post_read_boundary_ns: int = 0
-        self._read_interval_sum_ns: int = 0
-        self._read_start_ns: int = 0
         # ── Worker queue/publication tracking ────────────────────
         self._submitted_at_ns: int = 0
         self._worker_started_at_ns: int = 0
@@ -1650,22 +1576,9 @@ class ModelLaneTrace:
     # ── Internal lifecycle hooks (called by wrappers) ────────────────
 
     def _on_read_completed(self) -> None:
-        """Called by the ``load_torch_file`` wrapper after each read_end.
-
-        Emits ``cpu_prepare_start`` (generic) after the final expected read.
-        For CLIP lane also emits the named ``clip_cpu_prepare_start`` so the
-        outer span truthfully begins after all file reads.
-
-        Handles dual-CLIP (expected_read_count=2) and mismatch where observed
-        reads differ from expected.
-
-        Tracks ``_post_read_boundary_ns`` at the final-expected-read boundary
-        for post-read vs file-read separation in the CLIP load wrapper.
-        """
-        _now_ns = time.monotonic_ns()
+        """Called by the ``load_torch_file`` wrapper after each read_end."""
         self._actual_read_count += 1
         if self._actual_read_count >= self.expected_read_count and not self._cpu_prepare_started:
-            self._post_read_boundary_ns = _now_ns
             self._cpu_prepare_started = True
             if self.expected_read_count > 0 and self._actual_read_count != self.expected_read_count:
                 self.cpu_prepare_start(status="read_count_mismatch",
@@ -1673,16 +1586,6 @@ class ModelLaneTrace:
                                        actual=self._actual_read_count)
             else:
                 self.cpu_prepare_start()
-            # For CLIP lane: emit named outer-span start after final expected read.
-            # This makes clip_cpu_prepare_start/end truthfully represent post-read
-            # CPU preparation rather than including file-read time.
-            if self._lane == "CLIP":
-                self._trace.emit("clip_cpu_prepare_start", phase=self._phase, metadata={
-                    "lane": self._lane,
-                    "expected_read_count": self.expected_read_count,
-                    "actual_read_count": self._actual_read_count,
-                    "post_read_boundary_ns": _now_ns,
-                })
 
     def _on_gpu_commit_about_to_start(self) -> None:
         """Called by the ``load_models_gpu`` wrapper before commit events."""
@@ -1717,13 +1620,9 @@ class ModelLaneTrace:
                          metadata={"lane": self._lane, **metadata})
 
     def read_start(self, **metadata: Any) -> None:
-        self._read_start_ns = time.monotonic_ns()
         self._trace.emit("read_start", phase=self._phase, metadata={"lane": self._lane, **metadata})
 
     def read_end(self, **metadata: Any) -> None:
-        if self._read_start_ns:
-            self._read_interval_sum_ns += time.monotonic_ns() - self._read_start_ns
-            self._read_start_ns = 0
         self._trace.emit("read_end", phase=self._phase, metadata={"lane": self._lane, **metadata})
 
     def cpu_prepare_start(self, **metadata: Any) -> None:
@@ -2081,10 +1980,8 @@ def _capture_rusage_thread_delta() -> dict[str, Any] | None:
 
 def _capture_rusage_thread_snapshot() -> dict[str, Any] | None:
     """Return a raw RUSAGE_THREAD snapshot for before/after delta computation.
-    Only on Linux with deep diag enabled.  Returns flat dict of ints.
-    The caller must compute deltas externally."""
-    if not _DIAGNOSTIC_FLAG:
-        return None
+    Requires Linux.  Does NOT require COMFYMODAL_V2_DEEP_MODEL_DIAG.
+    Returns flat dict of ints.  The caller must compute deltas externally."""
     if platform.system() != "Linux":
         return None
     try:
@@ -2163,7 +2060,7 @@ def classify_active_read_dims(
     _DIMS: list[tuple[str, bool]] = [
         ("thread_cpu", True),       # thread-bounded
         ("process_cpu", False),     # process-wide (not thread-bounded)
-        ("io_deltas", True),        # thread-bounded (/proc/self/task/*/io)
+        ("io_deltas", True),        # thread-bounded
         ("page_faults", True),      # thread-bounded (RUSAGE_THREAD minflt/majflt)
         ("block_input", True),      # thread-bounded (RUSAGE_THREAD inblock/oublock)
         ("context_switches", True), # thread-bounded (RUSAGE_THREAD nvcsw/nivcsw)
@@ -2225,7 +2122,7 @@ def _compute_rusage_deltas(before: dict[str, Any] | None, after: dict[str, Any] 
 
 
 def _compute_io_deltas(before: dict[str, int] | None, after: dict[str, int] | None) -> dict[str, int] | None:
-    """Compute /proc/self/task/<tid>/io deltas (after - before)."""
+    """Compute /proc/self/io deltas (after - before)."""
     if not before or not after:
         return None
     result = {}
@@ -2278,6 +2175,516 @@ def _capture_file_identity(path: str) -> dict[str, Any]:
     except OSError:
         pass
     return result
+
+
+# ── Slow model-read diagnostic helpers (threshold-gated) ──────────────
+# Lightweight before-state (only wall/thread/process time + native TID)
+# is captured before every CLIP load_torch_file call and every
+# background-UNET active read.  Expensive diagnostics (/proc/meminfo,
+# cgroup memory.stat) are only collected when elapsed >= threshold.
+
+
+@dataclass
+class _SlowReadBeforeState:
+    """Inexpensive before-state captured before a model read.
+    No /proc, cgroup, rusage, tensor, or module inspection allowed here."""
+    mono_ns: int
+    thread_time_ns: int | None
+    process_time_ns: int | None
+    tid: int
+
+
+def _capture_slow_read_before() -> _SlowReadBeforeState:
+    """Inexpensive before-state capturing only timing + native TID."""
+    return _SlowReadBeforeState(
+        mono_ns=time.monotonic_ns(),
+        thread_time_ns=time.thread_time_ns() if hasattr(time, "thread_time_ns") else None,
+        process_time_ns=time.process_time_ns() if hasattr(time, "process_time_ns") else None,
+        tid=_capture_tid(),
+    )
+
+
+def _unescape_mountinfo_field(field: str) -> str:
+    """Unescape mountinfo(5) escaped characters in a single field.
+
+    Mountinfo encodes spaces as ``\\040``, tabs as ``\\011``, newlines as
+    ``\\012``, and backslashes as ``\\134``.  Must unescape backslash first
+    to avoid double-unescaping ``\\134040`` → ``\\040`` → `` ``.
+    """
+    field = field.replace("\\134", "\\")
+    field = field.replace("\\011", "\t")
+    field = field.replace("\\012", "\n")
+    field = field.replace("\\040", " ")
+    return field
+
+
+def _discover_cgroup2_path() -> tuple[str | None, str | None]:
+    """Discover the cgroup v2 mount path and the process's cgroup relative path.
+
+    Uses ``/proc/self/mountinfo`` to find the cgroup2 mount point (not assuming
+    ``/sys/fs/cgroup``) and ``/proc/self/cgroup`` to find the process's cgroup
+    relative path.  Returns ``(mount_point, cgroup_relative_path)`` on success,
+    ``(None, None)`` on any error.
+
+    Injectable via ``_read_file_lines`` for testing.
+    """
+    try:
+        # Find cgroup2 mount point
+        mount_lines = _read_file_lines("/proc/self/mountinfo")
+        mount_point: str | None = None
+        for line in mount_lines:
+            clean = line.strip()
+            # Split on " - " to separate pre-separator fields from fs_type/post fields
+            if " - " not in clean:
+                continue
+            pre_part, post_part = clean.split(" - ", 1)
+            pre_parts = pre_part.split()
+            post_fields = post_part.split()
+            # mountinfo format (pre-separator):
+            #   id parent_id major:minor root mount_point options ...
+            # root is index 3, mount_point is index 4
+            if len(pre_parts) >= 5 and len(post_fields) >= 1:
+                fs_type = post_fields[0]
+                if fs_type == "cgroup2":
+                    raw_root = pre_parts[3]
+                    raw_mount = pre_parts[4]
+                    # Unescape escaped characters in root and mount_point
+                    mount_point = _unescape_mountinfo_field(raw_mount)
+                    # Also unescape root for safety (not directly used here)
+                    break
+        if mount_point is None:
+            return None, None
+
+        # Read /proc/self/cgroup for the cgroup relative path
+        cgroup_lines = _read_file_lines("/proc/self/cgroup")
+        cgroup_rel: str | None = None
+        for line in cgroup_lines:
+            line = line.strip()
+            if not line:
+                continue
+            # Format: hierarchy-ID:controller-list:cgroup-path
+            # For cgroupv2, hierarchy-ID is 0, controller-list is empty
+            parts = line.split(":", 2)
+            if len(parts) == 3 and parts[0] == "0" and parts[1] == "":
+                cgroup_rel = parts[2]
+                break
+            # Fallback: any line with a path (some systems vary)
+            if len(parts) == 3 and parts[1] == "" and parts[2]:
+                cgroup_rel = parts[2]
+
+        if cgroup_rel is None:
+            # /proc/self/cgroup missing or malformed — nonfatal failure
+            return None, None
+        if cgroup_rel == "/":
+            # Process is in root cgroup — memory.stat at mount_point directly
+            return mount_point, ""
+
+        return mount_point, cgroup_rel
+    except Exception:
+        return None, None
+
+
+def _resolve_cgroup_memory_stat_path() -> str | None:
+    """Resolve the actual path to the cgroup v2 memory.stat file.
+
+    Returns the discovered path or ``None`` when cgroup v2 is unavailable
+    or discovery fails.  Uses only the mount point discovered from
+    ``/proc/self/mountinfo`` (no hardcoded fallback).
+    Guards against relative-path traversal in the cgroup relative path.
+    """
+    mount_point, cgroup_rel = _discover_cgroup2_path()
+    if mount_point is None:
+        return None
+    # Normalise and validate the cgroup relative path
+    rel = cgroup_rel.lstrip("/") if cgroup_rel else ""
+    # Prevent relative-path traversal: reject paths containing ".." segments
+    if rel:
+        _segments = rel.replace("\\", "/").split("/")
+        if ".." in _segments:
+            return None
+        memory_stat_path = os.path.join(mount_point, rel, "memory.stat")
+    else:
+        memory_stat_path = os.path.join(mount_point, "memory.stat")
+    if os.path.isfile(memory_stat_path):
+        return memory_stat_path
+    return None
+
+
+def _read_file_lines(path: str) -> list[str]:
+    """Read all lines from *path*.  Injectable for testing.
+
+    Returns empty list on any error.
+    """
+    try:
+        with open(path) as _f:
+            return _f.readlines()
+    except Exception:
+        return []
+
+
+def _parse_memory_stat(content: str) -> dict[str, int]:
+    """Parse memory.stat content into a dict of ints.
+
+    Extracts: file, inactive_file, active_file, workingset_refault_file,
+    workingset_activate_file, pgfault, pgmajfault.
+    """
+    result: dict[str, int] = {}
+    _TARGET_KEYS = frozenset({
+        "file", "inactive_file", "active_file",
+        "workingset_refault_file", "workingset_activate_file",
+        "pgfault", "pgmajfault",
+    })
+    for line in content.splitlines():
+        parts = line.strip().split()
+        if len(parts) == 2 and parts[0] in _TARGET_KEYS:
+            try:
+                result[parts[0]] = int(parts[1])
+            except ValueError:
+                pass
+    return result
+
+
+def _read_cgroup_memory_stat() -> dict[str, int] | None:
+    """Read cgroup v2 memory.stat using discovered path.
+
+    Uses ``_discover_cgroup2_path`` to find the actual cgroup v2 mount
+    and process cgroup.  Returns parsed dict or ``None`` on any error.
+    """
+    try:
+        path = _resolve_cgroup_memory_stat_path()
+        if path is None:
+            return None
+        content_lines = _read_file_lines(path)
+        if not content_lines:
+            return None
+        return _parse_memory_stat("".join(content_lines))
+    except Exception:
+        return None
+
+
+def _read_proc_meminfo_cached_available() -> dict[str, int | None] | None:
+    """Read Cached and MemAvailable from /proc/meminfo.
+    Only called after threshold exceeded.  Returns None on any error."""
+    try:
+        _cached: int | None = None
+        _avail: int | None = None
+        with open("/proc/meminfo") as _f:
+            for _line in _f:
+                if _line.startswith("Cached:"):
+                    _cached = int(_line.split()[1])
+                elif _line.startswith("MemAvailable:"):
+                    _avail = int(_line.split()[1])
+        return {"cached_kb": _cached, "mem_available_kb": _avail}
+    except Exception:
+        return None
+
+
+def _capture_proc_self_io() -> dict[str, int] | None:
+    """Read ``/proc/self/io`` for process-wide ``rchar`` and ``read_bytes``.
+
+    Does NOT require ``COMFYMODAL_V2_DEEP_MODEL_DIAG``.  Returns ``None`` on
+    any error or unsupported platform.  Missing files and unsupported platforms
+    do not raise.  Unsupported/unavailable counters are represented truthfully,
+    never invented zeroes.
+    """
+    if platform.system() != "Linux":
+        return None
+    try:
+        result: dict[str, int] = {}
+        with open("/proc/self/io") as _f:
+            for _line in _f:
+                for _prefix in ("rchar", "read_bytes"):
+                    if _line.startswith(_prefix + ":"):
+                        _parts = _line.strip().split(":")
+                        if len(_parts) == 2:
+                            result[_prefix] = int(_parts[1].strip())
+        return result if result else None
+    except Exception:
+        return None
+
+
+def _collect_rusage_and_io_snapshots() -> tuple[dict[str, Any] | None, dict[str, int] | None]:
+    """Capture RUSAGE_THREAD and /proc/self/io snapshots
+    for delta computation.  Dies silently on unsupported platforms."""
+    _ru = None
+    _io = None
+    if platform.system() == "Linux":
+        try:
+            import resource
+            _ru_raw = resource.getrusage(resource.RUSAGE_THREAD)
+            _ru = {
+                "minflt": _ru_raw.ru_minflt,
+                "majflt": _ru_raw.ru_majflt,
+                "inblock": _ru_raw.ru_inblock,
+                "nvcsw": _ru_raw.ru_nvcsw,
+                "nivcsw": _ru_raw.ru_nivcsw,
+            }
+        except Exception:
+            pass
+        try:
+            _io = _capture_proc_self_io()
+        except Exception:
+            pass
+    return _ru, _io
+
+
+def _compute_rusage_deltas_simple(before: dict[str, Any] | None,
+                                  after: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Compute rusage deltas (after - before). Both must share the same keys."""
+    if not before or not after:
+        return None
+    result = {}
+    for key in before:
+        if key in after and isinstance(before[key], (int, float)) and isinstance(after[key], (int, float)):
+            result[key] = max(0, after[key] - before[key])
+    return result
+
+
+def _compute_io_deltas_simple(before: dict[str, int] | None,
+                              after: dict[str, int] | None) -> dict[str, int] | None:
+    """Compute /proc/self/io deltas (after - before)."""
+    if not before or not after:
+        return None
+    result = {}
+    for key in before:
+        if key in after and isinstance(before[key], int) and isinstance(after[key], int):
+            result[key] = max(0, after[key] - before[key])
+    return result
+
+
+def _emit_slow_read_line(
+    *,
+    owner: str,
+    loader_type: str,
+    path_str: str,
+    request_id: str,
+    restore_session_id: str,
+    restored_instance_id: str,
+    before: _SlowReadBeforeState,
+    after_mono_ns: int,
+    after_thread_time_ns: int | None,
+    after_process_time_ns: int | None,
+    after_tid: int,
+    before_rusage: dict[str, Any] | None = None,
+    after_rusage: dict[str, Any] | None = None,
+    before_io: dict[str, int] | None = None,
+    after_io: dict[str, int] | None = None,
+    active_read_entry: dict[str, Any] | None = None,
+) -> None:
+    """Collect all diagnostics and emit exactly one ``[v2.slow_model_read]`` line.
+    Called only when elapsed >= threshold.  Missing/unsupported counters use
+    ``None`` (printed as ``None``), never invented zeros.
+
+    When *active_read_entry* is provided (UNET path), its pre-computed delta
+    fields are used instead of recalculating from before/after snapshots.
+    """
+    # ── Elapsed wall time ───────────────────────────────────────────
+    if active_read_entry is not None:
+        elapsed_ms = active_read_entry.get("active_read_wall_ms")
+    else:
+        elapsed_ms = round((after_mono_ns - before.mono_ns) / 1_000_000, 3)
+
+    # ── Path hash (normalized, never raw user path) ─────────────────
+    path_hash = stable_hash(path_str or "")[:16]
+
+    # ── File identity (stat inline) ─────────────────────────────────
+    file_size: Any = None
+    st_dev: Any = None
+    st_ino: Any = None
+    if active_read_entry is not None:
+        file_size = active_read_entry.get("active_read_file_size")
+        st_dev = active_read_entry.get("active_read_st_dev")
+        st_ino = active_read_entry.get("active_read_st_ino")
+    elif path_str:
+        try:
+            _st = os.stat(path_str)
+            file_size = _st.st_size
+            st_dev = _st.st_dev
+            st_ino = _st.st_ino
+        except OSError:
+            pass
+
+    # ── Thread / process CPU ────────────────────────────────────────
+    _same_tid = bool(before.tid and before.tid == after_tid)
+    _has_thread_cpu = before.thread_time_ns is not None and after_thread_time_ns is not None
+    _has_process_cpu = before.process_time_ns is not None and after_process_time_ns is not None
+
+    thread_cpu_ms: Any = None
+    if active_read_entry is not None:
+        thread_cpu_ms = active_read_entry.get("active_read_thread_cpu_ms")
+    elif _has_thread_cpu and _same_tid:
+        thread_cpu_ms = round((after_thread_time_ns - before.thread_time_ns) / 1_000_000, 3)
+
+    process_cpu_ms: Any = None
+    if active_read_entry is not None:
+        process_cpu_ms = active_read_entry.get("active_read_process_cpu_ms")
+    elif _has_process_cpu:
+        process_cpu_ms = round((after_process_time_ns - before.process_time_ns) / 1_000_000, 3)
+
+    # ── Counter deltas (rusage + io) ────────────────────────────────
+    rchar_delta: Any = None
+    read_bytes_delta: Any = None
+    minor_faults_delta: Any = None
+    major_faults_delta: Any = None
+    inblock_delta: Any = None
+    voluntary_cs_delta: Any = None
+    involuntary_cs_delta: Any = None
+
+    if active_read_entry is not None:
+        rchar_delta = active_read_entry.get("active_read_rchar_delta")
+        read_bytes_delta = active_read_entry.get("active_read_read_bytes_delta")
+        major_faults_delta = active_read_entry.get("active_read_major_faults_delta")
+        minor_faults_delta = active_read_entry.get("active_read_minor_faults_delta")
+        inblock_delta = active_read_entry.get("active_read_inblock_delta")
+        voluntary_cs_delta = active_read_entry.get("active_read_voluntary_context_switches_delta")
+        involuntary_cs_delta = active_read_entry.get("active_read_involuntary_context_switches_delta")
+    elif _same_tid and before_rusage is not None and after_rusage is not None:
+        _rd = _compute_rusage_deltas_simple(before_rusage, after_rusage)
+        if _rd:
+            minor_faults_delta = _rd.get("minflt")
+            major_faults_delta = _rd.get("majflt")
+            inblock_delta = _rd.get("inblock")
+            voluntary_cs_delta = _rd.get("nvcsw")
+            involuntary_cs_delta = _rd.get("nivcsw")
+    if _same_tid and before_io is not None and after_io is not None:
+        _iod = _compute_io_deltas_simple(before_io, after_io)
+        if _iod:
+            rchar_delta = _iod.get("rchar")
+            read_bytes_delta = _iod.get("read_bytes")
+
+    # ── /proc/meminfo (threshold-gated) ─────────────────────────────
+    _meminfo = _read_proc_meminfo_cached_available()
+    cached_kb: Any = _meminfo.get("cached_kb") if _meminfo else None
+    mem_available_kb: Any = _meminfo.get("mem_available_kb") if _meminfo else None
+
+    # ── Cgroup v2 memory.stat (threshold-gated) ──────────────────────
+    _cgroup = _read_cgroup_memory_stat()
+    memory_file_bytes: Any = _cgroup.get("file") if _cgroup else None
+    inactive_file_bytes: Any = _cgroup.get("inactive_file") if _cgroup else None
+    active_file_bytes: Any = _cgroup.get("active_file") if _cgroup else None
+    workingset_refault_file: Any = _cgroup.get("workingset_refault_file") if _cgroup else None
+    workingset_activate_file: Any = _cgroup.get("workingset_activate_file") if _cgroup else None
+    pgfault: Any = _cgroup.get("pgfault") if _cgroup else None
+    pgmajfault: Any = _cgroup.get("pgmajfault") if _cgroup else None
+
+    # ── Modal identity ──────────────────────────────────────────────
+    modal_task_id = os.environ.get("MODAL_TASK_ID", "")
+    modal_image_id = os.environ.get("MODAL_IMAGE_ID", "")
+    cloud = os.environ.get("MODAL_CLOUD_PROVIDER", "")
+    region = os.environ.get("MODAL_REGION", "")
+
+    # ── Aggregate counter_status ────────────────────────────────────
+    # One of: available, partial, unsupported, unavailable.
+    # available iff all requested counters valid (same thread, data captured).
+    # partial iff some valid and some missing.
+    # unsupported iff platform does not expose the counter type.
+    # unavailable iff no usable counters or collection failed.
+    _is_linux = platform.system() == "Linux"
+    _counters_available: dict[str, bool] = {}
+
+    # thread_cpu: available when same TID and has thread time deltas
+    _counters_available["thread_cpu"] = bool(
+        _is_linux and _same_tid and _has_thread_cpu and thread_cpu_ms is not None
+    )
+    # process_cpu: available when has process time deltas (not thread-bounded)
+    _counters_available["process_cpu"] = bool(
+        _is_linux and _has_process_cpu and process_cpu_ms is not None
+    )
+    # rusage counters (page_faults, inblock, context_switches): available
+    # when same TID and at least one rusage delta is present
+    _has_any_rusage_delta = any(v is not None for v in (
+        minor_faults_delta, major_faults_delta, inblock_delta,
+        voluntary_cs_delta, involuntary_cs_delta,
+    ))
+    _counters_available["rusage"] = bool(
+        _is_linux and _same_tid and _has_any_rusage_delta
+    )
+    # io counters: available when same TID and at least one io delta is present
+    _has_any_io_delta = any(v is not None for v in (
+        rchar_delta, read_bytes_delta,
+    ))
+    _counters_available["io"] = bool(
+        _is_linux and _same_tid and _has_any_io_delta
+    )
+
+    _valid_count = sum(1 for v in _counters_available.values() if v)
+    _total_count = len(_counters_available)
+
+    if not _is_linux:
+        counter_status: str = "unsupported"
+    elif _valid_count == _total_count:
+        counter_status = "available"
+    elif _valid_count > 0:
+        counter_status = "partial"
+    else:
+        counter_status = "unavailable"
+
+    # ── thread_cpu_ratio and classification ─────────────────────────
+    # Ratio = valid thread CPU delta / elapsed wall duration (both in ms).
+    # classification: cpu_bound >= 0.80, wait_bound <= 0.20, mixed otherwise,
+    # unknown when thread CPU unavailable.
+    thread_cpu_ratio: float | str | None = None
+    classification: str = "unknown"
+    if elapsed_ms is not None and elapsed_ms > 0 and thread_cpu_ms is not None:
+        _ratio = thread_cpu_ms / elapsed_ms
+        thread_cpu_ratio = round(_ratio, 4)
+        if _ratio >= 0.80:
+            classification = "cpu_bound"
+        elif _ratio <= 0.20:
+            classification = "wait_bound"
+        else:
+            classification = "mixed"
+    elif not _counters_available.get("thread_cpu"):
+        classification = "unknown"
+    elif elapsed_ms is not None and elapsed_ms > 0 and thread_cpu_ms is not None:
+        classification = "unknown"
+    else:
+        classification = "unknown"
+
+    pid = os.getpid()
+    native_thread_id = after_tid
+
+    print(
+        f"[v2.slow_model_read] "
+        f"owner={owner} "
+        f"loader_type={loader_type} "
+        f"path_hash={path_hash} "
+        f"file_size={file_size} "
+        f"st_dev={st_dev} "
+        f"st_ino={st_ino} "
+        f"request_id={request_id} "
+        f"restore_session_id={restore_session_id} "
+        f"restored_instance_id={restored_instance_id} "
+        f"modal_task_id={modal_task_id} "
+        f"modal_image_id={modal_image_id} "
+        f"cloud={cloud} "
+        f"region={region} "
+        f"pid={pid} "
+        f"native_thread_id={native_thread_id} "
+        f"elapsed_ms={elapsed_ms} "
+        f"thread_cpu_ms={thread_cpu_ms} "
+        f"process_cpu_ms={process_cpu_ms} "
+        f"thread_cpu_ratio={thread_cpu_ratio} "
+        f"classification={classification} "
+        f"rchar_delta={rchar_delta} "
+        f"read_bytes_delta={read_bytes_delta} "
+        f"minor_faults_delta={minor_faults_delta} "
+        f"major_faults_delta={major_faults_delta} "
+        f"inblock_delta={inblock_delta} "
+        f"voluntary_cs_delta={voluntary_cs_delta} "
+        f"involuntary_cs_delta={involuntary_cs_delta} "
+        f"memory_file_bytes={memory_file_bytes} "
+        f"inactive_file_bytes={inactive_file_bytes} "
+        f"active_file_bytes={active_file_bytes} "
+        f"workingset_refault_file={workingset_refault_file} "
+        f"workingset_activate_file={workingset_activate_file} "
+        f"pgfault={pgfault} "
+        f"pgmajfault={pgmajfault} "
+        f"cached_kb={cached_kb} "
+        f"mem_available_kb={mem_available_kb} "
+        f"counter_status={counter_status}",
+        flush=True,
+    )
 
 
 # ── Background UNET diagnostic helpers ─────────────────────────────
@@ -2538,14 +2945,6 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
 
     Summarises worker queue, model construction subfunction durations, GPU commit,
     and cache publication.  Missing stages → None.
-
-    Named UNET direct children (from ``_UNET_DECOMPOSE_TARGETS`` plus
-    ``model_config_get_model``, ``load_model_weights``, ``model_patcher_constructor``,
-    ``model_to``, ``convert_old_quants``) are reported with a deterministic >1ms
-    display threshold — children <= 1ms are listed in a separate ``fast_children``
-    count rather than individually, keeping the compact line concise.  Existing
-    totals (``model_construction_total_ms``, ``measured_direct_children_ms``,
-    ``model_construction_residual_ms``) are always included.
     """
     if not force and not _DIAGNOSTIC_FLAG:
         return
@@ -2575,12 +2974,7 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
     _sd_total = 0.0
     _children_total = 0.0
 
-    # Collect named UNET direct children with >1ms threshold
-    _named_children: dict[str, float] = {}
-    _fast_child_count: int = 0
-
     for i, evt in enumerate(events):
-        _meta = evt.metadata if hasattr(evt, "metadata") else {}
         if evt.name == "background_unet_submitted":
             _submitted_ns = evt.monotonic_ns
         elif evt.name == "background_unet_worker_start":
@@ -2600,62 +2994,16 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
         elif evt.name == "unet_cache_publish_end":
             _cache_pub_end = evt.monotonic_ns
         elif evt.name == "unet_load_diffusion_model_state_dict_start":
+            _sd_start = evt.monotonic_ns
             for j in range(i + 1, min(i + 300, len(events))):
                 if events[j].name == "unet_load_diffusion_model_state_dict_end":
                     _sd_total = events[j].metadata.get("duration_ms", 0) if hasattr(events[j], "metadata") else 0
                     _children_total = events[j].metadata.get("measured_child_total_ms", 0) if hasattr(events[j], "metadata") else 0
                     break
-        # Collect named UNET subfunction durations from _end events
         elif evt.name == "unet_model_config_get_model_end":
-            stages["model_config_get_model_ms"] = _meta.get("duration_ms")
-            _d = _meta.get("duration_ms")
-            if _d is not None:
-                if _d > 1.0:
-                    _named_children["model_config_get_model"] = _named_children.get("model_config_get_model", 0.0) + round(_d, 3)
-                else:
-                    _fast_child_count += 1
+            stages["model_config_get_model_ms"] = evt.metadata.get("duration_ms")
         elif evt.name == "unet_load_model_weights_end":
-            stages["load_model_weights_ms"] = _meta.get("duration_ms")
-            _d = _meta.get("duration_ms")
-            if _d is not None:
-                if _d > 1.0:
-                    _named_children["load_model_weights"] = _named_children.get("load_model_weights", 0.0) + round(_d, 3)
-                else:
-                    _fast_child_count += 1
-        elif evt.name == "unet_model_patcher_constructor_end":
-            _d = _meta.get("duration_ms")
-            if _d is not None:
-                if _d > 1.0:
-                    _named_children["model_patcher_constructor"] = _named_children.get("model_patcher_constructor", 0.0) + round(_d, 3)
-                else:
-                    _fast_child_count += 1
-        elif evt.name == "unet_model_to_end":
-            _d = _meta.get("duration_ms")
-            if _d is not None:
-                if _d > 1.0:
-                    _named_children["model_to"] = _named_children.get("model_to", 0.0) + round(_d, 3)
-                else:
-                    _fast_child_count += 1
-        elif evt.name == "unet_convert_old_quants_end":
-            _d = _meta.get("duration_ms")
-            if _d is not None:
-                if _d > 1.0:
-                    _named_children["convert_old_quants"] = _named_children.get("convert_old_quants", 0.0) + round(_d, 3)
-                else:
-                    _fast_child_count += 1
-        # Collect all unet_{short_name}_end events from _UNET_DECOMPOSE_TARGETS
-        elif evt.name.endswith("_end") and evt.name.startswith("unet_") and evt.name != "unet_gpu_commit_end":
-            # Skip well-known handled above
-            _skip = {"model_config_get_model", "load_model_weights", "model_patcher_constructor", "model_to", "convert_old_quants", "load_diffusion_model_state_dict"}
-            _short = evt.name[len("unet_"):-len("_end")]
-            if _short in _skip:
-                continue
-            _d = _meta.get("duration_ms")
-            if _d is not None:
-                if _d > 1.0:
-                    _named_children[_short] = _named_children.get(_short, 0.0) + round(_d, 3)
-                else:
-                    _fast_child_count += 1
+            stages["load_model_weights_ms"] = evt.metadata.get("duration_ms")
 
     if _submitted_ns and _worker_start_ns:
         stages["submission_to_worker_start_ms"] = round((_worker_start_ns - _submitted_ns) / 1_000_000, 3)
@@ -2672,13 +3020,7 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
 
     stages["model_construction_total_ms"] = round(_sd_total, 3) if _sd_total else None
     stages["measured_direct_children_ms"] = round(_children_total, 3) if _children_total else None
-    # Signed residual (not max-clamped) — overlap must be explicit
-    _raw_residual = (_sd_total - _children_total) if _sd_total else None
-    stages["model_construction_residual_ms"] = round(_raw_residual, 3) if _raw_residual is not None else None
-
-    # Build named children display (only >1ms shown individually)
-    _named_display = " ".join(f"{k}={v}" for k, v in sorted(_named_children.items()))
-    _fast_info = f"fast_children_le_1ms={_fast_child_count}" if _fast_child_count else "fast_children_le_1ms=0"
+    stages["model_construction_residual_ms"] = round(max(0.0, _sd_total - _children_total), 3) if _sd_total else None
 
     print(
         f"[v2.bg_unet_stages] "
@@ -2693,61 +3035,8 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
         f"gpu_commit_ms={stages['gpu_commit_ms']} "
         f"cache_publish_ms={stages['cache_publish_ms']} "
         f"background_gpu_transfer_present={stages['background_gpu_transfer_present']} "
-        f"named_children=({_named_display}) "
-        f"{_fast_info} "
         f"weight_dtype={stages['weight_dtype']} "
         f"canonical_key={canonical_key[-32:] if canonical_key else ''}",
-        flush=True,
-    )
-
-
-# ── Compact [v2.clip_cpu_children] summary ──────────────────────────
-
-
-def _emit_clip_cpu_children_summary(
-    *,
-    post_read_total_ms: float | None = None,
-    file_read_total_ms: float | None = None,
-    children: list[tuple[str, float]] | None = None,
-    load_text_encoder_state_dicts_ms: float | None = None,
-    detect_te_model_ms: float | None = None,
-    state_dict_conversion_ms: float | None = None,
-    clip_constructor_ms: float | None = None,
-    model_patcher_ms: float | None = None,
-    cache_publish_ms: float | None = None,
-    measured_children_ms: float | None = None,
-    residual_ms: float | None = None,
-    status: str = "ok",
-) -> None:
-    """Print a compact [v2.clip_cpu_children] summary line.
-
-    Exposes stable named fields when present (None/absent for unavailable
-    fields, never invented zeroes).  May also retain a ``children`` dict
-    for forward compatibility.
-
-    Named fields: post_read_total_ms, load_text_encoder_state_dicts_ms,
-    detect_te_model_ms, state_dict_conversion_ms, clip_constructor_ms,
-    model_patcher_ms, cache_publish_ms, measured_children_ms,
-    residual_ms, status.
-
-    Called from the CLIP load wrapper's finally block.
-    """
-    children_dict = {name: round(dur, 3) for name, dur in (children or [])}
-    _fmt = lambda v: f"{round(v, 3)}" if v is not None else "None"
-    print(
-        f"[v2.clip_cpu_children] "
-        f"post_read_total_ms={_fmt(post_read_total_ms)} "
-        f"file_read_total_ms={_fmt(file_read_total_ms)} "
-        f"load_text_encoder_state_dicts_ms={_fmt(load_text_encoder_state_dicts_ms)} "
-        f"detect_te_model_ms={_fmt(detect_te_model_ms)} "
-        f"state_dict_conversion_ms={_fmt(state_dict_conversion_ms)} "
-        f"clip_constructor_ms={_fmt(clip_constructor_ms)} "
-        f"model_patcher_ms={_fmt(model_patcher_ms)} "
-        f"cache_publish_ms={_fmt(cache_publish_ms)} "
-        f"measured_children_ms={_fmt(measured_children_ms)} "
-        f"residual_ms={_fmt(residual_ms)} "
-        f"children={children_dict} "
-        f"status={status}",
         flush=True,
     )
 

@@ -4126,19 +4126,22 @@ def _register_active_model_read(canonical_key: str, owner: str, path: str = "",
             request_id = request_id or _model_preload.get_active_request_id()
         except Exception:
             pass
-    # ── Capture deep diagnostics before-snapshot ─────────────────────────
+    # ── Capture lightweight before-snapshot counters ──────────────────────
+    # RUSAGE_THREAD and /proc/self/io are captured ONLY for the
+    # restore_background_unet slow-read boundary.  Other owners retain
+    # the fast path and must not incur new counter reads.
     _before_rusage = None
     _before_io = None
-    _deep_diag_here = (os.environ.get("COMFYMODAL_V2_DEEP_MODEL_DIAG", "0") == "1")
-    if _deep_diag_here:
+    if owner == "restore_background_unet":
         try:
             from comfymodal_runtime.model_preload import (
-                _capture_rusage_thread_snapshot, _capture_proc_tid_io_snapshot,
+                _capture_rusage_thread_snapshot, _capture_proc_self_io,
             )
             _before_rusage = _capture_rusage_thread_snapshot()
-            _before_io = _capture_proc_tid_io_snapshot()
+            _before_io = _capture_proc_self_io()
         except Exception:
             pass
+    _deep_diag_here = (os.environ.get("COMFYMODAL_V2_DEEP_MODEL_DIAG", "0") == "1")
     with _ACTIVE_MODEL_READS_LOCK:
         existing = _ACTIVE_MODEL_READS.get(canonical_key)
         if existing and existing["status"] in ("queued", "running"):
@@ -4332,20 +4335,7 @@ def _complete_active_model_read(canonical_key: str) -> None:
         _complete_tid = threading.get_native_id()
     except Exception:
         pass
-    # ── Capture deep diagnostics after-snapshot ──────────────────────────
     _deep_diag_here = (os.environ.get("COMFYMODAL_V2_DEEP_MODEL_DIAG", "0") == "1")
-    _after_rusage = None
-    _after_io = None
-    if _deep_diag_here:
-        try:
-            from comfymodal_runtime.model_preload import (
-                _capture_rusage_thread_snapshot, _capture_proc_tid_io_snapshot,
-                _compute_rusage_deltas, _compute_io_deltas,
-            )
-            _after_rusage = _capture_rusage_thread_snapshot()
-            _after_io = _capture_proc_tid_io_snapshot()
-        except Exception:
-            pass
     with _ACTIVE_MODEL_READS_LOCK:
         entry = _ACTIVE_MODEL_READS.get(canonical_key)
         if entry is None:
@@ -4359,8 +4349,10 @@ def _complete_active_model_read(canonical_key: str) -> None:
         entry["complete_thread_time_ns"] = _complete_thread_time_ns
         entry["complete_process_time_ns"] = _complete_process_time_ns
         entry["complete_native_tid"] = _complete_tid
-        entry["after_rusage"] = dict(_after_rusage) if _after_rusage else None
-        entry["after_io"] = dict(_after_io) if _after_io else None
+        # NOTE: after_rusage / after_io are NOT captured unconditionally.
+        # They are captured only in the threshold-gated slow-read block below,
+        # after elapsed wall time has crossed the parsed threshold.  For fast
+        # reads, the delta fields remain None in [v2.active_read_diag].
         # ── Compute delta fields ──────────────────────────────────
         _start_wall = entry.get("start_wall_unix_ns", 0)
         _start_mono = entry.get("start_monotonic_ns", 0)
@@ -4373,22 +4365,8 @@ def _complete_active_model_read(canonical_key: str) -> None:
         _start_pt = entry.get("start_process_time_ns")
         if _start_pt is not None and _complete_process_time_ns is not None:
             entry["active_read_process_cpu_ms"] = round((_complete_process_time_ns - _start_pt) / 1_000_000, 3)
-        # RUSAGE and IO deltas (Linux deep diag only)
-        _before_r = entry.get("before_rusage")
-        _before_i = entry.get("before_io")
-        if _same_native_thread and _before_r and _after_rusage:
-            _ru_deltas = _compute_rusage_deltas(_before_r, _after_rusage)
-            if _ru_deltas:
-                entry["active_read_major_faults_delta"] = _ru_deltas.get("majflt")
-                entry["active_read_minor_faults_delta"] = _ru_deltas.get("minflt")
-                entry["active_read_inblock_delta"] = _ru_deltas.get("inblock")
-                entry["active_read_voluntary_context_switches_delta"] = _ru_deltas.get("nvcsw")
-                entry["active_read_involuntary_context_switches_delta"] = _ru_deltas.get("nivcsw")
-        if _same_native_thread and _before_i and _after_io:
-            _io_deltas = _compute_io_deltas(_before_i, _after_io)
-            if _io_deltas:
-                entry["active_read_read_bytes_delta"] = _io_deltas.get("read_bytes")
-                entry["active_read_rchar_delta"] = _io_deltas.get("rchar")
+        # RUSAGE and IO after-snapshots + deltas are computed below in the
+        # threshold-gated block.  For fast reads they remain None.
         # Summarize active read raw counters
         _arid = entry.get("active_read_id", "")
         _rid = entry.get("restored_instance_id", "")
@@ -4397,6 +4375,8 @@ def _complete_active_model_read(canonical_key: str) -> None:
         _amaj = entry.get("active_read_major_faults_delta", "?")
         _amin = entry.get("active_read_minor_faults_delta", "?")
         _arbytes = entry.get("active_read_read_bytes_delta")
+        _before_r = entry.get("before_rusage")
+        _before_i = entry.get("before_io")
         if not _same_native_thread:
             _counter_status = "thread_changed"
         elif not _deep_diag_here:
@@ -4495,6 +4475,81 @@ def _complete_active_model_read(canonical_key: str) -> None:
         f"context_switch_status={_dim_statuses.get('context_switches', _counter_status)} "
         f"native_thread_id={entry.get('native_tid')}"
     )
+
+    # ── Threshold-gated slow read diagnostic (background UNET only) ──
+    _slow_read_owner = entry.get("owner", "")
+    if _slow_read_owner == "restore_background_unet":
+        _ar_elapsed = entry.get("active_read_wall_ms")
+        if _ar_elapsed is not None:
+            # Use the shared safe threshold parser (eval at runtime so env
+            # patches in tests are respected — the module-level constant
+            # is frozen at import time).
+            try:
+                from comfymodal_runtime.model_preload import _parse_slow_read_threshold
+                _sr_threshold = _parse_slow_read_threshold()
+            except Exception:
+                _sr_threshold = 3000.0
+            if _ar_elapsed >= _sr_threshold:
+                # ── Capture after-snapshots (threshold-gated) ─────
+                # RUSAGE_THREAD and /proc/self/io are captured now,
+                # only after we know the read was slow enough to warrant
+                # the diagnostic.  /proc/meminfo and cgroup reads are
+                # inside _emit_slow_read_line, also strictly after-threshold.
+                _sr_after_rusage = None
+                _sr_after_io = None
+                try:
+                    from comfymodal_runtime.model_preload import (
+                        _capture_rusage_thread_snapshot, _capture_proc_self_io,
+                        _compute_rusage_deltas, _compute_io_deltas,
+                    )
+                    _sr_after_rusage = _capture_rusage_thread_snapshot()
+                    _sr_after_io = _capture_proc_self_io()
+                    # ── Compute delta fields into entry ──────────────
+                    if _same_native_thread and _before_r and _sr_after_rusage:
+                        _ru_deltas = _compute_rusage_deltas(_before_r, _sr_after_rusage)
+                        if _ru_deltas:
+                            entry["active_read_major_faults_delta"] = _ru_deltas.get("majflt")
+                            entry["active_read_minor_faults_delta"] = _ru_deltas.get("minflt")
+                            entry["active_read_inblock_delta"] = _ru_deltas.get("inblock")
+                            entry["active_read_voluntary_context_switches_delta"] = _ru_deltas.get("nvcsw")
+                            entry["active_read_involuntary_context_switches_delta"] = _ru_deltas.get("nivcsw")
+                    if _same_native_thread and _before_i and _sr_after_io:
+                        _io_deltas = _compute_io_deltas(_before_i, _sr_after_io)
+                        if _io_deltas:
+                            entry["active_read_read_bytes_delta"] = _io_deltas.get("read_bytes")
+                            entry["active_read_rchar_delta"] = _io_deltas.get("rchar")
+                except Exception:
+                    pass  # never block completion for diagnostics
+                try:
+                    from comfymodal_runtime.model_preload import (
+                        _SlowReadBeforeState, _emit_slow_read_line,
+                    )
+                    _sr_before = _SlowReadBeforeState(
+                        mono_ns=entry.get("start_monotonic_ns", 0),
+                        thread_time_ns=entry.get("start_thread_time_ns"),
+                        process_time_ns=entry.get("start_process_time_ns"),
+                        tid=entry.get("native_tid", 0),
+                    )
+                    _sr_after_tid = entry.get("complete_native_tid", 0)
+                    _sr_after_tt = entry.get("complete_thread_time_ns")
+                    _sr_after_pt = entry.get("complete_process_time_ns")
+                    _sr_after_mono = entry.get("complete_monotonic_ns", _sr_before.mono_ns)
+                    _emit_slow_read_line(
+                        owner=_slow_read_owner,
+                        loader_type=entry.get("loader_type", ""),
+                        path_str=entry.get("path", ""),
+                        request_id=entry.get("request_id", ""),
+                        restore_session_id=entry.get("restore_session_id", ""),
+                        restored_instance_id=entry.get("restored_instance_id", ""),
+                        before=_sr_before,
+                        after_mono_ns=_sr_after_mono,
+                        after_thread_time_ns=_sr_after_tt,
+                        after_process_time_ns=_sr_after_pt,
+                        after_tid=_sr_after_tid,
+                        active_read_entry=entry,
+                    )
+                except Exception:
+                    pass  # never block completion for diagnostics
 
 
 def _fail_active_model_read(canonical_key: str, error: str = "") -> None:
@@ -17067,12 +17122,11 @@ class _ComfyAPIMixin:
                 except Exception:
                     pass
                 _actual_wait_ms = 0.0
-                _wait_successful = False
+                _handoff_success = False
                 if _api._consume_actual_load_future(key):
                     _f_wait_s = time.time()
                     _f_wait_ms = round((_f_wait_s - _f_wait_t0) * 1000, 1)
                     _actual_wait_ms = _f_wait_ms
-                    _wait_successful = True
                     # Critical-path recorder: graph UNET future wait end
                     try:
                         _api._record_critical_path(
@@ -17086,7 +17140,10 @@ class _ComfyAPIMixin:
                     except Exception:
                         pass
                     if key in _cache:
-                        # ── V2 cache hit (future) ───────────────
+                        # ── SUCCESS: await future exactly once, confirm
+                        #    cache, return completed object directly,
+                        #    never normal loader. ──────────────────
+                        _handoff_success = True
                         _f_diag_id = _future_meta.get("diagnostic_id", "") if isinstance(_future_meta, dict) else ""
                         _f_pub_ts = _future_meta.get("cache_published_at_unix_s", 0) if isinstance(_future_meta, dict) else 0
                         _f_demand_ts = _graph_entry_s
@@ -17108,19 +17165,7 @@ class _ComfyAPIMixin:
                                 "demand_timestamp_unix_s": _f_demand_ts,
                                 "completed_before_demand_ms": round(_completed_before_demand, 3) if _completed_before_demand is not None else None,
                             })
-                # If wait_start was emitted but consume failed, close the span
-                # with truthful status so no unmatched wait_start remains.
-                if not _wait_successful and _v2_trace is not None:
-                    try:
-                        _v2_trace.emit("graph_unet_wait_end", phase="execution", metadata={
-                            "canonical_key": str(key),
-                            "wait_ms": 0.0,
-                            "status": "unavailable",
-                            "reason": "future_consume_failed",
-                        })
-                    except Exception:
-                        pass
-                        print(f"[loader_future] returned_future_result loader=UNET key={key} wait_ms={_f_wait_ms}")
+                        print(f"[unet_loader_cache] future_handoff=success returned_future_object=1")
                         _api._unet_cache_hits = getattr(_api, '_unet_cache_hits', 0) + 1
                         _diag["unet_loaded_from"] = "restore_background_unet_future" if (
                             _restore_background_code_enabled() and _future_source_before == "restore_background_unet"
@@ -17136,7 +17181,6 @@ class _ComfyAPIMixin:
                                 _rec["cache_source"] = "future"
                                 _rec["future_hit"] = True
                                 break
-                        # Critical-path recorder: graph UNET cache result returned
                         try:
                             _api._record_critical_path(
                                 "graph_unet_cache_result_returned",
@@ -17148,7 +17192,6 @@ class _ComfyAPIMixin:
                             )
                         except Exception:
                             pass
-                        # ── Compact cache summary ───────────────
                         print(
                             f"[v2.bg_unet_cache] graph_demand=1 cache_hit=1 hit_source=future "
                             f"wait_ms={_f_wait_ms} "
@@ -17156,40 +17199,76 @@ class _ComfyAPIMixin:
                             flush=True,
                         )
                         return (_cache[key],)
-                if _restore_background_code_enabled() and _future_source_before == "restore_background_unet" and isinstance(getattr(_api, "_last_restore_timing", None), dict):
-                    _api._last_restore_timing["restore_background_unet_fallback_used"] = 1
-                    print(f"[loader_future] failed_future_fallback key={key} source=restore_background_unet")
-            _api._unet_cache_misses = getattr(_api, '_unet_cache_misses', 0) + 1
-            # ── V2 cache miss / fallback ─────────────────────────
-            _cache_lookup_miss = True
-            if _v2_trace is not None:
-                try:
-                    _v2_trace.emit("graph_unet_cache_lookup_end", phase="execution",
-                                    metadata={"status": "miss"})
-                    _v2_trace.emit("graph_unet_cache_miss", phase="execution", metadata={
-                        "canonical_key": str(key),
-                        "future_exists": _future_exists_before,
-                        "object_cache_exists": _object_cache_exists_before,
-                    })
-                    _v2_trace.emit("graph_unet_fallback", phase="execution", metadata={
-                        "canonical_key": str(key),
-                        "reason": "cache_miss",
-                    })
-                except Exception:
-                    pass
-            t0 = time.time()
-            result = orig_load(self_node, **kwargs)
-            d_ms = round((time.time() - t0) * 1000, 1)
-            _diag["unet_loaded_from"] = "actual_load"
-            _diag["unet_loaded_from_volume_or_original_loader"] = "1"
-            _diag["unet_original_loader_ms"] = d_ms
-            print(f"[unet_loader_cache] normal_load path={unet_name} source=actual_load ms={d_ms}")
-            if result and result[0] is not None:
-                _cache[key] = result[0]
-                _diag["unet_cached_after_load"] = "1"
-                print(f"[unet_loader_cache] returned_cached_object path={unet_name}")
-            _diag["unet_object_cache_size_after"] = len(_cache)
-            _diag["unet_object_cache_keys_after"] = str(list(_cache.keys())) if _cache else "empty"
+                if not _handoff_success:
+                    # Future await failed or cache miss — clean concise
+                    # diagnostic, exactly one normal fallback permitted.
+                    print(f"[unet_loader_cache] future_handoff=failed fallback_normal_load=1")
+                    if _v2_trace is not None:
+                        try:
+                            _v2_trace.emit("graph_unet_wait_end", phase="execution", metadata={
+                                "canonical_key": str(key),
+                                "wait_ms": 0.0,
+                                "status": "unavailable",
+                                "reason": "future_consume_failed",
+                            })
+                        except Exception:
+                            pass
+                    if _restore_background_code_enabled() and _future_source_before == "restore_background_unet" and isinstance(getattr(_api, "_last_restore_timing", None), dict):
+                        _api._last_restore_timing["restore_background_unet_fallback_used"] = 1
+            # ── Per-key locked fallback: exactly one normal load ──
+            # Acquire per-key lock, recheck cache (concurrent caller may
+            # have already published), then run exactly one orig_load and
+            # publish under the same lock.  Per-key lock is safe through
+            # orig_load: self-future detection prevents same-key re-entrancy
+            # and other keys use distinct locks.
+            _fallback_lock = _api._actual_load_locks.setdefault(key, threading.Lock())
+            _cache_under_lock = getattr(_api, '_unet_object_cache', {})
+            with _fallback_lock:
+                if key in _cache_under_lock:
+                    # Another producer published while we were waiting
+                    _api._unet_cache_hits = getattr(_api, '_unet_cache_hits', 0) + 1
+                    _diag["unet_loaded_from"] = "concurrent_fallback_share"
+                    _diag["unet_future_hit"] = "0"
+                    _diag["unet_loader_return_ms"] = round((time.time() - _loader_entry_t0) * 1000, 1)
+                    _api._unet_load_diagnostics = _diag
+                    print(f"[unet_loader_cache] concurrent_fallback_share path={unet_name}")
+                    return (_cache_under_lock[key],)
+                # We are the designated fallback producer (lock held through
+                # orig_load to serialize cache-recheck→load→publish and
+                # guarantee exactly one normal load).  Per-key lock is safe:
+                # self-future detection above prevents same-key re-entrancy,
+                # and other keys use distinct locks.
+                _api._unet_cache_misses = getattr(_api, '_unet_cache_misses', 0) + 1
+                # ── V2 cache miss / fallback ─────────────────────────
+                _cache_lookup_miss = True
+                if _v2_trace is not None:
+                    try:
+                        _v2_trace.emit("graph_unet_cache_lookup_end", phase="execution",
+                                        metadata={"status": "miss"})
+                        _v2_trace.emit("graph_unet_cache_miss", phase="execution", metadata={
+                            "canonical_key": str(key),
+                            "future_exists": _future_exists_before,
+                            "object_cache_exists": _object_cache_exists_before,
+                        })
+                        _v2_trace.emit("graph_unet_fallback", phase="execution", metadata={
+                            "canonical_key": str(key),
+                            "reason": "cache_miss",
+                        })
+                    except Exception:
+                        pass
+                t0 = time.time()
+                result = orig_load(self_node, **kwargs)
+                d_ms = round((time.time() - t0) * 1000, 1)
+                _diag["unet_loaded_from"] = "actual_load"
+                _diag["unet_loaded_from_volume_or_original_loader"] = "1"
+                _diag["unet_original_loader_ms"] = d_ms
+                print(f"[unet_loader_cache] normal_load path={unet_name} source=actual_load ms={d_ms}")
+                if result and result[0] is not None:
+                    _cache_under_lock[key] = result[0]
+                    _diag["unet_cached_after_load"] = "1"
+                    print(f"[unet_loader_cache] returned_cached_object path={unet_name}")
+            _diag["unet_object_cache_size_after"] = len(_cache_under_lock)
+            _diag["unet_object_cache_keys_after"] = str(list(_cache_under_lock.keys())) if _cache_under_lock else "empty"
             _diag["unet_cpu_cache_size_after"] = len(_cpu_cache)
             _diag["unet_loader_return_ms"] = round((time.time() - _loader_entry_t0) * 1000, 1)
             _api._unet_load_diagnostics = _diag
@@ -17275,19 +17354,31 @@ class _ComfyAPIMixin:
         print("[comfyapp] vae_loader_cache: patched VAELoader.load_vae")
 
     def _consume_actual_load_future(self, key: tuple) -> bool:
-        """Check and wait for an in-flight actual-load future. Returns True if consumed."""
+        """Check and wait for an in-flight actual-load future. Returns True if consumed.
+
+        Safe removal: only pops from ``_actual_load_futures`` after the thread
+        has completed/failed.  On timeout the entry is retained so other callers
+        can retry.  Uses per-key ``_actual_load_locks`` for matching-safe pop.
+        """
         futures = getattr(self, "_actual_load_futures", {})
         if key not in futures:
             return False
-        thread = futures.pop(key, None)
+        # Read thread ref WITHOUT pop — retain in registry on timeout.
+        thread = futures.get(key)
         if thread is None:
             return False
         t0 = time.time()
         thread.join(timeout=600)
         wait_ms = round((time.time() - t0) * 1000, 1)
         if thread.is_alive():
-            print(f"[loader_future] WARNING: waited key={key} timeout after 600s, returning not-consumed")
+            print(f"[loader_future] WARNING: waited key={key} timeout after 600s, retaining future entry")
             return False
+        # Thread completed/failed — safe to remove under lock.
+        _locks = getattr(self, "_actual_load_locks", {})
+        _lk = _locks.get(key) or threading.Lock()
+        with _lk:
+            if futures.get(key) is thread:
+                futures.pop(key, None)
         print(f"[loader_future] waited key={key} wait_ms={wait_ms}")
         meta = dict(getattr(self, "_actual_load_future_meta", {}).get(key, {}))
         # ── Strict no-fallback: always enforced, independent of experimental flag ──

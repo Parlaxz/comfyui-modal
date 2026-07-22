@@ -847,7 +847,7 @@ class TestExecutePlanGpuInvocation(unittest.TestCase):
             # Mock transport that yields a result immediately
             async def _mock_stream(
                 plan, *, gpu=None, workspace=None,
-                trace=None, runtime_trace=None,
+                trace=None, runtime_trace=None, **kwargs,
             ):
                 yield {"type": "result", "data": {"outputs": {}}}
 
@@ -875,6 +875,301 @@ class TestExecutePlanGpuInvocation(unittest.TestCase):
             self.assertGreater(
                 submit_idx, modal_start_idx,
                 "gpu_invocation_submit must appear after modal_submit_start",
+            )
+
+        asyncio.run(_run())
+
+
+# =========================================================================
+# V2 execute_plan regression: modal_input_id already present
+# =========================================================================
+
+
+class TestExecutePlanModalInputIdRegression(unittest.TestCase):
+    """``execute_plan`` must not raise ``UnboundLocalError`` when
+    ``modal_input_id`` is already present in transport metadata.
+
+    The fix in ``canonical_execution.py`` initializes ``_remote_metadata``
+    unconditionally from ``raw_remote_trace`` *before* the ``modal_input_id``
+    conditional branch, so a present ID + sparse remote trace metadata
+    cannot leave the variable undefined for later timestamp fallback reads.
+    """
+
+    def setUp(self):
+        self.mod = _load_canonical()
+
+    def test_modal_input_id_present_does_not_raise(self):
+        """execute_plan succeeds when modal_input_id is already set and
+        raw_remote_trace has sparse metadata."""
+        from unittest.mock import MagicMock
+
+        async def _run():
+            # Create a RuntimeTrace with modal_input_id pre-populated
+            trace = self.mod.RuntimeTrace(
+                request_id="test_modal_input_id_present",
+            )
+            trace.set_metadata(modal_input_id="existing_input_42")
+
+            # Build a minimal ExecutionPlan
+            from comfymodal_runtime.contracts import ExecutionPlan, ExecutionOptions
+            plan = ExecutionPlan(
+                workflow={"3": {"class_type": "KSampler", "inputs": {"seed": 42}}},
+                workflow_hash="test_hash",
+                source_workflow_hash="test_src_hash",
+                execution_options=ExecutionOptions.from_legacy(
+                    {}, default_production=False,
+                ),
+                request_metadata={"prompt_id": "test_modal_id"},
+            )
+
+            # Mock transport that returns a result with VERY sparse remote trace
+            # (empty metadata, no modal_input_id in remote metadata).
+            async def _mock_stream(
+                plan, *, gpu=None, workspace=None,
+                trace=None, runtime_trace=None, **kwargs,
+            ):
+                yield {
+                    "type": "result",
+                    "data": {
+                        "outputs": {},
+                        "trace": {"metadata": {}},  # sparse remote metadata
+                    },
+                }
+
+            mock_transport = MagicMock()
+            mock_transport.run_plan_stream = _mock_stream
+
+            # Must not raise UnboundLocalError
+            try:
+                result = await self.mod.execute_plan(
+                    plan,
+                    transport=mock_transport,
+                    trace=trace,
+                )
+            except Exception as exc:
+                self.fail(
+                    f"execute_plan raised unexpectedly with modal_input_id "
+                    f"present: {type(exc).__name__}: {exc}"
+                )
+
+            # Verify local_timing is present and _remote_metadata fallback
+            # produced absent values (not a crash).
+            local_timing = result.get("local_timing", {})
+            self.assertIn("trigger_to_local_receive_ms", local_timing)
+            self.assertEqual(
+                local_timing.get("trigger_to_local_receive_ms"), "absent",
+            )
+
+            # Verify modal_input_id was preserved from transport metadata
+            self.assertEqual(
+                trace._metadata.get("modal_input_id"), "existing_input_42",
+                "modal_input_id must remain unchanged when already present",
+            )
+
+        asyncio.run(_run())
+
+    def test_modal_input_id_from_remote_metadata(self):
+        """When modal_input_id is absent from transport metadata but present
+        in remote trace metadata, execute_plan must populate it."""
+        from unittest.mock import MagicMock
+
+        async def _run():
+            trace = self.mod.RuntimeTrace(
+                request_id="test_modal_input_id_remote",
+            )
+            # Intentionally NOT setting modal_input_id on transport metadata
+
+            from comfymodal_runtime.contracts import ExecutionPlan, ExecutionOptions
+            plan = ExecutionPlan(
+                workflow={"3": {"class_type": "KSampler", "inputs": {"seed": 42}}},
+                workflow_hash="test_hash",
+                source_workflow_hash="test_src_hash",
+                execution_options=ExecutionOptions.from_legacy(
+                    {}, default_production=False,
+                ),
+                request_metadata={"prompt_id": "test_modal_remote"},
+            )
+
+            async def _mock_stream(
+                plan, *, gpu=None, workspace=None,
+                trace=None, runtime_trace=None, **kwargs,
+            ):
+                yield {
+                    "type": "result",
+                    "data": {
+                        "outputs": {},
+                        "trace": {
+                            "metadata": {
+                                "modal_input_id": "remote_input_99",
+                            },
+                        },
+                    },
+                }
+
+            mock_transport = MagicMock()
+            mock_transport.run_plan_stream = _mock_stream
+
+            result = await self.mod.execute_plan(
+                plan,
+                transport=mock_transport,
+                trace=trace,
+            )
+
+            # Verify modal_input_id was pulled from remote metadata
+            self.assertEqual(
+                trace._metadata.get("modal_input_id"), "remote_input_99",
+            )
+
+        asyncio.run(_run())
+
+
+# =========================================================================
+# V2 execute_plan regression: raw_timestamps alias keys from result
+# =========================================================================
+
+
+class TestExecutePlanRawTimestampAliases(unittest.TestCase):
+    """``execute_plan`` must consume ``raw_timestamps`` alias keys from the
+    result data as a fourth-tier fallback for canonical timestamp fields,
+    and map them using explicit ``is not None`` checks."""
+
+    def setUp(self):
+        self.mod = _load_canonical()
+
+    def test_raw_timestamps_aliases_consumed(self):
+        """When _origin and transport metadata lack timestamps but
+        result.raw_timestamps supplies aliases, execute_plan must map them
+        into the local_timing output without crashing."""
+        from unittest.mock import MagicMock
+
+        async def _run():
+            trace = self.mod.RuntimeTrace(
+                request_id="test_raw_ts_aliases",
+            )
+
+            from comfymodal_runtime.contracts import ExecutionPlan, ExecutionOptions
+            plan = ExecutionPlan(
+                workflow={"3": {"class_type": "KSampler", "inputs": {"seed": 42}}},
+                workflow_hash="test_hash",
+                source_workflow_hash="test_src_hash",
+                execution_options=ExecutionOptions.from_legacy(
+                    {}, default_production=False,
+                ),
+                # No request_origin_info — _origin will be empty
+                request_metadata={"prompt_id": "test_raw_ts"},
+            )
+
+            raw_timestamps = {
+                # t0 → t1: 1 second interval
+                "t0_ui_trigger_wall_unix_ns": 1_000_000_000,
+                "t1_local_receive_wall_unix_ns": 2_000_000_000,
+                # Submission attempt
+                "modal_submission_attempt_wall_unix_ns": 3_000_000_000,
+                # Generator created
+                "modal_generator_created_wall_unix_ns": 4_000_000_000,
+                # Method entry and executor invoke
+                "t4_modal_method_entry_wall_unix_ns": 5_000_000_000,
+                "t5_prompt_executor_invoke_start_wall_unix_ns": 6_000_000_000,
+            }
+
+            async def _mock_stream(
+                plan, *, gpu=None, workspace=None,
+                trace=None, runtime_trace=None, **kwargs,
+            ):
+                yield {
+                    "type": "result",
+                    "data": {
+                        "outputs": {},
+                        "raw_timestamps": raw_timestamps,
+                        "trace": {"metadata": {}},
+                    },
+                }
+
+            mock_transport = MagicMock()
+            mock_transport.run_plan_stream = _mock_stream
+
+            result = await self.mod.execute_plan(
+                plan,
+                transport=mock_transport,
+                trace=trace,
+            )
+
+            local_timing = result.get("local_timing", {})
+
+            # trigger_to_local_receive_ms = (2e9 ns - 1e9 ns) / 1e6 = 1000 ms
+            self.assertEqual(
+                local_timing.get("trigger_to_local_receive_ms"), 1000.0,
+            )
+
+            # Verify raw timestamps flowed through without error.
+            # generator_create_ms is absent because generator_create_start
+            # was not supplied by any tier — ok.
+            self.assertIn("generator_create_ms", local_timing)
+            self.assertEqual(
+                local_timing.get("generator_create_ms"), "absent",
+            )
+
+        asyncio.run(_run())
+
+    def test_raw_timestamps_zero_values_preserved(self):
+        """Explicit is not None fallback must preserve valid zero ns values
+        from raw_timestamps (they were not skipped by truthiness check)."""
+        from unittest.mock import MagicMock
+
+        async def _run():
+            trace = self.mod.RuntimeTrace(
+                request_id="test_raw_ts_zero",
+            )
+
+            from comfymodal_runtime.contracts import ExecutionPlan, ExecutionOptions
+            plan = ExecutionPlan(
+                workflow={"3": {"class_type": "KSampler", "inputs": {"seed": 42}}},
+                workflow_hash="test_hash",
+                source_workflow_hash="test_src_hash",
+                execution_options=ExecutionOptions.from_legacy(
+                    {}, default_production=False,
+                ),
+                request_metadata={"prompt_id": "test_raw_ts_zero"},
+            )
+
+            # Zero ns values in raw_timestamps — must not be treated as falsy
+            raw_timestamps = {
+                "t0_ui_trigger_wall_unix_ns": 0,
+                "t1_local_receive_wall_unix_ns": 1_000_000_000,
+            }
+
+            async def _mock_stream(
+                plan, *, gpu=None, workspace=None,
+                trace=None, runtime_trace=None, **kwargs,
+            ):
+                yield {
+                    "type": "result",
+                    "data": {
+                        "outputs": {},
+                        "raw_timestamps": raw_timestamps,
+                        "trace": {"metadata": {}},
+                    },
+                }
+
+            mock_transport = MagicMock()
+            mock_transport.run_plan_stream = _mock_stream
+
+            result = await self.mod.execute_plan(
+                plan,
+                transport=mock_transport,
+                trace=trace,
+            )
+
+            local_timing = result.get("local_timing", {})
+
+            # t0=0 ns, t1=1e9 ns → (1e9 - 0)/1e6 = 1000.0 ms
+            # If or semantics were used, t0=0 would be falsy, t0 remains None,
+            # and the interval would be "absent".
+            trigger_ms = local_timing.get("trigger_to_local_receive_ms")
+            self.assertEqual(
+                trigger_ms, 1000.0,
+                f"Zero t0 must be preserved by is not None fallback, "
+                f"got {trigger_ms!r}",
             )
 
         asyncio.run(_run())
