@@ -172,7 +172,7 @@ _clip_constructor_depth: ContextVar[int] = ContextVar("_clip_constructor_depth",
 _DEEP_TARGET_PATH: ContextVar[str] = ContextVar("_deep_target_path", default="")
 
 # Residual tracking — list of child duration_ms collected during an SD outer call.
-_child_durations: ContextVar[list[float] | None] = ContextVar("_child_durations", default=None)
+_child_durations: ContextVar[list[float] | list[tuple[str, float]] | None] = ContextVar("_child_durations", default=None)
 
 # CLIP CPU prepare child durations.
 _clip_cpu_prepare_children: ContextVar[list[tuple[str, float]] | None] = ContextVar("_clip_cpu_prepare_children", default=None)
@@ -576,7 +576,9 @@ def _make_clip_load_wrapper(original):
         _result = None
         if emit:
             _clip_cpu_prepare_children.set([])
-            lane._trace.emit("clip_cpu_prepare_start", phase="restore")
+            lane._trace.emit("clip_load_call_start", phase="restore", metadata={
+                "lane": lane._lane,
+            })
         try:
             _result = original(*args, **kwargs)
             return _result
@@ -587,7 +589,14 @@ def _make_clip_load_wrapper(original):
                 _outer_dur_ms = round((time.monotonic_ns() - _outer_start_ns) / 1_000_000, 3)
                 _children = _clip_cpu_prepare_children.get() or []
                 _children_total = round(sum(c[1] for c in _children), 3)
-                _residual = round(max(0.0, _outer_dur_ms - _children_total), 3)
+                # Signed residual — allow negative when children exceed total
+                _residual = round(_outer_dur_ms - _children_total, 3)
+                # Determine status from read count match
+                _mismatch = (lane._actual_read_count != lane.expected_read_count
+                             if lane.expected_read_count > 0 else False)
+                _end_status = "read_count_mismatch" if _mismatch else "ok"
+                if _children_total > _outer_dur_ms:
+                    _end_status = "overlap_error"
                 # ── Cache publication observation ────────────────
                 if _result is not None:
                     _patcher = getattr(_result, "patcher", None)
@@ -599,12 +608,88 @@ def _make_clip_load_wrapper(original):
                                 "clip_cpu_prepare_total_ms": _outer_dur_ms,
                             })
                 _clip_cpu_prepare_children.set(_prior_children)
+                # Compute clip_file_read_total_ms from read start/end intervals
+                _clip_read_total = None
+                try:
+                    for ev in lane._trace.events:
+                        if ev.name == "read_start" and ev.metadata.get("lane") == "CLIP":
+                            _rs = ev.monotonic_ns
+                        elif ev.name == "read_end" and ev.metadata.get("lane") == "CLIP":
+                            _re = ev.monotonic_ns
+                            _val = max(0, (_re - _rs) / 1_000_000)
+                            _clip_read_total = (_clip_read_total or 0) + _val
+                except Exception:
+                    pass
+                _clip_file_read = round(_clip_read_total, 3) if _clip_read_total else None
+                _clip_post_read_cpu = (round(max(0.0, _outer_dur_ms - _clip_read_total), 3)
+                                       if _clip_read_total else None)
+                lane._trace.emit("clip_load_call_end", phase="restore", metadata={
+                    "lane": lane._lane,
+                    "clip_load_call_total_ms": _outer_dur_ms,
+                    "clip_file_read_total_ms": _clip_file_read,
+                    "clip_post_read_cpu_total_ms": _clip_post_read_cpu,
+                    "status": _end_status,
+                })
+                # post_read_total is None when _on_read_completed never fired
+                _post_read_total = _outer_dur_ms if lane._cpu_prepare_started else None
                 lane._trace.emit("clip_cpu_prepare_end", phase="restore", metadata={
-                    "clip_cpu_prepare_total_ms": _outer_dur_ms,
+                    "lane": lane._lane,
+                    "clip_cpu_prepare_total_ms": _post_read_total,
                     "children": [(name, dur) for name, dur in _children],
                     "clip_cpu_prepare_measured_children_ms": _children_total,
                     "clip_cpu_prepare_residual_ms": _residual,
+                    "clip_file_read_total_ms": _clip_file_read,
+                    "status": _end_status,
                 })
+                # Extract named children from trace events for the summary
+                _evts = lane._trace.events
+                _named_map: dict[str, float] = {}
+                for _ev in _evts:
+                    _en = _ev.name
+                    _meta = getattr(_ev, "metadata", None) or {}
+                    _dur = _meta.get("duration_ms")
+                    if _dur is None:
+                        continue
+                    # Match clip_*_end events, handling double prefix
+                    if _en.endswith("_end") and "clip_" in _en:
+                        # Extract base name after clip_ prefix(es)
+                        _base = _en.replace("clip_clip_", "clip_", 1)
+                        if _base.startswith("clip_"):
+                            _short = _base[len("clip_"):-len("_end")]
+                        else:
+                            _short = _base[:-len("_end")]
+                        _named_map[_short] = (_named_map.get(_short, 0) or 0) + _dur
+                    # Also match clip_clip_ double-prefix (already handled above)
+                # Map to named fields
+                _known_fields = {
+                    "load_text_encoder_state_dicts": "load_text_encoder_state_dicts_ms",
+                    "detect_te_model": "detect_te_model_ms",
+                    "text_transformers_convert": "state_dict_conversion_ms",
+                    "clip_text_transformers_convert": "state_dict_conversion_ms",
+                    "constructor": "clip_constructor_ms",
+                    "model_patcher_constructor": "model_patcher_ms",
+                }
+                _s = lambda k: _named_map.get(k)
+                # double-prefix variant also maps to state_dict_conversion
+                _sd_contrib = 0.0
+                for _k in ("text_transformers_convert", "clip_text_transformers_convert", "convert_old_quants"):
+                    _sd_contrib += _named_map.get(_k, 0) or 0
+                if _sd_contrib:
+                    _named_map["state_dict_conversion"] = _sd_contrib
+                _emit_clip_cpu_children_summary(
+                    post_read_total_ms=_post_read_total,
+                    file_read_total_ms=_clip_file_read,
+                    children=_children,
+                    load_text_encoder_state_dicts_ms=_named_map.get("load_text_encoder_state_dicts"),
+                    detect_te_model_ms=_named_map.get("detect_te_model"),
+                    state_dict_conversion_ms=_named_map.get("state_dict_conversion"),
+                    clip_constructor_ms=_named_map.get("constructor"),
+                    model_patcher_ms=_named_map.get("model_patcher_constructor"),
+                    cache_publish_ms=_named_map.get("cache_publish"),
+                    measured_children_ms=_children_total,
+                    residual_ms=_residual,
+                    status=_end_status,
+                )
     wrapper._comfy_modal_clip_wrapper = True
     return wrapper
 
@@ -703,15 +788,19 @@ def _make_convert_old_quants_wrapper(original):
             if lane._lane == "CLIP":
                 lane._trace.emit("clip_convert_old_quants_end", phase="restore", metadata={
                     "category": "utils", "duration_ms": _dur_ms})
-                _children = _clip_cpu_prepare_children.get()
-                if _children is not None:
-                    _children.append(("convert_old_quants", _dur_ms))
+                # Only direct children (depth=0) contribute to measured sum
+                if _clip_subfn_depth.get() == 0:
+                    _children = _clip_cpu_prepare_children.get()
+                    if _children is not None:
+                        _children.append(("convert_old_quants", _dur_ms))
             elif lane._lane == "UNET":
                 lane._trace.emit("unet_convert_old_quants_end", phase="restore", metadata={
                     "category": "utils", "duration_ms": _dur_ms})
-                _children = _child_durations.get()
-                if _children is not None:
-                    _children.append(_dur_ms)
+                # Only direct children (nesting depth 0) contribute to measured sum
+                if _unet_subfn_nesting_depth.get() == 0:
+                    _children = _child_durations.get()
+                    if _children is not None:
+                        _children.append(("convert_old_quants", _dur_ms))
     setattr(wrapper, _SENTINEL_SHARED_COQ, True)
     return wrapper
 
@@ -777,7 +866,7 @@ def _make_model_patcher_constructor_wrapper(original):
                     "duration_ms": _dur_ms})
                 _children = _child_durations.get()
                 if _children is not None:
-                    _children.append(_dur_ms)
+                    _children.append(("model_patcher_constructor", _dur_ms))
             elif emit_clip:
                 _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
                 lane._trace.emit("clip_model_patcher_constructor_end", phase="restore", metadata={
@@ -808,7 +897,7 @@ def _make_model_to_wrapper(original):
                     "duration_ms": _dur_ms})
                 _children = _child_durations.get()
                 if _children is not None:
-                    _children.append(_dur_ms)
+                    _children.append(("model_to", _dur_ms))
     setattr(wrapper, _SENTINEL_MODEL_TO, True)
     return wrapper
 
@@ -1251,7 +1340,7 @@ def _make_unet_subfn_wrapper(
                 if _nest_before == 0:
                     _children = _child_durations.get()
                     if _children is not None:
-                        _children.append(_dur_ms)
+                        _children.append((short_name, _dur_ms))
     return wrapper
 
 
@@ -1276,7 +1365,7 @@ def _instrument_unet_model_config(model_config: Any, lane: "ModelLaneTrace") -> 
             lane._trace.emit("unet_model_config_get_model_end", phase="restore", metadata={"duration_ms": duration_ms})
             children = _child_durations.get()
             if _nest_before == 0 and children is not None:
-                children.append(duration_ms)
+                children.append(("model_config_get_model", duration_ms))
 
     setattr(wrapped_get_model, _SENTINEL_SUBFN, True)
     try:
@@ -1304,7 +1393,7 @@ def _instrument_unet_model_weights(model: Any, lane: "ModelLaneTrace") -> None:
             lane._trace.emit("unet_load_model_weights_end", phase="restore", metadata={"duration_ms": duration_ms})
             children = _child_durations.get()
             if _nest_before == 0 and children is not None:
-                children.append(duration_ms)
+                children.append(("load_model_weights", duration_ms))
 
     setattr(wrapped_load_weights, _SENTINEL_SUBFN, True)
     try:
@@ -1349,10 +1438,21 @@ def _make_sd_state_dict_wrapper(original: Callable[..., Any]) -> Callable[..., A
             after = _sd_depth.get()
             _sd_depth.set(after - 1)
             if emit:  # before was 0, so we are the outermost invocation
-                _children = _child_durations.get() or []
-                _child_total = round(sum(_children), 3)
+                _children_raw = _child_durations.get() or []
+                # Separate into legacy numeric and named tuples
+                _legacy_durs: list[float] = []
+                _named_children: list[tuple[str, float]] = []
+                for _entry in _children_raw:
+                    if isinstance(_entry, tuple):
+                        _named_children.append(_entry)
+                        _legacy_durs.append(_entry[1])
+                    else:
+                        _legacy_durs.append(_entry)
+                _child_total = round(sum(_legacy_durs), 3)
                 _whole_ms = round((time.monotonic_ns() - _sd_start_ns) / 1_000_000, 3)
-                _residual_ms = round(max(0.0, _whole_ms - _child_total), 3)
+                # Signed residual — allow negative when children exceed total
+                _residual_ms = round(_whole_ms - _child_total, 3)
+                _sd_status = "overlap_error" if _residual_ms < 0 else "ok"
                 # Restore prior before emitting (children list snapshot taken)
                 _child_durations.set(_prior_children)
                 lane._trace.emit("unet_load_diffusion_model_state_dict_end", phase="restore", metadata={
@@ -1360,10 +1460,12 @@ def _make_sd_state_dict_wrapper(original: Callable[..., Any]) -> Callable[..., A
                     "model_construction_total_ms": _whole_ms,
                     "measured_child_total_ms": _child_total,
                     "measured_direct_children_ms": _child_total,
-                    "measured_child_count": len(_children),
-                    "measured_children": _children,
+                    "measured_child_count": len(_named_children),
+                    "measured_children": _legacy_durs,
+                    "measured_named_children": _named_children,
                     "residual_ms": _residual_ms,
                     "model_construction_residual_ms": _residual_ms,
+                    "status": _sd_status,
                     "classification": "residual_not_causal_owner",
                 })
 
@@ -1458,17 +1560,19 @@ def _get_mutation_lane() -> "MutationLane":
 
 
 class MutationLane:
-    """Coordinator-owned deterministic serialization of GPU/cache mutation.
+    """FIFO serialization of GPU/cache mutation — does NOT preempt.
 
-    Only one caller may hold the lane at a time.  Priority order:
-    ``UNET → CLIP → prefill → VAE → sampler``.  Acquire blocks until
-    the lane is free; release hands ownership to the next waiter.
-    Exception-safe via context manager.
+    Only one caller may hold the lane at a time.  Acquire blocks until
+    the lane is free; release hands ownership to the next waiter (plain
+    FIFO, no priority preemption).  Exception-safe via context manager.
     """
 
     _MUTEX_PRIORITY: dict[str, int] = {
         "UNET": 0, "CLIP": 1, "prefill": 2, "VAE": 3, "sampler": 4,
     }
+    # NOTE: _MUTEX_PRIORITY is defined for documentation / forward
+    # compatibility only.  The current implementation is plain FIFO —
+    # priority does NOT preempt.
 
     def __init__(self) -> None:
         self._lock = RLock()
@@ -1476,7 +1580,7 @@ class MutationLane:
         self._cond = Condition(self._lock)
 
     def acquire(self, owner: str | None, timeout: float | None = None) -> bool:
-        """Block until the lane is acquired for *owner*."""
+        """Block until the lane is acquired — plain FIFO, no preemption."""
         if owner is None:
             return True  # no tracking for anonymous callers
         with self._cond:
@@ -1582,10 +1686,24 @@ class ModelLaneTrace:
             self._cpu_prepare_started = True
             if self.expected_read_count > 0 and self._actual_read_count != self.expected_read_count:
                 self.cpu_prepare_start(status="read_count_mismatch",
-                                       expected=self.expected_read_count,
-                                       actual=self._actual_read_count)
+                                       expected_read_count=self.expected_read_count,
+                                       actual_read_count=self._actual_read_count)
+                if self._lane == "CLIP":
+                    self._trace.emit("clip_cpu_prepare_start", phase=self._phase, metadata={
+                        "lane": self._lane,
+                        "expected_read_count": self.expected_read_count,
+                        "actual_read_count": self._actual_read_count,
+                        "status": "read_count_mismatch",
+                    })
             else:
-                self.cpu_prepare_start()
+                self.cpu_prepare_start(expected_read_count=self.expected_read_count,
+                                       actual_read_count=self._actual_read_count)
+                if self._lane == "CLIP":
+                    self._trace.emit("clip_cpu_prepare_start", phase=self._phase, metadata={
+                        "lane": self._lane,
+                        "expected_read_count": self.expected_read_count,
+                        "actual_read_count": self._actual_read_count,
+                    })
 
     def _on_gpu_commit_about_to_start(self) -> None:
         """Called by the ``load_models_gpu`` wrapper before commit events."""
@@ -2033,12 +2151,19 @@ def classify_active_read_dims(
     has_process_cpu: bool = False,
     has_rusage: bool = False,
     has_io: bool = False,
+    has_cgroup: bool = False,
     os_supports_thread_cpu: bool = True,
     os_supports_process_cpu: bool = True,
     os_supports_rusage: bool = True,
     os_supports_io: bool = True,
+    os_supports_cgroup: bool = True,
 ) -> dict[str, str]:
     """Classify per-dimension active-read counter statuses using native thread IDs.
+
+    Each dimension is classified independently.  Missing is not zero: a
+    dimension whose before *or* after snapshot is missing gets a string status
+    rather than a numeric zero.  A valid zero delta is only possible when both
+    snapshots exist.
 
     Status vocabulary:
       ``available`` — data captured and valid for this dimension.
@@ -2050,6 +2175,14 @@ def classify_active_read_dims(
       ``not_observed_in_this_thread`` — deep_diag + same thread, the OS
           supports this counter, but no before-snapshot was captured for
           this dimension in this thread.
+      ``no_before_snapshot`` — deep_diag enabled, OS supports, but before
+          snapshot was not captured (e.g. late registration).
+      ``aggregate_available`` — (cgroup) aggregate memory.stat values
+          are present and merged from multiple dimensions.
+      ``aggregate_partial`` — (cgroup) some but not all cgroup dimensions
+          are available.
+      ``aggregate_unavailable`` — (cgroup) no cgroup data at all, preventing
+          aggregate status.
 
     Returns a dict keyed by dimension name with string status values.
     """
@@ -2064,6 +2197,7 @@ def classify_active_read_dims(
         ("page_faults", True),      # thread-bounded (RUSAGE_THREAD minflt/majflt)
         ("block_input", True),      # thread-bounded (RUSAGE_THREAD inblock/oublock)
         ("context_switches", True), # thread-bounded (RUSAGE_THREAD nvcsw/nivcsw)
+        ("cgroup_memory", False),   # process-wide cgroup v2 memory.stat
     ]
     # ── Per-dimension data-captured flag mapping ────────────────────
     _HAS_MAP: dict[str, bool] = {
@@ -2073,6 +2207,7 @@ def classify_active_read_dims(
         "page_faults": has_rusage,
         "block_input": has_rusage,
         "context_switches": has_rusage,
+        "cgroup_memory": has_cgroup,
     }
     # ── Per-dimension OS-support flag mapping ───────────────────────
     _OS_SUPPORTS_MAP: dict[str, bool] = {
@@ -2082,6 +2217,7 @@ def classify_active_read_dims(
         "page_faults": os_supports_rusage,
         "block_input": os_supports_rusage,
         "context_switches": os_supports_rusage,
+        "cgroup_memory": os_supports_cgroup,
     }
 
     result: dict[str, str] = {}
@@ -2094,19 +2230,25 @@ def classify_active_read_dims(
         has_data = _HAS_MAP[dim]
         os_supports = _OS_SUPPORTS_MAP[dim]
         if thread_bounded and not _same_tid:
-            # Thread changed — cannot compute meaningful delta for bounded dims
             result[dim] = "thread_changed"
         elif not has_data:
-            # Capability-vs-observation distinction:
-            #   os_supports=True  but has_data=False → supported counter not
-            #     observed in this thread → not_observed_in_this_thread
-            #   os_supports=False (OS cannot provide this counter) → unavailable
             if not os_supports:
                 result[dim] = "unavailable"
             else:
                 result[dim] = "not_observed_in_this_thread"
         else:
             result[dim] = "available"
+
+    # ── Cgroup aggregate status ─────────────────────────────────────
+    cg_avail = has_cgroup
+    if not deep_diag:
+        result["cgroup_aggregate"] = "unsupported"
+    elif not os_supports_cgroup:
+        result["cgroup_aggregate"] = "unavailable"
+    elif not cg_avail:
+        result["cgroup_aggregate"] = "unavailable"
+    else:
+        result["cgroup_aggregate"] = "available"
     return result
 
 
@@ -2573,42 +2715,35 @@ def _emit_slow_read_line(
     cloud = os.environ.get("MODAL_CLOUD_PROVIDER", "")
     region = os.environ.get("MODAL_REGION", "")
 
-    # ── Aggregate counter_status ────────────────────────────────────
-    # One of: available, partial, unsupported, unavailable.
-    # available iff all requested counters valid (same thread, data captured).
-    # partial iff some valid and some missing.
-    # unsupported iff platform does not expose the counter type.
-    # unavailable iff no usable counters or collection failed.
+    # ── Per-dimension independent status ────────────────────────────
+    # Each dimension is classified independently using classify_active_read_dims.
     _is_linux = platform.system() == "Linux"
-    _counters_available: dict[str, bool] = {}
-
-    # thread_cpu: available when same TID and has thread time deltas
-    _counters_available["thread_cpu"] = bool(
-        _is_linux and _same_tid and _has_thread_cpu and thread_cpu_ms is not None
-    )
-    # process_cpu: available when has process time deltas (not thread-bounded)
-    _counters_available["process_cpu"] = bool(
-        _is_linux and _has_process_cpu and process_cpu_ms is not None
-    )
-    # rusage counters (page_faults, inblock, context_switches): available
-    # when same TID and at least one rusage delta is present
-    _has_any_rusage_delta = any(v is not None for v in (
-        minor_faults_delta, major_faults_delta, inblock_delta,
-        voluntary_cs_delta, involuntary_cs_delta,
-    ))
-    _counters_available["rusage"] = bool(
-        _is_linux and _same_tid and _has_any_rusage_delta
-    )
-    # io counters: available when same TID and at least one io delta is present
-    _has_any_io_delta = any(v is not None for v in (
-        rchar_delta, read_bytes_delta,
-    ))
-    _counters_available["io"] = bool(
-        _is_linux and _same_tid and _has_any_io_delta
+    _dim_statuses = classify_active_read_dims(
+        deep_diag=True,
+        before_tid=before.tid,
+        after_tid=after_tid,
+        has_thread_cpu=bool(_has_thread_cpu and _same_tid and thread_cpu_ms is not None),
+        has_process_cpu=bool(_has_process_cpu and process_cpu_ms is not None),
+        has_rusage=bool(_same_tid and any(v is not None for v in (
+            minor_faults_delta, major_faults_delta, inblock_delta,
+            voluntary_cs_delta, involuntary_cs_delta,
+        ))),
+        has_io=bool(_same_tid and any(v is not None for v in (
+            rchar_delta, read_bytes_delta,
+        ))),
+        has_cgroup=bool(_cgroup is not None and memory_file_bytes is not None),
+        os_supports_thread_cpu=_is_linux,
+        os_supports_process_cpu=_is_linux,
+        os_supports_rusage=_is_linux,
+        os_supports_io=_is_linux,
+        os_supports_cgroup=_is_linux,
     )
 
-    _valid_count = sum(1 for v in _counters_available.values() if v)
-    _total_count = len(_counters_available)
+    # ── Aggregate counter_status (backward-compatible) ──────────────
+    _dim_avail = {k: v == "available" for k, v in _dim_statuses.items()
+                  if k not in ("cgroup_aggregate",)}
+    _valid_count = sum(1 for v in _dim_avail.values() if v)
+    _total_count = len(_dim_avail) if _dim_avail else 0
 
     if not _is_linux:
         counter_status: str = "unsupported"
@@ -2682,7 +2817,15 @@ def _emit_slow_read_line(
         f"pgmajfault={pgmajfault} "
         f"cached_kb={cached_kb} "
         f"mem_available_kb={mem_available_kb} "
-        f"counter_status={counter_status}",
+        f"counter_status={counter_status} "
+        f"dim_thread_cpu={_dim_statuses.get('thread_cpu', 'unknown')} "
+        f"dim_process_cpu={_dim_statuses.get('process_cpu', 'unknown')} "
+        f"dim_io_deltas={_dim_statuses.get('io_deltas', 'unknown')} "
+        f"dim_page_faults={_dim_statuses.get('page_faults', 'unknown')} "
+        f"dim_block_input={_dim_statuses.get('block_input', 'unknown')} "
+        f"dim_context_switches={_dim_statuses.get('context_switches', 'unknown')} "
+        f"dim_cgroup_memory={_dim_statuses.get('cgroup_memory', 'unknown')} "
+        f"cgroup_aggregate={_dim_statuses.get('cgroup_aggregate', 'unknown')}",
         flush=True,
     )
 
@@ -2849,6 +2992,52 @@ def _collect_restore_events_for_summary(
     return result_breakdown, result_clip
 
 
+# ── CLIP CPU children compact summary ────────────────────────────────
+
+
+def _emit_clip_cpu_children_summary(
+    *,
+    post_read_total_ms: float | None = None,
+    file_read_total_ms: float | None = None,
+    children: list[tuple[str, float]] | None = None,
+    load_text_encoder_state_dicts_ms: float | None = None,
+    detect_te_model_ms: float | None = None,
+    state_dict_conversion_ms: float | None = None,
+    clip_constructor_ms: float | None = None,
+    model_patcher_ms: float | None = None,
+    cache_publish_ms: float | None = None,
+    measured_children_ms: float = 0.0,
+    residual_ms: float = 0.0,
+    status: str = "ok",
+) -> None:
+    """Emit a compact [v2.clip_cpu_children] diagnostic line.
+
+    Named stage fields are printed as-is (None when unavailable).
+    *children* is rendered as an inline dict for compactness.
+    """
+    _children_dict: dict[str, float] = {}
+    if children:
+        for _name, _dur in children:
+            _children_dict[_name] = round(_dur, 3)
+
+    print(
+        f"[v2.clip_cpu_children] "
+        f"post_read_total_ms={post_read_total_ms} "
+        f"file_read_total_ms={file_read_total_ms} "
+        f"measured_children_ms={measured_children_ms} "
+        f"residual_ms={residual_ms} "
+        f"load_text_encoder_state_dicts_ms={load_text_encoder_state_dicts_ms} "
+        f"detect_te_model_ms={detect_te_model_ms} "
+        f"state_dict_conversion_ms={state_dict_conversion_ms} "
+        f"clip_constructor_ms={clip_constructor_ms} "
+        f"model_patcher_ms={model_patcher_ms} "
+        f"cache_publish_ms={cache_publish_ms} "
+        f"children={_children_dict} "
+        f"status={status}",
+        flush=True,
+    )
+
+
 # ── Background UNET IO/stages summary emission ──────────────────────
 
 
@@ -2856,9 +3045,16 @@ def _emit_bg_unet_io_summary(trace: RuntimeTrace, *, canonical_key: str = "",
                                target_path: str = "", force: bool = False) -> None:
     """Emit a compact [v2.bg_unet_io] line from trace events.
 
-    Summarises file stat, open, mmap, safetensors parse, tensor materialization
-    durations.  Missing stages → None.  Only emits when deep diag produced
+    Summarises file stat, open, mmap, safetensors open/parse/header,
+    tensor enumeration, tensor materialization, dtype_conversion,
+    state_dict_assembly, model_config, model_construction,
+    load_model_weights, post_load_cleanup, cache_publish durations.
+    Missing stages → None.  Only emits when deep diag produced
     events or *force* is True.
+
+    Each stage reports wall_ms, thread_cpu_ms, process_cpu_ms,
+    thread_cpu_ratio, tensor_count, materialized_bytes, source_dtype,
+    and destination_dtype where applicable from trace event metadata.
 
     NOTE: file_open and mmap_create are always None/absent because the real
     safetensors/torch.load implementations do not expose separable Python-callable
@@ -2867,15 +3063,41 @@ def _emit_bg_unet_io_summary(trace: RuntimeTrace, *, canonical_key: str = "",
     """
     if not force and not _DIAGNOSTIC_FLAG:
         return
-    stages: dict[str, Any] = {"file_stat_ms": None, "file_open_ms": None,
-                               "mmap_create_ms": None, "safetensors_open_ms": None,
-                               "safetensors_parse_ms": None,
-                               "tensor_materialization_ms": None,
-                               "safetensors_combined_ms": None,
-                               "load_torch_file_ms": None, "stage_split_available": None}
+    stages: dict[str, Any] = {
+        "file_stat_ms": None, "file_open_ms": None,
+        "mmap_create_ms": None, "safetensors_open_ms": None,
+        "safetensors_parse_ms": None, "header_parse_ms": None,
+        "tensor_enumeration_ms": None,
+        "tensor_materialization_ms": None,
+        "dtype_conversion_ms": None,
+        "state_dict_assembly_ms": None,
+        "model_config_ms": None, "model_construction_ms": None,
+        "load_model_weights_ms": None,
+        "post_load_cleanup_ms": None, "cache_publish_ms": None,
+        "safetensors_combined_ms": None,
+        "load_torch_file_ms": None, "stage_split_available": None,
+        "wall_ms": None, "thread_cpu_ms": None, "process_cpu_ms": None,
+        "thread_cpu_ratio": None,
+        "tensor_count": None, "materialized_bytes": None,
+        "source_dtype": None, "destination_dtype": None,
+    }
+    _worker_wall_start_ns = 0
+    _worker_wall_end_ns = 0
+    _worker_thread_start_ns = 0
+    _worker_thread_end_ns = 0
+    _worker_proc_start_ns = 0
+    _worker_proc_end_ns = 0
     events = trace.events
     for i, evt in enumerate(events):
         _meta = evt.metadata if hasattr(evt, "metadata") else {}
+        if evt.name == "background_unet_worker_start":
+            _worker_wall_start_ns = evt.monotonic_ns
+            _worker_thread_start_ns = _meta.get("thread_time_ns", 0) if _meta else 0
+            _worker_proc_start_ns = _meta.get("process_time_ns", 0) if _meta else 0
+        elif evt.name == "background_unet_worker_end":
+            _worker_wall_end_ns = evt.monotonic_ns
+            _worker_thread_end_ns = _meta.get("thread_time_ns", 0) if _meta else 0
+            _worker_proc_end_ns = _meta.get("process_time_ns", 0) if _meta else 0
         # unet_file_stat_start -> unet_file_stat_end
         if evt.name == "unet_file_stat_start":
             for j in range(i + 1, min(i + 20, len(events))):
@@ -2902,13 +3124,64 @@ def _emit_bg_unet_io_summary(trace: RuntimeTrace, *, canonical_key: str = "",
                 if events[j].name == "unet_safetensors_parse_end":
                     stages["safetensors_parse_ms"] = round((events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
                     stages["stage_split_available"] = _meta.get("stage_split_available", False)
+                    stages["tensor_count"] = _meta.get("tensor_count", stages["tensor_count"])
                     break
+        elif evt.name == "unet_header_parse_start":
+            for j in range(i + 1, min(i + 40, len(events))):
+                if events[j].name == "unet_header_parse_end":
+                    stages["header_parse_ms"] = round((events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    stages["source_dtype"] = _meta.get("source_dtype", stages["source_dtype"])
+                    stages["destination_dtype"] = _meta.get("destination_dtype", stages["destination_dtype"])
+                    break
+        elif evt.name == "unet_tensor_enumeration_start":
+            for j in range(i + 1, min(i + 200, len(events))):
+                if events[j].name == "unet_tensor_enumeration_end":
+                    stages["tensor_enumeration_ms"] = round((events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    stages["tensor_count"] = _meta.get("tensor_count", stages["tensor_count"])
+                    break
+        elif evt.name == "unet_tensor_materialize_aggregated":
+            stages["tensor_count"] = _meta.get("tensor_count", stages["tensor_count"])
+            stages["materialized_bytes"] = _meta.get("total_bytes", stages["materialized_bytes"])
         elif evt.name == "unet_tensor_materialize_start":
             for j in range(i + 1, min(i + 200, len(events))):
                 if events[j].name == "unet_tensor_materialize_end":
                     _prev = stages.get("tensor_materialization_ms", 0) or 0
                     stages["tensor_materialization_ms"] = round(
                         _prev + (events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    break
+        elif evt.name == "unet_dtype_conversion_start":
+            for j in range(i + 1, min(i + 100, len(events))):
+                if events[j].name == "unet_dtype_conversion_end":
+                    stages["dtype_conversion_ms"] = round((events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    stages["source_dtype"] = _meta.get("source_dtype", stages["source_dtype"])
+                    stages["destination_dtype"] = _meta.get("destination_dtype", stages["destination_dtype"])
+                    break
+        elif evt.name == "unet_state_dict_assembly_start":
+            for j in range(i + 1, min(i + 100, len(events))):
+                if events[j].name == "unet_state_dict_assembly_end":
+                    stages["state_dict_assembly_ms"] = round((events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    break
+        elif evt.name == "unet_model_config_start":
+            for j in range(i + 1, min(i + 100, len(events))):
+                if events[j].name == "unet_model_config_end":
+                    stages["model_config_ms"] = round((events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    break
+        elif evt.name == "unet_load_diffusion_model_state_dict_start":
+            for j in range(i + 1, min(i + 300, len(events))):
+                if events[j].name == "unet_load_diffusion_model_state_dict_end":
+                    stages["model_construction_ms"] = events[j].metadata.get("duration_ms", 0) if hasattr(events[j], "metadata") else 0
+                    break
+        elif evt.name == "unet_load_model_weights_end":
+            stages["load_model_weights_ms"] = _meta.get("duration_ms", stages["load_model_weights_ms"])
+        elif evt.name == "unet_post_load_cleanup_start":
+            for j in range(i + 1, min(i + 50, len(events))):
+                if events[j].name == "unet_post_load_cleanup_end":
+                    stages["post_load_cleanup_ms"] = round((events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    break
+        elif evt.name == "unet_cache_publish_start":
+            for j in range(i + 1, min(i + 100, len(events))):
+                if events[j].name == "unet_cache_publish_end":
+                    stages["cache_publish_ms"] = round((events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
                     break
         elif evt.name == "unet_safetensors_load_combined_start":
             for j in range(i + 1, min(i + 200, len(events))):
@@ -2923,6 +3196,19 @@ def _emit_bg_unet_io_summary(trace: RuntimeTrace, *, canonical_key: str = "",
                     stages["load_torch_file_ms"] = round(
                         (events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
                     break
+
+    # ── Worker wall, thread CPU, process CPU, ratio ─────────────────
+    if _worker_wall_start_ns and _worker_wall_end_ns:
+        _wall_ms = round((_worker_wall_end_ns - _worker_wall_start_ns) / 1_000_000, 3)
+        stages["wall_ms"] = _wall_ms
+        if _worker_thread_start_ns and _worker_thread_end_ns:
+            _tcpu = round((_worker_thread_end_ns - _worker_thread_start_ns) / 1_000_000, 3)
+            stages["thread_cpu_ms"] = _tcpu
+            if _wall_ms > 0:
+                stages["thread_cpu_ratio"] = round(_tcpu / _wall_ms, 4)
+        if _worker_proc_start_ns and _worker_proc_end_ns:
+            stages["process_cpu_ms"] = round((_worker_proc_end_ns - _worker_proc_start_ns) / 1_000_000, 3)
+
     print(
         f"[v2.bg_unet_io] "
         f"file_stat_ms={stages['file_stat_ms']} "
@@ -2930,10 +3216,27 @@ def _emit_bg_unet_io_summary(trace: RuntimeTrace, *, canonical_key: str = "",
         f"mmap_create_ms={stages['mmap_create_ms']} "
         f"safetensors_open_ms={stages['safetensors_open_ms']} "
         f"safetensors_parse_ms={stages['safetensors_parse_ms']} "
+        f"header_parse_ms={stages['header_parse_ms']} "
+        f"tensor_enumeration_ms={stages['tensor_enumeration_ms']} "
         f"tensor_materialization_ms={stages['tensor_materialization_ms']} "
+        f"dtype_conversion_ms={stages['dtype_conversion_ms']} "
+        f"state_dict_assembly_ms={stages['state_dict_assembly_ms']} "
+        f"model_config_ms={stages['model_config_ms']} "
+        f"model_construction_ms={stages['model_construction_ms']} "
+        f"load_model_weights_ms={stages['load_model_weights_ms']} "
+        f"post_load_cleanup_ms={stages['post_load_cleanup_ms']} "
+        f"cache_publish_ms={stages['cache_publish_ms']} "
         f"safetensors_combined_ms={stages['safetensors_combined_ms']} "
         f"load_torch_file_ms={stages['load_torch_file_ms']} "
         f"stage_split_available={stages['stage_split_available']} "
+        f"wall_ms={stages['wall_ms']} "
+        f"thread_cpu_ms={stages['thread_cpu_ms']} "
+        f"process_cpu_ms={stages['process_cpu_ms']} "
+        f"thread_cpu_ratio={stages['thread_cpu_ratio']} "
+        f"tensor_count={stages['tensor_count']} "
+        f"materialized_bytes={stages['materialized_bytes']} "
+        f"source_dtype={stages['source_dtype']} "
+        f"destination_dtype={stages['destination_dtype']} "
         f"canonical_key={canonical_key[-32:] if canonical_key else ''}",
         flush=True,
     )
@@ -2956,6 +3259,11 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
         "model_construction_residual_ms": None,
         "model_config_get_model_ms": None,
         "load_model_weights_ms": None,
+        "convert_old_quants_ms": None,
+        "model_patcher_constructor_ms": None,
+        "model_to_ms": None,
+        "state_dict_prefix_replace_ms": None,
+        "fast_children_le_1ms": 0.0,
         "gpu_lane_wait_ms": None, "gpu_commit_ms": None,
         "cache_publish_ms": None,
         "background_gpu_transfer_present": False,
@@ -3001,9 +3309,29 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
                     _children_total = events[j].metadata.get("measured_child_total_ms", 0) if hasattr(events[j], "metadata") else 0
                     break
         elif evt.name == "unet_model_config_get_model_end":
-            stages["model_config_get_model_ms"] = evt.metadata.get("duration_ms")
+            _val = evt.metadata.get("duration_ms")
+            if _val is not None:
+                stages["model_config_get_model_ms"] = (stages["model_config_get_model_ms"] or 0) + _val
         elif evt.name == "unet_load_model_weights_end":
-            stages["load_model_weights_ms"] = evt.metadata.get("duration_ms")
+            _val = evt.metadata.get("duration_ms")
+            if _val is not None:
+                stages["load_model_weights_ms"] = (stages["load_model_weights_ms"] or 0) + _val
+        elif evt.name == "unet_state_dict_prefix_replace_end":
+            _val = evt.metadata.get("duration_ms")
+            if _val is not None:
+                stages["state_dict_prefix_replace_ms"] = (stages["state_dict_prefix_replace_ms"] or 0) + _val
+        elif evt.name == "unet_convert_old_quants_end":
+            _val = evt.metadata.get("duration_ms")
+            if _val is not None:
+                stages["convert_old_quants_ms"] = (stages["convert_old_quants_ms"] or 0) + _val
+        elif evt.name == "unet_model_patcher_constructor_end":
+            _val = evt.metadata.get("duration_ms")
+            if _val is not None:
+                stages["model_patcher_constructor_ms"] = (stages["model_patcher_constructor_ms"] or 0) + _val
+        elif evt.name == "unet_model_to_end":
+            _val = evt.metadata.get("duration_ms")
+            if _val is not None:
+                stages["model_to_ms"] = (stages["model_to_ms"] or 0) + _val
 
     if _submitted_ns and _worker_start_ns:
         stages["submission_to_worker_start_ms"] = round((_worker_start_ns - _submitted_ns) / 1_000_000, 3)
@@ -3022,6 +3350,24 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
     stages["measured_direct_children_ms"] = round(_children_total, 3) if _children_total else None
     stages["model_construction_residual_ms"] = round(max(0.0, _sd_total - _children_total), 3) if _sd_total else None
 
+    # Separate children >1ms from fast (≤1ms) ones
+    _other_named: dict[str, float] = {}
+    _fast_total = 0.0
+    for _nkey, _nms in (
+        ("model_config_get_model", stages["model_config_get_model_ms"]),
+        ("load_model_weights", stages["load_model_weights_ms"]),
+        ("convert_old_quants", stages["convert_old_quants_ms"]),
+        ("state_dict_prefix_replace", stages["state_dict_prefix_replace_ms"]),
+        ("model_patcher_constructor", stages["model_patcher_constructor_ms"]),
+        ("model_to", stages["model_to_ms"]),
+    ):
+        if _nms is not None:
+            if _nms > 1.0:
+                _other_named[_nkey] = round(_nms, 3)
+            else:
+                _fast_total += _nms
+    stages["fast_children_le_1ms"] = round(_fast_total, 3) if _fast_total else None
+
     print(
         f"[v2.bg_unet_stages] "
         f"submission_to_worker_start_ms={stages['submission_to_worker_start_ms']} "
@@ -3029,12 +3375,12 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
         f"model_construction_total_ms={stages['model_construction_total_ms']} "
         f"measured_direct_children_ms={stages['measured_direct_children_ms']} "
         f"model_construction_residual_ms={stages['model_construction_residual_ms']} "
-        f"model_config_get_model_ms={stages['model_config_get_model_ms']} "
-        f"load_model_weights_ms={stages['load_model_weights_ms']} "
-        f"gpu_lane_wait_ms={stages['gpu_lane_wait_ms']} "
+        + " ".join(f"{k}={v}" for k, v in sorted(_other_named.items()))
+        + f" gpu_lane_wait_ms={stages['gpu_lane_wait_ms']} "
         f"gpu_commit_ms={stages['gpu_commit_ms']} "
         f"cache_publish_ms={stages['cache_publish_ms']} "
         f"background_gpu_transfer_present={stages['background_gpu_transfer_present']} "
+        f"fast_children_le_1ms={stages['fast_children_le_1ms']} "
         f"weight_dtype={stages['weight_dtype']} "
         f"canonical_key={canonical_key[-32:] if canonical_key else ''}",
         flush=True,

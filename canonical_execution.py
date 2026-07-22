@@ -61,10 +61,14 @@ _RESTORE_PUBLISH_CACHE: dict[str, str] = {}
 Cache-key format: ``{workspace_id}:{app_name}:{environment}:{identity_hash}``
 Cleared only by module reload; survives across calls within the same process.
 Thread-safe via ``_RESTORE_PUBLISH_CACHE_LOCK``.
+Bounded to ``_RESTORE_PUBLISH_CACHE_MAX`` entries.
 """
 
 _RESTORE_PUBLISH_CACHE_LOCK = threading.Lock()
 """Guard for all ``_RESTORE_PUBLISH_CACHE`` access."""
+
+_RESTORE_PUBLISH_CACHE_MAX = 100
+"""Maximum entries in the restore publish cache before eviction."""
 
 _APP_NAME_DEFAULT = "stable-modal-comfy-v2-shadow"
 """Fallback Modal app name when ``COMFYMODAL_V2_APP_NAME`` is unset."""
@@ -94,6 +98,13 @@ def _reset_restore_publish_cache() -> None:
         _RESTORE_PUBLISH_CACHE.clear()
 
 
+def _evict_restore_publish_cache() -> None:
+    """Evict oldest entries when cache exceeds ``_RESTORE_PUBLISH_CACHE_MAX``."""
+    with _RESTORE_PUBLISH_CACHE_LOCK:
+        while len(_RESTORE_PUBLISH_CACHE) > _RESTORE_PUBLISH_CACHE_MAX:
+            _RESTORE_PUBLISH_CACHE.pop(next(iter(_RESTORE_PUBLISH_CACHE)), None)
+
+
 # ---------------------------------------------------------------------------
 # Profile preparation cache — skip prepare_active_next_profile when the
 # plan identity (source_workflow_hash + production_plan_hash + workspace +
@@ -107,10 +118,14 @@ Cache-key format: ``stable_hash({source_workflow_hash, production_plan_hash,
 workspace_id, app_name, environment})``.
 Cleared only by module reload; survives across calls within the same process.
 Thread-safe via ``_PROFILE_PREP_CACHE_LOCK``.
+Bounded to ``_PROFILE_PREP_CACHE_MAX`` entries.
 """
 
 _PROFILE_PREP_CACHE_LOCK = threading.Lock()
 """Guard for all ``_PROFILE_PREP_CACHE`` access."""
+
+_PROFILE_PREP_CACHE_MAX = 100
+"""Maximum entries in the profile prep cache before eviction."""
 
 
 def _profile_prep_cache_key(
@@ -135,6 +150,13 @@ def _reset_profile_prep_cache() -> None:
     """Clear the profile prep cache (test / teardown only)."""
     with _PROFILE_PREP_CACHE_LOCK:
         _PROFILE_PREP_CACHE.clear()
+
+
+def _evict_profile_prep_cache() -> None:
+    """Evict oldest entries when cache exceeds ``_PROFILE_PREP_CACHE_MAX``."""
+    with _PROFILE_PREP_CACHE_LOCK:
+        while len(_PROFILE_PREP_CACHE) > _PROFILE_PREP_CACHE_MAX:
+            _PROFILE_PREP_CACHE.pop(next(iter(_PROFILE_PREP_CACHE)), None)
 
 
 # ---------------------------------------------------------------------------
@@ -661,7 +683,17 @@ async def execute_plan(
     # ── Single canonical payload — materialize the frozen plan exactly once ──
     # Reused for active-profile workflow, restore publication, and final Modal
     # payload.  ExecutionPlan is immutable; the thawed dict is a safe copy.
+    runtime_trace.emit("plan_materialization_start", phase="local")
+    _plan_mat_start_ns = time.perf_counter_ns()
     _canonical_dict: dict = plan.to_dict()
+    _plan_mat_end_ns = time.perf_counter_ns()
+    runtime_trace.emit("plan_materialization_end", phase="local")
+    _plan_mat_ms = round((_plan_mat_end_ns - _plan_mat_start_ns) / 1_000_000, 3)
+    runtime_trace.set_metadata(
+        plan_materialization_count=1,
+        plan_to_dict_count=1,
+        plan_materialization_ms=_plan_mat_ms,
+    )
     _canonical_workflow: dict = _canonical_dict["workflow"]
 
     # ── Profile preparation (before restore publication / Modal submission) ──
@@ -695,14 +727,15 @@ async def execute_plan(
                 metadata={"cache_key_prefix": _profile_cache_key[:16]},
             )
             runtime_trace.set_metadata(
-                active_profile_publish_decision=_pn_result.get("active_profile_publish_decision", "cached_unchanged"),
+                active_profile_publish_decision="cached_unchanged",
                 active_profile_stable_key=_pn_result.get("active_profile_stable_key", ""),
                 active_profile_token=_pn_result.get("active_profile_token", ""),
                 local_active_profile_prepare_ms=0.0,
                 active_profile_remote_call=0,
                 active_profile_remote_ms=0.0,
                 active_profile_prepare_count=0,
-                profile_prep_cache_hit=True,
+                profile_cache_hit=True,
+                profile_remote_call_performed=False,
                 source_workflow_hash=plan.source_workflow_hash,
                 model_stack=dict(plan.model_stack),
                 prompt_summary=dict(plan.prompt_bundle),
@@ -748,7 +781,8 @@ async def execute_plan(
                 active_profile_remote_call=_pn_result.get("active_profile_remote_call", 0),
                 active_profile_remote_ms=_pn_result.get("active_profile_remote_ms", 0.0),
                 active_profile_prepare_count=1,
-                profile_prep_cache_hit=False,
+                profile_cache_hit=False,
+                profile_remote_call_performed=bool(_pn_result.get("active_profile_remote_call", 0)),
                 source_workflow_hash=plan.source_workflow_hash,
                 model_stack=dict(plan.model_stack),
                 prompt_summary=dict(plan.prompt_bundle),
@@ -758,9 +792,12 @@ async def execute_plan(
                 "stable_key": _pn_result.get("active_profile_stable_key", "")[:16],
             })
             # On success, populate the cache so future identical calls skip
+            # Eviction is inlined (not via helper) to avoid lock reentry.
             if _pn_result.get("status") not in ("error",):
                 with _PROFILE_PREP_CACHE_LOCK:
                     _PROFILE_PREP_CACHE[_profile_cache_key] = dict(_pn_result)
+                    while len(_PROFILE_PREP_CACHE) > _PROFILE_PREP_CACHE_MAX:
+                        _PROFILE_PREP_CACHE.pop(next(iter(_PROFILE_PREP_CACHE)), None)
     else:
         runtime_trace.emit("active_next_profile_end", phase="local", metadata={"status": "dry_run"})
     runtime_trace.emit("active_profile_prepare_end", phase="local")
@@ -809,23 +846,48 @@ async def execute_plan(
                 "restore_publish_cache_skip", phase="local",
                 metadata={"cache_key_prefix": cache_key[:64], "identity": plan_identity[:16]},
             )
-            runtime_trace.set_metadata(restore_publish_cache_skipped=True)
+            runtime_trace.set_metadata(
+                restore_publish_cache_skipped=True,
+                restore_publish_cache_hit=True,
+                restore_remote_call_performed=False,
+            )
             observed_generation = 0
         else:
-            runtime_trace.set_metadata(restore_publish_cache_skipped=False)
+            runtime_trace.set_metadata(
+                restore_publish_cache_skipped=False,
+                restore_publish_cache_hit=False,
+            )
             publish_result = restore_publisher.publish(restore_plan)
             if inspect.isawaitable(publish_result):
                 publish_result = await publish_result
+            runtime_trace.set_metadata(restore_remote_call_performed=True)
+            _publish_succeeded = True
             if isinstance(publish_result, Mapping):
                 observed_generation = publish_result.get(
                     "generation", publish_result.get("observed_generation", "")
                 )
                 runtime_trace.set_metadata(restore_publish_result=dict(publish_result))
+                # Guard cache against semantic failure: detect any of:
+                #   status in error/failure/failed, ok==False, success==False,
+                #   or a truthy error/failure field.
+                _pub_status = publish_result.get("status", "")
+                _pub_ok = publish_result.get("ok", True)
+                _pub_success = publish_result.get("success", True)
+                _pub_error_field = publish_result.get("error") or publish_result.get("failure")
+                if (_pub_status in ("error", "failure", "failed")
+                        or _pub_ok is False
+                        or _pub_success is False
+                        or bool(_pub_error_field)):
+                    _publish_succeeded = False
             else:
                 observed_generation = publish_result
-            # On success, populate the cache so future identical calls skip
-            with _RESTORE_PUBLISH_CACHE_LOCK:
-                _RESTORE_PUBLISH_CACHE[cache_key] = plan_identity
+            # Only populate cache on semantic success.
+            # Eviction is inlined (not via helper) to avoid lock reentry.
+            if _publish_succeeded:
+                with _RESTORE_PUBLISH_CACHE_LOCK:
+                    _RESTORE_PUBLISH_CACHE[cache_key] = plan_identity
+                    while len(_RESTORE_PUBLISH_CACHE) > _RESTORE_PUBLISH_CACHE_MAX:
+                        _RESTORE_PUBLISH_CACHE.pop(next(iter(_RESTORE_PUBLISH_CACHE)), None)
 
         runtime_trace.emit("restore_plan_publish_end", phase="local", metadata={"generation": observed_generation})
     else:
@@ -918,7 +980,9 @@ async def execute_plan(
         "restore_plan_build_ms": _event_span_ms(runtime_trace, "restore_plan_build_start", "restore_plan_build_end"),
         "restore_publish_ms": _event_span_ms(runtime_trace, "restore_plan_publish_start", "restore_plan_publish_end"),
         "handle_lookup_ms": _event_span_ms(runtime_trace, "modal_handle_lookup_start", "modal_handle_lookup_end"),
-        "payload_serialize_ms": _event_span_ms(runtime_trace, "modal_payload_serialize_start", "modal_payload_serialize_end"),
+        "payload_serialize_ms": _derived_mono_delta_ms(runtime_trace, "modal_payload_serialize_start", "modal_payload_serialize_end"),
+        "payload_materialization_ms": _derived_mono_delta_ms(runtime_trace, "modal_payload_serialize_start", "payload_measure_size_start"),
+        "payload_size_measurement_ms": _derived_mono_delta_ms(runtime_trace, "payload_measure_size_start", "payload_measure_size_end"),
         "generator_create_ms": _transport_meta.get("generator_create_ms"),
     }
     _t1_to_submission_ms = _transport_meta.get("local_receive_to_actual_submission_ms")
@@ -1464,14 +1528,25 @@ async def execute_plan(
     _handle_lookup_ms = _strict_event_span_ms(runtime_trace,
                                                "modal_handle_lookup_start",
                                                "modal_handle_lookup_end")
-    _payload_serialize_ms = _strict_event_span_ms(runtime_trace,
-                                                   "modal_payload_serialize_start",
-                                                   "modal_payload_serialize_end")
+
+    # Payload stages: partition into three disjoint intervals.
+    #   modal_payload_serialize_start → payload_measure_size_start = payload materialization prep
+    #   payload_measure_size_start → payload_measure_size_end   = exact json.dumps measurement
+    #   payload_measure_size_end → modal_payload_serialize_end  = post-measurement wrap-up
+    _payload_materialization_prep_ms = _ld(runtime_trace,
+                                            "modal_payload_serialize_start",
+                                            "payload_measure_size_start")
+    _payload_size_measurement_ms = _ld(runtime_trace,
+                                        "payload_measure_size_start",
+                                        "payload_measure_size_end")
+    _payload_size_to_serialize_end_ms = _ld(runtime_trace,
+                                             "payload_measure_size_end",
+                                             "modal_payload_serialize_end")
 
     # ── Derived gap durations (start→end, non-overlapping) ──
-    _post_restore_pub_to_transport_ms = _ld(runtime_trace,
-                                             "restore_plan_publish_end",
-                                             "transport_entry")
+    _restore_pub_to_transport_entry_ms = _ld(runtime_trace,
+                                              "restore_plan_publish_end",
+                                              "transport_entry")
     _transport_entry_to_handle_lookup_ms = _ld(runtime_trace,
                                                 "transport_entry",
                                                 "modal_handle_lookup_start")
@@ -1485,6 +1560,22 @@ async def execute_plan(
                                          "modal_generator_created",
                                          "modal_first_iteration_start")
 
+    # Plan materialization stages (new trace events added in execute_plan)
+    _plan_materialization_ms = _ld(runtime_trace,
+                                    "plan_materialization_start",
+                                    "plan_materialization_end")
+
+    # ── Gap stages in the worker→plan→execute→materialize→profile sequence ──
+    _plan_build_to_exec_entry_ms = _ld(runtime_trace,
+                                        "plan_build_end",
+                                        "execute_plan_entry")
+    _exec_entry_to_plan_mat_ms = _ld(runtime_trace,
+                                      "execute_plan_entry",
+                                      "plan_materialization_start")
+    _plan_mat_to_active_profile_ms = _ld(runtime_trace,
+                                          "plan_materialization_end",
+                                          "active_profile_prepare_start")
+
     # ── Boundary-anchored durations ──
     # local_receive_to_worker_start_ms = worker_start - local_receive
     _local_receive_to_worker_start_ms: Any = _ABSENT_STR
@@ -1495,24 +1586,17 @@ async def execute_plan(
         else:
             _local_receive_to_worker_start_ms = round(_delta / 1_000_000, 3)
 
-    # worker_start_to_execute_plan_entry_ms =
-    #   (execute_plan_entry - worker_start) - plan_build_ms
-    # This is the residual in the worker_start→execute_plan_entry region
-    # after excluding the plan_build sub-interval.
-    _worker_start_to_exec_entry_ms: Any = _ABSENT_STR
-    if isinstance(_ref_mono_worker_start, int) and isinstance(_ref_mono_exec_entry, int):
-        _total = _ref_mono_exec_entry - _ref_mono_worker_start
-        if _total < 0:
-            _worker_start_to_exec_entry_ms = _INVALID_NEG_STR
-        elif isinstance(_plan_build_ms, (int, float)):
-            _residual = _total / 1_000_000 - float(_plan_build_ms)
-            if _residual < 0:
-                _worker_start_to_exec_entry_ms = _INVALID_NEG_STR
+    # worker_start_to_plan_build_ms = plan_build_start - worker_start
+    # (true adjacent gap before plan_build, no overlap with plan_build_ms).
+    _worker_start_to_plan_build_ms: Any = _ABSENT_STR
+    if isinstance(_ref_mono_worker_start, int):
+        _ref_mono_plan_build_start = _event_mono_ns(runtime_trace, "plan_build_start")
+        if isinstance(_ref_mono_plan_build_start, int):
+            _delta = _ref_mono_plan_build_start - _ref_mono_worker_start
+            if _delta < 0:
+                _worker_start_to_plan_build_ms = _INVALID_NEG_STR
             else:
-                _worker_start_to_exec_entry_ms = round(_residual, 3)
-        else:
-            # plan_build_ms absent → entire total becomes this residual
-            _worker_start_to_exec_entry_ms = round(_total / 1_000_000, 3)
+                _worker_start_to_plan_build_ms = round(_delta / 1_000_000, 3)
 
     # ── Total span ──
     # local_receive_to_actual_submission_ms = submission - local_receive
@@ -1525,17 +1609,27 @@ async def execute_plan(
             _total_ms = round(_delta / 1_000_000, 3)
 
     # ── Measured children: sum of all valid sequential non-overlapping stages ──
+    # Sequential non-overlapping stages: these partition the total
+    # local_receive→submission span.  The equation holds:
+    #   measured_children_ms + residual_ms == local_receive_to_actual_submission_ms
+    # for fully numeric data (no absent/invalid_negative).
     _child_keys = [
         ("local_receive_to_worker_start_ms", _local_receive_to_worker_start_ms),
-        ("worker_start_to_execute_plan_entry_ms", _worker_start_to_exec_entry_ms),
+        ("worker_start_to_plan_build_ms", _worker_start_to_plan_build_ms),
         ("plan_build_ms", _plan_build_ms),
+        ("plan_build_to_execute_plan_entry_ms", _plan_build_to_exec_entry_ms),
+        ("execute_plan_entry_to_plan_materialization_ms", _exec_entry_to_plan_mat_ms),
+        ("plan_materialization_ms", _plan_materialization_ms),
+        ("plan_materialization_to_active_profile_ms", _plan_mat_to_active_profile_ms),
         ("active_profile_ms", _active_profile_ms),
         ("restore_plan_build_ms", _restore_plan_build_ms),
         ("restore_publish_ms", _restore_publish_ms),
-        ("post_restore_publish_to_transport_ms", _post_restore_pub_to_transport_ms),
+        ("restore_publish_to_transport_entry_ms", _restore_pub_to_transport_entry_ms),
         ("transport_entry_to_handle_lookup_ms", _transport_entry_to_handle_lookup_ms),
         ("handle_lookup_ms", _handle_lookup_ms),
-        ("payload_serialize_ms", _payload_serialize_ms),
+        ("payload_materialization_ms", _payload_materialization_prep_ms),
+        ("payload_size_measurement_ms", _payload_size_measurement_ms),
+        ("payload_size_to_serialize_end_ms", _payload_size_to_serialize_end_ms),
         ("payload_ready_to_generator_create_ms", _payload_ready_to_gen_create_ms),
         ("generator_create_ms", _generator_create_ms),
         ("generator_created_to_first_iteration_ms", _gen_created_to_first_iter_ms),
@@ -1558,10 +1652,21 @@ async def execute_plan(
 
     # ── Residual from unrounded child sum for deterministic reconcile ──
     _residual_ms: Any = _ABSENT_STR
+    _unmeasured_boundary: str = ""
     if isinstance(_total_ms, (int, float)) and _all_numeric:
         # unrounded: residual = total - child_sum (not measured_children which is rounded)
         _residual_val = _total_ms - _child_sum
         _residual_ms = round(_residual_val, 3)
+        # When residual > 100ms, name the most likely unmeasured boundary
+        if _residual_ms > 100:
+            _missing_children = [_ck for _ck, _cv in _child_keys if not isinstance(_cv, (int, float))]
+            if _missing_children:
+                _unmeasured_boundary = f"absent_stage(s)={','.join(_missing_children)}"
+            else:
+                # All child stages are numeric but residual is >100ms → there is a
+                # measurement gap between two otherwise-recorded stages that no
+                # trace event name spans.  Report a stable diagnostic phrase.
+                _unmeasured_boundary = "between_recorded_stages"
 
     # ── Reconciliation status ──
     _reconciliation_status: str = "complete"
@@ -1653,15 +1758,16 @@ async def execute_plan(
         # ── Required fields ──────────────────────────────────────────
         "request_id": _origin.get("request_id") or runtime_trace.request_id,
         "local_receive_to_worker_start_ms": _local_receive_to_worker_start_ms,
-        "worker_start_to_execute_plan_entry_ms": _worker_start_to_exec_entry_ms,
+        "worker_start_to_plan_build_ms": _worker_start_to_plan_build_ms,
         "plan_build_ms": _plan_build_ms,
         "active_profile_ms": _active_profile_ms,
         "restore_plan_build_ms": _restore_plan_build_ms,
         "restore_publish_ms": _restore_publish_ms,
-        "post_restore_publish_to_transport_ms": _post_restore_pub_to_transport_ms,
+        "restore_publish_to_transport_entry_ms": _restore_pub_to_transport_entry_ms,
         "transport_entry_to_handle_lookup_ms": _transport_entry_to_handle_lookup_ms,
         "handle_lookup_ms": _handle_lookup_ms,
-        "payload_serialize_ms": _payload_serialize_ms,
+        "payload_materialization_ms": _payload_materialization_prep_ms,
+        "payload_size_measurement_ms": _payload_size_measurement_ms,
         "payload_ready_to_generator_create_ms": _payload_ready_to_gen_create_ms,
         "generator_create_ms": _generator_create_ms,
         "generator_created_to_first_iteration_ms": _gen_created_to_first_iter_ms,
@@ -1669,6 +1775,7 @@ async def execute_plan(
         "measured_children_ms": _measured_children_ms,
         "residual_ms": _residual_ms,
         "reconciliation_status": _reconciliation_status,
+        "unmeasured_boundary": _unmeasured_boundary,
 
         # ── Raw monotonic reference points (metadata, not required) ──
         "local_receive_mono_ns": _ref_mono_local_receive,
@@ -1682,6 +1789,8 @@ async def execute_plan(
         "active_profile_stable_key": _transport_meta.get("active_profile_stable_key", ""),
         "active_profile_token": _transport_meta.get("active_profile_token", ""),
         "local_active_profile_prepare_ms": _transport_meta.get("local_active_profile_prepare_ms"),
+        "profile_cache_hit": _transport_meta.get("profile_cache_hit"),
+        "profile_remote_call_performed": _transport_meta.get("profile_remote_call_performed"),
         "active_profile_remote_call": _remote_call_count,
         "active_profile_remote_ms": _transport_meta.get("active_profile_remote_ms"),
         "performed_remote_setter_call": _performed_remote_setter_call,
@@ -1692,15 +1801,15 @@ async def execute_plan(
         # ── Restore publication metadata ──
         "restore_publish_generation": _transport_meta.get("restore_publish_result", {}).get("generation")
         if isinstance(_transport_meta.get("restore_publish_result"), dict) else None,
-        "restore_publish_cache_skipped": _rpc_skipped,
-        "hit_restore_publish_cache": _hit_restore_publish_cache,
+        "restore_publish_cache_hit": _hit_restore_publish_cache,
+        "restore_remote_call_performed": _performed_remote_publish,
         "performed_remote_publish": _performed_remote_publish,
 
         # ── Handle lookup metadata ──
         "handle_lookup_app_name": _transport_meta.get("handle_lookup_app_name", ""),
         "handle_lookup_class_name": _transport_meta.get("handle_lookup_class_name", ""),
         "handle_lookup_gpu": _transport_meta.get("handle_lookup_gpu", ""),
-        "hit_handle_cache": _hit_handle_cache,
+        "handle_cache_hit": _hit_handle_cache,
         "created_modal_client": _created_modal_client,
         "performed_cls_from_name": _performed_cls_from_name,
         "constructed_class_instance": _constructed_class_instance,
@@ -1711,6 +1820,8 @@ async def execute_plan(
         "workflow_hash": _transport_meta.get("workflow_hash", ""),
         "input_image_count": _input_image_count,
         "workflow_node_count": _workflow_node_count,
+        "plan_materialization_count": _transport_meta.get("plan_materialization_count"),
+        "plan_to_dict_count": 1,
 
         # ── Cache / remote call metadata ──
         "handle_cache_action": _transport_meta.get("handle_cache_action", ""),
@@ -1721,23 +1832,36 @@ async def execute_plan(
         f"[v2.local_submission_breakdown] "
         f"request_id={_breakdown['request_id']} "
         f"local_receive_to_worker_start_ms={_fmt_bd(_breakdown['local_receive_to_worker_start_ms'])} "
-        f"worker_start_to_execute_plan_entry_ms={_fmt_bd(_breakdown['worker_start_to_execute_plan_entry_ms'])} "
+        f"worker_start_to_plan_build_ms={_fmt_bd(_breakdown['worker_start_to_plan_build_ms'])} "
         f"plan_build_ms={_fmt_bd(_breakdown['plan_build_ms'])} "
         f"active_profile_ms={_fmt_bd(_breakdown['active_profile_ms'])} "
         f"restore_plan_build_ms={_fmt_bd(_breakdown['restore_plan_build_ms'])} "
         f"restore_publish_ms={_fmt_bd(_breakdown['restore_publish_ms'])} "
-        f"post_restore_publish_to_transport_ms={_fmt_bd(_breakdown['post_restore_publish_to_transport_ms'])} "
+        f"restore_publish_to_transport_entry_ms={_fmt_bd(_breakdown['restore_publish_to_transport_entry_ms'])} "
         f"transport_entry_to_handle_lookup_ms={_fmt_bd(_breakdown['transport_entry_to_handle_lookup_ms'])} "
         f"handle_lookup_ms={_fmt_bd(_breakdown['handle_lookup_ms'])} "
-        f"payload_serialize_ms={_fmt_bd(_breakdown['payload_serialize_ms'])} "
+        f"payload_materialization_ms={_fmt_bd(_breakdown['payload_materialization_ms'])} "
+        f"payload_size_measurement_ms={_fmt_bd(_breakdown['payload_size_measurement_ms'])} "
         f"payload_ready_to_generator_create_ms={_fmt_bd(_breakdown['payload_ready_to_generator_create_ms'])} "
         f"generator_create_ms={_fmt_bd(_breakdown['generator_create_ms'])} "
         f"generator_created_to_first_iteration_ms={_fmt_bd(_breakdown['generator_created_to_first_iteration_ms'])} "
         f"local_receive_to_actual_submission_ms={_fmt_bd(_breakdown['local_receive_to_actual_submission_ms'])} "
         f"measured_children_ms={_fmt_bd(_breakdown['measured_children_ms'])} "
         f"residual_ms={_fmt_bd(_breakdown['residual_ms'])} "
+        f"unmeasured_boundary={_breakdown['unmeasured_boundary']} "
         f"reconciliation_status={_breakdown['reconciliation_status']} "
-        # Metadata (non-required, informative)
+        # Metadata exact keys
+        f"profile_cache_hit={_fmt_bd(_breakdown['profile_cache_hit'])} "
+        f"profile_remote_call_performed={_fmt_bd(_breakdown['profile_remote_call_performed'])} "
+        f"restore_publish_cache_hit={_fmt_bd(_breakdown['restore_publish_cache_hit'])} "
+        f"restore_remote_call_performed={_fmt_bd(_breakdown['restore_remote_call_performed'])} "
+        f"handle_cache_hit={_fmt_bd(_breakdown['handle_cache_hit'])} "
+        f"plan_materialization_count={_breakdown['plan_materialization_count']} "
+        f"plan_to_dict_count={_breakdown['plan_to_dict_count']} "
+        f"payload_bytes={_fmt_bd(_breakdown['payload_bytes'])} "
+        f"workflow_node_count={_fmt_bd(_breakdown['workflow_node_count'])} "
+        f"input_image_count={_breakdown['input_image_count']} "
+        # Informative metadata (backward compat with existing consumers)
         f"active_profile_publish_decision={_breakdown['active_profile_publish_decision']} "
         f"active_profile_stable_key_prefix={str(_breakdown['active_profile_stable_key'])[:16]} "
         f"active_profile_token_prefix={str(_breakdown['active_profile_token'])[:8]} "
@@ -1748,17 +1872,12 @@ async def execute_plan(
         f"performed_remote_setter_call={_fmt_bd(_breakdown['performed_remote_setter_call'])} "
         f"used_existing_stable_profile={_fmt_bd(_breakdown['used_existing_stable_profile'])} "
         f"rebuilt_profile_locally={_fmt_bd(_breakdown['rebuilt_profile_locally'])} "
-        f"hit_restore_publish_cache={_fmt_bd(_breakdown['hit_restore_publish_cache'])} "
         f"performed_remote_publish={_fmt_bd(_breakdown['performed_remote_publish'])} "
-        f"hit_handle_cache={_fmt_bd(_breakdown['hit_handle_cache'])} "
         f"created_modal_client={_fmt_bd(_breakdown['created_modal_client'])} "
         f"performed_cls_from_name={_fmt_bd(_breakdown['performed_cls_from_name'])} "
         f"constructed_class_instance={_fmt_bd(_breakdown['constructed_class_instance'])} "
-        f"payload_bytes={_fmt_bd(_breakdown['payload_bytes'])} "
         f"payload_serialized_bytes={_fmt_bd(_breakdown['payload_serialized_bytes'])} "
         f"workflow_hash_prefix={_breakdown['workflow_hash'][:12]} "
-        f"input_image_count={_breakdown['input_image_count']} "
-        f"workflow_node_count={_fmt_bd(_breakdown['workflow_node_count'])} "
         f"handle_cache_action={_breakdown['handle_cache_action']} "
         f"active_profile_remote_call_count={_breakdown['active_profile_remote_call_count']}",
         flush=True,

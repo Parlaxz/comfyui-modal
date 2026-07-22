@@ -31,12 +31,15 @@ class HandleCacheKey:
 
     Equality is value-based so the same workspace/app/target/gpu/cloud/
     environment produces the same dict key across call boundaries.
+    ``gpu`` is an immutable tuple of normalized lowercase GPU names
+    preserving caller order (not sorted).  A scalar string becomes a
+    single-element tuple.
     """
 
     workspace: str
     app_name: str
     target: str
-    gpu: str
+    gpu: tuple[str, ...]
     cloud: str = ""
     environment: str = ""
 
@@ -103,32 +106,64 @@ class ModalTransport:
             return env.strip()
         return ""
 
+    @staticmethod
+    def _gpu_cache_key(gpu: Any) -> tuple[str, ...]:
+        """Return an ordered immutable tuple of normalized GPU names for
+        cache-key identity.  Preserves caller order (not sorted).
+        List/tuple entries are lowered and stripped; None/empty falls back
+        to env var then default.  A scalar string becomes a single-element tuple."""
+        if isinstance(gpu, (list, tuple)):
+            _parts = tuple(str(g).strip().lower() for g in gpu if g)
+            if _parts:
+                return _parts
+        _fallback = str(gpu or os.environ.get("COMFYMODAL_V2_GPU", "rtx-pro-6000")).strip().lower()
+        return (_fallback,)
+
+    @staticmethod
+    def _canonicalize_gpu_config(gpu: Any) -> str:
+        """Canonicalize GPU configuration to a sorted immutable string for
+        SDK/metadata arguments (cache identity uses _gpu_cache_key tuple).
+        List/tuple GPUs are sorted and joined with '+'.
+        Empty list/tuple or None falls back to env var then default.
+        Single strings are stripped, lowered, and returned as-is."""
+        if isinstance(gpu, (list, tuple)):
+            _canonical = "+".join(sorted(str(g).strip().lower() for g in gpu if g))
+            if _canonical:
+                return _canonical
+        return str(gpu or os.environ.get("COMFYMODAL_V2_GPU", "rtx-pro-6000")).strip().lower()
+
     def _v2_handle(
         self,
         *,
         workspace: dict[str, Any] | None,
-        gpu: str | None,
+        gpu: Any = None,
         runtime_trace: RuntimeTrace | None = None,
     ) -> Any:
-        selected_gpu = str(gpu or os.environ.get("COMFYMODAL_V2_GPU", "rtx-pro-6000")).strip().lower()
+        selected_gpu_str = self._canonicalize_gpu_config(gpu)
+        selected_gpu_str_tuple = self._gpu_cache_key(gpu)  # preserves caller order
         app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow")
         class_name = os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2")
         workspace_id = str((workspace or {}).get("id", "default"))
-        cloud = self._resolve_v2_cloud(selected_gpu)
+        cloud = self._resolve_v2_cloud(selected_gpu_str)
         environment = self._resolve_environment()
-        key = HandleCacheKey(workspace_id, app_name, class_name, selected_gpu, cloud=cloud, environment=environment)
+        key = HandleCacheKey(workspace_id, app_name, class_name, selected_gpu_str_tuple, cloud=cloud, environment=environment)
         cached = self.handle_cache.get(key)
         if cached is not None:
             if runtime_trace is not None:
                 runtime_trace.emit("handle_cache_hit", phase="local", metadata={
                     "app_name": app_name, "class_name": class_name,
-                    "gpu": selected_gpu, "cloud": cloud,
+                    "gpu": selected_gpu_str, "cloud": cloud,
                 })
+                runtime_trace.set_metadata(
+                    handle_lookup_app_name=app_name,
+                    handle_lookup_class_name=class_name,
+                    handle_lookup_gpu=selected_gpu_str,
+                )
             return cached
         if runtime_trace is not None:
             runtime_trace.emit("handle_cache_miss", phase="local", metadata={
                 "app_name": app_name, "class_name": class_name,
-                "gpu": selected_gpu, "cloud": cloud,
+                "gpu": selected_gpu_str, "cloud": cloud,
             })
         if self.v2_handle_factory is not None:
             if runtime_trace is not None:
@@ -137,14 +172,20 @@ class ModalTransport:
                 workspace=workspace,
                 app_name=app_name,
                 class_name=class_name,
-                gpu=selected_gpu,
+                gpu=selected_gpu_str,
             )
+            if runtime_trace is not None:
+                runtime_trace.set_metadata(
+                    handle_lookup_app_name=app_name,
+                    handle_lookup_class_name=class_name,
+                    handle_lookup_gpu=selected_gpu_str,
+                )
             return self.handle_cache.put(key, handle)
         if _modal is None:
             raise TransportError("Modal SDK is unavailable for the v2 transport")
         if not workspace or not workspace.get("token_id") or not workspace.get("token_secret"):
             raise TransportError("v2 transport requires an active Modal workspace with credentials")
-        _handle_identity = {"app_name": app_name, "class_name": class_name, "gpu": selected_gpu, "cloud": cloud}
+        _handle_identity = {"app_name": app_name, "class_name": class_name, "gpu": selected_gpu_str, "cloud": cloud}
         try:
             if runtime_trace is not None:
                 runtime_trace.emit("client_resolution_start", phase="local", metadata=_handle_identity)
@@ -171,6 +212,11 @@ class ModalTransport:
             handle = cls_handle()
             if runtime_trace is not None:
                 runtime_trace.emit("instance_construction_end", phase="local")
+                runtime_trace.set_metadata(
+                    handle_lookup_app_name=app_name,
+                    handle_lookup_class_name=class_name,
+                    handle_lookup_gpu=selected_gpu_str,
+                )
         except Exception as exc:
             raise TransportError(f"v2 Modal handle lookup failed: {exc}") from exc
         return self.handle_cache.put(key, handle)
@@ -206,9 +252,10 @@ class ModalTransport:
                     plan_dict_images = plan_dict["input_images"]
                     plan_dict_report = plan_dict["production_report"]
                 else:
-                    plan_dict_workflow = plan.to_dict()["workflow"]
-                    plan_dict_images = plan.to_dict()["input_images"]
-                    plan_dict_report = plan.to_dict()["production_report"]
+                    plan_dict = plan.to_dict()
+                    plan_dict_workflow = plan_dict["workflow"]
+                    plan_dict_images = plan_dict["input_images"]
+                    plan_dict_report = plan_dict["production_report"]
                 if runtime_trace is not None:
                     rt_plan_dict = {
                         "workflow_bytes": len(str(plan_dict_workflow)),
@@ -241,9 +288,9 @@ class ModalTransport:
                 )
                 if runtime_trace is not None:
                     runtime_trace.emit("modal_handle_lookup_end", phase="local")
-                    gpu_str = str(gpu or os.environ.get("COMFYMODAL_V2_GPU", "rtx-pro-6000")).strip().lower()
+                    gpu_str = self._canonicalize_gpu_config(gpu)
+                    # handle_lookup_app_name set inside _v2_handle (actual app_name)
                     runtime_trace.set_metadata(
-                        handle_lookup_app_name=str(handle.__class__.__module__ if hasattr(handle, "__class__") else ""),
                         handle_lookup_class_name=type(handle).__name__,
                         handle_lookup_gpu=gpu_str,
                     )
@@ -256,7 +303,14 @@ class ModalTransport:
                 request_id = str(_origin_from_meta.get("request_id") or request_id)
                 if _origin_from_meta:
                     plan_dict["__request_origin_info__"] = _origin_from_meta
+                if runtime_trace is not None:
+                    runtime_trace.emit("payload_measure_size_start", phase="local")
+                _payload_size_start_ns = time.monotonic_ns()
                 _payload_bytes = len(json.dumps(plan_dict, separators=(",", ":"), default=str).encode("utf-8"))
+                _payload_size_end_ns = time.monotonic_ns()
+                _payload_size_measurement_ms = round((_payload_size_end_ns - _payload_size_start_ns) / 1_000_000, 3)
+                if runtime_trace is not None:
+                    runtime_trace.emit("payload_measure_size_end", phase="local")
                 _workflow_dict = plan_dict.get("workflow", {})
                 _image_dict = plan_dict.get("input_images", {})
                 _node_count = sum(
@@ -275,6 +329,7 @@ class ModalTransport:
                         payload_bytes=_payload_bytes,
                         workflow_node_count=_node_count,
                         input_image_count=_image_count,
+                        payload_size_measurement_ms=_payload_size_measurement_ms,
                     )
                 _generator_start_wall_ns = time.time_ns()
                 _generator_start_mono_ns = time.monotonic_ns()
@@ -506,7 +561,7 @@ class ModalTransport:
         app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow")
         workspace_id = str(workspace.get("id", "default"))
         environment = self._resolve_environment()
-        key = HandleCacheKey(workspace_id, app_name, "publish_restore_plan_remote", "cpu", environment=environment)
+        key = HandleCacheKey(workspace_id, app_name, "publish_restore_plan_remote", ("cpu",), environment=environment)
         function = self.handle_cache.get(key)
         if function is None:
             if runtime_trace is not None:

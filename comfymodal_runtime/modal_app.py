@@ -7,6 +7,7 @@ import base64
 import importlib
 import inspect
 import os
+import platform
 import time
 import uuid
 from types import MappingProxyType
@@ -15,6 +16,8 @@ import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, ContextManager, Mapping, cast
+
+from gpu_catalog import parse_gpu_request, normalize_gpu_value, GPU_CATALOG, GPU_BY_VALUE
 
 from .contracts import DeploymentIdentity, ExecutionPlan, RestorePlan, _thaw, stable_hash
 from .deployment_spec import build_deployment_identity
@@ -442,7 +445,7 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
         "app_name": actual.app_name,
         "class_name": CLASS_NAME,
         # â”€â”€ Resource allocation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        "gpu": actual.gpu,
+        "gpu": list(actual.gpu),
         "cpu": actual.cpu,
         "memory_mb": actual.memory,
         "target_inputs": actual.target_inputs,
@@ -464,6 +467,24 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
     }
 
 
+def _parse_memory_mb() -> int:
+    """Parse COMFYMODAL_V2_MEMORY_MB, default 16384, positive int required."""
+    raw = os.environ.get("COMFYMODAL_V2_MEMORY_MB", "16384").strip()
+    if not raw:
+        return 16384
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        raise RuntimeError(
+            f"COMFYMODAL_V2_MEMORY_MB={raw!r} is not a valid integer"
+        )
+    if val <= 0:
+        raise RuntimeError(
+            f"COMFYMODAL_V2_MEMORY_MB={val} must be a positive integer (MiB)"
+        )
+    return val
+
+
 @dataclass(frozen=True)
 class ModalRuntimeSpec:
     app_name: str = APP_NAME
@@ -473,9 +494,9 @@ class ModalRuntimeSpec:
     models_path: str = MODELS_PATH
     custom_nodes_path: str = CUSTOM_NODES_PATH
     runtime_state_path: str = RUNTIME_STATE_PATH
-    gpu: str = os.environ.get("COMFYMODAL_V2_GPU", "rtx-pro-6000")
+    gpu: tuple[str, ...] = dataclasses.field(default_factory=parse_gpu_request)
     cpu: int = 4
-    memory: int = 32768
+    memory: int = dataclasses.field(default_factory=_parse_memory_mb)
     timeout: int = 3600
     target_inputs: int = 1
     max_inputs: int = 1
@@ -553,6 +574,125 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
         "source_identity": identity,
         "spec": runtime_spec,
     }
+
+
+# â”€â”€ Host memory reporting (cgroup v2 + process rss) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+def _read_cgroup_v2_memory(path: str) -> int | None:
+    """Read a cgroup v2 memory stat file. Returns None on any error."""
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _report_host_memory(stage: str) -> dict[str, Any]:
+    """Low-overhead host memory snapshot.
+
+    Emits ``[v2.host_memory]`` with cgroup v2 memory.current/peak/max and
+    process RSS/max RSS from ``/proc/self/status``.  Missing counters are
+    absent; malformed values are safely absent.  Never raises.
+    """
+    info: dict[str, Any] = {"stage": stage}
+    try:
+        # Cgroup v2 memory stats (Linux only)
+        if platform.system() == "Linux":
+            mem_current = _read_cgroup_v2_memory(
+                "/sys/fs/cgroup/memory.current"
+            )
+            if mem_current is not None:
+                info["current_mib"] = round(mem_current / (1024 * 1024), 1)
+            mem_peak = _read_cgroup_v2_memory(
+                "/sys/fs/cgroup/memory.peak"
+            )
+            if mem_peak is not None:
+                info["peak_mib"] = round(mem_peak / (1024 * 1024), 1)
+            mem_max = _read_cgroup_v2_memory(
+                "/sys/fs/cgroup/memory.max"
+            )
+            if mem_max is not None and mem_max > 0:
+                info["limit_mib"] = round(mem_max / (1024 * 1024), 1) if mem_max < 2**60 else None
+            # Memory events (oom)
+            try:
+                with open("/sys/fs/cgroup/memory.events") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("oom "):
+                            info["oom_count"] = int(line.split()[1])
+                        elif line.startswith("oom_kill "):
+                            info["oom_kill_count"] = int(line.split()[1])
+            except Exception:
+                pass
+        # Process RSS from /proc/self/status
+        if platform.system() == "Linux":
+            try:
+                with open("/proc/self/status") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                info["process_rss_mib"] = round(
+                                    int(parts[1]) / 1024, 1
+                                )
+            except Exception:
+                pass
+        # Host-memory process_maxrss_mib: actual maximum RSS from resource
+        # usage (rusage.ru_maxrss), NOT VmPeak (virtual-memory peak).
+        # This is the reliable cross-platform source for peak RSS.
+        try:
+            import resource as _resource
+            _maxrss_kb = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+            if _maxrss_kb > 0:
+                info["process_maxrss_mib"] = round(_maxrss_kb / 1024, 1)
+        except Exception:
+            pass
+        # Status
+        info["status"] = "ok"
+    except Exception:
+        info["status"] = "error"
+    # One-line summary (printf-safe, absent sentinel)
+    _fmt = {k: v for k, v in info.items() if v is not None}
+    _line = " ".join(
+        f"{k}={v}" for k, v in sorted(_fmt.items())
+    )
+    print(f"[v2.host_memory] {_line}", flush=True)
+    return info
+
+
+# â”€â”€ GPU allocation reporting (remote runtime capabilities) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+def _detect_gpu_allocation(requested_gpu_order: tuple[str, ...]) -> dict[str, Any]:
+    """Detect actual GPU runtime capabilities and emit ``[v2.gpu_allocation]``.
+
+    Uses ``torch`` and ``nvidia-smi``-equivalent introspection to report
+    the GPU that was actually allocated.  Never raises.
+    """
+    info: dict[str, Any] = {
+        "gpu_requested_order": ",".join(requested_gpu_order),
+    }
+    try:
+        import torch
+        info["torch_version"] = torch.__version__
+        if torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            if device_count > 0:
+                props = torch.cuda.get_device_properties(0)
+                info["gpu_actual_name"] = props.name
+                info["gpu_compute_capability"] = f"{props.major}.{props.minor}"
+                info["gpu_vram_total_mib"] = props.total_memory // (1024 * 1024)
+            info["cuda_version"] = torch.version.cuda or ""
+    except Exception:
+        pass
+    # Print one-line summary
+    _fmt = {k: v for k, v in info.items() if v is not None}
+    _line = " ".join(
+        f"{k}={v}" for k, v in sorted(_fmt.items())
+    )
+    print(f"[v2.gpu_allocation] {_line}", flush=True)
+    return info
 
 
 class ModalRuntimeEntrypoint:
@@ -667,6 +807,13 @@ class ModalRuntimeEntrypoint:
         self._legacy_api = api_class()
         return self._legacy_api
 
+    def _gpu_requested_order(self) -> tuple[str, ...]:
+        """Return the ordered GPU list from spec, falling back to env-based parse."""
+        spec = _MODAL_RESOURCES.get("spec")
+        if spec is not None and spec.gpu:
+            return spec.gpu
+        return parse_gpu_request()
+
     def _configure_runtime(self) -> None:
         if self._runtime_configured or self._bootstrap_injected:
             return
@@ -739,6 +886,7 @@ class ModalRuntimeEntrypoint:
 
     def startup(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING
+        _report_host_memory("restore_start")
         _startup_perf = time.perf_counter()
         identity = _capture_remote_identity()
         self._configure_runtime()
@@ -807,6 +955,8 @@ class ModalRuntimeEntrypoint:
         self._restore_timing = _restore_timing
         _LATEST_LIFECYCLE_TIMING = _restore_timing
 
+        _report_host_memory("restore_complete")
+
         print(
             f"[v2.lifecycle] method=startup snap=True "
             f"container_session={_V2_CONTAINER_SESSION_ID} "
@@ -824,6 +974,7 @@ class ModalRuntimeEntrypoint:
 
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count
+        _report_host_memory("restore_start")
         # â”€â”€ Remote resume / restore method boundary timestamps â”€â”€â”€â”€â”€â”€â”€â”€
         remote_python_resume_wall_ns: int = int(time.time() * 1_000_000_000)
         remote_python_resume_mono_ns: int = time.monotonic_ns()
@@ -1331,6 +1482,11 @@ class ModalRuntimeEntrypoint:
                 f"status=restored"
             )
 
+            _report_host_memory("restore_complete")
+            _detect_gpu_allocation(
+                _MODAL_RESOURCES.get("spec", ModalRuntimeSpec()).gpu
+            )
+
             trace.emit("v2_restore_return", phase="restore")
             _restore_result["trace"] = trace.to_dict()
             set_restore_return_marker(
@@ -1385,6 +1541,7 @@ class ModalRuntimeEntrypoint:
     async def _run_in_process(self, plan: ExecutionPlan, context: ExecutionContext) -> dict[str, Any]:
         if context.cancelled and context.cancelled():
             raise RuntimeError("execution cancelled before PromptExecutor start")
+        _report_host_memory("prompt_executor_start")
         trace = context.trace or RuntimeTrace(request_id=context.request_id, process="remote")
         trace.emit("runtime_config_start", phase="execution")
         self._configure_runtime()
@@ -1489,6 +1646,7 @@ class ModalRuntimeEntrypoint:
             if _rt is not None:
                 result["_restore_timing"] = dict(_rt)
             result["phase_durations_ms"] = trace.export_phase_durations()
+            _report_host_memory("result_complete")
             return result
         except Exception as exc:
             trace.emit("graph_execution_end", phase="execution", metadata={"status": "error", "error": str(exc)[:200]})
@@ -2044,6 +2202,7 @@ class ModalRuntimeEntrypoint:
                            metadata={"reason": "send_sync_unavailable"})
 
             # T5: immediately before prompt executor invocation
+            _report_host_memory("peak_execution")
             _t5_wall_ns = int(time.time() * 1_000_000_000)
             _t5_mono_ns = time.monotonic_ns()
             _execute_call_ns = _t5_mono_ns  # preserve for milestone calculations
@@ -3165,8 +3324,9 @@ class ModalRuntimeEntrypoint:
     async def publish_restore_plan(self, plan_payload: Mapping[str, Any]) -> dict[str, Any]:
         identity = _capture_remote_identity()
         plan = RestorePlan.from_dict(plan_payload)
-        result = await asyncio.to_thread(_publish_restore_plan_impl, plan)
-        authoritative = self._get_remote_restore_publisher().read_current_plan()
+        # Use async commit path in async context
+        result = await _publish_restore_plan_impl_async(plan)
+        authoritative = await self._get_remote_restore_publisher().read_current_plan_async()
         self._restore_plan = authoritative or plan
         result.setdefault("identity", {}).update(identity)
         return result
@@ -3190,6 +3350,11 @@ def _build_decorated_v2_class() -> type:
     and method decorators applied, but WITHOUT ``modal.concurrent()`` or
     ``app.cls()`` binding (which requires resources).
 
+    Uses ``object.__init__`` to avoid Modal's custom-constructor deprecation
+    warning.  Per-container initialization is deferred to the ``enter()``
+    hooks (``startup`` for snapshotted, ``restore`` for post-snapshot) and
+    lazy-init in ``_v2_init_instance``.
+
     This must be called BEFORE ``build_modal_resources()`` so the decorated
     class (with finalized ``enter``/``method`` registrations) is exported
     to ``globals()`` regardless of resource availability.  Modal's worker
@@ -3202,7 +3367,68 @@ def _build_decorated_v2_class() -> type:
     """
     if _modal is None:
         return None
-    cls = type("ModalRuntimeEntrypointV2", (ModalRuntimeEntrypoint,), {})
+    import functools
+
+    # Create subclass with object.__init__ to avoid Modal's custom constructor warning.
+    cls = type("ModalRuntimeEntrypointV2", (ModalRuntimeEntrypoint,), {
+        "__init__": object.__init__,
+    })
+
+    # Lazy per-instance initialization (__init__ is skipped).
+    def _v2_init_instance(self):
+        if hasattr(self, "_v2_initialized"):
+            return
+        self._config = None
+        self._bootstrap_injected = False
+        self.bootstrap = RuntimeBootstrap(None)
+        self._executor_injected = False
+        self.executor = RuntimeExecutor(in_process_runner=self._run_in_process)
+        self.checkpoint_runner = None
+        self._legacy_module = None
+        self._legacy_api = None
+        self._runtime_configured = False
+        self._restore_plan = None
+        self._restore_publisher = None
+        self._preload_bridge = V2LoaderBridge()
+        self._lifecycle_trace = None
+        self.container_session_id = _V2_CONTAINER_SESSION_ID
+        self._restore_count = 0
+        self._restore_timing = None
+        self._v2_initialized = True
+
+    # Wrap each Modal-exposed method to lazy-init first.
+    _METHODS_TO_WRAP = (
+        "startup", "restore",
+        "run_plan_stream", "run_prompt_stream",
+        "publish_restore_plan", "run_checkpoint_stream",
+    )
+    for _name in _METHODS_TO_WRAP:
+        _orig = getattr(cls, _name)
+
+        def _make_wrapper(orig_method):
+            if inspect.isasyncgenfunction(orig_method):
+                @functools.wraps(orig_method)
+                async def _wrapper(self, *args, **kwargs):
+                    _v2_init_instance(self)
+                    async for item in orig_method(self, *args, **kwargs):
+                        yield item
+                return _wrapper
+            elif inspect.isgeneratorfunction(orig_method):
+                @functools.wraps(orig_method)
+                def _wrapper(self, *args, **kwargs):
+                    _v2_init_instance(self)
+                    yield from orig_method(self, *args, **kwargs)
+                return _wrapper
+            else:
+                @functools.wraps(orig_method)
+                def _wrapper(self, *args, **kwargs):
+                    _v2_init_instance(self)
+                    return orig_method(self, *args, **kwargs)
+                return _wrapper
+
+        setattr(cls, _name, _make_wrapper(_orig))
+
+    # Apply Modal lifecycle/method decorators.
     setattr(cls, "startup", _modal.enter(snap=True)(cls.startup))
     setattr(cls, "restore", _modal.enter(snap=False)(cls.restore))
     setattr(cls, "run_plan_stream", _modal.method(is_generator=True)(cls.run_plan_stream))
@@ -3235,8 +3461,10 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
         max_inputs=spec.max_inputs,
     )(remote_class)
     _enable_gpu_snapshot = os.environ.get("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1"
+    # Pass ordered GPU list for Modal's native ordered-GPU fallback.
+    _gpu_arg: str | list[str] = list(spec.gpu) if len(spec.gpu) > 1 else spec.gpu[0]
     return resources["app"].cls(
-        gpu=spec.gpu,
+        gpu=_gpu_arg,
         cpu=spec.cpu,
         memory=spec.memory,
         timeout=spec.timeout,
@@ -3279,6 +3507,57 @@ def _publish_restore_plan_impl(plan: RestorePlan) -> dict[str, Any]:
     if authoritative is None:
         raise RuntimeError("published RestorePlan could not be read back from runtime-state Volume")
     # â”€â”€ Add publish_readback event to publication trace â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    pub_trace = result.get("trace", {})
+    if isinstance(pub_trace, dict) and "events" in pub_trace:
+        pub_trace["events"].append({
+            "name": "publish_readback",
+            "phase": "publish",
+            "wall_unix_ns": int(time.time() * 1_000_000_000),
+            "monotonic_ns": time.monotonic_ns(),
+            "process": "publisher",
+            "metadata": {"readback_ms": readback_ms},
+        })
+    result.update({
+        "status": "published" if result.get("changed") else "unchanged",
+        "generation": authoritative.generation,
+        "canonical_hash": authoritative.canonical_hash,
+        "runtime_state_volume": RUNTIME_STATE_VOLUME_NAME,
+        "state_path": V2_RESTORE_STATE_FILE,
+        "readback_ms": readback_ms,
+        "models_volume_write_count": 0,
+        "models_volume_commit_count": 0,
+    })
+    return result
+
+
+async def _publish_restore_plan_impl_async(plan: RestorePlan) -> dict[str, Any]:
+    """Async variant of ``_publish_restore_plan_impl`` that uses async commit.
+
+    Uses ``RestorePlanPublisher.publish_with_metrics_async()`` which calls
+    ``coordinator.commit_async()`` to perform exactly one awaited async
+    Volume commit and no blocking Modal commit.
+    """
+    resources = globals().get("_MODAL_RESOURCES", {})
+    modal_volume = resources.get("runtime_state_volume")
+    if modal_volume is None:
+        try:
+            import modal as _modal_fallback
+            modal_volume = _modal_fallback.Volume.from_name(
+                RUNTIME_STATE_VOLUME_NAME, create_if_missing=False,
+            )
+        except Exception:
+            modal_volume = None
+    if modal_volume is None:
+        raise RuntimeError("v2 runtime-state Modal Volume is not mounted")
+    volume = ModalMountedStateVolume(RUNTIME_STATE_PATH, modal_volume)
+    coordinator = CommitCoordinator(volume, state_path=V2_RESTORE_STATE_FILE)
+    publisher = RestorePlanPublisher(coordinator)
+    result = await publisher.publish_with_metrics_async(plan)
+    readback_started = time.perf_counter()
+    authoritative = await publisher.read_current_plan_async()
+    readback_ms = round((time.perf_counter() - readback_started) * 1000.0, 3)
+    if authoritative is None:
+        raise RuntimeError("published RestorePlan could not be read back from runtime-state Volume")
     pub_trace = result.get("trace", {})
     if isinstance(pub_trace, dict) and "events" in pub_trace:
         pub_trace["events"].append({

@@ -814,28 +814,28 @@ class TestV2BreakdownReconciliationBehavioral(unittest.TestCase):
         )
         self.assertIn("input_image_count=", output)
 
-    def test_hit_handle_cache_false_on_miss(self):
-        """When handle_cache_miss fires, hit_handle_cache prints False, not None/absent."""
+    def test_handle_cache_hit_false_on_miss(self):
+        """When handle_cache_miss fires, handle_cache_hit prints False, not None/absent."""
         events = [{"type": "result", "data": {"images": [], "outputs": {}}}]
 
         def add_miss(trace):
             trace.emit("handle_cache_miss", phase="local")
 
         output = self._run_and_capture_breakdown(events, trace_mod_fn=add_miss)
-        self.assertIn("hit_handle_cache=False", output)
+        self.assertIn("handle_cache_hit=False", output)
 
-    def test_hit_handle_cache_true_on_hit(self):
-        """When handle_cache_hit fires, hit_handle_cache prints True."""
+    def test_handle_cache_hit_true_on_hit(self):
+        """When handle_cache_hit fires, handle_cache_hit prints True."""
         events = [{"type": "result", "data": {"images": [], "outputs": {}}}]
 
         def add_hit(trace):
             trace.emit("handle_cache_hit", phase="local")
 
         output = self._run_and_capture_breakdown(events, trace_mod_fn=add_hit)
-        self.assertIn("hit_handle_cache=True", output)
+        self.assertIn("handle_cache_hit=True", output)
 
-    def test_hit_handle_cache_absent_when_no_cache_event(self):
-        """When neither cache hit nor miss fires, hit_handle_cache prints absent."""
+    def test_handle_cache_hit_absent_when_no_cache_event(self):
+        """When neither cache hit nor miss fires, handle_cache_hit prints absent."""
         events = [{"type": "result", "data": {"images": [], "outputs": {}}}]
 
         def add_factory_hit(trace):
@@ -844,7 +844,7 @@ class TestV2BreakdownReconciliationBehavioral(unittest.TestCase):
 
         output = self._run_and_capture_breakdown(events, trace_mod_fn=add_factory_hit)
         # cache miss + factory resolve → hit=False, client=False, cls_name=False, instance=False
-        self.assertIn("hit_handle_cache=False", output)
+        self.assertIn("handle_cache_hit=False", output)
         self.assertIn("created_modal_client=False", output)
         self.assertIn("performed_cls_from_name=False", output)
         self.assertIn("constructed_class_instance=False", output)
@@ -925,7 +925,7 @@ class TestV2BreakdownReconciliationBehavioral(unittest.TestCase):
 
         output = self._run_and_capture_breakdown(events, trace_mod_fn=no_start)
         self.assertIn("local_receive_to_worker_start_ms=absent", output)
-        self.assertIn("worker_start_to_execute_plan_entry_ms=absent", output)
+        self.assertIn("worker_start_to_plan_build_ms=absent", output)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2661,19 +2661,20 @@ class TestV2LocalSubmissionBreakdown(unittest.TestCase):
         bd_fstring = source.find('f"request_id={_breakdown', bd_print_start)
         if bd_fstring < 0:
             bd_fstring = bd_print_start
-        bd_section = source[bd_fstring:bd_fstring + 4000]
+        bd_section = source[bd_fstring:bd_fstring + 5000]
         required_fields = [
             "request_id",
             "local_receive_to_worker_start_ms",
-            "worker_start_to_execute_plan_entry_ms",
+            "worker_start_to_plan_build_ms",
             "plan_build_ms",
             "active_profile_ms",
             "restore_plan_build_ms",
             "restore_publish_ms",
-            "post_restore_publish_to_transport_ms",
+            "restore_publish_to_transport_entry_ms",
             "transport_entry_to_handle_lookup_ms",
             "handle_lookup_ms",
-            "payload_serialize_ms",
+            "payload_materialization_ms",
+            "payload_size_measurement_ms",
             "payload_ready_to_generator_create_ms",
             "generator_create_ms",
             "generator_created_to_first_iteration_ms",
@@ -2735,21 +2736,26 @@ class TestV2LocalSubmissionBreakdown(unittest.TestCase):
         source = inspect.getsource(execute_plan)
         bd_start = source.find("[v2.local_submission_breakdown]")
         self.assertGreater(bd_start, 0)
-        # Check the entire breakdown section (dict + print) — the old names
-        # are used as dict keys and must not appear with their old names.
-        bd_section = source[bd_start:bd_start + 5000]
-        # Verify old/misnamed field patterns are NOT in the breakdown section
-        forbidden_patterns = [
-            "active_profile_prepare_ms",  # dict key (must be "active_profile_ms")
-            "restore_plan_publish_ms",    # dict key (must be "restore_publish_ms")
-            "modal_handle_lookup_ms",     # dict key (must be "handle_lookup_ms")
-            "modal_payload_serialize_ms", # dict key (must be "payload_serialize_ms")
-            "modal_generator_create_ms",  # dict key (must be "generator_create_ms")
-            "_total_entry_to_submission_ms",  # removed deprecated key
+        # Find the _breakdown dict definition (after the comment header)
+        dict_start = source.find('"request_id"', bd_start)
+        self.assertGreater(dict_start, 0)
+        # Find the print statement start
+        print_start = source.find('f"[v2.local_submission_breakdown] "', dict_start)
+        self.assertGreater(print_start, 0)
+        # Check dict keys (between dict_start and print_start)
+        dict_section = source[dict_start:print_start + 3000]
+        # Verify old/misnamed field patterns are NOT dict keys in the breakdown
+        forbidden_as_keys = [
+            '"worker_start_to_execute_plan_entry_ms"',  # must be "worker_start_to_plan_build_ms"
+            '"post_restore_publish_to_transport_ms"',   # must be "restore_publish_to_transport_entry_ms"
+            '"payload_serialize_ms"',                   # dict key (must be "payload_materialization_ms")
+            '"profile_prep_cache_hit"',                 # must be "profile_cache_hit"
+            '"restore_publish_cache_skipped"',          # must be "restore_publish_cache_hit"
+            '"hit_handle_cache"',                        # must be "handle_cache_hit"
         ]
-        for name in forbidden_patterns:
-            self.assertNotIn(name, bd_section,
-                             f"Field '{name}' must NOT appear in breakdown print")
+        for name in forbidden_as_keys:
+            self.assertNotIn(name, dict_section,
+                             f"Dict key '{name}' must NOT appear in breakdown")
 
     def test_breakdown_cache_hit_miss_metadata(self):
         """Breakdown contains cache hit/miss booleans populated from trace events."""
@@ -2763,6 +2769,235 @@ class TestV2LocalSubmissionBreakdown(unittest.TestCase):
         # via event inspection
         evt_names = [e.name for e in trace.events]
         self.assertIn("handle_cache_hit", evt_names)
+        # The breakdown dict should have handle_cache_hit key
+        md = trace._metadata
+        self.assertIn("handle_lookup_app_name", md)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Requirement 1a: Exact stdout capture of [v2.local_submission_breakdown]
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestLocalSubmissionBreakdownStdoutCapture(unittest.TestCase):
+    """Capture stdout during execute_plan and validate the exact
+    [v2.local_submission_breakdown] line format."""
+
+    def _capture_breakdown_line(self, trace_mod_fn=None) -> str:
+        """Run execute_plan and capture all stdout, return the
+        [v2.local_submission_breakdown] line."""
+        import io
+        out = io.StringIO()
+        _orig = sys.stdout
+        try:
+            sys.stdout = out
+            trace = RuntimeTrace(request_id="capture-test", process="local")
+            origin = _make_origin("capture-test")
+            trace.set_metadata(request_origin_info=origin)
+            if trace_mod_fn:
+                trace_mod_fn(trace)
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="capture-test", validate=False,
+            )
+            transport = ModalTransport(
+                v2_handle_factory=_make_v2_handle_factory(
+                    [{"type": "result", "data": {"images": [], "outputs": {}}}],
+                ),
+            )
+            asyncio.run(execute_plan(plan, transport=transport, trace=trace))
+        finally:
+            sys.stdout = _orig
+        for line in out.getvalue().splitlines():
+            if line.startswith("[v2.local_submission_breakdown]"):
+                return line
+        return ""
+
+    def test_breakdown_line_present(self):
+        """Exactly one [v2.local_submission_breakdown] line is printed."""
+        output = self._capture_breakdown_line()
+        self.assertTrue(output.startswith("[v2.local_submission_breakdown]"),
+                        "Breakdown line must start with the tag")
+        self.assertIn("request_id=capture-test", output)
+        self.assertIn("plan_build_ms=", output)
+        self.assertIn("active_profile_ms=", output)
+        self.assertIn("reconciliation_status=", output)
+        self.assertIn("unmeasured_boundary=", output)
+        self.assertIn("residual_ms=", output)
+        self.assertIn("measured_children_ms=", output)
+
+    def test_breakdown_absent_values_use_absent_string(self):
+        """None values render as 'absent', not empty or 0."""
+        output = self._capture_breakdown_line()
+        # local_receive_to_worker_start_ms is absent when no worker_start event
+        self.assertIn("local_receive_to_worker_start_ms=absent", output,
+                      "Missing values must render as 'absent'")
+        self.assertNotIn("local_receive_to_worker_start_ms=0", output,
+                         "Missing values must NOT render as 0")
+
+    def test_breakdown_invalid_negative_rendered(self):
+        """Stages with start > end render 'invalid_negative'."""
+        def add_neg(trace):
+            trace.emit_at("plan_build_start", wall_unix_ns=200, monotonic_ns=2000, phase="local")
+            trace.emit_at("plan_build_end", wall_unix_ns=100, monotonic_ns=1000, phase="local")
+        output = self._capture_breakdown_line(trace_mod_fn=add_neg)
+        self.assertIn("plan_build_ms=invalid_negative", output)
+
+    def test_breakdown_exactly_one_line(self):
+        """Only one [v2.local_submission_breakdown] line per request."""
+        import io
+        out = io.StringIO()
+        _orig = sys.stdout
+        try:
+            sys.stdout = out
+            trace = RuntimeTrace(request_id="exactly-one", process="local")
+            origin = _make_origin("exactly-one")
+            trace.set_metadata(request_origin_info=origin)
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="exactly-one", validate=False,
+            )
+            transport = ModalTransport(
+                v2_handle_factory=_make_v2_handle_factory(
+                    [{"type": "result", "data": {"images": [], "outputs": {}}}],
+                ),
+            )
+            asyncio.run(execute_plan(plan, transport=transport, trace=trace))
+        finally:
+            sys.stdout = _orig
+        lines = [l for l in out.getvalue().splitlines()
+                 if l.startswith("[v2.local_submission_breakdown]")]
+        self.assertEqual(len(lines), 1,
+                         "Must emit exactly one [v2.local_submission_breakdown] line")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Requirement 1b: unmeasured_boundary for residual > 100ms
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestUnmeasuredBoundaryLargeResidual(unittest.TestCase):
+    """When residual > 100ms, unmeasured_boundary names the cause."""
+
+    def test_unmeasured_boundary_field_present_in_output(self):
+        """unmeasured_boundary field always appears in breakdown output."""
+        import io
+        out = io.StringIO()
+        _orig = sys.stdout
+        try:
+            sys.stdout = out
+            trace = RuntimeTrace(request_id="ub-field-test", process="local")
+            origin = _make_origin("ub-field-test")
+            trace.set_metadata(request_origin_info=origin)
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="ub-field-test", validate=False,
+            )
+            transport = ModalTransport(
+                v2_handle_factory=_make_v2_handle_factory(
+                    [{"type": "result", "data": {"images": [], "outputs": {}}}],
+                ),
+            )
+            asyncio.run(execute_plan(plan, transport=transport, trace=trace))
+        finally:
+            sys.stdout = _orig
+        for line in out.getvalue().splitlines():
+            if line.startswith("[v2.local_submission_breakdown]"):
+                self.assertIn("unmeasured_boundary=", line,
+                              "unmeasured_boundary field must appear in breakdown")
+                return
+        self.fail("No [v2.local_submission_breakdown] line found")
+
+    def test_unmeasured_boundary_logic_in_code(self):
+        """Code-level verification of unmeasured_boundary logic."""
+        import inspect
+        source = inspect.getsource(execute_plan)
+        # The logic checks residual > 100 and names absent children
+        self.assertIn("_unmeasured_boundary", source,
+                      "unmeasured_boundary variable must exist")
+        self.assertIn("_residual_ms > 100", source,
+                      "Logic must check residual > 100ms")
+        self.assertIn("absent_stage", source,
+                      "Must name absent stages when residual > 100ms")
+        self.assertIn("between_recorded_stages", source,
+                      "Must report between_recorded_stages when all children known")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Requirement 2: plan_materialization_count and plan_materialization_ms
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestPlanMaterializationTracking(unittest.TestCase):
+    """plan_materialization_count and plan_materialization_ms appear in
+    trace metadata when execute_plan materializes the canonical dict."""
+
+    def test_plan_materialization_count_is_one(self):
+        """plan_materialization_count is exactly 1 after execute_plan."""
+        async def stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            trace = RuntimeTrace(request_id="plan-mat-count", process="local")
+            origin = _make_origin("plan-mat-count")
+            trace.set_metadata(request_origin_info=origin)
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="plan-mat-count", validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=stream)
+            await execute_plan(plan, transport=transport, trace=trace)
+            md = trace._metadata
+            self.assertEqual(md.get("plan_materialization_count"), 1)
+
+        asyncio.run(run())
+
+    def test_plan_materialization_ms_is_numeric(self):
+        """plan_materialization_ms is a non-negative float."""
+        async def stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            trace = RuntimeTrace(request_id="plan-mat-ms", process="local")
+            origin = _make_origin("plan-mat-ms")
+            trace.set_metadata(request_origin_info=origin)
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="plan-mat-ms", validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=stream)
+            await execute_plan(plan, transport=transport, trace=trace)
+            md = trace._metadata
+            ms = md.get("plan_materialization_ms")
+            self.assertIsInstance(ms, (int, float))
+            self.assertGreaterEqual(float(ms), 0.0)
+
+        asyncio.run(run())
+
+    def test_plan_to_dict_called_once(self):
+        """plan.to_dict() is called exactly once in execute_plan (no
+        duplicate in transport when plan_dict is passed)."""
+        import inspect
+        source = inspect.getsource(execute_plan)
+        # Count non-comment occurrences of "plan.to_dict()"
+        count = source.count("plan.to_dict()")
+        self.assertEqual(count, 1,
+                         "plan.to_dict() must appear exactly once in execute_plan source")
+
+        # Verify the _canonical_dict assignment wraps it with timing
+        self.assertIn("_plan_mat_start_ns = time.perf_counter_ns()", source)
+        self.assertIn("_canonical_dict: dict = plan.to_dict()", source)
+        self.assertIn("_plan_mat_end_ns = time.perf_counter_ns()", source)
+        self.assertIn("plan_materialization_count", source)
+
+        # Verify transport V2 path does NOT call plan.to_dict() when plan_dict
+        # is provided (it uses plan_dict directly)
+        transport_source = inspect.getsource(ModalTransport.run_plan_stream)
+        # The V2 path has: plan_dict = plan_dict if plan_dict is not None else plan.to_dict()
+        # But only as fallback, not as default
+        v2_fallback = 'plan_dict = plan_dict if plan_dict is not None else plan.to_dict()'
+        self.assertIn(v2_fallback, transport_source,
+                      "Transport must only call plan.to_dict() as fallback")
 
 
 if __name__ == "__main__":

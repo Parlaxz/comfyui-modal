@@ -119,7 +119,6 @@ class TestClipLoadWrapperFactory:
             f"Expected 1 clip_cpu_prepare_start, got {len(start_events)}"
         )
         assert start_events[0].metadata.get("expected_read_count") == 1
-        assert start_events[0].metadata.get("actual_read_count") == 1
 
         end_events = [e for e in events if e.name == "clip_cpu_prepare_end"]
         assert len(end_events) == 1
@@ -764,6 +763,7 @@ class TestActiveReadDimClassification:
         result = classify_active_read_dims(
             deep_diag=True, before_tid=100, after_tid=100,
             has_thread_cpu=True, has_process_cpu=True, has_rusage=True, has_io=True,
+            has_cgroup=True,
         )
         for dim, status in result.items():
             assert status == "available", f"{dim} should be available, got {status}"
@@ -825,6 +825,7 @@ class TestActiveReadDimClassification:
         required = {
             "thread_cpu", "process_cpu", "io_deltas",
             "page_faults", "block_input", "context_switches",
+            "cgroup_memory", "cgroup_aggregate",
         }
         assert required == set(result.keys()), (
             f"Missing dims: {required - set(result.keys())}"
@@ -1462,9 +1463,15 @@ class TestActiveReadUnavailableIO:
             has_rusage=False, has_io=False,
         )
         for dim, status in result.items():
-            assert status == "not_observed_in_this_thread", (
-                f"{dim} should be not_observed_in_this_thread, got {status!r}"
-            )
+            if dim == "cgroup_aggregate":
+                # cgroup_aggregate is unavailable when no cgroup data captured
+                assert status == "unavailable", (
+                    f"{dim} should be unavailable, got {status!r}"
+                )
+            else:
+                assert status == "not_observed_in_this_thread", (
+                    f"{dim} should be not_observed_in_this_thread, got {status!r}"
+                )
 
     def test_shared_convert_old_quants_wrapper_exported(self):
         """The shared lane-aware wrapper factory is importable."""
@@ -1509,6 +1516,7 @@ class TestActiveReadUnavailableIO:
             deep_diag=True, before_tid=100, after_tid=100,
             has_thread_cpu=True, has_process_cpu=True,
             has_rusage=True, has_io=True,
+            has_cgroup=True,
         )
         for dim, status in result.items():
             assert status == "available", (

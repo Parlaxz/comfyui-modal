@@ -123,8 +123,17 @@ def _compute_stable_key(warmup_profile: dict, *, bundle_hash: str | None = None)
 
 
 def _app_identity() -> str:
-    """Current app identity used for cache scoping."""
-    return (os.environ.get("COMFYMODAL_APP_NAME", "comfyui").strip() or "comfyui")
+    """Current app identity used for cache scoping.
+
+    Prefers ``COMFYMODAL_V2_APP_NAME`` to match canonical/transport scoping,
+    then falls back to ``COMFYMODAL_APP_NAME`` for backward compatibility,
+    then to ``"comfyui"``.  This ensures app scoping never diverges between
+    the warmup-profile cache and the V2 transport lookup.
+    """
+    app = os.environ.get("COMFYMODAL_V2_APP_NAME", "").strip()
+    if not app:
+        app = os.environ.get("COMFYMODAL_APP_NAME", "").strip()
+    return app or "comfyui"
 
 
 def _check_cache_identity(ws_id: str = "") -> None:

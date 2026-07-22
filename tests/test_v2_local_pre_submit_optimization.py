@@ -175,8 +175,8 @@ class TestProfilePrepCacheHits(unittest.TestCase):
                 workspace={"id": "ws_cache"},
                 trace=trace,
             )
-            self.assertTrue(trace._metadata.get("profile_prep_cache_hit"),
-                            "Metadata must show profile_prep_cache_hit=True")
+            self.assertTrue(trace._metadata.get("profile_cache_hit"),
+                            "Metadata must show profile_cache_hit=True")
         asyncio.run(run())
 
     def test_different_workflow_misses_cache(self):
@@ -788,8 +788,8 @@ class TestHandleCacheBehavior(unittest.TestCase):
     def test_same_key_returns_cached_handle(self):
         """``HandleCache`` with same values hits the cache."""
         cache = HandleCache()
-        key_a = HandleCacheKey("ws1", "app1", "cls1", "gpu1")
-        key_b = HandleCacheKey("ws1", "app1", "cls1", "gpu1")
+        key_a = HandleCacheKey("ws1", "app1", "cls1", ("gpu1",))
+        key_b = HandleCacheKey("ws1", "app1", "cls1", ("gpu1",))
         handle = object()
         self.assertIsNone(cache.get(key_b), "Cache must start empty")
         cache.put(key_a, handle)
@@ -799,8 +799,8 @@ class TestHandleCacheBehavior(unittest.TestCase):
     def test_different_gpu_misses_cache(self):
         """Different GPU → different key → cache miss."""
         cache = HandleCache()
-        key_a = HandleCacheKey("ws1", "app1", "cls1", "gpu1")
-        key_b = HandleCacheKey("ws1", "app1", "cls1", "gpu2")
+        key_a = HandleCacheKey("ws1", "app1", "cls1", ("gpu1",))
+        key_b = HandleCacheKey("ws1", "app1", "cls1", ("gpu2",))
         cache.put(key_a, object())
         self.assertIsNone(cache.get(key_b),
                           "Different GPU must miss the cache")
@@ -997,13 +997,13 @@ class TestBreakdownIntact(unittest.TestCase):
         source = inspect.getsource(execute_plan)
         required_fields = [
             "local_receive_to_worker_start_ms",
-            "worker_start_to_execute_plan_entry_ms",
+            "worker_start_to_plan_build_ms",
             "plan_build_ms",
             "active_profile_ms",
             "restore_plan_build_ms",
             "restore_publish_ms",
             "handle_lookup_ms",
-            "payload_serialize_ms",
+            "payload_materialization_ms",
             "generator_create_ms",
             "generator_created_to_first_iteration_ms",
             "local_receive_to_actual_submission_ms",
@@ -1016,11 +1016,11 @@ class TestBreakdownIntact(unittest.TestCase):
                           f"Breakdown must contain field: {field}")
 
     def test_breakdown_print_has_handle_cache_fields(self):
-        """Breakdown print includes hit_handle_cache, created_modal_client, etc."""
+        """Breakdown print includes handle_cache_hit, created_modal_client, etc."""
         import inspect
         from canonical_execution import execute_plan
         source = inspect.getsource(execute_plan)
-        for field in ("hit_handle_cache", "created_modal_client",
+        for field in ("handle_cache_hit", "created_modal_client",
                        "performed_cls_from_name", "constructed_class_instance"):
             self.assertIn(field, source,
                           f"Breakdown must reference {field}")
@@ -1155,13 +1155,48 @@ class TestDominantStageEvidence(unittest.TestCase):
         source = inspect.getsource(execute_plan)
         # Direct stages
         for stage in ("plan_build_ms", "active_profile_ms", "restore_plan_build_ms",
-                       "restore_publish_ms", "handle_lookup_ms", "payload_serialize_ms",
+                       "restore_publish_ms", "handle_lookup_ms", "payload_materialization_ms",
+                       "payload_size_measurement_ms",
                        "generator_create_ms", "generator_created_to_first_iteration_ms"):
             self.assertIn(stage, source,
                           f"Breakdown must contain {stage}")
         # Derived stages
-        for stage in ("post_restore_publish_to_transport_ms",
+        for stage in ("restore_publish_to_transport_entry_ms",
                        "transport_entry_to_handle_lookup_ms",
                        "payload_ready_to_generator_create_ms"):
             self.assertIn(stage, source,
                           f"Breakdown must contain {stage}")
+
+
+# =========================================================================
+# Requirement 5: Handle cache GPU config canonicalization
+# =========================================================================
+
+
+class TestHandleCacheGpuCanonicalization(unittest.TestCase):
+    """GPU config list/tuple is canonicalized to an ordered immutable string."""
+
+    def test_canonicalize_single_string(self):
+        """Single string GPU is lowered and stripped."""
+        result = ModalTransport._canonicalize_gpu_config("RTX-Pro-6000")
+        self.assertEqual(result, "rtx-pro-6000")
+
+    def test_canonicalize_list_sorted(self):
+        """List of GPUs is sorted and joined with '+'."""
+        result = ModalTransport._canonicalize_gpu_config(["t4", "a100", "rtx-pro-6000"])
+        self.assertEqual(result, "a100+rtx-pro-6000+t4")
+
+    def test_canonicalize_tuple_sorted(self):
+        """Tuple of GPUs is sorted and joined with '+'."""
+        result = ModalTransport._canonicalize_gpu_config(("rtx-pro-6000", "a100"))
+        self.assertEqual(result, "a100+rtx-pro-6000")
+
+    def test_canonicalize_none_uses_env_fallback(self):
+        """None GPU falls back to env var then default."""
+        result = ModalTransport._canonicalize_gpu_config(None)
+        self.assertIn(result, ("rtx-pro-6000",), "Must fall back to default GPU")
+
+    def test_canonicalize_empty_list(self):
+        """Empty list returns default GPU."""
+        result = ModalTransport._canonicalize_gpu_config([])
+        self.assertEqual(result, "rtx-pro-6000")

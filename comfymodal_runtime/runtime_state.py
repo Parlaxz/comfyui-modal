@@ -24,7 +24,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 
 # ── Volume abstraction ───────────────────────────────────────────────────
@@ -247,6 +247,30 @@ class ModalMountedStateVolume(MountedStateVolume):
             raise RuntimeError("runtime-state Modal Volume does not expose commit()")
         commit_fn()
 
+    async def commit_async(self) -> None:
+        """Async commit — uses Modal's native async Volume commit.
+
+        Prefers ``commit.aio()`` when available (Modal's synchronous wrapper
+        exposing the coroutine).  Falls back to ``commit()`` via
+        ``asyncio.to_thread`` for older APIs or fakes that only expose a
+        synchronous commit.
+
+        Does NOT call ``super().commit()`` (which performs a synchronous
+        fsync) — Modal's commit handles durability.  The coordinator's
+        ``commit_async`` caller tracks the single commit via metrics.
+        """
+        commit_fn = getattr(self._modal_volume, "commit", None)
+        if not callable(commit_fn):
+            raise RuntimeError("runtime-state Modal Volume does not expose commit()")
+        aio_method = getattr(commit_fn, "aio", None)
+        if callable(aio_method):
+            await aio_method()  # type: ignore[call-overload]
+        elif asyncio.iscoroutinefunction(commit_fn):
+            await commit_fn()  # type: ignore[call-overload]
+        else:
+            # Synchronous commit in a thread — never blocking Modal commit
+            await asyncio.to_thread(commit_fn)
+
 
 # ── Metrics ──────────────────────────────────────────────────────────────
 
@@ -384,6 +408,15 @@ class CommitCoordinator:
         if callable(reload_fn):
             reload_fn()
 
+    async def reload_async(self) -> None:
+        """Async reload — uses ``volume.reload_async`` when available,
+        falls back to ``asyncio.to_thread(self.reload)`` for older APIs."""
+        reload_fn = getattr(self._volume, "reload_async", None)
+        if callable(reload_fn):
+            await reload_fn()  # type: ignore[call-overload]
+        else:
+            await asyncio.to_thread(self.reload)
+
     def commit(self, generation: int) -> bool:
         """Commit *generation* if it matches the current dirty generation.
 
@@ -434,6 +467,54 @@ class CommitCoordinator:
         if follow_gen is not None:
             # Lock is released before recursive call (max depth 1).
             self.commit(follow_gen)
+
+        return True
+
+    async def commit_async(self, generation: int) -> bool:
+        """Async variant of ``commit()`` that uses the volume's async commit.
+
+        Same serialization semantics as ``commit()`` but uses
+        ``volume.commit_async()`` to avoid blocking the event loop when the
+        underlying Modal Volume.commit() is async.
+        """
+        with self._lock:
+            if generation != self._dirty_gen:
+                return False
+            if self._in_flight:
+                self._needs_follow_up = True
+                return False
+            self._in_flight = True
+
+        _start = time.perf_counter()
+        try:
+            self._volume.read_bytes(self._state_path)
+            commit_fn = getattr(self._volume, "commit_async", None)
+            if callable(commit_fn):
+                await commit_fn()  # type: ignore[call-overload]
+            else:
+                # No async commit method — use thread fallback to avoid
+                # blocking the event loop with a synchronous Modal commit.
+                await asyncio.to_thread(self._volume.commit)
+            with self._lock:
+                self._committed_gen = generation
+                self._metrics.commit_count += 1
+                self._metrics.last_commit_ms = (
+                    time.perf_counter() - _start
+                ) * 1000
+        finally:
+            with self._lock:
+                self._in_flight = False
+
+        follow_gen: int | None = None
+        with self._lock:
+            if self._needs_follow_up:
+                self._needs_follow_up = False
+                if self._dirty_gen > self._committed_gen:
+                    self._metrics.follow_up_count += 1
+                    follow_gen = self._dirty_gen
+
+        if follow_gen is not None:
+            await self.commit_async(follow_gen)
 
         return True
 

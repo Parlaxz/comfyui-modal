@@ -488,15 +488,99 @@ class RestorePlanPublisher:
         self.last_publish = result
         return result
 
+    async def publish_with_metrics_async(self, new_plan: RestorePlan) -> dict[str, Any]:
+        """Async variant of ``publish_with_metrics`` that performs exactly one
+        awaited async commit and no blocking Modal commit.
+
+        Same semantics as ``publish_with_metrics()`` but uses
+        ``coordinator.commit_async()`` to avoid blocking the event loop when
+        the underlying Modal Volume commit is async.  Also uses async reload
+        (``coordinator.reload_async()``) so Modal's Volume reload is not
+        called synchronously from async code.
+        """
+        started = time.perf_counter()
+        current_plan = await self._load_current_plan_async()
+        reload_completed = time.perf_counter()
+
+        compare_started = time.perf_counter()
+        if current_plan is not None:
+            if self._identity_hash(current_plan) == self._identity_hash(new_plan):
+                reload_ms = round((reload_completed - started) * 1000.0, 3)
+                compare_ms = round((time.perf_counter() - compare_started) * 1000.0, 3)
+                result = {
+                    "changed": False,
+                    "generation": self._safe_generation(current_plan.generation),
+                    "reload_ms": reload_ms,
+                    "compare_ms": compare_ms,
+                    "write_ms": 0.0,
+                    "commit_ms": 0.0,
+                    "bytes_written": 0,
+                    "state_path": getattr(self._coordinator, "state_path", ""),
+                }
+                result["trace"] = self._build_publication_trace(result).to_dict()
+                self.last_publish = result
+                return result
+
+        compare_completed = time.perf_counter()
+        incoming_gen = self._safe_generation(new_plan.generation)
+        if current_plan is not None:
+            current_gen = self._safe_generation(current_plan.generation)
+            if incoming_gen > current_gen:
+                generation = incoming_gen
+            else:
+                generation = current_gen + 1
+        else:
+            generation = incoming_gen
+
+        plan_dict = new_plan.to_dict()
+        plan_dict["generation"] = generation
+        before_bytes = self._coordinator.metrics.total_write_bytes
+        write_started = time.perf_counter()
+        self._coordinator.write_state(
+            generation,
+            {"restore_plan": plan_dict},
+        )
+        write_completed = time.perf_counter()
+        after_bytes = self._coordinator.metrics.total_write_bytes
+        commit_started = time.perf_counter()
+        await self._coordinator.commit_async(generation)
+        commit_completed = time.perf_counter()
+        result = {
+            "changed": True,
+            "generation": generation,
+            "reload_ms": round((reload_completed - started) * 1000.0, 3),
+            "compare_ms": round((compare_completed - compare_started) * 1000.0, 3),
+            "write_ms": round((write_completed - write_started) * 1000.0, 3),
+            "commit_ms": round((commit_completed - commit_started) * 1000.0, 3),
+            "bytes_written": after_bytes - before_bytes,
+            "state_path": getattr(self._coordinator, "state_path", ""),
+        }
+        result["trace"] = self._build_publication_trace(result).to_dict()
+        self.last_publish = result
+        return result
+
     def read_current_plan(self) -> RestorePlan | None:
         """Reload and return the authoritative plan currently on the volume."""
         return self._load_current_plan()
+
+    async def read_current_plan_async(self) -> RestorePlan | None:
+        """Async variant of ``read_current_plan`` using async reload."""
+        return await self._load_current_plan_async()
 
     def _load_current_plan(self) -> RestorePlan | None:
         """Load the current ``RestorePlan`` from authoritative state."""
         reload_fn = getattr(self._coordinator, "reload", None)
         if callable(reload_fn):
             reload_fn()
+        return self._read_state_plan()
+
+    async def _load_current_plan_async(self) -> RestorePlan | None:
+        """Async variant of ``_load_current_plan`` using async reload."""
+        await self._coordinator.reload_async()
+        return self._read_state_plan()
+
+    def _read_state_plan(self) -> RestorePlan | None:
+        """Read RestorePlan from coordinator state (no reload)."""
         state = self._coordinator.read_state()
         if state is None:
             return None
