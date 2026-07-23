@@ -143,7 +143,7 @@ _V2_CERT_FILENAME_PREFIX: str = "v2_cert_"
 _V2_DEPLOYMENT_COMBINED_HASH: str = ""
 
 
-# ── Plan A/B spec projection helpers (Plan C compatibility) ──────────────
+# Plan A/B spec projection helpers (Plan C compatibility)
 
 
 def _cpu_snapshot_spec_projection(spec: Any) -> dict[str, list[dict[str, Any]]]:
@@ -217,22 +217,89 @@ def _cpu_snapshot_specs_match(spec_a: Any, spec_b: Any) -> bool:
 def _cpu_snapshot_model_keys_match(key_a: ModelRestoreKey, key_b: ModelRestoreKey) -> bool:
     """Compare two model keys ignoring ``vae_identity``.
 
-    Compares all model identity fields relevant to UNET/CLIP/configuration:
-    ``unet_identity``, ``clip_identity``, ``clip_type``,
-    ``loader_configuration``, ``model_volume_generation``, and
-    ``optimization_loader_options``.  Only ``vae_identity`` is excluded.
+    Compares only fields that are materially derived on both Plan A snapshot
+    construction and Plan B request derivation: ``unet_identity``,
+    ``clip_identity`` (including dual-file dual identity), and ``clip_type``.
 
-    Plan A CPU snapshot keys intentionally have an empty VAE because
-    VAE remains normal graph-time loading.
+    Fields such as ``loader_configuration``, ``model_volume_generation``,
+    and ``optimization_loader_options`` are default-only and never populated
+    by ``identity_from_profile`` or ``derive_model_key`` — they are not
+    evidence and do not gate activation.
     """
     return (
         key_a.unet_identity == key_b.unet_identity
         and key_a.clip_identity == key_b.clip_identity
         and key_a.clip_type == key_b.clip_type
-        and key_a.loader_configuration == key_b.loader_configuration
-        and key_a.model_volume_generation == key_b.model_volume_generation
-        and key_a.optimization_loader_options == key_b.optimization_loader_options
     )
+
+
+def _cpu_snapshot_key_mismatch_reason(
+    key_a: ModelRestoreKey,
+    key_b: ModelRestoreKey,
+) -> str | None:
+    """Return exact mismatch reason or None if keys match (ignoring vae_identity).
+
+    Checks only the materially-derived fields: ``unet_identity``,
+    ``clip_identity`` (including dual-file dual identity), and ``clip_type``.
+    Fields never populated by ``identity_from_profile`` or ``derive_model_key``
+    (``loader_configuration``, ``model_volume_generation``,
+    ``optimization_loader_options``) are not checked.
+    """
+    if key_a.unet_identity != key_b.unet_identity:
+        return "UNET identity mismatch"
+    if key_a.clip_identity != key_b.clip_identity:
+        return "CLIP identity mismatch"
+    if key_a.clip_type != key_b.clip_type:
+        return "clip_type mismatch"
+    return None
+
+
+def _cpu_snapshot_spec_mismatch_reason(
+    spec_a: Any,
+    spec_b: Any,
+) -> str | None:
+    """Return exact mismatch reason or None if projected specs match.
+
+    Compares projected UNET identity (unet_name, weight_dtype, loader_class)
+    and CLIP identity (filenames, loader_class, type, single-vs-dual layout)
+    and returns the first field-level difference found.
+    """
+    proj_a = _cpu_snapshot_spec_projection(spec_a)
+    proj_b = _cpu_snapshot_spec_projection(spec_b)
+
+    unet_a = proj_a.get("unet", [])
+    unet_b = proj_b.get("unet", [])
+    if len(unet_a) != len(unet_b):
+        return "UNET loader count mismatch"
+    for i, (ua, ub) in enumerate(zip(unet_a, unet_b)):
+        if ua.get("loader_class") != ub.get("loader_class"):
+            return "UNET loader_class mismatch"
+        if ua.get("unet_name") != ub.get("unet_name"):
+            return "UNET filename mismatch"
+        if ua.get("weight_dtype") != ub.get("weight_dtype"):
+            return "UNET weight_dtype mismatch"
+
+    clip_a = proj_a.get("clip", [])
+    clip_b = proj_b.get("clip", [])
+    if len(clip_a) != len(clip_b):
+        return "CLIP loader count mismatch"
+    for i, (ca, cb) in enumerate(zip(clip_a, clip_b)):
+        if ca.get("loader_class") != cb.get("loader_class"):
+            return "CLIP loader_class mismatch"
+        if ca.get("type") != cb.get("type"):
+            return "CLIP type mismatch"
+        if "clip_name1" in ca and "clip_name1" in cb:
+            if ca["clip_name1"] != cb["clip_name1"] or ca["clip_name2"] != cb["clip_name2"]:
+                return "CLIP dual filename mismatch"
+        elif "clip_name" in ca and "clip_name" in cb:
+            if ca["clip_name"] != cb["clip_name"]:
+                return "CLIP filename mismatch"
+        else:
+            return "CLIP single/dual structural mismatch"
+
+    if proj_a != proj_b:
+        return "spec projection mismatch"
+    return None
 
 
 def _cpu_model_snapshot_enabled() -> bool:
@@ -587,6 +654,8 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
             actual.custom_nodes_volume_name: actual.custom_nodes_path,
             actual.runtime_state_volume_name: actual.runtime_state_path,
         },
+        # â”€â”€ Snapshot target fingerprint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        "fingerprint": _snapshot_target_fingerprint(actual),
     }
 
 
@@ -606,6 +675,84 @@ def _parse_memory_mb() -> int:
             f"COMFYMODAL_V2_MEMORY_MB={val} must be a positive integer (MiB)"
         )
     return val
+
+
+def _snapshot_target_fingerprint(
+    spec: ModalRuntimeSpec | None = None,
+) -> str:
+    """Deterministic stable hash of complete class resource configuration.
+
+    Hashes app, registered remote class name, lifecycle/method decorator
+    configuration, GPU/CPU/memory/timeout allocation, target/max inputs,
+    min_containers/scaledown_window, enable_memory_snapshot, all three
+    volume name + mount path identities, complete normalized
+    ``_runtime_env()`` mapping, experimental_options GPU snapshot setting
+    (when enabled), environment/cloud/region options, source deployment
+    combined hash, and runtime image identity from ``MODAL_IMAGE_ID``
+    (empty when absent).  Never hashes live object reprs or unstable
+    handles.  The result is a SHA-256 hex digest suitable for diagnostic
+    correlation across startup/restore/request boundaries.
+    """
+    actual = spec or _MODAL_RESOURCES.get("spec", ModalRuntimeSpec())
+    _source_id = _MODAL_RESOURCES.get("source_identity")
+    _combined = _source_id.combined_hash if _source_id is not None else ""
+
+    # Registered remote class name (decorated V2 subclass or base fallback)
+    _registered_cls = globals().get("ModalRuntimeEntrypointV2", ModalRuntimeEntrypoint)
+
+    # Stable static lifecycle/method decorator configuration (never changes at runtime)
+    _lifecycle_config: dict[str, dict[str, Any]] = {
+        "startup": {"enter": True, "snap": True},
+        "restore": {"enter": True, "snap": False},
+        "run_plan_stream": {"method": True, "is_generator": True},
+        "run_prompt_stream": {"method": True, "is_generator": True},
+        "publish_restore_plan": {"method": True, "is_generator": False},
+        "run_checkpoint_stream": {"method": True, "is_generator": True},
+    }
+
+    # Complete normalized _runtime_env() mapping (captures snapshot/warmup class env)
+    _env = _runtime_env()
+
+    # Experimental_options GPU snapshot flag
+    _enable_gpu_snapshot = os.environ.get("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1"
+
+    # Volume name + mount path identities
+    _vol_mount_paths: dict[str, str] = {
+        actual.models_volume_name: actual.models_path,
+        actual.custom_nodes_volume_name: actual.custom_nodes_path,
+        actual.runtime_state_volume_name: actual.runtime_state_path,
+    }
+
+    _fingerprint_fields: dict[str, Any] = {
+        # ── App / registered class identity ──────────────────────────────
+        "app": actual.app_name,
+        "class": _registered_cls.__name__,
+        "lifecycle": _lifecycle_config,
+        # ── Resource allocation ──────────────────────────────────────────
+        "gpu": list(actual.gpu),
+        "cpu": actual.cpu,
+        "memory_mb": actual.memory,
+        "timeout": actual.timeout,
+        "target_inputs": actual.target_inputs,
+        "max_inputs": actual.max_inputs,
+        "min_containers": actual.min_containers,
+        "scaledown_window": actual.scaledown_window,
+        "enable_memory_snapshot": actual.enable_memory_snapshot,
+        # ── Volume name + mount path identities ──────────────────────────
+        "models_volume": actual.models_volume_name,
+        "custom_nodes_volume": actual.custom_nodes_volume_name,
+        "runtime_state_volume": actual.runtime_state_volume_name,
+        "volume_mount_paths": _vol_mount_paths,
+        # ── Source / env / cloud / region / image ────────────────────────
+        "source_combined_hash": _combined,
+        "runtime_env": _env,
+        "experimental_options": {"enable_gpu_snapshot": _enable_gpu_snapshot},
+        "environment": os.environ.get("MODAL_ENVIRONMENT", ""),
+        "cloud": os.environ.get("MODAL_CLOUD_PROVIDER", ""),
+        "region": os.environ.get("MODAL_REGION", ""),
+        "image_id": os.environ.get("MODAL_IMAGE_ID", ""),
+    }
+    return stable_hash(_fingerprint_fields)
 
 
 @dataclass(frozen=True)
@@ -764,7 +911,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
     }
 
 
-# â”€â”€ Host memory reporting (cgroup v2 + process rss) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Host memory reporting (cgroup v2 + process rss)
 
 
 def _unescape_mountinfo_field(value: str) -> str:
@@ -1333,11 +1480,25 @@ class ModalRuntimeEntrypoint:
             metadata=_resource_identity(),
         )
         trace.emit("remote_lifecycle_start", phase="lifecycle", metadata={"snapshot": "True"})
+        _fp = _snapshot_target_fingerprint()
+        _spec = _MODAL_RESOURCES.get("spec", ModalRuntimeSpec())
+        _gpu_str = ",".join(_spec.gpu) if _spec.gpu else "none"
+        _reg_cls = globals().get("ModalRuntimeEntrypointV2", ModalRuntimeEntrypoint)
+        print(
+            f"[v2.snapshot_target] "
+            f"fingerprint={_fp} "
+            f"app={_spec.app_name} "
+            f"class={_reg_cls.__name__} "
+            f"gpu={_gpu_str} "
+            f"cpu={_spec.cpu} "
+            f"memory={_spec.memory}",
+            flush=True,
+        )
         _lifecycle_error: str | None = None
         try:
             state = self.bootstrap.startup(snapshot=True, trace=trace)
 
-            # ── Plan C: CPU model snapshot construction ──────────────────
+            # Plan C: CPU model snapshot construction
             if _cpu_model_snapshot_enabled():
                 self._lazy_init_snapshot_state()
                 _cpu_snap_ok = False
@@ -1763,10 +1924,14 @@ class ModalRuntimeEntrypoint:
                         _rt["restore_method_start_mono_ns"] = restore_method_start_mono_ns
                     _LATEST_LIFECYCLE_TIMING = _rt
             raise
-        # ── Plan C: CPU snapshot model activation ──────────────────
-        # Attempt to activate pre-loaded snapshot models when eligible.
-        # On success the bridge is configured to serve the snapshot
-        # models and the existing UNET/CLIP preload is skipped.
+        # Plan C: CPU snapshot model activation (Variant C)
+        # Compatibility-first flow: compare plan request key/spec to stored
+        # models key/spec using non-VAE/projected matchers.  On mismatch the
+        # bridge is cleared and the existing fallback handles preload.
+        # On match, models validate against their own identity (file facts,
+        # object shapes, tensor safety) before retarget and activation.
+        # Success preserves existing [v2.cpu_snapshot] status=hit output
+        # and skips bridge.prepare/background UNET submission.
         _cpu_snapshot_activated: bool = False
         self._lazy_init_snapshot_state()
         if (
@@ -1780,6 +1945,11 @@ class ModalRuntimeEntrypoint:
             models = self._cpu_snapshot_models
             if models is None:
                 raise RuntimeError("cpu snapshot models disappeared before activation")
+            # Pre-compute hashes for diagnostics (used in except block).
+            _snapshot_key_hash: str = models.model_key.stable_hash[:16] if models.model_key else ""
+            _snapshot_spec_hash: str = stable_hash(models.model_spec)[:16] if models.model_spec else ""
+            _request_key_hash: str = ""
+            _request_spec_hash: str = ""
             try:
                 import folder_paths as _fp_restore
 
@@ -1805,90 +1975,128 @@ class ModalRuntimeEntrypoint:
                     return resolved
 
                 plan = self._restore_plan
-                # Use validate_cpu_snapshot_models for authoritative validation.
-                # The resolve callback maps unet to 'diffusion_models' (the actual
-                # live diffusion model category used by nodes.py) and clip1/clip2
-                # to 'text_encoders'.  No hardcoded model names/paths.
-                _valid, _reason = validate_cpu_snapshot_models(
-                    models,
-                    expected_key=plan.model_key,
-                    expected_spec=plan.model_spec,
-                    resolve_path=_validate_resolve_path,
-                )
-                if not _valid:
-                    # Plan A (identity_from_profile) and Plan B
-                    # (build_restore_model_spec) produce structurally different
-                    # model_spec dicts (node_id, model_stack, VAE) and
-                    # model keys with/without VAE identity.  When the strict
-                    # validator fails but the non-VAE model key and spec
-                    # projection match, retry using the snapshot's own spec
-                    # and a validation key derived from plan.model_key with
-                    # vae_identity taken from models.model_key.
-                    _keys_match = _cpu_snapshot_model_keys_match(plan.model_key, models.model_key)
-                    _specs_match = _cpu_snapshot_specs_match(plan.model_spec, models.model_spec)
-                    if _keys_match and _specs_match:
-                        _retry_key = ModelRestoreKey(
-                            unet_identity=plan.model_key.unet_identity,
-                            clip_identity=plan.model_key.clip_identity,
-                            vae_identity=models.model_key.vae_identity,
-                            clip_type=plan.model_key.clip_type,
-                            loader_configuration=plan.model_key.loader_configuration,
-                            model_volume_generation=plan.model_key.model_volume_generation,
-                            optimization_loader_options=plan.model_key.optimization_loader_options,
-                        )
-                        _valid, _reason = validate_cpu_snapshot_models(
-                            models,
-                            expected_key=_retry_key,
-                            expected_spec=models.model_spec,
-                            resolve_path=_validate_resolve_path,
-                        )
-                if not _valid:
-                    raise RuntimeError(f"snapshot activation validation failed: {_reason}")
-                # Retarget devices through live model_management.
-                import comfy.model_management as _mm
-                retarget_ok, retarget_reason = retarget_cpu_snapshot_models(
-                    models, model_management=_mm,
-                )
-                if not retarget_ok:
-                    raise RuntimeError(f"retarget failed: {retarget_reason}")
-                # Activate on the bridge.
-                self._use_cpu_snapshot_models_on_bridge(
-                    plan.model_key,
-                    plan.prefill_key,
-                    plan.model_spec,
-                    models.unet,
-                    models.clip,
-                    trace=trace,
-                )
-                self._cpu_snapshot_models_active = True
-                _cpu_snapshot_activated = True
-                _activation_duration_ms = round(
-                    (time.perf_counter() - _activation_perf_start) * 1000.0,
-                    3,
-                )
-                trace.emit(
-                    "cpu_snapshot_models_activated",
-                    phase="restore",
-                    metadata={
-                        "status": "activated",
-                        "reason": "ok",
-                        "model_key_hash": models.model_key.stable_hash[:16]
-                        if models.model_key else "",
-                        "clip_object_type": type(models.clip).__name__ if models.clip is not None else "",
-                        "unet_object_type": type(models.unet).__name__ if models.unet is not None else "",
-                        "duration_ms": _activation_duration_ms,
-                    },
-                )
-                _bridge_installed = 1 if self._preload_bridge._original_methods else 0
-                _c_prep = self._preload_bridge._preparation
-                _c_clip_ready = 1 if _c_prep is not None and _c_prep.clip_future is not None and _c_prep.clip_future.done() else 0
-                _c_unet_ready = 1 if _c_prep is not None and _c_prep.unet_future is not None and _c_prep.unet_future.done() else 0
+
+                # Step 1: Compatibility check (non-VAE key, projected spec)
+                _keys_match = _cpu_snapshot_model_keys_match(plan.model_key, models.model_key)
+                _specs_match = _cpu_snapshot_specs_match(plan.model_spec, models.model_spec)
+                _key_reason = _cpu_snapshot_key_mismatch_reason(plan.model_key, models.model_key)
+                _spec_reason = _cpu_snapshot_spec_mismatch_reason(plan.model_spec, models.model_spec)
+                _request_key_hash = plan.model_key.stable_hash[:16] if plan.model_key else ""
+                _request_spec_hash = stable_hash(plan.model_spec)[:16] if plan.model_spec else ""
                 print(
-                    f"[v2.cpu_snapshot] status=hit reason=ok "
-                    f"bridge_installed={_bridge_installed} "
-                    f"clip_ready={_c_clip_ready} unet_ready={_c_unet_ready}",
+                    f"[v2.cpu_snapshot_match] "
+                    f"keys_match={int(_keys_match)} specs_match={int(_specs_match)} "
+                    f"key_reason={_key_reason or 'ok'} "
+                    f"spec_reason={_spec_reason or 'ok'} "
+                    f"snapshot_key_hash={_snapshot_key_hash} "
+                    f"request_key_hash={_request_key_hash} "
+                    f"snapshot_spec_hash={_snapshot_spec_hash} "
+                    f"request_spec_hash={_request_spec_hash}",
                     flush=True,
                 )
+
+                if not _keys_match or not _specs_match:
+                    # Incompatible: clear bridge and fall through to existing
+                    # preload branch exactly as before.
+                    self._preload_bridge.clear()
+                    self._cpu_snapshot_models_active = False
+                    _cpu_snapshot_activated = False
+                    # Combine both reasons when available
+                    _parts = []
+                    if _key_reason:
+                        _parts.append(f"key:{_key_reason}")
+                    if _spec_reason:
+                        _parts.append(f"spec:{_spec_reason}")
+                    _cpu_snapshot_activate_error = "; ".join(_parts) or "compatibility mismatch"
+                    _activation_duration_ms = round(
+                        (time.perf_counter() - _activation_perf_start) * 1000.0,
+                        3,
+                    )
+                    trace.emit(
+                        "cpu_snapshot_models_activated",
+                        phase="restore",
+                        metadata={
+                            "status": "failed",
+                            "reason": _cpu_snapshot_activate_error[:60],
+                            "model_key_hash": _snapshot_key_hash,
+                            "clip_object_type": type(models.clip).__name__
+                            if models.clip is not None else "",
+                            "unet_object_type": type(models.unet).__name__
+                            if models.unet is not None else "",
+                            "duration_ms": _activation_duration_ms,
+                            "keys_match": int(_keys_match),
+                            "specs_match": int(_specs_match),
+                        },
+                    )
+                    _bridge_installed = 1 if self._preload_bridge._original_methods else 0
+                    _c_prep = self._preload_bridge._preparation
+                    _c_clip_ready = 1 if _c_prep is not None and _c_prep.clip_future is not None and _c_prep.clip_future.done() else 0
+                    _c_unet_ready = 1 if _c_prep is not None and _c_prep.unet_future is not None and _c_prep.unet_future.done() else 0
+                    print(
+                        f"[v2.cpu_snapshot] status=miss reason={_cpu_snapshot_activate_error[:60]} "
+                        f"bridge_installed={_bridge_installed} "
+                        f"clip_ready={_c_clip_ready} unet_ready={_c_unet_ready}",
+                        flush=True,
+                    )
+                else:
+                    # Step 2: Full validation against models' own key/spec
+                    _valid, _reason = validate_cpu_snapshot_models(
+                        models,
+                        expected_key=models.model_key,
+                        expected_spec=models.model_spec,
+                        resolve_path=_validate_resolve_path,
+                    )
+                    if not _valid:
+                        raise RuntimeError(
+                            f"snapshot activation validation failed: {_reason}"
+                        )
+
+                    # Retarget devices through live model_management.
+                    import comfy.model_management as _mm
+                    retarget_ok, retarget_reason = retarget_cpu_snapshot_models(
+                        models, model_management=_mm,
+                    )
+                    if not retarget_ok:
+                        raise RuntimeError(f"retarget failed: {retarget_reason}")
+                    # Activate on the bridge.
+                    self._use_cpu_snapshot_models_on_bridge(
+                        plan.model_key,
+                        plan.prefill_key,
+                        plan.model_spec,
+                        models.unet,
+                        models.clip,
+                        trace=trace,
+                    )
+                    self._cpu_snapshot_models_active = True
+                    _cpu_snapshot_activated = True
+                    _activation_duration_ms = round(
+                        (time.perf_counter() - _activation_perf_start) * 1000.0,
+                        3,
+                    )
+                    trace.emit(
+                        "cpu_snapshot_models_activated",
+                        phase="restore",
+                        metadata={
+                            "status": "activated",
+                            "reason": "ok",
+                            "model_key_hash": _snapshot_key_hash,
+                            "clip_object_type": type(models.clip).__name__ if models.clip is not None else "",
+                            "unet_object_type": type(models.unet).__name__ if models.unet is not None else "",
+                            "duration_ms": _activation_duration_ms,
+                            "keys_match": int(_keys_match),
+                            "specs_match": int(_specs_match),
+                        },
+                    )
+                    _bridge_installed = 1 if self._preload_bridge._original_methods else 0
+                    _c_prep = self._preload_bridge._preparation
+                    _c_clip_ready = 1 if _c_prep is not None and _c_prep.clip_future is not None and _c_prep.clip_future.done() else 0
+                    _c_unet_ready = 1 if _c_prep is not None and _c_prep.unet_future is not None and _c_prep.unet_future.done() else 0
+                    print(
+                        f"[v2.cpu_snapshot] status=hit reason=ok "
+                        f"bridge_installed={_bridge_installed} "
+                        f"clip_ready={_c_clip_ready} unet_ready={_c_unet_ready}",
+                        flush=True,
+                    )
             except Exception as _act_exc:
                 self._preload_bridge.clear()
                 self._cpu_snapshot_models_active = False
@@ -1904,8 +2112,7 @@ class ModalRuntimeEntrypoint:
                     metadata={
                         "status": "failed",
                         "reason": _cpu_snapshot_activate_error,
-                        "model_key_hash": models.model_key.stable_hash[:16]
-                        if models.model_key else "",
+                        "model_key_hash": _snapshot_key_hash,
                         "clip_object_type": type(models.clip).__name__
                         if models.clip is not None else "",
                         "unet_object_type": type(models.unet).__name__
@@ -2514,6 +2721,7 @@ class ModalRuntimeEntrypoint:
             _rt = self._restore_timing or _LATEST_LIFECYCLE_TIMING
             if _rt is not None:
                 result["_restore_timing"] = dict(_rt)
+            result["_snapshot_target_fingerprint"] = _snapshot_target_fingerprint()
             result["phase_durations_ms"] = trace.export_phase_durations()
             _report_host_memory("result_complete")
             return result

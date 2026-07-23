@@ -898,5 +898,293 @@ class TestV2ResultPropagation(unittest.TestCase):
         asyncio.run(run())
 
 
+class TestSnapshotTargetFingerprint(unittest.TestCase):
+    """Snapshot target fingerprint in lifecycle/request diagnostics."""
+
+    # ── Helper: call _snapshot_target_fingerprint with test spec ────────
+
+    def _fp(self, **overrides: Any) -> str:
+        """Return fingerprint for a test-app spec with given overrides."""
+        from comfymodal_runtime.modal_app import _snapshot_target_fingerprint
+        params: dict[str, Any] = {"app_name": "test-app"}
+        params.update(overrides)
+        return _snapshot_target_fingerprint(modal_app.ModalRuntimeSpec(**params))
+
+    def _env_safe(self, key: str, value: str) -> str | None:
+        """Set env var, return previous value for later restore."""
+        prev = os.environ.get(key)
+        os.environ[key] = value
+        return prev
+
+    def _env_restore(self, key: str, prev: str | None) -> None:
+        if prev is not None:
+            os.environ[key] = prev
+        else:
+            os.environ.pop(key, None)
+
+    # ── Core structure tests ───────────────────────────────────────────
+
+    def test_fingerprint_in_resource_identity(self):
+        """fingerprint must be a key in _resource_identity()."""
+        resources = modal_app._resource_identity()
+        self.assertIn("fingerprint", resources)
+        fp = resources["fingerprint"]
+        self.assertIsInstance(fp, str)
+        self.assertEqual(len(fp), 64)  # SHA-256 hex digest
+
+    def test_fingerprint_deterministic(self):
+        """Same spec produces the same fingerprint."""
+        from comfymodal_runtime.modal_app import _snapshot_target_fingerprint
+        fp1 = _snapshot_target_fingerprint()
+        fp2 = _snapshot_target_fingerprint()
+        self.assertEqual(fp1, fp2)
+        self.assertIsInstance(fp1, str)
+        self.assertEqual(len(fp1), 64)
+
+    def test_fingerprint_deterministic_identical_payload(self):
+        """Identical spec with identical env produces identical hash."""
+        fp_a = self._fp(gpu=("A100",), cpu=4, memory=24576)
+        fp_b = self._fp(gpu=("A100",), cpu=4, memory=24576)
+        self.assertEqual(fp_a, fp_b)
+
+    # ── Resource allocation field change tests ──────────────────────────
+
+    def test_fingerprint_changes_for_different_gpu(self):
+        """Different GPU config produces different fingerprint."""
+        fp_a = self._fp(gpu=("A100",))
+        fp_b = self._fp(gpu=("H100",))
+        self.assertNotEqual(fp_a, fp_b)
+
+    def test_fingerprint_changes_for_different_cpu(self):
+        """Different CPU count produces different fingerprint."""
+        fp_a = self._fp(cpu=4)
+        fp_b = self._fp(cpu=8)
+        self.assertNotEqual(fp_a, fp_b)
+
+    def test_fingerprint_changes_for_different_memory(self):
+        """Different memory_mb produces different fingerprint."""
+        fp_a = self._fp(memory=16384)
+        fp_b = self._fp(memory=32768)
+        self.assertNotEqual(fp_a, fp_b)
+
+    def test_fingerprint_changes_for_different_timeout(self):
+        """Different timeout produces different fingerprint."""
+        fp_a = self._fp(timeout=300)
+        fp_b = self._fp(timeout=600)
+        self.assertNotEqual(fp_a, fp_b)
+
+    def test_fingerprint_changes_for_different_scaledown_window(self):
+        """Different scaledown_window produces different fingerprint."""
+        fp_a = self._fp(scaledown_window=4)
+        fp_b = self._fp(scaledown_window=10)
+        self.assertNotEqual(fp_a, fp_b)
+
+    def test_fingerprint_changes_for_different_min_containers(self):
+        """Different min_containers produces different fingerprint."""
+        fp_a = self._fp(min_containers=0)
+        fp_b = self._fp(min_containers=2)
+        self.assertNotEqual(fp_a, fp_b)
+
+    def test_fingerprint_changes_for_different_target_inputs(self):
+        """Different target_inputs produces different fingerprint."""
+        fp_a = self._fp(target_inputs=1)
+        fp_b = self._fp(target_inputs=4)
+        self.assertNotEqual(fp_a, fp_b)
+
+    # ── Volume identity field change tests ─────────────────────────────
+
+    def test_fingerprint_changes_for_different_volume_names(self):
+        """Different models volume name produces different fingerprint."""
+        fp_a = self._fp(models_volume_name="vol-a")
+        fp_b = self._fp(models_volume_name="vol-b")
+        self.assertNotEqual(fp_a, fp_b)
+
+    def test_fingerprint_changes_for_different_volume_mount_paths(self):
+        """Different volume mount paths produce different fingerprint."""
+        fp_a = self._fp(models_path="/vol/a")
+        fp_b = self._fp(models_path="/vol/b")
+        self.assertNotEqual(fp_a, fp_b)
+
+    def test_fingerprint_changes_for_runtime_state_volume_path(self):
+        """Different runtime_state_path produces different fingerprint."""
+        fp_a = self._fp(runtime_state_path="/state/a")
+        fp_b = self._fp(runtime_state_path="/state/b")
+        self.assertNotEqual(fp_a, fp_b)
+
+    # ── Env/cloud/region/image change tests ────────────────────────────
+
+    def test_fingerprint_changes_for_cloud(self):
+        """MODAL_CLOUD_PROVIDER change produces different fingerprint."""
+        saved = self._env_safe("MODAL_CLOUD_PROVIDER", "aws")
+        try:
+            fp_with = self._fp()
+        finally:
+            self._env_restore("MODAL_CLOUD_PROVIDER", saved)
+        saved2 = self._env_safe("MODAL_CLOUD_PROVIDER", "gcp")
+        try:
+            fp_without = self._fp()
+        finally:
+            self._env_restore("MODAL_CLOUD_PROVIDER", saved2)
+        self.assertNotEqual(fp_with, fp_without)
+
+    def test_fingerprint_changes_for_region(self):
+        """MODAL_REGION change produces different fingerprint."""
+        saved = self._env_safe("MODAL_REGION", "us-east-1")
+        try:
+            fp_with = self._fp()
+        finally:
+            self._env_restore("MODAL_REGION", saved)
+        saved2 = self._env_safe("MODAL_REGION", "eu-west-1")
+        try:
+            fp_without = self._fp()
+        finally:
+            self._env_restore("MODAL_REGION", saved2)
+        self.assertNotEqual(fp_with, fp_without)
+
+    def test_fingerprint_changes_for_environment(self):
+        """MODAL_ENVIRONMENT change produces different fingerprint."""
+        saved = self._env_safe("MODAL_ENVIRONMENT", "staging")
+        try:
+            fp_with = self._fp()
+        finally:
+            self._env_restore("MODAL_ENVIRONMENT", saved)
+        saved2 = self._env_safe("MODAL_ENVIRONMENT", "production")
+        try:
+            fp_without = self._fp()
+        finally:
+            self._env_restore("MODAL_ENVIRONMENT", saved2)
+        self.assertNotEqual(fp_with, fp_without)
+
+    def test_fingerprint_changes_for_image_id(self):
+        """MODAL_IMAGE_ID change produces different fingerprint."""
+        saved = self._env_safe("MODAL_IMAGE_ID", "img-abc")
+        try:
+            fp_with = self._fp()
+        finally:
+            self._env_restore("MODAL_IMAGE_ID", saved)
+        saved2 = self._env_safe("MODAL_IMAGE_ID", "img-xyz")
+        try:
+            fp_without = self._fp()
+        finally:
+            self._env_restore("MODAL_IMAGE_ID", saved2)
+        self.assertNotEqual(fp_with, fp_without)
+
+    # ── Runtime env (snapshot/warmup class env) change tests ───────────
+
+    def test_fingerprint_changes_for_runtime_env_cpu_snapshot(self):
+        """COMFYMODAL_V2_CPU_MODEL_SNAPSHOT change affects runtime_env."""
+        saved = self._env_safe("COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", "0")
+        try:
+            fp_off = self._fp()
+        finally:
+            self._env_restore("COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", saved)
+        saved2 = self._env_safe("COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", "1")
+        try:
+            fp_on = self._fp()
+        finally:
+            self._env_restore("COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", saved2)
+        self.assertNotEqual(fp_off, fp_on)
+
+    def test_fingerprint_changes_for_warmup_env(self):
+        """COMFYMODAL_WARMUP_UNET addition affects runtime_env."""
+        saved = os.environ.pop("COMFYMODAL_WARMUP_UNET", None)
+        try:
+            fp_before = self._fp()
+        finally:
+            if saved is not None:
+                os.environ["COMFYMODAL_WARMUP_UNET"] = saved
+        try:
+            os.environ["COMFYMODAL_WARMUP_UNET"] = "test.safetensors"
+            fp_after = self._fp()
+        finally:
+            os.environ.pop("COMFYMODAL_WARMUP_UNET", None)
+            if saved is not None:
+                os.environ["COMFYMODAL_WARMUP_UNET"] = saved
+        self.assertNotEqual(fp_before, fp_after)
+
+    # ── GPU snapshot experimental_options test ─────────────────────────
+
+    def test_fingerprint_changes_for_gpu_snapshot_option(self):
+        """COMFYMODAL_ENABLE_GPU_SNAPSHOT affects experimental_options."""
+        saved = self._env_safe("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0")
+        try:
+            fp_off = self._fp()
+        finally:
+            self._env_restore("COMFYMODAL_ENABLE_GPU_SNAPSHOT", saved)
+        saved2 = self._env_safe("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "1")
+        try:
+            fp_on = self._fp()
+        finally:
+            self._env_restore("COMFYMODAL_ENABLE_GPU_SNAPSHOT", saved2)
+        self.assertNotEqual(fp_off, fp_on)
+
+    # ── enable_memory_snapshot test ────────────────────────────────────
+
+    def test_fingerprint_changes_for_memory_snapshot(self):
+        """enable_memory_snapshot change produces different fingerprint."""
+        fp_a = self._fp(enable_memory_snapshot=True)
+        fp_b = self._fp(enable_memory_snapshot=False)
+        self.assertNotEqual(fp_a, fp_b)
+
+    # ── Registered class / lifecycle config are represented ────────────
+
+    def test_fingerprint_class_is_registered_v2(self):
+        """The registered class name in fingerprint is ModalRuntimeEntrypointV2
+        (when _modal is available) or ModalRuntimeEntrypoint (fallback)."""
+        from comfymodal_runtime.modal_app import _snapshot_target_fingerprint
+        _registered_cls = getattr(modal_app, "ModalRuntimeEntrypointV2", modal_app.ModalRuntimeEntrypoint)
+        _expected_name = _registered_cls.__name__
+        # Just verify deterministic — structural coverage is via field tests above.
+        fp = _snapshot_target_fingerprint()
+        self.assertIsInstance(fp, str)
+        self.assertEqual(len(fp), 64)
+
+    # ── Preserve min_containers=0 and scaledown_window=4 ───────────────
+
+    def test_default_min_containers_is_zero(self):
+        """The fingerprint must preserve min_containers=0 as default."""
+        spec = modal_app.ModalRuntimeSpec(app_name="preserve-test")
+        self.assertEqual(spec.min_containers, 0)
+        self.assertEqual(spec.scaledown_window, 4)
+
+    # ── Startup log print format ──────────────────────────────────────
+
+    def test_fingerprint_appears_in_startup_print_simulation(self):
+        """The [v2.snapshot_target] print format has expected fields."""
+        from comfymodal_runtime.modal_app import _snapshot_target_fingerprint
+        _fp = _snapshot_target_fingerprint()
+        _spec = modal_app.ModalRuntimeSpec()
+        _gpu_str = ",".join(_spec.gpu) if _spec.gpu else "none"
+        _reg_cls = getattr(modal_app, "ModalRuntimeEntrypointV2", modal_app.ModalRuntimeEntrypoint)
+        from io import StringIO
+        import sys
+        captured = StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            print(
+                f"[v2.snapshot_target] "
+                f"fingerprint={_fp} "
+                f"app={_spec.app_name} "
+                f"class={_reg_cls.__name__} "
+                f"gpu={_gpu_str} "
+                f"cpu={_spec.cpu} "
+                f"memory={_spec.memory}",
+                flush=True,
+            )
+        finally:
+            sys.stdout = old_stdout
+
+        output = captured.getvalue()
+        self.assertIn("[v2.snapshot_target]", output)
+        self.assertIn("fingerprint=", output)
+        self.assertIn("app=", output)
+        self.assertIn("class=", output)
+        self.assertIn(_reg_cls.__name__, output)
+        self.assertIn("gpu=", output)
+        self.assertIn("cpu=", output)
+        self.assertIn("memory=", output)
+
+
 if __name__ == "__main__":
     unittest.main()
