@@ -34,20 +34,16 @@ class TransportError(RuntimeError):
 class HandleCacheKey:
     """Cache key for Modal function/cls handles.
 
-    Equality is value-based so the same workspace/app/target/gpu/cloud/
+    Equality is value-based so the same workspace/app/target/
     environment produces the same dict key across call boundaries.
-    ``gpu`` is an immutable tuple of normalized lowercase GPU names
-    preserving caller order (not sorted).  A scalar string becomes a
-    single-element tuple.
+    Invocation-time cloud overrides are excluded — target identity
+    is purely workspace + environment + app + class.
     """
 
     workspace: str
     app_name: str
     target: str
-    gpu: tuple[str, ...]
-    cloud: str = ""
     environment: str = ""
-    factory_identity: Any = None
 
 
 class HandleCache:
@@ -108,14 +104,12 @@ class ModalTransport:
     def _resolve_environment() -> str:
         """Resolve the Modal environment name.
 
-        ``COMFYMODAL_V2_ENVIRONMENT`` takes precedence over
-        ``MODAL_ENVIRONMENT``.  Returns ``""`` when neither is set so callers
-        can pass ``None`` to SDK lookups, which uses the default environment.
+        Only ``COMFYMODAL_V2_ENVIRONMENT`` is honored; ambient
+        ``MODAL_ENVIRONMENT`` is never consulted.  Returns ``""`` when unset so
+        callers can pass ``None`` to SDK lookups, which uses the default
+        deployed environment.
         """
         env = os.environ.get("COMFYMODAL_V2_ENVIRONMENT", "")
-        if env:
-            return env.strip()
-        env = os.environ.get("MODAL_ENVIRONMENT", "")
         if env:
             return env.strip()
         return ""
@@ -154,27 +148,22 @@ class ModalTransport:
         runtime_trace: RuntimeTrace | None = None,
     ) -> Any:
         selected_gpu_str = self._canonicalize_gpu_config(gpu)
-        selected_gpu_str_tuple = self._gpu_cache_key(gpu)  # preserves caller order
         app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow")
         class_name = os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2")
         workspace_id = str((workspace or {}).get("id", "default"))
-        cloud = self._resolve_v2_cloud(selected_gpu_str)
         environment = self._resolve_environment()
         key = HandleCacheKey(
             workspace_id,
             app_name,
             class_name,
-            selected_gpu_str_tuple,
-            cloud=cloud,
             environment=environment,
-            factory_identity=self.v2_handle_factory,
         )
         cached = self.handle_cache.get(key)
         if cached is not None:
             if runtime_trace is not None:
                 runtime_trace.emit("handle_cache_hit", phase="local", metadata={
                     "app_name": app_name, "class_name": class_name,
-                    "gpu": selected_gpu_str, "cloud": cloud,
+                    "gpu": selected_gpu_str,
                 })
                 runtime_trace.set_metadata(
                     handle_lookup_app_name=app_name,
@@ -185,7 +174,7 @@ class ModalTransport:
         if runtime_trace is not None:
             runtime_trace.emit("handle_cache_miss", phase="local", metadata={
                 "app_name": app_name, "class_name": class_name,
-                "gpu": selected_gpu_str, "cloud": cloud,
+                "gpu": selected_gpu_str,
             })
         if self.v2_handle_factory is not None:
             if runtime_trace is not None:
@@ -207,7 +196,7 @@ class ModalTransport:
             raise TransportError("Modal SDK is unavailable for the v2 transport")
         if not workspace or not workspace.get("token_id") or not workspace.get("token_secret"):
             raise TransportError("v2 transport requires an active Modal workspace with credentials")
-        _handle_identity = {"app_name": app_name, "class_name": class_name, "gpu": selected_gpu_str, "cloud": cloud}
+        _handle_identity = {"app_name": app_name, "class_name": class_name, "gpu": selected_gpu_str}
         try:
             if runtime_trace is not None:
                 runtime_trace.emit("client_resolution_start", phase="local", metadata=_handle_identity)
@@ -217,18 +206,17 @@ class ModalTransport:
             if runtime_trace is not None:
                 runtime_trace.emit("client_resolution_end", phase="local")
                 runtime_trace.emit("class_lookup_start", phase="local", metadata=_handle_identity)
+            print(
+                f"[v2.modal_target] app={app_name} class={class_name} "
+                f"environment={environment or '(default)'} "
+                f"cloud_override=absent with_options_used=0"
+            )
             cls_handle = _modal.Cls.from_name(
                 app_name, class_name, client=client,
                 environment_name=environment or None,
             )
             if runtime_trace is not None:
                 runtime_trace.emit("class_lookup_end", phase="local")
-            if cloud:
-                if runtime_trace is not None:
-                    runtime_trace.emit("with_options_start", phase="local", metadata={"cloud": cloud})
-                cls_handle = cls_handle.with_options(cloud=cloud)
-                if runtime_trace is not None:
-                    runtime_trace.emit("with_options_end", phase="local")
             if runtime_trace is not None:
                 runtime_trace.emit("instance_construction_start", phase="local")
             handle = cls_handle()
@@ -602,7 +590,7 @@ class ModalTransport:
         app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow")
         workspace_id = str(workspace.get("id", "default"))
         environment = self._resolve_environment()
-        key = HandleCacheKey(workspace_id, app_name, "publish_restore_plan_remote", ("cpu",), environment=environment)
+        key = HandleCacheKey(workspace_id, app_name, "publish_restore_plan_remote", environment=environment)
         function = self.handle_cache.get(key)
         if function is None:
             if runtime_trace is not None:

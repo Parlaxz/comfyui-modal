@@ -74,6 +74,39 @@ def _fake_model_management():
     return _MM
 
 
+def _ensure_bridge_has_fake_nodes(bridge):
+    """Install minimal fake node classes on a bare bridge so use_ready_models can
+    establish loader wrappers.  Safe to call multiple times (idempotent)."""
+    if bridge._original_methods:  # already installed
+        return
+    class _FakeUNETLoader:
+        def load_unet(self, unet_name, weight_dtype):
+            return (object(),)
+    class _FakeCLIPLoader:
+        def load_clip(self, clip_name, type="stable_diffusion", device="default"):
+            return (_FakeClip(),)
+    class _FakeDualCLIPLoader:
+        def load_clip(self, clip_name1, clip_name2, type, device="default"):
+            return (_FakeClip(),)
+    class _FakeVAELoader:
+        def load_vae(self, vae_name):
+            return (f"vae:{vae_name}",)
+    class _FakeCLIPTextEncode:
+        def encode(self, clip, text):
+            return (f"conditioning:{text}",)
+    from types import SimpleNamespace
+    fake_nodes = SimpleNamespace(
+        NODE_CLASS_MAPPINGS={
+            "UNETLoader": _FakeUNETLoader,
+            "CLIPLoader": _FakeCLIPLoader,
+            "DualCLIPLoader": _FakeDualCLIPLoader,
+            "VAELoader": _FakeVAELoader,
+            "CLIPTextEncode": _FakeCLIPTextEncode,
+        }
+    )
+    bridge.install(fake_nodes)
+
+
 def _make_snapshot_models(
     unet_identity: str = "sd3.5_large.safetensors",
     clip_identity: str = "t5xxl_fp16.safetensors",
@@ -235,6 +268,7 @@ class CpuSnapshotBridgeActivationTests(unittest.TestCase):
     def setUp(self):
         _clean_env()
         self.entrypoint = ModalRuntimeEntrypoint()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
         self.trace = RuntimeTrace(request_id="bridge-test", process="remote")
         self.model_key = ModelRestoreKey(unet_identity="u", clip_identity="c", clip_type="sd3")
         self.prefill_key = PrefillKey(
@@ -319,6 +353,7 @@ class CpuSnapshotRequestBindingTests(unittest.TestCase):
     def setUp(self):
         _clean_env()
         self.entrypoint = ModalRuntimeEntrypoint()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
         self.trace = RuntimeTrace(request_id="req-bind", process="remote")
 
     def test_skip_when_not_active(self):
@@ -523,6 +558,7 @@ class CpuSnapshotBridgeUseReadyModelsTests(unittest.TestCase):
     def setUp(self):
         _clean_env()
         self.entrypoint = ModalRuntimeEntrypoint()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
         self.trace = RuntimeTrace(request_id="bridge-urm", process="remote")
         self.model_key = ModelRestoreKey(unet_identity="u", clip_identity="c", clip_type="sd3")
         self.prefill_key = PrefillKey(model_key=self.model_key)
@@ -558,23 +594,34 @@ class CpuSnapshotBridgeUseReadyModelsTests(unittest.TestCase):
         finally:
             self.entrypoint._preload_bridge = original_bridge
 
-    def test_falls_back_when_use_ready_models_absent(self):
-        """When the bridge lacks use_ready_models, the compat fallback sets bridge state."""
-        original_bridge = self.entrypoint._preload_bridge
-        # Verify the real bridge's internal state is set by the fallback
+    def test_use_ready_models_sets_correct_bridge_state(self):
+        """use_ready_models sets model_key, prefill_key, model_spec, and preparation."""
         self.entrypoint._use_cpu_snapshot_models_on_bridge(
             self.model_key, self.prefill_key, self.model_spec,
             self.unet_stub, self.clip_stub, trace=self.trace,
         )
-        self.assertEqual(self.entrypoint._preload_bridge._model_key, self.model_key)
-        self.assertIsNotNone(self.entrypoint._preload_bridge._preparation)
-        prep = self.entrypoint._preload_bridge._preparation
+        bridge = self.entrypoint._preload_bridge
+        self.assertEqual(bridge._model_key, self.model_key)
+        self.assertIsNotNone(bridge._preparation)
+        prep = bridge._preparation
         self.assertIsNotNone(prep.unet_future)
         self.assertIsNotNone(prep.clip_future)
         self.assertTrue(prep.unet_future.done())
         self.assertTrue(prep.clip_future.done())
         self.assertIs(prep.unet_future.result(), self.unet_stub)
         self.assertIs(prep.clip_future.result(), self.clip_stub)
+        self.assertEqual(bridge._prefill_key.prompt_bundle_hash,
+                         self.prefill_key.prompt_bundle_hash)
+
+    def test_use_ready_models_sets_coordinator_active(self):
+        """After activation, coordinator._active is set so wait_* without args works."""
+        self.entrypoint._use_cpu_snapshot_models_on_bridge(
+            self.model_key, self.prefill_key, self.model_spec,
+            self.unet_stub, self.clip_stub, trace=self.trace,
+        )
+        bridge = self.entrypoint._preload_bridge
+        self.assertIsNotNone(bridge.coordinator._active)
+        self.assertIs(bridge.coordinator._active, bridge._preparation)
 
 
 # ── Restore fast-path control flow tests ─────────────────────────────
@@ -590,6 +637,7 @@ class CpuSnapshotRestoreFastPathTests(unittest.TestCase):
     def setUp(self):
         _clean_env()
         self.entrypoint = ModalRuntimeEntrypoint()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
 
     def test_fast_path_skips_deferral_code(self):
         """When _cpu_snapshot_activated is True the else branch (containing
@@ -969,6 +1017,7 @@ class CpuSnapshotRequestBindingProjectionTests(unittest.TestCase):
     def setUp(self):
         _clean_env()
         self.entrypoint = ModalRuntimeEntrypoint()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
         self.trace = RuntimeTrace(request_id="req-proj", process="remote")
 
     def _make_plan_a_spec(self, unet_name="u.safetensors", clip_name="c.safetensors",

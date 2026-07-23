@@ -5,6 +5,7 @@ chcp 65001 >nul
 set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-shadow"
 set "COMFYMODAL_V2_CLASS_NAME=ModalRuntimeEntrypointV2"
 set "COMFYMODAL_V2_GPU=rtx-pro-6000"
+set "COMFYMODAL_V2_CLOUD="
 set "COMFYMODAL_V2_DEEP_MODEL_DIAG=1"
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
