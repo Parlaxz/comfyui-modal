@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import importlib
 import inspect
 import os
@@ -20,9 +21,9 @@ from typing import Any, AsyncIterator, Callable, ContextManager, Mapping, cast
 
 from gpu_catalog import parse_gpu_request, normalize_gpu_value, GPU_CATALOG, GPU_BY_VALUE
 
-from .contracts import DeploymentIdentity, ExecutionPlan, RestorePlan, _thaw, stable_hash
+from .contracts import DeploymentIdentity, ExecutionPlan, ModelRestoreKey, RestorePlan, _thaw, stable_hash
 from .deployment_spec import build_deployment_identity
-from .restore_plan import RestorePlanPublisher
+from .restore_plan import RestorePlanPublisher, build_restore_model_spec, derive_model_key, derive_prefill_key
 from .runtime_bootstrap import BootstrapConfig, RuntimeBootstrap
 from .runtime_executor import (
     ExecutionContext,
@@ -42,6 +43,13 @@ from .model_preload import (
     set_restore_return_marker,
     _capture_host_info,
     _DIAGNOSTIC_FLAG as _MP_DIAGNOSTIC_FLAG,
+)
+from .cpu_snapshot_models import (
+    CpuSnapshotModels,
+    identity_from_profile,
+    load_cpu_snapshot_models,
+    validate_cpu_snapshot_models,
+    retarget_cpu_snapshot_models,
 )
 from .output_delivery import (
     Attempt,
@@ -133,6 +141,115 @@ _V2_CERT_FILENAME_PREFIX: str = "v2_cert_"
 # Pre-computed deployment identity hash for certificate identity.
 # Populated at module level once during import.
 _V2_DEPLOYMENT_COMBINED_HASH: str = ""
+
+
+# ── Plan A/B spec projection helpers (Plan C compatibility) ──────────────
+
+
+def _cpu_snapshot_spec_projection(spec: Any) -> dict[str, list[dict[str, Any]]]:
+    """Project a model_spec dict to only the fields relevant for Plan A/B matching.
+
+    Extracts loaders from any spec shape (Plan A from identity_from_profile or
+    Plan B from build_restore_model_spec) and returns a canonical dict with
+    ``{"unet": [...], "clip": [...]}`` containing only the requested identity
+    fields.  Fields ignored: ``node_id``, ``model_stack``, VAE loaders, CLIP
+    ``device``, and any extra top-level keys.
+
+    UNET loaders keep ``loader_class``, ``unet_name``, ``weight_dtype``.
+    CLIP loaders keep ``loader_class``, ``clip_name`` (or ``clip_name1``/
+    ``clip_name2`` for dual), and ``type``.
+
+    Accepts any ``collections.abc.Mapping`` (including ``MappingProxyType``
+    used by frozen ``RestorePlan.model_spec``) as well as plain ``dict``.
+    Loader entries may also be ``Mapping`` types.
+
+    Preserves list multiplicity and order so extra or swapped loaders miss.
+    Returns an empty projection when *spec* is not a Mapping or has no loaders.
+    """
+    if not isinstance(spec, Mapping):
+        return {"unet": [], "clip": []}
+    loaders = spec.get("loaders", {})
+    if not isinstance(loaders, Mapping):
+        return {"unet": [], "clip": []}
+
+    result: dict[str, list[dict[str, Any]]] = {"unet": [], "clip": []}
+
+    for loader in loaders.get("unet", []):
+        if not isinstance(loader, Mapping):
+            continue
+        result["unet"].append({
+            "loader_class": loader.get("loader_class", ""),
+            "unet_name": loader.get("unet_name", ""),
+            "weight_dtype": str(loader.get("weight_dtype", "default")),
+        })
+
+    for loader in loaders.get("clip", []):
+        if not isinstance(loader, Mapping):
+            continue
+        entry: dict[str, Any] = {
+            "loader_class": loader.get("loader_class", ""),
+            "type": loader.get("type", ""),
+        }
+        if "clip_name1" in loader:
+            entry["clip_name1"] = loader.get("clip_name1", "")
+            entry["clip_name2"] = loader.get("clip_name2", "")
+        else:
+            entry["clip_name"] = loader.get("clip_name", "")
+        result["clip"].append(entry)
+
+    return result
+
+
+def _cpu_snapshot_specs_match(spec_a: Any, spec_b: Any) -> bool:
+    """Compare two model_spec dicts using only the requested identity fields.
+
+    Compares UNET identity (``unet_name``, ``weight_dtype``, ``loader_class``)
+    and CLIP identity (filenames, ``loader_class``, ``type``, single-vs-dual
+    layout) while ignoring ``node_id``, ``model_stack``, VAE loaders, CLIP
+    ``device``, and any other extraneous fields.
+
+    Preserves list multiplicity and order so extra or differently-ordered
+    loaders cause a mismatch.
+    """
+    return _cpu_snapshot_spec_projection(spec_a) == _cpu_snapshot_spec_projection(spec_b)
+
+
+def _cpu_snapshot_model_keys_match(key_a: ModelRestoreKey, key_b: ModelRestoreKey) -> bool:
+    """Compare two model keys ignoring ``vae_identity``.
+
+    Compares all model identity fields relevant to UNET/CLIP/configuration:
+    ``unet_identity``, ``clip_identity``, ``clip_type``,
+    ``loader_configuration``, ``model_volume_generation``, and
+    ``optimization_loader_options``.  Only ``vae_identity`` is excluded.
+
+    Plan A CPU snapshot keys intentionally have an empty VAE because
+    VAE remains normal graph-time loading.
+    """
+    return (
+        key_a.unet_identity == key_b.unet_identity
+        and key_a.clip_identity == key_b.clip_identity
+        and key_a.clip_type == key_b.clip_type
+        and key_a.loader_configuration == key_b.loader_configuration
+        and key_a.model_volume_generation == key_b.model_volume_generation
+        and key_a.optimization_loader_options == key_b.optimization_loader_options
+    )
+
+
+def _cpu_model_snapshot_enabled() -> bool:
+    """Return True when COMFYMODAL_V2_CPU_MODEL_SNAPSHOT == '1'.
+
+    Rejects the combination with COMFYMODAL_ENABLE_GPU_SNAPSHOT == '1'
+    with a clear RuntimeError.
+    """
+    enabled = os.environ.get("COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", "0") == "1"
+    if not enabled:
+        return False
+    if os.environ.get("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1":
+        raise RuntimeError(
+            "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1 is incompatible with "
+            "COMFYMODAL_ENABLE_GPU_SNAPSHOT=1"
+        )
+    return enabled
 
 
 def _get_preflight_context(api: Any, module: Any) -> tuple[str, str]:
@@ -518,16 +635,81 @@ def _local_custom_nodes_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _collect_warmup_env() -> dict[str, str]:
+    """Collect externally supplied ``COMFYMODAL_WARMUP_*`` env vars.
+
+    Returns a dict of warmup environment variables that are present in the
+    current process environment.  Absent keys are omitted so the Modal image
+    inherits module-level defaults from ``comfyapp`` rather than being forced
+    to empty strings.  Propagated keys:
+
+    * ``COMFYMODAL_WARMUP_PROFILE``
+    * ``COMFYMODAL_WARMUP_CHECKPOINT``
+    * ``COMFYMODAL_WARMUP_UNET``
+    * ``COMFYMODAL_WARMUP_CLIP1``
+    * ``COMFYMODAL_WARMUP_CLIP2``
+    * ``COMFYMODAL_WARMUP_VAE``
+    * ``COMFYMODAL_WARMUP_CLIP_TYPE``
+    * ``COMFYMODAL_WARMUP_TEXT``
+    """
+    _WARMUP_KEYS = (
+        "COMFYMODAL_WARMUP_PROFILE",
+        "COMFYMODAL_WARMUP_CHECKPOINT",
+        "COMFYMODAL_WARMUP_UNET",
+        "COMFYMODAL_WARMUP_CLIP1",
+        "COMFYMODAL_WARMUP_CLIP2",
+        "COMFYMODAL_WARMUP_VAE",
+        "COMFYMODAL_WARMUP_CLIP_TYPE",
+        "COMFYMODAL_WARMUP_TEXT",
+    )
+    return {k: os.environ[k] for k in _WARMUP_KEYS if k in os.environ}
+
+
+def _runtime_env() -> dict[str, str]:
+    """Build the runtime environment dict for Modal's class-level ``env=`` parameter.
+
+    Contains ``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT`` and
+    ``COMFYMODAL_ENABLE_GPU_SNAPSHOT`` (both defaulting to ``"0"`` when
+    absent from the local process environment), optional
+    ``COMFYMODAL_V2_MEMORY_MB`` when present, and any ``COMFYMODAL_WARMUP_*``
+    keys that are set in the current environment.
+
+    This is used at deploy time via ``resources["app"].cls(..., env=...)``
+    rather than as a build step on the Image, so Modal's requirement that
+    ``image.env()`` precede ``add_local_python_source`` does not apply.
+    """
+    env = {
+        "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": os.environ.get(
+            "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", "0"
+        ),
+        "COMFYMODAL_ENABLE_GPU_SNAPSHOT": os.environ.get(
+            "COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0"
+        ),
+    }
+    memory_mb = os.environ.get("COMFYMODAL_V2_MEMORY_MB")
+    if memory_mb is not None:
+        env["COMFYMODAL_V2_MEMORY_MB"] = memory_mb
+    # Propagate externally-supplied warmup profile env vars so startup
+    # snapshot creation can read a split profile via env_default fallback.
+    env.update(_collect_warmup_env())
+    return env
+
+
 def _reference_image() -> Any:
     """Build the V2 shadow deployment image from the production base.
 
-    Modal requires that all build steps (``.pip_install``, ``.run_commands``,
-    ``.env()``, ``.add_local_dir``) precede any ``.add_local_python_source()``
-    calls.  The production base (``_image_base``) already satisfies this, so
-    we start from it, then add the V2 source modules â€” preserving Modal's
-    ordering constraint and keeping diagnostics off the legacy production image.
-    The ``COMFYMODAL_V2_DEEP_MODEL_DIAG`` flag is NOT forced here; it follows
-    normal externally-controlled environment variable behavior.
+    Uses ``_image_base`` (pre-local-sources) so that the V2 source modules
+    can be appended legally — Modal requires that all build steps
+    (``.pip_install``, ``.run_commands``, ``.env()``, ``.add_local_dir``)
+    precede ``.add_local_python_source()``, and ``_image_base`` already
+    satisfies that constraint.
+
+    Environment variables (snapshot flags, warmup profile, memory) are
+    **not** set here via ``image.env()`` — they are propagated at deploy
+    time via the class-level ``env=`` parameter in
+    ``_register_remote_entrypoint`` using ``_runtime_env()``.  This avoids
+    adding build steps to an image whose base may already contain
+    ``add_local_dir``/``add_local_file`` operations.
     """
     try:
         legacy = importlib.import_module("comfyapp")
@@ -878,6 +1060,9 @@ class ModalRuntimeEntrypoint:
         self.container_session_id: str = _V2_CONTAINER_SESSION_ID
         self._restore_count: int = 0
         self._restore_timing: dict[str, Any] | None = None
+        # CPU snapshot model state (Plan C lifecycle)
+        self._cpu_snapshot_models: CpuSnapshotModels | None = None
+        self._cpu_snapshot_models_active: bool = False
 
     def _remember_lifecycle_trace(self, trace: RuntimeTrace) -> None:
         if self._lifecycle_trace is None:
@@ -943,6 +1128,98 @@ class ModalRuntimeEntrypoint:
             return True
         except Exception:
             return False
+
+    def _lazy_init_snapshot_state(self) -> None:
+        """Ensure CPU snapshot instance attrs exist after unpickling.
+
+        Modal may unpickle a cold instance whose __init__ was never called.
+        This helper ensures the two CPU-snapshot attrs are always present
+        regardless of how the instance was created.
+        """
+        if not hasattr(self, "_cpu_snapshot_models"):
+            self._cpu_snapshot_models = None
+        if not hasattr(self, "_cpu_snapshot_models_active"):
+            self._cpu_snapshot_models_active = False
+
+    def _cpu_snapshot_profile(self, api: Any) -> Mapping[str, Any] | None:
+        """Derive a validated warmup profile for a CPU model snapshot.
+
+        Requires the output of ``api._snapshot_preload_profile()`` to be a
+        Mapping containing ``mode`` (must be ``"split"``), ``unet``,
+        ``clip1``, and ``clip_type`` as non-empty strings.  ``clip2`` is
+        optional.  Raises ``RuntimeError`` when the profile is missing,
+        not a mapping, has an unsupported mode, or lacks required fields.
+        """
+        self._lazy_init_snapshot_state()
+        raw = api._snapshot_preload_profile()
+        if raw is None:
+            raise RuntimeError("cpu model snapshot profile is None")
+        if not isinstance(raw, Mapping):
+            raise RuntimeError(
+                f"cpu model snapshot profile must be a Mapping, got {type(raw).__name__}"
+            )
+        profile = dict(raw)
+        mode = profile.get("mode", "")
+        if not isinstance(mode, str) or mode.strip() != "split":
+            raise RuntimeError(
+                f"cpu model snapshot profile mode must be 'split', got {mode!r}"
+            )
+        required = ("unet", "clip1", "clip_type")
+        for key in required:
+            value = profile.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise RuntimeError(
+                    f"cpu model snapshot profile {key} must be a non-empty string, "
+                    f"got {value!r}"
+                )
+        return profile
+
+    def _use_cpu_snapshot_models_on_bridge(
+        self,
+        model_key: Any,
+        prefill_key: Any,
+        model_spec: Any,
+        unet: Any,
+        clip: Any,
+        trace: RuntimeTrace | None = None,
+    ) -> None:
+        """Activate already-loaded CPU snapshot models on the preload bridge.
+
+        Prefers ``V2LoaderBridge.use_ready_models(...)`` when the method
+        exists.  Falls back to creating a ``RestorePreparation`` with
+        resolved futures so the bridge's ``_consume_unet`` and
+        ``_consume_clip`` return the pre-loaded objects directly without
+        going through the thread pool.
+        """
+        use_ready = getattr(self._preload_bridge, "use_ready_models", None)
+        if callable(use_ready):
+            use_ready(
+                model_key=model_key,
+                prefill_key=prefill_key,
+                model_spec=model_spec,
+                unet=unet,
+                clip=clip,
+                trace=trace,
+            )
+            return
+
+        # Compatibility fallback: reproduce ready completed futures on the
+        # bridge internals for bridges that lack use_ready_models.
+        self._preload_bridge._model_key = model_key
+        self._preload_bridge._prefill_key = prefill_key
+        self._preload_bridge._model_spec = model_spec if isinstance(model_spec, Mapping) else {}
+        self._preload_bridge._trace = trace
+
+        prep = RestorePreparation(model_key=model_key, prefill_key=prefill_key)
+        unet_future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        unet_future.set_result(unet)
+        prep.unet_future = unet_future
+        clip_future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        clip_future.set_result(clip)
+        prep.clip_future = clip_future
+        self._preload_bridge._preparation = prep
+        with self._preload_bridge._prefill_lock:
+            self._preload_bridge._prefill_results.clear()
 
     def _load_legacy_runtime(self) -> Any:
         if self._legacy_api is not None:
@@ -1074,6 +1351,191 @@ class ModalRuntimeEntrypoint:
         _lifecycle_error: str | None = None
         try:
             state = self.bootstrap.startup(snapshot=True, trace=trace)
+
+            # ── Plan C: CPU model snapshot construction ──────────────────
+            if _cpu_model_snapshot_enabled():
+                self._lazy_init_snapshot_state()
+                _cpu_snap_ok = False
+                api: Any | None = None
+                cpu_profile: Mapping[str, Any] | None = None
+                _cpu_snapshot_perf_start = time.perf_counter()
+                try:
+                    api = self._load_legacy_runtime()
+                    # Derive profile from the live snapshot-preload profile.
+                    cpu_profile = self._cpu_snapshot_profile(api)
+                    if cpu_profile is None:
+                        raise RuntimeError("cpu model snapshot profile is unavailable")
+
+                    # Build resolve_path from live folder_paths on the
+                    # initialized backend.
+                    import folder_paths as _fp
+
+                    def _cpu_resolve_path(role: str, filename: str) -> str:
+                        if role in ("unet",):
+                            folder = "diffusion_models"
+                        elif role in ("clip1", "clip2"):
+                            folder = "text_encoders"
+                        else:
+                            folder = role
+                        resolver = getattr(_fp, "get_full_path_or_raise", None)
+                        if resolver is None:
+                            resolver = getattr(_fp, "get_full_path", None)
+                        if resolver is None:
+                            raise AttributeError(
+                                "folder_paths has neither get_full_path_or_raise nor get_full_path"
+                            )
+                        resolved = resolver(folder, filename)
+                        if resolved is None:
+                            raise FileNotFoundError(
+                                f"cannot resolve {role} file {filename!r} in folder {folder!r}"
+                            )
+                        return resolved
+
+                    # Build load_unet / load_clip callbacks from the live
+                    # node classes via NODE_CLASS_MAPPINGS, using the
+                    # original wrapped methods (_comfy_modal_v2_original)
+                    # when available to avoid double-wrapping.
+                    import nodes as _ns
+
+                    _mappings = getattr(_ns, "NODE_CLASS_MAPPINGS", {})
+                    _unet_cls = _mappings.get("UNETLoader")
+                    _clip_cls = _mappings.get("CLIPLoader")
+                    _dual_clip_cls = _mappings.get("DualCLIPLoader")
+
+                    # UNET loader: returns first public output.
+                    # load_cpu_snapshot_models passes (name, weight_dtype) — no device arg.
+                    # Resolve original from class-level _comfy_modal_v2_original (unbound)
+                    # when V2 wrappers are installed; otherwise use the bound method.
+                    def _cpu_load_unet(unet_name: str, weight_dtype: str) -> Any:
+                        loader = _unet_cls()
+                        cls_method = _unet_cls.load_unet if _unet_cls else None
+                        orig = getattr(cls_method, "_comfy_modal_v2_original", None)
+                        if orig is not None:
+                            out = orig(loader, unet_name, weight_dtype)
+                        else:
+                            out = loader.load_unet(unet_name, weight_dtype)
+                        if isinstance(out, (tuple, list)) and len(out) > 0:
+                            return out[0]
+                        return out
+
+                    # CLIP loader: returns first public output.
+                    # load_cpu_snapshot_models passes 3 positional args for single
+                    # (clip_name, type, "default") and 4 for dual
+                    # (clip_name1, clip_name2, type, "default").
+                    # Resolve original from class-level _comfy_modal_v2_original (unbound)
+                    # when V2 wrappers are installed; otherwise use the bound method.
+                    # Inspect the original callable's signature; pass device='cpu'
+                    # only when the method accepts it, otherwise omit.
+                    def _cpu_load_clip(*args: Any) -> Any:
+                        clip_name = args[0] if args else ""
+                        is_dual = len(args) >= 4
+                        if is_dual:
+                            if _dual_clip_cls is None:
+                                raise RuntimeError(
+                                    "DualCLIPLoader class not found; "
+                                    "cannot load dual clip model"
+                                )
+                            clip_name1, clip_name2, clip_type = args[0], args[1], args[2]
+                            loader = _dual_clip_cls()
+                            cls_method = _dual_clip_cls.load_clip if _dual_clip_cls else None
+                            orig = getattr(cls_method, "_comfy_modal_v2_original", None)
+                            if orig is not None:
+                                _sig = inspect.signature(orig) if callable(orig) else None
+                                if _sig is not None and 'device' in _sig.parameters:
+                                    out = orig(loader, clip_name1, clip_name2, clip_type, device='cpu')
+                                else:
+                                    out = orig(loader, clip_name1, clip_name2, clip_type)
+                            else:
+                                _sig = inspect.signature(loader.load_clip) if callable(loader.load_clip) else None
+                                if _sig is not None and 'device' in _sig.parameters:
+                                    out = loader.load_clip(clip_name1, clip_name2, clip_type, device='cpu')
+                                else:
+                                    out = loader.load_clip(clip_name1, clip_name2, clip_type)
+                        else:
+                            clip_type = args[1]
+                            loader = _clip_cls()
+                            cls_method = _clip_cls.load_clip if _clip_cls else None
+                            orig = getattr(cls_method, "_comfy_modal_v2_original", None)
+                            if orig is not None:
+                                _sig = inspect.signature(orig) if callable(orig) else None
+                                if _sig is not None and 'device' in _sig.parameters:
+                                    out = orig(loader, clip_name, clip_type, device='cpu')
+                                else:
+                                    out = orig(loader, clip_name, clip_type)
+                            else:
+                                _sig = inspect.signature(loader.load_clip) if callable(loader.load_clip) else None
+                                if _sig is not None and 'device' in _sig.parameters:
+                                    out = loader.load_clip(clip_name, clip_type, device='cpu')
+                                else:
+                                    out = loader.load_clip(clip_name, clip_type)
+                        if isinstance(out, (tuple, list)) and len(out) > 0:
+                            return out[0]
+                        return out
+
+                    # Load under CPU-only context
+                    import comfy.utils as _comfy_utils
+
+                    _cpu_models = None
+                    _MISSING = object()
+                    _mmap_orig = getattr(_comfy_utils, "DISABLE_MMAP", _MISSING)
+                    # Require callable _force_cpu_during_snapshot — no fallback.
+                    _snap_ctx = getattr(api, "_force_cpu_during_snapshot", None)
+                    if not callable(_snap_ctx):
+                        raise RuntimeError(
+                            "api._force_cpu_during_snapshot is not available; "
+                            "cannot construct CPU snapshot models"
+                        )
+                    try:
+                        with cast(ContextManager[Any], _snap_ctx()):
+                            _comfy_utils.DISABLE_MMAP = True
+                            _cpu_models = load_cpu_snapshot_models(
+                                cpu_profile,
+                                load_unet=_cpu_load_unet,
+                                load_clip=_cpu_load_clip,
+                                resolve_path=_cpu_resolve_path,
+                                trace=trace,
+                            )
+                    finally:
+                        if _mmap_orig is _MISSING:
+                            delattr(_comfy_utils, "DISABLE_MMAP")
+                        else:
+                            _comfy_utils.DISABLE_MMAP = _mmap_orig
+
+                    self._cpu_snapshot_models = _cpu_models
+                    self._cpu_snapshot_models_active = False
+                    _cpu_snap_ok = True
+                    _created_duration_ms = round((time.perf_counter() - _cpu_snapshot_perf_start) * 1000.0, 2)
+                    trace.emit(
+                        "cpu_snapshot_models_created",
+                        phase="lifecycle",
+                        metadata={
+                            "status": "created",
+                            "reason": "ok",
+                            "model_key_hash": _cpu_models.model_key.stable_hash[:16]
+                            if _cpu_models.model_key else "",
+                            "clip_object_type": type(_cpu_models.clip).__name__ if _cpu_models.clip is not None else "",
+                            "unet_object_type": type(_cpu_models.unet).__name__ if _cpu_models.unet is not None else "",
+                            "duration_ms": _created_duration_ms,
+                        },
+                    )
+                except BaseException as _cpu_exc:
+                    self._cpu_snapshot_models = None
+                    self._cpu_snapshot_models_active = False
+                    _created_duration_ms = round((time.perf_counter() - _cpu_snapshot_perf_start) * 1000.0, 2)
+                    trace.emit(
+                        "cpu_snapshot_models_created",
+                        phase="lifecycle",
+                        metadata={
+                            "status": "failed",
+                            "reason": str(_cpu_exc)[:200],
+                            "model_key_hash": "",
+                            "clip_object_type": "",
+                            "unet_object_type": "",
+                            "duration_ms": _created_duration_ms,
+                        },
+                    )
+                    raise
+
         except Exception as exc:
             _lifecycle_error = str(exc)[:200]
             trace.emit("remote_lifecycle_end", phase="lifecycle", metadata={"status": "error", "error": _lifecycle_error})
@@ -1316,21 +1778,164 @@ class ModalRuntimeEntrypoint:
                         _rt["restore_method_start_mono_ns"] = restore_method_start_mono_ns
                     _LATEST_LIFECYCLE_TIMING = _rt
             raise
+        # ── Plan C: CPU snapshot model activation ──────────────────
+        # Attempt to activate pre-loaded snapshot models when eligible.
+        # On success the bridge is configured to serve the snapshot
+        # models and the existing UNET/CLIP preload is skipped.
+        _cpu_snapshot_activated: bool = False
+        self._lazy_init_snapshot_state()
+        if (
+            _cpu_model_snapshot_enabled()
+            and self._cpu_snapshot_models is not None
+            and self._restore_plan is not None
+        ):
+            _cpu_snapshot_activate_error: str | None = None
+            _activation_perf_start = time.perf_counter()
+            _activation_duration_ms = 0.0
+            models = self._cpu_snapshot_models
+            if models is None:
+                raise RuntimeError("cpu snapshot models disappeared before activation")
+            try:
+                import folder_paths as _fp_restore
+
+                def _validate_resolve_path(role: str, filename: str) -> str:
+                    # Map unet -> diffusion_models (the live category used by
+                    # nodes.py), clip1/clip2 -> text_encoders.
+                    if role == "unet":
+                        folder = "diffusion_models"
+                    else:
+                        folder = "text_encoders"
+                    resolver = getattr(_fp_restore, "get_full_path_or_raise", None)
+                    if resolver is None:
+                        resolver = getattr(_fp_restore, "get_full_path", None)
+                    if resolver is None:
+                        raise AttributeError(
+                            "folder_paths has neither get_full_path_or_raise nor get_full_path"
+                        )
+                    resolved = resolver(folder, filename)
+                    if resolved is None:
+                        raise FileNotFoundError(
+                            f"validate: cannot resolve {role} file {filename!r}"
+                        )
+                    return resolved
+
+                plan = self._restore_plan
+                # Use validate_cpu_snapshot_models for authoritative validation.
+                # The resolve callback maps unet to 'diffusion_models' (the actual
+                # live diffusion model category used by nodes.py) and clip1/clip2
+                # to 'text_encoders'.  No hardcoded model names/paths.
+                _valid, _reason = validate_cpu_snapshot_models(
+                    models,
+                    expected_key=plan.model_key,
+                    expected_spec=plan.model_spec,
+                    resolve_path=_validate_resolve_path,
+                )
+                if not _valid:
+                    # Plan A (identity_from_profile) and Plan B
+                    # (build_restore_model_spec) produce structurally different
+                    # model_spec dicts (node_id, model_stack, VAE) and
+                    # model keys with/without VAE identity.  When the strict
+                    # validator fails but the non-VAE model key and spec
+                    # projection match, retry using the snapshot's own spec
+                    # and a validation key derived from plan.model_key with
+                    # vae_identity taken from models.model_key.
+                    _keys_match = _cpu_snapshot_model_keys_match(plan.model_key, models.model_key)
+                    _specs_match = _cpu_snapshot_specs_match(plan.model_spec, models.model_spec)
+                    if _keys_match and _specs_match:
+                        _retry_key = ModelRestoreKey(
+                            unet_identity=plan.model_key.unet_identity,
+                            clip_identity=plan.model_key.clip_identity,
+                            vae_identity=models.model_key.vae_identity,
+                            clip_type=plan.model_key.clip_type,
+                            loader_configuration=plan.model_key.loader_configuration,
+                            model_volume_generation=plan.model_key.model_volume_generation,
+                            optimization_loader_options=plan.model_key.optimization_loader_options,
+                        )
+                        _valid, _reason = validate_cpu_snapshot_models(
+                            models,
+                            expected_key=_retry_key,
+                            expected_spec=models.model_spec,
+                            resolve_path=_validate_resolve_path,
+                        )
+                if not _valid:
+                    raise RuntimeError(f"snapshot activation validation failed: {_reason}")
+                # Retarget devices through live model_management.
+                import comfy.model_management as _mm
+                retarget_ok, retarget_reason = retarget_cpu_snapshot_models(
+                    models, model_management=_mm,
+                )
+                if not retarget_ok:
+                    raise RuntimeError(f"retarget failed: {retarget_reason}")
+                # Activate on the bridge.
+                self._use_cpu_snapshot_models_on_bridge(
+                    plan.model_key,
+                    plan.prefill_key,
+                    plan.model_spec,
+                    models.unet,
+                    models.clip,
+                    trace=trace,
+                )
+                self._cpu_snapshot_models_active = True
+                _cpu_snapshot_activated = True
+                _activation_duration_ms = round(
+                    (time.perf_counter() - _activation_perf_start) * 1000.0,
+                    3,
+                )
+                trace.emit(
+                    "cpu_snapshot_models_activated",
+                    phase="restore",
+                    metadata={
+                        "status": "activated",
+                        "reason": "ok",
+                        "model_key_hash": models.model_key.stable_hash[:16]
+                        if models.model_key else "",
+                        "clip_object_type": type(models.clip).__name__ if models.clip is not None else "",
+                        "unet_object_type": type(models.unet).__name__ if models.unet is not None else "",
+                        "duration_ms": _activation_duration_ms,
+                    },
+                )
+            except BaseException as _act_exc:
+                self._preload_bridge.clear()
+                self._cpu_snapshot_models_active = False
+                _cpu_snapshot_activated = False
+                _cpu_snapshot_activate_error = str(_act_exc)[:200]
+                _activation_duration_ms = round(
+                    (time.perf_counter() - _activation_perf_start) * 1000.0,
+                    3,
+                )
+                trace.emit(
+                    "cpu_snapshot_models_activated",
+                    phase="restore",
+                    metadata={
+                        "status": "failed",
+                        "reason": _cpu_snapshot_activate_error,
+                        "model_key_hash": models.model_key.stable_hash[:16]
+                        if models.model_key else "",
+                        "clip_object_type": type(models.clip).__name__
+                        if models.clip is not None else "",
+                        "unet_object_type": type(models.unet).__name__
+                        if models.unet is not None else "",
+                        "duration_ms": _activation_duration_ms,
+                    },
+                )
+                # Fall through to the existing preload branch.
         try:
+            # Pre-initialize for Plan C gating
+            preparation: RestorePreparation | None = None
+            _optimized_ok = False
+            _unet_deferred_meta: dict[str, Any] = {}
+            _defer_api = None if _cpu_snapshot_activated else (self._load_legacy_runtime() if self._restore_plan else None)
+
             if self._restore_plan is not None:
                 trace.emit("preload_submission_start", phase="restore", metadata={
                     "restore_plan_generation": str(self._restore_plan.generation),
                 })
-                preparation: RestorePreparation | None = None
                 # â”€â”€ Bounded V2 latency: check if we can defer UNET+VAE to
                 #    original graph loaders and prepare only CLIP through the
                 #    V2 bridge.  On any failure (missing helper, exception,
                 #    non-submitted background future) we fail closed to the
                 #    existing full V2 preload path. â”€â”€
-                _optimized_ok = False
-                _unet_deferred_meta: dict[str, Any] = {}
-                _defer_api = self._load_legacy_runtime() if self._restore_plan else None
-                if self._check_unet_deferral_eligible(_defer_api, self._restore_plan):
+                if not _cpu_snapshot_activated and self._check_unet_deferral_eligible(_defer_api, self._restore_plan):
                     trace.emit("defer_trial_start", phase="restore", metadata={
                         "unet_identity_hash": stable_hash(self._restore_plan.model_key.unet_identity) if self._restore_plan else "",
                     })
@@ -1465,7 +2070,7 @@ class ModalRuntimeEntrypoint:
                             "submitted": False,
                             "reason": str(_defer_exc)[:200],
                         })
-                if not _optimized_ok:
+                if not _cpu_snapshot_activated and not _optimized_ok:
                     # Check whether an existing clip-only preparation can be
                     # extended with UNET+VAE rather than cleared+reprepared.
                     _existing = self._preload_bridge._preparation
@@ -1498,18 +2103,33 @@ class ModalRuntimeEntrypoint:
                             "preload_fallback_mode", phase="restore",
                             metadata={"mode": "full_reprepare", "reason": _reason},
                         )
-                # Shared tail: trace metadata common to both paths.
-                trace.emit("preload_submission_end", phase="restore", metadata={
-                    "preload_scheduled": str(bool(preparation)),
-                    "unet_deferred": _optimized_ok,
-                })
-                trace.set_metadata(
-                    restore_plan_generation=str(self._restore_plan.generation),
-                    preload_scheduled=bool(preparation),
-                    preload_diagnostics=self._preload_bridge.diagnostics(),
-                )
-                if _optimized_ok:
-                    trace.emit("unet_deferred", phase="restore", metadata=_unet_deferred_meta)
+                # Shared tail
+                if _cpu_snapshot_activated:
+                    trace.emit("preload_cpu_snapshot_skip", phase="restore", metadata={
+                        "unet_identity": self._restore_plan.model_key.unet_identity,
+                        "clip_identity": self._restore_plan.model_key.clip_identity,
+                    })
+                    trace.emit("preload_submission_end", phase="restore", metadata={
+                        "preload_scheduled": False,
+                        "cpu_snapshot": True,
+                    })
+                    trace.set_metadata(
+                        restore_plan_generation=str(self._restore_plan.generation),
+                        preload_scheduled=False,
+                        preload_diagnostics=self._preload_bridge.diagnostics(),
+                    )
+                else:
+                    trace.emit("preload_submission_end", phase="restore", metadata={
+                        "preload_scheduled": str(bool(preparation)),
+                        "unet_deferred": _optimized_ok,
+                    })
+                    trace.set_metadata(
+                        restore_plan_generation=str(self._restore_plan.generation),
+                        preload_scheduled=bool(preparation),
+                        preload_diagnostics=self._preload_bridge.diagnostics(),
+                    )
+                    if _optimized_ok:
+                        trace.emit("unet_deferred", phase="restore", metadata=_unet_deferred_meta)
             else:
                 self._preload_bridge.clear()
             trace.emit(
@@ -1715,6 +2335,82 @@ class ModalRuntimeEntrypoint:
             api._v2_graph_trace = trace
         except Exception:
             pass
+        # â”€â”€ Plan C: CPU snapshot request binding â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # When CPU snapshot models are active, derive the request identity
+        # and re-bind the bridge so the pre-loaded models serve this
+        # specific request.  If the request model identity differs, clear
+        # the bridge and deactivate without rebuilding the snapshot.
+        self._lazy_init_snapshot_state()
+        _bind_perf = time.perf_counter()
+        if self._cpu_snapshot_models_active and self._cpu_snapshot_models is not None:
+            try:
+                workflow = _thaw(plan.workflow) if hasattr(plan, "workflow") else {}
+                model_stack = dict(plan.model_stack) if hasattr(plan, "model_stack") else {}
+                request_model_key = derive_model_key(workflow)
+                request_prefill_key = derive_prefill_key(request_model_key, workflow)
+                request_model_spec = build_restore_model_spec(workflow, model_stack)
+                snapshot_key = self._cpu_snapshot_models.model_key
+                snapshot_spec = self._cpu_snapshot_models.model_spec
+                if (
+                    _cpu_snapshot_model_keys_match(request_model_key, snapshot_key)
+                    and _cpu_snapshot_specs_match(request_model_spec, snapshot_spec)
+                ):
+                    self._use_cpu_snapshot_models_on_bridge(
+                        request_model_key,
+                        request_prefill_key,
+                        request_model_spec,
+                        self._cpu_snapshot_models.unet,
+                        self._cpu_snapshot_models.clip,
+                        trace=trace,
+                    )
+                    # Remain active.
+                    trace.emit(
+                        "cpu_snapshot_models_request_bound",
+                        phase="execution",
+                        metadata={
+                            "status": "bound",
+                            "reason": "ok",
+                            "model_key_hash": snapshot_key.stable_hash[:16] if snapshot_key else "",
+                            "clip_object_type": type(self._cpu_snapshot_models.clip).__name__,
+                            "unet_object_type": type(self._cpu_snapshot_models.unet).__name__,
+                            "duration_ms": round((time.perf_counter() - _bind_perf) * 1000.0, 3),
+                        },
+                    )
+                else:
+                    # Model identity differs — clear bridge and deactivate.
+                    self._preload_bridge.clear()
+                    self._cpu_snapshot_models_active = False
+                    trace.emit(
+                        "cpu_snapshot_models_request_bound",
+                        phase="execution",
+                        metadata={
+                            "status": "mismatch",
+                            "reason": "model_or_spec_mismatch",
+                            "model_key_hash": snapshot_key.stable_hash[:16] if snapshot_key else "",
+                            "snapshot_key_hash": snapshot_key.stable_hash[:16] if snapshot_key else "",
+                            "request_key_hash": request_model_key.stable_hash[:16],
+                            "clip_object_type": type(self._cpu_snapshot_models.clip).__name__,
+                            "unet_object_type": type(self._cpu_snapshot_models.unet).__name__,
+                            "duration_ms": round((time.perf_counter() - _bind_perf) * 1000.0, 3),
+                        },
+                    )
+            except Exception as _bind_exc:
+                self._preload_bridge.clear()
+                self._cpu_snapshot_models_active = False
+                trace.emit(
+                    "cpu_snapshot_models_request_bound",
+                    phase="execution",
+                    metadata={
+                        "status": "error",
+                        "reason": str(_bind_exc)[:200],
+                        "model_key_hash": "",
+                        "clip_object_type": type(self._cpu_snapshot_models.clip).__name__
+                        if self._cpu_snapshot_models is not None and self._cpu_snapshot_models.clip is not None else "",
+                        "unet_object_type": type(self._cpu_snapshot_models.unet).__name__
+                        if self._cpu_snapshot_models is not None and self._cpu_snapshot_models.unet is not None else "",
+                        "duration_ms": round((time.perf_counter() - _bind_perf) * 1000.0, 3),
+                    },
+                )
         # â”€â”€ Execution-phase CLIP exact-prefill single-flight â”€â”€â”€â”€â”€â”€â”€â”€
         # Schedule prefill immediately after graph start so it runs
         # concurrently with execution setup.  The callback waits for both
@@ -3641,6 +4337,7 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
             spec.runtime_state_path: resources["runtime_state_volume"],
         },
         enable_memory_snapshot=spec.enable_memory_snapshot,
+        env=_runtime_env(),
         **({"experimental_options": {"enable_gpu_snapshot": True}} if _enable_gpu_snapshot else {}),
     )(remote_class)
 

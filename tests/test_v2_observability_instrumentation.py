@@ -1547,8 +1547,8 @@ class TestDeepDiagImageEnv(unittest.TestCase):
 
     def test_env_not_forced_in_reference_image(self):
         """_reference_image() uses _image_base, adds V2 source modules, and does NOT
-        force COMFYMODAL_V2_DEEP_MODEL_DIAG or contain an .env({...}) build call
-        in the code body (docstring mentions are allowed)."""
+        force COMFYMODAL_V2_DEEP_MODEL_DIAG or contain ANY .env() build call
+        in the code body — env is propagated via class-level env= instead."""
         import inspect
         from comfymodal_runtime.modal_app import _reference_image
         source = self._code_body(inspect.getsource(_reference_image))
@@ -1565,29 +1565,43 @@ class TestDeepDiagImageEnv(unittest.TestCase):
         self.assertNotIn('"COMFYMODAL_V2_DEEP_MODEL_DIAG"', source,
                          "Flag must NOT appear as a string literal in code body; "
                          "follows external env control")
-        # No .env({...) build call in the code body
-        self.assertNotIn(".env({", source,
-                         ".env({...) build call must not appear in code body")
+        # No .env( call at all in the code body — env is now propagated via
+        # class-level env= in _register_remote_entrypoint, not as a build step.
+        self.assertNotIn(".env(", source,
+                         ".env() build call must not appear in _reference_image code body; "
+                         "use class-level env= in _register_remote_entrypoint")
 
-    def test_uses_image_base_without_env_call(self):
-        """_reference_image() reads comfyapp._image_base, not comfyapp.image, with no .env({...})
-        build call — the production base already has build steps, and env control is external."""
+    def test_env_propagated_via_class_level_param(self):
+        """_reference_image() must NOT contain any .env() build call — env vars
+        (COMFYMODAL_V2_CPU_MODEL_SNAPSHOT, COMFYMODAL_ENABLE_GPU_SNAPSHOT,
+        optional COMFYMODAL_V2_MEMORY_MB, COMFYMODAL_WARMUP_*) are propagated
+        via the _runtime_env() helper and passed as env= to
+        resources["app"].cls(...) in _register_remote_entrypoint."""
         import inspect
-        from comfymodal_runtime.modal_app import _reference_image
+        from comfymodal_runtime.modal_app import _reference_image, _runtime_env, _register_remote_entrypoint
+        # Verify _reference_image has no .env() call
         source = self._code_body(inspect.getsource(_reference_image))
         self.assertIn('"_image_base"', source,
                       "Must reference _image_base (pre-local-sources) for legal build order")
-        # add_local_python_source must still exist (adds V2 modules)
         self.assertIn("add_local_python_source", source,
                       "Must add V2 source modules via add_local_python_source")
-        # No .env({) build call in the code body (docstring mentions are allowed)
-        self.assertNotIn(".env({", source,
-                         ".env({...) must NOT appear in code body; env follows external control")
-        # Verify there is no base.env or image.env call pattern
+        self.assertNotIn(".env(", source,
+                         "No .env() build call in _reference_image; "
+                         "env is propagated via class-level env= parameter")
         self.assertNotIn("base.env(", source,
                          "No base.env() call in code body")
-        self.assertNotIn("image.env(", source,
-                         "No image.env() call in code body")
+        # _runtime_env returns the expected keys
+        env_dict = _runtime_env()
+        self.assertIn("COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", env_dict,
+                      "Must propagate COMFYMODAL_V2_CPU_MODEL_SNAPSHOT")
+        self.assertIn("COMFYMODAL_ENABLE_GPU_SNAPSHOT", env_dict,
+                      "Must propagate COMFYMODAL_ENABLE_GPU_SNAPSHOT")
+        # Optional keys: COMFYMODAL_V2_MEMORY_MB, COMFYMODAL_WARMUP_*
+        # These are present only when set in the external environment.
+        # _register_remote_entrypoint must reference _runtime_env for the env= param
+        reg_source = self._code_body(inspect.getsource(_register_remote_entrypoint))
+        self.assertIn("env=_runtime_env()", reg_source,
+                      "_register_remote_entrypoint must pass env=_runtime_env() to cls()")
 
     def test_env_not_in_production_image_env_block(self):
         """The env var does NOT appear in comfyapp's production _image_base definition."""
