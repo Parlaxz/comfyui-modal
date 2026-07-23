@@ -7,7 +7,7 @@ Covers all required categories:
   4  identity_from_profile missing unet -> ValueError
   5  identity_from_profile missing clip1 -> ValueError
   6  identity_from_profile missing clip_type -> ValueError
-  7  identity_from_profile clip2 duplicate collapse
+  7  identity_from_profile clip2 duplicate preserved in spec, one fact
   8  identity_from_profile weight_dtype preserved in model_spec
   9  identity_from_profile weight_dtype absent -> "default" in model_spec
  10  ModelRestoreKey unet_identity
@@ -38,6 +38,7 @@ Covers all required categories:
  35  retarget: unsupported_clip_shape
  36  retarget: missing model_management function
  37  retarget: only patcher device attributes, no .to
+ 38  load: dual clip callback with clip1==clip2
 """
 
 from __future__ import annotations
@@ -288,13 +289,19 @@ class TestIdentityFromProfile(unittest.TestCase):
             identity_from_profile({"mode": "split", "unet": "x", "clip1": "y"}, resolve_path=self.resolve)
         self.assertIn("clip_type", str(ctx.exception).lower())
 
-    # 7. Duplicate clip2 collapsed
-    def test_clip2_duplicate_collapse(self):
+    # 7. Duplicate clip2: preserved in normalized, dual spec, one file fact
+    def test_clip2_duplicate_dual(self):
         from comfymodal_runtime.cpu_snapshot_models import identity_from_profile
         profile = dict(_VALID_SPLIT_PROFILE, clip2="clip_l.safetensors", clip1="clip_l.safetensors")
         key, spec, facts = identity_from_profile(profile, resolve_path=self.resolve)
+        # Compact identity: duplicate → single name
         self.assertEqual(key.clip_identity, "clip_l.safetensors")
-        # clip2 should be collapsed, so only 2 facts (unet, clip1)
+        # Dual loader spec (clip2 was supplied)
+        clip_loaders = spec["loaders"]["clip"]
+        self.assertEqual(clip_loaders[0]["loader_class"], "DualCLIPLoader")
+        self.assertEqual(clip_loaders[0]["clip_name1"], "clip_l.safetensors")
+        self.assertEqual(clip_loaders[0]["clip_name2"], "clip_l.safetensors")
+        # Unique file facts: only unet+clip1 (clip2 same file as clip1)
         self.assertEqual(len(facts), 2)
         self.assertEqual(facts[0].role, "unet")
         self.assertEqual(facts[1].role, "clip1")
@@ -643,6 +650,39 @@ class TestLoad(unittest.TestCase):
                 self.assertIn("object_type", e.metadata)
                 self.assertIn("status", e.metadata)
                 self.assertEqual(e.metadata["status"], "ok")
+
+    # 21b. Dual load callback with clip1==clip2
+    def test_dual_clip_load_callback(self):
+        """load_cpu_snapshot_models with clip1==clip2 invokes dual callback only."""
+        from comfymodal_runtime.cpu_snapshot_models import load_cpu_snapshot_models
+        unet_stub = _FakeUNETPatcher()
+        clip_stub = _FakeCLIP()
+        dual_calls = []
+        single_calls = []
+
+        def load_clip(*args):
+            if len(args) == 4:
+                dual_calls.append(args)
+            else:
+                single_calls.append(args)
+            return clip_stub
+
+        profile = dict(_VALID_SPLIT_PROFILE, clip1="clip_l.safetensors", clip2="clip_l.safetensors")
+        result = load_cpu_snapshot_models(
+            profile,
+            load_unet=lambda name, *args: unet_stub,
+            load_clip=load_clip,
+            resolve_path=self.resolve,
+        )
+        self.assertEqual(len(dual_calls), 1, "should invoke dual callback once")
+        name1, name2, clip_type, device = dual_calls[0]
+        self.assertEqual(name1, "clip_l.safetensors")
+        self.assertEqual(name2, "clip_l.safetensors")
+        self.assertEqual(clip_type, "flux")
+        self.assertEqual(device, "default")
+        self.assertEqual(len(single_calls), 0, "must not invoke single callback")
+        self.assertIsNotNone(result)
+        self.assertIs(result.clip, clip_stub)
 
     # 22. Failed trace event
     def test_failed_trace_event(self):

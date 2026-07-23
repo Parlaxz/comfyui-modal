@@ -4684,6 +4684,7 @@ class V2LoaderBridge:
         self._trace = None
         self._preparation_trace = None
         self._preparation_event_cursor = 0
+        self.coordinator._active = None
         with self._prefill_lock:
             self._prefill_results.clear()
 
@@ -4916,9 +4917,10 @@ class V2LoaderBridge:
 
     def _consume_clip(self, class_name: str, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Any:
         if class_name == "DualCLIPLoader":
+            from .restore_plan import _build_dual_clip_identity
             clip_a = kwargs.get("clip_name1", args[0] if args else "")
             clip_b = kwargs.get("clip_name2", args[1] if len(args) > 1 else "")
-            identity = f"{clip_a}||{clip_b}"
+            identity = _build_dual_clip_identity(clip_a, clip_b)
         else:
             identity = str(kwargs.get("clip_name", args[0] if args else ""))
         return self._consume_model_impl(

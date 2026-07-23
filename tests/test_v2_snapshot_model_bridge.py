@@ -15,7 +15,7 @@ import unittest
 
 from comfymodal_runtime.contracts import ModelRestoreKey, PrefillKey, RestorePlan, stable_hash
 from comfymodal_runtime.model_preload import V2LoaderBridge
-from comfymodal_runtime.restore_plan import build_restore_model_spec
+from comfymodal_runtime.restore_plan import build_restore_model_spec, derive_model_key
 from comfymodal_runtime.trace import RuntimeTrace
 from comfymodal_runtime.modal_app import _cpu_snapshot_specs_match, _cpu_snapshot_model_keys_match
 
@@ -305,7 +305,7 @@ class SnapshotDualClipSpecTests(unittest.TestCase):
         )
         self.model_key = ModelRestoreKey(
             unet_identity="u.safetensors",
-            clip_identity="clip_g.safetensors||clip_g.safetensors",
+            clip_identity="clip_g.safetensors",
             clip_type="sd3",
         )
         self.bridge.use_ready_models(
@@ -338,6 +338,39 @@ class SnapshotDualClipSpecTests(unittest.TestCase):
         self.assertTrue(prep.clip_future.done())
         result = prep.clip_future.result()
         self.assertIs(result, self.clip_obj)
+
+    def test_duplicate_dual_workflow_key_and_spec_match(self):
+        """Real workflow with duplicate DualCLIPLoader matches snapshot key/spec."""
+        workflow = {
+            "1": {"class_type": "DualCLIPLoader", "inputs": {
+                "clip_name1": "clip_g.safetensors", "clip_name2": "clip_g.safetensors", "type": "sd3",
+            }},
+            "2": {"class_type": "UNETLoader", "inputs": {
+                "unet_name": "u.safetensors", "weight_dtype": "default",
+            }},
+        }
+        request_key = derive_model_key(workflow)
+        request_spec = build_restore_model_spec(workflow)
+        self.assertTrue(
+            _cpu_snapshot_model_keys_match(request_key, self.bridge._model_key),
+            "request key must match snapshot key for duplicate dual CLIP",
+        )
+        self.assertTrue(
+            _cpu_snapshot_specs_match(request_spec, self.bridge._model_spec),
+            "request spec must match snapshot spec for duplicate dual CLIP",
+        )
+
+    def test_duplicate_dual_clip_graph_returns_snapshot_object(self):
+        """DualCLIPLoader with identical filenames returns snapshot clip."""
+        with self.bridge.request_scope():
+            result = self.nodes.NODE_CLASS_MAPPINGS["DualCLIPLoader"]().load_clip(
+                "clip_g.safetensors", "clip_g.safetensors", "sd3"
+            )
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 1)
+        self.assertIs(result[0], self.clip_obj)
+        dual_calls = [c for c in self.calls if c[0] == "dual_clip"]
+        self.assertEqual(len(dual_calls), 0, "original DualCLIPLoader not called")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -718,7 +751,69 @@ class SnapshotRetargetNoEagerCudaTests(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 10. VAE original path preserved
+# 10. Clear resets _preparation and coordinator._active
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class SnapshotClearResetsTests(unittest.TestCase):
+    """clear() resets bridge state and coordinator._active."""
+
+    def setUp(self):
+        self.calls: list[tuple] = []
+        self.nodes = _fake_nodes(self.calls)
+        self.bridge = V2LoaderBridge()
+        self.bridge.install(self.nodes)
+        self.bridge.use_ready_models(
+            model_key=ModelRestoreKey(unet_identity="u", clip_identity="c", clip_type="sd3"),
+            prefill_key=PrefillKey(),
+            model_spec={"loaders": {"unet": [], "clip": [], "vae": []}},
+            unet=object(),
+            clip=_FakeClip(),
+        )
+        self.assertIsNotNone(self.bridge.coordinator._active)
+
+    def test_clear_resets_preparation(self):
+        """clear() sets _preparation to None."""
+        self.bridge.clear()
+        self.assertIsNone(self.bridge._preparation)
+
+    def test_clear_resets_coordinator_active(self):
+        """clear() sets coordinator._active to None."""
+        self.bridge.clear()
+        self.assertIsNone(self.bridge.coordinator._active)
+
+    def test_clear_preserves_other_coordinator_state(self):
+        """clear() only sets coordinator._active = None; does not close pool or mutate callers."""
+        # Check coordinator is still usable after clear
+        self.bridge.clear()
+        self.assertIsNone(self.bridge.coordinator._active)
+        # A subsequent use_ready_models should work
+        self.bridge.use_ready_models(
+            model_key=ModelRestoreKey(unet_identity="u2", clip_identity="c2", clip_type="sd3"),
+            prefill_key=PrefillKey(),
+            model_spec={"loaders": {"unet": [], "clip": [], "vae": []}},
+            unet=object(),
+            clip=_FakeClip(),
+        )
+        self.assertIsNotNone(self.bridge.coordinator._active)
+
+    def test_clear_subsequent_use_falls_through(self):
+        """After clear(), wrapped loader falls through to original in request_scope."""
+        self.bridge.clear()
+        self.assertIsNone(self.bridge._preparation)
+        self.assertIsNone(self.bridge.coordinator._active)
+        with self.bridge.request_scope():
+            result = self.nodes.NODE_CLASS_MAPPINGS["CLIPLoader"]().load_clip(
+                "c.safetensors", "sd3"
+            )
+        self.assertIsInstance(result[0], _FakeClip)
+        clip_calls = [c for c in self.calls if c[0] == "clip"]
+        self.assertEqual(len(clip_calls), 1,
+                         "original loader must be called after clear")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 11. VAE original path preserved
 # ═══════════════════════════════════════════════════════════════════════════
 
 
