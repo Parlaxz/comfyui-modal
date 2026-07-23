@@ -10,12 +10,20 @@ operation timings for critical-path analysis.
 ``attach_pre_sampler_critical_path(result, plan, cache)`` — postprocessor that
 consumes an existing result dict and produces an additive pre-sampler critical
 path summary attached to ``result["trace"]`` or ``result`` directly.
+
+``PreSamplerInstrumentation`` — scoped live-instrumentation that hooks the
+native ComfyUI ``execution.PromptExecutor``, ``execution.execute``,
+``execution.get_input_data``, and ``comfy.model_management.load_models_gpu`` to
+capture wall-clock timings from actual production execution boundaries.
+Emits a single ``[v2.pre_sampler_critical_path]`` line per request.
 """
 
 from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
+import contextvars
 import inspect
 import threading
 import time
@@ -1063,6 +1071,503 @@ async def await_result(future: Awaitable[Any]) -> Any:
     return await future
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Pre-sampler live instrumentation
+# ═══════════════════════════════════════════════════════════════════════
+# Monkeys the actual ComfyUI execution functions with timed wrappers.
+# Scope: per-request via contextvars.  Emits exactly one summary line.
+
+_PRE_SAMPLER_ABSENT_STR: str = "absent"
+
+# Per-request state
+_instrumentation_var: contextvars.ContextVar[
+    dict[str, Any] | None
+] = contextvars.ContextVar("pre_sampler_instrumentation", default=None)
+
+# Bridge for sampler lane lock wait time from modal_app
+_lock_wait_bridge: contextvars.ContextVar[float] = contextvars.ContextVar(
+    "pre_sampler_lock_wait_bridge", default=0.0
+)
+
+# Originals saved once by install_hooks()
+_ORIGINAL_FUNCTIONS: dict[str, Any] = {}
+_hooks_installed: bool = False
+
+
+def _inst_state() -> dict[str, Any] | None:
+    return _instrumentation_var.get()
+
+
+def _get_class_type(node_id: str, prompt: dict[str, Any]) -> str:
+    """Look up class_type from the live prompt dict."""
+    node = prompt.get(node_id) or prompt.get(str(node_id))
+    if isinstance(node, dict):
+        return str(node.get("class_type", ""))
+    return ""
+
+
+def _ns_ms(ns_start: int) -> float:
+    """Convert perf_counter ns delta since *ns_start* to ms.
+
+    Uses ``time.perf_counter_ns()`` instead of ``time.monotonic_ns()``
+    because ``monotonic_ns`` on Windows can have ~15.6 ms resolution
+    (``GetTickCount64``), which makes sub-ms measurements unreliable.
+    ``perf_counter_ns`` uses ``QueryPerformanceCounter`` and has
+    microsecond-resolution timing on all platforms.
+    """
+    return round((time.perf_counter_ns() - ns_start) / 1_000_000, 3)
+
+
+def _fmt_or_absent(v: Any) -> str:
+    if v is None:
+        return _PRE_SAMPLER_ABSENT_STR
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float):
+        return f"{v:.3f}"
+    return str(v)
+
+
+def set_lock_wait_ms(ms: float) -> None:
+    """Bridge the sampler lane lock wait duration into instrumentation state.
+
+    Called by ``modal_app._execute_v2_prompt_executor`` after acquiring
+    the mutation lane for a sampler node.  The value is consumed by
+    ``_pop_lock_wait_ms`` during summary aggregation in the patched
+    ``execute_async`` wrapper.
+    """
+    _lock_wait_bridge.set(ms)
+
+
+def _pop_lock_wait_ms(state: dict[str, Any]) -> None:
+    """Consume the bridged lock_wait_ms value into *state*.
+
+    Called once per request in the patched ``execute_async`` finally
+    block.  Resets the bridge to 0.0 to prevent cross-request carryover.
+    """
+    lw = _lock_wait_bridge.get()
+    if lw > 0:
+        state["lock_wait_ms"] = state.get("lock_wait_ms", 0.0) + lw
+        state.setdefault("_lw_count", 0)
+        state["_lw_count"] += 1
+        _lock_wait_bridge.set(0.0)
+
+
+def _emit_pre_sampler_line(state: dict[str, Any]) -> None:
+    """Print exactly one [v2.pre_sampler_critical_path] summary line.
+
+    Uses the per-request aggregated state dict.
+    """
+    parts = ["[v2.pre_sampler_critical_path]"]
+    fields = (
+        "span", "start_node_id", "start_class_type",
+        "end_node_id", "end_class_type",
+        "cache_lookup_ms", "hash_or_cache_check_ms",
+        "input_resolution_ms", "future_wait_ms", "lock_wait_ms",
+        "model_patch_ms", "conditioning_ms", "node_execution_ms",
+        "unattributed_ms", "background_future_exists",
+        "background_future_done", "model_cache_hit",
+    )
+    for f in fields:
+        parts.append(f"{f}={_fmt_or_absent(state.get(f))}")
+    print(" ".join(parts), flush=True)
+
+
+def install_pre_sampler_hooks() -> None:
+    """Patch native ComfyUI execution functions with timed wrappers.
+
+    Safe to call multiple times — originals are stored on first call.
+    Each wrapper checks the per-request context variable; when unset
+    the original function is called with zero overhead.
+    """
+    global _hooks_installed
+    if _hooks_installed:
+        return
+
+    try:
+        import execution as _execution
+        import comfy.model_management as _mm
+    except ImportError:
+        # ComfyUI modules not available (e.g. test environment) —
+        # skip hook installation.  The contextvar gating ensures
+        # no overhead when hooks are absent.
+        return
+
+    # Track whether any execution-module hooks were installed
+    _installed_execution_hooks = False
+
+    # ── 1. execution.get_input_data ────────────────────────────────────
+    _orig_get_input_data = getattr(_execution, "get_input_data", None)
+    if _orig_get_input_data is not None:
+        _ORIGINAL_FUNCTIONS["get_input_data"] = _orig_get_input_data
+        _installed_execution_hooks = True
+
+        def _patched_get_input_data(
+            inputs, class_def, unique_id,
+            execution_list=None, dynprompt=None, extra_data=None,
+        ):
+            state = _instrumentation_var.get()
+            if state is None:
+                return _orig_get_input_data(
+                    inputs, class_def, unique_id,
+                    execution_list, dynprompt, extra_data,
+                )
+            _t0 = time.perf_counter_ns()
+            try:
+                return _orig_get_input_data(
+                    inputs, class_def, unique_id,
+                    execution_list, dynprompt, extra_data,
+                )
+            finally:
+                _elapsed = _ns_ms(_t0)
+                if state is not None:
+                    state["input_resolution_ms"] = state.get("input_resolution_ms", 0.0) + _elapsed
+                    state.setdefault("_ir_count", 0)
+                    state["_ir_count"] += 1
+
+        _execution.get_input_data = _patched_get_input_data
+
+    # ── 2. execution.execute (per-node) ────────────────────────────────
+    _orig_exec_node = getattr(_execution, "execute", None)
+    if _orig_exec_node is not None:
+        _ORIGINAL_FUNCTIONS["execute"] = _orig_exec_node
+        _installed_execution_hooks = True
+
+        async def _patched_exec_node(
+            server, dynprompt, caches, current_item, extra_data,
+            executed, prompt_id, execution_list,
+            pending_subgraph_results, pending_async_nodes, ui_outputs,
+        ):
+            state = _instrumentation_var.get()
+            if state is None:
+                return await _orig_exec_node(
+                    server, dynprompt, caches, current_item, extra_data,
+                    executed, prompt_id, execution_list,
+                    pending_subgraph_results, pending_async_nodes, ui_outputs,
+                )
+
+            # Resolve node identity — fall back to state prompt when dynprompt
+            # is unavailable (e.g. test or simplified execution paths).
+            node_class = ""
+            node_id = str(current_item) if current_item is not None else ""
+            try:
+                if dynprompt is not None:
+                    node_info = dynprompt.get_node(current_item)
+                    if isinstance(node_info, dict):
+                        node_class = str(node_info.get("class_type", "") or "")
+            except Exception:
+                pass
+            if not node_class:
+                # Fallback: look up class_type from the stored prompt dict
+                _prompt = state.get("_prompt", {})
+                _entry = _prompt.get(node_id) or _prompt.get(str(current_item))
+                if isinstance(_entry, dict):
+                    node_class = str(_entry.get("class_type", "") or "")
+
+            # Classify node type for phase tracking
+            _class_lower = node_class.lower()
+            _is_clip_text_encode = "cliptextencode" in _class_lower or "textencode" in _class_lower
+            _is_sampler = "sampler" in _class_lower or "ksampler" in _class_lower
+            _is_model_loader = (
+                not _is_clip_text_encode
+                and not _is_sampler
+                and ("loader" in _class_lower or "checkpoint" in _class_lower)
+            )
+
+            # Record span boundaries for dominant intervals
+            if "first_node_id" not in state:
+                state["first_node_id"] = node_id
+                state["first_class_type"] = node_class
+                state["span"] = "node_execution"
+            state["last_node_id"] = node_id
+            state["last_class_type"] = node_class
+
+            _t0 = time.perf_counter_ns()
+            try:
+                result = await _orig_exec_node(
+                    server, dynprompt, caches, current_item, extra_data,
+                    executed, prompt_id, execution_list,
+                    pending_subgraph_results, pending_async_nodes, ui_outputs,
+                )
+                return result
+            finally:
+                _elapsed = _ns_ms(_t0)
+                if state is None:
+                    return
+                state["node_execution_ms"] = state.get("node_execution_ms", 0.0) + _elapsed
+                state.setdefault("_ne_count", 0)
+                state["_ne_count"] += 1
+
+                # Conditioning sub-tracking
+                if _is_clip_text_encode:
+                    state["conditioning_ms"] = state.get("conditioning_ms", 0.0) + _elapsed
+
+                # Sampler entry tracking
+                if _is_sampler and "sampler_start_ns" not in state:
+                    state["sampler_start_ns"] = _t0
+                    state["sampler_node_id"] = node_id
+                    state["sampler_class_type"] = node_class
+
+                # Model loader tracking (first occurrence)
+                if _is_model_loader and "model_load_ns" not in state:
+                    state["model_load_ns"] = _t0
+
+        _execution.execute = _patched_exec_node
+
+    # ── 3. comfy.model_management.load_models_gpu ──────────────────────
+    _orig_load_models = getattr(_mm, "load_models_gpu", None)
+    if _orig_load_models is not None:
+        _ORIGINAL_FUNCTIONS["load_models_gpu"] = _orig_load_models
+
+        def _patched_load_models_gpu(
+            models, memory_required=0, force_patch_weights=False,
+            minimum_memory_required=None, force_full_load=False,
+        ):
+            state = _instrumentation_var.get()
+            if state is None:
+                return _orig_load_models(
+                    models, memory_required, force_patch_weights,
+                    minimum_memory_required, force_full_load,
+                )
+            _t0 = time.perf_counter_ns()
+            try:
+                return _orig_load_models(
+                    models, memory_required, force_patch_weights,
+                    minimum_memory_required, force_full_load,
+                )
+            finally:
+                _elapsed = _ns_ms(_t0)
+                if state is not None:
+                    state["model_patch_ms"] = state.get("model_patch_ms", 0.0) + _elapsed
+                    state.setdefault("_mp_count", 0)
+                    state["_mp_count"] += 1
+
+        _mm.load_models_gpu = _patched_load_models_gpu
+
+    # ── 4. PromptExecutor.execute_async ────────────────────────────────
+    _prompt_executor_cls = getattr(_execution, "PromptExecutor", None)
+    _orig_exec_async = getattr(_prompt_executor_cls, "execute_async", None) if _prompt_executor_cls is not None else None
+    if _orig_exec_async is not None:
+        _ORIGINAL_FUNCTIONS["execute_async"] = _orig_exec_async
+        _installed_execution_hooks = True
+
+        async def _patched_exec_async(self, prompt, prompt_id, extra_data=None, execute_outputs=None):
+            state = _instrumentation_var.get()
+            if state is None:
+                return await _orig_exec_async(
+                    self, prompt, prompt_id, extra_data, execute_outputs,
+                )
+
+            # Capture the live prompt dict for class_type lookup
+            state["_prompt"] = prompt
+
+            # ── Phase: execution_start_to_cached (cache results gather) ────
+            # Intercept the cache-results gather that happens inside execute_async.
+            # We hook into the section after executor.reset() and before the
+            # while-loop that executes nodes.  Since we cannot easily patch the
+            # internals of execute_async without a deeper rewrite, we note the
+            # start time and let the per-node hooks capture residual work.
+            _t_start = time.perf_counter_ns()
+            state["_exec_async_start_ns"] = _t_start
+
+            try:
+                return await _orig_exec_async(
+                    self, prompt, prompt_id, extra_data, execute_outputs,
+                )
+            finally:
+                if state is None:
+                    return
+                # Finalize aggregate state after execution completes
+                _t_end = time.perf_counter_ns()
+                _total_wall_ms = _ns_ms(_t_start)
+
+                # Consume lock_wait from bridge (set by modal_app send_sync wrapper)
+                _pop_lock_wait_ms(state)
+
+                # Determine dominant interval span name based on what was observed
+                _has_clip = bool(state.get("conditioning_ms", 0.0) > 0)
+                _has_sampler = "sampler_node_id" in state
+                _has_loader = "model_load_ns" in state
+
+                if not _has_clip and not _has_sampler:
+                    _span_name = "execution_complete"
+                elif _has_sampler and _has_clip:
+                    _span_name = "full_pre_sampler"
+                elif _has_sampler:
+                    _span_name = "sampler_path"
+                else:
+                    _span_name = "conditioning_only"
+
+                state["span"] = _span_name
+                state.setdefault("start_node_id", state.get("first_node_id", ""))
+                state.setdefault("start_class_type", state.get("first_class_type", ""))
+                state.setdefault("end_node_id", state.get("sampler_node_id", state.get("last_node_id", "")))
+                state.setdefault("end_class_type", state.get("sampler_class_type", state.get("last_class_type", "")))
+
+                # Compute hash_or_cache_check_ms from what we observed:
+                # This is the time before the first node execution - approximated
+                # by subtracting all measured node execution from the pre-sampler window.
+                _ne = state.get("node_execution_ms", 0.0)
+                _ir = state.get("input_resolution_ms", 0.0)
+                _mp = state.get("model_patch_ms", 0.0)
+                _co = state.get("conditioning_ms", 0.0)
+                _measured = _ne + _ir + _mp
+                _hash_check = max(0.0, _total_wall_ms - _measured)
+                state["hash_or_cache_check_ms"] = state.get("hash_or_cache_check_ms", 0.0) + _hash_check
+
+                # unattributed = wall minus sum of all measured operations
+                _sum_measured = (
+                    _ne + _ir + _mp + _co
+                    + state.get("cache_lookup_ms", 0.0)
+                    + state.get("future_wait_ms", 0.0)
+                    + state.get("lock_wait_ms", 0.0)
+                    + state.get("hash_or_cache_check_ms", 0.0)
+                )
+                _unattr = max(0.0, _total_wall_ms - _sum_measured)
+                if _unattr > 0.001:
+                    state["unattributed_ms"] = state.get("unattributed_ms", 0.0) + _unattr
+
+                # background_future flags
+                state.setdefault("background_future_exists", state.get("_model_loaded", False))
+                state.setdefault("background_future_done", state.get("_model_loaded", False))
+                state.setdefault("model_cache_hit", state.get("_mp_count", 0) == 0)
+
+                # ── Emit exactly one line ──────────────────────────────────
+                _emit_pre_sampler_line(state)
+
+        _execution.PromptExecutor.execute_async = _patched_exec_async
+
+    # ── 5. comfy_execution.caching.HierarchicalCache.get (cache lookup) ─
+    try:
+        from comfy_execution.caching import HierarchicalCache as _HCache
+    except ImportError:
+        _HCache = None
+
+    if _HCache is not None:
+        _orig_cache_get = _HCache.get
+        _ORIGINAL_FUNCTIONS["HierarchicalCache.get"] = _orig_cache_get
+
+        async def _patched_cache_get(self, node_id):
+            state = _instrumentation_var.get()
+            if state is None:
+                return await _orig_cache_get(self, node_id)
+            _t0 = time.perf_counter_ns()
+            result = await _orig_cache_get(self, node_id)
+            _elapsed = _ns_ms(_t0)
+            if state is not None:
+                state["cache_lookup_ms"] = state.get("cache_lookup_ms", 0.0) + _elapsed
+                state.setdefault("_cache_count", 0)
+                state["_cache_count"] += 1
+                if result is not None:
+                    state.setdefault("_cache_hit_count", 0)
+                    state["_cache_hit_count"] += 1
+                else:
+                    state.setdefault("_cache_miss_count", 0)
+                    state["_cache_miss_count"] += 1
+            return result
+
+        _HCache.get = _patched_cache_get
+
+    # ── 6. execution.resolve_map_node_over_list_results (future wait) ───
+    _orig_resolve = getattr(_execution, "resolve_map_node_over_list_results", None)
+    if _orig_resolve is not None:
+        _ORIGINAL_FUNCTIONS["resolve_map_node_over_list_results"] = _orig_resolve
+        _installed_execution_hooks = True
+
+        async def _patched_resolve_results(results):
+            state = _instrumentation_var.get()
+            if state is None:
+                return await _orig_resolve(results)
+            # Record whether any futures were actually pending (not done)
+            _has_pending = any(
+                isinstance(r, asyncio.Task) and not r.done()
+                for r in results
+            )
+            _t0 = time.perf_counter_ns()
+            try:
+                return await _orig_resolve(results)
+            finally:
+                _elapsed = _ns_ms(_t0)
+                if state is not None:
+                    state["future_wait_ms"] = state.get("future_wait_ms", 0.0) + _elapsed
+                    state.setdefault("_fw_count", 0)
+                    state["_fw_count"] += 1
+                    if not _has_pending:
+                        # All futures were already done — mark as cache hit
+                        # (zero wait, immediate completion)
+                        state.setdefault("_fw_immediate_count", 0)
+                        state["_fw_immediate_count"] += 1
+
+        _execution.resolve_map_node_over_list_results = _patched_resolve_results
+
+    # Only mark hooks as fully installed when execution-module hooks were
+    # actually placed (get_input_data, execute, execute_async, or
+    # resolve_map_node_over_list_results).  This prevents a partial fake
+    # execution module from permanently blocking real-module hooking.
+    if _installed_execution_hooks:
+        _hooks_installed = True
+
+
+def uninstall_pre_sampler_hooks() -> None:
+    """Restore all original ComfyUI execution functions.
+
+    Safe to call multiple times — no-op when hooks are not installed.
+    """
+    global _hooks_installed
+    if not _hooks_installed:
+        return
+
+    import execution as _execution
+    import comfy.model_management as _mm
+
+    _orig_get_data = _ORIGINAL_FUNCTIONS.get("get_input_data")
+    if _orig_get_data is not None:
+        _execution.get_input_data = _orig_get_data
+
+    _orig_exec = _ORIGINAL_FUNCTIONS.get("execute")
+    if _orig_exec is not None:
+        _execution.execute = _orig_exec
+
+    _orig_load = _ORIGINAL_FUNCTIONS.get("load_models_gpu")
+    if _orig_load is not None:
+        _mm.load_models_gpu = _orig_load
+
+    _orig_exec_async = _ORIGINAL_FUNCTIONS.get("execute_async")
+    if _orig_exec_async is not None:
+        _execution.PromptExecutor.execute_async = _orig_exec_async
+
+    # Restore new hooks (5, 6)
+    _orig_cache_get = _ORIGINAL_FUNCTIONS.get("HierarchicalCache.get")
+    if _orig_cache_get is not None:
+        from comfy_execution.caching import HierarchicalCache as _HCache
+        _HCache.get = _orig_cache_get
+
+    _orig_resolve = _ORIGINAL_FUNCTIONS.get("resolve_map_node_over_list_results")
+    if _orig_resolve is not None:
+        _execution.resolve_map_node_over_list_results = _orig_resolve
+
+    _ORIGINAL_FUNCTIONS.clear()
+    _hooks_installed = False
+
+
+@contextlib.contextmanager
+def pre_sampler_instrumentation_scope(state_override: dict[str, Any] | None = None):
+    """Context manager that installs hooks and sets per-request state.
+
+    Usage::
+
+        with pre_sampler_instrumentation_scope():
+            result = await executor.execute(plan, context=ctx)
+    """
+    state = state_override if state_override is not None else {}
+    token = _instrumentation_var.set(state)
+    install_pre_sampler_hooks()
+    try:
+        yield state
+    finally:
+        _instrumentation_var.reset(token)
+
+
 # ── Backend diagnostics (unchanged below) ────────────────────────────────
 
 @dataclass
@@ -1112,6 +1617,7 @@ class RuntimeExecutor:
         plan: ExecutionPlan,
         *,
         context: ExecutionContext | None = None,
+        enable_pre_sampler_instrumentation: bool = False,
     ) -> dict[str, Any]:
         ctx = context or ExecutionContext()
         cache: PreSamplerCache | None = ctx.metadata.get("pre_sampler_cache")
@@ -1123,9 +1629,22 @@ class RuntimeExecutor:
         try:
             if runner is None:
                 raise RuntimeError(f"requested execution backend unavailable: {diagnostics.selected}")
-            result = runner(plan, ctx)
-            if inspect.isawaitable(result):
-                result = await result
+
+            # ── Pre-sampler live instrumentation scope ─────────────
+            async def _run_with_instrumentation() -> dict[str, Any]:
+                with pre_sampler_instrumentation_scope():
+                    result = runner(plan, ctx)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    return result  # type: ignore[return-value]
+
+            if enable_pre_sampler_instrumentation:
+                result = await _run_with_instrumentation()
+            else:
+                result = runner(plan, ctx)
+                if inspect.isawaitable(result):
+                    result = await result
+
             if not isinstance(result, dict):
                 result = {"result": result}
             result.setdefault("backend", diagnostics.to_dict())

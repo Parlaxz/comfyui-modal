@@ -325,3 +325,392 @@ def merge_runtime_traces(*values: RuntimeTrace | Mapping[str, Any] | None) -> Ru
 def merge_traces(*values: RuntimeTrace | Mapping[str, Any] | None) -> RuntimeTrace:
     """Compatibility alias for the unified trace merge implementation."""
     return merge_runtime_traces(*values)
+
+
+# ---------------------------------------------------------------------------
+# Local submission breakdown helper
+# ---------------------------------------------------------------------------
+
+_ABSENT_STR = "absent"
+_INVALID_NEG_STR = "invalid_negative"
+
+
+def _event_mono_ns(trace: RuntimeTrace, name: str) -> int | None:
+    """Return the monotonic_ns of the first event with *name*, or None."""
+    for event in trace.events:
+        if event.name == name:
+            return event.monotonic_ns
+    return None
+
+
+def _strict_event_span_ms(trace: RuntimeTrace, start_name: str, end_name: str) -> float | str | None:
+    """Like _event_span_ms but returns _INVALID_NEG_STR for negative durations.
+    Returns None when missing, _INVALID_NEG_STR when start > end, float otherwise."""
+    start_ns: int | None = None
+    for event in trace.events:
+        if event.name == start_name:
+            start_ns = event.monotonic_ns
+        elif event.name == end_name and start_ns is not None:
+            delta = event.monotonic_ns - start_ns
+            if delta < 0:
+                return _INVALID_NEG_STR
+            return round(delta / 1_000_000, 3)
+    return None
+
+
+def _derived_mono_delta_ms(trace: RuntimeTrace, start_name: str, end_name: str) -> float | str | None:
+    """Compute ``end_name - start_name`` in ms using monotonic timestamps.
+    Returns ``None`` when either event is missing, ``"invalid_negative"`` when
+    the delta is negative, otherwise the non-negative float ms."""
+    start_ns = _event_mono_ns(trace, start_name)
+    end_ns = _event_mono_ns(trace, end_name)
+    if start_ns is None or end_ns is None:
+        return None
+    delta = end_ns - start_ns
+    if delta < 0:
+        return _INVALID_NEG_STR
+    return round(delta / 1_000_000, 3)
+
+
+# ---------------------------------------------------------------------------
+# Canonical field map for local_submission_breakdown
+# ---------------------------------------------------------------------------
+# One map used by both local and remote emitters so field names never diverge.
+
+LOCAL_SUBMISSION_FIELD_KEYS: tuple[tuple[str, str], ...] = (
+    ("request_id",                    "request_id"),
+    ("local_receive_to_worker_start_ms", "local_receive_to_worker_start_ms"),
+    ("worker_start_to_plan_build_ms", "worker_start_to_plan_build_ms"),
+    ("worker_queue_ms",               "worker_queue_ms"),
+    ("plan_build_ms",                 "plan_build_ms"),
+    ("plan_build_to_execute_plan_entry_ms", "plan_build_to_execute_plan_entry_ms"),
+    ("execute_plan_entry_to_plan_materialization_ms", "execute_plan_entry_to_plan_materialization_ms"),
+    ("plan_materialization_ms",       "plan_materialization_ms"),
+    ("plan_materialization_to_active_profile_ms", "plan_materialization_to_active_profile_ms"),
+    ("active_profile_ms",             "active_profile_ms"),
+    ("restore_plan_build_ms",         "restore_plan_build_ms"),
+    ("restore_publish_ms",            "restore_publish_ms"),
+    ("restore_publish_to_transport_entry_ms", "restore_publish_to_transport_entry_ms"),
+    ("transport_entry_to_handle_lookup_ms", "transport_entry_to_handle_lookup_ms"),
+    ("handle_lookup_ms",              "handle_lookup_ms"),
+    ("payload_materialization_ms",    "payload_materialization_ms"),
+    ("payload_size_measurement_ms",   "payload_size_measurement_ms"),
+    ("payload_size_to_serialize_end_ms", "payload_size_to_serialize_end_ms"),
+    ("payload_ready_to_modal_call_ms","payload_ready_to_modal_call_ms"),
+    ("local_receive_to_modal_call_ms","local_receive_to_modal_call_ms"),
+    ("generator_create_ms",           "generator_create_ms"),
+    ("generator_created_to_first_iteration_ms", "generator_created_to_first_iteration_ms"),
+    ("local_receive_to_actual_submission_ms", "local_receive_to_actual_submission_ms"),
+    ("measured_children_ms",          "measured_children_ms"),
+    ("residual_ms",                   "residual_ms"),
+    ("reconciliation_status",         "reconciliation_status"),
+    ("profile_cache_hit",             "profile_cache_hit"),
+    ("profile_remote_call_performed", "profile_remote_call_performed"),
+    ("restore_publish_cache_hit",     "restore_publish_cache_hit"),
+    ("restore_remote_call_performed", "restore_remote_call_performed"),
+    ("handle_cache_hit",              "handle_cache_hit"),
+    ("plan_to_dict_count",            "plan_to_dict_count"),
+    ("payload_bytes",                 "payload_bytes"),
+)
+"""Canonical ordered field list for [v2.local_submission_breakdown].
+Each entry is (dict_key, fmt_key) where fmt_key is the printed field name."""
+
+
+def _fmt_or_absent(v: Any) -> str:
+    """Format a value for one-line summary: numeric values (including 0.0)
+    are returned as str(v), None/"absent"/"invalid_negative" as-is."""
+    if v is None:
+        return _ABSENT_STR
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, (int, float)):
+        return str(v)
+    return str(v)
+
+
+def _emit_breakdown_line(prefix: str, breakdown: dict[str, Any],
+                         field_keys: tuple[tuple[str, str], ...] | None = None) -> None:
+    """Print one canonical breakdown line using *prefix* and *field_keys*.
+
+    When *field_keys* is None, uses LOCAL_SUBMISSION_FIELD_KEYS.
+    Only fields present in the breakdown dict are printed.
+    """
+    keys = field_keys if field_keys is not None else LOCAL_SUBMISSION_FIELD_KEYS
+    parts = [f"{prefix}"]
+    for dk, fk in keys:
+        v = breakdown.get(dk)
+        if v is not None:
+            parts.append(f"{fk}={_fmt_or_absent(v)}")
+        else:
+            parts.append(f"{fk}={_ABSENT_STR}")
+    print(" ".join(parts), flush=True)
+
+
+def _build_local_submission_breakdown(
+    trace: RuntimeTrace,
+    *,
+    origin: Mapping[str, Any] | None = None,
+    transport_meta: Mapping[str, Any] | None = None,
+    plan_to_dict_count: int = 1,
+) -> dict[str, Any]:
+    """Build the [v2.local_submission_breakdown] dict from trace events.
+
+    Extracts stage durations from RuntimeTrace events and metadata from
+    *origin* (request_origin_info) and *transport_meta* (trace._metadata).
+    Missing values render as *abs_str*. Negative deltas render as
+    *invalid_neg_str*.
+
+    This function computes whatever is available — callers that emit before
+    the Modal generator is created will see generator/timing fields as
+    "absent".  Callers that emit after the full flow see all fields.
+    """
+    _origin = dict(origin or {})
+    _transport_meta = dict(transport_meta or {})
+    _ABS = _ABSENT_STR
+    _INV = _INVALID_NEG_STR
+    _ld = lambda s, e: _derived_mono_delta_ms(trace, s, e)
+
+    # ── Shorthand: value or absent ──
+    def _val(v: Any) -> Any:
+        return _ABS if v is None else v
+
+    # ── Reference monotonic timestamps ──
+    _ref_mono_local_receive = _origin.get("local_receive_mono_ns")
+    _ref_mono_worker_start = _event_mono_ns(trace, "worker_start")
+    _ref_mono_submission = _event_mono_ns(trace, "modal_submission_attempt")
+
+    # ── One-stage durations ──
+    _plan_build_ms = _strict_event_span_ms(trace, "plan_build_start", "plan_build_end")
+    _active_profile_ms = _strict_event_span_ms(trace,
+                                                "active_profile_prepare_start",
+                                                "active_profile_prepare_end")
+    _restore_plan_build_ms = _strict_event_span_ms(trace,
+                                                    "restore_plan_build_start",
+                                                    "restore_plan_build_end")
+    _restore_publish_ms = _strict_event_span_ms(trace,
+                                                 "restore_plan_publish_start",
+                                                 "restore_plan_publish_end")
+    _handle_lookup_ms = _strict_event_span_ms(trace,
+                                               "modal_handle_lookup_start",
+                                               "modal_handle_lookup_end")
+
+    # Payload stages
+    _payload_materialization_prep_ms = _ld("modal_payload_serialize_start",
+                                            "payload_measure_size_start")
+    _payload_size_measurement_ms = _ld("payload_measure_size_start",
+                                        "payload_measure_size_end")
+    _payload_size_to_serialize_end_ms = _ld("payload_measure_size_end",
+                                             "modal_payload_serialize_end")
+
+    # ── Derived gap durations ──
+    _restore_pub_to_transport_entry_ms = _ld("restore_plan_publish_end",
+                                              "transport_entry")
+    _transport_entry_to_handle_lookup_ms = _ld("transport_entry",
+                                                "modal_handle_lookup_start")
+    _transport_entry_ms = _transport_entry_to_handle_lookup_ms
+    _payload_ready_to_gen_create_ms = _ld("modal_payload_serialize_end",
+                                           "modal_generator_create_start")
+    _generator_create_ms = _ld("modal_generator_create_start",
+                                "modal_generator_created")
+    _gen_created_to_first_iter_ms = _ld("modal_generator_created",
+                                         "modal_first_iteration_start")
+
+    # Plan materialization stages
+    _plan_materialization_ms = _ld("plan_materialization_start",
+                                    "plan_materialization_end")
+
+    # ── Gap stages in worker→plan→execute→materialize→profile sequence ──
+    _plan_build_to_exec_entry_ms = _ld("plan_build_end", "execute_plan_entry")
+    _exec_entry_to_plan_mat_ms = _ld("execute_plan_entry",
+                                      "plan_materialization_start")
+    _plan_mat_to_active_profile_ms = _ld("plan_materialization_end",
+                                          "active_profile_prepare_start")
+
+    # ── Boundary-anchored durations ──
+    _local_receive_to_worker_start_ms: Any = _ABS
+    if isinstance(_ref_mono_local_receive, int) and isinstance(_ref_mono_worker_start, int):
+        _delta = _ref_mono_worker_start - _ref_mono_local_receive
+        if _delta < 0:
+            _local_receive_to_worker_start_ms = _INV
+        else:
+            _local_receive_to_worker_start_ms = round(_delta / 1_000_000, 3)
+
+    _worker_start_to_plan_build_ms: Any = _ABS
+    if isinstance(_ref_mono_worker_start, int):
+        _ref_mono_plan_build_start = _event_mono_ns(trace, "plan_build_start")
+        if isinstance(_ref_mono_plan_build_start, int):
+            _delta = _ref_mono_plan_build_start - _ref_mono_worker_start
+            if _delta < 0:
+                _worker_start_to_plan_build_ms = _INV
+            else:
+                _worker_start_to_plan_build_ms = round(_delta / 1_000_000, 3)
+    _worker_queue_ms = _worker_start_to_plan_build_ms
+
+    # ── Total span: local_receive→submission ──
+    _total_ms: Any = _ABS
+    if isinstance(_ref_mono_local_receive, int) and isinstance(_ref_mono_submission, int):
+        _delta = _ref_mono_submission - _ref_mono_local_receive
+        if _delta < 0:
+            _total_ms = _INV
+        else:
+            _total_ms = round(_delta / 1_000_000, 3)
+
+    # local_receive → generator_create_start (modal_call)
+    _ref_mono_modal_call = _event_mono_ns(trace, "modal_generator_create_start")
+    _local_receive_to_modal_call_ms: Any = _ABS
+    if isinstance(_ref_mono_local_receive, int) and isinstance(_ref_mono_modal_call, int):
+        _delta = _ref_mono_modal_call - _ref_mono_local_receive
+        if _delta < 0:
+            _local_receive_to_modal_call_ms = _INV
+        else:
+            _local_receive_to_modal_call_ms = round(_delta / 1_000_000, 3)
+
+    # ── Measured children: sum of all valid sequential non-overlapping stages ──
+    _child_keys = [
+        ("local_receive_to_worker_start_ms", _local_receive_to_worker_start_ms),
+        ("worker_start_to_plan_build_ms", _worker_start_to_plan_build_ms),
+        ("plan_build_ms", _plan_build_ms),
+        ("plan_build_to_execute_plan_entry_ms", _plan_build_to_exec_entry_ms),
+        ("execute_plan_entry_to_plan_materialization_ms", _exec_entry_to_plan_mat_ms),
+        ("plan_materialization_ms", _plan_materialization_ms),
+        ("plan_materialization_to_active_profile_ms", _plan_mat_to_active_profile_ms),
+        ("active_profile_ms", _active_profile_ms),
+        ("restore_plan_build_ms", _restore_plan_build_ms),
+        ("restore_publish_ms", _restore_publish_ms),
+        ("restore_publish_to_transport_entry_ms", _restore_pub_to_transport_entry_ms),
+        ("transport_entry_to_handle_lookup_ms", _transport_entry_to_handle_lookup_ms),
+        ("handle_lookup_ms", _handle_lookup_ms),
+        ("payload_materialization_ms", _payload_materialization_prep_ms),
+        ("payload_size_measurement_ms", _payload_size_measurement_ms),
+        ("payload_size_to_serialize_end_ms", _payload_size_to_serialize_end_ms),
+        ("payload_ready_to_modal_call_ms", _payload_ready_to_gen_create_ms),
+        ("generator_create_ms", _generator_create_ms),
+        ("generator_created_to_first_iteration_ms", _gen_created_to_first_iter_ms),
+    ]
+    _measured_children_ms: Any = _ABS
+    _all_numeric = True
+    _child_sum = 0.0
+    for _ck, _cv in _child_keys:
+        if isinstance(_cv, (int, float)):
+            _child_sum += float(_cv)
+        else:
+            _all_numeric = False
+    if _all_numeric:
+        _measured_children_ms = round(_child_sum, 3)
+
+    # ── Residual ──
+    _residual_ms: Any = _ABS
+    if isinstance(_total_ms, (int, float)) and _all_numeric:
+        _residual_val = _total_ms - _child_sum
+        _residual_ms = round(_residual_val, 3)
+
+    # ── Reconciliation status ──
+    _reconciliation_status: str = "complete"
+    if not isinstance(_total_ms, (int, float)):
+        _reconciliation_status = "incomplete"
+    elif not isinstance(_measured_children_ms, (int, float)):
+        _reconciliation_status = "incomplete"
+    elif isinstance(_residual_ms, (int, float)) and _residual_ms < -0.001:
+        _reconciliation_status = "overlap"
+    for _ck, _cv in _child_keys:
+        if _cv == _INV:
+            _reconciliation_status = "overlap"
+            break
+
+    # ── Extract booleans from transport_meta ──
+    _performed_remote_setter_call: Any = None
+    _used_existing_stable_profile: Any = None
+    _rebuilt_profile_locally: Any = None
+    _ap_decision = _transport_meta.get("active_profile_publish_decision", "")
+    _remote_call_count = _transport_meta.get("active_profile_remote_call", 0)
+    if _ap_decision:
+        _performed_remote_setter_call = bool(_remote_call_count)
+        _used_existing_stable_profile = _ap_decision in ("stable_key_exists", "stable_found", "stable_key_found")
+        _rebuilt_profile_locally = _ap_decision in ("rebuilt", "rebuilt_locally", "rebuilt_profile")
+    _remote_call_performed = bool(_remote_call_count) if _ap_decision else None
+
+    _hit_restore_publish_cache: Any = None
+    _performed_remote_publish: Any = None
+    _rpc_skipped = _transport_meta.get("restore_publish_cache_skipped")
+    if isinstance(_rpc_skipped, bool):
+        _hit_restore_publish_cache = bool(_rpc_skipped)
+        _performed_remote_publish = not bool(_rpc_skipped)
+
+    _has_cache_hit_event = any(e.name == "handle_cache_hit" for e in trace.events)
+    _has_cache_miss_event = any(e.name == "handle_cache_miss" for e in trace.events)
+    if _has_cache_hit_event:
+        _hit_handle_cache = True
+    elif _has_cache_miss_event:
+        _hit_handle_cache = False
+    else:
+        _hit_handle_cache = None
+
+    _payload_bytes = _transport_meta.get("payload_bytes") or _transport_meta.get("modal_payload_serialize_bytes")
+
+    return {
+        # Required fields
+        "request_id": _origin.get("request_id") or trace.request_id,
+        "local_receive_to_worker_start_ms": _local_receive_to_worker_start_ms,
+        "worker_start_to_plan_build_ms": _worker_start_to_plan_build_ms,
+        "worker_queue_ms": _worker_queue_ms,
+        "plan_build_ms": _plan_build_ms,
+        "plan_build_to_execute_plan_entry_ms": _plan_build_to_exec_entry_ms,
+        "execute_plan_entry_to_plan_materialization_ms": _exec_entry_to_plan_mat_ms,
+        "plan_materialization_ms": _plan_materialization_ms,
+        "plan_materialization_to_active_profile_ms": _plan_mat_to_active_profile_ms,
+        "active_profile_ms": _active_profile_ms,
+        "restore_plan_build_ms": _restore_plan_build_ms,
+        "restore_publish_ms": _restore_publish_ms,
+        "restore_publish_to_transport_entry_ms": _restore_pub_to_transport_entry_ms,
+        "transport_entry_to_handle_lookup_ms": _transport_entry_to_handle_lookup_ms,
+        "transport_entry_ms": _transport_entry_ms,
+        "handle_lookup_ms": _handle_lookup_ms,
+        "payload_materialization_ms": _payload_materialization_prep_ms,
+        "payload_size_measurement_ms": _payload_size_measurement_ms,
+        "payload_size_to_serialize_end_ms": _payload_size_to_serialize_end_ms,
+        "payload_ready_to_modal_call_ms": _payload_ready_to_gen_create_ms,
+        "local_receive_to_modal_call_ms": _local_receive_to_modal_call_ms,
+        "generator_create_ms": _generator_create_ms,
+        "generator_created_to_first_iteration_ms": _gen_created_to_first_iter_ms,
+        "local_receive_to_actual_submission_ms": _total_ms,
+        "measured_children_ms": _measured_children_ms,
+        "residual_ms": _residual_ms,
+        "reconciliation_status": _reconciliation_status,
+        "profile_cache_hit": _transport_meta.get("profile_cache_hit"),
+        "profile_remote_call_performed": _transport_meta.get("profile_remote_call_performed"),
+        "restore_publish_cache_hit": _hit_restore_publish_cache,
+        "restore_remote_call_performed": _performed_remote_publish,
+        "handle_cache_hit": _hit_handle_cache,
+        "plan_to_dict_count": plan_to_dict_count,
+        "payload_bytes": _payload_bytes,
+        # Informative metadata (backward compat)
+        "active_profile_publish_decision": _ap_decision,
+        "active_profile_stable_key": _transport_meta.get("active_profile_stable_key", ""),
+        "active_profile_token": _transport_meta.get("active_profile_token", ""),
+        "local_active_profile_prepare_ms": _transport_meta.get("local_active_profile_prepare_ms"),
+        "profile_cache_hit": _transport_meta.get("profile_cache_hit"),
+        "profile_remote_call_performed": _transport_meta.get("profile_remote_call_performed"),
+        "active_profile_remote_call": _remote_call_count,
+        "active_profile_remote_ms": _transport_meta.get("active_profile_remote_ms"),
+        "performed_remote_setter_call": _performed_remote_setter_call,
+        "used_existing_stable_profile": _used_existing_stable_profile,
+        "rebuilt_profile_locally": _rebuilt_profile_locally,
+        "remote_call_performed": _remote_call_performed,
+        "restore_publish_generation": (
+            _transport_meta.get("restore_publish_result", {}).get("generation")
+            if isinstance(_transport_meta.get("restore_publish_result"), dict) else None
+        ),
+        "restore_publish_cache_hit": _hit_restore_publish_cache,
+        "restore_remote_call_performed": _performed_remote_publish,
+        "handle_lookup_app_name": _transport_meta.get("handle_lookup_app_name", ""),
+        "handle_lookup_class_name": _transport_meta.get("handle_lookup_class_name", ""),
+        "handle_lookup_gpu": _transport_meta.get("handle_lookup_gpu", ""),
+        "handle_cache_hit": _hit_handle_cache,
+        "payload_bytes": _payload_bytes,
+        "payload_serialized_bytes": _transport_meta.get("modal_payload_serialize_bytes"),
+        "workflow_hash": _transport_meta.get("workflow_hash", ""),
+        "input_image_count": _transport_meta.get("input_image_count", 0),
+        "workflow_node_count": _transport_meta.get("workflow_node_count"),
+        "plan_materialization_count": _transport_meta.get("plan_materialization_count"),
+        "plan_to_dict_count": plan_to_dict_count,
+    }

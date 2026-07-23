@@ -298,6 +298,7 @@ async def prepare_active_next_profile(
     production_options: dict | None = None,
     workspace: dict | None = None,
     setter: object | None = None,
+    checker: object | None = None,
 ) -> dict:
     """Prepare and (if changed) write an active-next warmup profile.
 
@@ -317,6 +318,20 @@ async def prepare_active_next_profile(
         An ``async setter(payload, workspace=None)`` used to persist
         the profile remotely.  When ``None``, the remote write is
         skipped entirely (test mode / dry run).
+    checker : async callable or None
+        An ``async checker(stable_key, workspace=None)`` used as a
+        read-only identity seam to check whether the durable runtime-config
+        volume already carries a profile matching *stable_key*.
+        When the checker returns ``{"matched": True, ...}`` the setter
+        is skipped entirely.  When ``None`` (or errored) the setter is
+        called as usual (fail-open).  Expected signature::
+
+            async def checker(
+                stable_key: str,
+                *,
+                workspace: dict | None = None,
+            ) -> dict:
+                ...
 
     Returns a dict with keys:
         status       : str — one of ``"skipped"``, ``"unchanged"``,
@@ -446,6 +461,34 @@ async def prepare_active_next_profile(
         result["active_profile_publish_decision"] = "skipped_unchanged"
         _emit_publish_log("skipped_unchanged", stable_key_short)
         return result
+
+    # 4c. Cold-safe check via read-only identity seam (volume-backed).
+    #     When the checker confirms the volume already carries a profile
+    #     with this stable key, skip the setter entirely.  The process-
+    #     local cache is populated so subsequent requests in the same
+    #     process hit step 4a without any remote call.
+    if checker is not None:
+        try:
+            _check_result = await checker(stable_key, workspace=workspace)
+            if isinstance(_check_result, dict) and _check_result.get("matched"):
+                _token = _check_result.get("profile_token", "")
+                result["status"] = "unchanged"
+                result["active_profile_dedup_status"] = "unchanged"
+                result["active_profile_publish_decision"] = "skipped_unchanged"
+                result["active_profile_token"] = _token
+                # Advance process-local cache so subsequent requests
+                # skip both checker and setter.
+                _last_stable_profile_cache[cache_key] = {
+                    "ts": time.time(),
+                    "token": _token,
+                    "stable_key_short": stable_key_short,
+                }
+                _emit_publish_log("skipped_unchanged", stable_key_short)
+                return result
+        except Exception:
+            # Fail-open: if the checker itself raises, proceed to the
+            # setter as if no check was performed.
+            pass
 
     # ── 5. Build activation payload (UUIDs created here) ─────────────────
     production_options = production_options or {}

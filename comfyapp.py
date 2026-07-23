@@ -7471,6 +7471,42 @@ def set_active_warmup_profile(payload: dict) -> dict:
     return _write_active_warmup_profile_payload(payload, runtime_config_vol)
 
 
+@app.function(
+    image=_add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ),
+    cpu=1,
+    memory=256,
+    timeout=15,
+    volumes={RUNTIME_CONFIG_PATH: runtime_config_vol},
+)
+def check_active_warmup_profile(stable_key: str) -> dict:
+    """Read-only identity seam: check if a profile matching *stable_key*
+    already exists on the runtime-config volume.
+
+    CPU-only, no GPU cost, no side effects (no Volume commit).
+    Returns ``{"matched": True, "profile_token": str, "stable_restore_key": str}``
+    when the volume carries a matching profile, or ``{"matched": False}``
+    when no file exists or the key differs.  Never raises (catches and
+    returns ``{"matched": False, "error": str}`` on unexpected failures).
+    """
+    try:
+        if os.path.isfile(ACTIVE_NEXT_PROFILE_PATH):
+            with open(ACTIVE_NEXT_PROFILE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                existing_key = data.get("stable_restore_key", "")
+                if existing_key and existing_key == stable_key:
+                    return {
+                        "matched": True,
+                        "profile_token": data.get("profile_token", ""),
+                        "stable_restore_key": existing_key,
+                    }
+        return {"matched": False}
+    except Exception as exc:
+        return {"matched": False, "error": str(exc)}
+
+
 def validate_active_warmup_profile_payload(payload: dict) -> None:
     if not isinstance(payload, dict):
         raise RuntimeError(

@@ -593,5 +593,196 @@ class WarmupProfileDedupResultFieldsTests(unittest.TestCase):
             self.assertIsInstance(result["local_active_profile_prepare_ms"], (int, float))
 
 
+# ── 9. Cold-safe identity seam tests ────────────────────────────────────
+
+
+class _MatchingChecker:
+    """Checker that confirms the stable key exists on the volume."""
+
+    def __init__(self):
+        self.invoke_count = 0
+
+    async def __call__(self, stable_key: str, *, workspace: dict | None = None) -> dict:
+        self.invoke_count += 1
+        return {"matched": True, "profile_token": "vol-token-abc123"}
+
+
+class _NonMatchingChecker:
+    """Checker that returns no match — caller should fall through to setter."""
+
+    def __init__(self):
+        self.invoke_count = 0
+
+    async def __call__(self, stable_key: str, *, workspace: dict | None = None) -> dict:
+        self.invoke_count += 1
+        return {"matched": False}
+
+
+class _FailingChecker:
+    """Checker that raises — caller must fail-open to setter."""
+
+    def __init__(self):
+        self.invoke_count = 0
+
+    async def __call__(self, stable_key: str, *, workspace: dict | None = None) -> dict:
+        self.invoke_count += 1
+        raise RuntimeError("checker simulated failure")
+
+
+class TestColdSafeIdentitySeam(unittest.TestCase):
+    """Cold-safe identity via read-only volume-backed checker.
+
+    Proves:
+    1. Matching checker → setter skipped, process-local cache populated.
+    2. Non-matching checker → setter called (fall-through).
+    3. Failing checker → setter still called (fail-open).
+    4. After checker match, second call hits process-local cache (no checker,
+       no setter).
+    """
+
+    def setUp(self):
+        import warmup_profile
+        warmup_profile._last_stable_profile_cache.clear()
+        warmup_profile._last_cache_app_identity = ""
+        warmup_profile._last_cache_ws_id = ""
+
+    def tearDown(self):
+        import warmup_profile
+        warmup_profile._last_stable_profile_cache.clear()
+        warmup_profile._last_cache_app_identity = ""
+        warmup_profile._last_cache_ws_id = ""
+
+    async def _do_prepare(self, setter=None, checker=None,
+                          prompt_text="a cat", workspace=None,
+                          workflow=None) -> dict:
+        from warmup_profile import prepare_active_next_profile as _prepare
+        import hashlib
+        import json
+        wf = workflow if workflow is not None else _make_workflow(prompt_text)
+        ws = workspace or _make_workspace()
+        return await _prepare(
+            wf,
+            hashlib.sha256(json.dumps(wf, sort_keys=True).encode()).hexdigest(),
+            workspace=ws,
+            setter=setter,
+            checker=checker,
+        )
+
+    # ── Test 1: Matching checker skips setter ────────────────────────────
+
+    def test_matching_checker_skips_setter(self):
+        """When checker returns matched=True, setter must NOT be called."""
+        checker = _MatchingChecker()
+        setter = _make_async_setter()
+
+        result = asyncio.run(self._do_prepare(setter=setter, checker=checker))
+
+        self.assertEqual(result["status"], "unchanged",
+                         "Matching checker must return unchanged")
+        self.assertEqual(result["active_profile_dedup_status"], "unchanged")
+        self.assertEqual(result["active_profile_remote_call"], 0,
+                         "Matching checker must NOT call setter")
+        self.assertEqual(setter.call_count, 0,
+                         "Setter must not be called with matching checker")
+        self.assertEqual(result["active_profile_token"], "vol-token-abc123",
+                         "Token from checker must be returned")
+        self.assertEqual(checker.invoke_count, 1,
+                         "Checker must have been called exactly once")
+
+    # ── Test 2: Non-matching checker falls through to setter ─────────────
+
+    def test_non_matching_checker_falls_through_to_setter(self):
+        """When checker returns matched=False, setter must be called."""
+        checker = _NonMatchingChecker()
+        setter = _make_async_setter()
+
+        result = asyncio.run(self._do_prepare(setter=setter, checker=checker))
+
+        self.assertEqual(result["status"], "written",
+                         "Non-matching checker must fall through to setter")
+        self.assertEqual(result["active_profile_remote_call"], 1,
+                         "Setter must be called when checker does not match")
+        self.assertEqual(setter.call_count, 1,
+                         "Setter must be called once")
+        self.assertEqual(checker.invoke_count, 1,
+                         "Checker must have been called exactly once")
+
+    # ── Test 3: Failing checker is fail-open ─────────────────────────────
+
+    def test_failing_checker_is_fail_open(self):
+        """When checker raises, setter must still be called."""
+        checker = _FailingChecker()
+        setter = _make_async_setter()
+
+        result = asyncio.run(self._do_prepare(setter=setter, checker=checker))
+
+        self.assertEqual(result["status"], "written",
+                         "Failing checker must fail-open to setter")
+        self.assertEqual(result["active_profile_remote_call"], 1,
+                         "Setter must be called after checker failure")
+        self.assertEqual(setter.call_count, 1,
+                         "Setter must be called once after checker failure")
+        self.assertEqual(checker.invoke_count, 1,
+                         "Checker must have been tried once")
+
+    # ── Test 4: After checker match, 2nd call hits process-local cache ───
+
+    def test_checker_match_populates_local_cache(self):
+        """After a matching checker populates the process-local cache,
+        a second identical request must skip both checker and setter."""
+        checker = _MatchingChecker()
+        setter = _make_async_setter()
+
+        # First call: checker matched, setter skipped, cache populated
+        r1 = asyncio.run(self._do_prepare(setter=setter, checker=checker))
+        self.assertEqual(r1["status"], "unchanged")
+        self.assertEqual(setter.call_count, 0)
+        self.assertEqual(checker.invoke_count, 1)
+
+        # Second call (same stack, same workspace): cache hit
+        r2 = asyncio.run(self._do_prepare(setter=setter, checker=checker))
+        self.assertEqual(r2["status"], "unchanged")
+        self.assertEqual(r2["active_profile_remote_call"], 0,
+                         "Second call must reuse cache, not call setter")
+        self.assertEqual(setter.call_count, 0,
+                         "Setter must never be called (all via checker)")
+        # Checker should not be called again either (cache hit)
+        self.assertEqual(checker.invoke_count, 1,
+                         "Checker must not be called on cache hit")
+
+    # ── Test 5: Changed identity triggers setter even with checker ───────
+
+    def test_changed_identity_triggers_setter_with_checker(self):
+        """When stable key changes (different model stack), checker returns
+        no match and setter must publish the new profile."""
+        call_counter: list = []
+        checker = _NonMatchingChecker()
+        setter = _make_async_setter(call_counter=call_counter)
+
+        # Stack A — first call: no cache, checker returns no match → setter
+        wf_a = _make_workflow("hello")
+        r1 = asyncio.run(self._do_prepare(
+            workflow=wf_a, setter=setter, checker=checker,
+        ))
+        self.assertEqual(r1["status"], "written")
+        self.assertEqual(len(call_counter), 1)
+
+        # Stack B — different model stack: checker returns no match → setter
+        wf_b = _make_workflow("world")
+        r2 = asyncio.run(self._do_prepare(
+            workflow=wf_b, setter=setter, checker=checker,
+        ))
+        self.assertEqual(r2["status"], "written")
+        self.assertEqual(len(call_counter), 2,
+                         "Changed identity must invoke setter again")
+
+        # Cache should have 2 entries (one per key)
+        import warmup_profile as wp
+        self.assertEqual(
+            len(wp._last_stable_profile_cache), 2,
+            "Two cache entries expected (one per distinct stable key)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -24,7 +24,12 @@ from .contracts import DeploymentIdentity, ExecutionPlan, RestorePlan, _thaw, st
 from .deployment_spec import build_deployment_identity
 from .restore_plan import RestorePlanPublisher
 from .runtime_bootstrap import BootstrapConfig, RuntimeBootstrap
-from .runtime_executor import ExecutionContext, RuntimeExecutor
+from .runtime_executor import (
+    ExecutionContext,
+    RuntimeExecutor,
+    pre_sampler_instrumentation_scope,
+    set_lock_wait_ms,
+)
 from .runtime_state import CommitCoordinator, ModalMountedStateVolume
 from .model_preload import (
     V2LoaderBridge,
@@ -45,7 +50,7 @@ from .output_delivery import (
     run_strategy_chain,
 )
 from .result_delivery import ConversionFailedError, convert_output_items
-from .trace import RuntimeTrace, merge_runtime_traces
+from .trace import RuntimeTrace, _emit_breakdown_line, merge_runtime_traces
 
 _V2_STAGE_MAP: tuple[tuple[str, str, str], ...] = (
     ("unet_load",      "t4b_unet_load_start",      "t4b_unet_load_end"),
@@ -2331,6 +2336,8 @@ class ModalRuntimeEntrypoint:
                                             "wait_ms": _lane_wait_ms,
                                             "blocking_owner": _blocking_owner,
                                         })
+                                        # Bridge lock wait duration into pre-sampler instrumentation state
+                                        set_lock_wait_ms(_lane_wait_ms)
                                         _lane_acquired[0] = True
                     elif event in ("sampler_start", "sampling_start", "sampler_stage_start", "progress") and "first_sampler_node" in _milestones:
                         if "first_sampler_stage_ns" not in _milestones:
@@ -2370,12 +2377,13 @@ class ModalRuntimeEntrypoint:
                 "total_nodes": len(_node_class_map),
             })
             try:
-                if callable(execute_async):
-                    execute_result = execute_async(**execute_kwargs)
-                    if inspect.isawaitable(execute_result):
-                        await execute_result
-                else:
-                    executor.execute(**execute_kwargs)
+                with pre_sampler_instrumentation_scope():
+                    if callable(execute_async):
+                        execute_result = execute_async(**execute_kwargs)
+                        if inspect.isawaitable(execute_result):
+                            await execute_result
+                    else:
+                        executor.execute(**execute_kwargs)
             finally:
                 try:
                     # Restore original add_message
@@ -2966,6 +2974,13 @@ class ModalRuntimeEntrypoint:
         if isinstance(_safe_payload, dict):
             _request_origin_info = dict(_safe_payload.pop("__request_origin_info__", {}) or {})
         _t4_request_id = str(_request_origin_info.get("request_id", request_id or ""))
+
+        # â”€â”€ Re-emit local submission breakdown from client â”€â”€â”€â”€â”€â”€
+        _local_submission_breakdown = _request_origin_info.pop("local_submission_breakdown", None)
+        if isinstance(_local_submission_breakdown, dict):
+            _emit_breakdown_line(
+                "[v2.local_submission_breakdown.remote]", _local_submission_breakdown,
+            )
 
         plan = ExecutionPlan.from_dict(_safe_payload if isinstance(_safe_payload, dict) else plan_payload)
         _deserialize_end_ns = time.monotonic_ns()

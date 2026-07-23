@@ -1361,11 +1361,13 @@ class LocalRemoteInvoker:
             # Collect input images for canonical executor
             _canonical_input_images = flat if flat else None
 
-            # Profile setter for the canonical executor (matches direct_studio_run_completion pattern)
+            # Profile setter/checker for the canonical executor (matches direct_studio_run_completion pattern)
             try:
                 from modal_client import set_active_warmup_profile as _canonical_profile_setter
+                from modal_client import check_active_warmup_profile as _canonical_profile_checker
             except ImportError:
                 _canonical_profile_setter = None
+                _canonical_profile_checker = None
 
             # ── Create RunTrace for this cell ──────────────────────────────
             # Use a stable trace_id from _mutable_trace when present.
@@ -1403,6 +1405,7 @@ class LocalRemoteInvoker:
                 workspace=self._workspace,
                 trace_payload=_mutable_trace,
                 profile_setter=_canonical_profile_setter,
+                profile_checker=_canonical_profile_checker,
                 comfyui_root=_comfyui_root,
                 event_sink=_canonical_event_sink,
                 run_trace=_cell_run_trace,

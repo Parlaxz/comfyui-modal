@@ -2759,6 +2759,7 @@ def _prepare_studio_run_context(
         try:
             from experiment_runner import _workflow_sha256
             from modal_client import set_active_warmup_profile as _remote_setter
+            from modal_client import check_active_warmup_profile as _remote_checker
             _hash = _workflow_sha256(resolved_workflow) if isinstance(resolved_workflow, dict) else ""
             _cell_report = cell.get("production_report")
             _compilation_prod_opts = compilation.get("production_options") or {}
@@ -2790,6 +2791,7 @@ def _prepare_studio_run_context(
                 production_options=_active_prod_opts,
                 workspace=_ws_captured,
                 setter=_remote_setter,
+                checker=_remote_checker,
             )
             return result
         except Exception:
@@ -2903,9 +2905,10 @@ async def direct_studio_run_completion(
             "studio_route_received": cell.get("trace", {}).get("studio_route_received", _time.time()),
         })
 
-        # Profile setter for execute_modal_prompt (the canonical executor
+        # Profile setter/checker for execute_modal_prompt (the canonical executor
         # handles production options enrichment internally)
         from modal_client import set_active_warmup_profile as _ws_setter
+        from modal_client import check_active_warmup_profile as _ws_checker
 
         result = await execute_modal_prompt(
             workflow,
@@ -2919,6 +2922,7 @@ async def direct_studio_run_completion(
             workspace=workspace,
             trace_payload=_trace_payload,
             profile_setter=_ws_setter,
+            profile_checker=_ws_checker,
             run_trace=_run_trace,
         )
 

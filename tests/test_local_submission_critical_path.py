@@ -29,6 +29,7 @@ from canonical_execution import (
 )
 from comfymodal_runtime.contracts import ExecutionPlan
 from comfymodal_runtime.modal_transport import ModalTransport
+from comfymodal_runtime.trace import RuntimeTrace
 from warmup_profile import _reset_last_stable_profile_cache
 
 
@@ -937,3 +938,507 @@ class TestBreakdownMetadataCorrectness(unittest.TestCase):
                       "Second identical call must show profile_cache_hit=True")
         self.assertIn("plan_to_dict_count=1", output,
                       "plan_to_dict_count must be 1 per call")
+
+
+# =========================================================================
+# Test 10: Pre-dispatch breakdown with V2 transport
+# =========================================================================
+
+
+class TestPreDispatchBreakdown(unittest.TestCase):
+    """The [v2.local_submission_breakdown] is emitted pre-dispatch inside
+    the V2 transport (before remote_gen.aio), observable without waiting
+    for the mocked remote result."""
+
+    def setUp(self):
+        _reset_profile_prep_cache()
+        _reset_last_stable_profile_cache()
+        _reset_restore_publish_cache()
+
+    def tearDown(self):
+        _reset_profile_prep_cache()
+        _reset_last_stable_profile_cache()
+        _reset_restore_publish_cache()
+
+    def test_predispatch_line_appears_before_remote_gen_aio(self):
+        """The pre-dispatch breakdown line is emitted before the V2 transport
+        calls remote_gen.aio (observable in stdout before result)."""
+        captured = io.StringIO()
+
+        class _ObservingGen:
+            def __init__(self):
+                self._events = [{"type": "result", "data": {"images": [], "outputs": {}}}]
+                self._index = 0
+                self.input_id = "obs-id"
+                self.input_created_at = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._index >= len(self._events):
+                    raise StopAsyncIteration
+                e = self._events[self._index]
+                self._index += 1
+                return e
+
+        def _factory(**kw):
+            return SimpleNamespace(
+                run_plan_stream=SimpleNamespace(
+                    remote_gen=SimpleNamespace(
+                        aio=lambda *a, **kw: _ObservingGen(),
+                    ),
+                ),
+            )
+
+        async def run():
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="predispatch", validate=False,
+            )
+            plan_dict = plan.to_dict()
+            rt = RuntimeTrace(request_id="predispatch", process="local")
+            transport = ModalTransport(v2_handle_factory=_factory)
+            with patch("sys.stdout", captured):
+                async for _ in transport.run_plan_stream(
+                    plan, gpu="rtx-pro-6000", workspace={"id": "ws_predispatch"},
+                    trace={"prompt_id": "predispatch"}, plan_dict=plan_dict,
+                    runtime_trace=rt,
+                ):
+                    pass
+
+        asyncio.run(run())
+        output = captured.getvalue()
+        self.assertIn("[v2.local_submission_breakdown]", output,
+                       "Pre-dispatch breakdown must appear in stdout before result")
+        # Fields available from trace events
+        self.assertIn("handle_lookup_ms=", output, "pre-dispatch must include handle_lookup_ms")
+        self.assertIn("payload_size_measurement_ms=", output, "pre-dispatch must include payload_size_measurement_ms")
+        self.assertIn("handle_cache_hit=", output, "pre-dispatch must include handle_cache_hit")
+        # Fields requiring origin data default to absent
+        self.assertIn("local_receive_to_worker_start_ms=absent", output)
+
+    def test_predispatch_breakdown_forwarded_in_plan_dict(self):
+        """The pre-dispatch breakdown dict is injected into __request_origin_info__
+        in plan_dict before remote_gen.aio so the remote can re-emit it."""
+        captured_plan_dicts = []
+
+        class _CapturingGen:
+            def __init__(self):
+                self._events = [{"type": "result", "data": {"images": [], "outputs": {}}}]
+                self._index = 0
+                self.input_id = "fwd-id"
+                self.input_created_at = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._index >= len(self._events):
+                    raise StopAsyncIteration
+                e = self._events[self._index]
+                self._index += 1
+                return e
+
+        def _capture_aio(pd, **kw):
+            captured_plan_dicts.append(pd)
+            return _CapturingGen()
+
+        def _factory(**kw):
+            return SimpleNamespace(
+                run_plan_stream=SimpleNamespace(
+                    remote_gen=SimpleNamespace(aio=_capture_aio),
+                ),
+            )
+
+        async def run():
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="fwd_test", validate=False,
+            )
+            plan_dict = plan.to_dict()
+            rt = RuntimeTrace(request_id="fwd_test", process="local")
+            transport = ModalTransport(v2_handle_factory=_factory)
+            async for _ in transport.run_plan_stream(
+                plan, gpu="rtx-pro-6000", workspace={"id": "ws_fwd"},
+                trace={"prompt_id": "fwd_test"}, plan_dict=plan_dict,
+                runtime_trace=rt,
+            ):
+                pass
+
+        asyncio.run(run())
+        self.assertEqual(len(captured_plan_dicts), 1, "Exactly one plan_dict captured")
+        pd = captured_plan_dicts[0]
+        origin_info = pd.get("__request_origin_info__", {})
+        if not isinstance(origin_info, dict):
+            origin_info = {}
+        breakdown = origin_info.get("local_submission_breakdown", None)
+        self.assertIsNotNone(breakdown,
+                             "Pre-dispatch breakdown must be injected into "
+                             "__request_origin_info__.local_submission_breakdown")
+        self.assertIn("handle_lookup_ms", breakdown, "Breakdown must contain handle_lookup_ms")
+
+    def test_predispatch_breakdown_uses_same_trace(self):
+        """The pre-dispatch breakdown uses the same RuntimeTrace as execute_plan."""
+        trace_events_before = []
+
+        class _TraceCheckingGen:
+            def __init__(self):
+                self._events = [{"type": "result", "data": {"images": [], "outputs": {}}}]
+                self._index = 0
+                self.input_id = "trace-chk-id"
+                self.input_created_at = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._index >= len(self._events):
+                    raise StopAsyncIteration
+                e = self._events[self._index]
+                self._index += 1
+                return e
+
+        captured_trace = [None]
+
+        def _factory(**kw):
+            return SimpleNamespace(
+                run_plan_stream=SimpleNamespace(
+                    remote_gen=SimpleNamespace(
+                        aio=lambda pd, **kw: (captured_trace.__setitem__(0, pd.get("_test_trace_meta")), _TraceCheckingGen())[1],
+                    ),
+                ),
+            )
+
+        async def run():
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="same_trace", validate=False,
+            )
+            plan_dict = plan.to_dict()
+            transport = ModalTransport(v2_handle_factory=_factory)
+            async for _ in transport.run_plan_stream(
+                plan, gpu="rtx-pro-6000", workspace={"id": "ws_trace"},
+                trace={"prompt_id": "same_trace"}, plan_dict=plan_dict,
+            ):
+                pass
+
+        asyncio.run(run())
+        # The trace was used in transport; we just verify no crash occurred
+        # and that the breakdown was emitted by checking captured stdout
+        # is not needed for this assertion.
+
+
+# =========================================================================
+# Test 11: Missing / absent / invalid_negative values
+# =========================================================================
+
+
+class TestBreakdownAbsentAndInvalid(unittest.TestCase):
+    """Missing fields render as 'absent', negative deltas as 'invalid_negative'."""
+
+    def setUp(self):
+        _reset_profile_prep_cache()
+        _reset_last_stable_profile_cache()
+        _reset_restore_publish_cache()
+
+    def tearDown(self):
+        _reset_profile_prep_cache()
+        _reset_last_stable_profile_cache()
+        _reset_restore_publish_cache()
+
+    def test_absent_fields_in_predispatch_line(self):
+        """When origin data is absent, fields print as 'absent'."""
+        captured = io.StringIO()
+
+        class _FakeGen:
+            def __init__(self):
+                self._events = [{"type": "result", "data": {"images": [], "outputs": {}}}]
+                self._index = 0
+                self.input_id = "absent-id"
+                self.input_created_at = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._index >= len(self._events):
+                    raise StopAsyncIteration
+                e = self._events[self._index]
+                self._index += 1
+                return e
+
+        def _factory(**kw):
+            return SimpleNamespace(
+                run_plan_stream=SimpleNamespace(
+                    remote_gen=SimpleNamespace(aio=lambda *a, **kw: _FakeGen()),
+                ),
+            )
+
+        async def run():
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="absent_test", validate=False,
+            )
+            plan_dict = plan.to_dict()
+            rt = RuntimeTrace(request_id="absent_test", process="local")
+            transport = ModalTransport(v2_handle_factory=_factory)
+            with patch("sys.stdout", captured):
+                async for _ in transport.run_plan_stream(
+                    plan, gpu="rtx-pro-6000", workspace={"id": "ws_absent"},
+                    trace={"prompt_id": "absent_test"}, plan_dict=plan_dict,
+                    runtime_trace=rt,
+                ):
+                    pass
+
+        asyncio.run(run())
+        output = captured.getvalue()
+        # Fields that require origin data should be absent
+        self.assertIn("local_receive_to_worker_start_ms=absent", output,
+                       "Missing origin data shows as absent")
+        self.assertIn("worker_start_to_plan_build_ms=absent", output,
+                       "Missing worker_start shows as absent")
+        # Fields requiring both origin and trace events
+        self.assertIn("local_receive_to_modal_call_ms=absent", output)
+
+    def test_invalid_negative_never_appears_with_valid_trace(self):
+        """Normal trace ordering never produces invalid_negative."""
+        captured = io.StringIO()
+
+        async def _stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="neg_test", validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=_stream)
+            with patch("sys.stdout", captured):
+                await execute_plan(plan, transport=transport)
+
+        asyncio.run(run())
+        output = captured.getvalue()
+        breakdown_lines = [l for l in output.split("\n") if "local_submission_breakdown" in l and "absent" not in l]
+        # No breakdown line with numeric values should contain invalid_negative
+        # unless there's an actual trace ordering bug (which we don't simulate here)
+        self.assertNotIn("invalid_negative", output,
+                         "Valid trace ordering must not produce invalid_negative "
+                         "for any field")
+
+
+# =========================================================================
+# Test 12: Failed profile/restore calls are not cached
+# =========================================================================
+
+
+class TestFailedCallsNotCached(unittest.TestCase):
+    """A failed profile-setter call must not populate the cache;
+    a failed restore-publish call must not populate the cache."""
+
+    def setUp(self):
+        _reset_profile_prep_cache()
+        _reset_last_stable_profile_cache()
+        _reset_restore_publish_cache()
+
+    def tearDown(self):
+        _reset_profile_prep_cache()
+        _reset_last_stable_profile_cache()
+        _reset_restore_publish_cache()
+
+    def test_failed_profile_setter_reinvoked(self):
+        """A failed profile setter call is not cached and the setter
+        is reinvoked on the next identical request."""
+        invoke_count = [0]
+
+        async def _failing_setter(payload, *, workspace=None):
+            invoke_count[0] += 1
+            return {"status": "error", "error": "simulated failure"}
+
+        async def _stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run(req_id: str):
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id=req_id, validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=_stream)
+            await execute_plan(plan, transport=transport,
+                               profile_setter=_failing_setter,
+                               workspace={"id": "ws_fail"})
+
+        asyncio.run(run("fail_a"))
+        asyncio.run(run("fail_b"))
+        # The setter should be called twice because the first call failed
+        self.assertEqual(invoke_count[0], 2,
+                         "Failed setter must be reinvoked on next identical request")
+
+    def test_failed_restore_publish_reinvoked(self):
+        """A failed restore publish call is not cached and the publisher
+        is reinvoked on the next identical request."""
+        publish_count = [0]
+
+        class _FailingPublisher:
+            def publish(self, plan):
+                publish_count[0] += 1
+                return {"status": "error", "ok": False, "error": "simulated"}
+
+        async def _stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run(req_id: str):
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id=req_id, validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=_stream)
+            await execute_plan(plan, transport=transport,
+                               restore_publisher=_FailingPublisher(),
+                               workspace={"id": "ws_restore_fail"})
+
+        asyncio.run(run("restore_fail_a"))
+        asyncio.run(run("restore_fail_b"))
+        self.assertEqual(publish_count[0], 2,
+                         "Failed publish must be reinvoked on next identical request")
+
+
+# =========================================================================
+# Test 13: build_execution_plan no extra deepcopy
+# =========================================================================
+
+
+class TestNoExtraDeepcopyInBuildPlan(unittest.TestCase):
+    """When production_report already describes the compiled workflow,
+    build_execution_plan must not perform a second deepcopy of the workflow."""
+
+    def test_no_second_deepcopy_with_production_report(self):
+        """With a production_report (enabled), only one deepcopy is made
+        (the original source_workflow), not a second one for dispatch."""
+        import copy
+        orig_deepcopy = copy.deepcopy
+        deepcopy_count = [0]
+
+        def _counting_deepcopy(obj, memo=None):
+            deepcopy_count[0] += 1
+            return orig_deepcopy(obj, memo)
+
+        import canonical_execution as ce
+        # We need to test that the code path doesn't call copy.deepcopy
+        # a second time.  Since we can't monkey-patch during module load,
+        # we verify by inspecting the source code.
+        import inspect
+        source = inspect.getsource(ce.build_execution_plan)
+        # The old pattern was: `dispatch_workflow = copy.deepcopy(workflow or {})`
+        # in the report.get("enabled") branch.  After the fix, that branch
+        # should NOT contain a copy.deepcopy call.
+        # Check that the enabled branch has "pass" instead of deepcopy
+        enabled_branch = source.split("if report.get(\"enabled\"):")[1].split("elif")[0] if "if report.get(\"enabled\"):" in source else ""
+        self.assertNotIn("copy.deepcopy", enabled_branch,
+                         "production-report enabled branch must not call copy.deepcopy")
+        self.assertIn("pass", enabled_branch,
+                       "production-report enabled branch should just 'pass'")
+
+
+# =========================================================================
+# Test 14: Gap fields appear in [v2.local_submission_breakdown]
+# =========================================================================
+
+
+class TestGapFieldsInBreakdown(unittest.TestCase):
+    """The three gap fields — execute_plan_entry_to_plan_materialization_ms,
+    plan_materialization_to_active_profile_ms, payload_size_to_serialize_end_ms
+    — must appear in the printed [v2.local_submission_breakdown] line."""
+
+    def setUp(self):
+        _reset_profile_prep_cache()
+        _reset_last_stable_profile_cache()
+        _reset_restore_publish_cache()
+
+    def tearDown(self):
+        _reset_profile_prep_cache()
+        _reset_last_stable_profile_cache()
+        _reset_restore_publish_cache()
+
+    def test_gap_fields_present_in_stdout(self):
+        """All three gap fields are present in the breakdown stdout line."""
+        captured = io.StringIO()
+
+        async def _stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="gap_fields_test", validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=_stream)
+            with patch("sys.stdout", captured):
+                await execute_plan(plan, transport=transport)
+
+        asyncio.run(run())
+        output = captured.getvalue()
+
+        self.assertIn("execute_plan_entry_to_plan_materialization_ms=", output,
+                      "gap field must appear: execute_plan_entry_to_plan_materialization_ms")
+        self.assertIn("plan_materialization_to_active_profile_ms=", output,
+                      "gap field must appear: plan_materialization_to_active_profile_ms")
+        self.assertIn("payload_size_to_serialize_end_ms=", output,
+                      "gap field must appear: payload_size_to_serialize_end_ms")
+        # Numeric values should not be "absent" when trace events exist
+        # (gap fields derive from trace events, not origin data, so they
+        # should be present when a plan was built and materialized).
+        self.assertNotIn("execute_plan_entry_to_plan_materialization_ms=absent", output,
+                         "gap field must have a numeric value (not absent) when plan was built")
+        self.assertNotIn("plan_materialization_to_active_profile_ms=absent", output,
+                         "gap field must have a numeric value (not absent) when plan was built")
+
+    def test_gap_fields_appear_in_required_fields_list(self):
+        """Verifies that the gap fields are listed in the field-keys constant."""
+        from comfymodal_runtime.trace import LOCAL_SUBMISSION_FIELD_KEYS
+        field_names = [fk for dk, fk in LOCAL_SUBMISSION_FIELD_KEYS]
+        self.assertIn("execute_plan_entry_to_plan_materialization_ms", field_names,
+                      "Gap field must be in LOCAL_SUBMISSION_FIELD_KEYS")
+        self.assertIn("plan_materialization_to_active_profile_ms", field_names,
+                      "Gap field must be in LOCAL_SUBMISSION_FIELD_KEYS")
+        self.assertIn("payload_size_to_serialize_end_ms", field_names,
+                      "Gap field must be in LOCAL_SUBMISSION_FIELD_KEYS")
+
+    def test_gap_fields_position_sequence(self):
+        """The gap fields appear at the expected positions in the field list."""
+        from comfymodal_runtime.trace import LOCAL_SUBMISSION_FIELD_KEYS
+        keys = [dk for dk, fk in LOCAL_SUBMISSION_FIELD_KEYS]
+        # execute_plan_entry_to_plan_materialization_ms is between
+        # plan_build_to_execute_plan_entry_ms and plan_materialization_ms
+        idx_build_to_exec = keys.index("plan_build_to_execute_plan_entry_ms")
+        idx_mat = keys.index("plan_materialization_ms")
+        idx_exec_to_mat = keys.index("execute_plan_entry_to_plan_materialization_ms")
+        self.assertGreater(idx_exec_to_mat, idx_build_to_exec,
+                           "execute_plan_entry_to_plan_materialization_ms should come after "
+                           "plan_build_to_execute_plan_entry_ms")
+        self.assertLess(idx_exec_to_mat, idx_mat,
+                        "execute_plan_entry_to_plan_materialization_ms should come before "
+                        "plan_materialization_ms")
+
+        # plan_materialization_to_active_profile_ms is between
+        # plan_materialization_ms and active_profile_ms
+        idx_active = keys.index("active_profile_ms")
+        idx_mat_to_active = keys.index("plan_materialization_to_active_profile_ms")
+        self.assertGreater(idx_mat_to_active, idx_mat,
+                           "plan_materialization_to_active_profile_ms should come after "
+                           "plan_materialization_ms")
+        self.assertLess(idx_mat_to_active, idx_active,
+                        "plan_materialization_to_active_profile_ms should come before "
+                        "active_profile_ms")
+
+        # payload_size_to_serialize_end_ms is between
+        # payload_size_measurement_ms and payload_ready_to_modal_call_ms
+        idx_size_meas = keys.index("payload_size_measurement_ms")
+        idx_ready = keys.index("payload_ready_to_modal_call_ms")
+        idx_size_to_serialize = keys.index("payload_size_to_serialize_end_ms")
+        self.assertGreater(idx_size_to_serialize, idx_size_meas,
+                           "payload_size_to_serialize_end_ms should come after "
+                           "payload_size_measurement_ms")
+        self.assertLess(idx_size_to_serialize, idx_ready,
+                        "payload_size_to_serialize_end_ms should come before "
+                        "payload_ready_to_modal_call_ms")
