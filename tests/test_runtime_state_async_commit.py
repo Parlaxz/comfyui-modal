@@ -487,5 +487,105 @@ class TestStateSerialization(unittest.TestCase):
         self.assertEqual(parsed["_committed_generation"], 1)
 
 
+
+# ── Test: no blocking synchronous Modal commit in async pipeline ─────
+
+
+class TestNoBlockingModalCommitInAsyncPath(unittest.IsolatedAsyncioTestCase):
+    """Verifies that the full async commit pipeline never calls a
+    synchronous Modal volume.commit() without .aio() or to_thread."""
+
+    async def test_modal_mounted_volume_async_commit_uses_aio(self):
+        """ModalMountedStateVolume.commit_async() uses .aio() when available,
+        never calls the synchronous commit path."""
+        fake = _AioFakeModal()
+        import tempfile, shutil
+        tmpdir = tempfile.mkdtemp()
+        try:
+            vol = ModalMountedStateVolume(tmpdir, fake)
+            await vol.commit_async()
+            # aio path called exactly once
+            self.assertEqual(fake.aio_call_count, 1,
+                             ".aio() must be called exactly once")
+            # sync path NOT called
+            self.assertEqual(fake.sync_call_count, 0,
+                             "sync commit must NOT be called in async path")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_coordinator_async_commit_uses_volume_async(self):
+        """CommitCoordinator.commit_async() delegates to volume.commit_async(),
+        NOT to volume.commit() directly."""
+        class _TrackingVolume:
+            """Volume that tracks which commit method is called."""
+            def __init__(self):
+                self._files = {}
+                self.sync_commit_calls = 0
+                self.async_commit_calls = 0
+            def write_bytes(self, path, data):
+                self._files[path] = data
+            def read_bytes(self, path):
+                return self._files.get(path, b"")
+            def exists(self, path):
+                return path in self._files
+            def remove(self, path):
+                self._files.pop(path, None)
+            def commit(self):
+                self.sync_commit_calls += 1
+            async def commit_async(self):
+                self.async_commit_calls += 1
+
+        vol = _TrackingVolume()
+        coord = CommitCoordinator(vol)
+        coord.write_state(1, {"key": "val"})
+        result = await coord.commit_async(1)
+        self.assertTrue(result)
+        self.assertEqual(vol.async_commit_calls, 1,
+                         "volume.commit_async() must be called exactly once")
+        self.assertEqual(vol.sync_commit_calls, 0,
+                         "volume.commit() must NOT be called in async path")
+
+    async def test_full_async_write_and_commit_pipeline(self):
+        """A complete write → commit_async pipeline works correctly."""
+        class _AsyncAwareVolume:
+            """Volume that supports both sync and async commit."""
+            def __init__(self):
+                self._files = {}
+                self.sync_commit_count = 0
+                self.async_commit_count = 0
+                self.write_count = 0
+                self.read_count = 0
+            def write_bytes(self, path, data):
+                self._files[path] = data
+                self.write_count += 1
+            def read_bytes(self, path):
+                self.read_count += 1
+                return self._files.get(path, b"")
+            def exists(self, path):
+                return path in self._files
+            def remove(self, path):
+                self._files.pop(path, None)
+            def commit(self):
+                self.sync_commit_count += 1
+            async def commit_async(self):
+                self.async_commit_count += 1
+
+        vol = _AsyncAwareVolume()
+        coord = CommitCoordinator(vol)
+        coord.write_state(1, {"data": "hello"})
+        coord.write_state(2, {"data": "world"})
+        result = await coord.commit_async(2)
+        self.assertTrue(result)
+        self.assertEqual(vol.write_count, 2)
+        self.assertEqual(vol.async_commit_count, 1)
+        self.assertEqual(vol.sync_commit_count, 0)
+        self.assertEqual(coord.committed_generation, 2)
+        # Verify persisted data
+        state = coord.read_state()
+        self.assertIsNotNone(state)
+        if state is not None:
+            self.assertEqual(state.get("data"), "world")
+
+
 if __name__ == "__main__":
     unittest.main()

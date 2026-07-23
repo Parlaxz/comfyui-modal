@@ -3937,13 +3937,14 @@ def _run_dependency_validation_with_cache(
     Returns a dict with all standard validation fields PLUS cache/timing metadata:
 
     Cache flow:
-    0. Ultra-fast pre-key memory check using cheap volume state (avoids fingerprint scan)
-    1. Build cheap dependency fingerprint
-    2. Compute deterministic cache key
-    3. Check per-container full-key memory cache
-    4. Check deployment sentinel on volume
-    5. Only if both miss, run full validation
-    6. On success, write caches + deployment sentinel
+    0. Persistent manifest identity check (avoids all fingerprint/validation on exact match)
+    1. Ultra-fast pre-key memory check using cheap volume state (avoids fingerprint scan)
+    2. Build cheap dependency fingerprint
+    3. Compute deterministic cache key
+    4. Check per-container full-key memory cache
+    5. Check deployment sentinel on volume
+    6. Only if both miss, run full validation
+    7. On success, write caches + deployment sentinel
 
     Returns a dict with keys:
     - All keys from validate_custom_node_dependencies_prepared()
@@ -3996,7 +3997,59 @@ def _run_dependency_validation_with_cache(
         "dependency_sentinel_lookup_ms": 0.0,
         "dependency_full_validation_ms": 0.0,
         "dependency_sentinel_write_ms": 0.0,
+        "dependency_persistent_manifest_ms": 0.0,
     }
+
+    # GÃ¶Ã‡GÃ¶Ã‡ Step 0: Persistent manifest identity check GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
+    # Loads the tiny JSON manifest from the runtime-config volume and compares
+    # its identity (deployment combined hash, custom-node fingerprint hash,
+    # custom-node generation, repair mode, schema version) against current
+    # values.  Exact match skips ALL fingerprint/validation — target <50ms.
+    # This is the outermost cache layer, checked before any baked manifest
+    # load, fingerprint scan, or sentinel lookup.
+    if repair_mode is None:
+        _pm_mode = REQUIREMENTS_REPAIR_MODE.strip().lower()
+        if _pm_mode not in ("off", "fail_fast", "dev"):
+            _pm_mode = "fail_fast"
+    else:
+        _pm_mode = repair_mode
+    if _pm_mode in ("off", "fail_fast"):
+        _pm_t0 = time.time()
+        _pm_manifest = _load_dependency_manifest()
+        if _pm_manifest is not None:
+            _pm_baked = baked if baked is not None else load_baked_custom_node_dependency_manifest()
+            _pm_combined = _resolve_deployment_combined_hash()
+            _pm_cn_fp = _pm_baked if _pm_baked else None
+            _pm_cn_gen = (_read_custom_nodes_generation_record() or {}).get("generation", "")
+            _pm_check = _check_dependency_manifest_identity(
+                _pm_manifest, _pm_combined, _pm_cn_fp, _pm_cn_gen, _pm_mode,
+            )
+            if _pm_check.get("identity_match"):
+                # Exact match: skip everything, return prepared=True immediately
+                _pm_ms = round((time.time() - _pm_t0) * 1000, 2)
+                result["dependency_persistent_manifest_ms"] = _pm_ms
+                result["dependency_validation_cache_layer"] = "persistent_manifest"
+                result["dependency_validation_cache_hit"] = True
+                result["dependency_validation_start_unix_s"] = _t_total
+                result["dependency_validation_end_unix_s"] = time.time()
+                result["dependency_total_ms"] = _pm_ms
+                result["dependency_validation_ms"] = _pm_ms
+                result["dependency_validation_result"] = "manifest_identity_match"
+                result["dependency_validation_reason"] = "manifest_identity_match"
+                val = {
+                    "prepared": True,
+                    "reason": "manifest_identity_match",
+                    "baked_hash": _pm_baked.get("overall_dependency_hash", "") if _pm_baked else "",
+                    "current_hash": _pm_baked.get("overall_dependency_hash", "") if _pm_baked else "",
+                    "changed_nodes": [],
+                }
+                result.update(val)
+                print(
+                    f"[comfyapp] dep_validation_cache: persistent manifest identity match "
+                    f"total_ms={_pm_ms}",
+                    flush=True,
+                )
+                return result
 
     # GÃ¶Ã‡GÃ¶Ã‡ Step 1: Load baked manifest first (needed for pre-key check) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
     if baked is None:
@@ -8818,27 +8871,103 @@ class _ComfyAPIMixin:
 
         # 4. Production modes: never pip install
         if mode in ("off", "fail_fast"):
-            dep_check = _run_dependency_validation_with_cache(repair_mode=mode)
-            dep_prepared = dep_check.get("prepared", False)
-            dep_reason = dep_check.get("dependency_validation_reason", dep_check.get("reason", ""))
-            if not dep_prepared:
-                baked_hash = dep_check.get("baked_hash", "?") or "?"
-                current_hash = dep_check.get("current_hash", "?") or "?"
-                changed_nodes = dep_check.get("changed_nodes", [])
-                error_msg = (
-                    "Custom node dependencies are not prepared for this image. "
-                    f"Runtime pip install is disabled in {mode} mode. "
-                    "Rebuild/deploy the Modal image after syncing "
-                    "custom-node requirements. "
-                    f"reason={dep_reason} "
-                    f"baked_hash={baked_hash} "
-                    f"current_hash={current_hash} "
-                    f"changed_nodes={changed_nodes}"
+            # 4a. Persistent-manifest fast path (cheap identity check)
+            #     Avoids expensive fingerprint/traversal on exact match.
+            _dep_t0 = time.time()
+            _combined_hash_pre = _resolve_deployment_combined_hash()
+            _baked_mft_pre = load_baked_custom_node_dependency_manifest()
+            _cn_fp_pre = _baked_mft_pre if _baked_mft_pre else None
+            _cn_gen_rec_pre = _read_custom_nodes_generation_record()
+            _cn_gen_pre = _cn_gen_rec_pre.get("generation", "") if _cn_gen_rec_pre else ""
+            _manifest_snapshot = _load_dependency_manifest()
+            _manifest_load_ms = round((time.time() - _dep_t0) * 1000, 2)
+            _chk_t0 = time.time()
+            _identity_check = _check_dependency_manifest_identity(
+                _manifest_snapshot,
+                _combined_hash_pre,
+                _cn_fp_pre,
+                _cn_gen_pre,
+                mode,
+            )
+            _cheap_check_ms = round((time.time() - _chk_t0) * 1000, 2)
+
+            if _identity_check.get("identity_match"):
+                # Fast path: exact identity match skips fingerprint/validation
+                dep_prepared = True
+                dep_reason = "manifest_identity_match"
+                dep_check = {"prepared": True, "reason": "manifest_identity_match"}
+                _v2_total = round((time.time() - _dep_t0) * 1000, 2)
+                _emit_dependency_validation_v2(
+                    source="persistent_manifest",
+                    identity_match=True,
+                    manifest_load_ms=_manifest_load_ms,
+                    cheap_check_ms=_cheap_check_ms,
+                    fingerprint_ms=0.0,
+                    full_validation_ms=0.0,
+                    total_ms=_v2_total,
+                    refresh_performed=False,
+                    reason="manifest_identity_match",
                 )
-                if stream:
-                    raise RuntimeError(error_msg)
-                else:
-                    raise RuntimeError(error_msg)
+            else:
+                # 4b. Manifest miss: run full existing validation
+                dep_check = _run_dependency_validation_with_cache(repair_mode=mode)
+                dep_prepared = dep_check.get("prepared", False)
+                dep_reason = dep_check.get("dependency_validation_reason", dep_check.get("reason", ""))
+                _fingerprint_ms = dep_check.get("dependency_fingerprint_ms", 0.0)
+                _full_val_ms = dep_check.get("dependency_full_validation_ms", 0.0)
+                _v2_total = round((time.time() - _dep_t0) * 1000, 2)
+                _refresh_performed = False
+                if dep_prepared and _combined_hash_pre:
+                    _new_mft = _build_and_persist_dependency_manifest(
+                        combined_hash=_combined_hash_pre,
+                        custom_node_fingerprint=_cn_fp_pre,
+                        custom_node_generation=_cn_gen_pre,
+                        repair_mode=mode,
+                        volume=runtime_config_vol,
+                        commit=True,
+                    )
+                    if _new_mft.get("identity"):
+                        _refresh_performed = True
+                    elif mode in ("off", "fail_fast"):
+                        error_msg = (
+                            "Immutable dependency manifest refresh failed: "
+                            "write or commit did not produce a valid identity. "
+                            f"repair_mode={mode}"
+                        )
+                        if stream:
+                            raise RuntimeError(error_msg)
+                        else:
+                            raise RuntimeError(error_msg)
+                _emit_dependency_validation_v2(
+                    source="request_rebuild",
+                    identity_match=False,
+                    manifest_load_ms=_manifest_load_ms,
+                    cheap_check_ms=_cheap_check_ms,
+                    fingerprint_ms=_fingerprint_ms,
+                    full_validation_ms=_full_val_ms,
+                    total_ms=_v2_total,
+                    refresh_performed=_refresh_performed,
+                    reason=_identity_check.get("reason", "manifest_mismatch"),
+                )
+
+                if not dep_prepared:
+                    baked_hash = dep_check.get("baked_hash", "?") or "?"
+                    current_hash = dep_check.get("current_hash", "?") or "?"
+                    changed_nodes = dep_check.get("changed_nodes", [])
+                    error_msg = (
+                        "Custom node dependencies are not prepared for this image. "
+                        f"Runtime pip install is disabled in {mode} mode. "
+                        "Rebuild/deploy the Modal image after syncing "
+                        "custom-node requirements. "
+                        f"reason={dep_reason} "
+                        f"baked_hash={baked_hash} "
+                        f"current_hash={current_hash} "
+                        f"changed_nodes={changed_nodes}"
+                    )
+                    if stream:
+                        raise RuntimeError(error_msg)
+                    else:
+                        raise RuntimeError(error_msg)
 
         # 5. Dev mode: runtime repair is allowed
         if mode == "dev":
@@ -10949,8 +11078,26 @@ class _ComfyAPIMixin:
         })
         rec_idx = len(self._wall_actual_load_per_model) - 1
 
-        def _load_restore_background_unet(k=key, un=eligibility["unet_name"], un_path=eligibility["unet_path"], _rec_idx=rec_idx):
+        # ── Create dedicated RuntimeTrace for background UNET instrumentation ──
+        from comfymodal_runtime.trace import RuntimeTrace as _bg_rtt
+        from comfymodal_runtime.model_preload import (
+            _LATEST_RESTORED_INSTANCE_ID as _bg_inst_id,
+            _LATEST_RESTORE_SESSION_ID as _bg_sess_id,
+        )
+        _bg_unet_trace = _bg_rtt(
+            process="remote_background_unet",
+            trace_id=uuid.uuid4().hex[:16],
+        )
+        _bg_unet_trace.set_metadata(
+            canonical_key=str(key),
+            restored_instance_id=_bg_inst_id,
+            restore_session_id=_bg_sess_id,
+            resolved_path=str(eligibility.get("unet_path", "")),
+        )
+
+        def _load_restore_background_unet(k=key, un=eligibility["unet_name"], un_path=eligibility["unet_path"], _rec_idx=rec_idx, _bg_trace=_bg_unet_trace):
             import threading as _thr_lu
+            from comfymodal_runtime.model_preload import external_model_lane_scope as _bg_lane_scope
             _tid = _thr_lu.current_thread().ident
             self._actual_load_owner_thread[k] = _tid
             _cpu_hits_before = sum(self._cpu_cache_hits.values()) if hasattr(self, "_cpu_cache_hits") else 0
@@ -10967,25 +11114,37 @@ class _ComfyAPIMixin:
             )
             t0 = time.time()
             try:
-                _orig_fn = self._original_loaders.get("UNETLoader.load_unet")
-                if _orig_fn is None:
-                    raise RuntimeError("UNETLoader original loader unavailable")
-                with _model_load_context(owner="restore_background_unet", loader_type="UNET", actual_key=k, canonical_path=un_path, record_id=str(_rec_idx)):
-                    obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["UNETLoader"](), unet_name=un, weight_dtype="default")
-                # P1 (corrected): signal the explicit
-                # "restore-background UNET load complete" event
-                # so the deferred VAE worker can start its
-                # physical read while this thread proceeds to
-                # the remaining bookkeeping. The event is keyed
-                # by the same key the VAE worker looks up.
-                try:
-                    _ev = getattr(self, "_rbg_unet_done_events", None)
-                    if _ev is not None:
-                        _ev.setdefault(k, _thr_lu.Event()).set()
-                except Exception:
-                    pass
-                if obj and obj[0] is not None:
-                    self._unet_object_cache[k] = obj[0]
+                # ── Lane-scoped loader call with attribution ────────────
+                with _bg_lane_scope(_bg_trace, lane="UNET", phase="restore", expected_read_count=1) as _bg_lane:
+                    _orig_fn = self._original_loaders.get("UNETLoader.load_unet")
+                    if _orig_fn is None:
+                        raise RuntimeError("UNETLoader original loader unavailable")
+                    with _model_load_context(owner="restore_background_unet", loader_type="UNET", actual_key=k, canonical_path=un_path, record_id=str(_rec_idx)):
+                        obj = _orig_fn(_al_nodes.NODE_CLASS_MAPPINGS["UNETLoader"](), unet_name=un, weight_dtype="default")
+                    # P1 (corrected): signal the explicit
+                    # "restore-background UNET load complete" event
+                    # so the deferred VAE worker can start its
+                    # physical read while this thread proceeds to
+                    # the remaining bookkeeping. The event is keyed
+                    # by the same key the VAE worker looks up.
+                    try:
+                        _ev = getattr(self, "_rbg_unet_done_events", None)
+                        if _ev is not None:
+                            _ev.setdefault(k, _thr_lu.Event()).set()
+                    except Exception:
+                        pass
+                    if obj and obj[0] is not None:
+                        self._unet_object_cache[k] = obj[0]
+                        # ── Lane cache publication (before scope exit/ready()) ──
+                        _bg_lane.cache_publish_start(canonical_key=str(k)[-32:])
+                        _bg_lane.cache_object_store(canonical_key=str(k)[-32:],
+                                                    object_type="ModelPatcher",
+                                                    object_id=str(id(obj[0]))[-16:])
+                        _bg_lane.cache_metadata_store(canonical_key=str(k)[-32:],
+                                                      metadata_status="completed")
+                        _bg_lane.done_event_set(canonical_key=str(k)[-32:])
+                        _bg_lane.cache_publish_end(canonical_key=str(k)[-32:])
+                # ── Bookkeeping after lane scope (scope exit calls ready()) ──
                 d_ms = round((time.time() - t0) * 1000, 1)
                 _cpu_hits_after = sum(self._cpu_cache_hits.values()) if hasattr(self, "_cpu_cache_hits") else 0
                 _cpu_misses_after = sum(self._cpu_cache_misses.values()) if hasattr(self, "_cpu_cache_misses") else 0

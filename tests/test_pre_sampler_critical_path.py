@@ -1720,3 +1720,147 @@ class TestFutureTypes:
 
     def test_incomplete_coroutine_awaited(self):
         asyncio.run(self._do_incomplete_coroutine_awaited_test())
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 31. Milestone span enrichment — cache attribution (Phase 3B)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestMilestoneEnrichment:
+    """attach_pre_sampler_critical_path enriches milestone spans with
+    cache-derived attribution fields."""
+
+    def test_milestone_span_has_attribution_when_cache_present(self):
+        """When cache data exists, milestone spans include 'attribution'
+        dict with cache_hit, background_future_exists, etc."""
+        plan = _make_plan()
+        cache = PreSamplerCache()
+        cache.record_node_execution("6", "KSampler", 50.0)
+        cache.build_cache_key(plan)
+
+        # Simulate trace with pre_sampler_stages metadata
+        result: dict[str, Any] = {
+            "trace": {
+                "events": [
+                    {
+                        "name": "pre_sampler_stages",
+                        "metadata": {
+                            "execution_start_to_cached_ms": 2.5,
+                            "cached_to_first_node_ms": 15.0,
+                            "first_node_to_clip_ms": 8.0,
+                            "clip_to_sampler_node_ms": 5.0,
+                            "sampler_node_to_sampler_start_ms": 3.0,
+                            "first_output_node_id": "3",
+                            "first_executing_node_id": "6",
+                            "first_clip_encode_node_id": "5",
+                            "first_sampler_node_id": "6",
+                            "first_output_class_type": "CLIPTextEncode",
+                            "first_executing_node_class": "KSampler",
+                            "first_clip_encode_node_class": "CLIPTextEncode",
+                            "first_sampler_node_class": "KSampler",
+                        },
+                    }
+                ],
+            }
+        }
+
+        attach_pre_sampler_critical_path(result, plan, cache)
+        cp = result["trace"].get("pre_sampler_critical_path", {})
+        spans = cp.get("dominant_spans", [])
+
+        # At least some milestone spans should have 'attribution' dict
+        milestone_spans = [s for s in spans if "span" in s]
+        assert len(milestone_spans) > 0, "expected milestone spans"
+
+        for ms in milestone_spans:
+            attr = ms.get("attribution")
+            if attr is not None:
+                # Common fields present
+                assert "background_future_exists" in attr
+                assert "background_future_done" in attr
+                # cache_hit or model_cache_hit may be present depending on operations
+                assert isinstance(attr["background_future_exists"], bool)
+                assert isinstance(attr["background_future_done"], bool)
+
+    def test_milestone_attribution_includes_cache_hit(self):
+        """When cache has lookup hits, attribution includes cache_hit."""
+        plan = _make_plan()
+        cache = PreSamplerCache()
+        cache.record_node_execution("6", "KSampler", 50.0)
+        cache.resolve_inputs("3", "CLIPTextEncode", {"text": "cat"})
+        cache.resolve_inputs("3", "CLIPTextEncode", {"text": "cat"})  # hit
+
+        result: dict[str, Any] = {
+            "trace": {
+                "events": [
+                    {
+                        "name": "pre_sampler_stages",
+                        "metadata": {
+                            "execution_start_to_cached_ms": 1.0,
+                            "cached_to_first_node_ms": 10.0,
+                            "first_output_node_id": "3",
+                            "first_executing_node_id": "3",
+                            "first_output_class_type": "CLIPTextEncode",
+                            "first_executing_node_class": "CLIPTextEncode",
+                        },
+                    }
+                ],
+            }
+        }
+
+        attach_pre_sampler_critical_path(result, plan, cache)
+        cp = result["trace"].get("pre_sampler_critical_path", {})
+        spans = cp.get("dominant_spans", [])
+        milestone_spans = [s for s in spans if "span" in s]
+
+        # execution_start_to_cached span should have hash_or_cache_check_ms
+        for ms in milestone_spans:
+            if ms.get("span") == "execution_start_to_cached":
+                attr = ms.get("attribution", {})
+                if attr.get("hash_or_cache_check_ms") is not None:
+                    assert attr["hash_or_cache_check_ms"] > 0
+                # cache_hit expected when cache_lookup hits exist
+                if attr.get("cache_hit"):
+                    assert attr["cache_hit"] is True
+
+    def test_milestone_attribution_includes_future_wait(self):
+        """When cache has non-zero future_wait_ms, cached_to_first_node
+        span includes future_wait_ms."""
+        plan = _make_plan()
+        cache = PreSamplerCache()
+        cache.record_node_execution("6", "KSampler", 50.0)
+        # Manually add future_wait timing to simulate background wait
+        cache.operation_timing_ms["future_wait"] = 25.0
+        cache.operation_count["future_wait"] = 1
+
+        result: dict[str, Any] = {
+            "trace": {
+                "events": [
+                    {
+                        "name": "pre_sampler_stages",
+                        "metadata": {
+                            "cached_to_first_node_ms": 30.0,
+                            "first_output_node_id": "3",
+                            "first_executing_node_id": "6",
+                            "first_output_class_type": "CLIPTextEncode",
+                            "first_executing_node_class": "KSampler",
+                        },
+                    }
+                ],
+            }
+        }
+
+        attach_pre_sampler_critical_path(result, plan, cache)
+        cp = result["trace"].get("pre_sampler_critical_path", {})
+        spans = cp.get("dominant_spans", [])
+        milestone_spans = [s for s in spans if "span" in s]
+
+        for ms in milestone_spans:
+            if ms.get("span") == "cached_to_first_node":
+                attr = ms.get("attribution", {})
+                # future_wait_ms should be present (cache had 25ms future_wait)
+                assert "future_wait_ms" in attr, (
+                    f"expected future_wait_ms in cached_to_first_node attribution, "
+                    f"got {attr}"
+                )

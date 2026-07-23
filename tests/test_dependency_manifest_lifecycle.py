@@ -1445,3 +1445,576 @@ class TestOneShotSyncBridge:
         assert result is False
         # Exactly one commit attempt
         assert mock_vol.commit.call_count == 1
+
+
+# ── Test: _handle_custom_node_sync_and_dependency_policy fast path ──────
+
+
+def _get_handle_policy_unbound():
+    """Lazy-import the unbound method so test collection doesn't
+    trigger comfyapp import (which requires ComfyUI dependencies)."""
+    import comfyapp as _cm
+    return _cm._ComfyAPIMixin._handle_custom_node_sync_and_dependency_policy
+
+
+class FakeComfyAppForHandlePolicy:
+    """Minimal stand-in for ComfyApp to exercise
+    _handle_custom_node_sync_and_dependency_policy."""
+
+    def __init__(self):
+        self._custom_nodes_state = {}
+
+    @staticmethod
+    def _resolve_requirements_repair_mode():
+        return "fail_fast"
+
+    @staticmethod
+    def _enforce_workflow_node_classes_available_before_model_work(wf):
+        return {"missing_node_check_ran": True, "missing_nodes_before_model_work": []}
+
+    def _sync_custom_nodes_from_volume(self):
+        return {"created": [], "kept": [], "removed": []}, {}
+
+
+class TestHandlePolicyPersistentManifestHit:
+    """_handle_custom_node_sync_and_dependency_policy must use
+    persistent manifest fast path before calling _run_dependency_validation_with_cache."""
+
+    @patch("comfyapp._emit_dependency_validation_v2")
+    @patch("comfyapp._run_dependency_validation_with_cache")
+    @patch("comfyapp._build_and_persist_dependency_manifest")
+    @patch("comfyapp._check_dependency_manifest_identity")
+    @patch("comfyapp._load_dependency_manifest")
+    @patch("comfyapp._read_custom_nodes_generation_record")
+    @patch("comfyapp.load_baked_custom_node_dependency_manifest")
+    @patch("comfyapp._resolve_deployment_combined_hash")
+    @patch("comfyapp.assert_valid_api_prompt_structure")
+    def test_first_request_exact_hit_no_fingerprint(
+        self,
+        mock_assert_valid,
+        mock_combined,
+        mock_baked,
+        mock_cn_gen,
+        mock_load_mft,
+        mock_check_id,
+        mock_build_persist,
+        mock_run_val,
+        mock_emit,
+        manifest_env,
+    ):
+        """First real request: persisted manifest identity match must skip
+        _run_dependency_validation_with_cache, fingerprint, and traversal."""
+        mock_combined.return_value = "combined_hash_val"
+        mock_baked.return_value = {"overall_dependency_hash": "fp"}
+        mock_cn_gen.return_value = {"generation": "gen"}
+        mock_load_mft.return_value = {"identity": "some_id", "schema_version": 1}
+        mock_check_id.return_value = {
+            "identity_match": True,
+            "manifest_load_ms": 2.0,
+            "cheap_check_ms": 1.0,
+            "computed_identity": "ident",
+            "stored_identity": "ident",
+            "reason": "",
+        }
+
+        app = FakeComfyAppForHandlePolicy()
+        t0 = time.time()
+        result = _get_handle_policy_unbound()(app, {"some": "workflow"})
+        elapsed_ms = (time.time() - t0) * 1000
+
+        assert result["dependency_prepared"] is True
+        assert result["dependency_reason"] == "manifest_identity_match"
+        # Must NOT call _run_dependency_validation_with_cache
+        mock_run_val.assert_not_called()
+        # Must NOT call _build_and_persist_dependency_manifest
+        mock_build_persist.assert_not_called()
+        # Must be fast (< 50ms for identity comparison)
+        assert elapsed_ms < 50, f"Expected <50ms but got {elapsed_ms:.1f}ms"
+        # Diagnostic was emitted with correct source
+        mock_emit.assert_called_once()
+        call_kwargs = mock_emit.call_args.kwargs
+        assert call_kwargs.get("source") == "persistent_manifest"
+        assert call_kwargs.get("identity_match") is True
+        assert call_kwargs.get("fingerprint_ms") == 0.0
+        assert call_kwargs.get("full_validation_ms") == 0.0
+        assert call_kwargs.get("refresh_performed") is False
+        assert call_kwargs.get("reason") == "manifest_identity_match"
+
+    @patch("comfyapp._emit_dependency_validation_v2")
+    @patch("comfyapp._run_dependency_validation_with_cache")
+    @patch("comfyapp._build_and_persist_dependency_manifest")
+    @patch("comfyapp._check_dependency_manifest_identity")
+    @patch("comfyapp._load_dependency_manifest")
+    @patch("comfyapp._read_custom_nodes_generation_record")
+    @patch("comfyapp.load_baked_custom_node_dependency_manifest")
+    @patch("comfyapp._resolve_deployment_combined_hash")
+    @patch("comfyapp.assert_valid_api_prompt_structure")
+    def test_identity_change_triggers_validation_and_rebuild(
+        self,
+        mock_assert_valid,
+        mock_combined,
+        mock_baked,
+        mock_cn_gen,
+        mock_load_mft,
+        mock_check_id,
+        mock_build_persist,
+        mock_run_val,
+        mock_emit,
+        manifest_env,
+    ):
+        """Identity mismatch: runs full validation and replacement write."""
+        mock_combined.return_value = "combined_hash_val"
+        mock_baked.return_value = {"overall_dependency_hash": "fp"}
+        mock_cn_gen.return_value = {"generation": "gen"}
+        mock_load_mft.return_value = {"identity": "old_id", "schema_version": 1}
+        mock_check_id.return_value = {
+            "identity_match": False,
+            "manifest_load_ms": 2.0,
+            "cheap_check_ms": 1.0,
+            "computed_identity": "new_id",
+            "stored_identity": "old_id",
+            "reason": "identity_mismatch",
+        }
+        mock_run_val.return_value = {
+            "prepared": True,
+            "reason": "hash_match",
+            "dependency_fingerprint_ms": 450.0,
+            "dependency_full_validation_ms": 300.0,
+            "dependency_validation_reason": "hash_match",
+        }
+        mock_build_persist.return_value = {
+            "identity": "new_identity_valid",
+            "combined_hash": "combined_hash_val",
+        }
+
+        app = FakeComfyAppForHandlePolicy()
+        result = _get_handle_policy_unbound()(app, {"some": "workflow"})
+
+        assert result["dependency_prepared"] is True
+        # Full validation was called
+        mock_run_val.assert_called_once()
+        # Replacement write was performed
+        mock_build_persist.assert_called_once()
+        # Verify commit=True on rebuild
+        call_kwargs = mock_build_persist.call_args.kwargs
+        assert call_kwargs.get("commit") is True
+        # Diagnostic emitted with request_rebuild source
+        mock_emit.assert_called_once()
+        emit_kwargs = mock_emit.call_args.kwargs
+        assert emit_kwargs.get("source") == "request_rebuild"
+        assert emit_kwargs.get("refresh_performed") is True
+
+    @patch("comfyapp._emit_dependency_validation_v2")
+    @patch("comfyapp._run_dependency_validation_with_cache")
+    @patch("comfyapp._build_and_persist_dependency_manifest")
+    @patch("comfyapp._check_dependency_manifest_identity")
+    @patch("comfyapp._load_dependency_manifest")
+    @patch("comfyapp._read_custom_nodes_generation_record")
+    @patch("comfyapp.load_baked_custom_node_dependency_manifest")
+    @patch("comfyapp._resolve_deployment_combined_hash")
+    @patch("comfyapp.assert_valid_api_prompt_structure")
+    def test_missing_manifest_fails_closed(
+        self,
+        mock_assert_valid,
+        mock_combined,
+        mock_baked,
+        mock_cn_gen,
+        mock_load_mft,
+        mock_check_id,
+        mock_build_persist,
+        mock_run_val,
+        mock_emit,
+        manifest_env,
+    ):
+        """Missing manifest: fail-closed, runs validation, raises on failure."""
+        mock_combined.return_value = "combined_hash_val"
+        mock_baked.return_value = {"overall_dependency_hash": "fp"}
+        mock_cn_gen.return_value = {"generation": "gen"}
+        mock_load_mft.return_value = None  # manifest missing
+        mock_check_id.return_value = {
+            "identity_match": False,
+            "manifest_load_ms": 0.0,
+            "cheap_check_ms": 0.5,
+            "computed_identity": "",
+            "stored_identity": "",
+            "reason": "manifest_missing",
+        }
+        mock_run_val.return_value = {
+            "prepared": False,
+            "reason": "baked_manifest_missing",
+            "baked_hash": None,
+            "current_hash": None,
+            "changed_nodes": [],
+            "dependency_fingerprint_ms": 0.0,
+            "dependency_full_validation_ms": 0.0,
+            "dependency_validation_reason": "baked_manifest_missing",
+        }
+
+        app = FakeComfyAppForHandlePolicy()
+        with pytest.raises(RuntimeError, match="not prepared"):
+            _get_handle_policy_unbound()(app, {"some": "workflow"})
+
+        # Validation was called
+        mock_run_val.assert_called_once()
+        # No replacement write (validation failed)
+        mock_build_persist.assert_not_called()
+        # Diagnostic emitted with request_rebuild source
+        mock_emit.assert_called_once()
+        emit_kwargs = mock_emit.call_args.kwargs
+        assert emit_kwargs.get("source") == "request_rebuild"
+        assert emit_kwargs.get("refresh_performed") is False
+
+    @patch("comfyapp._emit_dependency_validation_v2")
+    @patch("comfyapp._run_dependency_validation_with_cache")
+    @patch("comfyapp._build_and_persist_dependency_manifest")
+    @patch("comfyapp._check_dependency_manifest_identity")
+    @patch("comfyapp._load_dependency_manifest")
+    @patch("comfyapp._read_custom_nodes_generation_record")
+    @patch("comfyapp.load_baked_custom_node_dependency_manifest")
+    @patch("comfyapp._resolve_deployment_combined_hash")
+    @patch("comfyapp.assert_valid_api_prompt_structure")
+    def test_schema_mismatch_fails_closed_and_refreshes(
+        self,
+        mock_assert_valid,
+        mock_combined,
+        mock_baked,
+        mock_cn_gen,
+        mock_load_mft,
+        mock_check_id,
+        mock_build_persist,
+        mock_run_val,
+        mock_emit,
+        manifest_env,
+    ):
+        """Schema version mismatch: fails closed, runs full validation, refresh on success."""
+        mock_combined.return_value = "combined_hash_val"
+        mock_baked.return_value = {"overall_dependency_hash": "fp"}
+        mock_cn_gen.return_value = {"generation": "gen"}
+        # Loader returns None on schema mismatch
+        mock_load_mft.return_value = None
+        mock_check_id.return_value = {
+            "identity_match": False,
+            "manifest_load_ms": 0.0,
+            "cheap_check_ms": 0.5,
+            "computed_identity": "",
+            "stored_identity": "",
+            "reason": "manifest_missing",
+        }
+        mock_run_val.return_value = {
+            "prepared": True,
+            "reason": "hash_match",
+            "dependency_fingerprint_ms": 450.0,
+            "dependency_full_validation_ms": 200.0,
+            "dependency_validation_reason": "hash_match",
+        }
+        mock_build_persist.return_value = {
+            "identity": "new_identity",
+            "combined_hash": "combined_hash_val",
+        }
+
+        app = FakeComfyAppForHandlePolicy()
+        result = _get_handle_policy_unbound()(app, {"some": "workflow"})
+
+        assert result["dependency_prepared"] is True
+        mock_run_val.assert_called_once()
+        # Replacement write performed
+        mock_build_persist.assert_called_once()
+
+    @patch("comfyapp._emit_dependency_validation_v2")
+    @patch("comfyapp._run_dependency_validation_with_cache")
+    @patch("comfyapp._build_and_persist_dependency_manifest")
+    @patch("comfyapp._check_dependency_manifest_identity")
+    @patch("comfyapp._load_dependency_manifest")
+    @patch("comfyapp._read_custom_nodes_generation_record")
+    @patch("comfyapp.load_baked_custom_node_dependency_manifest")
+    @patch("comfyapp._resolve_deployment_combined_hash")
+    @patch("comfyapp.assert_valid_api_prompt_structure")
+    def test_corrupt_manifest_fails_closed_and_refreshes(
+        self,
+        mock_assert_valid,
+        mock_combined,
+        mock_baked,
+        mock_cn_gen,
+        mock_load_mft,
+        mock_check_id,
+        mock_build_persist,
+        mock_run_val,
+        mock_emit,
+        manifest_env,
+    ):
+        """Corrupt manifest: fails closed, runs full validation."""
+        # Setup same as missing manifest (loader returns None for corrupt)
+        mock_combined.return_value = "combined_hash_val"
+        mock_baked.return_value = {"overall_dependency_hash": "fp"}
+        mock_cn_gen.return_value = {"generation": "gen"}
+        mock_load_mft.return_value = None  # corrupt -> None
+        mock_check_id.return_value = {
+            "identity_match": False,
+            "manifest_load_ms": 0.0,
+            "cheap_check_ms": 0.5,
+            "computed_identity": "",
+            "stored_identity": "",
+            "reason": "manifest_missing",
+        }
+        mock_run_val.return_value = {
+            "prepared": True,
+            "reason": "hash_match",
+            "dependency_fingerprint_ms": 450.0,
+            "dependency_full_validation_ms": 200.0,
+            "dependency_validation_reason": "hash_match",
+        }
+        mock_build_persist.return_value = {
+            "identity": "new_identity",
+            "combined_hash": "combined_hash_val",
+        }
+
+        app = FakeComfyAppForHandlePolicy()
+        result = _get_handle_policy_unbound()(app, {"some": "workflow"})
+
+        assert result["dependency_prepared"] is True
+        mock_run_val.assert_called_once()
+        mock_build_persist.assert_called_once()
+
+
+# ── Test: _run_dependency_validation_with_cache persistent manifest step 0 ──
+
+
+class TestPersistentManifestStep0:
+    """_run_dependency_validation_with_cache checks persistent manifest
+    as step 0 before any baked manifest load or fingerprint."""
+
+    @patch("comfyapp._load_dependency_manifest")
+    @patch("comfyapp._check_dependency_manifest_identity")
+    @patch("comfyapp._resolve_deployment_combined_hash")
+    @patch("comfyapp.load_baked_custom_node_dependency_manifest")
+    @patch("comfyapp._read_custom_nodes_generation_record")
+    def test_step0_hit_returns_early(
+        self,
+        mock_cn_gen,
+        mock_baked,
+        mock_combined,
+        mock_check_id,
+        mock_load_mft,
+        manifest_env,
+    ):
+        """Persistent manifest identity match: step 0 returns immediately
+        without fingerprint/validation."""
+        mock_load_mft.return_value = {"identity": "some_id", "schema_version": 1}
+        mock_combined.return_value = "combined_hash_val"
+        mock_baked.return_value = {"overall_dependency_hash": "fp"}
+        mock_cn_gen.return_value = {"generation": "gen"}
+        mock_check_id.return_value = {
+            "identity_match": True,
+            "manifest_load_ms": 2.0,
+            "cheap_check_ms": 1.0,
+            "computed_identity": "ident",
+            "stored_identity": "ident",
+            "reason": "",
+        }
+
+        from comfyapp import _run_dependency_validation_with_cache
+
+        t0 = time.time()
+        result = _run_dependency_validation_with_cache(repair_mode="fail_fast")
+        elapsed_ms = (time.time() - t0) * 1000
+
+        assert result.get("prepared") is True
+        assert result.get("dependency_validation_cache_layer") == "persistent_manifest"
+        assert result.get("dependency_validation_cache_hit") is True
+        assert result.get("dependency_validation_reason") == "manifest_identity_match"
+        # Fingerprint and full validation should not have been called
+        # (we can verify by checking the timing fields are minimal)
+        assert result.get("dependency_fingerprint_ms", -1) == 0.0
+        assert result.get("dependency_full_validation_ms", -1) == 0.0
+        # Must be fast
+        assert elapsed_ms < 50, f"Expected <50ms but got {elapsed_ms:.1f}ms"
+
+    @patch("comfyapp._load_dependency_manifest")
+    @patch("comfyapp._check_dependency_manifest_identity")
+    @patch("comfyapp._resolve_deployment_combined_hash")
+    @patch("comfyapp.load_baked_custom_node_dependency_manifest")
+    @patch("comfyapp._read_custom_nodes_generation_record")
+    def test_step0_no_extra_commit(
+        self,
+        mock_cn_gen,
+        mock_baked,
+        mock_combined,
+        mock_check_id,
+        mock_load_mft,
+        manifest_env,
+    ):
+        """Step 0 hit does NOT trigger any volume commit."""
+        mock_load_mft.return_value = {"identity": "some_id", "schema_version": 1}
+        mock_combined.return_value = "combined_hash_val"
+        mock_baked.return_value = {"overall_dependency_hash": "fp"}
+        mock_cn_gen.return_value = {"generation": "gen"}
+        mock_check_id.return_value = {
+            "identity_match": True,
+            "manifest_load_ms": 2.0,
+            "cheap_check_ms": 1.0,
+            "computed_identity": "ident",
+            "stored_identity": "ident",
+            "reason": "",
+        }
+
+        from comfyapp import _run_dependency_validation_with_cache
+
+        with patch("comfyapp.runtime_config_vol") as mock_rc_vol:
+            result = _run_dependency_validation_with_cache(repair_mode="fail_fast")
+            assert result.get("prepared") is True
+            # No volume commit should occur
+            mock_rc_vol.commit.assert_not_called()
+
+    @patch("comfyapp._load_dependency_manifest")
+    @patch("comfyapp._check_dependency_manifest_identity")
+    @patch("comfyapp._resolve_deployment_combined_hash")
+    @patch("comfyapp.load_baked_custom_node_dependency_manifest")
+    @patch("comfyapp._read_custom_nodes_generation_record")
+    def test_step0_missing_manifest_falls_through(
+        self,
+        mock_cn_gen,
+        mock_baked,
+        mock_combined,
+        mock_check_id,
+        mock_load_mft,
+        manifest_env,
+    ):
+        """Missing manifest: step 0 passes through to regular validation."""
+        mock_load_mft.return_value = None  # manifest missing
+        mock_combined.return_value = "combined_hash_val"
+        mock_baked.return_value = {"overall_dependency_hash": "fp"}
+        mock_cn_gen.return_value = {"generation": "gen"}
+        # _check_dependency_manifest_identity should not be called
+        # when _load_dependency_manifest returns None, but we mock it anyway
+
+        from comfyapp import _run_dependency_validation_with_cache
+
+        # We just verify this doesn't crash and doesn't hit the manifest path
+        # The pre-key check will eventually fail too, and it'll return
+        # baked_manifest_missing or similar
+        with patch("comfyapp._cheap_volume_state_hash", return_value="volhash"):
+            with patch("comfyapp.custom_node_dependency_fingerprint") as mock_fp:
+                result = _run_dependency_validation_with_cache(repair_mode="fail_fast")
+                # Should NOT have set manifest cache layer
+                assert result.get("dependency_validation_cache_layer") != "persistent_manifest"
+                # Fingerprint was called (step 0 didn't short-circuit)
+                mock_fp.assert_called()
+
+    @patch("comfyapp._load_dependency_manifest")
+    @patch("comfyapp._check_dependency_manifest_identity")
+    @patch("comfyapp._resolve_deployment_combined_hash")
+    @patch("comfyapp.load_baked_custom_node_dependency_manifest")
+    @patch("comfyapp._read_custom_nodes_generation_record")
+    def test_step0_schema_mismatch_falls_through(
+        self,
+        mock_cn_gen,
+        mock_baked,
+        mock_combined,
+        mock_check_id,
+        mock_load_mft,
+        manifest_env,
+    ):
+        """Schema version mismatch: _load_dependency_manifest returns None,
+        step 0 passes through."""
+        mock_load_mft.return_value = None  # schema mismatch makes loader return None
+        mock_combined.return_value = "combined_hash_val"
+        mock_baked.return_value = {"overall_dependency_hash": "fp"}
+        mock_cn_gen.return_value = {"generation": "gen"}
+
+        from comfyapp import _run_dependency_validation_with_cache
+
+        with patch("comfyapp._cheap_volume_state_hash", return_value="volhash"):
+            result = _run_dependency_validation_with_cache(repair_mode="fail_fast")
+            # Must not have set manifest cache layer
+            assert result.get("dependency_validation_cache_layer") != "persistent_manifest"
+
+    @patch("comfyapp._load_dependency_manifest")
+    @patch("comfyapp._check_dependency_manifest_identity")
+    @patch("comfyapp._resolve_deployment_combined_hash")
+    @patch("comfyapp.load_baked_custom_node_dependency_manifest")
+    @patch("comfyapp._read_custom_nodes_generation_record")
+    def test_step0_identity_mismatch_falls_through(
+        self,
+        mock_cn_gen,
+        mock_baked,
+        mock_combined,
+        mock_check_id,
+        mock_load_mft,
+        manifest_env,
+    ):
+        """Identity mismatch: step 0 passes through to regular validation."""
+        mock_load_mft.return_value = {"identity": "old_identity", "schema_version": 1}
+        mock_combined.return_value = "combined_hash_val"
+        mock_baked.return_value = {"overall_dependency_hash": "fp_new"}
+        mock_cn_gen.return_value = {"generation": "gen"}
+        mock_check_id.return_value = {
+            "identity_match": False,
+            "manifest_load_ms": 2.0,
+            "cheap_check_ms": 1.0,
+            "computed_identity": "new_id",
+            "stored_identity": "old_identity",
+            "reason": "identity_mismatch",
+        }
+
+        from comfyapp import _run_dependency_validation_with_cache
+
+        with patch("comfyapp._cheap_volume_state_hash", return_value="volhash"):
+            with patch("comfyapp.custom_node_dependency_fingerprint") as mock_fp:
+                result = _run_dependency_validation_with_cache(repair_mode="fail_fast")
+                # Must not have set manifest cache layer
+                assert result.get("dependency_validation_cache_layer") != "persistent_manifest"
+                # Fingerprint was called (step 0 didn't short-circuit)
+                mock_fp.assert_called()
+
+    @patch("comfyapp._load_dependency_manifest")
+    @patch("comfyapp._check_dependency_manifest_identity")
+    @patch("comfyapp._resolve_deployment_combined_hash")
+    @patch("comfyapp.load_baked_custom_node_dependency_manifest")
+    @patch("comfyapp._read_custom_nodes_generation_record")
+    def test_step0_dev_mode_skips(
+        self,
+        mock_cn_gen,
+        mock_baked,
+        mock_combined,
+        mock_check_id,
+        mock_load_mft,
+        manifest_env,
+    ):
+        """Dev mode: step 0 is skipped (manifest identity not checked)."""
+        mock_load_mft.return_value = {"identity": "some_id", "schema_version": 1}
+        mock_combined.return_value = "combined_hash_val"
+        mock_baked.return_value = {"overall_dependency_hash": "fp"}
+        mock_cn_gen.return_value = {"generation": "gen"}
+
+        from comfyapp import _run_dependency_validation_with_cache
+
+        with patch("comfyapp._cheap_volume_state_hash", return_value="volhash"):
+            with patch("comfyapp.custom_node_dependency_fingerprint") as mock_fp:
+                result = _run_dependency_validation_with_cache(repair_mode="dev")
+                # Dev mode does proceed to fingerprint
+                assert result.get("dependency_validation_cache_layer") != "persistent_manifest"
+
+    def test_step0_with_persistent_manifest_diagnostic_fields(self, manifest_env, capsys):
+        """Verify [v2.dependency_validation] line structure with persistent_manifest source
+        via the diagnostic emitter directly."""
+        from comfymodal_runtime.dependency_manifest import emit_validation_diagnostic
+
+        emit_validation_diagnostic(
+            source="persistent_manifest",
+            identity_match=True,
+            manifest_load_ms=2.5,
+            cheap_check_ms=1.0,
+            fingerprint_ms=0.0,
+            full_validation_ms=0.0,
+            total_ms=3.5,
+            refresh_performed=False,
+            reason="manifest_identity_match",
+        )
+        captured = capsys.readouterr()
+        assert "[v2.dependency_validation]" in captured.out
+        assert "source=persistent_manifest" in captured.out
+        assert "identity_match=1" in captured.out
+        assert "fingerprint_ms=0.0" in captured.out
+        assert "full_validation_ms=0.0" in captured.out
+        assert "refresh_performed=0" in captured.out
+        assert "reason=manifest_identity_match" in captured.out
