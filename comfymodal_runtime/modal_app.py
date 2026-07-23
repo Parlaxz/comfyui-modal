@@ -1185,15 +1185,15 @@ class ModalRuntimeEntrypoint:
     ) -> None:
         """Activate already-loaded CPU snapshot models on the preload bridge.
 
-        Prefers ``V2LoaderBridge.use_ready_models(...)`` when the method
-        exists.  Falls back to creating a ``RestorePreparation`` with
-        resolved futures so the bridge's ``_consume_unet`` and
-        ``_consume_clip`` return the pre-loaded objects directly without
-        going through the thread pool.
+        Delegates to ``V2LoaderBridge.use_ready_models(...)`` which creates
+        a fully-resolved ``RestorePreparation`` with completed futures so
+        graph-time consumers retrieve the snapshot models without going
+        through the thread pool.  On failure the bridge is cleared and
+        active state is reset so the existing preload path runs.
+        Never sets private fields directly on the bridge.
         """
-        use_ready = getattr(self._preload_bridge, "use_ready_models", None)
-        if callable(use_ready):
-            use_ready(
+        try:
+            self._preload_bridge.use_ready_models(
                 model_key=model_key,
                 prefill_key=prefill_key,
                 model_spec=model_spec,
@@ -1201,25 +1201,10 @@ class ModalRuntimeEntrypoint:
                 clip=clip,
                 trace=trace,
             )
-            return
-
-        # Compatibility fallback: reproduce ready completed futures on the
-        # bridge internals for bridges that lack use_ready_models.
-        self._preload_bridge._model_key = model_key
-        self._preload_bridge._prefill_key = prefill_key
-        self._preload_bridge._model_spec = model_spec if isinstance(model_spec, Mapping) else {}
-        self._preload_bridge._trace = trace
-
-        prep = RestorePreparation(model_key=model_key, prefill_key=prefill_key)
-        unet_future: concurrent.futures.Future[Any] = concurrent.futures.Future()
-        unet_future.set_result(unet)
-        prep.unet_future = unet_future
-        clip_future: concurrent.futures.Future[Any] = concurrent.futures.Future()
-        clip_future.set_result(clip)
-        prep.clip_future = clip_future
-        self._preload_bridge._preparation = prep
-        with self._preload_bridge._prefill_lock:
-            self._preload_bridge._prefill_results.clear()
+        except Exception:
+            self._preload_bridge.clear()
+            self._cpu_snapshot_models_active = False
+            raise
 
     def _load_legacy_runtime(self) -> Any:
         if self._legacy_api is not None:
@@ -1894,11 +1879,21 @@ class ModalRuntimeEntrypoint:
                         "duration_ms": _activation_duration_ms,
                     },
                 )
-            except BaseException as _act_exc:
+                _bridge_installed = 1 if self._preload_bridge._original_methods else 0
+                _c_prep = self._preload_bridge._preparation
+                _c_clip_ready = 1 if _c_prep is not None and _c_prep.clip_future is not None and _c_prep.clip_future.done() else 0
+                _c_unet_ready = 1 if _c_prep is not None and _c_prep.unet_future is not None and _c_prep.unet_future.done() else 0
+                print(
+                    f"[v2.cpu_snapshot] status=hit reason=ok "
+                    f"bridge_installed={_bridge_installed} "
+                    f"clip_ready={_c_clip_ready} unet_ready={_c_unet_ready}",
+                    flush=True,
+                )
+            except Exception as _act_exc:
                 self._preload_bridge.clear()
                 self._cpu_snapshot_models_active = False
                 _cpu_snapshot_activated = False
-                _cpu_snapshot_activate_error = str(_act_exc)[:200]
+                _cpu_snapshot_activate_error = str(_act_exc)[:80]
                 _activation_duration_ms = round(
                     (time.perf_counter() - _activation_perf_start) * 1000.0,
                     3,
@@ -1917,6 +1912,16 @@ class ModalRuntimeEntrypoint:
                         if models.unet is not None else "",
                         "duration_ms": _activation_duration_ms,
                     },
+                )
+                _bridge_installed = 1 if self._preload_bridge._original_methods else 0
+                _c_prep = self._preload_bridge._preparation
+                _c_clip_ready = 1 if _c_prep is not None and _c_prep.clip_future is not None and _c_prep.clip_future.done() else 0
+                _c_unet_ready = 1 if _c_prep is not None and _c_prep.unet_future is not None and _c_prep.unet_future.done() else 0
+                print(
+                    f"[v2.cpu_snapshot] status=miss reason={_cpu_snapshot_activate_error[:60]} "
+                    f"bridge_installed={_bridge_installed} "
+                    f"clip_ready={_c_clip_ready} unet_ready={_c_unet_ready}",
+                    flush=True,
                 )
                 # Fall through to the existing preload branch.
         try:
@@ -2376,6 +2381,10 @@ class ModalRuntimeEntrypoint:
                             "duration_ms": round((time.perf_counter() - _bind_perf) * 1000.0, 3),
                         },
                     )
+                    print(
+                        "[v2.cpu_snapshot_request] status=reused reason=ok",
+                        flush=True,
+                    )
                 else:
                     # Model identity differs — clear bridge and deactivate.
                     self._preload_bridge.clear()
@@ -2394,6 +2403,10 @@ class ModalRuntimeEntrypoint:
                             "duration_ms": round((time.perf_counter() - _bind_perf) * 1000.0, 3),
                         },
                     )
+                    print(
+                        "[v2.cpu_snapshot_request] status=fallback reason=model_or_spec_mismatch",
+                        flush=True,
+                    )
             except Exception as _bind_exc:
                 self._preload_bridge.clear()
                 self._cpu_snapshot_models_active = False
@@ -2410,6 +2423,11 @@ class ModalRuntimeEntrypoint:
                         if self._cpu_snapshot_models is not None and self._cpu_snapshot_models.unet is not None else "",
                         "duration_ms": round((time.perf_counter() - _bind_perf) * 1000.0, 3),
                     },
+                )
+                print(
+                    "[v2.cpu_snapshot_request] status=fallback "
+                    f"reason=error:{str(_bind_exc)[:80]}",
+                    flush=True,
                 )
         # â”€â”€ Execution-phase CLIP exact-prefill single-flight â”€â”€â”€â”€â”€â”€â”€â”€
         # Schedule prefill immediately after graph start so it runs
