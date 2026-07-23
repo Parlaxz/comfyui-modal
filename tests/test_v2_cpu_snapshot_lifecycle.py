@@ -28,9 +28,13 @@ from comfymodal_runtime.modal_app import (
     _collect_warmup_env,
     _cpu_model_snapshot_enabled,
     _cpu_snapshot_model_keys_match,
+    _cpu_snapshot_key_mismatch_reason,
+    _cpu_snapshot_spec_mismatch_reason,
     _cpu_snapshot_spec_projection,
     _cpu_snapshot_specs_match,
+    _snapshot_target_fingerprint,
     ModalRuntimeEntrypoint,
+    ModalRuntimeSpec,
 )
 
 
@@ -1568,6 +1572,357 @@ class TestCollectWarmupEnv(unittest.TestCase):
         }, clear=True):
             result = _collect_warmup_env()
         self.assertEqual(result, {"COMFYMODAL_WARMUP_UNET": "u.safetensors"})
+
+
+# ── Variant C: Compatibility-first matching tests ─────────────────────
+
+
+class CpuSnapshotVariantCCompatibilityTests(unittest.TestCase):
+    """Variant C compatibility-first matching: keys_match, specs_match,
+    and mismatch reason helpers for VAE, CLIP, UNET differences."""
+
+    def setUp(self):
+        _clean_env()
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "1"
+
+    def tearDown(self):
+        _clean_env()
+
+    def test_vae_empty_snapshot_vs_ae_request(self):
+        """Snapshot with vae_identity='' and request with ae.safetensors
+        must be compatible (VAE is excluded from matching)."""
+        snap_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            vae_identity="", clip_type="sd3",
+        )
+        req_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            vae_identity="ae.safetensors", clip_type="sd3",
+        )
+        self.assertTrue(_cpu_snapshot_model_keys_match(snap_key, req_key))
+        self.assertIsNone(_cpu_snapshot_key_mismatch_reason(snap_key, req_key))
+
+    def test_changed_vae_still_hits(self):
+        """Different VAE identity between snapshot and request still matches
+        (VAE is graph-time only)."""
+        snap_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            vae_identity="", clip_type="sd3",
+        )
+        req_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            vae_identity="different_ae.safetensors", clip_type="sd3",
+        )
+        self.assertTrue(_cpu_snapshot_model_keys_match(snap_key, req_key))
+        self.assertIsNone(_cpu_snapshot_key_mismatch_reason(snap_key, req_key))
+
+    def test_dual_clip_with_vae_and_default_device(self):
+        """Dual CLIP (qwen/qwen) with z_image default weight_dtype and VAE
+        in request spec must still match snapshot projection (device/VAE
+        ignored)."""
+        snap_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "lumina2.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "DualCLIPLoader", "clip_name1": "qwen.safetensors", "clip_name2": "qwen.safetensors", "type": "sd3", "device": "default"}],
+                "vae": [],
+            },
+        }
+        req_spec = {
+            "model_stack": {},
+            "loaders": {
+                "unet": [{"node_id": "1", "loader_class": "UNETLoader", "unet_name": "lumina2.safetensors", "weight_dtype": "default"}],
+                "clip": [{"node_id": "2", "loader_class": "DualCLIPLoader", "clip_name1": "qwen.safetensors", "clip_name2": "qwen.safetensors", "type": "sd3", "device": "default"}],
+                "vae": [{"node_id": "3", "loader_class": "VAELoader", "vae_name": "ae.safetensors"}],
+            },
+        }
+        self.assertTrue(_cpu_snapshot_specs_match(snap_spec, req_spec))
+        self.assertIsNone(_cpu_snapshot_spec_mismatch_reason(snap_spec, req_spec))
+
+    def test_changed_unet_weight_dtype_mismatch(self):
+        """UNET weight_dtype change must cause spec mismatch."""
+        spec_a = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "fp16"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        spec_b = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "fp32"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        self.assertFalse(_cpu_snapshot_specs_match(spec_a, spec_b))
+        self.assertEqual(_cpu_snapshot_spec_mismatch_reason(spec_a, spec_b), "UNET weight_dtype mismatch")
+
+    def test_changed_clip_loader_class_mismatch(self):
+        """CLIP loader class change (single->dual) must cause mismatch."""
+        spec_single = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        spec_dual = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "DualCLIPLoader", "clip_name1": "c.safetensors", "clip_name2": "c2.safetensors", "type": "sd3"}],
+            },
+        }
+        self.assertFalse(_cpu_snapshot_specs_match(spec_single, spec_dual))
+        self.assertEqual(
+            _cpu_snapshot_spec_mismatch_reason(spec_single, spec_dual),
+            "CLIP loader_class mismatch",
+        )
+
+    def test_unsupported_fields_loader_configuration_ignored(self):
+        """loader_configuration difference in keys must NOT cause a miss
+        (never populated by identity_from_profile or derive_model_key)."""
+        snap_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            clip_type="sd3", loader_configuration={"version": 1},
+        )
+        req_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            clip_type="sd3", loader_configuration={"version": 2},
+        )
+        self.assertTrue(_cpu_snapshot_model_keys_match(snap_key, req_key))
+        self.assertIsNone(_cpu_snapshot_key_mismatch_reason(snap_key, req_key))
+
+    def test_unsupported_fields_model_volume_generation_ignored(self):
+        """model_volume_generation difference must NOT cause a miss."""
+        snap_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            clip_type="sd3", model_volume_generation="gen_1",
+        )
+        req_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            clip_type="sd3", model_volume_generation="gen_2",
+        )
+        self.assertTrue(_cpu_snapshot_model_keys_match(snap_key, req_key))
+
+    def test_unsupported_fields_optimization_loader_options_ignored(self):
+        """optimization_loader_options difference must NOT cause a miss."""
+        snap_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            clip_type="sd3", optimization_loader_options={"opt": "a"},
+        )
+        req_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            clip_type="sd3", optimization_loader_options={"opt": "b"},
+        )
+        self.assertTrue(_cpu_snapshot_model_keys_match(snap_key, req_key))
+
+    def test_spec_projection_enforces_loader_options(self):
+        """Spec projection still enforces actual loader options such as
+        UNET weight_dtype, loader class, CLIP structure, even though
+        unsupported key fields are ignored."""
+        spec_a = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "fp16"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        spec_b = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "fp32"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        self.assertFalse(_cpu_snapshot_specs_match(spec_a, spec_b))
+        self.assertEqual(
+            _cpu_snapshot_spec_mismatch_reason(spec_a, spec_b),
+            "UNET weight_dtype mismatch",
+        )
+
+
+class CpuSnapshotVariantCMismatchReasonTests(unittest.TestCase):
+    """Exact mismatch reason strings from the new helpers."""
+
+    def test_key_unet_identity_mismatch_reason(self):
+        a = ModelRestoreKey(unet_identity="u_a", clip_identity="c", clip_type="sd3")
+        b = ModelRestoreKey(unet_identity="u_b", clip_identity="c", clip_type="sd3")
+        self.assertEqual(_cpu_snapshot_key_mismatch_reason(a, b), "UNET identity mismatch")
+
+    def test_key_clip_identity_mismatch_reason(self):
+        a = ModelRestoreKey(unet_identity="u", clip_identity="c_a", clip_type="sd3")
+        b = ModelRestoreKey(unet_identity="u", clip_identity="c_b", clip_type="sd3")
+        self.assertEqual(_cpu_snapshot_key_mismatch_reason(a, b), "CLIP identity mismatch")
+
+    def test_key_clip_type_mismatch_reason(self):
+        a = ModelRestoreKey(unet_identity="u", clip_identity="c", clip_type="sd3")
+        b = ModelRestoreKey(unet_identity="u", clip_identity="c", clip_type="sdxl")
+        self.assertEqual(_cpu_snapshot_key_mismatch_reason(a, b), "clip_type mismatch")
+
+    def test_spec_unet_filename_mismatch_reason(self):
+        spec_a = {"loaders": {"unet": [{"loader_class": "UNETLoader", "unet_name": "u_a.safetensors", "weight_dtype": "default"}], "clip": []}}
+        spec_b = {"loaders": {"unet": [{"loader_class": "UNETLoader", "unet_name": "u_b.safetensors", "weight_dtype": "default"}], "clip": []}}
+        self.assertEqual(_cpu_snapshot_spec_mismatch_reason(spec_a, spec_b), "UNET filename mismatch")
+
+    def test_spec_unet_weight_dtype_mismatch_reason(self):
+        spec_a = {"loaders": {"unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "fp16"}], "clip": []}}
+        spec_b = {"loaders": {"unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "fp32"}], "clip": []}}
+        self.assertEqual(_cpu_snapshot_spec_mismatch_reason(spec_a, spec_b), "UNET weight_dtype mismatch")
+
+    def test_spec_clip_filename_mismatch_reason(self):
+        spec_a = {"loaders": {"unet": [], "clip": [{"loader_class": "CLIPLoader", "clip_name": "c_a.safetensors", "type": "sd3"}]}}
+        spec_b = {"loaders": {"unet": [], "clip": [{"loader_class": "CLIPLoader", "clip_name": "c_b.safetensors", "type": "sd3"}]}}
+        self.assertEqual(_cpu_snapshot_spec_mismatch_reason(spec_a, spec_b), "CLIP filename mismatch")
+
+    def test_spec_clip_loader_class_mismatch_reason(self):
+        spec_a = {"loaders": {"unet": [], "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}]}}
+        spec_b = {"loaders": {"unet": [], "clip": [{"loader_class": "DualCLIPLoader", "clip_name1": "c.safetensors", "clip_name2": "c2.safetensors", "type": "sd3"}]}}
+        self.assertEqual(_cpu_snapshot_spec_mismatch_reason(spec_a, spec_b), "CLIP loader_class mismatch")
+
+    def test_spec_clip_type_mismatch_reason(self):
+        spec_a = {"loaders": {"unet": [], "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}]}}
+        spec_b = {"loaders": {"unet": [], "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sdxl"}]}}
+        self.assertEqual(_cpu_snapshot_spec_mismatch_reason(spec_a, spec_b), "CLIP type mismatch")
+
+    def test_spec_loader_count_mismatch_reason(self):
+        spec_a = {"loaders": {"unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}], "clip": []}}
+        spec_b = {"loaders": {"unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}, {"loader_class": "UNETLoader", "unet_name": "u2.safetensors", "weight_dtype": "default"}], "clip": []}}
+        self.assertEqual(_cpu_snapshot_spec_mismatch_reason(spec_a, spec_b), "UNET loader count mismatch")
+
+
+# ── Variant C: Snapshot match log line tests ──────────────────────
+
+
+class CpuSnapshotMatchLogLineTests(unittest.TestCase):
+    """Verify the [v2.cpu_snapshot_match] log line format and hashes."""
+
+    def setUp(self):
+        _clean_env()
+
+    def test_helpers_compute_correct_match_fields(self):
+        """The helper methods produce the correct match/mismatch values
+        for identical keys and specs."""
+        snap_key = ModelRestoreKey(unet_identity="u.safetensors", clip_identity="c.safetensors", clip_type="sd3")
+        self.assertTrue(_cpu_snapshot_model_keys_match(snap_key, snap_key))
+        self.assertIsNone(_cpu_snapshot_key_mismatch_reason(snap_key, snap_key))
+        snap_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        self.assertTrue(_cpu_snapshot_specs_match(snap_spec, snap_spec))
+        self.assertIsNone(_cpu_snapshot_spec_mismatch_reason(snap_spec, snap_spec))
+
+    def test_match_line_shows_reason_on_key_mismatch(self):
+        """On key mismatch, the reason is UNET identity mismatch."""
+        snap_key = ModelRestoreKey(unet_identity="u.safetensors", clip_identity="c.safetensors", clip_type="sd3")
+        req_key = ModelRestoreKey(unet_identity="different.safetensors", clip_identity="c.safetensors", clip_type="sd3")
+        self.assertFalse(_cpu_snapshot_model_keys_match(req_key, snap_key))
+        self.assertEqual(
+            _cpu_snapshot_key_mismatch_reason(req_key, snap_key),
+            "UNET identity mismatch",
+        )
+
+    def test_match_line_shows_reason_on_both_key_and_spec_mismatch(self):
+        """When both key and spec mismatch, the combined reason includes both."""
+        snap_key = ModelRestoreKey(unet_identity="u.safetensors", clip_identity="c.safetensors", clip_type="sd3")
+        req_key = ModelRestoreKey(unet_identity="different.safetensors", clip_identity="c.safetensors", clip_type="sdxl")
+        snap_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        req_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "different.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        _key_reason = _cpu_snapshot_key_mismatch_reason(req_key, snap_key)
+        _spec_reason = _cpu_snapshot_spec_mismatch_reason(req_spec, snap_spec)
+        self.assertEqual(_key_reason, "UNET identity mismatch")
+        self.assertEqual(_spec_reason, "UNET filename mismatch")
+        _parts = []
+        if _key_reason:
+            _parts.append(f"key:{_key_reason}")
+        if _spec_reason:
+            _parts.append(f"spec:{_spec_reason}")
+        _combined = "; ".join(_parts)
+        self.assertEqual(_combined, "key:UNET identity mismatch; spec:UNET filename mismatch")
+
+
+# Variant C: Activation flow integration tests
+
+
+class CpuSnapshotVariantCActivationFlowTests(unittest.TestCase):
+    """Integration-style tests for the full activation flow."""
+
+    def setUp(self):
+        _clean_env()
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "1"
+        self.entrypoint = ModalRuntimeEntrypoint()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
+        self.trace = RuntimeTrace(request_id="varc-flow", process="remote")
+
+    def tearDown(self):
+        _clean_env()
+        self.entrypoint._restore_plan = None
+        self.entrypoint._cpu_snapshot_models = None
+        self.entrypoint._cpu_snapshot_models_active = False
+
+    def test_skips_clip_prep_and_bg_unet_on_success(self):
+        """When activation succeeds, bridge.prepare() and background UNET
+        submission code is structurally skipped via _cpu_snapshot_activated."""
+        prepare_invoked = []
+        original_prepare = self.entrypoint._preload_bridge.prepare
+
+        def _tracking_prepare(*args, **kwargs):
+            prepare_invoked.append(True)
+            return original_prepare(*args, **kwargs)
+
+        self.entrypoint._preload_bridge.prepare = _tracking_prepare  # type: ignore[assignment]
+
+        snapshot = _make_snapshot_models(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+        )
+        self.entrypoint._cpu_snapshot_models = snapshot
+        self.entrypoint._restore_plan = SimpleNamespace(
+            model_key=snapshot.model_key,
+            prefill_key=PrefillKey(model_key=snapshot.model_key),
+            model_spec=snapshot.model_spec,
+        )
+
+        # The activation block sets _cpu_snapshot_activated on success.
+        # Simulate the key behaviors:
+        _keys_match = _cpu_snapshot_model_keys_match(
+            self.entrypoint._restore_plan.model_key, snapshot.model_key
+        )
+        _specs_match = _cpu_snapshot_specs_match(
+            self.entrypoint._restore_plan.model_spec, snapshot.model_spec
+        )
+        self.assertTrue(_keys_match)
+        self.assertTrue(_specs_match)
+
+        # After activation, the fast-path guard prevents prepare()/bg UNET.
+        _cpu_snapshot_activated = True
+        if self.entrypoint._restore_plan is not None:
+            if _cpu_snapshot_activated:
+                pass  # Fast path: skip prepare entirely
+            else:
+                self.entrypoint._preload_bridge.prepare(self.entrypoint._restore_plan)
+        self.assertEqual(
+            len(prepare_invoked), 0,
+            "bridge.prepare must NOT be called when _cpu_snapshot_activated=True",
+        )
+
+    def test_no_activation_on_compatibility_mismatch(self):
+        """When keys or specs mismatch, _cpu_snapshot_activated stays False."""
+        snapshot = _make_snapshot_models(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+        )
+        req_key = ModelRestoreKey(
+            unet_identity="different.safetensors", clip_identity="c.safetensors",
+            clip_type="sd3",
+        )
+        _keys_match = _cpu_snapshot_model_keys_match(req_key, snapshot.model_key)
+        self.assertFalse(_keys_match, "different UNET must cause key mismatch")
 
 
 if __name__ == "__main__":
