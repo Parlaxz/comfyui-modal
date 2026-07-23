@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from canonical_execution import build_execution_plan, execute_plan
+from modal_client import check_active_warmup_profile, set_active_warmup_profile
 from comfymodal_runtime.modal_transport import ModalTransport
 from comfymodal_runtime.restore_plan import RemoteRestorePlanPublisher
 from comfymodal_runtime.trace import RuntimeTrace
@@ -178,7 +179,8 @@ async def _run_one(
         plan,
         transport=transport,
         restore_publisher=RemoteRestorePlanPublisher(transport, workspace),
-        profile_setter=None,
+        profile_setter=set_active_warmup_profile,
+        profile_checker=check_active_warmup_profile,
         gpu=GPU,
         workspace=workspace,
         trace=runtime_trace,

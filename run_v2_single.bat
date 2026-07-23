@@ -10,6 +10,8 @@ set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
 set "V2_BENCHMARK_RUNS=1"
 set "V2_BENCHMARK_GAP_SECONDS=0"
+set "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1"
+if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=49152"
 
 set "REPO_ROOT=%~dp0"
 cd /d "%REPO_ROOT%" || exit /b 1
@@ -25,7 +27,8 @@ if !IDX! lss 2 (
     exit /b 1
 )
 
-echo === Running one V2 benchmark trial; no deployment ===
+echo === Running one V2 benchmark trial against the existing deployment ===
+echo === Deploy first with deploy_and_run_v2_single.bat after source or env changes ===
 python tools\benchmark_v2_direct.py
 if errorlevel 1 (
     echo === ERROR: Benchmark failed ===

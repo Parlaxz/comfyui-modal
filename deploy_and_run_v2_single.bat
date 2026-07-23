@@ -10,6 +10,8 @@ set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
 set "V2_BENCHMARK_RUNS=1"
 set "V2_BENCHMARK_GAP_SECONDS=0"
+set "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1"
+if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=49152"
 
 set "REPO_ROOT=%~dp0"
 cd /d "%REPO_ROOT%" || exit /b 1
@@ -27,6 +29,18 @@ if !IDX! lss 3 (
     exit /b 1
 )
 echo === Active workspace: !MODAL_WORKSPACE_LABEL! ===
+
+echo === Extracting warmup profile from benchmark workflow ===
+python tools\extract_warmup_profile.py > "%TEMP%\_v2_warmup_profile.txt"
+if errorlevel 1 (
+    type "%TEMP%\_v2_warmup_profile.txt"
+    echo === ERROR: Warmup profile derivation failed ===
+    del "%TEMP%\_v2_warmup_profile.txt" 2>nul
+    exit /b 1
+)
+for /f "usebackq delims=" %%a in ("%TEMP%\_v2_warmup_profile.txt") do set "%%a"
+del "%TEMP%\_v2_warmup_profile.txt" 2>nul
+echo === Warmup profile loaded ===
 
 where modal >nul 2>nul
 if not errorlevel 1 (
