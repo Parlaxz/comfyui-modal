@@ -12,6 +12,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Mapping
 
 from .contracts import ExecutionPlan
+from .trace import (
+    _build_local_submission_breakdown,
+    _emit_breakdown_line,
+)
 
 if TYPE_CHECKING:
     from .trace import RuntimeTrace
@@ -365,6 +369,25 @@ class ModalTransport:
                         "request_id": request_id,
                         "payload_bytes": _payload_bytes,
                     })
+                # ── Pre-dispatch local submission breakdown ──────────
+                # Emit before the actual Modal invocation so the line is
+                # observable before the remote call completes.  Forward
+                # the breakdown dict to the remote via plan_dict.
+                if runtime_trace is not None:
+                    _pre_breakdown = _build_local_submission_breakdown(
+                        runtime_trace,
+                        origin=_origin_from_meta,
+                        transport_meta=runtime_trace._metadata,
+                        plan_to_dict_count=1,
+                    )
+                    _emit_breakdown_line("[v2.local_submission_breakdown]", _pre_breakdown)
+                    # Inject breakdown into plan_dict for remote re-emission.
+                    # Ensure the parent origin dict is in plan_dict even when
+                    # no prior origin data existed.
+                    if isinstance(_origin_from_meta, dict):
+                        _origin_from_meta["local_submission_breakdown"] = dict(_pre_breakdown)
+                        if "__request_origin_info__" not in plan_dict:
+                            plan_dict["__request_origin_info__"] = _origin_from_meta
                 try:
                     stream = handle.run_plan_stream.remote_gen.aio(
                         plan_dict, request_id=request_id,

@@ -1622,7 +1622,7 @@ sys.path.insert(0, _NODE_DIR)
 
 try:
     import modal as _modal_pkg
-    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, download_model_stream, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile, set_workspace_resolver, get_handle_cache_stats, get_modal_app_name, get_modal_class_name, get_modal_lookup_target, persist_validation_certificate
+    from modal_client import run_prompt, run_prompt_stream, get_object_info, health_check, download_model, download_model_stream, batch_download_models, list_models, delete_model, set_gpu, get_gpu, get_default_gpu, get_available_gpus, sync_custom_nodes, refresh_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, resync_runtime, get_runtime_state, set_active_warmup_profile, check_active_warmup_profile, set_workspace_resolver, get_handle_cache_stats, get_modal_app_name, get_modal_class_name, get_modal_lookup_target, persist_validation_certificate
 
     # ── Runtime flag helpers (lazy init to avoid import-time failures) ──
     _runtime_flag_funcs: dict = {}
@@ -1674,6 +1674,7 @@ except ImportError:
     def resync_runtime(*a, **kw): raise RuntimeError("modal not installed")
     def get_runtime_state(*a, **kw): raise RuntimeError("modal not installed")
     def set_active_warmup_profile(*a, **kw): raise RuntimeError("modal not installed")
+    async def check_active_warmup_profile(*a, **kw): raise RuntimeError("modal not installed")  # noqa: E704
     def get_default_gpu(): return "rtx-pro-6000"
     def get_available_gpus(): return [{"value": "rtx-pro-6000", "label": "RTX PRO 6000"}]
     def get_handle_cache_stats(): return {"hits": 0, "misses": 0}
@@ -2343,6 +2344,7 @@ async def _execute_job(item: tuple, item_id: int):
                 workspace=_request_workspace or None,
                 trace_payload={**trace.fields(), "prompt_id": prompt_id, "client_id": sid},
                 profile_setter=set_active_warmup_profile,
+                profile_checker=check_active_warmup_profile,
                 run_trace=_run_trace,
                 comfyui_root=_COMFYUI_ROOT,
                 event_sink=_event_sink,

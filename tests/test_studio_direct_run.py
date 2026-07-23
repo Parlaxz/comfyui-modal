@@ -962,6 +962,32 @@ class StudioDirectRunCompletionTests(unittest.TestCase):
 
         asyncio.run(_test())
 
+    def test_caller_passes_profile_checker(self):
+        """direct_studio_run_completion forwards profile_checker to execute_modal_prompt."""
+        _checker_called = False
+        async def _fake_checker(*a, **kw):
+            nonlocal _checker_called
+            _checker_called = True
+            return {"matched": False}
+
+        async def _run():
+            nonlocal _checker_called
+            with patch("studio_run_adapter.execute_modal_prompt") as mock_exec:
+                mock_exec.return_value = {
+                    "outputs": {"107": {"images": [{"filename": "test.png", "data": ""}]}},
+                    "trace": {"stages": {}, "deltas_ms": {}, "derived_ms": {},
+                              "trace_version": 3},
+                }
+                with tempfile.TemporaryDirectory() as tmp:
+                    ctx = self._make_context(tmp)
+                    result = await self.mod.direct_studio_run_completion(ctx, tmp)
+            self.assertIn("profile_checker", mock_exec.call_args.kwargs,
+                          "profile_checker must be passed to execute_modal_prompt")
+            self.assertIsNotNone(mock_exec.call_args.kwargs["profile_checker"])
+            self.assertEqual(result["status"], "ok")
+
+        asyncio.run(_run())
+
 
 class StudioDirectRunSchedulerPathPreservedTests(unittest.TestCase):
     """The scheduler path MUST still work when direct=False."""

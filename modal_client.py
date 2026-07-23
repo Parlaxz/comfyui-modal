@@ -758,6 +758,21 @@ async def set_active_warmup_profile(payload: dict, workspace: dict | None = None
     )
 
 
+@_modal_error_handler
+async def check_active_warmup_profile(stable_key: str, workspace: dict | None = None) -> dict:
+    """Read-only identity seam: check if a profile matching *stable_key*
+    already exists on the runtime-config volume.
+
+    CPU-only, no GPU cost, no side effects (no Volume commit).
+    Returns ``{"matched": True, "profile_token": str}`` on match,
+    ``{"matched": False}`` otherwise.
+    """
+    selected = _resolve_workspace(workspace)
+    return await asyncio.to_thread(
+        lambda: _workspace_function("check_active_warmup_profile", selected).remote(stable_key),
+    )
+
+
 def persist_clip_cache_payload(
     payload: dict,
     workspace: dict | None = None,

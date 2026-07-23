@@ -645,6 +645,38 @@ class TestExecuteModalPrompt(unittest.TestCase):
                         self.assertEqual(counts.get("production_compile_count"), 0)
         asyncio.run(_run())
 
+    def test_profile_checker_forwarded_to_prepare_next_profile(self):
+        """profile_checker is forwarded from execute_modal_prompt to prepare_active_next_profile."""
+        from unittest.mock import patch, AsyncMock
+        async def _run():
+            with patch("modal_client.run_prompt_stream") as mock_stream:
+                with patch("canonical_execution.prepare_active_next_profile", new_callable=AsyncMock) as mock_profile:
+                    with patch("canonical_execution.assert_valid_api_prompt_structure"):
+                        mock_profile.return_value = {"status": "ok"}
+                        mock_stream.return_value = self._make_mock_stream({"outputs": {}})()
+
+                        _checker_called = False
+                        async def _fake_checker(*a, **kw):
+                            nonlocal _checker_called
+                            _checker_called = True
+                            return {"matched": False}
+
+                        await self.mod.execute_modal_prompt(
+                            {"3": {"class_type": "KSampler"}},
+                            prompt_id="test_checker",
+                            input_images={},
+                            profile_setter=AsyncMock(),
+                            profile_checker=_fake_checker,
+                        )
+                        # Verify checker was passed to prepare_active_next_profile
+                        _call_kwargs = mock_profile.call_args.kwargs if mock_profile.call_args else {}
+                        self.assertIn("checker", _call_kwargs,
+                                      "profile_checker must be passed as checker= to prepare_active_next_profile")
+                        self.assertIsNotNone(_call_kwargs["checker"])
+                        # Verify the checker callable is the one we passed
+                        self.assertIs(_call_kwargs["checker"], _fake_checker)
+        asyncio.run(_run())
+
 
 # =========================================================================
 # modal_client placement tests

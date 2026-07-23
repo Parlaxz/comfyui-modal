@@ -144,6 +144,7 @@ _SENTINEL_SHARED_COQ = "_comfy_modal_shared_convert_old_quants"
 _SENTINEL_MODEL_PATCHER = "_comfy_modal_model_patcher_wrapper"
 _SENTINEL_MODEL_TO = "_comfy_modal_model_to_wrapper"
 _SENTINEL_CLIP_CONSTRUCTOR = "_comfy_modal_clip_constructor_wrapper"
+_SENTINEL_CLIP_LOAD_SD = "_comfy_modal_clip_load_sd_wrapper"
 
 _read_wrapper_installed: bool = False
 _gpu_wrapper_installed: bool = False
@@ -152,6 +153,7 @@ _subfn_wrappers_installed: bool = False
 _deep_diag_wrappers_installed: bool = False
 _clip_wrapper_installed: bool = False
 _clip_constructor_wrapper_installed: bool = False
+_clip_load_sd_wrapper_installed: bool = False
 _wrappers_lock = RLock()
 
 # Reentrancy guards — per-thread via ContextVar default=0.
@@ -229,7 +231,7 @@ def _make_torch_file_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 if lane._lane == "CLIP":
                     _slow_read_state = _capture_slow_read_before()
                     _slow_ru_before, _slow_io_before = _collect_rusage_and_io_snapshots()
-                if lane._lane == "UNET" and _DIAGNOSTIC_FLAG:
+                if lane._lane == "UNET":
                     lane._trace.emit(
                         "unet_load_torch_file_start",
                         phase=lane._phase,
@@ -272,7 +274,7 @@ def _make_torch_file_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                                 before_io=_slow_io_before,
                                 after_io=_slow_io_after,
                             )
-                    if lane._lane == "UNET" and _DIAGNOSTIC_FLAG:
+                    if lane._lane == "UNET":
                         lane._trace.emit(
                             "unet_load_torch_file_end",
                             phase=lane._phase,
@@ -661,6 +663,9 @@ def _make_clip_load_wrapper(original):
                     "clip_text_transformers_convert": "state_dict_conversion_ms",
                     "constructor": "clip_constructor_ms",
                     "model_patcher_constructor": "model_patcher_ms",
+                    "cond_stage_model_init": "cond_stage_model_init_ms",
+                    "tokenizer_init": "tokenizer_init_ms",
+                    "load_sd_weights": "load_sd_weights_ms",
                 }
                 _s = lambda k: _named_map.get(k)
                 # double-prefix variant also maps to state_dict_conversion
@@ -669,6 +674,16 @@ def _make_clip_load_wrapper(original):
                     _sd_contrib += _named_map.get(_k, 0) or 0
                 if _sd_contrib:
                     _named_map["state_dict_conversion"] = _sd_contrib
+                # ── Compute constructor residual ────────────────────
+                _ctor_ms = _named_map.get("constructor")
+                _csm_init = _named_map.get("cond_stage_model_init")
+                _tok_init = _named_map.get("tokenizer_init")
+                _lsd_w = _named_map.get("load_sd_weights")
+                _mp_ms = _named_map.get("model_patcher_constructor")
+                _ctor_residual: float | None = None
+                if _ctor_ms is not None:
+                    _known_ctor = [v for v in (_csm_init, _tok_init, _lsd_w, _mp_ms) if v is not None]
+                    _ctor_residual = round(_ctor_ms - sum(_known_ctor), 3) if _known_ctor else None
                 _emit_clip_cpu_children_summary(
                     post_read_total_ms=_post_read_total,
                     file_read_total_ms=_clip_file_read,
@@ -677,7 +692,11 @@ def _make_clip_load_wrapper(original):
                     detect_te_model_ms=_named_map.get("detect_te_model"),
                     state_dict_conversion_ms=_named_map.get("state_dict_conversion"),
                     clip_constructor_ms=_named_map.get("constructor"),
+                    cond_stage_model_init_ms=_named_map.get("cond_stage_model_init"),
+                    tokenizer_init_ms=_named_map.get("tokenizer_init"),
+                    load_sd_weights_ms=_named_map.get("load_sd_weights"),
                     model_patcher_ms=_named_map.get("model_patcher_constructor"),
+                    constructor_residual_ms=_ctor_residual,
                     cache_publish_ms=_named_map.get("cache_publish"),
                     measured_children_ms=_children_total,
                     residual_ms=_residual,
@@ -716,8 +735,99 @@ def _make_clip_subfn_wrapper(short_name, original, category):
     return wrapper
 
 
+class _ClipTargetProxy:
+    """Shallow proxy around a CLIP target that intercepts ``.clip`` and
+    ``.tokenizer`` attribute access, wrapping the retrieved callables with
+    timing instrumentation.  All other attribute access passes through to
+    the original target unchanged, preserving behavior.
+
+    Only created when a CLIP constructor wrapper is active and the lane
+    is CLIP.  A non-functional proxy (``copy.copy`` unavailable) falls
+    back to the original target without failing the load.
+    """
+
+    def __init__(self, original_target: Any, lane_trace: Any) -> None:
+        object.__setattr__(self, "_original_target", original_target)
+        # Accept ModelLaneTrace or RuntimeTrace; extract _trace for emit()
+        object.__setattr__(self, "_trace",
+                           getattr(lane_trace, "_trace", lane_trace))
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "clip":
+            return self._wrap_clip()
+        elif name == "tokenizer":
+            return self._wrap_tokenizer()
+        return getattr(self._original_target, name)
+
+    def _wrap_clip(self) -> Any:
+        orig_clip = self._original_target.clip
+        trace = self._trace
+
+        @functools.wraps(orig_clip)
+        def _timed_clip(*args: Any, **kwargs: Any) -> Any:
+            trace.emit("clip_cond_stage_model_init_start", phase="restore")
+            _start_ns = time.monotonic_ns()
+            try:
+                return orig_clip(*args, **kwargs)
+            finally:
+                _dur = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+                trace.emit("clip_cond_stage_model_init_end", phase="restore",
+                           metadata={"duration_ms": _dur})
+        return _timed_clip
+
+    def _wrap_tokenizer(self) -> Any:
+        orig_tokenizer = self._original_target.tokenizer
+        trace = self._trace
+
+        @functools.wraps(orig_tokenizer)
+        def _timed_tokenizer(*args: Any, **kwargs: Any) -> Any:
+            trace.emit("clip_tokenizer_init_start", phase="restore")
+            _start_ns = time.monotonic_ns()
+            try:
+                return orig_tokenizer(*args, **kwargs)
+            finally:
+                _dur = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+                trace.emit("clip_tokenizer_init_end", phase="restore",
+                           metadata={"duration_ms": _dur})
+        return _timed_tokenizer
+
+
+def _make_clip_load_sd_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``comfy.sd.CLIP.load_sd`` with timing instrumentation.
+
+    Only emits ``clip_load_sd_weights_start/end`` events when a CLIP
+    constructor wrapper is active (``_clip_constructor_depth > 0``) AND
+    the active lane is CLIP.  Outside the constructor, the wrapper
+    transparently forwards with zero overhead.
+
+    Sentinel-guarded for idempotent global install.
+    """
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(self: Any, sd: Any, full_model: bool = False) -> Any:
+        lane = _ACTIVE_LANE_TRACE.get()
+        emit = (lane is not None and lane._lane == "CLIP"
+                and _clip_constructor_depth.get() > 0)
+        _start_ns = time.monotonic_ns() if emit else 0
+        if emit:
+            lane._trace.emit("clip_load_sd_weights_start", phase="restore")
+        try:
+            return original(self, sd, full_model=full_model)
+        finally:
+            if emit:
+                _dur = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+                lane._trace.emit("clip_load_sd_weights_end", phase="restore",
+                                 metadata={"duration_ms": _dur})
+    setattr(wrapper, _SENTINEL_CLIP_LOAD_SD, True)
+    return wrapper
+
+
 def _make_clip_constructor_wrapper(original):
-    """Wrap ``comfy.sd.CLIP.__init__`` to emit ``clip_constructor_start/end``.
+    """Wrap ``comfy.sd.CLIP.__init__`` to emit ``clip_constructor_start/end``
+    and proxy ``target.clip`` / ``target.tokenizer`` + ``self.load_sd`` for
+    truthful live child attribution (``clip_cond_stage_model_init``,
+    ``clip_tokenizer_init``, ``clip_load_sd_weights``).
 
     Only active when ``_ACTIVE_LANE_TRACE`` is set AND the current lane
     is ``CLIP``.  Reentrancy-safe via ``_clip_constructor_depth``.
@@ -734,7 +844,23 @@ def _make_clip_constructor_wrapper(original):
         lane = _ACTIVE_LANE_TRACE.get()
         emit = (before == 0 and lane is not None and lane._lane == "CLIP")
         _fn_start_ns = time.monotonic_ns() if emit else 0
+
         if emit:
+            # ── Proxy target.clip / target.tokenizer ──────────────
+            _original_target = args[0] if args else kwargs.get("target")
+            if _original_target is not None:
+                try:
+                    import copy as _copy
+                    _proxy = _ClipTargetProxy(_original_target, lane)
+                    if args:
+                        _new_args = list(args)
+                        _new_args[0] = _proxy
+                        args = tuple(_new_args)
+                    else:
+                        kwargs = dict(kwargs)
+                        kwargs["target"] = _proxy
+                except Exception:
+                    pass  # Fall back to original target without failing
             lane._trace.emit("clip_constructor_start", phase="restore")
         try:
             return original(self, *args, **kwargs)
@@ -958,11 +1084,45 @@ def _install_model_patcher_wrappers(trace: RuntimeTrace | None = None) -> dict[s
     return result
 
 
+def _install_clip_load_sd_wrapper(sd_mod, trace=None):
+    """Install CLIP.load_sd wrapper on live comfy.sd.CLIP class.
+
+    Idempotent via sentinel.  Only emits ``clip_load_sd_weights_start/end``
+    while a CLIP constructor is active (``_clip_constructor_depth > 0``).
+    """
+    global _clip_load_sd_wrapper_installed
+    if _clip_load_sd_wrapper_installed:
+        return "already_installed"
+    CLIP_cls = getattr(sd_mod, "CLIP", None)
+    if CLIP_cls is None:
+        return "unavailable"
+    _orig_load_sd = getattr(CLIP_cls, "load_sd", None)
+    if not callable(_orig_load_sd):
+        return "unavailable"
+    if getattr(_orig_load_sd, _SENTINEL_CLIP_LOAD_SD, False):
+        _clip_load_sd_wrapper_installed = True
+        return "already_installed"
+    with _wrappers_lock:
+        if _clip_load_sd_wrapper_installed:
+            return "already_installed"
+        _check_load_sd = getattr(CLIP_cls, "load_sd", None)
+        if getattr(_check_load_sd, _SENTINEL_CLIP_LOAD_SD, False):
+            _clip_load_sd_wrapper_installed = True
+            return "already_installed"
+        setattr(CLIP_cls, "load_sd", _make_clip_load_sd_wrapper(_check_load_sd))
+        _clip_load_sd_wrapper_installed = True
+    if trace:
+        trace.emit("clip_load_sd_wrapper_install", phase="restore",
+                   metadata={"status": "installed"})
+    return "installed"
+
+
 def _install_clip_constructor_wrapper(sd_mod, trace=None):
     """Install CLIP.__init__ wrapper on live comfy.sd.CLIP class.
 
     Idempotent via sentinel.  Emits ``clip_constructor_start/end``
     named events that are NOT recorded into ``_clip_cpu_prepare_children``.
+    Also installs the load_sd wrapper for child weight-load attribution.
     """
     global _clip_constructor_wrapper_installed
     if _clip_constructor_wrapper_installed:
@@ -985,6 +1145,8 @@ def _install_clip_constructor_wrapper(sd_mod, trace=None):
             return "already_installed"
         setattr(CLIP_cls, "__init__", _make_clip_constructor_wrapper(_check_init))
         _clip_constructor_wrapper_installed = True
+        # Also install load_sd wrapper for child weight-load attribution.
+        _install_clip_load_sd_wrapper(sd_mod, trace=trace)
     if trace:
         trace.emit("clip_constructor_wrapper_install", phase="restore",
                    metadata={"status": "installed"})
@@ -1736,11 +1898,25 @@ class ModelLaneTrace:
 
     def worker_start(self, **metadata: Any) -> None:
         self._worker_started_at_ns = time.monotonic_ns()
+        # Capture thread and process CPU start for summary computation
+        _tt = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
+        _pt = time.process_time_ns() if hasattr(time, "process_time_ns") else None
+        if _tt is not None:
+            metadata["thread_time_ns"] = _tt
+        if _pt is not None:
+            metadata["process_time_ns"] = _pt
         self._trace.emit("background_unet_worker_start", phase=self._phase,
                          metadata={"lane": self._lane, **metadata})
 
     def worker_end(self, **metadata: Any) -> None:
         self._worker_ended_at_ns = time.monotonic_ns()
+        # Capture thread and process CPU end for summary computation
+        _tt = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
+        _pt = time.process_time_ns() if hasattr(time, "process_time_ns") else None
+        if _tt is not None:
+            metadata["thread_time_ns"] = _tt
+        if _pt is not None:
+            metadata["process_time_ns"] = _pt
         self._trace.emit("background_unet_worker_end", phase=self._phase,
                          metadata={"lane": self._lane, **metadata})
 
@@ -1857,6 +2033,24 @@ class ModelLaneTrace:
         self._trace.emit("unet_load_torch_file_start", phase=self._phase, metadata={"lane": self._lane, **metadata})
         self._trace.emit("unet_load_torch_file_end", phase=self._phase, metadata={"lane": self._lane})
 
+    def post_load_cleanup(self, **metadata: Any) -> None:
+        """Emit a truthful zero-duration post-load cleanup boundary.
+
+        ComfyUI has no separable post-load cleanup call; this method emits
+        start/end events at the same instant so the duration is truthfully
+        0.0 rather than fabricating elapsed work or inferring it from a
+        broad aggregate span.
+        """
+        _now_ns = time.monotonic_ns()
+        self._trace.emit(
+            "unet_post_load_cleanup_start", phase=self._phase,
+            metadata={"lane": self._lane, **metadata},
+        )
+        self._trace.emit(
+            "unet_post_load_cleanup_end", phase=self._phase,
+            metadata={"lane": self._lane, "duration_ms": 0.0, **metadata},
+        )
+
     # ── Consumer-side (graph demand) lifecycle ───────────────────────
 
     def graph_demand(self, **metadata: Any) -> None:
@@ -1937,11 +2131,23 @@ def external_model_lane_scope(
     # are instrumented under COMFYMODAL_V2_DEEP_MODEL_DIAG=1.
     _ensure_core_wrappers(trace=trace)
 
+    # Install UNET decomposition wrappers (model_config_get_model,
+    # load_model_weights, model_to, model_patcher_constructor, etc.)
+    # idempotently so the background UNET trace emits the full set of
+    # model-construction child stages.
+    _ensure_unet_decompose_wrappers(trace=trace)
+
     token = _ACTIVE_LANE_TRACE.set(lane_trace)
     lane_trace.worker_start(canonical_key=_canonical_key_str)
     try:
         yield lane_trace
         lane_trace.worker_end()
+        # Post-load cleanup boundary — truthfully 0.0 since ComfyUI has
+        # no separable finalization call between model construction and
+        # cache publication.  Placed after worker_end so the boundary
+        # captures the explicit handoff point; called before ready() so
+        # the cleanup stage precedes the terminal ready event.
+        lane_trace.post_load_cleanup()
         # ready() is called AFTER cache publication completes — the
         # caller is responsible for calling cache_publish_start(),
         # cache_object_store(), cache_metadata_store(), done_event_set(),
@@ -1949,6 +2155,7 @@ def external_model_lane_scope(
         lane_trace.ready()
     except BaseException as exc:
         lane_trace.worker_end()
+        lane_trace.post_load_cleanup(error_category=type(exc).__name__)
         lane_trace.worker_failed(error_category=type(exc).__name__)
         lane_trace.failed(error_category=type(exc).__name__)
         raise
@@ -3025,6 +3232,10 @@ def _emit_clip_cpu_children_summary(
     clip_constructor_ms: float | None = None,
     model_patcher_ms: float | None = None,
     cache_publish_ms: float | None = None,
+    cond_stage_model_init_ms: float | None = None,
+    tokenizer_init_ms: float | None = None,
+    load_sd_weights_ms: float | None = None,
+    constructor_residual_ms: float | None = None,
     measured_children_ms: float = 0.0,
     residual_ms: float = 0.0,
     status: str = "ok",
@@ -3033,6 +3244,16 @@ def _emit_clip_cpu_children_summary(
 
     Named stage fields are printed as-is (None when unavailable).
     *children* is rendered as an inline dict for compactness.
+
+    Phase 3 fields:
+      cond_stage_model_init_ms — time spent in ``target.clip(...)``
+      tokenizer_init_ms — time spent in ``target.tokenizer(...)``
+      load_sd_weights_ms — time spent in ``self.load_sd(...)``
+      constructor_residual_ms — unattributed time inside CLIP.__init__
+        after subtracting known children: clip_constructor_ms minus
+        (cond_stage_model_init_ms + tokenizer_init_ms +
+         load_sd_weights_ms + model_patcher_ms).  None when
+        clip_constructor_ms is unavailable.
     """
     _children_dict: dict[str, float] = {}
     if children:
@@ -3049,7 +3270,11 @@ def _emit_clip_cpu_children_summary(
         f"detect_te_model_ms={detect_te_model_ms} "
         f"state_dict_conversion_ms={state_dict_conversion_ms} "
         f"clip_constructor_ms={clip_constructor_ms} "
+        f"cond_stage_model_init_ms={cond_stage_model_init_ms} "
+        f"tokenizer_init_ms={tokenizer_init_ms} "
+        f"load_sd_weights_ms={load_sd_weights_ms} "
         f"model_patcher_ms={model_patcher_ms} "
+        f"constructor_residual_ms={constructor_residual_ms} "
         f"cache_publish_ms={cache_publish_ms} "
         f"children={_children_dict} "
         f"status={status}",
@@ -3267,6 +3492,7 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
 
     Summarises worker queue, model construction subfunction durations, GPU commit,
     and cache publication.  Missing stages → None.
+    Zero-valued stages (e.g. post_load_cleanup_ms) are reported as 0.0, not None.
     """
     if not force and not _DIAGNOSTIC_FLAG:
         return
@@ -3278,20 +3504,28 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
         "model_construction_residual_ms": None,
         "model_config_get_model_ms": None,
         "load_model_weights_ms": None,
+        "load_torch_file_ms": None,
         "convert_old_quants_ms": None,
         "model_patcher_constructor_ms": None,
         "model_to_ms": None,
         "state_dict_prefix_replace_ms": None,
+        "post_load_cleanup_ms": None,
         "fast_children_le_1ms": 0.0,
         "gpu_lane_wait_ms": None, "gpu_commit_ms": None,
         "cache_publish_ms": None,
         "background_gpu_transfer_present": False,
+        "thread_cpu_ms": None, "process_cpu_ms": None,
+        "thread_cpu_ratio": None,
         "weight_dtype": weight_dtype,
     }
     events = trace.events
     _submitted_ns = 0
     _worker_start_ns = 0
     _worker_end_ns = 0
+    _worker_thread_start_ns = 0
+    _worker_thread_end_ns = 0
+    _worker_proc_start_ns = 0
+    _worker_proc_end_ns = 0
     _gpu_wait_start = 0
     _gpu_wait_end = 0
     _gpu_commit_start = 0
@@ -3300,14 +3534,20 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
     _cache_pub_end = 0
     _sd_total = 0.0
     _children_total = 0.0
+    _sd_found = False
 
     for i, evt in enumerate(events):
+        _meta = evt.metadata if hasattr(evt, "metadata") else {}
         if evt.name == "background_unet_submitted":
             _submitted_ns = evt.monotonic_ns
         elif evt.name == "background_unet_worker_start":
             _worker_start_ns = evt.monotonic_ns
+            _worker_thread_start_ns = _meta.get("thread_time_ns", 0)
+            _worker_proc_start_ns = _meta.get("process_time_ns", 0)
         elif evt.name == "background_unet_worker_end":
             _worker_end_ns = evt.monotonic_ns
+            _worker_thread_end_ns = _meta.get("thread_time_ns", 0)
+            _worker_proc_end_ns = _meta.get("process_time_ns", 0)
         elif evt.name == "unet_gpu_lane_wait_start":
             _gpu_wait_start = evt.monotonic_ns
         elif evt.name == "unet_gpu_lane_wait_end":
@@ -3324,6 +3564,7 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
             _sd_start = evt.monotonic_ns
             for j in range(i + 1, min(i + 300, len(events))):
                 if events[j].name == "unet_load_diffusion_model_state_dict_end":
+                    _sd_found = True
                     _sd_total = events[j].metadata.get("duration_ms", 0) if hasattr(events[j], "metadata") else 0
                     _children_total = events[j].metadata.get("measured_child_total_ms", 0) if hasattr(events[j], "metadata") else 0
                     break
@@ -3351,11 +3592,31 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
             _val = evt.metadata.get("duration_ms")
             if _val is not None:
                 stages["model_to_ms"] = (stages["model_to_ms"] or 0) + _val
+        elif evt.name == "unet_load_torch_file_start":
+            for j in range(i + 1, min(i + 200, len(events))):
+                if events[j].name == "unet_load_torch_file_end":
+                    stages["load_torch_file_ms"] = round(
+                        (events[j].monotonic_ns - evt.monotonic_ns) / 1_000_000, 3)
+                    break
+        elif evt.name == "unet_post_load_cleanup_end":
+            _dur = _meta.get("duration_ms")
+            if _dur is not None:
+                stages["post_load_cleanup_ms"] = round(_dur, 3)
 
     if _submitted_ns and _worker_start_ns:
         stages["submission_to_worker_start_ms"] = round((_worker_start_ns - _submitted_ns) / 1_000_000, 3)
     if _worker_start_ns and _worker_end_ns:
-        stages["worker_wall_ms"] = round((_worker_end_ns - _worker_start_ns) / 1_000_000, 3)
+        _wall_ms = round((_worker_end_ns - _worker_start_ns) / 1_000_000, 3)
+        stages["worker_wall_ms"] = _wall_ms
+        # Thread CPU from worker_start/end metadata (captured via thread_time_ns)
+        if _worker_thread_start_ns and _worker_thread_end_ns:
+            _tcpu = round((_worker_thread_end_ns - _worker_thread_start_ns) / 1_000_000, 3)
+            stages["thread_cpu_ms"] = _tcpu
+            if _wall_ms > 0:
+                stages["thread_cpu_ratio"] = round(_tcpu / _wall_ms, 4)
+        # Process CPU
+        if _worker_proc_start_ns and _worker_proc_end_ns:
+            stages["process_cpu_ms"] = round((_worker_proc_end_ns - _worker_proc_start_ns) / 1_000_000, 3)
     if _gpu_wait_start and _gpu_wait_end:
         stages["gpu_lane_wait_ms"] = round((_gpu_wait_end - _gpu_wait_start) / 1_000_000, 3)
         stages["background_gpu_transfer_present"] = True
@@ -3365,9 +3626,12 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
     if _cache_pub_start and _cache_pub_end:
         stages["cache_publish_ms"] = round((_cache_pub_end - _cache_pub_start) / 1_000_000, 3)
 
-    stages["model_construction_total_ms"] = round(_sd_total, 3) if _sd_total else None
-    stages["measured_direct_children_ms"] = round(_children_total, 3) if _children_total else None
-    stages["model_construction_residual_ms"] = round(_sd_total - _children_total, 3) if _sd_total else None
+    # Fix falsy-zero bug: when the SD wrapper event was found (even with 0.0),
+    # report the literal value; when absent, report None.
+    if _sd_found:
+        stages["model_construction_total_ms"] = round(_sd_total, 3)
+        stages["measured_direct_children_ms"] = round(_children_total, 3)
+        stages["model_construction_residual_ms"] = round(_sd_total - _children_total, 3)
 
     # Separate children >1ms from fast (≤1ms) ones
     _other_named: dict[str, float] = {}
@@ -3385,7 +3649,7 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
                 _other_named[_nkey] = round(_nms, 3)
             else:
                 _fast_total += _nms
-    stages["fast_children_le_1ms"] = round(_fast_total, 3) if _fast_total else None
+    stages["fast_children_le_1ms"] = round(_fast_total, 3)
 
     print(
         f"[v2.bg_unet_stages] "
@@ -3399,6 +3663,11 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
         f"gpu_commit_ms={stages['gpu_commit_ms']} "
         f"cache_publish_ms={stages['cache_publish_ms']} "
         f"background_gpu_transfer_present={stages['background_gpu_transfer_present']} "
+        f"load_torch_file_ms={stages['load_torch_file_ms']} "
+        f"post_load_cleanup_ms={stages['post_load_cleanup_ms']} "
+        f"thread_cpu_ms={stages['thread_cpu_ms']} "
+        f"process_cpu_ms={stages['process_cpu_ms']} "
+        f"thread_cpu_ratio={stages['thread_cpu_ratio']} "
         f"fast_children_le_1ms={stages['fast_children_le_1ms']} "
         f"weight_dtype={stages['weight_dtype']} "
         f"canonical_key={canonical_key[-32:] if canonical_key else ''}",
