@@ -2759,10 +2759,10 @@ def _emit_slow_read_line(
     )
 
     # ── Aggregate counter_status (backward-compatible) ──────────────
-    _dim_avail = {k: v == "available" for k, v in _dim_statuses.items()
-                  if k not in ("cgroup_aggregate",)}
-    _valid_count = sum(1 for v in _dim_avail.values() if v)
-    _total_count = len(_dim_avail) if _dim_avail else 0
+    _counters_available = {k: v == "available" for k, v in _dim_statuses.items()
+                           if k not in ("cgroup_aggregate",)}
+    _valid_count = sum(1 for v in _counters_available.values() if v)
+    _total_count = len(_counters_available) if _counters_available else 0
 
     if not _is_linux:
         counter_status: str = "unsupported"
@@ -2788,7 +2788,7 @@ def _emit_slow_read_line(
             classification = "wait_bound"
         else:
             classification = "mixed"
-    elif not _counters_available.get("thread_cpu"):
+    elif not _dim_statuses.get("thread_cpu", "") == "available":
         classification = "unknown"
     elif elapsed_ms is not None and elapsed_ms > 0 and thread_cpu_ms is not None:
         classification = "unknown"
@@ -3367,7 +3367,7 @@ def _emit_bg_unet_stages_summary(trace: RuntimeTrace, *, canonical_key: str = ""
 
     stages["model_construction_total_ms"] = round(_sd_total, 3) if _sd_total else None
     stages["measured_direct_children_ms"] = round(_children_total, 3) if _children_total else None
-    stages["model_construction_residual_ms"] = round(max(0.0, _sd_total - _children_total), 3) if _sd_total else None
+    stages["model_construction_residual_ms"] = round(_sd_total - _children_total, 3) if _sd_total else None
 
     # Separate children >1ms from fast (≤1ms) ones
     _other_named: dict[str, float] = {}

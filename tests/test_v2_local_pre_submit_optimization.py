@@ -1200,3 +1200,84 @@ class TestHandleCacheGpuCanonicalization(unittest.TestCase):
         """Empty list returns default GPU."""
         result = ModalTransport._canonicalize_gpu_config([])
         self.assertEqual(result, "rtx-pro-6000")
+
+
+# =========================================================================
+# HandleCache cloud and factory_identity isolation
+# =========================================================================
+
+
+class TestHandleCacheCloudFactoryIsolation(unittest.TestCase):
+    """HandleCache with different cloud or factory_identity values misses."""
+
+    def test_different_cloud_misses_cache(self):
+        """Same workspace/app/GPU but different cloud → cache miss."""
+        cache = HandleCache()
+        key_a = HandleCacheKey("ws1", "app1", "cls1", ("gpu1",), cloud="gcp")
+        key_b = HandleCacheKey("ws1", "app1", "cls1", ("gpu1",), cloud="aws")
+        handle = object()
+        cache.put(key_a, handle)
+        self.assertIsNone(cache.get(key_b),
+                          "Different cloud must miss the cache")
+
+    def test_default_cloud_matches_empty_cloud(self):
+        """Default cloud ('') and explicit empty cloud match."""
+        cache = HandleCache()
+        key_a = HandleCacheKey("ws1", "app1", "cls1", ("gpu1",), cloud="")
+        key_b = HandleCacheKey("ws1", "app1", "cls1", ("gpu1",))
+        handle = object()
+        cache.put(key_a, handle)
+        self.assertIs(cache.get(key_b), handle,
+                      "Empty cloud and default must match")
+
+    def test_different_factory_identity_misses_cache(self):
+        """Same workspace/app/GPU/cloud but different factory_identity → miss."""
+        cache = HandleCache()
+        factory_a = lambda **kw: None
+        factory_b = lambda **kw: None
+        key_a = HandleCacheKey("ws1", "app1", "cls1", ("gpu1",),
+                               factory_identity=factory_a)
+        key_b = HandleCacheKey("ws1", "app1", "cls1", ("gpu1",),
+                               factory_identity=factory_b)
+        handle = object()
+        cache.put(key_a, handle)
+        self.assertIsNone(cache.get(key_b),
+                          "Different factory_identity must miss the cache")
+
+    def test_none_factory_identity_matches_none(self):
+        """None factory_identity matches another None."""
+        cache = HandleCache()
+        key_a = HandleCacheKey("ws1", "app1", "cls1", ("gpu1",),
+                               factory_identity=None)
+        key_b = HandleCacheKey("ws1", "app1", "cls1", ("gpu1",),
+                               factory_identity=None)
+        handle = object()
+        cache.put(key_a, handle)
+        self.assertIs(cache.get(key_b), handle,
+                      "Both None factory_identity must hit cache")
+
+    def test_same_factory_object_hits_cache(self):
+        """Same lambda object (same identity) hits cache."""
+        cache = HandleCache()
+        factory = lambda **kw: None
+        key_a = HandleCacheKey("ws1", "app1", "cls1", ("gpu1",),
+                               factory_identity=factory)
+        key_b = HandleCacheKey("ws1", "app1", "cls1", ("gpu1",),
+                               factory_identity=factory)
+        handle = object()
+        cache.put(key_a, handle)
+        self.assertIs(cache.get(key_b), handle,
+                      "Same factory object must hit cache")
+
+    def test_different_gpu_list_order_preserved_in_cache_key(self):
+        """GPU tuple preserves caller order; ['t4', 'a100'] != ['a100', 't4']."""
+        cache = HandleCache()
+        key_a = HandleCacheKey("ws1", "app1", "cls1", ("t4", "a100"))
+        key_b = HandleCacheKey("ws1", "app1", "cls1", ("a100", "t4"))
+        handle = object()
+        cache.put(key_a, handle)
+        # Different order means different key unless HandleCacheKey normalizes
+        # Currently order-preserving — so these are different keys
+        cached = cache.get(key_b)
+        self.assertIsNone(cached,
+                          "Different GPU order must miss cache when order-preserving")

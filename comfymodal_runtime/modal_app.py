@@ -592,8 +592,13 @@ def _unescape_mountinfo_field(value: str) -> str:
 def _resolve_cgroup_v2_base(
     mountinfo_path: str = "/proc/self/mountinfo",
     cgroup_path: str = "/proc/self/cgroup",
-) -> str | None:
-    """Resolve the process cgroup v2 directory from procfs metadata."""
+) -> tuple[str, str] | None:
+    """Resolve the process cgroup v2 directory from procfs metadata.
+
+    Returns ``(resolved_cgroup_base, mount_point)`` on success, ``None`` on any
+    error.  The resolved path includes the mount point and the cgroup relative
+    path joined together (e.g. ``/sys/fs/cgroup/user.slice/job-123``).
+    """
     mount_point: str | None = None
     try:
         with open(mountinfo_path) as f:
@@ -631,13 +636,13 @@ def _resolve_cgroup_v2_base(
     if cgroup_rel is None:
         return None
     if not cgroup_rel or cgroup_rel == "/":
-        return mount_point
+        return (mount_point, mount_point)
     if not cgroup_rel.startswith("/"):
         return None
     components = [component for component in cgroup_rel.split("/") if component]
     if any(component in {".", ".."} for component in components):
         return None
-    return posixpath.join(mount_point, *components)
+    return (posixpath.join(mount_point, *components), mount_point)
 
 
 def _read_cgroup_v2_memory(path: str) -> int | str | None:
@@ -655,10 +660,14 @@ def _read_cgroup_v2_memory(path: str) -> int | str | None:
 def _report_host_memory(stage: str) -> dict[str, Any]:
     """Low-overhead host memory snapshot.
 
-    Emits ``[v2.host_memory]`` with cgroup v2 memory raw bytes, MiB
-    conversions, OOM counters, and process RSS.  Resolves cgroup v2
+    Emits ``[v2.host_memory]`` with cgroup v2 memory MiB conversions, OOM
+    counters, process RSS, and resolved cgroup paths.  Resolves cgroup v2
     paths through ``/proc/self/mountinfo`` and ``/proc/self/cgroup``.
-    Unavailable counters use ``"absent"``.  Never raises.
+    Reads ``memory.current``, ``memory.peak``, ``memory.max``,
+    ``memory.events``, and ``memory.stat`` when available; parses OOM,
+    OOM kill, and selected memory.stat counters.  Missing values are
+    reported as ``"absent"``.  Unlimited memory.max is reported as
+    ``"unlimited"``.  Never raises.
     """
     info: dict[str, Any] = {
         "stage": stage,
@@ -673,10 +682,21 @@ def _report_host_memory(stage: str) -> dict[str, Any]:
         "process_maxrss_mib": "absent",
         "oom_count": "absent",
         "oom_kill_count": "absent",
+        "cgroup_path": "absent",
+        "cgroup_mount": "absent",
     }
     try:
         if platform.system() == "Linux":
-            cgroup_base = _resolve_cgroup_v2_base()
+            cgroup_result = _resolve_cgroup_v2_base()
+            cgroup_base: str | None = None
+            cgroup_mount: str | None = None
+            if cgroup_result is not None:
+                cgroup_base, cgroup_mount = cgroup_result
+            if cgroup_base:
+                info["cgroup_path"] = cgroup_base
+            if cgroup_mount:
+                info["cgroup_mount"] = cgroup_mount
+
             # memory.current
             if cgroup_base:
                 mem_current = _read_cgroup_v2_memory(posixpath.join(cgroup_base, "memory.current"))
@@ -698,12 +718,13 @@ def _report_host_memory(stage: str) -> dict[str, Any]:
                 mem_max = _read_cgroup_v2_memory(posixpath.join(cgroup_base, "memory.max"))
             else:
                 mem_max = None
-            if isinstance(mem_max, (int, str)):
+            if isinstance(mem_max, str) and mem_max == "max":
+                info["memory.max"] = "max"
+                info["limit_mib"] = "unlimited"
+            elif isinstance(mem_max, int) and mem_max >= 0:
                 info["memory.max"] = mem_max
-                if isinstance(mem_max, int) and 0 <= mem_max < 2**60:
+                if mem_max < 2**60:
                     info["limit_mib"] = round(mem_max / (1024 * 1024), 1)
-            else:
-                mem_max = None
             # memory.events (OOM)
             if cgroup_base:
                 try:
@@ -722,6 +743,27 @@ def _report_host_memory(stage: str) -> dict[str, Any]:
                         info["memory.events"] = events
                         info["oom_count"] = events.get("oom", "absent")
                         info["oom_kill_count"] = events.get("oom_kill", "absent")
+                except Exception:
+                    pass
+            # memory.stat (file, inactive_file, active_file, workingset_*)
+            if cgroup_base:
+                try:
+                    stat_path = posixpath.join(cgroup_base, "memory.stat")
+                    _stat_keys = {
+                        "file", "inactive_file", "active_file",
+                        "workingset_refault_file", "workingset_activate_file",
+                        "pgfault", "pgmajfault",
+                    }
+                    with open(stat_path) as f:
+                        for line in f:
+                            line = line.strip()
+                            if " " in line:
+                                key, val_str = line.split(" ", 1)
+                                if key in _stat_keys:
+                                    try:
+                                        info.setdefault("memory.stat", {})[key] = int(val_str)
+                                    except ValueError:
+                                        pass
                 except Exception:
                     pass
         # Process RSS from /proc/self/status
@@ -746,9 +788,24 @@ def _report_host_memory(stage: str) -> dict[str, Any]:
         info["status"] = "ok"
     except Exception:
         info["status"] = "error"
-    # One-line summary: include all keys, use "absent" sentinel for None
+    # One-line [v2.host_memory] with spec-compliant fields only.
+    # Do NOT include raw memory.current, memory.peak, memory.max, memory.events,
+    # memory.stat field names — only MiB-formatted values and aggregate counters.
+    _line_fields: dict[str, Any] = {
+        "stage": info.get("stage", stage),
+        "current_mib": info.get("current_mib", "absent"),
+        "peak_mib": info.get("peak_mib", "absent"),
+        "limit_mib": info.get("limit_mib", "absent"),
+        "process_rss_mib": info.get("process_rss_mib", "absent"),
+        "process_maxrss_mib": info.get("process_maxrss_mib", "absent"),
+        "oom_count": info.get("oom_count", "absent"),
+        "oom_kill_count": info.get("oom_kill_count", "absent"),
+        "status": info.get("status", "ok"),
+        "cgroup_path": info.get("cgroup_path", "absent"),
+        "cgroup_mount": info.get("cgroup_mount", "absent"),
+    }
     _line = " ".join(
-        f"{k}={v}" for k, v in sorted(info.items())
+        f"{k}={v}" for k, v in _line_fields.items()
     )
     print(f"[v2.host_memory] {_line}", flush=True)
     return info

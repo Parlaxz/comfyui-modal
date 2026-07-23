@@ -761,6 +761,90 @@ def attach_pre_sampler_critical_path(
             pass
         return ""
 
+    def _attribution_from_cache(span_name: str, span_duration_ms: float) -> dict[str, Any]:
+        """Build attribution sub-fields from cache operation timings.
+
+        Maps milestone span names to the cache operations that would
+        logically contribute to each span's wall-clock time.  Values
+        come from cache_data since that is the authoritative source
+        (cache data takes priority over trace-derived data).
+        Returns a dict of attribution fields or empty dict when cache
+        data is unavailable.
+        """
+        if not cache_data:
+            return {}
+        _attr: dict[str, Any] = {}
+        if span_name == "execution_start_to_cached":
+            _ckb = cache_data.get("cache_key_build_ms", 0.0)
+            _cl = cache_data.get("cache_lookup_ms", 0.0)
+            _hash_or_check = _ckb + _cl
+            if _hash_or_check > 0:
+                _attr["hash_or_cache_check_ms"] = round(_hash_or_check, 3)
+        elif span_name == "cached_to_first_node":
+            _fw = cache_data.get("future_wait_ms", 0.0)
+            _lw = cache_data.get("lock_wait_ms", 0.0)
+            _mp = cache_data.get("model_patch_ms", 0.0)
+            _ne = cache_data.get("node_execution_ms", 0.0)
+            _ir = cache_data.get("input_resolution_ms", 0.0)
+            if _fw > 0:
+                _attr["future_wait_ms"] = round(_fw, 3)
+            if _lw > 0:
+                _attr["lock_wait_ms"] = round(_lw, 3)
+            if _mp > 0:
+                _attr["model_patch_ms"] = round(_mp, 3)
+            if _ne > 0:
+                _attr["node_execution_ms"] = round(_ne, 3)
+            if _ir > 0:
+                _attr["input_resolution_ms"] = round(_ir, 3)
+        elif span_name in ("first_node_to_clip", "clip_to_sampler_node"):
+            _ne = cache_data.get("node_execution_ms", 0.0)
+            _co = cache_data.get("conditioning_ms", 0.0)
+            if _ne > 0:
+                _attr["node_execution_ms"] = round(_ne, 3)
+            if _co > 0:
+                _attr["conditioning_ms"] = round(_co, 3)
+        elif span_name == "sampler_node_to_sampler_start":
+            _fw = cache_data.get("future_wait_ms", 0.0)
+            _lw = cache_data.get("lock_wait_ms", 0.0)
+            if _fw > 0:
+                _attr["future_wait_ms"] = round(_fw, 3)
+            if _lw > 0:
+                _attr["lock_wait_ms"] = round(_lw, 3)
+
+        # Common attribution: cache hit, model cache hit, background future
+        _hits = cache_data.get("operation_hits", {})
+        if _hits.get("cache_lookup", 0) > 0:
+            _attr["cache_hit"] = True
+        if _hits.get("model_patch", 0) > 0:
+            _attr["model_cache_hit"] = True
+        _future_hit = _hits.get("future_wait", 0) > 0
+        _future_total = cache_data.get("operation_counts", {}).get("future_wait", 0)
+        _future_exists = _future_total > 0
+        _attr["background_future_exists"] = _future_exists
+        _attr["background_future_done"] = _future_hit and _future_exists
+        _un = cache_data.get("unattributed_ms", 0.0)
+        if _un > 0:
+            _attr["unattributed_ms"] = round(_un, 3)
+
+        # Outlier overlap explanation: if the sum of attributed operations
+        # is much less (or more) than the milestone wall duration, and
+        # background futures exist, the gap is likely overlapping wait.
+        _attributed_causes = sum(
+            v for k, v in _attr.items()
+            if k.endswith("_ms") and isinstance(v, (int, float))
+        )
+        if _attributed_causes > 0:
+            _gap = span_duration_ms - _attributed_causes
+            if abs(_gap) > span_duration_ms * 0.2 and _future_exists:
+                _attr["overlap_expectation"] = (
+                    "background_future_wait_overlaps_independent_work"
+                    if _gap > 0
+                    else "background_future_wait_inside_milestone"
+                )
+            elif abs(_gap) > span_duration_ms * 0.2:
+                _attr["overlap_expectation"] = "independent_work"
+        return _attr
+
     def _append_milestone_span(
         name: str,
         duration_ms: Any,
@@ -771,6 +855,7 @@ def attach_pre_sampler_critical_path(
     ) -> None:
         if not isinstance(duration_ms, (int, float)):
             return
+        _dur = float(duration_ms)
         start_id = "" if start_node_id in (None, "") else str(start_node_id)
         end_id = "" if end_node_id in (None, "") else str(end_node_id)
         start_class = str(start_class_type or "") or _workflow_class(start_id)
@@ -778,7 +863,7 @@ def attach_pre_sampler_critical_path(
         span: dict[str, Any] = {
             "span": name,
             "operation": "node_execution",
-            "duration_ms": round(float(duration_ms), 3),
+            "duration_ms": round(_dur, 3),
             "start_node_id": start_id or None,
             "start_node_class_type": start_class or None,
             "end_node_id": end_id or None,
@@ -787,6 +872,10 @@ def attach_pre_sampler_critical_path(
             if start_id and end_id
             else "boundary_node_not_observed",
         }
+        # Enrich with cache-derived attribution
+        _attribution = _attribution_from_cache(name, _dur)
+        if _attribution:
+            span["attribution"] = _attribution
         trace_derived_spans.append(span)
 
     if pre_sampler_stage_metadata:

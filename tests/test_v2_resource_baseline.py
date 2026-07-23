@@ -204,28 +204,34 @@ class TestV2Defaults(unittest.TestCase):
         )
 
 
+def _open_files(files):
+    """Shared helper: returns a side_effect callable for builtins.open.
+
+    *files* maps absolute paths to their string content.  Missing paths
+    raise FileNotFoundError.  Used across multiple test classes.
+    """
+    def open_file(path, *args, **kwargs):
+        if path not in files:
+            raise FileNotFoundError(path)
+        return io.StringIO(files[path])
+
+    return open_file
+
+
 class TestCgroupV2PathResolution(unittest.TestCase):
     """Cgroup v2 base resolution via /proc/self/mountinfo and /proc/self/cgroup."""
-
-    @staticmethod
-    def _open_files(files):
-        def open_file(path, *args, **kwargs):
-            if path not in files:
-                raise FileNotFoundError(path)
-            return io.StringIO(files[path])
-
-        return open_file
 
     def test_resolve_valid_mount_and_cgroup_files(self):
         files = {
             "/mountinfo": "36 29 0:32 / /custom\\040cgroup rw,relatime - cgroup2 cgroup rw\n",
             "/cgroup": "0::/user.slice/job\n",
         }
-        with patch("builtins.open", side_effect=self._open_files(files)):
-            self.assertEqual(
-                _resolve_cgroup_v2_base("/mountinfo", "/cgroup"),
-                "/custom cgroup/user.slice/job",
-            )
+        with patch("builtins.open", side_effect=_open_files(files)):
+            result = _resolve_cgroup_v2_base("/mountinfo", "/cgroup")
+            self.assertIsNotNone(result)
+            resolved_path, mount_point = result
+            self.assertEqual(resolved_path, "/custom cgroup/user.slice/job")
+            self.assertEqual(mount_point, "/custom cgroup")
 
     def test_resolve_missing_files_is_unavailable(self):
         with patch("builtins.open", side_effect=FileNotFoundError):
@@ -233,7 +239,7 @@ class TestCgroupV2PathResolution(unittest.TestCase):
 
     def test_resolve_malformed_files_is_unavailable(self):
         files = {"/mountinfo": "not mountinfo\n", "/cgroup": "0::relative\n"}
-        with patch("builtins.open", side_effect=self._open_files(files)):
+        with patch("builtins.open", side_effect=_open_files(files)):
             self.assertIsNone(_resolve_cgroup_v2_base("/mountinfo", "/cgroup"))
 
     def test_resolve_root_cgroup(self):
@@ -241,11 +247,12 @@ class TestCgroupV2PathResolution(unittest.TestCase):
             "/mountinfo": "36 29 0:32 / /custom/cgroup rw - cgroup2 cgroup rw\n",
             "/cgroup": "0::/\n",
         }
-        with patch("builtins.open", side_effect=self._open_files(files)):
-            self.assertEqual(
-                _resolve_cgroup_v2_base("/mountinfo", "/cgroup"),
-                "/custom/cgroup",
-            )
+        with patch("builtins.open", side_effect=_open_files(files)):
+            result = _resolve_cgroup_v2_base("/mountinfo", "/cgroup")
+            self.assertIsNotNone(result)
+            resolved_path, mount_point = result
+            self.assertEqual(resolved_path, "/custom/cgroup")
+            self.assertEqual(mount_point, "/custom/cgroup")
 
 
 class TestHostMemoryReporting(unittest.TestCase):
@@ -300,7 +307,7 @@ class TestHostMemoryReporting(unittest.TestCase):
 
     def test_valid_memory_counters_are_emitted(self):
         with patch("comfymodal_runtime.modal_app.platform.system", return_value="Linux"), \
-             patch("comfymodal_runtime.modal_app._resolve_cgroup_v2_base", return_value="/fake/cgroup"), \
+             patch("comfymodal_runtime.modal_app._resolve_cgroup_v2_base", return_value=("/fake/cgroup", "/fake/cgroup")), \
              patch(
                  "comfymodal_runtime.modal_app._read_cgroup_v2_memory",
                  side_effect=lambda path: {
@@ -325,9 +332,10 @@ class TestHostMemoryReporting(unittest.TestCase):
         self.assertEqual(result["oom_count"], 2)
         self.assertEqual(result["oom_kill_count"], 1)
 
-    def test_unlimited_memory_limit_is_absent(self):
+    def test_unlimited_memory_limit_reported_as_unlimited(self):
+        """When memory.max is 'max' (unlimited), limit_mib is 'unlimited' string."""
         with patch("comfymodal_runtime.modal_app.platform.system", return_value="Linux"), \
-             patch("comfymodal_runtime.modal_app._resolve_cgroup_v2_base", return_value="/fake/cgroup"), \
+             patch("comfymodal_runtime.modal_app._resolve_cgroup_v2_base", return_value=("/fake/cgroup", "/fake/cgroup")), \
              patch(
                  "comfymodal_runtime.modal_app._read_cgroup_v2_memory",
                  side_effect=lambda path: "max" if path.endswith("memory.max") else None,
@@ -335,11 +343,11 @@ class TestHostMemoryReporting(unittest.TestCase):
              patch("builtins.open", side_effect=FileNotFoundError):
             result = _report_host_memory("unlimited")
         self.assertEqual(result["memory.max"], "max")
-        self.assertEqual(result["limit_mib"], "absent")
+        self.assertEqual(result["limit_mib"], "unlimited")
 
     def test_malformed_memory_files_are_absent_and_safe(self):
         with patch("comfymodal_runtime.modal_app.platform.system", return_value="Linux"), \
-             patch("comfymodal_runtime.modal_app._resolve_cgroup_v2_base", return_value="/fake/cgroup"), \
+             patch("comfymodal_runtime.modal_app._resolve_cgroup_v2_base", return_value=("/fake/cgroup", "/fake/cgroup")), \
              patch(
                  "comfymodal_runtime.modal_app._read_cgroup_v2_memory",
                  return_value=None,
@@ -437,6 +445,239 @@ class TestModalRuntimeSpec(unittest.TestCase):
                 isinstance(identity[key], tuple) and len(identity[key]) == 2,
                 f"found unexpected tuple value in identity key '{key}'",
             )
+
+    def test_memory_is_int_not_tuple(self):
+        """Memory must be a flat int, 24576, with no hard maximum tuple."""
+        spec = ModalRuntimeSpec()
+        self.assertIsInstance(spec.memory, int)
+        self.assertEqual(spec.memory, 24576)
+        self.assertFalse(isinstance(spec.memory, tuple))
+
+    def test_no_warm_containers(self):
+        """min_containers=0 means no warm containers."""
+        self.assertEqual(MIN_CONTAINERS, 0)
+        spec = ModalRuntimeSpec()
+        self.assertEqual(spec.min_containers, 0)
+
+    def test_no_scheduling_policy_changes(self):
+        """Default scaledown_window=4, no scheduling_policy override."""
+        self.assertEqual(SCALEDOWN_WINDOW, 4)
+        spec = ModalRuntimeSpec()
+        self.assertEqual(spec.scaledown_window, 4)
+
+
+class TestCgroupV2Extended(unittest.TestCase):
+    """Extended cgroup v2 path resolution and edge cases."""
+
+    def test_nested_cgroup_path_resolution(self):
+        """Deeply nested cgroup paths are resolved correctly."""
+        files = {
+            "/mountinfo": (
+                "36 29 0:32 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime "
+                "- cgroup2 cgroup rw\n"
+            ),
+            "/cgroup": "0::/system.slice/docker/abc123\n",
+        }
+        with patch("builtins.open", side_effect=_open_files(files)):
+            result = _resolve_cgroup_v2_base("/mountinfo", "/cgroup")
+            self.assertIsNotNone(result)
+            resolved_path, mount_point = result
+            self.assertEqual(resolved_path, "/sys/fs/cgroup/system.slice/docker/abc123")
+            self.assertEqual(mount_point, "/sys/fs/cgroup")
+
+    def test_resolve_missing_mountinfo_line(self):
+        """When mountinfo has no cgroup2 line, returns None."""
+        files = {
+            "/mountinfo": "36 29 0:32 / /something rw - tmpfs tmpfs rw\n",
+            "/cgroup": "0::/user.slice\n",
+        }
+        with patch("builtins.open", side_effect=_open_files(files)):
+            self.assertIsNone(_resolve_cgroup_v2_base("/mountinfo", "/cgroup"))
+
+    def test_resolve_no_cgroup_entry(self):
+        """When /proc/self/cgroup has no 0:: line, returns None."""
+        files = {
+            "/mountinfo": (
+                "36 29 0:32 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+            ),
+            "/cgroup": "1::/user.slice\n",
+        }
+        with patch("builtins.open", side_effect=_open_files(files)):
+            self.assertIsNone(_resolve_cgroup_v2_base("/mountinfo", "/cgroup"))
+
+    def test_resolve_root_cgroup_returns_mount_point_only(self):
+        """When cgroup path is '/', returns (mount_point, mount_point)."""
+        files = {
+            "/mountinfo": (
+                "36 29 0:32 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+            ),
+            "/cgroup": "0::/\n",
+        }
+        with patch("builtins.open", side_effect=_open_files(files)):
+            result = _resolve_cgroup_v2_base("/mountinfo", "/cgroup")
+            self.assertIsNotNone(result)
+            resolved_path, mount_point = result
+            self.assertEqual(resolved_path, "/sys/fs/cgroup")
+            self.assertEqual(mount_point, "/sys/fs/cgroup")
+
+    def test_resolve_rejects_non_absolute_cgroup(self):
+        """Relative cgroup path without leading / returns None."""
+        files = {
+            "/mountinfo": (
+                "36 29 0:32 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+            ),
+            "/cgroup": "0::relative/path\n",
+        }
+        with patch("builtins.open", side_effect=_open_files(files)):
+            self.assertIsNone(_resolve_cgroup_v2_base("/mountinfo", "/cgroup"))
+
+    def test_resolve_rejects_dot_dot_components(self):
+        """Cgroup path with .. components returns None."""
+        files = {
+            "/mountinfo": (
+                "36 29 0:32 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+            ),
+            "/cgroup": "0::/user/../escape\n",
+        }
+        with patch("builtins.open", side_effect=_open_files(files)):
+            self.assertIsNone(_resolve_cgroup_v2_base("/mountinfo", "/cgroup"))
+
+
+class TestHostMemorySchema(unittest.TestCase):
+    """Host-memory one-line output schema compliance."""
+
+    def test_unlimited_memory_max_reported_as_unlimited(self):
+        """When memory.max is 'max', limit_mib is reported as 'unlimited'."""
+        with patch("comfymodal_runtime.modal_app.platform.system", return_value="Linux"), \
+             patch("comfymodal_runtime.modal_app._resolve_cgroup_v2_base",
+                   return_value=("/sys/fs/cgroup", "/sys/fs/cgroup")), \
+             patch(
+                 "comfymodal_runtime.modal_app._read_cgroup_v2_memory",
+                 side_effect=lambda path: {"memory.current": 1024 * 1024,
+                                           "memory.peak": 2048 * 1024,
+                                           "memory.max": "max"}.get(
+                     path.split("/")[-1]),
+             ), \
+             patch("builtins.open", side_effect=FileNotFoundError):
+            result = _report_host_memory("unlimited_check")
+
+        self.assertEqual(result["limit_mib"], "unlimited")
+        self.assertEqual(result["memory.max"], "max")
+
+    def test_line_omits_raw_memory_field_names(self):
+        """The printed [v2.host_memory] line must NOT contain raw
+        memory.current, memory.peak, memory.events or memory.stat field
+        names.  Only MiB-formatted values appear."""
+        import io as _io
+        _captured = _io.StringIO()
+        with patch("comfymodal_runtime.modal_app.platform.system", return_value="Linux"), \
+             patch("comfymodal_runtime.modal_app._resolve_cgroup_v2_base",
+                   return_value=("/sys/fs/cgroup", "/sys/fs/cgroup")), \
+             patch(
+                 "comfymodal_runtime.modal_app._read_cgroup_v2_memory",
+                 side_effect=lambda path: 1024 * 1024 if "current" in path else
+                                           2048 * 1024 if "peak" in path else
+                                           16 * 1024 * 1024 * 1024,
+             ), \
+             patch("builtins.open", side_effect=FileNotFoundError), \
+             patch("sys.stdout", _captured):
+            _report_host_memory("schema_check")
+
+        emitted = _captured.getvalue()
+        # Must contain line prefix
+        self.assertIn("[v2.host_memory]", emitted)
+        # Must NOT contain raw field names
+        self.assertNotIn("memory.current=", emitted)
+        self.assertNotIn("memory.peak=", emitted)
+        self.assertNotIn("memory.events=", emitted)
+        self.assertNotIn("memory.stat=", emitted)
+        # Must contain MiB fields
+        self.assertIn("current_mib=", emitted)
+        self.assertIn("peak_mib=", emitted)
+        self.assertIn("limit_mib=", emitted)
+        self.assertIn("cgroup_path=", emitted)
+        self.assertIn("cgroup_mount=", emitted)
+
+    def test_line_contains_all_eleven_fields(self):
+        """The [v2.host_memory] line has exactly the 11 spec-fields:
+        stage, current_mib, peak_mib, limit_mib, process_rss_mib,
+        process_maxrss_mib, oom_count, oom_kill_count, status,
+        cgroup_path, cgroup_mount."""
+        import io as _io
+        _captured = _io.StringIO()
+        with patch("comfymodal_runtime.modal_app.platform.system", return_value="Linux"), \
+             patch("comfymodal_runtime.modal_app._resolve_cgroup_v2_base",
+                   return_value=("/sys/fs/cgroup/test", "/sys/fs/cgroup")), \
+             patch(
+                 "comfymodal_runtime.modal_app._read_cgroup_v2_memory",
+                 side_effect=lambda path: {
+                     "memory.current": 2 * 1024 * 1024,
+                     "memory.peak": 4 * 1024 * 1024,
+                     "memory.max": 8 * 1024 * 1024,
+                 }.get(path.split("/")[-1]),
+             ), \
+             patch(
+                 "builtins.open",
+                 side_effect=lambda path, *args, **kwargs: _io.StringIO(
+                     "oom 1\noom_kill 0\n"
+                     if "memory.events" in path else
+                     "file 1048576\ninactive_file 524288\nactive_file 524288\n"
+                     "workingset_refault_file 0\nworkingset_activate_file 0\n"
+                     "pgfault 100\npgmajfault 0\n"
+                     if "memory.stat" in path else
+                     "VmRSS: 2048 kB\n"
+                 ),
+             ):
+            result = _report_host_memory("full_schema")
+
+        self.assertEqual(result["stage"], "full_schema")
+        self.assertEqual(result["current_mib"], 2.0)
+        self.assertEqual(result["peak_mib"], 4.0)
+        self.assertEqual(result["limit_mib"], 8.0)
+        self.assertEqual(result["process_rss_mib"], 2.0)
+        self.assertIn("process_maxrss_mib", result)
+        self.assertEqual(result["oom_count"], 1)
+        self.assertEqual(result["oom_kill_count"], 0)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["cgroup_path"], "/sys/fs/cgroup/test")
+        self.assertEqual(result["cgroup_mount"], "/sys/fs/cgroup")
+        # memory.stat parsed fields
+        stat = result.get("memory.stat", {})
+        self.assertIsInstance(stat, dict)
+        self.assertEqual(stat.get("file"), 1048576)
+        self.assertEqual(stat.get("inactive_file"), 524288)
+        self.assertEqual(stat.get("active_file"), 524288)
+        self.assertEqual(stat.get("workingset_refault_file"), 0)
+        self.assertEqual(stat.get("workingset_activate_file"), 0)
+        self.assertEqual(stat.get("pgfault"), 100)
+        self.assertEqual(stat.get("pgmajfault"), 0)
+
+    def test_never_fails_request(self):
+        """_report_host_memory never raises regardless of input."""
+        for stage in ("", "error_test", None):
+            try:
+                if stage is None:
+                    _report_host_memory("none_stage")
+                else:
+                    _report_host_memory(stage)
+            except Exception as exc:
+                self.fail(f"_report_host_memory({stage!r}) raised: {exc}")
+
+    def test_absent_for_all_unavailable_counters(self):
+        """When all cgroup/proc files are unavailable, every counter is absent."""
+        with patch("comfymodal_runtime.modal_app.platform.system", return_value="Linux"), \
+             patch("comfymodal_runtime.modal_app._resolve_cgroup_v2_base", return_value=None), \
+             patch("builtins.open", side_effect=FileNotFoundError):
+            result = _report_host_memory("all_absent")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["current_mib"], "absent")
+        self.assertEqual(result["peak_mib"], "absent")
+        self.assertEqual(result["limit_mib"], "absent")
+        self.assertEqual(result["process_rss_mib"], "absent")
+        self.assertEqual(result["oom_count"], "absent")
+        self.assertEqual(result["oom_kill_count"], "absent")
+        self.assertEqual(result["cgroup_path"], "absent")
+        self.assertEqual(result["cgroup_mount"], "absent")
 
 
 if __name__ == "__main__":

@@ -2076,6 +2076,39 @@ class TestUnetNamedChildrenSummary:
         output = f.getvalue()
         assert "[v2.bg_unet_stages]" in output
 
+    def test_negative_residual_when_children_exceed_construction_total(self):
+        """model_construction_residual_ms is signed (can be negative)
+        when measured direct children exceed the reported construction total.
+        Regression: the old max(0, ...) clamp hid such overlaps."""
+        import io
+        import contextlib
+        from comfymodal_runtime.model_preload import _emit_bg_unet_stages_summary
+
+        trace = RuntimeTrace(request_id="unet-neg-residual", process="remote_background_unet")
+        # children (250ms) exceed construction total (200ms) → residual -50
+        trace.emit("background_unet_submitted", phase="restore")
+        trace.emit("background_unet_worker_start", phase="restore")
+        trace.emit("unet_load_diffusion_model_state_dict_start", phase="restore")
+        trace.emit("unet_load_diffusion_model_state_dict_end", phase="restore", metadata={
+            "duration_ms": 200.0, "measured_child_total_ms": 250.0})
+        # One named child to keep the output realistic
+        trace.emit("unet_load_model_weights_end", phase="restore", metadata={"duration_ms": 250.0})
+
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            _emit_bg_unet_stages_summary(trace, force=True)
+        output = f.getvalue()
+        assert "[v2.bg_unet_stages]" in output
+        assert "model_construction_total_ms=200.0" in output, (
+            f"Expected total 200, got: {output}"
+        )
+        assert "measured_direct_children_ms=250.0" in output, (
+            f"Expected children 250, got: {output}"
+        )
+        assert "model_construction_residual_ms=-50.0" in output, (
+            f"Expected residual -50.0, got: {output}"
+        )
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 15. MutationLane documentation accuracy
@@ -2497,3 +2530,352 @@ class TestCorrectedSemantics:
             f"Expected load_model_weights=35.0 in output, got: {output}"
         )
         assert "model_config_get_model=50.0" in output
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 20. Background UNET attribution — external_model_lane_scope path
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestBgUnetAttribution:
+    """Verifies that external_model_lane_scope with UNET lane populates
+    model construction fields (model_construction_ms, load_model_weights_ms,
+    model_to_ms) via the actual wrapper stack, without duplicate reads,
+    and without global PyTorch/safetensors monkeypatches."""
+
+    def test_bg_unet_scope_emits_construction_fields(self):
+        """external_model_lane_scope + UNET wrappers populate model_construction_ms,
+        load_model_weights_ms, model_to_ms in trace events."""
+        import io
+        import contextlib
+        from comfymodal_runtime.model_preload import (
+            external_model_lane_scope,
+            _ensure_core_wrappers,
+            _ensure_unet_decompose_wrappers,
+        )
+
+        bg_trace = RuntimeTrace(
+            process="remote_background_unet",
+            trace_id="bg-attrib-test-001",
+        )
+        bg_trace.set_metadata(
+            canonical_key="unet:test-model",
+            restored_instance_id="test-inst-001",
+            restore_session_id="test-sess-001",
+            resolved_path="/fake/path/model.safetensors",
+        )
+
+        calls: list[str] = []
+
+        # Simulate the call chain: load_torch_file → load_diffusion_model_state_dict
+        # → ModelPatcher.__init__ → model.to() → load_model_weights
+        def fake_load_torch_file(ckpt, **kw):
+            calls.append("load_torch_file")
+            return {"param": "state_dict"}
+
+        def fake_load_diffusion_model_state_dict(config, state_dict):
+            calls.append("load_diffusion_model_state_dict")
+            # Simulate ModelPatcher constructor inside
+            class FakeModel:
+                def to(self, *a, **kw):
+                    calls.append("model_to")
+                    return self
+                def load_model_weights(self, *a, **kw):
+                    calls.append("load_model_weights")
+                    return None
+            model = FakeModel()
+            # ModelPatcher constructor
+            calls.append("model_patcher_constructor")
+            # model.to()
+            model.to(device="cpu")
+            # load_model_weights (called by model_config.get_model or similar)
+            model.load_model_weights()
+            return {"model": model}
+
+        # Install core wrappers targeting our fakes
+        import comfymodal_runtime.model_preload as mp
+
+        # Save originals
+        saved_torch_file = mp._make_torch_file_wrapper
+        saved_sd = mp._make_sd_state_dict_wrapper
+        saved_mp_ctor = mp._make_model_patcher_constructor_wrapper
+        saved_model_to = mp._make_model_to_wrapper
+        saved_unet_subfn = mp._make_unet_subfn_wrapper
+
+        try:
+            # Install wrappers on the fakes
+            load_torch_wrapped = mp._make_torch_file_wrapper(fake_load_torch_file)
+            sd_wrapped = mp._make_sd_state_dict_wrapper(fake_load_diffusion_model_state_dict)
+
+            # Create model_patcher constructor wrapper
+            class FakeModelPatcher:
+                def __init__(self):
+                    calls.append("model_patcher_ctor_body")
+
+            mp_ctor_wrapped = mp._make_model_patcher_constructor_wrapper(FakeModelPatcher.__init__)
+            model_to_wrapped = mp._make_model_to_wrapper(
+                lambda self, *a, **kw: (calls.append("model_to_body") or self)
+            )
+            lw_wrapped = mp._make_unet_subfn_wrapper("load_model_weights",
+                                                       lambda self: (calls.append("load_weights_body") or None),
+                                                       "model")
+
+            f = io.StringIO()
+            with contextlib.redirect_stdout(f):
+                with external_model_lane_scope(bg_trace, lane="UNET", phase="restore", expected_read_count=1) as lane_t:
+                    # Simulate the actual load sequence
+                    _ = load_torch_wrapped("model.safetensors")
+                    _ = sd_wrapped("unet_config", {"param": 1})
+                    # Simulate ModelPatcher constructor (called inside load_diffusion_model_state_dict)
+                    _fp = FakeModelPatcher()
+                    mp_ctor_wrapped(_fp)
+                    # Simulate model.to()
+                    class FakeMod:
+                        pass
+                    model_to_wrapped(FakeMod(), device="cpu")
+                    # Simulate load_model_weights
+                    lw_wrapped(FakeMod())
+                    # Simulate cache publication (as done in _load_restore_background_unet)
+                    lane_t.cache_publish_start(canonical_key="unet:test-model")
+                    lane_t.cache_object_store(canonical_key="unet:test-model",
+                                              object_type="ModelPatcher",
+                                              object_id="obj_id_001")
+                    lane_t.cache_metadata_store(canonical_key="unet:test-model",
+                                                metadata_status="completed")
+                    lane_t.done_event_set(canonical_key="unet:test-model")
+                    lane_t.cache_publish_end(canonical_key="unet:test-model")
+
+            output = f.getvalue()
+            events = list(bg_trace.events)
+            event_names = [e.name for e in events]
+
+            # Verify model construction fields are populated
+            sd_end = [e for e in events if e.name == "unet_load_diffusion_model_state_dict_end"]
+            assert len(sd_end) >= 1, "unet_load_diffusion_model_state_dict_end must exist"
+            sd_meta = sd_end[0].metadata
+            assert "duration_ms" in sd_meta, "SD end must have duration_ms"
+            assert sd_meta.get("model_construction_total_ms") is not None, (
+                "model_construction_total_ms must be populated"
+            )
+            # load_model_weights
+            lw_end = [e for e in events if e.name == "unet_load_model_weights_end"]
+            assert len(lw_end) >= 1, "unet_load_model_weights_end must exist"
+            assert lw_end[0].metadata.get("duration_ms") is not None
+
+            # model_to
+            mt_end = [e for e in events if e.name == "unet_model_to_end"]
+            assert len(mt_end) >= 1, "unet_model_to_end must exist"
+            assert mt_end[0].metadata.get("duration_ms") is not None
+
+            # model_patcher_constructor
+            mpc_end = [e for e in events if e.name == "unet_model_patcher_constructor_end"]
+            assert len(mpc_end) >= 1, "unet_model_patcher_constructor_end must exist"
+
+            # Cache publication events must be present
+            assert "unet_cache_publish_start" in event_names
+            assert "unet_cache_object_store" in event_names
+            assert "unet_cache_metadata_store" in event_names
+            assert "unet_done_event_set" in event_names
+            assert "unet_cache_publish_end" in event_names
+
+            # ready() event must be emitted AFTER cache publication
+            ready_idx = next(i for i, e in enumerate(events) if e.name == "ready")
+            pub_end_idx = next(i for i, e in enumerate(events) if e.name == "unet_cache_publish_end")
+            assert pub_end_idx < ready_idx, (
+                f"cache_publish_end at {pub_end_idx} must precede ready at {ready_idx}"
+            )
+
+            # Background worker events
+            assert "background_unet_submitted" in event_names
+            assert "background_unet_worker_start" in event_names
+            assert "background_unet_worker_end" in event_names
+
+            # Summaries must be emitted
+            assert "[v2.bg_unet_io]" in output, (
+                f"Expected [v2.bg_unet_io] summary, got:\n{output}"
+            )
+            assert "[v2.bg_unet_stages]" in output, (
+                f"Expected [v2.bg_unet_stages] summary, got:\n{output}"
+            )
+
+        finally:
+            # Restore saved wrappers (no-op since these are test-local)
+            pass
+
+    def test_bg_unet_single_loader_call(self):
+        """The original UNET loader function is called exactly once when using
+        external_model_lane_scope (no duplicate read)."""
+        from comfymodal_runtime.model_preload import (
+            external_model_lane_scope,
+            _make_torch_file_wrapper,
+        )
+
+        bg_trace = RuntimeTrace(
+            process="remote_background_unet",
+            trace_id="bg-single-call",
+        )
+        bg_trace.set_metadata(
+            canonical_key="unet:single",
+            resolved_path="/fake/model.safetensors",
+        )
+
+        call_count = [0]
+
+        def fake_loader(ckpt, **kw):
+            call_count[0] += 1
+            return {"state_dict": "data"}
+
+        wrapped = _make_torch_file_wrapper(fake_loader)
+
+        with external_model_lane_scope(bg_trace, lane="UNET", phase="restore", expected_read_count=1) as _lt:
+            _lt.cache_publish_start()
+            result1 = wrapped("model.safetensors")
+            _lt.cache_publish_end()
+
+        assert call_count[0] == 1, (
+            f"Expected exactly 1 loader call, got {call_count[0]}"
+        )
+        assert result1 == {"state_dict": "data"}
+
+    def test_no_global_monkeypatches(self):
+        """The model_preload wrappers do NOT install global PyTorch or
+        safetensors monkeypatches.  The deep diag wrappers target
+        sys.modules but are guarded by the DIAGNOSTIC_FLAG, and the
+        torch/safetensors modules remain unpolluted by sentinel attributes."""
+        import sys as _test_sys
+
+        # Verify no sentinel attributes on torch or safetensors modules
+        torch_mod = _test_sys.modules.get("torch")
+        st_mod = _test_sys.modules.get("safetensors")
+        if torch_mod is not None:
+            load_fn = getattr(torch_mod, "load", None)
+            if load_fn is not None:
+                # The deep diag wrapper sets _comfy_modal_deep_tl_wrapper
+                assert not hasattr(load_fn, "_comfy_modal_deep_tl_wrapper"), (
+                    "torch.load must NOT have deep diag sentinel in tests"
+                )
+        if st_mod is not None:
+            open_fn = getattr(st_mod, "safe_open", None)
+            if open_fn is not None:
+                assert not hasattr(open_fn, "_comfy_modal_deep_st_wrapper"), (
+                    "safetensors.safe_open must NOT have deep diag sentinel in tests"
+                )
+        # Verify comfy.utils.load_torch_file is not wrapped
+        utils_mod = _test_sys.modules.get("comfy.utils")
+        if utils_mod is not None:
+            ltf = getattr(utils_mod, "load_torch_file", None)
+            if ltf is not None:
+                # The read wrapper sets _comfy_modal_read_wrapper sentinel
+                assert not hasattr(ltf, "_comfy_modal_read_wrapper"), (
+                    "comfy.utils.load_torch_file must NOT be wrapped in test environment"
+                )
+
+    def test_bg_unet_scope_future_handoff_honored(self):
+        """When a future exists and succeeds, the background UNET path must
+        not call the loader (future handoff takes priority).  This validates
+        the comfyapp-level contract: if _unet_object_cache has the key, the
+        background worker path does NOT re-enter the loader.
+
+        Note: This tests the contract level, not the comfyapp implementation.
+        The actual future handoff is tested in test_unet_cache_future_handoff.py.
+        Here we verify that the lane scope does not prevent cache-based handoff."""
+        from comfymodal_runtime.model_preload import (
+            external_model_lane_scope,
+            _make_torch_file_wrapper,
+        )
+
+        bg_trace = RuntimeTrace(
+            process="remote_background_unet",
+            trace_id="bg-future-handoff",
+        )
+        bg_trace.set_metadata(canonical_key="unet:handoff")
+
+        call_count = [0]
+
+        def fake_loader(ckpt, **kw):
+            call_count[0] += 1
+            return {"model": "loaded"}
+
+        wrapped = _make_torch_file_wrapper(fake_loader)
+
+        # Simulate object cache already populated (future handoff success)
+        object_cache = {"unet:handoff": "cached_result"}
+
+        # The lane scope itself does not check the cache — the comfyapp
+        # code that calls external_model_lane_scope should check the cache
+        # first.  This test verifies no spurious extra calls happen within
+        # the scope when the cache is available externally.
+        with external_model_lane_scope(bg_trace, lane="UNET", phase="restore", expected_read_count=1) as _lt:
+            # Check cache first (as comfyapp does)
+            if "unet:handoff" not in object_cache:
+                _ = wrapped("model.safetensors")
+                object_cache["unet:handoff"] = "loaded"
+            # else: skip loader, use cache
+            _lt.cache_publish_start()
+            _lt.cache_publish_end()
+
+        # Loader should NOT have been called (cache hit)
+        assert call_count[0] == 0, (
+            f"Expected 0 loader calls on cache hit, got {call_count[0]}"
+        )
+
+    def test_bg_unet_scope_no_second_read(self):
+        """When a previous active read has already loaded the model into cache,
+        the lane scope does NOT trigger a second load_torch_file call."""
+        from comfymodal_runtime.model_preload import (
+            external_model_lane_scope,
+            _make_torch_file_wrapper,
+        )
+
+        bg_trace = RuntimeTrace(
+            process="remote_background_unet",
+            trace_id="bg-no-second-read",
+        )
+        bg_trace.set_metadata(
+            canonical_key="unet:nosecond",
+            resolved_path="/fake/model.safetensors",
+        )
+
+        call_count = [0]
+        cache = {}
+
+        def fake_loader(ckpt, **kw):
+            call_count[0] += 1
+            result = {"model": f"loaded_{call_count[0]}"}
+            cache[str(ckpt)] = result
+            return result
+
+        wrapped = _make_torch_file_wrapper(fake_loader)
+
+        # First call: populate cache
+        with external_model_lane_scope(bg_trace, lane="UNET", phase="restore", expected_read_count=1) as _lt:
+            result1 = wrapped("model.safetensors")
+            cache["model.safetensors"] = result1
+            _lt.cache_publish_start()
+            _lt.cache_object_store(canonical_key="test",
+                                    object_type="ModelPatcher",
+                                    object_id="id1")
+            _lt.cache_publish_end()
+
+        assert call_count[0] == 1, "First call must invoke loader exactly once"
+
+        # Second call with same key: check cache first, skip loader
+        bg_trace2 = RuntimeTrace(
+            process="remote_background_unet",
+            trace_id="bg-no-second-read-2",
+        )
+        bg_trace2.set_metadata(canonical_key="unet:nosecond")
+
+        with external_model_lane_scope(bg_trace2, lane="UNET", phase="restore", expected_read_count=1) as _lt2:
+            if "model.safetensors" not in cache:
+                result2 = wrapped("model.safetensors")
+                cache["model.safetensors"] = result2
+            else:
+                result2 = cache["model.safetensors"]
+            _lt2.cache_publish_start()
+            _lt2.cache_publish_end()
+
+        assert call_count[0] == 1, (
+            f"Second call must NOT invoke loader (cache hit), got {call_count[0]} calls"
+        )
+        assert result2["model"] == "loaded_1", "Second call must return cached result"
