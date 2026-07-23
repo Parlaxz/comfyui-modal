@@ -65,15 +65,19 @@ def _normalize_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
         key: stable.get(key, "")
         for key in ("mode", "unet", "clip1", "clip2", "clip_type")
     }
+    if raw.get("clip2") and normalized["clip2"] != raw["clip2"]:
+        normalized["clip2"] = raw["clip2"].strip()
     if "weight_dtype" in stable:
         normalized["weight_dtype"] = stable["weight_dtype"]
     return normalized
 
 
 def _build_model_key(normalized: dict[str, Any]) -> ModelRestoreKey:
-    clip = normalized["clip1"]
-    if normalized.get("clip2"):
-        clip = f"{normalized['clip1']}||{normalized['clip2']}"
+    from .restore_plan import _build_dual_clip_identity
+
+    clip1 = normalized["clip1"]
+    clip2 = normalized.get("clip2", "")
+    clip = _build_dual_clip_identity(clip1, clip2) if clip2 else clip1
     return ModelRestoreKey(
         unet_identity=normalized["unet"],
         clip_identity=clip,
@@ -382,12 +386,12 @@ def identity_from_profile(
     model_key = _build_model_key(normalized)
     model_spec = _build_model_spec(normalized)
 
-    # Stat files in deterministic role order: unet, clip1, clip2
+    # Stat files in deterministic role order: unet, clip1, clip2 (only when unique)
     facts: list[ModelFileFact] = [
         _stat_file("unet", normalized["unet"], resolve_path=resolve_path),
         _stat_file("clip1", normalized["clip1"], resolve_path=resolve_path),
     ]
-    if normalized.get("clip2"):
+    if normalized.get("clip2") and normalized["clip2"] != normalized["clip1"]:
         facts.append(_stat_file("clip2", normalized["clip2"], resolve_path=resolve_path))
 
     return (model_key, model_spec, tuple(facts))
@@ -610,21 +614,48 @@ def validate_cpu_snapshot_models(
         value = norm.get(field_name)
         if not isinstance(value, str) or not value.strip():
             return (False, f"normalized_profile {field_name} is not a non-empty string")
+    from .restore_plan import _build_dual_clip_identity
+
     clip2 = norm.get("clip2", "")
     if clip2 is None:
         clip2 = ""
     if not isinstance(clip2, str):
         return (False, "normalized_profile clip2 is not a string")
-    if clip2 == norm["clip1"] and clip2:
-        return (False, "normalized_profile clip2 was not collapsed")
-    normalized_clip_identity = norm["clip1"]
     if clip2:
-        normalized_clip_identity = f"{normalized_clip_identity}||{clip2}"
+        normalized_clip_identity = _build_dual_clip_identity(norm["clip1"], clip2)
+    else:
+        normalized_clip_identity = norm["clip1"]
     if models.model_key.unet_identity != norm["unet"]:
         return (False, "normalized_profile unet does not match model_key")
     if models.model_key.clip_identity != normalized_clip_identity:
         return (False, "normalized_profile clips do not match model_key")
-    expected_roles = ("unet", "clip1") + (("clip2",) if clip2 else ())
+
+    # Verify exact single/dual loader structure when clip loaders are present.
+    clip_loaders = models.model_spec.get("loaders", {}).get("clip", [])
+    if clip_loaders:
+        first = clip_loaders[0]
+        if clip2:
+            if first.get("loader_class") != "DualCLIPLoader":
+                return (False, "model_spec should use DualCLIPLoader when clip2 supplied")
+            if first.get("clip_name1") != norm["clip1"]:
+                return (False, "model_spec clip_name1 mismatch")
+            if first.get("clip_name2") != norm["clip2"]:
+                return (False, "model_spec clip_name2 mismatch")
+            if first.get("type") != norm.get("clip_type", ""):
+                return (False, "model_spec clip type mismatch")
+            if first.get("device") != "default":
+                return (False, "model_spec clip device should be 'default'")
+        else:
+            if first.get("loader_class") != "CLIPLoader":
+                return (False, "model_spec should use CLIPLoader when no clip2 supplied")
+            if first.get("clip_name") != norm["clip1"]:
+                return (False, "model_spec clip_name mismatch")
+
+    # Unique file facts: only include clip2 when different from clip1
+    if clip2 and clip2 != norm.get("clip1"):
+        expected_roles = ("unet", "clip1", "clip2")
+    else:
+        expected_roles = ("unet", "clip1")
     actual_roles = tuple(fact.role for fact in models.file_facts)
     if actual_roles != expected_roles:
         return (False, f"file fact roles mismatch: {actual_roles!r} != {expected_roles!r}")
