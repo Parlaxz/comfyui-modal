@@ -12,6 +12,7 @@ import platform
 import posixpath
 import time
 import uuid
+import copy
 from types import MappingProxyType
 
 import dataclasses
@@ -220,6 +221,16 @@ _V2_CERT_FILENAME_PREFIX: str = "v2_cert_"
 # Pre-computed deployment identity hash for certificate identity.
 # Populated at module level once during import.
 _V2_DEPLOYMENT_COMBINED_HASH: str = ""
+
+# Process-local validation certificate cache.
+# Keyed by (restored_instance_id, cert_identity).  Stores copies only of
+# outputs_to_execute, node_errors, preflight_ok, schema_version, and
+# identity_components for exact revalidation.  No live graph/executor/
+# model/node/cache objects are stored.  New instance ID -> fresh lookup.
+# Evicted on replacement write, component mismatch, or any validation
+# failure detected at read time.
+_V2_CERT_PROCESS_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+
 
 
 # Plan A/B spec projection helpers (Plan C compatibility)
@@ -479,6 +490,17 @@ def _write_v2_validation_certificate(
     """
     try:
         import json as _json
+
+        # Invalidate EVERY process-local cache entry for this certificate
+        # identity BEFORE any I/O or volume-lookup, so a failed or
+        # unavailable volume write still clears stale entries.
+        _keys_to_pop = [
+            k for k in _V2_CERT_PROCESS_CACHE
+            if len(k) == 2 and k[1] == cert_identity
+        ]
+        for _k in _keys_to_pop:
+            _V2_CERT_PROCESS_CACHE.pop(_k, None)
+
         resources = globals().get("_MODAL_RESOURCES", {})
         modal_volume = resources.get("runtime_state_volume")
         if modal_volume is None:
@@ -496,6 +518,7 @@ def _write_v2_validation_certificate(
         }
         if components:
             payload["identity_components"] = dict(components)
+
         encoded = _json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
         volume.write_bytes(filename, encoded)
         volume.commit()
@@ -512,28 +535,19 @@ def _write_v2_validation_certificate(
         return False
 
 
-def _read_and_validate_cert_payload(
-    volume: Any,
+def _validate_cert_dict_payload(
+    payload: dict[str, Any],
     cert_identity: str,
     *,
     expected_components: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
-    """Read and validate a certificate payload from an already-reloaded *volume*.
+    """Validate a parsed certificate payload *dict* against schema/identity/components.
 
-    Shared helper used by both sync (``_read_v2_validation_certificate``) and
-    async (``_read_v2_validation_certificate_async``) read paths.  Never raises.
-    Returns ``{"outputs_to_execute": [...], "node_errors": {...}}`` on hit, or
-    ``None`` on miss/mismatch/error.
+    Pure validation - no I/O.  Returns
+    ``{"outputs_to_execute": [...], "node_errors": {...}}`` on success or
+    ``None`` on any validation failure.  Never raises.
     """
     try:
-        import json as _json
-        filename = _v2_cert_filename(cert_identity)
-        if not volume.exists(filename):
-            return None
-        raw = volume.read_bytes(filename)
-        if not raw:
-            return None
-        payload = _json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict):
             return None
 
@@ -601,6 +615,37 @@ def _read_and_validate_cert_payload(
         return None
 
 
+def _read_and_validate_cert_payload(
+    volume: Any,
+    cert_identity: str,
+    *,
+    expected_components: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    """Read and validate a certificate payload from an already-reloaded *volume*.
+
+    Shared helper used by both sync and async read paths.  Never raises.
+    Returns ``{"outputs_to_execute": [...], "node_errors": {...}}`` on hit, or
+    ``None`` on miss/mismatch/error.
+    """
+    try:
+        import json as _json
+        filename = _v2_cert_filename(cert_identity)
+        if not volume.exists(filename):
+            return None
+        raw = volume.read_bytes(filename)
+        if not raw:
+            return None
+        payload = _json.loads(raw.decode("utf-8"))
+        return _validate_cert_dict_payload(
+            payload, cert_identity, expected_components=expected_components,
+        )
+    except Exception as exc:
+        print(
+            f"[v2.cert] read identity={cert_identity[:16]} "
+            f"status=error error={str(exc)[:120]}",
+            flush=True,
+        )
+        return None
 def _read_v2_validation_certificate(
     cert_identity: str,
     *,
@@ -643,34 +688,62 @@ async def _read_v2_validation_certificate_async(
     cert_identity: str,
     *,
     expected_components: dict[str, str] | None = None,
-) -> dict[str, Any] | None:
-    """Async variant â€” uses ``volume.reload_async()`` to avoid Modal's
-    "synchronous reload in async context" warning, then delegates to
-    ``_read_and_validate_cert_payload()``.
+) -> tuple[dict[str, Any] | None, dict[str, float]]:
+    """Async variant -- uses ``volume.reload_async()`` to avoid Modal's
+    "synchronous reload in async context" warning, then reads,
+    parses and validates the certificate payload.
+
+    Returns ``(result, timings)`` where *result* is
+    ``{"outputs_to_execute": [...], "node_errors": {...}}`` on hit
+    or ``None`` on miss/mismatch/error, and *timings* is a dict with
+    ``cert_volume_reload_ms``, ``cert_file_read_ms``, and
+    ``cert_json_parse_validate_ms`` keys.
 
     Prefer this over the sync variant when calling from an async context
     (e.g. ``_execute_v2_prompt_executor``).
     """
+    timings: dict[str, float] = {
+        "cert_volume_reload_ms": 0.0,
+        "cert_file_read_ms": 0.0,
+        "cert_json_parse_validate_ms": 0.0,
+    }
     try:
+        import json as _json
         resources = globals().get("_MODAL_RESOURCES", {})
         modal_volume = resources.get("runtime_state_volume")
         if modal_volume is None:
-            return None
+            return None, timings
         from .runtime_state import ModalMountedStateVolume
         volume = ModalMountedStateVolume(RUNTIME_STATE_PATH, modal_volume)
+
+        _t0 = time.perf_counter()
         await volume.reload_async()
-        return _read_and_validate_cert_payload(
-            volume, cert_identity, expected_components=expected_components,
+        timings["cert_volume_reload_ms"] = round((time.perf_counter() - _t0) * 1000, 3)
+
+        filename = _v2_cert_filename(cert_identity)
+        _t1 = time.perf_counter()
+        if not volume.exists(filename):
+            timings["cert_file_read_ms"] = round((time.perf_counter() - _t1) * 1000, 3)
+            return None, timings
+        raw = volume.read_bytes(filename)
+        timings["cert_file_read_ms"] = round((time.perf_counter() - _t1) * 1000, 3)
+        if not raw:
+            return None, timings
+
+        _t2 = time.perf_counter()
+        payload = _json.loads(raw.decode("utf-8"))
+        result = _validate_cert_dict_payload(
+            payload, cert_identity, expected_components=expected_components,
         )
+        timings["cert_json_parse_validate_ms"] = round((time.perf_counter() - _t2) * 1000, 3)
+        return result, timings
     except Exception as exc:
         print(
             f"[v2.cert] read identity={cert_identity[:16]} "
             f"status=error error={str(exc)[:120]}",
             flush=True,
         )
-        return None
-
-
+        return None, timings
 def _capture_remote_identity() -> dict[str, Any]:
     """Capture Modal identity and environment metadata at remote entry.
 
@@ -2980,11 +3053,13 @@ class ModalRuntimeEntrypoint:
             trace.emit("input_materialization_start", phase="execution")
             materialize_inputs(dict(plan.input_images))
             trace.emit("input_materialization_end", phase="execution")
-
-        # â”€â”€ Preflight context and certificate-gated preflight fast path â”€â”€
+        # Preflight context and certificate-gated preflight fast path
         # Phase 2: resolve the exact certificate before expensive preflight.
         # On exact identity/component hit + preflight_ok, skip preflight.
         # Missing-node repair always runs outside the certified skip.
+        # Process-local cache (keyed by restored_instance_id + cert_identity)
+        # avoids volume reload/read/parse on repeated hits within the same
+        # restore lifecycle.
         _v2_cert_hit = False
         _v2_cert_preflight_skip = False
         _v2_preflight_ran = False
@@ -3000,12 +3075,22 @@ class ModalRuntimeEntrypoint:
         outputs_to_execute: list[str] = []
         node_errors: dict[str, Any] = {}
 
+        # Diagnostic timing fields for certificate, preflight, and validation.
+        _diag_cert_identity_build_ms: float = 0.0
+        _diag_cert_cache_hit: bool = False
+        _diag_cert_volume_reload_ms: float = 0.0
+        _diag_cert_file_read_ms: float = 0.0
+        _diag_cert_json_parse_validate_ms: float = 0.0
+        _diag_cert_total_ms: float = 0.0
+        _diag_legacy_preflight_ms: float = 0.0
+        _diag_prompt_validation_ms: float = 0.0
+
         # Obtain preflight context from the loaded legacy API
         _preflight_fn = getattr(api, "_preflight_before_prompt_execution", None)
         if callable(_preflight_fn) and not getattr(api, "_preflight_already_ran", False):
             _v2_repair_mode, _v2_custom_nodes_gen = _get_preflight_context(api, module)
 
-            # Try cert lookup before preflight â€” only eligible when the
+            # Try cert lookup before preflight -- only eligible when the
             # deployment identity, repair mode, and custom-nodes generation
             # are all complete and recognised.
             if _V2_VALIDATION_CERT_ENABLED:
@@ -3023,50 +3108,181 @@ class ModalRuntimeEntrypoint:
                         and bool(_v2_custom_nodes_gen)
                     )
                     if _cert_eligible:
+                        # Compute cert identity WITH timing
+                        _cert_identity_build_start = time.perf_counter()
                         _v2_cert_identity, _v2_cert_components = _compute_v2_cert_identity(
                             _cert_wf_hash,
                             deployment_identity=_v2_dep_identity,
                             repair_mode=_v2_repair_mode,
                             custom_nodes_generation=_v2_custom_nodes_gen,
                         )
-                        trace.emit(
-                            "certificate_reload_start",
-                            phase="execution",
-                            metadata={"cert_identity": _v2_cert_identity[:16]},
-                        )
-                        _cert_result = await _read_v2_validation_certificate_async(
-                            _v2_cert_identity,
-                            expected_components=_v2_cert_components,
-                        )
+                        _diag_cert_identity_build_ms = round((time.perf_counter() - _cert_identity_build_start) * 1000, 3)
+
+                        # -- Process-local cache lookup --
+                        _cache_key = (getattr(self, "_restored_instance_id", ""), _v2_cert_identity)
+                        _cached = _V2_CERT_PROCESS_CACHE.get(_cache_key)
+                        _cached_valid = False
+                        if _cached is not None:
+                            # Full revalidation of all stored fields
+                            _cached_valid = True
+                            _evict_reason = ""
+
+                            # Check schema_version
+                            if _cached.get("schema_version") != _V2_CERT_SCHEMA_VERSION:
+                                _cached_valid = False
+                                _evict_reason = "schema_version_mismatch"
+
+                            # Check preflight_ok is True
+                            if _cached_valid and _cached.get("preflight_ok") is not True:
+                                _cached_valid = False
+                                _evict_reason = "preflight_not_ok"
+
+                            # Check identity_components
+                            if _cached_valid:
+                                _stored_comp = _cached.get("identity_components", {})
+                                if not isinstance(_stored_comp, dict) or _stored_comp != _v2_cert_components:
+                                    _cached_valid = False
+                                    _evict_reason = "component_mismatch"
+
+                            # Check outputs_to_execute is a list of unique strings
+                            if _cached_valid:
+                                _cached_outputs = _cached.get("outputs_to_execute", [])
+                                if not isinstance(_cached_outputs, list):
+                                    _cached_valid = False
+                                    _evict_reason = "outputs_not_list"
+                                else:
+                                    _seen_out: set[str] = set()
+                                    for _oid in _cached_outputs:
+                                        if not isinstance(_oid, str) or _oid in _seen_out:
+                                            _cached_valid = False
+                                            _evict_reason = "outputs_not_unique_strings"
+                                            break
+                                        _seen_out.add(_oid)
+
+                            # Check node_errors is a dict
+                            if _cached_valid:
+                                _cached_errs = _cached.get("node_errors", {})
+                                if not isinstance(_cached_errs, dict):
+                                    _cached_valid = False
+                                    _evict_reason = "node_errors_not_dict"
+
+                            if _cached_valid:
+                                # Full cache hit
+                                outputs_to_execute = list(_cached["outputs_to_execute"])
+                                node_errors = copy.deepcopy(_cached["node_errors"]) if _cached.get("node_errors") else {}
+                                _v2_cert_hit = True
+                                _v2_cert_preflight_skip = True
+                                _diag_cert_cache_hit = True
+                                _cached_valid = True
+                                # Cache hit uses 0.0 for volume/file/parse timings
+                                _diag_cert_volume_reload_ms = 0.0
+                                _diag_cert_file_read_ms = 0.0
+                                _diag_cert_json_parse_validate_ms = 0.0
+                                _diag_cert_total_ms = _diag_cert_identity_build_ms
+                                print(
+                                    f"[v2.cert] cache_hit=1 identity={_v2_cert_identity[:16]} "
+                                    f"outputs={len(outputs_to_execute)}",
+                                    flush=True,
+                                )
+                            else:
+                                # Revalidation failure -- evict cache entry and fall through
+                                _V2_CERT_PROCESS_CACHE.pop(_cache_key, None)
+                                print(
+                                    f"[v2.cert] cache_evict reason={_evict_reason} "
+                                    f"identity={_v2_cert_identity[:16]}",
+                                    flush=True,
+                                )
+
+                        if not _cached_valid:
+                            # Cache miss or evicted -- read from volume with granular timing
+                            trace.emit(
+                                "certificate_reload_start",
+                                phase="execution",
+                                metadata={"cert_identity": _v2_cert_identity[:16]},
+                            )
+                            _cert_result, _cert_timings = await _read_v2_validation_certificate_async(
+                                _v2_cert_identity,
+                                expected_components=_v2_cert_components,
+                            )
+                            _diag_cert_volume_reload_ms = _cert_timings["cert_volume_reload_ms"]
+                            _diag_cert_file_read_ms = _cert_timings["cert_file_read_ms"]
+                            _diag_cert_json_parse_validate_ms = _cert_timings["cert_json_parse_validate_ms"]
+                            _diag_cert_total_ms = round(
+                                _diag_cert_identity_build_ms
+                                + _diag_cert_volume_reload_ms
+                                + _diag_cert_file_read_ms
+                                + _diag_cert_json_parse_validate_ms,
+                                3,
+                            )
+
+                            if _cert_result is not None:
+                                outputs_to_execute = _cert_result["outputs_to_execute"]
+                                node_errors = _cert_result.get("node_errors", {})
+                                _v2_cert_hit = True
+                                _v2_cert_preflight_skip = True
+                                # Store in process-local cache (deep copies only)
+                                _V2_CERT_PROCESS_CACHE[_cache_key] = {
+                                    "outputs_to_execute": list(outputs_to_execute),
+                                    "node_errors": copy.deepcopy(node_errors) if node_errors else {},
+                                    "preflight_ok": True,
+                                    "schema_version": _V2_CERT_SCHEMA_VERSION,
+                                    "identity_components": dict(_v2_cert_components),
+                                }
+                                print(
+                                    f"[v2.cert] hit=1 preflight_skip=1 identity={_v2_cert_identity[:16]} "
+                                    f"outputs={len(outputs_to_execute)}",
+                                    flush=True,
+                                )
+                            else:
+                                # Volume read failed or invalid -- do NOT cache
+                                print(
+                                    f"[v2.cert] hit=0 identity={_v2_cert_identity[:16]}",
+                                    flush=True,
+                                )
+
+                            trace.emit(
+                                "certificate_reload_end",
+                                phase="execution",
+                                metadata={
+                                    "cert_identity": _v2_cert_identity[:16],
+                                    "hit": _v2_cert_hit,
+                                    "cert_cache_hit": _diag_cert_cache_hit,
+                                    "cert_identity_build_ms": _diag_cert_identity_build_ms,
+                                    "cert_volume_reload_ms": _diag_cert_volume_reload_ms,
+                                    "cert_file_read_ms": _diag_cert_file_read_ms,
+                                    "cert_json_parse_validate_ms": _diag_cert_json_parse_validate_ms,
+                                    "cert_total_ms": _diag_cert_total_ms,
+                                },
+                            )
+
+                        # certificate_read_outcome emitted for BOTH local-cache
+                        # AND volume paths without claiming a volume reload on cache hit.
                         trace.emit(
                             "certificate_read_outcome",
                             phase="execution",
                             metadata={
                                 "cert_identity": _v2_cert_identity[:16],
-                                "hit": _cert_result is not None,
-                                "preflight_skip": _cert_result is not None,
+                                "hit": _v2_cert_hit,
+                                "preflight_skip": _v2_cert_preflight_skip,
+                                "cert_cache_hit": _diag_cert_cache_hit,
+                                "cert_identity_build_ms": _diag_cert_identity_build_ms,
+                                "cert_volume_reload_ms": _diag_cert_volume_reload_ms,
+                                "cert_file_read_ms": _diag_cert_file_read_ms,
+                                "cert_json_parse_validate_ms": _diag_cert_json_parse_validate_ms,
+                                "cert_total_ms": _diag_cert_total_ms,
                             },
                         )
-                        trace.emit(
-                            "certificate_reload_end",
-                            phase="execution",
-                            metadata={
-                                "cert_identity": _v2_cert_identity[:16],
-                                "hit": _cert_result is not None,
-                            },
+                    else:
+                        # Not eligible for cert -- preflight+validate will run
+                        print(
+                            f"[v2.cert] skip reason=not_eligible "
+                            f"dep_hash={bool(_v2_dep_hash)} "
+                            f"repair_mode={_v2_repair_mode!r} "
+                            f"custom_nodes_gen={bool(_v2_custom_nodes_gen)}",
+                            flush=True,
                         )
-                        if _cert_result is not None:
-                            outputs_to_execute = _cert_result["outputs_to_execute"]
-                            node_errors = _cert_result.get("node_errors", {})
-                            _v2_cert_hit = True
-                            _v2_cert_preflight_skip = True
-                            print(
-                                f"[v2.cert] hit=1 preflight_skip=1 identity={_v2_cert_identity[:16]} "
-                                f"outputs={len(outputs_to_execute)}",
-                                flush=True,
-                            )
 
-        # â”€â”€ Preflight (skip on exact certificate hit) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Preflight (skip on exact certificate hit)
         if callable(_preflight_fn) and not getattr(api, "_preflight_already_ran", False):
             if _v2_cert_preflight_skip:
                 trace.emit(
@@ -3077,11 +3293,14 @@ class ModalRuntimeEntrypoint:
                         "cert_hit": True,
                     },
                 )
+                _diag_legacy_preflight_ms = 0.0
             else:
                 _v2_preflight_ran = True
+                _pf_start = time.perf_counter()
                 trace.emit("preflight_start", phase="execution")
                 await asyncio.to_thread(_preflight_fn, workflow)
                 trace.emit("preflight_end", phase="execution")
+                _diag_legacy_preflight_ms = round((time.perf_counter() - _pf_start) * 1000, 3)
 
         repair_missing_nodes = getattr(api, "_repair_missing_workflow_nodes", None)
         repair_summary: Any = None
@@ -3110,8 +3329,6 @@ class ModalRuntimeEntrypoint:
             # Oracle Gate 2: if a cert skip occurred but the repair reports
             # nodes that were missing before repair, the cached validation
             # result may be stale because repair changed node availability.
-            # Invalidate the cached cert result and fall through to full
-            # preflight+validate below.
             if (
                 _v2_cert_preflight_skip
                 and isinstance(repair_summary, Mapping)
@@ -3126,22 +3343,21 @@ class ModalRuntimeEntrypoint:
                 _v2_cert_preflight_skip = False
                 outputs_to_execute = []
                 node_errors = {}
-                # Re-run preflight now since the inline preflight block
-                # already executed (and skipped).  Validate will also run
-                # because _v2_cert_preflight_skip is now False.
+                _cache_key_inval = (getattr(self, "_restored_instance_id", ""), _v2_cert_identity)
+                _V2_CERT_PROCESS_CACHE.pop(_cache_key_inval, None)
                 _v2_preflight_ran = True
+                _pf_start2 = time.perf_counter()
                 if callable(_preflight_fn):
                     trace.emit("preflight_start", phase="execution")
                     await asyncio.to_thread(_preflight_fn, workflow)
                     trace.emit("preflight_end", phase="execution")
+                _diag_legacy_preflight_ms = round((time.perf_counter() - _pf_start2) * 1000, 3)
 
         import execution
 
-        # â”€â”€ Prompt validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Prompt validation
         # When preflight was skipped via certificate hit, outputs_to_execute
         # and node_errors are already populated from the stored certificate.
-        # When preflight ran, we run validate_prompt and schedule a new cert
-        # write (with preflight_ok=True) after successful execution.
         valid: bool = False
         error: dict[str, Any] | str = {}
         if not _v2_cert_preflight_skip:
@@ -3157,12 +3373,11 @@ class ModalRuntimeEntrypoint:
             },
         )
         if not _v2_cert_preflight_skip:
+            _pv_start = time.perf_counter()
             valid, error, outputs_to_execute, node_errors = await execution.validate_prompt(
                 prompt_id, workflow, None
             )
-            # Schedule certificate write only when the same eligibility
-            # conditions that would allow a read are met â€” incomplete or
-            # unknown context never produces a certificate.
+            _diag_prompt_validation_ms = round((time.perf_counter() - _pv_start) * 1000, 3)
             _cert_write_eligible = (
                 bool(_v2_dep_identity.combined_hash if _v2_dep_identity else "")
                 and _v2_repair_mode in ("off", "fail_fast", "dev")
@@ -3183,6 +3398,7 @@ class ModalRuntimeEntrypoint:
         else:
             valid = True
             error = {}
+            _diag_prompt_validation_ms = 0.0
         trace.emit(
             "prompt_validation_end",
             phase="execution",
@@ -3194,14 +3410,22 @@ class ModalRuntimeEntrypoint:
                 "preflight_skip": _v2_cert_preflight_skip,
                 "preflight_ran": _v2_preflight_ran,
                 "cert_identity": _v2_cert_identity[:16] if _v2_cert_identity else "",
+                # Diagnostic timing fields
+                "cert_identity_build_ms": _diag_cert_identity_build_ms,
+                "cert_cache_hit": _diag_cert_cache_hit,
+                "cert_volume_reload_ms": _diag_cert_volume_reload_ms,
+                "cert_file_read_ms": _diag_cert_file_read_ms,
+                "cert_json_parse_validate_ms": _diag_cert_json_parse_validate_ms,
+                "cert_total_ms": _diag_cert_total_ms,
+                "legacy_preflight_ms": _diag_legacy_preflight_ms,
+                "prompt_validation_ms": _diag_prompt_validation_ms,
+                "certificate_skipped_preflight": _v2_cert_preflight_skip,
+                "certificate_skipped_prompt_validation": _v2_cert_preflight_skip,
             },
         )
         if not valid:
             detail = error.get("message", str(error)) if isinstance(error, dict) else str(error)
             raise RuntimeError(f"Workflow validation failed: {detail}")
-
-        # â”€â”€ Pregraph setup: V2-owned work between prompt validation and
-        # PromptExecutor call (production registry, _begin_profile, etc.).
         trace.emit("pregraph_setup_start", phase="execution", metadata={
             "prompt_id": prompt_id,
         })

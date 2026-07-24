@@ -314,6 +314,26 @@ def _get_preflight_unbound():
 class TestFirstRequestHitsManifest:
     """First request after startup must hit the persisted manifest."""
 
+    @staticmethod
+    def _identity_return(match=True, **overrides):
+        """Build mock return for _check_dependency_manifest_identity."""
+        base = {
+            "identity_match": match,
+            "manifest_load_ms": 3.0,
+            "cheap_check_ms": 1.0,
+            "computed_identity": "ident" if match else "new_ident",
+            "stored_identity": "ident" if match else "old_ident",
+            "reason": "" if match else "identity_mismatch",
+            "stored_schema_version": 1,
+            "stored_combined_hash": "combined_hash_val",
+            "stored_custom_node_fingerprint_overall_dependency_hash": "fp",
+            "stored_custom_node_generation": "gen",
+            "stored_repair_mode": "fail_fast",
+            "miss_component": "" if match else "deployment_hash,baked_dependency_hash,custom_nodes_generation",
+        }
+        base.update(overrides)
+        return base
+
     @patch("comfyapp._run_dependency_validation_with_cache")
     @patch("comfyapp._build_and_persist_dependency_manifest")
     @patch("comfyapp._resolve_deployment_combined_hash")
@@ -339,14 +359,7 @@ class TestFirstRequestHitsManifest:
         mock_baked.return_value = {"overall_dependency_hash": "fp"}
         mock_cn_gen.return_value = {"generation": "gen"}
         mock_load_mft.return_value = {"identity": "some_id", "schema_version": 1}
-        mock_check_id.return_value = {
-            "identity_match": True,
-            "manifest_load_ms": 3.0,
-            "cheap_check_ms": 1.0,
-            "computed_identity": "ident",
-            "stored_identity": "ident",
-            "reason": "",
-        }
+        mock_check_id.return_value = self._identity_return(match=True)
 
         app = FakeComfyApp()
         t0 = time.time()
@@ -384,14 +397,7 @@ class TestFirstRequestHitsManifest:
         mock_baked.return_value = {"overall_dependency_hash": "fp"}
         mock_cn_gen.return_value = {"generation": "gen"}
         mock_load_mft.return_value = {"identity": "some_id", "schema_version": 1}
-        mock_check_id.return_value = {
-            "identity_match": True,
-            "manifest_load_ms": 3.0,
-            "cheap_check_ms": 1.0,
-            "computed_identity": "ident",
-            "stored_identity": "ident",
-            "reason": "",
-        }
+        mock_check_id.return_value = self._identity_return(match=True)
 
         app = FakeComfyApp()
         _get_preflight_unbound()(app, {"some": "workflow"})
@@ -422,14 +428,7 @@ class TestFirstRequestHitsManifest:
         mock_baked.return_value = {"overall_dependency_hash": "fp"}
         mock_cn_gen.return_value = {"generation": "gen"}
         mock_load_mft.return_value = {"identity": "some_id", "schema_version": 1}
-        mock_check_id.return_value = {
-            "identity_match": True,
-            "manifest_load_ms": 3.0,
-            "cheap_check_ms": 1.0,
-            "computed_identity": "ident",
-            "stored_identity": "ident",
-            "reason": "",
-        }
+        mock_check_id.return_value = self._identity_return(match=True)
 
         with patch("comfyapp.custom_node_dependency_fingerprint") as mock_fp:
             app = FakeComfyApp()

@@ -2052,9 +2052,17 @@ def _check_dependency_manifest_identity(
       manifest_load_ms: float
       cheap_check_ms: float
       computed_identity: str
+      stored_identity: str
+      reason: str
+      stored_schema_version: int|None
+      stored_combined_hash: str
+      stored_custom_node_fingerprint_overall_dependency_hash: str
+      stored_custom_node_generation: str
+      stored_repair_mode: str
+      miss_component: dict  (per-field comparison on miss)
 
-    When identity_match is False, a refresh is needed (caller should run
-    full validation then _build_and_persist_dependency_manifest).
+    When identity_match is False, the caller should run full validation
+    then _build_and_persist_dependency_manifest.
     """
     _t0 = time.time()
     if manifest is None:
@@ -2063,7 +2071,14 @@ def _check_dependency_manifest_identity(
             "manifest_load_ms": 0.0,
             "cheap_check_ms": round((time.time() - _t0) * 1000, 1),
             "computed_identity": "",
+            "stored_identity": "",
             "reason": "manifest_missing",
+            "stored_schema_version": None,
+            "stored_combined_hash": "",
+            "stored_custom_node_fingerprint_overall_dependency_hash": "",
+            "stored_custom_node_generation": "",
+            "stored_repair_mode": "",
+            "miss_component": "manifest_missing",
         }
     _manifest_load_ms = 0.0
     _chk_t0 = time.time()
@@ -2083,6 +2098,36 @@ def _check_dependency_manifest_identity(
             _reason = "computed_identity_empty"
         else:
             _reason = "identity_mismatch"
+
+    # -- Extract stored field values for miss_component --
+    _stored_sv = manifest.get("schema_version")
+    _stored_ch = manifest.get("combined_hash", "")
+    _stored_cn_fp = ""
+    _stored_cn_fingerprint = manifest.get("custom_node_fingerprint")
+    if isinstance(_stored_cn_fingerprint, dict):
+        _stored_cn_fp = _stored_cn_fingerprint.get("overall_dependency_hash", "")
+    _stored_cn_gen = manifest.get("custom_node_generation", "")
+    _stored_rm = manifest.get("repair_mode", "")
+
+    # -- Current inputs --
+    _curr_cn_fp = ""
+    if custom_node_fingerprint and isinstance(custom_node_fingerprint, dict):
+        _curr_cn_fp = custom_node_fingerprint.get("overall_dependency_hash", "")
+
+    # -- Build miss_component string (log-safe, short) --
+    _miss_names: list[str] = []
+    if _stored_sv != DEPENDENCY_MANIFEST_SCHEMA_VERSION:
+        _miss_names.append("schema_version")
+    if _stored_ch != combined_hash:
+        _miss_names.append("deployment_hash")
+    if _stored_cn_fp != _curr_cn_fp:
+        _miss_names.append("baked_dependency_hash")
+    if _stored_cn_gen != custom_node_generation:
+        _miss_names.append("custom_nodes_generation")
+    if _stored_rm != repair_mode:
+        _miss_names.append("repair_mode")
+    _miss_component = ",".join(_miss_names)
+
     return {
         "identity_match": _match,
         "manifest_load_ms": _manifest_load_ms,
@@ -2090,6 +2135,12 @@ def _check_dependency_manifest_identity(
         "computed_identity": _expected,
         "stored_identity": _stored,
         "reason": _reason,
+        "stored_schema_version": _stored_sv,
+        "stored_combined_hash": _stored_ch,
+        "stored_custom_node_fingerprint_overall_dependency_hash": _stored_cn_fp,
+        "stored_custom_node_generation": _stored_cn_gen,
+        "stored_repair_mode": _stored_rm,
+        "miss_component": _miss_component,
     }
 
 
@@ -2100,36 +2151,53 @@ def _emit_dependency_validation_v2(
     *,
     source: str = "",
     identity_match: bool = False,
+    prompt_structure_validation_ms: float = 0.0,
+    deployment_hash_resolution_ms: float = 0.0,
+    baked_manifest_read_ms: float = 0.0,
+    custom_node_generation_read_ms: float = 0.0,
     manifest_load_ms: float = 0.0,
-    cheap_check_ms: float = 0.0,
-    fingerprint_ms: float = 0.0,
-    full_validation_ms: float = 0.0,
-    total_ms: float = 0.0,
-    refresh_performed: bool = False,
+    manifest_identity_check_ms: float = 0.0,
+    fallback_validation_called: bool = False,
+    fallback_fingerprint_ms: float = 0.0,
+    fallback_validation_ms: float = 0.0,
+    preflight_total_ms: float = 0.0,
+    deployment_hash: str = "",
+    baked_dependency_hash: str = "",
+    custom_nodes_generation: str = "",
+    repair_mode: str = "",
+    stored_manifest_identity: str = "",
+    computed_manifest_identity: str = "",
+    miss_component: str = "",
     reason: str = "",
 ) -> None:
     """Emit a single [v2.dependency_validation] diagnostic line.
 
-    source: snapshot_manifest|persistent_manifest|request_rebuild
-    identity_match: True when persisted manifest identity matches expected
-    manifest_load_ms: time to load the persisted manifest from volume
-    cheap_check_ms: time for the cheap identity comparison
-    fingerprint_ms: time for dependency fingerprint computation
-    full_validation_ms: time for full validate_custom_node_dependencies_prepared
-    total_ms: total elapsed (manifest_load + cheap_check + fingerprint + validation)
-    refresh_performed: True if a write/replacement was performed
-    reason: short string explaining the outcome
+    New comprehensive field set with per-identity-input timing and
+    miss_component as a short log-safe string of mismatched component names.
+    Empty string on identity hit, "manifest_missing" on missing manifest,
+    or comma-separated component names on mismatch.
     """
     print(
         f"[v2.dependency_validation] "
         f"source={source} "
         f"identity_match={int(identity_match)} "
+        f"prompt_structure_validation_ms={prompt_structure_validation_ms} "
+        f"deployment_hash_resolution_ms={deployment_hash_resolution_ms} "
+        f"baked_manifest_read_ms={baked_manifest_read_ms} "
+        f"custom_node_generation_read_ms={custom_node_generation_read_ms} "
         f"manifest_load_ms={manifest_load_ms} "
-        f"cheap_check_ms={cheap_check_ms} "
-        f"fingerprint_ms={fingerprint_ms} "
-        f"full_validation_ms={full_validation_ms} "
-        f"total_ms={total_ms} "
-        f"refresh_performed={int(refresh_performed)} "
+        f"manifest_identity_check_ms={manifest_identity_check_ms} "
+        f"fallback_validation_called={int(fallback_validation_called)} "
+        f"fallback_fingerprint_ms={fallback_fingerprint_ms} "
+        f"fallback_validation_ms={fallback_validation_ms} "
+        f"preflight_total_ms={preflight_total_ms} "
+        f"deployment_hash={deployment_hash} "
+        f"baked_dependency_hash={baked_dependency_hash} "
+        f"custom_nodes_generation={custom_nodes_generation} "
+        f"repair_mode={repair_mode} "
+        f"stored_manifest_identity={stored_manifest_identity} "
+        f"computed_manifest_identity={computed_manifest_identity} "
+        f"miss_component={miss_component} "
         f"reason={reason}",
         flush=True,
     )
@@ -9064,10 +9132,13 @@ class _ComfyAPIMixin:
         CPU preload, direct warmup, ComfyUI validate_prompt.
 
         Returns a structured preflight summary dict.
+        Times each identity input individually for diagnostic transparency.
         """
+        _preflight_t0 = time.time()
         _repair_mode = self._resolve_requirements_repair_mode()
 
-        # 1. API prompt structure validation
+        # 1. API prompt structure validation (timed)
+        _ps_t0 = time.time()
         try:
             assert_valid_api_prompt_structure(workflow)
             valid_prompt = True
@@ -9083,6 +9154,7 @@ class _ComfyAPIMixin:
             )
             print(f"[comfyapp] FAILURE SUMMARY: {summary}")
             raise
+        _prompt_structure_validation_ms = round((time.time() - _ps_t0) * 1000, 2)
 
         # 2. Dependency validation for production modes
         #    2a. Persistent-manifest fast path (cheap identity check)
@@ -9091,17 +9163,31 @@ class _ComfyAPIMixin:
         dep_reason = ""
         if _repair_mode in ("off", "fail_fast"):
             _dep_t0 = time.time()
-            # Resolve current identity components (shared by both paths)
+
+            # -- Resolve each identity component with individual timing --
+            _dhr_t0 = time.time()
             _combined_hash_pre = _resolve_deployment_combined_hash()
+            _deployment_hash_resolution_ms = round((time.time() - _dhr_t0) * 1000, 2)
+
+            _bmr_t0 = time.time()
             _baked_mft_pre = load_baked_custom_node_dependency_manifest()
+            _baked_manifest_read_ms = round((time.time() - _bmr_t0) * 1000, 2)
+
             _cn_fp_pre = _baked_mft_pre if _baked_mft_pre else None
+
+            _cngr_t0 = time.time()
             _cn_gen_rec_pre = _read_custom_nodes_generation_record()
+            _custom_node_generation_read_ms = round((time.time() - _cngr_t0) * 1000, 2)
+
             _cn_gen_pre = _cn_gen_rec_pre.get("generation", "") if _cn_gen_rec_pre else ""
 
-            # 2a. Persistent manifest identity check
+            # 2a. Load persisted manifest (timed)
+            _ml_t0 = time.time()
             _manifest_snapshot = _load_dependency_manifest()
-            _manifest_load_ms = round((time.time() - _dep_t0) * 1000, 2)
-            _chk_t0 = time.time()
+            _manifest_load_ms = round((time.time() - _ml_t0) * 1000, 2)
+
+            # 2b. Cheap identity comparison (timed)
+            _mic_t0 = time.time()
             _identity_check = _check_dependency_manifest_identity(
                 _manifest_snapshot,
                 _combined_hash_pre,
@@ -9109,32 +9195,55 @@ class _ComfyAPIMixin:
                 _cn_gen_pre,
                 _repair_mode,
             )
-            _cheap_check_ms = round((time.time() - _chk_t0) * 1000, 2)
+            _manifest_identity_check_ms = round((time.time() - _mic_t0) * 1000, 2)
+
+            # -- Short display values --
+            _deployment_hash_short = _combined_hash_pre[:16] if _combined_hash_pre else ""
+            _baked_dep_hash_short = (_baked_mft_pre.get("overall_dependency_hash", "")[:16]
+                                     if _baked_mft_pre else "")
+            _cn_gen_short = _cn_gen_pre[:16] if _cn_gen_pre else ""
+            _stored_ident_short = (_identity_check.get("stored_identity", "")[:16]
+                                   if _identity_check.get("stored_identity") else "")
+            _computed_ident_short = (_identity_check.get("computed_identity", "")[:16]
+                                     if _identity_check.get("computed_identity") else "")
 
             if _identity_check.get("identity_match"):
                 # Fast path: exact identity match skips fingerprint/validation
                 dep_prepared = True
                 dep_reason = "manifest_identity_match"
-                _v2_total = round((time.time() - _dep_t0) * 1000, 2)
+                _preflight_total_ms = round((time.time() - _preflight_t0) * 1000, 2)
                 _emit_dependency_validation_v2(
                     source="persistent_manifest",
                     identity_match=True,
+                    prompt_structure_validation_ms=_prompt_structure_validation_ms,
+                    deployment_hash_resolution_ms=_deployment_hash_resolution_ms,
+                    baked_manifest_read_ms=_baked_manifest_read_ms,
+                    custom_node_generation_read_ms=_custom_node_generation_read_ms,
                     manifest_load_ms=_manifest_load_ms,
-                    cheap_check_ms=_cheap_check_ms,
-                    fingerprint_ms=0.0,
-                    full_validation_ms=0.0,
-                    total_ms=_v2_total,
-                    refresh_performed=False,
+                    manifest_identity_check_ms=_manifest_identity_check_ms,
+                    fallback_validation_called=False,
+                    fallback_fingerprint_ms=0.0,
+                    fallback_validation_ms=0.0,
+                    preflight_total_ms=_preflight_total_ms,
+                    deployment_hash=_deployment_hash_short,
+                    baked_dependency_hash=_baked_dep_hash_short,
+                    custom_nodes_generation=_cn_gen_short,
+                    repair_mode=_repair_mode,
+                    stored_manifest_identity=_stored_ident_short,
+                    computed_manifest_identity=_computed_ident_short,
+                    miss_component="",
                     reason="manifest_identity_match",
                 )
             else:
-                # 2b. Manifest miss: run full existing validation
+                # 2c. Manifest miss: run full existing validation
+                _fallback_t0 = time.time()
                 dep_check = _run_dependency_validation_with_cache(repair_mode=_repair_mode)
+                _fallback_validation_elapsed_ms = round((time.time() - _fallback_t0) * 1000, 2)
                 dep_prepared = dep_check.get("prepared", False)
                 dep_reason = dep_check.get("dependency_validation_reason", dep_check.get("reason", ""))
-                _fingerprint_ms = dep_check.get("dependency_fingerprint_ms", 0.0)
-                _full_val_ms = dep_check.get("dependency_full_validation_ms", 0.0)
-                _v2_total = round((time.time() - _dep_t0) * 1000, 2)
+                _fallback_fingerprint_ms = dep_check.get("dependency_fingerprint_ms", 0.0)
+                _fallback_validation_ms = dep_check.get("dependency_full_validation_ms", 0.0)
+                _fallback_validation_called = True
                 _refresh_performed = False
                 if dep_prepared and _combined_hash_pre:
                     _new_mft = _build_and_persist_dependency_manifest(
@@ -9153,15 +9262,30 @@ class _ComfyAPIMixin:
                             "write or commit did not produce a valid identity. "
                             f"repair_mode={_repair_mode}"
                         )
+                # preflight_total_ms calculated immediately before emission after refresh work
+                _preflight_total_ms = round((time.time() - _preflight_t0) * 1000, 2)
+                # miss_component from identity check (short log-safe string)
+                _mc = _identity_check.get("miss_component", "")
                 _emit_dependency_validation_v2(
                     source="request_rebuild",
                     identity_match=False,
+                    prompt_structure_validation_ms=_prompt_structure_validation_ms,
+                    deployment_hash_resolution_ms=_deployment_hash_resolution_ms,
+                    baked_manifest_read_ms=_baked_manifest_read_ms,
+                    custom_node_generation_read_ms=_custom_node_generation_read_ms,
                     manifest_load_ms=_manifest_load_ms,
-                    cheap_check_ms=_cheap_check_ms,
-                    fingerprint_ms=_fingerprint_ms,
-                    full_validation_ms=_full_val_ms,
-                    total_ms=_v2_total,
-                    refresh_performed=_refresh_performed,
+                    manifest_identity_check_ms=_manifest_identity_check_ms,
+                    fallback_validation_called=_fallback_validation_called,
+                    fallback_fingerprint_ms=_fallback_fingerprint_ms,
+                    fallback_validation_ms=_fallback_validation_ms,
+                    preflight_total_ms=_preflight_total_ms,
+                    deployment_hash=_deployment_hash_short,
+                    baked_dependency_hash=_baked_dep_hash_short,
+                    custom_nodes_generation=_cn_gen_short,
+                    repair_mode=_repair_mode,
+                    stored_manifest_identity=_stored_ident_short,
+                    computed_manifest_identity=_computed_ident_short,
+                    miss_component=_mc,
                     reason=_identity_check.get("reason", "manifest_mismatch"),
                 )
 
