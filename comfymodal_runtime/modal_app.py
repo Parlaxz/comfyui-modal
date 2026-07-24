@@ -2780,30 +2780,62 @@ class ModalRuntimeEntrypoint:
                     _cpu_snapshot_model_keys_match(request_model_key, snapshot_key)
                     and _cpu_snapshot_specs_match(request_model_spec, snapshot_spec)
                 ):
-                    self._use_cpu_snapshot_models_on_bridge(
-                        request_model_key,
-                        request_prefill_key,
-                        request_model_spec,
-                        self._cpu_snapshot_models.unet,
-                        self._cpu_snapshot_models.clip,
-                        trace=trace,
-                    )
-                    # Remain active.
+                    _flags = plan.execution_options.compatibility_flags
+                    _bypass_snapshot_unet = isinstance(_flags, Mapping) and _flags.get("diagnostic_bypass_cpu_snapshot_unet") is True
+                    if _bypass_snapshot_unet:
+                        self._preload_bridge.use_ready_clip(
+                            model_key=request_model_key,
+                            prefill_key=request_prefill_key,
+                            model_spec=request_model_spec,
+                            clip=self._cpu_snapshot_models.clip,
+                            trace=trace,
+                        )
+                        self._preload_bridge.extend_preparation(
+                            prepare_unet=True, prepare_vae=False, trace=trace,
+                        )
+                        _unet_source = "normal_loader"
+                        _clip_source = "cpu_snapshot"
+                        _reason = "diagnostic_unet_bypass"
+                    else:
+                        self._use_cpu_snapshot_models_on_bridge(
+                            request_model_key,
+                            request_prefill_key,
+                            request_model_spec,
+                            self._cpu_snapshot_models.unet,
+                            self._cpu_snapshot_models.clip,
+                            trace=trace,
+                        )
+                        _unet_source = "cpu_snapshot"
+                        _clip_source = "cpu_snapshot"
+                        _reason = "ok"
+                    if _bypass_snapshot_unet:
+                        print(
+                            "[v2.cpu_snapshot_request] status=partial_bypass "
+                            "reason=diagnostic_unet_bypass clip_source=cpu_snapshot "
+                            "unet_source=normal_loader",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "[v2.cpu_snapshot_request] status=reused reason=ok",
+                            flush=True,
+                        )
                     trace.emit(
                         "cpu_snapshot_models_request_bound",
                         phase="execution",
                         metadata={
                             "status": "bound",
-                            "reason": "ok",
+                            "reason": _reason,
+                            "diagnostic_bypass_cpu_snapshot_unet": 1 if _bypass_snapshot_unet else 0,
+                            "cpu_snapshot_clip_reused": 1,
+                            "cpu_snapshot_unet_reused": 0 if _bypass_snapshot_unet else 1,
+                            "unet_source": _unet_source,
+                            "clip_source": _clip_source,
                             "model_key_hash": snapshot_key.stable_hash[:16] if snapshot_key else "",
                             "clip_object_type": type(self._cpu_snapshot_models.clip).__name__,
                             "unet_object_type": type(self._cpu_snapshot_models.unet).__name__,
                             "duration_ms": round((time.perf_counter() - _bind_perf) * 1000.0, 3),
                         },
-                    )
-                    print(
-                        "[v2.cpu_snapshot_request] status=reused reason=ok",
-                        flush=True,
                     )
                 else:
                     # Model identity differs — clear bridge and deactivate.

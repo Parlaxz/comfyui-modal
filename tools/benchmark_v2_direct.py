@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
@@ -141,6 +142,7 @@ async def _run_one(
     workspace: dict[str, Any],
     transport: ModalTransport,
     output_dir: Path,
+    bypass_cpu_snapshot_unet: bool = False,
 ) -> dict[str, Any]:
     # T0: benchmark iteration origin (literal first line)
     _req_id = f"v2-benchmark-{index}-{uuid.uuid4().hex[:12]}"
@@ -159,13 +161,22 @@ async def _run_one(
     }
     prompt_id = _req_id  # request_id == prompt_id
     production_options = normalize_production_options(modal_options)
+    # ── Plan C UNET A/B diagnostic: inject bypass flag when requested ────
+    _bench_modal_options = dict(modal_options)
+    if bypass_cpu_snapshot_unet:
+        _existing_flags = _bench_modal_options.get("compatibility_flags", {})
+        if isinstance(_existing_flags, dict):
+            _bench_modal_options["compatibility_flags"] = dict(_existing_flags)
+        else:
+            _bench_modal_options["compatibility_flags"] = {}
+        _bench_modal_options["compatibility_flags"]["diagnostic_bypass_cpu_snapshot_unet"] = True
     runtime_trace = RuntimeTrace(request_id=prompt_id, process="local")
     runtime_trace.set_metadata(request_origin_info=request_origin_info)
     plan = build_execution_plan(
         workflow,
         prompt_id=prompt_id,
         client_id=f"v2-benchmark-client-{uuid.uuid4().hex[:8]}",
-        modal_options=modal_options,
+        modal_options=_bench_modal_options,
         production_options=production_options if production_options.get("enabled") else None,
         gpu=GPU,
         workspace=workspace,
@@ -174,7 +185,8 @@ async def _run_one(
         trace=runtime_trace,
         validate=False,
     )
-    print("[v2.benchmark] phase=plan_constructed", flush=True)
+    _mode = "bypass" if bypass_cpu_snapshot_unet else "reuse"
+    print(f"cpu_snapshot_unet_mode={_mode}", flush=True)
     started = time.perf_counter()
     print("[v2.benchmark] phase=execute_plan_start", flush=True)
     result = await execute_plan(
@@ -207,7 +219,7 @@ async def _run_one(
     return artifact
 
 
-async def main() -> None:
+async def main(bypass_cpu_snapshot_unet: bool = False) -> None:
     os.environ["COMFYMODAL_V2_APP_NAME"] = APP_NAME
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = CLASS_NAME
     os.environ["COMFYMODAL_V2_GPU"] = GPU
@@ -226,6 +238,7 @@ async def main() -> None:
             workspace=workspace,
             transport=transport,
             output_dir=output_dir,
+            bypass_cpu_snapshot_unet=bypass_cpu_snapshot_unet,
         ))
         if index + 1 < RUN_COUNT:
             await asyncio.sleep(GAP_SECONDS)
@@ -240,4 +253,14 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    _parser = argparse.ArgumentParser(description="V2 direct benchmark runner")
+    _parser.add_argument(
+        "--bypass-cpu-snapshot-unet",
+        action="store_true",
+        default=False,
+        help="Insert diagnostic_bypass_cpu_snapshot_unet=True into compatibility_flags "
+             "so the snapshot CLIP serves graph demands but UNET loads "
+             "through the original loader (A/B diagnostic mode)",
+    )
+    _args = _parser.parse_args()
+    asyncio.run(main(bypass_cpu_snapshot_unet=_args.bypass_cpu_snapshot_unet))
