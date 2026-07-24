@@ -600,5 +600,100 @@ class TestVolatileFieldNoop(unittest.TestCase):
         self.assertEqual(gen2, 2, "Changed identity must advance generation")
 
 
+
+# ── Publisher identity-change flags ──────────────────────────────────────
+
+
+class TestPublisherIdentityFlags(unittest.TestCase):
+    """publish_with_metrics must report model/prefill identity change flags."""
+
+    def setUp(self):
+        self.volume = FakeVolume()
+        self.coord = CommitCoordinator(self.volume)
+        self.publisher = RestorePlanPublisher(self.coord)
+
+    def test_first_publication_both_true(self):
+        """First publication: model_identity_changed and prefill_identity_changed both true."""
+        plan = RestorePlan(
+            generation=1,
+            model_key=ModelRestoreKey(unet_identity="u1"),
+            prefill_key=PrefillKey(prompt_bundle_hash="p1"),
+        )
+        result = self.publisher.publish_with_metrics(plan)
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["model_identity_changed"])
+        self.assertTrue(result["prefill_identity_changed"])
+
+    def test_identical_plan_both_false(self):
+        """No-op: model_identity_changed and prefill_identity_changed both false."""
+        plan = RestorePlan(
+            generation=1,
+            model_key=ModelRestoreKey(unet_identity="u1"),
+            prefill_key=PrefillKey(prompt_bundle_hash="p1"),
+        )
+        self.publisher.publish_with_metrics(plan)
+        result = self.publisher.publish_with_metrics(plan)
+        self.assertFalse(result["changed"])
+        self.assertFalse(result["model_identity_changed"])
+        self.assertFalse(result["prefill_identity_changed"])
+
+    def test_prompt_only_change(self):
+        """Prompt-only change: model_identity_changed false, prefill true."""
+        mk = ModelRestoreKey(unet_identity="u1")
+        plan1 = RestorePlan(generation=1, model_key=mk,
+                            prefill_key=PrefillKey(model_key=mk, prompt_bundle_hash="v1"))
+        plan2 = RestorePlan(generation=2, model_key=mk,
+                            prefill_key=PrefillKey(model_key=mk, prompt_bundle_hash="v2"))
+        self.publisher.publish_with_metrics(plan1)
+        result = self.publisher.publish_with_metrics(plan2)
+        self.assertTrue(result["changed"])
+        self.assertFalse(result["model_identity_changed"])
+        self.assertTrue(result["prefill_identity_changed"])
+
+    def test_model_only_change(self):
+        """Model-only change: model_identity_changed true, prefill false."""
+        plan1 = RestorePlan(generation=1,
+                            model_key=ModelRestoreKey(unet_identity="u1"),
+                            prefill_key=PrefillKey(prompt_bundle_hash="p1"))
+        plan2 = RestorePlan(generation=2,
+                            model_key=ModelRestoreKey(unet_identity="u2"),
+                            prefill_key=PrefillKey(prompt_bundle_hash="p1"))
+        self.publisher.publish_with_metrics(plan1)
+        result = self.publisher.publish_with_metrics(plan2)
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["model_identity_changed"])
+        self.assertFalse(result["prefill_identity_changed"])
+
+    def test_trace_contains_identity_flags(self):
+        """Trace metadata must include model/prefill_identity_changed."""
+        plan = RestorePlan(generation=1,
+                           model_key=ModelRestoreKey(unet_identity="u1"),
+                           prefill_key=PrefillKey(prompt_bundle_hash="p1"))
+        result = self.publisher.publish_with_metrics(plan)
+        meta = result["trace"]["metadata"]
+        self.assertIn("model_identity_changed", meta)
+        self.assertIn("prefill_identity_changed", meta)
+
+    def test_noop_trace_identity_flags_false(self):
+        """No-op trace metadata must have both flags false."""
+        plan = RestorePlan(generation=1,
+                           model_key=ModelRestoreKey(unet_identity="u1"),
+                           prefill_key=PrefillKey(prompt_bundle_hash="p1"))
+        self.publisher.publish_with_metrics(plan)
+        result = self.publisher.publish_with_metrics(plan)
+        meta = result["trace"]["metadata"]
+        self.assertFalse(meta["model_identity_changed"])
+        self.assertFalse(meta["prefill_identity_changed"])
+
+    def test_metrics_keys_present(self):
+        """Result dict must include model_identity_changed and prefill_identity_changed."""
+        plan = RestorePlan(generation=1,
+                           model_key=ModelRestoreKey(unet_identity="u1"),
+                           prefill_key=PrefillKey(prompt_bundle_hash="p1"))
+        result = self.publisher.publish_with_metrics(plan)
+        self.assertIn("model_identity_changed", result)
+        self.assertIn("prefill_identity_changed", result)
+
+
 if __name__ == "__main__":
     unittest.main()

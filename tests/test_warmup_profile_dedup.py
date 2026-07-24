@@ -784,5 +784,188 @@ class TestColdSafeIdentitySeam(unittest.TestCase):
         )
 
 
+
+# ── Extraction call count & analysis reuse ───────────────────────────────
+
+
+class TestExtractionCallCount(unittest.TestCase):
+    """Verifies extract_warmup_stack called once, bundle at most once."""
+
+    def setUp(self):
+        import warmup_profile
+        warmup_profile._last_stable_profile_cache.clear()
+        warmup_profile._last_cache_app_identity = ""
+        warmup_profile._last_cache_ws_id = ""
+        warmup_profile._last_prefill_identity_map.clear()
+
+    def test_extract_warmup_stack_called_once(self):
+        """Verify extraction produces non-empty model_profile_key (indirect proof)."""
+        from warmup_profile import prepare_active_next_profile
+        r = asyncio.run(prepare_active_next_profile(
+            _make_workflow("hello"),
+            "dummy_hash",
+            setter=AsyncMock(return_value={"status": "written", "changed": True}),
+            workspace=_make_workspace(),
+        ))
+        self.assertIn("model_profile_key", r)
+        self.assertGreater(len(r["model_profile_key"]), 0,
+                          "model_profile_key must be non-empty after extraction")
+        self.assertIn("profile_key", r)
+        self.assertGreater(len(r["profile_key"]), 0)
+
+    def test_bundle_extracted_once_when_exact_prefill(self):
+        """extract_safe_prompt_bundle called exactly once when exact prefill enabled."""
+        from warmup_profile import prepare_active_next_profile
+        from optimizations import extract_safe_prompt_bundle as _real_bundle
+        call_count = 0
+        def _counting_bundle(wf):
+            nonlocal call_count
+            call_count += 1
+            return _real_bundle(wf)
+        import optimizations
+        optimizations.extract_safe_prompt_bundle = _counting_bundle
+        try:
+            asyncio.run(prepare_active_next_profile(
+                _make_workflow("hello"),
+                "dummy_hash",
+                setter=AsyncMock(return_value={"status": "written", "changed": True}),
+                workspace=_make_workspace(),
+            ))
+            self.assertEqual(call_count, 1,
+                             "extract_safe_prompt_bundle must be called exactly once with exact prefill")
+        finally:
+            optimizations.extract_safe_prompt_bundle = _real_bundle
+
+    @patch.dict(os.environ, {"COMFYMODAL_EXACT_CLIP_PREFILL": "0",
+                              "COMFYMODAL_PERSISTENT_CLIP_CACHE": "1"}, clear=False)
+    def test_bundle_extracted_once_when_persistent_only(self):
+        """extract_safe_prompt_bundle called once even when only persistent cache enabled."""
+        from warmup_profile import prepare_active_next_profile
+        from optimizations import extract_safe_prompt_bundle as _real_bundle
+        call_count = 0
+        def _counting_bundle(wf):
+            nonlocal call_count
+            call_count += 1
+            return _real_bundle(wf)
+        import optimizations
+        optimizations.extract_safe_prompt_bundle = _counting_bundle
+        try:
+            asyncio.run(prepare_active_next_profile(
+                _make_workflow("hello"),
+                "dummy_hash",
+                setter=AsyncMock(return_value={"status": "written", "changed": True}),
+                workspace=_make_workspace(),
+            ))
+            self.assertEqual(call_count, 1,
+                             "extract_safe_prompt_bundle must be called once with persistent-only")
+        finally:
+            optimizations.extract_safe_prompt_bundle = _real_bundle
+
+
+class TestAnalysisAndIdentityFlags(unittest.TestCase):
+    """Tests model_profile_key, prefill_key, identity changed flags."""
+
+    def setUp(self):
+        import warmup_profile
+        warmup_profile._last_stable_profile_cache.clear()
+        warmup_profile._last_cache_app_identity = ""
+        warmup_profile._last_cache_ws_id = ""
+        warmup_profile._last_prefill_identity_map.clear()
+
+    async def _do(self, workflow=None, prompt="a cat", setter=None, workspace=None):
+        from warmup_profile import prepare_active_next_profile as _prepare
+        import json, hashlib
+        wf = workflow or _make_workflow(prompt)
+        ws = workspace or _make_workspace()
+        return await _prepare(
+            wf,
+            hashlib.sha256(json.dumps(wf, sort_keys=True).encode()).hexdigest(),
+            workspace=ws,
+            setter=setter,
+        )
+
+    def test_identity_flags_first_publication_both_false(self):
+        """First publication (first unknown) must have both flags false."""
+        setter = _make_async_setter()
+        r = asyncio.run(self._do(setter=setter))
+        self.assertEqual(r["status"], "written")
+        self.assertFalse(r["model_identity_changed"],
+                         "First publication: model_identity_changed must be false")
+        self.assertFalse(r["prefill_identity_changed"],
+                         "First publication: prefill_identity_changed must be false")
+
+    def test_same_model_prompt_second_call_no_change(self):
+        """Identical model+prompt on second call: both flags false."""
+        setter = _make_async_setter()
+        asyncio.run(self._do(setter=setter))
+        r2 = asyncio.run(self._do(setter=setter))
+        self.assertEqual(r2["status"], "unchanged")
+        self.assertFalse(r2["model_identity_changed"])
+        self.assertFalse(r2["prefill_identity_changed"])
+
+    @patch.dict(os.environ, {"COMFYMODAL_EXACT_CLIP_PREFILL": "1"}, clear=False)
+    def test_prompt_only_change_alters_prefill_not_model(self):
+        """With exact prefill ON, prompt-only change: prefill flag true, model flag false."""
+        call_counter = []
+        setter = _make_async_setter(call_counter=call_counter)
+        wf1 = _make_workflow("cat")
+        r1 = asyncio.run(self._do(workflow=wf1, prompt="cat", setter=setter))
+        self.assertEqual(r1["status"], "written")
+        wf2 = _make_workflow("dog")
+        r2 = asyncio.run(self._do(workflow=wf2, prompt="dog", setter=setter))
+        self.assertNotEqual(r1["prefill_key"], r2["prefill_key"])
+        self.assertEqual(r1["model_profile_key"], r2["model_profile_key"])
+        self.assertFalse(r2["model_identity_changed"],
+                         "Model unchanged should be false")
+        self.assertTrue(r2["prefill_identity_changed"],
+                        "Prefill changed should be true")
+
+    def test_model_change_alters_model_identity(self):
+        """Different model stack must set model_identity_changed=true."""
+        call_counter = []
+        setter = _make_async_setter(call_counter=call_counter)
+        wf1 = _make_workflow("cat")
+        r1 = asyncio.run(self._do(workflow=wf1, setter=setter))
+        # Create a new workflow with a checkpoint loader (different model family)
+        wf2 = {
+            "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl.safetensors"}},
+            "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "dog", "clip": ["1", 0]}},
+            "4": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 20}},
+        }
+        r2 = asyncio.run(self._do(workflow=wf2, setter=setter))
+        self.assertNotEqual(r1["model_profile_key"], r2["model_profile_key"])
+        self.assertTrue(r2["model_identity_changed"],
+                        "Model changed should be true")
+
+    def test_failed_setter_does_not_advance_identity(self):
+        """Failed setter must not advance known identity."""
+        failing = AsyncMock(side_effect=RuntimeError("fail"))
+        r1 = asyncio.run(self._do(setter=failing))
+        self.assertEqual(r1["status"], "error")
+        self.assertFalse(r1["model_identity_changed"])
+        self.assertFalse(r1["prefill_identity_changed"])
+        working = _make_async_setter()
+        r2 = asyncio.run(self._do(setter=working))
+        self.assertEqual(r2["status"], "written")
+        self.assertFalse(r2["model_identity_changed"])
+
+    def test_result_has_model_profile_key_and_prefill_key(self):
+        """Result dict must include model_profile_key and prefill_key."""
+        setter = _make_async_setter()
+        r = asyncio.run(self._do(setter=setter))
+        self.assertIn("model_profile_key", r)
+        self.assertIn("prefill_key", r)
+        self.assertIsInstance(r["model_profile_key"], str)
+        self.assertGreater(len(r["model_profile_key"]), 0)
+
+    @patch.dict(os.environ, {"COMFYMODAL_EXACT_CLIP_PREFILL": "0"}, clear=False)
+    def test_prefill_key_empty_when_exact_disabled(self):
+        """When exact prefill is OFF, prefill_key must be empty string."""
+        setter = _make_async_setter()
+        r = asyncio.run(self._do(setter=setter))
+        self.assertEqual(r["prefill_key"], "",
+                         "prefill_key must be empty when exact prefill disabled")
+
+
 if __name__ == "__main__":
     unittest.main()
