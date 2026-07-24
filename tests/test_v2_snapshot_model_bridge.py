@@ -865,5 +865,190 @@ class SnapshotVAEPathPreservedTests(unittest.TestCase):
         self.assertEqual(result, ("vae:different_vae.safetensors",))
 
 
+
+
+# 12. use_ready_clip — clip-only snapshot (no UNET future)
+
+
+class SnapshotUseReadyClipTests(unittest.TestCase):
+    """use_ready_clip — clip-only bridge preparation with no snapshot UNET."""
+
+    def setUp(self):
+        self.calls: list[tuple] = []
+        self.nodes = _fake_nodes(self.calls)
+        self.bridge = V2LoaderBridge()
+        self.bridge.install(self.nodes)
+        self.trace = RuntimeTrace(request_id="use_ready_clip", process="remote")
+        self.clip_obj = _FakeClip()
+        self.model_key = ModelRestoreKey(
+            unet_identity="u.safetensors",
+            clip_identity="c.safetensors",
+            clip_type="sd3",
+        )
+        self.prefill_key = PrefillKey(
+            model_key=self.model_key,
+            prompt_bundle_hash="clip-only-test",
+        )
+        self.model_spec = _make_snapshot_spec()
+
+    def _activate(self):
+        return self.bridge.use_ready_clip(
+            model_key=self.model_key,
+            prefill_key=self.prefill_key,
+            model_spec=self.model_spec,
+            clip=self.clip_obj,
+            trace=self.trace,
+        )
+
+    def test_use_ready_clip_returns_restore_preparation(self):
+        """use_ready_clip returns a RestorePreparation instance."""
+        prep = self._activate()
+        from comfymodal_runtime.model_preload import RestorePreparation
+        self.assertIsInstance(prep, RestorePreparation)
+
+    def test_clip_future_is_completed(self):
+        """clip_future is done and holds the exact clip object."""
+        prep = self._activate()
+        self.assertIsNotNone(prep.clip_future)
+        self.assertTrue(prep.clip_future.done())
+        self.assertIs(prep.clip_future.result(), self.clip_obj)
+
+    def test_unet_future_is_none(self):
+        """unet_future is None (no snapshot UNET)."""
+        prep = self._activate()
+        self.assertIsNone(prep.unet_future,
+                          "use_ready_clip must NOT set unet_future")
+
+    def test_preparation_has_no_unet_diagnostics(self):
+        """UNET diagnostics are zero (no snapshot UNET)."""
+        prep = self._activate()
+        self.assertEqual(prep.diagnostics.unet_started_at, 0.0)
+        self.assertEqual(prep.diagnostics.unet_completed_at, 0.0)
+
+    def test_clip_object_identity_preserved(self):
+        """Clip future returns the exact same clip object reference."""
+        prep = self._activate()
+        self.assertIs(prep.clip_future.result(), self.clip_obj)
+
+    def test_clip_graph_hit_returns_snapshot(self):
+        """CLIP graph loader returns the snapshot CLIP on hit."""
+        self._activate()
+        with self.bridge.request_scope():
+            result = self.nodes.NODE_CLASS_MAPPINGS["CLIPLoader"]().load_clip(
+                "c.safetensors", "sd3"
+            )
+        self.assertIs(result[0], self.clip_obj)
+
+    def test_unet_graph_falls_through_to_original(self):
+        """UNET graph loader falls through to original (no snapshot UNET)."""
+        self._activate()
+        with self.bridge.request_scope():
+            result = self.nodes.NODE_CLASS_MAPPINGS["UNETLoader"]().load_unet(
+                "u.safetensors", "default"
+            )
+        self.assertEqual(result, ("original-unet:u.safetensors:default",))
+
+    def test_unet_falls_through_triggers_future_unavailable(self):
+        """UNET graph call emits future_unavailable and original_loader_fallback
+        (no snapshot UNET future = no identity comparison)."""
+        self._activate()
+        with self.bridge.request_scope():
+            self.nodes.NODE_CLASS_MAPPINGS["UNETLoader"]().load_unet(
+                "u.safetensors", "default"
+            )
+        event_names = [e.name for e in self.trace.events]
+        self.assertIn("future_unavailable", event_names)
+        self.assertIn("original_loader_fallback", event_names)
+
+    def test_clip_hit_emits_prepared_result_consumed(self):
+        """CLIP hit emits prepared_result_consumed terminal event."""
+        self._activate()
+        with self.bridge.request_scope():
+            self.nodes.NODE_CLASS_MAPPINGS["CLIPLoader"]().load_clip(
+                "c.safetensors", "sd3"
+            )
+        event_names = [e.name for e in self.trace.events]
+        self.assertIn("prepared_result_consumed", event_names)
+        terminal = [
+            e for e in self.trace.events
+            if e.name == "prepared_result_consumed"
+        ]
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0].metadata.get("terminal_outcome"), "prepared")
+
+    def test_rebind_with_new_prefill_key(self):
+        """Rebind updates prefill_key while keeping same clip."""
+        new_prefill_key = PrefillKey(
+            model_key=self.model_key,
+            prompt_bundle_hash="rebind_hash",
+        )
+        self.bridge.use_ready_clip(
+            model_key=self.model_key,
+            prefill_key=new_prefill_key,
+            model_spec=self.model_spec,
+            clip=self.clip_obj,
+            trace=self.trace,
+        )
+        self.assertEqual(
+            self.bridge._prefill_key.prompt_bundle_hash,
+            "rebind_hash",
+        )
+        self.assertIs(
+            self.bridge._preparation.clip_future.result(), self.clip_obj,
+        )
+
+    def test_coordinator_active_after_use_ready_clip(self):
+        """coordinator._active is set so wait_clip works."""
+        self._activate()
+        self.assertIsNotNone(self.bridge.coordinator._active)
+        self.assertIs(self.bridge.coordinator._active, self.bridge._preparation)
+
+    def test_extend_preparation_adds_unet_after_clip_only(self):
+        """After use_ready_clip, extend_preparation(prepare_unet=True) submits UNET."""
+        self._activate()
+        self.assertIsNone(self.bridge._preparation.unet_future)
+        # Extend with UNET
+        self.bridge.extend_preparation(
+            prepare_unet=True, prepare_vae=False, trace=self.trace,
+        )
+        prep = self.bridge._preparation
+        self.assertIsNotNone(prep.unet_future)
+        # UNET future should be submitted to thread pool, may or may not be done
+        # Just verify it exists and is a Future
+        from concurrent.futures import Future
+        self.assertIsInstance(prep.unet_future, Future)
+        # VAE must remain None (prepare_vae=False)
+        self.assertIsNone(prep.vae_future)
+
+    def test_extend_preparation_keeps_clip_future(self):
+        """After use_ready_clip + extend, existing clip future remains intact."""
+        self._activate()
+        self.bridge.extend_preparation(
+            prepare_unet=True, prepare_vae=False, trace=self.trace,
+        )
+        prep = self.bridge._preparation
+        self.assertTrue(prep.clip_future.done())
+        self.assertIs(prep.clip_future.result(), self.clip_obj)
+
+    def test_clear_after_use_ready_clip(self):
+        """clear() resets state after use_ready_clip."""
+        self._activate()
+        self.bridge.clear()
+        self.assertIsNone(self.bridge._preparation)
+        self.assertIsNone(self.bridge.coordinator._active)
+
+    def test_use_ready_clip_with_missing(self):
+        """CLIP identity mismatch falls through to original loader."""
+        self._activate()
+        with self.bridge.request_scope():
+            result = self.nodes.NODE_CLASS_MAPPINGS["CLIPLoader"]().load_clip(
+                "different.safetensors", "sd3"
+            )
+        self.assertIsInstance(result[0], _FakeClip)
+        clip_calls = [c for c in self.calls if c[0] == "clip"]
+        self.assertEqual(len(clip_calls), 1,
+                         "original CLIP loader must be called on mismatch")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4611,6 +4611,59 @@ class V2LoaderBridge:
             trace=trace,
         )
 
+    def _init_ready_preparation(
+        self,
+        *,
+        model_key: ModelRestoreKey,
+        prefill_key: PrefillKey,
+        model_spec: Mapping[str, Any],
+        unet: Any = _LOADER_MISS,
+        clip: Any = _LOADER_MISS,
+        trace: RuntimeTrace | None = None,
+    ) -> RestorePreparation:
+        self._model_key = model_key
+        self._prefill_key = prefill_key
+        self._model_spec = dict(model_spec) if isinstance(model_spec, Mapping) else {}
+        self._trace = trace
+
+        if not self.install(self._nodes, trace=trace):
+            raise RuntimeError(
+                "V2LoaderBridge: install() could not establish "
+                "loader wrappers; bridge is not ready to serve snapshot models"
+            )
+
+        with self._prefill_lock:
+            self._prefill_results.clear()
+
+        prep = RestorePreparation(model_key=model_key, prefill_key=prefill_key)
+        _now = time.time()
+
+        # Set completed futures BEFORE publishing the preparation,
+        # so graph-time consumers never observe an incomplete state.
+        if unet is not _LOADER_MISS:
+            unet_future: Future[Any] = Future()
+            unet_future.set_result(unet)
+            prep.unet_future = unet_future
+            prep.diagnostics.unet_started_at = _now
+            prep.diagnostics.unet_completed_at = _now
+
+        if clip is not _LOADER_MISS:
+            clip_future: Future[Any] = Future()
+            clip_future.set_result(clip)
+            prep.clip_future = clip_future
+            prep.diagnostics.clip_started_at = _now
+            prep.diagnostics.clip_completed_at = _now
+
+        # Publish only after all ready futures are assigned.
+        self._preparation = prep
+        self.coordinator._active = prep
+
+        if trace is not None:
+            self._preparation_trace = trace
+            self._preparation_event_cursor = len(trace.events)
+
+        return prep
+
     def use_ready_models(
         self,
         *,
@@ -4621,59 +4674,24 @@ class V2LoaderBridge:
         clip: Any,
         trace: RuntimeTrace | None = None,
     ) -> RestorePreparation:
-        """Configure bridge with pre-loaded CPU snapshot models.
+        return self._init_ready_preparation(
+            model_key=model_key, prefill_key=prefill_key,
+            model_spec=model_spec, unet=unet, clip=clip, trace=trace,
+        )
 
-        Creates a fully-resolved RestorePreparation with completed futures
-        so graph-time consumers retrieve the snapshot models directly.
-        Clears prior prefill results and sets coordinator active state.
-        VAE and prompt-specific prefill remain on their existing paths.
-
-        Returns the RestorePreparation for diagnostic access.
-        """
-        self._model_key = model_key
-        self._prefill_key = prefill_key
-        self._model_spec = dict(model_spec) if isinstance(model_spec, Mapping) else {}
-        self._trace = trace
-
-        # Idempotently ensure loader wrappers are installed; without them
-        # graph-time interception cannot serve snapshot models.
-        if not self.install(self._nodes, trace=trace):
-            raise RuntimeError(
-                "V2LoaderBridge.use_ready_models: install() could not establish "
-                "loader wrappers; bridge is not ready to serve snapshot models"
-            )
-
-        # Clear old prompt-prefill results
-        with self._prefill_lock:
-            self._prefill_results.clear()
-
-        # Create standard completed futures for CLIP and UNET
-        prep = RestorePreparation(model_key=model_key, prefill_key=prefill_key)
-        _now = time.time()
-
-        unet_future: Future[Any] = Future()
-        unet_future.set_result(unet)
-        prep.unet_future = unet_future
-        prep.diagnostics.unet_started_at = _now
-        prep.diagnostics.unet_completed_at = _now
-
-        clip_future: Future[Any] = Future()
-        clip_future.set_result(clip)
-        prep.clip_future = clip_future
-        prep.diagnostics.clip_started_at = _now
-        prep.diagnostics.clip_completed_at = _now
-
-        # VAE and prefill remain on existing paths — no futures set.
-
-        self._preparation = prep
-        self.coordinator._active = prep
-
-        # Record trace cursor for late event drain
-        if trace is not None:
-            self._preparation_trace = trace
-            self._preparation_event_cursor = len(trace.events)
-
-        return prep
+    def use_ready_clip(
+        self,
+        *,
+        model_key: ModelRestoreKey,
+        prefill_key: PrefillKey,
+        model_spec: Mapping[str, Any],
+        clip: Any,
+        trace: RuntimeTrace | None = None,
+    ) -> RestorePreparation:
+        return self._init_ready_preparation(
+            model_key=model_key, prefill_key=prefill_key,
+            model_spec=model_spec, clip=clip, trace=trace,
+        )
 
     def clear(self) -> None:
         """Disable consumption when a restore has no authoritative plan."""

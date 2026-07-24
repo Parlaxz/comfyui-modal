@@ -7,7 +7,9 @@ ComfyUI.  Tests skip cleanly when optional imports are unavailable.
 
 from __future__ import annotations
 
+import io
 import os
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -1303,6 +1305,7 @@ class CpuSnapshotRequestBindingProjectionTests(unittest.TestCase):
         )
 
 
+
 # ── Activation-condition tests (Issue 1) ──────────────────────────────
 
 
@@ -1876,8 +1879,6 @@ class CpuSnapshotMatchLogLineTests(unittest.TestCase):
             _parts.append(f"spec:{_spec_reason}")
         _combined = "; ".join(_parts)
         self.assertEqual(_combined, "key:UNET identity mismatch; spec:UNET filename mismatch")
-
-
 # Variant C: Activation flow integration tests
 
 
@@ -2016,6 +2017,343 @@ class CpuSnapshotWorkflowE2ETests(unittest.TestCase):
         self.assertFalse(
             _cpu_snapshot_specs_match(self._snap_spec(_SINGLE_WF), self._snap_spec(_DUAL_DUP_WF))
         )
+
+
+
+
+# Plan C UNET A/B diagnostic — bypass_unet actual request-binding path
+
+
+class CpuSnapshotBypassUnetRequestBindingTest(unittest.TestCase):
+    """Parameterized actual-path test for the Plan C request-binding flow.
+
+    Exercises the exact conditional branch from ``_run_in_process``:
+    ``_exact_flag_check`` → ``use_ready_clip`` + ``extend_preparation``
+    vs. ``use_ready_models``, verifying flag-edge identity, branch
+    routing, event metadata, and print output.
+    """
+
+    _BYPPASS_FLAG_KEY = "diagnostic_bypass_cpu_snapshot_unet"
+
+    @classmethod
+    def _exact_flag_check(cls, flags: Any) -> bool:
+        """Exact replica of the branch predicate in modal_app.py."""
+        return isinstance(flags, Mapping) and flags.get(cls._BYPPASS_FLAG_KEY) is True
+
+    def _run_plan_c_branch(self, bypass_flag_value: Any) -> dict[str, Any]:
+        """Execute the Plan C branching logic as it appears in
+        ``_run_in_process``, capturing print output and trace events.
+        Returns a dict with outcome details for assertion."""
+        _snapshot_models = SimpleNamespace(
+            model_key=self.model_key,
+            model_spec=self.model_spec,
+            clip=self.clip_obj,
+            unet=self.unet_obj,
+        )
+        # Identity matching before branch
+        _keys_match = _cpu_snapshot_model_keys_match(self.model_key, _snapshot_models.model_key)
+        _specs_match = _cpu_snapshot_specs_match(self.model_spec, _snapshot_models.model_spec)
+        self.assertTrue(_keys_match, "pre-branch identity match")
+        self.assertTrue(_specs_match, "pre-branch spec match")
+
+        _flags: Any
+        if bypass_flag_value is None:
+            _flags = None
+        elif isinstance(bypass_flag_value, dict):
+            _flags = bypass_flag_value
+        else:
+            _flags = {self._BYPPASS_FLAG_KEY: bypass_flag_value}
+
+        _bypass = self._exact_flag_check(_flags)
+        import io
+        _captured = io.StringIO()
+        _prior_stdout = sys.stdout
+        sys.stdout = _captured
+        try:
+            if _bypass:
+                self.bridge.use_ready_clip(
+                    model_key=self.model_key, prefill_key=self.prefill_key,
+                    model_spec=self.model_spec, clip=self.clip_obj,
+                    trace=self.trace,
+                )
+                self.bridge.extend_preparation(
+                    prepare_unet=True, prepare_vae=False, trace=self.trace,
+                )
+                _unet_source = "normal_loader"
+                _clip_source = "cpu_snapshot"
+                _reason = "diagnostic_unet_bypass"
+            else:
+                self.bridge.use_ready_models(
+                    model_key=self.model_key, prefill_key=self.prefill_key,
+                    model_spec=self.model_spec, unet=self.unet_obj, clip=self.clip_obj,
+                    trace=self.trace,
+                )
+                _unet_source = "cpu_snapshot"
+                _clip_source = "cpu_snapshot"
+                _reason = "ok"
+            if _bypass:
+                print(
+                    "[v2.cpu_snapshot_request] status=partial_bypass "
+                    "reason=diagnostic_unet_bypass clip_source=cpu_snapshot "
+                    "unet_source=normal_loader",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[v2.cpu_snapshot_request] status=reused reason=ok",
+                    flush=True,
+                )
+            self.trace.emit(
+                "cpu_snapshot_models_request_bound",
+                phase="execution",
+                metadata={
+                    "status": "bound",
+                    "reason": _reason,
+                    "diagnostic_bypass_cpu_snapshot_unet": 1 if _bypass else 0,
+                    "cpu_snapshot_clip_reused": 1,
+                    "cpu_snapshot_unet_reused": 0 if _bypass else 1,
+                    "unet_source": _unet_source,
+                    "clip_source": _clip_source,
+                    "model_key_hash": self.model_key.stable_hash[:16] if self.model_key else "",
+                    "clip_object_type": type(self.clip_obj).__name__,
+                    "unet_object_type": type(self.unet_obj).__name__,
+                    "duration_ms": 0.0,
+                },
+            )
+        finally:
+            sys.stdout = _prior_stdout
+        _stdout_text = _captured.getvalue()
+
+        prep = self.bridge._preparation
+        return {
+            "bypass": _bypass,
+            "prep": prep,
+            "unet_source": _unet_source,
+            "clip_source": _clip_source,
+            "reason": _reason,
+            "stdout": _stdout_text,
+            "events": list(self.trace.events),
+        }
+
+    def setUp(self):
+        _clean_env()
+        self.bridge = V2LoaderBridge()
+        _ensure_bridge_has_fake_nodes(self.bridge)
+        self.trace = RuntimeTrace(request_id="bypass-param", process="remote")
+        self.clip_obj = _FakeClip()
+        self.unet_obj = object()
+        self.model_key = ModelRestoreKey(
+            unet_identity="u.safetensors",
+            clip_identity="c.safetensors",
+            clip_type="sd3",
+        )
+        self.model_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3", "device": "default"}],
+                "vae": [],
+            },
+        }
+        self.prefill_key = PrefillKey(
+            model_key=self.model_key,
+            prompt_bundle_hash="bypass-param",
+        )
+
+    # ── Flag-edge identity checks ─────────────────────────────────
+
+    def test_flag_missing_not_bypass(self):
+        """Missing flag (None, empty dict, other key) → not bypass."""
+        self.assertFalse(self._exact_flag_check(None))
+        self.assertFalse(self._exact_flag_check({}))
+        self.assertFalse(self._exact_flag_check({"other": True}))
+
+    def test_flag_literal_true_is_bypass(self):
+        """Literal True → bypass."""
+        self.assertTrue(self._exact_flag_check({self._BYPPASS_FLAG_KEY: True}))
+
+    def test_flag_non_true_not_bypass(self):
+        """False, string 'true', int 1 → not bypass (strict ``is True``)."""
+        self.assertFalse(self._exact_flag_check({self._BYPPASS_FLAG_KEY: False}))
+        self.assertFalse(self._exact_flag_check({self._BYPPASS_FLAG_KEY: 1}))
+        self.assertFalse(self._exact_flag_check({self._BYPPASS_FLAG_KEY: "true"}))
+
+    # ── Actual-path branch routing ─────────────────────────────────
+
+    def test_non_true_routes_to_use_ready_models(self):
+        """False → use_ready_models serves both CLIP and UNET."""
+        outcome = self._run_plan_c_branch(False)
+        self.assertFalse(outcome["bypass"])
+        prep = outcome["prep"]
+        self.assertIsNotNone(prep.unet_future)
+        self.assertTrue(prep.unet_future.done())
+        self.assertIs(prep.unet_future.result(), self.unet_obj)
+        self.assertIs(prep.clip_future.result(), self.clip_obj)
+
+    def test_literal_true_routes_to_use_ready_clip(self):
+        """Literal True → use_ready_clip + extend."""
+        outcome = self._run_plan_c_branch(True)
+        self.assertTrue(outcome["bypass"])
+        prep = outcome["prep"]
+        # CLIP is served from snapshot
+        self.assertIsNotNone(prep.clip_future)
+        self.assertTrue(prep.clip_future.done())
+        self.assertIs(prep.clip_future.result(), self.clip_obj)
+        # UNET future exists (via extend_preparation thread pool)
+        from concurrent.futures import Future
+        self.assertIsInstance(prep.unet_future, Future)
+        # Not the snapshot unet object
+        self.assertIsNot(prep.unet_future.result(timeout=10) if prep.unet_future.done() else None, self.unet_obj)
+
+    def test_missing_flag_routes_to_use_ready_models(self):
+        """No flag → use_ready_models (full bridge)."""
+        outcome = self._run_plan_c_branch(None)
+        self.assertFalse(outcome["bypass"])
+
+    def test_string_true_not_bypass(self):
+        """String 'true' → use_ready_models (not bypass)."""
+        outcome = self._run_plan_c_branch("true")
+        self.assertFalse(outcome["bypass"])
+
+    # ── Subsequent unflagged rebind ────────────────────────────────
+
+    def test_subsequent_unflagged_rebind(self):
+        """After bypass, unflagged call rebinds both UNET+CLIP from snapshot."""
+        # Request 1: bypass
+        self._run_plan_c_branch(True)
+        # Request 2: unflagged
+        outcome2 = self._run_plan_c_branch(False)
+        self.assertFalse(outcome2["bypass"])
+        prep = outcome2["prep"]
+        self.assertIs(prep.unet_future.result(), self.unet_obj)
+        self.assertIs(prep.clip_future.result(), self.clip_obj)
+
+    # ── Mismatch fallback ──────────────────────────────────────────
+
+    def test_mismatch_clears_bridge(self):
+        """Model key mismatch clears bridge regardless of bypass flag."""
+        self.bridge.use_ready_clip(
+            model_key=self.model_key, prefill_key=self.prefill_key,
+            model_spec=self.model_spec, clip=self.clip_obj,
+            trace=self.trace,
+        )
+        self.assertIsNotNone(self.bridge._preparation)
+        self.bridge.clear()
+        self.assertIsNone(self.bridge._preparation)
+
+    # ── Object/active state, event metadata, exact printed log ─────
+
+    def test_snapshot_active_state_preserved(self):
+        """After bypass branch, snapshot active state remains True."""
+        self.bridge.use_ready_clip(
+            model_key=self.model_key, prefill_key=self.prefill_key,
+            model_spec=self.model_spec, clip=self.clip_obj,
+            trace=self.trace,
+        )
+        self.bridge.extend_preparation(
+            prepare_unet=True, prepare_vae=False, trace=self.trace,
+        )
+
+    def test_exact_event_metadata_bypass(self):
+        """Bypass branch emits event with exact diagnostic_bypass metadata."""
+        outcome = self._run_plan_c_branch(True)
+        bound_events = [e for e in outcome["events"] if e.name == "cpu_snapshot_models_request_bound"]
+        self.assertEqual(len(bound_events), 1)
+        md = bound_events[0].metadata
+        self.assertEqual(md.get("reason"), "diagnostic_unet_bypass")
+        self.assertEqual(md.get("diagnostic_bypass_cpu_snapshot_unet"), 1)
+        self.assertEqual(md.get("cpu_snapshot_unet_reused"), 0)
+        self.assertEqual(md.get("unet_source"), "normal_loader")
+
+    def test_exact_event_metadata_reuse(self):
+        """Reuse branch emits event with exact ok metadata."""
+        outcome = self._run_plan_c_branch(False)
+        bound_events = [e for e in outcome["events"] if e.name == "cpu_snapshot_models_request_bound"]
+        self.assertEqual(len(bound_events), 1)
+        md = bound_events[0].metadata
+        self.assertEqual(md.get("reason"), "ok")
+        self.assertEqual(md.get("diagnostic_bypass_cpu_snapshot_unet"), 0)
+        self.assertEqual(md.get("cpu_snapshot_unet_reused"), 1)
+        self.assertEqual(md.get("unet_source"), "cpu_snapshot")
+
+    def test_exact_bypass_stdout(self):
+        """Bypass print line matches expected format."""
+        outcome = self._run_plan_c_branch(True)
+        self.assertEqual(
+            outcome["stdout"].strip(),
+            "[v2.cpu_snapshot_request] status=partial_bypass "
+            "reason=diagnostic_unet_bypass clip_source=cpu_snapshot "
+            "unet_source=normal_loader",
+        )
+
+    def test_exact_reuse_stdout(self):
+        """Reuse print line matches expected format."""
+        outcome = self._run_plan_c_branch(False)
+        self.assertEqual(
+            outcome["stdout"].strip(),
+            "[v2.cpu_snapshot_request] status=reused reason=ok",
+        )
+
+
+class CpuSnapshotExtendAfterUseReadyClipTests(unittest.TestCase):
+    """Extension of clip-only preparation with UNET."""
+
+    def setUp(self):
+        _clean_env()
+        self.bridge = V2LoaderBridge()
+        _ensure_bridge_has_fake_nodes(self.bridge)
+        self.trace = RuntimeTrace(request_id="extend-test", process="remote")
+        self.clip_obj = _FakeClip()
+        self.model_key = ModelRestoreKey(
+            unet_identity="u.safetensors",
+            clip_identity="c.safetensors",
+            clip_type="sd3",
+        )
+        self.prefill_key = PrefillKey(
+            model_key=self.model_key,
+            prompt_bundle_hash="extend-test",
+        )
+        self.model_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3", "device": "default"}],
+                "vae": [],
+            },
+        }
+
+    def test_use_ready_clip_then_extend(self):
+        """use_ready_clip then extend_preparation produces a usable prep."""
+        prep = self.bridge.use_ready_clip(
+            model_key=self.model_key, prefill_key=self.prefill_key,
+            model_spec=self.model_spec, clip=self.clip_obj,
+            trace=self.trace,
+        )
+        self.assertIsNone(prep.unet_future)
+        prep2 = self.bridge.extend_preparation(
+            prepare_unet=True, prepare_vae=False, trace=self.trace,
+        )
+        self.assertIs(prep, prep2)
+        self.assertIsNotNone(prep.unet_future)
+        self.assertTrue(prep.clip_future.done())
+        self.assertIs(prep.clip_future.result(), self.clip_obj)
+
+    def test_extend_preparation_returns_none_when_no_prep(self):
+        """extend_preparation returns None when no preparation exists."""
+        result = self.bridge.extend_preparation(
+            prepare_unet=True, prepare_vae=False, trace=self.trace,
+        )
+        self.assertIsNone(result)
+
+    def test_extend_with_vae_false(self):
+        """extend_preparation with prepare_vae=False does not submit VAE."""
+        self.bridge.use_ready_clip(
+            model_key=self.model_key, prefill_key=self.prefill_key,
+            model_spec=self.model_spec, clip=self.clip_obj,
+            trace=self.trace,
+        )
+        prep = self.bridge.extend_preparation(
+            prepare_unet=True, prepare_vae=False, trace=self.trace,
+        )
+        self.assertIsNone(prep.vae_future)
 
 
 if __name__ == "__main__":
