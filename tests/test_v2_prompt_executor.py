@@ -588,12 +588,12 @@ def test_v2_cert_identity_deterministic():
     inputs and different hashes for different workflow hashes."""
     from comfymodal_runtime.modal_app import _compute_v2_cert_identity
 
-    id1, comp1 = _compute_v2_cert_identity("wfhash_abc", deployment_identity=None)
-    id2, comp2 = _compute_v2_cert_identity("wfhash_abc", deployment_identity=None)
+    id1, comp1 = _compute_v2_cert_identity("wfhash_abc")
+    id2, comp2 = _compute_v2_cert_identity("wfhash_abc")
     assert id1 == id2, "identical inputs must produce same identity"
     assert comp1 == comp2
 
-    id3, _ = _compute_v2_cert_identity("wfhash_def", deployment_identity=None)
+    id3, _ = _compute_v2_cert_identity("wfhash_def")
     assert id1 != id3, "different workflow hashes must produce different identities"
 
 
@@ -689,7 +689,7 @@ def test_v2_cert_invalidation_on_component_mismatch():
     )
 
     # Identity and components from first deployment
-    identity, components_old = _compute_v2_cert_identity("wf_v1", deployment_identity=None)
+    identity, components_old = _compute_v2_cert_identity("wf_v1")
 
     # Simulate a changed deployment identity by passing different components
     components_new = {**components_old, "deployment_hash": "changed_deployment_hash"}
@@ -915,13 +915,13 @@ def test_v2_cert_preflight_skip_hit():
         custom_node_hash="ghi",
     )
 
-    # Compute identity with the SAME deployment_identity used at read time
-    identity, components = _compute_v2_cert_identity(
-        "wf_preflight_skip",
-        deployment_identity=_fake_dep_id,
-        repair_mode="dev",
-        custom_nodes_generation="gen42",
-    )
+    # Compute identity with the SAME deployment combined hash used at read time
+    with patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", _fake_dep_id.combined_hash):
+        identity, components = _compute_v2_cert_identity(
+            "wf_preflight_skip",
+            repair_mode="dev",
+            custom_nodes_generation="gen42",
+        )
 
     fake_vol = _FakeVolumeForCert()
     _repair_called = []
@@ -956,6 +956,10 @@ def test_v2_cert_preflight_skip_hit():
         def _current_custom_nodes_generation_id():
             return "gen42"
 
+        @staticmethod
+        def _resolve_custom_nodes_generation(api=None):
+            return ("gen42", "instance")
+
     api = _FakeRepairAPI()
     entrypoint = modal_app.ModalRuntimeEntrypoint()
     entrypoint._legacy_module = _FakeModule()
@@ -979,7 +983,8 @@ def test_v2_cert_preflight_skip_hit():
          patch.object(ModalMountedStateVolume, "exists", lambda s, p: fake_vol.exists(p)), \
          patch.object(ModalMountedStateVolume, "commit", lambda s: fake_vol.commit()), \
          patch.object(ModalMountedStateVolume, "reload", lambda s: None), \
-         patch.dict(_MODAL_RESOURCES, {"runtime_state_volume": _fake_runtime_state_volume(), "source_identity": _fake_dep_id}, clear=False):
+         patch.dict(_MODAL_RESOURCES, {"runtime_state_volume": _fake_runtime_state_volume(), "source_identity": _fake_dep_id}, clear=False), \
+         patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", _fake_dep_id.combined_hash):
 
         # Store cert with preflight_ok=True (within same volume patch context)
         _write_v2_validation_certificate(
@@ -1451,16 +1456,21 @@ class TestV2CertProcessCache:
             def _current_custom_nodes_generation_id():
                 return "gen_001"
 
+            @staticmethod
+            def _resolve_custom_nodes_generation(api=None):
+                return ("gen_001", "instance")
+
         # Pre-populate cache
         instance_id = "test_cache_hit_skip"
         wf_hash = "wf_cache_skip"
         _fake_dep_id = DeploymentIdentity(
             runtime_hash="a", dependency_hash="b", custom_node_hash="c",
         )
-        _cert_id, _components = modal_app._compute_v2_cert_identity(
-            wf_hash, deployment_identity=_fake_dep_id,
-            repair_mode="off", custom_nodes_generation="gen_001",
-        )
+        with patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", _fake_dep_id.combined_hash):
+            _cert_id, _components = modal_app._compute_v2_cert_identity(
+                wf_hash,
+                repair_mode="off", custom_nodes_generation="gen_001",
+            )
         cache_key = (instance_id, _cert_id)
         modal_app._V2_CERT_PROCESS_CACHE[cache_key] = {
             "outputs_to_execute": ["107"],
@@ -1495,7 +1505,8 @@ class TestV2CertProcessCache:
                  "runtime_state_volume": SimpleNamespace(
                      reload=lambda: None, commit=lambda: None,
                  ),
-             }):
+             }), \
+             patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", _fake_dep_id.combined_hash):
             result = asyncio.run(
                 entrypoint._execute_v2_prompt_executor(plan, context, api, trace)
             )
@@ -1603,7 +1614,7 @@ class TestV2CertProcessCache:
                  "source_identity": _fake_dep_id,
                  "runtime_state_volume": SimpleNamespace(reload=lambda: None, commit=lambda: None),
              }), \
-             patch.object(modal_app, "_get_preflight_context", return_value=("off", "gen_001")):
+             patch.object(modal_app, "_get_preflight_context", return_value=("off", "gen_001", "instance")):
 
             # First call: should read from volume
             trace1 = RuntimeTrace(request_id="req-first", process="remote")
@@ -1653,10 +1664,11 @@ class TestV2CertProcessCache:
         _fake_dep_id = DeploymentIdentity(
             runtime_hash="x", dependency_hash="y", custom_node_hash="z",
         )
-        _cert_id, _comps = modal_app._compute_v2_cert_identity(
-            wf_hash, deployment_identity=_fake_dep_id,
-            repair_mode="off", custom_nodes_generation="gen_001",
-        )
+        with patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", _fake_dep_id.combined_hash):
+            _cert_id, _comps = modal_app._compute_v2_cert_identity(
+                wf_hash,
+                repair_mode="off", custom_nodes_generation="gen_001",
+            )
         cache_key_a = (instance_a, _cert_id)
         modal_app._V2_CERT_PROCESS_CACHE[cache_key_a] = {
             "outputs_to_execute": ["107"],
@@ -1704,6 +1716,10 @@ class TestV2CertProcessCache:
             def _current_custom_nodes_generation_id():
                 return "gen_001"
 
+            @staticmethod
+            def _resolve_custom_nodes_generation(api=None):
+                return ("gen_001", "instance")
+
         plan = ExecutionPlan(
             workflow={"107": {"class_type": "SaveImage", "inputs": {}}},
             execution_options=ExecutionOptions(production_enabled=False),
@@ -1720,7 +1736,8 @@ class TestV2CertProcessCache:
                  "source_identity": _fake_dep_id,
                  "runtime_state_volume": SimpleNamespace(reload=lambda: None, commit=lambda: None),
              }), \
-             patch.object(modal_app, "_get_preflight_context", return_value=("off", "gen_001")):
+             patch.object(modal_app, "_get_preflight_context", return_value=("off", "gen_001", "instance")), \
+             patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", _fake_dep_id.combined_hash):
 
             # Instance A with existing cache entry should hit
             api_a = _FakeAPI()
@@ -1846,7 +1863,7 @@ class TestV2CertProcessCache:
                  "source_identity": _fake_dep_id,
                  "runtime_state_volume": SimpleNamespace(reload=lambda: None, commit=lambda: None),
              }), \
-             patch.object(modal_app, "_get_preflight_context", return_value=("off", "gen_001")):
+             patch.object(modal_app, "_get_preflight_context", return_value=("off", "gen_001", "instance")):
 
             # First call: volume read (MISS -> no cache), preflight runs, validation runs,
             # execution completes, then cert write is called (preflight_ran=True).
@@ -1898,10 +1915,11 @@ class TestV2CertProcessCache:
         _fake_dep_id = DeploymentIdentity(
             runtime_hash="r", dependency_hash="d", custom_node_hash="c",
         )
-        _cert_id, _comps = modal_app._compute_v2_cert_identity(
-            wf_hash, deployment_identity=_fake_dep_id,
-            repair_mode="off", custom_nodes_generation="gen_001",
-        )
+        with patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", _fake_dep_id.combined_hash):
+            _cert_id, _comps = modal_app._compute_v2_cert_identity(
+                wf_hash,
+                repair_mode="off", custom_nodes_generation="gen_001",
+            )
 
         # Pre-populate cache with WRONG components (simulating changed deployment)
         _wrong_comps = dict(_comps)
@@ -1952,6 +1970,10 @@ class TestV2CertProcessCache:
             def _current_custom_nodes_generation_id():
                 return "gen_001"
 
+            @staticmethod
+            def _resolve_custom_nodes_generation(api=None):
+                return ("gen_001", "instance")
+
         plan = ExecutionPlan(
             workflow={"107": {"class_type": "SaveImage", "inputs": {}}},
             execution_options=ExecutionOptions(production_enabled=False),
@@ -1968,7 +1990,8 @@ class TestV2CertProcessCache:
                  "source_identity": _fake_dep_id,
                  "runtime_state_volume": SimpleNamespace(reload=lambda: None, commit=lambda: None),
              }), \
-             patch.object(modal_app, "_get_preflight_context", return_value=("off", "gen_001")):
+             patch.object(modal_app, "_get_preflight_context", return_value=("off", "gen_001", "instance")), \
+             patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", _fake_dep_id.combined_hash):
 
             api = _FakeAPI()
             ep = modal_app.ModalRuntimeEntrypoint()

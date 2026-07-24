@@ -84,10 +84,12 @@ class TestProfilePrepCacheHits(unittest.TestCase):
     def setUp(self):
         _reset_profile_prep_cache()
         _reset_last_stable_profile_cache()
+        _reset_restore_publish_cache()
 
     def tearDown(self):
         _reset_profile_prep_cache()
         _reset_last_stable_profile_cache()
+        _reset_restore_publish_cache()
 
     def _run_execute_plan(self, setter: _CountingProfileSetter) -> dict:
         """Run execute_plan with a simple workflow and return the result."""
@@ -224,43 +226,46 @@ class TestProfilePrepCacheHits(unittest.TestCase):
 
 
 class TestProfilePrepCacheKey(unittest.TestCase):
-    """``_profile_prep_cache_key`` produces deterministic, partition-safe keys."""
+    """``_profile_prep_cache_key`` produces deterministic, partition-safe keys.
+
+    The key includes only stable model-identity components:
+    (app_identity, ws_id, model_profile_key, prefill_key).
+    """
 
     def test_deterministic_key(self):
         """Same inputs produce the same key."""
-        k1 = _profile_prep_cache_key("hash_a", "plan_a", "ws_1", "app1", "env1")
-        k2 = _profile_prep_cache_key("hash_a", "plan_a", "ws_1", "app1", "env1")
+        k1 = _profile_prep_cache_key("app1", "ws_1", "model_key_a", "prefill_a")
+        k2 = _profile_prep_cache_key("app1", "ws_1", "model_key_a", "prefill_a")
         self.assertEqual(k1, k2, "Same inputs must produce same key")
 
-    def test_different_source_hash_different_key(self):
-        """Different source_workflow_hash → different key."""
-        k1 = _profile_prep_cache_key("hash_a", "plan_a", "ws_1", "app1", "env1")
-        k2 = _profile_prep_cache_key("hash_b", "plan_a", "ws_1", "app1", "env1")
-        self.assertNotEqual(k1, k2, "Different source hash must produce different key")
+    def test_different_model_key_different_key(self):
+        """Different model_profile_key → different key."""
+        k1 = _profile_prep_cache_key("app1", "ws_1", "model_key_a", "prefill_a")
+        k2 = _profile_prep_cache_key("app1", "ws_1", "model_key_b", "prefill_a")
+        self.assertNotEqual(k1, k2, "Different model key must produce different key")
 
-    def test_different_prod_plan_hash_different_key(self):
-        """Different production_plan_hash → different key."""
-        k1 = _profile_prep_cache_key("hash_a", "plan_a", "ws_1", "app1", "env1")
-        k2 = _profile_prep_cache_key("hash_a", "plan_b", "ws_1", "app1", "env1")
-        self.assertNotEqual(k1, k2, "Different plan hash must produce different key")
+    def test_different_prefill_key_different_key(self):
+        """Different prefill_key → different key."""
+        k1 = _profile_prep_cache_key("app1", "ws_1", "model_key_a", "prefill_a")
+        k2 = _profile_prep_cache_key("app1", "ws_1", "model_key_a", "prefill_b")
+        self.assertNotEqual(k1, k2, "Different prefill key must produce different key")
 
     def test_different_workspace_different_key(self):
-        """Different workspace_id → different key."""
-        k1 = _profile_prep_cache_key("hash_a", "plan_a", "ws_1", "app1", "env1")
-        k2 = _profile_prep_cache_key("hash_a", "plan_a", "ws_2", "app1", "env1")
+        """Different ws_id → different key."""
+        k1 = _profile_prep_cache_key("app1", "ws_1", "model_key_a", "prefill_a")
+        k2 = _profile_prep_cache_key("app1", "ws_2", "model_key_a", "prefill_a")
         self.assertNotEqual(k1, k2, "Different workspace must produce different key")
 
     def test_different_app_name_different_key(self):
-        """Different app_name → different key."""
-        k1 = _profile_prep_cache_key("hash_a", "plan_a", "ws_1", "app1", "env1")
-        k2 = _profile_prep_cache_key("hash_a", "plan_a", "ws_1", "app2", "env1")
-        self.assertNotEqual(k1, k2, "Different app_name must produce different key")
+        """Different app_identity → different key."""
+        k1 = _profile_prep_cache_key("app1", "ws_1", "model_key_a", "prefill_a")
+        k2 = _profile_prep_cache_key("app2", "ws_1", "model_key_a", "prefill_a")
+        self.assertNotEqual(k1, k2, "Different app identity must produce different key")
 
-    def test_different_environment_different_key(self):
-        """Different environment → different key."""
-        k1 = _profile_prep_cache_key("hash_a", "plan_a", "ws_1", "app1", "env1")
-        k2 = _profile_prep_cache_key("hash_a", "plan_a", "ws_1", "app1", "env2")
-        self.assertNotEqual(k1, k2, "Different env must produce different key")
+    def test_old_hash_and_plan_params_removed(self):
+        """The old source_workflow_hash and production_plan_hash params are removed."""
+        with self.assertRaises(TypeError):
+            _profile_prep_cache_key("hash_a", "plan_a", "ws_1", "app1", "env1")
 
 
 # =========================================================================
@@ -1281,3 +1286,403 @@ class TestHandleCacheCloudFactoryIsolation(unittest.TestCase):
         cached = cache.get(key_b)
         self.assertIsNone(cached,
                           "Different GPU order must miss cache when order-preserving")
+
+
+# =========================================================================
+# Phase 2: Last-successful profile/restore store and instrumentation
+# =========================================================================
+
+
+class TestComputeProfileIdentityKeys(unittest.TestCase):
+    """compute_profile_identity_keys returns the same values that
+    prepare_active_next_profile would produce from the same workflow."""
+
+    def setUp(self):
+        from warmup_profile import _reset_last_stable_profile_cache
+        _reset_last_stable_profile_cache()
+
+    def test_returns_tuple_of_two_strings(self):
+        """Returns (model_profile_key, prefill_key) as strings."""
+        from canonical_execution import _reset_all_cache_counters
+        from warmup_profile import compute_profile_identity_keys
+        _reset_all_cache_counters()
+        mk, pk = compute_profile_identity_keys(
+            {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+        )
+        self.assertIsInstance(mk, str)
+        self.assertIsInstance(pk, str)
+        self.assertGreater(len(mk), 0, "model_profile_key must be non-empty")
+
+    def test_consistent_with_prepare_active_next_profile(self):
+        """compute_profile_identity_keys and prepare_active_next_profile
+        produce the same model_profile_key for the same workflow."""
+        import json, hashlib
+        from warmup_profile import (
+            compute_profile_identity_keys,
+            prepare_active_next_profile,
+            _reset_last_stable_profile_cache,
+        )
+        from canonical_execution import _reset_all_cache_counters
+        _reset_all_cache_counters()
+
+        wf = {
+            "1": {"class_type": "CheckpointLoaderSimple",
+                  "inputs": {"ckpt_name": "sd_xl.safetensors"}},
+            "2": {"class_type": "CLIPTextEncode",
+                  "inputs": {"text": "hello", "clip": ["1", 0]}},
+            "3": {"class_type": "KSampler", "inputs": {"seed": 42}},
+        }
+        wf_hash = hashlib.sha256(
+            json.dumps(wf, sort_keys=True).encode()
+        ).hexdigest()
+
+        mk1, pk1 = compute_profile_identity_keys(wf)
+        _reset_last_stable_profile_cache()
+        result = asyncio.run(prepare_active_next_profile(
+            wf, wf_hash, workspace={"id": "ws_key_consistency"},
+        ))
+        mk2 = result.get("model_profile_key", "")
+        self.assertEqual(
+            mk1, mk2,
+            "compute_profile_identity_keys must match prepare_active_next_profile "
+            f"({mk1[:12]} != {mk2[:12]})",
+        )
+
+    def test_different_stack_different_keys(self):
+        """Different model stacks produce different model_profile_keys."""
+        from warmup_profile import compute_profile_identity_keys
+        wf_a = {"1": {"class_type": "CheckpointLoaderSimple",
+                       "inputs": {"ckpt_name": "model_a.safetensors"}}}
+        wf_b = {"1": {"class_type": "CheckpointLoaderSimple",
+                       "inputs": {"ckpt_name": "model_b.safetensors"}}}
+        mk_a, _ = compute_profile_identity_keys(wf_a)
+        mk_b, _ = compute_profile_identity_keys(wf_b)
+        self.assertNotEqual(mk_a, mk_b)
+
+    def test_same_stack_same_keys(self):
+        """Same model stack produces same model_profile_key."""
+        from warmup_profile import compute_profile_identity_keys
+        wf = {"1": {"class_type": "CheckpointLoaderSimple",
+                     "inputs": {"ckpt_name": "model_a.safetensors"}}}
+        mk1, _ = compute_profile_identity_keys(wf)
+        mk2, _ = compute_profile_identity_keys(wf)
+        self.assertEqual(mk1, mk2)
+
+
+
+
+
+class TestCacheResetCount(unittest.TestCase):
+    """_profile_cache_reset_count and _restore_cache_reset_count
+    increment on each reset call."""
+
+    def setUp(self):
+        from canonical_execution import _reset_all_cache_counters
+        _reset_all_cache_counters()
+
+    def test_reset_count_increments(self):
+        """Each reset increments _profile_cache_reset_count (checks delta)."""
+        from canonical_execution import (
+            _reset_profile_prep_cache,
+            _reset_restore_publish_cache,
+        )
+
+        # Read counters at entry (these may be >0 from previous tests)
+        p_delta = [0]
+        r_delta = [0]
+
+        # Guard: record delta by capturing current then resetting
+        import canonical_execution as _ce
+        p_before = _ce._profile_cache_reset_count
+        r_before = _ce._restore_cache_reset_count
+
+        _reset_profile_prep_cache()
+        self.assertEqual(_ce._profile_cache_reset_count, p_before + 1,
+                         "profile reset count must increment by 1")
+
+        _reset_restore_publish_cache()
+        self.assertEqual(_ce._restore_cache_reset_count, r_before + 1,
+                         "restore reset count must increment by 1")
+
+
+class TestInstrumentationDiagnostics(unittest.TestCase):
+    """Instrumentation fields (pid, module_id, cache_object_id, etc.)
+    are present on cached and non-cached paths."""
+
+    def setUp(self):
+        from canonical_execution import _reset_all_cache_counters
+        _reset_all_cache_counters()
+
+    def tearDown(self):
+        from canonical_execution import _reset_all_cache_counters
+        _reset_all_cache_counters()
+
+    def test_profile_cache_hit_has_instrumentation(self):
+        """Second call (cache hit) has profile_cache_* fields in metadata."""
+        from canonical_execution import _reset_all_cache_counters
+        _reset_all_cache_counters()
+
+        setter = _CountingProfileSetter()
+
+        async def _stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run_first():
+            from canonical_execution import build_execution_plan, execute_plan
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="inst_first",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=_stream)
+            await execute_plan(
+                plan, transport=transport,
+                profile_setter=setter,
+                workspace={"id": "ws_inst"},
+            )
+        asyncio.run(run_first())
+
+        async def run_second():
+            from canonical_execution import build_execution_plan, execute_plan
+            trace = RuntimeTrace(request_id="inst_second", process="local")
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="inst_second",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=_stream)
+            await execute_plan(
+                plan, transport=transport,
+                profile_setter=setter,
+                workspace={"id": "ws_inst"},
+                trace=trace,
+            )
+            meta = trace._metadata
+            self.assertIn("profile_cache_pid", meta,
+                          "profile_cache_pid must be present on cache hit")
+            self.assertIn("profile_cache_module_id", meta,
+                          "profile_cache_module_id must be present")
+            self.assertIn("profile_cache_object_id", meta,
+                          "profile_cache_object_id must be present")
+            self.assertIn("profile_cache_size_before", meta,
+                          "profile_cache_size_before must be present")
+            self.assertIn("profile_cache_key_hash", meta,
+                          "profile_cache_key_hash must be present")
+            self.assertIn("profile_cache_reset_count", meta,
+                          "profile_cache_reset_count must be present")
+            self.assertEqual(meta.get("profile_miss_reason"), "",
+                             "miss_reason must be empty on cache hit")
+        asyncio.run(run_second())
+
+    def test_restore_cache_hit_has_instrumentation(self):
+        """Second call (restore cache hit) has restore_cache_* fields."""
+        from canonical_execution import _reset_all_cache_counters
+        _reset_all_cache_counters()
+
+        publisher = _Publisher()
+
+        async def _stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run_first():
+            from canonical_execution import build_execution_plan, execute_plan
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="rest_inst_first",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=_stream)
+            await execute_plan(
+                plan, transport=transport,
+                restore_publisher=publisher,
+                workspace={"id": "ws_rest_inst"},
+            )
+        asyncio.run(run_first())
+
+        async def run_second():
+            from canonical_execution import build_execution_plan, execute_plan
+            trace = RuntimeTrace(request_id="rest_inst_second", process="local")
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="rest_inst_second",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=_stream)
+            await execute_plan(
+                plan, transport=transport,
+                restore_publisher=publisher,
+                workspace={"id": "ws_rest_inst"},
+                trace=trace,
+            )
+            meta = trace._metadata
+            self.assertIn("restore_cache_pid", meta,
+                          "restore_cache_pid must be present on restore cache hit")
+            self.assertIn("restore_cache_module_id", meta,
+                          "restore_cache_module_id must be present")
+            self.assertIn("restore_cache_object_id", meta,
+                          "restore_cache_object_id must be present")
+            self.assertIn("restore_cache_size_before", meta,
+                          "restore_cache_size_before must be present")
+            self.assertIn("restore_cache_key_hash", meta,
+                          "restore_cache_key_hash must be present")
+            self.assertIn("restore_cache_reset_count", meta,
+                          "restore_cache_reset_count must be present")
+            self.assertIn("restore_identity_hash", meta,
+                          "restore_identity_hash must be present")
+            self.assertIn("complete_plan_identity_hash", meta,
+                          "complete_plan_identity_hash must be present")
+        asyncio.run(run_second())
+
+    def test_cache_miss_has_miss_reason(self):
+        """First call (cache miss) has non-empty miss_reason."""
+        from canonical_execution import _reset_all_cache_counters
+        _reset_all_cache_counters()
+
+        setter = _CountingProfileSetter()
+
+        async def _stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run():
+            from canonical_execution import build_execution_plan, execute_plan
+            trace = RuntimeTrace(request_id="miss_reason", process="local")
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                prompt_id="miss_reason",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=_stream)
+            await execute_plan(
+                plan, transport=transport,
+                profile_setter=setter,
+                workspace={"id": "ws_miss"},
+                trace=trace,
+            )
+            meta = trace._metadata
+            miss_reason = meta.get("profile_miss_reason", "")
+            self.assertIn(
+                miss_reason,
+                ("key_not_found", "cache_reset", "identity_mismatch"),
+                f"miss_reason must be valid on first call, got {miss_reason!r}",
+            )
+        asyncio.run(run())
+
+
+class TestTwoIdenticalExecutionsSkipBothRemoteOps(unittest.TestCase):
+    """A real execute_plan invoked twice in one process proves second
+    call skips BOTH the profile setter AND the restore publisher."""
+
+    def setUp(self):
+        from canonical_execution import _reset_all_cache_counters
+        _reset_all_cache_counters()
+
+    def tearDown(self):
+        from canonical_execution import _reset_all_cache_counters
+        _reset_all_cache_counters()
+
+    def test_second_call_skips_both_remote_operations(self):
+        """Two identical execute_plan calls: second skips setter AND publisher."""
+        setter_calls = [0]
+        publisher_calls = [0]
+
+        async def _counting_setter(payload, *, workspace=None):
+            setter_calls[0] += 1
+            return {"status": "written", "changed": True}
+
+        class _CountingPublisher:
+            def publish(self, plan):
+                publisher_calls[0] += 1
+                return 1
+
+        async def _stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run(iteration: int):
+            from canonical_execution import build_execution_plan, execute_plan
+            plan = build_execution_plan(
+                {"1": {"class_type": "KSampler", "inputs": {"seed": 42}}},
+                prompt_id=f"two_calls_{iteration}",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=_stream)
+            await execute_plan(
+                plan, transport=transport,
+                profile_setter=_counting_setter,
+                restore_publisher=_CountingPublisher(),
+                workspace={"id": "ws_two"},
+            )
+
+        asyncio.run(run(1))
+        self.assertEqual(setter_calls[0], 1,
+                         "First call must invoke setter once")
+        self.assertEqual(publisher_calls[0], 1,
+                         "First call must invoke publisher once")
+
+        asyncio.run(run(2))
+        self.assertEqual(setter_calls[0], 1,
+                         "Second call must NOT invoke setter")
+        self.assertEqual(publisher_calls[0], 1,
+                         "Second call must NOT invoke publisher")
+
+    def test_different_workflow_third_call_calls_both(self):
+        """A third call with a different workflow invokes both remote ops again."""
+        setter_calls = [0]
+        publisher_calls = [0]
+
+        async def _counting_setter(payload, *, workspace=None):
+            setter_calls[0] += 1
+            return {"status": "written", "changed": True}
+
+        class _CountingPublisher:
+            def publish(self, plan):
+                publisher_calls[0] += 1
+                return publisher_calls[0]
+
+        async def _stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def run(wf: dict, iteration: int):
+            from canonical_execution import build_execution_plan, execute_plan
+            plan = build_execution_plan(
+                wf, prompt_id=f"three_calls_{iteration}",
+                validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=_stream)
+            await execute_plan(
+                plan, transport=transport,
+                profile_setter=_counting_setter,
+                restore_publisher=_CountingPublisher(),
+                workspace={"id": "ws_three"},
+            )
+
+        asyncio.run(run(
+            {"1": {"class_type": "CheckpointLoaderSimple",
+                    "inputs": {"ckpt_name": "model_a.safetensors"}},
+             "2": {"class_type": "KSampler", "inputs": {"seed": 1}}}, 1,
+        ))
+        self.assertEqual(setter_calls[0], 1)
+        self.assertEqual(publisher_calls[0], 1)
+
+        asyncio.run(run(
+            {"1": {"class_type": "CheckpointLoaderSimple",
+                    "inputs": {"ckpt_name": "model_a.safetensors"}},
+             "2": {"class_type": "KSampler", "inputs": {"seed": 1}}}, 2,
+        ))
+        self.assertEqual(setter_calls[0], 1,
+                         "Second identical: setter must not be called")
+        self.assertEqual(publisher_calls[0], 1,
+                         "Second identical: publisher must not be called")
+
+        asyncio.run(run(
+            {"1": {"class_type": "CheckpointLoaderSimple",
+                    "inputs": {"ckpt_name": "model_b.safetensors"}},
+             "2": {"class_type": "KSampler", "inputs": {"seed": 99}}}, 3,
+        ))
+        self.assertEqual(setter_calls[0], 2,
+                         "Different workflow: setter must be called again")
+        self.assertEqual(publisher_calls[0], 2,
+                         "Different workflow: publisher must be called again")
+
+
+if __name__ == "__main__":
+    unittest.main()

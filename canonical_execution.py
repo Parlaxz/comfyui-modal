@@ -13,6 +13,7 @@ import copy
 import inspect
 import json
 import os
+import sys
 import threading
 import time
 import uuid
@@ -28,7 +29,10 @@ from production_workflow import (
     normalize_production_options,
 )
 # Note: modal_options are passed through without reconstructing model-loading policy.
-from warmup_profile import prepare_active_next_profile
+from warmup_profile import (
+    compute_profile_identity_keys,
+    prepare_active_next_profile,
+)
 from workflow_metadata import (
     extract_model_stack,
     extract_warmup_stack,
@@ -60,14 +64,16 @@ from comfymodal_runtime.trace import (
 
 # ---------------------------------------------------------------------------
 # Restore-plan publish cache (process-safe, skips remote calls when
-# the canonical identity is unchanged for the same workspace/app/env)
+# the canonical identity is unchanged for the same app/workspace)
 # ---------------------------------------------------------------------------
 
-_RESTORE_PUBLISH_CACHE: dict[str, str] = {}
-"""``{cache_key: identity_hash}`` — set of published plan identities.
+_RESTORE_PUBLISH_CACHE: dict[str, dict] = {}
+"""``{cache_key: {"identity_hash": str, "publication_result": dict}}`` — cached
+publication metadata keyed by plan identity.
 
-Cache-key format: ``{workspace_id}:{app_name}:{environment}:{identity_hash}``
-Cleared only by module reload; survives across calls within the same process.
+Cache-key format: ``stable_hash({app_identity, ws_id, plan_identity_hash})``.
+Also serves as the last-successful publication store — cleared only by
+module reload or explicit ``_reset_restore_publish_cache()``.
 Thread-safe via ``_RESTORE_PUBLISH_CACHE_LOCK``.
 Bounded to ``_RESTORE_PUBLISH_CACHE_MAX`` entries.
 """
@@ -78,8 +84,28 @@ _RESTORE_PUBLISH_CACHE_LOCK = threading.Lock()
 _RESTORE_PUBLISH_CACHE_MAX = 100
 """Maximum entries in the restore publish cache before eviction."""
 
-_APP_NAME_DEFAULT = "stable-modal-comfy-v2-shadow"
-"""Fallback Modal app name when ``COMFYMODAL_V2_APP_NAME`` is unset."""
+# ── Cache-reset counters (monotonic per process) ────────────────────────
+_profile_cache_reset_count: int = 0
+"""Monotonic counter incremented each time ``_reset_profile_prep_cache`` is called."""
+
+_restore_cache_reset_count: int = 0
+"""Monotonic counter incremented each time ``_reset_restore_publish_cache`` is called."""
+
+
+def _app_identity() -> str:
+    """Current app identity used for cache scoping (matches ``warmup_profile._app_identity``)."""
+    app = os.environ.get("COMFYMODAL_V2_APP_NAME", "").strip()
+    if not app:
+        app = os.environ.get("COMFYMODAL_APP_NAME", "").strip()
+    return app or "comfyui"
+
+
+def _workspace_identity(workspace: Mapping[str, Any] | None) -> str:
+    if isinstance(workspace, Mapping):
+        value = workspace.get("id") or workspace.get("workspace_id") or ""
+        if value:
+            return str(value)
+    return "__default__"
 
 
 def _restore_plan_identity_hash(plan: RestorePlan) -> str:
@@ -102,8 +128,10 @@ def _restore_plan_identity_hash(plan: RestorePlan) -> str:
 
 def _reset_restore_publish_cache() -> None:
     """Clear the restore-plan publish cache (test / teardown only)."""
+    global _restore_cache_reset_count
     with _RESTORE_PUBLISH_CACHE_LOCK:
         _RESTORE_PUBLISH_CACHE.clear()
+        _restore_cache_reset_count += 1
 
 
 def _evict_restore_publish_cache() -> None:
@@ -115,16 +143,19 @@ def _evict_restore_publish_cache() -> None:
 
 # ---------------------------------------------------------------------------
 # Profile preparation cache — skip prepare_active_next_profile when the
-# plan identity (source_workflow_hash + production_plan_hash + workspace +
-# app/environment) is unchanged for the same process.
+# model identity (app_identity, ws_id, model_profile_key, prefill_key) is
+# unchanged for the same process.  Also serves as the last-successful
+# profile store — populated on success, cleared only by module reload or
+# explicit ``_reset_profile_prep_cache()``.
 # ---------------------------------------------------------------------------
 
 _PROFILE_PREP_CACHE: dict[str, dict] = {}
 """``{cache_key: profile_result}`` — cached prepared profile results.
 
-Cache-key format: ``stable_hash({source_workflow_hash, production_plan_hash,
-workspace_id, app_name, environment})``.
-Cleared only by module reload; survives across calls within the same process.
+Cache-key format: ``stable_hash({app_identity, ws_id, model_profile_key,
+prefill_key})``.
+Also serves as the last-successful profile store — populated on success,
+cleared only by module reload or explicit ``_reset_profile_prep_cache()``.
 Thread-safe via ``_PROFILE_PREP_CACHE_LOCK``.
 Bounded to ``_PROFILE_PREP_CACHE_MAX`` entries.
 """
@@ -137,27 +168,34 @@ _PROFILE_PREP_CACHE_MAX = 100
 
 
 def _profile_prep_cache_key(
-    source_workflow_hash: str,
-    production_plan_hash: str,
-    workspace_id: str,
-    app_name: str,
-    environment: str,
+    app_identity: str,
+    ws_id: str,
+    model_profile_key: str,
+    prefill_key: str,
 ) -> str:
-    """Deterministic cache key for profile preparation results."""
+    """Deterministic cache key for profile preparation results.
+
+    Includes only stable identity fields that reflect the actual model
+    profile identity, excluding volatile workflow content hashes.
+    Matches the semantics of ``warmup_profile``'s own dedup key so the
+    outer (execute_plan) and inner (prepare_active_next_profile) caches
+    miss/populate consistently.
+    """
     identity = {
-        "s": source_workflow_hash,
-        "p": production_plan_hash,
-        "w": workspace_id,
-        "a": app_name,
-        "e": environment,
+        "a": app_identity,
+        "w": ws_id,
+        "m": model_profile_key,
+        "p": prefill_key,
     }
     return stable_hash(identity)
 
 
 def _reset_profile_prep_cache() -> None:
     """Clear the profile prep cache (test / teardown only)."""
+    global _profile_cache_reset_count
     with _PROFILE_PREP_CACHE_LOCK:
         _PROFILE_PREP_CACHE.clear()
+        _profile_cache_reset_count += 1
 
 
 def _evict_profile_prep_cache() -> None:
@@ -165,6 +203,23 @@ def _evict_profile_prep_cache() -> None:
     with _PROFILE_PREP_CACHE_LOCK:
         while len(_PROFILE_PREP_CACHE) > _PROFILE_PREP_CACHE_MAX:
             _PROFILE_PREP_CACHE.pop(next(iter(_PROFILE_PREP_CACHE)), None)
+
+
+def _reset_all_cache_counters() -> None:
+    """Reset all caches and counters.
+
+    Clears ``_PROFILE_PREP_CACHE`` and ``_RESTORE_PUBLISH_CACHE``
+    (the sole process-local stores) and resets their reset counters.
+    Also resets the warmup-profile module-level dedup cache so the
+    inner ``prepare_active_next_profile`` cannot short-circuit after
+    a cache reset.
+
+    Test / teardown only.
+    """
+    _reset_profile_prep_cache()
+    _reset_restore_publish_cache()
+    from warmup_profile import _reset_last_stable_profile_cache as _wp_reset
+    _wp_reset()
 
 
 # ---------------------------------------------------------------------------
@@ -680,22 +735,31 @@ async def execute_plan(
     runtime_trace.emit("active_next_profile_start", phase="local")
     if profile_setter is not None:
         # ── Profile prep cache identity keys ──
-        _profile_ws_id = str((workspace or {}).get("id", ""))
-        _profile_app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", _APP_NAME_DEFAULT)
-        _profile_env = (
-            os.environ.get("COMFYMODAL_V2_ENVIRONMENT", "")
-            or os.environ.get("MODAL_ENVIRONMENT", "")
-        )
-        _profile_src_hash = plan.source_workflow_hash or plan.workflow_hash
+        _profile_ws_id = _workspace_identity(workspace)
+        _profile_app_identity = _app_identity()
         _pr = dict(plan.production_report) if isinstance(plan.production_report, Mapping) else {}
-        _profile_prod_hash = str(_pr.get("production_plan_hash", ""))
+
+        # Compute stable model identity keys from the canonical workflow
+        # (same values prepare_active_next_profile would produce).
+        _model_profile_key, _prefill_key = compute_profile_identity_keys(
+            _canonical_workflow,
+        )
 
         _profile_cache_key = _profile_prep_cache_key(
-            _profile_src_hash, _profile_prod_hash,
-            _profile_ws_id, _profile_app_name, _profile_env,
+            _profile_app_identity, _profile_ws_id,
+            _model_profile_key, _prefill_key,
         )
 
         _profile_cache_lookup_start_ns = time.perf_counter_ns()
+
+        # ── Instrumentation: owner metadata for diagnostics ──
+        _cache_pid = os.getpid()
+        _cache_module_id = str(id(sys.modules[__name__]))
+        _cache_obj_id = str(id(_PROFILE_PREP_CACHE))
+        _cache_size_before = len(_PROFILE_PREP_CACHE)
+        _cache_reset_count_current = _profile_cache_reset_count
+        _profile_miss_reason = ""
+
         with _PROFILE_PREP_CACHE_LOCK:
             _cached_result = _PROFILE_PREP_CACHE.get(_profile_cache_key)
         _profile_cache_lookup_ms = round((time.perf_counter_ns() - _profile_cache_lookup_start_ns) / 1_000_000, 3)
@@ -705,7 +769,8 @@ async def execute_plan(
             _pn_result = dict(_cached_result)
             runtime_trace.emit(
                 "profile_prep_cache_hit", phase="local",
-                metadata={"cache_key_prefix": _profile_cache_key[:16]},
+                metadata={"cache_key_prefix": _profile_cache_key[:16],
+                          "source": "profile_prep_cache"},
             )
             runtime_trace.set_metadata(
                 active_profile_publish_decision="cached_unchanged",
@@ -720,7 +785,6 @@ async def execute_plan(
                 profile_remote_call_performed=False,
                 profile_checker_performed=False,
                 profile_setter_performed=False,
-                # Truthful timing decomposition: cache hit → only cache_lookup, no checker/setter
                 active_profile_local_ms=0.0,
                 active_profile_cache_lookup_ms=_profile_cache_lookup_ms,
                 active_profile_checker_ms=0.0,
@@ -729,19 +793,39 @@ async def execute_plan(
                 source_workflow_hash=plan.source_workflow_hash,
                 model_stack=dict(plan.model_stack),
                 prompt_summary=dict(plan.prompt_bundle),
+                # Instrumentation diagnostics
+                profile_cache_pid=_cache_pid,
+                profile_cache_module_id=_cache_module_id,
+                profile_cache_object_id=_cache_obj_id,
+                profile_cache_size_before=_cache_size_before,
+                profile_cache_key_hash=_profile_cache_key[:16],
+                profile_identity_key=_model_profile_key[:16],
+                profile_cache_reset_count=_cache_reset_count_current,
+                profile_miss_reason="",
             )
             runtime_trace.emit("active_next_profile_end", phase="local", metadata={
                 "decision": "profile_prep_cache_hit",
                 "stable_key": _pn_result.get("active_profile_stable_key", "")[:16],
             })
         else:
+            # ── Cache miss — determine reason ──
+            # Possible reasons: key not found (never seen), cache reset occurred,
+            # identity changed (model profile or prefill), or app/workspace changed.
+            # Compute the miss reason string for diagnostics.
+            _profile_miss_reason = "key_not_found"
+            if _cache_size_before > 0:
+                # Cache had entries but this key wasn't one of them
+                _profile_miss_reason = "identity_mismatch"
+            elif _cache_reset_count_current > 0:
+                _profile_miss_reason = "cache_reset"
+
             runtime_trace.emit("plan_serialization_start", phase="local",
                                metadata={"purpose": "profile_activation"})
             _activation_wf = _canonical_workflow  # reuse canonical payload
             runtime_trace.emit("plan_serialization_end", phase="local",
                                metadata={"purpose": "profile_activation",
                                          "reused_canonical": True})
-            _activation_hash = _profile_src_hash
+            _activation_hash = plan.source_workflow_hash or plan.workflow_hash
             _prod_opts: dict | None = None
             if _pr.get("enabled"):
                 _prod_opts = {
@@ -777,7 +861,6 @@ async def execute_plan(
                 profile_remote_call_performed=bool(_pn_result.get("active_profile_remote_call", 0)),
                 profile_checker_performed=bool(_pn_result.get("profile_checker_performed", False)),
                 profile_setter_performed=bool(_pn_result.get("profile_setter_performed", False)),
-                # Truthful timing decomposition: local excludes cache_lookup/checker/setter
                 active_profile_local_ms=_pn_result.get("active_profile_local_ms", 0.0),
                 active_profile_cache_lookup_ms=_pn_result.get("active_profile_cache_lookup_ms", _profile_cache_lookup_ms),
                 active_profile_checker_ms=_pn_result.get("active_profile_checker_ms", 0.0),
@@ -786,18 +869,31 @@ async def execute_plan(
                 source_workflow_hash=plan.source_workflow_hash,
                 model_stack=dict(plan.model_stack),
                 prompt_summary=dict(plan.prompt_bundle),
+                # Instrumentation diagnostics
+                profile_cache_pid=_cache_pid,
+                profile_cache_module_id=_cache_module_id,
+                profile_cache_object_id=_cache_obj_id,
+                profile_cache_size_before=_cache_size_before,
+                profile_cache_key_hash=_profile_cache_key[:16],
+                profile_identity_key=_model_profile_key[:16],
+                profile_cache_reset_count=_cache_reset_count_current,
+                profile_miss_reason=_profile_miss_reason,
             )
             runtime_trace.emit("active_next_profile_end", phase="local", metadata={
                 "decision": _pn_result.get("active_profile_publish_decision", ""),
                 "stable_key": _pn_result.get("active_profile_stable_key", "")[:16],
+                "miss_reason": _profile_miss_reason,
             })
-            # On success, populate the cache so future identical calls skip
-            # Eviction is inlined (not via helper) to avoid lock reentry.
+            # On success populate cache; on failure remove any stale entry
             if _pn_result.get("status") not in ("error",):
                 with _PROFILE_PREP_CACHE_LOCK:
                     _PROFILE_PREP_CACHE[_profile_cache_key] = dict(_pn_result)
                     while len(_PROFILE_PREP_CACHE) > _PROFILE_PREP_CACHE_MAX:
                         _PROFILE_PREP_CACHE.pop(next(iter(_PROFILE_PREP_CACHE)), None)
+            else:
+                # Failure: remove any stale cached entry for this key
+                with _PROFILE_PREP_CACHE_LOCK:
+                    _PROFILE_PREP_CACHE.pop(_profile_cache_key, None)
     else:
         runtime_trace.emit("active_next_profile_end", phase="local", metadata={"status": "dry_run"})
     runtime_trace.emit("active_profile_prepare_end", phase="local")
@@ -827,23 +923,34 @@ async def execute_plan(
         runtime_trace.emit("restore_plan_publish_start", phase="local")
 
         # ── Local process-safe cache: skip remote call when identity
-        #    is unchanged for the same workspace/app/environment ──
+        #    is unchanged for the same app/workspace ──
         plan_identity = _restore_plan_identity_hash(restore_plan)
-        ws_id = str((workspace or {}).get("id", ""))
-        app_name = os.environ.get("COMFYMODAL_V2_APP_NAME", _APP_NAME_DEFAULT)
-        env = (
-            os.environ.get("COMFYMODAL_V2_ENVIRONMENT", "")
-            or os.environ.get("MODAL_ENVIRONMENT", "")
+        _restore_app_identity = _app_identity()
+        _restore_ws_id = _workspace_identity(workspace)
+        cache_key = _profile_prep_cache_key(
+            _restore_app_identity, _restore_ws_id, plan_identity, "",
         )
-        cache_key = f"{ws_id}:{app_name}:{env}:{plan_identity}"
+
+        # ── Instrumentation metadata ──
+        _restore_cache_pid = os.getpid()
+        _restore_cache_module_id = str(id(sys.modules[__name__]))
+        _restore_cache_obj_id = str(id(_RESTORE_PUBLISH_CACHE))
+        _restore_cache_size_before = len(_RESTORE_PUBLISH_CACHE)
+        _restore_cache_reset_count_current = _restore_cache_reset_count
+        _restore_miss_reason = ""
 
         _restore_cache_lookup_start_ns = time.perf_counter_ns()
         with _RESTORE_PUBLISH_CACHE_LOCK:
-            cached_identity = _RESTORE_PUBLISH_CACHE.get(cache_key)
+            _cached_restore = _RESTORE_PUBLISH_CACHE.get(cache_key)
         _restore_cache_lookup_ms = round((time.perf_counter_ns() - _restore_cache_lookup_start_ns) / 1_000_000, 3)
 
-        if cached_identity is not None:
-            # Identity unchanged — skip the remote publish call entirely
+        if _cached_restore is not None:
+            # Identity unchanged — skip the remote publish call entirely.
+            # Return the cached metadata including observed generation.
+            _cached_publish_result = dict(_cached_restore.get("publication_result", {}))
+            observed_generation = _cached_publish_result.get(
+                "generation", _cached_publish_result.get("observed_generation", "")
+            )
             runtime_trace.emit(
                 "restore_publish_cache_skip", phase="local",
                 metadata={"cache_key_prefix": cache_key[:64], "identity": plan_identity[:16]},
@@ -852,10 +959,28 @@ async def execute_plan(
                 restore_publish_cache_skipped=True,
                 restore_publish_cache_hit=True,
                 restore_cache_lookup_ms=_restore_cache_lookup_ms,
+                restore_publish_ms=_restore_cache_lookup_ms,
                 restore_remote_call_performed=False,
+                restore_publish_result=_cached_publish_result,
+                # Restore instrumentation
+                restore_cache_pid=_restore_cache_pid,
+                restore_cache_module_id=_restore_cache_module_id,
+                restore_cache_object_id=_restore_cache_obj_id,
+                restore_cache_size_before=_restore_cache_size_before,
+                restore_cache_key_hash=cache_key[:64],
+                restore_identity_hash=plan_identity[:16],
+                complete_plan_identity_hash=plan_identity[:16],
+                restore_cache_reset_count=_restore_cache_reset_count_current,
+                restore_miss_reason="",
             )
-            observed_generation = 0
         else:
+            # ── Cache miss — determine reason ──
+            _restore_miss_reason = "key_not_found"
+            if _restore_cache_size_before > 0:
+                _restore_miss_reason = "identity_mismatch"
+            elif _restore_cache_reset_count_current > 0:
+                _restore_miss_reason = "cache_reset"
+
             runtime_trace.set_metadata(
                 restore_publish_cache_skipped=False,
                 restore_publish_cache_hit=False,
@@ -885,13 +1010,35 @@ async def execute_plan(
                     _publish_succeeded = False
             else:
                 observed_generation = publish_result
-            # Only populate cache on semantic success.
-            # Eviction is inlined (not via helper) to avoid lock reentry.
+            # On success populate cache with metadata; on failure remove stale.
             if _publish_succeeded:
+                _publication_result = (
+                    dict(publish_result)
+                    if isinstance(publish_result, Mapping)
+                    else {"generation": observed_generation}
+                )
                 with _RESTORE_PUBLISH_CACHE_LOCK:
-                    _RESTORE_PUBLISH_CACHE[cache_key] = plan_identity
+                    _RESTORE_PUBLISH_CACHE[cache_key] = {
+                        "identity_hash": plan_identity,
+                        "publication_result": _publication_result,
+                    }
                     while len(_RESTORE_PUBLISH_CACHE) > _RESTORE_PUBLISH_CACHE_MAX:
                         _RESTORE_PUBLISH_CACHE.pop(next(iter(_RESTORE_PUBLISH_CACHE)), None)
+            else:
+                with _RESTORE_PUBLISH_CACHE_LOCK:
+                    _RESTORE_PUBLISH_CACHE.pop(cache_key, None)
+            # Instrumentation metadata on miss path
+            runtime_trace.set_metadata(
+                restore_cache_pid=_restore_cache_pid,
+                restore_cache_module_id=_restore_cache_module_id,
+                restore_cache_object_id=_restore_cache_obj_id,
+                restore_cache_size_before=_restore_cache_size_before,
+                restore_cache_key_hash=cache_key[:64],
+                restore_identity_hash=plan_identity[:16],
+                complete_plan_identity_hash=plan_identity[:16],
+                restore_cache_reset_count=_restore_cache_reset_count_current,
+                restore_miss_reason=_restore_miss_reason,
+            )
 
         runtime_trace.emit("restore_plan_publish_end", phase="local", metadata={"generation": observed_generation})
     else:
