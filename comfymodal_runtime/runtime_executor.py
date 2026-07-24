@@ -1162,7 +1162,7 @@ def _emit_pre_sampler_line(state: dict[str, Any]) -> None:
     fields = (
         "span", "start_node_id", "start_class_type",
         "end_node_id", "end_class_type",
-        "cache_lookup_ms", "hash_or_cache_check_ms",
+        "cache_lookup_ms", "pre_sampler_unattributed_ms",
         "input_resolution_ms", "future_wait_ms", "lock_wait_ms",
         "model_patch_ms", "conditioning_ms", "node_execution_ms",
         "unattributed_ms", "background_future_exists",
@@ -1274,15 +1274,18 @@ def install_pre_sampler_hooks() -> None:
                 and ("loader" in _class_lower or "checkpoint" in _class_lower)
             )
 
+            # Capture node-entry perf counter before span boundary recording
+            _t0 = time.perf_counter_ns()
+
             # Record span boundaries for dominant intervals
             if "first_node_id" not in state:
                 state["first_node_id"] = node_id
                 state["first_class_type"] = node_class
+                state["first_node_enter_perf_ns"] = _t0
                 state["span"] = "node_execution"
             state["last_node_id"] = node_id
             state["last_class_type"] = node_class
 
-            _t0 = time.perf_counter_ns()
             try:
                 result = await _orig_exec_node(
                     server, dynprompt, caches, current_item, extra_data,
@@ -1302,9 +1305,9 @@ def install_pre_sampler_hooks() -> None:
                 if _is_clip_text_encode:
                     state["conditioning_ms"] = state.get("conditioning_ms", 0.0) + _elapsed
 
-                # Sampler entry tracking
-                if _is_sampler and "sampler_start_ns" not in state:
-                    state["sampler_start_ns"] = _t0
+                # Sampler node-entry tracking (perf_counter, NOT actual sampler start)
+                if _is_sampler and "sampler_node_enter_perf_ns" not in state:
+                    state["sampler_node_enter_perf_ns"] = _t0
                     state["sampler_node_id"] = node_id
                     state["sampler_class_type"] = node_class
 
@@ -1404,24 +1407,27 @@ def install_pre_sampler_hooks() -> None:
                 state.setdefault("end_node_id", state.get("sampler_node_id", state.get("last_node_id", "")))
                 state.setdefault("end_class_type", state.get("sampler_class_type", state.get("last_class_type", "")))
 
-                # Compute hash_or_cache_check_ms from what we observed:
-                # This is the time before the first node execution - approximated
-                # by subtracting all measured node execution from the pre-sampler window.
+                # Compute pre_sampler_unattributed_ms from what we observed:
+                # residual wall time not covered by the measured operations below.
                 _ne = state.get("node_execution_ms", 0.0)
                 _ir = state.get("input_resolution_ms", 0.0)
                 _mp = state.get("model_patch_ms", 0.0)
-                _co = state.get("conditioning_ms", 0.0)
                 _measured = _ne + _ir + _mp
-                _hash_check = max(0.0, _total_wall_ms - _measured)
-                state["hash_or_cache_check_ms"] = state.get("hash_or_cache_check_ms", 0.0) + _hash_check
+                _pre_sampler_unattributed = max(0.0, _total_wall_ms - _measured)
+                state["pre_sampler_unattributed_ms"] = (
+                    state.get("pre_sampler_unattributed_ms", 0.0)
+                    + _pre_sampler_unattributed
+                )
 
-                # unattributed = wall minus sum of all measured operations
+                # unattributed = wall minus sum of all measured operations.
+                # conditioning_ms is a subset of node_execution_ms (already in _ne),
+                # so we do NOT add it again here to avoid double-counting.
                 _sum_measured = (
-                    _ne + _ir + _mp + _co
+                    _ne + _ir + _mp
                     + state.get("cache_lookup_ms", 0.0)
                     + state.get("future_wait_ms", 0.0)
                     + state.get("lock_wait_ms", 0.0)
-                    + state.get("hash_or_cache_check_ms", 0.0)
+                    + state.get("pre_sampler_unattributed_ms", 0.0)
                 )
                 _unattr = max(0.0, _total_wall_ms - _sum_measured)
                 if _unattr > 0.001:

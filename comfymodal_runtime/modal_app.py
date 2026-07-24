@@ -74,6 +74,83 @@ _V2_STAGE_MAP: tuple[tuple[str, str, str], ...] = (
     ("sampler_setup",  "t8_sampler_setup_start",    "t8_sampler_setup_end"),
 )
 
+_V2_CRITICAL_PATH_FIELDS: tuple[str, ...] = (
+    "python_resume_to_restore_enter_ms",
+    "restore_total_ms",
+    "restore_exit_to_run_enter_ms",
+    "run_enter_to_plan_received_ms",
+    "plan_received_to_executor_invoke_ms",
+    "executor_invoke_to_first_node_ms",
+    "first_node_to_sampler_node_ms",
+    "sampler_node_to_sampler_start_ms",
+    "pre_sampler_unattributed_ms",
+)
+
+
+def _critical_path_delta_ms(start_ns: Any, end_ns: Any) -> float | None:
+    if not isinstance(start_ns, int) or not isinstance(end_ns, int):
+        return None
+    return round((end_ns - start_ns) / 1_000_000, 3)
+
+
+def _format_v2_critical_path(values: Mapping[str, Any]) -> str:
+    return " ".join(
+        ["[v2.critical_path]"]
+        + [
+            f"{field}={ModalRuntimeEntrypoint._fmt_or_absent(values.get(field))}"
+            for field in _V2_CRITICAL_PATH_FIELDS
+        ]
+    )
+
+
+def _build_v2_critical_path(
+    restore_timing: Mapping[str, Any],
+    execution_timing: Mapping[str, Any],
+    *,
+    run_enter_mono_ns: int,
+    plan_received_mono_ns: int,
+    same_process_as_restore: bool,
+) -> dict[str, Any]:
+    first_node_perf_ns = execution_timing.get("first_node_enter_perf_ns")
+    sampler_node_perf_ns = execution_timing.get("sampler_node_enter_perf_ns")
+    values: dict[str, Any] = {
+        "python_resume_to_restore_enter_ms": _critical_path_delta_ms(
+            restore_timing.get("remote_python_resume_mono_ns"),
+            restore_timing.get("restore_method_start_mono_ns"),
+        ),
+        "restore_total_ms": restore_timing.get("restore_total_ms"),
+        "restore_exit_to_run_enter_ms": (
+            _critical_path_delta_ms(
+                restore_timing.get("restore_method_end_mono_ns"),
+                run_enter_mono_ns,
+            )
+            if same_process_as_restore
+            else None
+        ),
+        "run_enter_to_plan_received_ms": _critical_path_delta_ms(
+            run_enter_mono_ns, plan_received_mono_ns
+        ),
+        "plan_received_to_executor_invoke_ms": _critical_path_delta_ms(
+            plan_received_mono_ns,
+            execution_timing.get("executor_invoke_mono_ns"),
+        ),
+        "executor_invoke_to_first_node_ms": _critical_path_delta_ms(
+            execution_timing.get("executor_invoke_perf_ns"),
+            first_node_perf_ns,
+        ),
+        "first_node_to_sampler_node_ms": _critical_path_delta_ms(
+            first_node_perf_ns, sampler_node_perf_ns
+        ),
+        "sampler_node_to_sampler_start_ms": _critical_path_delta_ms(
+            sampler_node_perf_ns,
+            execution_timing.get("sampler_stage_start_perf_ns"),
+        ),
+        "pre_sampler_unattributed_ms": execution_timing.get(
+            "pre_sampler_unattributed_ms"
+        ),
+    }
+    return values
+
 
 try:
     import modal as _modal
@@ -3336,6 +3413,7 @@ class ModalRuntimeEntrypoint:
             _report_host_memory("peak_execution")
             _t5_wall_ns = int(time.time() * 1_000_000_000)
             _t5_mono_ns = time.monotonic_ns()
+            _t5_perf_ns = time.perf_counter_ns()
             _execute_call_ns = _t5_mono_ns  # preserve for milestone calculations
             trace.emit("prompt_executor_invoke_start", phase="execution", metadata={
                 "prompt_id": prompt_id,
@@ -3351,7 +3429,7 @@ class ModalRuntimeEntrypoint:
                 "total_nodes": len(_node_class_map),
             })
             try:
-                with pre_sampler_instrumentation_scope():
+                with pre_sampler_instrumentation_scope() as _pre_sampler_state:
                     if callable(execute_async):
                         execute_result = execute_async(**execute_kwargs)
                         if inspect.isawaitable(execute_result):
@@ -3842,8 +3920,9 @@ class ModalRuntimeEntrypoint:
             )
 
             _stage_windows = getattr(api, "_stage_windows", None)
+            _sampler_stage_start_perf_ns: int | None = None
             if _stage_windows:
-                _stages: dict[str, float] = {}
+                _stages: dict[str, float | int] = {}
                 for _stage, _sk, _ek in _V2_STAGE_MAP:
                     _fields = _stage_windows.get(_stage, {})
                     _s = _fields.get("start")
@@ -3852,8 +3931,22 @@ class ModalRuntimeEntrypoint:
                         _stages[_sk] = _s
                     if _e is not None:
                         _stages[_ek] = _e
+                    if _stage == "sampler":
+                        _stage_perf_ns = _fields.get("start_perf_ns")
+                        if isinstance(_stage_perf_ns, int):
+                            _sampler_stage_start_perf_ns = _stage_perf_ns
+                            _stages["sampler_stage_start_perf_ns"] = _stage_perf_ns
                 if _stages:
                     result["_stage_timings"] = _stages
+
+            result["_v2_critical_path_data"] = {
+                "executor_invoke_mono_ns": _t5_mono_ns,
+                "executor_invoke_perf_ns": _t5_perf_ns,
+                "first_node_enter_perf_ns": _pre_sampler_state.get("first_node_enter_perf_ns"),
+                "sampler_node_enter_perf_ns": _pre_sampler_state.get("sampler_node_enter_perf_ns"),
+                "sampler_stage_start_perf_ns": _sampler_stage_start_perf_ns,
+                "pre_sampler_unattributed_ms": _pre_sampler_state.get("pre_sampler_unattributed_ms"),
+            }
 
             # â”€â”€ Write validation certificate after successful execution â”€â”€
             # Schema v2 certs include preflight_ok=True to attest that
@@ -4192,6 +4285,7 @@ class ModalRuntimeEntrypoint:
             context.trace.emit("run_plan_trace_setup_end", phase="method")
 
         # â”€â”€ First status yield â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        _plan_received_mono_ns = time.monotonic_ns()
         context.trace.emit("run_plan_first_status_yield", phase="method")
         yield {
             "type": "status",
@@ -4426,6 +4520,19 @@ class ModalRuntimeEntrypoint:
                     f"modal_task_id={_modal_task_id}",
                     flush=True,
                 )
+                _critical_path_data = data.pop("_v2_critical_path_data", {})
+                if not isinstance(_critical_path_data, Mapping):
+                    _critical_path_data = {}
+                _critical_path_values = _build_v2_critical_path(
+                    _rt or {},
+                    _critical_path_data,
+                    run_enter_mono_ns=_method_first_line_ns,
+                    plan_received_mono_ns=_plan_received_mono_ns,
+                    same_process_as_restore=bool(
+                        _method_entry_gap_results.get("same_process", False)
+                    ),
+                )
+                print(_format_v2_critical_path(_critical_path_values), flush=True)
                 event = {**event, "data": data}
             yield event
 

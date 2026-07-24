@@ -14,13 +14,71 @@ from unittest.mock import patch
 import pytest
 
 from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, ModelRestoreKey, PrefillKey, RestorePlan
-from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+from comfymodal_runtime.modal_app import (
+    ModalRuntimeEntrypoint,
+    _build_v2_critical_path,
+    _format_v2_critical_path,
+)
 from comfymodal_runtime.runtime_executor import ExecutionContext
 from comfymodal_runtime.runtime_bootstrap import BootstrapConfig, RuntimeBootstrap, BootstrapState
 from comfymodal_runtime.runtime_executor import RuntimeExecutor
 from comfymodal_runtime.restore_plan import build_restore_model_spec
 from comfymodal_runtime.trace import RuntimeTrace
 from comfymodal_runtime.model_preload import V2LoaderBridge
+
+
+def test_v2_critical_path_uses_separate_same_clock_sampler_boundaries():
+    values = _build_v2_critical_path(
+        {
+            "remote_python_resume_mono_ns": 1_000_000,
+            "restore_method_start_mono_ns": 2_000_000,
+            "restore_method_end_mono_ns": 5_000_000,
+            "restore_total_ms": 3.0,
+        },
+        {
+            "executor_invoke_mono_ns": 10_000_000,
+            "executor_invoke_perf_ns": 100_000_000,
+            "first_node_enter_perf_ns": 102_000_000,
+            "sampler_node_enter_perf_ns": 105_000_000,
+            "sampler_stage_start_perf_ns": 108_500_000,
+            "pre_sampler_unattributed_ms": 1.25,
+        },
+        run_enter_mono_ns=6_000_000,
+        plan_received_mono_ns=8_000_000,
+        same_process_as_restore=True,
+    )
+
+    assert values["sampler_node_to_sampler_start_ms"] == 3.5
+    assert values["executor_invoke_to_first_node_ms"] == 2.0
+    assert values["first_node_to_sampler_node_ms"] == 3.0
+    assert values["pre_sampler_unattributed_ms"] == 1.25
+
+
+def test_v2_critical_path_missing_boundaries_are_absent():
+    values = _build_v2_critical_path(
+        {},
+        {},
+        run_enter_mono_ns=1_000_000,
+        plan_received_mono_ns=2_000_000,
+        same_process_as_restore=False,
+    )
+    line = _format_v2_critical_path(values)
+
+    assert line.startswith("[v2.critical_path] ")
+    assert "restore_exit_to_run_enter_ms=absent" in line
+    assert "sampler_node_to_sampler_start_ms=absent" in line
+    assert "pre_sampler_unattributed_ms=absent" in line
+    assert line.split()[1:] == [
+        "python_resume_to_restore_enter_ms=absent",
+        "restore_total_ms=absent",
+        "restore_exit_to_run_enter_ms=absent",
+        "run_enter_to_plan_received_ms=1.0",
+        "plan_received_to_executor_invoke_ms=absent",
+        "executor_invoke_to_first_node_ms=absent",
+        "first_node_to_sampler_node_ms=absent",
+        "sampler_node_to_sampler_start_ms=absent",
+        "pre_sampler_unattributed_ms=absent",
+    ]
 
 # On Windows, ensure_models_symlink requires symlink privileges (admin/Developer Mode).
 # Patching it at the module-import level so it is a no-op in all startup tests.
@@ -342,7 +400,7 @@ def test_execution_phase_durations_exported():
     pd = result["phase_durations_ms"]
     assert isinstance(pd, dict), f"phase_durations_ms must be a dict, got {type(pd)}"
     # Execution phases that should have explicit spans
-    for expected_phase in ("prompt_validation", "executor_reset", "prompt_executor"):
+    for expected_phase in ("prompt_validation", "executor_reset", "prompt_executor_invoke"):
         assert expected_phase in pd, (
             f"Expected {expected_phase!r} in phase_durations_ms keys: {list(pd.keys())}"
         )
@@ -533,7 +591,7 @@ class _FakeExecutorWithMilestones:
 
 def test_pregraph_setup_ordering():
     """pregraph_setup_start must follow prompt_validation_end, and
-    pregraph_setup_end must precede prompt_executor_start, with
+    pregraph_setup_end must precede prompt_executor_invoke_start, with
     executor_reset_start/end inside the pregraph span."""
     executor = _FakeExecutorWithMilestones()
     api = SimpleNamespace(_executor=executor)
@@ -563,7 +621,7 @@ def test_pregraph_setup_ordering():
         idx_reset_start = event_names.index("executor_reset_start")
         idx_reset_end = event_names.index("executor_reset_end")
         idx_pg_end = event_names.index("pregraph_setup_end")
-        idx_pex_start = event_names.index("prompt_executor_start")
+        idx_pex_start = event_names.index("prompt_executor_invoke_start")
     except ValueError as exc:
         assert False, f"Missing expected event: {exc}"
 
@@ -577,7 +635,7 @@ def test_pregraph_setup_ordering():
         f"executor_reset_end ({idx_reset_end}) must precede pregraph_setup_end ({idx_pg_end})"
     )
     assert idx_pg_end < idx_pex_start, (
-        f"pregraph_setup_end ({idx_pg_end}) must precede prompt_executor_start ({idx_pex_start})"
+        f"pregraph_setup_end ({idx_pg_end}) must precede prompt_executor_invoke_start ({idx_pex_start})"
     )
 
 
@@ -746,8 +804,8 @@ def test_prompt_executor_events_emitted():
         result = asyncio.run(entrypoint._execute_v2_prompt_executor(plan, context, api, trace))
 
     event_names = [e.name for e in trace.events]
-    assert "prompt_executor_start" in event_names, (
-        f"Missing prompt_executor_start in events: {event_names}"
+    assert "prompt_executor_invoke_start" in event_names, (
+        f"Missing prompt_executor_invoke_start in events: {event_names}"
     )
     assert "prompt_executor_end" in event_names
 
@@ -767,8 +825,8 @@ def test_prompt_executor_maps_to_legacy_t3e_execution_start():
     assert "t3d_prompt_start" not in stages  # graph_execution_start not emitted — OK
 
 
-def test_prompt_executor_start_immediately_before_executor_call():
-    """prompt_executor_start must occur after executor_reset_end and before executor.execute()."""
+def test_prompt_executor_invoke_start_immediately_before_executor_call():
+    """prompt_executor_invoke_start follows reset and precedes executor.execute()."""
     executor = _Executor()
     api = SimpleNamespace(
         _executor=executor,
@@ -792,24 +850,24 @@ def test_prompt_executor_start_immediately_before_executor_call():
     # Find the indices
     try:
         idx_reset_end = event_names.index("executor_reset_end")
-        idx_start = event_names.index("prompt_executor_start")
+        idx_start = event_names.index("prompt_executor_invoke_start")
         idx_end = event_names.index("prompt_executor_end")
     except ValueError as exc:
         assert False, f"Missing expected event: {exc}"
 
     assert idx_reset_end < idx_start, (
-        f"executor_reset_end ({idx_reset_end}) must precede prompt_executor_start ({idx_start})"
+        f"executor_reset_end ({idx_reset_end}) must precede prompt_executor_invoke_start ({idx_start})"
     )
     assert idx_start < idx_end, (
-        f"prompt_executor_start ({idx_start}) must precede prompt_executor_end ({idx_end})"
+        f"prompt_executor_invoke_start ({idx_start}) must precede prompt_executor_end ({idx_end})"
     )
-    # prompt_executor_start should follow executor_reset_end (pregraph_setup_end
+    # prompt_executor_invoke_start should follow executor_reset_end (pregraph_setup_end
     # sits between them in the execution trace as the span boundary marker).
     assert idx_reset_end < idx_start, (
-        f"executor_reset_end ({idx_reset_end}) must precede prompt_executor_start ({idx_start})"
+        f"executor_reset_end ({idx_reset_end}) must precede prompt_executor_invoke_start ({idx_start})"
     )
     assert idx_start > idx_reset_end, (
-        f"prompt_executor_start should come after executor_reset_end, "
+        f"prompt_executor_invoke_start should come after executor_reset_end, "
         f"but found: events between = {event_names[idx_reset_end+1:idx_start+1]}"
     )
 

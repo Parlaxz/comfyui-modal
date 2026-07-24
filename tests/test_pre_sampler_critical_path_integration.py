@@ -513,9 +513,9 @@ class TestPreSamplerInstrumentationLive:
             f"expected non-zero conditioning_ms, got {state}"
         )
 
-        # hash_or_cache_check_ms: populated from wall time
-        assert state.get("hash_or_cache_check_ms", 0.0) > 0, (
-            f"expected non-zero hash_or_cache_check_ms, got {state}"
+        # pre_sampler_unattributed_ms: populated from wall time
+        assert state.get("pre_sampler_unattributed_ms", 0.0) > 0, (
+            f"expected non-zero pre_sampler_unattributed_ms, got {state}"
         )
 
     @pytest.mark.asyncio
@@ -543,6 +543,10 @@ class TestPreSamplerInstrumentationLive:
             f"expected sampler_node_id in state, got keys={list(state.keys())}"
         )
         assert state.get("sampler_class_type") == "KSampler"
+        assert isinstance(state.get("first_node_enter_perf_ns"), int)
+        assert isinstance(state.get("sampler_node_enter_perf_ns"), int)
+        assert state["sampler_node_enter_perf_ns"] >= state["first_node_enter_perf_ns"]
+        assert "sampler_start_ns" not in state
 
     @pytest.mark.asyncio
     async def test_first_and_last_node_tracked(self):
@@ -623,7 +627,7 @@ class TestPreSamplerSummaryLine:
         required_fields = [
             "span", "start_node_id", "start_class_type",
             "end_node_id", "end_class_type",
-            "cache_lookup_ms", "hash_or_cache_check_ms",
+            "cache_lookup_ms", "pre_sampler_unattributed_ms",
             "input_resolution_ms", "future_wait_ms", "lock_wait_ms",
             "model_patch_ms", "conditioning_ms", "node_execution_ms",
             "unattributed_ms", "background_future_exists",
@@ -651,7 +655,7 @@ class TestPreSamplerSummaryLine:
         assert line is not None
 
         timing_fields = [
-            "cache_lookup_ms", "hash_or_cache_check_ms",
+            "cache_lookup_ms", "pre_sampler_unattributed_ms",
             "input_resolution_ms", "future_wait_ms", "lock_wait_ms",
             "model_patch_ms", "conditioning_ms", "node_execution_ms",
             "unattributed_ms",

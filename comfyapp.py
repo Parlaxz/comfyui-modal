@@ -14189,6 +14189,8 @@ class _ComfyAPIMixin:
                     windows[stage]["source"] = "progress"
                     # Save perf_counter_ns for accurate critical-path recording
                     windows[stage]["start_ns"] = state.get("first_progress_ns", 0)
+                    # Distinct perf_counter_ns at this exact writer call (not copied from first_progress)
+                    windows[stage]["start_perf_ns"] = time.perf_counter_ns()
                 else:
                     previous_duration = float(windows[stage].get("duration_ms", -1.0))
                     if duration_ms > previous_duration:
