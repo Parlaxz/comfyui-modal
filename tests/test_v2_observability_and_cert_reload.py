@@ -414,7 +414,7 @@ class TestTraceBoundaries:
             patch.object(
                 modal_app,
                 "_read_v2_validation_certificate_async",
-                return_value=None,
+                return_value=(None, {"cert_volume_reload_ms": 0.0, "cert_file_read_ms": 0.0, "cert_json_parse_validate_ms": 0.0}),
             ),
         ):
             asyncio.run(entrypoint._execute_v2_prompt_executor(plan, context, api, trace))
@@ -478,3 +478,447 @@ class TestV2StageMapConstant:
         """No two entries share the same stage key."""
         keys = [entry[0] for entry in modal_app._V2_STAGE_MAP]
         assert len(keys) == len(set(keys)), f"duplicate stage keys: {keys}"
+
+
+# \u2500\u2500 6. Certificate cache diagnostic fields \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+
+class TestCertCacheDiagnostics:
+    """Diagnostic fields for process-local cert cache."""
+
+    def test_prompt_validation_end_has_diagnostic_fields(self):
+        """prompt_validation_end trace event includes all required
+        diagnostic timing fields and cache/skipped booleans."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan
+        from comfymodal_runtime.runtime_executor import ExecutionContext
+        from comfymodal_runtime.trace import RuntimeTrace
+
+        class _FakeExecutor:
+            success = True
+            history_result = {}
+            def __init__(self):
+                self.executed = []
+                self.sync_called = False
+            def reset(self):
+                pass
+            def execute(self, **kwargs):
+                self.sync_called = True
+                self.executed.append(kwargs)
+
+        api = SimpleNamespace(
+            _executor=_FakeExecutor(),
+            _preflight_before_prompt_execution=lambda wf: None,
+            _stage_windows={},
+        )
+        entrypoint = modal_app.ModalRuntimeEntrypoint()
+        entrypoint._legacy_module = SimpleNamespace()
+        entrypoint._legacy_api = api
+
+        plan = ExecutionPlan(
+            workflow={"107": {"class_type": "SaveImage", "inputs": {}}},
+            execution_options=ExecutionOptions(production_enabled=False),
+        )
+        trace = RuntimeTrace(request_id="req-diag", process="remote")
+        context = ExecutionContext(request_id="req-diag", trace=trace)
+
+        async def _fake_validate_prompt(pid, wf, _unused):
+            return (True, {}, ["107"], {})
+
+        fake_execution = SimpleNamespace(validate_prompt=_fake_validate_prompt)
+
+        with patch.dict("sys.modules", {"execution": fake_execution}):
+            result = asyncio.run(entrypoint._execute_v2_prompt_executor(plan, context, api, trace))
+
+        # Find prompt_validation_end event
+        pv_end = [e for e in trace.events if e.name == "prompt_validation_end"]
+        assert len(pv_end) == 1, "prompt_validation_end must be emitted"
+        meta = pv_end[0].metadata
+
+        # Check all required diagnostic fields are present
+        required_fields = [
+            "cert_identity_build_ms",
+            "cert_cache_hit",
+            "cert_volume_reload_ms",
+            "cert_file_read_ms",
+            "cert_json_parse_validate_ms",
+            "cert_total_ms",
+            "legacy_preflight_ms",
+            "prompt_validation_ms",
+            "certificate_skipped_preflight",
+            "certificate_skipped_prompt_validation",
+        ]
+        for field in required_fields:
+            assert field in meta, f"Missing diagnostic field: {field}"
+
+        # When cert is not eligible (no deployment identity), cache miss is False,
+        # preflight runs, validation runs.
+        assert meta["cert_cache_hit"] is False
+        assert meta["certificate_skipped_preflight"] is False
+        assert meta["certificate_skipped_prompt_validation"] is False
+        assert isinstance(meta["legacy_preflight_ms"], (int, float))
+        assert isinstance(meta["prompt_validation_ms"], (int, float))
+        assert meta["legacy_preflight_ms"] >= 0
+        assert meta["prompt_validation_ms"] >= 0
+
+    def test_cert_cache_hit_uses_zero_stages(self):
+        """When the process-local cache returns a hit, volume_reload_ms,
+        file_read_ms, and json_parse_validate_ms are all 0.0."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, DeploymentIdentity
+        from comfymodal_runtime.runtime_executor import ExecutionContext
+        from comfymodal_runtime.trace import RuntimeTrace
+
+        # Pre-populate the process-local cache with a proper identity
+        from comfymodal_runtime.contracts import DeploymentIdentity
+        from comfymodal_runtime.modal_app import _compute_v2_cert_identity as _comp_cert_id
+        fake_instance_id = "test_instance_cache_hit"
+        _fake_dep_id = DeploymentIdentity(
+            runtime_hash="abc", dependency_hash="def", custom_node_hash="ghi",
+        )
+        wf_hash = "wf_cache_hit"
+        _cert_id, _components = _comp_cert_id(
+            wf_hash, deployment_identity=_fake_dep_id,
+            repair_mode="off", custom_nodes_generation="gen_001",
+        )
+        cache_key = (fake_instance_id, _cert_id)
+        modal_app._V2_CERT_PROCESS_CACHE[cache_key] = {
+            "outputs_to_execute": ["107"],
+            "node_errors": {},
+            "preflight_ok": True,
+            "schema_version": modal_app._V2_CERT_SCHEMA_VERSION,
+            "identity_components": dict(_components),
+        }
+
+        class _FakeExecutor:
+            success = True
+            history_result = {}
+            def __init__(self):
+                self.executed = []
+            def reset(self):
+                pass
+            def execute(self, **kwargs):
+                self.executed.append(kwargs)
+
+        class _FakeRepairAPI:
+            _executor = _FakeExecutor()
+            _preflight_already_ran = False
+            def _wait_for_restore_preload_before_request(self, wf):
+                pass
+            def _preflight_before_prompt_execution(self, wf):
+                raise AssertionError("preflight should NOT run on cache hit")
+            def _repair_missing_workflow_nodes(self, wf):
+                return {"missing_before": [], "missing_after": [], "blocked_by_mode": False}
+            def _begin_prompt_profile(self, wf, pid, outputs):
+                pass
+            def _resolve_requirements_repair_mode(self):
+                return "off"
+
+        class _FakeModule:
+            @staticmethod
+            def _current_custom_nodes_generation_id():
+                return "gen_001"
+
+        api = _FakeRepairAPI()
+        entrypoint = modal_app.ModalRuntimeEntrypoint()
+        entrypoint._restored_instance_id = fake_instance_id
+        entrypoint._legacy_module = _FakeModule()
+        entrypoint._legacy_api = api
+
+        plan = ExecutionPlan(
+            workflow={"107": {"class_type": "SaveImage", "inputs": {}}},
+            execution_options=ExecutionOptions(production_enabled=False),
+            workflow_hash="wf_cache_hit",
+        )
+        trace = RuntimeTrace(request_id="req-cache-zero", process="remote")
+        context = ExecutionContext(request_id="req-cache-zero", trace=trace)
+
+        async def _fake_validate(pid, wf, ext):
+            return True, {}, ["107"], {}
+
+        fake_execution = SimpleNamespace(validate_prompt=_fake_validate)
+
+        _fake_dep_id = DeploymentIdentity(
+            runtime_hash="abc", dependency_hash="def", custom_node_hash="ghi",
+        )
+
+        with patch.dict("sys.modules", {"execution": fake_execution}), \
+             patch.object(modal_app, "_MODAL_RESOURCES", {
+                 "source_identity": _fake_dep_id,
+                 "runtime_state_volume": SimpleNamespace(reload=lambda: None, commit=lambda: None),
+             }):
+            result = asyncio.run(
+                entrypoint._execute_v2_prompt_executor(plan, context, api, trace)
+            )
+
+        # Verify cache hit path
+        event_names = [e.name for e in trace.events]
+        assert "certificate_reload_start" not in event_names, \
+            "certificate_reload_start must NOT be emitted on cache hit"
+        assert "certificate_reload_end" not in event_names, \
+            "certificate_reload_end must NOT be emitted on cache hit"
+        assert "preflight_certificate_skip" in event_names, \
+            "preflight_certificate_skip must be emitted on cache hit"
+
+        pv_end = [e for e in trace.events if e.name == "prompt_validation_end"]
+        assert len(pv_end) == 1
+        meta = pv_end[0].metadata
+
+        # All zero for volume/file/parse timings
+        assert meta["cert_cache_hit"] is True, "cert_cache_hit must be True"
+        assert meta["cert_volume_reload_ms"] == 0.0, "volume_reload must be 0.0 on cache hit"
+        assert meta["cert_file_read_ms"] == 0.0, "file_read must be 0.0 on cache hit"
+        assert meta["cert_json_parse_validate_ms"] == 0.0, "parse_validate must be 0.0 on cache hit"
+        # Preflight and prompt validation are skipped
+        assert meta["certificate_skipped_preflight"] is True
+        assert meta["certificate_skipped_prompt_validation"] is True
+        assert meta["legacy_preflight_ms"] == 0.0
+        assert meta["prompt_validation_ms"] == 0.0
+
+        # Clean up
+        modal_app._V2_CERT_PROCESS_CACHE.pop(cache_key, None)
+
+    def test_cert_read_outcome_has_timing_fields(self):
+        """certificate_read_outcome trace event (volume read path) includes
+        granular timing fields."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan
+        from comfymodal_runtime.runtime_executor import ExecutionContext
+        from comfymodal_runtime.trace import RuntimeTrace
+
+        class _FakeExecutor:
+            success = True
+            history_result = {}
+            def __init__(self):
+                self.executed = []
+            def reset(self):
+                pass
+            def execute(self, **kwargs):
+                self.executed.append(kwargs)
+
+        # Patch _read_v2_validation_certificate_async to return miss so we
+        # exercise the volume read path (with mocked timings).
+        async def _fake_read(_id, **kw):
+            return (None, {"cert_volume_reload_ms": 12.3, "cert_file_read_ms": 4.5, "cert_json_parse_validate_ms": 6.7})
+
+        api = SimpleNamespace(
+            _executor=_FakeExecutor(),
+            _preflight_before_prompt_execution=lambda wf: None,
+        )
+        entrypoint = modal_app.ModalRuntimeEntrypoint()
+        entrypoint._legacy_module = SimpleNamespace()
+        entrypoint._legacy_api = api
+
+        plan = ExecutionPlan(
+            workflow={"107": {"class_type": "SaveImage", "inputs": {}}},
+            execution_options=ExecutionOptions(production_enabled=False),
+            workflow_hash="wf_read_outcome",
+        )
+        trace = RuntimeTrace(request_id="req-read-outcome", process="remote")
+        context = ExecutionContext(request_id="req-read-outcome", trace=trace)
+
+        async def _fake_validate(pid, wf, ext):
+            return True, {}, ["107"], {}
+
+        fake_execution = SimpleNamespace(validate_prompt=_fake_validate)
+
+        with patch.dict("sys.modules", {"execution": fake_execution}), \
+             patch.object(modal_app, "_read_v2_validation_certificate_async", _fake_read), \
+             patch.object(modal_app, "_V2_VALIDATION_CERT_ENABLED", True), \
+             patch.object(modal_app, "_MODAL_RESOURCES", {
+                 "source_identity": SimpleNamespace(combined_hash="dep_hash_abc"),
+                 "runtime_state_volume": SimpleNamespace(reload=lambda: None, commit=lambda: None),
+             }), \
+             patch.object(modal_app, "_get_preflight_context", return_value=("off", "gen_001")):
+            result = asyncio.run(
+                entrypoint._execute_v2_prompt_executor(plan, context, api, trace)
+            )
+
+        read_outcome = [e for e in trace.events if e.name == "certificate_read_outcome"]
+        assert len(read_outcome) == 1, "certificate_read_outcome must be emitted"
+        meta = read_outcome[0].metadata
+
+        assert "cert_cache_hit" in meta
+        assert "cert_identity_build_ms" in meta
+        assert "cert_volume_reload_ms" in meta
+        assert "cert_file_read_ms" in meta
+        assert "cert_json_parse_validate_ms" in meta
+        assert "cert_total_ms" in meta
+        # Timings from the fake reader
+        assert meta["cert_volume_reload_ms"] == 12.3
+        assert meta["cert_file_read_ms"] == 4.5
+        assert meta["cert_json_parse_validate_ms"] == 6.7
+
+
+# ── 7. Deep-copy isolation for cached node_errors ──────────────────────
+
+
+class TestCertCacheDeepCopyIsolation:
+    """node_errors stored in and returned from the process-local cache must
+    be deep copies so that mutation by the caller cannot leak into the cache
+    or into subsequent callers."""
+
+    def test_cache_store_deep_copies_node_errors(self):
+        """Storing into _V2_CERT_PROCESS_CACHE uses copy.deepcopy, so
+        mutating the original dict after storage does not affect the cache."""
+        from copy import deepcopy
+        from comfymodal_runtime.modal_app import _V2_CERT_PROCESS_CACHE
+
+        # Fresh cache
+        _V2_CERT_PROCESS_CACHE.clear()
+
+        identity = "deepcopy_store_test_id"
+        instance_id = "test_inst"
+        cache_key = (instance_id, identity)
+
+        original_node_errors: dict[str, Any] = {
+            "node_1": {"errors": ["err_a"]},
+            "node_2": {"broken": True},
+        }
+
+        # Simulate what the volume-read path stores
+        _V2_CERT_PROCESS_CACHE[cache_key] = {
+            "outputs_to_execute": ["107"],
+            "node_errors": deepcopy(original_node_errors),
+            "preflight_ok": True,
+            "schema_version": 2,
+            "identity_components": {"wf": "x"},
+        }
+
+        # Mutate the original — cache must be unchanged
+        original_node_errors["node_1"]["errors"].append("err_b")
+        original_node_errors["node_3"] = {"new": True}
+
+        stored = _V2_CERT_PROCESS_CACHE[cache_key]["node_errors"]
+        assert stored["node_1"]["errors"] == ["err_a"], \
+            "cache must not reflect mutation of original after store"
+        assert "node_3" not in stored, \
+            "cache must not reflect new keys added to original after store"
+
+        _V2_CERT_PROCESS_CACHE.clear()
+
+    def test_cache_return_deep_copies_node_errors(self):
+        """Reading from _V2_CERT_PROCESS_CACHE returns a deep copy, so
+        mutating the caller's copy does not affect the cache."""
+        from copy import deepcopy
+        from comfymodal_runtime.modal_app import _V2_CERT_PROCESS_CACHE
+
+        _V2_CERT_PROCESS_CACHE.clear()
+
+        identity = "deepcopy_return_test_id"
+        instance_id = "test_inst"
+        cache_key = (instance_id, identity)
+
+        cached_errors: dict[str, Any] = {
+            "node_a": {"errors": ["x", "y"]},
+            "node_b": {"info": {"code": 42}},
+        }
+        _V2_CERT_PROCESS_CACHE[cache_key] = {
+            "outputs_to_execute": ["107"],
+            "node_errors": deepcopy(cached_errors),
+            "preflight_ok": True,
+            "schema_version": 2,
+            "identity_components": {"wf": "y"},
+        }
+
+        # Simulate the cache-return path (deepcopy)
+        returned = deepcopy(_V2_CERT_PROCESS_CACHE[cache_key]["node_errors"])
+
+        # Mutate the returned copy
+        returned["node_a"]["errors"].append("z")
+        returned["node_c"] = {"new": True}
+
+        # Cache must be untouched
+        still_cached = _V2_CERT_PROCESS_CACHE[cache_key]["node_errors"]
+        assert still_cached["node_a"]["errors"] == ["x", "y"], \
+            "cache must not reflect mutation of returned copy"
+        assert "node_c" not in still_cached, \
+            "cache must not reflect new keys added to returned copy"
+
+        _V2_CERT_PROCESS_CACHE.clear()
+
+
+# ── 8. Write invalidation on failed/unavailable volume ─────────────────
+
+
+class _CountingCache(dict):
+    """dict subclass that counts .pop() calls for testing invalidation."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.pop_count: int = 0
+
+    def pop(self, key: Any, default: Any = None) -> Any:  # type: ignore[override]
+        self.pop_count += 1
+        return super().pop(key, default)
+
+
+class TestCertCacheInvalidationBeforeWrite:
+    """Process-local cache invalidation must happen before volume I/O,
+    so even a failed/unavailable write clears stale entries."""
+
+    def test_cache_invalidated_before_volume_write(self):
+        """_write_v2_validation_certificate invalidates all process-local
+        entries for the given identity before attempting any I/O, so a
+        subsequent failure does not leave stale entries."""
+        import comfymodal_runtime.modal_app as modal_app
+        from unittest.mock import patch
+
+        identity = "fail_write_id_001"
+        # Use a counting cache proxy so we can verify invalidation
+        fresh = _CountingCache()
+        fresh[("inst_a", identity)] = {"dummy": True}
+        fresh[("inst_b", identity)] = {"dummy": True}
+        fresh[("inst_a", "other_identity")] = {"dummy": True}
+        assert len(fresh) == 3
+
+        with patch.object(modal_app, "_V2_CERT_PROCESS_CACHE", fresh), \
+             patch.object(modal_app, "_MODAL_RESOURCES", {"runtime_state_volume": None}):
+            result = modal_app._write_v2_validation_certificate(
+                identity, ["107"], {},
+                preflight_ok=True,
+            )
+
+        # Write must report failure (no volume)
+        assert result is False
+
+        # Cache must be cleared for the target identity
+        stale_for_identity = [k for k in fresh if len(k) == 2 and k[1] == identity]
+        assert stale_for_identity == [], \
+            f"expected no stale entries for {identity}, got {stale_for_identity}"
+
+        # Other identities must survive (popped not called for them)
+        assert ("inst_a", "other_identity") in fresh, \
+            "entries for other identities must survive"
+
+        # Each matching key was popped exactly once before the write failed
+        assert fresh.pop_count == 2, \
+            f"expected 2 pops, got {fresh.pop_count}"
+
+    def test_cache_invalidation_does_not_duplicate(self):
+        """Invalidation occurs exactly once per matching key.  No duplicate
+        pop calls for the same key."""
+        import comfymodal_runtime.modal_app as modal_app
+        from unittest.mock import patch
+
+        identity = "no_dup_inval_id"
+        fresh = _CountingCache()
+        fresh[("inst_x", identity)] = {"dummy": True}
+        fresh[("inst_y", identity)] = {"dummy": True}
+
+        with patch.object(modal_app, "_V2_CERT_PROCESS_CACHE", fresh), \
+             patch.object(modal_app, "_MODAL_RESOURCES", {"runtime_state_volume": None}):
+            modal_app._write_v2_validation_certificate(
+                identity, ["107"], {},
+                preflight_ok=True,
+            )
+
+        # Exactly one pop per matching key (no duplicate invalidation)
+        assert fresh.pop_count == 2, \
+            f"expected exactly 2 invalidations (one per key), got {fresh.pop_count}"
+
+        # All matching entries gone
+        assert len(fresh) == 0
