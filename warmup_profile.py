@@ -191,14 +191,33 @@ def _emit_publish_log(decision: str, stable_key_short: str) -> None:
 
 
 def _finalize_timing(result: dict, build_start: float) -> None:
-    """Set timing fields at return."""
+    """Set timing fields at return.
+
+    Decomposes the active-profile operation into four non-overlapping
+    components:
+
+      total_ms = cache_lookup_ms + checker_ms + setter_ms + local_ms
+
+    * *cache_lookup_ms* — time to probe the process-local dedup cache.
+    * *checker_ms* — time to call the remote read-only identity seam.
+    * *setter_ms* — time to call the remote writer.
+    * *local_ms* — everything else (extraction, hashing, payload build).
+
+    On cache-hit paths, cache_lookup_ms is nonzero while checker and
+    setter are zero.  On checker-matched paths, checker_ms is nonzero,
+    setter is zero.  On setter-written paths, setter_ms is nonzero.
+    Exceptions/timeouts never advance the cache and never contribute
+    nonzero checker/setter on the subsequent retry.
+    """
     total_ms = round((time.time() - build_start) * 1000, 2)
     result["active_profile_total_ms"] = total_ms
+    cache_lookup_ms = result.get("cache_lookup_ms", 0.0)
     checker_ms = result.get("active_profile_checker_ms", 0.0)
     setter_ms = result.get("active_profile_setter_ms", 0.0)
-    local_ms = round(max(0.0, total_ms - checker_ms - setter_ms), 2)
+    local_ms = round(max(0.0, total_ms - max(0.0, cache_lookup_ms) - max(0.0, checker_ms) - max(0.0, setter_ms)), 2)
     result["active_profile_local_ms"] = local_ms
     result["local_active_profile_prepare_ms"] = local_ms
+    result["active_profile_cache_lookup_ms"] = cache_lookup_ms
 
 
 # ── Identity-change tracking ──────────────────────────────────────────
@@ -423,9 +442,15 @@ async def prepare_active_next_profile(
         "active_profile_token": "",
         # New unambiguous timing fields
         "active_profile_local_ms": 0.0,
+        "active_profile_cache_lookup_ms": 0.0,
         "active_profile_checker_ms": 0.0,
         "active_profile_setter_ms": 0.0,
         "active_profile_total_ms": 0.0,
+        "cache_lookup_ms": 0.0,
+        # Reuse booleans
+        "profile_cache_hit": False,
+        "profile_checker_performed": False,
+        "profile_setter_performed": False,
         # Identity-change report fields
         "model_profile_key": "",
         "prefill_key": "",
@@ -534,7 +559,10 @@ async def prepare_active_next_profile(
         effective_ttl_s * 0.5,
         effective_ttl_s - 1.0,
     ))
+    _cache_lookup_start_ns = time.perf_counter_ns()
     cached = _last_stable_profile_cache.get(cache_key)
+    _cache_lookup_ms = round((time.perf_counter_ns() - _cache_lookup_start_ns) / 1_000_000, 3)
+    result["cache_lookup_ms"] = _cache_lookup_ms
     if cached is not None and (time.time() - cached["ts"]) < refresh_after_s:
         result["status"] = "unchanged"
         result["active_profile_dedup_status"] = "unchanged"
@@ -542,6 +570,9 @@ async def prepare_active_next_profile(
         result["active_profile_token"] = cached["token"]
         result["model_identity_changed"] = False
         result["prefill_identity_changed"] = False
+        result["profile_cache_hit"] = True
+        result["profile_checker_performed"] = False
+        result["profile_setter_performed"] = False
         _finalize_timing(result, _build_start)
         _emit_publish_log("skipped_unchanged", stable_key_short)
         return result
@@ -551,6 +582,9 @@ async def prepare_active_next_profile(
         result["status"] = "skipped"
         result["active_profile_dedup_status"] = "skipped"
         result["active_profile_publish_decision"] = "skipped_unchanged"
+        result["profile_cache_hit"] = False
+        result["profile_checker_performed"] = False
+        result["profile_setter_performed"] = False
         _finalize_timing(result, _build_start)
         _emit_publish_log("skipped_unchanged", stable_key_short)
         return result
@@ -567,12 +601,16 @@ async def prepare_active_next_profile(
             _check_result = await checker(stable_key, workspace=workspace)
             _checker_ms = round((time.time() - _checker_start) * 1000, 2)
             result["active_profile_checker_ms"] = _checker_ms
+            result["profile_checker_performed"] = True
             if isinstance(_check_result, dict) and _check_result.get("matched"):
                 _token = _check_result.get("profile_token", "")
                 result["status"] = "unchanged"
                 result["active_profile_dedup_status"] = "unchanged"
                 result["active_profile_publish_decision"] = "skipped_unchanged"
                 result["active_profile_token"] = _token
+                result["profile_cache_hit"] = False
+                result["profile_checker_performed"] = True
+                result["profile_setter_performed"] = False
                 # Advance process-local cache so subsequent requests
                 # skip both checker and setter.
                 _last_stable_profile_cache[cache_key] = {
@@ -599,6 +637,7 @@ async def prepare_active_next_profile(
             result["active_profile_checker_ms"] = _checker_ms
             # Fail-open: if the checker itself raises, proceed to the
             # setter as if no check was performed.
+            result["profile_checker_performed"] = True
             print(f"[warmup_profile] phase=checker_done stable_key={stable_key_short} fail_open=True", flush=True)
             pass
 
@@ -617,6 +656,8 @@ async def prepare_active_next_profile(
     # ── 6. Write via setter ──────────────────────────────────────────────
     result["remote_call"] = 1
     result["active_profile_remote_call"] = 1
+    result["profile_cache_hit"] = False
+    result["profile_setter_performed"] = True
     _setter_start = time.time()
     profile_token = payload.get("profile_token", "")
     print(f"[warmup_profile] phase=setter_start stable_key={stable_key_short}", flush=True)

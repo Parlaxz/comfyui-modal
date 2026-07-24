@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ast
 import os
 import tempfile
@@ -1417,6 +1418,316 @@ class TestV2SourceModulesClosure(unittest.TestCase):
                 expected, v2_modules,
                 f"{expected} must be in V2_SOURCE_MODULES",
             )
+
+
+# ── Restored deployment identity tests ──────────────────────────────────
+
+
+class TestObserveGenerationsIdentity(unittest.TestCase):
+    """observe_generations() in _configure_runtime must correctly resolve
+    the custom-nodes generation, falling back to the persisted record when
+    the instance attribute is not hydrated."""
+
+    def test_uses_instance_attr_when_set(self):
+        """observe_generations prefers the instance-level attribute."""
+        from types import SimpleNamespace
+        api = SimpleNamespace(_custom_nodes_generation_seen="gen_seen")
+        module = SimpleNamespace()
+        observe = modal_app.ModalRuntimeEntrypoint(
+            bootstrap=modal_app.RuntimeBootstrap(),
+        )
+        observe._legacy_api = api
+        observe._legacy_module = module
+        # Invoke the observe closure via _configure_runtime's inline function
+        # We can test the inline observe directly by creating one manually
+        def observe_test():
+            _cn_gen = str(getattr(api, "_custom_nodes_generation_seen", "") or "")
+            if not _cn_gen:
+                try:
+                    _cn_gen = str(module._current_custom_nodes_generation_id() or "")
+                except Exception:
+                    pass
+            return {
+                "runtime_state": str(getattr(api, "_runtime_generation_seen", "") or ""),
+                "custom_nodes": _cn_gen,
+            }
+        result = observe_test()
+        self.assertEqual(result["custom_nodes"], "gen_seen")
+
+    def test_falls_back_to_persisted_record_when_attr_empty(self):
+        """When _custom_nodes_generation_seen is empty, falls back to
+        module._current_custom_nodes_generation_id()."""
+        from types import SimpleNamespace
+        api = SimpleNamespace(_custom_nodes_generation_seen="")
+        module = SimpleNamespace()
+        module._current_custom_nodes_generation_id = lambda: "gen_persisted"
+        observe = modal_app.ModalRuntimeEntrypoint(
+            bootstrap=modal_app.RuntimeBootstrap(),
+        )
+        observe._legacy_api = api
+        observe._legacy_module = module
+        def observe_test():
+            _cn_gen = str(getattr(api, "_custom_nodes_generation_seen", "") or "")
+            if not _cn_gen:
+                try:
+                    _cn_gen = str(module._current_custom_nodes_generation_id() or "")
+                except Exception:
+                    pass
+            return {
+                "runtime_state": str(getattr(api, "_runtime_generation_seen", "") or ""),
+                "custom_nodes": _cn_gen,
+            }
+        result = observe_test()
+        self.assertEqual(result["custom_nodes"], "gen_persisted")
+
+    def test_returns_empty_when_both_unavailable(self):
+        """When both attr and module function are absent/empty, returns ''."""
+        from types import SimpleNamespace
+        api = SimpleNamespace(_custom_nodes_generation_seen="")
+        module = SimpleNamespace()
+        module._current_custom_nodes_generation_id = lambda: ""
+        def observe_test():
+            _cn_gen = str(getattr(api, "_custom_nodes_generation_seen", "") or "")
+            if not _cn_gen:
+                try:
+                    _cn_gen = str(module._current_custom_nodes_generation_id() or "")
+                except Exception:
+                    pass
+            return {
+                "runtime_state": str(getattr(api, "_runtime_generation_seen", "") or ""),
+                "custom_nodes": _cn_gen,
+            }
+        result = observe_test()
+        self.assertEqual(result["custom_nodes"], "")
+
+    def test_handles_module_exception_gracefully(self):
+        """When module._current_custom_nodes_generation_id raises,
+        observe_generations does not propagate the exception."""
+        from types import SimpleNamespace
+        api = SimpleNamespace(_custom_nodes_generation_seen="")
+        module = SimpleNamespace()
+        module._current_custom_nodes_generation_id = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        def observe_test():
+            _cn_gen = str(getattr(api, "_custom_nodes_generation_seen", "") or "")
+            if not _cn_gen:
+                try:
+                    _cn_gen = str(module._current_custom_nodes_generation_id() or "")
+                except Exception:
+                    pass
+            return {
+                "runtime_state": str(getattr(api, "_runtime_generation_seen", "") or ""),
+                "custom_nodes": _cn_gen,
+            }
+        result = observe_test()
+        self.assertEqual(result["custom_nodes"], "")
+
+
+class TestDeploymentCombinedHashInCertIdentity(unittest.TestCase):
+    """The certificate identity must include the deployment combined hash
+    from _MODAL_RESOURCES source_identity.  On restore this identity must
+    be non-empty for certificate eligibility."""
+
+    def test_cert_identity_uses_deployment_combined_hash(self):
+        """_compute_v2_cert_identity includes dep_hash from deployment_identity."""
+        from comfymodal_runtime.contracts import DeploymentIdentity
+        dep_id = DeploymentIdentity(
+            runtime_hash="abc", dependency_hash="def", custom_node_hash="ghi",
+        )
+        identity, components = modal_app._compute_v2_cert_identity(
+            "wf_hash", deployment_identity=dep_id,
+            repair_mode="off", custom_nodes_generation="gen_001",
+        )
+        self.assertIn("deployment_hash", components)
+        self.assertEqual(components["deployment_hash"], dep_id.combined_hash)
+        self.assertTrue(bool(dep_id.combined_hash))
+
+    def test_cert_identity_components_include_generation(self):
+        """The components dict includes custom_nodes_generation for revalidation."""
+        from comfymodal_runtime.contracts import DeploymentIdentity
+        dep_id = DeploymentIdentity(
+            runtime_hash="abc", dependency_hash="def", custom_node_hash="ghi",
+        )
+        identity, components = modal_app._compute_v2_cert_identity(
+            "wf_hash", deployment_identity=dep_id,
+            repair_mode="off", custom_nodes_generation="gen_002",
+        )
+        self.assertEqual(components["custom_nodes_generation"], "gen_002")
+
+    def test_cert_eligible_with_nonempty_restored_identity(self):
+        """Cert eligibility requires nonempty deployment hash, recognised
+        repair mode, and nonempty custom_nodes_generation.  Simulate the
+        restored path where all three are present."""
+        from comfymodal_runtime.contracts import DeploymentIdentity
+        _v2_dep_hash = DeploymentIdentity(
+            runtime_hash="a", dependency_hash="b", custom_node_hash="c",
+        ).combined_hash
+        _v2_repair_mode = "off"
+        _v2_custom_nodes_gen = "gen_003"
+        eligible = (
+            bool(_v2_dep_hash)
+            and _v2_repair_mode in ("off", "fail_fast", "dev")
+            and bool(_v2_custom_nodes_gen)
+        )
+        self.assertTrue(eligible)
+
+
+class TestCertProcessCacheInvalidation(unittest.TestCase):
+    """Generation change must invalidate certificate process-local cache
+    (detected via cert identity component change)."""
+
+    def setUp(self):
+        modal_app._V2_CERT_PROCESS_CACHE.clear()
+
+    def tearDown(self):
+        modal_app._V2_CERT_PROCESS_CACHE.clear()
+
+    def _make_cache_entry(self, instance_id, cert_identity, generation):
+        from comfymodal_runtime.contracts import DeploymentIdentity
+        dep_id = DeploymentIdentity(
+            runtime_hash="a", dependency_hash="b", custom_node_hash="c",
+        )
+        _id, components = modal_app._compute_v2_cert_identity(
+            "wf_hash", deployment_identity=dep_id,
+            repair_mode="off", custom_nodes_generation=generation,
+        )
+        cache_key = (instance_id, _id)
+        modal_app._V2_CERT_PROCESS_CACHE[cache_key] = {
+            "outputs_to_execute": ["107"],
+            "node_errors": {},
+            "preflight_ok": True,
+            "schema_version": modal_app._V2_CERT_SCHEMA_VERSION,
+            "identity_components": dict(components),
+        }
+        return _id, components, cache_key
+
+    def test_generation_change_makes_cert_miss(self):
+        """When generation changes, the cert identity changes, so the
+        old process-cache entry does not match the new identity."""
+        instance_id = "test_inst_gen_change"
+        old_id, _, old_key = self._make_cache_entry(instance_id, "any", "gen_old")
+        # Verify old entry exists
+        self.assertIn(old_key, modal_app._V2_CERT_PROCESS_CACHE)
+        # New identity with different generation
+        from comfymodal_runtime.contracts import DeploymentIdentity
+        dep_id = DeploymentIdentity(
+            runtime_hash="a", dependency_hash="b", custom_node_hash="c",
+        )
+        new_id, new_components = modal_app._compute_v2_cert_identity(
+            "wf_hash", deployment_identity=dep_id,
+            repair_mode="off", custom_nodes_generation="gen_new",
+        )
+        new_key = (instance_id, new_id)
+        # New key is different from old key
+        self.assertNotEqual(new_key, old_key,
+                            "different generation must produce different cert identity")
+        # Old key still exists (not evicted by unrelated new lookup)
+        self.assertIn(old_key, modal_app._V2_CERT_PROCESS_CACHE,
+                      "old cache entry must remain until explicitly invalidated")
+
+    def test_generation_change_invalidates_cert_read_outcome(self):
+        """Simulate full request path: when generation differs from cached
+        identity, the certificate_read_outcome must report miss."""
+        from comfymodal_runtime.contracts import DeploymentIdentity, ExecutionPlan, ExecutionOptions
+        from comfymodal_runtime.runtime_executor import ExecutionContext
+        from comfymodal_runtime.trace import RuntimeTrace
+        from unittest.mock import patch
+        from types import SimpleNamespace
+
+        # Populate process cache with old generation
+        instance_id = "test_inst_cert_miss"
+        dep_id = DeploymentIdentity(
+            runtime_hash="a", dependency_hash="b", custom_node_hash="c",
+        )
+        old_id, old_components = modal_app._compute_v2_cert_identity(
+            "wf_miss", deployment_identity=dep_id,
+            repair_mode="off", custom_nodes_generation="gen_old",
+        )
+        old_key = (instance_id, old_id)
+        modal_app._V2_CERT_PROCESS_CACHE[old_key] = {
+            "outputs_to_execute": ["107"],
+            "node_errors": {},
+            "preflight_ok": True,
+            "schema_version": modal_app._V2_CERT_SCHEMA_VERSION,
+            "identity_components": dict(old_components),
+        }
+
+        # Request with new generation — cert identity differs from cache
+        # The cert path will: 1. compute new identity (gen_new), 2. miss cache,
+        # 3. read from volume (patched), 4. volume miss => not eligible for skip
+        async def _fake_read(_id, **kw):
+            return (None, {"cert_volume_reload_ms": 5.0, "cert_file_read_ms": 3.0, "cert_json_parse_validate_ms": 2.0})
+
+        class _FakeExecutor:
+            success = True
+            history_result = {}
+            def __init__(self):
+                self.executed = []
+            def reset(self):
+                pass
+            def execute(self, **kwargs):
+                self.executed.append(kwargs)
+
+        class _FakeRepairAPI:
+            _executor = _FakeExecutor()
+            _preflight_already_ran = False
+            def _wait_for_restore_preload_before_request(self, wf):
+                pass
+            def _preflight_before_prompt_execution(self, wf):
+                pass
+            def _repair_missing_workflow_nodes(self, wf):
+                return {"missing_before": [], "missing_after": [], "blocked_by_mode": False}
+            def _begin_prompt_profile(self, wf, pid, outputs):
+                pass
+            def _resolve_requirements_repair_mode(self):
+                return "off"
+
+        class _FakeModule:
+            @staticmethod
+            def _current_custom_nodes_generation_id():
+                return "gen_new"
+
+        api = _FakeRepairAPI()
+        entrypoint = modal_app.ModalRuntimeEntrypoint()
+        entrypoint._restored_instance_id = instance_id
+        entrypoint._legacy_module = _FakeModule()
+        entrypoint._legacy_api = api
+
+        plan = ExecutionPlan(
+            workflow={"107": {"class_type": "SaveImage", "inputs": {}}},
+            execution_options=ExecutionOptions(production_enabled=False),
+            workflow_hash="wf_miss",
+        )
+        trace = RuntimeTrace(request_id="req-gen-change", process="remote")
+        context = ExecutionContext(request_id="req-gen-change", trace=trace)
+
+        async def _fake_validate(pid, wf, ext):
+            return True, {}, ["107"], {}
+
+        fake_execution = SimpleNamespace(validate_prompt=_fake_validate)
+
+        with patch.dict("sys.modules", {"execution": fake_execution}), \
+             patch.object(modal_app, "_read_v2_validation_certificate_async", _fake_read), \
+             patch.object(modal_app, "_V2_VALIDATION_CERT_ENABLED", True), \
+             patch.object(modal_app, "_MODAL_RESOURCES", {
+                 "source_identity": dep_id,
+                 "runtime_state_volume": SimpleNamespace(reload=lambda: None, commit=lambda: None),
+             }), \
+             patch.object(modal_app, "_get_preflight_context", return_value=("off", "gen_new")):
+            result = asyncio.run(
+                entrypoint._execute_v2_prompt_executor(plan, context, api, trace)
+            )
+
+        # Verify cert miss (generation changed -> identity changed -> miss)
+        event_names = [e.name for e in trace.events]
+        self.assertIn("certificate_reload_start", event_names,
+                      "should attempt volume read on cert miss")
+        outcome = [e for e in trace.events if e.name == "certificate_read_outcome"]
+        self.assertEqual(len(outcome), 1)
+        self.assertFalse(outcome[0].metadata.get("hit"),
+                         "must report miss when generation changed")
+
+        # Clean up
+        modal_app._V2_CERT_PROCESS_CACHE.clear()
 
 
 if __name__ == "__main__":

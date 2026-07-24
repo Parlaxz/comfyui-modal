@@ -1979,3 +1979,210 @@ def test_progress_after_sampler_node_accepted():
     assert ps.get("first_sampler_stage_monotonic_ns") is not None, (
         "first_sampler_stage_monotonic_ns must be set when progress is accepted"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# T1/T2/T3 authoritative calculation consistency (Fix 4)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def test_sampler_node_to_sampler_start_authoritative_calculation():
+    """T1/T2/T3 consistency: sampler_node_to_sampler_start_ms is computed
+    once from milestone timestamps (monotonic_ns) and reused identically
+    in prompt_executor_milestones, pre_sampler_stages, and
+    _v2_critical_path_data.  Both summaries use T2-T1
+    (first_sampler_stage_ns - first_sampler_ns), never T3 completion."""
+    executor = _FakeExecutor(use_async=True)
+    _add_msgs: list[str] = []
+    _send_syncs: list[tuple] = []
+
+    def _add_msg(event: str, *a, **kw):
+        _add_msgs.append(event)
+
+    def _send_sync(event: str, data: dict | None = None, *a, **kw):
+        _send_syncs.append((event, data))
+
+    executor.add_message = _add_msg
+    executor.server = SimpleNamespace(send_sync=_send_sync)
+
+    api = _build_fake_api(executor)
+    entrypoint = modal_app.ModalRuntimeEntrypoint()
+    entrypoint._legacy_module = SimpleNamespace()
+
+    plan = ExecutionPlan(
+        workflow={
+            "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "cat"}},
+            "6": {"class_type": "KSampler", "inputs": {}},
+        },
+        execution_options=ExecutionOptions(production_enabled=False),
+    )
+    trace = RuntimeTrace(request_id="test-t123-auth", process="remote")
+    context = ExecutionContext(request_id="test-t123-auth", trace=trace)
+
+    original_execute = executor.execute_async
+
+    async def _wrapped_execute(**kwargs):
+        executor.add_message("execution_start")
+        executor.add_message("execution_cached")
+        # T1: first executing node (CLIPTextEncode)
+        executor.server.send_sync("executing", {"node": "5"})
+        # T2: sampler node
+        executor.server.send_sync("executing", {"node": "6"})
+        # T3: sampler stage start — should trigger first_sampler_stage_ns
+        executor.server.send_sync("sampler_start", {})
+        await original_execute(**kwargs)
+
+    executor.execute_async = _wrapped_execute  # type: ignore[assignment]
+
+    fake_execution = SimpleNamespace(validate_prompt=_async_validate)
+    with patch.dict("sys.modules", {"execution": fake_execution}):
+        result = asyncio.run(
+            entrypoint._execute_v2_prompt_executor(plan, context, api, trace)
+        )
+
+    # === Verify all three summaries carry the same non-None value ===
+
+    # 1. prompt_executor_milestones event
+    ms_events = [e for e in trace.events if e.name == "prompt_executor_milestones"]
+    assert len(ms_events) == 1, "expected exactly one prompt_executor_milestones event"
+    ms_val = ms_events[0].metadata.get("sampler_node_to_sampler_start_ms")
+    assert ms_val is not None, (
+        "sampler_node_to_sampler_start_ms must be non-None in milestones "
+        "when sampler stage event fires"
+    )
+    assert isinstance(ms_val, (int, float)), f"expected numeric, got {type(ms_val)}"
+    assert ms_val >= 0, f"expected non-negative, got {ms_val}"
+
+    # 2. pre_sampler_stages event
+    ps_events = [e for e in trace.events if e.name == "pre_sampler_stages"]
+    assert len(ps_events) == 1, "expected exactly one pre_sampler_stages event"
+    ps_val = ps_events[0].metadata.get("sampler_node_to_sampler_start_ms")
+    assert ps_val is not None, (
+        "sampler_node_to_sampler_start_ms must be non-None in "
+        "pre_sampler_stages when sampler stage event fires"
+    )
+    assert isinstance(ps_val, (int, float))
+    assert ps_val >= 0
+
+    # Milestones and pre_sampler_stages must agree (same local calculation)
+    assert ms_val == ps_val, (
+        f"Mismatch: milestones={ms_val} vs pre_sampler_stages={ps_val}"
+    )
+
+    # 3. _v2_critical_path_data (reuses pre-computed value, never T3)
+    cp_data = result.get("_v2_critical_path_data", {})
+    assert isinstance(cp_data, dict), (
+        f"expected dict, got {type(cp_data)}"
+    )
+    cp_val = cp_data.get("sampler_node_to_sampler_start_ms")
+    assert cp_val is not None, (
+        "sampler_node_to_sampler_start_ms must be non-None in "
+        "_v2_critical_path_data when sampler stage event fires"
+    )
+    assert isinstance(cp_val, (int, float))
+    assert cp_val >= 0
+
+    # Critical path value must match the authoritative milestone calculation
+    assert cp_val == ms_val, (
+        f"Critical path mismatch: critical_path={cp_val} vs milestones={ms_val}"
+    )
+
+    # All three summaries report the same exact value
+    assert cp_val == ps_val == ms_val, (
+        f"Triple mismatch: cp={cp_val} ps={ps_val} ms={ms_val}"
+    )
+
+
+def test_t2_t1_consistency_first_node_to_sampler_node_and_stage():
+    """Verifies the T2-T1 pair used for sampler_node_to_sampler_start_ms:
+    the interval is (first_sampler_stage_ns - first_sampler_ns), NOT
+    (completion_time - first_sampler_ns).  Injects known monotonic timestamps
+    via the send_sync wrapper and confirms the computed delta matches the
+    deterministic wall offset between the two events."""
+    import time as _time
+
+    executor = _FakeExecutor(use_async=True)
+    _add_msgs: list[str] = []
+
+    def _add_msg(event: str, *a, **kw):
+        _add_msgs.append(event)
+
+    executor.add_message = _add_msg
+    executor.server = SimpleNamespace(send_sync=lambda *a, **kw: None)
+
+    api = _build_fake_api(executor)
+    entrypoint = modal_app.ModalRuntimeEntrypoint()
+    entrypoint._legacy_module = SimpleNamespace()
+
+    plan = ExecutionPlan(
+        workflow={
+            "6": {"class_type": "KSampler", "inputs": {}},
+        },
+        execution_options=ExecutionOptions(production_enabled=False),
+    )
+    trace = RuntimeTrace(request_id="test-t2-t1-consistency", process="remote")
+    context = ExecutionContext(request_id="test-t2-t1-consistency", trace=trace)
+
+    original_execute = executor.execute_async
+
+    # Use a real monotonic_ns offset so we can assert the delta deterministically.
+    # The sampler_node and sampler_stage events fire at known offsets.
+    _event_log: list[tuple[str, int]] = []
+    _SAMPLER_NODE_OFFSET_NS = 5_000_000  # 5ms after first event
+    _SAMPLER_STAGE_OFFSET_NS = 12_000_000  # 12ms after first event
+    _t_start = _time.monotonic_ns()
+
+    async def _wrapped_execute(**kwargs):
+        executor.add_message("execution_start")
+        executor.add_message("execution_cached")
+        t0 = _time.monotonic_ns()
+        _event_log.append(("t0", t0))
+        # Sampler node executing
+        executor.server.send_sync("executing", {"node": "6"})
+        t0_2 = _time.monotonic_ns()
+        _event_log.append(("sampler_node_executing", t0_2))
+        # Wait for known offset
+        while _time.monotonic_ns() - t0 < _SAMPLER_NODE_OFFSET_NS:
+            pass
+        # Simulate sampler_stage_start at the target offset
+        executor.server.send_sync("sampler_stage_start", {})
+        t1 = _time.monotonic_ns()
+        _event_log.append(("sampler_stage_start", t1))
+        await original_execute(**kwargs)
+
+    executor.execute_async = _wrapped_execute  # type: ignore[assignment]
+
+    fake_execution = SimpleNamespace(validate_prompt=_async_validate)
+    with patch.dict("sys.modules", {"execution": fake_execution}):
+        result = asyncio.run(
+            entrypoint._execute_v2_prompt_executor(plan, context, api, trace)
+        )
+
+    # === Verify ===
+    ps_events = [e for e in trace.events if e.name == "pre_sampler_stages"]
+    assert len(ps_events) == 1
+    ps_val = ps_events[0].metadata.get("sampler_node_to_sampler_start_ms")
+    assert ps_val is not None, "pre_sampler_stages must have non-None value"
+
+    ms_events = [e for e in trace.events if e.name == "prompt_executor_milestones"]
+    assert len(ms_events) == 1
+    ms_val = ms_events[0].metadata.get("sampler_node_to_sampler_start_ms")
+    assert ms_val is not None, "milestones must have non-None value"
+
+    cp_data = result.get("_v2_critical_path_data", {})
+    cp_val = cp_data.get("sampler_node_to_sampler_start_ms")
+    assert cp_val is not None, "_v2_critical_path_data must have non-None value"
+
+    # All three summaries agree
+    assert ms_val == ps_val == cp_val, (
+        f"Triple mismatch: ms={ms_val} ps={ps_val} cp={cp_val}"
+    )
+
+    # The delta should be approximately _SAMPLER_STAGE_OFFSET_NS - _SAMPLER_NODE_OFFSET_NS
+    # = (12000000 - 5000000) / 1000000 = 7.0 ms
+    expected_ms = (_SAMPLER_STAGE_OFFSET_NS - _SAMPLER_NODE_OFFSET_NS) / 1_000_000
+    tolerance_ms = 10.0  # busy-wait has jitter; 10ms is generous
+    assert abs(ms_val - expected_ms) < tolerance_ms, (
+        f"Expected ~{expected_ms}ms, got {ms_val}ms "
+        f"(tolerance {tolerance_ms}ms)"
+    )

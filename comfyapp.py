@@ -9734,6 +9734,16 @@ class _ComfyAPIMixin:
                     f"[comfyapp] custom_node_sync memoized_hit reason=source_fingerprint_unchanged "
                     f"nodes={node_count} created=0"
                 )
+                # Sync the cached generation from the reloaded volume so
+                # observe_generations and downstream identity consumers see
+                # the current value even on memoized-hit paths.
+                try:
+                    _gen_rec_memo = _read_custom_nodes_generation_record()
+                    _gen_now_memo = (_gen_rec_memo or {}).get("generation", "") if _gen_rec_memo else ""
+                    if _gen_now_memo:
+                        self._custom_nodes_generation_seen = _gen_now_memo
+                except Exception:
+                    pass
                 _sanitized = (
                     {
                         "created": [],
@@ -9771,6 +9781,16 @@ class _ComfyAPIMixin:
                 cheap_state,
             )
             self._validation_cache.set("custom_node_sync", _result, fingerprint=cheap_hash)
+            # Sync the cached generation from the reloaded volume so
+            # observe_generations reflects current state even when the
+            # source fingerprint is unchanged across lifecycle boundaries.
+            try:
+                _gen_rec_skip = _read_custom_nodes_generation_record()
+                _gen_now_skip = (_gen_rec_skip or {}).get("generation", "") if _gen_rec_skip else ""
+                if _gen_now_skip:
+                    self._custom_nodes_generation_seen = _gen_now_skip
+            except Exception:
+                pass
             return _result
 
         # Step 3: Content actually changed GÃ‡Ã¶ run the real sync

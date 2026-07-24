@@ -411,6 +411,12 @@ LOCAL_SUBMISSION_FIELD_KEYS: tuple[tuple[str, str], ...] = (
     ("handle_cache_hit",              "handle_cache_hit"),
     ("plan_to_dict_count",            "plan_to_dict_count"),
     ("payload_bytes",                 "payload_bytes"),
+    # Active-profile timing decomposition (blended into local stage)
+    ("active_profile_local_ms",       "active_profile_local_ms"),
+    ("active_profile_cache_lookup_ms","active_profile_cache_lookup_ms"),
+    ("active_profile_checker_ms",     "active_profile_checker_ms"),
+    ("active_profile_setter_ms",      "active_profile_setter_ms"),
+    ("active_profile_total_ms",       "active_profile_total_ms"),
 )
 """Canonical ordered field list for [v2.local_submission_breakdown].
 Each entry is (dict_key, fmt_key) where fmt_key is the printed field name."""
@@ -713,4 +719,10 @@ def _build_local_submission_breakdown(
         "workflow_node_count": _transport_meta.get("workflow_node_count"),
         "plan_materialization_count": _transport_meta.get("plan_materialization_count"),
         "plan_to_dict_count": plan_to_dict_count,
+        # Active-profile timing decomposition (truthful non-overlapping)
+        "active_profile_local_ms": _transport_meta.get("active_profile_local_ms"),
+        "active_profile_cache_lookup_ms": _transport_meta.get("active_profile_cache_lookup_ms"),
+        "active_profile_checker_ms": _transport_meta.get("active_profile_checker_ms"),
+        "active_profile_setter_ms": _transport_meta.get("active_profile_setter_ms"),
+        "active_profile_total_ms": _transport_meta.get("active_profile_total_ms"),
     }
