@@ -57,6 +57,25 @@ WORKFLOW_DUAL_CLIP_FLUX2 = {
     "3": {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}},
 }
 
+WORKFLOW_SINGLE_CLIP = {
+    "1": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip_l.safetensors", "type": "flux"}},
+    "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux-2-klein-9b-fp8.safetensors"}},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}},
+}
+
+WORKFLOW_DUAL_CLIP_DUPLICATE = {
+    "1": {
+        "class_type": "DualCLIPLoader",
+        "inputs": {
+            "clip_name1": "clip_l.safetensors",
+            "clip_name2": "clip_l.safetensors",
+            "type": "flux",
+        },
+    },
+    "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux-2-klein-9b-fp8.safetensors"}},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}},
+}
+
 
 class WorkflowMetadataTests(unittest.TestCase):
     def test_prompt_hash_is_stable_across_key_order(self):
@@ -115,3 +134,60 @@ class WorkflowMetadataTests(unittest.TestCase):
             "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip_l.safetensors"}},
         })
         self.assertEqual(refs, [{"role": "clip", "filename": "clip_l.safetensors"}])
+
+    # ── Bounded CLIP extraction acceptance ──────────────────────────────
+
+    def test_clip_extraction_acceptance(self):
+        """(1) Single CLIP → clip2 empty; (2) dual duplicate → both clip_l; (3) distinct dual → normalized."""
+        # (1) Single CLIPLoader
+        s = extract_warmup_stack(WORKFLOW_SINGLE_CLIP)
+        self.assertEqual(s["clip_loader_class"], "CLIPLoader")
+        self.assertEqual(s["clip1"], "clip_l.safetensors")
+        self.assertEqual(s["clip2"], "")
+        self.assertEqual(stack_to_warmup_profile(s)["clip2"], "")
+
+        # (2) DualCLIPLoader with identical names
+        d = extract_warmup_stack(WORKFLOW_DUAL_CLIP_DUPLICATE)
+        self.assertEqual(d["clip_loader_class"], "DualCLIPLoader")
+        self.assertEqual(d["clip1"], "clip_l.safetensors")
+        self.assertEqual(d["clip2"], "clip_l.safetensors")
+        p = stack_to_warmup_profile(d)
+        self.assertEqual(p["clip1"], "clip_l.safetensors")
+        self.assertEqual(p["clip2"], "clip_l.safetensors")
+
+        # (3) DualCLIPLoader distinct → FLUX-normalized swap
+        n = extract_warmup_stack(WORKFLOW_DUAL_CLIP_FLUX)
+        self.assertEqual(n["clip_loader_class"], "DualCLIPLoader")
+        self.assertEqual(n["clip1"], "t5xxl_fp16.safetensors")
+        self.assertEqual(n["clip2"], "clip_l.safetensors")
+        pn = stack_to_warmup_profile(n)
+        self.assertEqual(pn["clip1"], "clip_l.safetensors")
+        self.assertEqual(pn["clip2"], "t5xxl_fp16.safetensors")
+
+    def test_single_clip_warmup_profile_matches_stack(self):
+        """warmup_profile_matches_stack accepts single-CLIPLoader requests."""
+        p = stack_to_warmup_profile(extract_warmup_stack(WORKFLOW_SINGLE_CLIP))
+        self.assertTrue(warmup_profile_matches_stack(p, extract_warmup_stack(WORKFLOW_SINGLE_CLIP)))
+
+    def test_extractor_main_emits_clip2_for_single_loader(self):
+        """Main() with single CLIP emits COMFYMODAL_WARMUP_CLIP2= (empty)."""
+        import io, json, sys, tempfile
+        from pathlib import Path
+        tp = Path(__file__).resolve().parent.parent / "tools" / "extract_warmup_profile.py"
+        ns: dict[str, object] = {"__name__": "__not_main__", "__file__": str(tp)}
+        exec(compile(open(tp, encoding="utf-8").read(), str(tp), "exec"), ns)
+        p = {"payload": {"prompt": WORKFLOW_SINGLE_CLIP}}
+        with tempfile.TemporaryDirectory() as tmp:
+            wf = Path(tmp) / "w.json"
+            wf.write_text(json.dumps(p))
+            ns["WORKFLOW_PATH"] = str(wf)
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+            try:
+                main = ns["main"]
+                self.assertTrue(callable(main))
+                getattr(main, "__call__")()
+                out = sys.stdout.getvalue()
+            finally:
+                sys.stdout = old_stdout
+        self.assertIn("COMFYMODAL_WARMUP_CLIP2=\n", out)

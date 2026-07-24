@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import tempfile
 import unittest
@@ -15,6 +16,51 @@ from comfymodal_runtime.runtime_bootstrap import BootstrapConfig, RuntimeBootstr
 from comfymodal_runtime.trace import PROCESS_REMOTE_LIFECYCLE, PROCESS_REMOTE_METHOD
 
 import comfymodal_runtime.modal_app as modal_app
+
+# ── Repo root for static source analysis ──────────────────────────────────
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_MODAL_APP_PATH = _REPO_ROOT / "comfymodal_runtime" / "modal_app.py"
+
+# Known stdlib modules — imported names that are NOT repo-local.
+# Extended on discovery; the test fails if an unresolved import is not here.
+_STDLIB_MODULES: frozenset[str] = frozenset({
+    "abc", "ast", "asyncio", "base64", "binascii", "calendar", "collections",
+    "concurrent", "contextlib", "copy", "csv", "dataclasses", "datetime",
+    "decimal", "enum", "functools", "glob", "gzip", "hashlib", "html",
+    "http", "importlib", "inspect", "io", "itertools", "json", "logging",
+    "math", "multiprocessing", "numbers", "operator", "os", "pathlib",
+    "pickle", "platform", "pprint", "queue", "random", "re", "resource",
+    "select", "shlex", "shutil", "signal", "socket", "sqlite3", "statistics",
+    "string", "struct", "subprocess", "sys", "tempfile", "textwrap",
+    "threading", "time", "traceback", "typing", "types", "unittest",
+    "urllib", "uuid", "warnings", "weakref", "xml", "zipfile",
+})
+
+# Third-party / external packages known NOT to be repo-local.
+_THIRD_PARTY_PREFIXES: tuple[str, ...] = (
+    "comfy",            # ComfyUI runtime
+    "comfy_execution",  # ComfyUI execution engine
+    "modal",            # Modal SDK
+    "PIL",              # Pillow
+    "cv2",              # opencv-python
+    "numpy",            # numpy
+    "torch",            # pytorch
+    "safetensors",      # safetensors
+    "sentencepiece",    # sentencepiece
+    "tokenizers",       # huggingface tokenizers
+    "tqdm",             # tqdm
+    "requests",         # requests
+    "aiohttp",          # aiohttp
+    "pydantic",         # pydantic
+    "orjson",           # orjson
+)
+
+# ComfyUI-specific modules that live in the ComfyUI parent repo (not this
+# custom node) or are otherwise provided by the base runtime image.
+_COMFYUI_MODULES: frozenset[str] = frozenset({
+    "nodes", "folder_paths", "execution", "server", "comfy",
+    "comfy_execution",
+})
 
 
 def _writable_config(comfyui_root: str | None = None) -> BootstrapConfig:
@@ -1013,8 +1059,8 @@ class TestSnapshotTargetFingerprint(unittest.TestCase):
 
     # ── Env/cloud/region/image change tests ────────────────────────────
 
-    def test_fingerprint_changes_for_cloud(self):
-        """MODAL_CLOUD_PROVIDER change produces different fingerprint."""
+    def test_fingerprint_identical_for_cloud(self):
+        """MODAL_CLOUD_PROVIDER (runtime) does NOT affect static fingerprint."""
         saved = self._env_safe("MODAL_CLOUD_PROVIDER", "aws")
         try:
             fp_with = self._fp()
@@ -1025,10 +1071,10 @@ class TestSnapshotTargetFingerprint(unittest.TestCase):
             fp_without = self._fp()
         finally:
             self._env_restore("MODAL_CLOUD_PROVIDER", saved2)
-        self.assertNotEqual(fp_with, fp_without)
+        self.assertEqual(fp_with, fp_without)
 
-    def test_fingerprint_changes_for_region(self):
-        """MODAL_REGION change produces different fingerprint."""
+    def test_fingerprint_identical_for_region(self):
+        """MODAL_REGION (runtime) does NOT affect static fingerprint."""
         saved = self._env_safe("MODAL_REGION", "us-east-1")
         try:
             fp_with = self._fp()
@@ -1039,7 +1085,7 @@ class TestSnapshotTargetFingerprint(unittest.TestCase):
             fp_without = self._fp()
         finally:
             self._env_restore("MODAL_REGION", saved2)
-        self.assertNotEqual(fp_with, fp_without)
+        self.assertEqual(fp_with, fp_without)
 
     def test_fingerprint_changes_for_environment(self):
         """MODAL_ENVIRONMENT change produces different fingerprint."""
@@ -1055,8 +1101,8 @@ class TestSnapshotTargetFingerprint(unittest.TestCase):
             self._env_restore("MODAL_ENVIRONMENT", saved2)
         self.assertNotEqual(fp_with, fp_without)
 
-    def test_fingerprint_changes_for_image_id(self):
-        """MODAL_IMAGE_ID change produces different fingerprint."""
+    def test_fingerprint_identical_for_image_id(self):
+        """MODAL_IMAGE_ID (runtime) does NOT affect static fingerprint."""
         saved = self._env_safe("MODAL_IMAGE_ID", "img-abc")
         try:
             fp_with = self._fp()
@@ -1067,7 +1113,7 @@ class TestSnapshotTargetFingerprint(unittest.TestCase):
             fp_without = self._fp()
         finally:
             self._env_restore("MODAL_IMAGE_ID", saved2)
-        self.assertNotEqual(fp_with, fp_without)
+        self.assertEqual(fp_with, fp_without)
 
     # ── Runtime env (snapshot/warmup class env) change tests ───────────
 
@@ -1164,7 +1210,7 @@ class TestSnapshotTargetFingerprint(unittest.TestCase):
         try:
             print(
                 f"[v2.snapshot_target] "
-                f"fingerprint={_fp} "
+                f"static_fingerprint={_fp} "
                 f"app={_spec.app_name} "
                 f"class={_reg_cls.__name__} "
                 f"gpu={_gpu_str} "
@@ -1177,13 +1223,200 @@ class TestSnapshotTargetFingerprint(unittest.TestCase):
 
         output = captured.getvalue()
         self.assertIn("[v2.snapshot_target]", output)
-        self.assertIn("fingerprint=", output)
+        self.assertIn("static_fingerprint=", output)
         self.assertIn("app=", output)
         self.assertIn("class=", output)
         self.assertIn(_reg_cls.__name__, output)
         self.assertIn("gpu=", output)
         self.assertIn("cpu=", output)
         self.assertIn("memory=", output)
+
+
+    # ── Runtime env (cloud/region/image_id/task_id) leaves static fingerprint stable ──
+
+    def test_fingerprint_stable_across_runtime_env_changes(self):
+        """Placement/container env (cloud, region, image_id, task_id) do NOT alter fingerprint.
+        container_session_id is module-level state, not part of the spec hash."""
+        fp_base = self._fp(gpu=("A100",))
+        for k, v in [("MODAL_CLOUD_PROVIDER", "aws"), ("MODAL_REGION", "us-east-1"),
+                     ("MODAL_IMAGE_ID", "img-abc"), ("MODAL_TASK_ID", "task-xyz")]:
+            saved = os.environ.pop(k, None)
+            os.environ[k] = v
+            try:
+                self.assertEqual(self._fp(gpu=("A100",)), fp_base, f"{k} must not change fingerprint")
+            finally:
+                os.environ.pop(k, None)
+                if saved is not None:
+                    os.environ[k] = saved
+        with patch.object(modal_app, "_V2_CONTAINER_SESSION_ID", "different-session"):
+            self.assertEqual(self._fp(gpu=("A100",)), fp_base)
+
+
+class TestV2SourceModulesClosure(unittest.TestCase):
+    """Static dependency-closure regression: every repo-local top-level Python
+    module reachable from ``V2_SOURCE_MODULES`` (including lazy imports inside
+    the ``comfymodal_runtime`` package) must itself be listed in the tuple so
+    the V2 shadow container image includes it.
+
+    The test parses source with ``ast`` — it never imports ``modal_app.py``
+    (which would pull in the Modal SDK) and never deploys anything.
+
+    ``_IMPORTED_BUT_NON_V2`` lists repo-local modules that ARE imported by
+    ``comfymodal_runtime`` submodules but only within V1/studio-specific code
+    paths that never execute during V2 shadow runs.  Adding them to
+    ``V2_SOURCE_MODULES`` would be harmless but unnecessary — and this set
+    prevents such pre-existing imports from masking a new genuine omission.
+    """
+
+    # Modules that exist in the repo and are imported by comfymodal_runtime
+    # submodules, but only inside V1/studio-specific functions that never
+    # execute during V2 shadow container operation.  These are NOT omissions
+    # requiring a fix: the V2 container doesn't need them.
+    _IMPORTED_BUT_NON_V2: frozenset[str] = frozenset({
+        "experiment_service",
+        "local_artifacts",
+        "output_converter",
+        "output_saver",
+        "studio_models",
+        "studio_run_adapter",
+    })
+
+    _REPO_ROOT = _REPO_ROOT
+    _MODAL_APP_PATH = _MODAL_APP_PATH
+
+    @classmethod
+    def _get_v2_source_modules(cls) -> list[str]:
+        """Parse ``V2_SOURCE_MODULES`` from ``modal_app.py`` source via AST."""
+        source = cls._MODAL_APP_PATH.read_text(encoding="utf-8-sig")
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "V2_SOURCE_MODULES"
+                    and isinstance(node.value, ast.Tuple)):
+                return [elt.value for elt in node.value.elts
+                        if isinstance(elt, ast.Constant)]
+        raise AssertionError("V2_SOURCE_MODULES not found in modal_app.py")
+
+    @classmethod
+    def _repo_local_modules(cls) -> dict[str, Path]:
+        """Return ``{module_name: Path}`` for every top-level ``.py`` file in
+        the repo root, excluding ``__init__.py`` and test-only artifacts."""
+        modules: dict[str, Path] = {}
+        for child in cls._REPO_ROOT.iterdir():
+            if child.suffix != ".py":
+                continue
+            name = child.stem
+            # Skip dunder-init and test-only/discovery entries
+            if name == "__init__" or name.startswith("__"):
+                continue
+            modules[name] = child
+        return modules
+
+    @classmethod
+    def _stdlib_or_third_party(cls, module_name: str) -> bool:
+        """Return True if *module_name* is stdlib, third-party, or ComfyUI."""
+        if module_name in _STDLIB_MODULES:
+            return True
+        if module_name in _COMFYUI_MODULES:
+            return True
+        for prefix in _THIRD_PARTY_PREFIXES:
+            if module_name == prefix or module_name.startswith(prefix + "."):
+                return True
+        return False
+
+    def _imported_names_from_source(self, path: Path) -> set[str]:
+        """Return all top-level module names imported (directly or via
+        ``from X import Y``) in the given Python source file.
+
+        Walks all AST nodes including those inside function/class bodies
+        (lazy imports) and ``except`` / ``try`` blocks.
+        """
+        source = path.read_text(encoding="utf-8-sig")
+        tree = ast.parse(source)
+        names: set[str] = set()
+
+        for node in ast.walk(tree):
+            # ``import X`` or ``import X.Y.Z``
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".", 1)[0]
+                    if top:
+                        names.add(top)
+            # ``from X import Y`` or ``from X.Y import Z``
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    top = node.module.split(".", 1)[0]
+                    if top:
+                        names.add(top)
+        return names
+
+    def test_v2_source_modules_cover_repo_local_imports(self):
+        """Every repo-local top-level module imported (directly or lazily)
+        by any module in ``V2_SOURCE_MODULES`` must itself be listed in the
+        tuple.
+
+        The first scan finds the omissions (``warmup_profile`` and
+        ``workflow_metadata`` were previously missing).  The test
+        prevents regressions where a newly added lazy import inside
+        ``comfymodal_runtime/`` is forgotten.
+        """
+        v2_modules = set(self._get_v2_source_modules())
+        local_modules = self._repo_local_modules()
+
+        # Collect all imports from every V2 source module
+        repo_imports: set[str] = set()
+        for mod_name in v2_modules:
+            path = _REPO_ROOT / f"{mod_name}.py"
+            if not path.is_file():
+                # ``comfymodal_runtime`` is a package, not a single .py
+                if mod_name == "comfymodal_runtime":
+                    pkg_dir = _REPO_ROOT / "comfymodal_runtime"
+                    if pkg_dir.is_dir():
+                        # Also scan the package's public submodules
+                        for py_file in pkg_dir.glob("*.py"):
+                            if py_file.stem != "__init__":
+                                repo_imports.update(
+                                    self._imported_names_from_source(py_file)
+                                )
+                    continue
+                # Module not found as a file — may be external.  Skip.
+                continue
+            repo_imports.update(self._imported_names_from_source(path))
+
+        # Filter to only repo-local modules (excluding V2 modules themselves)
+        missing: list[str] = []
+        for imported_name in sorted(repo_imports):
+            if imported_name in v2_modules:
+                continue
+            if imported_name not in local_modules:
+                continue
+            if self._stdlib_or_third_party(imported_name):
+                continue
+            missing.append(imported_name)
+
+        # Remove known non-V2 imports (V1/studio-only code paths)
+        unaccounted = [m for m in missing if m not in self._IMPORTED_BUT_NON_V2]
+        self.assertFalse(
+            unaccounted,
+            "Repo-local modules imported by V2_SOURCE_MODULES but missing "
+            f"from the tuple:\n  " + "\n  ".join(unaccounted) +
+            "\n\nAdd them to V2_SOURCE_MODULES in comfymodal_runtime/modal_app.py "
+            "to ensure the V2 shadow container includes them.\n"
+            "(Modules in _IMPORTED_BUT_NON_V2 are known V1/studio-only imports.)",
+        )
+
+    def test_v2_source_modules_contains_warmup_profile_and_workflow_metadata(self):
+        """Explicit gate: ``warmup_profile`` and ``workflow_metadata`` must be
+        present in ``V2_SOURCE_MODULES`` (the specific fix for the audited
+        omission)."""
+        v2_modules = set(self._get_v2_source_modules())
+        for expected in ("warmup_profile", "workflow_metadata"):
+            self.assertIn(
+                expected, v2_modules,
+                f"{expected} must be in V2_SOURCE_MODULES",
+            )
 
 
 if __name__ == "__main__":

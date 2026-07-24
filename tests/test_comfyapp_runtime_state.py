@@ -921,7 +921,7 @@ class RuntimeConfigVolumePathTests(unittest.TestCase):
     """Verify all runtime/control paths live under /root/comfymodal_runtime,
     not /root/models."""
 
-    _RUNTIME_PREFIX = "/root/comfymodal_runtime"
+    _RUNTIME_PREFIX = "/root/comfymodal_runtime_state"
 
     def setUp(self):
         self.module = load_module()

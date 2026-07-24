@@ -468,6 +468,7 @@ async def prepare_active_next_profile(
     #     local cache is populated so subsequent requests in the same
     #     process hit step 4a without any remote call.
     if checker is not None:
+        print(f"[warmup_profile] phase=checker_start stable_key={stable_key_short}", flush=True)
         try:
             _check_result = await checker(stable_key, workspace=workspace)
             if isinstance(_check_result, dict) and _check_result.get("matched"):
@@ -484,10 +485,18 @@ async def prepare_active_next_profile(
                     "stable_key_short": stable_key_short,
                 }
                 _emit_publish_log("skipped_unchanged", stable_key_short)
+                print(f"[warmup_profile] phase=checker_done stable_key={stable_key_short} matched=True", flush=True)
                 return result
+        except TimeoutError:
+            # Do NOT swallow TimeoutError — propagate immediately so the
+            # caller can distinguish a hung platform from a genuine miss
+            # and avoid falling through into a second long setter wait.
+            print(f"[warmup_profile] phase=checker_done stable_key={stable_key_short} timeout=True", flush=True)
+            raise
         except Exception:
             # Fail-open: if the checker itself raises, proceed to the
             # setter as if no check was performed.
+            print(f"[warmup_profile] phase=checker_done stable_key={stable_key_short} fail_open=True", flush=True)
             pass
 
     # ── 5. Build activation payload (UUIDs created here) ─────────────────
@@ -507,6 +516,7 @@ async def prepare_active_next_profile(
     result["active_profile_remote_call"] = 1
     _remote_start = time.time()
     profile_token = payload.get("profile_token", "")
+    print(f"[warmup_profile] phase=setter_start stable_key={stable_key_short}", flush=True)
     try:
         activation_result = await setter(payload, workspace=workspace or None)
         _remote_ms = round((time.time() - _remote_start) * 1000, 2)
@@ -536,6 +546,8 @@ async def prepare_active_next_profile(
         result["active_profile_publish_decision"] = "published"
         result["active_profile_token"] = profile_token
         # Do NOT advance cache on error
+    finally:
+        print(f"[warmup_profile] phase=setter_done stable_key={stable_key_short}", flush=True)
 
     # local_active_profile_prepare_ms: total elapsed including remote publication
     _total_ms = round((time.time() - _build_start) * 1000, 2)

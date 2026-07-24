@@ -49,29 +49,112 @@ if not errorlevel 1 (
     set "MODAL_CLI=python -m modal"
 )
 
-echo === Deploying V2 shadow app ===
-%MODAL_CLI% deploy -m comfymodal_runtime.modal_app > "%TEMP%\_v2_deploy.txt" 2>&1
-set "DEPLOY_EXIT=%errorlevel%"
-type "%TEMP%\_v2_deploy.txt"
-if %DEPLOY_EXIT% neq 0 (
-    echo === ERROR: Deploy failed with exit code %DEPLOY_EXIT% ===
-    del "%TEMP%\_v2_deploy.txt" 2>nul
-    exit /b %DEPLOY_EXIT%
+REM ── Concurrent deployment via Python helper ────────────────────────────
+set "V1_CMD_FILE=%TEMP%\_v1_deploy_cmd_%RANDOM%.bat"
+set "V2_CMD_FILE=%TEMP%\_v2_deploy_cmd_%RANDOM%.bat"
+set "V1_DEPLOY_LOG=%TEMP%\_v1_deploy.txt"
+set "V2_DEPLOY_LOG=%TEMP%\_v2_deploy.txt"
+set "DEPLOY_RESULT_LOG=%TEMP%\_deploy_result_%RANDOM%.txt"
+
+REM Write tiny command files so the Python helper receives pre-resolved args.
+REM Escape percent signs so each worker evaluates its own exit code at runtime.
+> "%V1_CMD_FILE%" echo @echo off
+>>"%V1_CMD_FILE%" echo %MODAL_CLI% deploy comfyapp.py
+>>"%V1_CMD_FILE%" echo exit /b %%errorlevel%%
+> "%V2_CMD_FILE%" echo @echo off
+>>"%V2_CMD_FILE%" echo %MODAL_CLI% deploy -m comfymodal_runtime.modal_app
+>>"%V2_CMD_FILE%" echo exit /b %%errorlevel%%
+
+if not defined COMFYMODAL_DEPLOY_TIMEOUT_SECONDS set "COMFYMODAL_DEPLOY_TIMEOUT_SECONDS=3600"
+
+echo === Deploying V1 (comfyui) and V2 (shadow) concurrently (timeout=%COMFYMODAL_DEPLOY_TIMEOUT_SECONDS%s) ===
+python tools\run_deploys_concurrent.py ^
+    "%V1_CMD_FILE%" "%V2_CMD_FILE%" ^
+    "%V1_DEPLOY_LOG%" "%V2_DEPLOY_LOG%" ^
+    "%COMFYMODAL_DEPLOY_TIMEOUT_SECONDS%" ^
+    > "%DEPLOY_RESULT_LOG%"
+set "PARALLEL_EXIT=%errorlevel%"
+
+REM Remove command-file artifacts immediately (no longer needed)
+del "%V1_CMD_FILE%" 2>nul
+del "%V2_CMD_FILE%" 2>nul
+
+REM Parse the key=value lines produced by the Python helper
+set "V1_DEPLOY_EXIT="
+set "V2_DEPLOY_EXIT="
+set "TIMED_OUT="
+for /f "usebackq tokens=1,* delims==" %%a in ("%DEPLOY_RESULT_LOG%") do (
+    if "%%a"=="V1_EXIT" set "V1_DEPLOY_EXIT=%%b"
+    if "%%a"=="V2_EXIT" set "V2_DEPLOY_EXIT=%%b"
+    if "%%a"=="TIMED_OUT" set "TIMED_OUT=%%b"
 )
-findstr /C:"stable-modal-comfy-v2-shadow" "%TEMP%\_v2_deploy.txt" >nul
-if errorlevel 1 (
-    echo === ERROR: Deploy output missing shadow app identifier ===
-    del "%TEMP%\_v2_deploy.txt" 2>nul
+del "%DEPLOY_RESULT_LOG%" 2>nul
+
+REM Surface both deployment logs
+echo.
+echo === V1 deploy log ===
+type "%V1_DEPLOY_LOG%" 2>nul
+echo.
+echo === V2 deploy log ===
+type "%V2_DEPLOY_LOG%" 2>nul
+echo.
+
+REM Validate: timeout
+if /i "!TIMED_OUT!"=="true" (
+    echo === ERROR: Concurrent deploy timed out after %COMFYMODAL_DEPLOY_TIMEOUT_SECONDS%s ===
+    del "%V1_DEPLOY_LOG%" 2>nul
+    del "%V2_DEPLOY_LOG%" 2>nul
     exit /b 1
 )
-findstr /C:"ModalRuntimeEntrypointV2" "%TEMP%\_v2_deploy.txt" >nul
+
+REM Validate: V1 exit code
+if not defined V1_DEPLOY_EXIT set "V1_DEPLOY_EXIT=-1"
+if !V1_DEPLOY_EXIT! neq 0 (
+    echo === ERROR: V1 deploy failed with exit code !V1_DEPLOY_EXIT! ===
+    del "%V1_DEPLOY_LOG%" 2>nul
+    del "%V2_DEPLOY_LOG%" 2>nul
+    exit /b !V1_DEPLOY_EXIT!
+)
+
+REM Validate: V2 exit code
+if not defined V2_DEPLOY_EXIT set "V2_DEPLOY_EXIT=-1"
+if !V2_DEPLOY_EXIT! neq 0 (
+    echo === ERROR: V2 deploy failed with exit code !V2_DEPLOY_EXIT! ===
+    del "%V1_DEPLOY_LOG%" 2>nul
+    del "%V2_DEPLOY_LOG%" 2>nul
+    exit /b !V2_DEPLOY_EXIT!
+)
+
+REM Validate: V1 output contains app identifier
+findstr /C:"comfyui" "%V1_DEPLOY_LOG%" >nul 2>nul
 if errorlevel 1 (
-    echo === ERROR: Deploy output missing V2 class identifier ===
-    del "%TEMP%\_v2_deploy.txt" 2>nul
+    echo === ERROR: V1 deploy output missing 'comfyui' app identifier ===
+    del "%V1_DEPLOY_LOG%" 2>nul
+    del "%V2_DEPLOY_LOG%" 2>nul
     exit /b 1
 )
-del "%TEMP%\_v2_deploy.txt" 2>nul
-echo === Deploy verified OK ===
+
+REM Validate: V2 output contains app and class identifiers
+findstr /C:"stable-modal-comfy-v2-shadow" "%V2_DEPLOY_LOG%" >nul 2>nul
+if errorlevel 1 (
+    echo === ERROR: V2 deploy output missing shadow app identifier ===
+    del "%V1_DEPLOY_LOG%" 2>nul
+    del "%V2_DEPLOY_LOG%" 2>nul
+    exit /b 1
+)
+findstr /C:"ModalRuntimeEntrypointV2" "%V2_DEPLOY_LOG%" >nul 2>nul
+if errorlevel 1 (
+    echo === ERROR: V2 deploy output missing V2 class identifier ===
+    del "%V1_DEPLOY_LOG%" 2>nul
+    del "%V2_DEPLOY_LOG%" 2>nul
+    exit /b 1
+)
+
+REM Clean deploy logs
+del "%V1_DEPLOY_LOG%" 2>nul
+del "%V2_DEPLOY_LOG%" 2>nul
+
+echo === V1 and V2 deploys both verified OK ===
 
 echo === Running one V2 benchmark trial ===
 python tools\benchmark_v2_direct.py

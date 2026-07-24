@@ -174,7 +174,9 @@ async def _run_one(
         trace=runtime_trace,
         validate=False,
     )
+    print("[v2.benchmark] phase=plan_constructed", flush=True)
     started = time.perf_counter()
+    print("[v2.benchmark] phase=execute_plan_start", flush=True)
     result = await execute_plan(
         plan,
         transport=transport,
