@@ -416,6 +416,8 @@ class RestorePlanPublisher:
             generation=str(metrics.get("generation", "")),
             changed=bool(metrics.get("changed")),
             state_path=str(metrics.get("state_path", "")),
+            model_identity_changed=bool(metrics.get("model_identity_changed", False)),
+            prefill_identity_changed=bool(metrics.get("prefill_identity_changed", False)),
             duration_source="event_metadata",
             wall_timestamps_are="assembly_time",
         )
@@ -445,12 +447,32 @@ class RestorePlanPublisher:
                     "commit_ms": 0.0,
                     "bytes_written": 0,
                     "state_path": getattr(self._coordinator, "state_path", ""),
+                    "model_identity_changed": False,
+                    "prefill_identity_changed": False,
                 }
                 result["trace"] = self._build_publication_trace(result).to_dict()
                 self.last_publish = result
                 return result
 
         compare_completed = time.perf_counter()
+        # Identity-change flags: first publication both true; otherwise compare
+        if current_plan is None:
+            model_identity_changed = True
+            prefill_identity_changed = True
+        else:
+            model_identity_changed = (
+                current_plan.model_key.stable_hash != new_plan.model_key.stable_hash
+                or bool(current_plan.model_spec) != bool(new_plan.model_spec)
+                or (current_plan.model_spec and new_plan.model_spec
+                    and stable_hash(current_plan.model_spec) != stable_hash(new_plan.model_spec))
+            )
+            prefill_identity_changed = (
+                current_plan.prefill_key.stable_hash != new_plan.prefill_key.stable_hash
+                or bool(current_plan.prefill_spec) != bool(new_plan.prefill_spec)
+                or (current_plan.prefill_spec and new_plan.prefill_spec
+                    and stable_hash(current_plan.prefill_spec) != stable_hash(new_plan.prefill_spec))
+            )
+
         incoming_gen = self._safe_generation(new_plan.generation)
         if current_plan is not None:
             current_gen = self._safe_generation(current_plan.generation)
@@ -483,6 +505,8 @@ class RestorePlanPublisher:
             "commit_ms": round((commit_completed - commit_started) * 1000.0, 3),
             "bytes_written": after_bytes - before_bytes,
             "state_path": getattr(self._coordinator, "state_path", ""),
+            "model_identity_changed": model_identity_changed,
+            "prefill_identity_changed": prefill_identity_changed,
         }
         result["trace"] = self._build_publication_trace(result).to_dict()
         self.last_publish = result
@@ -516,12 +540,32 @@ class RestorePlanPublisher:
                     "commit_ms": 0.0,
                     "bytes_written": 0,
                     "state_path": getattr(self._coordinator, "state_path", ""),
+                    "model_identity_changed": False,
+                    "prefill_identity_changed": False,
                 }
                 result["trace"] = self._build_publication_trace(result).to_dict()
                 self.last_publish = result
                 return result
 
         compare_completed = time.perf_counter()
+        # Identity-change flags: first publication both true; otherwise compare
+        if current_plan is None:
+            model_identity_changed = True
+            prefill_identity_changed = True
+        else:
+            model_identity_changed = (
+                current_plan.model_key.stable_hash != new_plan.model_key.stable_hash
+                or bool(current_plan.model_spec) != bool(new_plan.model_spec)
+                or (current_plan.model_spec and new_plan.model_spec
+                    and stable_hash(current_plan.model_spec) != stable_hash(new_plan.model_spec))
+            )
+            prefill_identity_changed = (
+                current_plan.prefill_key.stable_hash != new_plan.prefill_key.stable_hash
+                or bool(current_plan.prefill_spec) != bool(new_plan.prefill_spec)
+                or (current_plan.prefill_spec and new_plan.prefill_spec
+                    and stable_hash(current_plan.prefill_spec) != stable_hash(new_plan.prefill_spec))
+            )
+
         incoming_gen = self._safe_generation(new_plan.generation)
         if current_plan is not None:
             current_gen = self._safe_generation(current_plan.generation)
@@ -554,6 +598,8 @@ class RestorePlanPublisher:
             "commit_ms": round((commit_completed - commit_started) * 1000.0, 3),
             "bytes_written": after_bytes - before_bytes,
             "state_path": getattr(self._coordinator, "state_path", ""),
+            "model_identity_changed": model_identity_changed,
+            "prefill_identity_changed": prefill_identity_changed,
         }
         result["trace"] = self._build_publication_trace(result).to_dict()
         self.last_publish = result
