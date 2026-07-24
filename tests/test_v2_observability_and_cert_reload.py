@@ -409,7 +409,7 @@ class TestTraceBoundaries:
             patch.object(
                 modal_app,
                 "_get_preflight_context",
-                return_value=("off", "gen_001"),
+                return_value=("off", "gen_001", "instance"),
             ),
             patch.object(
                 modal_app,
@@ -579,10 +579,11 @@ class TestCertCacheDiagnostics:
             runtime_hash="abc", dependency_hash="def", custom_node_hash="ghi",
         )
         wf_hash = "wf_cache_hit"
-        _cert_id, _components = _comp_cert_id(
-            wf_hash, deployment_identity=_fake_dep_id,
-            repair_mode="off", custom_nodes_generation="gen_001",
-        )
+        with patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", _fake_dep_id.combined_hash):
+            _cert_id, _components = _comp_cert_id(
+                wf_hash,
+                repair_mode="off", custom_nodes_generation="gen_001",
+            )
         cache_key = (fake_instance_id, _cert_id)
         modal_app._V2_CERT_PROCESS_CACHE[cache_key] = {
             "outputs_to_execute": ["107"],
@@ -621,6 +622,10 @@ class TestCertCacheDiagnostics:
             def _current_custom_nodes_generation_id():
                 return "gen_001"
 
+            @staticmethod
+            def _resolve_custom_nodes_generation(api=None):
+                return ("gen_001", "instance")
+
         api = _FakeRepairAPI()
         entrypoint = modal_app.ModalRuntimeEntrypoint()
         entrypoint._restored_instance_id = fake_instance_id
@@ -648,7 +653,8 @@ class TestCertCacheDiagnostics:
              patch.object(modal_app, "_MODAL_RESOURCES", {
                  "source_identity": _fake_dep_id,
                  "runtime_state_volume": SimpleNamespace(reload=lambda: None, commit=lambda: None),
-             }):
+             }), \
+             patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", _fake_dep_id.combined_hash):
             result = asyncio.run(
                 entrypoint._execute_v2_prompt_executor(plan, context, api, trace)
             )
@@ -732,7 +738,7 @@ class TestCertCacheDiagnostics:
                  "source_identity": SimpleNamespace(combined_hash="dep_hash_abc"),
                  "runtime_state_volume": SimpleNamespace(reload=lambda: None, commit=lambda: None),
              }), \
-             patch.object(modal_app, "_get_preflight_context", return_value=("off", "gen_001")):
+             patch.object(modal_app, "_get_preflight_context", return_value=("off", "gen_001", "instance")):
             result = asyncio.run(
                 entrypoint._execute_v2_prompt_executor(plan, context, api, trace)
             )

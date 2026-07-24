@@ -358,6 +358,48 @@ def _build_activation_payload(
     return payload
 
 
+# ── Lightweight key computation (no caching, no remote) ────────────────
+
+def compute_profile_identity_keys(workflow: dict) -> tuple[str, str]:
+    """Compute ``model_profile_key`` and ``prefill_key`` from *workflow*.
+
+    Pure local computation with no side effects and no remote calls.
+    Produces the same values that ``prepare_active_next_profile`` would
+    produce from the same input.  Used by ``canonical_execution.execute_plan``
+    to derive cache keys **before** deciding whether to enter the full
+    profile-preparation path.
+
+    Returns
+    -------
+    ``(model_profile_key: str, prefill_key: str)``
+    """
+    stack = extract_warmup_stack(workflow) if isinstance(workflow, dict) else {}
+    profile = stack_to_warmup_profile(stack)
+    if profile and isinstance(profile, dict):
+        p = dict(profile)
+        if p.get("clip2") == p.get("clip1"):
+            p["clip2"] = ""
+        profile = p
+    normalized = _normalize_stable_profile(profile)
+    model_profile_key = hashlib.sha256(
+        json.dumps(normalized, sort_keys=True, separators=(",", ":"),
+                   ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    prefill_key = ""
+    _need_bundle = _exact_prefill_enabled() or _persistent_cache_enabled()
+    if _need_bundle:
+        try:
+            from optimizations import extract_safe_prompt_bundle
+            bundle_res = extract_safe_prompt_bundle(workflow)
+            if bundle_res.get("eligible") and bundle_res.get("bundle"):
+                bundle_hash = bundle_res["bundle"].get("bundle_hash") or ""
+                if bundle_hash and _exact_prefill_enabled():
+                    prefill_key = bundle_hash
+        except Exception:
+            pass
+    return model_profile_key, prefill_key
+
+
 # ── Public entry point ──────────────────────────────────────────────────
 
 async def prepare_active_next_profile(

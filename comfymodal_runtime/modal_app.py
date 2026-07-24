@@ -411,45 +411,48 @@ def _cpu_model_snapshot_enabled() -> bool:
     return enabled
 
 
-def _get_preflight_context(api: Any, module: Any) -> tuple[str, str]:
+def _get_preflight_context(api: Any, module: Any) -> tuple[str, str, str]:
     """Extract cheap request-time preflight context from the loaded legacy API.
 
-    Calls the authoritative helpers ``api._resolve_requirements_repair_mode()``
-    and ``module._current_custom_nodes_generation_id()``.  Returns
-    ``(repair_mode, custom_nodes_generation)``.  Either may be empty when
-    the helpers are absent or raise â€” optimisation fails closed.
+    Calls ``api._resolve_requirements_repair_mode()`` for repair mode and
+    ``module._resolve_custom_nodes_generation(api=api)`` for the authoritative
+    custom-nodes generation (hydrated API field first, persisted record
+    fallback).  Returns ``(repair_mode, custom_nodes_generation, source)``.
+    Either may be empty when the helpers are absent or raise — optimisation fails
+    closed.
     """
     repair_mode = ""
-    custom_nodes_gen = ""
     try:
         repair_mode = str(api._resolve_requirements_repair_mode() or "")
     except Exception:
         pass
+    custom_nodes_gen = ""
+    source = "missing"
     try:
-        custom_nodes_gen = str(module._current_custom_nodes_generation_id() or "")
+        _cn_val, _cn_src = module._resolve_custom_nodes_generation(api=api)
+        custom_nodes_gen = _cn_val
+        source = _cn_src
     except Exception:
         pass
-    return repair_mode, custom_nodes_gen
+    return repair_mode, custom_nodes_gen, source
 
 
 def _compute_v2_cert_identity(
     workflow_hash: str,
-    deployment_identity: DeploymentIdentity | None = None,
     repair_mode: str = "",
     custom_nodes_generation: str = "",
 ) -> tuple[str, dict[str, str]]:
     """Build a deterministic certificate identity from *workflow_hash*,
-    the deployment's combined hash, and mutable preflight context.
+    the deployment's combined hash (``_V2_DEPLOYMENT_COMBINED_HASH``), and
+    mutable preflight context.
 
     Returns ``(identity_hex, components_dict)``.  Identity is a SHA-256 hex
-    string.  When *deployment_identity* is absent or empty, only the
-    workflow_hash is used (deployment combined hash is empty â€” less
+    string.  When ``_V2_DEPLOYMENT_COMBINED_HASH`` is empty, only the
+    workflow_hash is used (deployment combined hash is empty — less
     discrimination but still safe).
     """
     import hashlib
-    dep_hash = ""
-    if deployment_identity is not None:
-        dep_hash = deployment_identity.combined_hash
+    dep_hash = _V2_DEPLOYMENT_COMBINED_HASH
     h = hashlib.sha256()
     h.update(f"cert_schema={_V2_CERT_SCHEMA_VERSION}\n".encode())
     h.update(f"workflow_hash={workflow_hash}\n".encode())
@@ -1579,6 +1582,11 @@ class ModalRuntimeEntrypoint:
         api = self._load_legacy_runtime()
         module = self._legacy_module
 
+        # Make the canonical deployment combined hash available to the loaded
+        # comfyapp module so that ``_resolve_deployment_combined_hash()``
+        # returns the builder-computed value on first priority.
+        module._CANONICAL_DEPLOYMENT_COMBINED_HASH = _V2_DEPLOYMENT_COMBINED_HASH
+
         def reload_models() -> None:
             volume = getattr(module, "vol", None)
             if volume is not None:
@@ -1617,18 +1625,11 @@ class ModalRuntimeEntrypoint:
             return api._apply_sage_attention_policy()
 
         def observe_generations() -> dict[str, str]:
-            _cn_gen = str(getattr(api, "_custom_nodes_generation_seen", "") or "")
-            if not _cn_gen:
-                # Fallback to the persisted generation record when the
-                # instance attribute was not hydrated (e.g. memoized custom-
-                # node sync returned before setting the attr on restore).
-                try:
-                    _cn_gen = str(module._current_custom_nodes_generation_id() or "")
-                except Exception:
-                    pass
+            _cn_val, _cn_src = module._resolve_custom_nodes_generation(api=api)
             return {
                 "runtime_state": str(getattr(api, "_runtime_generation_seen", "") or ""),
-                "custom_nodes": _cn_gen,
+                "custom_nodes": _cn_val,
+                "custom_nodes_source": _cn_src,
             }
 
         config = self._config or BootstrapConfig(
@@ -1710,6 +1711,31 @@ class ModalRuntimeEntrypoint:
         _lifecycle_error: str | None = None
         try:
             state = self.bootstrap.startup(snapshot=True, trace=trace)
+
+            # [v2.generation_identity] bootstrap diagnostic
+            _boot_cn_gen = str(state.custom_node_generation or "")
+            _boot_cn_short = (_boot_cn_gen[:24] + "…") if len(_boot_cn_gen) > 24 else _boot_cn_gen
+            _boot_rs_gen = str(state.runtime_generation or "")
+            _boot_cn_src = "missing"
+            _boot_api_id = str(id(self._legacy_api))
+            try:
+                _boot_r, _boot_src = self._legacy_module._resolve_custom_nodes_generation(
+                    api=self._legacy_api
+                )
+                _boot_cn_src = _boot_src
+            except Exception:
+                pass
+            print(
+                f"[v2.generation_identity] "
+                f"method=startup "
+                f"custom_nodes_generation={_boot_cn_short!r} "
+                f"raw_empty={str(not bool(_boot_cn_gen)).lower()} "
+                f"source={_boot_cn_src} "
+                f"runtime_state_generation={_boot_rs_gen!r} "
+                f"api_object_id={_boot_api_id} "
+                f"deployment_combined_hash={_V2_DEPLOYMENT_COMBINED_HASH[:16] if _V2_DEPLOYMENT_COMBINED_HASH else '<empty>'}",
+                flush=True,
+            )
 
             # Plan C: CPU model snapshot construction
             if _cpu_model_snapshot_enabled():
@@ -2029,6 +2055,31 @@ class ModalRuntimeEntrypoint:
                 trace.emit("v2_bootstrap_restore_start", phase="restore")
                 state = self.bootstrap.restore(trace=trace)
                 trace.emit("v2_bootstrap_restore_end", phase="restore")
+
+                # [v2.generation_identity] bootstrap diagnostic
+                _boot_cn_gen = str(state.custom_node_generation or "")
+                _boot_cn_short = (_boot_cn_gen[:24] + "…") if len(_boot_cn_gen) > 24 else _boot_cn_gen
+                _boot_rs_gen = str(state.runtime_generation or "")
+                _boot_cn_src = "missing"
+                _boot_api_id = str(id(self._legacy_api))
+                try:
+                    _boot_r, _boot_src = self._legacy_module._resolve_custom_nodes_generation(
+                        api=self._legacy_api
+                    )
+                    _boot_cn_src = _boot_src
+                except Exception:
+                    pass
+                print(
+                    f"[v2.generation_identity] "
+                    f"method=restore "
+                    f"custom_nodes_generation={_boot_cn_short!r} "
+                    f"raw_empty={str(not bool(_boot_cn_gen)).lower()} "
+                    f"source={_boot_cn_src} "
+                    f"runtime_state_generation={_boot_rs_gen!r} "
+                    f"api_object_id={_boot_api_id} "
+                    f"deployment_combined_hash={_V2_DEPLOYMENT_COMBINED_HASH[:16] if _V2_DEPLOYMENT_COMBINED_HASH else '<empty>'}",
+                    flush=True,
+                )
             except Exception as exc:
                 _lifecycle_error = str(exc)[:200]
                 trace.emit("v2_bootstrap_restore_end", phase="restore", metadata={"status": "error", "error": _lifecycle_error})
@@ -3131,7 +3182,25 @@ class ModalRuntimeEntrypoint:
         # Obtain preflight context from the loaded legacy API
         _preflight_fn = getattr(api, "_preflight_before_prompt_execution", None)
         if callable(_preflight_fn) and not getattr(api, "_preflight_already_ran", False):
-            _v2_repair_mode, _v2_custom_nodes_gen = _get_preflight_context(api, module)
+            _v2_repair_mode, _v2_custom_nodes_gen, _v2_custom_nodes_src = _get_preflight_context(api, module)
+
+            # [v2.generation_identity] diagnostic: source, raw-empty visibility,
+            # short value, runtime state generation, api object id
+            _cn_diag_val = _v2_custom_nodes_gen
+            _cn_diag_short = (_cn_diag_val[:24] + "…") if len(_cn_diag_val) > 24 else _cn_diag_val
+            _cn_diag_raw_empty = str(not bool(_cn_diag_val)).lower()
+            _rs_gen = str(getattr(api, "_runtime_generation_seen", "") or "")
+            _api_id = str(id(api))
+            print(
+                f"[v2.generation_identity] "
+                f"custom_nodes_generation={_cn_diag_short!r} "
+                f"raw_empty={_cn_diag_raw_empty} "
+                f"source={_v2_custom_nodes_src} "
+                f"runtime_state_generation={_rs_gen!r} "
+                f"api_object_id={_api_id} "
+                f"deployment_combined_hash={_V2_DEPLOYMENT_COMBINED_HASH[:16] if _V2_DEPLOYMENT_COMBINED_HASH else '<empty>'}",
+                flush=True,
+            )
 
             # Try cert lookup before preflight -- only eligible when the
             # deployment identity, repair mode, and custom-nodes generation
@@ -3139,7 +3208,7 @@ class ModalRuntimeEntrypoint:
             if _V2_VALIDATION_CERT_ENABLED:
                 _cert_wf_hash = plan.workflow_hash or plan.source_workflow_hash or ""
                 if _cert_wf_hash:
-                    _v2_dep_hash = _v2_dep_identity.combined_hash if _v2_dep_identity else ""
+                    _v2_dep_hash = _V2_DEPLOYMENT_COMBINED_HASH
 
                     # Cert read eligibility: nonempty deployment combined
                     # hash, recognised repair mode, and nonempty custom-nodes
@@ -3155,7 +3224,6 @@ class ModalRuntimeEntrypoint:
                         _cert_identity_build_start = time.perf_counter()
                         _v2_cert_identity, _v2_cert_components = _compute_v2_cert_identity(
                             _cert_wf_hash,
-                            deployment_identity=_v2_dep_identity,
                             repair_mode=_v2_repair_mode,
                             custom_nodes_generation=_v2_custom_nodes_gen,
                         )
@@ -3422,7 +3490,7 @@ class ModalRuntimeEntrypoint:
             )
             _diag_prompt_validation_ms = round((time.perf_counter() - _pv_start) * 1000, 3)
             _cert_write_eligible = (
-                bool(_v2_dep_identity.combined_hash if _v2_dep_identity else "")
+                bool(_V2_DEPLOYMENT_COMBINED_HASH)
                 and _v2_repair_mode in ("off", "fail_fast", "dev")
                 and bool(_v2_custom_nodes_gen)
             )
@@ -3432,7 +3500,6 @@ class ModalRuntimeEntrypoint:
                     if _cert_wf_hash and _V2_VALIDATION_CERT_ENABLED:
                         _v2_cert_identity, _v2_cert_components = _compute_v2_cert_identity(
                             _cert_wf_hash,
-                            deployment_identity=_v2_dep_identity,
                             repair_mode=_v2_repair_mode,
                             custom_nodes_generation=_v2_custom_nodes_gen,
                         )
@@ -5143,6 +5210,16 @@ except Exception:
         "source_identity": None,
         "spec": ModalRuntimeSpec(),
     }
+# Phase 1: Pre-compute deployment combined hash from the canonical
+# DeploymentIdentity / source_identity used by V2 resources.  This
+# stable nonempty value is what startup/restore/request consumers and
+# certificate / manifest expected identity paths all reference — never
+# an ad-hoc env hash or Modal image ID.
+_V2_DEPLOYMENT_COMBINED_HASH = (
+    _MODAL_RESOURCES.get("source_identity").combined_hash
+    if _MODAL_RESOURCES.get("source_identity") is not None
+    else ""
+)
 # Modal CLI discovers the application through a module-level ``app`` object.
 # Keep the resource construction above as the single source of truth while
 # exposing the registered shadow app for ``modal deploy -m``.

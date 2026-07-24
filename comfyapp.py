@@ -1580,6 +1580,39 @@ def _current_custom_nodes_generation_id() -> str:
     return _rec["generation"]
 
 
+def _resolve_custom_nodes_generation(api: Any = None) -> tuple[str, str]:
+    """Authoritative request-time custom-node generation resolution.
+
+    Priority (first non-empty value wins):
+    1. ``api._custom_nodes_generation_seen`` (hydrated API field — fast path)
+    2. ``_read_custom_nodes_generation_record()`` (persisted record fallback)
+
+    Returns ``(value, source)`` where *source* is one of ``"instance"``,
+    ``"persisted_record"``, or ``"missing"``.  Never raises: both paths are
+    wrapped in try/except.  The returned *value* is always a ``str``,
+    possibly empty when neither source is available.
+    """
+    # First: hydrated API field (fast path, set by _sync_custom_nodes_from_volume)
+    if api is not None:
+        try:
+            val = str(getattr(api, "_custom_nodes_generation_seen", "") or "").strip()
+            if val:
+                return val, "instance"
+        except Exception:
+            pass
+
+    # Fallback: persisted generation record on the custom-nodes volume
+    try:
+        rec = _read_custom_nodes_generation_record()
+        gen = str((rec or {}).get("generation", "") or "").strip()
+        if gen:
+            return gen, "persisted_record"
+    except Exception:
+        pass
+
+    return "", "missing"
+
+
 def _log_remote_identity(event: str, *, cls_name: str = "", method_name: str = "", restore_session_id: str = "", request_seq: int = 0, snapshot_created: int = 0, restored_from_snapshot: int = 0, restored_instance_id: str = "") -> None:
     _gen_rec = _read_models_generation_record()
     _active_profile_token = ""
@@ -1919,18 +1952,29 @@ def _build_immutable_dependency_manifest_identity(
     return _h.hexdigest()
 
 
+# Canonical deployment combined hash, set by modal_app._configure_runtime()
+# from ``_MODAL_RESOURCES['source_identity'].combined_hash``.  When nonempty
+# ``_resolve_deployment_combined_hash()`` returns this value first, falling
+# back to the legacy derivation only as a backward-compatible safety net.
+_CANONICAL_DEPLOYMENT_COMBINED_HASH: str = ""
+
+
 def _resolve_deployment_combined_hash() -> str:
     """Build a deterministic combined hash representing deployment identity.
 
-    Combines:
-    - COMFYAPP_VERSION
-    - runtime revision (``_V2_RUNTIME_REVISION``)
-    - baked dependency overall hash
-    - custom-nodes generation
+    Priority:
+    1. ``_CANONICAL_DEPLOYMENT_COMBINED_HASH`` (set by modal_app's
+       ``_configure_runtime`` from deployment builder's combined hash).
+    2. Legacy derivation from COMFYAPP_VERSION, runtime revision, baked
+       dependency hash, and custom-nodes generation (fail-closed fallback).
 
-    Returns empty string when any required identity component is unavailable,
-    signalling that a reusable dependency manifest cannot be created.
+    Returns empty string when no identity component is available.
     """
+    # Canonical source: deployment builder combined hash
+    if _CANONICAL_DEPLOYMENT_COMBINED_HASH:
+        return _CANONICAL_DEPLOYMENT_COMBINED_HASH
+
+    # Legacy fail-closed fallback
     _baked = load_baked_custom_node_dependency_manifest()
     _baked_hash = _baked.get("overall_dependency_hash", "") if _baked else ""
     if not _baked_hash:
@@ -4088,7 +4132,7 @@ def _run_dependency_validation_with_cache(
             _pm_baked = baked if baked is not None else load_baked_custom_node_dependency_manifest()
             _pm_combined = _resolve_deployment_combined_hash()
             _pm_cn_fp = _pm_baked if _pm_baked else None
-            _pm_cn_gen = (_read_custom_nodes_generation_record() or {}).get("generation", "")
+            _pm_cn_gen = _resolve_custom_nodes_generation()[0]
             _pm_check = _check_dependency_manifest_identity(
                 _pm_manifest, _pm_combined, _pm_cn_fp, _pm_cn_gen, _pm_mode,
             )
