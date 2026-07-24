@@ -33,7 +33,7 @@ from workflow_metadata import extract_warmup_stack, stack_to_warmup_profile
 WORKFLOW_PATH = os.path.join(_PARENT, "latest_benchmark_workflow.json")
 
 # Required fields for a valid split warmup profile.
-_REQUIRED_SPLIT_FIELDS = ("unet", "clip1", "clip2", "vae", "clip_type")
+_REQUIRED_SPLIT_FIELDS = ("unet", "clip1", "vae", "clip_type")
 
 
 def _fail(msg: str, *, detail: object = None) -> None:
@@ -82,7 +82,7 @@ def main() -> None:
     print(f"COMFYMODAL_WARMUP_PROFILE=split")
     print(f"COMFYMODAL_WARMUP_UNET={profile['unet']}")
     print(f"COMFYMODAL_WARMUP_CLIP1={profile['clip1']}")
-    print(f"COMFYMODAL_WARMUP_CLIP2={profile['clip2']}")
+    print(f"COMFYMODAL_WARMUP_CLIP2={profile.get('clip2', '')}")
     print(f"COMFYMODAL_WARMUP_VAE={profile['vae']}")
     print(f"COMFYMODAL_WARMUP_CLIP_TYPE={profile['clip_type']}")
     print(f"COMFYMODAL_WARMUP_TEXT=warmup")

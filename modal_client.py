@@ -135,11 +135,25 @@ _run_prompt_semaphore = asyncio.Semaphore(1)
 # (workspace["id"], gpu_value, region, cloud) for Cls instances.
 _workspace_resolver: Callable[[], dict | None] | None = None
 _workspace_clients: dict[str, object] = {}
-_workspace_function_handles: dict[tuple[str, str], object] = {}
+_workspace_function_handles: dict[tuple[str, str, str | None], object] = {}
 _workspace_cls_instances: dict[tuple[str, str, str, str], object] = {}
 _current_gpu = DEFAULT_GPU
 _handle_cache_hits = 0
 _handle_cache_misses = 0
+
+
+def _resolve_v1_environment() -> str | None:
+    """Resolve Modal environment name for V1 function lookups.
+
+    Uses ``COMFYMODAL_ENVIRONMENT`` (V1-specific variable), then
+    falls back to ``MODAL_ENVIRONMENT`` for compatibility.
+    Returns ``None`` when unset so the SDK uses the default
+    deployed environment.
+    """
+    env = os.environ.get("COMFYMODAL_ENVIRONMENT", "").strip()
+    if not env:
+        env = os.environ.get("MODAL_ENVIRONMENT", "").strip()
+    return env or None
 
 
 # ── Workspace helpers ────────────────────────────────────────────────────
@@ -177,14 +191,27 @@ def _workspace_client(workspace: dict):
     return client
 
 
-def _workspace_function(name: str, workspace: dict):
-    """Return (and cache) a ``modal.Function`` handle scoped to *workspace*."""
+def _workspace_function(name: str, workspace: dict, environment_name: str | None = None):
+    """Return (and cache) a ``modal.Function`` handle scoped to *workspace*.
+
+    When *environment_name* is ``None`` (the default) the active environment
+    is resolved via ``_resolve_v1_environment()``, which checks
+    ``COMFYMODAL_ENVIRONMENT`` then ``MODAL_ENVIRONMENT``.
+    The environment is part of the cache key so different environments
+    produce distinct handles.
+    """
     global _handle_cache_hits, _handle_cache_misses
-    key = (workspace["id"], name)
+    if environment_name is None:
+        environment_name = _resolve_v1_environment()
+    key = (workspace["id"], name, environment_name)
     handle = _workspace_function_handles.get(key)
     if handle is None:
         _handle_cache_misses += 1
-        handle = modal.Function.from_name(APP_NAME, name, client=_workspace_client(workspace))
+        handle = modal.Function.from_name(
+            APP_NAME, name,
+            client=_workspace_client(workspace),
+            environment_name=environment_name,
+        )
         _workspace_function_handles[key] = handle
     else:
         _handle_cache_hits += 1
@@ -750,15 +777,43 @@ async def get_runtime_state(workspace: dict | None = None) -> dict:
     return await asyncio.to_thread(lambda: _workspace_function("runtime_state_cpu", selected).remote())
 
 
-@_modal_error_handler
 async def set_active_warmup_profile(payload: dict, workspace: dict | None = None) -> dict:
+    """Write an active warmup profile to the runtime-config Volume.
+
+    CPU-only Modal function call with configurable timeout.
+    Uses Modal 1.4.3+ native async ``.remote.aio()``.
+    """
     selected = _resolve_workspace(workspace)
-    return await asyncio.to_thread(
-        lambda: _workspace_function("set_active_warmup_profile", selected).remote(payload),
-    )
+    env = _resolve_v1_environment()
+    timeout = float(os.environ.get("COMFYMODAL_PROFILE_SETTER_TIMEOUT", "120"))
+    handle = _workspace_function("set_active_warmup_profile", selected, environment_name=env)
+    try:
+        return await asyncio.wait_for(
+            handle.remote.aio(payload),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"[modal-client] phase=set_active_warmup_profile "
+            f"app={APP_NAME} workspace={selected.get('name', '?')} "
+            f"env={env or '(default)'} timed out after {timeout}s"
+        )
+    except (ConnectionError, OSError) as e:
+        raise ConnectionError(
+            f"[modal-client] phase=set_active_warmup_profile "
+            f"app={APP_NAME} workspace={selected.get('name', '?')} "
+            f"env={env or '(default)'} connection failed: {e}"
+        ) from e
+    except Exception as e:
+        if getattr(type(e), "__module__", "").startswith("modal"):
+            raise RuntimeError(
+                f"[modal-client] phase=set_active_warmup_profile "
+                f"app={APP_NAME} workspace={selected.get('name', '?')} "
+                f"env={env or '(default)'} error: {e}"
+            ) from e
+        raise
 
 
-@_modal_error_handler
 async def check_active_warmup_profile(stable_key: str, workspace: dict | None = None) -> dict:
     """Read-only identity seam: check if a profile matching *stable_key*
     already exists on the runtime-config volume.
@@ -766,11 +821,39 @@ async def check_active_warmup_profile(stable_key: str, workspace: dict | None = 
     CPU-only, no GPU cost, no side effects (no Volume commit).
     Returns ``{"matched": True, "profile_token": str}`` on match,
     ``{"matched": False}`` otherwise.
+
+    Uses Modal 1.4.3+ native async ``.remote.aio()``.
+    TimeoutError propagates to the caller (not swallowed by fail-open).
     """
     selected = _resolve_workspace(workspace)
-    return await asyncio.to_thread(
-        lambda: _workspace_function("check_active_warmup_profile", selected).remote(stable_key),
-    )
+    env = _resolve_v1_environment()
+    timeout = float(os.environ.get("COMFYMODAL_PROFILE_CHECKER_TIMEOUT", "60"))
+    handle = _workspace_function("check_active_warmup_profile", selected, environment_name=env)
+    try:
+        return await asyncio.wait_for(
+            handle.remote.aio(stable_key),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"[modal-client] phase=check_active_warmup_profile "
+            f"app={APP_NAME} workspace={selected.get('name', '?')} "
+            f"env={env or '(default)'} timed out after {timeout}s"
+        )
+    except (ConnectionError, OSError) as e:
+        raise ConnectionError(
+            f"[modal-client] phase=check_active_warmup_profile "
+            f"app={APP_NAME} workspace={selected.get('name', '?')} "
+            f"env={env or '(default)'} connection failed: {e}"
+        ) from e
+    except Exception as e:
+        if getattr(type(e), "__module__", "").startswith("modal"):
+            raise RuntimeError(
+                f"[modal-client] phase=check_active_warmup_profile "
+                f"app={APP_NAME} workspace={selected.get('name', '?')} "
+                f"env={env or '(default)'} error: {e}"
+            ) from e
+        raise
 
 
 def persist_clip_cache_payload(

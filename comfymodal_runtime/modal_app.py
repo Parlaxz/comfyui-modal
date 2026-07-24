@@ -126,6 +126,8 @@ V2_SOURCE_MODULES = (
     "run_prompt_options",
     "timing_trace",
     "wall_clock_trace_v3",
+    "warmup_profile",
+    "workflow_metadata",
 )
 
 # â”€â”€ V2 validation certificate (V1-parity persistent validation cache) â”€â”€
@@ -680,18 +682,23 @@ def _parse_memory_mb() -> int:
 def _snapshot_target_fingerprint(
     spec: ModalRuntimeSpec | None = None,
 ) -> str:
-    """Deterministic stable hash of complete class resource configuration.
+    """Deterministic stable hash of deployment-defined class resource config.
 
     Hashes app, registered remote class name, lifecycle/method decorator
     configuration, GPU/CPU/memory/timeout allocation, target/max inputs,
     min_containers/scaledown_window, enable_memory_snapshot, all three
     volume name + mount path identities, complete normalized
     ``_runtime_env()`` mapping, experimental_options GPU snapshot setting
-    (when enabled), environment/cloud/region options, source deployment
-    combined hash, and runtime image identity from ``MODAL_IMAGE_ID``
-    (empty when absent).  Never hashes live object reprs or unstable
-    handles.  The result is a SHA-256 hex digest suitable for diagnostic
-    correlation across startup/restore/request boundaries.
+    (when enabled), registration-known environment (``MODAL_ENVIRONMENT``),
+    and source deployment combined hash.
+
+    **Excludes** runtime-varying fields: cloud, region, image ID,
+    task/container/session identity, hostname, PID. Those are emitted
+    separately in ``[v2.snapshot_runtime]``.
+
+    Never hashes live object reprs or unstable handles.  The result is a
+    SHA-256 hex digest suitable for diagnostic correlation across
+    startup/restore/request boundaries.
     """
     actual = spec or _MODAL_RESOURCES.get("spec", ModalRuntimeSpec())
     _source_id = _MODAL_RESOURCES.get("source_identity")
@@ -743,16 +750,29 @@ def _snapshot_target_fingerprint(
         "custom_nodes_volume": actual.custom_nodes_volume_name,
         "runtime_state_volume": actual.runtime_state_volume_name,
         "volume_mount_paths": _vol_mount_paths,
-        # ── Source / env / cloud / region / image ────────────────────────
+        # ── Source / env (static deployment config only) ─────────────────
         "source_combined_hash": _combined,
         "runtime_env": _env,
         "experimental_options": {"enable_gpu_snapshot": _enable_gpu_snapshot},
         "environment": os.environ.get("MODAL_ENVIRONMENT", ""),
-        "cloud": os.environ.get("MODAL_CLOUD_PROVIDER", ""),
-        "region": os.environ.get("MODAL_REGION", ""),
-        "image_id": os.environ.get("MODAL_IMAGE_ID", ""),
     }
     return stable_hash(_fingerprint_fields)
+
+
+def _snapshot_runtime_identity() -> dict[str, str]:
+    """Runtime-specific identity for ``[v2.snapshot_runtime]`` emission.
+
+    Contains ``image_id``, ``cloud``, ``region``, and
+    ``container_session_id`` — fields that vary per runtime container
+    but are NOT part of the static deployment snapshot target
+    fingerprint.
+    """
+    return {
+        "image_id": os.environ.get("MODAL_IMAGE_ID", ""),
+        "cloud": os.environ.get("MODAL_CLOUD_PROVIDER", ""),
+        "region": os.environ.get("MODAL_REGION", ""),
+        "container_session_id": _V2_CONTAINER_SESSION_ID,
+    }
 
 
 @dataclass(frozen=True)
@@ -1300,6 +1320,29 @@ class ModalRuntimeEntrypoint:
         self._lazy_init_snapshot_state()
         raw = api._snapshot_preload_profile()
         if raw is None:
+            env_profile = os.environ.get("COMFYMODAL_WARMUP_PROFILE", "")
+            env_unet = os.environ.get("COMFYMODAL_WARMUP_UNET", "")
+            env_clip1 = os.environ.get("COMFYMODAL_WARMUP_CLIP1", "")
+            env_clip_type = os.environ.get("COMFYMODAL_WARMUP_CLIP_TYPE", "")
+            if (
+                env_profile == "split"
+                and env_unet.strip()
+                and env_clip1.strip()
+                and env_clip_type.strip()
+            ):
+                profile: dict[str, str] = {
+                    "mode": "split",
+                    "unet": env_unet,
+                    "clip1": env_clip1,
+                    "clip_type": env_clip_type,
+                }
+                env_clip2 = os.environ.get("COMFYMODAL_WARMUP_CLIP2", "")
+                if env_clip2.strip():
+                    profile["clip2"] = env_clip2
+                env_vae = os.environ.get("COMFYMODAL_WARMUP_VAE", "")
+                if env_vae.strip():
+                    profile["vae"] = env_vae
+                return profile
             raise RuntimeError("cpu model snapshot profile is None")
         if not isinstance(raw, Mapping):
             raise RuntimeError(
@@ -1486,12 +1529,21 @@ class ModalRuntimeEntrypoint:
         _reg_cls = globals().get("ModalRuntimeEntrypointV2", ModalRuntimeEntrypoint)
         print(
             f"[v2.snapshot_target] "
-            f"fingerprint={_fp} "
+            f"static_fingerprint={_fp} "
             f"app={_spec.app_name} "
             f"class={_reg_cls.__name__} "
             f"gpu={_gpu_str} "
             f"cpu={_spec.cpu} "
             f"memory={_spec.memory}",
+            flush=True,
+        )
+        _runtime_id = _snapshot_runtime_identity()
+        print(
+            f"[v2.snapshot_runtime] "
+            f"image_id={_runtime_id['image_id']} "
+            f"cloud={_runtime_id['cloud']} "
+            f"region={_runtime_id['region']} "
+            f"container_session_id={_runtime_id['container_session_id']}",
             flush=True,
         )
         _lifecycle_error: str | None = None

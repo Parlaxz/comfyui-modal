@@ -1426,8 +1426,8 @@ def _make_hardware_dependent_cache_key(base_key: str) -> str:
     if _cap is None or _cap[0] < 0:
         return base_key
     return f"{base_key}_cc{_cap[0]}{_cap[1]}"
-PRELOAD_MODE_PATH = "/root/comfymodal_runtime/.preload_mode"
-RUNTIME_CONFIG_DIR = "/root/comfymodal_runtime"
+PRELOAD_MODE_PATH = "/root/comfymodal_runtime_state/.preload_mode"
+RUNTIME_CONFIG_DIR = "/root/comfymodal_runtime_state"
 RUNTIME_RETURN_MODE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "return_mode.txt")
 RUNTIME_STATE_SNAPSHOT_PATH = os.path.join(RUNTIME_CONFIG_DIR, ".runtime_state_snapshot.json")
 
@@ -5804,7 +5804,7 @@ def _verify_model_file(path: str, expected_size: int | None = None, expected_sha
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.16.24"
+COMFYAPP_VERSION = "2.16.26"
 CONTROL_BASELINE = "v2.16.5_exact_plus_direct_memory_production"
 
 
@@ -5812,7 +5812,7 @@ APP_NAME = "comfyui"
 # Model weights are read-only during generation; never store request/runtime state here.
 VOLUME_NAME = "comfyui-models"
 RUNTIME_CONFIG_VOLUME_NAME = "comfymodal-runtime-config"
-RUNTIME_CONFIG_PATH = "/root/comfymodal_runtime"
+RUNTIME_CONFIG_PATH = "/root/comfymodal_runtime_state"
 CUSTOM_NODES_VOLUME_NAME = "comfyui-custom-nodes"
 # P2: dedicated prompt-encoding cache volume. NEVER written to the
 # models or custom-nodes volumes. The volume is mounted only by the
@@ -6607,11 +6607,11 @@ if not _INSIDE_MODAL_CONTAINER:
 COMFYUI_API_PORT = 8189
 MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
-LAST_MODEL_STACK_PATH = "/root/comfymodal_runtime/.last_model_stack.json"
+LAST_MODEL_STACK_PATH = "/root/comfymodal_runtime_state/.last_model_stack.json"
 ACTIVE_NEXT_PROFILE_PATH = os.path.join(RUNTIME_CONFIG_DIR, "active_next_profile.json")
 ACTIVE_NEXT_PROFILE_TTL_S = int(os.getenv("COMFYMODAL_ACTIVE_NEXT_PROFILE_TTL_S", "3600"))
-LAST_WARMUP_WORKFLOW_PATH = "/root/comfymodal_runtime/.last_warmup_workflow.json"
-SAGE_RUNTIME_CACHE_PATH = "/root/comfymodal_runtime/.sage_runtime_cache.json"
+LAST_WARMUP_WORKFLOW_PATH = "/root/comfymodal_runtime_state/.last_warmup_workflow.json"
+SAGE_RUNTIME_CACHE_PATH = "/root/comfymodal_runtime_state/.sage_runtime_cache.json"
 
 SUPPORTED_GPUS = get_supported_gpus()
 
@@ -6690,7 +6690,7 @@ _image_base = (
     )
     .env(
         {
-            "TORCHINDUCTOR_CACHE_DIR": "/root/comfymodal_runtime/.inductor-cache",
+            "TORCHINDUCTOR_CACHE_DIR": "/root/comfymodal_runtime_state/.inductor-cache",
             "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
             "TRITON_CACHE_DIR": "/tmp/triton_cache",
             "TORCHINDUCTOR_EMULATE_PRECISION_CASTS": "1",
@@ -6879,6 +6879,7 @@ _COMFYMODAL_LOCAL_PYTHON_SOURCES = (
     "failure_summary",
     "production_workflow",
     "optimizations",
+    "comfymodal_runtime",
 )
 
 def _add_comfymodal_local_python_sources(img):

@@ -111,7 +111,11 @@ def extract_model_stack(prompt: dict) -> dict[str, list[str]]:
 
 def extract_warmup_stack(prompt: dict) -> dict:
     """Extract the warmup-relevant model stack from a workflow prompt."""
-    stack: dict = {"checkpoint": [], "unet": [], "clip": [], "vae": [], "clip_type": "flux"}
+    stack: dict = {
+        "checkpoint": [], "unet": [], "clip": [], "vae": [],
+        "clip_type": "flux", "clip_loader_class": None,
+        "clip1": "", "clip2": "",
+    }
     for node in prompt.values():
         if not isinstance(node, dict):
             continue
@@ -129,17 +133,28 @@ def extract_warmup_stack(prompt: dict) -> dict:
             if isinstance(value, str) and value and value not in stack["unet"]:
                 stack["unet"].append(value)
         elif class_type == "DualCLIPLoader":
+            stack["clip_loader_class"] = "DualCLIPLoader"
             for key in ("clip_name1", "clip_name2"):
                 value = inputs.get(key)
                 if isinstance(value, str) and value and value not in stack["clip"]:
                     stack["clip"].append(value)
+            v1 = inputs.get("clip_name1")
+            v2 = inputs.get("clip_name2")
+            if isinstance(v1, str) and v1:
+                stack["clip1"] = v1
+            if isinstance(v2, str) and v2:
+                stack["clip2"] = v2
             clip_type = inputs.get("type", "")
             if isinstance(clip_type, str) and clip_type:
                 stack["clip_type"] = clip_type
         elif class_type == "CLIPLoader":
+            stack["clip_loader_class"] = "CLIPLoader"
             value = inputs.get("clip_name")
             if isinstance(value, str) and value and value not in stack["clip"]:
                 stack["clip"].append(value)
+            if isinstance(value, str) and value:
+                stack["clip1"] = value
+            stack["clip2"] = ""
             clip_type = inputs.get("type", "")
             if isinstance(clip_type, str) and clip_type:
                 stack["clip_type"] = clip_type
@@ -156,8 +171,14 @@ def stack_to_warmup_profile(stack: dict) -> dict:
         return {"mode": "checkpoint", "checkpoint": stack["checkpoint"][0]}
     if stack.get("unet") and stack.get("clip") and stack.get("vae"):
         clips = stack["clip"]
-        clip1, clip2 = normalize_flux_clip_pair(clips[0], clips[-1] if len(clips) > 1 else clips[0])
         clip_type = stack.get("clip_type", "flux")
+        if stack.get("clip_loader_class") == "DualCLIPLoader":
+            clip1 = stack.get("clip1", clips[0] if clips else "")
+            clip2 = stack.get("clip2", "")
+            clip1, clip2 = normalize_flux_clip_pair(clip1, clip2)
+        else:
+            clip1 = stack.get("clip1", clips[0] if clips else "")
+            clip2 = ""
         return {
             "mode": "split",
             "unet": stack["unet"][0],
@@ -178,11 +199,12 @@ def warmup_profile_matches_stack(profile: dict, requested: dict) -> bool:
         checkpoint = profile.get("checkpoint", "")
         return bool(checkpoint) and checkpoint in requested.get("checkpoint", [])
     if mode == "split":
+        clip2 = profile.get("clip2", "")
         return (
             profile.get("clip_type", "flux") == requested.get("clip_type", "flux")
             and profile.get("unet", "") in requested.get("unet", [])
             and profile.get("clip1", "") in requested.get("clip", [])
-            and profile.get("clip2", "") in requested.get("clip", [])
+            and (not clip2 or clip2 in requested.get("clip", []))
             and profile.get("vae", "") in requested.get("vae", [])
         )
     return False

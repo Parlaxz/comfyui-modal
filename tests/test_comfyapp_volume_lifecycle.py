@@ -232,9 +232,9 @@ class ComfyAppVolumeLifecycleTests(unittest.TestCase):
         old_meta_path = '"/root/models/runtime_config/runtime_metadata.json"'
         self.assertNotIn(old_meta_path, source,
                          "RUNTIME_METADATA_PATH must not point to /root/models")
-        # Key module-level constants already point to /root/comfymodal_runtime
-        self.assertIn("RUNTIME_CONFIG_PATH = \"/root/comfymodal_runtime\"", source)
-        self.assertIn("RUNTIME_CONFIG_DIR = \"/root/comfymodal_runtime\"", source)
+        # Key module-level constants point to /root/comfymodal_runtime_state
+        self.assertIn("RUNTIME_CONFIG_PATH = \"/root/comfymodal_runtime_state\"", source)
+        self.assertIn("RUNTIME_CONFIG_DIR = \"/root/comfymodal_runtime_state\"", source)
 
     def test_active_next_profile_path_under_runtime_config(self):
         """ACTIVE_NEXT_PROFILE_PATH must be under /root/comfymodal_runtime."""
@@ -298,6 +298,87 @@ class ComfyAppVolumeLifecycleTests(unittest.TestCase):
             "runtime_config_volume.commit()",
             source,
             "_write_active_next_profile must commit the passed runtime_config_volume",
+        )
+
+
+class TestMountCollisionRegression(unittest.TestCase):
+    """Static regression: V1 runtime data paths use ``/root/comfymodal_runtime_state``
+    so they cannot collide with the packaged ``comfymodal_runtime`` Python module source.
+    """
+
+    V2_RUNTIME_STATE_PATH = "/root/comfymodal_runtime_state"
+    EXPECTED_PATHS = (
+        ("PRELOAD_MODE_PATH", "/root/comfymodal_runtime_state/.preload_mode"),
+        ("RUNTIME_CONFIG_DIR", "/root/comfymodal_runtime_state"),
+        ("RUNTIME_CONFIG_PATH", "/root/comfymodal_runtime_state"),
+        ("LAST_MODEL_STACK_PATH", "/root/comfymodal_runtime_state/.last_model_stack.json"),
+        ("LAST_WARMUP_WORKFLOW_PATH", "/root/comfymodal_runtime_state/.last_warmup_workflow.json"),
+        ("SAGE_RUNTIME_CACHE_PATH", "/root/comfymodal_runtime_state/.sage_runtime_cache.json"),
+        ("TORCHINDUCTOR_CACHE_DIR (env)", "/root/comfymodal_runtime_state/.inductor-cache"),
+    )
+
+    def setUp(self):
+        self.source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
+
+    def test_all_v1_runtime_paths_use_runtime_state(self):
+        """Every V1 runtime-config data path must use /root/comfymodal_runtime_state."""
+        errors = []
+        for name, expected in self.EXPECTED_PATHS:
+            if expected not in self.source:
+                errors.append(f"{name}: expected {expected!r} not found in source")
+        self.assertFalse(errors, "\n".join(errors))
+
+    def test_no_v1_runtime_path_uses_old_comfymodal_runtime(self):
+        """No V1 runtime-config data path must point to /root/comfymodal_runtime
+        (the packaged module path)."""
+        import re
+        # Look for assignments of string literals containing
+        # "/root/comfymodal_runtime" that are NOT followed by "_state".
+        # This catches bare old paths that were missed.
+        pattern = r'"/root/comfymodal_runtime[^_]'
+        matches = re.findall(pattern, self.source)
+        # Filter out Python import lines (e.g. from comfymodal_runtime.contracts ...)
+        # which are legitimate package references, not data paths.
+        lines = self.source.split("\n")
+        bad = []
+        for i, line in enumerate(lines, 1):
+            if '"/root/comfymodal_runtime"' in line or '"/root/comfymodal_runtime/' in line:
+                # Check this is not an import statement
+                stripped = line.strip()
+                if not (stripped.startswith("from") or stripped.startswith("import") or
+                        "#" in stripped and any(kw in stripped for kw in ("import", "from"))):
+                    bad.append(f"  Line {i}: {stripped}")
+        self.assertFalse(bad,
+                         f"Found data-path references to old /root/comfymodal_runtime:\n" + "\n".join(bad))
+
+    def test_python_package_imports_unchanged(self):
+        """Python package imports of comfymodal_runtime must still use the module
+        name (not _state) — these are source imports, not data paths."""
+        self.assertIn("from comfymodal_runtime", self.source,
+                      "comfymodal_runtime Python package imports must remain intact")
+        self.assertIn("import comfymodal_runtime", self.source,
+                      "comfymodal_runtime Python package import must remain intact")
+
+    def test_v1_matches_v2_runtime_state_path(self):
+        """V1 runtime data path must match V2's RUNTIME_STATE_PATH."""
+        self.assertIn(
+            self.V2_RUNTIME_STATE_PATH,
+            self.source,
+            f"V1 must use {self.V2_RUNTIME_STATE_PATH} (same as V2)",
+        )
+
+    def test_volume_name_unchanged(self):
+        """The Modal volume name comfymodal-runtime-config must not be changed."""
+        self.assertIn(
+            'RUNTIME_CONFIG_VOLUME_NAME = "comfymodal-runtime-config"',
+            self.source,
+        )
+
+    def test_COMFYAPP_VERSION_bumped(self):
+        """COMFYAPP_VERSION must be 2.16.26."""
+        self.assertIn(
+            'COMFYAPP_VERSION = "2.16.26"',
+            self.source,
         )
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace, MappingProxyType
 from typing import Any
 from collections.abc import Mapping
@@ -261,6 +262,35 @@ class CpuSnapshotProfileTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             entrypoint._cpu_snapshot_profile(api)
         self.assertIn("unet", str(ctx.exception))
+
+    def test_reconstructs_from_env_when_api_none_with_empty_clip2(self):
+        """None API profile + single-loader env with empty CLIP2 returns a valid
+        split profile and CLIP2 remains absent."""
+        entrypoint = ModalRuntimeEntrypoint()
+        api = self._make_api(None)
+        with patch.dict(os.environ, {
+            "COMFYMODAL_WARMUP_PROFILE": "split",
+            "COMFYMODAL_WARMUP_UNET": "flux_1_dev.safetensors",
+            "COMFYMODAL_WARMUP_CLIP1": "clip_l.safetensors",
+            "COMFYMODAL_WARMUP_CLIP_TYPE": "flux",
+        }, clear=True):
+            result = entrypoint._cpu_snapshot_profile(api)
+        assert result is not None
+        self.assertEqual(result.get("mode"), "split")
+        self.assertEqual(result.get("unet"), "flux_1_dev.safetensors")
+        self.assertEqual(result.get("clip1"), "clip_l.safetensors")
+        self.assertEqual(result.get("clip_type"), "flux")
+        self.assertNotIn("clip2", result)
+
+    def test_still_rejects_none_profile_when_no_env(self):
+        """Without valid COMFYMODAL_WARMUP_* env vars, None API profile still
+        raises RuntimeError (existing behavior preserved)."""
+        entrypoint = ModalRuntimeEntrypoint()
+        api = self._make_api(None)
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(RuntimeError) as ctx:
+                entrypoint._cpu_snapshot_profile(api)
+        self.assertIn("None", str(ctx.exception))
 
 
 # ── Bridge activation tests ──────────────────────────────────────────────
@@ -1923,6 +1953,69 @@ class CpuSnapshotVariantCActivationFlowTests(unittest.TestCase):
         )
         _keys_match = _cpu_snapshot_model_keys_match(req_key, snapshot.model_key)
         self.assertFalse(_keys_match, "different UNET must cause key mismatch")
+
+
+# ── Workflow e2e: snapshot spec vs request spec matching ───────────
+
+_SINGLE_WF = {
+    "1": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip_l.safetensors", "type": "flux"}},
+    "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux_1_dev.safetensors"}},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "flux_vae.safetensors"}},
+}
+
+_DUAL_DUP_WF = {
+    "1": {"class_type": "DualCLIPLoader", "inputs": {
+        "clip_name1": "clip_l.safetensors", "clip_name2": "clip_l.safetensors", "type": "flux",
+    }},
+    "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux_1_dev.safetensors"}},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "flux_vae.safetensors"}},
+}
+
+
+class CpuSnapshotWorkflowE2ETests(unittest.TestCase):
+    """End-to-end: extract → profile → spec matching for single and dual CLIP."""
+
+    def setUp(self):
+        self._d = tempfile.mkdtemp(prefix="wf_e2e_")
+        for n in ("flux_1_dev.safetensors", "clip_l.safetensors"):
+            open(os.path.join(self._d, n), "a").close()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._d, ignore_errors=True)
+
+    def _resolve_path(self, _role, fname):
+        return os.path.join(self._d, fname)
+
+    def _snap_spec(self, workflow):
+        from workflow_metadata import extract_warmup_stack, stack_to_warmup_profile
+        stack = extract_warmup_stack(workflow)
+        profile = stack_to_warmup_profile(stack)
+        _key, spec, _facts = identity_from_profile(profile, resolve_path=self._resolve_path)
+        return spec
+
+    @staticmethod
+    def _req_spec(workflow):
+        return build_restore_model_spec(workflow)
+
+    def test_single_clip_e2e_specs_match(self):
+        snap = self._snap_spec(_SINGLE_WF)
+        req = self._req_spec(_SINGLE_WF)
+        self.assertEqual(snap["loaders"]["clip"][0]["loader_class"], "CLIPLoader")
+        self.assertEqual(req["loaders"]["clip"][0]["loader_class"], "CLIPLoader")
+        self.assertTrue(_cpu_snapshot_specs_match(snap, req))
+
+    def test_dual_clip_duplicate_e2e_specs_match(self):
+        snap = self._snap_spec(_DUAL_DUP_WF)
+        req = self._req_spec(_DUAL_DUP_WF)
+        self.assertEqual(snap["loaders"]["clip"][0]["loader_class"], "DualCLIPLoader")
+        self.assertEqual(req["loaders"]["clip"][0]["loader_class"], "DualCLIPLoader")
+        self.assertTrue(_cpu_snapshot_specs_match(snap, req))
+
+    def test_single_vs_dual_strict_mismatch(self):
+        self.assertFalse(
+            _cpu_snapshot_specs_match(self._snap_spec(_SINGLE_WF), self._snap_spec(_DUAL_DUP_WF))
+        )
 
 
 if __name__ == "__main__":
