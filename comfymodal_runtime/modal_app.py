@@ -142,9 +142,11 @@ def _build_v2_critical_path(
         "first_node_to_sampler_node_ms": _critical_path_delta_ms(
             first_node_perf_ns, sampler_node_perf_ns
         ),
-        "sampler_node_to_sampler_start_ms": _critical_path_delta_ms(
-            sampler_node_perf_ns,
-            execution_timing.get("sampler_stage_start_perf_ns"),
+        # Reuse pre-computed value from pre_sampler_stages authoritative
+        # calculation (milestone-based T1/T2 monotonic_ns) rather than
+        # recalculating from sampler_stage_start_perf_ns (separate wall-clock).
+        "sampler_node_to_sampler_start_ms": execution_timing.get(
+            "sampler_node_to_sampler_start_ms"
         ),
         "pre_sampler_unattributed_ms": execution_timing.get(
             "pre_sampler_unattributed_ms"
@@ -1615,9 +1617,18 @@ class ModalRuntimeEntrypoint:
             return api._apply_sage_attention_policy()
 
         def observe_generations() -> dict[str, str]:
+            _cn_gen = str(getattr(api, "_custom_nodes_generation_seen", "") or "")
+            if not _cn_gen:
+                # Fallback to the persisted generation record when the
+                # instance attribute was not hydrated (e.g. memoized custom-
+                # node sync returned before setting the attr on restore).
+                try:
+                    _cn_gen = str(module._current_custom_nodes_generation_id() or "")
+                except Exception:
+                    pass
             return {
                 "runtime_state": str(getattr(api, "_runtime_generation_seen", "") or ""),
-                "custom_nodes": str(getattr(api, "_custom_nodes_generation_seen", "") or ""),
+                "custom_nodes": _cn_gen,
             }
 
         config = self._config or BootstrapConfig(
@@ -3706,6 +3717,9 @@ class ModalRuntimeEntrypoint:
                 _clip_to_sampler_node_ms = round((_first_sampler_ns - _first_clip_ns) / 1_000_000, 3)
             if _first_sampler_ns is not None and _first_sampler_stage_ns is not None:
                 _sampler_node_to_sampler_start_ms = round((_first_sampler_stage_ns - _first_sampler_ns) / 1_000_000, 3)
+                # Store in pre_sampler_state so _v2_critical_path_data reuses this
+                # authoritative calculation instead of recalculating from T3.
+                _pre_sampler_state["sampler_node_to_sampler_start_ms"] = _sampler_node_to_sampler_start_ms
             if _milestones:
                 trace.emit("prompt_executor_milestones", phase="execution", metadata={
                     "executor_call_to_execution_start_ms": _exec_st_val,
@@ -4180,6 +4194,10 @@ class ModalRuntimeEntrypoint:
                 "sampler_node_enter_perf_ns": _pre_sampler_state.get("sampler_node_enter_perf_ns"),
                 "sampler_stage_start_perf_ns": _sampler_stage_start_perf_ns,
                 "pre_sampler_unattributed_ms": _pre_sampler_state.get("pre_sampler_unattributed_ms"),
+                # Pre-computed authoritative value from milestone calculation;
+                # _build_v2_critical_path reads this directly rather than
+                # recalculating from sampler_stage_start_perf_ns (T3).
+                "sampler_node_to_sampler_start_ms": _pre_sampler_state.get("sampler_node_to_sampler_start_ms"),
             }
 
             # â”€â”€ Write validation certificate after successful execution â”€â”€

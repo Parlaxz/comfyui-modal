@@ -105,6 +105,8 @@ from canonical_execution import (
     execute_modal_prompt,
     execute_plan,
     prepare_modal_execution,
+    _reset_restore_publish_cache,
+    _reset_profile_prep_cache,
 )
 from comfymodal_runtime.modal_transport import ModalTransport
 from comfymodal_runtime.restore_plan import RemoteRestorePlanPublisher
@@ -4680,6 +4682,14 @@ if _server:
         if scope not in ("models", "custom_nodes", "all"):
             return web.json_response({"status": "error", "message": "scope must be 'models', 'custom_nodes', or 'all'"}, status=400)
         try:
+            # ── Clear local caches before triggering remote resync ──
+            # Canonical restore-publish cache and profile-prep cache.
+            _reset_restore_publish_cache()
+            _reset_profile_prep_cache()
+            # Warmup-profile process-local dedup cache and identity state.
+            from warmup_profile import _reset_last_stable_profile_cache
+            _reset_last_stable_profile_cache()
+
             result = await resync_runtime(scope)
             return web.json_response(result)
         except Exception as e:

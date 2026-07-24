@@ -695,8 +695,10 @@ async def execute_plan(
             _profile_ws_id, _profile_app_name, _profile_env,
         )
 
+        _profile_cache_lookup_start_ns = time.perf_counter_ns()
         with _PROFILE_PREP_CACHE_LOCK:
             _cached_result = _PROFILE_PREP_CACHE.get(_profile_cache_key)
+        _profile_cache_lookup_ms = round((time.perf_counter_ns() - _profile_cache_lookup_start_ns) / 1_000_000, 3)
 
         if _cached_result is not None:
             # Identity unchanged — reuse cached result, no remote calls
@@ -714,7 +716,16 @@ async def execute_plan(
                 active_profile_remote_ms=0.0,
                 active_profile_prepare_count=0,
                 profile_cache_hit=True,
+                profile_cache_lookup_ms=_profile_cache_lookup_ms,
                 profile_remote_call_performed=False,
+                profile_checker_performed=False,
+                profile_setter_performed=False,
+                # Truthful timing decomposition: cache hit → only cache_lookup, no checker/setter
+                active_profile_local_ms=0.0,
+                active_profile_cache_lookup_ms=_profile_cache_lookup_ms,
+                active_profile_checker_ms=0.0,
+                active_profile_setter_ms=0.0,
+                active_profile_total_ms=_profile_cache_lookup_ms,
                 source_workflow_hash=plan.source_workflow_hash,
                 model_stack=dict(plan.model_stack),
                 prompt_summary=dict(plan.prompt_bundle),
@@ -762,7 +773,16 @@ async def execute_plan(
                 active_profile_remote_ms=_pn_result.get("active_profile_remote_ms", 0.0),
                 active_profile_prepare_count=1,
                 profile_cache_hit=False,
+                profile_cache_lookup_ms=_profile_cache_lookup_ms,
                 profile_remote_call_performed=bool(_pn_result.get("active_profile_remote_call", 0)),
+                profile_checker_performed=bool(_pn_result.get("profile_checker_performed", False)),
+                profile_setter_performed=bool(_pn_result.get("profile_setter_performed", False)),
+                # Truthful timing decomposition: local excludes cache_lookup/checker/setter
+                active_profile_local_ms=_pn_result.get("active_profile_local_ms", 0.0),
+                active_profile_cache_lookup_ms=_pn_result.get("active_profile_cache_lookup_ms", _profile_cache_lookup_ms),
+                active_profile_checker_ms=_pn_result.get("active_profile_checker_ms", 0.0),
+                active_profile_setter_ms=_pn_result.get("active_profile_setter_ms", 0.0),
+                active_profile_total_ms=_pn_result.get("active_profile_total_ms", 0.0),
                 source_workflow_hash=plan.source_workflow_hash,
                 model_stack=dict(plan.model_stack),
                 prompt_summary=dict(plan.prompt_bundle),
@@ -817,8 +837,10 @@ async def execute_plan(
         )
         cache_key = f"{ws_id}:{app_name}:{env}:{plan_identity}"
 
+        _restore_cache_lookup_start_ns = time.perf_counter_ns()
         with _RESTORE_PUBLISH_CACHE_LOCK:
             cached_identity = _RESTORE_PUBLISH_CACHE.get(cache_key)
+        _restore_cache_lookup_ms = round((time.perf_counter_ns() - _restore_cache_lookup_start_ns) / 1_000_000, 3)
 
         if cached_identity is not None:
             # Identity unchanged — skip the remote publish call entirely
@@ -829,6 +851,7 @@ async def execute_plan(
             runtime_trace.set_metadata(
                 restore_publish_cache_skipped=True,
                 restore_publish_cache_hit=True,
+                restore_cache_lookup_ms=_restore_cache_lookup_ms,
                 restore_remote_call_performed=False,
             )
             observed_generation = 0
@@ -836,6 +859,7 @@ async def execute_plan(
             runtime_trace.set_metadata(
                 restore_publish_cache_skipped=False,
                 restore_publish_cache_hit=False,
+                restore_cache_lookup_ms=_restore_cache_lookup_ms,
             )
             publish_result = restore_publisher.publish(restore_plan)
             if inspect.isawaitable(publish_result):

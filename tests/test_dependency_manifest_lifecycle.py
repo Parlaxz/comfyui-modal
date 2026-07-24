@@ -1993,6 +1993,162 @@ class TestPersistentManifestStep0:
                 # Dev mode does proceed to fingerprint
                 assert result.get("dependency_validation_cache_layer") != "persistent_manifest"
 
+# ── Test: Memoized-hit path sets _custom_nodes_generation_seen ──────────
+
+
+class TestMemoizedHitGenerationSeen:
+    """The memoized-hit paths in _sync_custom_nodes_from_volume must
+    hydrate _custom_nodes_generation_seen so observe_generations and
+    downstream identity consumers see the current value."""
+
+    def _make_mock_gen_record(self, manifest_env, generation="test_gen"):
+        """Configure the mocked _read_custom_nodes_generation_record to
+        return a dict matching the written file."""
+        _write_gen_record(manifest_env["gen_dir"], generation=generation)
+        manifest_env["mock_gen"].return_value = {
+            "generation": generation,
+            "schema_version": 1,
+        }
+
+    def test_memoized_hit_sets_generation_seen(self, manifest_env):
+        """When the validation cache returns a memoized hit (source
+        fingerprint unchanged), _custom_nodes_generation_seen is updated
+        from the persisted generation record."""
+        from comfyapp import _ComfyAPIMixin
+
+        generation = "memo_gen_001"
+        self._make_mock_gen_record(manifest_env, generation=generation)
+
+        # Create a minimal _ComfyAPIMixin instance with only what's needed
+        app = _ComfyAPIMixin.__new__(_ComfyAPIMixin)
+        app._custom_nodes_generation_seen = ""
+        app._custom_nodes_state = {}
+        app._custom_nodes_state_last_synced = None
+        app._last_custom_node_source_fingerprint = None
+        app._ensure_validation_cache()
+
+        cached_result = (
+            {"created": [], "removed": [], "kept": ["node_a"], "blocked": []},
+            {"node_a": {"mtime": 100.0}},
+        )
+        app._validation_cache.set(
+            "custom_node_sync", cached_result, fingerprint="memo_fp"
+        )
+        app._custom_nodes_state_last_synced = cached_result
+
+        # Force validation cache hit for our category
+        orig_has = app._validation_cache.has
+        def _fake_has(category, fingerprint=None):
+            if category == "custom_node_sync":
+                return True
+            return orig_has(category, fingerprint=fingerprint)
+        app._validation_cache.has = _fake_has
+
+        orig_get = app._validation_cache.get
+        def _fake_get(category):
+            if category == "custom_node_sync":
+                return cached_result
+            return orig_get(category)
+        app._validation_cache.get = _fake_get
+
+        with (
+            patch("comfyapp.custom_node_volume_state",
+                   return_value={"node_a": {"mtime": 100.0}}),
+            patch("comfyapp.CUSTOM_NODES_PATH", manifest_env["tmpdir"]),
+        ):
+            summary, state = app._sync_custom_nodes_from_volume()
+
+        assert app._custom_nodes_generation_seen == generation, (
+            f"expected {generation!r}, got {app._custom_nodes_generation_seen!r}"
+        )
+
+    def test_fingerprint_skipped_path_sets_generation_seen(self, manifest_env):
+        """When the source fingerprint matches (second skip path),
+        _custom_nodes_generation_seen is updated from the persisted
+        generation record."""
+        from comfyapp import _ComfyAPIMixin
+        from unittest.mock import patch
+
+        generation = "skip_gen_002"
+        self._make_mock_gen_record(manifest_env, generation=generation)
+
+        app = _ComfyAPIMixin.__new__(_ComfyAPIMixin)
+        app._custom_nodes_generation_seen = ""
+        app._custom_nodes_state = {}
+        app._custom_nodes_state_last_synced = None
+        app._last_custom_node_source_fingerprint = None
+        app._ensure_validation_cache()
+
+        current_fp = {"nodes": {"node_x": "hash_abc"}}
+        app._last_custom_node_source_fingerprint = current_fp
+
+        with (
+            patch("comfyapp.custom_node_volume_state",
+                   return_value={"node_x": {"mtime": 200.0}}),
+            patch("comfyapp.CUSTOM_NODES_PATH", manifest_env["tmpdir"]),
+            patch("comfyapp.custom_node_source_fingerprint",
+                   return_value=current_fp),
+        ):
+            summary, state = app._sync_custom_nodes_from_volume()
+
+        assert app._custom_nodes_generation_seen == generation, (
+            f"expected {generation!r}, got {app._custom_nodes_generation_seen!r}"
+        )
+
+    def test_memoized_hit_preserves_existing_generation(self, manifest_env):
+        """When _custom_nodes_generation_seen is already set and matches
+        the persisted record, the memoized-hit path preserves it."""
+        from comfyapp import _ComfyAPIMixin
+        from unittest.mock import patch
+
+        generation = "same_gen"
+        self._make_mock_gen_record(manifest_env, generation=generation)
+
+        app = _ComfyAPIMixin.__new__(_ComfyAPIMixin)
+        app._custom_nodes_generation_seen = generation  # already set
+        app._custom_nodes_state = {}
+        app._custom_nodes_state_last_synced = None
+        app._last_custom_node_source_fingerprint = None
+        app._ensure_validation_cache()
+
+        cached_result = (
+            {"created": [], "removed": [], "kept": ["node_b"], "blocked": []},
+            {"node_b": {"mtime": 300.0}},
+        )
+        app._validation_cache.set(
+            "custom_node_sync", cached_result, fingerprint="memo_fp2"
+        )
+        app._custom_nodes_state_last_synced = cached_result
+
+        orig_has = app._validation_cache.has
+        def _fake_has(cat, fingerprint=None):
+            if cat == "custom_node_sync":
+                return True
+            return orig_has(cat, fingerprint=fingerprint)
+        app._validation_cache.has = _fake_has
+
+        orig_get = app._validation_cache.get
+        def _fake_get(cat):
+            if cat == "custom_node_sync":
+                return cached_result
+            return orig_get(cat)
+        app._validation_cache.get = _fake_get
+
+        with (
+            patch("comfyapp.custom_node_volume_state",
+                   return_value={"node_b": {"mtime": 300.0}}),
+            patch("comfyapp.CUSTOM_NODES_PATH", manifest_env["tmpdir"]),
+        ):
+            summary, state = app._sync_custom_nodes_from_volume()
+
+        assert app._custom_nodes_generation_seen == generation, (
+            f"expected {generation!r}, got {app._custom_nodes_generation_seen!r}"
+        )
+
+
+class TestStep0WithPersistentManifestDiagnosticFields:
+    """Step 0 diagnostic emission for persistent_manifest source."""
+
     def test_step0_with_persistent_manifest_diagnostic_fields(self, manifest_env, capsys):
         """Verify [v2.dependency_validation] line structure with persistent_manifest source
         via the diagnostic emitter directly."""

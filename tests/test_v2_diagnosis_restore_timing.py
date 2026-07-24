@@ -27,7 +27,10 @@ from comfymodal_runtime.trace import RuntimeTrace
 from comfymodal_runtime.model_preload import V2LoaderBridge
 
 
-def test_v2_critical_path_uses_separate_same_clock_sampler_boundaries():
+def test_v2_critical_path_uses_passed_sampler_node_to_sampler_start():
+    """_build_v2_critical_path reads sampler_node_to_sampler_start_ms as a
+    pre-computed value from execution_timing (the authoritative milestone-based
+    calculation) rather than recalculating from raw perf-ns timestamps."""
     values = _build_v2_critical_path(
         {
             "remote_python_resume_mono_ns": 1_000_000,
@@ -40,7 +43,7 @@ def test_v2_critical_path_uses_separate_same_clock_sampler_boundaries():
             "executor_invoke_perf_ns": 100_000_000,
             "first_node_enter_perf_ns": 102_000_000,
             "sampler_node_enter_perf_ns": 105_000_000,
-            "sampler_stage_start_perf_ns": 108_500_000,
+            "sampler_node_to_sampler_start_ms": 3.5,
             "pre_sampler_unattributed_ms": 1.25,
         },
         run_enter_mono_ns=6_000_000,
