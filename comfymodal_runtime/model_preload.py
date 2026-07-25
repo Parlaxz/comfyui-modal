@@ -24,6 +24,10 @@ from collections.abc import Mapping
 from typing import Any, Callable, Iterator
 
 from .contracts import ModelRestoreKey, PrefillKey, stable_hash
+from .cpu_snapshot_models import (
+    collect_unet_runtime_state,
+    diff_unet_runtime_states,
+)
 from .trace import RuntimeTrace
 
 # ── Prefill lane mode ─────────────────────────────────────────────────
@@ -77,6 +81,26 @@ _LATEST_RESTORE_RETURN_MARKER: dict[str, Any] | None = None
 """Set immediately before ``restore()`` returns with wall/monotonic time,
 both restore IDs, MODAL_TASK_ID, and PID.  Read by ``run_plan_stream`` method
 entry for method-entry-gap computation."""
+
+_LATEST_SNAPSHOT_UNET_STATE: dict[str, Any] | None = None
+"""Captured ``collect_unet_runtime_state`` after successful retarget of a
+CPU-snapshot UNET.  Used by ``V2LoaderBridge._load_unet`` to emit a runtime-
+state diff when the normal loader path serves a request.  Set via
+``_set_latest_snapshot_unet_state()``, reset to ``None`` after consuming."""
+
+
+def _set_latest_snapshot_unet_state(state: dict[str, Any]) -> None:
+    """Store the latest post-retarget snapshot UNET state for diff emission."""
+    global _LATEST_SNAPSHOT_UNET_STATE
+    _LATEST_SNAPSHOT_UNET_STATE = dict(state) if state else None
+
+
+def _consume_latest_snapshot_unet_state() -> dict[str, Any] | None:
+    """Return and clear the stored snapshot UNET state."""
+    global _LATEST_SNAPSHOT_UNET_STATE
+    result = _LATEST_SNAPSHOT_UNET_STATE
+    _LATEST_SNAPSHOT_UNET_STATE = None
+    return result
 
 _DIAGNOSTIC_FLAG: bool = (
     os.environ.get("COMFYMODAL_V2_DEEP_MODEL_DIAG", "0") == "1"
@@ -4826,7 +4850,40 @@ class V2LoaderBridge:
             "weight_dtype": request.get("weight_dtype", "default"),
         }
         result = self._invoke_original("UNETLoader", kwargs)
-        return result[0] if isinstance(result, (tuple, list)) and result else result
+        unet = result[0] if isinstance(result, (tuple, list)) and result else result
+
+        # ── Emit normal_loader_ready state ──────────────────────────────
+        try:
+            _normal_state = collect_unet_runtime_state(unet, model_management=None)
+            _state_json = __import__("json").dumps(
+                _normal_state, default=str, separators=(",", ":"), sort_keys=True,
+            )
+            print(
+                f"[v2.unet_runtime_state] "
+                f"stage=normal_loader_ready "
+                f"unet_identity={model_key.unet_identity} "
+                f"weight_dtype={_normal_state.get('weight_dtype', 'absent')} "
+                f"state={_state_json}",
+                flush=True,
+            )
+            # ── Emit diff against snapshot state when available ─────────
+            _snap_state = _consume_latest_snapshot_unet_state()
+            if _snap_state is not None:
+                _diff = diff_unet_runtime_states(_snap_state, _normal_state)
+                if _diff:
+                    _diff_json = __import__("json").dumps(
+                        _diff, default=str, separators=(",", ":"), sort_keys=True,
+                    )
+                    print(
+                        f"[v2.unet_runtime_diff] "
+                        f"field_count={len(_diff)} "
+                        f"fields={_diff_json}",
+                        flush=True,
+                    )
+        except Exception:
+            pass
+
+        return unet
 
     def _load_clip(self, model_key: ModelRestoreKey) -> Any:
         request = self._find_request("clip", model_key.clip_identity)

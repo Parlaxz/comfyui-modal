@@ -1256,5 +1256,289 @@ class TestDataclassDefaults(unittest.TestCase):
         self.assertEqual(models.load_timings_ms, {})
 
 
+# ---------------------------------------------------------------------------
+# Extra fake patchers for runtime-state tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeUNETComplete:
+    """Full-featured fake UNET patcher with all expected attributes."""
+    def __init__(self, device="cpu", dtype="torch.float16"):
+        self.model = _FakeModule(device)
+        self.model.diffusion_model = _FakeModule(device)
+        self.load_device = device
+        self.offload_device = "cpu"
+        self.model_dtype = dtype
+        self.manual_cast_dtype = dtype
+        self.weight_dtype = dtype
+        self.model_options = {"some_option": 1}
+        self.transformer_options = {"some_transformer_opt": 2}
+        self.patches = {"patch1": object(), "patch2": object()}
+        self.object_patches = {"op1": object()}
+        self.model_loaded_weight_memory = 1234567890
+        self.model_lowvram = False
+        self.model_lowvram_patch_counter = 0
+
+    def forward(self, x):
+        return x
+
+
+class _FakeUNETMinimal:
+    """Minimal UNET patcher with only the required attributes."""
+    def __init__(self):
+        self.model = _FakeModule("cpu")
+        self.load_device = "cpu"
+        self.offload_device = "cpu"
+
+
+class _FakeUNETNoModel:
+    """UNET-like object without .model attribute."""
+    pass
+
+
+class TestCollectUnetRuntimeState(unittest.TestCase):
+    """collect_unet_runtime_state edge-to-edge coverage."""
+
+    def test_collect_complete_patcher(self):
+        """Complete patcher returns all fields, no absent values for standard attrs."""
+        from comfymodal_runtime.cpu_snapshot_models import collect_unet_runtime_state
+        patcher = _FakeUNETComplete()
+        state = collect_unet_runtime_state(patcher)
+        self.assertIsInstance(state, dict)
+        # Type identities present
+        self.assertEqual(state["patcher_type"], "_FakeUNETComplete")
+        self.assertEqual(state["model_type"], "_FakeModule")
+        self.assertIn("diffusion_model_type", state)
+        # Object IDs present (non-empty strings)
+        self.assertTrue(state["patcher_object_id"])
+        self.assertTrue(state["model_object_id"])
+        self.assertTrue(state["diffusion_model_object_id"])
+        # Device fields
+        self.assertIn(state["load_device"], ("cpu", "absent"))
+        self.assertIn(state["offload_device"], ("cpu", "absent"))
+        # Parameter/buffer fields from first parameter only
+        self.assertEqual(state["first_parameter_device"], "cpu")
+        self.assertEqual(state["first_buffer_device"], "cpu")
+        # Options keys sorted
+        self.assertEqual(state["model_options_keys"], ["some_option"])
+        self.assertEqual(state["transformer_options_keys"], ["some_transformer_opt"])
+        # Patch counts
+        self.assertEqual(state["patch_count"], 2)
+        self.assertEqual(state["object_patch_count"], 1)
+        # Memory / lowvram
+        self.assertEqual(state["model_loaded_weight_memory"], "1234567890")
+        self.assertEqual(state["model_lowvram"], "False")
+        # Forward
+        self.assertEqual(state["forward_module"], "_FakeUNETComplete")
+        self.assertIsInstance(state["forward_qualname"], str)
+        self.assertTrue(state["forward_qualname"].endswith("forward"))
+
+    def test_collect_minimal_patcher(self):
+        """Minimal patcher returns 'absent' for missing advanced fields."""
+        from comfymodal_runtime.cpu_snapshot_models import collect_unet_runtime_state
+        patcher = _FakeUNETMinimal()
+        state = collect_unet_runtime_state(patcher)
+        self.assertIsInstance(state, dict)
+        # model_dtype, manual_cast_dtype, weight_dtype all absent
+        self.assertEqual(state["model_dtype"], "absent")
+        self.assertEqual(state["manual_cast_dtype"], "absent")
+        self.assertEqual(state["weight_dtype"], "absent")
+        # patch counts absent when attribute missing
+        self.assertEqual(state["patch_count"], "absent")
+        self.assertEqual(state["object_patch_count"], "absent")
+        # model_loaded_weight_memory absent
+        self.assertEqual(state["model_loaded_weight_memory"], "absent")
+
+    def test_collect_no_model(self):
+        """Object without .model returns absent for model-specific fields."""
+        from comfymodal_runtime.cpu_snapshot_models import collect_unet_runtime_state
+        state = collect_unet_runtime_state(_FakeUNETNoModel())
+        self.assertEqual(state["model_type"], "absent")
+        self.assertEqual(state["diffusion_model_type"], "absent")
+        self.assertEqual(state["model_object_id"], "absent")
+        self.assertEqual(state["diffusion_model_object_id"], "absent")
+        self.assertEqual(state["first_parameter_device"], "absent")
+
+    def test_collect_no_tensor_contents(self):
+        """No tensor values or reprs in state values."""
+        from comfymodal_runtime.cpu_snapshot_models import collect_unet_runtime_state
+        state = collect_unet_runtime_state(_FakeUNETComplete())
+        for key, value in state.items():
+            self.assertIsInstance(value, (str, int, float, bool, list, dict))
+            s = str(value)
+            # Ensure no tensor repr leaks
+            self.assertNotIn("FakeTensor", s, msg=f"tensor content leaked in {key}={value!r}")
+            self.assertNotIn("<", s, msg=f"object repr leaked in {key}={value!r}")
+
+    def test_collect_only_first_parameter_and_buffer(self):
+        """Only first parameter and first buffer are inspected."""
+        from comfymodal_runtime.cpu_snapshot_models import collect_unet_runtime_state
+        patcher = _FakeUNETComplete()
+        state = collect_unet_runtime_state(patcher)
+        self.assertIsInstance(state["first_parameter_device"], str)
+        self.assertIsInstance(state["first_parameter_dtype"], str)
+        self.assertIsInstance(state["first_buffer_device"], str)
+        self.assertIsInstance(state["first_buffer_dtype"], str)
+        # Should not iterate beyond first
+        self.assertNotIn("all_parameters", state)
+        self.assertNotIn("all_buffers", state)
+
+    def test_collect_deterministic_keys(self):
+        """State dict keys are deterministic (sorted by insertion order)."""
+        from comfymodal_runtime.cpu_snapshot_models import collect_unet_runtime_state
+        state_a = collect_unet_runtime_state(_FakeUNETComplete())
+        state_b = collect_unet_runtime_state(_FakeUNETComplete())
+        self.assertEqual(list(state_a.keys()), list(state_b.keys()))
+
+
+class TestDiffUnetRuntimeStates(unittest.TestCase):
+    """diff_unet_runtime_states coverage."""
+
+    def _make_state(self, overrides: dict | None = None) -> dict[str, str]:
+        base = {
+            "patcher_type": "ModelPatcher",
+            "model_type": "UNetModel",
+            "load_device": "cpu",
+            "offload_device": "cpu",
+            "weight_dtype": "fp8_e4m3fn",
+            "patch_count": "0",
+            "model_loaded_weight_memory": "1000",
+        }
+        if overrides:
+            base.update(overrides)
+        return base
+
+    def test_diff_identical(self):
+        from comfymodal_runtime.cpu_snapshot_models import diff_unet_runtime_states
+        s = self._make_state()
+        diff = diff_unet_runtime_states(s, s)
+        self.assertEqual(diff, {})
+
+    def test_diff_single_field(self):
+        from comfymodal_runtime.cpu_snapshot_models import diff_unet_runtime_states
+        a = self._make_state({"load_device": "cpu"})
+        b = self._make_state({"load_device": "cuda:0"})
+        diff = diff_unet_runtime_states(a, b)
+        self.assertIn("load_device", diff)
+        self.assertEqual(diff["load_device"]["snapshot"], "cpu")
+        self.assertEqual(diff["load_device"]["normal"], "cuda:0")
+        # Only the differing field
+        self.assertEqual(len(diff), 1)
+
+    def test_diff_multiple_fields(self):
+        from comfymodal_runtime.cpu_snapshot_models import diff_unet_runtime_states
+        a = self._make_state({"load_device": "cpu", "offload_device": "cpu", "patch_count": "5"})
+        b = self._make_state({"load_device": "cuda:0", "offload_device": "cpu", "patch_count": "3"})
+        diff = diff_unet_runtime_states(a, b)
+        self.assertIn("load_device", diff)
+        self.assertIn("patch_count", diff)
+        self.assertNotIn("offload_device", diff)
+        self.assertEqual(len(diff), 2)
+
+    def test_diff_missing_key(self):
+        from comfymodal_runtime.cpu_snapshot_models import diff_unet_runtime_states
+        a = self._make_state({"extra_field": "present"})
+        b = self._make_state({})
+        diff = diff_unet_runtime_states(a, b)
+        self.assertIn("extra_field", diff)
+
+    def test_diff_sorted_output(self):
+        """Diff keys are sorted for deterministic output."""
+        from comfymodal_runtime.cpu_snapshot_models import diff_unet_runtime_states
+        a = self._make_state({"b_field": "1", "a_field": "2"})
+        b = self._make_state({"b_field": "x", "a_field": "y"})
+        diff = diff_unet_runtime_states(a, b)
+        keys = list(diff.keys())
+        self.assertEqual(keys, sorted(keys))
+
+
+class TestRehydrateCpuSnapshotUnet(unittest.TestCase):
+    """rehydrate_cpu_snapshot_unet coverage."""
+
+    def test_rehydrate_success(self):
+        from comfymodal_runtime.cpu_snapshot_models import rehydrate_cpu_snapshot_unet
+        patcher = _FakeUNETComplete(device="cpu", dtype="torch.float16")
+        ok, reason = rehydrate_cpu_snapshot_unet(
+            patcher,
+            model_management=_FakeModelManagement,
+        )
+        self.assertTrue(ok, msg=reason)
+        self.assertEqual(reason, "ok")
+        # load_device and offload_device changed
+        self.assertEqual(patcher.load_device, "cuda:0")
+        self.assertEqual(patcher.offload_device, "cpu")
+
+    def test_rehydrate_no_change_to_other_fields(self):
+        """Rehydration changes only load_device (and offload_device when different)."""
+        from comfymodal_runtime.cpu_snapshot_models import (
+            rehydrate_cpu_snapshot_unet,
+            collect_unet_runtime_state,
+        )
+        patcher = _FakeUNETComplete(device="cpu", dtype="torch.float16")
+        state_before = collect_unet_runtime_state(patcher)
+        ok, reason = rehydrate_cpu_snapshot_unet(
+            patcher,
+            model_management=_FakeModelManagement,
+        )
+        self.assertTrue(ok)
+        state_after = collect_unet_runtime_state(patcher)
+        # Identify what changed
+        changed = {k for k in state_before if str(state_before[k]) != str(state_after[k])}
+        # load_device must change (cpu -> cuda:0)
+        self.assertIn("load_device", changed)
+        # Core identity fields must NOT change
+        frozen = {"patcher_type", "model_type", "diffusion_model_type",
+                  "patcher_object_id", "model_object_id", "diffusion_model_object_id",
+                  "model_dtype", "manual_cast_dtype", "weight_dtype",
+                  "model_options_keys", "transformer_options_keys",
+                  "patch_count", "object_patch_count",
+                  "model_loaded_weight_memory", "model_lowvram",
+                  "model_lowvram_patch_counter", "forward_module", "forward_qualname"}
+        actually_changed_frozen = changed & frozen
+        self.assertEqual(
+            actually_changed_frozen, set(),
+            msg=f"Frozen fields changed: {actually_changed_frozen}",
+        )
+
+    def test_rehydrate_no_model(self):
+        from comfymodal_runtime.cpu_snapshot_models import rehydrate_cpu_snapshot_unet
+        ok, reason = rehydrate_cpu_snapshot_unet(
+            _FakeUNETNoModel(),
+            model_management=_FakeModelManagement,
+        )
+        self.assertFalse(ok)
+        self.assertIn("model", reason.lower())
+
+    def test_rehydrate_missing_mgmt_func(self):
+        from comfymodal_runtime.cpu_snapshot_models import rehydrate_cpu_snapshot_unet
+        patcher = _FakeUNETComplete(device="cpu")
+        ok, reason = rehydrate_cpu_snapshot_unet(
+            patcher,
+            model_management=_FakeModelManagementMissingFunc,
+        )
+        self.assertFalse(ok)
+        # Either missing function is reported first
+        self.assertTrue(
+            "get_torch_device" in reason or "unet_offload_device" in reason,
+            msg=f"Expected one of the missing functions in reason, got: {reason}",
+        )
+
+    def test_rehydrate_with_trace(self):
+        """rehydrate emits pre/post state via trace when trace is provided."""
+        from comfymodal_runtime.cpu_snapshot_models import rehydrate_cpu_snapshot_unet
+        from comfymodal_runtime.trace import RuntimeTrace
+        patcher = _FakeUNETComplete(device="cpu")
+        trace = RuntimeTrace()
+        ok, reason = rehydrate_cpu_snapshot_unet(
+            patcher,
+            model_management=_FakeModelManagement,
+            trace=trace,
+        )
+        self.assertTrue(ok)
+        names = {e.name for e in trace.events}
+        self.assertIn("unet_rehydrate_pre_state", names)
+        self.assertIn("unet_rehydrate_post_state", names)
+
+
 if __name__ == "__main__":
     unittest.main()

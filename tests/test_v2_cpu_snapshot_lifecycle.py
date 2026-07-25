@@ -2278,19 +2278,23 @@ class CpuSnapshotBypassUnetRequestBindingTest(unittest.TestCase):
     def test_exact_bypass_stdout(self):
         """Bypass print line matches expected format."""
         outcome = self._run_plan_c_branch(True)
-        self.assertEqual(
-            outcome["stdout"].strip(),
+        stdout = outcome["stdout"].strip()
+        self.assertIn(
             "[v2.cpu_snapshot_request] status=partial_bypass "
             "reason=diagnostic_unet_bypass clip_source=cpu_snapshot "
             "unet_source=normal_loader",
+            stdout,
         )
+        # Runtime state line is emitted by bridge._load_unet
+        self.assertIn("[v2.unet_runtime_state] stage=normal_loader_ready", stdout)
 
     def test_exact_reuse_stdout(self):
         """Reuse print line matches expected format."""
         outcome = self._run_plan_c_branch(False)
-        self.assertEqual(
-            outcome["stdout"].strip(),
+        stdout = outcome["stdout"].strip()
+        self.assertIn(
             "[v2.cpu_snapshot_request] status=reused reason=ok",
+            stdout,
         )
 
 

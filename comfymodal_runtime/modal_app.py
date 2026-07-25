@@ -47,6 +47,8 @@ from .model_preload import (
 )
 from .cpu_snapshot_models import (
     CpuSnapshotModels,
+    collect_unet_runtime_state,
+    diff_unet_runtime_states,
     identity_from_profile,
     load_cpu_snapshot_models,
     validate_cpu_snapshot_models,
@@ -1886,6 +1888,25 @@ class ModalRuntimeEntrypoint:
                         else:
                             _comfy_utils.DISABLE_MMAP = _mmap_orig
 
+                    # ── Emit snapshot_created runtime state ─────────────────
+                    try:
+                        _snap_state = collect_unet_runtime_state(
+                            _cpu_models.unet,
+                            model_management=None,
+                        )
+                        _unet_ident = getattr(getattr(_cpu_models, "model_key", None), "unet_identity", "")
+                        _state_json = __import__("json").dumps(_snap_state, default=str, separators=(",", ":"), sort_keys=True)
+                        print(
+                            f"[v2.unet_runtime_state] "
+                            f"stage=snapshot_created "
+                            f"unet_identity={_unet_ident} "
+                            f"weight_dtype={_snap_state.get('weight_dtype', 'absent')} "
+                            f"state={_state_json}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
+
                     self._cpu_snapshot_models = _cpu_models
                     self._cpu_snapshot_models_active = False
                     _cpu_snap_ok = True
@@ -2317,11 +2338,66 @@ class ModalRuntimeEntrypoint:
 
                     # Retarget devices through live model_management.
                     import comfy.model_management as _mm
+                    _unet_ident = getattr(getattr(models, "model_key", None), "unet_identity", "")
+
+                    # ── Emit pre-retarget state ─────────────────────────
+                    _pre_retarget_state: dict[str, Any] = {}
+                    try:
+                        _pre_retarget_state = collect_unet_runtime_state(
+                            models.unet, model_management=_mm,
+                        )
+                        _state_json_pre = __import__("json").dumps(
+                            _pre_retarget_state, default=str, separators=(",", ":"), sort_keys=True,
+                        )
+                        print(
+                            f"[v2.unet_runtime_state] "
+                            f"stage=snapshot_restored_pre_retarget "
+                            f"unet_identity={_unet_ident} "
+                            f"weight_dtype={_pre_retarget_state.get('weight_dtype', 'absent')} "
+                            f"restored_instance_id={restored_instance_id} "
+                            f"restore_session_id={restore_session_id} "
+                            f"state={_state_json_pre}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
+
                     retarget_ok, retarget_reason = retarget_cpu_snapshot_models(
                         models, model_management=_mm,
                     )
                     if not retarget_ok:
                         raise RuntimeError(f"retarget failed: {retarget_reason}")
+
+                    # ── Emit post-retarget state ────────────────────────
+                    _post_retarget_state: dict[str, Any] = {}
+                    try:
+                        _post_retarget_state = collect_unet_runtime_state(
+                            models.unet, model_management=_mm,
+                        )
+                        _state_json_post = __import__("json").dumps(
+                            _post_retarget_state, default=str, separators=(",", ":"), sort_keys=True,
+                        )
+                        print(
+                            f"[v2.unet_runtime_state] "
+                            f"stage=snapshot_restored_post_retarget "
+                            f"unet_identity={_unet_ident} "
+                            f"weight_dtype={_post_retarget_state.get('weight_dtype', 'absent')} "
+                            f"restored_instance_id={restored_instance_id} "
+                            f"restore_session_id={restore_session_id} "
+                            f"state={_state_json_post}",
+                            flush=True,
+                        )
+                        # Store for later diff against normal_loader_ready
+                        try:
+                            from comfymodal_runtime.model_preload import (
+                                _set_latest_snapshot_unet_state,
+                            )
+                            _set_latest_snapshot_unet_state(_post_retarget_state)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
                     # Activate on the bridge.
                     self._use_cpu_snapshot_models_on_bridge(
                         plan.model_key,
