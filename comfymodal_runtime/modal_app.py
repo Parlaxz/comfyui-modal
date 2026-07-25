@@ -2469,6 +2469,16 @@ class ModalRuntimeEntrypoint:
                             "restore_session_id": restore_session_id,
                             "state": _post_retarget_state,
                         })
+                        # Diagnostic: confirm store succeeded
+                        _diag_stored = self._cpu_snapshot_unet_runtime_state
+                        print(
+                            f"[v2.unet_runtime_state_store] "
+                            f"status={'stored' if _diag_stored is not None else 'failed'} "
+                            f"unet_identity={_unet_ident} "
+                            f"state_type={type(_post_retarget_state).__name__} "
+                            f"state_len={len(_post_retarget_state)}",
+                            flush=True,
+                        )
                     except Exception:
                         pass
 
