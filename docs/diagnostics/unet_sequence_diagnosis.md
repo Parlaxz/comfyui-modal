@@ -4,9 +4,13 @@
 
 **Selected diagnosis: Snapshot construction or runtime-form divergence**
 
-**Confidence: medium**
+**Confidence:**
+- Persistent snapshot-path sampling regression: **high**
+- Container warmth only fixes setup work: **high**
+- Snapshot construction/runtime-form divergence: **high**
+- FP32/CPU actual-forward execution as the precise cause: **unproven**
 
-The CPU snapshot model persists in FP32 on CPU (`torch.float32`, `current_device=cpu`) while the normal loader produces BF16 on CUDA (`torch.bfloat16`, `current_device=cuda:0`). Every request using the snapshot UNET takes approximately 20.6 seconds for sampling regardless of container warmth, while every request using the normal-loader bypass takes approximately 3.7 seconds from the very first execution in a restored container. The difference in dtype/device between the two paths is the most visible and measurable divergence. However, this correlation does not fully prove that restoration-time dtype/device alone determines forward speed -- the snapshot path may also produce a structurally different model that cannot exploit CUDA tensor cores even if moved to GPU.
+The snapshot model is observed as FP32 on CPU (`torch.float32`, `current_device=cpu`) at the restore/post-retarget state while the normal loader produces BF16 on CUDA (`torch.bfloat16`, `current_device=cuda:0`) at the normal-loader-ready state. Every request using the snapshot UNET takes approximately 20.6 seconds for sampling regardless of container warmth, while every request using the normal-loader bypass takes approximately 3.7 seconds from the very first execution in a restored container. The difference in dtype/device between the two paths is the most visible and measurable divergence. However, this correlation does not fully prove that restoration-time dtype/device alone determines forward speed -- the snapshot path may also produce a structurally different model that cannot exploit CUDA tensor cores even if moved to GPU. The actual `NextDiT.forward` state has not yet been measured, so the forward pass dtype and device remain unconfirmed.
 
 **Container warmth does NOT fix:**
 - **Graph/cache setup:** Container warmth removes pre-sampler overhead (graph load, GPU commit, model loading) but the sampler duration remains unchanged.
@@ -33,7 +37,8 @@ The CPU snapshot model persists in FP32 on CPU (`torch.float32`, `current_device
 |---|---|---|---|---|---|---|
 | RR | Yes | `576be42a962b400a` | `cabe87bcddd94aa5a674af6fb3ee93dd` | `9a6dc99e37cb4e5c9622aac38c799cc1` | PID 2, hostname `modal` | Both RR requests share all three identity fields. |
 | BB | Yes | `576be42a962b400a` | `62cf7f1a70be4b93a4a73859ffa027eb` | `fe1e8078b8234aea9df7bc07563349c6` | PID 2, hostname `modal` | Both BB requests share all three identity fields. Container_session_id matches RR because the same Modal container process handled both sequences (container did not fully scale down). However, a new restore occurred due to the changed execution plan (bypass flag), producing a new restored_instance_id. Valid for within-sequence comparison. |
-| RBR | Yes | `ead69123aebf408f` | R1: `83f5ee0f725e4e7e814f7f1f049b1c99`, B2/R3: `f68cc2ec858a43d3a2fc780a5934dbb7` | R1: `a6d0bdce221c4cffa35f4f07fbdc4713`, B2/R3: `ba022c5955824917a942129bfcdf76d2` | PID 2, hostname `modal` | All three requests in the same Modal container. R1 has a different restored_instance_id because the initial snapshot session was replaced when the bypass flag changed the restore plan. B2 and R3 share the same restore session. All three share `container_session_id=ead69123aebf408f`. |
+| full RBR | No | `ead69123aebf408f` | R1: `83f5ee0f725e4e7e814f7f1f049b1c99`, B2/R3: `f68cc2ec858a43d3a2fc780a5934dbb7` | R1: `a6d0bdce221c4cffa35f4f07fbdc4713`, B2/R3: `ba022c5955824917a942129bfcdf76d2` | PID 2, hostname `modal` | Full RBR crosses restored-instance and restore-session identities (R1 different from B2/R3). Invalid as one restored-instance sequence. |
+| B2→R3 | Yes | `ead69123aebf408f` | `f68cc2ec858a43d3a2fc780a5934dbb7` | `ba022c5955824917a942129bfcdf76d2` | PID 2, hostname `modal` | B2 and R3 share restored_instance_id and restore_session_id. Valid within one restored instance. |
 
 ## 4. Request timing results
 
@@ -69,9 +74,11 @@ Key observations:
 | loaded_models_member | 0 | 0 | 0 |
 | model_loaded_weight_memory | 0 | 0 | 0 |
 
-The critical difference: the snapshot model's `first_parameter_device` is `cpu` and `first_parameter_dtype` is `torch.float32` even after retargetting to `load_device=cuda:0`. The snapshot restoration does load the model into CUDA memory (restore_gpu_state_ms is significant: 2449-5038ms), but the parameter tensors themselves remain in FP32 on the CPU. The normal loader produces parameters that are already `torch.bfloat16` on `cuda:0`.
+The critical difference: the snapshot model's `first_parameter_device` is `cpu` and `first_parameter_dtype` is `torch.float32` even after retargetting to `load_device=cuda:0`. The `restore_gpu_state_ms` values (2449-5038ms) indicate GPU-side restore work occurred, but this does not confirm that UNET parameter tensors themselves were transferred to CUDA -- the metric covers general GPU state restoration, not per-tensor placement. The normal loader produces parameters that are already `torch.bfloat16` on `cuda:0`.
 
-Both paths report `manual_cast_dtype=absent`, meaning no automatic dtype casting is applied after loading.
+Both paths report `manual_cast_dtype=absent`. This indicates the field was absent at the inspected object location, but does not prove that no dtype casting occurs elsewhere in the loading pipeline.
+
+Note: `loaded_models_member=0` in all three columns. This value may be limited by wrapper shape and is not authoritative until the pinned ComfyUI `LoadedModel` structure is inspected.
 
 ## 6. RR analysis
 
@@ -143,13 +150,16 @@ Improves with container warmth. Pre-sampler drops from approximately 16-34s to a
 The pre-sampler phase includes sampler node resolution, model patching, conditioning, and graph execution. After container warmth, the pre-sampler for snapshot requests drops to approximately 3.7-8.7s. This is the same pattern as graph/cache initialization.
 
 **UNET forward/sampling:**
-This is the dominant bottleneck. Snapshot: approximately 20.6s regardless of container warmth. Normal-loader: approximately 3.7s regardless of container warmth. The 5.6x difference (20600/3690) correlates with the dtype/device divergence. The snapshot model runs its forward pass in FP32 on CPU (after retarget, parameters remain on CPU despite load_device=cuda:0), while the normal-loaded model runs in BF16 on CUDA. An RTX-PRO-6000 with tensor cores would be expected to execute BF16 matrix multiplications 4-8x faster than FP32 CPU execution, consistent with the observed gap.
+This is the dominant bottleneck. Snapshot: approximately 20.6s regardless of container warmth. Normal-loader: approximately 3.7s regardless of container warmth. The 5.6x difference (20600/3690) correlates with observed static-state divergence: the snapshot model is FP32 on CPU at restore/post-retarget state, while the normal-loaded model is BF16 on CUDA at normal-loader-ready state. However, the actual `NextDiT.forward` state has not been measured -- the forward pass dtype, device, and execution path remain unconfirmed. If confirmed, an RTX-PRO-6000 with tensor cores executing BF16 would be expected to significantly outperform FP32 on CPU, but this remains a hypothesis until forward-time measurement is performed.
 
-## 11. Recommended next step
+## 11. Actual-forward measurement still required
 
-Capture the snapshot and normal-loader model's actual dtype and device at the first `NextDiT.forward` call. If confirmed FP32 (snapshot) versus BF16 (normal loader), construct the CPU snapshot through the original loader using the explicit intended BF16 weight dtype. Retest RR.
+The next diagnostic must capture the model state at two critical points:
 
-Do not implement this repair in this task -- this is a diagnostic recommendation only.
+1. State immediately after `load_models_gpu` completes.
+2. State immediately before the first `NextDiT.forward` call.
+
+This will confirm whether the snapshot path actually executes its forward pass in FP32 on CPU, and whether the normal-loader path actually executes in BF16 on CUDA. Until these measurements are taken, the dtype/device divergence is only confirmed at static inspection points, not during execution.
 
 ## 12. Artifact locations
 
@@ -173,7 +183,16 @@ All paths are relative to the repository root (`C:\Users\parla\OneDrive\Document
 
 ## 13. Remaining uncertainty
 
-- The test did not confirm that FP32 on CPU is the *sole* cause of the slow sampler. The snapshot and normal-loader models may also differ in structure (e.g., memory format, graph compilation state, CUDA graph capture) that affects forward speed independently of dtype.
+### High-confidence findings
+- **Persistent snapshot-path sampling regression:** The snapshot UNET consistently takes approximately 20.6s per sampling call across all sequences, regardless of container warmth. This is the primary regression.
+- **Container warmth only fixes setup work:** Pre-sampler work (graph loading, GPU commit, model setup) improves with warmth; the sampler itself does not. This applies to both snapshot and normal-loader paths.
+- **Snapshot construction/runtime-form divergence:** The snapshot model is observed as FP32 on CPU at restore/post-retarget state, while the normal-loader model is BF16 on CUDA at normal-loader-ready state. This static-state divergence is the most visible difference and the leading hypothesis for the 5.6x latency gap.
+
+### Unproven
+- **FP32/CPU actual-forward execution as the precise cause:** The snapshot forward pass has not been instrumented. The observed static state (FP32/CPU after restore/post-retarget) may not reflect the actual execution state at `NextDiT.forward` time. The model could be moved or cast between the inspection point and execution. This must be confirmed by measuring state immediately after `load_models_gpu` and immediately before the first `NextDiT.forward` call.
+
+### Additional uncertainties
 - The BB sequence ran in the same Modal container process as RR (same `container_session_id`). While a new restore occurred (different `restored_instance_id`), some residual GPU state from RR's snapshot restore may have persisted. This does not affect the within-sequence comparison but means the BB-first-request wall time of 127s included some shared initialization.
+- `loaded_models_member=0` may be limited by wrapper shape and is not authoritative until the pinned ComfyUI `LoadedModel` structure is inspected.
 - No Modal-side logs were available to confirm container task IDs, GPU metrics, or CUDA kernel timing at runtime. The analysis relies entirely on the generated JSON artifacts and trace events.
 - The workflow uses a Z-Image-Turbo (Lumina2/NextDiT) model. The findings may not generalize to other model architectures.
