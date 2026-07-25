@@ -32,18 +32,18 @@ class GpuCatalogTests(unittest.TestCase):
             os.environ[self._ENV_KEY] = self._old_env
 
     # ── baseline ─────────────────────────────────────────────────────
-    def test_default_gpu_is_a10g(self):
-        self.assertEqual(DEFAULT_GPU, "a10g")
+    def test_default_gpu_is_rtx_pro_6000(self):
+        self.assertEqual(DEFAULT_GPU, "rtx-pro-6000")
 
     def test_catalog_contains_expected_single_gpu_values(self):
         self.assertEqual(
             GPU_VALUES,
             [
+                "rtx-pro-6000",
                 "t4",
                 "l4",
                 "a10g",
                 "l40s",
-                "rtx-pro-6000",
                 "a100",
                 "a100-40gb",
                 "a100-80gb",
@@ -104,7 +104,7 @@ class GpuCatalogTests(unittest.TestCase):
     def test_get_default_gpu_unchanged_when_default_not_hidden(self):
         os.environ[self._ENV_KEY] = "t4"
         _clear_hidden_cache()
-        self.assertEqual(get_default_gpu(), "a10g")
+        self.assertEqual(get_default_gpu(), "rtx-pro-6000")
 
     def test_normalize_gpu_value_handles_edge_cases(self):
         self.assertEqual(normalize_gpu_value(""), "")
@@ -174,6 +174,7 @@ class GpuCatalogTests(unittest.TestCase):
             value = entry["value"]
             result = gpu_supports_bf16(value)
             self.assertIsInstance(result, bool, f"GPU {value} has no BF16 classification")
+            self.assertEqual(result, value != "t4", f"Unexpected BF16 policy for {value}")
 
 
 if __name__ == "__main__":
