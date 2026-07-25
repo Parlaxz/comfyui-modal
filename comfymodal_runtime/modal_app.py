@@ -2955,6 +2955,8 @@ class ModalRuntimeEntrypoint:
             raise RuntimeError("execution cancelled before PromptExecutor start")
         _report_host_memory("prompt_executor_start")
         trace = context.trace or RuntimeTrace(request_id=context.request_id, process="remote")
+        # RUN_IN_PROCESS_ENTERED: verify this code is deployed
+        print("[v2.unet_diag] RUN_IN_PROCESS_ENTERED", flush=True)
         trace.emit("runtime_config_start", phase="execution")
         self._configure_runtime()
         trace.emit("runtime_config_end", phase="execution")
