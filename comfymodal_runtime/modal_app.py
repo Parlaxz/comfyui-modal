@@ -1894,12 +1894,22 @@ class ModalRuntimeEntrypoint:
                             model_management=None,
                         )
                         _unet_ident = getattr(getattr(_cpu_models, "model_key", None), "unet_identity", "")
+                        # Derive requested_weight_dtype from model_spec loaders.unet
+                        _req_wd_snap = "default"
+                        try:
+                            _snap_loaders = (_cpu_models.model_spec or {}).get("loaders", {}).get("unet", [])
+                            for _sl in _snap_loaders:
+                                if isinstance(_sl, Mapping) and _sl.get("unet_name") == _unet_ident:
+                                    _req_wd_snap = str(_sl.get("weight_dtype", "default"))
+                                    break
+                        except Exception:
+                            _req_wd_snap = "default"
                         _state_json = __import__("json").dumps(_snap_state, default=str, separators=(",", ":"), sort_keys=True)
                         print(
                             f"[v2.unet_runtime_state] "
                             f"stage=snapshot_created "
                             f"unet_identity={_unet_ident} "
-                            f"weight_dtype={_snap_state.get('weight_dtype', 'absent')} "
+                            f"requested_weight_dtype={_req_wd_snap} "
                             f"state={_state_json}",
                             flush=True,
                         )
@@ -1908,7 +1918,7 @@ class ModalRuntimeEntrypoint:
                             metadata={
                                 "stage": "snapshot_created",
                                 "unet_identity": _unet_ident,
-                                "requested_weight_dtype": _snap_state.get("weight_dtype", ""),
+                                "requested_weight_dtype": _req_wd_snap,
                                 "request_id": "",
                                 "restored_instance_id": "",
                                 "restore_session_id": "",
@@ -2357,6 +2367,17 @@ class ModalRuntimeEntrypoint:
                         _pre_retarget_state = collect_unet_runtime_state(
                             models.unet, model_management=_mm,
                         )
+                        # Derive requested_weight_dtype from plan.model_spec
+                        _req_wd_pre = "default"
+                        try:
+                            _plan_unet = (plan.model_spec or {}).get("loaders", {}).get("unet", [])
+                            _plan_uid = getattr(getattr(plan, "model_key", None), "unet_identity", "")
+                            for _pl in _plan_unet:
+                                if isinstance(_pl, Mapping) and _pl.get("unet_name") == _plan_uid:
+                                    _req_wd_pre = str(_pl.get("weight_dtype", "default"))
+                                    break
+                        except Exception:
+                            _req_wd_pre = "default"
                         _state_json_pre = __import__("json").dumps(
                             _pre_retarget_state, default=str, separators=(",", ":"), sort_keys=True,
                         )
@@ -2364,7 +2385,7 @@ class ModalRuntimeEntrypoint:
                             f"[v2.unet_runtime_state] "
                             f"stage=snapshot_restored_pre_retarget "
                             f"unet_identity={_unet_ident} "
-                            f"weight_dtype={_pre_retarget_state.get('weight_dtype', 'absent')} "
+                            f"requested_weight_dtype={_req_wd_pre} "
                             f"restored_instance_id={restored_instance_id} "
                             f"restore_session_id={restore_session_id} "
                             f"state={_state_json_pre}",
@@ -2375,7 +2396,7 @@ class ModalRuntimeEntrypoint:
                             metadata={
                                 "stage": "snapshot_restored_pre_retarget",
                                 "unet_identity": _unet_ident,
-                                "requested_weight_dtype": _pre_retarget_state.get("weight_dtype", ""),
+                                "requested_weight_dtype": _req_wd_pre,
                                 "request_id": str(trace.request_id if trace else ""),
                                 "restored_instance_id": restored_instance_id,
                                 "restore_session_id": restore_session_id,
@@ -2397,6 +2418,17 @@ class ModalRuntimeEntrypoint:
                         _post_retarget_state = collect_unet_runtime_state(
                             models.unet, model_management=_mm,
                         )
+                        # Derive requested_weight_dtype from plan.model_spec
+                        _req_wd_post = "default"
+                        try:
+                            _plan_unet_post = (plan.model_spec or {}).get("loaders", {}).get("unet", [])
+                            _plan_uid_post = getattr(getattr(plan, "model_key", None), "unet_identity", "")
+                            for _pl in _plan_unet_post:
+                                if isinstance(_pl, Mapping) and _pl.get("unet_name") == _plan_uid_post:
+                                    _req_wd_post = str(_pl.get("weight_dtype", "default"))
+                                    break
+                        except Exception:
+                            _req_wd_post = "default"
                         _state_json_post = __import__("json").dumps(
                             _post_retarget_state, default=str, separators=(",", ":"), sort_keys=True,
                         )
@@ -2404,7 +2436,7 @@ class ModalRuntimeEntrypoint:
                             f"[v2.unet_runtime_state] "
                             f"stage=snapshot_restored_post_retarget "
                             f"unet_identity={_unet_ident} "
-                            f"weight_dtype={_post_retarget_state.get('weight_dtype', 'absent')} "
+                            f"requested_weight_dtype={_req_wd_post} "
                             f"restored_instance_id={restored_instance_id} "
                             f"restore_session_id={restore_session_id} "
                             f"state={_state_json_post}",
@@ -2415,7 +2447,7 @@ class ModalRuntimeEntrypoint:
                             metadata={
                                 "stage": "snapshot_restored_post_retarget",
                                 "unet_identity": _unet_ident,
-                                "requested_weight_dtype": _post_retarget_state.get("weight_dtype", ""),
+                                "requested_weight_dtype": _req_wd_post,
                                 "request_id": str(trace.request_id if trace else ""),
                                 "restored_instance_id": restored_instance_id,
                                 "restore_session_id": restore_session_id,
