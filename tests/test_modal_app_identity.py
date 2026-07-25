@@ -22,6 +22,7 @@ from comfymodal_runtime.runtime_bootstrap import BootstrapConfig, RuntimeBootstr
 from comfymodal_runtime.trace import PROCESS_REMOTE_LIFECYCLE, PROCESS_REMOTE_METHOD
 
 import comfymodal_runtime.modal_app as modal_app
+import comfyapp
 from comfyapp import _resolve_custom_nodes_generation
 
 # ── Repo root for static source analysis ──────────────────────────────────
@@ -1503,6 +1504,227 @@ class TestResolveCustomNodesGeneration(unittest.TestCase):
         val, src = _resolve_custom_nodes_generation(api=None)
         self.assertIsInstance(val, str)
         self.assertIsInstance(src, str)
+
+
+# ── Sync actual-sync generation record creation ──────────────────────
+
+
+def _fake_cn_volume_state(_path):
+    """Minimal fake for custom_node_volume_state()."""
+    return {"dummy_node": 123.0}
+
+
+def _make_fingerprint(seed: str) -> dict:
+    """Return a custom_node_source_fingerprint-shaped dict."""
+    return {"nodes": [{"path": f"/n/{seed}", "hash": seed * 8}]}
+
+
+class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
+    """Phase 1 — _sync_custom_nodes_from_volume Step 3 must create a
+    generation record when one is absent after a successful actual sync.
+    Uses content-derived deterministic generation so concurrent containers
+    syncing identical content converge on the same value."""
+
+    # Shared fingerprint seed drives both the mock return value and the
+    # expected content-derived generation (MD5 of JSON-dumped fingerprint).
+    _FP_SEED = "test_content"
+    _EXPECTED_FP = {"nodes": [{"path": "/n/test_content", "hash": "test_contenttest_content"}]}
+
+    @classmethod
+    def _expected_gen(cls):
+        import hashlib, json
+        return hashlib.md5(json.dumps(cls._EXPECTED_FP, sort_keys=True).encode()).hexdigest()
+
+    def setUp(self):
+        from comfyapp import _ComfyAPIMixin
+
+        class _MinimalSyncAPI(_ComfyAPIMixin):
+            pass
+
+        self.api = _MinimalSyncAPI()
+        self.api._custom_nodes_generation_seen = ""
+        self.api._validation_cache = SimpleNamespace(
+            has=lambda _key, fingerprint=False: False,
+            get=lambda _key: None,
+            set=lambda _key, _value, fingerprint=False: None,
+        )
+        self.api._custom_nodes_state_last_synced = None
+
+        # Common patches that all tests need to force Step 3 actual sync.
+        self._fp_patch = patch("comfyapp.custom_node_source_fingerprint",
+                               return_value=dict(self._EXPECTED_FP))
+        self._state_patch = patch("comfyapp.custom_node_volume_state", _fake_cn_volume_state)
+        self._isdir_patch = patch("comfyapp.os.path.isdir", return_value=True)
+        self._sync_patch = patch("comfyapp.sync_custom_nodes_into_comfy",
+                                 return_value={"created": [], "removed": [], "kept": [],
+                                               "state": {"dummy": 1}})
+        self._env_patch = patch.dict("os.environ",
+                                     {"COMFYMODAL_CUSTOM_NODE_GENERATION_FASTPATH": "0"})
+        self._fp_patch.start()
+        self._state_patch.start()
+        self._isdir_patch.start()
+        self._sync_patch.start()
+        self._env_patch.start()
+        # Stub out hashlib.md5/json.dumps so the real modules work normally
+        # (the test uses the actual md5 of the mock fingerprint).
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self._sync_patch.stop()
+        self._isdir_patch.stop()
+        self._state_patch.stop()
+        self._fp_patch.stop()
+
+    def _step3_mocks(self, record_exists, record_value=None):
+        """Return a context manager that patches the record helpers and
+        ``_last_custom_node_source_fingerprint`` so the sync reaches Step 3
+        with the desired record state."""
+        _last_fp = {"nodes": [{"path": "/n/old", "hash": "oldoldoldold"}]}
+        _record_return = record_value
+        return patch.object(self.api, "_last_custom_node_source_fingerprint",
+                            _last_fp, create=True), \
+               patch("comfyapp._read_custom_nodes_generation_record",
+                     return_value=_record_return)
+
+    def test_creates_content_derived_generation_when_record_absent(self):
+        """When no generation record exists, a content-derived generation is
+        written (MD5 of the synced fingerprint), the volume is committed, and
+        ``_custom_nodes_generation_seen`` is hydrated to the same value."""
+        write_kwargs = {}
+
+        def _capture_write(reason="", generation=None):
+            write_kwargs["generation"] = generation
+            return {"generation": generation or "uuid_fallback", "schema_version": 1}
+
+        fp_patch, rec_patch = self._step3_mocks(record_exists=False, record_value=None)
+        with fp_patch, rec_patch, \
+             patch("comfyapp._write_custom_nodes_generation_record_no_commit",
+                   side_effect=_capture_write), \
+             patch("comfyapp.custom_nodes_vol") as mock_vol:
+            mock_vol.commit.side_effect = lambda: setattr(mock_vol, '_committed', True)
+            self.api._sync_custom_nodes_from_volume()
+
+        self.assertIn("generation", write_kwargs,
+                      "generation kwarg must be passed to write helper")
+        self.assertEqual(write_kwargs["generation"], self._expected_gen(),
+                         "write helper must receive the content-derived generation")
+        self.assertTrue(getattr(mock_vol, '_committed', False),
+                        "custom_nodes_vol.commit() must be called after creation")
+        self.assertEqual(self.api._custom_nodes_generation_seen, self._expected_gen(),
+                         "_custom_nodes_generation_seen must be content-derived generation")
+
+    def test_preserves_existing_record(self):
+        """When a generation record already exists, no write occurs and
+        ``_custom_nodes_generation_seen`` is hydrated from the existing value."""
+        existing_gen = "existing_gen_001"
+        called = {"write": False}
+
+        def _fail_if_called(reason="", generation=None):
+            called["write"] = True
+            return {"generation": "should_not_be_called", "schema_version": 1}
+
+        fp_patch, rec_patch = self._step3_mocks(
+            record_exists=True,
+            record_value={"generation": existing_gen, "schema_version": 1},
+        )
+        with fp_patch, rec_patch, \
+             patch("comfyapp._write_custom_nodes_generation_record_no_commit",
+                   side_effect=_fail_if_called), \
+             patch("comfyapp.custom_nodes_vol"):
+            self.api._sync_custom_nodes_from_volume()
+
+        self.assertFalse(called["write"],
+                         "_write_custom_nodes_generation_record_no_commit must NOT be called")
+        self.assertEqual(self.api._custom_nodes_generation_seen, existing_gen,
+                         "_custom_nodes_generation_seen must hydrate from existing record")
+
+    def test_record_creation_failure_does_not_raise(self):
+        """If the write helper raises, the sync does not propagate the
+        exception and ``_custom_nodes_generation_seen`` stays empty."""
+        def _raise_on_write(reason="", generation=None):
+            raise RuntimeError("write failed")
+
+        fp_patch, rec_patch = self._step3_mocks(record_exists=False, record_value=None)
+        with fp_patch, rec_patch, \
+             patch("comfyapp._write_custom_nodes_generation_record_no_commit",
+                   side_effect=_raise_on_write), \
+             patch("comfyapp.custom_nodes_vol"):
+            self.api._sync_custom_nodes_from_volume()
+
+        self.assertEqual(self.api._custom_nodes_generation_seen, "",
+                         "_custom_nodes_generation_seen must stay empty on write failure")
+
+    def test_convergence_identical_content_same_generation(self):
+        """Two instances syncing identical content produce the same
+        content-derived generation (proving concurrent convergence)."""
+        write_calls = []
+
+        def _capture(reason="", generation=None):
+            write_calls.append(generation)
+            return {"generation": generation, "schema_version": 1}
+
+        fp_patch, rec_patch = self._step3_mocks(record_exists=False, record_value=None)
+        with fp_patch, rec_patch, \
+             patch("comfyapp._write_custom_nodes_generation_record_no_commit",
+                   side_effect=_capture), \
+             patch("comfyapp.custom_nodes_vol"):
+            self.api._sync_custom_nodes_from_volume()
+            # Simulate a second container with identical content
+            self.api._sync_custom_nodes_from_volume()
+
+        self.assertGreaterEqual(len(write_calls), 1)
+        for _gen in write_calls:
+            self.assertEqual(_gen, self._expected_gen(),
+                             "every write of identical content must use the same generation")
+
+
+class TestGenerationWriteTempPathDistinct(unittest.TestCase):
+    """The temp file path must be unique per invocation so concurrent
+    writers cannot cause ``os.replace`` source-pathname collisions."""
+
+    def test_distinct_temp_paths_per_invocation(self):
+        """Each call to the write helper opens a distinct ``.tmp.{pid}.{uuid}``
+        path so concurrent writers never share a source pathname."""
+        import builtins as _builtins
+        _real_open = _builtins.open
+        _paths = []
+
+        def _tracking_open(path, *a, **kw):
+            _paths.append(path)
+            return _real_open(path, *a, **kw)
+
+        import tempfile
+        _tmpdir = tempfile.mkdtemp()
+        _fake_path = os.path.join(_tmpdir, "test_gen.json")
+        try:
+            with patch.object(comfyapp, "CUSTOM_NODES_GENERATION_CONTROL_PATH", _fake_path), \
+                 patch.object(comfyapp, "CUSTOM_NODES_GENERATION_CONTROL_DIR", _tmpdir), \
+                 patch("builtins.open", _tracking_open):
+                comfyapp._write_custom_nodes_generation_record_no_commit(
+                    reason="test_1", generation="gen_a",
+                )
+                comfyapp._write_custom_nodes_generation_record_no_commit(
+                    reason="test_2", generation="gen_b",
+                )
+            _tmp_paths = [p for p in _paths if ".tmp." in p]
+            self.assertGreaterEqual(len(_tmp_paths), 2,
+                                    "must open at least two .tmp.* files across two invocations")
+            self.assertEqual(len(_tmp_paths), len(set(_tmp_paths)),
+                             "each invocation must use a distinct .tmp.* path")
+            for p in _tmp_paths:
+                self.assertIn(_tmpdir, p,
+                              "temp path must be in the same directory as the final file")
+                self.assertIn("test_gen.json.tmp.", p,
+                              "temp path must start with the final filename + .tmp.")
+        finally:
+            try:
+                os.unlink(_fake_path)
+            except Exception:
+                pass
+            try:
+                os.rmdir(_tmpdir)
+            except Exception:
+                pass
 
 
 class TestObserveGenerationsDelegatesToHelper(unittest.TestCase):

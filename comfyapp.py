@@ -1541,25 +1541,51 @@ def _read_custom_nodes_generation_record() -> dict | None:
     return _data
 
 
-def _write_custom_nodes_generation_record_no_commit(reason: str) -> dict:
+def _write_custom_nodes_generation_record_no_commit(reason: str, generation: str | None = None) -> dict:
     """Create a new custom-nodes generation record and atomically
     persist it (without committing the volume). The caller is
     responsible for calling ``custom_nodes_vol.commit()`` after
     this returns. Raises on failure.
+
+    When *generation* is provided it is used as-is (caller-chosen
+    deterministic value).  When omitted a UUID is generated.  Using
+    a content-derived deterministic generation ensures concurrent
+    containers syncing identical custom-node content converge on the
+    same persisted value — the atomic ``os.replace`` still resolves
+    races, but the identical value makes last-writer-wins harmless.
+
+    **Temp-path uniqueness**: each invocation uses a distinct per-process
+    temp path (``{final}.tmp.{pid}.{short_uuid}``) so concurrent writers
+    never share a ``.tmp`` pathname.  Without this, one writer's
+    ``os.replace`` could remove the source pathname from under another
+    in-flight writer, causing a ``FileNotFoundError``.  On failure the
+    temp file is cleaned up before re-raising.
     """
     _record = {
         "schema_version": CUSTOM_NODES_GENERATION_SCHEMA_VERSION,
-        "generation": uuid.uuid4().hex,
+        "generation": generation if generation is not None else uuid.uuid4().hex,
         "updated_at_unix": time.time(),
         "reason": reason,
     }
     os.makedirs(CUSTOM_NODES_GENERATION_CONTROL_DIR, exist_ok=True)
-    _tmp_path = CUSTOM_NODES_GENERATION_CONTROL_PATH + ".tmp"
-    with open(_tmp_path, "w") as _f:
-        json.dump(_record, _f, separators=(",", ":"))
-        _f.flush()
-        os.fsync(_f.fileno())
-    os.replace(_tmp_path, CUSTOM_NODES_GENERATION_CONTROL_PATH)
+    _tmp_path = (
+        CUSTOM_NODES_GENERATION_CONTROL_PATH
+        + f".tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    )
+    try:
+        with open(_tmp_path, "w") as _f:
+            json.dump(_record, _f, separators=(",", ":"))
+            _f.flush()
+            os.fsync(_f.fileno())
+        os.replace(_tmp_path, CUSTOM_NODES_GENERATION_CONTROL_PATH)
+    except BaseException:
+        # Clean up the unique temp file before propagating — leave no
+        # orphaned ``.tmp.*`` files behind on any failure path.
+        try:
+            os.unlink(_tmp_path)
+        except Exception:
+            pass
+        raise
     print(f"[comfyapp.custom_nodes_gen] wrote generation={_record['generation'][:12]}... reason={reason}")
     return _record
 
@@ -9850,9 +9876,24 @@ class _ComfyAPIMixin:
         self._validation_cache.set("custom_node_sync", _result, fingerprint=cheap_hash)
         # Record the generation so the fast path works on subsequent calls
         # within the same container session.
+        # V2 actual-sync branch: when no generation record exists yet
+        # (e.g. first sync after a v2 restore), create one atomically
+        # so downstream identity consumers see a non-empty value.
+        # Uses the content-derived ``current_fp_hash`` (MD5 of the synced
+        # custom-node source fingerprint) as the generation so that
+        # concurrent containers syncing identical content converge on the
+        # same persisted value.  The atomic ``os.replace`` inside the
+        # write helper resolves any race, but with an identical generation
+        # the race is harmless by construction.
         try:
             _gen_rec = _read_custom_nodes_generation_record()
             _gen_now = (_gen_rec or {}).get("generation", "") if _gen_rec else ""
+            if not _gen_now:
+                _gen_rec = _write_custom_nodes_generation_record_no_commit(
+                    reason="actual_sync_created", generation=current_fp_hash,
+                )
+                custom_nodes_vol.commit()
+                _gen_now = current_fp_hash
             if _gen_now:
                 self._custom_nodes_generation_seen = _gen_now
         except Exception:

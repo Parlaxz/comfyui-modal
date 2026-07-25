@@ -967,5 +967,95 @@ class TestAnalysisAndIdentityFlags(unittest.TestCase):
                          "prefill_key must be empty when exact prefill disabled")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# profile_checker_matched — source-result + execute_plan propagation
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestProfileCheckerMatchedDirect(unittest.TestCase):
+    """profile_checker_matched in prepare_active_next_profile result:
+    True only on checker match, False on setter-write / no-checker / default."""
+
+    def setUp(self):
+        import warmup_profile
+        warmup_profile._last_stable_profile_cache.clear()
+        warmup_profile._last_cache_app_identity = ""
+        warmup_profile._last_cache_ws_id = ""
+        warmup_profile._last_prefill_identity_map.clear()
+
+    async def _prepare(self, checker=None, setter=None):
+        from warmup_profile import prepare_active_next_profile
+        wf = _make_workflow("hello")
+        h = hashlib.sha256(json.dumps(wf, sort_keys=True).encode()).hexdigest()
+        return await prepare_active_next_profile(
+            wf, h, workspace=_make_workspace(),
+            checker=checker, setter=setter,
+        )
+
+    def test_checker_match_sets_true(self):
+        """Matching checker → profile_checker_matched=True."""
+        r = asyncio.run(self._prepare(checker=_MatchingChecker(),
+                                      setter=_make_async_setter()))
+        self.assertIs(r.get("profile_checker_matched"), True)
+        self.assertIs(r.get("profile_cache_hit"), False)
+
+    def test_default_and_nonmatch_are_false(self):
+        """Default result and non-matching checker → False."""
+        r = asyncio.run(self._prepare(setter=_make_async_setter()))
+        self.assertIs(r.get("profile_checker_matched"), False,
+                      "Default (setter-written) must be False")
+        r2 = asyncio.run(self._prepare(checker=_NonMatchingChecker(),
+                                       setter=_make_async_setter()))
+        self.assertIs(r2.get("profile_checker_matched"), False,
+                      "Non-matching checker must be False")
+
+
+class TestProfileCheckerMatchedBreakdown(unittest.TestCase):
+    """profile_checker_matched propagated through execute_plan and visible
+    in the [v2.local_submission_breakdown] one-line summary."""
+
+    def setUp(self):
+        from canonical_execution import _reset_all_cache_counters
+        _reset_all_cache_counters()
+
+    def tearDown(self):
+        from canonical_execution import _reset_all_cache_counters
+        _reset_all_cache_counters()
+
+    def test_checker_match_in_breakdown(self):
+        """Checker match → breakdown prints profile_checker_matched=True."""
+        import io
+        from unittest.mock import patch
+        from canonical_execution import build_execution_plan, execute_plan
+        from comfymodal_runtime.modal_transport import ModalTransport
+
+        captured = io.StringIO()
+
+        async def _stream(**kw):
+            yield {"type": "result", "data": {"images": [], "outputs": {}}}
+
+        async def _setter(payload, *, workspace=None):
+            return {"status": "written", "changed": True}
+
+        async def run():
+            plan = build_execution_plan(
+                {"1": {"class_type": "CheckpointLoaderSimple",
+                        "inputs": {"ckpt_name": "model_a.safetensors"}}},
+                prompt_id="brk_chk", validate=False,
+            )
+            transport = ModalTransport(prompt_stream_fn=_stream)
+            with patch("sys.stdout", captured):
+                await execute_plan(
+                    plan, transport=transport,
+                    profile_setter=_setter,
+                    profile_checker=_MatchingChecker(),
+                    workspace={"id": "ws_brk"},
+                )
+
+        asyncio.run(run())
+        self.assertIn("profile_checker_matched=True", captured.getvalue())
+        self.assertIn("profile_cache_hit=False", captured.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
