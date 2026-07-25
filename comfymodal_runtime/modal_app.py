@@ -53,7 +53,9 @@ from .cpu_snapshot_models import (
     inspect_and_validate_snapshot_params,
     load_cpu_snapshot_models,
     validate_cpu_snapshot_models,
+    validate_snapshot_unet_bf16_native,
     retarget_cpu_snapshot_models,
+    _COMPUTE_POLICY_BF16_NATIVE,
 )
 from .unet_forward_probe import register_unet_forward_probe
 from .output_delivery import (
@@ -269,6 +271,11 @@ def _cpu_snapshot_spec_projection(spec: Any) -> dict[str, list[dict[str, Any]]]:
         return {"unet": [], "clip": []}
 
     result: dict[str, list[dict[str, Any]]] = {"unet": [], "clip": []}
+
+    # NOTE: compute policy is NOT included in the projection. It is stored
+    # separately on CpuSnapshotModels.compute_policy and compared outside
+    # the spec matching path.  This keeps the request model_spec clean
+    # (weight_dtype="default" only) while snapshot matching still works.
 
     for loader in loaders.get("unet", []):
         if not isinstance(loader, Mapping):
@@ -1031,21 +1038,60 @@ def _load_cpu_snapshot_unet(
     target_gpus: tuple[str, ...],
     unet_cls: Any,
 ) -> Any:
-    """Load one snapshot UNET with the target-GPU-resolved dtype."""
+    """Load one snapshot UNET with the target-GPU-resolved dtype.
+
+    For BF16-native compute policy (effective BF16 + BF16-capable target GPU),
+    wraps the construction call in ``cpu_snapshot_unet_compute_policy`` so
+    that ``comfy.model_management.unet_manual_cast`` returns ``None`` during
+    the call.  This prevents ComfyUI from falling back to ``torch.float32``
+    manual-cast on CPU and instead builds the model with native BF16 compute.
+    """
+    from comfymodal_runtime.model_preload import cpu_snapshot_unet_compute_policy
+    from gpu_catalog import gpu_supports_bf16
+    import torch as _torch_validate
+
     _eff_dtype, _eff_label = resolve_unet_effective_dtype(
         weight_dtype, target_gpus=target_gpus,
     )
+
+    # Determine if BF16-native compute policy applies.
+    # Primary GPU semantics: only the first target GPU determines BF16 capability,
+    # consistent with resolve_unet_effective_dtype and _resolve_compute_policy.
+    _primary_gpu = target_gpus[0] if target_gpus else ""
+    _is_bf16_native = (
+        _eff_dtype is not None
+        and _eff_dtype == _torch_validate.bfloat16
+        and _primary_gpu
+        and gpu_supports_bf16(_primary_gpu)
+    )
+
     if _eff_dtype is not None:
         import comfy.sd as _comfy_sd
         import folder_paths as _fp
 
         _unet_path = _fp.get_full_path_or_raise("diffusion_models", unet_name)
-        _model = _comfy_sd.load_diffusion_model(
-            _unet_path,
-            model_options={"dtype": _eff_dtype},
-        )
+
+        with cpu_snapshot_unet_compute_policy(
+            effective_weight_dtype=_eff_dtype,
+            target_gpus=target_gpus,
+        ):
+            _model = _comfy_sd.load_diffusion_model(
+                _unet_path,
+                model_options={"dtype": _eff_dtype},
+            )
         if isinstance(_model, (tuple, list)) and len(_model) > 0:
-            return _model[0]
+            _model = _model[0]
+
+        # Construction validation for BF16-native policy
+        if _is_bf16_native:
+            validate_snapshot_unet_bf16_native(
+                _model,
+                context="snapshot_construction.",
+                target_gpus=target_gpus,
+                requested_weight_dtype=weight_dtype,
+                effective_weight_dtype=_eff_dtype,
+                effective_compute_dtype=_eff_dtype,
+            )
         return _model
 
     if unet_cls is None:
@@ -1056,11 +1102,30 @@ def _load_cpu_snapshot_unet(
     cls_method = unet_cls.load_unet if unet_cls else None
     orig = getattr(cls_method, "_comfy_modal_v2_original", None)
     if orig is not None:
-        out = orig(loader, unet_name, weight_dtype)
+        with cpu_snapshot_unet_compute_policy(
+            effective_weight_dtype=_eff_dtype,
+            target_gpus=target_gpus,
+        ):
+            out = orig(loader, unet_name, weight_dtype)
     else:
-        out = loader.load_unet(unet_name, weight_dtype)
+        with cpu_snapshot_unet_compute_policy(
+            effective_weight_dtype=_eff_dtype,
+            target_gpus=target_gpus,
+        ):
+            out = loader.load_unet(unet_name, weight_dtype)
     if isinstance(out, (tuple, list)) and len(out) > 0:
-        return out[0]
+        out = out[0]
+
+    # Construction validation for BF16-native policy (unet_cls path)
+    if _is_bf16_native:
+        validate_snapshot_unet_bf16_native(
+            out,
+            context="snapshot_construction.",
+            target_gpus=target_gpus,
+            requested_weight_dtype=weight_dtype,
+            effective_weight_dtype=_eff_dtype,
+            effective_compute_dtype=_eff_dtype,
+        )
     return out
 
 
@@ -1934,6 +1999,7 @@ class ModalRuntimeEntrypoint:
                                 load_clip=_cpu_load_clip,
                                 resolve_path=_cpu_resolve_path,
                                 trace=trace,
+                                target_gpus=_target_gpus,
                             )
                     finally:
                         if _mmap_orig is _MISSING:
@@ -1996,9 +2062,25 @@ class ModalRuntimeEntrypoint:
                             ) from _dtype_exc
                         except Exception:
                             pass
+                        # ── Derive compute / manual-cast dtype from policy, not observed state ──
+                        _snap_compute_dtype = _eff_label_snap  # "bfloat16" not "torch.bfloat16"
+                        _observed_manual = _snap_state.get("manual_cast_dtype", "absent")
+                        # When effective weight is bf16 and target supports BF16, effective
+                        # manual_cast_dtype is "none" (native). Otherwise fall back to observed.
+                        from gpu_catalog import gpu_supports_bf16 as _gsb
+                        _snap_primary_gpu = _target_gpus[0] if _target_gpus else ""
+                        _eff_is_bf16_native = (
+                            _eff_dtype_snap is not None
+                            and _eff_label_snap == "bfloat16"
+                            and _snap_primary_gpu
+                            and _gsb(_snap_primary_gpu)
+                        )
+                        _snap_manual_cast_eff = "none" if _eff_is_bf16_native else _observed_manual
                         # ── Log snapshot_created state with dtype metadata ────
                         _dtype_source = "target_gpu_policy"
                         _snap_state["param_distribution"] = _snap_param_dist
+                        _snap_state["effective_snapshot_compute_dtype"] = _snap_compute_dtype
+                        _snap_state["effective_snapshot_manual_cast_dtype"] = _snap_manual_cast_eff
                         _state_json = __import__("json").dumps(_snap_state, default=str, separators=(",", ":"), sort_keys=True)
                         print(
                             f"[v2.unet_runtime_state] "
@@ -2006,6 +2088,8 @@ class ModalRuntimeEntrypoint:
                             f"unet_identity={_unet_ident} "
                             f"requested_weight_dtype={_req_wd_snap} "
                             f"effective_snapshot_weight_dtype={_eff_label_snap} "
+                            f"effective_snapshot_compute_dtype={_snap_compute_dtype} "
+                            f"effective_snapshot_manual_cast_dtype={_snap_manual_cast_eff} "
                             f"effective_weight_dtype={_eff_label_snap} "
                             f"dtype_resolution_source={_dtype_source} "
                             f"target_gpus={','.join(_target_gpus)} "
@@ -2019,6 +2103,8 @@ class ModalRuntimeEntrypoint:
                                 "unet_identity": _unet_ident,
                                 "requested_weight_dtype": _req_wd_snap,
                                 "effective_snapshot_weight_dtype": _eff_label_snap,
+                                "effective_snapshot_compute_dtype": _snap_compute_dtype,
+                                "effective_snapshot_manual_cast_dtype": _snap_manual_cast_eff,
                                 "effective_weight_dtype": _eff_label_snap,
                                 "dtype_resolution_source": _dtype_source,
                                 "target_gpus": list(_target_gpus),
@@ -2516,6 +2602,14 @@ class ModalRuntimeEntrypoint:
                         _pre_retarget_state["effective_weight_dtype"] = _pre_effective_label
                         _pre_retarget_state["dtype_resolution_source"] = "target_gpu_policy"
                         _pre_retarget_state["target_gpus"] = list(parse_gpu_request())
+                        # ── Effective labels from policy, not serialized dtype ─
+                        _pre_compute_dtype = _pre_effective_label  # "bfloat16" not "torch.bfloat16"
+                        _pre_manual_cast_eff = (
+                            "none" if _pre_effective_label == "bfloat16" and _pre_expected_dtype is not None
+                            else _pre_retarget_state.get("manual_cast_dtype", "absent")
+                        )
+                        _pre_retarget_state["effective_snapshot_compute_dtype"] = _pre_compute_dtype
+                        _pre_retarget_state["effective_snapshot_manual_cast_dtype"] = _pre_manual_cast_eff
                         _state_json_pre = __import__("json").dumps(
                             _pre_retarget_state, default=str, separators=(",", ":"), sort_keys=True,
                         )
@@ -2525,6 +2619,8 @@ class ModalRuntimeEntrypoint:
                             f"unet_identity={_unet_ident} "
                             f"requested_weight_dtype={_req_wd_pre} "
                             f"effective_snapshot_weight_dtype={_pre_effective_label} "
+                            f"effective_snapshot_compute_dtype={_pre_compute_dtype} "
+                            f"effective_snapshot_manual_cast_dtype={_pre_manual_cast_eff} "
                             f"effective_weight_dtype={_pre_effective_label} "
                             f"dtype_resolution_source=target_gpu_policy "
                             f"target_gpus={','.join(parse_gpu_request())} "
@@ -2540,6 +2636,8 @@ class ModalRuntimeEntrypoint:
                                 "unet_identity": _unet_ident,
                                 "requested_weight_dtype": _req_wd_pre,
                                 "effective_snapshot_weight_dtype": _pre_effective_label,
+                                "effective_snapshot_compute_dtype": _pre_compute_dtype,
+                                "effective_snapshot_manual_cast_dtype": _pre_manual_cast_eff,
                                 "effective_weight_dtype": _pre_effective_label,
                                 "dtype_resolution_source": "target_gpu_policy",
                                 "target_gpus": list(parse_gpu_request()),
@@ -2609,6 +2707,14 @@ class ModalRuntimeEntrypoint:
                         _post_retarget_state["effective_weight_dtype"] = _post_effective_label
                         _post_retarget_state["dtype_resolution_source"] = "target_gpu_policy"
                         _post_retarget_state["target_gpus"] = list(parse_gpu_request())
+                        # ── Effective labels from policy, not serialized dtype ─
+                        _post_compute_dtype = _post_effective_label
+                        _post_manual_cast_eff = (
+                            "none" if _post_effective_label == "bfloat16" and _post_expected_dtype is not None
+                            else _post_retarget_state.get("manual_cast_dtype", "absent")
+                        )
+                        _post_retarget_state["effective_snapshot_compute_dtype"] = _post_compute_dtype
+                        _post_retarget_state["effective_snapshot_manual_cast_dtype"] = _post_manual_cast_eff
                         _state_json_post = __import__("json").dumps(
                             _post_retarget_state, default=str, separators=(",", ":"), sort_keys=True,
                         )
@@ -2618,6 +2724,8 @@ class ModalRuntimeEntrypoint:
                             f"unet_identity={_unet_ident} "
                             f"requested_weight_dtype={_req_wd_post} "
                             f"effective_snapshot_weight_dtype={_post_effective_label} "
+                            f"effective_snapshot_compute_dtype={_post_compute_dtype} "
+                            f"effective_snapshot_manual_cast_dtype={_post_manual_cast_eff} "
                             f"effective_weight_dtype={_post_effective_label} "
                             f"dtype_resolution_source=target_gpu_policy "
                             f"target_gpus={','.join(parse_gpu_request())} "
@@ -2633,6 +2741,8 @@ class ModalRuntimeEntrypoint:
                                 "unet_identity": _unet_ident,
                                 "requested_weight_dtype": _req_wd_post,
                                 "effective_snapshot_weight_dtype": _post_effective_label,
+                                "effective_snapshot_compute_dtype": _post_compute_dtype,
+                                "effective_snapshot_manual_cast_dtype": _post_manual_cast_eff,
                                 "effective_weight_dtype": _post_effective_label,
                                 "dtype_resolution_source": "target_gpu_policy",
                                 "target_gpus": list(parse_gpu_request()),
@@ -2652,6 +2762,8 @@ class ModalRuntimeEntrypoint:
                             "unet_identity": _unet_ident,
                             "requested_weight_dtype": _req_wd_post,
                             "effective_snapshot_weight_dtype": _post_effective_label,
+                            "effective_snapshot_compute_dtype": _post_compute_dtype,
+                            "effective_snapshot_manual_cast_dtype": _post_manual_cast_eff,
                             "effective_weight_dtype": _post_effective_label,
                             "dtype_resolution_source": "target_gpu_policy",
                             "target_gpus": list(parse_gpu_request()),
@@ -2661,6 +2773,19 @@ class ModalRuntimeEntrypoint:
                         })
                     except Exception:
                         pass
+
+                    # ── BF16-native validation before bridge publication ──
+                    # Uses models.compute_policy (not plan.model_spec) since
+                    # compute_policy is stored separately from model_spec.
+                    if models.compute_policy == _COMPUTE_POLICY_BF16_NATIVE:
+                        validate_snapshot_unet_bf16_native(
+                            models.unet,
+                            context="restore_pre_bridge.",
+                            target_gpus=parse_gpu_request(),
+                            requested_weight_dtype=_req_wd_post,
+                            effective_weight_dtype=_post_effective_label,
+                            effective_compute_dtype=_post_effective_label,
+                        )
 
                     # Activate on the bridge.
                     self._use_cpu_snapshot_models_on_bridge(

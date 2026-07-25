@@ -219,6 +219,123 @@ _not_observed_gpu_calls: int = 0
 # DO NOT call torch.cuda.* APIs from code that runs during snapshot
 # construction.
 
+# ── CPU-snapshot native-BF16 compute policy ─────────────────────────────
+# Contextmanager that temporarily patches comfy.model_management.unet_manual_cast
+# during snapshot UNET construction on CPU so native BF16 compute is used.
+# Without this patch, unet_manual_cast gets CPU as inference_device and falls
+# through to torch.float32, building the model with fp32 compute even though
+# weights are bfloat16.
+#
+# Thread-safety: the dedicated lock is held across the entire patched interval
+# (install + yield + restore).  The patched wrapper uses a thread-identity
+# ContextVar so unrelated callers on other threads always delegate to the
+# original function.
+
+_CPU_SNAPSHOT_UNET_COMPUTE_POLICY_LOCK: RLock = RLock()
+
+_CPU_SNAPSHOT_UNET_POLICY_ACTIVE_THREAD: ContextVar[int] = ContextVar(
+    "_cpu_snapshot_unet_policy_active_thread", default=0
+)
+
+_CPU_SNAPSHOT_UNET_MANUAL_CAST_OVERRIDE: ContextVar[str] = ContextVar(
+    "_cpu_snapshot_unet_manual_cast_override", default=""
+)
+
+
+@contextmanager
+def cpu_snapshot_unet_compute_policy(
+    *,
+    effective_weight_dtype: Any,
+    target_gpus: tuple[str, ...],
+) -> Iterator[None]:
+    import sys as _sys
+    import torch as _torch
+    import threading
+    from gpu_catalog import gpu_supports_bf16
+
+    # Primary GPU semantics: only the first target GPU determines BF16 capability,
+    # consistent with resolve_unet_effective_dtype and _resolve_compute_policy.
+    _primary_gpu = target_gpus[0] if target_gpus else ""
+    _should_patch = (
+        effective_weight_dtype is not None
+        and effective_weight_dtype == _torch.bfloat16
+        and _primary_gpu
+        and gpu_supports_bf16(_primary_gpu)
+    )
+
+    if not _should_patch:
+        yield
+        return
+
+    _tid = threading.get_ident()
+    _current = _CPU_SNAPSHOT_UNET_POLICY_ACTIVE_THREAD.get()
+    if _current != 0 and _current == _tid:
+        raise RuntimeError(
+            "cpu_snapshot_unet_compute_policy is not reentrant: "
+            "a policy context is already active on this thread"
+        )
+
+    _mm = None
+    _orig_fn = None
+    _installed = False
+    try:
+        with _CPU_SNAPSHOT_UNET_COMPUTE_POLICY_LOCK:
+            if _CPU_SNAPSHOT_UNET_POLICY_ACTIVE_THREAD.get() != 0:
+                yield
+                return
+
+            _mm = _sys.modules.get("comfy.model_management")
+            if _mm is None:
+                yield
+                return
+
+            _orig_fn = getattr(_mm, "unet_manual_cast", None)
+            if _orig_fn is None:
+                yield
+                return
+
+            _CPU_SNAPSHOT_UNET_POLICY_ACTIVE_THREAD.set(_tid)
+            _CPU_SNAPSHOT_UNET_MANUAL_CAST_OVERRIDE.set("none")
+
+            def _policy_wrapper(
+                weight_dtype: Any,
+                inference_device: Any,
+                supported_dtypes: list | None = None,
+            ) -> Any:
+                if _CPU_SNAPSHOT_UNET_POLICY_ACTIVE_THREAD.get() == threading.get_ident():
+                    _mode = _CPU_SNAPSHOT_UNET_MANUAL_CAST_OVERRIDE.get()
+                    if _mode == "none" and weight_dtype is _torch.bfloat16:
+                        return None
+                if _orig_fn is not None:
+                    if supported_dtypes is not None:
+                        return _orig_fn(weight_dtype, inference_device, supported_dtypes)
+                    return _orig_fn(weight_dtype, inference_device)
+                return None
+
+            setattr(_mm, "unet_manual_cast", _policy_wrapper)
+            _installed = True
+
+            # Yield INSIDE the lock — lock covers install + yield + restore
+            yield
+
+    finally:
+        if _installed and _mm is not None and _orig_fn is not None:
+            # Restore under the same lock acquisition; re-read the live
+            # module to handle edge cases where model_management was
+            # reloaded between yield and finally.
+            # ContextVars are reset in a nested try/finally so they are
+            # cleared even if the module attribute restore raises.
+            with _CPU_SNAPSHOT_UNET_COMPUTE_POLICY_LOCK:
+                _CPU_SNAPSHOT_UNET_POLICY_ACTIVE_THREAD.set(0)
+                _CPU_SNAPSHOT_UNET_MANUAL_CAST_OVERRIDE.set("")
+                _installed = False
+                # Restore the original function — if this raises, the
+                # ContextVars above have already been reset so subsequent
+                # operations are not permanently broken.
+                restore_target = _sys.modules.get("comfy.model_management")
+                if restore_target is not None:
+                    setattr(restore_target, "unet_manual_cast", _orig_fn)
+
 
 def resolve_unet_effective_dtype(
     weight_dtype_str: str = "default",

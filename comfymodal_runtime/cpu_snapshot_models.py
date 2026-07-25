@@ -31,6 +31,26 @@ class ModelFileFact:
     mtime_ns: int
 
 
+# Current policy version — increment when compute-policy semantics change
+# so that old snapshots with stale/legacy defaults are rejected.
+CPU_SNAPSHOT_UNET_POLICY_VERSION: int = 2
+
+
+def _policy_identity(
+    version: int,
+    effective_weight_dtype: str,
+    effective_compute_dtype: str,
+    manual_cast_policy: str,
+) -> str:
+    """Deterministic identity derived from version and effective policies."""
+    return (
+        f"v{version}:"
+        f"weight={effective_weight_dtype}:"
+        f"compute={effective_compute_dtype}:"
+        f"manual={manual_cast_policy}"
+    )
+
+
 @dataclass
 class CpuSnapshotModels:
     model_key: ModelRestoreKey
@@ -40,6 +60,9 @@ class CpuSnapshotModels:
     unet: Any = None
     clip: Any = None
     load_timings_ms: dict[str, float] = field(default_factory=dict)
+    compute_policy: str = "default"
+    policy_version: int = CPU_SNAPSHOT_UNET_POLICY_VERSION
+    target_gpus: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -86,12 +109,59 @@ def _build_model_key(normalized: dict[str, Any]) -> ModelRestoreKey:
     )
 
 
+# ── Compute policy identity field ───────────────────────────────────
+# This field in model_spec distinguishes the compute/manual-cast policy
+# used during snapshot construction so that a snapshot built with one
+# policy cannot match an identity that requested a different policy.
+#   "default"  — no explicit override (legacy / non-BF16).
+#   "bf16_native" — manual_cast_dtype=None, native BF16 compute.
+_COMPUTE_POLICY_DEFAULT = "default"
+_COMPUTE_POLICY_BF16_NATIVE = "bf16_native"
+
+
+def _resolve_compute_policy(
+    weight_dtype_str: str,
+    *,
+    target_gpus: tuple[str, ...] | None = None,
+) -> str:
+    """Determine the compute policy label for snapshot identity.
+
+    Returns ``"bf16_native"`` when the effective dtype resolves to BF16
+    AND the primary target GPU supports BF16 (so the model is built with
+    native BF16 compute, no manual cast).  Uses primary target semantics
+    consistently with ``resolve_unet_effective_dtype`` — fallback GPUs
+    are NOT considered for policy resolution.
+
+    Returns ``"default"`` otherwise.
+    """
+    from gpu_catalog import gpu_supports_bf16
+    _primary = target_gpus[0] if target_gpus else ""
+    if not _primary:
+        return _COMPUTE_POLICY_DEFAULT
+    # "default" weight_dtype on a BF16-capable primary → native
+    if weight_dtype_str == "default" and gpu_supports_bf16(_primary):
+        return _COMPUTE_POLICY_BF16_NATIVE
+    # Explicit bf16 on a BF16-capable primary → native
+    import torch as _torch
+    _is_explicit_bf16 = (
+        weight_dtype_str == "bfloat16"
+        or weight_dtype_str == "bf16"
+        or weight_dtype_str == str(_torch.bfloat16)
+    )
+    if _is_explicit_bf16 and gpu_supports_bf16(_primary):
+        return _COMPUTE_POLICY_BF16_NATIVE
+    return _COMPUTE_POLICY_DEFAULT
+
+
 def _build_model_spec(normalized: dict[str, Any]) -> dict[str, Any]:
     """Build loaders from the normalized profile.
 
     Matches restore_plan.py shape: weight_dtype always present
     in the UNET loader ("default" when absent from profile).
     No node IDs, prompt fields, or hashes.
+
+    NOTE: compute policy identity is stored separately on
+    CpuSnapshotModels.compute_policy, NOT in model_spec.
     """
     unet_loader: dict[str, Any] = {
         "loader_class": "UNETLoader",
@@ -334,6 +404,171 @@ def _tensor_device_type_of_value(val: Any) -> str | None:
     if dt is None:
         return str(val).strip().lower().split(":")[0]
     return str(dt).strip().lower()
+
+
+# ---------------------------------------------------------------------------
+# BF16-native validation
+# ---------------------------------------------------------------------------
+
+
+def _build_detail_str(
+    requested_weight_dtype: str = "",
+    effective_weight_dtype: Any = None,
+    effective_compute_dtype: Any = None,
+    target_gpus: tuple[str, ...] | None = None,
+) -> str:
+    _parts: list[str] = []
+    if requested_weight_dtype:
+        _parts.append(f"requested_weight_dtype={requested_weight_dtype}")
+    if effective_weight_dtype is not None:
+        _parts.append(f"effective_weight_dtype={effective_weight_dtype}")
+    if effective_compute_dtype is not None:
+        _parts.append(f"effective_compute_dtype={effective_compute_dtype}")
+    if target_gpus:
+        _parts.append(f"target_gpus={','.join(target_gpus)}")
+    return " ".join(_parts) + " " if _parts else ""
+
+
+def validate_snapshot_unet_bf16_native(
+    unet: Any,
+    *,
+    context: str = "",
+    target_gpus: tuple[str, ...] | None = None,
+    requested_weight_dtype: str = "",
+    effective_weight_dtype: Any = None,
+    effective_compute_dtype: Any = None,
+    param_distribution: dict[str, Any] | None = None,
+) -> None:
+    """Strict post-construction validation for BF16-native compute policy.
+
+    Resolves the real diffusion model via ``unet.model.diffusion_model``
+    (ComfyUI ModelPatcher structure), then verifies:
+      - ``manual_cast_dtype`` on the inner BaseModel is ``None`` (absent)
+      - ``model_dtype()`` on the patcher returns bfloat16
+      - All floating-point parameters are CPU bfloat16 (no CUDA/meta/fp32/mixed)
+      - Non-zero floating parameters (detects uninspected state)
+
+    Uses ``inspect_and_validate_snapshot_params`` with
+    ``expected_dtype=None, require_cpu=False`` to capture the full parameter
+    distribution first, then evaluates all invariants.
+
+    Every failure includes all metadata fields.  Does not fail before
+    distribution is obtained except when the diffusion model is uninspectable
+    (distribution shows ``"unavailable"``).
+
+    When *param_distribution* is provided (pre-computed), it is included
+    directly rather than re-inspecting.
+    """
+    import torch as _torch
+
+    _detail_str = _build_detail_str(
+        requested_weight_dtype, effective_weight_dtype,
+        effective_compute_dtype, target_gpus,
+    )
+
+    if unet is None:
+        raise RuntimeError(
+            f"{context}BF16-native validation failed: unet is None. "
+            f"{_detail_str}"
+        )
+
+    # ── Resolve the actual diffusion model ─────────────────────────────
+    _model = getattr(unet, "model", None)
+    if _model is None:
+        raise RuntimeError(
+            f"{context}BF16-native validation failed: unet missing .model attribute. "
+            f"{_detail_str}"
+        )
+    _dm = getattr(_model, "diffusion_model", _model)
+
+    # ── Read manual_cast_dtype from inner BaseModel ────────────────────
+    _manual = getattr(_model, "manual_cast_dtype", None)
+    _manual_str = str(_manual) if _manual is not None else "none"
+
+    # ── Read model_dtype() from patcher ────────────────────────────────
+    _md_fn = getattr(unet, "model_dtype", None)
+    _model_dtype_str: str = "absent"
+    if callable(_md_fn):
+        try:
+            _md_val = _md_fn()
+            _model_dtype_str = str(_md_val)
+        except Exception:
+            _model_dtype_str = "error"
+
+    # ── Capture parameter distribution (full, no early raise) ──────────
+    _distribution: dict[str, Any] | str = "unavailable"
+    if param_distribution is not None:
+        _distribution = param_distribution
+    else:
+        try:
+            _distribution = inspect_and_validate_snapshot_params(
+                _dm,
+                expected_dtype=None,
+                require_cpu=False,
+                context=f"{context}dist:",
+            )
+        except Exception:
+            _distribution = "unavailable"
+
+    # ── Build full metadata string for all error messages ──────────────
+    def _full_msg(checks: list[str]) -> str:
+        _parts = [f"{context}BF16-native validation failed"]
+        if checks:
+            _parts.append("; ".join(checks))
+        _parts.append(
+            f"{_detail_str}"
+            f"model_dtype={_model_dtype_str} "
+            f"manual_cast_dtype={_manual_str} "
+            f"param_distribution={_distribution}"
+        )
+        return " ".join(_parts)
+
+    # ── Invariant 1: manual_cast_dtype must be None ────────────────────
+    if _manual is not None:
+        raise RuntimeError(_full_msg([
+            f"manual_cast_dtype is {_manual!r}, expected None",
+        ]))
+
+    # ── Invariant 2: model_dtype() must be bfloat16 ────────────────────
+    if _model_dtype_str not in (str(_torch.bfloat16), "torch.bfloat16"):
+        raise RuntimeError(_full_msg([
+            f"model_dtype={_model_dtype_str}, expected bfloat16",
+        ]))
+
+    # ── Invariant 3: non-zero floating params, all BF16 on CPU ─────────
+    if isinstance(_distribution, str) and _distribution == "unavailable":
+        raise RuntimeError(_full_msg([
+            "diffusion model is uninspectable (no parameters accessible)",
+        ]))
+
+    _dist_count = _distribution.get("param_count", 0)
+    _fp_dist = _distribution.get("param_dev_dtype_numel", {})
+    _total_fp_numel = sum(_fp_dist.values())
+    _bf16_cpu_numel = _fp_dist.get("cpu|torch.bfloat16", 0)
+    _non_bf16 = {k: v for k, v in _fp_dist.items() if k != "cpu|torch.bfloat16"}
+    _non_cpu = {k: v for k, v in _fp_dist.items()
+                if not k.startswith("cpu|")}
+
+    if _total_fp_numel == 0:
+        raise RuntimeError(_full_msg([
+            "zero floating-point parameters found (model state not inspected)",
+            f"param_count={_dist_count}",
+        ]))
+
+    _checks: list[str] = []
+    if _non_cpu:
+        _checks.append(f"non-CPU devices: {dict(list(_non_cpu.items())[:10])}")
+    if _non_bf16:
+        _checks.append(f"non-BF16 floating params: {dict(list(_non_bf16.items())[:10])}")
+    if _bf16_cpu_numel != _total_fp_numel:
+        missing = _total_fp_numel - _bf16_cpu_numel
+        _checks.append(
+            f"bf16_numel={_bf16_cpu_numel}/{_total_fp_numel} "
+            f"({missing} numel non-BF16 on CPU)"
+        )
+
+    if _checks:
+        raise RuntimeError(_full_msg(_checks))
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +1198,9 @@ def identity_from_profile(
 ) -> tuple[ModelRestoreKey, dict[str, Any], tuple[ModelFileFact, ...]]:
     """Build a ModelRestoreKey, model_spec, and file facts from a warmup profile.
 
+    NOTE: compute policy identity is NOT included in model_spec; it is
+    stored separately on CpuSnapshotModels.compute_policy.
+
     Returns
     -------
     (ModelRestoreKey, model_spec_dict, file_facts_tuple)
@@ -1019,8 +1257,15 @@ def load_cpu_snapshot_models(
     load_clip: Callable[..., Any],
     resolve_path: Callable[[str, str], str],
     trace: RuntimeTrace | None = None,
+    target_gpus: tuple[str, ...] | None = None,
 ) -> CpuSnapshotModels:
     """Load CLIP and UNET from the given profile and return a validated snapshot.
+
+    When *target_gpus* is provided (snapshot construction path), the
+    returned ``CpuSnapshotModels`` carries a ``compute_policy`` attribute
+    that distinguishes the compute/manual-cast policy so stale snapshots
+    built with a different policy cannot match.  The model_spec does NOT
+    contain compute_policy — matching uses the separate field.
 
     Load order: CLIP -> gc.collect -> UNET -> gc.collect.
     All loading happens under torch.no_grad().
@@ -1126,6 +1371,12 @@ def load_cpu_snapshot_models(
 
         gc.collect()
 
+        # Derive compute policy from target_gpus (snapshot identity)
+        _cp = _COMPUTE_POLICY_DEFAULT
+        if target_gpus:
+            _wd = normalized.get("weight_dtype", "default")
+            _cp = _resolve_compute_policy(_wd, target_gpus=target_gpus)
+
         models = CpuSnapshotModels(
             model_key=model_key,
             model_spec=model_spec,
@@ -1134,6 +1385,9 @@ def load_cpu_snapshot_models(
             unet=unet_obj,
             clip=clip_obj,
             load_timings_ms=timings,
+            compute_policy=_cp,
+            policy_version=CPU_SNAPSHOT_UNET_POLICY_VERSION,
+            target_gpus=target_gpus or (),
         )
 
         ok, reason = validate_cpu_snapshot_models(
@@ -1327,6 +1581,37 @@ def validate_cpu_snapshot_models(
     ok, reason = _is_valid_clip_patcher(models.clip)
     if not ok:
         return (False, reason)
+
+    # Policy version/identity validation — reject legacy/stale snapshots
+    if models.policy_version == 0:
+        return (False, "policy_version is 0 (legacy/unset); current version is "
+                f"{CPU_SNAPSHOT_UNET_POLICY_VERSION}")
+    if models.policy_version != CPU_SNAPSHOT_UNET_POLICY_VERSION:
+        return (False, f"policy_version mismatch: stored={models.policy_version} "
+                f"current={CPU_SNAPSHOT_UNET_POLICY_VERSION}")
+    # Verify policy identity is consistent with resolved policy metadata
+    _wd = models.normalized_profile.get("weight_dtype", "default")
+    _tg = models.target_gpus
+    _resolved_cp = models.compute_policy
+    if _tg:
+        _resolved_cp = _resolve_compute_policy(_wd, target_gpus=_tg)
+        if _resolved_cp != models.compute_policy:
+            return (False, f"compute_policy mismatch: stored={models.compute_policy} "
+                    f"resolved={_resolved_cp} from weight_dtype={_wd} target_gpus={_tg}")
+
+    # BF16-native compute policy validation (from models.compute_policy)
+    if models.compute_policy == _COMPUTE_POLICY_BF16_NATIVE:
+        try:
+            validate_snapshot_unet_bf16_native(
+                models.unet,
+                context="validate_cpu_snapshot_models.",
+                target_gpus=_tg or None,
+                requested_weight_dtype=_wd,
+                effective_weight_dtype=_resolved_cp,
+                effective_compute_dtype=_resolved_cp,
+            )
+        except RuntimeError as _exc:
+            return (False, str(_exc))
 
     return (True, "ok")
 
