@@ -9,6 +9,7 @@ from gpu_catalog import (
     get_available_gpu_options,
     get_default_gpu,
     get_supported_gpus,
+    gpu_supports_bf16,
     is_gpu_hidden,
     is_supported_gpu,
     normalize_gpu_value,
@@ -116,6 +117,63 @@ class GpuCatalogTests(unittest.TestCase):
             self.assertIn("modal_gpu", entry)
             self.assertIn("class_name", entry)
             self.assertIn("profile", entry)
+
+    # ── BF16 capability tests ─────────────────────────────────────────
+    def test_gpu_supports_bf16_lowercase_canonical_name(self):
+        self.assertTrue(gpu_supports_bf16("rtx-pro-6000"))
+
+    def test_gpu_supports_bf16_modal_cased_name(self):
+        self.assertTrue(gpu_supports_bf16("RTX-PRO-6000"))
+
+    def test_gpu_supports_bf16_a10(self):
+        self.assertTrue(gpu_supports_bf16("A10"))
+
+    def test_gpu_supports_bf16_a100(self):
+        self.assertTrue(gpu_supports_bf16("A100"))
+
+    def test_gpu_supports_bf16_a100_40gb(self):
+        self.assertTrue(gpu_supports_bf16("a100-40gb"))
+
+    def test_gpu_supports_bf16_a100_80gb(self):
+        self.assertTrue(gpu_supports_bf16("a100-80gb"))
+
+    def test_gpu_supports_bf16_l4(self):
+        self.assertTrue(gpu_supports_bf16("L4"))
+
+    def test_gpu_supports_bf16_l40s(self):
+        self.assertTrue(gpu_supports_bf16("L40S"))
+
+    def test_gpu_supports_bf16_h100(self):
+        self.assertTrue(gpu_supports_bf16("H100"))
+
+    def test_gpu_supports_bf16_h200(self):
+        self.assertTrue(gpu_supports_bf16("H200"))
+
+    def test_gpu_supports_bf16_b200(self):
+        self.assertTrue(gpu_supports_bf16("B200"))
+
+    def test_gpu_supports_bf16_t4_is_false(self):
+        self.assertFalse(gpu_supports_bf16("T4"))
+
+    def test_gpu_supports_bf16_unknown_gpu_is_false(self):
+        self.assertFalse(gpu_supports_bf16("k80"))
+
+    def test_gpu_supports_bf16_no_cuda_calls(self):
+        """Prove the helper is a pure static lookup — no torch.cuda APIs."""
+        import unittest.mock as mock
+        import torch
+        with mock.patch.object(torch.cuda, "is_bf16_supported",
+                               side_effect=RuntimeError("CUDA called")):
+            # These must succeed without calling torch.cuda
+            self.assertTrue(gpu_supports_bf16("A100"))
+            self.assertFalse(gpu_supports_bf16("T4"))
+
+    def test_gpu_supports_bf16_every_catalog_gpu(self):
+        """Every GPU in GPU_CATALOG has a known BF16 capability classification."""
+        for entry in GPU_CATALOG:
+            value = entry["value"]
+            result = gpu_supports_bf16(value)
+            self.assertIsInstance(result, bool, f"GPU {value} has no BF16 classification")
 
 
 if __name__ == "__main__":

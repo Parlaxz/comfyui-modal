@@ -1797,31 +1797,29 @@ class ModalRuntimeEntrypoint:
                     _clip_cls = _mappings.get("CLIPLoader")
                     _dual_clip_cls = _mappings.get("DualCLIPLoader")
 
-                    # ── Cache GPU BF16 support BEFORE _force_cpu_during_snapshot ──
-                    # Inside the snapshot context, torch.cuda.is_available() is
-                    # monkey-patched to return False, which prevents us from querying
-                    # the real GPU's BF16 capability.  We capture the answer here,
-                    # before the context is entered, so the shared resolver
-                    # (_gpu_bf16_supported → resolve_unet_effective_dtype) can
-                    # return the correct dtype for the normal GPU path.
+                    # ── Resolve target GPU(s) from configured policy ──
+                    # Inside the CPU snapshot context, CUDA APIs cannot be
+                    # called (Modal's snapshot builder has no GPU).  We use
+                    # the configured target GPU(s) from the deployment policy
+                    # to determine the effective UNET dtype, not a live probe.
+                    from gpu_catalog import parse_gpu_request
+                    _target_gpus = parse_gpu_request()
                     from comfymodal_runtime.model_preload import (
-                        cache_gpu_bf16_support,
                         resolve_unet_effective_dtype,
                     )
-                    _gpu_bf16_cached = cache_gpu_bf16_support()
 
                     # UNET loader: returns first public output.
                     # load_cpu_snapshot_models passes (name, weight_dtype) — no device arg.
                     # Resolve original from class-level _comfy_modal_v2_original (unbound)
                     # when V2 wrappers are installed; otherwise use the bound method.
                     def _cpu_load_unet(unet_name: str, weight_dtype: str) -> Any:
-                        # Resolve "default" to the effective dtype the normal GPU
-                        # load path would use.  During the CPU snapshot context the
-                        # ComfyUI auto-detection falls back to FP32 (because CUDA is
-                        # hidden), so we explicitly set model_options["dtype"] when
-                        # the effective dtype differs from what the string "default"
-                        # would produce on CPU.
-                        _eff_dtype, _eff_label = resolve_unet_effective_dtype(weight_dtype)
+                        # Resolve "default" to the effective dtype the configured
+                        # target GPU(s) would use.  During CPU snapshot no live
+                        # CUDA probe is performed — the answer comes from a pure
+                        # name-based lookup in gpu_catalog.gpu_supports_bf16().
+                        _eff_dtype, _eff_label = resolve_unet_effective_dtype(
+                            weight_dtype, target_gpus=_target_gpus,
+                        )
                         if _eff_dtype is not None and _eff_label not in ("default", "float32"):
                             # Load with explicit dtype so the model parameters are
                             # created in the correct dtype (e.g. bfloat16) even
@@ -1951,7 +1949,53 @@ class ModalRuntimeEntrypoint:
                         except Exception:
                             _req_wd_snap = "default"
                         # Resolve effective dtype for the runtime state record
-                        _eff_dtype_snap, _eff_label_snap = resolve_unet_effective_dtype(_req_wd_snap)
+                        _eff_dtype_snap, _eff_label_snap = resolve_unet_effective_dtype(
+                            _req_wd_snap, target_gpus=_target_gpus,
+                        )
+                        import torch as _torch_snap
+                        # ── Hard correctness guard ────────────────────────────
+                        # After snapshot UNET construction, verify all floating
+                        # parameters have the expected effective dtype.  If the
+                        # expected dtype is BF16 but the model is FP32, fail
+                        # immediately — do not silently publish a slow FP32 snapshot.
+                        _expected_dtype_str = str(getattr(_eff_dtype_snap, "__name__", str(_eff_dtype_snap)))
+                        _fp32_count = 0
+                        _bf16_count = 0
+                        _total_fp = 0
+                        try:
+                            _unet_module = getattr(_cpu_models.unet, "model", None)
+                            if _unet_module is not None:
+                                _dm = getattr(_unet_module, "diffusion_model", _unet_module)
+                            else:
+                                _dm = getattr(_cpu_models.unet, "diffusion_model", None)
+                            if _dm is not None:
+                                for _p in _dm.parameters():
+                                    if _p.is_floating_point():
+                                        _total_fp += _p.numel()
+                                        if _p.dtype == _torch_snap.float32:
+                                            _fp32_count += _p.numel()
+                                        elif _p.dtype == _torch_snap.bfloat16:
+                                            _bf16_count += _p.numel()
+                        except Exception:
+                            pass
+                        if (
+                            _eff_dtype_snap is not None
+                            and _eff_dtype_snap == _torch_snap.bfloat16
+                            and _total_fp > 0
+                            and _fp32_count == _total_fp
+                        ):
+                            raise RuntimeError(
+                                f"CPU snapshot UNET dtype validation FAILED: "
+                                f"expected effective dtype={_expected_dtype_str} "
+                                f"but all {_total_fp} floating-point parameters "
+                                f"are torch.float32. "
+                                f"requested_weight_dtype={_req_wd_snap!r} "
+                                f"target_gpus={_target_gpus} "
+                                f"bf16_params={_bf16_count} "
+                                f"fp32_params={_fp32_count}"
+                            )
+                        # ── Log snapshot_created state with dtype metadata ────
+                        _dtype_source = "target_gpu_policy"
                         _state_json = __import__("json").dumps(_snap_state, default=str, separators=(",", ":"), sort_keys=True)
                         print(
                             f"[v2.unet_runtime_state] "
@@ -1959,6 +2003,8 @@ class ModalRuntimeEntrypoint:
                             f"unet_identity={_unet_ident} "
                             f"requested_weight_dtype={_req_wd_snap} "
                             f"effective_weight_dtype={_eff_label_snap} "
+                            f"dtype_resolution_source={_dtype_source} "
+                            f"target_gpus={','.join(_target_gpus)} "
                             f"state={_state_json}",
                             flush=True,
                         )
@@ -1969,6 +2015,8 @@ class ModalRuntimeEntrypoint:
                                 "unet_identity": _unet_ident,
                                 "requested_weight_dtype": _req_wd_snap,
                                 "effective_weight_dtype": _eff_label_snap,
+                                "dtype_resolution_source": _dtype_source,
+                                "target_gpus": list(_target_gpus),
                                 "request_id": "",
                                 "restored_instance_id": "",
                                 "restore_session_id": "",
@@ -2505,6 +2553,38 @@ class ModalRuntimeEntrypoint:
                                 "state": _post_retarget_state,
                             },
                         )
+                        # ── Restore-time dtype validation ────────────────────
+                        # Verify that the actual model tensor dtype matches the
+                        # expected effective dtype.  This catches stale/invalid
+                        # FP32 snapshots that could have been created before the
+                        # construction-time guard was installed.
+                        try:
+                            import torch as _torch_rt
+                            _rt_dm = None
+                            _rt_model = getattr(models.unet, "model", None)
+                            if _rt_model is not None:
+                                _rt_dm = getattr(_rt_model, "diffusion_model", _rt_model)
+                            else:
+                                _rt_dm = getattr(models.unet, "diffusion_model", None)
+                            if _rt_dm is not None:
+                                _rt_eff = _snap_state.get("effective_weight_dtype", "")
+                                _rt_first_fp = None
+                                for _rt_p in _rt_dm.parameters():
+                                    if _rt_p.is_floating_point():
+                                        _rt_first_fp = _rt_p.dtype
+                                        break
+                                if _rt_eff == "bfloat16" and _rt_first_fp is not None and _rt_first_fp != _torch_rt.bfloat16:
+                                    raise RuntimeError(
+                                        f"Restore-time UNET dtype validation FAILED: "
+                                        f"effective_weight_dtype={_rt_eff} "
+                                        f"but first parameter dtype={_rt_first_fp}. "
+                                        f"unet_identity={_unet_ident} "
+                                        f"restored_instance_id={restored_instance_id}"
+                                    )
+                        except RuntimeError:
+                            raise
+                        except Exception:
+                            pass
                         # Stash post-retarget state for request-trace propagation.
                         self._cpu_snapshot_unet_runtime_state = copy.deepcopy({
                             "stage": "snapshot_restored_post_retarget",

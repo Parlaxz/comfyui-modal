@@ -41,6 +41,37 @@ def _normalize_gpu_name(raw: str) -> str:
     return GPU_CANONICAL_MAP.get(cleaned, cleaned)
 
 
+# ── BF16 capability (canonical GPU name → bool) ─────────────────────────
+# GPUs with NVIDIA Compute Capability >= 8.0 (Ampere or newer) support
+# bfloat16 natively.  This is a pure name-based lookup — no CUDA API calls.
+_BF16_CAPABLE_GPU_NAMES: set[str] = {
+    "RTX-PRO-6000",
+    "A10",
+    "A100",
+    "A100-40GB",
+    "A100-80GB",
+    "L4",
+    "L40S",
+    "H100",
+    "H200",
+    "B200",
+}
+"""Set of canonical Modal GPU names that support bfloat16."""
+
+
+def gpu_supports_bf16(gpu_name: str) -> bool:
+    """Return True if *gpu_name* (canonical Modal name) supports bfloat16.
+
+    This is a pure static lookup — no CUDA API calls, no hardware probe.
+    Accepts both lower-case canoncial values (e.g. ``"a100"``) and
+    Modal-cased canonical names (e.g. ``"A100"``).
+    """
+    # Normalize to match canonical map casing
+    cleaned = gpu_name.strip().lower().replace("_", "-").replace(" ", "-")
+    canonical = GPU_CANONICAL_MAP.get(cleaned, cleaned)
+    return canonical.upper() in {n.upper() for n in _BF16_CAPABLE_GPU_NAMES}
+
+
 def _dedupe_preserve_order(items: list[str]) -> list[str]:
     """Remove duplicates while preserving first-seen order."""
     seen: set[str] = set()
