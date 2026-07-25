@@ -28,6 +28,11 @@ from .cpu_snapshot_models import (
     collect_unet_runtime_state,
 )
 from .trace import RuntimeTrace
+from .unet_forward_probe import (
+    emit_post_load_models_gpu_event,
+    install_nextdit_forward_pre_hook,
+    register_unet_forward_probe,
+)
 
 # ── Prefill lane mode ─────────────────────────────────────────────────
 # Controls which CLIPTextEncode entries are pre-encoded during restore.
@@ -370,11 +375,14 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                     gpu_wrapper_status=_wrapper_status,
                     gpu_request_invocation_count=_gpu_request_call_count_var.get(),
                 )
+        _diag_ok = False
         try:
-            return original(models, memory_required=memory_required,
-                            force_patch_weights=force_patch_weights,
-                            minimum_memory_required=minimum_memory_required,
-                            force_full_load=force_full_load)
+            _retval = original(models, memory_required=memory_required,
+                               force_patch_weights=force_patch_weights,
+                               minimum_memory_required=minimum_memory_required,
+                               force_full_load=force_full_load)
+            _diag_ok = True
+            return _retval
         finally:
             after = _gpu_depth.get()
             _gpu_depth.set(after - 1)
@@ -414,6 +422,8 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                         "force_patch_weights": force_patch_weights,
                         "force_full_load": force_full_load,
                     })
+                if _diag_ok:
+                    emit_post_load_models_gpu_event(models)
     wrapper._comfy_modal_gpu_wrapper = True
     return wrapper
 
@@ -1380,6 +1390,9 @@ def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
                     "status": status,
                 },
             )
+
+    # Install NextDiT forward pre-hook for forward-probe diagnostics.
+    result["nextdit_forward_pre_hook"] = "installed" if install_nextdit_forward_pre_hook() else "unavailable"
 
     return result
 
@@ -4883,6 +4896,7 @@ class V2LoaderBridge:
         except Exception:
             pass
 
+        register_unet_forward_probe(unet, source="normal_loader")
         return unet
 
     def _load_clip(self, model_key: ModelRestoreKey) -> Any:
