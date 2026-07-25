@@ -3020,18 +3020,28 @@ class ModalRuntimeEntrypoint:
                         _unet_source = "cpu_snapshot"
                         _clip_source = "cpu_snapshot"
                         _reason = "ok"
+                        # Diagnostic: check state BEFORE propagation
+                        _before_state = self._cpu_snapshot_unet_runtime_state
+                        trace.emit(
+                            "unet_runtime_state_propagate_diag",
+                            metadata={
+                                "status": "before_propagate",
+                                "state_is_none": _before_state is None,
+                                "state_val": str(_before_state is not None),
+                                "req_id": str(trace.request_id if trace else ""),
+                            },
+                        )
                         self._maybe_propagate_cpu_snapshot_unet_state(
                             request_model_key, request_model_spec, trace,
                         )
-                        # Diagnostic: verify state was available
+                        # Diagnostic: verify state after propagation
                         _diag_state = self._cpu_snapshot_unet_runtime_state
                         trace.emit(
                             "unet_runtime_state_propagate_diag",
                             metadata={
                                 "status": "after_helper",
                                 "state_is_none": _diag_state is None,
-                                "state_stage": _diag_state.get("stage", "") if _diag_state is not None else "",
-                                "request_id": str(trace.request_id if trace else ""),
+                                "req_id": str(trace.request_id if trace else ""),
                             },
                         )
                     if _bypass_snapshot_unet:
