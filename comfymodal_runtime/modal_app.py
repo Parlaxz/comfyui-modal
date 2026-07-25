@@ -2469,16 +2469,6 @@ class ModalRuntimeEntrypoint:
                             "restore_session_id": restore_session_id,
                             "state": _post_retarget_state,
                         })
-                        # Diagnostic: confirm store succeeded
-                        _diag_stored = self._cpu_snapshot_unet_runtime_state
-                        print(
-                            f"[v2.unet_runtime_state_store] "
-                            f"status={'stored' if _diag_stored is not None else 'failed'} "
-                            f"unet_identity={_unet_ident} "
-                            f"state_type={type(_post_retarget_state).__name__} "
-                            f"state_len={len(_post_retarget_state)}",
-                            flush=True,
-                        )
                     except Exception:
                         pass
 
@@ -2955,8 +2945,6 @@ class ModalRuntimeEntrypoint:
             raise RuntimeError("execution cancelled before PromptExecutor start")
         _report_host_memory("prompt_executor_start")
         trace = context.trace or RuntimeTrace(request_id=context.request_id, process="remote")
-        # RUN_IN_PROCESS_ENTERED: verify this code is deployed
-        print("[v2.unet_diag] RUN_IN_PROCESS_ENTERED", flush=True)
         trace.emit("runtime_config_start", phase="execution")
         self._configure_runtime()
         trace.emit("runtime_config_end", phase="execution")
@@ -3022,32 +3010,8 @@ class ModalRuntimeEntrypoint:
                         _unet_source = "cpu_snapshot"
                         _clip_source = "cpu_snapshot"
                         _reason = "ok"
-                        # Diagnostic: check state BEFORE propagation
-                        _before_state = self._cpu_snapshot_unet_runtime_state
-                        trace.emit(
-                            "unet_runtime_state_propagate_diag",
-                            phase="execution",
-                            metadata={
-                                "status": "before_propagate",
-                                "state_is_none": _before_state is None,
-                                "state_val": str(_before_state is not None),
-                                "req_id": str(trace.request_id if trace else ""),
-                            },
-                        )
-                        print("[v2.unet_diag] before_propagate state_is_none=%s" % (_before_state is None), flush=True)
                         self._maybe_propagate_cpu_snapshot_unet_state(
                             request_model_key, request_model_spec, trace,
-                        )
-                        # Diagnostic: verify state after propagation
-                        _diag_state = self._cpu_snapshot_unet_runtime_state
-                        trace.emit(
-                            "unet_runtime_state_propagate_diag",
-                            phase="execution",
-                            metadata={
-                                "status": "after_helper",
-                                "state_is_none": _diag_state is None,
-                                "req_id": str(trace.request_id if trace else ""),
-                            },
                         )
                     if _bypass_snapshot_unet:
                         print(
@@ -3275,14 +3239,7 @@ class ModalRuntimeEntrypoint:
         Must be called only when ``_cpu_snapshot_models_active`` is True,
         models match, and ``diagnostic_bypass_cpu_snapshot_unet`` is False.
         """
-        print("[v2.unet_diag] _maybe_propagate called, state_is_none=%s" % (self._cpu_snapshot_unet_runtime_state is None), flush=True)
         if self._cpu_snapshot_unet_runtime_state is None:
-            trace.emit(
-                "unet_runtime_state_propagate_diag",
-                phase="execution",
-                metadata={"status": "skipped", "reason": "state_is_none"},
-            )
-            print("[v2.unet_runtime_state_propagated] status=skipped reason=state_is_none", flush=True)
             return
         _req_unet_ident = str(getattr(request_model_key, "unet_identity", ""))
         _req_wd = "default"
@@ -3311,18 +3268,6 @@ class ModalRuntimeEntrypoint:
                 flush=True,
             )
         else:
-            trace.emit(
-                "unet_runtime_state_propagate_diag",
-                phase="execution",
-                metadata={
-                    "status": "skipped",
-                    "reason": "identity_or_dtype_mismatch",
-                    "req_unet_ident": _req_unet_ident,
-                    "stored_unet": _stored_unet,
-                    "req_wd": _req_wd,
-                    "stored_wd": _stored_wd,
-                },
-            )
             self._cpu_snapshot_unet_runtime_state = None
             print(
                 f"[v2.unet_runtime_state_propagated] status=skipped "
