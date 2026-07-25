@@ -1797,11 +1797,48 @@ class ModalRuntimeEntrypoint:
                     _clip_cls = _mappings.get("CLIPLoader")
                     _dual_clip_cls = _mappings.get("DualCLIPLoader")
 
+                    # ── Cache GPU BF16 support BEFORE _force_cpu_during_snapshot ──
+                    # Inside the snapshot context, torch.cuda.is_available() is
+                    # monkey-patched to return False, which prevents us from querying
+                    # the real GPU's BF16 capability.  We capture the answer here,
+                    # before the context is entered, so the shared resolver
+                    # (_gpu_bf16_supported → resolve_unet_effective_dtype) can
+                    # return the correct dtype for the normal GPU path.
+                    from comfymodal_runtime.model_preload import (
+                        cache_gpu_bf16_support,
+                        resolve_unet_effective_dtype,
+                    )
+                    _gpu_bf16_cached = cache_gpu_bf16_support()
+
                     # UNET loader: returns first public output.
                     # load_cpu_snapshot_models passes (name, weight_dtype) — no device arg.
                     # Resolve original from class-level _comfy_modal_v2_original (unbound)
                     # when V2 wrappers are installed; otherwise use the bound method.
                     def _cpu_load_unet(unet_name: str, weight_dtype: str) -> Any:
+                        # Resolve "default" to the effective dtype the normal GPU
+                        # load path would use.  During the CPU snapshot context the
+                        # ComfyUI auto-detection falls back to FP32 (because CUDA is
+                        # hidden), so we explicitly set model_options["dtype"] when
+                        # the effective dtype differs from what the string "default"
+                        # would produce on CPU.
+                        _eff_dtype, _eff_label = resolve_unet_effective_dtype(weight_dtype)
+                        if _eff_dtype is not None and _eff_label not in ("default", "float32"):
+                            # Load with explicit dtype so the model parameters are
+                            # created in the correct dtype (e.g. bfloat16) even
+                            # though we are on CPU.
+                            import comfy.sd as _comfy_sd
+                            import folder_paths as _fp
+                            import torch as _torch
+                            _unet_path = _fp.get_full_path_or_raise("diffusion_models", unet_name)
+                            _model = _comfy_sd.load_diffusion_model(
+                                _unet_path,
+                                model_options={"dtype": _eff_dtype},
+                            )
+                            if isinstance(_model, (tuple, list)) and len(_model) > 0:
+                                return _model[0]
+                            return _model
+                        # Fallback: normal path (preserves original behaviour for
+                        # explicit fp8 strings and for "default" on non-BF16 hardware).
                         loader = _unet_cls()
                         cls_method = _unet_cls.load_unet if _unet_cls else None
                         orig = getattr(cls_method, "_comfy_modal_v2_original", None)
@@ -1913,12 +1950,15 @@ class ModalRuntimeEntrypoint:
                                     break
                         except Exception:
                             _req_wd_snap = "default"
+                        # Resolve effective dtype for the runtime state record
+                        _eff_dtype_snap, _eff_label_snap = resolve_unet_effective_dtype(_req_wd_snap)
                         _state_json = __import__("json").dumps(_snap_state, default=str, separators=(",", ":"), sort_keys=True)
                         print(
                             f"[v2.unet_runtime_state] "
                             f"stage=snapshot_created "
                             f"unet_identity={_unet_ident} "
                             f"requested_weight_dtype={_req_wd_snap} "
+                            f"effective_weight_dtype={_eff_label_snap} "
                             f"state={_state_json}",
                             flush=True,
                         )
@@ -1928,6 +1968,7 @@ class ModalRuntimeEntrypoint:
                                 "stage": "snapshot_created",
                                 "unet_identity": _unet_ident,
                                 "requested_weight_dtype": _req_wd_snap,
+                                "effective_weight_dtype": _eff_label_snap,
                                 "request_id": "",
                                 "restored_instance_id": "",
                                 "restore_session_id": "",
