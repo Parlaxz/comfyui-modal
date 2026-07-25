@@ -69,7 +69,7 @@ class TestParseGpuRequest(unittest.TestCase):
         result = parse_gpu_request()
         self.assertEqual(
             result,
-            ("RTX-PRO-6000", "A100-80GB", "A100-40GB"),
+            ("RTX-PRO-6000",),
         )
 
     # --- Case 2: COMFYMODAL_V2_GPU overrides primary ---
@@ -77,7 +77,7 @@ class TestParseGpuRequest(unittest.TestCase):
         os.environ["COMFYMODAL_V2_GPU"] = "h100"
         result = parse_gpu_request()
         self.assertEqual(result[0], "H100")
-        self.assertIn("A100-80GB", result)
+        self.assertEqual(result, ("H100",))
 
     # --- Case 3: COMFYMODAL_V2_GPU_FALLBACKS overrides defaults ---
     def test_fallbacks_env_overrides_defaults(self):
@@ -90,7 +90,7 @@ class TestParseGpuRequest(unittest.TestCase):
         # Remove COMFYMODAL_V2_GPU_FALLBACKS so it's truly absent
         os.environ.pop("COMFYMODAL_V2_GPU_FALLBACKS", None)
         result = parse_gpu_request()
-        self.assertEqual(result, ("RTX-PRO-6000", "A100-80GB", "A100-40GB"))
+        self.assertEqual(result, ("RTX-PRO-6000",))
 
     # --- Case 5: explicitly empty fallback env disables all fallbacks ---
     def test_empty_fallback_env_disables_fallbacks(self):
@@ -133,7 +133,7 @@ class TestParseGpuRequest(unittest.TestCase):
         os.environ["COMFYMODAL_V2_GPU"] = ""
         os.environ.pop("COMFYMODAL_V2_GPU_FALLBACKS", None)
         result = parse_gpu_request()
-        self.assertEqual(result, ("RTX-PRO-6000", "A100-80GB", "A100-40GB"))
+        self.assertEqual(result, ("RTX-PRO-6000",))
         # Must NOT produce legacy lowercase DEFAULT_GPU ("rtx-pro-6000")
         self.assertEqual(result[0], V2_DEFAULT_GPU)
 
@@ -142,7 +142,7 @@ class TestParseGpuRequest(unittest.TestCase):
         os.environ["COMFYMODAL_V2_GPU"] = "   "
         os.environ.pop("COMFYMODAL_V2_GPU_FALLBACKS", None)
         result = parse_gpu_request()
-        self.assertEqual(result, ("RTX-PRO-6000", "A100-80GB", "A100-40GB"))
+        self.assertEqual(result, ("RTX-PRO-6000",))
         self.assertEqual(result[0], V2_DEFAULT_GPU)
 
 
@@ -199,7 +199,7 @@ class TestModalRuntimeSpec(unittest.TestCase):
     def test_default_gpu_is_tuple(self):
         spec = ModalRuntimeSpec()
         self.assertIsInstance(spec.gpu, tuple)
-        self.assertEqual(spec.gpu, ("RTX-PRO-6000", "A100-80GB", "A100-40GB"))
+        self.assertEqual(spec.gpu, ("RTX-PRO-6000",))
 
     def test_gpu_from_env(self):
         os.environ["COMFYMODAL_V2_GPU"] = "h100"
@@ -207,9 +207,9 @@ class TestModalRuntimeSpec(unittest.TestCase):
         spec = ModalRuntimeSpec()
         self.assertEqual(spec.gpu, ("H100", "T4"))
 
-    def test_default_memory_is_16384(self):
+    def test_default_memory_is_24576(self):
         spec = ModalRuntimeSpec()
-        self.assertEqual(spec.memory, 16384)
+        self.assertEqual(spec.memory, 24576)
 
     def test_memory_from_env(self):
         os.environ["COMFYMODAL_V2_MEMORY_MB"] = "24576"
@@ -258,7 +258,7 @@ class TestReportHostMemory(unittest.TestCase):
         """process_maxrss_mib should be populated from rusage, not VmPeak."""
         result = _report_host_memory("rss_test")
         maxrss = result.get("process_maxrss_mib")
-        if maxrss is not None:
+        if maxrss not in (None, "absent"):
             self.assertIsInstance(maxrss, (int, float))
             self.assertGreater(maxrss, 0)
 
@@ -270,11 +270,11 @@ class TestReportHostMemory(unittest.TestCase):
         mock_read_cgroup.return_value = None  # all reads return None
         result = _report_host_memory("cgroup_missing")
         # cgroup counters should be absent
-        self.assertNotIn("current_mib", result)
-        self.assertNotIn("peak_mib", result)
-        self.assertNotIn("limit_mib", result)
-        self.assertNotIn("oom_count", result)
-        self.assertNotIn("oom_kill_count", result)
+        self.assertEqual(result.get("current_mib"), "absent")
+        self.assertEqual(result.get("peak_mib"), "absent")
+        self.assertEqual(result.get("limit_mib"), "absent")
+        self.assertEqual(result.get("oom_count"), "absent")
+        self.assertEqual(result.get("oom_kill_count"), "absent")
         self.assertEqual(result.get("status"), "ok")
 
     @patch("comfymodal_runtime.modal_app.platform.system")
@@ -305,9 +305,17 @@ class TestReportHostMemory(unittest.TestCase):
                 return 4 * 1024 * 1024 * 1024  # 4 GB
             return None
         mock_read_cgroup.side_effect = side_effect
-        # Patch memory.events to return valid data
-        mock_events = io.StringIO("oom 1\noom_kill 0\n")
-        with patch("builtins.open", return_value=mock_events):
+        with patch(
+            "comfymodal_runtime.modal_app._resolve_cgroup_v2_base",
+            return_value=("/fake/cgroup", "/fake/mount"),
+        ), patch(
+            "builtins.open",
+            side_effect=lambda path, *args, **kwargs: io.StringIO(
+                "oom 1\noom_kill 0\n"
+            ) if str(path).endswith("memory.events") else (_ for _ in ()).throw(
+                FileNotFoundError(path)
+            ),
+        ):
             result = _report_host_memory("cgroup_valid")
             self.assertEqual(result.get("current_mib"), round(2048, 1))  # 2 GB
             self.assertEqual(result.get("peak_mib"), round(4096, 1))  # 4 GB
@@ -665,12 +673,11 @@ class TestAppClsContract(unittest.TestCase):
         # Modal accepts list[str] for ordered fallback; verify spec produces it
         self.assertIsInstance(spec.gpu, tuple)
         gpu_list = list(spec.gpu) if len(spec.gpu) > 1 else spec.gpu[0]
-        self.assertIsInstance(gpu_list, list)
-        self.assertEqual(gpu_list, ["RTX-PRO-6000", "A100-80GB", "A100-40GB"])
+        self.assertEqual(gpu_list, "RTX-PRO-6000")
 
-    def test_spec_memory_default_16384(self):
+    def test_spec_memory_default_24576(self):
         spec = ModalRuntimeSpec()
-        self.assertEqual(spec.memory, 16384)
+        self.assertEqual(spec.memory, 24576)
 
     def test_spec_min_containers_zero(self):
         spec = ModalRuntimeSpec()
@@ -683,6 +690,7 @@ class TestAppClsContract(unittest.TestCase):
     def test_spec_identity_order_sensitive(self):
         """GPU order change alters identity hash (order-sensitive)."""
         from comfymodal_runtime.contracts import stable_hash
+        os.environ["COMFYMODAL_V2_GPU_FALLBACKS"] = "A100-80GB"
         spec_a = ModalRuntimeSpec()
         # Override spec_b gpu order
         spec_b = ModalRuntimeSpec()
@@ -738,7 +746,7 @@ class TestAppClsContract(unittest.TestCase):
     def test_parse_gpu_request_default_proper_casing(self):
         """The default return value is exactly the Modal-canonical casing."""
         result = parse_gpu_request()
-        self.assertEqual(result, ("RTX-PRO-6000", "A100-80GB", "A100-40GB"))
+        self.assertEqual(result, ("RTX-PRO-6000",))
 
 
 if __name__ == "__main__":

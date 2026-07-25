@@ -1924,5 +1924,232 @@ class TestNoModuleLevelBridge(unittest.TestCase):
                          "Consumer function must be removed")
 
 
+# ══════════════════════════════════════════════════════════════════════
+# Tests: inspect_and_validate_snapshot_params
+# ══════════════════════════════════════════════════════════════════════
+
+# Better tensor stub with numel/dtype/is_floating_point for param inspection tests
+
+
+class _FakeParamTensor:
+    """Tensor stub with numel, dtype, and is_floating_point for param distribution."""
+    def __init__(self, device="cpu", dtype="torch.bfloat16", numel=1000, is_float=True):
+        self.device = device
+        self._dtype_str = dtype
+        self._numel = numel
+        self._is_float = is_float
+
+    @property
+    def dtype(self):
+        return self._dtype_str
+
+    def numel(self):
+        return self._numel
+
+    def is_floating_point(self):
+        return self._is_float
+
+
+class _FakeParamModule:
+    """Module with iterable parameters for inspect_and_validate_snapshot_params."""
+    def __init__(self, params):
+        """params: list of _FakeParamTensor"""
+        self._params = params
+
+    def parameters(self, recurse=True):
+        return iter(self._params)
+
+
+class TestInspectAndValidateSnapshotParams(unittest.TestCase):
+    """inspect_and_validate_snapshot_params coverage."""
+
+    def test_accepts_cpu_bf16_params(self):
+        """CPU BF16 params pass validation with expected_dtype=bf16."""
+        from comfymodal_runtime.cpu_snapshot_models import inspect_and_validate_snapshot_params
+        module = _FakeParamModule([
+            _FakeParamTensor("cpu", "torch.bfloat16", 5000, True),
+            _FakeParamTensor("cpu", "torch.bfloat16", 3000, True),
+        ])
+        result = inspect_and_validate_snapshot_params(
+            module, expected_dtype="torch.bfloat16", require_cpu=True,
+        )
+        self.assertIn("param_count", result)
+        self.assertEqual(result["param_count"], 2)
+        self.assertEqual(result["total_param_numel"], 8000)
+        self.assertIn("cpu|torch.bfloat16", result["param_dev_dtype_count"])
+        self.assertEqual(result["param_dev_dtype_numel"]["cpu|torch.bfloat16"], 8000)
+        self.assertIn("param_distribution_hash", result)
+        self.assertIsInstance(result["param_distribution_hash"], str)
+
+    def test_rejects_cpu_fp32_when_bf16_expected(self):
+        """All FP32 params with expected_dtype=bf16 raises RuntimeError."""
+        from comfymodal_runtime.cpu_snapshot_models import inspect_and_validate_snapshot_params
+        module = _FakeParamModule([
+            _FakeParamTensor("cpu", "torch.float32", 5000, True),
+            _FakeParamTensor("cpu", "torch.float32", 3000, True),
+        ])
+        with self.assertRaises(RuntimeError) as ctx:
+            inspect_and_validate_snapshot_params(
+                module, expected_dtype="torch.bfloat16", require_cpu=True,
+            )
+        self.assertIn("dtype mismatch", str(ctx.exception).lower())
+
+
+class TestCpuSnapshotUnetConstruction(unittest.TestCase):
+    """The target-GPU policy must reach ComfyUI's construction loader."""
+
+    def test_default_rtx_pro_6000_passes_bf16_model_option(self):
+        import types
+        import torch
+
+        from comfymodal_runtime.modal_app import _load_cpu_snapshot_unet
+
+        calls = {}
+        fake_sd = types.ModuleType("comfy.sd")
+        fake_folder_paths = types.ModuleType("folder_paths")
+        sentinel = object()
+
+        def load_diffusion_model(path, *, model_options):
+            calls["path"] = path
+            calls["model_options"] = model_options
+            return sentinel
+
+        fake_sd.load_diffusion_model = load_diffusion_model
+        fake_folder_paths.get_full_path_or_raise = (
+            lambda category, name: f"/models/{category}/{name}"
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "comfy.sd": fake_sd,
+                "folder_paths": fake_folder_paths,
+            },
+        ):
+            result = _load_cpu_snapshot_unet(
+                "z_image_turbo_bf16.safetensors",
+                "default",
+                target_gpus=("RTX-PRO-6000",),
+                unet_cls=None,
+            )
+
+        self.assertIs(result, sentinel)
+        self.assertEqual(
+            calls["path"],
+            "/models/diffusion_models/z_image_turbo_bf16.safetensors",
+        )
+        self.assertIs(calls["model_options"]["dtype"], torch.bfloat16)
+
+    def test_default_t4_passes_float32_model_option(self):
+        import types
+        import torch
+
+        from comfymodal_runtime.modal_app import _load_cpu_snapshot_unet
+
+        calls = {}
+        fake_sd = types.ModuleType("comfy.sd")
+        fake_folder_paths = types.ModuleType("folder_paths")
+        sentinel = object()
+
+        def load_diffusion_model(path, *, model_options):
+            calls["path"] = path
+            calls["model_options"] = model_options
+            return sentinel
+
+        fake_sd.load_diffusion_model = load_diffusion_model
+        fake_folder_paths.get_full_path_or_raise = (
+            lambda category, name: f"/models/{category}/{name}"
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "comfy.sd": fake_sd,
+                "folder_paths": fake_folder_paths,
+            },
+        ):
+            result = _load_cpu_snapshot_unet(
+                "model.safetensors",
+                "default",
+                target_gpus=("T4",),
+                unet_cls=None,
+            )
+
+        self.assertIs(result, sentinel)
+        self.assertIs(calls["model_options"]["dtype"], torch.float32)
+
+    def test_accepts_mixed_dtype_when_no_expected_dtype(self):
+        """Mixed FP32/BF16 params pass when expected_dtype is None."""
+        from comfymodal_runtime.cpu_snapshot_models import inspect_and_validate_snapshot_params
+        module = _FakeParamModule([
+            _FakeParamTensor("cpu", "torch.float32", 5000, True),
+            _FakeParamTensor("cpu", "torch.bfloat16", 3000, True),
+        ])
+        result = inspect_and_validate_snapshot_params(
+            module, expected_dtype=None, require_cpu=True,
+        )
+        self.assertEqual(result["param_count"], 2)
+
+    def test_rejects_non_cpu_param(self):
+        """CUDA parameter with require_cpu=True raises RuntimeError."""
+        from comfymodal_runtime.cpu_snapshot_models import inspect_and_validate_snapshot_params
+        module = _FakeParamModule([
+            _FakeParamTensor("cuda:0", "torch.bfloat16", 5000, True),
+        ])
+        with self.assertRaises(RuntimeError) as ctx:
+            inspect_and_validate_snapshot_params(
+                module, require_cpu=True,
+            )
+        self.assertIn("non-cpu", str(ctx.exception).lower())
+
+    def test_rejects_meta_param(self):
+        """Meta parameter with require_cpu=True raises RuntimeError."""
+        from comfymodal_runtime.cpu_snapshot_models import inspect_and_validate_snapshot_params
+        module = _FakeParamModule([
+            _FakeParamTensor("meta", "torch.bfloat16", 5000, True),
+        ])
+        with self.assertRaises(RuntimeError) as ctx:
+            inspect_and_validate_snapshot_params(
+                module, require_cpu=True,
+            )
+        self.assertIn("non-cpu", str(ctx.exception).lower())
+
+    def test_require_cpu_false_allows_non_cpu(self):
+        """require_cpu=False allows CUDA params (restore time)."""
+        from comfymodal_runtime.cpu_snapshot_models import inspect_and_validate_snapshot_params
+        module = _FakeParamModule([
+            _FakeParamTensor("cuda:0", "torch.bfloat16", 5000, True),
+        ])
+        result = inspect_and_validate_snapshot_params(
+            module, require_cpu=False,
+        )
+        self.assertEqual(result["param_count"], 1)
+        self.assertIn("cuda:0|torch.bfloat16", result["param_dev_dtype_count"])
+
+    def test_empty_module(self):
+        """Module with no parameters returns zeros."""
+        from comfymodal_runtime.cpu_snapshot_models import inspect_and_validate_snapshot_params
+        module = _FakeParamModule([])
+        result = inspect_and_validate_snapshot_params(
+            module, expected_dtype="torch.bfloat16", require_cpu=True,
+        )
+        self.assertEqual(result["param_count"], 0)
+        self.assertEqual(result["total_param_numel"], 0)
+        self.assertEqual(result["param_dev_dtype_count"], {})
+        self.assertEqual(result["param_dev_dtype_numel"], {})
+
+    def test_expected_dtype_mismatch_with_mixed_params(self):
+        """When expected_dtype is bf16 and NO float params are bf16, raise."""
+        from comfymodal_runtime.cpu_snapshot_models import inspect_and_validate_snapshot_params
+        module = _FakeParamModule([
+            _FakeParamTensor("cpu", "torch.float32", 5000, True),
+            # Non-float param should not be counted
+            _FakeParamTensor("cpu", "torch.int64", 100, False),
+        ])
+        with self.assertRaises(RuntimeError) as ctx:
+            inspect_and_validate_snapshot_params(
+                module, expected_dtype="torch.bfloat16", require_cpu=True,
+            )
+        self.assertIn("dtype mismatch", str(ctx.exception).lower())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -337,6 +337,105 @@ def _tensor_device_type_of_value(val: Any) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Parameter distribution / validation helper
+# ---------------------------------------------------------------------------
+
+
+def inspect_and_validate_snapshot_params(
+    model: Any,
+    *,
+    expected_dtype: Any = None,
+    require_cpu: bool = True,
+    context: str = "",
+) -> dict[str, Any]:
+    """Inspect ALL parameters of *model*, report distribution, and validate.
+
+    Iterates every parameter in the model (not just the first), collecting
+    device and dtype metadata across all parameters.  For floating-point
+    parameters, also reports count/numel grouped by ``device|dtype``.
+
+    Returns a dict with:
+      - ``param_count``: total number of parameters.
+      - ``total_param_numel``: total number of elements across all params.
+      - ``param_dev_dtype_count``: ``{device|dtype: count}`` across all
+        floating-point parameters.
+      - ``param_dev_dtype_numel``: ``{device|dtype: numel}`` across all
+        floating-point parameters.
+      - ``param_distribution_hash``: SHA-256 of sorted ``(device, dtype,
+        numel)`` tuples for deterministic change detection.
+
+    Raises ``RuntimeError`` when:
+      - *require_cpu* is True and any parameter's device type is not ``cpu``.
+      - *expected_dtype* is not None and any floating-point parameter has a
+        different dtype (stale-FP32 snapshot detection).
+
+    This helper uses ``model.parameters()`` which returns ALL parameters
+    including those nested in submodules.  It never mutates the model or
+    calls CUDA synchronisation.
+    """
+    import hashlib
+    _param_count = 0
+    _total_param_numel = 0
+    _fp_dev_dtype_count: dict[str, int] = {}
+    _fp_dev_dtype_numel: dict[str, int] = {}
+    _param_tuples: list[tuple[str, str, int]] = []
+    _any_non_cpu: list[str] = []
+    _total_fp = 0
+    _fp_of_expected_dtype = 0
+
+    try:
+        for _p in model.parameters():
+            _param_count += 1
+            _numel = _p.numel()
+            _total_param_numel += _numel
+            _dev_str = str(_p.device)
+            _dtype_str = str(_p.dtype)
+            if _p.is_floating_point():
+                _key = f"{_dev_str}|{_dtype_str}"
+                _fp_dev_dtype_count[_key] = _fp_dev_dtype_count.get(_key, 0) + 1
+                _fp_dev_dtype_numel[_key] = _fp_dev_dtype_numel.get(_key, 0) + _numel
+                _param_tuples.append((_dev_str, _dtype_str, _numel))
+                _total_fp += _numel
+                if expected_dtype is not None and _p.dtype == expected_dtype:
+                    _fp_of_expected_dtype += _numel
+            if require_cpu:
+                _dev_type = _dev_str.strip().lower().split(":")[0]
+                if _dev_type != "cpu":
+                    _any_non_cpu.append(_dev_str)
+    except Exception as exc:
+        raise RuntimeError(f"{context}parameter inspection failed: {exc}") from exc
+
+    _param_tuples.sort(key=lambda _x: (_x[0], _x[1], _x[2]))
+    _param_h = hashlib.sha256()
+    for _dev, _dt, _n in _param_tuples:
+        _param_h.update(f"{_dev}|{_dt}|{_n}\n".encode())
+
+    result: dict[str, Any] = {
+        "param_count": _param_count,
+        "total_param_numel": _total_param_numel,
+        "param_dev_dtype_count": dict(_fp_dev_dtype_count),
+        "param_dev_dtype_numel": dict(_fp_dev_dtype_numel),
+        "param_distribution_hash": _param_h.hexdigest(),
+    }
+
+    if _any_non_cpu:
+        raise RuntimeError(
+            f"{context}non-CPU parameters found: {_any_non_cpu[:5]}... "
+            f"({len(_any_non_cpu)} total)"
+        )
+
+    if expected_dtype is not None and _total_fp > 0 and _fp_of_expected_dtype != _total_fp:
+        raise RuntimeError(
+            f"{context}floating-point parameter dtype mismatch: "
+            f"expected {expected_dtype}, matching_numel={_fp_of_expected_dtype}, "
+            f"total_floating_numel={_total_fp}. "
+            f"Distribution: {dict(_fp_dev_dtype_count)}"
+        )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 

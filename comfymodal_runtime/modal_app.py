@@ -40,6 +40,7 @@ from .model_preload import (
     get_restore_return_marker,
     gpu_not_observed_summary,
     request_execution_trace_scope,
+    resolve_unet_effective_dtype,
     set_model_load_identity,
     set_restore_return_marker,
     _capture_host_info,
@@ -49,6 +50,7 @@ from .cpu_snapshot_models import (
     CpuSnapshotModels,
     collect_unet_runtime_state,
     identity_from_profile,
+    inspect_and_validate_snapshot_params,
     load_cpu_snapshot_models,
     validate_cpu_snapshot_models,
     retarget_cpu_snapshot_models,
@@ -1022,6 +1024,46 @@ def _runtime_env() -> dict[str, str]:
     return env
 
 
+def _load_cpu_snapshot_unet(
+    unet_name: str,
+    weight_dtype: str,
+    *,
+    target_gpus: tuple[str, ...],
+    unet_cls: Any,
+) -> Any:
+    """Load one snapshot UNET with the target-GPU-resolved dtype."""
+    _eff_dtype, _eff_label = resolve_unet_effective_dtype(
+        weight_dtype, target_gpus=target_gpus,
+    )
+    if _eff_dtype is not None:
+        import comfy.sd as _comfy_sd
+        import folder_paths as _fp
+
+        _unet_path = _fp.get_full_path_or_raise("diffusion_models", unet_name)
+        _model = _comfy_sd.load_diffusion_model(
+            _unet_path,
+            model_options={"dtype": _eff_dtype},
+        )
+        if isinstance(_model, (tuple, list)) and len(_model) > 0:
+            return _model[0]
+        return _model
+
+    if unet_cls is None:
+        raise RuntimeError(
+            f"snapshot UNET loader is unavailable for unresolved dtype {weight_dtype!r}"
+        )
+    loader = unet_cls()
+    cls_method = unet_cls.load_unet if unet_cls else None
+    orig = getattr(cls_method, "_comfy_modal_v2_original", None)
+    if orig is not None:
+        out = orig(loader, unet_name, weight_dtype)
+    else:
+        out = loader.load_unet(unet_name, weight_dtype)
+    if isinstance(out, (tuple, list)) and len(out) > 0:
+        return out[0]
+    return out
+
+
 def _reference_image() -> Any:
     """Build the V2 shadow deployment image from the production base.
 
@@ -1802,51 +1844,19 @@ class ModalRuntimeEntrypoint:
                     # called (Modal's snapshot builder has no GPU).  We use
                     # the configured target GPU(s) from the deployment policy
                     # to determine the effective UNET dtype, not a live probe.
-                    from gpu_catalog import parse_gpu_request
                     _target_gpus = parse_gpu_request()
-                    from comfymodal_runtime.model_preload import (
-                        resolve_unet_effective_dtype,
-                    )
 
                     # UNET loader: returns first public output.
                     # load_cpu_snapshot_models passes (name, weight_dtype) — no device arg.
                     # Resolve original from class-level _comfy_modal_v2_original (unbound)
                     # when V2 wrappers are installed; otherwise use the bound method.
                     def _cpu_load_unet(unet_name: str, weight_dtype: str) -> Any:
-                        # Resolve "default" to the effective dtype the configured
-                        # target GPU(s) would use.  During CPU snapshot no live
-                        # CUDA probe is performed — the answer comes from a pure
-                        # name-based lookup in gpu_catalog.gpu_supports_bf16().
-                        _eff_dtype, _eff_label = resolve_unet_effective_dtype(
-                            weight_dtype, target_gpus=_target_gpus,
+                        return _load_cpu_snapshot_unet(
+                            unet_name,
+                            weight_dtype,
+                            target_gpus=_target_gpus,
+                            unet_cls=_unet_cls,
                         )
-                        if _eff_dtype is not None and _eff_label not in ("default", "float32"):
-                            # Load with explicit dtype so the model parameters are
-                            # created in the correct dtype (e.g. bfloat16) even
-                            # though we are on CPU.
-                            import comfy.sd as _comfy_sd
-                            import folder_paths as _fp
-                            import torch as _torch
-                            _unet_path = _fp.get_full_path_or_raise("diffusion_models", unet_name)
-                            _model = _comfy_sd.load_diffusion_model(
-                                _unet_path,
-                                model_options={"dtype": _eff_dtype},
-                            )
-                            if isinstance(_model, (tuple, list)) and len(_model) > 0:
-                                return _model[0]
-                            return _model
-                        # Fallback: normal path (preserves original behaviour for
-                        # explicit fp8 strings and for "default" on non-BF16 hardware).
-                        loader = _unet_cls()
-                        cls_method = _unet_cls.load_unet if _unet_cls else None
-                        orig = getattr(cls_method, "_comfy_modal_v2_original", None)
-                        if orig is not None:
-                            out = orig(loader, unet_name, weight_dtype)
-                        else:
-                            out = loader.load_unet(unet_name, weight_dtype)
-                        if isinstance(out, (tuple, list)) and len(out) > 0:
-                            return out[0]
-                        return out
 
                     # CLIP loader: returns first public output.
                     # load_cpu_snapshot_models passes 3 positional args for single
@@ -1952,56 +1962,50 @@ class ModalRuntimeEntrypoint:
                         _eff_dtype_snap, _eff_label_snap = resolve_unet_effective_dtype(
                             _req_wd_snap, target_gpus=_target_gpus,
                         )
-                        import torch as _torch_snap
-                        # ── Hard correctness guard ────────────────────────────
-                        # After snapshot UNET construction, verify all floating
-                        # parameters have the expected effective dtype.  If the
-                        # expected dtype is BF16 but the model is FP32, fail
-                        # immediately — do not silently publish a slow FP32 snapshot.
-                        _expected_dtype_str = str(getattr(_eff_dtype_snap, "__name__", str(_eff_dtype_snap)))
-                        _fp32_count = 0
-                        _bf16_count = 0
-                        _total_fp = 0
+                        # ── Hard correctness guard (reusable helper) ──────────
+                        # After snapshot UNET construction, verify ALL floating-
+                        # point parameters have the expected effective dtype and
+                        # are on CPU.  Rejects stale FP32 snapshots with a clear
+                        # RuntimeError — does not catch and suppress.
+                        _snap_param_dist = {}
                         try:
                             _unet_module = getattr(_cpu_models.unet, "model", None)
                             if _unet_module is not None:
-                                _dm = getattr(_unet_module, "diffusion_model", _unet_module)
+                                _snap_dm = getattr(_unet_module, "diffusion_model", _unet_module)
                             else:
-                                _dm = getattr(_cpu_models.unet, "diffusion_model", None)
-                            if _dm is not None:
-                                for _p in _dm.parameters():
-                                    if _p.is_floating_point():
-                                        _total_fp += _p.numel()
-                                        if _p.dtype == _torch_snap.float32:
-                                            _fp32_count += _p.numel()
-                                        elif _p.dtype == _torch_snap.bfloat16:
-                                            _bf16_count += _p.numel()
+                                _snap_dm = getattr(_cpu_models.unet, "diffusion_model", None)
+                            if _snap_dm is None:
+                                raise RuntimeError(
+                                    "snapshot_created: diffusion model is unavailable "
+                                    "for parameter dtype validation"
+                                )
+                            _snap_param_dist = inspect_and_validate_snapshot_params(
+                                _snap_dm,
+                                expected_dtype=_eff_dtype_snap,
+                                require_cpu=True,
+                                context="snapshot_created:",
+                            )
+                        except RuntimeError as _dtype_exc:
+                            raise RuntimeError(
+                                "CPU snapshot UNET dtype validation failed: "
+                                f"requested_weight_dtype={_req_wd_snap!r} "
+                                f"effective_snapshot_weight_dtype={_eff_label_snap} "
+                                f"target_gpus={_target_gpus} "
+                                f"parameter_distribution={_snap_param_dist} "
+                                f"detail={_dtype_exc}"
+                            ) from _dtype_exc
                         except Exception:
                             pass
-                        if (
-                            _eff_dtype_snap is not None
-                            and _eff_dtype_snap == _torch_snap.bfloat16
-                            and _total_fp > 0
-                            and _fp32_count == _total_fp
-                        ):
-                            raise RuntimeError(
-                                f"CPU snapshot UNET dtype validation FAILED: "
-                                f"expected effective dtype={_expected_dtype_str} "
-                                f"but all {_total_fp} floating-point parameters "
-                                f"are torch.float32. "
-                                f"requested_weight_dtype={_req_wd_snap!r} "
-                                f"target_gpus={_target_gpus} "
-                                f"bf16_params={_bf16_count} "
-                                f"fp32_params={_fp32_count}"
-                            )
                         # ── Log snapshot_created state with dtype metadata ────
                         _dtype_source = "target_gpu_policy"
+                        _snap_state["param_distribution"] = _snap_param_dist
                         _state_json = __import__("json").dumps(_snap_state, default=str, separators=(",", ":"), sort_keys=True)
                         print(
                             f"[v2.unet_runtime_state] "
                             f"stage=snapshot_created "
                             f"unet_identity={_unet_ident} "
                             f"requested_weight_dtype={_req_wd_snap} "
+                            f"effective_snapshot_weight_dtype={_eff_label_snap} "
                             f"effective_weight_dtype={_eff_label_snap} "
                             f"dtype_resolution_source={_dtype_source} "
                             f"target_gpus={','.join(_target_gpus)} "
@@ -2014,6 +2018,7 @@ class ModalRuntimeEntrypoint:
                                 "stage": "snapshot_created",
                                 "unet_identity": _unet_ident,
                                 "requested_weight_dtype": _req_wd_snap,
+                                "effective_snapshot_weight_dtype": _eff_label_snap,
                                 "effective_weight_dtype": _eff_label_snap,
                                 "dtype_resolution_source": _dtype_source,
                                 "target_gpus": list(_target_gpus),
@@ -2024,7 +2029,7 @@ class ModalRuntimeEntrypoint:
                             },
                         )
                     except Exception:
-                        pass
+                        raise
 
                     self._cpu_snapshot_models = _cpu_models
                     self._cpu_snapshot_models_active = False
@@ -2477,6 +2482,40 @@ class ModalRuntimeEntrypoint:
                                     break
                         except Exception:
                             _req_wd_pre = "default"
+                        _pre_expected_dtype, _pre_effective_label = resolve_unet_effective_dtype(
+                            _req_wd_pre, target_gpus=parse_gpu_request(),
+                        )
+                        _pre_model = getattr(models.unet, "model", None)
+                        _pre_dm = (
+                            getattr(_pre_model, "diffusion_model", _pre_model)
+                            if _pre_model is not None
+                            else getattr(models.unet, "diffusion_model", None)
+                        )
+                        if _pre_dm is None:
+                            raise RuntimeError(
+                                "restore: diffusion model is unavailable for "
+                                "snapshot parameter validation"
+                            )
+                        try:
+                            _pre_param_dist = inspect_and_validate_snapshot_params(
+                                _pre_dm,
+                                expected_dtype=_pre_expected_dtype,
+                                require_cpu=True,
+                                context="restore:",
+                            )
+                        except RuntimeError as _dtype_exc:
+                            raise RuntimeError(
+                                "Restore-time UNET dtype validation failed: "
+                                f"requested_weight_dtype={_req_wd_pre!r} "
+                                f"effective_snapshot_weight_dtype={_pre_effective_label} "
+                                f"target_gpus={parse_gpu_request()} "
+                                f"detail={_dtype_exc}"
+                            ) from _dtype_exc
+                        _pre_retarget_state["param_distribution"] = _pre_param_dist
+                        _pre_retarget_state["effective_snapshot_weight_dtype"] = _pre_effective_label
+                        _pre_retarget_state["effective_weight_dtype"] = _pre_effective_label
+                        _pre_retarget_state["dtype_resolution_source"] = "target_gpu_policy"
+                        _pre_retarget_state["target_gpus"] = list(parse_gpu_request())
                         _state_json_pre = __import__("json").dumps(
                             _pre_retarget_state, default=str, separators=(",", ":"), sort_keys=True,
                         )
@@ -2485,6 +2524,10 @@ class ModalRuntimeEntrypoint:
                             f"stage=snapshot_restored_pre_retarget "
                             f"unet_identity={_unet_ident} "
                             f"requested_weight_dtype={_req_wd_pre} "
+                            f"effective_snapshot_weight_dtype={_pre_effective_label} "
+                            f"effective_weight_dtype={_pre_effective_label} "
+                            f"dtype_resolution_source=target_gpu_policy "
+                            f"target_gpus={','.join(parse_gpu_request())} "
                             f"restored_instance_id={restored_instance_id} "
                             f"restore_session_id={restore_session_id} "
                             f"state={_state_json_pre}",
@@ -2496,6 +2539,10 @@ class ModalRuntimeEntrypoint:
                                 "stage": "snapshot_restored_pre_retarget",
                                 "unet_identity": _unet_ident,
                                 "requested_weight_dtype": _req_wd_pre,
+                                "effective_snapshot_weight_dtype": _pre_effective_label,
+                                "effective_weight_dtype": _pre_effective_label,
+                                "dtype_resolution_source": "target_gpu_policy",
+                                "target_gpus": list(parse_gpu_request()),
                                 "request_id": str(trace.request_id if trace else ""),
                                 "restored_instance_id": restored_instance_id,
                                 "restore_session_id": restore_session_id,
@@ -2503,7 +2550,7 @@ class ModalRuntimeEntrypoint:
                             },
                         )
                     except Exception:
-                        pass
+                        raise
 
                     retarget_ok, retarget_reason = retarget_cpu_snapshot_models(
                         models, model_management=_mm,
@@ -2513,12 +2560,12 @@ class ModalRuntimeEntrypoint:
 
                     # ── Emit post-retarget state (print + trace) ──────────
                     _post_retarget_state: dict[str, Any] = {}
+                    _req_wd_post = "default"
                     try:
                         _post_retarget_state = collect_unet_runtime_state(
                             models.unet, model_management=_mm,
                         )
                         # Derive requested_weight_dtype from plan.model_spec
-                        _req_wd_post = "default"
                         try:
                             _plan_unet_post = (plan.model_spec or {}).get("loaders", {}).get("unet", [])
                             _plan_uid_post = getattr(getattr(plan, "model_key", None), "unet_identity", "")
@@ -2528,6 +2575,40 @@ class ModalRuntimeEntrypoint:
                                     break
                         except Exception:
                             _req_wd_post = "default"
+                        _post_expected_dtype, _post_effective_label = resolve_unet_effective_dtype(
+                            _req_wd_post, target_gpus=parse_gpu_request(),
+                        )
+                        _post_model = getattr(models.unet, "model", None)
+                        _post_dm = (
+                            getattr(_post_model, "diffusion_model", _post_model)
+                            if _post_model is not None
+                            else getattr(models.unet, "diffusion_model", None)
+                        )
+                        if _post_dm is None:
+                            raise RuntimeError(
+                                "restore: diffusion model is unavailable for "
+                                "post-retarget parameter validation"
+                            )
+                        try:
+                            _post_param_dist = inspect_and_validate_snapshot_params(
+                                _post_dm,
+                                expected_dtype=_post_expected_dtype,
+                                require_cpu=False,
+                                context="restore:",
+                            )
+                        except RuntimeError as _dtype_exc:
+                            raise RuntimeError(
+                                "Restore-time post-retarget UNET dtype validation failed: "
+                                f"requested_weight_dtype={_req_wd_post!r} "
+                                f"effective_snapshot_weight_dtype={_post_effective_label} "
+                                f"target_gpus={parse_gpu_request()} "
+                                f"detail={_dtype_exc}"
+                            ) from _dtype_exc
+                        _post_retarget_state["param_distribution"] = _post_param_dist
+                        _post_retarget_state["effective_snapshot_weight_dtype"] = _post_effective_label
+                        _post_retarget_state["effective_weight_dtype"] = _post_effective_label
+                        _post_retarget_state["dtype_resolution_source"] = "target_gpu_policy"
+                        _post_retarget_state["target_gpus"] = list(parse_gpu_request())
                         _state_json_post = __import__("json").dumps(
                             _post_retarget_state, default=str, separators=(",", ":"), sort_keys=True,
                         )
@@ -2536,6 +2617,10 @@ class ModalRuntimeEntrypoint:
                             f"stage=snapshot_restored_post_retarget "
                             f"unet_identity={_unet_ident} "
                             f"requested_weight_dtype={_req_wd_post} "
+                            f"effective_snapshot_weight_dtype={_post_effective_label} "
+                            f"effective_weight_dtype={_post_effective_label} "
+                            f"dtype_resolution_source=target_gpu_policy "
+                            f"target_gpus={','.join(parse_gpu_request())} "
                             f"restored_instance_id={restored_instance_id} "
                             f"restore_session_id={restore_session_id} "
                             f"state={_state_json_post}",
@@ -2547,49 +2632,29 @@ class ModalRuntimeEntrypoint:
                                 "stage": "snapshot_restored_post_retarget",
                                 "unet_identity": _unet_ident,
                                 "requested_weight_dtype": _req_wd_post,
+                                "effective_snapshot_weight_dtype": _post_effective_label,
+                                "effective_weight_dtype": _post_effective_label,
+                                "dtype_resolution_source": "target_gpu_policy",
+                                "target_gpus": list(parse_gpu_request()),
                                 "request_id": str(trace.request_id if trace else ""),
                                 "restored_instance_id": restored_instance_id,
                                 "restore_session_id": restore_session_id,
                                 "state": _post_retarget_state,
                             },
                         )
-                        # ── Restore-time dtype validation ────────────────────
-                        # Verify that the actual model tensor dtype matches the
-                        # expected effective dtype.  This catches stale/invalid
-                        # FP32 snapshots that could have been created before the
-                        # construction-time guard was installed.
-                        try:
-                            import torch as _torch_rt
-                            _rt_dm = None
-                            _rt_model = getattr(models.unet, "model", None)
-                            if _rt_model is not None:
-                                _rt_dm = getattr(_rt_model, "diffusion_model", _rt_model)
-                            else:
-                                _rt_dm = getattr(models.unet, "diffusion_model", None)
-                            if _rt_dm is not None:
-                                _rt_eff = _snap_state.get("effective_weight_dtype", "")
-                                _rt_first_fp = None
-                                for _rt_p in _rt_dm.parameters():
-                                    if _rt_p.is_floating_point():
-                                        _rt_first_fp = _rt_p.dtype
-                                        break
-                                if _rt_eff == "bfloat16" and _rt_first_fp is not None and _rt_first_fp != _torch_rt.bfloat16:
-                                    raise RuntimeError(
-                                        f"Restore-time UNET dtype validation FAILED: "
-                                        f"effective_weight_dtype={_rt_eff} "
-                                        f"but first parameter dtype={_rt_first_fp}. "
-                                        f"unet_identity={_unet_ident} "
-                                        f"restored_instance_id={restored_instance_id}"
-                                    )
-                        except RuntimeError:
-                            raise
-                        except Exception:
-                            pass
-                        # Stash post-retarget state for request-trace propagation.
+                    except Exception:
+                        raise
+
+                    # Stash post-retarget state for request-trace propagation.
+                    try:
                         self._cpu_snapshot_unet_runtime_state = copy.deepcopy({
                             "stage": "snapshot_restored_post_retarget",
                             "unet_identity": _unet_ident,
                             "requested_weight_dtype": _req_wd_post,
+                            "effective_snapshot_weight_dtype": _post_effective_label,
+                            "effective_weight_dtype": _post_effective_label,
+                            "dtype_resolution_source": "target_gpu_policy",
+                            "target_gpus": list(parse_gpu_request()),
                             "restored_instance_id": restored_instance_id,
                             "restore_session_id": restore_session_id,
                             "state": _post_retarget_state,
