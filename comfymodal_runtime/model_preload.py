@@ -197,68 +197,55 @@ _unet_subfn_nesting_depth: ContextVar[int] = ContextVar("_unet_subfn_nesting_dep
 _not_observed_gpu_calls: int = 0
 
 # ── UNET effective-dtype resolver (shared by snapshot and normal paths) ──
-# Module-level cached GPU BF16 support, populated by the first call to
-# _gpu_bf16_supported().  During CPU snapshot creation (_force_cpu_during_snapshot)
-# the normal CUDA query functions are monkey-patched to return False, so we
-# capture the real answer before that context is entered via
-# _cache_gpu_bf16_support_if_needed().  In the normal path the check runs
-# directly.
-_CACHED_GPU_BF16_SUPPORT: bool | None = None
-
-def _gpu_bf16_supported() -> bool:
-    """Check if the real GPU supports bfloat16.
-
-    Uses a module-level cache populated by the first successful probe.
-    During CPU snapshot creation (``_force_cpu_during_snapshot``) the cache
-    must be primed *before* the context is entered via
-    ``cache_gpu_bf16_support_if_needed()`` — see ``modal_app.py`` startup().
-    """
-    global _CACHED_GPU_BF16_SUPPORT
-    if _CACHED_GPU_BF16_SUPPORT is not None:
-        return _CACHED_GPU_BF16_SUPPORT
-    import torch
-    try:
-        _CACHED_GPU_BF16_SUPPORT = torch.cuda.is_bf16_supported()
-    except Exception:
-        _CACHED_GPU_BF16_SUPPORT = False
-    return _CACHED_GPU_BF16_SUPPORT
-
-
-def cache_gpu_bf16_support() -> bool:
-    """Prime ``_CACHED_GPU_BF16_SUPPORT`` before a CPU-snapshot context hides CUDA.
-
-    Safe to call multiple times — the result is cached.  Returns the cached
-    value so callers can use it immediately.
-    """
-    return _gpu_bf16_supported()
-
-
-_RESOLVED_DTYPE_MAP: dict[str, str] = {
-    "fp8_e4m3fn": "torch.float8_e4m3fn",
-    "fp8_e4m3fn_fast": "torch.float8_e4m3fn",
-    "fp8_e5m2": "torch.float8_e5m2",
-}
-"""String weight_dtype values whose effective torch dtype is unambiguous.
-These are the values accepted by ``UNETLoader.load_unet`` in ``nodes.py``."""
+# Resolution strategy depends on context:
+#
+#   1. Normal (GPU) load path — uses the real CUDA hardware via ComfyUI's
+#      model_management.unet_dtype() auto-detection.  The "default" string
+#      is passed through to UNETLoader.load_unet which leaves model_options
+#      empty, letting ComfyUI probe the real GPU.  This works because CUDA
+#      is available.
+#
+#   2. CPU snapshot construction path — there is NO GPU available (Modal's
+#      CPU snapshot builder).  CUDA APIs cannot be called.  The effective
+#      dtype must be resolved from the *configured* target GPU(s) via the
+#      target-GPU policy in gpu_catalog.gpu_supports_bf16().
+#
+# The resolve_unet_effective_dtype() function accepts an optional
+# *target_gpus* parameter.  When provided (snapshot path), it uses
+# the pure static lookup.  When absent (normal path), it falls back
+# to the real GPU probe path.
+#
+# DO NOT cache a false CUDA capability result from the CPU snapshot builder.
+# DO NOT call torch.cuda.* APIs from code that runs during snapshot
+# construction.
 
 
 def resolve_unet_effective_dtype(
     weight_dtype_str: str = "default",
+    *,
+    target_gpus: tuple[str, ...] | None = None,
 ) -> tuple[Any, str]:
     """Resolve a weight_dtype string to the *effective* torch dtype.
 
     Returns ``(effective_dtype, resolved_label)`` where *effective_dtype* is
-    the ``torch.dtype`` the normal (GPU) load path would use for this string,
-    and *resolved_label* is a short diagnostic label such as ``"bfloat16"``,
-    ``"float32"``, or the original string for opaque values.
+    the ``torch.dtype`` the configured GPU load path would use for this
+    string, and *resolved_label* is a short diagnostic label.
 
-    For ``"default"`` the function determines what ``model_management.unet_dtype()``
-    would return in the normal GPU context (not the CPU-snapshot context where
-    BF16 is unavailable).  The decision logic mirrors ``unet_dtype()``:
+    **target_gpus** (tuple of canonical Modal GPU names, optional):
+      When provided (CPU snapshot construction), the effective dtype is
+      determined from the *configured* target GPU(s) via a pure name-based
+      lookup — no CUDA API calls.  The primary (first) GPU in the tuple
+      is used.
+      When ``None`` (normal runtime path), the function falls through to
+      let ComfyUI's normal runtime policy apply (``"default"`` passes
+      through as-is, returning ``(None, "default")``).
 
-    1. CLI flags override everything (``--fp32-unet``, ``--bf16-unet``, …).
-    2. Explicit fp8/e4m3fn/e5m2 strings -> corresponding torch dtype.
-    3. ``"default"`` -> GPU BF16 when the real GPU supports it, else FP32.
+    Decision order:
+      1. CLI flags override everything (``--fp32-unet``, ``--bf16-unet``, …).
+      2. Explicit fp8/e4m3fn/e5m2 strings -> corresponding torch dtype.
+      3. ``"default"`` with *target_gpus* -> target-GPU policy lookup.
+      4. ``"default"`` without *target_gpus* -> ``(None, "default")``
+         (let ComfyUI auto-detect at load time).
 
     Both the snapshot construction path (``_cpu_load_unet``) and the normal
     loader path (``V2LoaderBridge._load_unet``) use this function so they
@@ -267,7 +254,8 @@ def resolve_unet_effective_dtype(
     Returns
     -------
     effective_dtype
-        The resolved ``torch.dtype``, or ``None`` for unrecognised strings.
+        The resolved ``torch.dtype``, or ``None`` for unrecognised strings
+        / pass-through values.
     resolved_label
         Short string for diagnostic logging.
     """
@@ -301,18 +289,19 @@ def resolve_unet_effective_dtype(
     if weight_dtype_str != "default":
         return (None, weight_dtype_str)
 
-    # 4. "default" — determine what the GPU path would do
-    try:
-        import comfy.model_management as _mm
-        if getattr(_mm, "FORCE_FP32", False):
-            return (_torch.float32, "float32")
-    except Exception:
-        pass
+    # 4. "default" with target_gpus — snapshot construction path.
+    #    Use the configured target GPU(s), not the local CUDA state.
+    if target_gpus is not None:
+        from gpu_catalog import gpu_supports_bf16
+        # Use the primary (first) target GPU for capability check
+        _primary = target_gpus[0] if target_gpus else ""
+        if _primary and gpu_supports_bf16(_primary):
+            return (_torch.bfloat16, "bfloat16")
+        return (_torch.float32, "float32")
 
-    if _gpu_bf16_supported():
-        return (_torch.bfloat16, "bfloat16")
-
-    return (_torch.float32, "float32")
+    # 5. "default" without target_gpus — normal runtime path.
+    #    Let ComfyUI auto-detect at load time by returning None.
+    return (None, "default")
 
 # Submission correlation counter
 _SUBMISSION_COUNTER: int = 0

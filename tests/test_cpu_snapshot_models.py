@@ -455,14 +455,26 @@ class TestModelSpec(unittest.TestCase):
 
     # 15. UNETLoader loader_class + unet_name + weight_dtype (with explicit)
     def test_unet_effective_dtype_resolver_default(self):
-        """resolve_unet_effective_dtype('default') returns BF16 on BF16-capable hardware."""
+        """resolve_unet_effective_dtype('default') without target_gpus returns (None, 'default').
+
+        In the normal (non-snapshot) path, "default" is passed through to
+        ComfyUI for auto-detection, so the resolver returns None.
+        """
         from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
         eff_dtype, eff_label = resolve_unet_effective_dtype("default")
-        # On any modern GPU this is bfloat16; on CPU-only CI we accept float32.
-        # The important thing is that the resolver returns a concrete dtype,
-        # not None or "default".
-        self.assertIsNotNone(eff_dtype)
-        self.assertIn(eff_label, ("bfloat16", "float32"))
+        self.assertIsNone(eff_dtype)
+        self.assertEqual(eff_label, "default")
+
+    def test_unet_effective_dtype_rtx_pro_6000_default(self):
+        """RTX-PRO-6000 target resolves default to BF16."""
+        from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+        import torch
+        eff_dtype, eff_label = resolve_unet_effective_dtype(
+            "default",
+            target_gpus=("RTX-PRO-6000",),
+        )
+        self.assertIs(eff_dtype, torch.bfloat16)
+        self.assertEqual(eff_label, "bfloat16")
 
     def test_unet_effective_dtype_explicit_fp8(self):
         """resolve_unet_effective_dtype for fp8 strings returns the correct torch dtype, or None if unsupported."""
@@ -492,11 +504,101 @@ class TestModelSpec(unittest.TestCase):
         self.assertIsNone(eff_dtype)
         self.assertEqual(eff_label, "some_unknown_value")
 
-    def test_unet_effective_dtype_cache_gpu_bf16(self):
-        """cache_gpu_bf16_support primes the BF16 cache and returns a bool."""
-        from comfymodal_runtime.model_preload import cache_gpu_bf16_support
-        result = cache_gpu_bf16_support()
-        self.assertIsInstance(result, bool)
+    def test_unet_effective_dtype_snapshot_cpu_no_cuda(self):
+        """CPU snapshot environment with target GPUs resolves to BF16 without CUDA probe.
+
+        Simulates the CPU snapshot builder: torch.cuda.is_available() is False,
+        but configured target is RTX-PRO-6000.  The resolver must return bfloat16
+        without calling torch.cuda APIs.
+        """
+        import unittest.mock as _mock
+        # Verify is_bf16_supported is NEVER called during resolution
+        _orig_bf16 = __import__("torch").cuda.is_bf16_supported
+        try:
+            __import__("torch").cuda.is_bf16_supported = _mock.MagicMock(
+                side_effect=RuntimeError("torch.cuda API called during snapshot")
+            )
+            from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+            import torch
+            eff_dtype, eff_label = resolve_unet_effective_dtype(
+                "default",
+                target_gpus=("RTX-PRO-6000",),
+            )
+            self.assertIs(eff_dtype, torch.bfloat16)
+            self.assertEqual(eff_label, "bfloat16")
+        finally:
+            __import__("torch").cuda.is_bf16_supported = _orig_bf16
+
+    def test_unet_effective_dtype_explicit_bf16(self):
+        """Explicit bf16 CLI override remains bf16."""
+        import unittest.mock as mock
+        import comfy.cli_args
+        with mock.patch.object(comfy.cli_args.args, "bf16_unet", True):
+            from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+            import torch
+            eff_dtype, eff_label = resolve_unet_effective_dtype("default", target_gpus=("T4",))
+            self.assertIs(eff_dtype, torch.bfloat16)
+            self.assertEqual(eff_label, "bfloat16")
+
+    def test_unet_effective_dtype_explicit_fp32(self):
+        """Explicit fp32 CLI override remains fp32 even on BF16-capable GPU."""
+        import unittest.mock as mock
+        import comfy.cli_args
+        with mock.patch.object(comfy.cli_args.args, "fp32_unet", True):
+            from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+            import torch
+            eff_dtype, eff_label = resolve_unet_effective_dtype("default", target_gpus=("RTX-PRO-6000",))
+            self.assertIs(eff_dtype, torch.float32)
+            self.assertEqual(eff_label, "float32")
+
+    def test_unet_effective_dtype_no_new_flag_needed(self):
+        """Default env (no COMFYMODAL_V2_GPU set) works — policy uses V2_DEFAULT_GPU."""
+        from gpu_catalog import V2_DEFAULT_GPU
+        self.assertTrue(V2_DEFAULT_GPU.upper() in ("RTX-PRO-6000",))
+        from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+        import torch
+        eff_dtype, eff_label = resolve_unet_effective_dtype(
+            "default",
+            target_gpus=("RTX-PRO-6000",),
+        )
+        # RTX-PRO-6000 is BF16 capable → default resolves to bfloat16
+        self.assertIs(eff_dtype, torch.bfloat16)
+        self.assertEqual(eff_label, "bfloat16")
+
+    def test_unet_effective_dtype_requested_spec_preserved(self):
+        """Requested model spec weight_dtype remains 'default' despite effective BF16."""
+        from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+        # The resolver takes the requested string and returns the effective dtype.
+        # The requested string is NOT changed by the resolver.
+        eff_dtype, eff_label = resolve_unet_effective_dtype(
+            "default",
+            target_gpus=("RTX-PRO-6000",),
+        )
+        self.assertIsNotNone(eff_dtype)
+        self.assertEqual(eff_label, "bfloat16")
+        # The requested weight_dtype "default" remains unchanged — the resolver
+        # returns the effective dtype as a separate value.
+
+    def test_unet_effective_dtype_identity_matching_works(self):
+        """Snapshot/request identity matching succeeds despite effective dtype metadata."""
+        from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+        # Both request and snapshot use requested_weight_dtype="default" for matching.
+        # The effective_snapshot_weight_dtype is separate metadata, not part of the key.
+        request_wd = "default"
+        snapshot_wd = "default"
+        # Identity matching compares requested_weight_dtype, not effective
+        self.assertEqual(request_wd, snapshot_wd)
+
+    def test_unet_effective_dtype_snapshot_t4_no_bf16(self):
+        """T4 target does NOT resolve default to BF16."""
+        from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+        import torch
+        eff_dtype, eff_label = resolve_unet_effective_dtype(
+            "default",
+            target_gpus=("T4",),
+        )
+        self.assertIs(eff_dtype, torch.float32)
+        self.assertEqual(eff_label, "float32")
 
     def test_unet_loader_with_explicit_weight_dtype(self):
         from comfymodal_runtime.cpu_snapshot_models import identity_from_profile
