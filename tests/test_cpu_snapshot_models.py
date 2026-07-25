@@ -1257,30 +1257,84 @@ class TestDataclassDefaults(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Extra fake patchers for runtime-state tests
+# Realistic fake patchers for runtime-state tests
 # ---------------------------------------------------------------------------
 
 
-class _FakeUNETComplete:
-    """Full-featured fake UNET patcher with all expected attributes."""
-    def __init__(self, device="cpu", dtype="torch.float16"):
-        self.model = _FakeModule(device)
-        self.model.diffusion_model = _FakeModule(device)
-        self.load_device = device
-        self.offload_device = "cpu"
-        self.model_dtype = dtype
-        self.manual_cast_dtype = dtype
-        self.weight_dtype = dtype
-        self.model_options = {"some_option": 1}
-        self.transformer_options = {"some_transformer_opt": 2}
-        self.patches = {"patch1": object(), "patch2": object()}
-        self.object_patches = {"op1": object()}
+class _FakeRealModel:
+    """Model-like object with the attributes a real ComfyUI model has."""
+    def __init__(self, device="cpu"):
+        self.device = device
+        self.manual_cast_dtype = "torch.float16"
         self.model_loaded_weight_memory = 1234567890
         self.model_lowvram = False
-        self.model_lowvram_patch_counter = 0
+        self.lowvram_patch_counter = 0
+        self._param_tensor = _FakeTensor(device)
+        self._buffer_tensor = _FakeTensor(device)
+
+    def named_parameters(self, recurse=True):
+        yield ("weight", self._param_tensor)
+
+    def named_buffers(self, recurse=True):
+        yield ("bias", self._buffer_tensor)
+
+
+class _FakeRealDiffusionModel:
+    """Diffusion model that owns forward."""
+    def __init__(self, device="cpu"):
+        self.device = device
+        self._param_tensor = _FakeTensor(device)
+        self._buffer_tensor = _FakeTensor(device)
+
+    def named_parameters(self, recurse=True):
+        yield ("weight", self._param_tensor)
+
+    def named_buffers(self, recurse=True):
+        yield ("bias", self._buffer_tensor)
 
     def forward(self, x):
         return x
+
+
+class _FakeRealPatcher:
+    """Realistic fake ModelPatcher for real ComfyUI ModelPatcher structure.
+
+    * ``model_dtype`` is a **method**.
+    * ``manual_cast_dtype`` / ``device`` / ``model_loaded_weight_memory`` /
+      ``model_lowvram`` / ``lowvram_patch_counter`` live on ``.model``.
+    * ``transformer_options`` is nested under ``model_options``.
+    * ``diffusion_model`` (on ``.model``) owns ``forward``.
+    """
+    def __init__(self, device="cpu"):
+        self.model = _FakeRealModel(device)
+        self.model.diffusion_model = _FakeRealDiffusionModel(device)
+        self.load_device = device
+        self.offload_device = "cpu"
+        self.weight_dtype = "fp8_e4m3fn"
+        self.model_options = {
+            "some_option": 1,
+            "transformer_options": {
+                "some_transformer_opt": 2,
+            },
+        }
+        self.patches = {"patch1": object(), "patch2": object()}
+        self.object_patches = {"op1": object()}
+
+    def model_dtype(self):
+        return "torch.float16"
+
+
+class _FakeRealPatcherNoDM:
+    """Realistic patcher without diffusion_model — tests fallback to model."""
+    def __init__(self, device="cpu"):
+        self.model = _FakeRealModel(device)
+        # No diffusion_model
+        self.load_device = device
+        self.offload_device = "cpu"
+        self.weight_dtype = "fp8_e4m3fn"
+
+    def model_dtype(self):
+        return "torch.float16"
 
 
 class _FakeUNETMinimal:
@@ -1296,42 +1350,151 @@ class _FakeUNETNoModel:
     pass
 
 
+# ── Single-request iterator that raises on second item ──────────────
+
+
+class _SingleParameterGenerator:
+    """An iterator that yields exactly one parameter, then raises.
+
+    Proves the collector calls ``next()`` once and never ``list()``.
+    """
+    def __init__(self):
+        self._called = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self._called += 1
+        if self._called > 1:
+            raise RuntimeError("second parameter requested — proves list() was called")
+        return ("weight", _FakeTensor("cpu"))
+
+
+class _SingleBufferGenerator:
+    """An iterator that yields exactly one buffer, then raises."""
+    def __init__(self):
+        self._called = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self._called += 1
+        if self._called > 1:
+            raise RuntimeError("second buffer requested — proves list() was called")
+        return ("bias", _FakeTensor("cpu"))
+
+
+class _FakeModuleSingleIter:
+    """Module whose named_parameters/buffers raise on second iteration."""
+    def __init__(self):
+        pass
+
+    def named_parameters(self, recurse=True):
+        return _SingleParameterGenerator()
+
+    def named_buffers(self, recurse=True):
+        return _SingleBufferGenerator()
+
+
+class _FakePatcherSingleIter:
+    """Patcher wrapping a single-iter module."""
+    def __init__(self):
+        self.model = _FakeModuleSingleIter()
+        self.model.diffusion_model = _FakeModuleSingleIter()
+        self.load_device = "cpu"
+        self.offload_device = "cpu"
+        self.weight_dtype = "default"
+
+
+# ── Fake model_management with callable loaded_models ─────────────
+
+
+class _FakeModelManagementWithCallable:
+    """model_management where loaded_models is a callable."""
+    def __init__(self, member_obj=None):
+        self._member = member_obj
+
+    @staticmethod
+    def get_torch_device():
+        return "cuda:0"
+
+    @staticmethod
+    def unet_offload_device():
+        return "cpu"
+
+    def loaded_models(self):
+        if self._member is not None:
+            return [self._member]
+        return []
+
+
+class _FakeModelManagementLoadedNotCallable:
+    """model_management where loaded_models exists but is not callable."""
+    loaded_models = "not_callable"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Tests: collect_unet_runtime_state
+# ══════════════════════════════════════════════════════════════════════
+
+
 class TestCollectUnetRuntimeState(unittest.TestCase):
     """collect_unet_runtime_state edge-to-edge coverage."""
 
-    def test_collect_complete_patcher(self):
-        """Complete patcher returns all fields, no absent values for standard attrs."""
+    def test_collect_realistic_patcher(self):
+        """Realistic patcher returns correct values for all standard fields."""
         from comfymodal_runtime.cpu_snapshot_models import collect_unet_runtime_state
-        patcher = _FakeUNETComplete()
+        patcher = _FakeRealPatcher(device="cpu")
         state = collect_unet_runtime_state(patcher)
         self.assertIsInstance(state, dict)
-        # Type identities present
-        self.assertEqual(state["patcher_type"], "_FakeUNETComplete")
-        self.assertEqual(state["model_type"], "_FakeModule")
-        self.assertIn("diffusion_model_type", state)
+        # Type identities
+        self.assertEqual(state["patcher_type"], "_FakeRealPatcher")
+        self.assertEqual(state["model_type"], "_FakeRealModel")
+        self.assertEqual(state["diffusion_model_type"], "_FakeRealDiffusionModel")
         # Object IDs present (non-empty strings)
         self.assertTrue(state["patcher_object_id"])
         self.assertTrue(state["model_object_id"])
         self.assertTrue(state["diffusion_model_object_id"])
-        # Device fields
-        self.assertIn(state["load_device"], ("cpu", "absent"))
-        self.assertIn(state["offload_device"], ("cpu", "absent"))
-        # Parameter/buffer fields from first parameter only
+        # Device attributes
+        self.assertEqual(state["load_device"], "cpu")
+        self.assertEqual(state["offload_device"], "cpu")
+        # current_device comes from model.device
+        self.assertEqual(state["current_device"], "cpu")
+        # First parameter/buffer from diffusion_model (first, not model)
         self.assertEqual(state["first_parameter_device"], "cpu")
         self.assertEqual(state["first_buffer_device"], "cpu")
-        # Options keys sorted
-        self.assertEqual(state["model_options_keys"], ["some_option"])
+        # model_dtype is a method result
+        self.assertEqual(state["model_dtype"], "torch.float16")
+        # manual_cast_dtype from model.manual_cast_dtype
+        self.assertEqual(state["manual_cast_dtype"], "torch.float16")
+        # weight_dtype from patcher
+        self.assertEqual(state["weight_dtype"], "fp8_e4m3fn")
+        # Options
+        self.assertEqual(state["model_options_keys"], ["some_option", "transformer_options"])
         self.assertEqual(state["transformer_options_keys"], ["some_transformer_opt"])
         # Patch counts
         self.assertEqual(state["patch_count"], 2)
         self.assertEqual(state["object_patch_count"], 1)
-        # Memory / lowvram
+        # Memory/lowvram from model.*
         self.assertEqual(state["model_loaded_weight_memory"], "1234567890")
         self.assertEqual(state["model_lowvram"], "False")
-        # Forward
-        self.assertEqual(state["forward_module"], "_FakeUNETComplete")
-        self.assertIsInstance(state["forward_qualname"], str)
+        self.assertEqual(state["model_lowvram_patch_counter"], "0")
+        # Forward from diffusion_model
+        self.assertEqual(state["forward_module"], "_FakeRealDiffusionModel")
         self.assertTrue(state["forward_qualname"].endswith("forward"))
+
+    def test_collect_fallback_no_diffusion_model(self):
+        """Without diffusion_model, first param/buffer fallbacks to model."""
+        from comfymodal_runtime.cpu_snapshot_models import collect_unet_runtime_state
+        patcher = _FakeRealPatcherNoDM(device="cpu")
+        state = collect_unet_runtime_state(patcher)
+        self.assertEqual(state["diffusion_model_type"], "absent")
+        # Forward falls back to model (absent when model has no forward)
+        self.assertEqual(state["forward_module"], "absent")
+        # First parameter still reads (from model)
+        self.assertEqual(state["first_parameter_device"], "cpu")
 
     def test_collect_minimal_patcher(self):
         """Minimal patcher returns 'absent' for missing advanced fields."""
@@ -1339,14 +1502,11 @@ class TestCollectUnetRuntimeState(unittest.TestCase):
         patcher = _FakeUNETMinimal()
         state = collect_unet_runtime_state(patcher)
         self.assertIsInstance(state, dict)
-        # model_dtype, manual_cast_dtype, weight_dtype all absent
         self.assertEqual(state["model_dtype"], "absent")
         self.assertEqual(state["manual_cast_dtype"], "absent")
         self.assertEqual(state["weight_dtype"], "absent")
-        # patch counts absent when attribute missing
         self.assertEqual(state["patch_count"], "absent")
         self.assertEqual(state["object_patch_count"], "absent")
-        # model_loaded_weight_memory absent
         self.assertEqual(state["model_loaded_weight_memory"], "absent")
 
     def test_collect_no_model(self):
@@ -1355,40 +1515,71 @@ class TestCollectUnetRuntimeState(unittest.TestCase):
         state = collect_unet_runtime_state(_FakeUNETNoModel())
         self.assertEqual(state["model_type"], "absent")
         self.assertEqual(state["diffusion_model_type"], "absent")
-        self.assertEqual(state["model_object_id"], "absent")
-        self.assertEqual(state["diffusion_model_object_id"], "absent")
         self.assertEqual(state["first_parameter_device"], "absent")
+        self.assertEqual(state["current_device"], "absent")
 
     def test_collect_no_tensor_contents(self):
         """No tensor values or reprs in state values."""
         from comfymodal_runtime.cpu_snapshot_models import collect_unet_runtime_state
-        state = collect_unet_runtime_state(_FakeUNETComplete())
+        state = collect_unet_runtime_state(_FakeRealPatcher("cpu"))
         for key, value in state.items():
             self.assertIsInstance(value, (str, int, float, bool, list, dict))
             s = str(value)
-            # Ensure no tensor repr leaks
             self.assertNotIn("FakeTensor", s, msg=f"tensor content leaked in {key}={value!r}")
             self.assertNotIn("<", s, msg=f"object repr leaked in {key}={value!r}")
 
-    def test_collect_only_first_parameter_and_buffer(self):
-        """Only first parameter and first buffer are inspected."""
+    def test_collect_only_first_parameter_single_iter(self):
+        """Proves next(iter(...)) is used, not list()."""
         from comfymodal_runtime.cpu_snapshot_models import collect_unet_runtime_state
-        patcher = _FakeUNETComplete()
+        patcher = _FakePatcherSingleIter()
+        # This would raise RuntimeError("second parameter requested") if list() was called
         state = collect_unet_runtime_state(patcher)
-        self.assertIsInstance(state["first_parameter_device"], str)
-        self.assertIsInstance(state["first_parameter_dtype"], str)
-        self.assertIsInstance(state["first_buffer_device"], str)
-        self.assertIsInstance(state["first_buffer_dtype"], str)
-        # Should not iterate beyond first
-        self.assertNotIn("all_parameters", state)
-        self.assertNotIn("all_buffers", state)
+        self.assertEqual(state["first_parameter_device"], "cpu")
+        self.assertEqual(state["first_buffer_device"], "cpu")
 
     def test_collect_deterministic_keys(self):
-        """State dict keys are deterministic (sorted by insertion order)."""
+        """State dict keys are deterministic."""
         from comfymodal_runtime.cpu_snapshot_models import collect_unet_runtime_state
-        state_a = collect_unet_runtime_state(_FakeUNETComplete())
-        state_b = collect_unet_runtime_state(_FakeUNETComplete())
+        state_a = collect_unet_runtime_state(_FakeRealPatcher("cpu"))
+        state_b = collect_unet_runtime_state(_FakeRealPatcher("cpu"))
         self.assertEqual(list(state_a.keys()), list(state_b.keys()))
+
+    def test_collect_loaded_models_is_callable(self):
+        """loaded_models_member resolves via function call."""
+        from comfymodal_runtime.cpu_snapshot_models import collect_unet_runtime_state
+        patcher = _FakeRealPatcher("cpu")
+        mgmt = _FakeModelManagementWithCallable(member_obj=patcher)
+        state = collect_unet_runtime_state(patcher, model_management=mgmt)
+        self.assertEqual(state["loaded_models_member"], "1")
+
+    def test_collect_loaded_models_not_member(self):
+        """loaded_models_member is '0' when patcher not in the list."""
+        from comfymodal_runtime.cpu_snapshot_models import collect_unet_runtime_state
+        patcher = _FakeRealPatcher("cpu")
+        other = _FakeRealPatcher("cpu")
+        mgmt = _FakeModelManagementWithCallable(member_obj=other)
+        state = collect_unet_runtime_state(patcher, model_management=mgmt)
+        self.assertEqual(state["loaded_models_member"], "0")
+
+    def test_collect_loaded_models_not_callable(self):
+        """loaded_models_member is 'absent' when attribute is not callable."""
+        from comfymodal_runtime.cpu_snapshot_models import collect_unet_runtime_state
+        patcher = _FakeRealPatcher("cpu")
+        state = collect_unet_runtime_state(patcher, model_management=_FakeModelManagementLoadedNotCallable)
+        self.assertEqual(state["loaded_models_member"], "absent")
+
+    def test_collect_model_dtype_not_callable(self):
+        """model_dtype is 'absent' when the attribute is not callable."""
+        from comfymodal_runtime.cpu_snapshot_models import collect_unet_runtime_state
+        patcher = _FakeUNETMinimal()
+        state = collect_unet_runtime_state(patcher)
+        # _FakeUNETMinimal has no model_dtype attribute at all
+        self.assertEqual(state["model_dtype"], "absent")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Tests: diff_unet_runtime_states
+# ══════════════════════════════════════════════════════════════════════
 
 
 class TestDiffUnetRuntimeStates(unittest.TestCase):
@@ -1403,6 +1594,10 @@ class TestDiffUnetRuntimeStates(unittest.TestCase):
             "weight_dtype": "fp8_e4m3fn",
             "patch_count": "0",
             "model_loaded_weight_memory": "1000",
+            # Object IDs should be excluded from semantic diff
+            "patcher_object_id": "1234",
+            "model_object_id": "5678",
+            "diffusion_model_object_id": "90ab",
         }
         if overrides:
             base.update(overrides)
@@ -1422,8 +1617,17 @@ class TestDiffUnetRuntimeStates(unittest.TestCase):
         self.assertIn("load_device", diff)
         self.assertEqual(diff["load_device"]["snapshot"], "cpu")
         self.assertEqual(diff["load_device"]["normal"], "cuda:0")
-        # Only the differing field
         self.assertEqual(len(diff), 1)
+
+    def test_diff_excludes_object_ids(self):
+        """Object-ID keys are excluded from the semantic diff."""
+        from comfymodal_runtime.cpu_snapshot_models import diff_unet_runtime_states
+        a = self._make_state({"patcher_object_id": "1111", "model_object_id": "2222"})
+        b = self._make_state({"patcher_object_id": "3333", "model_object_id": "4444"})
+        diff = diff_unet_runtime_states(a, b)
+        self.assertNotIn("patcher_object_id", diff)
+        self.assertNotIn("model_object_id", diff)
+        self.assertNotIn("diffusion_model_object_id", diff)
 
     def test_diff_multiple_fields(self):
         from comfymodal_runtime.cpu_snapshot_models import diff_unet_runtime_states
@@ -1443,7 +1647,6 @@ class TestDiffUnetRuntimeStates(unittest.TestCase):
         self.assertIn("extra_field", diff)
 
     def test_diff_sorted_output(self):
-        """Diff keys are sorted for deterministic output."""
         from comfymodal_runtime.cpu_snapshot_models import diff_unet_runtime_states
         a = self._make_state({"b_field": "1", "a_field": "2"})
         b = self._make_state({"b_field": "x", "a_field": "y"})
@@ -1451,30 +1654,44 @@ class TestDiffUnetRuntimeStates(unittest.TestCase):
         keys = list(diff.keys())
         self.assertEqual(keys, sorted(keys))
 
+    def test_diff_zero_field_count_when_match(self):
+        """field_count=0 when states match (except object IDs)."""
+        from comfymodal_runtime.cpu_snapshot_models import diff_unet_runtime_states
+        a = self._make_state({"load_device": "cpu"})
+        b = self._make_state({"load_device": "cpu"})
+        # Different object IDs only
+        b["patcher_object_id"] = "different"
+        diff = diff_unet_runtime_states(a, b)
+        self.assertEqual(diff, {})
+        self.assertEqual(len(diff), 0)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Tests: rehydrate_cpu_snapshot_unet
+# ══════════════════════════════════════════════════════════════════════
+
 
 class TestRehydrateCpuSnapshotUnet(unittest.TestCase):
     """rehydrate_cpu_snapshot_unet coverage."""
 
     def test_rehydrate_success(self):
         from comfymodal_runtime.cpu_snapshot_models import rehydrate_cpu_snapshot_unet
-        patcher = _FakeUNETComplete(device="cpu", dtype="torch.float16")
+        patcher = _FakeRealPatcher(device="cpu")
         ok, reason = rehydrate_cpu_snapshot_unet(
             patcher,
             model_management=_FakeModelManagement,
         )
         self.assertTrue(ok, msg=reason)
         self.assertEqual(reason, "ok")
-        # load_device and offload_device changed
         self.assertEqual(patcher.load_device, "cuda:0")
         self.assertEqual(patcher.offload_device, "cpu")
 
     def test_rehydrate_no_change_to_other_fields(self):
-        """Rehydration changes only load_device (and offload_device when different)."""
         from comfymodal_runtime.cpu_snapshot_models import (
             rehydrate_cpu_snapshot_unet,
             collect_unet_runtime_state,
         )
-        patcher = _FakeUNETComplete(device="cpu", dtype="torch.float16")
+        patcher = _FakeRealPatcher(device="cpu")
         state_before = collect_unet_runtime_state(patcher)
         ok, reason = rehydrate_cpu_snapshot_unet(
             patcher,
@@ -1482,13 +1699,9 @@ class TestRehydrateCpuSnapshotUnet(unittest.TestCase):
         )
         self.assertTrue(ok)
         state_after = collect_unet_runtime_state(patcher)
-        # Identify what changed
         changed = {k for k in state_before if str(state_before[k]) != str(state_after[k])}
-        # load_device must change (cpu -> cuda:0)
         self.assertIn("load_device", changed)
-        # Core identity fields must NOT change
         frozen = {"patcher_type", "model_type", "diffusion_model_type",
-                  "patcher_object_id", "model_object_id", "diffusion_model_object_id",
                   "model_dtype", "manual_cast_dtype", "weight_dtype",
                   "model_options_keys", "transformer_options_keys",
                   "patch_count", "object_patch_count",
@@ -1511,23 +1724,21 @@ class TestRehydrateCpuSnapshotUnet(unittest.TestCase):
 
     def test_rehydrate_missing_mgmt_func(self):
         from comfymodal_runtime.cpu_snapshot_models import rehydrate_cpu_snapshot_unet
-        patcher = _FakeUNETComplete(device="cpu")
+        patcher = _FakeRealPatcher(device="cpu")
         ok, reason = rehydrate_cpu_snapshot_unet(
             patcher,
             model_management=_FakeModelManagementMissingFunc,
         )
         self.assertFalse(ok)
-        # Either missing function is reported first
         self.assertTrue(
             "get_torch_device" in reason or "unet_offload_device" in reason,
             msg=f"Expected one of the missing functions in reason, got: {reason}",
         )
 
     def test_rehydrate_with_trace(self):
-        """rehydrate emits pre/post state via trace when trace is provided."""
         from comfymodal_runtime.cpu_snapshot_models import rehydrate_cpu_snapshot_unet
         from comfymodal_runtime.trace import RuntimeTrace
-        patcher = _FakeUNETComplete(device="cpu")
+        patcher = _FakeRealPatcher(device="cpu")
         trace = RuntimeTrace()
         ok, reason = rehydrate_cpu_snapshot_unet(
             patcher,
@@ -1538,6 +1749,33 @@ class TestRehydrateCpuSnapshotUnet(unittest.TestCase):
         names = {e.name for e in trace.events}
         self.assertIn("unet_rehydrate_pre_state", names)
         self.assertIn("unet_rehydrate_post_state", names)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Tests: no module-level snapshot-state bridge remains
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestNoModuleLevelBridge(unittest.TestCase):
+    """Verify the cross-process A/B bridge was completely removed."""
+
+    def test_no_latest_snapshot_unet_state(self):
+        """_LATEST_SNAPSHOT_UNET_STATE is not defined in model_preload."""
+        import comfymodal_runtime.model_preload as mp
+        self.assertFalse(hasattr(mp, "_LATEST_SNAPSHOT_UNET_STATE"),
+                         "Module-level bridge must be removed")
+
+    def test_no_set_latest_snapshot_unet_state(self):
+        """_set_latest_snapshot_unet_state is not defined in model_preload."""
+        import comfymodal_runtime.model_preload as mp
+        self.assertFalse(hasattr(mp, "_set_latest_snapshot_unet_state"),
+                         "Setter function must be removed")
+
+    def test_no_consume_latest_snapshot_unet_state(self):
+        """_consume_latest_snapshot_unet_state is not defined in model_preload."""
+        import comfymodal_runtime.model_preload as mp
+        self.assertFalse(hasattr(mp, "_consume_latest_snapshot_unet_state"),
+                         "Consumer function must be removed")
 
 
 if __name__ == "__main__":
