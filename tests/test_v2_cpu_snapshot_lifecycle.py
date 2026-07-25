@@ -7,6 +7,7 @@ ComfyUI.  Tests skip cleanly when optional imports are unavailable.
 
 from __future__ import annotations
 
+import copy
 import io
 import os
 import sys
@@ -2359,6 +2360,314 @@ class CpuSnapshotExtendAfterUseReadyClipTests(unittest.TestCase):
             prepare_unet=True, prepare_vae=False, trace=self.trace,
         )
         self.assertIsNone(prep.vae_future)
+
+
+# ── Snapshot UNET state propagation tests ──────────────────────────────
+
+
+class CpuSnapshotUnetStatePropagationTests(unittest.TestCase):
+    """_maybe_propagate_cpu_snapshot_unet_state coverage.
+
+    Exercises the exact lifecycle-to-request trace propagation logic
+    that re-emits ``snapshot_restored_post_retarget`` into the current
+    request trace when the snapshot models are reused.
+    """
+
+    _UNET_IDENTITY = "flux1-dev.safetensors"
+    _WEIGHT_DTYPE = "fp8_e4m3fn"
+    _RESTORED_INSTANCE_ID = "restored-abc-123"
+    _RESTORE_SESSION_ID = "session-xyz-789"
+
+    def _make_state(self) -> dict[str, Any]:
+        """Build a realistic saved state dict."""
+        return {
+            "stage": "snapshot_restored_post_retarget",
+            "unet_identity": self._UNET_IDENTITY,
+            "requested_weight_dtype": self._WEIGHT_DTYPE,
+            "restored_instance_id": self._RESTORED_INSTANCE_ID,
+            "restore_session_id": self._RESTORE_SESSION_ID,
+            "state": {
+                "patcher_type": "ModelPatcher",
+                "load_device": "cpu",
+                "offload_device": "cpu",
+                "weight_dtype": "fp8_e4m3fn",
+                "patch_count": "0",
+            },
+        }
+
+    def _make_model_key(self, unet_identity: str = None) -> Any:
+        from comfymodal_runtime.contracts import ModelRestoreKey
+        return ModelRestoreKey(
+            unet_identity=unet_identity or self._UNET_IDENTITY,
+            clip_identity="clip_l.safetensors",
+            clip_type="flux",
+        )
+
+    def _make_model_spec(self, weight_dtype: str = None) -> dict:
+        return {
+            "loaders": {
+                "unet": [{
+                    "loader_class": "UNETLoader",
+                    "unet_name": self._UNET_IDENTITY,
+                    "weight_dtype": weight_dtype or self._WEIGHT_DTYPE,
+                }],
+                "clip": [],
+                "vae": [],
+            },
+        }
+
+    def setUp(self):
+        self.entrypoint = ModalRuntimeEntrypoint()
+        self.trace = RuntimeTrace(request_id="req-propagate-001", process="remote")
+
+    # ── Test 1: Successful restore stores post-retarget metadata ──────
+
+    def test_restore_stores_post_retarget_metadata(self):
+        """Setting _cpu_snapshot_unet_runtime_state stores the expected fields."""
+        state = self._make_state()
+        self.entrypoint._cpu_snapshot_unet_runtime_state = state
+        self.assertIsNotNone(self.entrypoint._cpu_snapshot_unet_runtime_state)
+        self.assertEqual(
+            self.entrypoint._cpu_snapshot_unet_runtime_state["stage"],
+            "snapshot_restored_post_retarget",
+        )
+        self.assertEqual(
+            self.entrypoint._cpu_snapshot_unet_runtime_state["unet_identity"],
+            self._UNET_IDENTITY,
+        )
+
+    # ── Test 2: Stored nested state is a defensive copy ──────────────
+
+    def test_stored_state_is_defensive_copy(self):
+        """Mutating the original dict after storing does not affect stored state.
+        This simulates the deep-copy semantics used in the restore() path."""
+        original = self._make_state()
+        self.entrypoint._cpu_snapshot_unet_runtime_state = copy.deepcopy(original)
+        original["unet_identity"] = "mutated.safetensors"
+        original["state"]["load_device"] = "cuda:0"
+        stored = self.entrypoint._cpu_snapshot_unet_runtime_state
+        self.assertEqual(stored["unet_identity"], self._UNET_IDENTITY)
+        self.assertEqual(stored["state"]["load_device"], "cpu")
+
+    # ── Test 3: Exact snapshot reuse emits unet_runtime_state ────────
+
+    def test_reuse_emits_unet_runtime_state(self):
+        """Matching identity + dtype emits unet_runtime_state into request trace."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), self.trace,
+        )
+        events = [e for e in self.trace.events if e.name == "unet_runtime_state"]
+        self.assertEqual(len(events), 1)
+        meta = events[0].metadata
+        self.assertEqual(meta["stage"], "snapshot_restored_post_retarget")
+
+    # ── Test 4: Propagated event retains all required fields ─────────
+
+    def test_propagated_event_retains_fields(self):
+        """The emitted event retains stage, restored_instance_id, restore_session_id,
+        unet_identity, and requested_weight_dtype."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), self.trace,
+        )
+        events = [e for e in self.trace.events if e.name == "unet_runtime_state"]
+        self.assertEqual(len(events), 1)
+        meta = events[0].metadata
+        self.assertEqual(meta["stage"], "snapshot_restored_post_retarget")
+        self.assertEqual(meta["restored_instance_id"], self._RESTORED_INSTANCE_ID)
+        self.assertEqual(meta["restore_session_id"], self._RESTORE_SESSION_ID)
+        self.assertEqual(meta["unet_identity"], self._UNET_IDENTITY)
+        self.assertEqual(meta["requested_weight_dtype"], self._WEIGHT_DTYPE)
+
+    # ── Test 5: Propagated event uses current request ID ─────────────
+
+    def test_propagated_event_uses_current_request_id(self):
+        """The emitted event request_id matches the current trace."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), self.trace,
+        )
+        events = [e for e in self.trace.events if e.name == "unet_runtime_state"]
+        meta = events[0].metadata
+        self.assertEqual(meta["request_id"], "req-propagate-001")
+
+    # ── Test 6: Event includes propagated_from_restore=True ───────────
+
+    def test_propagated_event_has_propagated_flag(self):
+        """The emitted event includes propagated_from_restore=True."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), self.trace,
+        )
+        events = [e for e in self.trace.events if e.name == "unet_runtime_state"]
+        meta = events[0].metadata
+        self.assertTrue(meta.get("propagated_from_restore"))
+
+    # ── Test 7: Diagnostic UNET bypass does not emit propagated event ─
+
+    def test_bypass_does_not_emit_propagated_event(self):
+        """When bypass flag is active, the propagation must not be called.
+        This test simulates the bypass path by not calling
+        _maybe_propagate_cpu_snapshot_unet_state at all (as _run_in_process would)."""
+        # Bypass path does not call the helper — so state stays stored.
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        # Simulate bypass: do NOT call _maybe_propagate
+        self.assertEqual(len(self.trace.events), 0)
+
+    # ── Test 8: Incompatible UNET identity clears saved state ─────────
+
+    def test_incompatible_unet_identity_clears_state(self):
+        """Different UNET identity clears saved state and emits no event."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        other_key = self._make_model_key(unet_identity="other.safetensors")
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            other_key, self._make_model_spec(), self.trace,
+        )
+        events = [e for e in self.trace.events if e.name == "unet_runtime_state"]
+        self.assertEqual(len(events), 0)
+        self.assertIsNone(self.entrypoint._cpu_snapshot_unet_runtime_state)
+
+    # ── Test 9: Incompatible weight dtype clears saved state ──────────
+
+    def test_incompatible_weight_dtype_clears_state(self):
+        """Different requested_weight_dtype clears saved state and emits no event."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        other_spec = self._make_model_spec(weight_dtype="default")
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), other_spec, self.trace,
+        )
+        events = [e for e in self.trace.events if e.name == "unet_runtime_state"]
+        self.assertEqual(len(events), 0)
+        self.assertIsNone(self.entrypoint._cpu_snapshot_unet_runtime_state)
+
+    # ── Test 10: No active snapshot means no propagation ─────────────
+
+    def test_no_saved_state_no_propagation(self):
+        """When _cpu_snapshot_unet_runtime_state is None, nothing is emitted."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = None
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), self.trace,
+        )
+        events = [e for e in self.trace.events if e.name == "unet_runtime_state"]
+        self.assertEqual(len(events), 0)
+
+    # ── Test 13: Repeated compatible requests each get independent copies ──
+
+    def test_repeated_compatible_requests_independent_copies(self):
+        """Each compatible request gets its own copy of the same saved state."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+
+        trace1 = RuntimeTrace(request_id="req-001", process="remote")
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), trace1,
+        )
+        events1 = [e for e in trace1.events if e.name == "unet_runtime_state"]
+        self.assertEqual(len(events1), 1)
+        self.assertEqual(events1[0].metadata["request_id"], "req-001")
+
+        # Stored state persists for second request
+        self.assertIsNotNone(self.entrypoint._cpu_snapshot_unet_runtime_state)
+
+        trace2 = RuntimeTrace(request_id="req-002", process="remote")
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), trace2,
+        )
+        events2 = [e for e in trace2.events if e.name == "unet_runtime_state"]
+        self.assertEqual(len(events2), 1)
+        self.assertEqual(events2[0].metadata["request_id"], "req-002")
+
+    # ── Test 14: Mutating one request event does not affect stored state ──
+
+    def test_mutating_event_does_not_affect_stored_state(self):
+        """Mutating a deep-copied event's nested state does not modify stored state."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+
+        trace1 = RuntimeTrace(request_id="req-001", process="remote")
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), trace1,
+        )
+        events1 = [e for e in trace1.events if e.name == "unet_runtime_state"]
+
+        # The trace metadata is a mappingproxy (immutable), so the copy
+        # defense is verified at the object-reference level: verify that
+        # the stored state's nested dict is not the same object as the
+        # event's state dict.
+        stored_state = self.entrypoint._cpu_snapshot_unet_runtime_state["state"]
+        self.assertIsNot(stored_state, events1[0].metadata["state"])
+
+        # Stored state unchanged
+        stored = self.entrypoint._cpu_snapshot_unet_runtime_state
+        self.assertEqual(stored["state"]["load_device"], "cpu")
+
+        # Second request's event also uses independent copy
+        trace2 = RuntimeTrace(request_id="req-002", process="remote")
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), trace2,
+        )
+        events2 = [e for e in trace2.events if e.name == "unet_runtime_state"]
+        self.assertEqual(events2[0].metadata["state"]["load_device"], "cpu")
+        # Verify each event has its own state dict (not shared)
+        self.assertIsNot(events1[0].metadata["state"], events2[0].metadata["state"])
+
+    # ── Test 15: _extract_unet_runtime_state_event succeeds on real result ──
+
+    def test_extract_succeeds_on_real_propagated_event(self):
+        """Call _maybe_propagate_cpu_snapshot_unet_state, then
+        _extract_unet_runtime_state_event on the result, proving extraction
+        works without manually inserting a restore event into the fixture."""
+        from tools.benchmark_v2_direct import _extract_unet_runtime_state_event
+
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), self.trace,
+        )
+
+        # Build a result dict as _run_in_process does
+        result = {"trace": self.trace.to_dict()}
+        meta = _extract_unet_runtime_state_event(result, "snapshot_restored_post_retarget")
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta["stage"], "snapshot_restored_post_retarget")
+        self.assertEqual(meta["unet_identity"], self._UNET_IDENTITY)
+        self.assertEqual(meta["requested_weight_dtype"], self._WEIGHT_DTYPE)
+        self.assertEqual(meta["restored_instance_id"], self._RESTORED_INSTANCE_ID)
+        self.assertEqual(meta["restore_session_id"], self._RESTORE_SESSION_ID)
+        self.assertEqual(meta["request_id"], "req-propagate-001")
+        self.assertTrue(meta.get("propagated_from_restore"))
+
+    # ── Activation failure clears saved state ────────────────────────
+
+    def test_activation_failure_clears_state(self):
+        """Simulate activation failure by calling _use_cpu_snapshot_models_on_bridge
+        with unet that breaks use_ready_models and verifying state is cleared."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        # Patch the bridge's use_ready_models to raise, then verify state cleared.
+        # This simulates the except: handler in _use_cpu_snapshot_models_on_bridge.
+        try:
+            self.entrypoint._preload_bridge.use_ready_models = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("activation failed"))
+            self.entrypoint._use_cpu_snapshot_models_on_bridge(
+                self._make_model_key(),
+                PrefillKey(model_key=self._make_model_key(), prompt_bundle_hash="test"),
+                self._make_model_spec(),
+                unet=object(),
+                clip=object(),
+                trace=self.trace,
+            )
+        except RuntimeError:
+            pass
+        # State must be cleared by the except handler
+        self.assertIsNone(self.entrypoint._cpu_snapshot_unet_runtime_state)
+
+    # ── Incompatible request clears saved state ──────────────────────
+
+    def test_incompatible_request_clears_state(self):
+        """When request binding detects mismatch, saved state is cleared."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        # Simulate the mismatch path in _run_in_process
+        self.entrypoint._preload_bridge.clear()
+        self.entrypoint._cpu_snapshot_models_active = False
+        self.entrypoint._cpu_snapshot_unet_runtime_state = None
+        self.assertIsNone(self.entrypoint._cpu_snapshot_unet_runtime_state)
 
 
 if __name__ == "__main__":

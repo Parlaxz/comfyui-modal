@@ -1386,6 +1386,8 @@ class ModalRuntimeEntrypoint:
         # CPU snapshot model state (Plan C lifecycle)
         self._cpu_snapshot_models: CpuSnapshotModels | None = None
         self._cpu_snapshot_models_active: bool = False
+        # Propagated UNET runtime state from restore() to request trace.
+        self._cpu_snapshot_unet_runtime_state: dict[str, Any] | None = None
 
     def _remember_lifecycle_trace(self, trace: RuntimeTrace) -> None:
         if self._lifecycle_trace is None:
@@ -1456,13 +1458,15 @@ class ModalRuntimeEntrypoint:
         """Ensure CPU snapshot instance attrs exist after unpickling.
 
         Modal may unpickle a cold instance whose __init__ was never called.
-        This helper ensures the two CPU-snapshot attrs are always present
+        This helper ensures the three CPU-snapshot attrs are always present
         regardless of how the instance was created.
         """
         if not hasattr(self, "_cpu_snapshot_models"):
             self._cpu_snapshot_models = None
         if not hasattr(self, "_cpu_snapshot_models_active"):
             self._cpu_snapshot_models_active = False
+        if not hasattr(self, "_cpu_snapshot_unet_runtime_state"):
+            self._cpu_snapshot_unet_runtime_state = None
 
     def _cpu_snapshot_profile(self, api: Any) -> Mapping[str, Any] | None:
         """Derive a validated warmup profile for a CPU model snapshot.
@@ -1550,6 +1554,7 @@ class ModalRuntimeEntrypoint:
         except Exception:
             self._preload_bridge.clear()
             self._cpu_snapshot_models_active = False
+            self._cpu_snapshot_unet_runtime_state = None
             raise
 
     def _load_legacy_runtime(self) -> Any:
@@ -2306,6 +2311,7 @@ class ModalRuntimeEntrypoint:
                     # preload branch exactly as before.
                     self._preload_bridge.clear()
                     self._cpu_snapshot_models_active = False
+                    self._cpu_snapshot_unet_runtime_state = None
                     _cpu_snapshot_activated = False
                     # Combine both reasons when available
                     _parts = []
@@ -2454,6 +2460,15 @@ class ModalRuntimeEntrypoint:
                                 "state": _post_retarget_state,
                             },
                         )
+                        # Stash post-retarget state for request-trace propagation.
+                        self._cpu_snapshot_unet_runtime_state = copy.deepcopy({
+                            "stage": "snapshot_restored_post_retarget",
+                            "unet_identity": _unet_ident,
+                            "requested_weight_dtype": _req_wd_post,
+                            "restored_instance_id": restored_instance_id,
+                            "restore_session_id": restore_session_id,
+                            "state": _post_retarget_state,
+                        })
                     except Exception:
                         pass
 
@@ -2499,6 +2514,7 @@ class ModalRuntimeEntrypoint:
             except Exception as _act_exc:
                 self._preload_bridge.clear()
                 self._cpu_snapshot_models_active = False
+                self._cpu_snapshot_unet_runtime_state = None
                 _cpu_snapshot_activated = False
                 _cpu_snapshot_activate_error = str(_act_exc)[:80]
                 _activation_duration_ms = round(
@@ -2994,6 +3010,9 @@ class ModalRuntimeEntrypoint:
                         _unet_source = "cpu_snapshot"
                         _clip_source = "cpu_snapshot"
                         _reason = "ok"
+                        self._maybe_propagate_cpu_snapshot_unet_state(
+                            request_model_key, request_model_spec, trace,
+                        )
                     if _bypass_snapshot_unet:
                         print(
                             "[v2.cpu_snapshot_request] status=partial_bypass "
@@ -3027,6 +3046,7 @@ class ModalRuntimeEntrypoint:
                     # Model identity differs — clear bridge and deactivate.
                     self._preload_bridge.clear()
                     self._cpu_snapshot_models_active = False
+                    self._cpu_snapshot_unet_runtime_state = None
                     trace.emit(
                         "cpu_snapshot_models_request_bound",
                         phase="execution",
@@ -3048,6 +3068,7 @@ class ModalRuntimeEntrypoint:
             except Exception as _bind_exc:
                 self._preload_bridge.clear()
                 self._cpu_snapshot_models_active = False
+                self._cpu_snapshot_unet_runtime_state = None
                 trace.emit(
                     "cpu_snapshot_models_request_bound",
                     phase="execution",
@@ -3199,6 +3220,60 @@ class ModalRuntimeEntrypoint:
             except Exception:
                 pass
             raise
+
+    def _maybe_propagate_cpu_snapshot_unet_state(
+        self,
+        request_model_key: Any,
+        request_model_spec: Any,
+        trace: RuntimeTrace,
+    ) -> None:
+        """Propagate saved snapshot UNET state into request trace.
+
+        Called from ``_run_in_process`` inside the exact-match reuse branch.
+        Validates that the stored state belongs to the current request by
+        comparing UNET identity and requested weight dtype, then emits the
+        state as a trace event with ``propagated_from_restore=True`` and the
+        current request ID.  On mismatch the saved state is cleared so no
+        stale state is used by later requests.
+
+        Must be called only when ``_cpu_snapshot_models_active`` is True,
+        models match, and ``diagnostic_bypass_cpu_snapshot_unet`` is False.
+        """
+        if self._cpu_snapshot_unet_runtime_state is None:
+            return
+        _req_unet_ident = str(getattr(request_model_key, "unet_identity", ""))
+        _req_wd = "default"
+        try:
+            _plan_unet = (request_model_spec or {}).get("loaders", {}).get("unet", [])
+            for _pl in _plan_unet:
+                if isinstance(_pl, Mapping) and _pl.get("unet_name") == _req_unet_ident:
+                    _req_wd = str(_pl.get("weight_dtype", "default"))
+                    break
+        except Exception:
+            _req_wd = "default"
+        _stored_unet = self._cpu_snapshot_unet_runtime_state.get("unet_identity", "")
+        _stored_wd = self._cpu_snapshot_unet_runtime_state.get("requested_weight_dtype", "")
+        if _req_unet_ident == _stored_unet and _req_wd == _stored_wd:
+            _prop_meta = copy.deepcopy(self._cpu_snapshot_unet_runtime_state)
+            _prop_meta["request_id"] = str(trace.request_id if trace else "")
+            _prop_meta["propagated_from_restore"] = True
+            trace.emit("unet_runtime_state", metadata=_prop_meta)
+            print(
+                f"[v2.unet_runtime_state_propagated] status=emitted "
+                f"request_id={trace.request_id} "
+                f"unet_identity={_stored_unet} "
+                f"requested_weight_dtype={_stored_wd} "
+                f"restored_instance_id={_prop_meta.get('restored_instance_id', '')} "
+                f"restore_session_id={_prop_meta.get('restore_session_id', '')}",
+                flush=True,
+            )
+        else:
+            self._cpu_snapshot_unet_runtime_state = None
+            print(
+                f"[v2.unet_runtime_state_propagated] status=skipped "
+                f"reason=identity_or_dtype_mismatch",
+                flush=True,
+            )
 
     @staticmethod
     def _interval_from_trace(trace: Any, start_name: str, end_name: str) -> float | None:
@@ -5126,6 +5201,7 @@ def _build_decorated_v2_class() -> type:
         self.container_session_id = _V2_CONTAINER_SESSION_ID
         self._restore_count = 0
         self._restore_timing = None
+        self._cpu_snapshot_unet_runtime_state = None
         self._v2_initialized = True
 
     # Wrap each Modal-exposed method to lazy-init first.
