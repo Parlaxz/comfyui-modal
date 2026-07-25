@@ -3024,6 +3024,7 @@ class ModalRuntimeEntrypoint:
                         _before_state = self._cpu_snapshot_unet_runtime_state
                         trace.emit(
                             "unet_runtime_state_propagate_diag",
+                            phase="execution",
                             metadata={
                                 "status": "before_propagate",
                                 "state_is_none": _before_state is None,
@@ -3031,6 +3032,7 @@ class ModalRuntimeEntrypoint:
                                 "req_id": str(trace.request_id if trace else ""),
                             },
                         )
+                        print("[v2.unet_diag] before_propagate state_is_none=%s" % (_before_state is None), flush=True)
                         self._maybe_propagate_cpu_snapshot_unet_state(
                             request_model_key, request_model_spec, trace,
                         )
@@ -3038,6 +3040,7 @@ class ModalRuntimeEntrypoint:
                         _diag_state = self._cpu_snapshot_unet_runtime_state
                         trace.emit(
                             "unet_runtime_state_propagate_diag",
+                            phase="execution",
                             metadata={
                                 "status": "after_helper",
                                 "state_is_none": _diag_state is None,
@@ -3270,9 +3273,11 @@ class ModalRuntimeEntrypoint:
         Must be called only when ``_cpu_snapshot_models_active`` is True,
         models match, and ``diagnostic_bypass_cpu_snapshot_unet`` is False.
         """
+        print("[v2.unet_diag] _maybe_propagate called, state_is_none=%s" % (self._cpu_snapshot_unet_runtime_state is None), flush=True)
         if self._cpu_snapshot_unet_runtime_state is None:
             trace.emit(
                 "unet_runtime_state_propagate_diag",
+                phase="execution",
                 metadata={"status": "skipped", "reason": "state_is_none"},
             )
             print("[v2.unet_runtime_state_propagated] status=skipped reason=state_is_none", flush=True)
@@ -3306,6 +3311,7 @@ class ModalRuntimeEntrypoint:
         else:
             trace.emit(
                 "unet_runtime_state_propagate_diag",
+                phase="execution",
                 metadata={
                     "status": "skipped",
                     "reason": "identity_or_dtype_mismatch",
