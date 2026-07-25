@@ -180,9 +180,16 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...]) -> None:
 def install_nextdit_forward_pre_hook() -> bool:
     """Install the ``NextDiT.forward`` pre-hook once (idempotent).
 
+    Patches ``NextDiT.forward`` at the class level so every instance
+    runs the diagnostic pre-hook before its forward pass.  This is
+    necessary because ``register_forward_pre_hook`` is an instance
+    method on ``nn.Module`` and cannot be called on the class itself.
+
     Returns ``True`` if installed or already installed, ``False`` if
     ``NextDiT`` is unavailable or diagnostics are disabled.
     """
+    import functools
+
     global _nextdit_hook_installed
     if _nextdit_hook_installed:
         return True
@@ -190,7 +197,14 @@ def install_nextdit_forward_pre_hook() -> bool:
         return False
     try:
         from comfy.ldm.lumina.model import NextDiT  # type: ignore[import-untyped]
-        NextDiT.register_forward_pre_hook(_forward_pre_hook)
+        _orig_forward = NextDiT.forward
+
+        @functools.wraps(_orig_forward)
+        def _patched_forward(self, *args: object, **kwargs: object) -> object:
+            _forward_pre_hook(self, args)
+            return _orig_forward(self, *args, **kwargs)
+
+        NextDiT.forward = _patched_forward
         _nextdit_hook_installed = True
         return True
     except (ImportError, AttributeError):

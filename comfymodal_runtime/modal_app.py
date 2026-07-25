@@ -1009,6 +1009,9 @@ def _runtime_env() -> dict[str, str]:
         "COMFYMODAL_ENABLE_GPU_SNAPSHOT": os.environ.get(
             "COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0"
         ),
+        "COMFYMODAL_V2_UNET_FORWARD_DIAG": os.environ.get(
+            "COMFYMODAL_V2_UNET_FORWARD_DIAG", "0"
+        ),
     }
     memory_mb = os.environ.get("COMFYMODAL_V2_MEMORY_MB")
     if memory_mb is not None:
