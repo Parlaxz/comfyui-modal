@@ -581,6 +581,201 @@ def diff_unet_runtime_states(
     return diff
 
 
+def collect_unet_forward_probe_state(
+    unet: Any,
+    *,
+    diffusion_model: Any = None,
+) -> dict[str, Any]:
+    """Collect read-only diagnostic state from a UNET patcher and its
+    diffusion model **immediately before** ``NextDiT.forward`` is called.
+
+    The caller has already called ``load_models_gpu``.  This helper
+    records identity, model-state fields, parameter/buffer distribution,
+    forward-callable structure, and collector timing.
+
+    **Safety (enforced by caller convention — never guaranteed at
+    runtime)**: this function never calls ``.cpu()``, ``.cuda()``,
+    ``.to()``, ``.item()``, ``.clone()``, ``.numpy()``,
+    ``torch.cuda.synchronize()``, or ``load_models_gpu()``.  It never
+    mutates models or tensors.
+
+    Parameters
+    ----------
+    unet
+        A ComfyUI ``ModelPatcher`` (or duck-typed equivalent) for a UNET.
+    diffusion_model
+        Optional explicit reference to the diffusion model (the
+        ``torch.nn.Module`` that owns ``forward``).  When omitted the
+        collector resolves it as ``unet.model.diffusion_model`` (then
+        ``unet.diffusion_model`` as fallback).
+
+    Returns
+    -------
+    dict[str, Any]
+        Flat dictionary of probe fields (see module doctest or
+        ``collect_unet_forward_probe_state`` tests for the full
+        field list).
+    """
+    import hashlib
+    import time
+
+    _start_ns = time.monotonic_ns()
+
+    state: dict[str, Any] = {}
+
+    # ── Resolve diffusion_model ──────────────────────────────────────
+    _model = getattr(unet, "model", None)
+    _dm: Any = diffusion_model
+    if _dm is None:
+        if _model is not None:
+            _dm = getattr(_model, "diffusion_model", None)
+        if _dm is None:
+            _dm = getattr(unet, "diffusion_model", None)
+
+    # ── 1. Identity ──────────────────────────────────────────────────
+    state["patcher_object_id"] = str(id(unet))
+    state["patcher_type"] = type(unet).__qualname__
+
+    state["model_object_id"] = str(id(_model)) if _model is not None else "absent"
+    state["model_type"] = type(_model).__qualname__ if _model is not None else "absent"
+
+    state["diffusion_model_object_id"] = str(id(_dm)) if _dm is not None else "absent"
+    state["diffusion_model_type"] = type(_dm).__qualname__ if _dm is not None else "absent"
+
+    # ── 2. Model state ───────────────────────────────────────────────
+    state["load_device"] = _safe_str_of_attr(unet, "load_device")
+    state["offload_device"] = _safe_str_of_attr(unet, "offload_device")
+
+    _model_device = getattr(_model, "device", None) if _model is not None else None
+    state["model_device"] = _safe_str(_model_device)
+
+    # model_dtype() — callable method on patcher
+    _md_fn = getattr(unet, "model_dtype", None)
+    if callable(_md_fn):
+        try:
+            state["model_dtype"] = str(_md_fn())
+        except Exception:
+            state["model_dtype"] = "absent"
+    else:
+        state["model_dtype"] = "absent"
+
+    state["manual_cast_dtype"] = (
+        _safe_str_of_attr(_model, "manual_cast_dtype") if _model is not None else "absent"
+    )
+    state["model_loaded_weight_memory"] = (
+        _safe_str_of_attr(_model, "model_loaded_weight_memory") if _model is not None else "absent"
+    )
+    state["model_lowvram"] = (
+        _safe_str_of_attr(_model, "model_lowvram") if _model is not None else "absent"
+    )
+    state["lowvram_patch_counter"] = (
+        _safe_str_of_attr(_model, "lowvram_patch_counter") if _model is not None else "absent"
+    )
+
+    # ── 3. Parameter distribution ────────────────────────────────────
+    _param_count = 0
+    _total_param_numel = 0
+    _param_dev_dtype_count: dict[str, int] = {}
+    _param_dev_dtype_numel: dict[str, int] = {}
+    _param_tuples: list[tuple[str, str, int]] = []
+
+    if _dm is not None:
+        try:
+            for _p in _dm.parameters():
+                _param_count += 1
+                _numel = _p.numel()
+                _total_param_numel += _numel
+                _key = f"{_p.device}|{_p.dtype}"
+                _param_dev_dtype_count[_key] = _param_dev_dtype_count.get(_key, 0) + 1
+                _param_dev_dtype_numel[_key] = _param_dev_dtype_numel.get(_key, 0) + _numel
+                _param_tuples.append((str(_p.device), str(_p.dtype), _numel))
+        except Exception:
+            pass
+
+    _param_tuples.sort(key=lambda _x: (_x[0], _x[1], _x[2]))
+    _param_h = hashlib.sha256()
+    for _dev, _dt, _n in _param_tuples:
+        _param_h.update(f"{_dev}|{_dt}|{_n}\n".encode())
+
+    state["param_count"] = _param_count
+    state["total_param_numel"] = _total_param_numel
+    state["param_dev_dtype_count"] = dict(_param_dev_dtype_count)
+    state["param_dev_dtype_numel"] = dict(_param_dev_dtype_numel)
+    state["param_distribution_hash"] = _param_h.hexdigest()
+
+    # ── 4. Buffer distribution ───────────────────────────────────────
+    _buffer_count = 0
+    _total_buffer_numel = 0
+    _buf_dev_dtype_count: dict[str, int] = {}
+    _buf_dev_dtype_numel: dict[str, int] = {}
+    _buf_tuples: list[tuple[str, str, int]] = []
+
+    if _dm is not None:
+        try:
+            for _b in _dm.buffers():
+                _buffer_count += 1
+                _numel = _b.numel()
+                _total_buffer_numel += _numel
+                _key = f"{_b.device}|{_b.dtype}"
+                _buf_dev_dtype_count[_key] = _buf_dev_dtype_count.get(_key, 0) + 1
+                _buf_dev_dtype_numel[_key] = _buf_dev_dtype_numel.get(_key, 0) + _numel
+                _buf_tuples.append((str(_b.device), str(_b.dtype), _numel))
+        except Exception:
+            pass
+
+    _buf_tuples.sort(key=lambda _x: (_x[0], _x[1], _x[2]))
+    _buf_h = hashlib.sha256()
+    for _dev, _dt, _n in _buf_tuples:
+        _buf_h.update(f"{_dev}|{_dt}|{_n}\n".encode())
+
+    state["buffer_count"] = _buffer_count
+    state["total_buffer_numel"] = _total_buffer_numel
+    state["buffer_dev_dtype_count"] = dict(_buf_dev_dtype_count)
+    state["buffer_dev_dtype_numel"] = dict(_buf_dev_dtype_numel)
+    state["buffer_distribution_hash"] = _buf_h.hexdigest()
+
+    # ── 5. Forward callable structure ────────────────────────────────
+    _forward_fn = getattr(_dm, "forward", None) if _dm is not None else None
+    if _forward_fn is not None:
+        _self = getattr(_forward_fn, "__self__", None)
+        state["forward_module"] = type(_self).__qualname__ if _self is not None else "absent"
+        state["forward_qualname"] = str(getattr(_forward_fn, "__qualname__", "absent"))
+
+        # Wrapper chain via __wrapped__ (max depth 8)
+        _wrapper_chain: list[str] = []
+        _seen: set[int] = set()
+        _fn = _forward_fn
+        for _ in range(8):
+            _wrapped = getattr(_fn, "__wrapped__", None)
+            if _wrapped is None:
+                break
+            _wrapped_id = id(_wrapped)
+            if _wrapped_id in _seen:
+                break
+            _seen.add(_wrapped_id)
+            _wq = str(getattr(_wrapped, "__qualname__", ""))
+            _wrapper_chain.append(_wq)
+            _fn = _wrapped
+
+        _wc_h = hashlib.sha256()
+        for _entry in _wrapper_chain:
+            _wc_h.update(f"{_entry}\n".encode())
+
+        state["wrapper_chain"] = list(_wrapper_chain)
+        state["wrapper_chain_hash"] = _wc_h.hexdigest()
+    else:
+        state["forward_module"] = "absent"
+        state["forward_qualname"] = "absent"
+        state["wrapper_chain"] = []
+        state["wrapper_chain_hash"] = hashlib.sha256().hexdigest()
+
+    # ── 6. Collector metadata ────────────────────────────────────────
+    _elapsed_ms = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+    state["collector_duration_ms"] = _elapsed_ms
+
+    return state
+
+
 def rehydrate_cpu_snapshot_unet(
     unet: Any,
     *,
