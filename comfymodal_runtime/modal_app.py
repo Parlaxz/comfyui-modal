@@ -53,6 +53,7 @@ from .cpu_snapshot_models import (
     validate_cpu_snapshot_models,
     retarget_cpu_snapshot_models,
 )
+from .unet_forward_probe import register_unet_forward_probe
 from .output_delivery import (
     Attempt,
     _measure_json_bytes,
@@ -2483,6 +2484,7 @@ class ModalRuntimeEntrypoint:
                     )
                     self._cpu_snapshot_models_active = True
                     _cpu_snapshot_activated = True
+                    register_unet_forward_probe(models.unet, source="cpu_snapshot")
                     _activation_duration_ms = round(
                         (time.perf_counter() - _activation_perf_start) * 1000.0,
                         3,
