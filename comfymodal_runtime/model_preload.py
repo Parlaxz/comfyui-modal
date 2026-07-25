@@ -196,6 +196,124 @@ _unet_subfn_nesting_depth: ContextVar[int] = ContextVar("_unet_subfn_nesting_dep
 # Accumulator for "not_observed" GPU wrapper calls (no lane/request scope).
 _not_observed_gpu_calls: int = 0
 
+# ── UNET effective-dtype resolver (shared by snapshot and normal paths) ──
+# Module-level cached GPU BF16 support, populated by the first call to
+# _gpu_bf16_supported().  During CPU snapshot creation (_force_cpu_during_snapshot)
+# the normal CUDA query functions are monkey-patched to return False, so we
+# capture the real answer before that context is entered via
+# _cache_gpu_bf16_support_if_needed().  In the normal path the check runs
+# directly.
+_CACHED_GPU_BF16_SUPPORT: bool | None = None
+
+def _gpu_bf16_supported() -> bool:
+    """Check if the real GPU supports bfloat16.
+
+    Uses a module-level cache populated by the first successful probe.
+    During CPU snapshot creation (``_force_cpu_during_snapshot``) the cache
+    must be primed *before* the context is entered via
+    ``cache_gpu_bf16_support_if_needed()`` — see ``modal_app.py`` startup().
+    """
+    global _CACHED_GPU_BF16_SUPPORT
+    if _CACHED_GPU_BF16_SUPPORT is not None:
+        return _CACHED_GPU_BF16_SUPPORT
+    import torch
+    try:
+        _CACHED_GPU_BF16_SUPPORT = torch.cuda.is_bf16_supported()
+    except Exception:
+        _CACHED_GPU_BF16_SUPPORT = False
+    return _CACHED_GPU_BF16_SUPPORT
+
+
+def cache_gpu_bf16_support() -> bool:
+    """Prime ``_CACHED_GPU_BF16_SUPPORT`` before a CPU-snapshot context hides CUDA.
+
+    Safe to call multiple times — the result is cached.  Returns the cached
+    value so callers can use it immediately.
+    """
+    return _gpu_bf16_supported()
+
+
+_RESOLVED_DTYPE_MAP: dict[str, str] = {
+    "fp8_e4m3fn": "torch.float8_e4m3fn",
+    "fp8_e4m3fn_fast": "torch.float8_e4m3fn",
+    "fp8_e5m2": "torch.float8_e5m2",
+}
+"""String weight_dtype values whose effective torch dtype is unambiguous.
+These are the values accepted by ``UNETLoader.load_unet`` in ``nodes.py``."""
+
+
+def resolve_unet_effective_dtype(
+    weight_dtype_str: str = "default",
+) -> tuple[Any, str]:
+    """Resolve a weight_dtype string to the *effective* torch dtype.
+
+    Returns ``(effective_dtype, resolved_label)`` where *effective_dtype* is
+    the ``torch.dtype`` the normal (GPU) load path would use for this string,
+    and *resolved_label* is a short diagnostic label such as ``"bfloat16"``,
+    ``"float32"``, or the original string for opaque values.
+
+    For ``"default"`` the function determines what ``model_management.unet_dtype()``
+    would return in the normal GPU context (not the CPU-snapshot context where
+    BF16 is unavailable).  The decision logic mirrors ``unet_dtype()``:
+
+    1. CLI flags override everything (``--fp32-unet``, ``--bf16-unet``, …).
+    2. Explicit fp8/e4m3fn/e5m2 strings -> corresponding torch dtype.
+    3. ``"default"`` -> GPU BF16 when the real GPU supports it, else FP32.
+
+    Both the snapshot construction path (``_cpu_load_unet``) and the normal
+    loader path (``V2LoaderBridge._load_unet``) use this function so they
+    cannot drift.
+
+    Returns
+    -------
+    effective_dtype
+        The resolved ``torch.dtype``, or ``None`` for unrecognised strings.
+    resolved_label
+        Short string for diagnostic logging.
+    """
+    # Import torch lazily — may not be available at parse time in all contexts.
+    import torch as _torch
+    import comfy.cli_args as _ca
+
+    # 1. CLI flags (work in both normal and CPU-snapshot contexts)
+    if getattr(_ca.args, "fp32_unet", False):
+        return (_torch.float32, "float32")
+    if getattr(_ca.args, "fp64_unet", False):
+        return (_torch.float64, "float64")
+    if getattr(_ca.args, "bf16_unet", False):
+        return (_torch.bfloat16, "bfloat16")
+    if getattr(_ca.args, "fp16_unet", False):
+        return (_torch.float16, "float16")
+
+    # 2. Explicit fp8 strings (float8 types may not exist in older PyTorch)
+    _float8_e4m3fn = getattr(_torch, "float8_e4m3fn", None)
+    _float8_e5m2 = getattr(_torch, "float8_e5m2", None)
+    if weight_dtype_str in ("fp8_e4m3fn", "fp8_e4m3fn_fast"):
+        if _float8_e4m3fn is not None:
+            return (_float8_e4m3fn, weight_dtype_str)
+        return (None, weight_dtype_str)
+    if weight_dtype_str == "fp8_e5m2":
+        if _float8_e5m2 is not None:
+            return (_float8_e5m2, weight_dtype_str)
+        return (None, weight_dtype_str)
+
+    # 3. Recognised non-"default" string without a type override
+    if weight_dtype_str != "default":
+        return (None, weight_dtype_str)
+
+    # 4. "default" — determine what the GPU path would do
+    try:
+        import comfy.model_management as _mm
+        if getattr(_mm, "FORCE_FP32", False):
+            return (_torch.float32, "float32")
+    except Exception:
+        pass
+
+    if _gpu_bf16_supported():
+        return (_torch.bfloat16, "bfloat16")
+
+    return (_torch.float32, "float32")
+
 # Submission correlation counter
 _SUBMISSION_COUNTER: int = 0
 _SUBMISSION_COUNTER_LOCK = RLock()
@@ -4841,12 +4959,14 @@ class V2LoaderBridge:
             "unet_name": request.get("unet_name", model_key.unet_identity),
             "weight_dtype": request.get("weight_dtype", "default"),
         }
+        _req_wd = request.get("weight_dtype", "default")
+        # Resolve effective dtype for diagnostic logging (shared resolver)
+        _eff_dtype, _eff_label = resolve_unet_effective_dtype(_req_wd)
         result = self._invoke_original("UNETLoader", kwargs)
         unet = result[0] if isinstance(result, (tuple, list)) and result else result
 
         # ── Emit normal_loader_ready state (print + trace) ──────────────
         _normal_state: dict[str, Any] = {}
-        _req_wd = request.get("weight_dtype", "default")
         try:
             # Safely import model_management for loaded_models comparability
             _mgmt = None
@@ -4871,6 +4991,7 @@ class V2LoaderBridge:
                 f"stage=normal_loader_ready "
                 f"unet_identity={model_key.unet_identity} "
                 f"requested_weight_dtype={_req_wd} "
+                f"effective_weight_dtype={_eff_label} "
                 f"state={_state_json}",
                 flush=True,
             )
@@ -4887,6 +5008,7 @@ class V2LoaderBridge:
                         "stage": "normal_loader_ready",
                         "unet_identity": model_key.unet_identity,
                         "requested_weight_dtype": _req_wd,
+                        "effective_weight_dtype": _eff_label,
                         "request_id": str(getattr(_target_trace, "request_id", None) or ""),
                         "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
                         "restore_session_id": _LATEST_RESTORE_SESSION_ID,

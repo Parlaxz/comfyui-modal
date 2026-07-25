@@ -454,6 +454,50 @@ class TestModelSpec(unittest.TestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     # 15. UNETLoader loader_class + unet_name + weight_dtype (with explicit)
+    def test_unet_effective_dtype_resolver_default(self):
+        """resolve_unet_effective_dtype('default') returns BF16 on BF16-capable hardware."""
+        from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+        eff_dtype, eff_label = resolve_unet_effective_dtype("default")
+        # On any modern GPU this is bfloat16; on CPU-only CI we accept float32.
+        # The important thing is that the resolver returns a concrete dtype,
+        # not None or "default".
+        self.assertIsNotNone(eff_dtype)
+        self.assertIn(eff_label, ("bfloat16", "float32"))
+
+    def test_unet_effective_dtype_explicit_fp8(self):
+        """resolve_unet_effective_dtype for fp8 strings returns the correct torch dtype, or None if unsupported."""
+        from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+        import torch
+        eff_dtype, eff_label = resolve_unet_effective_dtype("fp8_e4m3fn")
+        if hasattr(torch, "float8_e4m3fn"):
+            self.assertIs(eff_dtype, torch.float8_e4m3fn)
+        else:
+            self.assertIsNone(eff_dtype)
+        self.assertEqual(eff_label, "fp8_e4m3fn")
+
+    def test_unet_effective_dtype_explicit_fp8_e5m2(self):
+        from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+        import torch
+        eff_dtype, eff_label = resolve_unet_effective_dtype("fp8_e5m2")
+        if hasattr(torch, "float8_e5m2"):
+            self.assertIs(eff_dtype, torch.float8_e5m2)
+        else:
+            self.assertIsNone(eff_dtype)
+        self.assertEqual(eff_label, "fp8_e5m2")
+
+    def test_unet_effective_dtype_unknown_string(self):
+        """resolve_unet_effective_dtype for unknown strings returns (None, string)."""
+        from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+        eff_dtype, eff_label = resolve_unet_effective_dtype("some_unknown_value")
+        self.assertIsNone(eff_dtype)
+        self.assertEqual(eff_label, "some_unknown_value")
+
+    def test_unet_effective_dtype_cache_gpu_bf16(self):
+        """cache_gpu_bf16_support primes the BF16 cache and returns a bool."""
+        from comfymodal_runtime.model_preload import cache_gpu_bf16_support
+        result = cache_gpu_bf16_support()
+        self.assertIsInstance(result, bool)
+
     def test_unet_loader_with_explicit_weight_dtype(self):
         from comfymodal_runtime.cpu_snapshot_models import identity_from_profile
         profile = dict(_SINGLE_CLIP_PROFILE, weight_dtype="fp8_e4m3fn")
