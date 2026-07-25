@@ -875,6 +875,7 @@ class TestValidate(unittest.TestCase):
             CpuSnapshotModels,
             ModelRestoreKey,
             ModelFileFact,
+            CPU_SNAPSHOT_UNET_POLICY_VERSION,
         )
         # Create files
         u_path = _create_file(self.temp_dir, "u.safetensors", 100)
@@ -910,6 +911,7 @@ class TestValidate(unittest.TestCase):
             file_facts=facts,
             unet=unet_obj,
             clip=clip_obj,
+            policy_version=CPU_SNAPSHOT_UNET_POLICY_VERSION,
         ), key, spec
 
     # 23. Identity mismatch
@@ -2007,12 +2009,27 @@ class TestCpuSnapshotUnetConstruction(unittest.TestCase):
         calls = {}
         fake_sd = types.ModuleType("comfy.sd")
         fake_folder_paths = types.ModuleType("folder_paths")
-        sentinel = object()
+
+        class _FakeValidPatcher:
+            """Mimics a ModelPatcher returned by load_diffusion_model."""
+            def __init__(self):
+                self.model = _FakeManualCastModule(manual_cast_dtype=None,
+                                                   params_dtype="torch.bfloat16")
+                self.load_device = "cpu"
+                self.offload_device = "cpu"
+            def model_dtype(self):
+                return torch.bfloat16
+            def parameters(self, recurse=True):
+                return self.model.parameters(recurse)
+            def named_parameters(self, recurse=True):
+                return iter([])
+            def named_buffers(self, recurse=True):
+                return iter([])
 
         def load_diffusion_model(path, *, model_options):
             calls["path"] = path
             calls["model_options"] = model_options
-            return sentinel
+            return _FakeValidPatcher()
 
         fake_sd.load_diffusion_model = load_diffusion_model
         fake_folder_paths.get_full_path_or_raise = (
@@ -2032,7 +2049,7 @@ class TestCpuSnapshotUnetConstruction(unittest.TestCase):
                 unet_cls=None,
             )
 
-        self.assertIs(result, sentinel)
+        self.assertIsInstance(result, _FakeValidPatcher)
         self.assertEqual(
             calls["path"],
             "/models/diffusion_models/z_image_turbo_bf16.safetensors",
@@ -2149,6 +2166,702 @@ class TestCpuSnapshotUnetConstruction(unittest.TestCase):
                 module, expected_dtype="torch.bfloat16", require_cpu=True,
             )
         self.assertIn("dtype mismatch", str(ctx.exception).lower())
+
+
+# ── BF16-native validation tests ──────────────────────────────────────
+
+
+class _FakeManualCastModule:
+    """Fake .model attribute with manual_cast_dtype.
+    model_dtype() lives on the patcher (unet), not on .model."""
+    def __init__(self, manual_cast_dtype=None, params_device="cpu",
+                 params_dtype="torch.bfloat16"):
+        self.manual_cast_dtype = manual_cast_dtype
+        self._params = [_FakeParamTensor(params_device, params_dtype, 1000, True)]
+
+    def parameters(self, recurse=True):
+        return iter(self._params)
+
+
+class _FakeBF16Unet:
+    """Duck-typed unet patcher for validate_snapshot_unet_bf16_native.
+    model_dtype() is on the patcher (self), not on .model."""
+    def __init__(self, manual_cast_dtype=None, model_dtype_val="torch.bfloat16",
+                 params_device="cpu", params_dtype="torch.bfloat16"):
+        self.model = _FakeManualCastModule(
+            manual_cast_dtype=manual_cast_dtype,
+            params_device=params_device,
+            params_dtype=params_dtype,
+        )
+        self._model_dtype_val = model_dtype_val
+        self.load_device = "cpu"
+        self.offload_device = "cpu"
+
+    def model_dtype(self):
+        return self._model_dtype_val
+
+    def parameters(self, recurse=True):
+        return self.model.parameters(recurse)
+
+
+class TestBF16NativeValidation(unittest.TestCase):
+    """validate_snapshot_unet_bf16_native coverage."""
+
+    def test_accepts_native_bf16_unet(self):
+        """All-BF16 CPU params with no manual_cast passes."""
+        from comfymodal_runtime.cpu_snapshot_models import validate_snapshot_unet_bf16_native
+        unet = _FakeBF16Unet(manual_cast_dtype=None)
+        try:
+            validate_snapshot_unet_bf16_native(unet)
+        except RuntimeError as exc:
+            self.fail(f"Unexpected RuntimeError: {exc}")
+
+    def test_rejects_manual_cast_float32(self):
+        """manual_cast_dtype=torch.float32 raises."""
+        from comfymodal_runtime.cpu_snapshot_models import validate_snapshot_unet_bf16_native
+        unet = _FakeBF16Unet(manual_cast_dtype="torch.float32")
+        with self.assertRaises(RuntimeError) as ctx:
+            validate_snapshot_unet_bf16_native(unet)
+        self.assertIn("manual_cast_dtype", str(ctx.exception).lower())
+        self.assertIn("float32", str(ctx.exception))
+
+    def test_rejects_model_dtype_not_bf16(self):
+        """model_dtype returning float32 raises."""
+        from comfymodal_runtime.cpu_snapshot_models import validate_snapshot_unet_bf16_native
+        unet = _FakeBF16Unet(model_dtype_val="torch.float32", manual_cast_dtype=None)
+        with self.assertRaises(RuntimeError) as ctx:
+            validate_snapshot_unet_bf16_native(unet)
+        self.assertIn("model_dtype", str(ctx.exception).lower())
+
+    def test_rejects_non_cpu_params(self):
+        """CUDA params raise."""
+        from comfymodal_runtime.cpu_snapshot_models import validate_snapshot_unet_bf16_native
+        unet = _FakeBF16Unet(params_device="cuda:0")
+        with self.assertRaises(RuntimeError) as ctx:
+            validate_snapshot_unet_bf16_native(unet)
+        self.assertIn("non-cpu", str(ctx.exception).lower())
+
+    def test_rejects_non_bf16_fp_params(self):
+        """FP32 params on CPU raise."""
+        from comfymodal_runtime.cpu_snapshot_models import validate_snapshot_unet_bf16_native
+        unet = _FakeBF16Unet(params_dtype="torch.float32")
+        with self.assertRaises(RuntimeError) as ctx:
+            validate_snapshot_unet_bf16_native(unet)
+        self.assertIn("non-bf16", str(ctx.exception).lower())
+
+    def test_rejects_none_unet(self):
+        """None unet raises."""
+        from comfymodal_runtime.cpu_snapshot_models import validate_snapshot_unet_bf16_native
+        with self.assertRaises(RuntimeError) as ctx:
+            validate_snapshot_unet_bf16_native(None)
+        self.assertIn("none", str(ctx.exception).lower())
+
+    def test_accepts_include_target_gpus(self):
+        """target_gpus parameter is accepted (no-op for validation)."""
+        from comfymodal_runtime.cpu_snapshot_models import validate_snapshot_unet_bf16_native
+        unet = _FakeBF16Unet(manual_cast_dtype=None)
+        try:
+            validate_snapshot_unet_bf16_native(unet, target_gpus=("RTX-PRO-6000",))
+        except RuntimeError as exc:
+            self.fail(f"Unexpected RuntimeError: {exc}")
+
+
+# ── Compute policy identity tests ─────────────────────────────────────
+
+
+class TestComputePolicyIdentity(unittest.TestCase):
+    """_resolve_compute_policy and model_spec compute_policy field."""
+
+    def test_rtx_pro_6000_resolves_bf16_native(self):
+        """RTX-PRO-6000 default weight_dtype -> bf16_native."""
+        from comfymodal_runtime.cpu_snapshot_models import _resolve_compute_policy
+        result = _resolve_compute_policy("default", target_gpus=("RTX-PRO-6000",))
+        self.assertEqual(result, "bf16_native")
+
+    def test_t4_resolves_default(self):
+        """T4 default weight_dtype -> default (no bf16)."""
+        from comfymodal_runtime.cpu_snapshot_models import _resolve_compute_policy
+        result = _resolve_compute_policy("default", target_gpus=("T4",))
+        self.assertEqual(result, "default")
+
+    def test_no_target_gpus_resolves_default(self):
+        """No target_gpus -> default."""
+        from comfymodal_runtime.cpu_snapshot_models import _resolve_compute_policy
+        result = _resolve_compute_policy("default")
+        self.assertEqual(result, "default")
+
+    def test_explicit_fp32_resolves_default(self):
+        """fp32 weight_dtype -> default even for RTX."""
+        from comfymodal_runtime.cpu_snapshot_models import _resolve_compute_policy
+        result = _resolve_compute_policy("fp32", target_gpus=("RTX-PRO-6000",))
+        self.assertEqual(result, "default")
+
+    def test_compute_policy_resolved_separately(self):
+        """compute_policy is stored separately, NOT in model_spec."""
+        from comfymodal_runtime.cpu_snapshot_models import _build_model_spec, _normalize_profile
+        profile = {"mode": "split", "unet": "unet.safetensors", "clip1": "clip1.safetensors",
+                    "clip_type": "stable_diffusion"}
+        norm = _normalize_profile(profile)
+        spec = _build_model_spec(norm)
+        self.assertNotIn("compute_policy", spec)
+        # Verify _resolve_compute_policy still works
+        from comfymodal_runtime.cpu_snapshot_models import _resolve_compute_policy
+        _cp = _resolve_compute_policy("default", target_gpus=("RTX-PRO-6000",))
+        self.assertEqual(_cp, "bf16_native")
+        _cp2 = _resolve_compute_policy("default", target_gpus=("T4",))
+        self.assertEqual(_cp2, "default")
+
+
+# ── cpu_snapshot_unet_compute_policy contextmanager tests ─────────────
+
+
+class _FakeMMForContext:
+    """Duck-typed comfy.model_management with inspectable unet_manual_cast."""
+    def __init__(self, return_value="torch.float32"):
+        self._return_value = return_value
+        self.call_count = 0
+        self.last_weight_dtype = None
+        self.last_device = None
+
+    def unet_manual_cast(self, weight_dtype, inference_device, supported_dtypes=None):
+        self.call_count += 1
+        self.last_weight_dtype = weight_dtype
+        self.last_device = inference_device
+        # Simulate CPU behavior: return float32 for bf16 on CPU
+        if str(weight_dtype) == "torch.bfloat16":
+            return "torch.float32"
+        return self._return_value
+
+
+class TestComputePolicyContextmanager(unittest.TestCase):
+    """cpu_snapshot_unet_compute_policy coverage."""
+
+    def setUp(self):
+        # Install fake model_management in sys.modules
+        self._mm = _FakeMMForContext()
+        self._orig_module = sys.modules.get("comfy.model_management")
+        sys.modules["comfy.model_management"] = self._mm
+
+    def tearDown(self):
+        # Restore original module
+        if self._orig_module is not None:
+            sys.modules["comfy.model_management"] = self._orig_module
+        else:
+            sys.modules.pop("comfy.model_management", None)
+        # Clean up any thread state left behind
+        from comfymodal_runtime.model_preload import (
+            _CPU_SNAPSHOT_UNET_POLICY_ACTIVE_THREAD,
+            _CPU_SNAPSHOT_UNET_MANUAL_CAST_OVERRIDE,
+        )
+        _CPU_SNAPSHOT_UNET_POLICY_ACTIVE_THREAD.set(0)
+        _CPU_SNAPSHOT_UNET_MANUAL_CAST_OVERRIDE.set("")
+
+    def _import_cm(self):
+        from comfymodal_runtime.model_preload import cpu_snapshot_unet_compute_policy
+        return cpu_snapshot_unet_compute_policy
+
+    def test_bf16_rtx_returns_none(self):
+        """BF16 weight + RTX target -> unet_manual_cast returns None."""
+        import torch
+        cm = self._import_cm()
+        with cm(effective_weight_dtype=torch.bfloat16, target_gpus=("RTX-PRO-6000",)):
+            result = self._mm.unet_manual_cast(torch.bfloat16, "cpu")
+        self.assertIsNone(result)
+        # Original function was called 0 times during the patched interval
+        self.assertEqual(self._mm.call_count, 0)
+
+    def test_bf16_t4_delegates(self):
+        """BF16 weight + T4 target -> unet_manual_cast delegates (returns float32)."""
+        import torch
+        cm = self._import_cm()
+        with cm(effective_weight_dtype=torch.bfloat16, target_gpus=("T4",)):
+            result = self._mm.unet_manual_cast(torch.bfloat16, "cpu")
+        self.assertEqual(result, "torch.float32")
+        # Original was called once (our fake's unet_manual_cast)
+        self.assertEqual(self._mm.call_count, 1)
+
+    def test_no_patch_when_not_bf16(self):
+        """fp32 weight with RTX target does not patch."""
+        import torch
+        cm = self._import_cm()
+        with cm(effective_weight_dtype=torch.float32, target_gpus=("RTX-PRO-6000",)):
+            result = self._mm.unet_manual_cast(torch.float32, "cpu")
+        self.assertEqual(result, "torch.float32")
+
+    def test_no_patch_when_no_target_gpus(self):
+        """No target_gpus does not patch."""
+        import torch
+        cm = self._import_cm()
+        with cm(effective_weight_dtype=torch.bfloat16, target_gpus=()):
+            result = self._mm.unet_manual_cast(torch.bfloat16, "cpu")
+        self.assertEqual(result, "torch.float32")
+
+    def test_restores_after_success(self):
+        """After context, unet_manual_cast is the original function."""
+        import torch
+        cm = self._import_cm()
+        with cm(effective_weight_dtype=torch.bfloat16, target_gpus=("RTX-PRO-6000",)):
+            self.assertIsNone(self._mm.unet_manual_cast(torch.bfloat16, "cpu"))
+        # After context, original behavior restored
+        result = self._mm.unet_manual_cast(torch.bfloat16, "cpu")
+        self.assertEqual(result, "torch.float32")
+        self.assertEqual(self._mm.call_count, 1)  # The call after restore
+
+    def test_restores_after_exception(self):
+        """After exception, unet_manual_cast is the original function."""
+        import torch
+        cm = self._import_cm()
+        try:
+            with cm(effective_weight_dtype=torch.bfloat16, target_gpus=("RTX-PRO-6000",)):
+                self.assertIsNone(self._mm.unet_manual_cast(torch.bfloat16, "cpu"))
+                raise ValueError("test error")
+        except ValueError:
+            pass
+        # After exception, original behavior restored
+        result = self._mm.unet_manual_cast(torch.bfloat16, "cpu")
+        self.assertEqual(result, "torch.float32")
+
+    def test_normal_loader_unaffected(self):
+        """Outside policy context, unet_manual_cast behaves normally."""
+        import torch
+        result = self._mm.unet_manual_cast(torch.bfloat16, "cpu")
+        self.assertEqual(result, "torch.float32")
+
+    def test_does_not_call_cuda_apis(self):
+        """Contextmanager never calls torch.cuda.* APIs.
+
+        Patches ``is_available``, ``is_bf16_supported``, ``get_device_capability``,
+        and ``get_device_properties`` to raise ``AssertionError`` if called.
+        The test passes only if none of these are called.
+        """
+        import torch
+        from unittest.mock import patch as _mpatch
+
+        def _raise(*a, **kw):
+            raise AssertionError("torch.cuda API was called during compute policy resolution")
+
+        _patchers = []
+        _cuda_mod = getattr(torch, "cuda", None)
+        if _cuda_mod is not None:
+            for _name in ("is_available", "is_bf16_supported",
+                          "get_device_capability", "get_device_properties"):
+                if hasattr(_cuda_mod, _name):
+                    _patchers.append(_mpatch.object(_cuda_mod, _name, _raise))
+        for _p in _patchers:
+            _p.start()
+        try:
+            cm = self._import_cm()
+            with cm(effective_weight_dtype=torch.bfloat16, target_gpus=("RTX-PRO-6000",)):
+                self.assertIsNone(self._mm.unet_manual_cast(torch.bfloat16, "cpu"))
+        except AssertionError:
+            raise
+        finally:
+            for _p in _patchers:
+                _p.stop()
+
+    def test_unrelated_call_delegates_during_patch(self):
+        """A call on the same thread that looks different delegates."""
+        import torch
+        cm = self._import_cm()
+        with cm(effective_weight_dtype=torch.bfloat16, target_gpus=("RTX-PRO-6000",)):
+            # Active thread calls with bf16 -> gets None
+            self.assertIsNone(self._mm.unet_manual_cast(torch.bfloat16, "cpu"))
+            # But a call with float32 delegates
+            result = self._mm.unet_manual_cast(torch.float32, "cpu")
+            self.assertEqual(result, "torch.float32")
+
+    def test_other_thread_delegates_during_patch(self):
+        """An unrelated caller on another thread delegates while wrapper installed."""
+        import torch
+        import threading
+        cm = self._import_cm()
+        _other_result = []
+        def _other_thread():
+            # Call from another thread during the active context
+            _other_result.append(self._mm.unet_manual_cast(torch.bfloat16, "cpu"))
+        with cm(effective_weight_dtype=torch.bfloat16, target_gpus=("RTX-PRO-6000",)):
+            # Main thread gets None
+            self.assertIsNone(self._mm.unet_manual_cast(torch.bfloat16, "cpu"))
+            # Other thread calls - should delegate to original (returns float32)
+            _t = threading.Thread(target=_other_thread)
+            _t.start()
+            _t.join(timeout=5)
+            self.assertFalse(_t.is_alive())
+        self.assertEqual(len(_other_result), 1)
+        # Other thread saw original behavior (delegated)
+        self.assertEqual(_other_result[0], "torch.float32")
+
+    def test_second_context_cannot_replace(self):
+        """A second context cannot replace/observe the first override (lock-held).
+
+        Deterministic: verify second context remains blocked while first is
+        active, then exit first and verify the second entered afterward.
+        """
+        import torch
+        import threading
+        cm = self._import_cm()
+        _second_entered = threading.Event()
+        _second_done = threading.Event()
+        _second_result = []
+        def _second_thread():
+            try:
+                with cm(effective_weight_dtype=torch.bfloat16, target_gpus=("RTX-PRO-6000",)):
+                    _second_entered.set()
+                    _second_result.append(self._mm.unet_manual_cast(torch.bfloat16, "cpu"))
+            except Exception as e:
+                _second_result.append(e)
+            finally:
+                _second_done.set()
+        with cm(effective_weight_dtype=torch.bfloat16, target_gpus=("RTX-PRO-6000",)):
+            # Start second thread that tries to enter another context
+            _t = threading.Thread(target=_second_thread)
+            _t.start()
+            # Give second thread a moment to attempt entry — it must remain
+            # blocked because the lock is held by the outer context.
+            _entered = _second_entered.wait(timeout=1.5)
+            self.assertFalse(
+                _entered,
+                "Second context should not be able to enter while first holds the lock",
+            )
+            # Main thread still gets None from the override
+            self.assertIsNone(self._mm.unet_manual_cast(torch.bfloat16, "cpu"))
+            self.assertEqual(self._mm.call_count, 0)
+        # Outer context exited — second thread can now acquire the lock.
+        # Wait for it to enter and complete.
+        _done = _second_done.wait(timeout=5)
+        self.assertTrue(_done, "Second thread did not complete after outer context exited")
+        _t.join(timeout=2)
+        self.assertTrue(_second_entered.is_set(),
+                        "Second context should have entered after first exited")
+        # The second thread enters its OWN context (after outer exited)
+        # so it sees None from its own override.
+        self.assertEqual(len(_second_result), 1)
+        self.assertIsNone(_second_result[0])
+        # Verify original is restored on main thread too
+        self.assertEqual(self._mm.unet_manual_cast(torch.bfloat16, "cpu"), "torch.float32")
+        self.assertEqual(self._mm.call_count, 1)  # one call after restore
+
+    def test_bf16_native_validated_by_validate_cpu_snapshot_models(self):
+        """validate_cpu_snapshot_models with bf16_native compute_policy calls bf16 validation.
+
+        Uses temp files and real resolve_path to pass file facts validation,
+        then verifies that validate_snapshot_unet_bf16_native rejects
+        manual_cast_dtype at the validate_cpu_snapshot_models level."""
+        import tempfile, types
+        from comfymodal_runtime.cpu_snapshot_models import (
+            validate_cpu_snapshot_models,
+            CpuSnapshotModels,
+            _COMPUTE_POLICY_BF16_NATIVE,
+            ModelFileFact,
+            CPU_SNAPSHOT_UNET_POLICY_VERSION,
+        )
+        from comfymodal_runtime.contracts import ModelRestoreKey
+        _tmpdir = tempfile.mkdtemp()
+        _unet_path = os.path.join(_tmpdir, "unet.safetensors")
+        _clip1_path = os.path.join(_tmpdir, "clip1.safetensors")
+        open(_unet_path, "w").close()
+        open(_clip1_path, "w").close()
+        _st_un = os.stat(_unet_path)
+        _st_cl = os.stat(_clip1_path)
+        _key = ModelRestoreKey(unet_identity="unet.safetensors", clip_identity="clip1.safetensors",
+                                clip_type="stable_diffusion")
+        # Build unet that passes _is_valid_unet_patcher but fails bf16-native
+        # Must have non-zero floating params so zero-param check passes
+        _fake_param = types.SimpleNamespace(
+            device="cpu", dtype=types.SimpleNamespace(),
+            is_floating_point=lambda: True, numel=lambda: 1000,
+        )
+        _fake_param.dtype = "torch.bfloat16"
+        _mod = types.ModuleType("m")
+        _mod.named_parameters = lambda recurse=True: iter([])
+        _mod.named_buffers = lambda recurse=True: iter([])
+        _mod.diffusion_model = _mod
+        _mod.manual_cast_dtype = "torch.float32"  # Will fail bf16-native
+        _unet = types.SimpleNamespace(
+            model=_mod,
+            load_device="cpu", offload_device="cpu",
+            model_dtype=lambda: "torch.bfloat16",
+            parameters=lambda: iter([_fake_param]),
+            named_parameters=lambda recurse=True: iter([]),
+            named_buffers=lambda recurse=True: iter([]),
+        )
+        _clip_mod = types.ModuleType("cm")
+        _clip_mod.named_parameters = lambda recurse=True: iter([])
+        _clip_mod.named_buffers = lambda recurse=True: iter([])
+        _clip_patcher = types.SimpleNamespace(load_device="cpu", offload_device="cpu")
+        _clip = types.SimpleNamespace(
+            patcher=_clip_patcher,
+            tokenizer=object(),
+            cond_stage_model=_clip_mod,
+        )
+        models = CpuSnapshotModels(
+            model_key=_key,
+            model_spec={"loaders": {"unet": [], "clip": []}},
+            normalized_profile={"mode": "split", "unet": "unet.safetensors",
+                                "clip1": "clip1.safetensors", "clip_type": "stable_diffusion"},
+            file_facts=[
+                ModelFileFact(role="unet", path=_unet_path, size_bytes=_st_un.st_size, mtime_ns=0),
+                ModelFileFact(role="clip1", path=_clip1_path, size_bytes=_st_cl.st_size, mtime_ns=0),
+            ],
+            unet=_unet,
+            clip=_clip,
+            compute_policy=_COMPUTE_POLICY_BF16_NATIVE,
+            policy_version=CPU_SNAPSHOT_UNET_POLICY_VERSION,
+            target_gpus=("RTX-PRO-6000",),
+        )
+        ok, reason = validate_cpu_snapshot_models(
+            models,
+            expected_key=_key,
+            expected_spec={"loaders": {"unet": [], "clip": []}},
+            resolve_path=lambda role, name: os.path.join(_tmpdir, name),
+        )
+        import shutil
+        shutil.rmtree(_tmpdir, ignore_errors=True)
+        self.assertFalse(ok)
+        self.assertIn("manual_cast", reason.lower())
+
+    def test_compute_policy_not_in_model_spec_via_identity_from_profile(self):
+        """identity_from_profile model_spec does NOT contain compute_policy."""
+        import tempfile
+        from comfymodal_runtime.cpu_snapshot_models import identity_from_profile
+        _tmpdir = tempfile.mkdtemp()
+        _unet_path = os.path.join(_tmpdir, "unet.safetensors")
+        _clip1_path = os.path.join(_tmpdir, "clip1.safetensors")
+        open(_unet_path, "w").close()
+        open(_clip1_path, "w").close()
+        profile = {
+            "mode": "split",
+            "unet": "unet.safetensors",
+            "clip1": "clip1.safetensors",
+            "clip_type": "stable_diffusion",
+        }
+        _key, spec, _facts = identity_from_profile(
+            profile,
+            resolve_path=lambda role, name: os.path.join(_tmpdir, name),
+        )
+        self.assertNotIn("compute_policy", spec)
+        import shutil
+        shutil.rmtree(_tmpdir, ignore_errors=True)
+
+
+# ── Policy version / identity tests ──────────────────────────────────
+
+
+class TestPolicyVersionIdentity(unittest.TestCase):
+    """CPU_SNAPSHOT_UNET_POLICY_VERSION and _policy_identity."""
+
+    def test_current_version_is_2(self):
+        from comfymodal_runtime.cpu_snapshot_models import CPU_SNAPSHOT_UNET_POLICY_VERSION
+        self.assertEqual(CPU_SNAPSHOT_UNET_POLICY_VERSION, 2)
+
+    def test_policy_identity_changes_with_version(self):
+        from comfymodal_runtime.cpu_snapshot_models import _policy_identity
+        id1 = _policy_identity(2, "bfloat16", "bfloat16", "none")
+        id2 = _policy_identity(1, "bfloat16", "bfloat16", "none")
+        self.assertNotEqual(id1, id2)
+
+    def test_policy_identity_changes_with_compute(self):
+        from comfymodal_runtime.cpu_snapshot_models import _policy_identity
+        id1 = _policy_identity(2, "bfloat16", "bfloat16", "none")
+        id2 = _policy_identity(2, "bfloat16", "float32", "none")
+        self.assertNotEqual(id1, id2)
+
+    def test_policy_identity_changes_with_manual(self):
+        from comfymodal_runtime.cpu_snapshot_models import _policy_identity
+        id1 = _policy_identity(2, "bfloat16", "bfloat16", "none")
+        id2 = _policy_identity(2, "bfloat16", "bfloat16", "float32")
+        self.assertNotEqual(id1, id2)
+
+    def test_current_native_snapshot_identity_accepted(self):
+        """Native BF16 snapshot produces expected identity."""
+        from comfymodal_runtime.cpu_snapshot_models import (
+            _policy_identity, CPU_SNAPSHOT_UNET_POLICY_VERSION,
+        )
+        ident = _policy_identity(CPU_SNAPSHOT_UNET_POLICY_VERSION,
+                                 "bfloat16", "bfloat16", "none")
+        self.assertIn("v2:", ident)
+        self.assertIn("weight=bfloat16", ident)
+        self.assertIn("compute=bfloat16", ident)
+        self.assertIn("manual=none", ident)
+
+    def test_stale_version_rejected(self):
+        """validate_cpu_snapshot_models rejects policy_version=0."""
+        import tempfile
+        from comfymodal_runtime.cpu_snapshot_models import (
+            validate_cpu_snapshot_models, CpuSnapshotModels, ModelFileFact,
+        )
+        from comfymodal_runtime.contracts import ModelRestoreKey
+        _tmpdir = tempfile.mkdtemp()
+        _unet_path = os.path.join(_tmpdir, "u.safetensors")
+        _clip_path = os.path.join(_tmpdir, "c.safetensors")
+        open(_unet_path, "w").close()
+        open(_clip_path, "w").close()
+        _st_u = os.stat(_unet_path)
+        _st_c = os.stat(_clip_path)
+        _key = ModelRestoreKey(unet_identity="u.safetensors",
+                               clip_identity="c.safetensors",
+                               clip_type="stable_diffusion")
+        models = CpuSnapshotModels(
+            model_key=_key,
+            model_spec={"loaders": {"unet": [], "clip": []}},
+            normalized_profile={"mode": "split", "unet": "u.safetensors",
+                                "clip1": "c.safetensors", "clip_type": "stable_diffusion"},
+            file_facts=[
+                ModelFileFact(role="unet", path=_unet_path, size_bytes=_st_u.st_size, mtime_ns=0),
+                ModelFileFact(role="clip1", path=_clip_path, size_bytes=_st_c.st_size, mtime_ns=0),
+            ],
+            unet=_FakeUNETPatcher(), clip=_FakeCLIP(),
+            policy_version=0,  # legacy
+        )
+        ok, reason = validate_cpu_snapshot_models(
+            models, expected_key=_key,
+            expected_spec={"loaders": {"unet": [], "clip": []}},
+            resolve_path=lambda r, n: os.path.join(_tmpdir, n),
+        )
+        import shutil
+        shutil.rmtree(_tmpdir, ignore_errors=True)
+        self.assertFalse(ok)
+        self.assertIn("policy_version", reason.lower())
+        self.assertIn("legacy", reason.lower())
+
+    def test_model_spec_remains_default_weight_dtype(self):
+        """model_spec weight_dtype stays 'default' even with effective BF16."""
+        from comfymodal_runtime.cpu_snapshot_models import _build_model_spec, _normalize_profile
+        prof = {"mode": "split", "unet": "u.safetensors",
+                "clip1": "c.safetensors", "clip_type": "stable_diffusion"}
+        norm = _normalize_profile(prof)
+        spec = _build_model_spec(norm)
+        unet_loader = spec.get("loaders", {}).get("unet", [{}])[0]
+        self.assertEqual(unet_loader.get("weight_dtype"), "default")
+
+
+class TestConstructionSelectionAndExceptionRestoration(unittest.TestCase):
+    """_load_cpu_snapshot_unet construction selection and exception restoration."""
+
+    def setUp(self):
+        # Install fake model_management in sys.modules
+        self._mm = _FakeMMForContext()
+        self._orig_mm = sys.modules.get("comfy.model_management")
+        sys.modules["comfy.model_management"] = self._mm
+        self._orig_cm = sys.modules.get("comfy.sd")
+        self._orig_fp = sys.modules.get("folder_paths")
+
+    def tearDown(self):
+        if self._orig_mm is not None:
+            sys.modules["comfy.model_management"] = self._orig_mm
+        else:
+            sys.modules.pop("comfy.model_management", None)
+        if self._orig_cm is not None:
+            sys.modules["comfy.sd"] = self._orig_cm
+        else:
+            sys.modules.pop("comfy.sd", None)
+        if self._orig_fp is not None:
+            sys.modules["folder_paths"] = self._orig_fp
+        else:
+            sys.modules.pop("folder_paths", None)
+        from comfymodal_runtime.model_preload import (
+            _CPU_SNAPSHOT_UNET_POLICY_ACTIVE_THREAD,
+            _CPU_SNAPSHOT_UNET_MANUAL_CAST_OVERRIDE,
+        )
+        _CPU_SNAPSHOT_UNET_POLICY_ACTIVE_THREAD.set(0)
+        _CPU_SNAPSHOT_UNET_MANUAL_CAST_OVERRIDE.set("")
+
+    def test_construction_returns_none_manual_cast(self):
+        """BF16-native construction: unet_manual_cast returns None, model_dtype BF16,
+        manual None, CPU BF16 params, original restored after."""
+        import types, torch
+        from comfymodal_runtime.modal_app import _load_cpu_snapshot_unet
+
+        # Fake comfy.sd with load_diffusion_model
+        _fake_sd = types.ModuleType("comfy.sd")
+        _construction_calls = []
+
+        class _FakeModelPatcher:
+            """Mimics ModelPatcher returned by load_diffusion_model."""
+            def __init__(self):
+                self.model = _FakeManualCastModule(manual_cast_dtype=None,
+                                                   params_dtype="torch.bfloat16")
+                self.load_device = "cpu"
+                self.offload_device = "cpu"
+
+            def model_dtype(self):
+                return torch.bfloat16
+
+            def parameters(self, recurse=True):
+                return self.model.parameters(recurse)
+
+            def named_parameters(self, recurse=True):
+                return iter([])
+
+            def named_buffers(self, recurse=True):
+                return iter([])
+
+        def _fake_load(path, *, model_options):
+            _construction_calls.append(("load_diffusion_model", path, model_options))
+            # Inside the compute policy context, verify unet_manual_cast returns None
+            _call_result = self._mm.unet_manual_cast(torch.bfloat16, "cpu")
+            _construction_calls.append(("unet_manual_cast_in_context", _call_result))
+            return _FakeModelPatcher()
+
+        _fake_sd.load_diffusion_model = _fake_load
+        _fake_fp = types.ModuleType("folder_paths")
+        _fake_fp.get_full_path_or_raise = lambda cat, name: f"/models/{cat}/{name}"
+        sys.modules["comfy.sd"] = _fake_sd
+        sys.modules["folder_paths"] = _fake_fp
+
+        result = _load_cpu_snapshot_unet(
+            "test_unet.safetensors", "default",
+            target_gpus=("RTX-PRO-6000",), unet_cls=None,
+        )
+
+        # Verify load_diffusion_model was called
+        self.assertEqual(len(_construction_calls), 2)
+        self.assertEqual(_construction_calls[0][0], "load_diffusion_model")
+        # Verify dtype model_option is bf16
+        self.assertIs(_construction_calls[0][2]["dtype"], torch.bfloat16)
+        # Verify unet_manual_cast returned None during context
+        self.assertIsNone(_construction_calls[1][1])
+
+        # Verify returned patcher has correct state
+        self.assertIsInstance(result, _FakeModelPatcher)
+        self.assertIsNone(result.model.manual_cast_dtype)
+        self.assertEqual(result.model_dtype(), torch.bfloat16)
+        # Verify original unet_manual_cast is restored after construction
+        post_result = self._mm.unet_manual_cast(torch.bfloat16, "cpu")
+        self.assertEqual(post_result, "torch.float32")
+        self.assertEqual(self._mm.call_count, 1)  # call after restore
+
+    def test_exception_restores_original(self):
+        """Exception during construction restores unet_manual_cast."""
+        import types, torch
+        from comfymodal_runtime.modal_app import _load_cpu_snapshot_unet
+
+        _fake_sd = types.ModuleType("comfy.sd")
+        def _fake_load(path, *, model_options):
+            raise ValueError("construction failure")
+
+        _fake_sd.load_diffusion_model = _fake_load
+        _fake_fp = types.ModuleType("folder_paths")
+        _fake_fp.get_full_path_or_raise = lambda cat, name: f"/models/{cat}/{name}"
+        sys.modules["comfy.sd"] = _fake_sd
+        sys.modules["folder_paths"] = _fake_fp
+
+        with self.assertRaises(ValueError):
+            _load_cpu_snapshot_unet(
+                "test_unet.safetensors", "default",
+                target_gpus=("RTX-PRO-6000",), unet_cls=None,
+            )
+
+        # Original unet_manual_cast must be restored after exception
+        post_result = self._mm.unet_manual_cast(torch.bfloat16, "cpu")
+        self.assertEqual(post_result, "torch.float32")
+        # The policy must also leave thread state clean
+        from comfymodal_runtime.model_preload import (
+            _CPU_SNAPSHOT_UNET_POLICY_ACTIVE_THREAD,
+            _CPU_SNAPSHOT_UNET_MANUAL_CAST_OVERRIDE,
+        )
+        self.assertEqual(_CPU_SNAPSHOT_UNET_POLICY_ACTIVE_THREAD.get(), 0)
+        self.assertEqual(_CPU_SNAPSHOT_UNET_MANUAL_CAST_OVERRIDE.get(), "")
 
 
 if __name__ == "__main__":
