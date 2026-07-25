@@ -784,6 +784,7 @@ async def execute_plan(
                 profile_cache_lookup_ms=_profile_cache_lookup_ms,
                 profile_remote_call_performed=False,
                 profile_checker_performed=False,
+                profile_checker_matched=False,
                 profile_setter_performed=False,
                 active_profile_local_ms=0.0,
                 active_profile_cache_lookup_ms=_profile_cache_lookup_ms,
@@ -860,6 +861,10 @@ async def execute_plan(
                 profile_cache_lookup_ms=_profile_cache_lookup_ms,
                 profile_remote_call_performed=bool(_pn_result.get("active_profile_remote_call", 0)),
                 profile_checker_performed=bool(_pn_result.get("profile_checker_performed", False)),
+                # Propagated from prepare_active_next_profile result.
+                # True only when the volume-backed checker returned matched=True;
+                # False for process-local dedup hit, setter-write, or no-checker paths.
+                profile_checker_matched=_pn_result.get("profile_checker_matched", False),
                 profile_setter_performed=bool(_pn_result.get("profile_setter_performed", False)),
                 active_profile_local_ms=_pn_result.get("active_profile_local_ms", 0.0),
                 active_profile_cache_lookup_ms=_pn_result.get("active_profile_cache_lookup_ms", _profile_cache_lookup_ms),

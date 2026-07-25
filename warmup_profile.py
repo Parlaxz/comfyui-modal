@@ -492,6 +492,7 @@ async def prepare_active_next_profile(
         # Reuse booleans
         "profile_cache_hit": False,
         "profile_checker_performed": False,
+        "profile_checker_matched": False,
         "profile_setter_performed": False,
         # Identity-change report fields
         "model_profile_key": "",
@@ -652,6 +653,7 @@ async def prepare_active_next_profile(
                 result["active_profile_token"] = _token
                 result["profile_cache_hit"] = False
                 result["profile_checker_performed"] = True
+                result["profile_checker_matched"] = True
                 result["profile_setter_performed"] = False
                 # Advance process-local cache so subsequent requests
                 # skip both checker and setter.
