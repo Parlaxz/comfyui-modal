@@ -341,6 +341,279 @@ def _tensor_device_type_of_value(val: Any) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+# ── Protected helpers for collect_unet_runtime_state ────────────────────
+
+
+def _first_parameter_info(
+    module: Any,
+) -> tuple[str, str]:
+    """Inspect only the first named parameter.
+
+    Returns ``(device_str, dtype_str)``.  Uses ``"absent"`` when the
+    module has no parameters or when inspection fails.  No CUDA sync.
+    """
+    try:
+        params = list(module.named_parameters(recurse=False))
+        if not params:
+            return ("absent", "absent")
+        _name, tensor = params[0]
+        _dev = str(getattr(tensor, "device", "absent"))
+        _dtype = str(getattr(tensor, "dtype", "absent"))
+        return (_dev, _dtype)
+    except Exception:
+        return ("absent", "absent")
+
+
+def _first_buffer_info(
+    module: Any,
+) -> tuple[str, str]:
+    """Inspect only the first named buffer.
+
+    Returns ``(device_str, dtype_str)``.  Uses ``"absent"`` when the
+    module has no buffers or when inspection fails.  No CUDA sync.
+    """
+    try:
+        bufs = list(module.named_buffers(recurse=False))
+        if not bufs:
+            return ("absent", "absent")
+        _name, tensor = bufs[0]
+        _dev = str(getattr(tensor, "device", "absent"))
+        _dtype = str(getattr(tensor, "dtype", "absent"))
+        return (_dev, _dtype)
+    except Exception:
+        return ("absent", "absent")
+
+
+# ---------------------------------------------------------------------------
+# UNET runtime-state collector, differ, and rehydration helper
+# ---------------------------------------------------------------------------
+
+
+def collect_unet_runtime_state(
+    unet: Any,
+    *,
+    model_management: Any = None,
+) -> dict[str, Any]:
+    """Capture the current runtime state of a UNET patcher object.
+
+    Returns a flat dict with the fields specified in the comfymodal
+    runtime-state comparison protocol.  All values are string-coercible;
+    missing attributes are reported as ``"absent"``.  No mutation, no
+    CUDA synchronisation, no tensor content.  Inspects only the **first**
+    parameter and the **first** buffer of ``unet.model`` and
+    ``unet.model.diffusion_model`` (when available).
+    """
+    state: dict[str, Any] = {}
+
+    def _g(attr: str, default: str = "absent") -> Any:
+        return getattr(unet, attr, default)
+
+    _MISSING = object()
+
+    # ── Patcher-level type identities ─────────────────────────────────
+    state["patcher_type"] = type(unet).__qualname__ if not isinstance(unet, (int, float, bool, str, bytes)) else type(unet).__name__
+    _model = getattr(unet, "model", None)
+    state["model_type"] = type(_model).__qualname__ if _model is not None else "absent"
+    _dm = None
+    if _model is not None:
+        _dm = getattr(_model, "diffusion_model", None)
+    elif hasattr(unet, "diffusion_model"):
+        _dm = getattr(unet, "diffusion_model", None)
+    state["diffusion_model_type"] = type(_dm).__qualname__ if _dm is not None else "absent"
+
+    # ── Object identities (stable within process) ─────────────────────
+    state["patcher_object_id"] = str(id(unet))
+    state["model_object_id"] = str(id(_model)) if _model is not None else "absent"
+    state["diffusion_model_object_id"] = str(id(_dm)) if _dm is not None else "absent"
+
+    # ── Device attributes ─────────────────────────────────────────────
+    state["load_device"] = str(_g("load_device"))
+    state["offload_device"] = str(_g("offload_device"))
+
+    # ── First-parameter / first-buffer inspection (no CUDA sync) ─────
+    _fp_dev, _fp_dtype = ("absent", "absent")
+    _fb_dev, _fb_dtype = ("absent", "absent")
+    if _model is not None:
+        _fp_dev, _fp_dtype = _first_parameter_info(_model)
+        _fb_dev, _fb_dtype = _first_buffer_info(_model)
+    state["current_device"] = _fp_dev
+    state["first_parameter_device"] = _fp_dev
+    state["first_parameter_dtype"] = _fp_dtype
+    state["first_buffer_device"] = _fb_dev
+    state["first_buffer_dtype"] = _fb_dtype
+
+    # ── Model dtype fields ────────────────────────────────────────────
+    state["model_dtype"] = str(_g("model_dtype"))
+    state["manual_cast_dtype"] = str(_g("manual_cast_dtype"))
+    state["weight_dtype"] = str(_g("weight_dtype"))
+
+    # ── Options ───────────────────────────────────────────────────────
+    _mo = getattr(unet, "model_options", _MISSING)
+    if _mo is _MISSING:
+        state["model_options_keys"] = "absent"
+    elif isinstance(_mo, dict):
+        state["model_options_keys"] = sorted(str(k) for k in _mo.keys())
+    else:
+        state["model_options_keys"] = "absent"
+    _to = getattr(unet, "transformer_options", _MISSING)
+    if _to is _MISSING:
+        state["transformer_options_keys"] = "absent"
+    elif isinstance(_to, dict):
+        state["transformer_options_keys"] = sorted(str(k) for k in _to.keys())
+    else:
+        state["transformer_options_keys"] = "absent"
+
+    # ── Patch counters ────────────────────────────────────────────────
+    _patches = getattr(unet, "patches", _MISSING)
+    if _patches is _MISSING:
+        state["patch_count"] = "absent"
+    elif isinstance(_patches, dict):
+        state["patch_count"] = len(_patches)
+    else:
+        state["patch_count"] = "absent"
+    _obj_patches = getattr(unet, "object_patches", _MISSING)
+    if _obj_patches is _MISSING:
+        state["object_patch_count"] = "absent"
+    elif isinstance(_obj_patches, dict):
+        state["object_patch_count"] = len(_obj_patches)
+    else:
+        state["object_patch_count"] = "absent"
+
+    # ─── Memory / lowvram ────────────────────────────────────────────
+    state["model_loaded_weight_memory"] = str(_g("model_loaded_weight_memory"))
+    state["model_lowvram"] = str(_g("model_lowvram"))
+    state["model_lowvram_patch_counter"] = str(_g("model_lowvram_patch_counter"))
+
+    # ── Forward function ──────────────────────────────────────────────
+    _forward = getattr(unet, "forward", None)
+    if _forward is not None:
+        _self = getattr(_forward, "__self__", None)
+        state["forward_module"] = type(_self).__qualname__ if _self is not None else "absent"
+        state["forward_qualname"] = str(getattr(_forward, "__qualname__", "absent"))
+    else:
+        state["forward_module"] = "absent"
+        state["forward_qualname"] = "absent"
+
+    # ── loaded_models membership ──────────────────────────────────────
+    _loaded = "absent"
+    if model_management is not None:
+        try:
+            _lm = getattr(model_management, "loaded_models", None)
+            if isinstance(_lm, (list, tuple)):
+                _present = any(
+                    _item is unet for _item in _lm
+                )
+                _loaded = str(int(_present))
+            else:
+                _loaded = "absent"
+        except Exception:
+            _loaded = "absent"
+    state["loaded_models_member"] = _loaded
+
+    return state
+
+
+def diff_unet_runtime_states(
+    snapshot_state: dict[str, Any],
+    normal_state: dict[str, Any],
+) -> dict[str, Any]:
+    """Return only differing fields between two ``collect_unet_runtime_state`` outputs.
+
+    Keys present in both dicts whose string values differ are included.
+    Keys present in only one dict are included with their value from the
+    dict that has them.  Returns an empty dict when states are identical.
+    """
+    diff: dict[str, Any] = {}
+    all_keys = set(snapshot_state.keys()) | set(normal_state.keys())
+    for key in sorted(all_keys):
+        sv = snapshot_state.get(key, "<missing>")
+        nv = normal_state.get(key, "<missing>")
+        if str(sv) != str(nv):
+            diff[key] = {"snapshot": sv, "normal": nv}
+    return diff
+
+
+def rehydrate_cpu_snapshot_unet(
+    unet: Any,
+    *,
+    model_management: Any,
+    trace: Any = None,
+) -> tuple[bool, str]:
+    """Validate and re-target device attributes of a CPU-snapshot UNET.
+
+    For this patch the helper must only:
+
+    1. Validate that *unet* has ``.model``, ``.load_device``, and
+       ``.offload_device`` attributes.
+    2. Assign ``model_management.get_torch_device()`` to
+       ``unet.load_device`` and ``model_management.unet_offload_device()``
+       to ``unet.offload_device``.
+    3. Emit pre/post runtime state when *trace* is provided.
+
+    Returns ``(True, "ok")`` or ``(False, reason_string)``.
+
+    Does **not** modify ``current_device``, change dtype/manual-cast
+    fields, clear CacheDiT, call ``load_models_gpu``, reconstruct or
+    reload the UNET, or copy state from another object.
+    """
+    # ── Pre-state ─────────────────────────────────────────────────────
+    _pre_state = collect_unet_runtime_state(unet, model_management=model_management)
+
+    # ── Validate shape ────────────────────────────────────────────────
+    if not hasattr(unet, "model"):
+        return False, "unet missing .model attribute"
+    if not hasattr(unet, "load_device"):
+        return False, "unet missing .load_device attribute"
+    if not hasattr(unet, "offload_device"):
+        return False, "unet missing .offload_device attribute"
+
+    # ── Validate required model_management functions ──────────────────
+    _gt = getattr(model_management, "get_torch_device", None)
+    _uo = getattr(model_management, "unet_offload_device", None)
+    if not callable(_gt):
+        return False, "model_management.get_torch_device is not callable"
+    if not callable(_uo):
+        return False, "model_management.unet_offload_device is not callable"
+
+    # ── Assign devices ────────────────────────────────────────────────
+    try:
+        unet.load_device = _gt()
+        unet.offload_device = _uo()
+    except Exception as exc:
+        return False, f"device assignment failed: {exc}"
+
+    # ── Post-state ────────────────────────────────────────────────────
+    _post_state = collect_unet_runtime_state(unet, model_management=model_management)
+
+    # Emit pre/post trace when available
+    if trace is not None:
+        try:
+            _pre_state_safe = {k: str(v) for k, v in _pre_state.items()}
+            _post_state_safe = {k: str(v) for k, v in _post_state.items()}
+            _diff = diff_unet_runtime_states(_pre_state, _post_state)
+            trace.emit(
+                "unet_rehydrate_pre_state",
+                metadata={"state": _pre_state_safe},
+            )
+            trace.emit(
+                "unet_rehydrate_post_state",
+                metadata={"state": _post_state_safe},
+            )
+            if _diff:
+                _diff_safe = {
+                    k: {"snapshot": str(v.get("snapshot", "")), "normal": str(v.get("normal", ""))}
+                    for k, v in _diff.items()
+                }
+                trace.emit(
+                    "unet_rehydrate_diff",
+                    metadata={"diff": _diff_safe, "changed_fields": sorted(_diff.keys())},
+                )
+        except Exception:
+            pass
+
+    return True, "ok"
+
+
 def identity_from_profile(
     profile: Mapping[str, Any],
     *,
@@ -760,8 +1033,13 @@ def retarget_cpu_snapshot_models(
         return (False, "unsupported_clip_shape")
 
     # All checks passed - make device-policy assignments only.
-    models.unet.load_device = model_management.get_torch_device()
-    models.unet.offload_device = model_management.unet_offload_device()
+    # UNET: delegate to rehydrate_cpu_snapshot_unet for instrumentation.
+    ok_rehydrate, reason_rehydrate = rehydrate_cpu_snapshot_unet(
+        models.unet, model_management=model_management,
+    )
+    if not ok_rehydrate:
+        return (False, f"unet_rehydration_failed:{reason_rehydrate}")
+
     clip_patcher.load_device = model_management.text_encoder_device()
     clip_patcher.offload_device = model_management.text_encoder_offload_device()
 
