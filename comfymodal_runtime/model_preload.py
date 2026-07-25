@@ -4832,13 +4832,27 @@ class V2LoaderBridge:
         unet = result[0] if isinstance(result, (tuple, list)) and result else result
 
         # ── Emit normal_loader_ready state (print + trace) ──────────────
+        _normal_state: dict[str, Any] = {}
+        _req_wd = request.get("weight_dtype", "default")
         try:
+            # Safely import model_management for loaded_models comparability
+            _mgmt = None
+            try:
+                import comfy.model_management as _comfy_mm
+                _mgmt = _comfy_mm
+            except Exception:
+                _mgmt = None
+
+            _normal_state = collect_unet_runtime_state(
+                unet, model_management=_mgmt,
+            )
+        except Exception:
             _normal_state = collect_unet_runtime_state(unet, model_management=None)
+
+        try:
             _state_json = __import__("json").dumps(
                 _normal_state, default=str, separators=(",", ":"), sort_keys=True,
             )
-            # Compact print
-            _req_wd = request.get("weight_dtype", "default")
             print(
                 f"[v2.unet_runtime_state] "
                 f"stage=normal_loader_ready "
@@ -4847,16 +4861,20 @@ class V2LoaderBridge:
                 f"state={_state_json}",
                 flush=True,
             )
-            # Trace event
-            _active_request_trace = _ACTIVE_REQUEST_TRACE.get()
-            if _active_request_trace is not None:
-                _active_request_trace.emit(
+        except Exception:
+            pass
+
+        try:
+            # Trace event — prefer request trace, fallback to bridge trace
+            _target_trace = _ACTIVE_REQUEST_TRACE.get() or self._trace
+            if _target_trace is not None:
+                _target_trace.emit(
                     "unet_runtime_state",
                     metadata={
                         "stage": "normal_loader_ready",
                         "unet_identity": model_key.unet_identity,
                         "requested_weight_dtype": _req_wd,
-                        "request_id": str(_active_request_trace.request_id or ""),
+                        "request_id": str(getattr(_target_trace, "request_id", None) or ""),
                         "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
                         "restore_session_id": _LATEST_RESTORE_SESSION_ID,
                         "state": _normal_state,
