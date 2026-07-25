@@ -3013,6 +3013,17 @@ class ModalRuntimeEntrypoint:
                         self._maybe_propagate_cpu_snapshot_unet_state(
                             request_model_key, request_model_spec, trace,
                         )
+                        # Diagnostic: verify state was available
+                        _diag_state = self._cpu_snapshot_unet_runtime_state
+                        trace.emit(
+                            "unet_runtime_state_propagate_diag",
+                            metadata={
+                                "status": "after_helper",
+                                "state_is_none": _diag_state is None,
+                                "state_stage": _diag_state.get("stage", "") if _diag_state is not None else "",
+                                "request_id": str(trace.request_id if trace else ""),
+                            },
+                        )
                     if _bypass_snapshot_unet:
                         print(
                             "[v2.cpu_snapshot_request] status=partial_bypass "
@@ -3240,6 +3251,11 @@ class ModalRuntimeEntrypoint:
         models match, and ``diagnostic_bypass_cpu_snapshot_unet`` is False.
         """
         if self._cpu_snapshot_unet_runtime_state is None:
+            trace.emit(
+                "unet_runtime_state_propagate_diag",
+                metadata={"status": "skipped", "reason": "state_is_none"},
+            )
+            print("[v2.unet_runtime_state_propagated] status=skipped reason=state_is_none", flush=True)
             return
         _req_unet_ident = str(getattr(request_model_key, "unet_identity", ""))
         _req_wd = "default"
@@ -3268,6 +3284,17 @@ class ModalRuntimeEntrypoint:
                 flush=True,
             )
         else:
+            trace.emit(
+                "unet_runtime_state_propagate_diag",
+                metadata={
+                    "status": "skipped",
+                    "reason": "identity_or_dtype_mismatch",
+                    "req_unet_ident": _req_unet_ident,
+                    "stored_unet": _stored_unet,
+                    "req_wd": _req_wd,
+                    "stored_wd": _stored_wd,
+                },
+            )
             self._cpu_snapshot_unet_runtime_state = None
             print(
                 f"[v2.unet_runtime_state_propagated] status=skipped "
