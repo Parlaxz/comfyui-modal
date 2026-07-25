@@ -7081,10 +7081,18 @@ custom_nodes_vol = modal.Volume.from_name(CUSTOM_NODES_VOLUME_NAME, create_if_mi
     timeout=1800,
     volumes={MODELS_PATH: vol},
 )
+def _ensure_url_scheme(url: str) -> str:
+    """Prepend https:// if url is missing a scheme."""
+    if url and not url.startswith(("http://", "https://")):
+        return "https://" + url
+    return url
+
+
 def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoints", hf_token: str = "", civitai_token: str = ""):
     import httpx
     from pathlib import Path
 
+    url = _ensure_url_scheme(url)
     dest = Path(MODELS_PATH) / save_path / filename
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -7136,6 +7144,7 @@ def download_model_stream(url: str, filename: str, save_path: str = "checkpoints
     import httpx
     from pathlib import Path
 
+    url = _ensure_url_scheme(url)
     dest = Path(MODELS_PATH) / save_path / filename
     dest.parent.mkdir(parents=True, exist_ok=True)
 
