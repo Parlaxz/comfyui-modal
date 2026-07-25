@@ -48,7 +48,6 @@ from .model_preload import (
 from .cpu_snapshot_models import (
     CpuSnapshotModels,
     collect_unet_runtime_state,
-    diff_unet_runtime_states,
     identity_from_profile,
     load_cpu_snapshot_models,
     validate_cpu_snapshot_models,
@@ -1888,7 +1887,7 @@ class ModalRuntimeEntrypoint:
                         else:
                             _comfy_utils.DISABLE_MMAP = _mmap_orig
 
-                    # ── Emit snapshot_created runtime state ─────────────────
+                    # ── Emit snapshot_created runtime state (print + trace) ─
                     try:
                         _snap_state = collect_unet_runtime_state(
                             _cpu_models.unet,
@@ -1903,6 +1902,18 @@ class ModalRuntimeEntrypoint:
                             f"weight_dtype={_snap_state.get('weight_dtype', 'absent')} "
                             f"state={_state_json}",
                             flush=True,
+                        )
+                        trace.emit(
+                            "unet_runtime_state",
+                            metadata={
+                                "stage": "snapshot_created",
+                                "unet_identity": _unet_ident,
+                                "requested_weight_dtype": _snap_state.get("weight_dtype", ""),
+                                "request_id": "",
+                                "restored_instance_id": "",
+                                "restore_session_id": "",
+                                "state": _snap_state,
+                            },
                         )
                     except Exception:
                         pass
@@ -2340,7 +2351,7 @@ class ModalRuntimeEntrypoint:
                     import comfy.model_management as _mm
                     _unet_ident = getattr(getattr(models, "model_key", None), "unet_identity", "")
 
-                    # ── Emit pre-retarget state ─────────────────────────
+                    # ── Emit pre-retarget state (print + trace) ──────────
                     _pre_retarget_state: dict[str, Any] = {}
                     try:
                         _pre_retarget_state = collect_unet_runtime_state(
@@ -2359,6 +2370,18 @@ class ModalRuntimeEntrypoint:
                             f"state={_state_json_pre}",
                             flush=True,
                         )
+                        trace.emit(
+                            "unet_runtime_state",
+                            metadata={
+                                "stage": "snapshot_restored_pre_retarget",
+                                "unet_identity": _unet_ident,
+                                "requested_weight_dtype": _pre_retarget_state.get("weight_dtype", ""),
+                                "request_id": str(trace.request_id if trace else ""),
+                                "restored_instance_id": restored_instance_id,
+                                "restore_session_id": restore_session_id,
+                                "state": _pre_retarget_state,
+                            },
+                        )
                     except Exception:
                         pass
 
@@ -2368,7 +2391,7 @@ class ModalRuntimeEntrypoint:
                     if not retarget_ok:
                         raise RuntimeError(f"retarget failed: {retarget_reason}")
 
-                    # ── Emit post-retarget state ────────────────────────
+                    # ── Emit post-retarget state (print + trace) ──────────
                     _post_retarget_state: dict[str, Any] = {}
                     try:
                         _post_retarget_state = collect_unet_runtime_state(
@@ -2387,14 +2410,18 @@ class ModalRuntimeEntrypoint:
                             f"state={_state_json_post}",
                             flush=True,
                         )
-                        # Store for later diff against normal_loader_ready
-                        try:
-                            from comfymodal_runtime.model_preload import (
-                                _set_latest_snapshot_unet_state,
-                            )
-                            _set_latest_snapshot_unet_state(_post_retarget_state)
-                        except Exception:
-                            pass
+                        trace.emit(
+                            "unet_runtime_state",
+                            metadata={
+                                "stage": "snapshot_restored_post_retarget",
+                                "unet_identity": _unet_ident,
+                                "requested_weight_dtype": _post_retarget_state.get("weight_dtype", ""),
+                                "request_id": str(trace.request_id if trace else ""),
+                                "restored_instance_id": restored_instance_id,
+                                "restore_session_id": restore_session_id,
+                                "state": _post_retarget_state,
+                            },
+                        )
                     except Exception:
                         pass
 

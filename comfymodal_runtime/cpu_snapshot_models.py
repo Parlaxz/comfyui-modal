@@ -341,52 +341,67 @@ def _tensor_device_type_of_value(val: Any) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-# ── Protected helpers for collect_unet_runtime_state ────────────────────
+# ── Object-ID keys excluded from semantic diff ─────────────────────────
 
-
-def _first_parameter_info(
-    module: Any,
-) -> tuple[str, str]:
-    """Inspect only the first named parameter.
-
-    Returns ``(device_str, dtype_str)``.  Uses ``"absent"`` when the
-    module has no parameters or when inspection fails.  No CUDA sync.
-    """
-    try:
-        params = list(module.named_parameters(recurse=False))
-        if not params:
-            return ("absent", "absent")
-        _name, tensor = params[0]
-        _dev = str(getattr(tensor, "device", "absent"))
-        _dtype = str(getattr(tensor, "dtype", "absent"))
-        return (_dev, _dtype)
-    except Exception:
-        return ("absent", "absent")
-
-
-def _first_buffer_info(
-    module: Any,
-) -> tuple[str, str]:
-    """Inspect only the first named buffer.
-
-    Returns ``(device_str, dtype_str)``.  Uses ``"absent"`` when the
-    module has no buffers or when inspection fails.  No CUDA sync.
-    """
-    try:
-        bufs = list(module.named_buffers(recurse=False))
-        if not bufs:
-            return ("absent", "absent")
-        _name, tensor = bufs[0]
-        _dev = str(getattr(tensor, "device", "absent"))
-        _dtype = str(getattr(tensor, "dtype", "absent"))
-        return (_dev, _dtype)
-    except Exception:
-        return ("absent", "absent")
-
+_OBJECT_ID_KEYS: frozenset[str] = frozenset({
+    "patcher_object_id",
+    "model_object_id",
+    "diffusion_model_object_id",
+})
 
 # ---------------------------------------------------------------------------
 # UNET runtime-state collector, differ, and rehydration helper
 # ---------------------------------------------------------------------------
+
+
+def _first_tensor_info(iterator_fn: Callable[..., Any]) -> tuple[str, str]:
+    """Inspect exactly the first item from *iterator_fn(recurse=True)*.
+
+    Uses ``next(iter(...), None)`` — never calls ``list()``, never inspects
+    a second tensor.  Returns ``(device_str, dtype_str)`` or
+    ``("absent", "absent")`` on any failure.
+    """
+    try:
+        it = iterator_fn(recurse=True)
+        if it is None:
+            return ("absent", "absent")
+        entry = next(iter(it), None)
+        if entry is None:
+            return ("absent", "absent")
+        if isinstance(entry, tuple) and len(entry) == 2:
+            _name, tensor = entry
+        else:
+            tensor = entry
+        _dev = str(getattr(tensor, "device", "absent"))
+        _dtype = str(getattr(tensor, "dtype", "absent"))
+        return (_dev, _dtype)
+    except Exception:
+        return ("absent", "absent")
+
+
+def _safe_str(val: Any) -> str:
+    """Return ``str(val)`` when *val* is not callable and not ``None``.
+
+    Returns ``"absent"`` for callable objects, ``None``, or any exception.
+    """
+    if val is None:
+        return "absent"
+    if callable(val):
+        return "absent"
+    try:
+        return str(val)
+    except Exception:
+        return "absent"
+
+
+def _safe_str_of_attr(obj: Any, attr: str) -> str:
+    """Safely stringify *getattr(obj, attr, None)*.
+
+    Returns ``"absent"`` when the attribute is missing, callable, or
+    cannot be converted to string.
+    """
+    val = getattr(obj, attr, None)
+    return _safe_str(val)
 
 
 def collect_unet_runtime_state(
@@ -394,58 +409,78 @@ def collect_unet_runtime_state(
     *,
     model_management: Any = None,
 ) -> dict[str, Any]:
-    """Capture the current runtime state of a UNET patcher object.
+    """Capture the current runtime state of a ComfyUI ModelPatcher for UNET.
 
     Returns a flat dict with the fields specified in the comfymodal
-    runtime-state comparison protocol.  All values are string-coercible;
-    missing attributes are reported as ``"absent"``.  No mutation, no
-    CUDA synchronisation, no tensor content.  Inspects only the **first**
-    parameter and the **first** buffer of ``unet.model`` and
-    ``unet.model.diffusion_model`` (when available).
+    runtime-state comparison protocol.  Inspects at most one parameter
+    and one buffer (``next(iter(...))`` — never ``list()``).  No mutation,
+    no CUDA synchronisation, no tensor content.
+
+    For a real ``comfy.model_patcher.ModelPatcher``:
+
+    * ``model_dtype`` is a **method** — called safely.
+    * ``manual_cast_dtype`` / ``device`` / ``model_loaded_weight_memory`` /
+      ``model_lowvram`` / ``lowvram_patch_counter`` live on ``.model``
+      (patches a long-standing bug where the previous code read them
+      from the wrong object).
+    * ``transformer_options`` is nested under ``model_options``.
+    * ``diffusion_model`` (on ``.model``) owns ``forward``.
+    * ``loaded_models`` is a **function** call.
     """
     state: dict[str, Any] = {}
 
-    def _g(attr: str, default: str = "absent") -> Any:
-        return getattr(unet, attr, default)
-
-    _MISSING = object()
-
-    # ── Patcher-level type identities ─────────────────────────────────
-    state["patcher_type"] = type(unet).__qualname__ if not isinstance(unet, (int, float, bool, str, bytes)) else type(unet).__name__
     _model = getattr(unet, "model", None)
-    state["model_type"] = type(_model).__qualname__ if _model is not None else "absent"
     _dm = None
     if _model is not None:
         _dm = getattr(_model, "diffusion_model", None)
     elif hasattr(unet, "diffusion_model"):
         _dm = getattr(unet, "diffusion_model", None)
+
+    _MISSING = object()
+
+    # ── Type identities ───────────────────────────────────────────────
+    state["patcher_type"] = type(unet).__qualname__ if not isinstance(unet, (int, float, bool, str, bytes)) else type(unet).__name__
+    state["model_type"] = type(_model).__qualname__ if _model is not None else "absent"
     state["diffusion_model_type"] = type(_dm).__qualname__ if _dm is not None else "absent"
 
-    # ── Object identities (stable within process) ─────────────────────
+    # ── Object identities (included in raw records, excluded from diff) ─
     state["patcher_object_id"] = str(id(unet))
     state["model_object_id"] = str(id(_model)) if _model is not None else "absent"
     state["diffusion_model_object_id"] = str(id(_dm)) if _dm is not None else "absent"
 
-    # ── Device attributes ─────────────────────────────────────────────
-    state["load_device"] = str(_g("load_device"))
-    state["offload_device"] = str(_g("offload_device"))
+    # ── Device attributes (on patcher) ────────────────────────────────
+    state["load_device"] = _safe_str_of_attr(unet, "load_device")
+    state["offload_device"] = _safe_str_of_attr(unet, "offload_device")
 
-    # ── First-parameter / first-buffer inspection (no CUDA sync) ─────
-    _fp_dev, _fp_dtype = ("absent", "absent")
-    _fb_dev, _fb_dtype = ("absent", "absent")
-    if _model is not None:
-        _fp_dev, _fp_dtype = _first_parameter_info(_model)
-        _fb_dev, _fb_dtype = _first_buffer_info(_model)
-    state["current_device"] = _fp_dev
+    # ── current_device = model.device (not from first parameter) ───────
+    state["current_device"] = _safe_str(getattr(_model, "device", None)) if _model is not None else "absent"
+
+    # ── First parameter / first buffer (diffusion_model first, model fallback) ─
+    _inspect_module = _dm if _dm is not None else _model
+    if _inspect_module is not None:
+        _fp_dev, _fp_dtype = _first_tensor_info(_inspect_module.named_parameters)
+        _fb_dev, _fb_dtype = _first_tensor_info(_inspect_module.named_buffers)
+    else:
+        _fp_dev, _fp_dtype = ("absent", "absent")
+        _fb_dev, _fb_dtype = ("absent", "absent")
     state["first_parameter_device"] = _fp_dev
     state["first_parameter_dtype"] = _fp_dtype
     state["first_buffer_device"] = _fb_dev
     state["first_buffer_dtype"] = _fb_dtype
 
     # ── Model dtype fields ────────────────────────────────────────────
-    state["model_dtype"] = str(_g("model_dtype"))
-    state["manual_cast_dtype"] = str(_g("manual_cast_dtype"))
-    state["weight_dtype"] = str(_g("weight_dtype"))
+    # model_dtype is a method on the patcher; call it safely.
+    _md_fn = getattr(unet, "model_dtype", None)
+    if callable(_md_fn):
+        try:
+            state["model_dtype"] = str(_md_fn())
+        except Exception:
+            state["model_dtype"] = "absent"
+    else:
+        state["model_dtype"] = "absent"
+
+    state["manual_cast_dtype"] = _safe_str_of_attr(_model, "manual_cast_dtype") if _model is not None else "absent"
+    state["weight_dtype"] = _safe_str_of_attr(unet, "weight_dtype")
 
     # ── Options ───────────────────────────────────────────────────────
     _mo = getattr(unet, "model_options", _MISSING)
@@ -455,11 +490,13 @@ def collect_unet_runtime_state(
         state["model_options_keys"] = sorted(str(k) for k in _mo.keys())
     else:
         state["model_options_keys"] = "absent"
-    _to = getattr(unet, "transformer_options", _MISSING)
-    if _to is _MISSING:
-        state["transformer_options_keys"] = "absent"
-    elif isinstance(_to, dict):
-        state["transformer_options_keys"] = sorted(str(k) for k in _to.keys())
+    # transformer_options is nested under model_options
+    if isinstance(_mo, dict):
+        _to = _mo.get("transformer_options", _MISSING)
+        if isinstance(_to, dict):
+            state["transformer_options_keys"] = sorted(str(k) for k in _to.keys())
+        else:
+            state["transformer_options_keys"] = "absent"
     else:
         state["transformer_options_keys"] = "absent"
 
@@ -479,13 +516,16 @@ def collect_unet_runtime_state(
     else:
         state["object_patch_count"] = "absent"
 
-    # ─── Memory / lowvram ────────────────────────────────────────────
-    state["model_loaded_weight_memory"] = str(_g("model_loaded_weight_memory"))
-    state["model_lowvram"] = str(_g("model_lowvram"))
-    state["model_lowvram_patch_counter"] = str(_g("model_lowvram_patch_counter"))
+    # ── Model-level memory / lowvram (on .model) ──────────────────────
+    state["model_loaded_weight_memory"] = _safe_str_of_attr(_model, "model_loaded_weight_memory") if _model is not None else "absent"
+    state["model_lowvram"] = _safe_str_of_attr(_model, "model_lowvram") if _model is not None else "absent"
+    state["model_lowvram_patch_counter"] = _safe_str_of_attr(_model, "lowvram_patch_counter") if _model is not None else "absent"
 
-    # ── Forward function ──────────────────────────────────────────────
-    _forward = getattr(unet, "forward", None)
+    # ── Forward function (from diffusion_model, not patcher) ──────────
+    if _dm is not None:
+        _forward = getattr(_dm, "forward", None)
+    else:
+        _forward = getattr(_model, "forward", None) if _model is not None else None
     if _forward is not None:
         _self = getattr(_forward, "__self__", None)
         state["forward_module"] = type(_self).__qualname__ if _self is not None else "absent"
@@ -494,16 +534,18 @@ def collect_unet_runtime_state(
         state["forward_module"] = "absent"
         state["forward_qualname"] = "absent"
 
-    # ── loaded_models membership ──────────────────────────────────────
+    # ── loaded_models membership (function call) ──────────────────────
     _loaded = "absent"
     if model_management is not None:
         try:
-            _lm = getattr(model_management, "loaded_models", None)
-            if isinstance(_lm, (list, tuple)):
-                _present = any(
-                    _item is unet for _item in _lm
-                )
-                _loaded = str(int(_present))
+            _lm_fn = getattr(model_management, "loaded_models", None)
+            if callable(_lm_fn):
+                _lm = _lm_fn()
+                if isinstance(_lm, (list, tuple)):
+                    _present = any(_item is unet for _item in _lm)
+                    _loaded = str(int(_present))
+                else:
+                    _loaded = "absent"
             else:
                 _loaded = "absent"
         except Exception:
@@ -517,7 +559,11 @@ def diff_unet_runtime_states(
     snapshot_state: dict[str, Any],
     normal_state: dict[str, Any],
 ) -> dict[str, Any]:
-    """Return only differing fields between two ``collect_unet_runtime_state`` outputs.
+    """Return only semantically meaningful differing fields.
+
+    **Excludes** machine-local object IDs (``patcher_object_id``,
+    ``model_object_id``, ``diffusion_model_object_id``) that are
+    never meaningful across processes.
 
     Keys present in both dicts whose string values differ are included.
     Keys present in only one dict are included with their value from the
@@ -526,6 +572,8 @@ def diff_unet_runtime_states(
     diff: dict[str, Any] = {}
     all_keys = set(snapshot_state.keys()) | set(normal_state.keys())
     for key in sorted(all_keys):
+        if key in _OBJECT_ID_KEYS:
+            continue
         sv = snapshot_state.get(key, "<missing>")
         nv = normal_state.get(key, "<missing>")
         if str(sv) != str(nv):

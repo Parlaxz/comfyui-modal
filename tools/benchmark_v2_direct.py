@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 
 from canonical_execution import build_execution_plan, execute_plan
 from modal_client import check_active_warmup_profile, set_active_warmup_profile
+from comfymodal_runtime.cpu_snapshot_models import diff_unet_runtime_states
 from comfymodal_runtime.modal_transport import ModalTransport
 from comfymodal_runtime.restore_plan import RemoteRestorePlanPublisher
 from comfymodal_runtime.trace import RuntimeTrace
@@ -219,7 +220,121 @@ async def _run_one(
     return artifact
 
 
-async def main(bypass_cpu_snapshot_unet: bool = False) -> None:
+def _extract_unet_runtime_state_event(
+    result: dict[str, Any],
+    stage: str,
+) -> dict[str, Any] | None:
+    """Extract the first ``unet_runtime_state`` trace event at *stage*.
+
+    Returns the metadata dict, or ``None`` if not found.
+    """
+    trace_data = result.get("trace", {}) if isinstance(result, dict) else {}
+    events = trace_data.get("events", []) if isinstance(trace_data, dict) else []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("name") != "unet_runtime_state":
+            continue
+        meta = event.get("metadata", {})
+        if isinstance(meta, dict) and meta.get("stage") == stage:
+            return meta
+    return None
+
+
+async def _run_ab_compare(
+    workflow: dict[str, Any],
+    modal_options: dict[str, Any],
+    workspace: dict[str, Any],
+    transport: ModalTransport,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Run one reuse request and one bypass request, then compute A/B diff.
+
+    Uses the same ``ModalTransport`` but the remote requests may execute
+    in different container processes.  Extracts ``unet_runtime_state``
+    trace events from each returned trace, validates identity, calls
+    ``diff_unet_runtime_states`` locally, and saves the result.
+
+    Raises ``RuntimeError`` when either state is missing or models differ.
+    """
+    # ── Run A (reuse) ───────────────────────────────────────────────────
+    print("[v2.unet_ab] phase=reuse_start", flush=True)
+    reuse_result = await _run_one(
+        index=0, workflow=workflow, modal_options=modal_options,
+        workspace=workspace, transport=transport, output_dir=output_dir,
+        bypass_cpu_snapshot_unet=False,
+    )
+    reuse_meta = _extract_unet_runtime_state_event(
+        reuse_result.get("result", {}), "snapshot_restored_post_retarget",
+    )
+    if reuse_meta is None:
+        raise RuntimeError(
+            "A/B diff: snapshot_restored_post_retarget state not found in reuse result"
+        )
+
+    # ── Run B (bypass) ──────────────────────────────────────────────────
+    print("[v2.unet_ab] phase=bypass_start", flush=True)
+    bypass_result = await _run_one(
+        index=1, workflow=workflow, modal_options=modal_options,
+        workspace=workspace, transport=transport, output_dir=output_dir,
+        bypass_cpu_snapshot_unet=True,
+    )
+    bypass_meta = _extract_unet_runtime_state_event(
+        bypass_result.get("result", {}), "normal_loader_ready",
+    )
+    if bypass_meta is None:
+        raise RuntimeError(
+            "A/B diff: normal_loader_ready state not found in bypass result"
+        )
+
+    # ── Validate identity match ─────────────────────────────────────────
+    reuse_identity = str(reuse_meta.get("unet_identity", ""))
+    bypass_identity = str(bypass_meta.get("unet_identity", ""))
+    reuse_wd = str(reuse_meta.get("requested_weight_dtype", ""))
+    bypass_wd = str(bypass_meta.get("requested_weight_dtype", ""))
+    if reuse_identity != bypass_identity:
+        raise RuntimeError(
+            f"A/B diff: UNET identity mismatch "
+            f"reuse={reuse_identity!r} bypass={bypass_identity!r}"
+        )
+    if reuse_wd != bypass_wd:
+        raise RuntimeError(
+            f"A/B diff: weight_dtype mismatch "
+            f"reuse={reuse_wd!r} bypass={bypass_wd!r}"
+        )
+
+    # ── Compute diff ────────────────────────────────────────────────────
+    snapshot_state = dict(reuse_meta.get("state", {})) if isinstance(reuse_meta.get("state"), dict) else {}
+    normal_state = dict(bypass_meta.get("state", {})) if isinstance(bypass_meta.get("state"), dict) else {}
+    diff = diff_unet_runtime_states(snapshot_state, normal_state)
+
+    # ── Print and save ──────────────────────────────────────────────────
+    _diff_json = json.dumps(diff, default=str, separators=(",", ":"), sort_keys=True)
+    print(
+        f"[v2.unet_runtime_diff] "
+        f"field_count={len(diff)} "
+        f"fields={_diff_json}",
+        flush=True,
+    )
+
+    ab_artifact = {
+        "unet_identity": reuse_identity,
+        "requested_weight_dtype": reuse_wd,
+        "reuse_state": snapshot_state,
+        "bypass_state": normal_state,
+        "diff": diff,
+        "field_count": len(diff),
+    }
+    (output_dir / "unet_runtime_diff.json").write_text(
+        json.dumps(ab_artifact, default=str, indent=2), encoding="utf-8",
+    )
+    print(
+        json.dumps({"ab_diff": {"field_count": len(diff), "output": str(output_dir / "unet_runtime_diff.json")}}, default=str),
+    )
+    return ab_artifact
+
+
+async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: bool = False) -> None:
     os.environ["COMFYMODAL_V2_APP_NAME"] = APP_NAME
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = CLASS_NAME
     os.environ["COMFYMODAL_V2_GPU"] = GPU
@@ -229,6 +344,14 @@ async def main(bypass_cpu_snapshot_unet: bool = False) -> None:
     output_dir = ROOT.parent.parent / "comfymodal-data" / "benchmarks" / "runs" / f"v2_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     transport = ModalTransport()
+
+    if cpu_snapshot_unet_ab:
+        await _run_ab_compare(
+            workflow=workflow, modal_options=modal_options,
+            workspace=workspace, transport=transport, output_dir=output_dir,
+        )
+        return
+
     artifacts = []
     for index in range(RUN_COUNT):
         artifacts.append(await _run_one(
@@ -262,5 +385,16 @@ if __name__ == "__main__":
              "so the snapshot CLIP serves graph demands but UNET loads "
              "through the original loader (A/B diagnostic mode)",
     )
+    _parser.add_argument(
+        "--cpu-snapshot-unet-ab",
+        action="store_true",
+        default=False,
+        help="Run A/B comparison: one reuse + one bypass request, compare "
+             "unet_runtime_state from trace events, print and save diff "
+             "(does not require same remote process)",
+    )
     _args = _parser.parse_args()
-    asyncio.run(main(bypass_cpu_snapshot_unet=_args.bypass_cpu_snapshot_unet))
+    asyncio.run(main(
+        bypass_cpu_snapshot_unet=_args.bypass_cpu_snapshot_unet,
+        cpu_snapshot_unet_ab=_args.cpu_snapshot_unet_ab,
+    ))
