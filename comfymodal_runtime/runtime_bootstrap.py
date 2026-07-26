@@ -1,4 +1,11 @@
-"""Snapshot-safe runtime bootstrap and restore lifecycle."""
+"""Snapshot-safe runtime bootstrap and restore lifecycle.
+
+Lane B extensions:
+  - Authoritative pre-scan generation identity freeze/reuse
+  - Sage patch snapshot identity retention after real CUDA init
+  - Snapshot-memory validation certificate with Volume fallback
+  - Reachability-based graph trimming report (delegates to production_workflow)
+"""
 
 from __future__ import annotations
 
@@ -35,6 +42,8 @@ class BootstrapConfig:
     scaledown_window: int = 4
     manager_offline: bool = True
     install_requirements_on_startup: bool = False
+    # Lane B — path for persisting pre-scan generation record
+    prescan_record_path: str = ""
 
 
 @dataclass
@@ -58,6 +67,51 @@ class BootstrapState:
     # SageAttention policy observability
     sage_mode: str = ""
     sage_reason: str = ""
+    # Lane B — pre-scan generation identity (frozen at startup, reused at restore)
+    prescan_runtime_generation: str = ""
+    prescan_custom_node_generation: str = ""
+    prescan_record_path: str = ""
+    # Lane B — snapshot-memory validation certificate
+    snapshot_certificate: dict[str, Any] = field(default_factory=dict)
+    snapshot_cert_valid: bool = False
+    # Lane B — graph trimming evidence
+    graph_removable_node_ids: list[str] = field(default_factory=list)
+    graph_trimming_possible: bool = False
+
+    def freeze_prescan_identity(self, *, record_path: str = "") -> None:
+        """Freeze the pre-scan generation identity from observed values.
+        Called at the end of startup() before the snapshot is taken.
+        """
+        self.prescan_runtime_generation = str(self.runtime_generation)
+        self.prescan_custom_node_generation = str(self.custom_node_generation)
+        self.prescan_record_path = str(record_path)
+
+    def has_prescan_identity(self) -> bool:
+        """True when both pre-scan generations are non-empty."""
+        return bool(self.prescan_runtime_generation and self.prescan_custom_node_generation)
+
+    def sage_identity(self) -> dict[str, str]:
+        """Return frozen Sage identity for certificate creation."""
+        return {
+            "sage_mode": self.sage_mode,
+            "sage_reason": self.sage_reason,
+        }
+
+    def set_snapshot_certificate(self, cert: dict[str, Any]) -> None:
+        self.snapshot_certificate = dict(cert)
+        # Validate inline
+        try:
+            from optimizations import validate_snapshot_certificate
+            result = validate_snapshot_certificate(cert)
+            self.snapshot_cert_valid = bool(result.get("valid"))
+        except Exception:
+            self.snapshot_cert_valid = False
+
+    def set_graph_trimming_evidence(
+        self, *, removable_ids: list[str], trimming_possible: bool,
+    ) -> None:
+        self.graph_removable_node_ids = list(removable_ids)
+        self.graph_trimming_possible = bool(trimming_possible)
 
 
 def ensure_models_symlink(models_path: str, comfyui_root: str) -> str:
@@ -279,6 +333,32 @@ class RuntimeBootstrap:
             if trace:
                 trace.emit("observe_generations_end", phase="startup")
 
+            # Lane B — freeze pre-scan identity and persist the record
+            try:
+                from optimizations import prescan_custom_node_generation
+                prescan_custom_node_generation(
+                    observe_generations=True,
+                    runtime_generation=self.state.runtime_generation,
+                    custom_node_generation=self.state.custom_node_generation,
+                    reason="startup_prescan",
+                    record_path=self.config.prescan_record_path,
+                )
+                self.state.freeze_prescan_identity(
+                    record_path=self.config.prescan_record_path,
+                )
+                if trace:
+                    trace.emit(
+                        "prescan_identity_frozen",
+                        phase="startup",
+                        metadata={
+                            "runtime_gen": self.state.prescan_runtime_generation,
+                            "cn_gen": self.state.prescan_custom_node_generation,
+                            "record_path": self.config.prescan_record_path,
+                        },
+                    )
+            except Exception as _pexc:
+                print(f"[bootstrap] prescan_identity error: {_pexc}", flush=True)
+
             self.state.startup_completed_at = time.time()
             if trace:
                 trace.emit(
@@ -299,9 +379,65 @@ class RuntimeBootstrap:
                 )
             raise
 
+    def _try_restore_prescan_identity(self) -> None:
+        """Attempt to restore the pre-scan generation identity from a
+        previously persisted record.  On success, populates state fields
+        so the caller can skip re-observation.
+        """
+        record_path = self.config.prescan_record_path
+        if not record_path:
+            return
+        try:
+            from optimizations import read_prescan_generation_record
+            record: dict[str, str] = read_prescan_generation_record(record_path)
+            if record.get("generation"):
+                self.state.prescan_custom_node_generation = record["generation"]
+                self.state.prescan_custom_node_generation = record["generation"]
+                self.state.prescan_runtime_generation = record.get("content_hash", "")
+                self.state.prescan_record_path = record_path
+                print(
+                    f"[bootstrap] prescan_identity_restored "
+                    f"cn_gen={record['generation'][:24]} "
+                    f"reason={record.get('reason', '')}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"[bootstrap] prescan_identity_restore_error: {exc}", flush=True)
+
+    def _build_and_store_snapshot_certificate(self) -> None:
+        """Build a snapshot-memory validation certificate from current
+        state and store it on the state object.
+        """
+        try:
+            from optimizations import build_snapshot_certificate
+
+            cert = build_snapshot_certificate(
+                runtime_generation=self.state.prescan_runtime_generation
+                or self.state.runtime_generation,
+                custom_node_generation=self.state.prescan_custom_node_generation
+                or self.state.custom_node_generation,
+                sage_mode=self.state.sage_mode,
+                sage_reason=self.state.sage_reason,
+                unet_identity=self.state.cuda.get("unet_identity", ""),
+                clip_identity=self.state.cuda.get("clip_identity", ""),
+                clip_type=self.state.cuda.get("clip_type", ""),
+            )
+            self.state.set_snapshot_certificate(cert)
+            cert_hash = str(cert.get("cert_hash", ""))
+            print(
+                f"[bootstrap] snapshot_cert built "
+                f"valid={int(self.state.snapshot_cert_valid)} "
+                f"hash={cert_hash[:16]}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[bootstrap] snapshot_cert_build_error: {exc}", flush=True)
+
     def restore(self, *, trace: RuntimeTrace | None = None) -> BootstrapState:
         started = time.time()
         self.state.restore_started_at = started
+        # Lane B — try to restore pre-scan generation identity from persisted record
+        self._try_restore_prescan_identity()
         # Phase 0/3 — capture identity/environment metadata at lifecycle entry
         if trace:
             self.state.modal_task_id = os.environ.get("MODAL_TASK_ID", "")
@@ -391,6 +527,9 @@ class RuntimeBootstrap:
                 self.state.custom_node_generation = str(observed.get("custom_nodes", ""))
             if trace:
                 trace.emit("observe_generations_end", phase="restore")
+
+            # Lane B — build snapshot-memory validation certificate
+            self._build_and_store_snapshot_certificate()
 
             self.state.restore_completed_at = time.time()
             if trace:

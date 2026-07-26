@@ -10,6 +10,7 @@ import os
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -920,6 +921,141 @@ _RES4LYF_SAMPLER_CLASS = "ClownsharKSampler_Beta"
 _RES4LYF_OPTIONS_CLASS = "ClownOptions_ExtraOptions_Beta"
 _RES4LYF_ENV_VAR = "COMFYMODAL_DISABLE_RES4LYF_DUMMY_SAMPLER_INIT"
 _RES4LYF_ID_OFFSET = 100000
+
+
+# ---------------------------------------------------------------------------
+# Lane B: Reachability-based graph trimming evidence reporter
+# ---------------------------------------------------------------------------
+#
+# Reports which nodes can be safely removed from a workflow via
+# output-node reachability analysis.  The existing ``_collect_reachable``
+# function already computes the safe keep-set.  This reporter adds
+# evidence documentation so the caller can decide whether to trim or not.
+#
+# Never mutates the input workflow.  Never removes nodes on its own.
+
+
+def report_graph_trimming_candidates(
+    workflow: dict | None,
+    output_node_ids: list[str],
+    *,
+    stable: bool = False,
+) -> dict[str, Any]:
+    """Analyse a production workflow and report which nodes are candidates
+    for safe removal via reachability analysis.
+
+    When *stable* is ``True``, the entire workflow is considered reachable
+    (no trimming candidates).  This matches the existing ``stable``
+    parameter in ``compile_production_workflow``.
+
+    Returns a dict with:
+      * trimming_possible (bool) — True when at least one node can be
+        safely removed without affecting selected outputs.
+      * removable_node_ids (list[str]) — node IDs that can be safely
+        removed (empty when trimming is not possible).
+      * kept_node_ids (list[str]) — node IDs that would be kept.
+      * original_node_count (int) — number of nodes in the input.
+      * removable_node_count (int) — number of removable nodes.
+      * kept_node_count (int) — number of nodes in the keep-set.
+      * evidence (list[dict]) — per-node removal evidence (class_type,
+        reason, connectivity).
+      * stable (bool) — whether stable mode was used.
+      * analysis_ms (float) — wall-clock time for the analysis in ms.
+      * method (str) — always ``reachability_from_outputs``.
+
+    Never raises.  Never mutates the input workflow.
+    """
+    import time as _time
+    t0 = _time.perf_counter()
+
+    result: dict[str, Any] = {
+        "trimming_possible": False,
+        "removable_node_ids": [],
+        "kept_node_ids": [],
+        "original_node_count": 0,
+        "removable_node_count": 0,
+        "kept_node_count": 0,
+        "evidence": [],
+        "stable": bool(stable),
+        "analysis_ms": 0.0,
+        "method": "reachability_from_outputs",
+    }
+
+    if not isinstance(workflow, dict):
+        result["analysis_ms"] = round((_time.perf_counter() - t0) * 1000, 3)
+        return result
+
+    result["original_node_count"] = len(workflow)
+
+    try:
+        nid_map = _build_normalized_id_map(workflow)
+    except Exception:
+        result["analysis_ms"] = round((_time.perf_counter() - t0) * 1000, 3)
+        return result
+
+    # Validate output_node_ids exist in workflow
+    if not output_node_ids:
+        result["analysis_ms"] = round((_time.perf_counter() - t0) * 1000, 3)
+        return result
+
+    valid_outputs: list[str] = []
+    for oid in output_node_ids:
+        if oid in nid_map:
+            valid_outputs.append(oid)
+
+    if not valid_outputs:
+        result["analysis_ms"] = round((_time.perf_counter() - t0) * 1000, 3)
+        return result
+
+    if stable:
+        # In stable mode, the entire workflow is reachable — no trimming.
+        all_ids = list(nid_map.keys())
+        result["kept_node_ids"] = all_ids
+        result["kept_node_count"] = len(all_ids)
+        result["removable_node_ids"] = []
+        result["removable_node_count"] = 0
+        result["trimming_possible"] = False
+        result["evidence"] = [
+            {
+                "node_id": "all",
+                "reason": "stable_mode_active",
+                "detail": "Stable mode keeps the entire workflow.",
+            }
+        ]
+        result["analysis_ms"] = round((_time.perf_counter() - t0) * 1000, 3)
+        return result
+
+    reachable = _collect_reachable(valid_outputs, workflow, nid_map)
+    all_ids = list(nid_map.keys())
+
+    kept_ids = [nid for nid in all_ids if nid in reachable]
+    removable_ids = [nid for nid in all_ids if nid not in reachable]
+
+    # Build per-node evidence
+    evidence: list[dict[str, Any]] = []
+    for nid in removable_ids:
+        original_key = nid_map[nid]
+        node = workflow.get(original_key, {})
+        ct = str(node.get("class_type", "?"))
+        evidence.append({
+            "node_id": nid,
+            "class_type": ct,
+            "reason": "not_reachable_from_outputs",
+            "detail": (
+                f"Node {nid} ({ct}) is not on any path from the "
+                f"selected outputs ({valid_outputs})."
+            ),
+        })
+
+    result["trimming_possible"] = len(removable_ids) > 0
+    result["removable_node_ids"] = removable_ids
+    result["kept_node_ids"] = kept_ids
+    result["removable_node_count"] = len(removable_ids)
+    result["kept_node_count"] = len(kept_ids)
+    result["evidence"] = evidence
+    result["analysis_ms"] = round((_time.perf_counter() - t0) * 1000, 3)
+
+    return result
 
 
 def _apply_res4lyf_dummy_sampler_transform(compiled, nid_map):

@@ -12,6 +12,7 @@ Each strategy returns a structured ``Attempt`` with metrics.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import json
 import os
@@ -33,6 +34,7 @@ class ConversionMeta:
     """Per-item conversion metadata.
 
     Computed by the strategy that converts raw bytes into deliverable forms.
+    Base64 metrics are zero in descriptor mode (no base64 for mere metrics).
     """
     format: str = ""
     mime_type: str = ""
@@ -107,6 +109,169 @@ class Attempt:
 
 
 # ---------------------------------------------------------------------------
+# Lane C: AssetDescriptor — lightweight metadata-only output descriptor
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class AssetDescriptor:
+    """Lightweight asset metadata for V2 production and Studio consumption.
+
+    Contains NO raw bytes or base64 data.  Frontend fetches actual bytes
+    asynchronously through the existing asset-serving route.
+
+    Fields match the Studio frontend contract:
+      identity            — content hash (sha256:hex) for dedup/caching
+      path                — filesystem path on backend volume or local FS
+      filename            — display filename
+      mime_type           — MIME type (e.g. ``image/png``)
+      file_ext            — file extension (e.g. ``.png``)
+      width, height       — pixel dimensions
+      byte_count          — file size in bytes
+      node_id             — ComfyUI node that produced this output
+      output_key          — output key (e.g. ``images``, ``b_images``)
+      output_index        — index within the output list
+      comparison_side     — ``"a"``, ``"b"``, or ``""``
+      generation          — generation / version tag
+      thumbnail_identity  — optional identity string for thumbnail variant
+    """
+    identity: str = ""
+    path: str = ""
+    filename: str = ""
+    mime_type: str = ""
+    file_ext: str = ""
+    width: int = 0
+    height: int = 0
+    byte_count: int = 0
+    node_id: str = ""
+    output_key: str = ""
+    output_index: int = 0
+    comparison_side: str = ""
+    generation: str = ""
+    thumbnail_identity: str = ""
+
+
+def build_asset_descriptor_list(
+    attempt: Attempt,
+    *,
+    generation: str = "",
+    thumbnail_identities: Mapping[str, str] | None = None,
+) -> list[AssetDescriptor]:
+    """Build a list of lightweight ``AssetDescriptor`` from an *Attempt*.
+
+    *generation* is an optional version tag applied to all descriptors.
+    *thumbnail_identities* maps ``node_id`` → thumbnail identity string.
+
+    No base64 data is computed or included — this is the pure metadata path.
+    """
+    descriptors: list[AssetDescriptor] = []
+    for item in attempt.items:
+        raw = item.raw_bytes
+        identity = (
+            f"sha256:{hashlib.sha256(raw).hexdigest()}"
+            if raw else ""
+        )
+        thumb_id = ""
+        if thumbnail_identities is not None:
+            thumb_id = thumbnail_identities.get(item.node_id, "")
+        descriptors.append(AssetDescriptor(
+            identity=identity,
+            path=item.path,
+            filename=item.filename,
+            mime_type=item.mime_type,
+            file_ext=item.file_ext,
+            width=item.width,
+            height=item.height,
+            byte_count=len(raw),
+            node_id=item.node_id,
+            output_key=item.output_key,
+            output_index=item.output_index,
+            comparison_side=item.comparison_side,
+            generation=generation,
+            thumbnail_identity=thumb_id,
+        ))
+    return descriptors
+
+
+def attempt_to_descriptor_result(
+    attempt: Attempt,
+    *,
+    generation: str = "",
+    legacy_data: bool = False,
+    thumbnail_identities: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Convert an *Attempt* to a result dict with lightweight descriptors.
+
+    Default mode (``legacy_data=False``) produces entries WITHOUT ``data``
+    or ``base64_data`` — frontend fetches bytes via existing asset route.
+
+    Set *legacy_data* to ``True`` for the narrow fallback that includes
+    inline base64 ``data`` (preserved for backward compatibility).
+
+    The returned dict always carries:
+      - ``images`` / ``videos`` arrays with metadata-only entries
+      - ``outputs`` dict with native ComfyUI ``{filename, subfolder, type}``
+      - ``asset_descriptors`` list with full ``AssetDescriptor`` dicts
+    """
+    descriptors = build_asset_descriptor_list(
+        attempt,
+        generation=generation,
+        thumbnail_identities=thumbnail_identities,
+    )
+    outputs: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    images: list[dict[str, Any]] = []
+    videos: list[dict[str, Any]] = []
+
+    for item in attempt.items:
+        output_key = item.output_key or ("gifs" if item.animated else "images")
+        raw = item.raw_bytes
+        identity = (
+            f"sha256:{hashlib.sha256(raw).hexdigest()}"
+            if raw else ""
+        )
+        entry: dict[str, Any] = {
+            "filename": item.filename,
+            "node_id": item.node_id,
+            "output_key": output_key,
+            "comparison_side": item.comparison_side,
+            "mime_type": item.mime_type,
+            "file_ext": item.file_ext,
+            "width": item.width,
+            "height": item.height,
+            "output_index": item.output_index,
+            "format": item.format,
+            "byte_count": len(raw),
+            "identity": identity,
+            "path": item.path,
+        }
+        if legacy_data:
+            data = item.base64_data or base64.b64encode(raw).decode("ascii") if raw else ""
+            entry["data"] = data
+
+        # Native ComfyUI output descriptor (filename/subfolder/type)
+        native_entry = {
+            "filename": item.filename,
+            "subfolder": "",
+            "type": "output",
+        }
+        outputs.setdefault(item.node_id, {}).setdefault(output_key, []).append(native_entry)
+
+        if item.animated or output_key in {"gifs", "videos"}:
+            videos.append(entry)
+        else:
+            images.append(entry)
+
+    descriptors_as_dicts = [dataclasses.asdict(d) for d in descriptors]
+
+    return {
+        "images": images,
+        "videos": videos,
+        "outputs": outputs,
+        "asset_descriptors": descriptors_as_dicts,
+        "use_descriptors": True,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Conversion helpers (dependency-safe; uses output_converter via narrow import)
 # ---------------------------------------------------------------------------
 
@@ -143,16 +308,20 @@ def _make_conversion_meta(
     file_ext: str,
     conversion_time_ms: float,
 ) -> ConversionMeta:
-    """Build ConversionMeta from converted raw bytes (already encoded)."""
-    b64 = base64.b64encode(raw_bytes)
-    json_result = json.dumps({"data": b64.decode("ascii")}, separators=(",", ":")).encode("utf-8")
+    """Build ConversionMeta from raw bytes.
+
+    NOTE: base64 is NOT constructed merely for metrics — the
+    ``base64_bytes`` and ``json_result_bytes`` fields are set to 0.
+    In the narrow legacy path where base64 is actually needed,
+    those fields are populated downstream.
+    """
     return ConversionMeta(
         format=format,
         mime_type=mime_type,
         file_ext=file_ext,
         raw_bytes=len(raw_bytes),
-        base64_bytes=len(b64),
-        json_result_bytes=len(json_result),
+        base64_bytes=0,
+        json_result_bytes=0,
         hash_of_raw=_hash_raw_bytes(raw_bytes),
         conversion_time_ms=conversion_time_ms,
     )
@@ -177,8 +346,14 @@ def _item_from_entry(
     output_key: str,
     fallback_index: int = 0,
     path: str = "",
+    descriptor_mode: bool = True,
 ) -> tuple[OutputItem, float]:
     """Build an OutputItem from a dictionary entry (registry or result dict).
+
+    In *descriptor_mode* (default), base64 is NOT computed — the returned
+    ``OutputItem`` has an empty ``base64_data`` field.  Set
+    ``descriptor_mode=False`` for the narrow legacy fallback that includes
+    base64 encoding.
 
     Returns ``(item, base64_encoding_time_ms)``.
     """
@@ -187,7 +362,7 @@ def _item_from_entry(
         raw = base64.b64decode(entry["data"])
     b64_data = entry.get("base64_data") or ""
     b64_time_ms = 0.0
-    if not b64_data and raw:
+    if not descriptor_mode and not b64_data and raw:
         b64_data, b64_time_ms = _timed_b64_encode(raw)
     meta_raw = entry.get("conversion_meta")
     if meta_raw is not None and isinstance(meta_raw, ConversionMeta):
@@ -253,6 +428,7 @@ class DirectOutputSink:
         *,
         prompt_id: str = "",
         output_node_ids: tuple[str, ...] = (),
+        descriptor_mode: bool = True,
     ) -> Attempt:
         items: list[OutputItem] = []
         total_raw = 0
@@ -281,10 +457,12 @@ class DirectOutputSink:
                         node_id=node_id,
                         output_key=str(entry.get("output_key") or output_key),
                         fallback_index=idx,
+                        descriptor_mode=descriptor_mode,
                     )
                     items.append(item)
                     total_raw += len(item.raw_bytes)
-                    total_b64 += len(item.base64_data)
+                    if item.base64_data:
+                        total_b64 += len(item.base64_data)
                     total_b64_time_ms += b64_time
                     if item.conversion_meta:
                         total_json += item.conversion_meta.json_result_bytes
@@ -335,6 +513,7 @@ class HistoryOutputCollector:
         prompt_id: str = "",
         output_node_ids: tuple[str, ...] = (),
         materials_dir: str = "",
+        descriptor_mode: bool = True,
     ) -> Attempt:
         items: list[OutputItem] = []
         total_b64_time_ms = 0.0
@@ -376,6 +555,7 @@ class HistoryOutputCollector:
                         output_key=str(output_key),
                         fallback_index=idx,
                         path=resolved_path,
+                        descriptor_mode=descriptor_mode,
                     )
                     items.append(item)
                     total_b64_time_ms += b64_time
@@ -439,6 +619,7 @@ class RequestBoundFilesystemCollector:
         prompt_id: str = "",
         output_node_ids: tuple[str, ...] = (),
         request_start_boundary: float = 0.0,
+        descriptor_mode: bool = True,
     ) -> Attempt:
         items: list[OutputItem] = []
         if not self._materials_dir or not os.path.isdir(self._materials_dir):
@@ -491,8 +672,11 @@ class RequestBoundFilesystemCollector:
                     derived_node_id = nid
                     break
             conv = _make_conversion_meta(raw, "original", self._mime_type_hint, ext, 0.0)
-            b64_data, b64_time = _timed_b64_encode(raw)
-            total_b64_time_ms += b64_time
+            b64_data = ""
+            b64_time = 0.0
+            if not descriptor_mode:
+                b64_data, b64_time = _timed_b64_encode(raw)
+                total_b64_time_ms += b64_time
             item = OutputItem(
                 node_id=derived_node_id,
                 output_key="images",
@@ -553,6 +737,7 @@ class SubprocessOutputCollector:
         *,
         prompt_id: str = "",
         output_node_ids: tuple[str, ...] = (),
+        descriptor_mode: bool = True,
     ) -> Attempt:
         items: list[OutputItem] = []
         if not self._output_dir or not os.path.isdir(self._output_dir):
@@ -604,8 +789,11 @@ class SubprocessOutputCollector:
                     break
 
             conv = _make_conversion_meta(raw, "original", mime, ext, 0.0)
-            b64_data, b64_time = _timed_b64_encode(raw)
-            total_b64_time_ms += b64_time
+            b64_data = ""
+            b64_time = 0.0
+            if not descriptor_mode:
+                b64_data, b64_time = _timed_b64_encode(raw)
+                total_b64_time_ms += b64_time
             item = OutputItem(
                 node_id=derived_node_id,
                 output_key=prompt_id if prompt_id else "subprocess",
@@ -652,6 +840,7 @@ def run_strategy_chain(
     output_node_ids: tuple[str, ...] = (),
     materials_dir: str = "",
     request_start_boundary: float = 0.0,
+    descriptor_mode: bool = True,
     **kwargs: Any,
 ) -> list[Attempt]:
     """Run each strategy in order, collecting attempts.
@@ -659,6 +848,10 @@ def run_strategy_chain(
     Strategies are called left-to-right. Each strategy's ``collect``
     method receives the ``prompt_id``, ``output_node_ids``, and
     strategy-specific extras.
+
+    When *descriptor_mode* is True (default), base64 is NOT computed
+    — the returned Attempts carry ``OutputItem`` objects with empty
+    ``base64_data`` fields, suitable for ``attempt_to_descriptor_result``.
 
     Each returned ``Attempt`` includes per-strategy timing
     (``strategy_start_ms``, ``strategy_end_ms``, ``strategy_duration_ms``),
@@ -672,13 +865,13 @@ def run_strategy_chain(
         t0 = time.monotonic()
         try:
             if isinstance(strat, DirectOutputSink):
-                attempt = strat.collect(strategy_config, prompt_id=prompt_id, output_node_ids=output_node_ids)
+                attempt = strat.collect(strategy_config, prompt_id=prompt_id, output_node_ids=output_node_ids, descriptor_mode=descriptor_mode)
             elif isinstance(strat, HistoryOutputCollector):
-                attempt = strat.collect(strategy_config, prompt_id=prompt_id, output_node_ids=output_node_ids, materials_dir=materials_dir)
+                attempt = strat.collect(strategy_config, prompt_id=prompt_id, output_node_ids=output_node_ids, materials_dir=materials_dir, descriptor_mode=descriptor_mode)
             elif isinstance(strat, RequestBoundFilesystemCollector):
-                attempt = strat.collect(strategy_config, prompt_id=prompt_id, output_node_ids=output_node_ids, request_start_boundary=request_start_boundary)
+                attempt = strat.collect(strategy_config, prompt_id=prompt_id, output_node_ids=output_node_ids, request_start_boundary=request_start_boundary, descriptor_mode=descriptor_mode)
             elif isinstance(strat, SubprocessOutputCollector):
-                attempt = strat.collect(strategy_config, prompt_id=prompt_id, output_node_ids=output_node_ids)
+                attempt = strat.collect(strategy_config, prompt_id=prompt_id, output_node_ids=output_node_ids, descriptor_mode=descriptor_mode)
             else:
                 attempt = Attempt(strategy=getattr(strat, "NAME", "unknown"), success=False, error="unknown strategy type")
         except Exception as exc:

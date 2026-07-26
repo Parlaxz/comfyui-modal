@@ -14,6 +14,7 @@ import inspect
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -61,6 +62,278 @@ from comfymodal_runtime.trace import (
     _derived_mono_delta_ms,
     merge_runtime_traces,
 )
+
+# ---------------------------------------------------------------------------
+# Disk-persisted cache — bounded/versioned atomic JSON state shared across
+# separate run_v2_single processes.  Extends the in-memory profile and
+# restore-publication caches so that the second invocation of a separate
+# process can reuse the first process's cached result without a remote call.
+#
+# Default behavior — no flag required.  The cache is loaded on module
+# import and written only after confirmed remote success.
+#
+# Design:
+#   * Two files under .cache/: v2_profile_cache.json, v2_restore_cache.json
+#   * Schema-versioned (bump _DISK_CACHE_VERSION on incompatible format change)
+#   * Bounded to _DISK_CACHE_MAX entries per file
+#   * Atomic writes via tempfile.mkstemp + os.replace (crash-safe)
+#   * Thread-safe via per-file threading.Lock
+#   * Only stable identity fields and successful metadata — NEVER serializes
+#     handles, credentials, full workflows, base64 images, output data, or
+#     request-specific payloads.
+#   * Telemetry counters (read/write/miss/corruption) exposed via module vars.
+#   * Exact invalidation: when a remote operation fails, the entry for that
+#     exact cache key is removed from both the in-memory and disk caches.
+# ---------------------------------------------------------------------------
+
+import errno as _errno
+
+_DISK_CACHE_VERSION = 1
+"""Schema version for this cache format.  Bump on incompatible changes."""
+
+_DISK_CACHE_MAX = 100
+"""Maximum entries per disk cache before LRU-style eviction."""
+
+# ── Cache directory (lazy-initialised) ──────────────────────────────
+_DISK_CACHE_DIR: str | None = None
+"""Lazy-resolved path to the .cache/ directory."""
+
+def _disk_cache_dir() -> str:
+    global _DISK_CACHE_DIR
+    if _DISK_CACHE_DIR is None:
+        _DISK_CACHE_DIR = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), ".cache",
+        )
+    os.makedirs(_DISK_CACHE_DIR, exist_ok=True)
+    return _DISK_CACHE_DIR
+
+_PROFILE_DISK_CACHE_FILE = "v2_profile_cache.json"
+_RESTORE_DISK_CACHE_FILE = "v2_restore_cache.json"
+
+# ── In-memory shadow of the disk cache (populated at load, written on change) ──
+_profile_disk_cache: dict[str, dict] = {}
+"""In-memory mirror of the profile cache disk file."""
+_profile_disk_lock = threading.Lock()
+"""Thread lock for profile disk cache I/O."""
+
+_restore_disk_cache: dict[str, dict] = {}
+"""In-memory mirror of the restore cache disk file."""
+_restore_disk_lock = threading.Lock()
+"""Thread lock for restore disk cache I/O."""
+
+# ── Telemetry counters (monotonic per process) ──────────────────────
+_disk_profile_read_count: int = 0
+"""Monotonic count of disk-profile-cache reads."""
+_disk_profile_write_count: int = 0
+"""Monotonic count of disk-profile-cache writes."""
+_disk_profile_miss_count: int = 0
+"""Monotonic count of disk-profile-cache read misses."""
+_disk_profile_corruption_count: int = 0
+"""Monotonic count of disk-profile-cache corrupt-file detections."""
+
+_disk_restore_read_count: int = 0
+"""Monotonic count of disk-restore-cache reads."""
+_disk_restore_write_count: int = 0
+"""Monotonic count of disk-restore-cache writes."""
+_disk_restore_miss_count: int = 0
+"""Monotonic count of disk-restore-cache read misses."""
+_disk_restore_corruption_count: int = 0
+"""Monotonic count of disk-restore-cache corrupt-file detections."""
+
+
+def _disk_cache_filepath(kind: str) -> str:
+    """Return the absolute file path for the given cache *kind*.
+
+    *kind* must be ``"profile"`` or ``"restore"``.
+    """
+    filename = (
+        _PROFILE_DISK_CACHE_FILE if kind == "profile"
+        else _RESTORE_DISK_CACHE_FILE if kind == "restore"
+        else _PROFILE_DISK_CACHE_FILE
+    )
+    return os.path.join(_disk_cache_dir(), filename)
+
+
+def _read_disk_cache(kind: str) -> dict:
+    """Load the disk cache file for *kind* and return its entries dict.
+
+    Returns an empty dict when the file is missing, corrupt, or at a
+    different schema version.  Updates telemetry counters.
+    """
+    global _disk_profile_read_count, _disk_profile_corruption_count
+    global _disk_restore_read_count, _disk_restore_corruption_count
+
+    path = _disk_cache_filepath(kind)
+    if not os.path.isfile(path):
+        return {}
+
+    if kind == "profile":
+        _disk_profile_read_count += 1
+    else:
+        _disk_restore_read_count += 1
+
+    try:
+        with open(path, "rb") as _f:
+            raw = _f.read()
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        if kind == "profile":
+            _disk_profile_corruption_count += 1
+        else:
+            _disk_restore_corruption_count += 1
+        return {}
+
+    if not isinstance(data, dict) or data.get("version") != _DISK_CACHE_VERSION:
+        if kind == "profile":
+            _disk_profile_corruption_count += 1
+        else:
+            _disk_restore_corruption_count += 1
+        return {}
+
+    entries = data.get("entries")
+    if not isinstance(entries, dict):
+        return {}
+    return entries
+
+
+def _write_disk_cache(kind: str, entries: dict) -> None:
+    """Atomically write *entries* to the disk cache for *kind*.
+
+    Uses ``tempfile.mkstemp`` + ``os.replace`` for crash safety.
+    Only writes entries dict (never handles, images, prompts, or outputs).
+    """
+    global _disk_profile_write_count, _disk_restore_write_count
+    path = _disk_cache_filepath(kind)
+    data = {
+        "version": _DISK_CACHE_VERSION,
+        "created_at": time.time(),
+        "max_entries": _DISK_CACHE_MAX,
+        "entries": entries,
+    }
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    try:
+        fd, tmp = tempfile.mkstemp(
+            suffix=".tmp",
+            prefix=os.path.basename(path) + ".",
+            dir=parent,
+        )
+        try:
+            with os.fdopen(fd, "wb") as _f:
+                _f.write(json.dumps(data, separators=(",", ":")).encode("utf-8"))
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError as _exc:
+        # Non-fatal: cache write failures must never raise.
+        print(f"[disk_cache] write failed for {kind}: {_exc}", flush=True)
+
+    if kind == "profile":
+        _disk_profile_write_count += 1
+    else:
+        _disk_restore_write_count += 1
+
+
+def _populate_profile_cache_from_disk() -> None:
+    """Load profile disk cache entries into ``_PROFILE_PREP_CACHE`` (fast path).
+
+    Called once at process startup.  Skips entries whose identity fields
+    would have already expired (TTL is managed upstream).
+    """
+    entries = _read_disk_cache("profile")
+    if not entries:
+        return
+    with _PROFILE_PREP_CACHE_LOCK:
+        for ck, ev in entries.items():
+            if ck not in _PROFILE_PREP_CACHE and isinstance(ev, dict):
+                result = ev.get("result")
+                if isinstance(result, dict) and result.get("status") not in ("error",):
+                    _PROFILE_PREP_CACHE[ck] = dict(result)
+    # Keep mirror in sync
+    with _profile_disk_lock:
+        _profile_disk_cache.update(entries)
+    # Evict in-memory cache if over limit
+    _evict_profile_prep_cache()
+
+
+def _populate_restore_cache_from_disk() -> None:
+    """Load restore disk cache entries into ``_RESTORE_PUBLISH_CACHE``.
+
+    Called once at process startup.
+    """
+    entries = _read_disk_cache("restore")
+    if not entries:
+        return
+    with _RESTORE_PUBLISH_CACHE_LOCK:
+        for ck, ev in entries.items():
+            if ck not in _RESTORE_PUBLISH_CACHE and isinstance(ev, dict):
+                identity_hash = ev.get("identity_hash", "")
+                publication_result = ev.get("publication_result")
+                if identity_hash and isinstance(publication_result, dict):
+                    _RESTORE_PUBLISH_CACHE[ck] = {
+                        "identity_hash": identity_hash,
+                        "publication_result": dict(publication_result),
+                    }
+    with _restore_disk_lock:
+        _restore_disk_cache.update(entries)
+    _evict_restore_publish_cache()
+
+
+def _flush_profile_disk_cache() -> None:
+    """Write the current in-memory shadow of the profile cache to disk.
+
+    Only stores stable identity metadata — never serialises handles,
+    full workflows, images, prompts, or output data.
+    """
+    with _profile_disk_lock:
+        entries = dict(_profile_disk_cache)
+        # Prune stale or oversized entries before write
+        if len(entries) > _DISK_CACHE_MAX:
+            _keys = list(entries.keys())
+            for _k in _keys[:_DISK_CACHE_MAX // 2]:
+                entries.pop(_k, None)
+    _write_disk_cache("profile", entries)
+
+
+def _flush_restore_disk_cache() -> None:
+    """Write the current in-memory shadow of the restore cache to disk."""
+    with _restore_disk_lock:
+        entries = dict(_restore_disk_cache)
+        if len(entries) > _DISK_CACHE_MAX:
+            _keys = list(entries.keys())
+            for _k in _keys[:_DISK_CACHE_MAX // 2]:
+                entries.pop(_k, None)
+    _write_disk_cache("restore", entries)
+
+
+def _remove_profile_disk_entry(cache_key: str) -> None:
+    """Remove a single entry from the profile disk cache (invalidation)."""
+    with _profile_disk_lock:
+        _profile_disk_cache.pop(cache_key, None)
+    _flush_profile_disk_cache()
+
+
+def _remove_restore_disk_entry(cache_key: str) -> None:
+    """Remove a single entry from the restore disk cache (invalidation)."""
+    with _restore_disk_lock:
+        _restore_disk_cache.pop(cache_key, None)
+    _flush_restore_disk_cache()
+
+
+def _reset_disk_caches() -> None:
+    """Clear both disk caches in memory and on filesystem (test/teardown only)."""
+    with _profile_disk_lock:
+        _profile_disk_cache.clear()
+    with _restore_disk_lock:
+        _restore_disk_cache.clear()
+    # Write empty files to reset on-disk state
+    _write_disk_cache("profile", {})
+    _write_disk_cache("restore", {})
+
 
 # ---------------------------------------------------------------------------
 # Restore-plan publish cache (process-safe, skips remote calls when
@@ -205,6 +478,14 @@ def _evict_profile_prep_cache() -> None:
             _PROFILE_PREP_CACHE.pop(next(iter(_PROFILE_PREP_CACHE)), None)
 
 
+# ── Bootstrap: pre-populate in-memory caches from disk on import ─────
+# Must live here — after _PROFILE_PREP_CACHE, _PROFILE_PREP_CACHE_LOCK,
+# _RESTORE_PUBLISH_CACHE, _RESTORE_PUBLISH_CACHE_LOCK, _evict_profile_prep_cache,
+# and _evict_restore_publish_cache are all defined.
+_populate_profile_cache_from_disk()
+_populate_restore_cache_from_disk()
+
+
 def _reset_all_cache_counters() -> None:
     """Reset all caches and counters.
 
@@ -213,11 +494,13 @@ def _reset_all_cache_counters() -> None:
     Also resets the warmup-profile module-level dedup cache so the
     inner ``prepare_active_next_profile`` cannot short-circuit after
     a cache reset.
+    Also clears and persists both disk-backed caches.
 
     Test / teardown only.
     """
     _reset_profile_prep_cache()
     _reset_restore_publish_cache()
+    _reset_disk_caches()
     from warmup_profile import _reset_last_stable_profile_cache as _wp_reset
     _wp_reset()
 
@@ -803,6 +1086,12 @@ async def execute_plan(
                 profile_identity_key=_model_profile_key[:16],
                 profile_cache_reset_count=_cache_reset_count_current,
                 profile_miss_reason="",
+                # Disk cache telemetry
+                disk_profile_cache_hit=_profile_cache_key in _profile_disk_cache,
+                disk_profile_read_count=_disk_profile_read_count,
+                disk_profile_write_count=_disk_profile_write_count,
+                disk_profile_miss_count=_disk_profile_miss_count,
+                disk_profile_corruption_count=_disk_profile_corruption_count,
             )
             runtime_trace.emit("active_next_profile_end", phase="local", metadata={
                 "decision": "profile_prep_cache_hit",
@@ -883,6 +1172,12 @@ async def execute_plan(
                 profile_identity_key=_model_profile_key[:16],
                 profile_cache_reset_count=_cache_reset_count_current,
                 profile_miss_reason=_profile_miss_reason,
+                # Disk cache telemetry
+                disk_profile_cache_hit=False,
+                disk_profile_read_count=_disk_profile_read_count,
+                disk_profile_write_count=_disk_profile_write_count,
+                disk_profile_miss_count=_disk_profile_miss_count,
+                disk_profile_corruption_count=_disk_profile_corruption_count,
             )
             runtime_trace.emit("active_next_profile_end", phase="local", metadata={
                 "decision": _pn_result.get("active_profile_publish_decision", ""),
@@ -895,10 +1190,27 @@ async def execute_plan(
                     _PROFILE_PREP_CACHE[_profile_cache_key] = dict(_pn_result)
                     while len(_PROFILE_PREP_CACHE) > _PROFILE_PREP_CACHE_MAX:
                         _PROFILE_PREP_CACHE.pop(next(iter(_PROFILE_PREP_CACHE)), None)
+                # Persist to disk after confirmed remote success
+                _disk_entry = {
+                    "result": dict(_pn_result),
+                    "model_profile_key": _model_profile_key,
+                    "prefill_key": _prefill_key,
+                    "ws_id": _profile_ws_id,
+                    "app_identity": _profile_app_identity,
+                    "ts": time.time(),
+                    "pid": _cache_pid,
+                }
+                with _profile_disk_lock:
+                    _profile_disk_cache[_profile_cache_key] = _disk_entry
+                    while len(_profile_disk_cache) > _DISK_CACHE_MAX:
+                        _profile_disk_cache.pop(next(iter(_profile_disk_cache)), None)
+                _flush_profile_disk_cache()
             else:
                 # Failure: remove any stale cached entry for this key
                 with _PROFILE_PREP_CACHE_LOCK:
                     _PROFILE_PREP_CACHE.pop(_profile_cache_key, None)
+                # Also remove from disk cache (invalidation)
+                _remove_profile_disk_entry(_profile_cache_key)
     else:
         runtime_trace.emit("active_next_profile_end", phase="local", metadata={"status": "dry_run"})
     runtime_trace.emit("active_profile_prepare_end", phase="local")
@@ -977,6 +1289,12 @@ async def execute_plan(
                 complete_plan_identity_hash=plan_identity[:16],
                 restore_cache_reset_count=_restore_cache_reset_count_current,
                 restore_miss_reason="",
+                # Disk cache telemetry
+                disk_restore_cache_hit=cache_key in _restore_disk_cache,
+                disk_restore_read_count=_disk_restore_read_count,
+                disk_restore_write_count=_disk_restore_write_count,
+                disk_restore_miss_count=_disk_restore_miss_count,
+                disk_restore_corruption_count=_disk_restore_corruption_count,
             )
         else:
             # ── Cache miss — determine reason ──
@@ -1029,9 +1347,25 @@ async def execute_plan(
                     }
                     while len(_RESTORE_PUBLISH_CACHE) > _RESTORE_PUBLISH_CACHE_MAX:
                         _RESTORE_PUBLISH_CACHE.pop(next(iter(_RESTORE_PUBLISH_CACHE)), None)
+                # Persist to disk after confirmed remote success
+                _restore_disk_entry = {
+                    "identity_hash": plan_identity,
+                    "publication_result": dict(_publication_result),
+                    "ws_id": _restore_ws_id,
+                    "app_identity": _restore_app_identity,
+                    "ts": time.time(),
+                    "pid": _restore_cache_pid,
+                }
+                with _restore_disk_lock:
+                    _restore_disk_cache[cache_key] = _restore_disk_entry
+                    while len(_restore_disk_cache) > _DISK_CACHE_MAX:
+                        _restore_disk_cache.pop(next(iter(_restore_disk_cache)), None)
+                _flush_restore_disk_cache()
             else:
                 with _RESTORE_PUBLISH_CACHE_LOCK:
                     _RESTORE_PUBLISH_CACHE.pop(cache_key, None)
+                # Also remove from disk cache (invalidation)
+                _remove_restore_disk_entry(cache_key)
             # Instrumentation metadata on miss path
             runtime_trace.set_metadata(
                 restore_cache_pid=_restore_cache_pid,
@@ -1043,6 +1377,12 @@ async def execute_plan(
                 complete_plan_identity_hash=plan_identity[:16],
                 restore_cache_reset_count=_restore_cache_reset_count_current,
                 restore_miss_reason=_restore_miss_reason,
+                # Disk cache telemetry
+                disk_restore_cache_hit=cache_key in _restore_disk_cache,
+                disk_restore_read_count=_disk_restore_read_count,
+                disk_restore_write_count=_disk_restore_write_count,
+                disk_restore_miss_count=_disk_restore_miss_count,
+                disk_restore_corruption_count=_disk_restore_corruption_count,
             )
 
         runtime_trace.emit("restore_plan_publish_end", phase="local", metadata={"generation": observed_generation})

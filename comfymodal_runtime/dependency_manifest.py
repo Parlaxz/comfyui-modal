@@ -6,6 +6,12 @@ ComfyUI or Modal runtime.  The functions here are used by ``comfyapp.py``
 to build, persist, load, check, and emit diagnostics for the immutable
 dependency manifest.
 
+Lane B extensions:
+  - Snapshot-memory validation certificate with Volume fallback
+  - Immutable workflow artifact identity computation (no live/request/model/
+    output objects ever captured)
+  - Snapshot identity service for pre-scan generation reuse
+
 All existing public/private helper names in ``comfyapp.py`` remain
 unchanged and continue to be the patch targets for existing tests.
 """
@@ -320,3 +326,326 @@ def emit_validation_diagnostic(
         f"reason={reason}",
         flush=True,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Lane B — Snapshot-memory validation certificate (Volume-compatible)
+# ═══════════════════════════════════════════════════════════════════════
+
+SNAPSHOT_CERT_PAYLOAD_SCHEMA_VERSION = 1
+SNAPSHOT_CERT_FILENAME_PREFIX = "snapshot_cert_"
+
+
+def build_snapshot_cert_payload(
+    *,
+    runtime_generation: str,
+    custom_node_generation: str,
+    sage_mode: str,
+    sage_reason: str,
+    unet_identity: str = "",
+    clip_identity: str = "",
+    clip_type: str = "",
+) -> dict[str, Any]:
+    """Build a serializable, verifiable snapshot-memory validation
+    certificate payload.
+
+    This is the **data-plane** representation (pure dict, no Volume
+    reference).  The caller is responsible for persisting it via
+    ``persist_snapshot_cert_to_volume`` or an equivalent Volume write.
+
+    Fields capture only snapshot-safe identity values — never live
+    objects, model references, request state, or mutable state.
+
+    Returns a dict with an embedded ``cert_identity`` (deterministic
+    SHA-256 of semantic content, excluding ``created_at``).
+    """
+    identity_components: dict[str, str] = {
+        "runtime_generation": str(runtime_generation),
+        "custom_node_generation": str(custom_node_generation),
+        "sage_mode": str(sage_mode),
+        "sage_reason": str(sage_reason),
+        "unet_identity": str(unet_identity),
+        "clip_identity": str(clip_identity),
+        "clip_type": str(clip_type),
+    }
+    h = hashlib.sha256()
+    h.update(f"schema={SNAPSHOT_CERT_PAYLOAD_SCHEMA_VERSION}\n".encode())
+    for key in sorted(identity_components):
+        h.update(f"{key}={identity_components[key]}\n".encode())
+    cert_identity = h.hexdigest()
+
+    return {
+        "schema_version": SNAPSHOT_CERT_PAYLOAD_SCHEMA_VERSION,
+        "cert_identity": cert_identity,
+        "created_at": time.time(),
+        "identity_components": identity_components,
+    }
+
+
+def validate_snapshot_cert_payload(
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Validate a previously built snapshot cert payload.
+
+    Returns ``{"valid": True, "cert_identity": ..., "reason": ""}`` on
+    success or ``{"valid": False, "cert_identity": "", "reason": ...}``
+    on failure.  Never raises.
+    """
+    result: dict[str, Any] = {
+        "valid": False, "cert_identity": "", "reason": "",
+    }
+    if not isinstance(payload, dict):
+        result["reason"] = "not_a_dict"
+        return result
+    try:
+        sv = payload.get("schema_version")
+        if sv != SNAPSHOT_CERT_PAYLOAD_SCHEMA_VERSION:
+            result["reason"] = f"schema_version_mismatch:got={sv}"
+            return result
+        stored_identity = str(payload.get("cert_identity", ""))
+        if not stored_identity:
+            result["reason"] = "missing_cert_identity"
+            return result
+
+        # Recompute identity from components
+        components = payload.get("identity_components", {})
+        if not isinstance(components, dict):
+            result["reason"] = "invalid_identity_components"
+            return result
+
+        h = hashlib.sha256()
+        h.update(f"schema={SNAPSHOT_CERT_PAYLOAD_SCHEMA_VERSION}\n".encode())
+        for key in sorted(components):
+            h.update(f"{key}={str(components[key])}\n".encode())
+        computed = h.hexdigest()
+
+        if stored_identity != computed:
+            result["reason"] = (
+                f"identity_mismatch:stored={stored_identity[:16]}"
+                f"!=computed={computed[:16]}"
+            )
+            return result
+
+        result["valid"] = True
+        result["cert_identity"] = stored_identity
+        result["reason"] = ""
+        return result
+    except Exception as exc:
+        result["reason"] = f"validation_error:{exc}"
+        return result
+
+
+def _snapshot_cert_filename(cert_identity: str) -> str:
+    """Return the on-volume filename for a snapshot cert identity."""
+    return f"{SNAPSHOT_CERT_FILENAME_PREFIX}{cert_identity}.json"
+
+
+def persist_snapshot_cert_to_volume(
+    volume: Any,
+    *,
+    payload: dict[str, Any],
+    volume_dir: str = "",
+) -> bool:
+    """Persist a snapshot cert payload to a Modal-compatible Volume.
+
+    *volume* is expected to expose ``write_bytes(path, data)`` and
+    ``commit()``.  *volume_dir* is an optional subdirectory prefix
+    within the volume.
+
+    Never raises.  Returns ``True`` on success.
+    """
+    try:
+        cert_identity = str(payload.get("cert_identity", ""))
+        if not cert_identity:
+            return False
+
+        filename = _snapshot_cert_filename(cert_identity)
+        if volume_dir:
+            filepath = os.path.join(volume_dir, filename)
+        else:
+            filepath = filename
+
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        volume.write_bytes(filepath, encoded)
+        # Commit via safe helper
+        try:
+            commit_volume_sync(volume)
+        except Exception:
+            pass
+        return True
+    except Exception as exc:
+        print(f"[snapshot_cert] persist error: {exc}", flush=True)
+        return False
+
+
+def read_snapshot_cert_from_volume(
+    volume: Any,
+    *,
+    cert_identity: str,
+    volume_dir: str = "",
+) -> dict[str, Any] | None:
+    """Read and validate a snapshot cert from a Modal-compatible Volume.
+
+    Returns the validated payload dict on hit, or ``None`` on
+    miss/mismatch/error.  Never raises.
+    """
+    try:
+        filename = _snapshot_cert_filename(cert_identity)
+        if volume_dir:
+            filepath = os.path.join(volume_dir, filename)
+        else:
+            filepath = filename
+
+        if not volume.exists(filepath):
+            return None
+
+        raw = volume.read_bytes(filepath)
+        if not raw:
+            return None
+
+        import json as _json
+        payload = _json.loads(raw.decode("utf-8"))
+        validation = validate_snapshot_cert_payload(payload)
+        if not validation.get("valid"):
+            return None
+
+        return payload
+    except Exception as exc:
+        print(f"[snapshot_cert] read error: {exc}", flush=True)
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Lane B — Immutable workflow artifact identity
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Returns a deterministic identity for a workflow artifact WITHOUT
+# capturing prompt text, model objects, node outputs, or any live/
+# request-scoped state.  Only structural topology and class types
+# participate.
+
+IMMUTABLE_ARTIFACT_SCHEMA_VERSION = 1
+
+
+def build_immutable_artifact_identity(
+    *,
+    compiled_workflow_hash: str,
+    source_workflow_hash: str,
+    production_plan_hash: str,
+    output_node_ids: list[str] | None = None,
+    topology_hash: str = "",
+) -> dict[str, Any]:
+    """Compute a deterministic identity for an immutable workflow
+    artifact.
+
+    Only structural metadata participates — never live objects,
+    prompt text, model outputs, or runtime state.  This identity
+    can be used as a certificate key or cache tag that survives
+    snapshot boundaries.
+
+    Returns:
+      * artifact_identity — SHA-256 hex string
+      * components — dict of all fields that were hashed
+      * schema_version — current schema version
+    """
+    components: dict[str, str] = {
+        "schema_version": str(IMMUTABLE_ARTIFACT_SCHEMA_VERSION),
+        "compiled_workflow_hash": str(compiled_workflow_hash),
+        "source_workflow_hash": str(source_workflow_hash),
+        "production_plan_hash": str(production_plan_hash),
+        "topology_hash": str(topology_hash),
+    }
+    if output_node_ids:
+        components["output_node_ids"] = ",".join(sorted(str(i) for i in output_node_ids))
+
+    h = hashlib.sha256()
+    for key in sorted(components):
+        h.update(f"{key}={components[key]}\n".encode())
+
+    return {
+        "artifact_identity": h.hexdigest(),
+        "components": components,
+        "schema_version": IMMUTABLE_ARTIFACT_SCHEMA_VERSION,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Lane B — Snapshot identity service (pre-scan generation reuse)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Lightweight service that bridges the pre-scan generation identity
+# (captured during startup) to the restore phase without coupling to
+# the BootstrapState dataclass.
+
+SNAPSHOT_IDENTITY_SCHEMA_VERSION = 1
+
+
+def build_snapshot_identity(
+    *,
+    runtime_generation: str,
+    custom_node_generation: str,
+    combined_hash: str = "",
+) -> dict[str, Any]:
+    """Build a snapshot identity that can be used to detect changes
+    between startup (pre-scan) and restore.
+
+    Returns a dict with:
+      * snapshot_identity — SHA-256 hex string
+      * runtime_generation — from bootstrap state
+      * custom_node_generation — from bootstrap state
+      * combined_hash — deployment combined hash
+      * schema_version — current version
+    """
+    h = hashlib.sha256()
+    h.update(f"schema={SNAPSHOT_IDENTITY_SCHEMA_VERSION}\n".encode())
+    h.update(f"runtime_gen={str(runtime_generation)}\n".encode())
+    h.update(f"cn_gen={str(custom_node_generation)}\n".encode())
+    h.update(f"combined_hash={str(combined_hash)}\n".encode())
+
+    return {
+        "snapshot_identity": h.hexdigest(),
+        "schema_version": SNAPSHOT_IDENTITY_SCHEMA_VERSION,
+        "runtime_generation": str(runtime_generation),
+        "custom_node_generation": str(custom_node_generation),
+        "combined_hash": str(combined_hash),
+        "created_at": time.time(),
+    }
+
+
+def check_snapshot_identity_match(
+    identity_a: dict[str, Any] | None,
+    identity_b: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Compare two snapshot identity dicts.
+
+    Returns a dict with:
+      * match — bool
+      * reason — str (empty on match, describes difference on mismatch)
+      * identity_a_hash, identity_b_hash — the hex digests
+    """
+    result: dict[str, Any] = {
+        "match": False,
+        "reason": "",
+        "identity_a_hash": "",
+        "identity_b_hash": "",
+    }
+    if not isinstance(identity_a, dict):
+        result["reason"] = "identity_a_missing"
+        return result
+    if not isinstance(identity_b, dict):
+        result["reason"] = "identity_b_missing"
+        return result
+    hash_a = str(identity_a.get("snapshot_identity", ""))
+    hash_b = str(identity_b.get("snapshot_identity", ""))
+    result["identity_a_hash"] = hash_a
+    result["identity_b_hash"] = hash_b
+    if hash_a and hash_b and hash_a == hash_b:
+        result["match"] = True
+    else:
+        result["reason"] = "identity_mismatch"
+    return result

@@ -341,25 +341,47 @@ def _materialize_modal_outputs(
     total_write_time_ms: float = 0.0
     _materialization_wall_start = time.perf_counter()
 
+    def _is_valid_entry(entry: Any) -> bool:
+        """Returns True for entries with either base64 'data' (legacy) or
+        descriptor metadata ('filename' + one of 'byte_count'/'identity'/'path')."""
+        if not isinstance(entry, dict):
+            return False
+        if "data" in entry and entry["data"]:
+            return True
+        return bool(entry.get("filename")) and (
+            "byte_count" in entry or "identity" in entry or "path" in entry
+        )
+
     def _store_entry(node_id: str, output_key: str, entry: dict, fallback_index: int = 0) -> None:
         nonlocal image_count, video_count, output_bytes_written, total_decode_time_ms, total_write_time_ms
-        _t0 = time.perf_counter()
-        raw_bytes = base64.b64decode(entry["data"], validate=True)
-        total_decode_time_ms += (time.perf_counter() - _t0) * 1000.0
-        local_filename = entry.get("filename", f"output_{fallback_index}.bin")
-        local_path = _unique_path(output_dir, local_filename)
-        local_filename = os.path.basename(local_path)
-        _t1 = time.perf_counter()
-        with open(local_path, "wb") as f:
-            f.write(raw_bytes)
-        total_write_time_ms += (time.perf_counter() - _t1) * 1000.0
-        written_files.append(local_path)
-        output_bytes_written += len(raw_bytes)
-        is_video = output_key == "gifs" or (entry.get("format", "") in {"gif", "mp4", "webm"})
-        if is_video:
-            video_count += 1
+        has_data = "data" in entry and entry["data"]
+        if has_data:
+            _t0 = time.perf_counter()
+            raw_bytes = base64.b64decode(entry["data"], validate=True)
+            total_decode_time_ms += (time.perf_counter() - _t0) * 1000.0
+            local_filename = entry.get("filename", f"output_{fallback_index}.bin")
+            local_path = _unique_path(output_dir, local_filename)
+            local_filename = os.path.basename(local_path)
+            _t1 = time.perf_counter()
+            with open(local_path, "wb") as f:
+                f.write(raw_bytes)
+            total_write_time_ms += (time.perf_counter() - _t1) * 1000.0
+            written_files.append(local_path)
+            output_bytes_written += len(raw_bytes)
+            decoded_bytes = raw_bytes
         else:
-            image_count += 1
+            # Descriptor mode — no inline data; skip decode/write
+            raw_bytes = b""
+            local_filename = entry.get("filename", f"output_{fallback_index}.bin")
+            local_path = entry.get("path", "")
+            decoded_bytes = b""
+
+        is_video = output_key == "gifs" or (entry.get("format", "") in {"gif", "mp4", "webm"})
+        if has_data:
+            if is_video:
+                video_count += 1
+            else:
+                image_count += 1
         native_entry = _build_native_output_descriptor(local_filename)
         internal_entry = _build_materialized_output_entry(
             entry,
@@ -367,7 +389,7 @@ def _materialize_modal_outputs(
             output_key=output_key,
             local_filename=local_filename,
             local_path=local_path,
-            decoded_bytes=raw_bytes,
+            decoded_bytes=decoded_bytes if decoded_bytes else (entry.get("byte_count", 0)).to_bytes(8, "big"),
             fallback_index=fallback_index,
         )
         native_outputs.setdefault(str(node_id), {}).setdefault(output_key, []).append(native_entry)
@@ -377,11 +399,12 @@ def _materialize_modal_outputs(
             materialized_outputs[str(node_id)]["animated"] = [True] * len(materialized_outputs[str(node_id)][output_key])
         handled_output_ids.add(_stable_output_identity(str(node_id), output_key, entry, fallback_index))
         primary_flag = 1 if entry.get("comparison_side") == "b" or output_key == "b_images" else 0
-        print(
-            f"[modal-local.write] node_id={node_id} output_key={output_key} "
-            f"comparison_side={entry.get('comparison_side', '')} path={local_path} bytes={len(raw_bytes)}"
-            f"{' primary=1' if primary_flag else ''}"
-        )
+        if has_data:
+            print(
+                f"[modal-local.write] node_id={node_id} output_key={output_key} "
+                f"comparison_side={entry.get('comparison_side', '')} path={local_path} bytes={len(raw_bytes)}"
+                f"{' primary=1' if primary_flag else ''}"
+            )
 
     structured_outputs = result.get("outputs", {}) if isinstance(result, dict) else {}
     for node_id, node_outputs in structured_outputs.items():
@@ -391,12 +414,12 @@ def _materialize_modal_outputs(
             if not isinstance(entries, list):
                 continue
             for index, entry in enumerate(entries):
-                if isinstance(entry, dict) and "data" in entry:
+                if _is_valid_entry(entry):
                     _store_entry(str(node_id), str(output_key), entry, index)
 
     flat_node_events: dict[str, dict[str, list]] = {}
     for index, img in enumerate(result.get("images", []) if isinstance(result, dict) else []):
-        if not isinstance(img, dict) or "data" not in img:
+        if not _is_valid_entry(img):
             continue
         node_id = str(img.get("node_id", ""))
         output_key = str(img.get("output_key") or "images")
@@ -408,7 +431,7 @@ def _materialize_modal_outputs(
         )
 
     for index, vid in enumerate(result.get("videos", []) if isinstance(result, dict) else []):
-        if not isinstance(vid, dict) or "data" not in vid:
+        if not _is_valid_entry(vid):
             continue
         node_id = str(vid.get("node_id", ""))
         output_key = str(vid.get("output_key") or "gifs")

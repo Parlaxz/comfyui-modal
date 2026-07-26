@@ -3,6 +3,9 @@
 Provides legacy payload adapters and a materialization function that
 can accept current Modal result dictionaries *without* importing
 ComfyUI at module import time.
+
+Lane C: lightweight descriptor mode (``data``-free entries) is the
+default.  Narrow legacy fallback with inline base64 is preserved.
 """
 
 from __future__ import annotations
@@ -20,11 +23,13 @@ from typing import Any, Callable, Mapping
 
 from .output_delivery import (
     Attempt,
+    AssetDescriptor,
     ConversionMeta,
     OutputItem,
     _item_from_entry,
     _make_conversion_meta,
     _measure_json_bytes,
+    build_asset_descriptor_list,
 )
 
 
@@ -492,23 +497,34 @@ def materialize_modal_result(
         fallback_index: int = 0,
     ) -> None:
         nonlocal image_count, video_count, output_bytes_written, total_decode_time_ms, total_write_time_ms
-        t0 = time.monotonic()
-        raw_bytes = base64.b64decode(entry["data"], validate=True)
-        total_decode_time_ms += (time.monotonic() - t0) * 1000.0
-        local_filename = entry.get("filename", f"output_{fallback_index}.bin")
-        local_path = unique_path(output_dir, local_filename)
-        local_filename = os.path.basename(local_path)
-        t1 = time.monotonic()
-        Path(local_path).write_bytes(raw_bytes)
-        total_write_time_ms += (time.monotonic() - t1) * 1000.0
-        written_files.append(local_path)
-        output_bytes_written += len(raw_bytes)
+        has_data = "data" in entry and entry["data"]
+        if has_data:
+            t0 = time.monotonic()
+            raw_bytes = base64.b64decode(entry["data"], validate=True)
+            total_decode_time_ms += (time.monotonic() - t0) * 1000.0
+            local_filename = entry.get("filename", f"output_{fallback_index}.bin")
+            local_path = unique_path(output_dir, local_filename)
+            local_filename = os.path.basename(local_path)
+            t1 = time.monotonic()
+            Path(local_path).write_bytes(raw_bytes)
+            total_write_time_ms += (time.monotonic() - t1) * 1000.0
+            written_files.append(local_path)
+            output_bytes_written += len(raw_bytes)
+            decoded_bytes = raw_bytes
+        else:
+            # Descriptor mode (no inline data) — skip decode/write,
+            # use metadata from the entry for output construction.
+            raw_bytes = b""
+            local_filename = entry.get("filename", f"output_{fallback_index}.bin")
+            local_path = entry.get("path", "")
+            decoded_bytes = b""
 
         is_video = output_key == "gifs" or (entry.get("format", "") in {"gif", "mp4", "webm"})
-        if is_video:
-            video_count += 1
-        else:
-            image_count += 1
+        if has_data:
+            if is_video:
+                video_count += 1
+            else:
+                image_count += 1
 
         native_entry = build_native_output_descriptor(local_filename)
         internal_entry = build_materialized_output_entry(
@@ -517,7 +533,7 @@ def materialize_modal_result(
             output_key=output_key,
             local_filename=local_filename,
             local_path=local_path,
-            decoded_bytes=raw_bytes,
+            decoded_bytes=decoded_bytes if decoded_bytes else (entry.get("byte_count", 0)).to_bytes(8, "big"),
             fallback_index=fallback_index,
         )
 
@@ -530,6 +546,18 @@ def materialize_modal_result(
 
         handled_output_ids.add(stable_output_identity(str(node_id), output_key, entry, fallback_index))
 
+    def _is_valid_entry(entry: Any) -> bool:
+        """Returns True for entries with either base64 'data' (legacy) or
+        descriptor metadata ('filename' + one of 'byte_count'/'identity'/'path')."""
+        if not isinstance(entry, dict):
+            return False
+        if "data" in entry and entry["data"]:
+            return True
+        # Descriptor mode: must have at least filename and a descriptor field
+        return bool(entry.get("filename")) and (
+            "byte_count" in entry or "identity" in entry or "path" in entry
+        )
+
     # Process structured outputs
     structured_outputs = adapted.get("outputs", {})
     for node_id, node_outputs in structured_outputs.items():
@@ -539,12 +567,12 @@ def materialize_modal_result(
             if not isinstance(entries, list):
                 continue
             for index, entry in enumerate(entries):
-                if isinstance(entry, dict) and "data" in entry:
+                if _is_valid_entry(entry):
                     _store_entry(str(node_id), str(output_key), entry, index)
 
     # Process flat images
     for index, img in enumerate(adapted.get("images", [])):
-        if not isinstance(img, dict) or "data" not in img:
+        if not _is_valid_entry(img):
             continue
         node_id = str(img.get("node_id", ""))
         output_key = str(img.get("output_key") or "images")
@@ -554,7 +582,7 @@ def materialize_modal_result(
 
     # Process flat videos
     for index, vid in enumerate(adapted.get("videos", [])):
-        if not isinstance(vid, dict) or "data" not in vid:
+        if not _is_valid_entry(vid):
             continue
         node_id = str(vid.get("node_id", ""))
         output_key = str(vid.get("output_key") or "gifs")
