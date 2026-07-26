@@ -14,6 +14,7 @@ import time
 from collections import namedtuple
 from pathlib import Path
 import traceback as _traceback
+from typing import Any
 
 _NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 if _NODE_DIR not in sys.path:
@@ -279,7 +280,10 @@ def _build_materialized_output_entry(remote_entry: dict, *, node_id: str, output
         "height": remote_entry.get("height"),
         "format": remote_entry.get("format", ""),
         "output_index": remote_entry.get("output_index", fallback_index),
-        "byte_count": len(decoded_bytes),
+        "byte_count": len(decoded_bytes) if decoded_bytes else int(remote_entry.get("byte_count", 0) or 0),
+        "asset_id": remote_entry.get("asset_id", ""),
+        "identity": remote_entry.get("identity", ""),
+        "backend_path": remote_entry.get("backend_path", remote_entry.get("path", "")),
     }
 
 
@@ -377,11 +381,10 @@ def _materialize_modal_outputs(
             decoded_bytes = b""
 
         is_video = output_key == "gifs" or (entry.get("format", "") in {"gif", "mp4", "webm"})
-        if has_data:
-            if is_video:
-                video_count += 1
-            else:
-                image_count += 1
+        if is_video:
+            video_count += 1
+        else:
+            image_count += 1
         native_entry = _build_native_output_descriptor(local_filename)
         internal_entry = _build_materialized_output_entry(
             entry,
@@ -389,10 +392,12 @@ def _materialize_modal_outputs(
             output_key=output_key,
             local_filename=local_filename,
             local_path=local_path,
-            decoded_bytes=decoded_bytes if decoded_bytes else (entry.get("byte_count", 0)).to_bytes(8, "big"),
+            decoded_bytes=decoded_bytes,
             fallback_index=fallback_index,
         )
         native_outputs.setdefault(str(node_id), {}).setdefault(output_key, []).append(native_entry)
+        if entry.get("asset_id"):
+            native_entry["asset_id"] = entry["asset_id"]
         materialized_outputs.setdefault(str(node_id), {}).setdefault(output_key, []).append(internal_entry)
         if is_video:
             native_outputs[str(node_id)]["animated"] = [True] * len(native_outputs[str(node_id)][output_key])
@@ -575,6 +580,45 @@ def _materialize_modal_outputs(
             "bytes_written": output_bytes_written,
         },
     }
+
+
+def _register_remote_result_assets(
+    result: dict,
+    *,
+    workspace: dict,
+    gpu: str,
+    prompt_id: str,
+) -> None:
+    descriptors = result.get("asset_descriptors", []) if isinstance(result, dict) else []
+    if not isinstance(descriptors, list):
+        return
+    workspace_id = str((workspace or {}).get("id", ""))
+    if not workspace_id:
+        return
+    leases = REGISTRY.leases()
+    for descriptor in descriptors:
+        if not isinstance(descriptor, dict):
+            continue
+        asset_id = str(descriptor.get("asset_id", ""))
+        backend_path = str(descriptor.get("backend_path") or descriptor.get("path") or "")
+        if not asset_id or not backend_path:
+            continue
+        leases.register_asset(
+            asset_id=asset_id,
+            experiment_id="",
+            cell_key=prompt_id,
+            variant="original",
+            path=f"modal://{workspace_id}|{gpu}|{backend_path}",
+            mime_type=str(descriptor.get("mime_type") or "application/octet-stream"),
+            byte_size=int(descriptor.get("byte_count", 0) or 0),
+            content_hash=asset_id,
+            node_id=str(descriptor.get("node_id", "")),
+            output_key=str(descriptor.get("output_key", "")),
+            output_index=int(descriptor.get("output_index", 0) or 0),
+            comparison_side=str(descriptor.get("comparison_side", "")),
+            width=int(descriptor.get("width", 0) or 0),
+            height=int(descriptor.get("height", 0) or 0),
+        )
 
 
 def _make_thumbnail(input_path: str, output_path: str, max_size: int = 256) -> bool:
@@ -2374,6 +2418,13 @@ async def _execute_job(item: tuple, item_id: int):
                 comfyui_root=_COMFYUI_ROOT,
                 event_sink=_event_sink,
             )
+        if isinstance(result, dict) and result.get("use_descriptors"):
+            _register_remote_result_assets(
+                result,
+                workspace=_request_workspace or {},
+                gpu=str(extra_data.get("gpu") or get_gpu() or ""),
+                prompt_id=prompt_id,
+            )
         # ── Extract canonical metadata from run_trace ──
         _result_trace = result.get("trace", {}) if isinstance(result, dict) else {}
         _run_trace_summary = _result_trace.get("_run_trace", {}) if isinstance(_result_trace, dict) else {}
@@ -2504,6 +2555,27 @@ async def _execute_job(item: tuple, item_id: int):
         _mo = extra_data.get("modal_options") if isinstance(extra_data, dict) else None
         _settings = _load_modal_settings()
         if _mode == "v2":
+            _remote_fetch_workspace = _request_workspace or _active_workspace() or {}
+            _remote_fetch_gpu = str(extra_data.get("gpu") or get_gpu() or "")
+
+            def _remote_fetch_fn(backend_path: str, asset_id: str) -> bytes:
+                from modal_client import read_output_asset as _read_asset
+                import asyncio
+                try:
+                    _loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    _loop = None
+                _coro = _read_asset(backend_path, expected_sha256=asset_id, gpu=_remote_fetch_gpu, workspace=_remote_fetch_workspace)
+                if _loop is not None and _loop.is_running():
+                    _future = asyncio.run_coroutine_threadsafe(_coro, _loop)
+                    _result = _future.result(timeout=120)
+                else:
+                    _result = asyncio.run(_coro)
+                _data = _result.get("data", b"") if isinstance(_result, dict) else b""
+                if not isinstance(_data, bytes):
+                    raise TypeError("remote fetch returned unexpected type")
+                return _data
+
             delivery = _materialize_v2_result(
                 result,
                 output_dir=output_dir,
@@ -2518,6 +2590,7 @@ async def _execute_job(item: tuple, item_id: int):
                 width=prompt_summary.get("width", 0),
                 height=prompt_summary.get("height", 0),
                 comfyui_root=_COMFYUI_ROOT,
+                remote_fetch_fn=_remote_fetch_fn,
             )
         else:
             delivery = _materialize_modal_outputs(
@@ -6373,9 +6446,41 @@ if _server:
         record = REGISTRY.leases().resolve_asset(asset_id)
         if record is None:
             return web.json_response({"status": "error", "message": "asset not found"}, status=404)
+        registered_path = str(record.get("path", ""))
+        if registered_path.startswith("modal://"):
+            try:
+                workspace_id, gpu, backend_path = registered_path[len("modal://"):].split("|", 2)
+            except ValueError:
+                return web.json_response({"status": "error", "message": "asset origin invalid"}, status=400)
+            workspace = _workspace_or_400(workspace_id)
+            if not workspace:
+                return web.json_response({"status": "error", "message": "asset workspace unavailable"}, status=404)
+            started = time.perf_counter()
+            try:
+                from modal_client import read_output_asset
+                remote = await read_output_asset(
+                    backend_path,
+                    expected_sha256=str(record.get("content_hash", "")),
+                    gpu=gpu or None,
+                    workspace=workspace,
+                )
+                data = remote.get("data", b"") if isinstance(remote, dict) else b""
+                if not isinstance(data, bytes):
+                    raise TypeError("remote asset payload is not bytes")
+            except FileNotFoundError:
+                return web.json_response({"status": "error", "message": "asset file missing"}, status=404)
+            except Exception as exc:
+                return web.json_response({"status": "error", "message": f"asset fetch failed: {exc}"}, status=502)
+            fetch_ms = round((time.perf_counter() - started) * 1000.0, 3)
+            print(f"[comfymodal.asset] asset_id={asset_id[:12]} source=modal bytes={len(data)} fetch_ms={fetch_ms}")
+            return web.Response(
+                body=data,
+                content_type=record["mime_type"],
+                headers={"X-ComfyModal-Asset-Fetch-Ms": str(fetch_ms)},
+            )
         # Path traversal check: the path must be under the node directory
         node_dir = Path(_NODE_DIR).resolve()
-        asset_path = Path(record["path"])
+        asset_path = Path(registered_path).resolve()
         try:
             asset_path.relative_to(node_dir)
         except ValueError:

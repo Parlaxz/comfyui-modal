@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import concurrent.futures
+import hashlib
 import importlib
 import inspect
 import os
@@ -61,6 +62,7 @@ from .unet_forward_probe import register_unet_forward_probe
 from .output_delivery import (
     Attempt,
     _measure_json_bytes,
+    attempt_to_descriptor_result,
     build_default_chain,
     run_strategy_chain,
 )
@@ -173,7 +175,7 @@ CUSTOM_NODES_VOLUME_NAME = os.environ.get("COMFYMODAL_CUSTOM_NODES_VOLUME", "com
 RUNTIME_STATE_VOLUME_NAME = os.environ.get("COMFYMODAL_RUNTIME_STATE_VOLUME", "comfymodal-runtime-config")
 MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
-RUNTIME_STATE_PATH = "/root/comfymodal_runtime_state"
+RUNTIME_STATE_PATH = "/mnt/comfymodal_runtime_state"
 V2_RESTORE_STATE_FILE = "v2_restore_plan.json"
 MIN_CONTAINERS = 0
 SCALEDOWN_WINDOW = 4
@@ -231,10 +233,11 @@ _V2_CERT_FILENAME_PREFIX: str = "v2_cert_"
 _V2_DEPLOYMENT_COMBINED_HASH: str = ""
 
 # Process-local validation certificate cache.
-# Keyed by (restored_instance_id, cert_identity).  Stores copies only of
-# outputs_to_execute, node_errors, preflight_ok, schema_version, and
-# identity_components for exact revalidation.  No live graph/executor/
-# model/node/cache objects are stored.  New instance ID -> fresh lookup.
+# Keyed by (container_session_id, cert_identity).  The container session ID
+# is stable across restores within the same container, so the cache persists
+# across multiple restore cycles.  Stores copies only of outputs_to_execute,
+# node_errors, preflight_ok, schema_version, and identity_components for exact
+# revalidation.  No live graph/executor/model/node/cache objects are stored.
 # Evicted on replacement write, component mismatch, or any validation
 # failure detected at read time.
 _V2_CERT_PROCESS_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
@@ -958,6 +961,7 @@ def _snapshot_target_fingerprint(
         "run_plan_stream": {"method": True, "is_generator": True},
         "run_prompt_stream": {"method": True, "is_generator": True},
         "publish_restore_plan": {"method": True, "is_generator": False},
+        "read_output_asset": {"method": True, "is_generator": False},
         "run_checkpoint_stream": {"method": True, "is_generator": True},
     }
 
@@ -1831,6 +1835,7 @@ class ModalRuntimeEntrypoint:
             comfyui_root="/root/comfy/ComfyUI",
             models_path=MODELS_PATH,
             custom_nodes_path=CUSTOM_NODES_PATH,
+            prescan_record_path=f"{RUNTIME_STATE_PATH}/prescan_custom_nodes.json",
             min_containers=MIN_CONTAINERS,
             scaledown_window=SCALEDOWN_WINDOW,
         )
@@ -3858,8 +3863,21 @@ class ModalRuntimeEntrypoint:
                         )
                         _diag_cert_identity_build_ms = round((time.perf_counter() - _cert_identity_build_start) * 1000, 3)
 
+                        # -- Snapshot-memory certificate check --
+                        if hasattr(self, 'bootstrap') and self.bootstrap is not None:
+                            _bs = getattr(self.bootstrap, 'state', None)
+                            if _bs is not None and _bs.snapshot_cert_valid:
+                                _sc = _bs.snapshot_certificate
+                                _sc_components = _sc.get("identity_components", {}) if isinstance(_sc, dict) else {}
+                                if _sc_components and _sc_components == _v2_cert_components:
+                                    if _v2_cert_identity:
+                                        print(
+                                            f"[v2.cert] source=snapshot_memory identity={_v2_cert_identity[:16]}",
+                                            flush=True,
+                                        )
+
                         # -- Process-local cache lookup --
-                        _cache_key = (getattr(self, "_restored_instance_id", ""), _v2_cert_identity)
+                        _cache_key = (self.container_session_id or _V2_CONTAINER_SESSION_ID, _v2_cert_identity)
                         _cached = _V2_CERT_PROCESS_CACHE.get(_cache_key)
                         _cached_valid = False
                         if _cached is not None:
@@ -4083,7 +4101,7 @@ class ModalRuntimeEntrypoint:
                 _v2_cert_preflight_skip = False
                 outputs_to_execute = []
                 node_errors = {}
-                _cache_key_inval = (getattr(self, "_restored_instance_id", ""), _v2_cert_identity)
+                _cache_key_inval = (self.container_session_id or _V2_CONTAINER_SESSION_ID, _v2_cert_identity)
                 _V2_CERT_PROCESS_CACHE.pop(_cache_key_inval, None)
                 _v2_preflight_ran = True
                 _pf_start2 = time.perf_counter()
@@ -4858,7 +4876,13 @@ class ModalRuntimeEntrypoint:
                         ) if hasattr(selected, "metrics") and isinstance(selected.metrics, Mapping) else False,
                     },
                 )
-            result = self._attempt_to_result(selected)
+            selected = self._persist_output_assets(selected)
+            if selected_index is not None:
+                attempts[selected_index] = selected
+            result = attempt_to_descriptor_result(
+                selected,
+                generation=_snapshot_target_fingerprint(),
+            )
             result["output_attempts"] = [
                 {
                     "strategy": attempt.strategy,
@@ -4994,6 +5018,64 @@ class ModalRuntimeEntrypoint:
             else:
                 images.append(entry)
         return {"images": images, "videos": videos, "outputs": outputs}
+
+    @staticmethod
+    def _persist_output_assets(attempt: Attempt) -> Attempt:
+        root = Path(RUNTIME_STATE_PATH, "output_assets")
+        root.mkdir(parents=True, exist_ok=True)
+        persisted = []
+        wrote = False
+        for item in attempt.items:
+            raw = item.raw_bytes
+            if not raw:
+                persisted.append(item)
+                continue
+            digest = hashlib.sha256(raw).hexdigest()
+            ext = item.file_ext if item.file_ext in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"} else ".bin"
+            relative_path = f"output_assets/{digest}{ext}"
+            target = Path(RUNTIME_STATE_PATH, relative_path)
+            if not target.exists():
+                temp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+                try:
+                    temp.write_bytes(raw)
+                    os.replace(temp, target)
+                    wrote = True
+                finally:
+                    try:
+                        temp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            persisted.append(dataclasses.replace(item, path=relative_path))
+        if wrote:
+            volume = globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume")
+            commit = getattr(volume, "commit", None)
+            if callable(commit):
+                commit()
+        return dataclasses.replace(attempt, items=tuple(persisted))
+
+    def read_output_asset(self, backend_path: str, expected_sha256: str = "") -> dict[str, Any]:
+        volume = globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume")
+        reload_volume = getattr(volume, "reload", None)
+        if callable(reload_volume):
+            reload_volume()
+        root = Path(RUNTIME_STATE_PATH, "output_assets").resolve()
+        candidate = Path(RUNTIME_STATE_PATH, str(backend_path or "")).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("invalid output asset path") from exc
+        if not candidate.is_file():
+            raise FileNotFoundError("output asset not found")
+        data = candidate.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        if expected_sha256 and digest != expected_sha256:
+            raise ValueError("output asset identity mismatch")
+        return {
+            "data": data,
+            "byte_count": len(data),
+            "sha256": digest,
+            "filename": candidate.name,
+        }
 
     async def run_plan_stream(
         self,
@@ -5627,7 +5709,7 @@ def _build_decorated_v2_class() -> type:
     _METHODS_TO_WRAP = (
         "startup", "restore",
         "run_plan_stream", "run_prompt_stream",
-        "publish_restore_plan", "run_checkpoint_stream",
+        "publish_restore_plan", "read_output_asset", "run_checkpoint_stream",
     )
     for _name in _METHODS_TO_WRAP:
         _orig = getattr(cls, _name)
@@ -5661,6 +5743,7 @@ def _build_decorated_v2_class() -> type:
     setattr(cls, "run_plan_stream", _modal.method(is_generator=True)(cls.run_plan_stream))
     setattr(cls, "run_prompt_stream", _modal.method(is_generator=True)(cls.run_prompt_stream))
     setattr(cls, "publish_restore_plan", _modal.method()(cls.publish_restore_plan))
+    setattr(cls, "read_output_asset", _modal.method()(cls.read_output_asset))
     setattr(cls, "run_checkpoint_stream", _modal.method(is_generator=True)(cls.run_checkpoint_stream))
     return cls
 

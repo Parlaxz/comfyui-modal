@@ -67,6 +67,7 @@ class BootstrapState:
     # SageAttention policy observability
     sage_mode: str = ""
     sage_reason: str = ""
+    sage_identity_captured: bool = False
     # Lane B — pre-scan generation identity (frozen at startup, reused at restore)
     prescan_runtime_generation: str = ""
     prescan_custom_node_generation: str = ""
@@ -392,7 +393,6 @@ class RuntimeBootstrap:
             record: dict[str, str] = read_prescan_generation_record(record_path)
             if record.get("generation"):
                 self.state.prescan_custom_node_generation = record["generation"]
-                self.state.prescan_custom_node_generation = record["generation"]
                 self.state.prescan_runtime_generation = record.get("content_hash", "")
                 self.state.prescan_record_path = record_path
                 print(
@@ -434,8 +434,8 @@ class RuntimeBootstrap:
             print(f"[bootstrap] snapshot_cert_build_error: {exc}", flush=True)
 
     def restore(self, *, trace: RuntimeTrace | None = None) -> BootstrapState:
-        started = time.time()
-        self.state.restore_started_at = started
+        started = time.perf_counter()
+        self.state.restore_started_at = time.time()
         # Lane B — try to restore pre-scan generation identity from persisted record
         self._try_restore_prescan_identity()
         # Phase 0/3 — capture identity/environment metadata at lifecycle entry
@@ -478,25 +478,45 @@ class RuntimeBootstrap:
                     },
                 )
 
-            if trace:
-                trace.emit("sage_policy_start", phase="restore")
-            if self.apply_sage_policy:
-                sage_result = self.apply_sage_policy()
-                if isinstance(sage_result, bool):
-                    self.state.sage_mode = "baked_cuda" if sage_result else "triton_fallback"
-                    self.state.sage_reason = "patched" if sage_result else "not-patched-or-not-found"
-                elif isinstance(sage_result, dict):
-                    self.state.sage_mode = str(sage_result.get("mode", ""))
-                    self.state.sage_reason = str(sage_result.get("reason", ""))
-            if trace:
-                trace.emit(
-                    "sage_policy_end",
-                    phase="restore",
-                    metadata={
-                        "sage_mode": self.state.sage_mode,
-                        "sage_reason": self.state.sage_reason,
-                    },
+            # ── Lane B: Sage exact-match fast path ──
+            # When sage_identity_captured is True, Sage was successfully applied
+            # during a previous restore in this container and the in-memory patch
+            # persists across restore cycles.  Skip the discovery/patch call
+            # when the environment (custom-node generation) is still consistent
+            # as proven by has_prescan_identity().
+            _skipped_sage = False
+            if self.state.sage_identity_captured and self.state.has_prescan_identity():
+                _skipped_sage = True
+                _check_ms = round((time.perf_counter() - started) * 1000, 3) if started else 0
+                print(
+                    f"[v2.sage_restore] decision=snapshot_exact_skip "
+                    f"discovery_called=0 check_ms={_check_ms}",
+                    flush=True,
                 )
+
+            if not _skipped_sage:
+                if trace:
+                    trace.emit("sage_policy_start", phase="restore")
+                if self.apply_sage_policy:
+                    sage_result = self.apply_sage_policy()
+                    if isinstance(sage_result, bool):
+                        self.state.sage_mode = "baked_cuda" if sage_result else "triton_fallback"
+                        self.state.sage_reason = "patched" if sage_result else "not-patched-or-not-found"
+                    elif isinstance(sage_result, dict):
+                        self.state.sage_mode = str(sage_result.get("mode", ""))
+                        self.state.sage_reason = str(sage_result.get("reason", ""))
+                    # Lane B: capture sage identity after successful application
+                    if self.state.sage_mode:
+                        self.state.sage_identity_captured = True
+                if trace:
+                    trace.emit(
+                        "sage_policy_end",
+                        phase="restore",
+                        metadata={
+                            "sage_mode": self.state.sage_mode,
+                            "sage_reason": self.state.sage_reason,
+                        },
+                    )
 
             if trace:
                 trace.emit("reload_runtime_state_start", phase="restore")
@@ -512,12 +532,27 @@ class RuntimeBootstrap:
             if trace:
                 trace.emit("reload_models_end", phase="restore")
 
-            if trace:
-                trace.emit("sync_custom_nodes_start", phase="restore")
-            if self.sync_custom_nodes:
-                self.sync_custom_nodes()
-            if trace:
-                trace.emit("sync_custom_nodes_end", phase="restore")
+            # ── Lane B: custom-node restore fast path ──
+            # When the prescan identity (frozen at startup) is present and
+            # was restored from the persisted record, the custom-node state
+            # is unchanged since snapshot time.  Skip the full sync.
+            _skipped_cn_sync = False
+            if self.state.has_prescan_identity() and self.sync_custom_nodes:
+                _skipped_cn_sync = True
+                _check_ms = round((time.perf_counter() - started) * 1000, 3) if started else 0
+                print(
+                    f"[v2.custom_node_restore] decision=snapshot_exact_skip "
+                    f"callback_called=0 check_ms={_check_ms}",
+                    flush=True,
+                )
+
+            if not _skipped_cn_sync:
+                if trace:
+                    trace.emit("sync_custom_nodes_start", phase="restore")
+                if self.sync_custom_nodes:
+                    self.sync_custom_nodes()
+                if trace:
+                    trace.emit("sync_custom_nodes_end", phase="restore")
 
             if trace:
                 trace.emit("observe_generations_start", phase="restore")

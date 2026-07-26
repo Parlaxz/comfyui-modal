@@ -553,6 +553,20 @@ async def run_prompt_stream(
                 pass
 
 
+async def read_output_asset(
+    backend_path: str,
+    *,
+    expected_sha256: str = "",
+    gpu: str | None = None,
+    workspace: dict | None = None,
+) -> dict:
+    selected = _resolve_workspace(workspace)
+    return await _workspace_api(selected, gpu).read_output_asset.remote.aio(
+        backend_path,
+        expected_sha256,
+    )
+
+
 async def run_checkpoint_stream(
     checkpoint_id: str,
     worker_invocation_id: str,

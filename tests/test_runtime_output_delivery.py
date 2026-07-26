@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import os
 import tempfile
 import time
@@ -84,9 +83,9 @@ class TestConversionMeta:
         raw = b"hello-image-bytes"
         meta = _make_conversion_meta(raw, "original", "image/png", ".png", 1.5)
         assert meta.raw_bytes == len(raw)
-        assert meta.base64_bytes == len(base64.b64encode(raw))
-        json_result = json.dumps({"data": base64.b64encode(raw).decode("ascii")}, separators=(",", ":")).encode("utf-8")
-        assert meta.json_result_bytes == len(json_result)
+        # Lane C: base64 is NOT constructed merely for metrics
+        assert meta.base64_bytes == 0
+        assert meta.json_result_bytes == 0
         assert meta.hash_of_raw == hashlib.sha256(raw).hexdigest()
         assert meta.conversion_time_ms == 1.5
 
@@ -98,9 +97,9 @@ class TestConversionMeta:
             elif ext == ".jpg":
                 raw = b"\xff\xd8\xff\xe0" + raw[4:]
             meta = _make_conversion_meta(raw, fmt, mime, ext, 2.0)
-            b64 = base64.b64encode(raw)
             assert meta.raw_bytes == len(raw)
-            assert meta.base64_bytes == len(b64)
+            # Lane C: base64 is NOT constructed merely for metrics
+            assert meta.base64_bytes == 0
             assert meta.mime_type == mime
             assert meta.file_ext == ext
             assert meta.format == fmt
@@ -222,7 +221,8 @@ class TestDirectOutputSink:
         sink = DirectOutputSink(registry=registry)
         attempt = sink.collect(prompt_id="p1", output_node_ids=("107",))
         assert attempt.total_raw_bytes == len(raw)
-        assert attempt.total_base64_bytes > 0
+        # Lane C: base64 is NOT constructed in descriptor mode (default)
+        assert attempt.total_base64_bytes == 0
         assert attempt.metrics.get("node_count") == 1
 
     def test_conversion_meta_preserved(self):

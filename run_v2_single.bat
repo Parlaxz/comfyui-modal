@@ -1,5 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
+for /f %%a in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()"') do set "COMMAND_START_MS=%%a"
 
 chcp 65001 >nul
 set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-shadow"
@@ -31,9 +32,14 @@ if !IDX! lss 2 (
 echo === Running one V2 benchmark trial against the existing deployment ===
 echo === Deploy first with deploy_and_run_v2_single.bat after source or env changes ===
 python tools\benchmark_v2_direct.py
-if errorlevel 1 (
+set "BENCHMARK_EXIT_CODE=!errorlevel!"
+for /f %%a in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()"') do set "COMMAND_END_MS=%%a"
+for /f %%a in ('powershell -NoProfile -Command "(([long]!COMMAND_END_MS! - [long]!COMMAND_START_MS!) / 1000.0).ToString('0.000', [Globalization.CultureInfo]::InvariantCulture)"') do set "COMMAND_ELAPSED_SECONDS=%%a"
+if !BENCHMARK_EXIT_CODE! geq 1 (
     echo === ERROR: Benchmark failed ===
+    echo === Total command-to-response time: !COMMAND_ELAPSED_SECONDS!s ===
     exit /b 1
 )
 echo === Single V2 benchmark completed ===
+echo === Total command-to-response time: !COMMAND_ELAPSED_SECONDS!s ===
 exit /b 0

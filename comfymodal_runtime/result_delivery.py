@@ -166,7 +166,10 @@ def build_materialized_output_entry(
         "height": remote_entry.get("height"),
         "format": remote_entry.get("format", ""),
         "output_index": remote_entry.get("output_index", fallback_index),
-        "byte_count": len(decoded_bytes),
+        "byte_count": len(decoded_bytes) if decoded_bytes else int(remote_entry.get("byte_count", 0) or 0),
+        "asset_id": remote_entry.get("asset_id", ""),
+        "identity": remote_entry.get("identity", ""),
+        "backend_path": remote_entry.get("backend_path", remote_entry.get("path", "")),
     }
 
 
@@ -303,6 +306,7 @@ def convert_output_items(
     webp_lossless_compression: str = "balanced",
     *,
     converter_fn: Callable | None = None,
+    include_base64: bool = True,
 ) -> ConversionBatchResult:
     """Convert a batch of OutputItems, recording per-item ConversionMeta.
 
@@ -374,7 +378,7 @@ def convert_output_items(
             filename=item.filename,
             path=item.path,
             raw_bytes=converted_bytes,
-            base64_data=base64.b64encode(converted_bytes).decode("ascii"),
+            base64_data=base64.b64encode(converted_bytes).decode("ascii") if include_base64 else "",
             mime_type=mime_type,
             file_ext=file_ext,
             width=item.width,
@@ -458,6 +462,7 @@ def materialize_modal_result(
     converter_fn: Callable | None = None,
     output_format: str = "original",
     require_output: bool = False,
+    remote_fetch_fn: Callable[[str, str], bytes] | None = None,
 ) -> dict:
     """Materialise a Modal result dict to the local filesystem.
 
@@ -520,11 +525,10 @@ def materialize_modal_result(
             decoded_bytes = b""
 
         is_video = output_key == "gifs" or (entry.get("format", "") in {"gif", "mp4", "webm"})
-        if has_data:
-            if is_video:
-                video_count += 1
-            else:
-                image_count += 1
+        if is_video:
+            video_count += 1
+        else:
+            image_count += 1
 
         native_entry = build_native_output_descriptor(local_filename)
         internal_entry = build_materialized_output_entry(
@@ -533,11 +537,13 @@ def materialize_modal_result(
             output_key=output_key,
             local_filename=local_filename,
             local_path=local_path,
-            decoded_bytes=decoded_bytes if decoded_bytes else (entry.get("byte_count", 0)).to_bytes(8, "big"),
+            decoded_bytes=decoded_bytes,
             fallback_index=fallback_index,
         )
 
         native_outputs.setdefault(str(node_id), {}).setdefault(output_key, []).append(native_entry)
+        if entry.get("asset_id"):
+            native_entry["asset_id"] = entry["asset_id"]
         materialized_outputs.setdefault(str(node_id), {}).setdefault(output_key, []).append(internal_entry)
 
         if is_video:
@@ -626,12 +632,28 @@ def materialize_modal_result(
             "file_ext": primary_entry.get("file_ext", ""),
             "output_index": primary_entry.get("output_index", 0),
             "byte_count": primary_entry.get("byte_count", 0),
+            "asset_id": primary_entry.get("asset_id", ""),
+            "backend_path": primary_entry.get("backend_path", ""),
         }
 
     # Auto-save primary output
     if auto_save_local and primary_output and primary_output.get("path"):
         try:
-            image_bytes = Path(primary_output["path"]).read_bytes()
+            local_path = Path(primary_output["path"])
+            if local_path.is_file():
+                image_bytes = local_path.read_bytes()
+            elif remote_fetch_fn is not None:
+                asset_id = primary_output.get("asset_id", "")
+                backend_path = primary_output.get("backend_path") or primary_output.get("path", "")
+                if asset_id:
+                    fetched = remote_fetch_fn(backend_path, asset_id)
+                    image_bytes = fetched
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    local_path.write_bytes(image_bytes)
+                else:
+                    raise FileNotFoundError(f"output not found locally and no asset_id: {primary_output['path']}")
+            else:
+                raise FileNotFoundError(f"output not found locally: {primary_output['path']}")
 
             if save_output_image_fn is None:
                 try:

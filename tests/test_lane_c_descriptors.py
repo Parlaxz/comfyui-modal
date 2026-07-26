@@ -339,7 +339,8 @@ class TestMaterializationWithDescriptors:
             assert "outputs" in summary
             assert "107" in summary["outputs"]
             assert summary["written_files"] == []
-            assert summary["image_count"] == 0  # no files written
+            assert summary["image_count"] == 1
+            assert summary["bytes_written"] == 0
             # Should still have history_outputs
             assert "history_outputs" in summary
             assert "107" in summary["history_outputs"]
@@ -383,7 +384,7 @@ class TestMaterializationWithDescriptors:
                 output_dir=tmp,
                 prompt_id="p1",
             )
-            assert summary["image_count"] == 1  # only the one with data
+            assert summary["image_count"] == 2
             assert len(summary["written_files"]) == 1
             assert os.path.exists(summary["written_files"][0])
             assert "with_data" in summary["written_files"][0]

@@ -252,7 +252,7 @@ class TestConvertOutputItems:
         assert result.converted_count == 1
         assert result.failed_count == 0
         assert result.total_raw_bytes == len(b"converted")
-        assert result.total_base64_bytes > 0
+        assert result.total_base64_bytes == 0
         assert result.total_conversion_time_ms == 2.0
 
     def test_conversion_failure_raises(self):

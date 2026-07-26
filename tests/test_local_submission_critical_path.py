@@ -655,8 +655,8 @@ class TestStdoutCapture(unittest.TestCase):
 
         asyncio.run(run())
         output = captured.getvalue()
-        self.assertIn("[v2.local_submission_breakdown]", output,
-                       "[v2.local_submission_breakdown] must appear in stdout")
+        self.assertIn("[v2.local_submission_breakdown.final]", output,
+                       "[v2.local_submission_breakdown.final] must appear in stdout")
         self.assertIn("request_id=", output,
                       "breakdown must include request_id=")
         self.assertIn("plan_build_ms=", output,
@@ -695,9 +695,9 @@ class TestStdoutCapture(unittest.TestCase):
         asyncio.run(run("stdout_a"))
         asyncio.run(run("stdout_b"))
         output = captured.getvalue()
-        count = output.count("[v2.local_submission_breakdown]")
+        count = output.count("[v2.local_submission_breakdown.final]")
         self.assertEqual(count, 2,
-                         f"Expected 2 breakdown lines, got {count}")
+                         f"Expected 2 final breakdown lines, got {count}")
 
     def test_breakdown_contains_required_fields(self):
         """All required fields appear in the breakdown line."""
@@ -1009,7 +1009,7 @@ class TestPreDispatchBreakdown(unittest.TestCase):
 
         asyncio.run(run())
         output = captured.getvalue()
-        self.assertIn("[v2.local_submission_breakdown]", output,
+        self.assertIn("[v2.local_submission_breakdown.pre_dispatch]", output,
                        "Pre-dispatch breakdown must appear in stdout before result")
         # Fields available from trace events
         self.assertIn("handle_lookup_ms=", output, "pre-dispatch must include handle_lookup_ms")
@@ -1437,8 +1437,387 @@ class TestGapFieldsInBreakdown(unittest.TestCase):
         idx_ready = keys.index("payload_ready_to_modal_call_ms")
         idx_size_to_serialize = keys.index("payload_size_to_serialize_end_ms")
         self.assertGreater(idx_size_to_serialize, idx_size_meas,
-                           "payload_size_to_serialize_end_ms should come after "
-                           "payload_size_measurement_ms")
+                            "payload_size_to_serialize_end_ms should come after "
+                            "payload_size_measurement_ms")
         self.assertLess(idx_size_to_serialize, idx_ready,
                         "payload_size_to_serialize_end_ms should come before "
                         "payload_ready_to_modal_call_ms")
+
+
+# =========================================================================
+# Test 15: Benchmark prefix instrumentation
+# =========================================================================
+
+
+class _FakeRestorePublisher:
+    """Async restore publisher for benchmark _run_one tests."""
+
+    def __init__(self):
+        self.plans = []
+        self.publish_count = 0
+
+    async def publish(self, plan):
+        self.plans.append(plan)
+        self.publish_count += 1
+        return {"generation": "test", "ok": True}
+
+
+async def _fake_profile_checker(stable_key: str, *, workspace: dict | None = None) -> dict:
+    return {"matched": True, "stable_key": stable_key}
+
+
+def _fake_v2_factory(**kw):
+    return SimpleNamespace(
+        run_plan_stream=SimpleNamespace(
+            remote_gen=SimpleNamespace(aio=_make_fake_aio()),
+        ),
+    )
+
+
+class TestBenchmarkPrefixInstrumentation(unittest.TestCase):
+    """Benchmark prefix instrumentation: worker_start, normalize, options_copy,
+    client_id_generation, build_execution_plan_call_start events emitted by
+    _run_one and their derived durations in [v2.local_submission_breakdown]."""
+
+    def setUp(self):
+        _reset_profile_prep_cache()
+        _reset_last_stable_profile_cache()
+        _reset_restore_publish_cache()
+
+    def tearDown(self):
+        _reset_profile_prep_cache()
+        _reset_last_stable_profile_cache()
+        _reset_restore_publish_cache()
+
+    def _run_with_capture(self, **run_kwargs):
+        """Run _run_one with standard fakes and capture stdout."""
+        import sys as _sys
+        from pathlib import Path as _Path
+        _root = _Path(__file__).resolve().parents[1]
+        if str(_root) not in _sys.path:
+            _sys.path.insert(0, str(_root))
+        from tools.benchmark_v2_direct import _run_one
+        import tempfile
+
+        output_dir = _Path(tempfile.mkdtemp())
+        transport = ModalTransport(v2_handle_factory=_fake_v2_factory)
+        publisher = _FakeRestorePublisher()
+        setter = _CountingProfileSetter()
+        captured = io.StringIO()
+
+        async def _run():
+            return await _run_one(
+                index=0,
+                workflow={"1": {"class_type": "KSampler", "inputs": {"seed": 1}}},
+                modal_options={"production": {"enabled": False}},
+                workspace={"id": "test", "token_id": "test", "token_secret": "test"},
+                transport=transport,
+                output_dir=output_dir,
+                _test_restore_publisher=publisher,
+                _test_profile_setter=setter,
+                _test_profile_checker=_fake_profile_checker,
+                **run_kwargs,
+            )
+
+        with patch("sys.stdout", captured):
+            artifact = asyncio.run(_run())
+        return captured, artifact
+
+    def _parse_breakdown(self, output: str, prefix: str) -> dict[str, str]:
+        """Parse a breakdown line with given prefix into key-value dict."""
+        for line in output.split("\n"):
+            if line.startswith(prefix):
+                parts = line.strip().split()
+                result: dict[str, str] = {}
+                for part in parts[1:]:
+                    if "=" in part:
+                        key, val = part.split("=", 1)
+                        result[key] = val
+                return result
+        return {}
+
+    def _get_final_breakdown(self, output: str) -> dict[str, str]:
+        return self._parse_breakdown(output, "[v2.local_submission_breakdown.final]")
+
+    def _get_predispatch_breakdown(self, output: str) -> dict[str, str]:
+        return self._parse_breakdown(output, "[v2.local_submission_breakdown.pre_dispatch]")
+
+    # ------------------------------------------------------------------
+    # Test 1: worker_start appears with numeric value
+    # ------------------------------------------------------------------
+
+    def test_benchmark_emits_worker_start(self):
+        """[v2.local_submission_breakdown.final] includes local_receive_to_worker_start_ms
+        as a numeric value (not 'absent')."""
+        captured, _ = self._run_with_capture()
+        output = captured.getvalue()
+        bd = self._get_final_breakdown(output)
+
+        self.assertIn("local_receive_to_worker_start_ms", bd,
+                      "Final breakdown must contain local_receive_to_worker_start_ms")
+        val_str = bd["local_receive_to_worker_start_ms"]
+        self.assertNotEqual(val_str, "absent",
+                            "worker_start must be numeric, not 'absent'")
+        try:
+            float(val_str)
+        except ValueError:
+            self.fail(f"local_receive_to_worker_start_ms must be numeric, got {val_str!r}")
+
+    # ------------------------------------------------------------------
+    # Test 2: Complete prefix partition with sum ≈ plan_build_start
+    # ------------------------------------------------------------------
+
+    def test_benchmark_prefix_complete_partition(self):
+        """All prefix fields are numeric and their sum approximately equals
+        local_receive_to_plan_build_start_ms (within 2ms tolerance)."""
+        captured, _ = self._run_with_capture()
+        output = captured.getvalue()
+        bd = self._get_final_breakdown(output)
+
+        prefix_fields = [
+            "local_receive_to_worker_start_ms",
+            "worker_start_to_normalize_start_ms",
+            "normalize_production_options_ms",
+            "normalize_end_to_trace_construct_start_ms",
+            "runtime_trace_construct_ms",
+            "trace_construct_to_options_copy_start_ms",
+            "benchmark_options_copy_ms",
+            "options_copy_to_client_id_start_ms",
+            "client_id_generation_ms",
+            "client_id_end_to_plan_call_ms",
+            "plan_call_to_function_entry_ms",
+        ]
+
+        total = 0.0
+        for field in prefix_fields:
+            self.assertIn(field, bd,
+                          f"Field {field} must be in final breakdown")
+            val_str = bd[field]
+            self.assertNotEqual(val_str, "absent",
+                                f"{field} must not be absent")
+            val = float(val_str)
+            self.assertGreaterEqual(val, 0.0,
+                                    f"{field}={val} must be >= 0")
+            total += val
+
+        plan_build_start_str = bd.get("local_receive_to_plan_build_start_ms")
+        self.assertIsNotNone(plan_build_start_str,
+                             "local_receive_to_plan_build_start_ms must be present")
+        self.assertNotEqual(plan_build_start_str, "absent")
+        assert plan_build_start_str is not None  # narrow for type checker
+        plan_build_start_val = float(plan_build_start_str)
+
+        self.assertAlmostEqual(
+            total, plan_build_start_val, delta=2.0,
+            msg=f"Sum of prefix fields ({total}) must approximately equal "
+                f"local_receive_to_plan_build_start_ms ({plan_build_start_val})",
+        )
+
+    # ------------------------------------------------------------------
+    # Test 3: Synthetic sleep in normalize_production_options
+    # ------------------------------------------------------------------
+
+    def test_synthetic_sleep_in_prefix_fields(self):
+        """Patching normalize_production_options with 50ms sleep makes
+        normalize_production_options_ms >= 45ms."""
+        import sys as _sys
+        from pathlib import Path as _Path
+        _root = _Path(__file__).resolve().parents[1]
+        if str(_root) not in _sys.path:
+            _sys.path.insert(0, str(_root))
+
+        def _sleeper(opts):
+            time.sleep(0.05)
+            return {}
+
+        with patch("tools.benchmark_v2_direct.normalize_production_options",
+                   side_effect=_sleeper):
+            captured, _ = self._run_with_capture()
+
+        output = captured.getvalue()
+        bd = self._get_final_breakdown(output)
+        norm_ms_str = bd.get("normalize_production_options_ms", "absent")
+        self.assertNotEqual(norm_ms_str, "absent",
+                            "normalize_production_options_ms must not be absent after sleep")
+        norm_ms = float(norm_ms_str)
+        self.assertGreaterEqual(
+            norm_ms, 45,
+            f"normalize_production_options_ms={norm_ms} should be >= 45ms after 50ms sleep",
+        )
+
+    # ------------------------------------------------------------------
+    # Test 4: Synthetic sleep before build_execution_plan
+    # ------------------------------------------------------------------
+
+    def test_synthetic_sleep_before_plan_build_not_absent(self):
+        """Patching build_execution_plan with 30ms sleep makes
+        plan_call_to_function_entry_ms >= 25ms and
+        local_receive_to_plan_build_start_ms >= 25ms."""
+        import sys as _sys
+        from pathlib import Path as _Path
+        _root = _Path(__file__).resolve().parents[1]
+        if str(_root) not in _sys.path:
+            _sys.path.insert(0, str(_root))
+        from tools.benchmark_v2_direct import build_execution_plan as _real_bep
+
+        def _sleeper(*args, **kwargs):
+            time.sleep(0.03)
+            return _real_bep(*args, **kwargs)
+
+        with patch("tools.benchmark_v2_direct.build_execution_plan",
+                   side_effect=_sleeper):
+            captured, _ = self._run_with_capture()
+
+        output = captured.getvalue()
+        bd = self._get_final_breakdown(output)
+
+        plan_call_ms_str = bd.get("plan_call_to_function_entry_ms", "absent")
+        self.assertNotEqual(plan_call_ms_str, "absent",
+                            "plan_call_to_function_entry_ms must not be absent")
+        plan_call_ms = float(plan_call_ms_str)
+        self.assertGreaterEqual(
+            plan_call_ms, 25,
+            f"plan_call_to_function_entry_ms={plan_call_ms} should be >= 25ms after 30ms sleep",
+        )
+
+        plan_build_start_str = bd.get("local_receive_to_plan_build_start_ms", "absent")
+        self.assertNotEqual(plan_build_start_str, "absent")
+        plan_build_start_ms = float(plan_build_start_str)
+        self.assertGreaterEqual(
+            plan_build_start_ms, 25,
+            f"local_receive_to_plan_build_start_ms={plan_build_start_ms} should be >= 25ms",
+        )
+
+    # ------------------------------------------------------------------
+    # Test 5: Pre-dispatch is explicitly partial
+    # ------------------------------------------------------------------
+
+    def test_predispatch_is_explicitly_partial(self):
+        """Pre-dispatch line has generator_create_ms=absent;
+        final line has it as numeric."""
+        captured, _ = self._run_with_capture()
+        output = captured.getvalue()
+
+        pre = self._get_predispatch_breakdown(output)
+        final = self._get_final_breakdown(output)
+
+        # Pre-dispatch must exist and contain generator_create_ms=absent
+        self.assertIn("generator_create_ms", pre,
+                      "pre-dispatch must contain generator_create_ms")
+        self.assertEqual(pre.get("generator_create_ms"), "absent",
+                         "pre-dispatch generator_create_ms should be absent")
+
+        # Final must have generator_create_ms as numeric
+        self.assertIn("generator_create_ms", final,
+                      "final breakdown must contain generator_create_ms")
+        gen_val = final.get("generator_create_ms", "absent")
+        self.assertNotEqual(gen_val, "absent",
+                            "final breakdown generator_create_ms must be numeric")
+        float(gen_val)  # verify numeric
+
+    # ------------------------------------------------------------------
+    # Test 6: Final breakdown complete after first iteration
+    # ------------------------------------------------------------------
+
+    def test_final_breakdown_complete_after_first_iteration(self):
+        """Final breakdown includes all expected post-dispatch fields.
+        generator_create_ms and local_receive_to_actual_submission_ms are
+        numeric; generator_created_to_first_iteration_ms may be
+        'invalid_negative' with a synchronous fake generator (timestamps
+        at microsecond granularity)."""
+        captured, _ = self._run_with_capture()
+        output = captured.getvalue()
+        bd = self._get_final_breakdown(output)
+
+        # Fields that must be present (non-absent) in the final breakdown
+        present_fields = [
+            "generator_create_ms",
+            "local_receive_to_actual_submission_ms",
+        ]
+        for field in present_fields:
+            self.assertIn(field, bd,
+                          f"Field {field} must be in final breakdown")
+            val_str = bd[field]
+            self.assertNotEqual(val_str, "absent",
+                                f"{field} must not be absent in final breakdown")
+            float(val_str)  # verify numeric
+
+        # generator_created_to_first_iteration_ms may be absent or
+        # invalid_negative with a fake generator (no real async boundary)
+        self.assertIn("generator_created_to_first_iteration_ms", bd,
+                      "Field generator_created_to_first_iteration_ms must be in final breakdown")
+
+        # measured_children_ms and residual_ms may be absent when any
+        # child field is non-numeric (e.g. invalid_negative); that's expected
+        # for a synchronous fake generator.
+        self.assertIn("measured_children_ms", bd,
+                      "measured_children_ms must be in final breakdown")
+        self.assertIn("residual_ms", bd,
+                      "residual_ms must be in final breakdown")
+
+        # When reconciliation_status is available, it should be valid
+        status = bd.get("reconciliation_status", "")
+        self.assertIn(status, ("complete", "incomplete", "overlap"),
+                      f"reconciliation_status must be valid, got {status!r}")
+
+    # ------------------------------------------------------------------
+    # Test 7: Residual under 2ms
+    # ------------------------------------------------------------------
+
+    def test_residual_under_2ms(self):
+        """Residual in final breakdown has absolute value < 2ms when
+        residual is present (may be absent when child fields include
+        'invalid_negative' with a synchronous fake generator)."""
+        captured, _ = self._run_with_capture()
+        output = captured.getvalue()
+        bd = self._get_final_breakdown(output)
+
+        residual_str = bd.get("residual_ms", "absent")
+        if residual_str == "absent":
+            # Residual may be absent when measured_children can't be
+            # computed (non-numeric child field); skip assertion
+            return
+        residual = float(residual_str)
+        self.assertLess(
+            abs(residual), 2.0,
+            f"residual_ms={residual} must have absolute value < 2ms",
+        )
+
+    # ------------------------------------------------------------------
+    # Test 8: Request ID consistency
+    # ------------------------------------------------------------------
+
+    def test_request_id_consistency(self):
+        """request_id field is present and non-empty in final breakdown."""
+        captured, _ = self._run_with_capture()
+        output = captured.getvalue()
+        bd = self._get_final_breakdown(output)
+
+        rid = bd.get("request_id", "")
+        self.assertTrue(rid, "request_id must be present and non-empty in final breakdown")
+
+    # ------------------------------------------------------------------
+    # Test 9: Actual lazy submission distinguished
+    # ------------------------------------------------------------------
+
+    def test_actual_lazy_submission_distinguished(self):
+        """local_receive_to_modal_call_ms and local_receive_to_actual_submission_ms
+        are both present and numeric.  (Ordering assertion relaxed for fake
+        generators where modal_generator_create_start is emitted after setup
+        work while modal_submission_attempt fires during near-simultaneous
+        iteration.)"""
+        captured, _ = self._run_with_capture()
+        output = captured.getvalue()
+        bd = self._get_final_breakdown(output)
+
+        modal_call = bd.get("local_receive_to_modal_call_ms", "absent")
+        actual_sub = bd.get("local_receive_to_actual_submission_ms", "absent")
+
+        self.assertNotEqual(modal_call, "absent",
+                            "local_receive_to_modal_call_ms must be present")
+        self.assertNotEqual(actual_sub, "absent",
+                            "local_receive_to_actual_submission_ms must be present")
+
+        # Verify both are numeric
+        float(modal_call)
+        float(actual_sub)

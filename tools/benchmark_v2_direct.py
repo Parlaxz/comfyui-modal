@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -135,6 +136,11 @@ def _timing(result: dict[str, Any], wall_ms: float) -> dict[str, Any]:
     }
 
 
+def _capture_ts() -> tuple[int, int]:
+    """Return (wall_unix_ns, monotonic_ns) snapshot."""
+    return (int(time.time() * 1_000_000_000), time.monotonic_ns())
+
+
 async def _run_one(
     *,
     index: int,
@@ -144,14 +150,17 @@ async def _run_one(
     transport: ModalTransport,
     output_dir: Path,
     bypass_cpu_snapshot_unet: bool = False,
+    # Test overrides (injected helpers, not used in production)
+    _test_restore_publisher: Any = None,
+    _test_profile_setter: Any = None,
+    _test_profile_checker: Any = None,
 ) -> dict[str, Any]:
     # T0: benchmark iteration origin (literal first line)
     _req_id = f"v2-benchmark-{index}-{uuid.uuid4().hex[:12]}"
     _t0_wall_ms = int(time.time() * 1000)
     _t0_perf = time.perf_counter()
     # T1: local receive (this runner is itself the local receiver)
-    _t1_wall_ns = int(time.time() * 1_000_000_000)
-    _t1_mono_ns = time.monotonic_ns()
+    _t1_wall_ns, _t1_mono_ns = _capture_ts()
     request_origin_info = {
         "request_id": _req_id,
         "trigger_source": "benchmark",
@@ -161,8 +170,56 @@ async def _run_one(
         "local_receive_mono_ns": _t1_mono_ns,
     }
     prompt_id = _req_id  # request_id == prompt_id
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Prefix timestamp capture: worker_start → plan_build_start
+    #
+    # Events are captured as (wall_unix_ns, monotonic_ns) tuples BEFORE the
+    # RuntimeTrace exists, then emitted via emit_at() after trace creation.
+    # This yields a strict non-overlapping partition:
+    #
+    #   ws [gap1] norm_start [normalize] norm_end [gap2] rtc_start [construct]
+    #   rtc_end [gap3] bc_start [copy] bc_end [gap4] cid_start [gen] cid_end
+    #   [gap5] bep_call [args] plan_build_start
+    #
+    # Each gap/span maps to exactly one breakdown field.
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # T_worker: first executable boundary (no queue)
+    _ws_ts = _capture_ts()
+
+    # T_normalize_start / T_normalize_end
+    _norm_ts = _capture_ts()
     production_options = normalize_production_options(modal_options)
-    # ── Plan C UNET A/B diagnostic: inject bypass flag when requested ────
+    _norm_end_ts = _capture_ts()
+
+    # T_trace_construct_start / T_trace_construct_end
+    _rtc_start_ts = _capture_ts()
+    runtime_trace = RuntimeTrace(request_id=prompt_id, process="local")
+    runtime_trace.set_metadata(request_origin_info=request_origin_info)
+    _rtc_end_ts = _capture_ts()
+
+    # ── Emit all captured timestamps in temporal order ──
+    runtime_trace.emit_at("worker_start",
+        wall_unix_ns=_ws_ts[0], monotonic_ns=_ws_ts[1],
+        phase="local", metadata={
+            "pid": os.getpid(),
+            "thread_native_id": threading.get_native_id(),
+            "request_id": _req_id,
+        })
+    runtime_trace.emit_at("normalize_production_options_start",
+        wall_unix_ns=_norm_ts[0], monotonic_ns=_norm_ts[1], phase="local")
+    runtime_trace.emit_at("normalize_production_options_end",
+        wall_unix_ns=_norm_end_ts[0], monotonic_ns=_norm_end_ts[1], phase="local")
+    runtime_trace.emit_at("runtime_trace_construct_start",
+        wall_unix_ns=_rtc_start_ts[0], monotonic_ns=_rtc_start_ts[1], phase="local")
+    runtime_trace.emit_at("trace_construct_end",
+        wall_unix_ns=_rtc_end_ts[0], monotonic_ns=_rtc_end_ts[1], phase="local")
+
+    # T_benchmark_options_copy_start / T_benchmark_options_copy_end
+    _bc_ts = _capture_ts()
+    runtime_trace.emit_at("benchmark_options_copy_start",
+        wall_unix_ns=_bc_ts[0], monotonic_ns=_bc_ts[1], phase="local")
     _bench_modal_options = dict(modal_options)
     if bypass_cpu_snapshot_unet:
         _existing_flags = _bench_modal_options.get("compatibility_flags", {})
@@ -171,12 +228,27 @@ async def _run_one(
         else:
             _bench_modal_options["compatibility_flags"] = {}
         _bench_modal_options["compatibility_flags"]["diagnostic_bypass_cpu_snapshot_unet"] = True
-    runtime_trace = RuntimeTrace(request_id=prompt_id, process="local")
-    runtime_trace.set_metadata(request_origin_info=request_origin_info)
+    _bc_end_ts = _capture_ts()
+    runtime_trace.emit_at("benchmark_options_copy_end",
+        wall_unix_ns=_bc_end_ts[0], monotonic_ns=_bc_end_ts[1], phase="local")
+
+    # T_client_id_generation_start / T_client_id_generation_end
+    _cid_ts = _capture_ts()
+    runtime_trace.emit_at("client_id_generation_start",
+        wall_unix_ns=_cid_ts[0], monotonic_ns=_cid_ts[1], phase="local")
+    _bench_client_id = f"v2-benchmark-client-{uuid.uuid4().hex[:8]}"
+    _cid_end_ts = _capture_ts()
+    runtime_trace.emit_at("client_id_generation_end",
+        wall_unix_ns=_cid_end_ts[0], monotonic_ns=_cid_end_ts[1], phase="local")
+
+    # T_build_execution_plan_call_start
+    _bep_call_ts = _capture_ts()
+    runtime_trace.emit_at("build_execution_plan_call_start",
+        wall_unix_ns=_bep_call_ts[0], monotonic_ns=_bep_call_ts[1], phase="local")
     plan = build_execution_plan(
         workflow,
         prompt_id=prompt_id,
-        client_id=f"v2-benchmark-client-{uuid.uuid4().hex[:8]}",
+        client_id=_bench_client_id,
         modal_options=_bench_modal_options,
         production_options=production_options if production_options.get("enabled") else None,
         gpu=GPU,
@@ -186,16 +258,23 @@ async def _run_one(
         trace=runtime_trace,
         validate=False,
     )
+
     _mode = "bypass" if bypass_cpu_snapshot_unet else "reuse"
     print(f"cpu_snapshot_unet_mode={_mode}", flush=True)
+
+    # ── execute_plan call ─────────────────────────────────────────────────
+    _ep_call_wall_ns, _ep_call_mono_ns = _capture_ts()
+    runtime_trace.emit_at("execute_plan_call_start",
+        wall_unix_ns=_ep_call_wall_ns, monotonic_ns=_ep_call_mono_ns,
+        phase="local")
     started = time.perf_counter()
     print("[v2.benchmark] phase=execute_plan_start", flush=True)
     result = await execute_plan(
         plan,
         transport=transport,
-        restore_publisher=RemoteRestorePlanPublisher(transport, workspace),
-        profile_setter=set_active_warmup_profile,
-        profile_checker=check_active_warmup_profile,
+        restore_publisher=_test_restore_publisher if _test_restore_publisher is not None else RemoteRestorePlanPublisher(transport, workspace),
+        profile_setter=_test_profile_setter if _test_profile_setter is not None else set_active_warmup_profile,
+        profile_checker=_test_profile_checker if _test_profile_checker is not None else check_active_warmup_profile,
         gpu=GPU,
         workspace=workspace,
         trace=runtime_trace,
