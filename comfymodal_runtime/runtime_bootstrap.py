@@ -591,7 +591,7 @@ class BootstrapState:
 
             # 7. Insert into outputs cache
             try:
-                _outputs_list = list(_out) if isinstance(_out, (tuple, list)) else [_out]
+                _outputs_list = [[v] for v in _out] if isinstance(_out, (tuple, list)) else [[_out]]
                 _entry_obj = (
                     _CacheEntry(ui={}, outputs=_outputs_list)
                     if _CacheEntry is not None

@@ -717,6 +717,18 @@ def _check_acceptance(
     """
     failures: list[str] = []
 
+    # ── Unwrap artifact['result'] for trace/event inspection ──
+    # In production acceptance mode, this function receives the artifact wrapper
+    # (keys: identity, images, timing, asset_proofs, result).  The actual remote
+    # result with the 'trace' key lives at result['result'].
+    # Unwrap transparently so both direct (unit-test flat dict) and wrapped
+    # (production artifact) callers work — trace/event helpers see the raw result.
+    _ev_result: dict[str, Any] = result
+    if isinstance(result, dict):
+        _inner = result.get("result")
+        if isinstance(_inner, dict) and "trace" in _inner:
+            _ev_result = _inner
+
     # ── Identity checks ──
     identity = result.get("identity", {})
     restored_instance_id = str(identity.get("restored_instance_id", ""))
@@ -838,56 +850,110 @@ def _check_acceptance(
         # Informational — not a blocking check since clip load is a restore-stage
         # operation and may be per-container rather than per-request.
 
-        # Certificate source snapshot_memory (check trace for cert build events)
-        _trace = result.get("trace", {})
-        _events = _trace.get("events", []) if isinstance(_trace, dict) else []
-        _has_snapshot_cert = any(
-            isinstance(ev, dict) and ev.get("name") == "v2_cert_written"
-            for ev in _events
-        )
-        if not _has_snapshot_cert:
-            # Less strict: check execution_plan metadata for cert_identity
-            pass  # cert source check informative, not blocking
+        # ── UNET/CLIP/VAE seeded check from seed_loader_cache_signatures evidence ──
+        # Require executor_loader_cache_seed_end event containing diagnostics from
+        # seed_loader_cache_signatures().  Every fresh request must have exactly
+        # one non-conflicting decision per role: unet=seeded, clip=seeded,
+        # vae=missing_snapshot_output.
+        _seed_ev = _trace_event(_ev_result, "executor_loader_cache_seed_end")
+        if _seed_ev is None:
+            failures.append(
+                f"{run_label}: seed_loader_cache_signatures evidence missing "
+                "(no executor_loader_cache_seed_end trace event)"
+            )
+        else:
+            _seed_meta = _event_metadata(_seed_ev, "diagnostics", {})
+            if not isinstance(_seed_meta, dict) or not _seed_meta:
+                failures.append(f"{run_label}: seed diagnostics empty or absent")
+            else:
+                # Collect decisions per role
+                role_decisions: dict[str, list[str]] = {}
+                role_node_ids: dict[str, list[str]] = {}
+                for node_id, decision in _seed_meta.items():
+                    if not isinstance(decision, dict):
+                        continue
+                    role = decision.get("role", "")
+                    dec = decision.get("decision", "")
+                    if role:
+                        role_decisions.setdefault(role, []).append(dec)
+                        role_node_ids.setdefault(role, []).append(node_id)
 
-        # UNET/CLIP seeded check from seed decisions
-        if isinstance(_trace, dict):
-            for ev in _events:
-                if isinstance(ev, dict) and ev.get("name") == "seed_loader_cache_signatures":
-                    meta = ev.get("metadata", {})
-                    if isinstance(meta, dict):
-                        for node_id, decision in meta.items():
-                            if isinstance(decision, dict):
-                                role = decision.get("role", "")
-                                dec = decision.get("decision", "")
-                                if role == "unet" and dec != "seeded":
-                                    failures.append(f"{run_label}: UNET not seeded ({dec})")
-                                if role == "clip" and dec != "seeded":
-                                    failures.append(f"{run_label}: CLIP not seeded ({dec})")
-                                if role == "vae" and dec != "missing_snapshot_output":
-                                    failures.append(f"{run_label}: VAE not missing_snapshot_output ({dec})")
+                # Each required role must be present
+                for role in ("unet", "clip", "vae"):
+                    if role not in role_decisions:
+                        failures.append(
+                            f"{run_label}: no {role} decision in seed evidence "
+                            f"(present roles: {sorted(role_decisions)})"
+                        )
 
-        # exec_start_to_cached <= 500ms
+                # No conflicting decisions within a role
+                for role, decisions in role_decisions.items():
+                    unique = set(decisions)
+                    if len(unique) > 1:
+                        failures.append(
+                            f"{run_label}: conflicting {role} decisions: "
+                            f"{dict(zip(role_node_ids[role], decisions))}"
+                        )
+
+                # Verify expected decision values for known roles
+                _EXPECTED: dict[str, str] = {
+                    "unet": "seeded",
+                    "clip": "seeded",
+                    "vae": "missing_snapshot_output",
+                }
+                for role, expected in _EXPECTED.items():
+                    if role in role_decisions:
+                        actual = role_decisions[role][0]
+                        if actual != expected:
+                            failures.append(
+                                f"{run_label}: {role} decision={actual!r}, "
+                                f"expected={expected!r}"
+                            )
+
+        # exec_start_to_cached_ms must be present; threshold <= 500ms
         _esc = timing.get("exec_start_to_cached_ms")
-        if isinstance(_esc, (int, float)) and _esc > 500:
+        if not isinstance(_esc, (int, float)):
+            failures.append(
+                f"{run_label}: exec_start_to_cached_ms missing/absent ({_esc})"
+            )
+        elif _esc > 500:
             failures.append(f"{run_label}: exec_start_to_cached_ms={_esc} > 500")
 
-        # sampler_node_to_sampler_start <= 1000ms
+        # sampler_node_to_sampler_start_ms must be present; threshold <= 1000ms
         _snss = timing.get("sampler_node_to_sampler_start_ms")
-        if isinstance(_snss, (int, float)) and _snss > 1000:
+        if not isinstance(_snss, (int, float)):
+            failures.append(
+                f"{run_label}: sampler_node_to_sampler_start_ms missing/absent ({_snss})"
+            )
+        elif _snss > 1000:
             failures.append(f"{run_label}: sampler_node_to_sampler_start_ms={_snss} > 1000")
 
-        # Exactly 8 steps
-        _sampling_end = _trace_event(result, "sampling_end")
+        # Require authoritative sampling_start and sampling_end events
+        _sampling_start = _trace_event(_ev_result, "sampling_start")
+        _sampling_end = _trace_event(_ev_result, "sampling_end")
+        if _sampling_start is None:
+            failures.append(f"{run_label}: sampling_start event missing")
+        if _sampling_end is None:
+            failures.append(f"{run_label}: sampling_end event missing")
+
+        # Exactly 8 sigma-derived wrapper steps
         if _sampling_end is not None:
             _steps = _event_metadata(_sampling_end, "steps", None)
-            if _steps is not None and _steps != 8:
+            if _steps is None:
+                failures.append(
+                    f"{run_label}: steps not found on sampling_end event"
+                )
+            elif _steps != 8:
                 failures.append(f"{run_label}: steps={_steps}, expected 8")
 
-        # Sampling ends before VAE: sampling_end monotonic_ns < vae_decode_start
-        _ss_ns = _event_mono_ns(result, "sampling_end")
-        _vd_ns = _event_mono_ns(result, "vae_decode_start")
-        if _ss_ns is not None and _vd_ns is not None and _ss_ns >= _vd_ns:
-            failures.append(f"{run_label}: sampling_end ({_ss_ns}) >= vae_decode_start ({_vd_ns})")
+        # Sampling ends before VAE decode starts
+        _ss_ns = _event_mono_ns(_ev_result, "sampling_end")
+        _vd_ns = _event_mono_ns(_ev_result, "vae_decode_start")
+        if _ss_ns is not None and _vd_ns is not None:
+            if _ss_ns >= _vd_ns:
+                failures.append(
+                    f"{run_label}: sampling_end ({_ss_ns}) >= vae_decode_start ({_vd_ns})"
+                )
 
     # ── Reused request (B) specific checks ──
     # B must share A's restored_instance_id (same container, no new restore).
@@ -902,7 +968,7 @@ def _check_acceptance(
         # Lifecycle event check: count request-scoped events with names indicating
         # a restore lifecycle ran during this request.
         _req_id = str(identity.get("request_id", ""))
-        _lifecycle_events = _trace_events_for_request(result, _req_id)
+        _lifecycle_events = _trace_events_for_request(_ev_result, _req_id)
         _restore_lifecycle = [
             ev for ev in _lifecycle_events
             if isinstance(ev, dict) and ev.get("name", "") in (

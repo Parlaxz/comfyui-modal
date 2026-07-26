@@ -998,6 +998,42 @@ class CpuSnapshotSpecProjectionTests(unittest.TestCase):
         self.assertEqual(proj["unet"][0]["unet_name"], "m.safetensors")
         self.assertEqual(proj["unet"][0]["weight_dtype"], "fp16")
 
+    def test_dict_vs_mappingproxy_spec_match(self):
+        """Plain dict request spec matches MappingProxyType snapshot spec."""
+        request_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "m.safetensors", "weight_dtype": "fp16"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        snap_spec = MappingProxyType({
+            "loaders": MappingProxyType({
+                "unet": [MappingProxyType({"loader_class": "UNETLoader", "unet_name": "m.safetensors", "weight_dtype": "fp16"})],
+                "clip": [MappingProxyType({"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"})],
+            }),
+        })
+        self.assertTrue(
+            _cpu_snapshot_specs_match(request_spec, snap_spec),
+            "dict request spec must match MappingProxyType snapshot spec via projection",
+        )
+
+    def test_dict_vs_mappingproxy_key_match(self):
+        """Plain dict restore key matches ModelRestoreKey (frozen dataclass)."""
+        req_key = ModelRestoreKey(
+            unet_identity="u.safetensors",
+            clip_identity="c.safetensors",
+            clip_type="sd3",
+        )
+        snap_key = ModelRestoreKey(
+            unet_identity="u.safetensors",
+            clip_identity="c.safetensors",
+            clip_type="sd3",
+        )
+        self.assertTrue(
+            _cpu_snapshot_model_keys_match(req_key, snap_key),
+            "key match must succeed for identical identity fields",
+        )
+
 
 # ── Model key matching tests (non-VAE) ──────────────────────────────
 
@@ -1817,6 +1853,42 @@ class CpuSnapshotVariantCMismatchReasonTests(unittest.TestCase):
         spec_a = {"loaders": {"unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}], "clip": []}}
         spec_b = {"loaders": {"unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}, {"loader_class": "UNETLoader", "unet_name": "u2.safetensors", "weight_dtype": "default"}], "clip": []}}
         self.assertEqual(_cpu_snapshot_spec_mismatch_reason(spec_a, spec_b), "UNET loader count mismatch")
+
+    def test_different_unet_rejects_unet_independent_clip(self):
+        """Different UNET causes key mismatch with UNET reason; unchanged CLIP
+        does NOT produce a CLIP mismatch reason — per-role independence."""
+        snap_key = ModelRestoreKey(
+            unet_identity="u_a.safetensors", clip_identity="c.safetensors", clip_type="sd3",
+        )
+        req_key = ModelRestoreKey(
+            unet_identity="u_b.safetensors", clip_identity="c.safetensors", clip_type="sd3",
+        )
+        keys_match = _cpu_snapshot_model_keys_match(req_key, snap_key)
+        self.assertFalse(keys_match, "different UNET must cause key mismatch")
+        reason = _cpu_snapshot_key_mismatch_reason(req_key, snap_key)
+        self.assertEqual(reason, "UNET identity mismatch",
+                         "reason must be UNET (not CLIP) identity mismatch")
+
+    def test_different_unet_spec_rejects_unet_independent_clip(self):
+        """Different UNET spec causes spec mismatch with UNET reason; unchanged
+        CLIP does NOT produce a CLIP mismatch — per-role independence via spec."""
+        snap_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u_a.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        req_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u_b.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        specs_match = _cpu_snapshot_specs_match(req_spec, snap_spec)
+        self.assertFalse(specs_match, "different UNET spec must cause projection mismatch")
+        reason = _cpu_snapshot_spec_mismatch_reason(req_spec, snap_spec)
+        self.assertEqual(reason, "UNET filename mismatch",
+                         "reason must be UNET (not CLIP) filename mismatch")
 
 
 # ── Variant C: Snapshot match log line tests ──────────────────────

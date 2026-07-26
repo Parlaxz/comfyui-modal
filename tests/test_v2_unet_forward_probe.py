@@ -28,7 +28,9 @@ from comfymodal_runtime.unet_forward_probe import (
     emit_post_load_models_gpu_event,
     install_nextdit_forward_pre_hook,
     register_unet_forward_probe,
+    resolve_diffusion_model,
 )
+from comfymodal_runtime.runtime_executor import ensure_sampling_timing_wrapper
 from comfymodal_runtime.trace import RuntimeTrace
 
 
@@ -549,6 +551,118 @@ class TestBoundedDedup(unittest.TestCase):
                 self.assertLessEqual(len(_ufp_mod._dedup), _ufp_mod._DEDUP_MAX)
         finally:
             _ufp_mod._DEDUP_MAX = saved_max
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Fix 4: resolve_diffusion_model tests
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class _FakeModelPatcher:
+    """Minimal ModelPatcher duck type with model_options."""
+    def __init__(self, dm=None):
+        self.model = _FakeModel(diffusion_model=dm or _FakeDiffusionModel())
+        self.model_options = {}
+
+
+class _FakeLoadedModel:
+    """LoadedModel shape: .model is a ModelPatcher."""
+    def __init__(self, dm=None):
+        self.model = _FakeModelPatcher(dm=dm)
+
+
+class _FakeRawDM:
+    """Raw diffusion model (no model_options, just forward)."""
+    def forward(self, x):
+        return x
+
+
+class TestResolveDiffusionModel(unittest.TestCase):
+    """Behavioral tests for resolve_diffusion_model."""
+
+    def test_model_patcher_resolved(self):
+        """ModelPatcher -> (patcher, diffusion_model)."""
+        dm = _FakeDiffusionModel()
+        mp = _FakeModelPatcher(dm=dm)
+        patcher, resolved_dm = resolve_diffusion_model(mp)
+        self.assertIs(patcher, mp)
+        self.assertIs(resolved_dm, dm)
+
+    def test_loaded_model_unwrapped(self):
+        """LoadedModel -> (inner_patcher, diffusion_model)."""
+        dm = _FakeDiffusionModel()
+        loaded = _FakeLoadedModel(dm=dm)
+        patcher, resolved_dm = resolve_diffusion_model(loaded)
+        self.assertIs(patcher, loaded.model)
+        self.assertIs(resolved_dm, dm)
+
+    def test_raw_diffusion_model(self):
+        """Raw diffusion model -> (None, model)."""
+        raw = _FakeRawDM()
+        patcher, resolved_dm = resolve_diffusion_model(raw)
+        self.assertIsNone(patcher)
+        self.assertIs(resolved_dm, raw)
+
+    def test_none_returns_none(self):
+        """None input -> (None, None)."""
+        self.assertEqual(resolve_diffusion_model(None), (None, None))
+
+    def test_model_without_diffusion_model(self):
+        """Patcher without diffusion_model -> (patcher, None)."""
+        mp = _FakeModelPatcher(dm=None)
+        mp.model.diffusion_model = None
+        patcher, resolved_dm = resolve_diffusion_model(mp)
+        self.assertIs(patcher, mp)
+        self.assertIsNone(resolved_dm)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Fix 4: ensure_sampling_timing_wrapper tests
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestEnsureSamplingTimingWrapper(unittest.TestCase):
+    """Behavioral tests for ensure_sampling_timing_wrapper."""
+
+    def setUp(self):
+        self._patcher = _FakeModelPatcher()
+
+    def test_missing_model_options_returns_false(self):
+        """Model patcher without model_options -> False."""
+        obj = object()
+        result = ensure_sampling_timing_wrapper(obj)
+        self.assertFalse(result)
+
+    def test_no_model_options_attribute_returns_false(self):
+        """Object without model_options attr -> False."""
+        result = ensure_sampling_timing_wrapper(object())
+        self.assertFalse(result)
+
+    @patch("comfymodal_runtime.runtime_executor.ensure_sampling_timing_wrapper")
+    def test_register_unet_calls_ensure_wrapper(self, mock_ensure):
+        """register_unet_forward_probe must call ensure_sampling_timing_wrapper."""
+        dm = _FakeDiffusionModel()
+        mp = _FakeModelPatcher(dm=dm)
+        mock_ensure.return_value = True
+        register_unet_forward_probe(mp, source="test")
+        mock_ensure.assert_called_once()
+        # Verify it was called with the patcher
+        call_args = mock_ensure.call_args[0]
+        self.assertIs(call_args[0], mp)
+
+    def test_register_unet_probes_loaded_model_calls_ensure(self):
+        """register_unet_forward_probe with LoadedModel must call
+        ensure_sampling_timing_wrapper on the inner ModelPatcher."""
+        from unittest.mock import patch as _patch
+        dm = _FakeDiffusionModel()
+        loaded = _FakeLoadedModel(dm=dm)
+        with _patch("comfymodal_runtime.runtime_executor.ensure_sampling_timing_wrapper") as mock_ensure:
+            mock_ensure.return_value = True
+            register_unet_forward_probe(loaded, source="test_loaded")
+            # Should have been called with the inner patcher
+            mock_ensure.assert_called_once()
+            call_args = mock_ensure.call_args[0]
+            self.assertIs(call_args[0], loaded.model)
 
 
 if __name__ == "__main__":

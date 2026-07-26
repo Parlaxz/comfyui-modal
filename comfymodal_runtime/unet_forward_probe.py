@@ -6,6 +6,8 @@ Always-on (lightweight):
   - ``set_unet_gpu_demand_start(request_id, monotonic_ns)`` -- called by load_models_gpu wrapper
   - ``reset_first_cuda_dedup()`` -- called at start of each request
   - First forward with CUDA input emits ``unet_first_cuda_op`` with real elapsed
+  - ``resolve_diffusion_model(model)`` -- shared resolution helper (Fix 4)
+  - ``ensure_sampling_timing_wrapper(model_patcher)`` -- install SAMPLER_SAMPLE wrapper (Fix 4)
 
 Diagnostic-only (gated by COMFYMODAL_V2_UNET_FORWARD_DIAG=1):
   - ``emit_post_load_models_gpu_event(models)``
@@ -24,6 +26,59 @@ from contextvars import ContextVar
 from typing import Any
 
 from .cpu_snapshot_models import collect_unet_forward_probe_state
+
+# ── Shared model resolution helper (Fix 4) ──────────────────────────────────
+
+
+def resolve_diffusion_model(model: Any) -> tuple[Any | None, Any | None]:
+    """Resolve *model* to ``(model_patcher_or_None, diffusion_model_or_None)``.
+
+    Handles four shapes:
+
+    * **ModelPatcher** (has ``model_options``) — walks ``.model.diffusion_model``
+      then falls back to ``.diffusion_model``; returns ``(patcher, dm)``.
+    * **LoadedModel** — the ``.model`` attribute is itself a ``ModelPatcher``;
+      unwrapped recursively to return the inner ``(patcher, dm)``.
+    * **BaseModel** (has ``.diffusion_model``, no ``model_options``) —
+      returned as ``(None, diffusion_model)``.
+    * **Raw diffusion model** (has ``forward``, no ``model_options``, no
+      ``diffusion_model`` attribute) — returned as ``(None, model)``.
+    """
+    if model is None:
+        return None, None
+
+    # LoadedModel: .model is a ModelPatcher
+    inner = getattr(model, "model", None)
+    if inner is not None and hasattr(inner, "model_options"):
+        return resolve_diffusion_model(inner)
+
+    # ModelPatcher path: walk .model.diffusion_model, then .diffusion_model
+    m = getattr(model, "model", None)
+    if m is not None:
+        dm = getattr(m, "diffusion_model", None)
+        if dm is not None:
+            return model, dm
+    dm = getattr(model, "diffusion_model", None)
+    if dm is not None:
+        # If model has model_options it is a ModelPatcher; otherwise BaseModel-like
+        if hasattr(model, "model_options"):
+            return model, dm
+        return None, dm
+
+    # ModelPatcher found but no diffusion_model yet
+    if hasattr(model, "model_options"):
+        return model, None
+
+    # Raw diffusion model (has forward, is itself the model)
+    if hasattr(model, "forward"):
+        return None, model
+
+    return None, None
+
+
+# ``ensure_sampling_timing_wrapper`` lives in ``runtime_executor`` (neutral module).
+# Imported lazily inside register_unet_forward_probe to avoid circular import
+# (runtime_executor -> model_preload -> unet_forward_probe -> runtime_executor).
 
 # ── Diagnostic gate ──────────────────────────────────────────────────────────
 # Disabled by default; set COMFYMODAL_V2_UNET_FORWARD_DIAG=1 to enable.
@@ -112,8 +167,12 @@ class _ProbeEntry:
 
 
 def register_unet_forward_probe(unet: Any, source: str = "cpu_snapshot") -> None:
-    """Register *unet* (a ModelPatcher) for forward-probe diagnostics
-    and always-on first-CUDA timing.
+    """Register *unet* for forward-probe diagnostics and always-on
+    first-CUDA timing.  Also installs the authoritative SAMPLER_SAMPLE
+    timing wrapper via ``ensure_sampling_timing_wrapper``.
+
+    *unet* may be a ``ModelPatcher``, ``LoadedModel``, or raw diffusion
+    model — resolved via ``resolve_diffusion_model``.
 
     Idempotent: duplicate registrations for the same diffusion-model
     object are silently ignored.
@@ -126,12 +185,7 @@ def register_unet_forward_probe(unet: Any, source: str = "cpu_snapshot") -> None
     After registration, automatically installs forward pre-hooks on the
     diffusion model so ``_forward_pre_hook`` fires on the first forward.
     """
-    model = getattr(unet, "model", None)
-    if model is None:
-        return
-    dm = getattr(model, "diffusion_model", None)
-    if dm is None:
-        dm = getattr(unet, "diffusion_model", None)
+    patcher, dm = resolve_diffusion_model(unet)
     if dm is None:
         return
     dm_id = id(dm)
@@ -141,6 +195,12 @@ def register_unet_forward_probe(unet: Any, source: str = "cpu_snapshot") -> None
         _registry[dm_id] = _ProbeEntry(unet, source)
     # Auto-clean when the diffusion_model is garbage collected.
     weakref.finalize(dm, _cleanup_registry_entry, dm_id)
+
+    # Install SAMPLER_SAMPLE timing wrapper on the model patcher (Fix 4).
+    if patcher is not None:
+        from comfymodal_runtime.runtime_executor import ensure_sampling_timing_wrapper
+        ensure_sampling_timing_wrapper(patcher)
+
     # Install forward pre-hook on this specific diffusion model immediately.
     # This ensures the hook is in place before load_models_gpu or forward.
     try:
@@ -181,18 +241,11 @@ def _has_registered_unet_in_models(models: list[Any]) -> bool:
     """Check if any model in *models* has a registered diffusion_model.
 
     Always-on helper for the load_models_gpu wrapper.
+    Uses ``resolve_diffusion_model`` for uniform resolution.
     """
     for model in models:
-        m = getattr(model, "model", None)
-        if m is None:
-            dm = getattr(model, "diffusion_model", None)
-        else:
-            dm = getattr(m, "diffusion_model", None)
-            if dm is None:
-                dm = getattr(model, "diffusion_model", None)
-        if dm is None:
-            continue
-        if _lookup_entry(dm) is not None:
+        _, dm = resolve_diffusion_model(model)
+        if dm is not None and _lookup_entry(dm) is not None:
             return True
     return False
 
@@ -430,13 +483,7 @@ def emit_post_load_models_gpu_event(models: list[Any]) -> None:
         caller = "graph_model_loading"
 
     for model in models:
-        m = getattr(model, "model", None)
-        if m is None:
-            dm = getattr(model, "diffusion_model", None)
-        else:
-            dm = getattr(m, "diffusion_model", None)
-            if dm is None:
-                dm = getattr(model, "diffusion_model", None)
+        patcher, dm = resolve_diffusion_model(model)
         if dm is None:
             continue
 
@@ -447,6 +494,7 @@ def emit_post_load_models_gpu_event(models: list[Any]) -> None:
 
         state = collect_unet_forward_probe_state(unet, diffusion_model=dm)
 
+        m = getattr(patcher, "model", None) if patcher is not None else None
         metadata: dict[str, Any] = {
             "schema_version": schema_version,
             "source": source,
@@ -455,8 +503,8 @@ def emit_post_load_models_gpu_event(models: list[Any]) -> None:
             "gpu_call_index": gpu_call_index,
             "caller_classification": caller,
             "diffusion_model_object_id": str(id(dm)),
-            "patcher_object_id": str(id(unet)),
-            "model_object_id": str(id(m)),
+            "patcher_object_id": str(id(patcher)) if patcher is not None else str(id(unet)),
+            "model_object_id": str(id(m)) if m is not None else "",
         }
         metadata.update(state)
 

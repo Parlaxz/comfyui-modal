@@ -1330,22 +1330,12 @@ def _make_model_patcher_constructor_wrapper(original):
             lane._trace.emit("clip_model_patcher_constructor_start", phase="restore")
         try:
             result = original(self, *args, **kwargs)
-            # Install SAMPLER_SAMPLE wrapper on every model patcher for always-on
-            # sampling timing.  The wrapper reads _ACTIVE_REQUEST_TRACE and emits
-            # sampling_start/sampling_end via the production RuntimeTrace.
+            # Install SAMPLER_SAMPLE wrapper via the shared helper.
+            # The helper itself emits a concise exception-type line and returns
+            # False on failure — never silently swallows installation failure.
             if hasattr(self, "model_options"):
-                try:
-                    import comfy.patcher_extension as _pe
-                    from comfymodal_runtime.runtime_executor import _COMFYMODAL_V2_SAMPLING_WRAPPER
-                    _pe.add_wrapper_with_key(
-                        _pe.WrappersMP.SAMPLER_SAMPLE,
-                        "comfymodal_v2_sampling_timing",
-                        _COMFYMODAL_V2_SAMPLING_WRAPPER,
-                        self.model_options,
-                        is_model_options=True,
-                    )
-                except Exception:
-                    pass  # Non-fatal: sampling timing unavailable for this model
+                from comfymodal_runtime.runtime_executor import ensure_sampling_timing_wrapper
+                ensure_sampling_timing_wrapper(self)
             # Register every ModelPatcher for UNET first-CUDA timing.
             # Idempotent: duplicate registrations for the same diffusion_model
             # are silently ignored by register_unet_forward_probe.
