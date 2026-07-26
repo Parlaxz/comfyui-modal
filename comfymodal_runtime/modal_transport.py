@@ -125,6 +125,30 @@ class ModalTransport:
             return env.strip()
         return ""
 
+    async def _call_publish_with_spawn(
+        self, target: Any, payload: dict[str, Any],
+    ) -> Any:
+        """Shared async helper: spawn the Modal call, wait with bounded timeout.
+
+        Uses ``target.spawn.aio(payload)`` then ``call.get.aio(timeout=180)``.
+        On ``asyncio.TimeoutError`` cancels the Modal container and raises
+        ``TransportError``.  On ``asyncio.CancelledError`` cancels the Modal
+        container then re-raises.  Other exceptions are wrapped in
+        ``TransportError``.  Never logs payload contents or credentials.
+        """
+        _PUBLISH_TIMEOUT = 180
+        call = await target.spawn.aio(payload)
+        try:
+            return await call.get.aio(timeout=_PUBLISH_TIMEOUT)
+        except asyncio.TimeoutError:
+            await call.cancel.aio(terminate_containers=True)
+            raise TransportError("v2 RestorePlan publication timed out after 180s")
+        except asyncio.CancelledError:
+            await call.cancel.aio(terminate_containers=True)
+            raise
+        except Exception as exc:
+            raise TransportError(f"v2 RestorePlan publication failed: {exc}") from exc
+
     @staticmethod
     def _gpu_cache_key(gpu: Any) -> tuple[str, ...]:
         """Return an ordered immutable tuple of normalized GPU names for
@@ -608,7 +632,9 @@ class ModalTransport:
             if runtime_trace is not None:
                 runtime_trace.emit("restore_publish_lookup_end", phase="local")
                 runtime_trace.emit("restore_publish_call_start", phase="local")
-            pub_result = await asyncio.to_thread(handle.publish_restore_plan.remote, dict(payload))
+            pub_result = await self._call_publish_with_spawn(
+                handle.publish_restore_plan, dict(payload),
+            )
             if runtime_trace is not None:
                 runtime_trace.emit("restore_publish_call_end", phase="local",
                                    metadata={"generation": str(pub_result)})
@@ -647,11 +673,8 @@ class ModalTransport:
         if runtime_trace is not None:
             runtime_trace.emit("restore_publish_call_start", phase="local",
                                metadata={"payload_bytes": len(str(payload))})
-        try:
-            pub_result = await asyncio.to_thread(function.remote, dict(payload))
-            if runtime_trace is not None:
-                runtime_trace.emit("restore_publish_call_end", phase="local",
-                                   metadata={"generation": str(pub_result)})
-            return pub_result
-        except Exception as exc:
-            raise TransportError(f"v2 RestorePlan publication failed: {exc}") from exc
+        pub_result = await self._call_publish_with_spawn(function, dict(payload))
+        if runtime_trace is not None:
+            runtime_trace.emit("restore_publish_call_end", phase="local",
+                               metadata={"generation": str(pub_result)})
+        return pub_result

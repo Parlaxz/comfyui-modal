@@ -113,19 +113,29 @@ def _lookup_entry(dm: Any) -> tuple[Any, str, int] | None:
 
 # ── Forward pre-hook ─────────────────────────────────────────────────────────
 _nextdit_hook_installed: bool = False
+# Track whether PyTorch forward pre-hooks have been installed on registered
+# diffusion models (non-NextDiT UNET architectures).
+_unet_forward_hooks_installed: bool = False
+# Store installed hook handles for cleanup
+_installed_hook_handles: list[Any] = []
 
 # Bounded dedup: ``(request_id, str(dm_id)) -> True``.
 _dedup: dict[tuple[str, str], bool] = {}
 _dedup_lock = RLock()
 _DEDUP_MAX = 1024
 
+# Separate dedup for unet_first_cuda_op (one per request)
+_first_cuda_dedup: set[str] = set()
+_first_cuda_dedup_lock = RLock()
+
 
 def _forward_pre_hook(module: Any, args: tuple[Any, ...]) -> None:
-    """Instance-level forward pre-hook on NextDiT.
+    """Instance-level forward pre-hook on diffusion model.
 
-    Emits ``unet_forward_probe`` / ``first_nextdit_forward`` once per
+    Emits ``unet_forward_probe`` and ``unet_first_cuda_op`` once per
     ``(request_id, diffusion_model_object_id)``.  Returns ``None`` and
-    never modifies inputs.
+    never modifies inputs.  Works for any registered diffusion model
+    (not just NextDiT) when installed via ``nn.Module.register_forward_pre_hook``.
     """
     if not _ENABLED:
         return None
@@ -163,7 +173,7 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...]) -> None:
         "schema_version": schema_version,
         "source": source,
         "request_id": request_id,
-        "stage": "first_nextdit_forward",
+        "stage": "first_nextdit_forward" if "NextDiT" in type(module).__name__ else "first_unet_forward",
         "diffusion_model_object_id": dm_id,
         "patcher_object_id": str(id(unet)),
         "model_object_id": str(id(getattr(unet, "model", None))),
@@ -174,6 +184,25 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...]) -> None:
     metadata.update(state)
 
     request_trace.emit("unet_forward_probe", metadata=metadata)
+
+    # Emit unet_first_cuda_op once per request (not per-diffusion-model)
+    # with elapsed-from-demand timing and model identity.
+    with _first_cuda_dedup_lock:
+        if request_id not in _first_cuda_dedup:
+            _first_cuda_dedup.add(request_id)
+            # Compute elapsed from execution demand to actual first CUDA op.
+            # The duration is from the first sampler stage (when sampling was
+            # demanded) to this first actual forward, capturing any GPU warmup.
+            _elapsed_ms = 0.0  # Caller may supply; 0.0 if unavailable
+            request_trace.emit("unet_first_cuda_op", metadata={
+                "diffusion_model_object_id": dm_id,
+                "patcher_object_id": str(id(unet)),
+                "model_object_id": str(id(getattr(unet, "model", None))),
+                "x_device": str(x.device) if x is not None else "",
+                "x_dtype": str(x.dtype) if x is not None else "",
+                "elapsed_ms": _elapsed_ms,
+                "model_identity": source,
+            })
     return None
 
 
@@ -209,6 +238,58 @@ def install_nextdit_forward_pre_hook() -> bool:
         return True
     except (ImportError, AttributeError):
         return False
+
+
+def install_registered_unet_forward_hooks() -> int:
+    """Install PyTorch ``register_forward_pre_hook`` on all currently
+    registered UNET diffusion models.
+
+    Each registered model gets a forward pre-hook that calls
+    ``_forward_pre_hook``.  This covers non-NextDiT UNET architectures
+    (e.g. Flux, SD3, SDXL, SD1.5) that would otherwise not be probed.
+
+    Returns the number of hooks installed.
+    """
+    import torch
+    global _unet_forward_hooks_installed
+    _count = 0
+    with _registry_lock:
+        for dm_id, entry in list(_registry.items()):
+            unet = entry.unet_ref()
+            if unet is None:
+                continue
+            model = getattr(unet, "model", None)
+            if model is None:
+                continue
+            dm = getattr(model, "diffusion_model", None)
+            if dm is None:
+                continue
+            if id(dm) != dm_id:
+                continue
+            # Skip NextDiT (handled by install_nextdit_forward_pre_hook)
+            if "NextDiT" in type(dm).__name__:
+                continue
+            try:
+                handle = dm.register_forward_pre_hook(_forward_pre_hook)
+                _installed_hook_handles.append(handle)
+                _count += 1
+            except Exception:
+                pass
+    if _count > 0:
+        _unet_forward_hooks_installed = True
+    return _count
+
+
+def reset_first_cuda_dedup() -> None:
+    """Clear the per-request dedup for ``unet_first_cuda_op``.
+
+    Must be called at the start of each new request so the next forward
+    pass emits ``unet_first_cuda_op`` again.
+    """
+    global _first_cuda_dedup
+    _first_cuda_dedup.clear()
+
+
 
 
 # ── post_load_models_gpu event ───────────────────────────────────────────────

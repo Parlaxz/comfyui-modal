@@ -366,6 +366,7 @@ class RestorePlanPublisher:
             "model_spec": dict(plan.model_spec),
             "prefill_spec": dict(plan.prefill_spec),
             "source_workflow_hash": plan.source_workflow_hash,
+            "workflow_hash": plan.workflow_hash,
         }
         return stable_hash(identity)
 

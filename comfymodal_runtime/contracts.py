@@ -449,8 +449,8 @@ class RestorePlan:
     created_at: float = field(default_factory=time.time)
     source_workflow_hash: str = ""
     # ── Startup-cert construction fields ──
-    # Captured from ExecutionPlan payload at publish time; not serialized
-    # to the persisted RestorePlan (to_dict omits them).
+    # Captured from ExecutionPlan payload at publish time; serialized
+    # by to_dict and persisted alongside source_workflow_hash.
     workflow: Mapping[str, Any] = field(default_factory=dict)
     workflow_hash: str = ""
 
@@ -676,3 +676,146 @@ class TraceEvent:
             "trace_id": self.trace_id,
             "metadata": _thaw(self.metadata),
         }
+
+
+# ── Canonical per-role identity for cold-path acceptance ──────────────────
+
+
+def compute_loader_role_identity(
+    role: str,
+    spec: Mapping[str, Any],
+    custom_node_generation: str = "",
+    deployment_combined_hash: str = "",
+    static_model_patches_hash: str = "",
+    *,
+    effective_compute_dtype_label: str = "",
+    model_configuration_hash: str = "",
+) -> dict[str, str]:
+    """Compute canonical identity for a single loader role from a model_spec.
+
+    Used for both CPU snapshot restore matching (Plan A) and executor
+    cache seeding (Plan B).  Returns a dict with identity fields and a
+    ``stable_id`` hash that captures all fields relevant to this role.
+
+    Parameters
+    ----------
+    role:
+        One of ``"unet"``, ``"clip"``, ``"vae"``.
+    spec:
+        A ``model_spec`` dict with a ``loaders`` key containing per-role
+        loader entry lists (the shape produced by ``build_restore_model_spec``
+        and ``identity_from_profile``).
+    custom_node_generation:
+        Custom-node generation value for identity comparison.
+    deployment_combined_hash:
+        Deployment identity hash for identity comparison.
+    static_model_patches_hash:
+        Static model patches hash (UNET-specific; ``"none"`` when no patch
+        metadata is present in the cached output).
+    effective_compute_dtype_label:
+        Effective weight/compute dtype label for UNET (e.g. ``"bfloat16"``,
+        ``"float16"``, ``"float32"``, ``"default"``).  Derived by callers
+        from ``resolve_unet_effective_dtype`` without CUDA calls.
+    model_configuration_hash:
+        Canonical hash of static UNET model-type/configuration fields
+        available in the spec.  Empty when no config fields exist.
+    """
+    loaders_raw = (spec or {}).get("loaders", {}) if isinstance(spec, Mapping) else {}
+    entries = list(loaders_raw.get(role, [])) if isinstance(loaders_raw, Mapping) else []
+
+    base: dict[str, str] = {
+        "role": role,
+        "custom_node_generation": custom_node_generation or "",
+        "deployment_combined_hash": deployment_combined_hash or "",
+    }
+
+    if role == "unet":
+        unet_entries = tuple(
+            (
+                str(e.get("unet_name", "")),
+                str(e.get("weight_dtype", "default")),
+                str(e.get("loader_class", "")),
+            )
+            for e in entries
+            if isinstance(e, Mapping)
+        )
+        base["model_identity"] = ";".join(f"{n}:{d}:{c}" for n, d, c in unet_entries)
+        base["weight_dtype"] = unet_entries[0][1] if unet_entries else ""
+        base["loader_class"] = unet_entries[0][2] if unet_entries else ""
+        base["loader_count"] = str(len(unet_entries))
+        # Explicit "none" when no static patch metadata
+        base["static_model_patches_hash"] = (
+            static_model_patches_hash
+            if static_model_patches_hash
+            else "none"
+        )
+        base["effective_compute_dtype_label"] = effective_compute_dtype_label or base["weight_dtype"]
+        base["model_configuration_hash"] = model_configuration_hash or ""
+    elif role == "clip":
+        clip_parts: list[str] = []
+        for e in entries:
+            if not isinstance(e, Mapping):
+                continue
+            lc = str(e.get("loader_class", ""))
+            if "clip_name1" in e:
+                clip_parts.append(
+                    f"{e.get('clip_name1','')}||{e.get('clip_name2','')}:{lc}"
+                )
+            else:
+                clip_parts.append(f"{str(e.get('clip_name', ''))}:{lc}")
+        base["model_identity"] = ";".join(clip_parts) if clip_parts else ""
+        base["loader_class"] = str(entries[0].get("loader_class", "")) if entries else ""
+        base["clip_type"] = str(entries[0].get("type", "")) if entries else ""
+        base["device"] = str(entries[0].get("device", "default")) if entries else ""
+        base["device_policy"] = str(entries[0].get("device", "default")) if entries else ""
+        base["loader_count"] = str(len(clip_parts))
+    elif role == "vae":
+        vae_entries = tuple(
+            str(e.get("vae_name", ""))
+            for e in entries
+            if isinstance(e, Mapping)
+        )
+        base["model_identity"] = ";".join(vae_entries) if vae_entries else ""
+        base["loader_count"] = str(len(vae_entries))
+    else:
+        base["model_identity"] = ""
+        base["loader_count"] = "0"
+
+    base["stable_id"] = stable_hash(base)
+    return base
+
+
+def find_role_identity_mismatch_fields(
+    request_identity: dict[str, str],
+    snapshot_identity: dict[str, str],
+) -> list[str]:
+    """Return ordered list of field names that differ between two role identities.
+
+    Excludes ``stable_id`` and ``role`` from comparison.  Fields that are
+    empty on both sides are not reported.  Returns empty list when identities
+    are equivalent (including when both are empty/missing).
+    """
+    _IDENTITY_FIELDS = (
+        "model_identity",
+        "weight_dtype",
+        "loader_class",
+        "clip_type",
+        "device",
+        "device_policy",
+        "static_model_patches_hash",
+        "effective_compute_dtype_label",
+        "model_configuration_hash",
+        "custom_node_generation",
+        "deployment_combined_hash",
+        "loader_count",
+    )
+    mismatched: list[str] = []
+    for field in _IDENTITY_FIELDS:
+        rv = request_identity.get(field, "")
+        sv = snapshot_identity.get(field, "")
+        # Skip when both empty — same effective value
+        if not rv and not sv:
+            continue
+        if rv != sv:
+            mismatched.append(field)
+    return mismatched
