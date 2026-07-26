@@ -1395,7 +1395,8 @@ async def execute_plan(
         runtime_trace.emit("restore_plan_publish_end", phase="local", metadata={"status": "not_configured"})
 
     # ── Modal submission ──
-    runtime_trace.emit("modal_submit_start", phase="local")
+    runtime_trace.emit("modal_submit_start", phase="local",
+                       metadata={"request_id": runtime_trace.request_id})
     runtime_trace.emit("gpu_invocation_submit", phase="local")
     result: dict[str, Any] | None = None
     async for message in active_transport.run_plan_stream(

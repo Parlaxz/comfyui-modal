@@ -1,11 +1,15 @@
-"""Diagnostic-only UNET forward probe: weak registry, GPU event, forward pre-hook.
+"""UNET forward probe: weak registry, always-on first-CUDA timing, optional diagnostics.
 
-Disabled by default.  Enable with ``COMFYMODAL_V2_UNET_FORWARD_DIAG=1``.
+Always-on (lightweight):
+  - ``register_unet_forward_probe(unet, source)`` -- register at snapshot/normal-loader
+  - ``install_nextdit_forward_pre_hook()`` / ``install_registered_unet_forward_hooks()``
+  - ``set_unet_gpu_demand_start(request_id, monotonic_ns)`` -- called by load_models_gpu wrapper
+  - ``reset_first_cuda_dedup()`` -- called at start of each request
+  - First forward with CUDA input emits ``unet_first_cuda_op`` with real elapsed
 
-Provides:
-  register_unet_forward_probe(unet, source)  -- registration at snapshot/normal-loader points
-  install_nextdit_forward_pre_hook()          -- install NextDiT forward pre-hook (once)
-  emit_post_load_models_gpu_event(models)     -- emit after outermost load_models_gpu success
+Diagnostic-only (gated by COMFYMODAL_V2_UNET_FORWARD_DIAG=1):
+  - ``emit_post_load_models_gpu_event(models)``
+  - Full ``unet_forward_probe`` events with model state
 
 Safety: read-only, no CUDA synchronize, no tensor mutation, no dtype/device transfer.
 """
@@ -13,16 +17,28 @@ Safety: read-only, no CUDA synchronize, no tensor mutation, no dtype/device tran
 from __future__ import annotations
 
 import os
+import threading
+import time
 import weakref
 from contextvars import ContextVar
-from threading import RLock
 from typing import Any
 
 from .cpu_snapshot_models import collect_unet_forward_probe_state
 
 # ── Diagnostic gate ──────────────────────────────────────────────────────────
 # Disabled by default; set COMFYMODAL_V2_UNET_FORWARD_DIAG=1 to enable.
-_ENABLED: bool = os.environ.get("COMFYMODAL_V2_UNET_FORWARD_DIAG", "") == "1"
+# Checked at call time (not import time) so test files can set the env var
+# before importing.
+_DIAG_ENV_KEY = "COMFYMODAL_V2_UNET_FORWARD_DIAG"
+
+
+def _is_enabled() -> bool:
+    """Return True when COMFYMODAL_V2_UNET_FORWARD_DIAG=1.
+
+    Checked at call time so test files can set the env var between
+    test file imports.
+    """
+    return os.environ.get(_DIAG_ENV_KEY, "") == "1"
 
 # ── Lazy-resolved ContextVar references ──────────────────────────────────────
 # Resolved at first use (not at import) to avoid circular imports.
@@ -46,11 +62,43 @@ def _ensure_context_vars() -> None:
     _GPU_REQUEST_CALL_COUNT_VAR = _GRC
 
 
+# ── Always-on GPU demand start (first-CUDA timing) ──────────────────────────
+# Map: request_id -> monotonic_ns of when load_models_gpu was first called
+# for a registered UNET in this request.
+_unet_gpu_demand_start: dict[str, int] = {}
+_unet_gpu_demand_lock = threading.RLock()
+
+
+def set_unet_gpu_demand_start(request_id: str, monotonic_ns: int) -> None:
+    """Record demand start for UNET GPU first forward timing.
+
+    Called from the outermost ``load_models_gpu`` wrapper when the model
+    list contains a registered UNET.  Thread-safe.
+    """
+    with _unet_gpu_demand_lock:
+        # Only record the *first* demand start per request.
+        if request_id not in _unet_gpu_demand_start:
+            _unet_gpu_demand_start[request_id] = monotonic_ns
+
+
+def _get_demand_start_ns(request_id: str) -> int | None:
+    """Return the demand start monotonic_ns for *request_id*, or None."""
+    with _unet_gpu_demand_lock:
+        return _unet_gpu_demand_start.get(request_id)
+
+
+def _clear_demand_start_ns(request_id: str) -> None:
+    """Clean up demand start after consumption."""
+    with _unet_gpu_demand_lock:
+        _unet_gpu_demand_start.pop(request_id, None)
+
+
 # ── Weak registry ────────────────────────────────────────────────────────────
 # Maps id(diffusion_model) -> _ProbeEntry.
 # Entries auto-clean when the diffusion_model is garbage collected via finalizer.
+# Always active (not gated by _ENABLED) so first-CUDA timing works.
 _registry: dict[int, Any] = {}
-_registry_lock = RLock()
+_registry_lock = threading.RLock()
 
 
 class _ProbeEntry:
@@ -64,16 +112,20 @@ class _ProbeEntry:
 
 
 def register_unet_forward_probe(unet: Any, source: str = "cpu_snapshot") -> None:
-    """Register *unet* (a ModelPatcher) for forward-probe diagnostics.
+    """Register *unet* (a ModelPatcher) for forward-probe diagnostics
+    and always-on first-CUDA timing.
 
     Idempotent: duplicate registrations for the same diffusion-model
     object are silently ignored.
 
     Must be called after the UNET's diffusion_model is populated and
     before ``load_models_gpu`` / ``NextDiT.forward``.
+
+    Always active (not gated by COMFYMODAL_V2_UNET_FORWARD_DIAG).
+
+    After registration, automatically installs forward pre-hooks on the
+    diffusion model so ``_forward_pre_hook`` fires on the first forward.
     """
-    if not _ENABLED:
-        return
     model = getattr(unet, "model", None)
     if model is None:
         return
@@ -89,6 +141,20 @@ def register_unet_forward_probe(unet: Any, source: str = "cpu_snapshot") -> None
         _registry[dm_id] = _ProbeEntry(unet, source)
     # Auto-clean when the diffusion_model is garbage collected.
     weakref.finalize(dm, _cleanup_registry_entry, dm_id)
+    # Install forward pre-hook on this specific diffusion model immediately.
+    # This ensures the hook is in place before load_models_gpu or forward.
+    try:
+        import torch
+        # Skip NextDiT (handled by install_nextdit_forward_pre_hook)
+        if "NextDiT" in type(dm).__name__:
+            return
+        handle = dm.register_forward_pre_hook(_forward_pre_hook, with_kwargs=True)
+        _installed_hook_handles.append(handle)
+        global _unet_forward_hooks_installed
+        _unet_forward_hooks_installed = True
+    except Exception as _hook_exc:
+        print(f"[unet_probe] hook_install_failed dm_type={type(dm).__name__} "
+              f"error={str(_hook_exc)[:120]}", flush=True)
 
 
 def _cleanup_registry_entry(dm_id: int) -> None:
@@ -111,6 +177,26 @@ def _lookup_entry(dm: Any) -> tuple[Any, str, int] | None:
     return unet, entry.source, entry.schema_version
 
 
+def _has_registered_unet_in_models(models: list[Any]) -> bool:
+    """Check if any model in *models* has a registered diffusion_model.
+
+    Always-on helper for the load_models_gpu wrapper.
+    """
+    for model in models:
+        m = getattr(model, "model", None)
+        if m is None:
+            dm = getattr(model, "diffusion_model", None)
+        else:
+            dm = getattr(m, "diffusion_model", None)
+            if dm is None:
+                dm = getattr(model, "diffusion_model", None)
+        if dm is None:
+            continue
+        if _lookup_entry(dm) is not None:
+            return True
+    return False
+
+
 # ── Forward pre-hook ─────────────────────────────────────────────────────────
 _nextdit_hook_installed: bool = False
 # Track whether PyTorch forward pre-hooks have been installed on registered
@@ -121,24 +207,28 @@ _installed_hook_handles: list[Any] = []
 
 # Bounded dedup: ``(request_id, str(dm_id)) -> True``.
 _dedup: dict[tuple[str, str], bool] = {}
-_dedup_lock = RLock()
+_dedup_lock = threading.RLock()
 _DEDUP_MAX = 1024
 
 # Separate dedup for unet_first_cuda_op (one per request)
 _first_cuda_dedup: set[str] = set()
-_first_cuda_dedup_lock = RLock()
+_first_cuda_dedup_lock = threading.RLock()
 
 
-def _forward_pre_hook(module: Any, args: tuple[Any, ...]) -> None:
+def _forward_pre_hook(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any] | None = None) -> None:
     """Instance-level forward pre-hook on diffusion model.
 
-    Emits ``unet_forward_probe`` and ``unet_first_cuda_op`` once per
-    ``(request_id, diffusion_model_object_id)``.  Returns ``None`` and
-    never modifies inputs.  Works for any registered diffusion model
-    (not just NextDiT) when installed via ``nn.Module.register_forward_pre_hook``.
+    Always-on behavior (not gated by ``_ENABLED``):
+      - Emits ``unet_first_cuda_op`` once per request with elapsed-from-demand
+        timing when the input is on a CUDA device.
+
+    Diagnostic-only (gated by ``_ENABLED``):
+      - Emits ``unet_forward_probe`` with full model state metadata.
+
+    Returns ``None`` and never modifies inputs.  Works for any registered
+    diffusion model (not just NextDiT) when installed via
+    ``nn.Module.register_forward_pre_hook``.
     """
-    if not _ENABLED:
-        return None
     _ensure_context_vars()
 
     request_trace = _ACTIVE_REQUEST_TRACE.get() if _ACTIVE_REQUEST_TRACE is not None else None
@@ -153,6 +243,49 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...]) -> None:
     request_id = request_trace.request_id
     dm_id = str(id(module))
 
+    # Primary input tensor (1st positional arg) - used by both always-on and diagnostic paths.
+    x = args[0] if args else None
+
+    # ── Always-on: unet_first_cuda_op once per request ─────────────────
+    # Only consumes the dedup slot when the input is CUDA, so a non-CUDA
+    # first forward does not prevent a later CUDA forward from emitting.
+    _first_cuda_emitted = False
+    with _first_cuda_dedup_lock:
+        if request_id not in _first_cuda_dedup:
+            x_device = str(x.device) if x is not None else ""
+            if x_device.startswith("cuda"):
+                _first_cuda_dedup.add(request_id)
+                _first_cuda_emitted = True
+
+                # Compute elapsed from demand start.
+                demand_ns = _get_demand_start_ns(request_id)
+                demand_present = 1 if demand_ns is not None else 0
+                if demand_ns is not None:
+                    elapsed_ns = time.monotonic_ns() - demand_ns
+                    elapsed_ms = round(elapsed_ns / 1_000_000, 3)
+                else:
+                    elapsed_ms = "absent"
+
+                metadata: dict[str, Any] = {
+                    "event_semantics": "first_unet_forward_with_cuda_input",
+                    "demand_start_present": demand_present,
+                    "elapsed_ms": elapsed_ms,
+                    "x_device": x_device,
+                    "x_dtype": str(x.dtype) if x is not None else "",
+                    "diffusion_model_object_id": dm_id,
+                    "patcher_object_id": str(id(unet)),
+                    "model_object_id": str(id(getattr(unet, "model", None))),
+                    "model_identity": source,
+                }
+                request_trace.emit("unet_first_cuda_op", metadata=metadata)
+
+                # Clean up demand start storage (no longer needed for this request)
+                _clear_demand_start_ns(request_id)
+
+    # ── Diagnostic-only: unet_forward_probe (gated by COMFYMODAL_V2_UNET_FORWARD_DIAG) ────────
+    if not _is_enabled():
+        return None
+
     # Dedup: once per (request_id, dm_id).
     dedup_key = (request_id, dm_id)
     with _dedup_lock:
@@ -164,12 +297,9 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...]) -> None:
             for k in list(_dedup.keys())[:excess]:
                 del _dedup[k]
 
-    # Primary input tensor (1st positional arg).
-    x = args[0] if args else None
-
     state = collect_unet_forward_probe_state(unet, diffusion_model=module)
 
-    metadata: dict[str, Any] = {
+    diag_metadata: dict[str, Any] = {
         "schema_version": schema_version,
         "source": source,
         "request_id": request_id,
@@ -181,49 +311,24 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...]) -> None:
         "x_device": str(x.device) if x is not None else "",
         "x_dtype": str(x.dtype) if x is not None else "",
     }
-    metadata.update(state)
+    diag_metadata.update(state)
 
-    request_trace.emit("unet_forward_probe", metadata=metadata)
-
-    # Emit unet_first_cuda_op once per request (not per-diffusion-model)
-    # with elapsed-from-demand timing and model identity.
-    with _first_cuda_dedup_lock:
-        if request_id not in _first_cuda_dedup:
-            _first_cuda_dedup.add(request_id)
-            # Compute elapsed from execution demand to actual first CUDA op.
-            # The duration is from the first sampler stage (when sampling was
-            # demanded) to this first actual forward, capturing any GPU warmup.
-            _elapsed_ms = 0.0  # Caller may supply; 0.0 if unavailable
-            request_trace.emit("unet_first_cuda_op", metadata={
-                "diffusion_model_object_id": dm_id,
-                "patcher_object_id": str(id(unet)),
-                "model_object_id": str(id(getattr(unet, "model", None))),
-                "x_device": str(x.device) if x is not None else "",
-                "x_dtype": str(x.dtype) if x is not None else "",
-                "elapsed_ms": _elapsed_ms,
-                "model_identity": source,
-            })
+    request_trace.emit("unet_forward_probe", metadata=diag_metadata)
     return None
 
 
 def install_nextdit_forward_pre_hook() -> bool:
     """Install the ``NextDiT.forward`` pre-hook once (idempotent).
 
-    Patches ``NextDiT.forward`` at the class level so every instance
-    runs the diagnostic pre-hook before its forward pass.  This is
-    necessary because ``register_forward_pre_hook`` is an instance
-    method on ``nn.Module`` and cannot be called on the class itself.
-
+    Always installed (not gated by ``_ENABLED``) so first-CUDA timing works.
     Returns ``True`` if installed or already installed, ``False`` if
-    ``NextDiT`` is unavailable or diagnostics are disabled.
+    ``NextDiT`` is unavailable.
     """
     import functools
 
     global _nextdit_hook_installed
     if _nextdit_hook_installed:
         return True
-    if not _ENABLED:
-        return False
     try:
         from comfy.ldm.lumina.model import NextDiT  # type: ignore[import-untyped]
         _orig_forward = NextDiT.forward
@@ -244,9 +349,8 @@ def install_registered_unet_forward_hooks() -> int:
     """Install PyTorch ``register_forward_pre_hook`` on all currently
     registered UNET diffusion models.
 
-    Each registered model gets a forward pre-hook that calls
-    ``_forward_pre_hook``.  This covers non-NextDiT UNET architectures
-    (e.g. Flux, SD3, SDXL, SD1.5) that would otherwise not be probed.
+    Always installed (not gated by ``_ENABLED``) so first-CUDA timing works.
+    This covers non-NextDiT UNET architectures (e.g. Flux, SD3, SDXL, SD1.5).
 
     Returns the number of hooks installed.
     """
@@ -270,7 +374,7 @@ def install_registered_unet_forward_hooks() -> int:
             if "NextDiT" in type(dm).__name__:
                 continue
             try:
-                handle = dm.register_forward_pre_hook(_forward_pre_hook)
+                handle = dm.register_forward_pre_hook(_forward_pre_hook, with_kwargs=True)
                 _installed_hook_handles.append(handle)
                 _count += 1
             except Exception:
@@ -290,9 +394,7 @@ def reset_first_cuda_dedup() -> None:
     _first_cuda_dedup.clear()
 
 
-
-
-# ── post_load_models_gpu event ───────────────────────────────────────────────
+# ── post_load_models_gpu event (diagnostic-only) ────────────────────────────
 
 def emit_post_load_models_gpu_event(models: list[Any]) -> None:
     """Emit ``unet_forward_probe`` / ``post_load_models_gpu`` for registered UNETs.
@@ -300,8 +402,10 @@ def emit_post_load_models_gpu_event(models: list[Any]) -> None:
     Called from the GPU loader outer wrapper after ``original()`` succeeds
     (outermost reentrancy level only).  Iterates the ``models`` list and
     emits one event per registered (matched) diffusion model.
+
+    Gated by COMFYMODAL_V2_UNET_FORWARD_DIAG=1 (diagnostic-only).
     """
-    if not _ENABLED:
+    if not _is_enabled():
         return
     _ensure_context_vars()
 

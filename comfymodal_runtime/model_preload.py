@@ -32,6 +32,8 @@ from .unet_forward_probe import (
     emit_post_load_models_gpu_event,
     install_nextdit_forward_pre_hook,
     register_unet_forward_probe,
+    set_unet_gpu_demand_start,
+    _has_registered_unet_in_models,
 )
 
 # ── Prefill lane mode ─────────────────────────────────────────────────
@@ -631,7 +633,20 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                     "restore_session_id": _LATEST_RESTORE_SESSION_ID,
                     "restored_instance_id": _LATEST_RESTORED_INSTANCE_ID,
                 })
-            elif lane is None and request_trace is None:
+            # Always-on UNET first-CUDA demand start:
+            # Record the monotonic_ns when load_models_gpu is first called
+            # for a registered UNET in this request, regardless of lane state.
+            # Previously this was inside `elif lane is None` so lane-owned
+            # calls (e.g. background restore) or any non-None lane during
+            # request execution would skip demand tracking.
+            # Must stay inside `if before == 0:` scope.
+            if request_trace is not None and _has_registered_unet_in_models(models):
+                set_unet_gpu_demand_start(request_trace.request_id, time.monotonic_ns())
+                request_trace.emit("unet_gpu_demand_start", metadata={
+                    "request_id": request_trace.request_id,
+                    "caller_classification": _caller,
+                })
+            if lane is None and request_trace is None:
                 # Installed wrapper called outside any lane/request scope
                 _caller = "not_observed"
                 global _not_observed_gpu_calls
@@ -1314,7 +1329,32 @@ def _make_model_patcher_constructor_wrapper(original):
         elif emit_clip:
             lane._trace.emit("clip_model_patcher_constructor_start", phase="restore")
         try:
-            return original(self, *args, **kwargs)
+            result = original(self, *args, **kwargs)
+            # Install SAMPLER_SAMPLE wrapper on every model patcher for always-on
+            # sampling timing.  The wrapper reads _ACTIVE_REQUEST_TRACE and emits
+            # sampling_start/sampling_end via the production RuntimeTrace.
+            if hasattr(self, "model_options"):
+                try:
+                    import comfy.patcher_extension as _pe
+                    from comfymodal_runtime.runtime_executor import _COMFYMODAL_V2_SAMPLING_WRAPPER
+                    _pe.add_wrapper_with_key(
+                        _pe.WrappersMP.SAMPLER_SAMPLE,
+                        "comfymodal_v2_sampling_timing",
+                        _COMFYMODAL_V2_SAMPLING_WRAPPER,
+                        self.model_options,
+                        is_model_options=True,
+                    )
+                except Exception:
+                    pass  # Non-fatal: sampling timing unavailable for this model
+            # Register every ModelPatcher for UNET first-CUDA timing.
+            # Idempotent: duplicate registrations for the same diffusion_model
+            # are silently ignored by register_unet_forward_probe.
+            try:
+                from comfymodal_runtime.unet_forward_probe import register_unet_forward_probe as _reg_unet
+                _reg_unet(self, source="model_patcher_constructor")
+            except Exception:
+                pass
+            return result
         finally:
             if emit_unet:
                 _dur_ms = round((time.monotonic_ns() - _fn_start_ns) / 1_000_000, 3)
@@ -4981,6 +5021,9 @@ class V2LoaderBridge:
         # Set completed futures BEFORE publishing the preparation,
         # so graph-time consumers never observe an incomplete state.
         if unet is not _LOADER_MISS:
+            # Register snapshot UNET for first-CUDA timing and install
+            # forward pre-hook on its diffusion model.
+            register_unet_forward_probe(unet, source="cpu_snapshot")
             unet_future: Future[Any] = Future()
             unet_future.set_result(unet)
             prep.unet_future = unet_future

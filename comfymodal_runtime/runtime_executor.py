@@ -1748,3 +1748,79 @@ class RuntimeExecutor:
 
     def _runner_for(self, selected: str) -> Callable[..., Any] | None:
         return self.in_process_runner if selected == "in_process" else self.subprocess_runner
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SAMPLER_SAMPLE production wrapper — always-on sampling timing
+# ═══════════════════════════════════════════════════════════════════════
+# Lives here (not in modal_app.py) to avoid circular import with model_preload.
+
+# Per-request dedup set for SAMPLER_SAMPLE wrapper.
+_sampler_wrapper_dedup: set[tuple[str, str]] = set()
+_sampler_wrapper_dedup_lock = threading.RLock()
+
+
+def _build_sampling_wrapper() -> Callable:
+    """Build a production SAMPLER_SAMPLE wrapper that emits sampling_start
+    and sampling_end events to the active request RuntimeTrace.
+
+    The wrapper reads ``_ACTIVE_REQUEST_TRACE`` from model_preload's ContextVar,
+    emits ``sampling_start`` immediately before the inner executor, emits
+    ``sampling_end`` in a ``finally`` block immediately after, computes duration
+    via ``time.monotonic_ns()``, and reads step count from the sigma argument.
+
+    Deduplication is per ``(request_id, id(executor))`` to ensure exactly one
+    start/end pair per sampler invocation, even if the wrapper is registered
+    on multiple model options (snapshot, normal, alternate).
+
+    Does NOT copy ``CFGGuider.inner_sample`` or any other sampler internals.
+    Preserves all model options and wrapper chains.
+    """
+    from comfymodal_runtime.model_preload import _ACTIVE_REQUEST_TRACE
+
+    def _wrapper(executor: Any, *args: Any, **kwargs: Any) -> Any:
+        trace = _ACTIVE_REQUEST_TRACE.get()
+        if trace is None:
+            return executor(*args, **kwargs)
+
+        # Dedup: one start/end per (request_id, id(executor)).
+        dedup_key = (trace.request_id, str(id(executor)))
+        with _sampler_wrapper_dedup_lock:
+            if dedup_key in _sampler_wrapper_dedup:
+                return executor(*args, **kwargs)
+            _sampler_wrapper_dedup.add(dedup_key)
+
+        # Extract step count from sigma argument (torch tensor length).
+        sigmas = kwargs.get("sigmas") if "sigmas" in kwargs else (
+            args[1] if len(args) > 1 else None
+        )
+        steps = int(len(sigmas)) - 1 if sigmas is not None and hasattr(sigmas, "__len__") else 0
+
+        # Get node metadata from sampler (first arg is CFGGuider self).
+        sampler_self = args[0] if args else None
+        node_id = str(getattr(sampler_self, "_node_id", getattr(sampler_self, "node_id", "")))
+        node_class = str(getattr(sampler_self, "_class_type", getattr(sampler_self, "class_type", "")))
+
+        t0 = time.monotonic_ns()
+        trace.emit("sampling_start", phase="execution", metadata={
+            "node_id": node_id,
+            "node_class": node_class,
+            "steps": steps,
+        })
+        try:
+            return executor(*args, **kwargs)
+        finally:
+            duration_ms = round((time.monotonic_ns() - t0) / 1_000_000, 3)
+            trace.emit("sampling_end", phase="execution", metadata={
+                "node_id": node_id,
+                "node_class": node_class,
+                "duration_ms": duration_ms,
+                "steps": steps,
+                "source": "sampler_sample_wrapper",
+            })
+
+    return _wrapper
+
+
+# Pre-built SAMPLER_SAMPLE wrapper singleton.
+_COMFYMODAL_V2_SAMPLING_WRAPPER: Callable = _build_sampling_wrapper()
