@@ -38,12 +38,23 @@ class HandleCacheKey:
     environment produces the same dict key across call boundaries.
     Invocation-time cloud overrides are excluded — target identity
     is purely workspace + environment + app + class.
+
+    *cloud* (optional) isolates caches across different Modal cloud
+    placements (e.g. ``"gcp"`` vs ``"aws"``).  *factory_identity*
+    (optional) isolates caches across different ``v2_handle_factory``
+    callables so that distinct factory objects never share a cached
+    handle.  *gpu* (optional) isolates caches across different GPU
+    configurations so that distinct GPU targets never share a cached
+    handle.
     """
 
     workspace: str
     app_name: str
     target: str
     environment: str = ""
+    cloud: str = ""
+    gpu: str = ""
+    factory_identity: object | None = None
 
 
 class HandleCache:
@@ -152,11 +163,15 @@ class ModalTransport:
         class_name = os.environ.get("COMFYMODAL_V2_CLASS_NAME", "ModalRuntimeEntrypointV2")
         workspace_id = str((workspace or {}).get("id", "default"))
         environment = self._resolve_environment()
+        cloud = self._resolve_v2_cloud(gpu)
         key = HandleCacheKey(
             workspace_id,
             app_name,
             class_name,
             environment=environment,
+            cloud=cloud,
+            gpu=selected_gpu_str,
+            factory_identity=self.v2_handle_factory,
         )
         cached = self.handle_cache.get(key)
         if cached is not None:
@@ -368,7 +383,7 @@ class ModalTransport:
                         transport_meta=runtime_trace._metadata,
                         plan_to_dict_count=1,
                     )
-                    _emit_breakdown_line("[v2.local_submission_breakdown]", _pre_breakdown)
+                    _emit_breakdown_line("[v2.local_submission_breakdown.pre_dispatch]", _pre_breakdown)
                     # Inject breakdown into plan_dict for remote re-emission.
                     # Ensure the parent origin dict is in plan_dict even when
                     # no prior origin data existed.

@@ -2002,7 +2002,7 @@ async def execute_plan(
         transport_meta=_transport_meta,
         plan_to_dict_count=1,
     )
-    _emit_breakdown_line("[v2.local_submission_breakdown]", _breakdown)
+    _emit_breakdown_line("[v2.local_submission_breakdown.final]", _breakdown)
     result["trace"] = remote_trace
     return result
 

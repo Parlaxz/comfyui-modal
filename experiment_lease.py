@@ -49,8 +49,7 @@ class UnknownCheckpointError(LeaseError):
 def _migrate_asset_schema(conn: sqlite3.Connection) -> None:
     """Migrate the assets table to the extended B3 schema if needed.
     
-    Adds columns: parent_asset_id, node_id, output_key, output_index,
-    comparison_side, width, height.  Existing rows get default values.
+    Existing rows get default values.
     """
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(assets)").fetchall()}
     new_cols = {

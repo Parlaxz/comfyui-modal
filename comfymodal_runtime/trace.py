@@ -378,10 +378,21 @@ def _derived_mono_delta_ms(trace: RuntimeTrace, start_name: str, end_name: str) 
 # One map used by both local and remote emitters so field names never diverge.
 
 LOCAL_SUBMISSION_FIELD_KEYS: tuple[tuple[str, str], ...] = (
-    ("request_id",                    "request_id"),
-    ("local_receive_to_worker_start_ms", "local_receive_to_worker_start_ms"),
-    ("worker_start_to_plan_build_ms", "worker_start_to_plan_build_ms"),
-    ("worker_queue_ms",               "worker_queue_ms"),
+    ("request_id",                          "request_id"),
+    ("local_receive_to_worker_start_ms",    "local_receive_to_worker_start_ms"),
+    ("worker_start_to_normalize_start_ms",  "worker_start_to_normalize_start_ms"),
+    ("normalize_production_options_ms",     "normalize_production_options_ms"),
+    ("normalize_end_to_trace_construct_start_ms", "normalize_end_to_trace_construct_start_ms"),
+    ("runtime_trace_construct_ms",          "runtime_trace_construct_ms"),
+    ("trace_construct_to_options_copy_start_ms", "trace_construct_to_options_copy_start_ms"),
+    ("benchmark_options_copy_ms",           "benchmark_options_copy_ms"),
+    ("options_copy_to_client_id_start_ms",  "options_copy_to_client_id_start_ms"),
+    ("client_id_generation_ms",             "client_id_generation_ms"),
+    ("client_id_end_to_plan_call_ms",       "client_id_end_to_plan_call_ms"),
+    ("plan_call_to_function_entry_ms",      "plan_call_to_function_entry_ms"),
+    ("worker_start_to_plan_build_ms",       "worker_start_to_plan_build_ms"),
+    ("local_receive_to_plan_build_start_ms","local_receive_to_plan_build_start_ms"),
+    ("worker_queue_ms",                     "worker_queue_ms"),
     ("plan_build_ms",                 "plan_build_ms"),
     ("plan_build_to_execute_plan_entry_ms", "plan_build_to_execute_plan_entry_ms"),
     ("execute_plan_entry_to_plan_materialization_ms", "execute_plan_entry_to_plan_materialization_ms"),
@@ -553,6 +564,44 @@ def _build_local_submission_breakdown(
                 _worker_start_to_plan_build_ms = round(_delta / 1_000_000, 3)
     _worker_queue_ms = _worker_start_to_plan_build_ms
 
+    # ── Benchmark prefix stages (decompose worker_start→plan_build_start) ──
+    # ── Benchmark prefix stages (non-overlapping partition: ws→norm_start→norm_end→
+    #    rtc_start→rtc_end→bc_start→bc_end→cid_start→cid_end→bep_call→plan_build_start) ──
+    _normalize_production_options_ms = _strict_event_span_ms(trace,
+        "normalize_production_options_start", "normalize_production_options_end")
+    _benchmark_options_copy_ms = _strict_event_span_ms(trace,
+        "benchmark_options_copy_start", "benchmark_options_copy_end")
+    _client_id_generation_ms = _strict_event_span_ms(trace,
+        "client_id_generation_start", "client_id_generation_end")
+    _plan_call_to_func_entry_ms = _derived_mono_delta_ms(trace,
+        "build_execution_plan_call_start", "plan_build_start")
+
+    # Gap fields: each is the delta between consecutive prefix boundaries.
+    # These form a strict non-overlapping partition of ws→plan_build_start.
+    _worker_start_to_normalize_start_ms = _derived_mono_delta_ms(trace,
+        "worker_start", "normalize_production_options_start")
+    _normalize_end_to_trace_construct_start_ms = _derived_mono_delta_ms(trace,
+        "normalize_production_options_end", "runtime_trace_construct_start")
+    _runtime_trace_construct_ms = _derived_mono_delta_ms(trace,
+        "runtime_trace_construct_start", "trace_construct_end")
+    _trace_construct_to_options_copy_start_ms = _derived_mono_delta_ms(trace,
+        "trace_construct_end", "benchmark_options_copy_start")
+    _options_copy_to_client_id_start_ms = _derived_mono_delta_ms(trace,
+        "benchmark_options_copy_end", "client_id_generation_start")
+    _client_id_end_to_plan_call_ms = _derived_mono_delta_ms(trace,
+        "client_id_generation_end", "build_execution_plan_call_start")
+
+    # Total: local_receive → plan_build_start
+    _local_receive_to_plan_build_start_ms: Any = _ABS
+    if isinstance(_ref_mono_local_receive, int):
+        _ref_mono_plan_bs = _event_mono_ns(trace, "plan_build_start")
+        if isinstance(_ref_mono_plan_bs, int):
+            _delta = _ref_mono_plan_bs - _ref_mono_local_receive
+            if _delta < 0:
+                _local_receive_to_plan_build_start_ms = _INV
+            else:
+                _local_receive_to_plan_build_start_ms = round(_delta / 1_000_000, 3)
+
     # ── Total span: local_receive→submission ──
     _total_ms: Any = _ABS
     if isinstance(_ref_mono_local_receive, int) and isinstance(_ref_mono_submission, int):
@@ -573,9 +622,31 @@ def _build_local_submission_breakdown(
             _local_receive_to_modal_call_ms = round(_delta / 1_000_000, 3)
 
     # ── Measured children: sum of all valid sequential non-overlapping stages ──
+    # Prefix stage fields (benchmark) replace the coarse worker_start_to_plan_build_ms
+    # when detailed events exist; when absent the coarse field is used.
+    _prefix_keys = [
+        ("worker_start_to_normalize_start_ms", _worker_start_to_normalize_start_ms),
+        ("normalize_production_options_ms", _normalize_production_options_ms),
+        ("normalize_end_to_trace_construct_start_ms", _normalize_end_to_trace_construct_start_ms),
+        ("runtime_trace_construct_ms", _runtime_trace_construct_ms),
+        ("trace_construct_to_options_copy_start_ms", _trace_construct_to_options_copy_start_ms),
+        ("benchmark_options_copy_ms", _benchmark_options_copy_ms),
+        ("options_copy_to_client_id_start_ms", _options_copy_to_client_id_start_ms),
+        ("client_id_generation_ms", _client_id_generation_ms),
+        ("client_id_end_to_plan_call_ms", _client_id_end_to_plan_call_ms),
+        ("plan_call_to_function_entry_ms", _plan_call_to_func_entry_ms),
+    ]
+    _has_prefix_stages = any(
+        isinstance(v, (int, float)) for _, v in _prefix_keys
+    )
     _child_keys = [
         ("local_receive_to_worker_start_ms", _local_receive_to_worker_start_ms),
-        ("worker_start_to_plan_build_ms", _worker_start_to_plan_build_ms),
+    ]
+    if _has_prefix_stages:
+        _child_keys.extend(_prefix_keys)
+    else:
+        _child_keys.append(("worker_start_to_plan_build_ms", _worker_start_to_plan_build_ms))
+    _child_keys.extend([
         ("plan_build_ms", _plan_build_ms),
         ("plan_build_to_execute_plan_entry_ms", _plan_build_to_exec_entry_ms),
         ("execute_plan_entry_to_plan_materialization_ms", _exec_entry_to_plan_mat_ms),
@@ -593,7 +664,7 @@ def _build_local_submission_breakdown(
         ("payload_ready_to_modal_call_ms", _payload_ready_to_gen_create_ms),
         ("generator_create_ms", _generator_create_ms),
         ("generator_created_to_first_iteration_ms", _gen_created_to_first_iter_ms),
-    ]
+    ])
     _measured_children_ms: Any = _ABS
     _all_numeric = True
     _child_sum = 0.0
@@ -658,7 +729,18 @@ def _build_local_submission_breakdown(
         # Required fields
         "request_id": _origin.get("request_id") or trace.request_id,
         "local_receive_to_worker_start_ms": _local_receive_to_worker_start_ms,
+        "worker_start_to_normalize_start_ms": _worker_start_to_normalize_start_ms,
+        "normalize_production_options_ms": _normalize_production_options_ms,
+        "normalize_end_to_trace_construct_start_ms": _normalize_end_to_trace_construct_start_ms,
+        "runtime_trace_construct_ms": _runtime_trace_construct_ms,
+        "trace_construct_to_options_copy_start_ms": _trace_construct_to_options_copy_start_ms,
+        "benchmark_options_copy_ms": _benchmark_options_copy_ms,
+        "options_copy_to_client_id_start_ms": _options_copy_to_client_id_start_ms,
+        "client_id_generation_ms": _client_id_generation_ms,
+        "client_id_end_to_plan_call_ms": _client_id_end_to_plan_call_ms,
+        "plan_call_to_function_entry_ms": _plan_call_to_func_entry_ms,
         "worker_start_to_plan_build_ms": _worker_start_to_plan_build_ms,
+        "local_receive_to_plan_build_start_ms": _local_receive_to_plan_build_start_ms,
         "worker_queue_ms": _worker_queue_ms,
         "plan_build_ms": _plan_build_ms,
         "plan_build_to_execute_plan_entry_ms": _plan_build_to_exec_entry_ms,

@@ -6373,6 +6373,36 @@ def _rmtree_robust(path: str) -> None:
             raise
 
 
+_REQUIREMENTS_CONTEXT_MTIME = 946684800  # 2000-01-01 UTC
+
+
+def _normalize_requirements_context_metadata(root: str) -> None:
+    """Make staged dependency context metadata deterministic for Modal caching.
+
+    Fresh checkouts and regenerated staging trees can carry different mtimes
+    and modes even when every dependency file is byte-for-byte unchanged.
+    Normalize files and directories so metadata-only changes cannot invalidate
+    the custom-node dependency image layer.
+    """
+    if not os.path.isdir(root):
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        for dirname in dirnames:
+            directory = os.path.join(dirpath, dirname)
+            if os.path.islink(directory):
+                continue
+            os.chmod(directory, 0o755)
+            os.utime(directory, (_REQUIREMENTS_CONTEXT_MTIME, _REQUIREMENTS_CONTEXT_MTIME))
+        for filename in filenames:
+            file_path = os.path.join(dirpath, filename)
+            if os.path.islink(file_path):
+                continue
+            os.chmod(file_path, 0o644)
+            os.utime(file_path, (_REQUIREMENTS_CONTEXT_MTIME, _REQUIREMENTS_CONTEXT_MTIME))
+    os.chmod(root, 0o755)
+    os.utime(root, (_REQUIREMENTS_CONTEXT_MTIME, _REQUIREMENTS_CONTEXT_MTIME))
+
+
 def _build_requirements_context_manifest(root: str) -> dict[str, str]:
     manifest = {}
     if not os.path.isdir(root):
@@ -6849,12 +6879,15 @@ def _sync_custom_node_dependency_files(node_path: str, dst_node_dir: str) -> Non
                     f"directory. Aborting copy for {node_path}."
                 )
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)
+            shutil.copyfile(src, dst)
+            os.chmod(dst, 0o644)
+            os.utime(dst, (_REQUIREMENTS_CONTEXT_MTIME, _REQUIREMENTS_CONTEXT_MTIME))
         if _build_requirements_context_manifest(staged_dir) == _build_requirements_context_manifest(dst_node_dir):
             return
         if os.path.isdir(dst_node_dir):
             _rmtree_robust(dst_node_dir)
         shutil.copytree(staged_dir, dst_node_dir)
+        _normalize_requirements_context_metadata(dst_node_dir)
 
 
 def _prepare_custom_node_requirements_build_context(source_root: str, target_root: str) -> None:
@@ -6886,6 +6919,8 @@ def _prepare_custom_node_requirements_build_context(source_root: str, target_roo
         entry_path = os.path.join(target_root, entry)
         if os.path.isdir(entry_path) and entry not in desired_nodes:
             _rmtree_robust(entry_path)
+
+    _normalize_requirements_context_metadata(target_root)
 
 
 if not _INSIDE_MODAL_CONTAINER:
@@ -7044,7 +7079,7 @@ if not _INSIDE_MODAL_CONTAINER:
         '  _total_req=$((_total_req+1)); '
         '  local t0; t0=$(__ts_ms); '
         '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name start_ts=$t0"; '
-        '  cd "$d" && pip install -r requirements.txt -c "$_lock" --quiet; '
+        '  cd "$d" && python -m pip install --disable-pip-version-check --no-input -r requirements.txt -c "$_lock" --quiet; '
         '  local t1; t1=$(__ts_ms); '
         '  local dur; dur=$((t1 - t0)); '
         '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name end_ts=$t1 duration_ms=$dur"; '
@@ -7056,9 +7091,9 @@ if not _INSIDE_MODAL_CONTAINER:
         '_end_ts=$(__ts_ms); '
         'echo "CUSTOM_NODE_PREREQ_INSTALL_END ts_ms=$_end_ts total_nodes=$_total_req installed=$_total_installed skipped_no_req=$_total_skipped"; '
         # CacheDiT final family reinstall (after all custom-node reqs)
-        'echo "CACHEDIT_LOCK_FAMILY_REINSTALL_START ts_ms=$(__ts_ms)"; '
-        'pip install --force-reinstall --no-deps -r "$_lock" --quiet; '
-        'echo "CACHEDIT_LOCK_FAMILY_REINSTALL_END ts_ms=$(__ts_ms)"; '
+        'echo "CACHEDIT_LOCK_FAMILY_ENSURE_START ts_ms=$(__ts_ms)"; '
+        'python -m pip install --disable-pip-version-check --no-input --no-deps -r "$_lock" --quiet; '
+        'echo "CACHEDIT_LOCK_FAMILY_ENSURE_END ts_ms=$(__ts_ms)"; '
         # CacheDiT image-build import gate
         # Override compiler cache envs to /tmp paths — the image env sets
         # TORCHINDUCTOR_CACHE_DIR=/root/comfymodal_runtime_state/.inductor-cache,
@@ -7110,7 +7145,7 @@ if not _INSIDE_MODAL_CONTAINER:
         'assert ok, "CACHEDIT_LOCK_GATE FAILED: one or more locked packages missing or version mismatch"\n'
         'print("CACHEDIT_LOCK_GATE PASSED")\n'
         'import shutil\n'
-        'shutil.rmtree("/root/comfymodal_runtime_state", ignore_errors=True)\n'
+        'None\n'
         'print("CACHEDIT_LOCK_GATE cleanup complete")\n'
         'PYEOF\n'
     )

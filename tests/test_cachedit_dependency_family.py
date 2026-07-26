@@ -307,6 +307,7 @@ def load_modal_app():
     sys.modules["comfymodal_runtime.output_delivery"].__dict__.update({
         "Attempt": MagicMock(),
         "_measure_json_bytes": lambda x: 0,
+        "attempt_to_descriptor_result": lambda **kw: {"images": [], "videos": [], "outputs": {}, "asset_descriptors": [], "use_descriptors": True},
         "build_default_chain": lambda **kw: [],
         "run_strategy_chain": lambda **kw: {},
     })

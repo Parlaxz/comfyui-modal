@@ -134,7 +134,9 @@ class AssetDescriptor:
       generation          — generation / version tag
       thumbnail_identity  — optional identity string for thumbnail variant
     """
+    asset_id: str = ""
     identity: str = ""
+    backend_path: str = ""
     path: str = ""
     filename: str = ""
     mime_type: str = ""
@@ -166,15 +168,15 @@ def build_asset_descriptor_list(
     descriptors: list[AssetDescriptor] = []
     for item in attempt.items:
         raw = item.raw_bytes
-        identity = (
-            f"sha256:{hashlib.sha256(raw).hexdigest()}"
-            if raw else ""
-        )
+        digest = hashlib.sha256(raw).hexdigest() if raw else ""
+        identity = f"sha256:{digest}" if digest else ""
         thumb_id = ""
         if thumbnail_identities is not None:
             thumb_id = thumbnail_identities.get(item.node_id, "")
         descriptors.append(AssetDescriptor(
+            asset_id=digest,
             identity=identity,
+            backend_path=item.path,
             path=item.path,
             filename=item.filename,
             mime_type=item.mime_type,
@@ -224,11 +226,10 @@ def attempt_to_descriptor_result(
     for item in attempt.items:
         output_key = item.output_key or ("gifs" if item.animated else "images")
         raw = item.raw_bytes
-        identity = (
-            f"sha256:{hashlib.sha256(raw).hexdigest()}"
-            if raw else ""
-        )
+        digest = hashlib.sha256(raw).hexdigest() if raw else ""
+        identity = f"sha256:{digest}" if digest else ""
         entry: dict[str, Any] = {
+            "asset_id": digest,
             "filename": item.filename,
             "node_id": item.node_id,
             "output_key": output_key,
@@ -241,7 +242,9 @@ def attempt_to_descriptor_result(
             "format": item.format,
             "byte_count": len(raw),
             "identity": identity,
+            "backend_path": item.path,
             "path": item.path,
+            "generation": generation,
         }
         if legacy_data:
             data = item.base64_data or base64.b64encode(raw).decode("ascii") if raw else ""
