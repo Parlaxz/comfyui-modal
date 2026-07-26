@@ -539,6 +539,21 @@ class ModalTransport:
                             first_iteration_to_first_remote_event_ms=round((_first_event_mono_ns - _submission_mono_ns) / 1_000_000, 3),
                             local_receive_to_actual_submission_ms=(round((_submission_mono_ns - _t1_mono) / 1_000_000, 3) if isinstance(_t1_mono, int) else None),
                         )
+                if runtime_trace is not None:
+                    _final_breakdown = _build_local_submission_breakdown(
+                        runtime_trace,
+                        origin=_origin_from_meta,
+                        transport_meta=runtime_trace._metadata,
+                        plan_to_dict_count=1,
+                    )
+                    runtime_trace.set_metadata(
+                        local_submission_breakdown=dict(_final_breakdown),
+                        local_submission_breakdown_status="complete",
+                    )
+                    _emit_breakdown_line(
+                        "[v2.local_submission_breakdown]",
+                        _final_breakdown,
+                    )
                 yield first_event
                 async for event in iterator:
                     if runtime_trace is not None and isinstance(event, dict) and event.get("type") == "result":

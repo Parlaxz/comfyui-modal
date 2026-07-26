@@ -196,19 +196,19 @@ class TestCustomNodeRestoreFastPath:
 class TestSageRestoreFastPath:
     """Verify identity-based skip of Sage discovery/patch during restore()."""
 
-    def test_sage_identity_captured_skips_discovery(self) -> None:
-        """When sage_identity_captured is True and env stable,
-        apply_sage_policy is NOT called."""
+    def test_sage_not_captured_calls_policy(self) -> None:
+        """When sage_identity_captured is False, apply_sage_policy
+        IS called during restore."""
         bootstrap, _, sage_mock = _make_restore_bootstrap(
             prescan_cn_gen="gen-1",
             record_gen="gen-1",
             sage_mode="baked_cuda",
-            sage_captured=True,
+            sage_captured=False,
         )
         with patch.object(bootstrap, "observe_generations", return_value={"runtime_state": "rs-gen-1", "custom_nodes": "gen-1"}):
             bootstrap.restore()
-        assert sage_mock.call_count == 0, (
-            f"apply_sage_policy should not be called on identity match, "
+        assert sage_mock.call_count == 1, (
+            f"apply_sage_policy should be called when not captured, "
             f"called {sage_mock.call_count} times"
         )
 
@@ -359,15 +359,15 @@ class TestConvertOutputItemsBase64:
             "base64_data should be the encoded value in legacy mode"
         )
 
-    def test_legacy_mode_default(self) -> None:
-        """Default include_base64 should be True (backward compat)."""
+    def test_descriptor_mode_default(self) -> None:
+        """Descriptor mode is the safe default; legacy mode is explicit."""
         from inspect import signature
         from comfymodal_runtime.result_delivery import convert_output_items
         sig = signature(convert_output_items)
         assert "include_base64" in sig.parameters
         param = sig.parameters["include_base64"]
-        assert param.default is True, (
-            "include_base64 should default to True"
+        assert param.default is False, (
+            "include_base64 should default to False"
         )
 
     def test_byte_count_preserved_in_descriptor_mode(self) -> None:
@@ -397,54 +397,55 @@ class TestConvertOutputItemsBase64:
 class TestRestoreFastPathIntegration:
     """Verify multiple fast paths work together in a single restore()."""
 
-    def test_both_fast_paths_on_exact_match(self) -> None:
-        """When both custom-node and Sage identities match, neither
-        sync_custom_nodes nor apply_sage_policy is called."""
+    def test_custom_node_skip_on_exact_match(self) -> None:
+        """When prescan identity matches, sync_custom_nodes is skipped."""
         bootstrap, sync_mock, sage_mock = _make_restore_bootstrap(
             prescan_cn_gen="gen-1",
             record_gen="gen-1",
             sage_mode="baked_cuda",
-            sage_captured=True,
-        )
-        with patch.object(bootstrap, "observe_generations", return_value={"runtime_state": "rs-gen-1", "custom_nodes": "gen-1"}):
-            bootstrap.restore()
-        assert sync_mock.call_count == 0, "sync should be skipped on identity match"
-        assert sage_mock.call_count == 0, "sage should be skipped on identity match"
-
-    def test_first_call_runs_both(self) -> None:
-        """On first restore (sage not captured yet), both callbacks run."""
-        bootstrap, sync_mock, sage_mock = _make_restore_bootstrap(
-            prescan_cn_gen="gen-1",
-            record_gen="gen-1",
-            sage_mode="",      # Not captured yet
             sage_captured=False,
         )
         with patch.object(bootstrap, "observe_generations", return_value={"runtime_state": "rs-gen-1", "custom_nodes": "gen-1"}):
             bootstrap.restore()
-        # Sage runs because sage_identity_captured is False
+        assert sync_mock.call_count == 0, "sync should be skipped on identity match"
+        # Sage runs because snapshot_sage_identity is empty (no real module)
+        assert sage_mock.call_count >= 1, "sage runs since no real Sage module for verify"
+
+    def test_first_call_runs_both(self) -> None:
+        """On first restore, sync is skipped (prescan match) and Sage runs."""
+        bootstrap, sync_mock, sage_mock = _make_restore_bootstrap(
+            prescan_cn_gen="gen-1",
+            record_gen="gen-1",
+            sage_mode="",      # Not set yet
+            sage_captured=False,
+        )
+        with patch.object(bootstrap, "observe_generations", return_value={"runtime_state": "rs-gen-1", "custom_nodes": "gen-1"}):
+            bootstrap.restore()
+        # Sage runs because snapshot_sage_identity is empty
         assert sage_mock.call_count >= 1, "sage should run on first restore"
         # CN sync is skipped because has_prescan_identity() is True (record restored)
         assert sync_mock.call_count == 0, (
             "sync is skipped because has_prescan_identity() succeeds"
         )
-        # After first restore, sage identity is captured
+        # After first restore, sage identity is captured by apply_sage_policy
         assert bootstrap.state.sage_identity_captured
 
-    def test_sage_skip_while_cn_runs(self) -> None:
-        """Sage can be skipped (captured) while CN sync runs (no record).
+    def test_sage_runs_while_cn_skips(self) -> None:
+        """Sage always runs when verify fails; CN sync skips when record exists.
 
-        When has_prescan_identity() is False (no prescan record available),
-        the custom-node fast path falls through, but the Sage fast path
-        skips if sage_identity_captured is True."""
+        The sage_identity_captured flag alone is not sufficient to skip Sage
+        (the fallback was removed per spec). The snapshot_sage_identity
+        must verify against the real module for the skip to work."""
         tmpdir = tempfile.mkdtemp()
-        record_path = os.path.join(tmpdir, "nonexistent.json")
+        record_path = os.path.join(tmpdir, "prescan_test.json")
+        _write_prescan_record(record_path, "gen-1")
         config = BootstrapConfig(
             comfyui_root=tmpdir,
             models_path=os.path.join(tmpdir, "models"),
             prescan_record_path=record_path,
         )
         sync_mock = MagicMock()
-        sage_mock = MagicMock()
+        sage_mock = MagicMock(return_value={"mode": "baked_cuda", "reason": "patched"})
         bootstrap = RuntimeBootstrap(
             config,
             reload_models=MagicMock(),
@@ -456,10 +457,9 @@ class TestRestoreFastPathIntegration:
             apply_sage_policy=sage_mock,
             observe_generations=lambda: {"runtime_state": "rs-gen-1", "custom_nodes": "gen-1"},
         )
-        # Sage was captured in a previous restore
-        bootstrap.state.sage_mode = "baked_cuda"
-        bootstrap.state.sage_identity_captured = True
-        # No record → has_prescan_identity() False → Sage fast path skips (needs has_prescan_identity)
         bootstrap.restore()
-        assert sync_mock.call_count >= 1, "sync should run (no prescan record)"
+        # CN sync skipped because prescan record exists
+        assert sync_mock.call_count == 0, "sync should be skipped (prescan record exists)"
+        # Sage runs because snapshot_sage_identity is empty (verify fails)
+        assert sage_mock.call_count >= 1, "sage should run (no snapshot_sage_identity)"
         assert sage_mock.call_count >= 1, "sage should run (no prescan identity to verify env)"

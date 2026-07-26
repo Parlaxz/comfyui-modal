@@ -6,6 +6,7 @@ import time
 import uuid
 import os
 import threading
+from dataclasses import replace
 from contextlib import contextmanager
 from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
@@ -63,6 +64,7 @@ class RuntimeTrace:
         self.trace_id = trace_id or uuid.uuid4().hex[:16]
         self._events: list[TraceEvent] = []
         self._started_ns: dict[str, int] = {}
+        self._last_emitted_mono_ns = 0
         self._metadata: dict[str, Any] = {}
 
     @property
@@ -115,6 +117,9 @@ class RuntimeTrace:
             trace_id=self.trace_id,
             metadata=event_metadata,
         )
+        if event.monotonic_ns <= self._last_emitted_mono_ns:
+            event = replace(event, monotonic_ns=self._last_emitted_mono_ns + 1)
+        self._last_emitted_mono_ns = event.monotonic_ns
         self._events.append(event)
         return event
 
@@ -128,7 +133,12 @@ class RuntimeTrace:
         phase: str = "",
         metadata: Mapping[str, Any] | None = None,
     ) -> TraceEvent:
-        """Append an event whose timestamp was captured at another boundary."""
+        """Append an event whose timestamp was captured at another boundary.
+
+        Preserves the supplied timestamps exactly — does not mix clock domains.
+        ``wall_unix_ns`` is for cross-process correlation; ``monotonic_ns`` is
+        for same-process duration calculations.
+        """
         event_metadata = dict(metadata or {})
         event_metadata.setdefault("trace_id", self.trace_id)
         event_metadata.setdefault("pid", os.getpid())
@@ -171,6 +181,11 @@ class RuntimeTrace:
             trace_id=self.trace_id,
             metadata=event_metadata,
         )
+        if event.process == self.process:
+            self._last_emitted_mono_ns = max(
+                self._last_emitted_mono_ns,
+                event.monotonic_ns,
+            )
         self._events.append(event)
         return event
 
@@ -291,8 +306,13 @@ def merge_runtime_traces(*values: RuntimeTrace | Mapping[str, Any] | None) -> Ru
     Mapping inputs are normalized through the legacy serializer first. Exact
     duplicate events are removed, metadata is merged in input order (so a
     later remote payload can supply authoritative derived fields), and the
-    resulting event list is sorted by wall time for display. Monotonic clocks
-    are never compared across processes.
+    resulting event list is sorted by wall_unix_ns for display.
+
+    IMPORTANT: monotonic_ns values are only valid for same-process duration
+    calculations (they come from ``time.monotonic_ns()`` which has no meaning
+    across processes). Wall_unix_ns (from ``time.time_ns()``) is used for
+    cross-process correlation only. The sort key is wall_unix_ns, not
+    monotonic_ns.
     """
     result = RuntimeTrace(process="merged")
     seen: set[str] = set()
@@ -429,6 +449,15 @@ LOCAL_SUBMISSION_FIELD_KEYS: tuple[tuple[str, str], ...] = (
     ("active_profile_checker_ms",     "active_profile_checker_ms"),
     ("active_profile_setter_ms",      "active_profile_setter_ms"),
     ("active_profile_total_ms",       "active_profile_total_ms"),
+    # Handle resolution booleans
+    ("created_modal_client",          "created_modal_client"),
+    ("performed_cls_from_name",       "performed_cls_from_name"),
+    ("constructed_class_instance",    "constructed_class_instance"),
+    # Payload / workflow metadata
+    ("input_image_count",             "input_image_count"),
+    ("workflow_node_count",           "workflow_node_count"),
+    # Large-residual diagnostic
+    ("unmeasured_boundary",           "unmeasured_boundary"),
 )
 """Canonical ordered field list for [v2.local_submission_breakdown].
 Each entry is (dict_key, fmt_key) where fmt_key is the printed field name."""
@@ -622,6 +651,8 @@ def _build_local_submission_breakdown(
             _local_receive_to_modal_call_ms = round(_delta / 1_000_000, 3)
 
     # ── Measured children: sum of all valid sequential non-overlapping stages ──
+    # After first iterator submission this is rebuilt from the live local trace
+    # (not pre-dispatch data) so the final reconciliation is complete.
     # Prefix stage fields (benchmark) replace the coarse worker_start_to_plan_build_ms
     # when detailed events exist; when absent the coarse field is used.
     _prefix_keys = [
@@ -723,7 +754,24 @@ def _build_local_submission_breakdown(
     else:
         _hit_handle_cache = None
 
+    # Handle resolution booleans from transport events
+    _created_client = any(e.name == "client_resolution_start" for e in trace.events)
+    _performed_cls = any(e.name == "class_lookup_start" for e in trace.events)
+    _constructed_instance = any(e.name == "instance_construction_start" for e in trace.events)
+
     _payload_bytes = _transport_meta.get("payload_bytes") or _transport_meta.get("modal_payload_serialize_bytes")
+
+    # ── unmeasured_boundary = diagnostic when residual > 100ms ──
+    _unmeasured_boundary: Any = _ABS
+    if isinstance(_residual_ms, (int, float)) and _residual_ms > 100:
+        _absent_for_boundary: list[str] = []
+        for _ck, _cv in _child_keys:
+            if not isinstance(_cv, (int, float)):
+                _absent_for_boundary.append(str(_ck))
+        if _absent_for_boundary:
+            _unmeasured_boundary = ",".join(_absent_for_boundary)
+        else:
+            _unmeasured_boundary = "between_recorded_stages"
 
     return {
         # Required fields
@@ -809,4 +857,10 @@ def _build_local_submission_breakdown(
         "active_profile_checker_ms": _transport_meta.get("active_profile_checker_ms"),
         "active_profile_setter_ms": _transport_meta.get("active_profile_setter_ms"),
         "active_profile_total_ms": _transport_meta.get("active_profile_total_ms"),
+        # Handle resolution booleans
+        "created_modal_client": _created_client,
+        "performed_cls_from_name": _performed_cls,
+        "constructed_class_instance": _constructed_instance,
+        # Large-residual diagnostic
+        "unmeasured_boundary": _unmeasured_boundary,
     }

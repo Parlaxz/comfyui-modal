@@ -20,6 +20,9 @@ _NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 if _NODE_DIR not in sys.path:
     sys.path.insert(0, _NODE_DIR)
 
+_local_exact_prefill = os.environ.get("COMFYMODAL_EXACT_CLIP_PREFILL", "1") == "1"
+print(f"[exact_prefill.local] enabled={int(_local_exact_prefill)} source=env")
+
 _log = logging.getLogger(__name__)
 
 from aiohttp import web
@@ -2215,6 +2218,23 @@ async def _execute_job(item: tuple, item_id: int):
     if not _request_workspace:
         _request_workspace = _active_workspace() or {}
 
+    # ── Active-next dedup bounding & TTL guard (audit round 7) ──
+    # Bounded in-memory dedup cache complementary to
+    # warmup_profile._last_stable_profile_cache.  Prunes stale entries
+    # and computes refresh windows; the actual setter/write side effects
+    # are handled by prepare_active_next_profile in warmup_profile.py.
+    if len(_last_written_stable_profile) > 100:
+        _last_written_stable_profile = {
+            k: v for k, v in _last_written_stable_profile.items()
+            if time.time() - v < _ACTIVE_NEXT_PROFILE_TTL_S
+        }
+    _effective_ttl_s = max(2.0, float(_ACTIVE_NEXT_PROFILE_TTL_S))
+    _refresh_after_s = min(
+        _effective_ttl_s * 0.5,
+        _effective_ttl_s - 1.0,
+    )
+    _refresh_after_s = max(1.0, _refresh_after_s)
+
     task_key = _register_running(item)
 
     # ── v2.16.20: Read acknowledgment event ──
@@ -2815,6 +2835,21 @@ async def _execute_job(item: tuple, item_id: int):
             if os.environ.get("COMFYMODAL_PERSISTENT_CLIP_CACHE", "0") == "1":
                 _clip_candidate = result.get("_clip_cache_candidate") if isinstance(result, dict) else None
                 _clip_fingerprint = result.get("_clip_cache_fingerprint") if isinstance(result, dict) else None
+                _bundle = _clip_candidate.get("bundle") if isinstance(_clip_candidate, dict) else None
+                if isinstance(_bundle, dict) and _bundle.get("encodes"):
+                    print(
+                        f"[exact_prefill.bundle] eligible=1 encode_count={len(_bundle['encodes'])} "
+                        f"hash={str(_bundle.get('bundle_hash', ''))[:16] or 'absent'}"
+                    )
+                else:
+                    _bundle_failure_reason = (
+                        result.get("_clip_cache_error") if isinstance(result, dict) else None
+                    ) or "neither_exact_clip_prefill_nor_persistent_clip_cache_enabled"
+                    if _bundle_failure_reason == "exception":
+                        _bundle_failure_reason = "extraction_exception"
+                    print(
+                        f"[exact_prefill.bundle] eligible=0 reason={_bundle_failure_reason}"
+                    )
                 if _clip_candidate and _clip_fingerprint:
                     from optimizations import candidate_payload_bytes, PERSISTENT_CLIP_CACHE_MAX_CANDIDATE_MB, _POST_DELIVERY_SINGLETON
                     _payload_bytes = candidate_payload_bytes(_clip_candidate)
@@ -2824,6 +2859,10 @@ async def _execute_job(item: tuple, item_id: int):
                         _dispatcher = _POST_DELIVERY_SINGLETON
                         _bundle_hash = (
                             _clip_candidate.get("bundle", {}).get("bundle_hash", "")
+                        )
+                        print(
+                            f"[exact_prefill.active_next_write] bundle_present={int(bool(_bundle_hash))} "
+                            f"bundle_hash={_bundle_hash[:16] or 'absent'}"
                         )
                         # Per audit round 7: the dedup identity
                         # must include the workspace, the

@@ -1831,6 +1831,35 @@ class ModalRuntimeEntrypoint:
                 "custom_nodes_source": _cn_src,
             }
 
+        def read_current_custom_node_identity() -> dict[str, str]:
+            """Authoritative-only current identity read via API token API."""
+            result: dict[str, str] = {
+                "custom_node_generation": "",
+                "generation_source": "unavailable",
+                "schema_version": "0",
+                "deployment_combined_hash": "",
+                "token": "",
+            }
+            try:
+                # Use the module's _resolve_custom_nodes_generation with
+                # API token only — no directory scan, no hash.
+                cn_gen, cn_src = module._resolve_custom_nodes_generation(
+                    api=api,
+                    authoritative_only=True,
+                )
+                if cn_gen:
+                    result["custom_node_generation"] = str(cn_gen)
+                    result["generation_source"] = str(cn_src)
+                    result["schema_version"] = "1"
+                    result["deployment_combined_hash"] = _V2_DEPLOYMENT_COMBINED_HASH
+                # Capture API token
+                token = getattr(api, "_runtime_generation_seen", "")
+                if token:
+                    result["token"] = str(token)
+            except Exception:
+                pass
+            return result
+
         config = self._config or BootstrapConfig(
             comfyui_root="/root/comfy/ComfyUI",
             models_path=MODELS_PATH,
@@ -1850,6 +1879,11 @@ class ModalRuntimeEntrypoint:
             initialize_cuda=initialize_cuda,
             apply_sage_policy=apply_sage_policy,
             observe_generations=observe_generations,
+            read_current_custom_node_identity=read_current_custom_node_identity,
+            deployment_combined_hash=_V2_DEPLOYMENT_COMBINED_HASH,
+        )
+        self.bootstrap._sage_baked_cuda_available = (
+            getattr(api, "_sage_runtime_mode", "triton_fallback") == "baked_cuda"
         )
         self._runtime_configured = True
 
@@ -2905,6 +2939,14 @@ class ModalRuntimeEntrypoint:
                     )
                     self._cpu_snapshot_models_active = True
                     _cpu_snapshot_activated = True
+                    state.snapshot_loader_outputs = {
+                        "unet": models.unet,
+                        "clip": models.clip,
+                    }
+                    state.snapshot_model_identities = {
+                        "unet": str(getattr(plan.model_key, "unet_identity", "") or ""),
+                        "clip": str(getattr(plan.model_key, "clip_identity", "") or ""),
+                    }
                     register_unet_forward_probe(models.unet, source="cpu_snapshot")
                     _activation_duration_ms = round(
                         (time.perf_counter() - _activation_perf_start) * 1000.0,
@@ -3864,31 +3906,54 @@ class ModalRuntimeEntrypoint:
                         _diag_cert_identity_build_ms = round((time.perf_counter() - _cert_identity_build_start) * 1000, 3)
 
                         # -- Snapshot-memory certificate check --
+                        # On exact hit, assign outputs/node_errors from stored payload,
+                        # set V2 cert skip flags, and do NOT enter process-cache/Volume branches.
+                        _snap_cert_source = None
                         if hasattr(self, 'bootstrap') and self.bootstrap is not None:
                             _bs = getattr(self.bootstrap, 'state', None)
                             if _bs is not None and _bs.snapshot_cert_valid:
                                 _sc = _bs.snapshot_certificate
                                 _sc_components = _sc.get("identity_components", {}) if isinstance(_sc, dict) else {}
-                                if _sc_components and _sc_components == _v2_cert_components:
-                                    if _v2_cert_identity:
-                                        print(
-                                            f"[v2.cert] source=snapshot_memory identity={_v2_cert_identity[:16]}",
-                                            flush=True,
-                                        )
+                                _sc_outputs = _sc.get("outputs_to_execute", [])
+                                _sc_errors = _sc.get("node_errors", {})
+                                if (
+                                    isinstance(_sc_components, dict)
+                                    and _sc_components.get("workflow_hash", "") == _cert_wf_hash
+                                    and _sc_components.get("custom_node_generation", "") == _v2_custom_nodes_gen
+                                    and _sc.get("preflight_ok") is True
+                                    and isinstance(_sc_outputs, list)
+                                    and len(_sc_outputs) > 0
+                                ):
+                                    outputs_to_execute = list(_sc_outputs)
+                                    node_errors = copy.deepcopy(_sc_errors) if isinstance(_sc_errors, dict) else {}
+                                    _v2_cert_hit = True
+                                    _v2_cert_preflight_skip = True
+                                    _diag_cert_cache_hit = True
+                                    _diag_cert_volume_reload_ms = 0.0
+                                    _diag_cert_file_read_ms = 0.0
+                                    _diag_cert_json_parse_validate_ms = 0.0
+                                    _diag_cert_total_ms = _diag_cert_identity_build_ms
+                                    _snap_cert_source = "snapshot_memory"
+                                    print(
+                                        f"[v2.cert] source=snapshot_memory identity={_v2_cert_identity[:16]} "
+                                        f"outputs={len(outputs_to_execute)}",
+                                        flush=True,
+                                    )
 
-                        # -- Process-local cache lookup --
-                        _cache_key = (self.container_session_id or _V2_CONTAINER_SESSION_ID, _v2_cert_identity)
-                        _cached = _V2_CERT_PROCESS_CACHE.get(_cache_key)
-                        _cached_valid = False
-                        if _cached is not None:
-                            # Full revalidation of all stored fields
-                            _cached_valid = True
-                            _evict_reason = ""
+                        if _snap_cert_source != "snapshot_memory":
+                            # -- Process-local cache lookup --
+                            _cache_key = (self.container_session_id or _V2_CONTAINER_SESSION_ID, _v2_cert_identity)
+                            _cached = _V2_CERT_PROCESS_CACHE.get(_cache_key)
+                            _cached_valid = False
+                            _evict_reason: str = ""
+                            if _cached is not None:
+                                # Full revalidation of all stored fields
+                                _cached_valid = True
 
-                            # Check schema_version
-                            if _cached.get("schema_version") != _V2_CERT_SCHEMA_VERSION:
-                                _cached_valid = False
-                                _evict_reason = "schema_version_mismatch"
+                                # Check schema_version
+                                if _cached.get("schema_version") != _V2_CERT_SCHEMA_VERSION:
+                                    _cached_valid = False
+                                    _evict_reason = "schema_version_mismatch"
 
                             # Check preflight_ok is True
                             if _cached_valid and _cached.get("preflight_ok") is not True:
@@ -4241,11 +4306,15 @@ class ModalRuntimeEntrypoint:
 
         _lane = getattr(self._preload_bridge.coordinator, "mutation_lane", None)
         _lane_acquired = [False]
+        _seed_hook_restore: Callable[[], None] | None = None
         started = time.time()
         try:
             trace.emit("executor_reset_start", phase="execution")
             executor.reset()
             trace.emit("executor_reset_end", phase="execution")
+            _seed_hook_restore = self._install_snapshot_executor_seed_hook(
+                executor, workflow, plan, trace,
+            )
             # End pregraph span here â€” before prompt_executor_invoke_start, after
             # all V2-owned setup including executor.reset().
             trace.emit("pregraph_setup_end", phase="execution", metadata={
@@ -4876,13 +4945,28 @@ class ModalRuntimeEntrypoint:
                         ) if hasattr(selected, "metrics") and isinstance(selected.metrics, Mapping) else False,
                     },
                 )
-            selected = self._persist_output_assets(selected)
+            selected, _asset_commit_task, _asset_diag = await self._persist_output_assets(selected)
             if selected_index is not None:
                 attempts[selected_index] = selected
+            if _asset_commit_task is not None:
+                await asyncio.sleep(0)
             result = attempt_to_descriptor_result(
                 selected,
                 generation=_snapshot_target_fingerprint(),
+                legacy_data=False,
             )
+            if _asset_commit_task is not None:
+                _asset_commit_diag = await _asset_commit_task
+                _asset_diag.update(_asset_commit_diag)
+            result["output_diagnostics"] = {
+                "output_asset_write_ms": _asset_diag.get("write_ms", 0.0),
+                "output_volume_commit_ms": _asset_diag.get("commit_ms", 0.0),
+                "output_commit_overlap_ms": _asset_diag.get("overlap_ms", 0.0),
+                "output_hash_count": selected.output_hash_count,
+                "base64_encode_count": selected.base64_encode_count,
+                "base64_decode_count": selected.base64_decode_count,
+                "serialized_result_bytes": 0,
+            }
             result["output_attempts"] = [
                 {
                     "strategy": attempt.strategy,
@@ -4907,6 +4991,8 @@ class ModalRuntimeEntrypoint:
             )
             if selected_index is not None:
                 result["output_attempts"][selected_index]["metrics"]["serialized_result_bytes"] = payload_bytes
+            if isinstance(result.get("output_diagnostics"), dict):
+                result["output_diagnostics"]["serialized_result_bytes"] = payload_bytes
 
             trace.emit(
                 "output_collect_end",
@@ -4967,6 +5053,8 @@ class ModalRuntimeEntrypoint:
 
             return result
         finally:
+            if _seed_hook_restore is not None:
+                _seed_hook_restore()
             # Release sampler lane if acquired during execution.
             # Must happen before production cleanup to ensure GPU
             # commit lane is free before any post-execution work.
@@ -4990,6 +5078,147 @@ class ModalRuntimeEntrypoint:
             if event == "execution_error" and isinstance(payload, dict)
         ]
         return "; ".join(errors) or "ComfyUI PromptExecutor failed"
+
+    def _install_snapshot_executor_seed_hook(
+        self,
+        executor: Any,
+        workflow: Mapping[str, Any],
+        plan: ExecutionPlan,
+        trace: RuntimeTrace,
+    ) -> Callable[[], None] | None:
+        state = getattr(getattr(self, "bootstrap", None), "state", None)
+        if state is None or not state.snapshot_loader_outputs:
+            return None
+        model_key = getattr(plan, "model_key", None)
+        for role, identity in state.snapshot_model_identities.items():
+            requested = str(getattr(model_key, f"{role}_identity", "") or "")
+            if identity and requested and identity != requested:
+                trace.emit(
+                    "executor_seed_rejected",
+                    phase="execution",
+                    metadata={"reason": "model_identity_mismatch", "role": role},
+                )
+                return None
+        caches = getattr(executor, "caches", None)
+        outputs_cache = getattr(caches, "outputs", None) if caches is not None else None
+        original_set_prompt = getattr(outputs_cache, "set_prompt", None)
+        if not callable(original_set_prompt):
+            return None
+        loader_types = {
+            "UNETLoader": "unet",
+            "CLIPLoader": "clip",
+            "DualCLIPLoader": "clip",
+            "VAELoader": "vae",
+            "CheckpointLoaderSimple": "checkpoint",
+        }
+        loader_nodes = [
+            (str(node_id), loader_types.get(str(node.get("class_type", ""))))
+            for node_id, node in workflow.items()
+            if isinstance(node, Mapping) and str(node.get("class_type", "")) in loader_types
+        ]
+        loader_nodes = [
+            (node_id, role) for node_id, role in loader_nodes
+            if role in state.snapshot_loader_outputs
+        ]
+        if not loader_nodes:
+            return None
+
+        sampler_nodes = [
+            (str(node_id), dict(node.get("inputs", {})))
+            for node_id, node in workflow.items()
+            if isinstance(node, Mapping)
+            and "Sampler" in str(node.get("class_type", ""))
+        ]
+        static_sampler_inputs = [
+            {
+                "node_id": node_id,
+                "inputs": {
+                    key: value for key, value in inputs.items()
+                    if key not in {"seed", "noise_seed", "latent_image", "positive", "negative"}
+                },
+            }
+            for node_id, inputs in sampler_nodes
+        ]
+        state.build_snapshot_execution_seed(
+            workflow_hash=plan.workflow_hash,
+            loader_node_ids=[node_id for node_id, _role in loader_nodes],
+            sampler_node_ids=[node_id for node_id, _inputs in sampler_nodes],
+            sampler_static_inputs=static_sampler_inputs,
+            custom_node_generation=state.snapshot_custom_node_generation,
+            deployment_combined_hash=state.deployment_combined_hash,
+        )
+        trace.emit("cachedit_restore_attach_start", phase="restore")
+        sampler_prepare = state.prepare_restored_sampler_runtime(
+            executor,
+            dit_model=state.snapshot_loader_outputs.get("unet"),
+            static_options={item["node_id"]: item["inputs"] for item in static_sampler_inputs},
+        )
+        trace.emit(
+            "cachedit_restore_attach_end",
+            phase="restore",
+            metadata={"prepared": bool(sampler_prepare.get("ok"))},
+        )
+        trace.emit("res4lyf_static_prepare_start", phase="restore")
+        trace.emit(
+            "res4lyf_static_prepare_end",
+            phase="restore",
+            metadata={"sampler_nodes": len(sampler_nodes)},
+        )
+        trace.emit("sampler_runtime_seed_ready", phase="restore")
+
+        async def seeded_set_prompt(*args: Any, **kwargs: Any) -> Any:
+            result = await original_set_prompt(*args, **kwargs)
+            trace.emit(
+                "executor_seed_apply_start",
+                phase="execution",
+                metadata={"loader_count": len(loader_nodes), "workflow_hash": plan.workflow_hash},
+            )
+            cache_entries: list[dict[str, Any]] = []
+            for node_id, _role in loader_nodes:
+                cache_key = outputs_cache.cache_key_set.get_data_key(node_id)
+                cache_entries.append({"node_id": node_id, "signature": str(cache_key)})
+            state.build_snapshot_execution_seed(
+                workflow_hash=plan.workflow_hash,
+                loader_node_ids=[node_id for node_id, _role in loader_nodes],
+                loader_cache_signatures=cache_entries,
+                sampler_node_ids=[
+                    str(node_id) for node_id, node in workflow.items()
+                    if isinstance(node, Mapping)
+                    and "Sampler" in str(node.get("class_type", ""))
+                ],
+                custom_node_generation=state.snapshot_custom_node_generation,
+                deployment_combined_hash=state.deployment_combined_hash,
+            )
+            trace.emit("executor_loader_cache_seed_start", phase="execution")
+            diagnostics = await state.seed_loader_cache_signatures(
+                executor,
+                loader_node_ids=[node_id for node_id, _role in loader_nodes],
+                loader_outputs={
+                    node_id: state.snapshot_loader_outputs[role]
+                    for node_id, role in loader_nodes
+                },
+                workflow_hash=plan.workflow_hash,
+                custom_node_generation=state.snapshot_custom_node_generation,
+                deployment_combined_hash=state.deployment_combined_hash,
+            )
+            trace.emit(
+                "executor_loader_cache_seed_end",
+                phase="execution",
+                metadata={"diagnostics": diagnostics},
+            )
+            trace.emit(
+                "executor_seed_apply_end",
+                phase="execution",
+                metadata={"seeded": sum(str(v).startswith("seeded:") for v in diagnostics.values())},
+            )
+            return result
+
+        outputs_cache.set_prompt = seeded_set_prompt
+
+        def restore_hook() -> None:
+            outputs_cache.set_prompt = original_set_prompt
+
+        return restore_hook
 
     @staticmethod
     def _attempt_to_result(attempt: Attempt) -> dict[str, Any]:
@@ -5019,18 +5248,27 @@ class ModalRuntimeEntrypoint:
                 images.append(entry)
         return {"images": images, "videos": videos, "outputs": outputs}
 
-    @staticmethod
-    def _persist_output_assets(attempt: Attempt) -> Attempt:
+    async def _persist_output_assets(
+        self,
+        attempt: Attempt,
+    ) -> tuple[Attempt, asyncio.Task[Any] | None, dict[str, Any]]:
         root = Path(RUNTIME_STATE_PATH, "output_assets")
         root.mkdir(parents=True, exist_ok=True)
         persisted = []
         wrote = False
+        write_start = time.monotonic()
         for item in attempt.items:
             raw = item.raw_bytes
             if not raw:
                 persisted.append(item)
                 continue
-            digest = hashlib.sha256(raw).hexdigest()
+            digest = item.content_sha256 or (
+                item.conversion_meta.hash_of_raw
+                if item.conversion_meta is not None else ""
+            )
+            if not digest:
+                digest = hashlib.sha256(raw).hexdigest()
+                item = dataclasses.replace(item, content_sha256=digest)
             ext = item.file_ext if item.file_ext in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"} else ".bin"
             relative_path = f"output_assets/{digest}{ext}"
             target = Path(RUNTIME_STATE_PATH, relative_path)
@@ -5046,12 +5284,39 @@ class ModalRuntimeEntrypoint:
                     except OSError:
                         pass
             persisted.append(dataclasses.replace(item, path=relative_path))
-        if wrote:
-            volume = globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume")
-            commit = getattr(volume, "commit", None)
-            if callable(commit):
-                commit()
-        return dataclasses.replace(attempt, items=tuple(persisted))
+        diag: dict[str, Any] = {
+            "write_ms": round((time.monotonic() - write_start) * 1000, 3),
+            "commit_ms": 0.0,
+            "overlap_ms": 0.0,
+            "files_written": int(wrote),
+            "commit_error": "",
+        }
+        if not wrote:
+            return dataclasses.replace(attempt, items=tuple(persisted)), None, diag
+        volume = globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume")
+        commit = getattr(volume, "commit", None)
+        commit_aio = getattr(commit, "aio", None) if commit is not None else None
+        if not callable(commit_aio):
+            diag["commit_error"] = "commit_aio_unavailable"
+            return dataclasses.replace(attempt, items=tuple(persisted)), None, diag
+        commit_start = time.monotonic()
+
+        async def commit_volume() -> dict[str, Any]:
+            try:
+                result = commit_aio()
+                if inspect.isawaitable(result):
+                    await result
+                elif inspect.isawaitable(commit_aio):
+                    await commit_aio
+                return {"commit_ms": round((time.monotonic() - commit_start) * 1000, 3)}
+            except Exception as exc:
+                return {
+                    "commit_ms": round((time.monotonic() - commit_start) * 1000, 3),
+                    "commit_error": str(exc)[:120],
+                }
+
+        commit_task = asyncio.create_task(commit_volume())
+        return dataclasses.replace(attempt, items=tuple(persisted)), commit_task, diag
 
     def read_output_asset(self, backend_path: str, expected_sha256: str = "") -> dict[str, Any]:
         volume = globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume")

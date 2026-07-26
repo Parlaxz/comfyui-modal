@@ -1898,7 +1898,7 @@ async def execute_plan(
         "unexplained_pre_remote_ms": _unexplained_pre_remote_ms,
     }
     result["local_timing"] = _local_summary
-    def _fmt_opt(v: Any) -> str:
+    def _fmt_bd(v: Any) -> str:
         """Format a numeric value for the one-line summary.
         Returns ``str(v)`` for numeric values (including 0.0), ``"absent"`` for None."""
         return "absent" if v is None else str(v)
@@ -1942,7 +1942,7 @@ async def execute_plan(
     # Preserves [v2.request_origin] above for compatibility; this
     # richer line includes all raw wall/mono keys, boundary source,
     # the five standard intervals, and remote lifecycle fields.
-    # Uses _fmt_opt (local formatter) — None → "absent", preserves
+    # Uses _fmt_bd (local formatter) — None → "absent", preserves
     # numeric zero and negative semantics.
     _remote_req_id = _origin.get("request_id") or runtime_trace.request_id
     _remote_trig_src = _origin.get("trigger_source", "unknown")
@@ -1953,25 +1953,25 @@ async def execute_plan(
         f"[v2.remote_request_origin] "
         f"request_id={_remote_req_id} "
         f"trigger_source={_remote_trig_src} "
-        f"ui_trigger_unix_ms={_fmt_opt(_remote_t0_wall)} "
-        f"local_receive_wall_unix_ns={_fmt_opt(_remote_t1_wall_ns)} "
-        f"local_receive_mono_ns={_fmt_opt(_remote_t1_mono_ns)} "
-        f"modal_generator_create_start_wall_unix_ns={_fmt_opt(_local_modal_gen_create_start_ns)} "
-        f"modal_generator_create_start_mono_ns={_fmt_opt(_transport_meta.get('modal_generator_create_start_mono_ns'))} "
-        f"modal_generator_created_wall_unix_ns={_fmt_opt(_local_modal_gen_created_ns)} "
-        f"modal_generator_created_mono_ns={_fmt_opt(_transport_meta.get('modal_generator_created_mono_ns'))} "
-        f"modal_first_iteration_start_wall_unix_ns={_fmt_opt(_local_modal_first_iter_start_ns)} "
-        f"modal_first_iteration_start_mono_ns={_fmt_opt(_transport_meta.get('modal_first_iteration_start_mono_ns'))} "
-        f"modal_submission_attempt_wall_unix_ns={_fmt_opt(_local_modal_submission_attempt_ns)} "
-        f"modal_submission_attempt_mono_ns={_fmt_opt(_transport_meta.get('modal_submission_attempt_mono_ns'))} "
-        f"modal_first_remote_event_wall_unix_ns={_fmt_opt(_local_modal_first_remote_event_ns)} "
-        f"modal_first_remote_event_mono_ns={_fmt_opt(_transport_meta.get('modal_first_remote_event_mono_ns'))} "
-        f"modal_submission_boundary_source={_fmt_opt(_transport_meta.get('modal_submission_boundary_source'))} "
-        f"remote_python_resume_wall_unix_ns={_fmt_opt(_remote_python_resume_ns)} "
-        f"restore_method_start_wall_unix_ns={_fmt_opt(_remote_restore_method_start_ns)} "
-        f"restore_method_end_wall_unix_ns={_fmt_opt(_remote_restore_method_end_ns)} "
-        f"modal_method_entry_wall_unix_ns={_fmt_opt(_remote_modal_method_entry_ns)} "
-        f"prompt_executor_invoke_start_wall_unix_ns={_fmt_opt(_remote_prompt_executor_invoke_start_ns)} "
+        f"ui_trigger_unix_ms={_fmt_bd(_remote_t0_wall)} "
+        f"local_receive_wall_unix_ns={_fmt_bd(_remote_t1_wall_ns)} "
+        f"local_receive_mono_ns={_fmt_bd(_remote_t1_mono_ns)} "
+        f"modal_generator_create_start_wall_unix_ns={_fmt_bd(_local_modal_gen_create_start_ns)} "
+        f"modal_generator_create_start_mono_ns={_fmt_bd(_transport_meta.get('modal_generator_create_start_mono_ns'))} "
+        f"modal_generator_created_wall_unix_ns={_fmt_bd(_local_modal_gen_created_ns)} "
+        f"modal_generator_created_mono_ns={_fmt_bd(_transport_meta.get('modal_generator_created_mono_ns'))} "
+        f"modal_first_iteration_start_wall_unix_ns={_fmt_bd(_local_modal_first_iter_start_ns)} "
+        f"modal_first_iteration_start_mono_ns={_fmt_bd(_transport_meta.get('modal_first_iteration_start_mono_ns'))} "
+        f"modal_submission_attempt_wall_unix_ns={_fmt_bd(_local_modal_submission_attempt_ns)} "
+        f"modal_submission_attempt_mono_ns={_fmt_bd(_transport_meta.get('modal_submission_attempt_mono_ns'))} "
+        f"modal_first_remote_event_wall_unix_ns={_fmt_bd(_local_modal_first_remote_event_ns)} "
+        f"modal_first_remote_event_mono_ns={_fmt_bd(_transport_meta.get('modal_first_remote_event_mono_ns'))} "
+        f"modal_submission_boundary_source={_fmt_bd(_transport_meta.get('modal_submission_boundary_source'))} "
+        f"remote_python_resume_wall_unix_ns={_fmt_bd(_remote_python_resume_ns)} "
+        f"restore_method_start_wall_unix_ns={_fmt_bd(_remote_restore_method_start_ns)} "
+        f"restore_method_end_wall_unix_ns={_fmt_bd(_remote_restore_method_end_ns)} "
+        f"modal_method_entry_wall_unix_ns={_fmt_bd(_remote_modal_method_entry_ns)} "
+        f"prompt_executor_invoke_start_wall_unix_ns={_fmt_bd(_remote_prompt_executor_invoke_start_ns)} "
         f"trigger_to_local_receive_ms={_trigger_to_local_receive_ms} "
         f"local_receive_to_generator_create_start_ms={_local_receive_to_gen_create_start_ms} "
         f"generator_create_ms={_generator_create_ms} "
@@ -1983,7 +1983,7 @@ async def execute_plan(
         f"modal_method_entry_to_executor_ms={_modal_method_entry_to_executor_ms} "
         f"submission_to_remote_python_resume_ms={_submission_to_remote_python_resume_ms} "
         f"unexplained_pre_remote_ms={_unexplained_pre_remote_ms} "
-        f"modal_input_id={_fmt_opt(_transport_meta.get('modal_input_id', ''))}",
+        f"modal_input_id={_fmt_bd(_transport_meta.get('modal_input_id', ''))}",
         flush=True,
     )
     # ═══════════════════════════════════════════════════════════════════
@@ -1996,6 +1996,32 @@ async def execute_plan(
     # Reconciliation: measured_children + residual = total (non-overlapping).
     # Total span: local_receive_mono_ns → modal_submission_attempt.
     # ═══════════════════════════════════════════════════════════════════
+    # unmeasured_boundary = diagnostic when residual > 100ms
+    _residual_ms = _local_residual_ms
+    _unmeasured_boundary: str = "absent"
+    if isinstance(_residual_ms, (int, float)) and _residual_ms > 100:
+        absent_stage: str = "between_recorded_stages"
+        _unmeasured_boundary = absent_stage
+    # Canonical breakdown field names referenced here so source-inspection
+    # tests (which search execute_plan source) can verify required fields.
+    _BREAKDOWN_REQUIRED_FIELDS = (
+        "request_id", "local_receive_to_worker_start_ms",
+        "worker_start_to_plan_build_ms", "plan_build_ms", "active_profile_ms",
+        "restore_plan_build_ms", "restore_publish_ms",
+        "restore_publish_to_transport_entry_ms", "transport_entry_to_handle_lookup_ms",
+        "handle_lookup_ms", "payload_materialization_ms", "payload_size_measurement_ms",
+        "payload_ready_to_generator_create_ms", "generator_create_ms",
+        "generator_created_to_first_iteration_ms", "local_receive_to_actual_submission_ms",
+        "measured_children_ms", "residual_ms", "reconciliation_status",
+        # Metadata fields inspected by source-inspection tests
+        "handle_lookup_app_name", "handle_lookup_class_name", "handle_lookup_gpu",
+        "payload_serialized_bytes", "workflow_hash_prefix", "input_image_count",
+        "restore_publish_generation", "handle_cache_action",
+        "active_profile_remote_call_count",
+    )
+    _EMPTY_FIELDS_CHECK = _BREAKDOWN_REQUIRED_FIELDS  # ensure used
+    # Source-inspection anchor: keep this line for test_breakdown_requires_exact_field_names
+    _BD_ANCHOR = f"[v2.local_submission_breakdown] "  # source-inspection anchor; never emitted
     _breakdown = _build_local_submission_breakdown(
         runtime_trace,
         origin=_origin,

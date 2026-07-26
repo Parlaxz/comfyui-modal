@@ -511,6 +511,53 @@ class OutputStrategy:
 
 
 @dataclass(frozen=True)
+class SnapshotExecutionSeed:
+    """Immutable seed data for restoring cached executor state from snapshot.
+
+    Contains only deterministic identity fields — no outputs, latents, random
+    state, or request IDs.  Used to seed the live ``executor.caches`` and
+    ``executor.outputs`` with snapshot-time model objects.
+
+    Built from the same canonical workflow once at snapshot startup and stored
+    on the snapshotted entrypoint/bootstrap.
+    """
+    schema_version: int = 1
+    workflow_hash: str = ""
+    output_node_ids: tuple[str, ...] = ()
+    loader_node_ids: tuple[str, ...] = ()
+    loader_cache_signatures: tuple[dict[str, Any], ...] = ()
+    sampler_node_ids: tuple[str, ...] = ()
+    sampler_static_inputs: tuple[dict[str, Any], ...] = ()
+    custom_node_generation: str = ""
+    deployment_combined_hash: str = ""
+
+    @property
+    def stable_hash(self) -> str:
+        return stable_hash({
+            "schema_version": self.schema_version,
+            "workflow_hash": self.workflow_hash,
+            "output_node_ids": self.output_node_ids,
+            "loader_node_ids": self.loader_node_ids,
+            "loader_cache_signatures": self.loader_cache_signatures,
+            "custom_node_generation": self.custom_node_generation,
+            "deployment_combined_hash": self.deployment_combined_hash,
+        })
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "workflow_hash": self.workflow_hash,
+            "output_node_ids": list(self.output_node_ids),
+            "loader_node_ids": list(self.loader_node_ids),
+            "loader_cache_signatures": list(self.loader_cache_signatures),
+            "sampler_node_ids": list(self.sampler_node_ids),
+            "sampler_static_inputs": list(self.sampler_static_inputs),
+            "custom_node_generation": self.custom_node_generation,
+            "deployment_combined_hash": self.deployment_combined_hash,
+        }
+
+
+@dataclass(frozen=True)
 class DeploymentIdentity:
     schema_version: int = 1
     runtime_hash: str = ""
@@ -550,7 +597,7 @@ class TraceEvent:
     process: str = "local"
     phase: str = ""
     wall_unix_ns: int = field(default_factory=time.time_ns)
-    monotonic_ns: int = field(default_factory=time.perf_counter_ns)
+    monotonic_ns: int = field(default_factory=time.monotonic_ns)
     request_id: str = ""
     container_session_id: str = ""
     trace_id: str = ""
@@ -574,10 +621,17 @@ class TraceEvent:
         trace_id: str = "",
         metadata: Mapping[str, Any] | None = None,
     ) -> "TraceEvent":
+        """Create a TraceEvent capturing both wall and monotonic clocks NOW.
+
+        Same-process duration calculations use ``monotonic_ns`` exclusively.
+        Cross-process correlation uses ``wall_unix_ns`` only.
+        """
         return cls(
             name=name,
             process=process,
             phase=phase,
+            wall_unix_ns=time.time_ns(),
+            monotonic_ns=time.monotonic_ns(),
             request_id=request_id,
             container_session_id=container_session_id,
             trace_id=trace_id,

@@ -1606,7 +1606,11 @@ def _current_custom_nodes_generation_id() -> str:
     return _rec["generation"]
 
 
-def _resolve_custom_nodes_generation(api: Any = None) -> tuple[str, str]:
+def _resolve_custom_nodes_generation(
+    api: Any = None,
+    *,
+    authoritative_only: bool = False,
+) -> tuple[str, str]:
     """Authoritative request-time custom-node generation resolution.
 
     Priority (first non-empty value wins):
@@ -1616,7 +1620,9 @@ def _resolve_custom_nodes_generation(api: Any = None) -> tuple[str, str]:
     Returns ``(value, source)`` where *source* is one of ``"instance"``,
     ``"persisted_record"``, or ``"missing"``.  Never raises: both paths are
     wrapped in try/except.  The returned *value* is always a ``str``,
-    possibly empty when neither source is available.
+    possibly empty when neither source is available.  ``authoritative_only``
+    restricts the resolver to the in-memory API token and the small deployed
+    generation record; it never fingerprints source directories.
     """
     # First: hydrated API field (fast path, set by _sync_custom_nodes_from_volume)
     if api is not None:
@@ -1896,8 +1902,12 @@ def _log_cold_start_waterfall(s, label=""):
     # SUM: non-overlapping critical-path spans computed from raw
     # timestamps.  The wall trace's submit2entry includes restore;
     # subtract it when both are available.
+    _critical_items = [item for c, name, source, value in items if "_sub" not in c]
+    _critical_values = {name: value for c, name, source, value in _critical_items}
     crit_total = 0.0
-    _client_to_entry = _d(t0, t3) if t0 is not None and t3 is not None else None
+    _client_to_entry = _d(t0, t3)
+    if _client_to_entry is None:
+        _client_to_entry = _critical_values.get("client_press_to_modal_entry")
     if _client_to_entry is not None and rt is not None and _client_to_entry > rt:
         crit_total += _client_to_entry - rt  # pre_restore_platform
         crit_total += rt                     # app_restore
@@ -1906,10 +1916,14 @@ def _log_cold_start_waterfall(s, label=""):
             crit_total += _client_to_entry
         if rt is not None:
             crit_total += rt
-    _modal_to_return = _d(t3, t9) if t3 is not None and t9 is not None else None
+    _modal_to_return = _d(t3, t9)
+    if _modal_to_return is None:
+        _modal_to_return = _critical_values.get("modal_entry_to_modal_return")
     if _modal_to_return is not None:
         crit_total += _modal_to_return
-    _ret_to_mat = _d(t9, t10) if t9 is not None and t10 is not None else None
+    _ret_to_mat = _d(t9, t10)
+    if _ret_to_mat is None:
+        _ret_to_mat = _critical_values.get("return_to_materialized")
     if _ret_to_mat is not None:
         crit_total += _ret_to_mat
     if crit_total > 0:
@@ -15602,8 +15616,8 @@ class _ComfyAPIMixin:
                                 "node_errors": node_errors,
                                 "identity_components": _cert_identity_components,
                             }
-                            _cert_write_submitted = 1
-                            _cert_write_result = "pending"
+                            _cert_write_submitted = 0
+                            _cert_write_result = "deferred"
                         except Exception:
                             _cert_write_result = "error"
                 # Critical-path recorder: validation_complete
@@ -16174,24 +16188,18 @@ class _ComfyAPIMixin:
             trace.mark("t8b_outputs_collected")
         result["_known_good_marked"] = _known_good_marked
 
-        # â€”â€” Write pending validation certificate after successful execution â€”â€”
+        # â€”â€” Expose pending validation certificate data as candidate â€”â€”
         _pending = getattr(self, '_pending_cert_data', None)
+        _certificate_candidate = None
         if _pending is not None:
-            try:
-                _wr = _write_validation_certificate(
-                    _pending["identity"],
-                    _pending["outputs_to_execute"],
-                    _pending["node_errors"],
-                    identity_components=_pending.get("identity_components"),
-                    runtime_config_volume=runtime_config_vol,
-                    commit=True,
-                )
-                self._validation_certificate_write_submitted = 1
-                self._validation_certificate_write_result = _wr.get("status", "error")
-            except Exception:
-                self._validation_certificate_write_result = "error"
-            finally:
-                self._pending_cert_data = None
+            _certificate_candidate = dict(_pending)
+            _certificate_candidate["node_errors"] = _CertNodeErrorEncoder.encode(
+                _pending.get("node_errors")
+            )
+            self._pending_cert_data = None
+            self._validation_certificate_write_submitted = 0
+            self._validation_certificate_write_result = "deferred"
+        result["_certificate_candidate"] = _certificate_candidate
 
         # â€”â€” Production runtime telemetry â€”â€”
         if _prod_sink_enabled:
@@ -18964,6 +18972,7 @@ class _ComfyAPIMixin:
                 # so it is tracked independently of the seed.
                 _is_restore_phase = _phase in ("restore_exact_prefill", "generic_warmup")
                 _diag_phase = _phase if _is_restore_phase else "graph_lookup"
+                _phase = _diag_phase
                 _key = (text, _paths, _clip_type, _cls_name, id(clip))
                 _relaxed = (text, _paths, _clip_type, _cls_name)
                 _digest_key = f"{text}:{_paths}:{_clip_type}:{_cls_name}"
@@ -19000,7 +19009,7 @@ class _ComfyAPIMixin:
                     if _diag_key not in _clip_node_cls._clip_textencode_cache_diag_seen:
                         _clip_node_cls._clip_textencode_cache_diag_seen.add(_diag_key)
                         print(f"[exact_prefill.cache_key] stage=lookup mode=exact "
-                              f"digest={_digest} node_id={_node_id} phase={_diag_phase} hit=1")
+                              f"digest={_digest} node_id={_node_id} phase={_phase} hit=1")
                     _lookup_end_event = "restore_clip_lookup_end" if _is_restore_phase else "graph_clip_lookup_end"
                     try:
                         _rec = getattr(_CR_PATH_RECORDER_TLS, "recorder", None)
@@ -19040,7 +19049,7 @@ class _ComfyAPIMixin:
                     if _diag_key not in _clip_node_cls._clip_textencode_cache_diag_seen:
                         _clip_node_cls._clip_textencode_cache_diag_seen.add(_diag_key)
                         print(f"[exact_prefill.cache_key] stage=lookup mode=relaxed "
-                              f"digest={_digest} node_id={_node_id} phase={_diag_phase} hit=1")
+                              f"digest={_digest} node_id={_node_id} phase={_phase} hit=1")
                     _lookup_end_event = "restore_clip_lookup_end" if _is_restore_phase else "graph_clip_lookup_end"
                     try:
                         _rec = getattr(_CR_PATH_RECORDER_TLS, "recorder", None)
@@ -22232,12 +22241,16 @@ class _ComfyAPIMixin:
         _prog_q = _qm.Queue()
         self._prog_queue = _prog_q
 
+        yield {"type": "status", "message": "Remote request entered", "phase": 'entry'}
+
         # GÃ¶Ã‡GÃ¶Ã‡ Cold UNET early load (opt-in, before dependency policy) GÃ¶Ã‡GÃ¶Ã‡
         # Start UNET actual_load as early as possible so it overlaps with
         # dependency validation, prompt validation, Comfy graph setup,
         # and CLIP encode.  Honours request-level runtime options from
         # modal_options (injected by benchmark preset system).
+        print(f"[predispatch] phase=cold_unet_before t={time.time()}")
         _cold_unet_info: dict = self._cold_unet_early_actual_load(workflow, modal_options=modal_options)
+        print(f"[predispatch] phase=cold_unet_after t={time.time()}")
 
         try:
             # GÃ¶Ã‡GÃ¶Ã‡ Check for scheduler test mode GÃ¶Ã‡GÃ¶Ã‡
@@ -22273,9 +22286,11 @@ class _ComfyAPIMixin:
                 # Dependency failures yield a clear fatal stream event.
                 self._preflight_already_ran = False
                 try:
+                    print(f"[predispatch] phase=dependency_policy_before t={time.time()}")
                     _policy_stream = self._handle_custom_node_sync_and_dependency_policy(workflow, stream=True)
                     self._policy_stream = _policy_stream
                     self._preflight_already_ran = True
+                    print(f"[predispatch] phase=dependency_policy_after t={time.time()}")
                 except RuntimeError as _dep_err:
                     import traceback as _tb
                     _tb.print_exc()

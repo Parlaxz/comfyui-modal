@@ -188,7 +188,8 @@ class TestPrescanGenerationIdentity:
 
     def test_prescan_via_bootstrap_startup(self):
         """Verify that startup() freezes the pre-scan identity
-        via the observe_generations callback.
+        via the observe_generations callback and persists via
+        _persist_custom_node_identity_record.
         """
         from comfymodal_runtime.runtime_bootstrap import (
             BootstrapConfig,
@@ -208,19 +209,14 @@ class TestPrescanGenerationIdentity:
         bootstrap = RuntimeBootstrap(config=config, observe_generations=_observe)
 
         with (
-            patch("optimizations.prescan_custom_node_generation") as mock_prescan,
             patch("comfymodal_runtime.runtime_bootstrap.ensure_models_symlink") as mock_symlink,
         ):
             bootstrap.startup(trace=trace)
             assert observe_called
-            # prescan_custom_node_generation should have been called with
-            # the observed generations
-            mock_prescan.assert_called_once()
-            _call_kwargs = mock_prescan.call_args[1]
-            assert _call_kwargs["runtime_generation"] == "obs-rt"
-            assert _call_kwargs["custom_node_generation"] == "obs-cn"
-            assert _call_kwargs["reason"] == "startup_prescan"
-            assert _call_kwargs["record_path"] == "/tmp/prescan_test.json"
+            # After startup, the state should have the frozen identity
+            assert bootstrap.state.snapshot_custom_node_generation == "obs-cn"
+            assert bootstrap.state.custom_node_generation == "obs-cn"
+            assert bootstrap.state.runtime_generation == "obs-rt"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -959,6 +955,15 @@ class TestBootstrapSnapshotCertificate:
 
         assert state.snapshot_certificate != {}
         cert = state.snapshot_certificate
+        # V2 schema fields
+        assert cert["schema_version"] == 2
+        assert "identity" in cert
+        assert "identity_components" in cert
+        assert "cert_identity" in cert
+        assert "outputs_to_execute" in cert
+        assert "node_errors" in cert
+        assert "preflight_ok" in cert
+        # Legacy diagnostic fields
         assert cert["runtime_generation"] == "rt-42"
         assert cert["custom_node_generation"] == "cn-7"
         assert cert["sage_mode"] == "baked_cuda"
