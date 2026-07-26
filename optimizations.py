@@ -684,7 +684,6 @@ def clip_fingerprint_key(fp: Dict[str, Any]) -> str:
 _NATIVE_CLIP_LOADER_CLASSES = {
     "CLIPLoader",
     "DualCLIPLoader",
-    "CLIPLoaderAdvanced",
     "CLIPTextEncode",
 }
 
@@ -701,7 +700,6 @@ def _is_native_clip_loader_class(cls_name: str) -> bool:
 _LOADER_MODEL_KEYS = {
     "CLIPLoader": ["clip_name"],
     "DualCLIPLoader": ["clip_name1", "clip_name2"],
-    "CLIPLoaderAdvanced": ["clip_name1", "clip_name2"],
 }
 
 
@@ -2799,6 +2797,172 @@ def emit_bake_candidate_report() -> Dict[str, Any]:
 
 
 # ── Convenience: process-wide singletons (lazy) ─────────────────────────
+
+
+# ── Lane B: Pre-scan generation identity helpers ─────────────────────────
+#
+# Authoritative pre-scan generation identity for custom nodes.  Called
+# during startup BEFORE the snapshot is taken to establish a generation
+# identity that can be reused during restore, avoiding a full custom-node
+# fingerprint recompute on every restore.
+
+
+def prescan_custom_node_generation(
+    *,
+    observe_generations: bool = True,
+    runtime_generation: str = "",
+    custom_node_generation: str = "",
+    reason: str = "prescan",
+    record_path: str = "",
+) -> dict[str, str]:
+    """Capture and optionally persist the authoritative pre-scan
+    custom-node generation identity.
+
+    When *record_path* is provided, the generation identity is atomically
+    persisted to that path for reuse during restore.  Returns a dict with
+    ``runtime_generation`` and ``custom_node_generation`` keys.
+
+    Never raises — on any error returns empty strings and logs via print.
+    """
+    try:
+        result = {
+            "runtime_generation": str(runtime_generation or ""),
+            "custom_node_generation": str(custom_node_generation or ""),
+        }
+        if record_path and custom_node_generation:
+            _write_custom_node_generation_record(
+                record_path,
+                generation=custom_node_generation,
+                content_hash=runtime_generation,
+                reason=reason,
+            )
+        return result
+    except Exception as exc:
+        print(f"[prescan_gen] error: {exc}", flush=True)
+        return {"runtime_generation": "", "custom_node_generation": ""}
+
+
+def read_prescan_generation_record(
+    record_path: str,
+) -> dict[str, str]:
+    """Read a previously persisted pre-scan generation record.
+
+    Returns ``{"generation": ..., "content_hash": ..., "reason": ...}``
+    with empty strings on any error.  Never raises.
+    """
+    try:
+        data = _read_custom_node_generation_record(record_path)
+        if data is None:
+            return {"generation": "", "content_hash": "", "reason": ""}
+        return {
+            "generation": str(data.get("generation", "")),
+            "content_hash": str(data.get("content_hash", "")),
+            "reason": str(data.get("reason", "")),
+        }
+    except Exception:
+        return {"generation": "", "content_hash": "", "reason": ""}
+
+
+# ── Lane B: Snapshot-memory validation certificate helpers ───────────────
+#
+# These helpers produce a lightweight certificate that can be stored on the
+# runtime-state Volume and validated on restore.  The certificate attests
+# that the snapshot-memory region (model objects, Sage state, generation
+# identity) is consistent with the current deployment.
+
+SNAPSHOT_CERT_SCHEMA_VERSION = 1
+
+
+def build_snapshot_certificate(
+    *,
+    runtime_generation: str,
+    custom_node_generation: str,
+    sage_mode: str,
+    sage_reason: str,
+    unet_identity: str = "",
+    clip_identity: str = "",
+    clip_type: str = "",
+) -> dict[str, object]:
+    """Build a snapshot-memory validation certificate dict.
+
+    Fields:
+      * schema_version — ``SNAPSHOT_CERT_SCHEMA_VERSION``
+      * runtime_generation — generation token from bootstrap state
+      * custom_node_generation — custom-node generation from pre-scan
+      * sage_mode — baked_cuda | triton_fallback | absent
+      * sage_reason — why Sage policy chose that mode
+      * unet_identity — UNET model identity hash (from cpu_snapshot_models)
+      * clip_identity — CLIP model identity hash
+      * clip_type — stable_diffusion | sdxl | flux | ...
+
+    Returns a dict suitable for JSON serialization and Volume storage.
+    Never raises.
+    """
+    import hashlib as _hashlib
+    import time as _time
+
+    cert = {
+        "schema_version": SNAPSHOT_CERT_SCHEMA_VERSION,
+        "created_at": _time.time(),
+        "runtime_generation": str(runtime_generation),
+        "custom_node_generation": str(custom_node_generation),
+        "sage_mode": str(sage_mode),
+        "sage_reason": str(sage_reason),
+        "unet_identity": str(unet_identity),
+        "clip_identity": str(clip_identity),
+        "clip_type": str(clip_type),
+    }
+    # Deterministic identity hash of the cert content (excluding created_at)
+    h = _hashlib.sha256()
+    h.update(f"schema={SNAPSHOT_CERT_SCHEMA_VERSION}\n".encode())
+    h.update(f"runtime_gen={runtime_generation}\n".encode())
+    h.update(f"cn_gen={custom_node_generation}\n".encode())
+    h.update(f"sage={sage_mode}|{sage_reason}\n".encode())
+    h.update(f"unet={unet_identity}\n".encode())
+    h.update(f"clip={clip_identity}|{clip_type}\n".encode())
+    cert["cert_hash"] = h.hexdigest()
+    return cert
+
+
+def validate_snapshot_certificate(
+    cert: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Validate a snapshot-memory certificate dict.
+
+    Returns ``{"valid": True, "cert_hash": ..., "reason": ""}`` on success,
+    or ``{"valid": False, "cert_hash": "", "reason": "..."}`` on failure.
+    Never raises.
+    """
+    if not isinstance(cert, dict):
+        return {"valid": False, "cert_hash": "", "reason": "not_a_dict"}
+    try:
+        sv = cert.get("schema_version")
+        if sv != SNAPSHOT_CERT_SCHEMA_VERSION:
+            return {
+                "valid": False, "cert_hash": "",
+                "reason": f"schema_version_mismatch:got={sv}",
+            }
+        stored_hash = str(cert.get("cert_hash", ""))
+        if not stored_hash:
+            return {"valid": False, "cert_hash": "", "reason": "missing_cert_hash"}
+        # Recompute hash
+        import hashlib as _h
+        h = _h.sha256()
+        h.update(f"schema={SNAPSHOT_CERT_SCHEMA_VERSION}\n".encode())
+        h.update(f"runtime_gen={cert.get('runtime_generation', '')}\n".encode())
+        h.update(f"cn_gen={cert.get('custom_node_generation', '')}\n".encode())
+        h.update(f"sage={cert.get('sage_mode', '')}|{cert.get('sage_reason', '')}\n".encode())
+        h.update(f"unet={cert.get('unet_identity', '')}\n".encode())
+        h.update(f"clip={cert.get('clip_identity', '')}|{cert.get('clip_type', '')}\n".encode())
+        computed = h.hexdigest()
+        if stored_hash != computed:
+            return {
+                "valid": False, "cert_hash": stored_hash,
+                "reason": f"hash_mismatch:stored={stored_hash[:16]}!=computed={computed[:16]}",
+            }
+        return {"valid": True, "cert_hash": stored_hash, "reason": ""}
+    except Exception as exc:
+        return {"valid": False, "cert_hash": "", "reason": f"validation_error:{exc}"}
 
 
 # Process-wide singleton for the post-delivery persistence

@@ -6054,6 +6054,10 @@ else:
 _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR = os.path.join(
     _COMFYUI_MODAL_DIR, ".custom_node_requirements"
 )
+_CACHEDIT_LOCK_FILENAME = "cachedit_dependency_lock.txt"
+_CACHEDIT_LOCK_SRC = os.path.join(_COMFYUI_MODAL_DIR, _CACHEDIT_LOCK_FILENAME)
+_CACHEDIT_LOCK_DST = "/opt/comfymodal/cachedit_dependency_lock.txt"
+"""In-image destination for the lock file (used at build and runtime)."""
 
 _CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".ipynb_checkpoints"}
 _CUSTOM_NODE_IMAGE_IGNORE_PATTERNS = [
@@ -6205,6 +6209,153 @@ def _patch_cachedit_node_class(cachedit_cls) -> bool:
     _cd_noop._comfy_modal_disabled = True
     setattr(cachedit_cls, cachedit_func, _cd_noop)
     return True
+
+
+def _guard_cachedit_node_class(cachedit_cls) -> bool:
+    """Wrap CacheDiT model optimizer node so initialization failure is fatal
+    for CacheDiT workflows (original exception plus locked package versions).
+
+    Non-CacheDiT workflows are unaffected (no wrapping applied).
+    If DISABLE_CACHEDIT_FOR_Z_IMAGE is active the guard is skipped.
+    Returns True when wrapping was applied, False when skipped.
+    """
+    if DISABLE_CACHEDIT_FOR_Z_IMAGE:
+        # Existing disable behavior takes precedence
+        return False
+    cachedit_func = getattr(cachedit_cls, "FUNCTION", "apply_model_optimization")
+    original = getattr(cachedit_cls, cachedit_func, None)
+    if original is None:
+        return False
+    if getattr(original, "_comfy_modal_guarded", False):
+        return True
+    if getattr(original, "_comfy_modal_disabled", False):
+        return False
+
+    # Collect locked versions at wrapping time (module-level)
+    _locked_versions: dict[str, str] = {}
+    try:
+        import importlib.metadata as _ilm
+        for _pkg in ("cache-dit", "transformers", "diffusers",
+                     "huggingface-hub", "accelerate", "safetensors", "tokenizers"):
+            try:
+                _locked_versions[_pkg] = _ilm.version(_pkg)
+            except Exception:
+                _locked_versions[_pkg] = "unknown"
+    except Exception:
+        _locked_versions = {"error": "unable to read versions"}
+
+    def _cd_guard(self_node, model, *args, **kwargs):
+        try:
+            print("[cachedit] calling CacheDiT model optimizer", flush=True)
+            result = original(self_node, model, *args, **kwargs)
+            print("[cachedit] CacheDiT model optimizer completed successfully", flush=True)
+            return result
+        except Exception as _cd_exc:
+            _ver_str = " ".join(f"{k}={v}" for k, v in _locked_versions.items())
+            raise RuntimeError(
+                "CacheDiT model optimizer FAILED. "
+                f"Original error: {_cd_exc}\n"
+                f"Locked package versions: {_ver_str}"
+            ) from _cd_exc
+
+    _cd_guard._comfy_modal_guarded = True
+    setattr(cachedit_cls, cachedit_func, _cd_guard)
+    return True
+
+
+# CacheDiT dependency family import gate (unit-testable)
+def _cachedit_import_gate(
+    *,
+    _importlib: Any = None,
+    _print: Callable[..., None] = print,
+) -> dict[str, Any]:
+    """Execute the CacheDiT dependency family import gate.
+
+    Checks all seven locked packages:
+      cache-dit, transformers, diffusers, huggingface-hub,
+      accelerate, safetensors, tokenizers
+
+    Verifies:
+    - Every package is importable (by mapped import name where different)
+    - ``importlib.metadata.version()`` succeeds for each
+    - ``transformers.utils.is_flash_attn_2_available()`` returns a bool
+    - No exception escapes
+
+    Returns a dict with keys:
+      ``ok`` (bool), ``versions`` (dict[str, str]), ``flash_attn_available`` (bool),
+      ``flash_attn_type_ok`` (bool), ``errors`` (list[str]).
+
+    When *errors* is non-empty the caller should consider the gate failed.
+    Never raises (exceptions are caught and recorded in *errors*).
+    """
+    result: dict[str, Any] = {
+        "ok": False,
+        "versions": {},
+        "flash_attn_available": None,
+        "flash_attn_type_ok": False,
+        "errors": [],
+    }
+    if _importlib is None:
+        import importlib
+        import importlib.metadata  # ensure metadata submodule is loaded
+        _importlib = importlib
+
+    lock_pkgs: list[tuple[str, str]] = [
+        ("cache-dit", "cache_dit"),
+        ("transformers", "transformers"),
+        ("diffusers", "diffusers"),
+        ("huggingface-hub", "huggingface_hub"),
+        ("accelerate", "accelerate"),
+        ("safetensors", "safetensors"),
+        ("tokenizers", "tokenizers"),
+    ]
+
+    _LOCKED_VERSIONS: dict[str, str] = {
+        "cache-dit": "1.2.3",
+        "transformers": "4.55.2",
+        "diffusers": "0.36.0",
+        "huggingface-hub": "0.34.4",
+        "accelerate": "1.10.1",
+        "safetensors": "0.5.3",
+        "tokenizers": "0.21.4",
+    }
+
+    for pkg_name, import_name in lock_pkgs:
+        try:
+            ver = _importlib.metadata.version(pkg_name)
+            mod = _importlib.import_module(import_name)
+            mod_path = getattr(mod, "__file__", "?")
+            result["versions"][pkg_name] = ver
+            _print(f"[cachedit_gate] pkg={pkg_name} version={ver} import={import_name} path={mod_path}")
+            expected = _LOCKED_VERSIONS.get(pkg_name)
+            if expected is not None and ver != expected:
+                msg = (
+                    f"{pkg_name} version mismatch: installed {ver!r}, "
+                    f"expected {expected!r} (pinned in cachedit_dependency_lock.txt)"
+                )
+                result["errors"].append(msg)
+                _print(f"[cachedit_gate] ERROR {msg}")
+        except Exception as exc:
+            msg = f"{pkg_name} (import={import_name}): {exc}"
+            result["errors"].append(msg)
+            _print(f"[cachedit_gate] ERROR {msg}")
+
+    # Boolean flash-attn-2-available check
+    try:
+        from transformers.utils import is_flash_attn_2_available
+        fa_result = is_flash_attn_2_available()
+        result["flash_attn_available"] = fa_result
+        result["flash_attn_type_ok"] = isinstance(fa_result, bool)
+        _print(
+            f"[cachedit_gate] is_flash_attn_2_available={fa_result} "
+            f"type={type(fa_result).__name__} result_type_ok={result['flash_attn_type_ok']}"
+        )
+    except Exception as exc:
+        result["errors"].append(f"is_flash_attn_2_available: {exc}")
+        _print(f"[cachedit_gate] ERROR is_flash_attn_2_available: {exc}")
+
+    result["ok"] = (len(result["errors"]) == 0 and result["flash_attn_type_ok"] is True)
+    return result
 
 
 def _rmtree_robust(path: str) -> None:
@@ -6874,12 +7025,17 @@ _image_base = (
 # Changed requirements cause all pip installs to re-run within this layer.
 # Only runs during local deploy. Skipped inside remote Modal containers.
 if not _INSIDE_MODAL_CONTAINER:
-    _image_base = _image_base.add_local_dir(
+    _image_base = _image_base.add_local_file(
+        _CACHEDIT_LOCK_SRC,
+        _CACHEDIT_LOCK_DST,
+        copy=True,
+    ).add_local_dir(
         _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR,
         "/root/comfy-build/custom_node_requirements",
         copy=True,
     ).run_commands(
         '__ts_ms() { python3 -c "import time; print(int(time.time()*1000))"; }; '
+        '_lock="' + _CACHEDIT_LOCK_DST + '"; '
         'echo "CUSTOM_NODE_PREREQ_INSTALL_START ts_ms=$(__ts_ms)"; '
         '_total_req=0; _total_installed=0; _total_skipped=0; '
         '_pip_node() { local d="$1"; '
@@ -6888,7 +7044,7 @@ if not _INSIDE_MODAL_CONTAINER:
         '  _total_req=$((_total_req+1)); '
         '  local t0; t0=$(__ts_ms); '
         '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name start_ts=$t0"; '
-        '  cd "$d" && pip install -r requirements.txt --quiet; '
+        '  cd "$d" && pip install -r requirements.txt -c "$_lock" --quiet; '
         '  local t1; t1=$(__ts_ms); '
         '  local dur; dur=$((t1 - t0)); '
         '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name end_ts=$t1 duration_ms=$dur"; '
@@ -6898,7 +7054,65 @@ if not _INSIDE_MODAL_CONTAINER:
         '  _pip_node "$d"; '
         'done; '
         '_end_ts=$(__ts_ms); '
-        'echo "CUSTOM_NODE_PREREQ_INSTALL_END ts_ms=$_end_ts total_nodes=$_total_req installed=$_total_installed skipped_no_req=$_total_skipped"'
+        'echo "CUSTOM_NODE_PREREQ_INSTALL_END ts_ms=$_end_ts total_nodes=$_total_req installed=$_total_installed skipped_no_req=$_total_skipped"; '
+        # CacheDiT final family reinstall (after all custom-node reqs)
+        'echo "CACHEDIT_LOCK_FAMILY_REINSTALL_START ts_ms=$(__ts_ms)"; '
+        'pip install --force-reinstall --no-deps -r "$_lock" --quiet; '
+        'echo "CACHEDIT_LOCK_FAMILY_REINSTALL_END ts_ms=$(__ts_ms)"; '
+        # CacheDiT image-build import gate
+        # Override compiler cache envs to /tmp paths — the image env sets
+        # TORCHINDUCTOR_CACHE_DIR=/root/comfymodal_runtime_state/.inductor-cache,
+        # so imports during the gate would create content under the future
+        # volume mount point and cause "cannot mount volume on non-empty path".
+        'export TORCHINDUCTOR_CACHE_DIR=/tmp/build_gate_inductor_cache; '
+        'export TRITON_CACHE_DIR=/tmp/build_gate_triton_cache; '
+        'python3 << "PYEOF"\n'
+        'import importlib.metadata, sys\n'
+        'import transformers, diffusers, cache_dit\n'
+        'from transformers.utils import is_flash_attn_2_available\n'
+        'ok = True\n'
+        'pkgs = [\n'
+        '    ("cache-dit", "cache_dit"),\n'
+        '    ("transformers", "transformers"),\n'
+        '    ("diffusers", "diffusers"),\n'
+        '    ("huggingface-hub", "huggingface_hub"),\n'
+        '    ("accelerate", "accelerate"),\n'
+        '    ("safetensors", "safetensors"),\n'
+        '    ("tokenizers", "tokenizers"),\n'
+        ']\n'
+        'for pkg, imp in pkgs:\n'
+        '    try:\n'
+        '        ver = importlib.metadata.version(pkg)\n'
+        '        mod = __import__(imp)\n'
+        '        _mp = getattr(mod, "__file__", "?")\n'
+        '        print(f"CACHEDIT_LOCK_GATE pkg={pkg} version={ver} path={_mp}")\n'
+        '        expected = {\n'
+        '            "cache-dit": "1.2.3",\n'
+        '            "transformers": "4.55.2",\n'
+        '            "diffusers": "0.36.0",\n'
+        '            "huggingface-hub": "0.34.4",\n'
+        '            "accelerate": "1.10.1",\n'
+        '            "safetensors": "0.5.3",\n'
+        '            "tokenizers": "0.21.4",\n'
+        '        }[pkg]\n'
+        '        if ver != expected:\n'
+        '            print(f"CACHEDIT_LOCK_GATE pkg={pkg} VERSION_MISMATCH '
+        'installed={ver} expected={expected}")\n'
+        '            ok = False\n'
+        '    except Exception as e:\n'
+        '        print(f"CACHEDIT_LOCK_GATE pkg={pkg} ERROR={e}")\n'
+        '        ok = False\n'
+        'fa_result = is_flash_attn_2_available()\n'
+        'print(f"CACHEDIT_LOCK_GATE is_flash_attn_2_available={fa_result} '
+        'type={type(fa_result).__name__}")\n'
+        'assert isinstance(fa_result, bool), \\\n'
+        '    f"is_flash_attn_2_available returned {type(fa_result).__name__}"\n'
+        'assert ok, "CACHEDIT_LOCK_GATE FAILED: one or more locked packages missing or version mismatch"\n'
+        'print("CACHEDIT_LOCK_GATE PASSED")\n'
+        'import shutil\n'
+        'shutil.rmtree("/root/comfymodal_runtime_state", ignore_errors=True)\n'
+        'print("CACHEDIT_LOCK_GATE cleanup complete")\n'
+        'PYEOF\n'
     )
 
 # GÃ¶Ã‡GÃ¶Ã‡ PART 3b: Custom-node source copy (combined or per-node) GÃ¶Ã‡GÃ¶Ã‡
@@ -13951,8 +14165,18 @@ class _ComfyAPIMixin:
                 f"timeout_s={CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S}"
             )
             try:
+                _pip_cmd = [sys.executable, "-m", "pip", "install", "-r", req_file]
+                if os.path.isfile(_CACHEDIT_LOCK_DST):
+                    _pip_cmd.extend(["-c", _CACHEDIT_LOCK_DST])
+                elif os.path.isfile(_CACHEDIT_LOCK_SRC):
+                    _pip_cmd.extend(["-c", _CACHEDIT_LOCK_SRC])
+                else:
+                    raise RuntimeError(
+                        "CacheDiT dependency lock not found at either "
+                        f"{_CACHEDIT_LOCK_DST} or {_CACHEDIT_LOCK_SRC}"
+                    )
                 result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "-r", req_file],
+                    _pip_cmd,
                     capture_output=True,
                     text=True,
                     timeout=CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S,
@@ -19168,6 +19392,26 @@ class _ComfyAPIMixin:
                 __stages["disable_cachedit"] = 0
         else:
             __stages["disable_cachedit"] = 0
+
+        # GÃ¶Ã‡GÃ¶Ã‡ CacheDiT initialization guard GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
+        # Wrap CacheDiT model optimizer node so failure is fatal only for
+        # explicit CacheDiT workflows.  Non-CacheDiT workflows unaffected.
+        # Already guarded by DISABLE_CACHEDIT_FOR_Z_IMAGE check inside the
+        # helper, so skip the guard flag check here.
+        try:
+            import nodes as _cd_guard_nodes
+            _cd_guard_cls = getattr(_cd_guard_nodes, "NODE_CLASS_MAPPINGS", {}).get("CacheDiT_Model_Optimizer")
+            if _cd_guard_cls is None:
+                _cd_guard_stage = "not_registered"
+            else:
+                if _guard_cachedit_node_class(_cd_guard_cls):
+                    _cd_guard_stage = "guarded"
+                    print("[comfyapp] CacheDiT_Model_Optimizer initialization guard active", flush=True)
+                else:
+                    _cd_guard_stage = "skipped"
+        except Exception as _cdg_exc:
+            _cd_guard_stage = f"error:{_cdg_exc}"
+        __stages["cachedit_guard_stage"] = _cd_guard_stage
 
         # GÃ¶Ã‡GÃ¶Ã‡ Pre-resolve warmup profile + model paths GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
         # FUSE stat calls for model file location are I/O-bound and

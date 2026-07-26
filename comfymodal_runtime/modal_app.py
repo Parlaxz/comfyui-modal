@@ -448,6 +448,84 @@ def _get_preflight_context(api: Any, module: Any) -> tuple[str, str, str]:
     return repair_mode, custom_nodes_gen, source
 
 
+# ── CacheDiT snapshot-safe pre-import (testable) ──────────────────────
+_CACHEDIT_LOCK_PACKAGES: list[tuple[str, str, str]] = [
+    ("transformers", "transformers", "transformers"),
+    ("diffusers", "diffusers", "diffusers"),
+    ("cache-dit", "cache_dit", "cache_dit"),
+]
+"""Snapshot-safe pre-import list: (metadata_name, import_name, display_label)."""
+
+
+def preimport_cachedit_family(
+    *,
+    _importlib: Any = None,
+    _print: Callable[..., None] = print,
+) -> dict[str, Any]:
+    """Pre-import transformers, diffusers, cache_dit in snapshot-safe mode.
+
+    Resolves only safe immutable metadata/classes/config validation available
+    in cache-dit v1.2.3 (inspects APIs rather than inventing symbols).
+    Does NOT create prompt/timestep/cache/latent/CUDA/session state.
+
+    Returns a dict with:
+      ``ok`` (bool), ``versions`` (dict), ``paths`` (dict),
+      ``cache_dit_info`` (dict | str), ``errors`` (list).
+
+    On any import failure, ``ok`` is False and *errors* describes the issue.
+    Never raises.
+    """
+    result: dict[str, Any] = {
+        "ok": False,
+        "versions": {},
+        "paths": {},
+        "cache_dit_info": {},
+        "errors": [],
+    }
+    if _importlib is None:
+        import importlib
+        import importlib.metadata  # ensure metadata submodule is loaded
+        _importlib = importlib
+
+    for meta_name, import_name, label in _CACHEDIT_LOCK_PACKAGES:
+        try:
+            ver = _importlib.metadata.version(meta_name)
+            mod = _importlib.import_module(import_name)
+            mod_path = getattr(mod, "__file__", "?")
+            result["versions"][label] = ver
+            result["paths"][label] = mod_path
+            _print(f"[cachedit.startup] preimport {label} version={ver} path={mod_path}")
+        except Exception as exc:
+            msg = f"preimport {label} ({meta_name}): {exc}"
+            result["errors"].append(msg)
+            _print(f"[cachedit.startup] ERROR {msg}")
+
+    # Immutable cache_dit v1.2.3 API inspection (no request/CUDA/session state)
+    # Use injected _importlib when available; fall back to real import otherwise.
+    try:
+        _cd = _importlib.import_module("cache_dit") if _importlib else __import__("cache_dit")
+        _cd_info: dict[str, Any] = {}
+        for attr in ("__version__", "__title__", "__description__"):
+            val = getattr(_cd, attr, None)
+            if val is not None:
+                _cd_info[attr] = str(val)
+        # Inspect safe top-level class names (no instantiation)
+        _class_names = [
+            name for name in dir(_cd)
+            if isinstance(getattr(_cd, name, None), type)
+            and not name.startswith("_")
+        ]
+        _cd_info["top_level_classes"] = sorted(_class_names)
+        result["cache_dit_info"] = _cd_info
+        _print(f"[cachedit.startup] cache_dit metadata={_cd_info}")
+    except Exception as exc:
+        result["errors"].append(f"cache_dit api inspection: {exc}")
+        _print(f"[cachedit.startup] ERROR cache_dit api inspection: {exc}")
+
+    result["ok"] = len(result["errors"]) == 0
+    return result
+
+
 def _compute_v2_cert_identity(
     workflow_hash: str,
     repair_mode: str = "",
@@ -2190,6 +2268,29 @@ class ModalRuntimeEntrypoint:
 
         _report_host_memory("restore_complete")
 
+        # Pre-import transformers, diffusers, cache_dit in snapshot-safe mode.
+        # Resolves only safe immutable metadata/classes/config validation;
+        # does NOT create prompt/timestep/cache/latent/CUDA/session state.
+        _cd_preimport = preimport_cachedit_family()
+        if not _cd_preimport["ok"]:
+            _cd_errors = "; ".join(_cd_preimport["errors"])
+            raise RuntimeError(
+                f"CacheDiT snapshot preimport FAILED: {_cd_errors} "
+                "(image should have passed build gate)"
+            )
+        else:
+            _cd_vers = _cd_preimport["versions"]
+            _cd_paths = _cd_preimport["paths"]
+            _cd_meta = _cd_preimport["cache_dit_info"]
+            print(
+                f"[cachedit.startup] preimport ok "
+                f"transformers={_cd_vers.get('transformers', '?')} "
+                f"diffusers={_cd_vers.get('diffusers', '?')} "
+                f"cache_dit={_cd_vers.get('cache_dit', '?')} "
+                f"cache_dit_info={_cd_meta}",
+                flush=True,
+            )
+
         print(
             f"[v2.lifecycle] method=startup snap=True "
             f"container_session={_V2_CONTAINER_SESSION_ID} "
@@ -2203,6 +2304,7 @@ class ModalRuntimeEntrypoint:
             "trace": trace.to_dict(),
             "_restore_timing": _restore_timing,
             "phase_durations_ms": trace.export_phase_durations(),
+            "_cachedit_preimport": _cd_preimport,
         }
 
     def restore(self) -> dict[str, Any]:
@@ -3201,6 +3303,7 @@ class ModalRuntimeEntrypoint:
             )
 
             _report_host_memory("restore_complete")
+
             _detect_gpu_allocation(
                 _MODAL_RESOURCES.get("spec", ModalRuntimeSpec()).gpu
             )

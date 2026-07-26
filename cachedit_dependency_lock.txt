@@ -1,0 +1,7 @@
+cache-dit==1.2.3
+transformers==4.55.2
+diffusers==0.36.0
+huggingface-hub==0.34.4
+accelerate==1.10.1
+safetensors==0.5.3
+tokenizers==0.21.4

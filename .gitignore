@@ -84,3 +84,6 @@ playwright-*.md
 
 # Local orchestrator deepwork state
 .slim/deepwork/
+
+# Lane A disk-persisted caches
+.cache/

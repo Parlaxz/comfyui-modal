@@ -780,6 +780,154 @@ class TestImports(unittest.TestCase):
 
 
 # =========================================================================
+# Disk-cache bootstrap regression — import-time NameError guard
+# =========================================================================
+
+
+class TestDiskCacheBootstrap(unittest.TestCase):
+    """Verify that importing ``canonical_execution`` with disk-cache files
+    present on disk does NOT raise ``NameError`` and correctly populates
+    the in-memory caches.
+
+    The bootstrap calls (``_populate_profile_cache_from_disk`` and
+    ``_populate_restore_cache_from_disk``) must execute only after
+    ``_PROFILE_PREP_CACHE``, ``_PROFILE_PREP_CACHE_LOCK``,
+    ``_RESTORE_PUBLISH_CACHE``, ``_RESTORE_PUBLISH_CACHE_LOCK``,
+    ``_evict_profile_prep_cache``, and ``_evict_restore_publish_cache``
+    are all defined.
+
+    This regression test creates valid cache files *before* importing so
+    the bootstrap code path is fully exercised (the early-return guard
+    ``if not entries: return`` does NOT short-circuit).
+    """
+
+    _CACHE_DIR = REPO_ROOT / ".cache"
+    _PROFILE_PATH = _CACHE_DIR / "v2_profile_cache.json"
+    _RESTORE_PATH = _CACHE_DIR / "v2_restore_cache.json"
+
+    @classmethod
+    def tearDownClass(cls):
+        """Remove any cache files we created."""
+        for p in (cls._PROFILE_PATH, cls._RESTORE_PATH):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _write_cache_file(self, path, entries):
+        """Write a valid disk-cache JSON file identical to what
+        ``_write_disk_cache`` produces (schema version, max_entries, etc.)."""
+        import json, os, tempfile, time
+
+        data = {
+            "version": 1,         # _DISK_CACHE_VERSION
+            "created_at": time.time(),
+            "max_entries": 100,   # _DISK_CACHE_MAX
+            "entries": entries,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            suffix=".tmp",
+            prefix=path.name + ".",
+            dir=path.parent,
+        )
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(json.dumps(data, separators=(",", ":")).encode("utf-8"))
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _fresh_import(self):
+        """Force a fresh import of ``canonical_execution`` and return the
+        module object (bypassing any cached version in ``sys.modules``)."""
+        import importlib.util, sys
+        name = "__canonical_execution_test_bootstrap__"
+        # Remove any stale entry
+        sys.modules.pop(name, None)
+        spec = importlib.util.spec_from_file_location(
+            name, REPO_ROOT / "canonical_execution.py"
+        )
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_import_with_disk_cache_files_does_not_nameerror(self):
+        """Import succeeds without ``NameError`` when cache files exist."""
+        # Arrange: create valid cache files that will exercise the full
+        # bootstrap path (no early return).
+        known_hash = "a0" * 32  # 64-char hex string as a plausible stable_hash
+        profile_entries = {
+            known_hash: {
+                "result": {"status": "ok", "payload_bytes": 128},
+            },
+        }
+        restore_entries = {
+            known_hash: {
+                "identity_hash": known_hash,
+                "publication_result": {"status": "published"},
+            },
+        }
+        self._write_cache_file(self._PROFILE_PATH, profile_entries)
+        self._write_cache_file(self._RESTORE_PATH, restore_entries)
+
+        # Act & Assert: import must not raise NameError or any other error
+        try:
+            mod = self._fresh_import()
+        except Exception as exc:
+            self.fail(
+                f"Import raised {type(exc).__name__}: {exc}\n"
+                f"This likely means the bootstrap calls at module level "
+                f"still reference names that aren't yet defined."
+            )
+
+        # Assert: the in-memory caches were populated from disk
+        profile_keys = list(getattr(mod, "_PROFILE_PREP_CACHE", {}).keys())
+        restore_keys = list(getattr(mod, "_RESTORE_PUBLISH_CACHE", {}).keys())
+        self.assertIn(
+            known_hash, profile_keys,
+            f"Profile prep cache should contain the known cache key. "
+            f"Got keys: {profile_keys}",
+        )
+        self.assertIn(
+            known_hash, restore_keys,
+            f"Restore publish cache should contain the known cache key. "
+            f"Got keys: {restore_keys}",
+        )
+
+    def test_import_without_cache_files_still_succeeds(self):
+        """Import also succeeds when no cache files exist (early-return path)."""
+        # Ensure files are absent
+        for p in (self._PROFILE_PATH, self._RESTORE_PATH):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        try:
+            mod = self._fresh_import()
+        except Exception as exc:
+            self.fail(
+                f"Import raised {type(exc).__name__}: {exc} "
+                f"(no cache files case)"
+            )
+
+        # Both caches should exist but be empty
+        self.assertEqual(
+            len(getattr(mod, "_PROFILE_PREP_CACHE", {})), 0,
+        )
+        self.assertEqual(
+            len(getattr(mod, "_RESTORE_PUBLISH_CACHE", {})), 0,
+        )
+
+
+# =========================================================================
 # Source-level regression tests
 # =========================================================================
 
