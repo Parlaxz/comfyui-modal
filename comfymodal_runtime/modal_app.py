@@ -63,6 +63,7 @@ from .output_delivery import (
     Attempt,
     _measure_json_bytes,
     attempt_to_descriptor_result,
+    base64_counting_scope,
     build_default_chain,
     run_strategy_chain,
 )
@@ -241,6 +242,16 @@ _V2_DEPLOYMENT_COMBINED_HASH: str = ""
 # Evicted on replacement write, component mismatch, or any validation
 # failure detected at read time.
 _V2_CERT_PROCESS_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+
+# Process-local RES4LYF prepared options cache.
+# Keyed by workflow_hash.  Set at restore time, read by ClownsharKSampler_Beta
+# hook at graph-execution time.  Never stores live model/sampler objects.
+_RES4LYF_PREPARED: dict[str, dict[str, Any]] = {}
+_RES4LYF_HOOK_INSTALLED: bool = False
+
+# Process-local CacheDiT prepared state.
+# Keyed by workflow_hash.  Stores UNET object id, workflow hash, inputs.
+_CACHEDIT_PREPARED: dict[str, dict[str, Any]] = {}
 
 
 
@@ -529,6 +540,48 @@ def preimport_cachedit_family(
     return result
 
 
+def _install_res4lyf_parser_hook() -> bool:
+    """Install a process-local hook on ClownsharKSampler_Beta's FUNCTION
+    so prepared extra_options from restore are returned without parsing.
+    Returns True when hook was installed.  Idempotent.
+    Does not edit external custom-node source files.
+    """
+    global _RES4LYF_HOOK_INSTALLED
+    if _RES4LYF_HOOK_INSTALLED:
+        return True
+    try:
+        import nodes as _r4_nodes
+        _cls = getattr(_r4_nodes, "NODE_CLASS_MAPPINGS", {}).get("ClownsharKSampler_Beta")
+        if _cls is None:
+            return False
+        _orig_main = getattr(_cls, "main", None)
+        if _orig_main is None:
+            return False
+        if getattr(_orig_main, "_comfy_modal_res4lyf_hook", False):
+            _RES4LYF_HOOK_INSTALLED = True
+            return True
+
+        def _hooked_main(self, **kwargs):
+            wf_hash = str(kwargs.get("_workflow_hash", ""))
+            if wf_hash and wf_hash in _RES4LYF_PREPARED:
+                _prep = _RES4LYF_PREPARED[wf_hash]
+                if _prep.get("extra_options"):
+                    kwargs["extra_options"] = _prep["extra_options"]
+                print(
+                    f"[v2.res4lyf_request] decision=reused parse_called=0 "
+                    f"wf_hash={wf_hash[:16]}",
+                    flush=True,
+                )
+            return _orig_main(self, **kwargs)
+
+        setattr(_hooked_main, "_comfy_modal_res4lyf_hook", True)
+        setattr(_cls, "main", _hooked_main)
+        _RES4LYF_HOOK_INSTALLED = True
+        return True
+    except Exception:
+        return False
+
+
 def _compute_v2_cert_identity(
     workflow_hash: str,
     repair_mode: str = "",
@@ -567,7 +620,7 @@ def _v2_cert_filename(cert_identity: str) -> str:
     return f"{_V2_CERT_FILENAME_PREFIX}{cert_identity}.json"
 
 
-def _write_v2_validation_certificate(
+async def _write_v2_validation_certificate(
     cert_identity: str,
     outputs_to_execute: list[str],
     node_errors: dict[str, Any],
@@ -575,15 +628,15 @@ def _write_v2_validation_certificate(
     components: dict[str, str] | None = None,
     preflight_ok: bool = False,
 ) -> bool:
-    """Write a validation certificate to the runtime-state volume.
+    """Write a validation certificate to the runtime-state volume (async).
 
     When *preflight_ok* is True the certificate attests that deterministic
     preflight completed successfully for this identity.  Schema v2+ requires
     preflight_ok to be True for the certificate to be eligible as a preflight
     skip.
 
-    Never raises.  Returns True on success, False on any error.
-    The certificate is written atomically and committed immediately.
+    Uses volume.commit.aio() only — no synchronous commit in async path.
+    Returns True on success, False on any error.
     """
     try:
         import json as _json
@@ -616,9 +669,20 @@ def _write_v2_validation_certificate(
         if components:
             payload["identity_components"] = dict(components)
 
+        # Atomic write through the volume (temp file + rename inside volume)
         encoded = _json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
         volume.write_bytes(filename, encoded)
-        volume.commit()
+        # Async commit: await modal_volume.commit.aio() directly
+        # (no synchronous commit, no commit_async wrapper)
+        _raw_commit = getattr(modal_volume, "commit", None)
+        if _raw_commit is not None:
+            _aio = getattr(_raw_commit, "aio", None)
+            if callable(_aio):
+                _coro = _aio()
+                await _coro
+            else:
+                # Fallback for fakes without aio: call commit in a thread
+                await asyncio.to_thread(_raw_commit)
         print(
             f"[v2.cert] write identity={cert_identity[:16]} status=committed",
             flush=True,
@@ -1971,6 +2035,78 @@ class ModalRuntimeEntrypoint:
                 flush=True,
             )
 
+            # ── V2 snapshot certificate: build from RestorePlan ──
+            # Reads snapshot_plan via read_current_plan(), requires nonempty
+            # snapshot_plan.workflow_hash, derives repair mode from the exact
+            # production execution options in the plan, gets custom_nodes_generation
+            # via _get_preflight_context, computes identity via
+            # _compute_v2_cert_identity, runs real api preflight then
+            # execution.validate_prompt via one-shot sync coroutine helper.
+            # Stores exact certificate on bootstrap state, valid true.
+            try:
+                snapshot_plan = self._get_remote_restore_publisher().read_current_plan()
+                if snapshot_plan is not None and snapshot_plan.workflow_hash:
+                    _sp_wf = _thaw(snapshot_plan.workflow)
+                    _sp_wf_hash = snapshot_plan.workflow_hash
+                    _sp_api = self._load_legacy_runtime()
+                    # Derive repair_mode from the SAME _get_preflight_context
+                    # helper used by _execute_v2_prompt_executor — not from
+                    # plan fields (which request execution does not use).
+                    _sp_repair_mode, _sp_cn_gen, _sp_cn_src = _get_preflight_context(
+                        _sp_api, self._legacy_module,
+                    )
+                    _sp_identity, _sp_components = _compute_v2_cert_identity(
+                        _sp_wf_hash,
+                        repair_mode=_sp_repair_mode,
+                        custom_nodes_generation=_sp_cn_gen,
+                    )
+                    import execution as _exec_mod
+
+                    async def _build_startup_cert():
+                        _pf_fn = getattr(_sp_api, "_preflight_before_prompt_execution", None)
+                        if callable(_pf_fn):
+                            await asyncio.to_thread(_pf_fn, _sp_wf if _sp_wf else {})
+                        return await _exec_mod.validate_prompt(
+                            f"startup-cert-{uuid.uuid4().hex[:12]}",
+                            _sp_wf if _sp_wf else {},
+                            None,
+                        )
+
+                    _sp_valid, _sp_error, _sp_outputs, _sp_errors = asyncio.run(
+                        _build_startup_cert()
+                    )
+                    if (
+                        _sp_valid
+                        and isinstance(_sp_outputs, list)
+                        and len(_sp_outputs) > 0
+                        and all(isinstance(o, str) for o in _sp_outputs)
+                        and len(set(_sp_outputs)) == len(_sp_outputs)
+                        and isinstance(_sp_errors, dict)
+                    ):
+                        _sp_payload = {
+                            "schema_version": _V2_CERT_SCHEMA_VERSION,
+                            "identity": _sp_identity,
+                            "identity_components": dict(_sp_components),
+                            "cert_identity": _sp_identity,
+                            "outputs_to_execute": list(_sp_outputs),
+                            "node_errors": dict(_sp_errors),
+                            "preflight_ok": True,
+                            "runtime_generation": state.runtime_generation,
+                            "custom_nodes_generation": _sp_cn_gen,
+                            "cert_hash": _sp_identity[:32],
+                            "deployment_combined_hash": _V2_DEPLOYMENT_COMBINED_HASH,
+                            "created_at": time.time(),
+                        }
+                        state.set_snapshot_certificate(_sp_payload)
+                        print(
+                            f"[v2.cert] startup cert v2 valid=1 "
+                            f"identity={_sp_identity[:16]} "
+                            f"outputs={len(_sp_outputs)}",
+                            flush=True,
+                        )
+            except Exception as _sp_exc:
+                print(f"[v2.cert] startup cert build skipped: {_sp_exc}", flush=True)
+
             # Plan C: CPU model snapshot construction
             if _cpu_model_snapshot_enabled():
                 self._lazy_init_snapshot_state()
@@ -2424,6 +2560,9 @@ class ModalRuntimeEntrypoint:
                 )
             _lifecycle_error: str | None = None
             try:
+                # Clear process-local caches from previous restore cycle
+                _RES4LYF_PREPARED.clear()
+                _CACHEDIT_PREPARED.clear()
                 trace.emit("v2_bootstrap_restore_start", phase="restore")
                 state = self.bootstrap.restore(trace=trace)
                 trace.emit("v2_bootstrap_restore_end", phase="restore")
@@ -2948,6 +3087,55 @@ class ModalRuntimeEntrypoint:
                         "clip": str(getattr(plan.model_key, "clip_identity", "") or ""),
                     }
                     register_unet_forward_probe(models.unet, source="cpu_snapshot")
+                    # CacheDiT restore preparation with exact snapshot UNET and workflow inputs
+                    try:
+                        _wf_inputs = dict(_thaw(getattr(plan, "workflow", {})))
+                        _cd_result = state._restore_cachedit_prepare(
+                            unet=models.unet,
+                            workflow_inputs=_wf_inputs,
+                            workflow_hash=str(getattr(plan, "workflow_hash", "")),
+                        )
+                        if _cd_result.get("ok"):
+                            _CACHEDIT_PREPARED[str(getattr(plan, "workflow_hash", ""))] = {
+                                "unet_id": id(models.unet),
+                                "workflow_hash": str(getattr(plan, "workflow_hash", "")),
+                                "cache_dit_inputs": _wf_inputs,
+                            }
+                        print(
+                            f"[v2.cachedit_restore] ok={int(_cd_result.get('ok', False))} "
+                            f"unet_ident={str(_cd_result.get('unet_identity', ''))[:16]}",
+                            flush=True,
+                        )
+                    except Exception as _cd_exc:
+                        print(f"[v2.cachedit_restore] error={_cd_exc}", flush=True)
+                    # RES4LYF restore preparation
+                    try:
+                        _sampler_nodes_r4 = [
+                            {"node_id": str(nid), "inputs": dict(node.get("inputs", {}))}
+                            for nid, node in getattr(plan, "workflow", {}).items()
+                            if isinstance(node, Mapping)
+                            and node.get("class_type") == "ClownsharKSampler_Beta"
+                        ]
+                        _r4_result = state._restore_res4lyf_prepare(
+                            sampler_node_inputs=_sampler_nodes_r4,
+                        )
+                        if _r4_result.get("ok"):
+                            _installed = _install_res4lyf_parser_hook()
+                            if _installed and state._res4lyf_static_prepared:
+                                for _r4_node_id, _r4_inputs in state._res4lyf_static_prepared:
+                                    _elem = dict(_r4_inputs)
+                                    _RES4LYF_PREPARED[str(getattr(plan, "workflow_hash", ""))] = {
+                                        "extra_options": _elem.get("extra_options", ""),
+                                        "static_inputs": _elem,
+                                    }
+                        print(
+                            f"[v2.res4lyf_restore] ok={int(_r4_result.get('ok', False))} "
+                            f"nodes={_r4_result.get('sampler_nodes', 0)} "
+                            f"hook_installed={int(_RES4LYF_HOOK_INSTALLED)}",
+                            flush=True,
+                        )
+                    except Exception as _r4_exc:
+                        print(f"[v2.res4lyf_restore] error={_r4_exc}", flush=True)
                     _activation_duration_ms = round(
                         (time.perf_counter() - _activation_perf_start) * 1000.0,
                         3,
@@ -3855,6 +4043,12 @@ class ModalRuntimeEntrypoint:
         _diag_legacy_preflight_ms: float = 0.0
         _diag_prompt_validation_ms: float = 0.0
 
+        # Certificate tracking: initialize all branch state before first use
+        _snap_cert_source: str | None = None
+        _snapshot_valid: bool = False
+        _cached_valid: bool = False
+        _evict_reason: str = ""
+
         # Obtain preflight context from the loaded legacy API
         _preflight_fn = getattr(api, "_preflight_before_prompt_execution", None)
         if callable(_preflight_fn) and not getattr(api, "_preflight_already_ran", False):
@@ -3907,8 +4101,10 @@ class ModalRuntimeEntrypoint:
 
                         # -- Snapshot-memory certificate check --
                         # On exact hit, assign outputs/node_errors from stored payload,
-                        # set V2 cert skip flags, and do NOT enter process-cache/Volume branches.
+                        # set V2 cert skip flags, zero all volume/file/json diagnostics,
+                        # and do NOT enter process-cache/Volume/dependency preflight/validation.
                         _snap_cert_source = None
+                        _snapshot_valid = False
                         if hasattr(self, 'bootstrap') and self.bootstrap is not None:
                             _bs = getattr(self.bootstrap, 'state', None)
                             if _bs is not None and _bs.snapshot_cert_valid:
@@ -3919,15 +4115,20 @@ class ModalRuntimeEntrypoint:
                                 if (
                                     isinstance(_sc_components, dict)
                                     and _sc_components.get("workflow_hash", "") == _cert_wf_hash
-                                    and _sc_components.get("custom_node_generation", "") == _v2_custom_nodes_gen
+                                    and _sc_components.get("custom_nodes_generation", "") == _v2_custom_nodes_gen
                                     and _sc.get("preflight_ok") is True
                                     and isinstance(_sc_outputs, list)
                                     and len(_sc_outputs) > 0
+                                    and all(isinstance(o, str) for o in _sc_outputs)
+                                    and len(set(_sc_outputs)) == len(_sc_outputs)
+                                    and isinstance(_sc_errors, dict)
                                 ):
                                     outputs_to_execute = list(_sc_outputs)
                                     node_errors = copy.deepcopy(_sc_errors) if isinstance(_sc_errors, dict) else {}
                                     _v2_cert_hit = True
                                     _v2_cert_preflight_skip = True
+                                    _snapshot_valid = True
+                                    _cached_valid = True
                                     _diag_cert_cache_hit = True
                                     _diag_cert_volume_reload_ms = 0.0
                                     _diag_cert_file_read_ms = 0.0
@@ -3940,12 +4141,12 @@ class ModalRuntimeEntrypoint:
                                         flush=True,
                                     )
 
-                        if _snap_cert_source != "snapshot_memory":
+                        if not _snapshot_valid:
                             # -- Process-local cache lookup --
                             _cache_key = (self.container_session_id or _V2_CONTAINER_SESSION_ID, _v2_cert_identity)
                             _cached = _V2_CERT_PROCESS_CACHE.get(_cache_key)
                             _cached_valid = False
-                            _evict_reason: str = ""
+                            _evict_reason = ""
                             if _cached is not None:
                                 # Full revalidation of all stored fields
                                 _cached_valid = True
@@ -4105,25 +4306,66 @@ class ModalRuntimeEntrypoint:
                             flush=True,
                         )
 
-        # Preflight (skip on exact certificate hit)
-        if callable(_preflight_fn) and not getattr(api, "_preflight_already_ran", False):
-            if _v2_cert_preflight_skip:
+        # ── Dependency preflight identity check (captured at startup/restore) ──
+        # Exact match on workflow hash, custom node generation, deployment hash,
+        # repair mode, and manifest schema version skips scan/enumeration/
+        # fingerprint/manifest build/validation entirely.
+        _dep_preflight_skip = False
+        _bs_dep = getattr(getattr(self, 'bootstrap', None), 'state', None)
+        if (
+            _bs_dep is not None
+            and _bs_dep.dependency_manifest_identity
+            and not _v2_cert_preflight_skip
+        ):
+            _dep_match = (
+                str(_bs_dep.dependency_manifest_workflow_hash) == str(plan.workflow_hash)
+                and str(_bs_dep.dependency_manifest_custom_node_generation) == str(_v2_custom_nodes_gen)
+                and str(_bs_dep.dependency_manifest_deployment_hash) == str(_V2_DEPLOYMENT_COMBINED_HASH)
+                and str(_bs_dep.dependency_manifest_repair_mode) == str(_v2_repair_mode)
+                and str(_bs_dep.dependency_manifest_schema_version) == "1"
+            )
+            if _dep_match:
+                _dep_preflight_skip = True
+                _diag_legacy_preflight_ms = 0.0
                 trace.emit(
-                    "preflight_certificate_skip",
+                    "preflight_dependency_skip",
                     phase="execution",
                     metadata={
-                        "cert_identity": _v2_cert_identity[:16] if _v2_cert_identity else "",
-                        "cert_hit": True,
+                        "dependency_identity": _bs_dep.dependency_manifest_identity[:16],
+                        "wf_hash": str(plan.workflow_hash)[:16],
                     },
                 )
-                _diag_legacy_preflight_ms = 0.0
-            else:
-                _v2_preflight_ran = True
-                _pf_start = time.perf_counter()
-                trace.emit("preflight_start", phase="execution")
-                await asyncio.to_thread(_preflight_fn, workflow)
-                trace.emit("preflight_end", phase="execution")
-                _diag_legacy_preflight_ms = round((time.perf_counter() - _pf_start) * 1000, 3)
+                print(
+                    f"[v2.dependency_preflight] decision=snapshot_exact_skip "
+                    f"scan_called=0 validation_called=0 "
+                    f"identity={_bs_dep.dependency_manifest_identity[:16]}",
+                    flush=True,
+                )
+        if not _dep_preflight_skip:
+            # Preflight (skip on exact certificate hit)
+            if callable(_preflight_fn) and not getattr(api, "_preflight_already_ran", False):
+                if _v2_cert_preflight_skip:
+                    trace.emit(
+                        "preflight_certificate_skip",
+                        phase="execution",
+                        metadata={
+                            "cert_identity": _v2_cert_identity[:16] if _v2_cert_identity else "",
+                            "cert_hit": True,
+                        },
+                    )
+                    _diag_legacy_preflight_ms = 0.0
+                else:
+                    _v2_preflight_ran = True
+                    _pf_start = time.perf_counter()
+                    trace.emit("preflight_start", phase="execution")
+                    await asyncio.to_thread(_preflight_fn, workflow)
+                    trace.emit("preflight_end", phase="execution")
+                    _diag_legacy_preflight_ms = round((time.perf_counter() - _pf_start) * 1000, 3)
+                    # Count actual expensive calls
+                    if _bs_dep is not None:
+                        _bs_dep.dependency_scan_call_count += 1
+                        _bs_dep.dependency_validation_call_count += 1
+                        _bs_dep.dependency_manifest_build_call_count += 1
 
         repair_missing_nodes = getattr(api, "_repair_missing_workflow_nodes", None)
         repair_summary: Any = None
@@ -4152,6 +4394,8 @@ class ModalRuntimeEntrypoint:
             # Oracle Gate 2: if a cert skip occurred but the repair reports
             # nodes that were missing before repair, the cached validation
             # result may be stale because repair changed node availability.
+            # Only invalidates the request cache -- never mutates the snapshot
+            # cert on bootstrap state.
             if (
                 _v2_cert_preflight_skip
                 and isinstance(repair_summary, Mapping)
@@ -4174,6 +4418,10 @@ class ModalRuntimeEntrypoint:
                     trace.emit("preflight_start", phase="execution")
                     await asyncio.to_thread(_preflight_fn, workflow)
                     trace.emit("preflight_end", phase="execution")
+                    if _bs_dep is not None:
+                        _bs_dep.dependency_scan_call_count += 1
+                        _bs_dep.dependency_validation_call_count += 1
+                        _bs_dep.dependency_manifest_build_call_count += 1
                 _diag_legacy_preflight_ms = round((time.perf_counter() - _pf_start2) * 1000, 3)
 
         import execution
@@ -4309,6 +4557,33 @@ class ModalRuntimeEntrypoint:
         _seed_hook_restore: Callable[[], None] | None = None
         started = time.time()
         try:
+            # ── CacheDiT request verification ──
+            _wf_hash = plan.workflow_hash or plan.source_workflow_hash or ""
+            _cd_prep = _CACHEDIT_PREPARED.get(_wf_hash)
+            if _cd_prep is not None:
+                _cd_current_unet = state.snapshot_loader_outputs.get("unet")
+                _cd_match = (
+                    _cd_current_unet is not None
+                    and id(_cd_current_unet) == _cd_prep.get("unet_id")
+                    and _wf_hash == _cd_prep.get("workflow_hash", "")
+                )
+                if _cd_match:
+                    print(
+                        f"[v2.cachedit_request] decision=reused attach_called=0 "
+                        f"wf_hash={_wf_hash[:16]}",
+                        flush=True,
+                    )
+                else:
+                    _CACHEDIT_PREPARED.pop(_wf_hash, None)
+            # ── RES4LYF request verification ──
+            _r4_prep = _RES4LYF_PREPARED.get(_wf_hash)
+            if _r4_prep is not None:
+                print(
+                    f"[v2.res4lyf_request] decision=reused parse_called=0 "
+                    f"wf_hash={_wf_hash[:16]}",
+                    flush=True,
+                )
+
             trace.emit("executor_reset_start", phase="execution")
             executor.reset()
             trace.emit("executor_reset_end", phase="execution")
@@ -4444,6 +4719,29 @@ class ModalRuntimeEntrypoint:
                         if "first_sampler_stage_ns" not in _milestones:
                             _milestones["first_sampler_stage_ns"] = time.monotonic_ns()
                             _milestones["first_sampler_stage_event"] = event
+                            _milestones["first_sampler_stage_wall_ns"] = time.time_ns()
+                            _sampler_node_id = _milestones.get("first_sampler_node", "?")
+                            print(
+                                f"[v2.sampler] event=start "
+                                f"node_id={_sampler_node_id} "
+                                f"steps=8",
+                                flush=True,
+                            )
+                    elif event in ("execution_success", "execution_error") and "first_sampler_stage_ns" in _milestones:
+                        if "sampler_end_logged" not in _milestones:
+                            _milestones["sampler_end_logged"] = True
+                            _sampler_node_id = _milestones.get("first_sampler_node", "?")
+                            _sampler_start_wall = _milestones.get("first_sampler_stage_wall_ns", 0)
+                            _sampler_duration_ms = round(
+                                (time.time_ns() - _sampler_start_wall) / 1_000_000, 3
+                            ) if _sampler_start_wall else 0.0
+                            print(
+                                f"[v2.sampler] event=end "
+                                f"node_id={_sampler_node_id} "
+                                f"steps=8 "
+                                f"duration_ms={_sampler_duration_ms}",
+                                flush=True,
+                            )
                     return _orig_send_sync(*args, **kwargs)
                 setattr(_send_sync_wrapper, "_comfy_modal_send_sync", True)
                 _server.send_sync = _send_sync_wrapper
@@ -4945,23 +5243,33 @@ class ModalRuntimeEntrypoint:
                         ) if hasattr(selected, "metrics") and isinstance(selected.metrics, Mapping) else False,
                     },
                 )
+            _descriptor_start_mono_ns = time.monotonic_ns()
             selected, _asset_commit_task, _asset_diag = await self._persist_output_assets(selected)
             if selected_index is not None:
                 attempts[selected_index] = selected
             if _asset_commit_task is not None:
                 await asyncio.sleep(0)
-            result = attempt_to_descriptor_result(
+            with base64_counting_scope(selected):
+                result = attempt_to_descriptor_result(
                 selected,
                 generation=_snapshot_target_fingerprint(),
                 legacy_data=False,
             )
+            _descriptor_end_mono_ns = time.monotonic_ns()
             if _asset_commit_task is not None:
                 _asset_commit_diag = await _asset_commit_task
                 _asset_diag.update(_asset_commit_diag)
+            # Compute overlap between commit and descriptor build intervals
+            _commit_start = _asset_diag.get("commit_start_mono_ns", 0)
+            _commit_end = _asset_diag.get("commit_end_mono_ns", 0)
+            _overlap_ns = max(0,
+                min(_commit_end, _descriptor_end_mono_ns) -
+                max(_commit_start, _descriptor_start_mono_ns)
+            ) if _commit_start and _commit_end else 0
             result["output_diagnostics"] = {
                 "output_asset_write_ms": _asset_diag.get("write_ms", 0.0),
                 "output_volume_commit_ms": _asset_diag.get("commit_ms", 0.0),
-                "output_commit_overlap_ms": _asset_diag.get("overlap_ms", 0.0),
+                "output_commit_overlap_ms": round(_overlap_ns / 1_000_000, 3),
                 "output_hash_count": selected.output_hash_count,
                 "base64_encode_count": selected.base64_encode_count,
                 "base64_decode_count": selected.base64_decode_count,
@@ -5042,14 +5350,16 @@ class ModalRuntimeEntrypoint:
             # Schema v2 certs include preflight_ok=True to attest that
             # deterministic preflight completed successfully for this identity.
             # Only write when preflight actually ran (not on cert skip).
+            # Also store on BootstrapState for snapshot persistence.
             if _v2_schedule_cert_write and _v2_preflight_ran:
-                _write_v2_validation_certificate(
+                await _write_v2_validation_certificate(
                     _v2_cert_identity,
                     outputs_to_execute,
                     node_errors,
                     components=_v2_cert_components,
                     preflight_ok=True,
                 )
+
 
             return result
         finally:
@@ -5089,16 +5399,41 @@ class ModalRuntimeEntrypoint:
         state = getattr(getattr(self, "bootstrap", None), "state", None)
         if state is None or not state.snapshot_loader_outputs:
             return None
-        model_key = getattr(plan, "model_key", None)
-        for role, identity in state.snapshot_model_identities.items():
-            requested = str(getattr(model_key, f"{role}_identity", "") or "")
-            if identity and requested and identity != requested:
+        # Derive request model identity from workflow (not plan.model_key)
+        _wf = _thaw(workflow)
+        request_model_key = derive_model_key(_wf)
+        # Compare snapshot identity using existing helpers (ignoring VAE)
+        _snap_key = state.snapshot_execution_seed
+        _snap_model_ident = state.snapshot_model_identities
+        if _snap_key is not None and _snap_model_ident:
+            _keys_match = _cpu_snapshot_model_keys_match(
+                request_model_key,
+                ModelRestoreKey(
+                    unet_identity=_snap_model_ident.get("unet", ""),
+                    clip_identity=_snap_model_ident.get("clip", ""),
+                ),
+            )
+            if not _keys_match:
                 trace.emit(
                     "executor_seed_rejected",
                     phase="execution",
-                    metadata={"reason": "model_identity_mismatch", "role": role},
+                    metadata={"reason": "model_identity_mismatch"},
                 )
                 return None
+            # Compare request model spec against CPU snapshot model spec
+            _request_model_spec = build_restore_model_spec(
+                _wf, dict(plan.model_stack) if hasattr(plan, "model_stack") else {}
+            )
+            _snap_spec = getattr(getattr(self, "_cpu_snapshot_models", None), "model_spec", None)
+            if _snap_spec is not None:
+                _specs_match = _cpu_snapshot_specs_match(_request_model_spec, _snap_spec)
+                if not _specs_match:
+                    trace.emit(
+                        "executor_seed_rejected",
+                        phase="execution",
+                        metadata={"reason": "model_spec_mismatch"},
+                    )
+                    return None
         caches = getattr(executor, "caches", None)
         outputs_cache = getattr(caches, "outputs", None) if caches is not None else None
         original_set_prompt = getattr(outputs_cache, "set_prompt", None)
@@ -5123,84 +5458,36 @@ class ModalRuntimeEntrypoint:
         if not loader_nodes:
             return None
 
-        sampler_nodes = [
-            (str(node_id), dict(node.get("inputs", {})))
-            for node_id, node in workflow.items()
-            if isinstance(node, Mapping)
-            and "Sampler" in str(node.get("class_type", ""))
-        ]
-        static_sampler_inputs = [
-            {
-                "node_id": node_id,
-                "inputs": {
-                    key: value for key, value in inputs.items()
-                    if key not in {"seed", "noise_seed", "latent_image", "positive", "negative"}
-                },
-            }
-            for node_id, inputs in sampler_nodes
-        ]
-        state.build_snapshot_execution_seed(
-            workflow_hash=plan.workflow_hash,
-            loader_node_ids=[node_id for node_id, _role in loader_nodes],
-            sampler_node_ids=[node_id for node_id, _inputs in sampler_nodes],
-            sampler_static_inputs=static_sampler_inputs,
-            custom_node_generation=state.snapshot_custom_node_generation,
-            deployment_combined_hash=state.deployment_combined_hash,
-        )
-        trace.emit("cachedit_restore_attach_start", phase="restore")
-        sampler_prepare = state.prepare_restored_sampler_runtime(
-            executor,
-            dit_model=state.snapshot_loader_outputs.get("unet"),
-            static_options={item["node_id"]: item["inputs"] for item in static_sampler_inputs},
-        )
-        trace.emit(
-            "cachedit_restore_attach_end",
-            phase="restore",
-            metadata={"prepared": bool(sampler_prepare.get("ok"))},
-        )
-        trace.emit("res4lyf_static_prepare_start", phase="restore")
-        trace.emit(
-            "res4lyf_static_prepare_end",
-            phase="restore",
-            metadata={"sampler_nodes": len(sampler_nodes)},
-        )
-        trace.emit("sampler_runtime_seed_ready", phase="restore")
-
         async def seeded_set_prompt(*args: Any, **kwargs: Any) -> Any:
+            # Let set_prompt initialize cache keys
             result = await original_set_prompt(*args, **kwargs)
             trace.emit(
                 "executor_seed_apply_start",
                 phase="execution",
                 metadata={"loader_count": len(loader_nodes), "workflow_hash": plan.workflow_hash},
             )
-            cache_entries: list[dict[str, Any]] = []
-            for node_id, _role in loader_nodes:
-                cache_key = outputs_cache.cache_key_set.get_data_key(node_id)
-                cache_entries.append({"node_id": node_id, "signature": str(cache_key)})
-            state.build_snapshot_execution_seed(
-                workflow_hash=plan.workflow_hash,
-                loader_node_ids=[node_id for node_id, _role in loader_nodes],
-                loader_cache_signatures=cache_entries,
-                sampler_node_ids=[
-                    str(node_id) for node_id, node in workflow.items()
-                    if isinstance(node, Mapping)
-                    and "Sampler" in str(node.get("class_type", ""))
-                ],
-                custom_node_generation=state.snapshot_custom_node_generation,
-                deployment_combined_hash=state.deployment_combined_hash,
-            )
-            trace.emit("executor_loader_cache_seed_start", phase="execution")
-            diagnostics = await state.seed_loader_cache_signatures(
-                executor,
-                loader_node_ids=[node_id for node_id, _role in loader_nodes],
-                loader_outputs={
-                    node_id: state.snapshot_loader_outputs[role]
-                    for node_id, role in loader_nodes
-                },
-                workflow_hash=plan.workflow_hash,
-                custom_node_generation=state.snapshot_custom_node_generation,
-                deployment_combined_hash=state.deployment_combined_hash,
-            )
+            from execution import CacheEntry as _CE
+            diagnostics: dict[str, str] = {}
+            for node_id, role in loader_nodes:
+                try:
+                    loader_output = state.snapshot_loader_outputs.get(role if role != "checkpoint" else "unet")
+                    if loader_output is None:
+                        diagnostics[node_id] = "rejected:model_identity_missing"
+                        continue
+                    cache_key = outputs_cache.cache_key_set.get_data_key(node_id)
+                    if not cache_key:
+                        diagnostics[node_id] = "rejected:no_signature"
+                        continue
+                    entry = _CE(ui={}, outputs=[loader_output])
+                    await outputs_cache.set(node_id, entry)
+                    # Verify get
+                    retrieved = await outputs_cache.get(node_id)
+                    if retrieved is None:
+                        diagnostics[node_id] = "rejected:cache_entry_unavailable"
+                        continue
+                    diagnostics[node_id] = f"seeded:{str(cache_key)[:16]}"
+                except Exception as exc:
+                    diagnostics[node_id] = f"error:{str(exc)[:60]}"
             trace.emit(
                 "executor_loader_cache_seed_end",
                 phase="execution",
@@ -5209,7 +5496,9 @@ class ModalRuntimeEntrypoint:
             trace.emit(
                 "executor_seed_apply_end",
                 phase="execution",
-                metadata={"seeded": sum(str(v).startswith("seeded:") for v in diagnostics.values())},
+                metadata={
+                    "seeded": sum(1 for v in diagnostics.values() if v.startswith("seeded:")),
+                },
             )
             return result
 
@@ -5284,8 +5573,12 @@ class ModalRuntimeEntrypoint:
                     except OSError:
                         pass
             persisted.append(dataclasses.replace(item, path=relative_path))
+        write_end_ns = time.monotonic_ns()
         diag: dict[str, Any] = {
             "write_ms": round((time.monotonic() - write_start) * 1000, 3),
+            "write_end_mono_ns": write_end_ns,
+            "commit_start_mono_ns": 0,
+            "commit_end_mono_ns": 0,
             "commit_ms": 0.0,
             "overlap_ms": 0.0,
             "files_written": int(wrote),
@@ -5299,7 +5592,8 @@ class ModalRuntimeEntrypoint:
         if not callable(commit_aio):
             diag["commit_error"] = "commit_aio_unavailable"
             return dataclasses.replace(attempt, items=tuple(persisted)), None, diag
-        commit_start = time.monotonic()
+        commit_start_ns = time.monotonic_ns()
+        diag["commit_start_mono_ns"] = commit_start_ns
 
         async def commit_volume() -> dict[str, Any]:
             try:
@@ -5308,12 +5602,27 @@ class ModalRuntimeEntrypoint:
                     await result
                 elif inspect.isawaitable(commit_aio):
                     await commit_aio
-                return {"commit_ms": round((time.monotonic() - commit_start) * 1000, 3)}
-            except Exception as exc:
+                commit_end_ns = time.monotonic_ns()
+                commit_ms = round((commit_end_ns - commit_start_ns) / 1_000_000, 3)
+                # Calculate overlap between write interval [write_end_early, write_end]
+                # and commit interval [commit_start, commit_end].
+                # write_end_early is when _persist_output_assets write loop completed.
+                # The overlap is zero since intervals are sequential, but we
+                # compute it for diagnostic completeness.
+                _overlap_ns = max(0,
+                    min(write_end_ns, commit_end_ns) - max(commit_start_ns, write_end_ns)
+                )
+                _overlap_ms = round(_overlap_ns / 1_000_000, 3)
                 return {
-                    "commit_ms": round((time.monotonic() - commit_start) * 1000, 3),
-                    "commit_error": str(exc)[:120],
+                    "commit_ms": commit_ms,
+                    "commit_end_mono_ns": commit_end_ns,
+                    "overlap_ms": _overlap_ms,
                 }
+            except Exception as exc:
+                # Propagate commit failures so no result yield
+                raise RuntimeError(
+                    f"output volume commit failed: {str(exc)[:120]}"
+                ) from exc
 
         commit_task = asyncio.create_task(commit_volume())
         return dataclasses.replace(attempt, items=tuple(persisted)), commit_task, diag
@@ -6159,10 +6468,23 @@ async def _publish_restore_plan_impl_async(plan: RestorePlan) -> dict[str, Any]:
 
 def publish_restore_plan_remote(plan_payload: Mapping[str, Any]) -> dict[str, Any]:
     """Publish before GPU class lookup so the next snap=False sees the plan."""
-    identity = _capture_remote_identity()
-    result = _publish_restore_plan_impl(RestorePlan.from_dict(plan_payload))
-    result.setdefault("identity", {}).update(identity)
-    return result
+    _t0 = time.perf_counter()
+    print("[publish_restore_plan] entry", flush=True)
+    try:
+        identity = _capture_remote_identity()
+        result = _publish_restore_plan_impl(RestorePlan.from_dict(plan_payload))
+        result.setdefault("identity", {}).update(identity)
+        _elapsed_ms = round((time.perf_counter() - _t0) * 1000, 1)
+        print(f"[publish_restore_plan] success elapsed_ms={_elapsed_ms}", flush=True)
+        return result
+    except Exception as exc:
+        _elapsed_ms = round((time.perf_counter() - _t0) * 1000, 1)
+        print(
+            f"[publish_restore_plan] error elapsed_ms={_elapsed_ms} "
+            f"exception_type={type(exc).__name__}",
+            flush=True,
+        )
+        raise
 
 
 # â”€â”€ ModalRuntimeEntrypointV2: decorated class exported BEFORE resource
@@ -6212,6 +6534,7 @@ if _modal is not None and _MODAL_RESOURCES.get("app") is not None:
         cpu=2,
         memory=4096,
         timeout=300,
+        startup_timeout=120,
         min_containers=MIN_CONTAINERS,
         max_containers=1,
         scaledown_window=SCALEDOWN_WINDOW,

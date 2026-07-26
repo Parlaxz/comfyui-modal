@@ -12,6 +12,8 @@ Each strategy returns a structured ``Attempt`` with metrics.
 from __future__ import annotations
 
 import base64
+import contextlib
+import contextvars
 import dataclasses
 import hashlib
 import json
@@ -20,7 +22,35 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
+
+# Per-request base64 counter callback.
+# Set by caller before calling helper functions; called after each
+# base64.b64encode or base64.b64decode with the operation name
+# ("encode" or "decode") so the caller can increment Attempt counters.
+_base64_counter_cb: contextvars.ContextVar[Callable[[str], None] | None] = (
+    contextvars.ContextVar("_base64_counter_cb", default=None)
+)
+
+
+@contextlib.contextmanager
+def base64_counting_scope(attempt: Attempt) -> Iterator[None]:
+    """Context manager that sets up a per-call base64 counter callback.
+    Every actual base64.b64encode / base64.b64decode call within the
+    scope increments the corresponding Attempt counter truthfully.
+    """
+    _attempt_ref = attempt
+    def _counter(op: str) -> None:
+        nonlocal _attempt_ref
+        if op == "encode":
+            object.__setattr__(_attempt_ref, "base64_encode_count", _attempt_ref.base64_encode_count + 1)
+        elif op == "decode":
+            object.__setattr__(_attempt_ref, "base64_decode_count", _attempt_ref.base64_decode_count + 1)
+    _token = _base64_counter_cb.set(_counter)
+    try:
+        yield
+    finally:
+        _base64_counter_cb.reset(_token)
 
 from .contracts import OutputStrategy
 
@@ -286,7 +316,12 @@ def attempt_to_descriptor_result(
             "generation": generation,
         }
         if legacy_data:
-            data = item.base64_data or base64.b64encode(raw).decode("ascii") if raw else ""
+            if not item.base64_data and raw:
+                _enc = base64.b64encode(raw)
+                object.__setattr__(attempt, "base64_encode_count", attempt.base64_encode_count + 1)
+                data = _enc.decode("ascii")
+            else:
+                data = item.base64_data or ""
             entry["data"] = data
 
         # Native ComfyUI output descriptor (filename/subfolder/type)
@@ -396,6 +431,9 @@ def _timed_b64_encode(data: bytes) -> tuple[str, float]:
     """Base64-encode *data* and return (encoded_str, duration_ms)."""
     t0 = time.monotonic()
     encoded = base64.b64encode(data).decode("ascii")
+    _cb = _base64_counter_cb.get()
+    if _cb is not None:
+        _cb("encode")
     duration_ms = (time.monotonic() - t0) * 1000.0
     return encoded, duration_ms
 
@@ -425,6 +463,9 @@ def _item_from_entry(
     raw = entry.get("raw_bytes") or entry.get("bytes") or b""
     if not raw and "data" in entry:
         raw = base64.b64decode(entry["data"])
+        _cb = _base64_counter_cb.get()
+        if _cb is not None:
+            _cb("decode")
     b64_data = entry.get("base64_data") or ""
     b64_time_ms = 0.0
     if not descriptor_mode and not b64_data and raw:
