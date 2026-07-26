@@ -306,7 +306,7 @@ def convert_output_items(
     webp_lossless_compression: str = "balanced",
     *,
     converter_fn: Callable | None = None,
-    include_base64: bool = True,
+    include_base64: bool = False,
 ) -> ConversionBatchResult:
     """Convert a batch of OutputItems, recording per-item ConversionMeta.
 
@@ -379,6 +379,7 @@ def convert_output_items(
             path=item.path,
             raw_bytes=converted_bytes,
             base64_data=base64.b64encode(converted_bytes).decode("ascii") if include_base64 else "",
+            content_sha256=conv_meta.hash_of_raw,
             mime_type=mime_type,
             file_ext=file_ext,
             width=item.width,

@@ -1,4 +1,4 @@
-"""Focused tests for the live v2 PromptExecutor/output boundary."""
+﻿"""Focused tests for the live v2 PromptExecutor/output boundary."""
 
 from __future__ import annotations
 
@@ -99,8 +99,11 @@ def test_v2_runner_uses_prompt_executor_and_live_registry_without_legacy_wrapper
     with patch.dict("sys.modules", {"execution": fake_execution}):
         result = asyncio.run(entrypoint._execute_v2_prompt_executor(plan, context, api, trace))
 
-    assert result["images"][0]["data"]
-    assert result["outputs"]["107"]["images"][0]["node_id"] == "107"
+        assert "data" not in result["images"][0], "descriptor mode should not include base64 data"
+        assert result["images"][0]["asset_id"] != ""
+        # Native ComfyUI output entries use filename/subfolder/type (not node_id)
+        assert result["outputs"]["107"]["images"][0]["filename"] != ""
+        assert result["outputs"]["107"]["images"][0]["type"] == "output"
     assert registered["req-1"]["authorized_node_ids"] == ["107"]
     assert executor.executed[0]["prompt_id"] == "req-1"
     assert executor.sync_called is False
@@ -181,7 +184,8 @@ def test_v2_fallback_conversion_failure_keeps_original_materialized_bytes():
     ):
         result = asyncio.run(entrypoint._execute_v2_prompt_executor(plan, context, api, trace))
 
-    assert base64.b64decode(result["images"][0]["data"]) == original
+    assert "data" not in result["images"][0], "descriptor mode should not include base64 data"
+    assert result["images"][0]["asset_id"] != ""
     assert result["output_attempts"][1]["metrics"]["conversion_fallback"] is True
 
     # Verify non-production spans are present, production spans are absent
@@ -1482,6 +1486,7 @@ class TestV2CertProcessCache:
 
         api = _FakeAPI()
         entrypoint = modal_app.ModalRuntimeEntrypoint()
+        entrypoint.container_session_id = instance_id
         entrypoint._restored_instance_id = instance_id
         entrypoint._legacy_module = _FakeModule()
         entrypoint._legacy_api = api
@@ -1589,6 +1594,7 @@ class TestV2CertProcessCache:
         api = _FakeAPI()
         entrypoint = modal_app.ModalRuntimeEntrypoint()
         entrypoint._restored_instance_id = instance_id
+        entrypoint.container_session_id = instance_id
         entrypoint._legacy_module = _FakeModule()
         entrypoint._legacy_api = api
 
@@ -1632,6 +1638,7 @@ class TestV2CertProcessCache:
             api2 = _FakeAPI()
             api2._executor = _FakeExecutor()
             entrypoint2 = modal_app.ModalRuntimeEntrypoint()
+            entrypoint2.container_session_id = instance_id
             entrypoint2._restored_instance_id = instance_id
             entrypoint2._legacy_module = _FakeModule()
             entrypoint2._legacy_api = api2
@@ -1742,6 +1749,7 @@ class TestV2CertProcessCache:
             # Instance A with existing cache entry should hit
             api_a = _FakeAPI()
             ep_a = modal_app.ModalRuntimeEntrypoint()
+            ep_a.container_session_id = instance_a
             ep_a._restored_instance_id = instance_a
             ep_a._legacy_module = _FakeModule()
             ep_a._legacy_api = api_a
@@ -1869,6 +1877,7 @@ class TestV2CertProcessCache:
             # execution completes, then cert write is called (preflight_ran=True).
             api = _WriteTestAPI()
             ep = modal_app.ModalRuntimeEntrypoint()
+            ep.container_session_id = instance_id
             ep._restored_instance_id = instance_id
             ep._legacy_module = _FakeModule()
             ep._legacy_api = api
@@ -1891,6 +1900,7 @@ class TestV2CertProcessCache:
             # it goes to volume again.
             api2 = _WriteTestAPI()
             ep2 = modal_app.ModalRuntimeEntrypoint()
+            ep2.container_session_id = instance_id
             ep2._restored_instance_id = instance_id
             ep2._legacy_module = _FakeModule()
             ep2._legacy_api = api2
@@ -1989,12 +1999,13 @@ class TestV2CertProcessCache:
              patch.object(modal_app, "_MODAL_RESOURCES", {
                  "source_identity": _fake_dep_id,
                  "runtime_state_volume": SimpleNamespace(reload=lambda: None, commit=lambda: None),
-             }), \
-             patch.object(modal_app, "_get_preflight_context", return_value=("off", "gen_001", "instance")), \
-             patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", _fake_dep_id.combined_hash):
+              }), \
+              patch.object(modal_app, "_get_preflight_context", return_value=("off", "gen_001", "instance")), \
+              patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", _fake_dep_id.combined_hash):
 
             api = _FakeAPI()
             ep = modal_app.ModalRuntimeEntrypoint()
+            ep.container_session_id = instance_id
             ep._restored_instance_id = instance_id
             ep._legacy_module = _FakeModule()
             ep._legacy_api = api

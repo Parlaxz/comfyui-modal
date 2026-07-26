@@ -628,6 +628,7 @@ class TestCertCacheDiagnostics:
 
         api = _FakeRepairAPI()
         entrypoint = modal_app.ModalRuntimeEntrypoint()
+        entrypoint.container_session_id = fake_instance_id
         entrypoint._restored_instance_id = fake_instance_id
         entrypoint._legacy_module = _FakeModule()
         entrypoint._legacy_api = api

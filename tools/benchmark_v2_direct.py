@@ -137,7 +137,11 @@ def _timing(result: dict[str, Any], wall_ms: float) -> dict[str, Any]:
 
 
 def _capture_ts() -> tuple[int, int]:
-    """Return (wall_unix_ns, monotonic_ns) snapshot."""
+    """Return (wall_unix_ns, monotonic_ns) snapshot.
+
+    Same-process duration calculations use monotonic_ns exclusively.
+    Cross-process correlation uses wall_unix_ns only.
+    """
     return (int(time.time() * 1_000_000_000), time.monotonic_ns())
 
 

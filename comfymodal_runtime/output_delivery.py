@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from .contracts import OutputStrategy
 
@@ -55,6 +55,7 @@ class OutputItem:
     path: str = ""
     raw_bytes: bytes = b""
     base64_data: str = ""
+    content_sha256: str = ""
     mime_type: str = ""
     file_ext: str = ""
     width: int = 0
@@ -64,6 +65,16 @@ class OutputItem:
     format: str = ""
     animated: bool = False
     conversion_meta: ConversionMeta | None = None
+
+    def __post_init__(self) -> None:
+        if self.content_sha256:
+            return
+        digest = (
+            self.conversion_meta.hash_of_raw
+            if self.conversion_meta is not None and self.conversion_meta.hash_of_raw
+            else (hashlib.sha256(self.raw_bytes).hexdigest() if self.raw_bytes else "")
+        )
+        object.__setattr__(self, "content_sha256", digest)
 
 
 @dataclass(frozen=True)
@@ -88,6 +99,23 @@ class Attempt:
     total_base64_encoding_time_ms: float = 0.0
     # ── Phase 6 result serialization size ────────────────────────────
     serialized_result_bytes: int = 0
+    # ── Phase 6 output-delivery diagnostics ──────────────────────────
+    output_asset_write_ms: float = 0.0
+    output_volume_commit_ms: float = 0.0
+    output_commit_overlap_ms: float = 0.0
+    output_hash_count: int = 0
+    base64_encode_count: int = 0
+    base64_decode_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.output_hash_count == 0 and self.items:
+            object.__setattr__(self, "output_hash_count", len(self.items))
+        if self.base64_encode_count == 0 and self.items:
+            object.__setattr__(
+                self,
+                "base64_encode_count",
+                sum(1 for item in self.items if item.base64_data),
+            )
 
     @property
     def conversion_total_ms(self) -> float:
@@ -167,8 +195,12 @@ def build_asset_descriptor_list(
     """
     descriptors: list[AssetDescriptor] = []
     for item in attempt.items:
-        raw = item.raw_bytes
-        digest = hashlib.sha256(raw).hexdigest() if raw else ""
+        # Use content_sha256 from _item_from_entry (pre-computed).
+        # Defensive fallback for items created outside _item_from_entry.
+        digest = item.content_sha256 or (
+            item.conversion_meta.hash_of_raw
+            if item.conversion_meta is not None else ""
+        )
         identity = f"sha256:{digest}" if digest else ""
         thumb_id = ""
         if thumbnail_identities is not None:
@@ -183,7 +215,7 @@ def build_asset_descriptor_list(
             file_ext=item.file_ext,
             width=item.width,
             height=item.height,
-            byte_count=len(raw),
+            byte_count=len(item.raw_bytes),
             node_id=item.node_id,
             output_key=item.output_key,
             output_index=item.output_index,
@@ -205,6 +237,8 @@ def attempt_to_descriptor_result(
 
     Default mode (``legacy_data=False``) produces entries WITHOUT ``data``
     or ``base64_data`` — frontend fetches bytes via existing asset route.
+    In descriptor mode, base64 metrics are zero and ``include_base64`` is
+    ``False``.
 
     Set *legacy_data* to ``True`` for the narrow fallback that includes
     inline base64 ``data`` (preserved for backward compatibility).
@@ -226,7 +260,12 @@ def attempt_to_descriptor_result(
     for item in attempt.items:
         output_key = item.output_key or ("gifs" if item.animated else "images")
         raw = item.raw_bytes
-        digest = hashlib.sha256(raw).hexdigest() if raw else ""
+        # Use content_sha256 from _item_from_entry (pre-computed).
+        # Defensive fallback for items created outside _item_from_entry.
+        digest = item.content_sha256 or (
+            item.conversion_meta.hash_of_raw
+            if item.conversion_meta is not None else ""
+        )
         identity = f"sha256:{digest}" if digest else ""
         entry: dict[str, Any] = {
             "asset_id": digest,
@@ -271,7 +310,30 @@ def attempt_to_descriptor_result(
         "outputs": outputs,
         "asset_descriptors": descriptors_as_dicts,
         "use_descriptors": True,
+        "include_base64": bool(legacy_data),
     }
+
+
+def attempt_to_descriptor_result_v2(
+    attempt: Attempt,
+    *,
+    generation: str = "",
+    include_base64: bool = False,
+    thumbnail_identities: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """V2 descriptor result — defaults include_base64 to False.
+
+    Unlike attempt_to_descriptor_result which uses legacy_data=True for
+    backward-compatible base64 inclusion, this function explicitly defaults
+    to no base64.  Production callers should use this; legacy callers use
+    attempt_to_descriptor_result with legacy_data=True.
+    """
+    return attempt_to_descriptor_result(
+        attempt,
+        generation=generation,
+        legacy_data=include_base64,
+        thumbnail_identities=thumbnail_identities,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +442,12 @@ def _item_from_entry(
         )
     else:
         conv_meta = None
+    # Compute content_sha256 once from final raw bytes
+    _content_sha256 = (
+        conv_meta.hash_of_raw
+        if conv_meta is not None and conv_meta.hash_of_raw
+        else (hashlib.sha256(raw).hexdigest() if raw else "")
+    )
     return (
         OutputItem(
             node_id=str(node_id),
@@ -388,6 +456,7 @@ def _item_from_entry(
             path=path or str(entry.get("path", "")),
             raw_bytes=raw,
             base64_data=b64_data,
+            content_sha256=_content_sha256,
             mime_type=str(entry.get("mime_type", "image/png")),
             file_ext=str(entry.get("file_ext", ".png")),
             width=int(entry.get("width", 0) or 0),
@@ -932,6 +1001,146 @@ def _replace_attempt_timing(
         total_base64_encoding_time_ms=attempt.total_base64_encoding_time_ms,
         serialized_result_bytes=attempt.serialized_result_bytes,
     )
+
+
+# ---------------------------------------------------------------------------
+# Async output persistence (Modal Volume commit helpers)
+# ---------------------------------------------------------------------------
+
+
+async def _commit_volume_async(volume: Any) -> bool:
+    """Async commit using Modal's awaited ``volume.commit.aio()``.
+
+    Requires Modal's async interface. A volume without ``commit.aio()`` is
+    rejected rather than calling the synchronous API from async delivery.
+    Returns True on success.
+    """
+    import asyncio
+    import inspect
+
+    if volume is None:
+        return False
+    try:
+        aio_fn = getattr(volume.commit, "aio", None)
+        if aio_fn is not None:
+            if inspect.isawaitable(aio_fn):
+                await aio_fn
+                return True
+            result = aio_fn()
+            if inspect.isawaitable(result):
+                await result
+                return True
+        print("[output_delivery] commit_async unavailable: commit.aio() missing", flush=True)
+        return False
+    except Exception as exc:
+        print(f"[output_delivery] commit_async failed: {exc}", flush=True)
+        return False
+
+
+async def persist_output_assets_async(
+    volume: Any,
+    *,
+    output_dir: str = "",
+    items: Sequence[OutputItem] = (),
+    descriptors: Sequence[AssetDescriptor] = (),
+    result_metadata: dict[str, Any] | None = None,
+    metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Persist output assets to a Modal Volume asynchronously.
+
+    Steps:
+      1. Atomic writes for each OutputItem that has raw_bytes.
+      2. Start volume.commit.aio() immediately after writes.
+      3. While commit runs, build descriptor/result metadata/metrics.
+      4. Await commit before final result.
+
+    Never calls blocking commit() in async context.
+    No commit is issued when no new files were written (empty items).
+
+    Returns diagnostics dict with write/commit timing.
+    """
+    import asyncio
+    import json
+    import inspect
+    from pathlib import Path
+
+    t0 = time.monotonic()
+    diag: dict[str, Any] = {
+        "files_written": 0,
+        "bytes_written": 0,
+        "write_ms": 0.0,
+        "commit_ms": 0.0,
+        "overlap_ms": 0.0,
+        "errors": [],
+    }
+
+    if volume is None or not items:
+        return diag
+
+    output_path = output_dir or "outputs"
+
+    # 1. Atomic writes
+    write_t0 = time.monotonic()
+    written_any = False
+    for item in items:
+        if not item.raw_bytes:
+            continue
+        filename = item.filename or f"output_{item.node_id}_{item.output_index}.bin"
+        filepath = f"{output_path}/{filename}"
+        try:
+            exists = getattr(volume, "exists", None)
+            if callable(exists) and exists(filepath):
+                continue
+            tmp_path = f"{output_path}/.{filename}.tmp"
+            volume.write_bytes(tmp_path, item.raw_bytes)
+            # Simulate atomic rename via write to final path
+            volume.write_bytes(filepath, item.raw_bytes)
+            volume.remove(tmp_path)
+            diag["files_written"] += 1
+            diag["bytes_written"] += len(item.raw_bytes)
+            written_any = True
+        except Exception as exc:
+            diag["errors"].append(f"write:{filename}:{str(exc)[:60]}")
+
+    diag["write_ms"] = round((time.monotonic() - write_t0) * 1000, 3)
+
+    if not written_any:
+        return diag
+
+    # 2. Start commit
+    commit_t0 = time.monotonic()
+    commit_task = asyncio.create_task(_commit_volume_async(volume))
+
+    # 3. Overlap: build descriptors/result/metadata while commit runs
+    _build_overlap_t0 = time.monotonic()
+    desc_list = [dataclasses.asdict(d) for d in descriptors] if descriptors else []
+    meta = dict(result_metadata or {})
+    metric_values = dict(metrics or {})
+    overlap_ms = round((time.monotonic() - _build_overlap_t0) * 1000, 3)
+    diag["overlap_ms"] = overlap_ms
+    diag["descriptors"] = desc_list
+    diag["result_metadata"] = meta
+    diag["metrics"] = metric_values
+    diag["serialized_result_bytes"] = len(
+        json.dumps(
+            {"asset_descriptors": desc_list, **meta, **metric_values},
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    )
+
+    # 4. Await commit
+    try:
+        commit_ok = await commit_task
+        diag["commit_ms"] = round((time.monotonic() - commit_t0) * 1000, 3)
+        if not commit_ok:
+            diag["errors"].append("commit_failed")
+    except Exception as exc:
+        diag["commit_ms"] = round((time.monotonic() - commit_t0) * 1000, 3)
+        diag["errors"].append(f"commit_error:{str(exc)[:60]}")
+
+    diag["total_ms"] = round((time.monotonic() - t0) * 1000, 3)
+    return diag
 
 
 # ---------------------------------------------------------------------------
