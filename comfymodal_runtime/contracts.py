@@ -448,6 +448,11 @@ class RestorePlan:
     prefill_spec: Mapping[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     source_workflow_hash: str = ""
+    # ── Startup-cert construction fields ──
+    # Captured from ExecutionPlan payload at publish time; not serialized
+    # to the persisted RestorePlan (to_dict omits them).
+    workflow: Mapping[str, Any] = field(default_factory=dict)
+    workflow_hash: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, ModelRestoreKey):
@@ -457,6 +462,8 @@ class RestorePlan:
         object.__setattr__(self, "model_spec", _freeze(self.model_spec or {}))
         object.__setattr__(self, "prefill_spec", _freeze(self.prefill_spec or {}))
         object.__setattr__(self, "source_workflow_hash", str(self.source_workflow_hash or ""))
+        object.__setattr__(self, "workflow", _freeze(self.workflow or {}))
+        object.__setattr__(self, "workflow_hash", str(self.workflow_hash or ""))
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any] | None) -> "RestorePlan":
@@ -470,6 +477,8 @@ class RestorePlan:
             prefill_spec=source.get("prefill_spec", {}),
             created_at=float(source.get("created_at", time.time())),
             source_workflow_hash=str(source.get("source_workflow_hash", "")),
+            workflow=source.get("workflow", {}),
+            workflow_hash=str(source.get("workflow_hash", source.get("source_workflow_hash", ""))),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -482,6 +491,8 @@ class RestorePlan:
             "prefill_spec": _thaw(self.prefill_spec),
             "created_at": self.created_at,
             "source_workflow_hash": self.source_workflow_hash,
+            "workflow": _thaw(self.workflow),
+            "workflow_hash": self.workflow_hash,
         }
 
     @property

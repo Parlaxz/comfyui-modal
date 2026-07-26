@@ -255,6 +255,23 @@ class BootstrapState:
     prescan_runtime_generation: str = ""
     prescan_custom_node_generation: str = ""
     prescan_record_path: str = ""
+    # -- CacheDiT restore preparation state --
+    _cachedit_unet_identity: str = ""
+    _cachedit_workflow_hash: str = ""
+    _cachedit_inputs_prepared: bool = False
+    # -- RES4LYF restore preparation state --
+    _res4lyf_static_prepared: tuple = ()
+    # -- Dependency preflight identity (captured at startup, checked at request) --
+    dependency_manifest_identity: str = ""
+    dependency_manifest_schema_version: str = "0"
+    dependency_manifest_workflow_hash: str = ""
+    dependency_manifest_custom_node_generation: str = ""
+    dependency_manifest_deployment_hash: str = ""
+    dependency_manifest_repair_mode: str = ""
+    # -- Dependency preflight counters (actual expensive calls, not skips) --
+    dependency_scan_call_count: int = 0
+    dependency_validation_call_count: int = 0
+    dependency_manifest_build_call_count: int = 0
 
     def has_prescan_identity(self) -> bool:
         """Backward-compatible diagnostic — checks frozen prescan identity."""
@@ -438,48 +455,102 @@ class BootstrapState:
                 results[node_id] = f"error:{str(exc)[:60]}"
         return results
 
-    def prepare_restored_sampler_runtime(
+    def _restore_cachedit_prepare(
         self,
-        executor: Any,
         *,
-        dit_model: Any = None,
-        static_options: dict[str, Any] | None = None,
-        sampler_class: Any = None,
+        unet: Any = None,
+        workflow_inputs: dict[str, Any] | None = None,
+        workflow_hash: str = "",
     ) -> dict[str, Any]:
-        """Perform deterministic idempotent CacheDiT attachment and
-        RES4LYF static option/sampler construction.
-
-        No sample/dummy forward — only identity-safe wiring.
-        Returns diagnostics.
+        """Resolve the actual CacheDiT_Model_Optimizer node class and call its
+        deterministic ``optimize`` FUNCTION with the exact restored snapshot
+        UNET and exact workflow inputs.  The node checks ``_cache_dit_config``
+        on the transformer and is idempotent (returns early if config matches).
+        No forward/dummy/config change.
+        Returns diagnostics dict.
         """
-        results: dict[str, Any] = {}
-        if getattr(executor, "_comfymodal_sampler_runtime_prepared", False):
-            return {"ok": True, "already_prepared": True}
-        if dit_model is not None:
-            try:
-                from cache_dit import wrap_diffusion_model
-                wrapped = wrap_diffusion_model(dit_model)
-                executor._comfymodal_cachedit_model = wrapped
-                results["cache_dit_wrapped"] = str(type(wrapped).__name__)
-            except Exception as exc:
-                results["cache_dit_error"] = str(exc)[:120]
-        if static_options:
-            try:
-                options = dict(static_options)
-                executor._res4lyf_static_options = options
-                results["res4lyf_static_options"] = list(options.keys())
-            except Exception as exc:
-                results["res4lyf_options_error"] = str(exc)[:120]
-        if sampler_class is not None:
-            try:
-                sampler = sampler_class()
-                executor._res4lyf_sampler = sampler
-                results["sampler_constructed"] = str(type(sampler).__name__)
-            except Exception as exc:
-                results["sampler_construction_error"] = str(exc)[:120]
-        results["ok"] = len([k for k in results if "error" in k]) == 0
-        if results["ok"]:
-            executor._comfymodal_sampler_runtime_prepared = True
+        results: dict[str, Any] = {"ok": False}
+        try:
+            import nodes as _cd_nodes
+            _mappings = getattr(_cd_nodes, "NODE_CLASS_MAPPINGS", {})
+            _cachedit_cls = _mappings.get("CacheDiT_Model_Optimizer")
+            if _cachedit_cls is None:
+                results["error"] = "CacheDiT_Model_Optimizer node class not found"
+                return results
+            # Call the node's FUNCTION = "optimize" with the restored UNET model
+            # and the exact workflow inputs.  The node clones the model, attaches
+            # config to transformer._cache_dit_config, and installs wrappers.
+            # If config already matches, the node returns (model,) as a no-op.
+            _inputs = dict(workflow_inputs or {})
+            _optimize = getattr(_cachedit_cls, "optimize", None)
+            if _optimize is None:
+                results["error"] = "CacheDiT_Model_Optimizer has no optimize method"
+                return results
+            _result = _optimize(unet, **_inputs)
+            # Mark identity/workflow hash/inputs prepared
+            _transformer = getattr(getattr(unet, "model", None), "diffusion_model", None)
+            self._cachedit_unet_identity = str(getattr(_transformer, "_cache_dit_identity", str(id(unet))))
+            self._cachedit_workflow_hash = workflow_hash
+            self._cachedit_inputs_prepared = True
+            results["cache_dit_applied"] = True
+            results["unet_identity"] = self._cachedit_unet_identity
+            results["workflow_hash"] = workflow_hash[:16] if workflow_hash else ""
+            results["ok"] = True
+        except Exception as exc:
+            results["error"] = str(exc)[:120]
+        return results
+
+    def _restore_res4lyf_prepare(
+        self,
+        *,
+        sampler_node_inputs: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Extract static RES4LYF (ClownsharKSampler_Beta) inputs excluding
+        seed/noise/latent/positive/negative, invoke the same existing parser
+        for static extra options, and store immutable parsed structure.
+        No unsafe sampler construction.
+        Returns diagnostics dict.
+        """
+        results: dict[str, Any] = {"ok": False, "res4lyf_static_prepared": False}
+        try:
+            if not sampler_node_inputs:
+                results["reason"] = "no_sampler_node_inputs"
+                results["ok"] = True
+                return results
+            _parsed = []
+            for _entry in sampler_node_inputs:
+                _node_id = _entry.get("node_id", "")
+                _inputs = dict(_entry.get("inputs", {}))
+                # Exclude runtime-varying inputs
+                for _exclude in ("seed", "noise_seed", "latent_image", "positive", "negative"):
+                    _inputs.pop(_exclude, None)
+                # Invoke existing ClownsharKSampler_Beta extra_options parsing
+                import nodes as _r4_nodes
+                _res4lyf_cls = getattr(_r4_nodes, "NODE_CLASS_MAPPINGS", {}).get(
+                    "ClownsharKSampler_Beta"
+                )
+                if _res4lyf_cls is not None:
+                    _parser = getattr(_res4lyf_cls, "parse_extra_options", None)
+                    if _parser is not None:
+                        try:
+                            _parsed_options = _parser(_inputs.get("extra_options", ""))
+                            _inputs["_parsed_extra_options"] = _parsed_options
+                        except Exception:
+                            pass
+                # Preserve disable_dummy_sampler_init if present
+                if "disable_dummy_sampler_init" not in _inputs:
+                    _inputs["disable_dummy_sampler_init"] = True
+                # Freeze as immutable tuple of frozenset items
+                _frozen = {k: v for k, v in _inputs.items() if not k.startswith("_")}
+                _parsed.append({"node_id": _node_id, "static_inputs": _frozen})
+            self._res4lyf_static_prepared = tuple(
+                (p["node_id"], p["static_inputs"]) for p in _parsed
+            )
+            results["res4lyf_static_prepared"] = True
+            results["sampler_nodes"] = len(_parsed)
+            results["ok"] = True
+        except Exception as exc:
+            results["error"] = str(exc)[:120]
         return results
 
 
@@ -888,83 +959,8 @@ class RuntimeBootstrap:
         except Exception as exc:
             print(f"[bootstrap] prescan_identity_restore_error: {exc}", flush=True)
 
-    def _build_and_store_snapshot_certificate(self) -> None:
-        """Build a snapshot-memory validation certificate from current
-        state and store it on the state object.
-
-        Uses V2 cert identity scheme with schema/identity_components for
-        exact-match validation. Backward-compatible legacy fields
-        (runtime_generation, custom_node_generation, sage_mode, sage_reason,
-        unet_identity, clip_identity, clip_type, cert_hash) are retained for
-        diagnostic compatibility with the V1 generic optimizer validator.
-
-        After prompt validation in _execute_v2_prompt_executor, outputs_to_execute,
-        node_errors, and preflight_ok are populated on the state cert to enable
-        snapshot-memory preflight/validation skip on subsequent requests.
-        """
-        try:
-            cn_gen = (self.state.prescan_custom_node_generation
-                      or self.state.snapshot_custom_node_generation
-                      or self.state.custom_node_generation)
-            import hashlib
-
-            # Build complete identity_components first, THEN compute identity
-            wf_hash = getattr(self.state, '_last_workflow_hash', '')
-            try:
-                from .modal_app import _compute_v2_cert_identity
-                cert_identity, identity_components = _compute_v2_cert_identity(
-                    str(wf_hash),
-                    repair_mode="off",
-                    custom_nodes_generation=str(cn_gen),
-                )
-            except Exception:
-                identity_components = {
-                    "schema_version": "2",
-                    "workflow_hash": str(wf_hash),
-                    "deployment_hash": str(self.state.deployment_combined_hash),
-                    "repair_mode": "off",
-                    "custom_nodes_generation": str(cn_gen),
-                }
-                h = hashlib.sha256()
-                h.update("cert_schema=2\n".encode())
-                for key in sorted(identity_components):
-                    h.update(f"{key}={identity_components[key]}\n".encode())
-                cert_identity = h.hexdigest()
-
-            # Build with V2 schema components + legacy diagnostic fields
-            now = time.time()
-            cert: dict[str, Any] = {
-                # V2 primary schema
-                "schema_version": 2,
-                "identity": cert_identity,
-                "identity_components": dict(identity_components),
-                "cert_identity": cert_identity,
-                # V2 payload fields for snapshot-memory hit eligibility
-                "outputs_to_execute": [],
-                "node_errors": {},
-                "preflight_ok": False,
-                # Legacy diagnostic fields (V1 optimizer validator compatible)
-                "runtime_generation": self.state.runtime_generation,
-                "custom_node_generation": cn_gen,
-                "sage_mode": self.state.sage_mode,
-                "sage_reason": self.state.sage_reason,
-                "unet_identity": self.state.cuda.get("unet_identity", ""),
-                "clip_identity": self.state.cuda.get("clip_identity", ""),
-                "clip_type": self.state.cuda.get("clip_type", ""),
-                "cert_hash": cert_identity[:32] if cert_identity else "",
-                "deployment_combined_hash": self.state.deployment_combined_hash,
-                "created_at": now,
-            }
-            self.state.set_snapshot_certificate(cert)
-            cert_id_short = cert_identity[:16] if cert_identity else "none"
-            print(
-                f"[bootstrap] snapshot_cert v2 "
-                f"valid={int(self.state.snapshot_cert_valid)} "
-                f"identity={cert_id_short}",
-                flush=True,
-            )
-        except Exception as exc:
-            print(f"[bootstrap] snapshot_cert_build_error: {exc}", flush=True)
+    # REMOVED: _build_and_store_snapshot_certificate — placeholder superseded
+    # by the V2 workflow certificate built in ModalRuntimeEntrypoint.startup().
 
     def restore(self, *, trace: RuntimeTrace | None = None) -> BootstrapState:
         started = time.perf_counter()
@@ -1012,14 +1008,17 @@ class RuntimeBootstrap:
             # ── Lane B: Sage exact-match fast path ──
             # After initialize_cuda, read sys.modules and verify the snapshot
             # Sage identity sentinel.  Exact match skips full Sage discovery.
+            # Timer immediately around _verify_sage_snapshot_identity only.
             _skipped_sage = False
             _sage_verify_ok = False
+            _sage_verify_ms = 0.0
             if self.state.snapshot_sage_identity:
                 _sage_current_identity = (
                     self.read_current_custom_node_identity()
                     if self.read_current_custom_node_identity is not None
                     else {}
                 )
+                _sage_t0 = time.perf_counter()
                 _sage_verify_ok = bool(
                     not self.read_current_custom_node_identity
                     or _sage_current_identity.get("custom_node_generation")
@@ -1038,12 +1037,12 @@ class RuntimeBootstrap:
                         )
                     ),
                 )
+                _sage_verify_ms = round((time.perf_counter() - _sage_t0) * 1000, 3)
             if _sage_verify_ok:
                 _skipped_sage = True
-                _check_ms = round((time.perf_counter() - started) * 1000, 3) if started else 0
                 print(
                     f"[v2.sage_restore] decision=snapshot_exact_skip "
-                    f"discovery_called=0 check_ms={_check_ms}",
+                    f"discovery_called=0 verify_ms={_sage_verify_ms}",
                     flush=True,
                 )
             else:
@@ -1187,9 +1186,6 @@ class RuntimeBootstrap:
                         print(f"[bootstrap] identity_publish_after_sync error: {_pexc}", flush=True)
             else:
                 self.state.custom_node_generation = self.state.snapshot_custom_node_generation
-
-            # Lane B — build snapshot-memory validation certificate
-            self._build_and_store_snapshot_certificate()
 
             # Lane B — build SnapshotExecutionSeed from model identities
             _unet_id = self.state.cuda.get("unet_identity", "")
