@@ -21,9 +21,9 @@ os.environ["COMFYMODAL_V2_UNET_FORWARD_DIAG"] = "1"
 import comfymodal_runtime.unet_forward_probe as _ufp_mod
 
 from comfymodal_runtime.unet_forward_probe import (
-    _ENABLED,
     _dedup_lock,
     _forward_pre_hook,
+    _is_enabled,
     _lookup_entry,
     emit_post_load_models_gpu_event,
     install_nextdit_forward_pre_hook,
@@ -53,7 +53,8 @@ class _FakeDiffusionModel:
     def forward(self, *args, **kwargs):
         return None
 
-    def register_forward_pre_hook(self, hook):
+    def register_forward_pre_hook(self, hook, **kwargs):
+        """Accept **kwargs (e.g. with_kwargs=True) to match production API."""
         self._hooks.append(hook)
         return hook
 
@@ -118,17 +119,20 @@ _reset_globals()
 class TestDiagnosticGate(unittest.TestCase):
     """Diagnostics disabled by default."""
 
-    def test_register_noop_when_disabled(self):
-        with patch.object(_ufp_mod, "_ENABLED", False):
+    def test_register_always_on(self):
+        """Registration always succeeds (needed for always-on first-CUDA timing),
+        even when diagnostics are disabled."""
+        with patch.object(_ufp_mod, "_is_enabled", return_value=False):
             dm = _FakeDiffusionModel()
             model = _FakeModel(diffusion_model=dm)
             patcher = _FakeUNETPatcher(model=model)
             register_unet_forward_probe(patcher, source="cpu_snapshot")
             with _ufp_mod._registry_lock:
-                self.assertEqual(len(_ufp_mod._registry), 0)
+                self.assertEqual(len(_ufp_mod._registry), 1,
+                                 "registration must succeed even when diagnostics are disabled")
 
     def test_emit_noop_when_disabled(self):
-        with patch.object(_ufp_mod, "_ENABLED", False):
+        with patch.object(_ufp_mod, "_is_enabled", return_value=False):
             with _TraceContext("test") as trace:
                 emit_post_load_models_gpu_event([])
                 self.assertIsNone(_forward_pre_hook(object(), ()))
@@ -424,11 +428,16 @@ class TestForwardHookInstallation(unittest.TestCase):
     """install_nextdit_forward_pre_hook behavior."""
 
     def test_noop_when_disabled(self):
-        with patch.object(_ufp_mod, "_ENABLED", False):
-            saved = _ufp_mod._nextdit_hook_installed
-            _ufp_mod._nextdit_hook_installed = False
+        # install_nextdit_forward_pre_hook is not gated by _is_enabled,
+        # so it always tries to install.  When NextDiT is unavailable
+        # it returns False.
+        saved = _ufp_mod._nextdit_hook_installed
+        _ufp_mod._nextdit_hook_installed = False
+        try:
             result = install_nextdit_forward_pre_hook()
+            # NextDiT is not available in test env, so returns False
             self.assertFalse(result)
+        finally:
             _ufp_mod._nextdit_hook_installed = saved
 
     def test_idempotent(self):
@@ -493,7 +502,8 @@ class TestForwardEventSchema(unittest.TestCase):
         probe_events = [e for e in trace._events if e.name == "unet_forward_probe"]
         self.assertEqual(len(probe_events), 1)
         meta = probe_events[0].metadata
-        self.assertEqual(meta.get("stage"), "first_nextdit_forward")
+        # _FakeDiffusionModel is not a NextDiT, so stage is first_unet_forward
+        self.assertEqual(meta.get("stage"), "first_unet_forward")
         self.assertIn("source", meta)
         self.assertIn("request_id", meta)
         self.assertIn("diffusion_model_object_id", meta)

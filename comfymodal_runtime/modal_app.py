@@ -11,6 +11,7 @@ import inspect
 import os
 import platform
 import posixpath
+import threading
 import time
 import uuid
 import copy
@@ -270,7 +271,8 @@ _CACHEDIT_PREPARED: dict[str, dict[str, Any]] = {}
 # passing undeclared kwargs through the graph node interface.
 _V2_WORKFLOW_HASH: ContextVar[str] = ContextVar("_v2_workflow_hash", default="")
 
-
+# Import SAMPLER_SAMPLE wrapper from runtime_executor (neutral module).
+from comfymodal_runtime.runtime_executor import _COMFYMODAL_V2_SAMPLING_WRAPPER, _sampler_wrapper_dedup, _sampler_wrapper_dedup_lock
 
 # ── Canonical per-role identity comparison for restore + request binding ──
 
@@ -1875,6 +1877,7 @@ class ModalRuntimeEntrypoint:
         # Stable module-level identity so snapshot boundaries cannot erase identity.
         self.container_session_id: str = _V2_CONTAINER_SESSION_ID
         self._restore_count: int = 0
+        self._request_count: int = 0
         self._restore_timing: dict[str, Any] | None = None
         # CPU snapshot model state (Plan C lifecycle)
         self._cpu_snapshot_models: CpuSnapshotModels | None = None
@@ -2755,6 +2758,9 @@ class ModalRuntimeEntrypoint:
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
         _report_host_memory("restore_start")
+        # Reset per-request counter so first request after every fresh restore
+        # is exactly 1.  Snapshotted state cannot carry request count.
+        self._request_count = 0
         # Reset process-global restore-stage timers at entry to prevent
         # stale accumulation across restores.  Each restore gets its own
         # timing state.
@@ -4361,6 +4367,10 @@ class ModalRuntimeEntrypoint:
         # Reset the per-request unet_first_cuda_op dedup so the first forward
         # pass of this request emits the event.  Must fire before any CUDA op.
         reset_first_cuda_dedup()
+        # Clear SAMPLER_SAMPLE wrapper dedup so each new request gets fresh
+        # sampling_start/sampling_end events.
+        with _sampler_wrapper_dedup_lock:
+            _sampler_wrapper_dedup.clear()
 
         if context.cancelled and context.cancelled():
             raise RuntimeError("execution cancelled before PromptExecutor start")
@@ -5104,6 +5114,17 @@ class ModalRuntimeEntrypoint:
                                         "node_id": _node_str,
                                         "node_class": _class_node,
                                     })
+                                # VAE end: when a different node or None executes after VAEDecode
+                                # (before or independently of output encode check).
+                                if ("vae_decode_started" in _milestones and "vae_decode_ended" not in _milestones
+                                        and (_node is None or _node_str != _milestones.get("vae_decode_node_id", ""))):
+                                    _milestones["vae_decode_ended"] = _event_ns
+                                    _vae_dur = round(
+                                        (_event_ns - _milestones["vae_decode_started"]) / 1_000_000, 3
+                                    )
+                                    trace.emit("vae_decode_end", phase="execution", metadata={
+                                        "duration_ms": _vae_dur,
+                                    })
                                 # Production output encode tracking: ComfyModalProductionOutput
                                 # and ComfyModalProductionImageComparerOutput are OUTPUT_NODE=True
                                 # nodes that run after VAE decode to encode images to WebP/PNG.
@@ -5128,16 +5149,6 @@ class ModalRuntimeEntrypoint:
                                         )
                                         trace.emit("output_encode_end", phase="execution", metadata={
                                             "duration_ms": _enc_dur,
-                                        })
-                                elif "vae_decode_started" in _milestones and "vae_decode_ended" not in _milestones:
-                                    # Track VAE end when a different node or None executes after VAEDecode
-                                    if _node is None or _node_str != _milestones.get("vae_decode_node_id", ""):
-                                        _milestones["vae_decode_ended"] = _event_ns
-                                        _vae_dur = round(
-                                            (_event_ns - _milestones["vae_decode_started"]) / 1_000_000, 3
-                                        )
-                                        trace.emit("vae_decode_end", phase="execution", metadata={
-                                            "duration_ms": _vae_dur,
                                         })
                                 # First sampler-related node
                                 if ("first_sampler_node" not in _milestones
@@ -5185,39 +5196,6 @@ class ModalRuntimeEntrypoint:
                                 f"steps=8",
                                 flush=True,
                             )
-                    # Compatibility fallback: only emit sampling_end if the
-                    # authoritative post-executor path did not already fire it.
-                    # This fallback cannot be authoritative and cannot overwrite.
-                    elif event in ("execution_success", "execution_error") and "first_sampler_stage_ns" in _milestones:
-                        if "sampler_end_logged" not in _milestones:
-                            _milestones["sampler_end_logged"] = True
-                            _sampler_node_id = _milestones.get("first_sampler_node", "?")
-                            _sampler_start_wall = _milestones.get("first_sampler_stage_wall_ns", 0)
-                            _sampler_duration_ms = round(
-                                (time.time_ns() - _sampler_start_wall) / 1_000_000, 3
-                            ) if _sampler_start_wall else 0.0
-                            _sampler_duration_mono: float | None = None
-                            _ss_ns = _milestones.get("first_sampler_stage_ns")
-                            if _ss_ns:
-                                _sampler_duration_mono = round(
-                                    (time.monotonic_ns() - _ss_ns) / 1_000_000, 3
-                                )
-                            # Only emit if the authoritative path did not already emit
-                            if not _milestones.get("_authoritative_sampler_end_emitted", False):
-                                trace.emit("sampling_end", phase="execution", metadata={
-                                    "node_id": _sampler_node_id,
-                                    "node_class": _node_class_map.get(_sampler_node_id, ""),
-                                    "duration_ms": _sampler_duration_mono or _sampler_duration_ms,
-                                    "steps": 8,
-                                    "source": "execution_success_fallback",
-                                })
-                                print(
-                                    f"[v2.sampler] event=end (fallback) "
-                                    f"node_id={_sampler_node_id} "
-                                    f"steps=8 "
-                                    f"duration_ms={_sampler_duration_ms}",
-                                    flush=True,
-                                )
                     return _orig_send_sync(*args, **kwargs)
                 setattr(_send_sync_wrapper, "_comfy_modal_send_sync", True)
                 _server.send_sync = _send_sync_wrapper
@@ -5278,29 +5256,6 @@ class ModalRuntimeEntrypoint:
                     })
 
             # â”€â”€ Compute derived milestone intervals â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            # ---- Authoritative sampling_end (before VAE decode, before derived milestones) ----
-            if _milestones and "first_sampler_stage_ns" in _milestones and "sampler_end_logged" not in _milestones:
-                _milestones["_authoritative_sampler_end_emitted"] = True
-                _sampler_node_id = _milestones.get("first_sampler_node", "?")
-                _ss_ns = _milestones.get("first_sampler_stage_ns")
-                if _ss_ns:
-                    _auth_sampler_duration_ms = round(
-                        (time.monotonic_ns() - _ss_ns) / 1_000_000, 3
-                    )
-                    trace.emit("sampling_end", phase="execution", metadata={
-                        "node_id": _sampler_node_id,
-                        "node_class": _node_class_map.get(_sampler_node_id, ""),
-                        "duration_ms": _auth_sampler_duration_ms,
-                        "steps": 8,
-                        "source": "authoritative_post_executor",
-                    })
-                    print(
-                        f"[v2.sampler] event=end (authoritative) "
-                        f"node_id={_sampler_node_id} "
-                        f"steps=8 "
-                        f"duration_ms={_auth_sampler_duration_ms}",
-                        flush=True,
-                    )
             _exec_st_ns = _milestones.get("execution_start") if _milestones else None
             _cached_ns = _milestones.get("execution_cached") if _milestones else None
             _first_ns = _milestones.get("executing") if _milestones else None
@@ -5744,6 +5699,16 @@ class ModalRuntimeEntrypoint:
                         ) if hasattr(selected, "metrics") and isinstance(selected.metrics, Mapping) else False,
                     },
                 )
+            # If output_encode_started but output_encode_ended not set (final
+            # output node in graph), emit output_encode_end now at persist boundary.
+            if _milestones and "output_encode_started" in _milestones and "output_encode_ended" not in _milestones:
+                _milestones["output_encode_ended"] = time.monotonic_ns()
+                _enc_dur = round(
+                    (_milestones["output_encode_ended"] - _milestones["output_encode_started"]) / 1_000_000, 3
+                ) if _milestones.get("output_encode_started") else 0.0
+                trace.emit("output_encode_end", phase="execution", metadata={
+                    "duration_ms": _enc_dur,
+                })
             # output_persist_start/end: wraps actual volume persistence + descriptor
             # construction.  Distinguished from output_encode_start/end which wrap
             # the actual image encoding inside the executor (ComfyModalProductionOutput).
@@ -6396,6 +6361,8 @@ class ModalRuntimeEntrypoint:
         )
 
         # â”€â”€ Normal trace setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        self._request_count = getattr(self, "_request_count", 0) + 1
+
         if context.trace is not None:
             _auth_cid = self.container_session_id or _V2_CONTAINER_SESSION_ID
             context.trace.container_session_id = _auth_cid
@@ -6435,6 +6402,8 @@ class ModalRuntimeEntrypoint:
                     # â”€â”€ Correlation identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     "restored_instance_id": getattr(self, "_restored_instance_id", ""),
                     "restore_session_id": (self._restore_timing or {}).get("restore_session_id", ""),
+                    "restore_count": getattr(self, "_restore_count", 0),
+                    "request_count": getattr(self, "_request_count", 0),
                     "legacy_container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
                     # â”€â”€ Method-entry timestamps for downstream consumers â”€â”€â”€â”€â”€
                     "modal_method_entry_wall_unix_ns": _method_first_line_wall_ns,
@@ -6502,6 +6471,8 @@ class ModalRuntimeEntrypoint:
                     "request_id": _t4_request_id,
                     "restored_instance_id": getattr(self, "_restored_instance_id", ""),
                     "restore_session_id": (self._restore_timing or {}).get("restore_session_id", ""),
+                    "restore_count": getattr(self, "_restore_count", 0),
+                    "request_count": getattr(self, "_request_count", 0),
                     "modal_task_id": identity.get("container_task_id", ""),
                 }
                 _enrich_identity = {k: v for k, v in _enrich_identity.items() if v}

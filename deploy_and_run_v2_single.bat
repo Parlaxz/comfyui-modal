@@ -156,11 +156,11 @@ del "%V2_DEPLOY_LOG%" 2>nul
 
 echo === V1 and V2 deploys both verified OK ===
 
-echo === Running one V2 benchmark trial ===
-python tools\benchmark_v2_direct.py
+echo === Running V2 acceptance benchmark ===
+python tools\benchmark_v2_direct.py --acceptance
 if errorlevel 1 (
-    echo === ERROR: Benchmark failed ===
+    echo === ERROR: Acceptance benchmark failed ===
     exit /b 1
 )
-echo === Single V2 deploy and run completed ===
+echo === V2 acceptance benchmark completed ===
 exit /b 0
