@@ -284,18 +284,19 @@ def _resolve_effective_dtype_from_spec(model_spec: Any) -> str:
     through the snapshot-safe resolver.  Returns the resolved label or
     ``"default"`` when the spec or entry is unavailable.  Never raises.
     Logs ``"absent"`` when no UNET loader entry is present.
+    Accepts any ``collections.abc.Mapping`` (including ``MappingProxyType``).
     """
     try:
-        if not isinstance(model_spec, dict):
+        if not isinstance(model_spec, Mapping):
             return "absent"
         loaders = model_spec.get("loaders", {})
-        if not isinstance(loaders, dict):
+        if not isinstance(loaders, Mapping):
             return "absent"
         unet_entries = loaders.get("unet", [])
         if not isinstance(unet_entries, (list, tuple)) or not unet_entries:
             return "absent"
         entry = unet_entries[0]
-        if not isinstance(entry, dict):
+        if not isinstance(entry, Mapping):
             return "absent"
         weight_dtype = str(entry.get("weight_dtype", "default"))
         # Resolve through the snapshot-safe helper (no CUDA calls)
@@ -309,18 +310,19 @@ def _resolve_effective_dtype_from_spec(model_spec: Any) -> str:
 def _resolve_model_config_hash_from_spec(model_spec: Any) -> str:
     """Compute a deterministic hash of UNET model-type/configuration fields
     available in the spec.  Returns ``"absent"`` when no config fields exist.
+    Accepts any ``collections.abc.Mapping`` (including ``MappingProxyType``).
     """
     try:
-        if not isinstance(model_spec, dict):
+        if not isinstance(model_spec, Mapping):
             return "absent"
         loaders = model_spec.get("loaders", {})
-        if not isinstance(loaders, dict):
+        if not isinstance(loaders, Mapping):
             return "absent"
         unet_entries = loaders.get("unet", [])
         if not isinstance(unet_entries, (list, tuple)) or not unet_entries:
             return "absent"
         entry = unet_entries[0]
-        if not isinstance(entry, dict):
+        if not isinstance(entry, Mapping):
             return "absent"
         # Include UNET name, loader_class, and weight_dtype in config identity
         config_parts = {
@@ -340,9 +342,10 @@ def _resolve_static_patch_hash_from_spec(model_spec: Any) -> str:
     """Return static model patches hash from model_spec if present,
     ``"none"`` when no patch metadata exists, ``"absent"`` when the spec
     is not available.
+    Accepts any ``collections.abc.Mapping`` (including ``MappingProxyType``).
     """
     try:
-        if not isinstance(model_spec, dict):
+        if not isinstance(model_spec, Mapping):
             return "absent"
         # Static patches would be stored in model_spec["static_patches_hash"]
         # if present.  For standard V2 fast paths without CacheDiT/RES4LYF
@@ -3033,57 +3036,31 @@ class ModalRuntimeEntrypoint:
 
                 plan = self._restore_plan
 
-                # Step 1: Compatibility check using canonical per-role identity
-                # Derive custom_node_generation from bootstrap state if available
-                _restore_cn_gen = ""
-                _restore_dep_hash = _V2_DEPLOYMENT_COMBINED_HASH
-                try:
-                    _bs = getattr(getattr(self, 'bootstrap', None), 'state', None)
-                    if _bs is not None:
-                        _restore_cn_gen = str(_bs.snapshot_custom_node_generation or "")
-                        if not _restore_dep_hash:
-                            _restore_dep_hash = str(_bs.deployment_combined_hash or "")
-                except Exception:
-                    pass
+                # Step 1: Compatibility check using non-VAE key matcher
+                #          + projected spec matcher (no canonical role identity).
                 _identity_check_start_ns = time.monotonic_ns()
-                _role_report = _canonical_role_match_report(
-                    request_model_spec=plan.model_spec,
-                    snapshot_model_spec=models.model_spec,
-                    request_custom_node_generation=_restore_cn_gen,
-                    request_deployment_combined_hash=_restore_dep_hash,
-                    snapshot_custom_node_generation=str(
-                        getattr(models, "custom_node_generation", "")
-                    ) if _restore_cn_gen else "",
-                    snapshot_deployment_combined_hash=_restore_dep_hash,
-                    request_unet_effective_dtype=_resolve_effective_dtype_from_spec(plan.model_spec),
-                    request_unet_model_config_hash=_resolve_model_config_hash_from_spec(plan.model_spec),
-                    request_unet_static_patches_hash=_resolve_static_patch_hash_from_spec(plan.model_spec),
-                    snapshot_unet_static_patches_hash=_resolve_static_patch_hash_from_spec(models.model_spec),
-                )
+                _keys_match = _cpu_snapshot_model_keys_match(plan.model_key, models.model_key)
+                _specs_match = _cpu_snapshot_specs_match(plan.model_spec, models.model_spec)
+                _key_reason = _cpu_snapshot_key_mismatch_reason(plan.model_key, models.model_key) if not _keys_match else None
+                _spec_reason = _cpu_snapshot_spec_mismatch_reason(plan.model_spec, models.model_spec) if not _specs_match else None
                 _RESTORE_STAGE_TIMERS["snapshot_identity_checks"] = round(
                     (time.monotonic_ns() - _identity_check_start_ns) / 1_000_000, 3
                 )
-                _keys_match = _role_report["compatible"]
-                _specs_match = _role_report["compatible"]
-                _key_reason = _role_report["reason"] if not _role_report["compatible"] else None
-                _spec_reason = None
-                _request_key_hash = stable_hash(plan.model_spec)[:16] if plan.model_spec else ""
+                _request_key_hash = stable_hash(plan.model_key.to_dict())[:16] if plan.model_key else ""
                 _request_spec_hash = stable_hash(models.model_spec)[:16] if models.model_spec else ""
                 print(
                     f"[v2.cpu_snapshot_match] "
                     f"keys_match={int(_keys_match)} specs_match={int(_specs_match)} "
                     f"key_reason={_key_reason or 'ok'} "
-                    f"spec_reason=unified "
+                    f"spec_reason={_spec_reason or 'ok'} "
                     f"snapshot_key_hash={_snapshot_key_hash} "
                     f"request_key_hash={_request_key_hash} "
                     f"snapshot_spec_hash={_snapshot_spec_hash} "
-                    f"request_spec_hash={_request_spec_hash} "
-                    f"unet_match={int(_role_report['unet_match'])} "
-                    f"clip_match={int(_role_report['clip_match'])}",
+                    f"request_spec_hash={_request_spec_hash}",
                     flush=True,
                 )
 
-                if not _role_report["compatible"]:
+                if not (_keys_match and _specs_match):
                     # Incompatible: clear bridge and fall through to existing
                     # preload branch exactly as before.
                     self._preload_bridge.clear()
@@ -3092,10 +3069,8 @@ class ModalRuntimeEntrypoint:
                     _cpu_snapshot_activated = False
                     _role_reason = "; ".join(
                         p for p in [
-                            f"UNET:{','.join(_role_report['unet_mismatch_fields'])}"
-                            if not _role_report['unet_match'] else "",
-                            f"CLIP:{','.join(_role_report['clip_mismatch_fields'])}"
-                            if not _role_report['clip_match'] else "",
+                            f"key:{_key_reason}" if _key_reason else "",
+                            f"spec:{_spec_reason}" if _spec_reason else "",
                         ] if p
                     ) or "compatibility mismatch"
                     _cpu_snapshot_activate_error = _role_reason
@@ -3115,10 +3090,8 @@ class ModalRuntimeEntrypoint:
                             "unet_object_type": type(models.unet).__name__
                             if models.unet is not None else "",
                             "duration_ms": _activation_duration_ms,
-                            "keys_match": int(_role_report["compatible"]),
-                            "specs_match": int(_role_report["compatible"]),
-                            "unet_match": int(_role_report["unet_match"]),
-                            "clip_match": int(_role_report["clip_match"]),
+                            "keys_match": int(_keys_match),
+                            "specs_match": int(_specs_match),
                         },
                     )
                     _bridge_installed = 1 if self._preload_bridge._original_methods else 0
@@ -3408,6 +3381,13 @@ class ModalRuntimeEntrypoint:
                         "clip": str(getattr(plan.model_key, "clip_identity", "") or ""),
                     }
                     register_unet_forward_probe(models.unet, source="cpu_snapshot")
+                    # Explicitly install SAMPLER_SAMPLE timing wrapper on the
+                    # restored snapshot UNET, even though register_unet_forward_probe
+                    # also calls ensure_sampling_timing_wrapper internally.
+                    # This redundancy ensures the wrapper is installed regardless
+                    # of which code path activates the UNET.
+                    from comfymodal_runtime.runtime_executor import ensure_sampling_timing_wrapper
+                    ensure_sampling_timing_wrapper(models.unet)
                     install_registered_unet_forward_hooks()
                     # CacheDiT restore preparation: locate exactly one
                     # CacheDiT_Model_Optimizer node from snapshot plan.workflow,
@@ -3448,6 +3428,10 @@ class ModalRuntimeEntrypoint:
                                     )
                                     # Re-register forward probe after replacement
                                     register_unet_forward_probe(_patched_model, source="cachedit_restore")
+                                    # Also explicitly install timing wrapper on the
+                                    # CacheDiT-patched model.
+                                    from comfymodal_runtime.runtime_executor import ensure_sampling_timing_wrapper
+                                    ensure_sampling_timing_wrapper(_patched_model)
                                 _CACHEDIT_PREPARED[str(getattr(plan, "workflow_hash", ""))] = {
                                     "unet_id": id(_patched_model) if _patched_model is not None else id(models.unet),
                                     "workflow_hash": str(getattr(plan, "workflow_hash", "")),
@@ -5180,22 +5164,14 @@ class ModalRuntimeEntrypoint:
                                         set_lock_wait_ms(_lane_wait_ms)
                                         _lane_acquired[0] = True
                     elif event in ("sampler_start", "sampling_start", "sampler_stage_start", "progress") and "first_sampler_node" in _milestones:
-                        if "first_sampler_stage_ns" not in _milestones:
-                            _milestones["first_sampler_stage_ns"] = time.monotonic_ns()
-                            _milestones["first_sampler_stage_event"] = event
-                            _milestones["first_sampler_stage_wall_ns"] = time.time_ns()
-                            _sampler_node_id = _milestones.get("first_sampler_node", "?")
-                            trace.emit("sampling_start", phase="execution", metadata={
-                                "node_id": _sampler_node_id,
-                                "node_class": _node_class_map.get(_sampler_node_id, ""),
-                                "steps": 8,
-                            })
-                            print(
-                                f"[v2.sampler] event=start "
-                                f"node_id={_sampler_node_id} "
-                                f"steps=8",
-                                flush=True,
-                            )
+                        # Diagnostics-only marker: records that a progress-like
+                        # event was observed for this request.  This is NOT a
+                        # start boundary — authoritative sampling_start/end are
+                        # emitted only by the SAMPLER_SAMPLE production wrapper
+                        # (see runtime_executor._build_sampling_wrapper).
+                        if "sampler_first_progress_ns" not in _milestones:
+                            _milestones["sampler_first_progress_ns"] = time.monotonic_ns()
+                            _milestones["sampler_first_progress_event"] = event
                     return _orig_send_sync(*args, **kwargs)
                 setattr(_send_sync_wrapper, "_comfy_modal_send_sync", True)
                 _server.send_sync = _send_sync_wrapper
@@ -5269,8 +5245,13 @@ class ModalRuntimeEntrypoint:
             _first_loader_node_ns = _milestones.get("first_loader_node_ns") if _milestones else None
             _first_clip_ns = _milestones.get("first_clip_encode_node_ns") if _milestones else None
             _first_sampler_ns = _milestones.get("first_sampler_node_ns") if _milestones else None
-            _first_sampler_stage_ns = _milestones.get("first_sampler_stage_ns") if _milestones else None
-            _first_sampler_stage_event = _milestones.get("first_sampler_stage_event", "") if _milestones else ""
+            # Fix 3: authoritative sampling_start from SAMPLER_SAMPLE wrapper (not progress).
+            _sampling_start_ns: int | None = None
+            for _ev in trace.events:
+                if _ev.name == "sampling_start":
+                    _sampling_start_ns = _ev.monotonic_ns
+                    break
+            _first_sampler_stage_event = _milestones.get("sampler_first_progress_event", "") if _milestones else ""
             _exec_st_val = round((_exec_st_ns - _execute_call_ns) / 1_000_000, 3) if _exec_st_ns else None
             _exec_to_cache = round((_cached_ns - _exec_st_ns) / 1_000_000, 3) if _exec_st_ns and _cached_ns else None
             _cache_to_node = round((_first_ns - _cached_ns) / 1_000_000, 3) if _cached_ns and _first_ns else None
@@ -5284,10 +5265,8 @@ class ModalRuntimeEntrypoint:
                 _first_node_to_clip_ms = round((_first_clip_ns - _first_exec_node_ns) / 1_000_000, 3)
             if _first_clip_ns is not None and _first_sampler_ns is not None:
                 _clip_to_sampler_node_ms = round((_first_sampler_ns - _first_clip_ns) / 1_000_000, 3)
-            if _first_sampler_ns is not None and _first_sampler_stage_ns is not None:
-                _sampler_node_to_sampler_start_ms = round((_first_sampler_stage_ns - _first_sampler_ns) / 1_000_000, 3)
-                # Store in pre_sampler_state so _v2_critical_path_data reuses this
-                # authoritative calculation instead of recalculating from T3.
+            if _first_sampler_ns is not None and _sampling_start_ns is not None:
+                _sampler_node_to_sampler_start_ms = round((_sampling_start_ns - _first_sampler_ns) / 1_000_000, 3)
                 _pre_sampler_state["sampler_node_to_sampler_start_ms"] = _sampler_node_to_sampler_start_ms
             if _milestones:
                 trace.emit("prompt_executor_milestones", phase="execution", metadata={
@@ -5312,7 +5291,7 @@ class ModalRuntimeEntrypoint:
                     "first_loader_node_monotonic_ns": _first_loader_node_ns,
                     "first_clip_encode_node_monotonic_ns": _first_clip_ns,
                     "first_sampler_node_monotonic_ns": _first_sampler_ns,
-                    "first_sampler_stage_monotonic_ns": _first_sampler_stage_ns,
+                    "sampling_start_monotonic_ns": _sampling_start_ns,
                 })
 
             # â”€â”€ Classify sampler stage from first executing node â”€â”€
@@ -5381,8 +5360,8 @@ class ModalRuntimeEntrypoint:
             _lane_acquired_to_actual_stage_ms: float | None = None
             if _first_sampler_ns is not None and _lane_acquired_ns is not None:
                 _sampler_node_to_lane_acquired_ms = round((_lane_acquired_ns - _first_sampler_ns) / 1_000_000, 3)
-            if _lane_acquired_ns is not None and _first_sampler_stage_ns is not None:
-                _lane_acquired_to_actual_stage_ms = round((_first_sampler_stage_ns - _lane_acquired_ns) / 1_000_000, 3)
+            if _lane_acquired_ns is not None and _sampling_start_ns is not None:
+                _lane_acquired_to_actual_stage_ms = round((_sampling_start_ns - _lane_acquired_ns) / 1_000_000, 3)
             _leaf_milestone = [
                 _exec_st_val, _exec_to_cache, _cache_to_node,
                 _first_node_to_clip_ms, _clip_to_sampler_node_ms,
@@ -5419,8 +5398,8 @@ class ModalRuntimeEntrypoint:
                 if ev.name == "remote_method_entry":
                     _remote_method_entry_ns = ev.monotonic_ns
                     break
-            if _remote_method_entry_ns is not None and _first_sampler_stage_ns is not None:
-                _pre_sampler_total_ms = round((_first_sampler_stage_ns - _remote_method_entry_ns) / 1_000_000, 3)
+            if _remote_method_entry_ns is not None and _sampling_start_ns is not None:
+                _pre_sampler_total_ms = round((_sampling_start_ns - _remote_method_entry_ns) / 1_000_000, 3)
             else:
                 _pre_sampler_total_ms = None
             if _pre_sampler_total_ms is not None:
@@ -5501,7 +5480,7 @@ class ModalRuntimeEntrypoint:
                 "first_loader_node_monotonic_ns": _first_loader_node_ns,
                 "first_clip_encode_node_monotonic_ns": _first_clip_ns,
                 "first_sampler_node_monotonic_ns": _first_sampler_ns,
-                "first_sampler_stage_monotonic_ns": _first_sampler_stage_ns,
+                "sampling_start_monotonic_ns": _sampling_start_ns,
                 "sampler_stage_status": _sampler_stage_status,
                 "has_clip_loader": _has_clip_loader,
                 "has_text_encode": _has_text_encode,

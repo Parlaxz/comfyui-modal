@@ -108,6 +108,13 @@ class TestAcceptanceIdentityProof(unittest.TestCase):
        B: same instance, request_count>=2, restore_count=1, no lifecycle events.
        C: different instance, restore_count=1 request_count=1."""
 
+    def _make_seed_diag(self) -> dict[str, dict[str, str]]:
+        return {
+            "10": {"role": "unet", "decision": "seeded"},
+            "20": {"role": "clip", "decision": "seeded"},
+            "30": {"role": "vae", "decision": "missing_snapshot_output"},
+        }
+
     def _result_with_counts(self, instance_id: str, request_id: str,
                              restore_count: int, request_count: int,
                              lifecycle_events: list[dict] | None = None,
@@ -121,12 +128,29 @@ class TestAcceptanceIdentityProof(unittest.TestCase):
         ]
         if include_all_timing:
             events += [
-                _make_event("unet_first_cuda_op", mono_ns=2000,
+                _make_event("executor_loader_cache_seed_end", mono_ns=1500,
+                            metadata={"request_id": request_id,
+                                      "diagnostics": self._make_seed_diag()}),
+                _make_event("prompt_executor_milestones", mono_ns=2000,
+                            metadata={"request_id": request_id,
+                                      "execution_start_to_cached_ms": 200.0}),
+                _make_event("unet_first_cuda_op", mono_ns=2500,
                             metadata={"request_id": request_id, "elapsed_ms": 150.0,
                                       "demand_start_present": 1}),
                 _make_event("clip_prepare_start", mono_ns=3000,
                             metadata={"request_id": request_id}),
                 _make_event("clip_prepare_end", mono_ns=4000,
+                            metadata={"request_id": request_id}),
+                _make_event("pre_sampler_stages", mono_ns=5000,
+                            metadata={"request_id": request_id,
+                                      "sampler_node_to_sampler_start_ms": 400.0}),
+                _make_event("sampling_start", mono_ns=10000000,
+                            metadata={"request_id": request_id}),
+                _make_event("sampling_end", mono_ns=15000000,
+                            metadata={"request_id": request_id, "steps": 8}),
+                _make_event("vae_decode_start", mono_ns=16000000,
+                            metadata={"request_id": request_id}),
+                _make_event("vae_decode_end", mono_ns=19000000,
                             metadata={"request_id": request_id}),
                 _make_event("output_encode_start", mono_ns=4500,
                             metadata={"request_id": request_id}),
@@ -269,10 +293,22 @@ class TestAssetFetch(unittest.TestCase):
             _make_event("remote_method_entry", mono_ns=1000,
                         metadata={"request_id": "r", "restored_instance_id": "X",
                                   "restore_count": 1, "request_count": 1}),
-            _make_event("unet_first_cuda_op", mono_ns=2000,
+            _make_event("executor_loader_cache_seed_end", mono_ns=1500,
+                        metadata={"request_id": "r", "diagnostics": {
+                            "10": {"role": "unet", "decision": "seeded"},
+                            "20": {"role": "clip", "decision": "seeded"},
+                            "30": {"role": "vae", "decision": "missing_snapshot_output"},
+                        }}),
+            _make_event("prompt_executor_milestones", mono_ns=2000,
+                        metadata={"request_id": "r", "execution_start_to_cached_ms": 200.0}),
+            _make_event("unet_first_cuda_op", mono_ns=2500,
                         metadata={"request_id": "r", "elapsed_ms": 150.0, "demand_start_present": 1}),
             _make_event("clip_prepare_start", mono_ns=3000, metadata={"request_id": "r"}),
             _make_event("clip_prepare_end", mono_ns=4000, metadata={"request_id": "r"}),
+            _make_event("pre_sampler_stages", mono_ns=5000,
+                        metadata={"request_id": "r", "sampler_node_to_sampler_start_ms": 400.0}),
+            _make_event("sampling_start", mono_ns=10000000, metadata={"request_id": "r"}),
+            _make_event("sampling_end", mono_ns=15000000, metadata={"request_id": "r", "steps": 8}),
             _make_event("output_encode_start", mono_ns=4500, metadata={"request_id": "r"}),
             _make_event("output_persist_start", mono_ns=4600, metadata={"request_id": "r"}),
             _make_event("output_persist_end", mono_ns=5000000,
@@ -331,10 +367,24 @@ class TestTimingGates(unittest.TestCase):
             _make_event("remote_method_entry", mono_ns=base,
                         metadata={"request_id": request_id, "restored_instance_id": "X",
                                   "restore_count": 1, "request_count": 1}),
+            _make_event("executor_loader_cache_seed_end", mono_ns=base + 200000,
+                        metadata={"request_id": request_id, "diagnostics": {
+                            "10": {"role": "unet", "decision": "seeded"},
+                            "20": {"role": "clip", "decision": "seeded"},
+                            "30": {"role": "vae", "decision": "missing_snapshot_output"},
+                        }}),
+            _make_event("prompt_executor_milestones", mono_ns=base + 300000,
+                        metadata={"request_id": request_id, "execution_start_to_cached_ms": 200.0}),
             _make_event("unet_first_cuda_op", mono_ns=base + 500000,
                         metadata={"request_id": request_id, "elapsed_ms": 150.0, "demand_start_present": 1}),
             _make_event("clip_prepare_start", mono_ns=base + 1000000, metadata={"request_id": request_id}),
             _make_event("clip_prepare_end", mono_ns=base + 1500000, metadata={"request_id": request_id}),
+            _make_event("pre_sampler_stages", mono_ns=base + 7000000,
+                        metadata={"request_id": request_id, "sampler_node_to_sampler_start_ms": 400.0}),
+            _make_event("sampling_start", mono_ns=base + 8000000, metadata={"request_id": request_id}),
+            _make_event("sampling_end", mono_ns=base + 13000000, metadata={"request_id": request_id, "steps": 8}),
+            _make_event("vae_decode_start", mono_ns=base + 14000000, metadata={"request_id": request_id}),
+            _make_event("vae_decode_end", mono_ns=base + 17000000, metadata={"request_id": request_id}),
             _make_event("output_encode_start", mono_ns=base + 2000000, metadata={"request_id": request_id}),
             _make_event("output_persist_start", mono_ns=base + 2001000, metadata={"request_id": request_id}),
             _make_event("output_persist_end", mono_ns=int(base + ms * 1_000_000),
@@ -562,6 +612,119 @@ class TestScopedTimingExtraction(unittest.TestCase):
         self.assertIsNone(timing_b.get("sampling_ms"))
         self.assertIsNotNone(timing_a.get("method_entry_to_durable_result_ms"))
         self.assertIsNotNone(timing_b.get("method_entry_to_durable_result_ms"))
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Wrapped-artifact regression: _check_acceptance must unwrap artifact['result']
+# for trace/event checks (seed, sampling_start, sampling_end, lifecycle).
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestWrappedArtifact(unittest.TestCase):
+    """Regression: _check_acceptance transparently unwraps artifact['result']
+    for trace/event inspection, avoiding false 'missing evidence' failures.
+
+    Production _run_acceptance_sequence passes the artifact wrapper (keys:
+    identity, images, timing, asset_proofs, result — NO top-level 'trace').
+    Unit tests pass the flat raw result directly.  This test verifies the
+    wrapper path works the same.
+    """
+
+    def _raw_result_with_all_events(self) -> dict[str, Any]:
+        base = 1_000_000_000  # 1 second in ns
+        events = [
+            _make_event("remote_method_entry", mono_ns=base,
+                        metadata={"request_id": "r", "restored_instance_id": "X",
+                                  "restore_count": 1, "request_count": 1}),
+            _make_event("executor_loader_cache_seed_end", mono_ns=base + 200_000_000,
+                        metadata={"request_id": "r", "diagnostics": {
+                            "10": {"role": "unet", "decision": "seeded"},
+                            "20": {"role": "clip", "decision": "seeded"},
+                            "30": {"role": "vae", "decision": "missing_snapshot_output"},
+                        }}),
+            _make_event("prompt_executor_milestones", mono_ns=base + 300_000_000,
+                        metadata={"request_id": "r", "execution_start_to_cached_ms": 200.0}),
+            _make_event("unet_first_cuda_op", mono_ns=base + 500_000_000,
+                        metadata={"request_id": "r", "elapsed_ms": 150.0,
+                                  "demand_start_present": 1}),
+            _make_event("clip_prepare_start", mono_ns=base + 1_000_000_000,
+                        metadata={"request_id": "r"}),
+            _make_event("clip_prepare_end", mono_ns=base + 1_500_000_000,
+                        metadata={"request_id": "r"}),
+            _make_event("pre_sampler_stages", mono_ns=base + 3_000_000_000,
+                        metadata={"request_id": "r",
+                                  "sampler_node_to_sampler_start_ms": 400.0}),
+            _make_event("sampling_start", mono_ns=base + 4_000_000_000,
+                        metadata={"request_id": "r"}),
+            _make_event("sampling_end", mono_ns=base + 9_000_000_000,
+                        metadata={"request_id": "r", "steps": 8}),
+            _make_event("vae_decode_start", mono_ns=base + 10_000_000_000,
+                        metadata={"request_id": "r"}),
+            _make_event("vae_decode_end", mono_ns=base + 12_000_000_000,
+                        metadata={"request_id": "r"}),
+            _make_event("output_encode_start", mono_ns=base + 2_000_000_000,
+                        metadata={"request_id": "r"}),
+            _make_event("output_persist_start", mono_ns=base + 2_100_000_000,
+                        metadata={"request_id": "r"}),
+            _make_event("output_persist_end", mono_ns=base + 9_500_000_000,
+                        metadata={"request_id": "r", "duration_ms": 5.0,
+                                  "commit_ms": 3.0}),
+        ]
+        result = _make_result_with_events(
+            events, images=[{"asset_id": "a", "backend_path": "p.png"}],
+        )
+        result["output_diagnostics"] = {"output_volume_commit_ms": 3.0}
+        result["identity"] = _extract_identity_from_trace(result, "r")
+        return result
+
+    def test_wrapped_artifact_no_false_seed_sampling_failures(self):
+        """Artifact wrapper must not produce false missing-seed/sampling failures."""
+        raw = self._raw_result_with_all_events()
+
+        # Extract timing from raw (as production does before wrapping)
+        timing = _extract_acceptance_timing_scoped(
+            raw, "r", trigger_to_modal_entry_ms=2000.0, wall_ms=11000.0,
+        )
+
+        # Build the production-shaped artifact wrapper — NO top-level 'trace'
+        artifact: dict[str, Any] = {
+            "label": "W",
+            "run_index": 0,
+            "identity": raw["identity"],
+            "images": raw.get("images", []),
+            "asset_proofs": [
+                {"backend_path": "p.png", "expected_sha256": "a",
+                 "actual_sha256": "a", "byte_count": 100},
+            ],
+            "timing": timing,
+            "wall_ms": 11000.0,
+            "result": raw,  # trace lives here, NOT at top level
+        }
+
+        # Regression: passes artifact wrapper, NOT flat raw result
+        failures = _check_acceptance(
+            "W", artifact, timing, artifact["images"], artifact["asset_proofs"],
+            is_fresh=True, expected_restore_count=1, expected_request_count=1,
+        )
+
+        # Isolate seed/sampling false failures
+        seed_fails = [
+            f for f in failures
+            if "seed_loader_cache_signatures" in f or "seed evidence" in f
+        ]
+        sampling_fails = [
+            f for f in failures
+            if "sampling_start" in f or "sampling_end" in f
+        ]
+        self.assertEqual(
+            seed_fails, [],
+            f"false seed event failures with wrapped artifact: {seed_fails}",
+        )
+        self.assertEqual(
+            sampling_fails, [],
+            f"false sampling event failures with wrapped artifact: {sampling_fails}",
+        )
+        # Full pass expected
+        self.assertEqual(failures, [], f"unexpected failures: {failures}")
 
 
 if __name__ == "__main__":

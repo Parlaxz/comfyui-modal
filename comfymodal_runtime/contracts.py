@@ -710,15 +710,14 @@ def compute_loader_role_identity(
     deployment_combined_hash:
         Deployment identity hash for identity comparison.
     static_model_patches_hash:
-        Static model patches hash (UNET-specific; ``"none"`` when no patch
-        metadata is present in the cached output).
+        *Deprecated — no longer included in identity.*  Kept for caller
+        compatibility; unused.
     effective_compute_dtype_label:
-        Effective weight/compute dtype label for UNET (e.g. ``"bfloat16"``,
-        ``"float16"``, ``"float32"``, ``"default"``).  Derived by callers
-        from ``resolve_unet_effective_dtype`` without CUDA calls.
+        *Deprecated — no longer included in identity.*  Kept for caller
+        compatibility; unused.
     model_configuration_hash:
-        Canonical hash of static UNET model-type/configuration fields
-        available in the spec.  Empty when no config fields exist.
+        *Deprecated — no longer included in identity.*  Kept for caller
+        compatibility; unused.
     """
     loaders_raw = (spec or {}).get("loaders", {}) if isinstance(spec, Mapping) else {}
     entries = list(loaders_raw.get(role, [])) if isinstance(loaders_raw, Mapping) else []
@@ -743,14 +742,6 @@ def compute_loader_role_identity(
         base["weight_dtype"] = unet_entries[0][1] if unet_entries else ""
         base["loader_class"] = unet_entries[0][2] if unet_entries else ""
         base["loader_count"] = str(len(unet_entries))
-        # Explicit "none" when no static patch metadata
-        base["static_model_patches_hash"] = (
-            static_model_patches_hash
-            if static_model_patches_hash
-            else "none"
-        )
-        base["effective_compute_dtype_label"] = effective_compute_dtype_label or base["weight_dtype"]
-        base["model_configuration_hash"] = model_configuration_hash or ""
     elif role == "clip":
         clip_parts: list[str] = []
         for e in entries:
@@ -802,9 +793,6 @@ def find_role_identity_mismatch_fields(
         "clip_type",
         "device",
         "device_policy",
-        "static_model_patches_hash",
-        "effective_compute_dtype_label",
-        "model_configuration_hash",
         "custom_node_generation",
         "deployment_combined_hash",
         "loader_count",

@@ -704,6 +704,8 @@ def attach_pre_sampler_critical_path(
     trace_derived_hits: dict[str, int] = {}
     trace_derived_spans: list[dict] = []
     pre_sampler_stage_metadata: dict[str, Any] = {}
+    # Fix 3: detect authoritative sampling_start event boundary
+    _found_sampling_start_ns: int | None = None
     if isinstance(trace_data, dict):
         events = trace_data.get("events", [])
         if isinstance(events, list):
@@ -714,6 +716,10 @@ def attach_pre_sampler_critical_path(
                     stage_meta = ev.get("metadata") or {}
                     if isinstance(stage_meta, dict):
                         pre_sampler_stage_metadata.update(stage_meta)
+                # Fix 3: detect authoritative sampling_start event
+                if _found_sampling_start_ns is None and ev.get("name") == "sampling_start":
+                    _found_sampling_start_ns = ev.get("monotonic_ns")
+
                 meta = ev.get("metadata") or {}
                 if not isinstance(meta, dict):
                     continue
@@ -811,13 +817,9 @@ def attach_pre_sampler_critical_path(
                 _attr["node_execution_ms"] = round(_ne, 3)
             if _co > 0:
                 _attr["conditioning_ms"] = round(_co, 3)
-        elif span_name == "sampler_node_to_sampler_start":
-            _fw = cache_data.get("future_wait_ms", 0.0)
-            _lw = cache_data.get("lock_wait_ms", 0.0)
-            if _fw > 0:
-                _attr["future_wait_ms"] = round(_fw, 3)
-            if _lw > 0:
-                _attr["lock_wait_ms"] = round(_lw, 3)
+        # Fix 3: sampler_node_to_sampler_start case removed — not derived from
+        # progress.  Authoritative sampling_start from the SAMPLER_SAMPLE
+        # wrapper is the true end boundary for pre-sampler timing.
 
         # Common attribution: cache hit, model cache hit, background future
         _hits = cache_data.get("operation_hits", {})
@@ -921,14 +923,9 @@ def attach_pre_sampler_critical_path(
             pre_sampler_stage_metadata.get("first_clip_encode_node_class"),
             pre_sampler_stage_metadata.get("first_sampler_node_class"),
         )
-        _append_milestone_span(
-            "sampler_node_to_sampler_start",
-            pre_sampler_stage_metadata.get("sampler_node_to_sampler_start_ms"),
-            pre_sampler_stage_metadata.get("first_sampler_node_id"),
-            pre_sampler_stage_metadata.get("sampler_stage_node_id"),
-            pre_sampler_stage_metadata.get("first_sampler_node_class"),
-            pre_sampler_stage_metadata.get("sampler_stage_node_class"),
-        )
+        # Fix 3: sampler_node_to_sampler_start milestone removed — the
+        # authoritative sampling_start from the SAMPLER_SAMPLE wrapper is
+        # the true pre-sampler end boundary and is resolved below.
 
     # Try to derive total wall time from trace events or stages
     total_wall_ms: float | None = None
@@ -1052,6 +1049,10 @@ def attach_pre_sampler_critical_path(
 
     if isinstance(pre_sampler_total_ms, (int, float)):
         summary["pre_sampler_total_ms"] = round(float(pre_sampler_total_ms), 3)
+
+    # Fix 3: mark whether authoritative sampling_start was observed
+    if _found_sampling_start_ns is not None:
+        summary["sampling_start_authoritative"] = True
 
     # Attach to result
     if summary:
@@ -1824,3 +1825,45 @@ def _build_sampling_wrapper() -> Callable:
 
 # Pre-built SAMPLER_SAMPLE wrapper singleton.
 _COMFYMODAL_V2_SAMPLING_WRAPPER: Callable = _build_sampling_wrapper()
+
+
+def ensure_sampling_timing_wrapper(model_patcher: Any) -> bool:
+    """Install authoritative ``SAMPLER_SAMPLE`` timing wrapper on *model_patcher*.
+
+    Uses ``WrappersMP.SAMPLER_SAMPLE`` key ``comfymodal_v2_sampling_timing``
+    with ``_COMFYMODAL_V2_SAMPLING_WRAPPER`` (defined above).
+    Idempotent — checks whether the keyed wrapper already exists.
+
+    Returns ``True`` on success, ``False`` on any failure (prints exception
+    type name only — no traceback captured).
+    """
+    try:
+        if not hasattr(model_patcher, "model_options"):
+            return False
+        import comfy.patcher_extension as _pe
+
+        # Idempotent guard
+        existing = _pe.get_wrappers_with_key(
+            _pe.WrappersMP.SAMPLER_SAMPLE,
+            "comfymodal_v2_sampling_timing",
+            model_patcher.model_options,
+            is_model_options=True,
+        )
+        if existing:
+            return True
+
+        _pe.add_wrapper_with_key(
+            _pe.WrappersMP.SAMPLER_SAMPLE,
+            "comfymodal_v2_sampling_timing",
+            _COMFYMODAL_V2_SAMPLING_WRAPPER,
+            model_patcher.model_options,
+            is_model_options=True,
+        )
+        return True
+    except Exception as _exc:
+        print(
+            f"[comfymodal] ensure_sampling_timing_wrapper failed: "
+            f"{type(_exc).__name__}",
+            flush=True,
+        )
+        return False

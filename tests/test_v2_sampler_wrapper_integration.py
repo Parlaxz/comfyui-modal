@@ -671,5 +671,99 @@ class TestLoadModelsGpuShape(unittest.TestCase):
                         "must detect registered UNET in model list")
 
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# Fix 3: pre-sampler critical path sampling_start_authoritative flag
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestPreSamplerCriticalPathFix3(unittest.TestCase):
+    """attach_pre_sampler_critical_path must set sampling_start_authoritative
+    when sampling_start event is present in trace events (Fix 3)."""
+
+    def _make_minimal_plan(self):
+        class _FakePlan:
+            workflow = {}
+            workflow_hash = "test_hash"
+        return _FakePlan()
+
+    def test_sampling_start_present_sets_flag(self):
+        """When sampling_start event in trace, flag must be True."""
+        from comfymodal_runtime.runtime_executor import attach_pre_sampler_critical_path
+        result = {
+            "trace": {
+                "events": [
+                    {"name": "sampling_start", "monotonic_ns": 1000, "metadata": {}},
+                ],
+            },
+        }
+        plan = self._make_minimal_plan()
+        enriched = attach_pre_sampler_critical_path(result, plan, cache=None)
+        cpath = enriched.get("trace", {}).get("pre_sampler_critical_path", {})
+        self.assertTrue(cpath.get("sampling_start_authoritative"),
+                        "sampling_start_authoritative must be True when event present")
+
+    def test_sampling_start_absent_no_flag(self):
+        """Without sampling_start event, flag must not be set."""
+        from comfymodal_runtime.runtime_executor import attach_pre_sampler_critical_path
+        result = {
+            "trace": {
+                "events": [
+                    {"name": "some_other_event", "monotonic_ns": 500, "metadata": {}},
+                ],
+            },
+        }
+        plan = self._make_minimal_plan()
+        enriched = attach_pre_sampler_critical_path(result, plan, cache=None)
+        cpath = enriched.get("trace", {}).get("pre_sampler_critical_path", {})
+        self.assertNotIn("sampling_start_authoritative", cpath,
+                         "flag must not be present when sampling_start absent")
+
+    def test_milestone_does_not_include_sampler_node_to_sampler_start(self):
+        """The removed sampler_node_to_sampler_start milestone must NOT
+        appear in dominant_spans even when pre_sampler_stage_metadata
+        contains the field."""
+        from comfymodal_runtime.runtime_executor import attach_pre_sampler_critical_path
+        result = {
+            "trace": {
+                "events": [
+                    {
+                        "name": "pre_sampler_stages",
+                        "metadata": {
+                            "sampler_node_to_sampler_start_ms": 42.0,
+                            "first_sampler_node_id": "n1",
+                            "sampler_stage_node_id": "n2",
+                        },
+                    },
+                ],
+            },
+        }
+        plan = self._make_minimal_plan()
+        enriched = attach_pre_sampler_critical_path(result, plan, cache=None)
+        cpath = enriched.get("trace", {}).get("pre_sampler_critical_path", {})
+        spans = cpath.get("dominant_spans", [])
+        span_names = [s.get("span") for s in spans]
+        self.assertNotIn("sampler_node_to_sampler_start", span_names,
+                         "sampler_node_to_sampler_start milestone must be removed")
+
+    def test_sampling_start_first_event_detected(self):
+        """Only the first sampling_start event triggers the flag."""
+        from comfymodal_runtime.runtime_executor import attach_pre_sampler_critical_path
+        result = {
+            "trace": {
+                "events": [
+                    {"name": "pre_sampler_stages", "metadata": {}},
+                    {"name": "sampling_start", "monotonic_ns": 2000, "metadata": {}},
+                    {"name": "sampling_start", "monotonic_ns": 3000, "metadata": {}},
+                ],
+            },
+        }
+        plan = self._make_minimal_plan()
+        enriched = attach_pre_sampler_critical_path(result, plan, cache=None)
+        cpath = enriched.get("trace", {}).get("pre_sampler_critical_path", {})
+        self.assertTrue(cpath.get("sampling_start_authoritative"),
+                        "flag must be set when sampling_start appears")
+
+
 if __name__ == "__main__":
     unittest.main()
