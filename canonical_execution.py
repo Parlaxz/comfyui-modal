@@ -395,6 +395,7 @@ def _restore_plan_identity_hash(plan: RestorePlan) -> str:
         "model_spec": dict(plan.model_spec),
         "prefill_spec": dict(plan.prefill_spec),
         "source_workflow_hash": plan.source_workflow_hash,
+        "workflow_hash": plan.workflow_hash,
     }
     return stable_hash(identity)
 
@@ -1235,6 +1236,8 @@ async def execute_plan(
             model_spec=build_restore_model_spec(workflow, dict(plan.model_stack)),
             prefill_spec=dict(prefill_key.encode_options),
             source_workflow_hash=plan.source_workflow_hash,
+            workflow=workflow,
+            workflow_hash=plan.workflow_hash,
         )
         runtime_trace.emit("restore_plan_build_end", phase="local")
         runtime_trace.emit("restore_plan_publish_start", phase="local")

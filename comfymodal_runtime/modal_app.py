@@ -17,6 +17,7 @@ import copy
 from types import MappingProxyType
 
 import dataclasses
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, ContextManager, Mapping, cast
@@ -58,7 +59,11 @@ from .cpu_snapshot_models import (
     retarget_cpu_snapshot_models,
     _COMPUTE_POLICY_BF16_NATIVE,
 )
-from .unet_forward_probe import register_unet_forward_probe
+from .unet_forward_probe import (
+    register_unet_forward_probe,
+    install_registered_unet_forward_hooks,
+    reset_first_cuda_dedup,
+)
 from .output_delivery import (
     Attempt,
     _measure_json_bytes,
@@ -180,7 +185,13 @@ RUNTIME_STATE_PATH = "/mnt/comfymodal_runtime_state"
 V2_RESTORE_STATE_FILE = "v2_restore_plan.json"
 MIN_CONTAINERS = 0
 SCALEDOWN_WINDOW = 4
+_PUBLISHER_MARKER = "COMFYMODAL_PUBLISHER_CONTAINER"
 CLASS_NAME = "ModalRuntimeEntrypoint"
+# Process-local restore-stage timer accumulator.
+# Populated by _wrap_restore_stage wrappers in _configure_runtime, consumed by
+# restore() when building _restore_timing.  Thread-safe via GIL.
+_RESTORE_STAGE_TIMERS: dict[str, float] = {}
+
 # Process-local fallback for lifecycle timing when Modal separates enter/method instances.
 # Both startup() and restore() refresh this; _run_in_process and run_plan_stream
 # read it when self._restore_timing is None.
@@ -253,9 +264,199 @@ _RES4LYF_HOOK_INSTALLED: bool = False
 # Keyed by workflow_hash.  Stores UNET object id, workflow hash, inputs.
 _CACHEDIT_PREPARED: dict[str, dict[str, Any]] = {}
 
+# ContextVar for the current request's workflow hash.
+# Set in _execute_v2_prompt_executor immediately before PromptExecutor
+# execution and reset in finally.  Read by the RES4LYF hook to avoid
+# passing undeclared kwargs through the graph node interface.
+_V2_WORKFLOW_HASH: ContextVar[str] = ContextVar("_v2_workflow_hash", default="")
 
 
-# Plan A/B spec projection helpers (Plan C compatibility)
+
+# ── Canonical per-role identity comparison for restore + request binding ──
+
+
+def _resolve_effective_dtype_from_spec(model_spec: Any) -> str:
+    """Extract effective compute dtype label from a model_spec.
+
+    Reads the first UNET loader entry's weight_dtype and resolves it
+    through the snapshot-safe resolver.  Returns the resolved label or
+    ``"default"`` when the spec or entry is unavailable.  Never raises.
+    Logs ``"absent"`` when no UNET loader entry is present.
+    """
+    try:
+        if not isinstance(model_spec, dict):
+            return "absent"
+        loaders = model_spec.get("loaders", {})
+        if not isinstance(loaders, dict):
+            return "absent"
+        unet_entries = loaders.get("unet", [])
+        if not isinstance(unet_entries, (list, tuple)) or not unet_entries:
+            return "absent"
+        entry = unet_entries[0]
+        if not isinstance(entry, dict):
+            return "absent"
+        weight_dtype = str(entry.get("weight_dtype", "default"))
+        # Resolve through the snapshot-safe helper (no CUDA calls)
+        from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+        _dtype, _label = resolve_unet_effective_dtype(weight_dtype)
+        return _label or weight_dtype
+    except Exception:
+        return "absent"
+
+
+def _resolve_model_config_hash_from_spec(model_spec: Any) -> str:
+    """Compute a deterministic hash of UNET model-type/configuration fields
+    available in the spec.  Returns ``"absent"`` when no config fields exist.
+    """
+    try:
+        if not isinstance(model_spec, dict):
+            return "absent"
+        loaders = model_spec.get("loaders", {})
+        if not isinstance(loaders, dict):
+            return "absent"
+        unet_entries = loaders.get("unet", [])
+        if not isinstance(unet_entries, (list, tuple)) or not unet_entries:
+            return "absent"
+        entry = unet_entries[0]
+        if not isinstance(entry, dict):
+            return "absent"
+        # Include UNET name, loader_class, and weight_dtype in config identity
+        config_parts = {
+            "unet_name": str(entry.get("unet_name", "")),
+            "loader_class": str(entry.get("loader_class", "")),
+            "weight_dtype": str(entry.get("weight_dtype", "default")),
+        }
+        if not any(config_parts.values()):
+            return "absent"
+        from comfymodal_runtime.contracts import stable_hash
+        return stable_hash(config_parts)[:16]
+    except Exception:
+        return "absent"
+
+
+def _resolve_static_patch_hash_from_spec(model_spec: Any) -> str:
+    """Return static model patches hash from model_spec if present,
+    ``"none"`` when no patch metadata exists, ``"absent"`` when the spec
+    is not available.
+    """
+    try:
+        if not isinstance(model_spec, dict):
+            return "absent"
+        # Static patches would be stored in model_spec["static_patches_hash"]
+        # if present.  For standard V2 fast paths without CacheDiT/RES4LYF
+        # no patch metadata exists.
+        patch_hash = model_spec.get("static_patches_hash", "")
+        if patch_hash:
+            return str(patch_hash)
+        return "none"
+    except Exception:
+        return "absent"
+
+
+def _canonical_role_match_report(
+    *,
+    request_model_spec: Any,
+    snapshot_model_spec: Any,
+    request_custom_node_generation: str = "",
+    request_deployment_combined_hash: str = "",
+    snapshot_custom_node_generation: str = "",
+    snapshot_deployment_combined_hash: str = "",
+    request_unet_effective_dtype: str = "",
+    snapshot_unet_effective_dtype: str = "",
+    request_unet_model_config_hash: str = "",
+    snapshot_unet_model_config_hash: str = "",
+    request_unet_static_patches_hash: str = "",
+    snapshot_unet_static_patches_hash: str = "",
+) -> dict[str, Any]:
+    """Compare request and snapshot model specs using canonical per-role identity.
+
+    Returns a dict with:
+      ``compatible`` (bool) — True when BOTH UNET and CLIP role identities
+        are equivalent.  VAE does NOT participate.
+      ``unet_match`` (bool) — True when UNET identity matches.
+      ``clip_match`` (bool) — True when CLIP identity matches.
+      ``unet_mismatch_fields`` (list[str]) — Differing UNET fields.
+      ``clip_mismatch_fields`` (list[str]) — Differing CLIP fields.
+      ``unet_request_identity``, ``unet_snapshot_identity``,
+      ``clip_request_identity``, ``clip_snapshot_identity`` — the computed
+        identity dicts (with ``stable_id``).
+      ``reason`` (str) — Human-readable mismatch description, or ``"ok"``.
+
+    Uses the same ``compute_loader_role_identity`` /
+    ``find_role_identity_mismatch_fields`` helpers as executor seeding so
+    that restore matching and cache seeding derive from a single canonical
+    implementation.
+    """
+    from .contracts import (
+        compute_loader_role_identity,
+        find_role_identity_mismatch_fields,
+    )
+
+    result: dict[str, Any] = {
+        "compatible": False,
+        "unet_match": False,
+        "clip_match": False,
+        "unet_mismatch_fields": [],
+        "clip_mismatch_fields": [],
+        "reason": "unknown",
+    }
+
+    unet_request = compute_loader_role_identity(
+        "unet", request_model_spec or {},
+        custom_node_generation=request_custom_node_generation,
+        deployment_combined_hash=request_deployment_combined_hash,
+        static_model_patches_hash=request_unet_static_patches_hash,
+        effective_compute_dtype_label=request_unet_effective_dtype,
+        model_configuration_hash=request_unet_model_config_hash,
+    )
+    unet_snapshot = compute_loader_role_identity(
+        "unet", snapshot_model_spec or {},
+        custom_node_generation=snapshot_custom_node_generation,
+        deployment_combined_hash=snapshot_deployment_combined_hash,
+        static_model_patches_hash=snapshot_unet_static_patches_hash,
+        effective_compute_dtype_label=snapshot_unet_effective_dtype,
+        model_configuration_hash=snapshot_unet_model_config_hash,
+    )
+    clip_request = compute_loader_role_identity(
+        "clip", request_model_spec or {},
+        custom_node_generation=request_custom_node_generation,
+        deployment_combined_hash=request_deployment_combined_hash,
+    )
+    clip_snapshot = compute_loader_role_identity(
+        "clip", snapshot_model_spec or {},
+        custom_node_generation=snapshot_custom_node_generation,
+        deployment_combined_hash=snapshot_deployment_combined_hash,
+    )
+
+    unet_mismatch = find_role_identity_mismatch_fields(unet_request, unet_snapshot)
+    clip_mismatch = find_role_identity_mismatch_fields(clip_request, clip_snapshot)
+
+    unet_match = len(unet_mismatch) == 0
+    clip_match = len(clip_mismatch) == 0
+    compatible = unet_match and clip_match
+
+    # Build human-readable reason
+    parts: list[str] = []
+    if not unet_match:
+        parts.append(f"UNET:{','.join(unet_mismatch)}")
+    if not clip_match:
+        parts.append(f"CLIP:{','.join(clip_mismatch)}")
+    reason = "; ".join(parts) if parts else "ok"
+
+    result["compatible"] = compatible
+    result["unet_match"] = unet_match
+    result["clip_match"] = clip_match
+    result["unet_mismatch_fields"] = unet_mismatch
+    result["clip_mismatch_fields"] = clip_mismatch
+    result["unet_request_identity"] = unet_request
+    result["unet_snapshot_identity"] = unet_snapshot
+    result["clip_request_identity"] = clip_request
+    result["clip_snapshot_identity"] = clip_snapshot
+    result["reason"] = reason
+    return result
+
+
+# Plan A/B spec projection helpers (Plan C compatibility, kept for reference)
 
 
 def _cpu_snapshot_spec_projection(spec: Any) -> dict[str, list[dict[str, Any]]]:
@@ -541,8 +742,17 @@ def preimport_cachedit_family(
 
 
 def _install_res4lyf_parser_hook() -> bool:
-    """Install a process-local hook on ClownsharKSampler_Beta's FUNCTION
-    so prepared extra_options from restore are returned without parsing.
+    """Install a process-local hook on the ``ExtraOptions`` class used by
+    ClownsharKSampler_Beta's module so that when ``ExtraOptions(raw_string)``
+    is called at request time, the cached restore-prepared parser result is
+    returned when the current workflow hash and exact raw options match.
+
+    Reads ``_V2_WORKFLOW_HASH`` ContextVar — never adds undeclared kwargs
+    or passes parser objects as string arguments.  The hook replaces
+    ``ExtraOptions`` in the sampler module's namespace with a wrapper that
+    checks the ContextVar and returns a cached dict-based instance on exact
+    match, otherwise falling through to the original class.
+
     Returns True when hook was installed.  Idempotent.
     Does not edit external custom-node source files.
     """
@@ -554,28 +764,40 @@ def _install_res4lyf_parser_hook() -> bool:
         _cls = getattr(_r4_nodes, "NODE_CLASS_MAPPINGS", {}).get("ClownsharKSampler_Beta")
         if _cls is None:
             return False
-        _orig_main = getattr(_cls, "main", None)
-        if _orig_main is None:
+        _mod = getattr(_cls, "__module__", "")
+        if not _mod:
             return False
-        if getattr(_orig_main, "_comfy_modal_res4lyf_hook", False):
+        import importlib
+        _sampler_mod = importlib.import_module(_mod)
+        _orig_extra_options = getattr(_sampler_mod, "ExtraOptions", None)
+        if _orig_extra_options is None:
+            return False
+        if getattr(_orig_extra_options, "_comfy_modal_res4lyf_hook", False):
             _RES4LYF_HOOK_INSTALLED = True
             return True
 
-        def _hooked_main(self, **kwargs):
-            wf_hash = str(kwargs.get("_workflow_hash", ""))
-            if wf_hash and wf_hash in _RES4LYF_PREPARED:
-                _prep = _RES4LYF_PREPARED[wf_hash]
-                if _prep.get("extra_options"):
-                    kwargs["extra_options"] = _prep["extra_options"]
-                print(
-                    f"[v2.res4lyf_request] decision=reused parse_called=0 "
-                    f"wf_hash={wf_hash[:16]}",
-                    flush=True,
-                )
-            return _orig_main(self, **kwargs)
+        # Wrapper that checks ContextVar and caches parser result
+        class _HookedExtraOptions(_orig_extra_options):
+            _comfy_modal_res4lyf_hook = True
 
-        setattr(_hooked_main, "_comfy_modal_res4lyf_hook", True)
-        setattr(_cls, "main", _hooked_main)
+            def __init__(self, raw_options, *args, **kwargs):
+                wf_hash = _V2_WORKFLOW_HASH.get()
+                if wf_hash and wf_hash in _RES4LYF_PREPARED:
+                    _prep = _RES4LYF_PREPARED[wf_hash]
+                    _raw_key = str(raw_options).strip()
+                    for _record in _prep.get("records", ()):
+                        if _record.get("raw_options") == _raw_key:
+                            _parser_state = _record.get("parser_state")
+                            if _parser_state is not None:
+                                self.__dict__.update(dict(_parser_state))
+                                print(
+                                    "[v2.res4lyf_request] decision=reused parse_called=0",
+                                    flush=True,
+                                )
+                                return
+                super().__init__(raw_options, *args, **kwargs)
+
+        setattr(_sampler_mod, "ExtraOptions", _HookedExtraOptions)
         _RES4LYF_HOOK_INSTALLED = True
         return True
     except Exception:
@@ -1314,6 +1536,20 @@ def _reference_image() -> Any:
 def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
     """Build the actual v2 app, image, Volumes, and source identity."""
     runtime_spec = spec or ModalRuntimeSpec()
+    # Lightweight container path: standalone publisher never needs
+    # custom_nodes_root, deployment identity, reference image, or
+    # Modal volume/app handles.  Return null resources immediately.
+    if os.environ.get(_PUBLISHER_MARKER) == "1":
+        print("[comfymodal] publisher_container=1 skipping heavyweight resource construction", flush=True)
+        return {
+            "app": None,
+            "image": None,
+            "models_volume": None,
+            "custom_nodes_volume": None,
+            "runtime_state_volume": None,
+            "source_identity": None,
+            "spec": runtime_spec,
+        }
     runtime_root = Path(__file__).resolve().parent
     custom_root = _local_custom_nodes_root()
     identity = build_deployment_identity(runtime_root, custom_node_paths=[custom_root])
@@ -1850,6 +2086,22 @@ class ModalRuntimeEntrypoint:
         # returns the builder-computed value on first priority.
         module._CANONICAL_DEPLOYMENT_COMBINED_HASH = _V2_DEPLOYMENT_COMBINED_HASH
 
+        # ── Restore-accounting timer wrappers ──
+        # Each wrapped callback records monotonic duration into module-level
+        # _RESTORE_STAGE_TIMERS.  The accumulated durations are merged into
+        # _restore_timing at the restore() method boundary.
+        def _wrap_restore_stage(name: str, fn: Callable[[], Any]) -> Callable[[], Any]:
+            """Return a wrapper that records monotonic wall time in _RESTORE_STAGE_TIMERS."""
+            global _RESTORE_STAGE_TIMERS
+            def _timed() -> Any:
+                _start = time.monotonic_ns()
+                try:
+                    return fn()
+                finally:
+                    _dur = round((time.monotonic_ns() - _start) / 1_000_000, 3)
+                    _RESTORE_STAGE_TIMERS[name] = _RESTORE_STAGE_TIMERS.get(name, 0.0) + _dur
+            return _timed
+
         def reload_models() -> None:
             volume = getattr(module, "vol", None)
             if volume is not None:
@@ -1883,6 +2135,14 @@ class ModalRuntimeEntrypoint:
             if isinstance(value, tuple) and len(value) == 2:
                 return {"device": str(value[0]), "diagnostics": value[1]}
             return {"result": value}
+
+        # Wrap restore-related callbacks with monotonic timers for restore accounting.
+        # The _RESTORE_STAGE_TIMERS dict is accumulated here and consumed by the
+        # restore() method's final _restore_timing merge.
+        reload_models = _wrap_restore_stage("reload_models", reload_models)
+        reload_runtime_state = _wrap_restore_stage("reload_runtime_state", reload_runtime_state)
+        restore_gpu_state = _wrap_restore_stage("restore_gpu_state", restore_gpu_state)
+        initialize_cuda = _wrap_restore_stage("initialize_cuda", initialize_cuda)
 
         def apply_sage_policy() -> Any:
             return api._apply_sage_attention_policy()
@@ -2043,8 +2303,18 @@ class ModalRuntimeEntrypoint:
             # _compute_v2_cert_identity, runs real api preflight then
             # execution.validate_prompt via one-shot sync coroutine helper.
             # Stores exact certificate on bootstrap state, valid true.
+            snapshot_plan = None
             try:
                 snapshot_plan = self._get_remote_restore_publisher().read_current_plan()
+            except Exception:
+                pass
+            # Exact guard: if snapshot_plan has workflow_hash but no workflow,
+            # the plan is corrupt and cannot build a certificate.  This guard
+            # is OUTSIDE the cert try/except so RuntimeError escapes startup
+            # and snapshot creation stops.
+            if snapshot_plan is not None and snapshot_plan.workflow_hash and not snapshot_plan.workflow:
+                raise RuntimeError("restore plan contains workflow_hash but no workflow")
+            try:
                 if snapshot_plan is not None and snapshot_plan.workflow_hash:
                     _sp_wf = _thaw(snapshot_plan.workflow)
                     _sp_wf_hash = snapshot_plan.workflow_hash
@@ -2483,8 +2753,14 @@ class ModalRuntimeEntrypoint:
         }
 
     def restore(self) -> dict[str, Any]:
-        global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count
+        global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
         _report_host_memory("restore_start")
+        # Reset process-global restore-stage timers at entry to prevent
+        # stale accumulation across restores.  Each restore gets its own
+        # timing state.
+        _RESTORE_STAGE_TIMERS.clear()
+        _RESTORE_STAGE_TIMERS["snapshot_identity_checks"] = 0.0
+        _RESTORE_STAGE_TIMERS["cpu_snapshot_retargeting"] = 0.0
         # â”€â”€ Remote resume / restore method boundary timestamps â”€â”€â”€â”€â”€â”€â”€â”€
         remote_python_resume_wall_ns: int = int(time.time() * 1_000_000_000)
         remote_python_resume_mono_ns: int = time.monotonic_ns()
@@ -2751,39 +3027,72 @@ class ModalRuntimeEntrypoint:
 
                 plan = self._restore_plan
 
-                # Step 1: Compatibility check (non-VAE key, projected spec)
-                _keys_match = _cpu_snapshot_model_keys_match(plan.model_key, models.model_key)
-                _specs_match = _cpu_snapshot_specs_match(plan.model_spec, models.model_spec)
-                _key_reason = _cpu_snapshot_key_mismatch_reason(plan.model_key, models.model_key)
-                _spec_reason = _cpu_snapshot_spec_mismatch_reason(plan.model_spec, models.model_spec)
-                _request_key_hash = plan.model_key.stable_hash[:16] if plan.model_key else ""
-                _request_spec_hash = stable_hash(plan.model_spec)[:16] if plan.model_spec else ""
+                # Step 1: Compatibility check using canonical per-role identity
+                # Derive custom_node_generation from bootstrap state if available
+                _restore_cn_gen = ""
+                _restore_dep_hash = _V2_DEPLOYMENT_COMBINED_HASH
+                try:
+                    _bs = getattr(getattr(self, 'bootstrap', None), 'state', None)
+                    if _bs is not None:
+                        _restore_cn_gen = str(_bs.snapshot_custom_node_generation or "")
+                        if not _restore_dep_hash:
+                            _restore_dep_hash = str(_bs.deployment_combined_hash or "")
+                except Exception:
+                    pass
+                _identity_check_start_ns = time.monotonic_ns()
+                _role_report = _canonical_role_match_report(
+                    request_model_spec=plan.model_spec,
+                    snapshot_model_spec=models.model_spec,
+                    request_custom_node_generation=_restore_cn_gen,
+                    request_deployment_combined_hash=_restore_dep_hash,
+                    snapshot_custom_node_generation=str(
+                        getattr(models, "custom_node_generation", "")
+                    ) if _restore_cn_gen else "",
+                    snapshot_deployment_combined_hash=_restore_dep_hash,
+                    request_unet_effective_dtype=_resolve_effective_dtype_from_spec(plan.model_spec),
+                    request_unet_model_config_hash=_resolve_model_config_hash_from_spec(plan.model_spec),
+                    request_unet_static_patches_hash=_resolve_static_patch_hash_from_spec(plan.model_spec),
+                    snapshot_unet_static_patches_hash=_resolve_static_patch_hash_from_spec(models.model_spec),
+                )
+                _RESTORE_STAGE_TIMERS["snapshot_identity_checks"] = round(
+                    (time.monotonic_ns() - _identity_check_start_ns) / 1_000_000, 3
+                )
+                _keys_match = _role_report["compatible"]
+                _specs_match = _role_report["compatible"]
+                _key_reason = _role_report["reason"] if not _role_report["compatible"] else None
+                _spec_reason = None
+                _request_key_hash = stable_hash(plan.model_spec)[:16] if plan.model_spec else ""
+                _request_spec_hash = stable_hash(models.model_spec)[:16] if models.model_spec else ""
                 print(
                     f"[v2.cpu_snapshot_match] "
                     f"keys_match={int(_keys_match)} specs_match={int(_specs_match)} "
                     f"key_reason={_key_reason or 'ok'} "
-                    f"spec_reason={_spec_reason or 'ok'} "
+                    f"spec_reason=unified "
                     f"snapshot_key_hash={_snapshot_key_hash} "
                     f"request_key_hash={_request_key_hash} "
                     f"snapshot_spec_hash={_snapshot_spec_hash} "
-                    f"request_spec_hash={_request_spec_hash}",
+                    f"request_spec_hash={_request_spec_hash} "
+                    f"unet_match={int(_role_report['unet_match'])} "
+                    f"clip_match={int(_role_report['clip_match'])}",
                     flush=True,
                 )
 
-                if not _keys_match or not _specs_match:
+                if not _role_report["compatible"]:
                     # Incompatible: clear bridge and fall through to existing
                     # preload branch exactly as before.
                     self._preload_bridge.clear()
                     self._cpu_snapshot_models_active = False
                     self._cpu_snapshot_unet_runtime_state = None
                     _cpu_snapshot_activated = False
-                    # Combine both reasons when available
-                    _parts = []
-                    if _key_reason:
-                        _parts.append(f"key:{_key_reason}")
-                    if _spec_reason:
-                        _parts.append(f"spec:{_spec_reason}")
-                    _cpu_snapshot_activate_error = "; ".join(_parts) or "compatibility mismatch"
+                    _role_reason = "; ".join(
+                        p for p in [
+                            f"UNET:{','.join(_role_report['unet_mismatch_fields'])}"
+                            if not _role_report['unet_match'] else "",
+                            f"CLIP:{','.join(_role_report['clip_mismatch_fields'])}"
+                            if not _role_report['clip_match'] else "",
+                        ] if p
+                    ) or "compatibility mismatch"
+                    _cpu_snapshot_activate_error = _role_reason
                     _activation_duration_ms = round(
                         (time.perf_counter() - _activation_perf_start) * 1000.0,
                         3,
@@ -2800,8 +3109,10 @@ class ModalRuntimeEntrypoint:
                             "unet_object_type": type(models.unet).__name__
                             if models.unet is not None else "",
                             "duration_ms": _activation_duration_ms,
-                            "keys_match": int(_keys_match),
-                            "specs_match": int(_specs_match),
+                            "keys_match": int(_role_report["compatible"]),
+                            "specs_match": int(_role_report["compatible"]),
+                            "unet_match": int(_role_report["unet_match"]),
+                            "clip_match": int(_role_report["clip_match"]),
                         },
                     )
                     _bridge_installed = 1 if self._preload_bridge._original_methods else 0
@@ -3068,6 +3379,7 @@ class ModalRuntimeEntrypoint:
                         )
 
                     # Activate on the bridge.
+                    _retarget_start_ns = time.monotonic_ns()
                     self._use_cpu_snapshot_models_on_bridge(
                         plan.model_key,
                         plan.prefill_key,
@@ -3075,6 +3387,9 @@ class ModalRuntimeEntrypoint:
                         models.unet,
                         models.clip,
                         trace=trace,
+                    )
+                    _RESTORE_STAGE_TIMERS["cpu_snapshot_retargeting"] = round(
+                        (time.monotonic_ns() - _retarget_start_ns) / 1_000_000, 3
                     )
                     self._cpu_snapshot_models_active = True
                     _cpu_snapshot_activated = True
@@ -3087,25 +3402,58 @@ class ModalRuntimeEntrypoint:
                         "clip": str(getattr(plan.model_key, "clip_identity", "") or ""),
                     }
                     register_unet_forward_probe(models.unet, source="cpu_snapshot")
-                    # CacheDiT restore preparation with exact snapshot UNET and workflow inputs
+                    install_registered_unet_forward_hooks()
+                    # CacheDiT restore preparation: locate exactly one
+                    # CacheDiT_Model_Optimizer node from snapshot plan.workflow,
+                    # pass ONLY its node inputs (helper removes 'model'), consume
+                    # patched_model and replace all UNET references.
+                    _cd_restore_node_ids: list[str] = []
+                    _cd_restore_inputs: dict[str, Any] = {}
                     try:
-                        _wf_inputs = dict(_thaw(getattr(plan, "workflow", {})))
-                        _cd_result = state._restore_cachedit_prepare(
-                            unet=models.unet,
-                            workflow_inputs=_wf_inputs,
-                            workflow_hash=str(getattr(plan, "workflow_hash", "")),
-                        )
-                        if _cd_result.get("ok"):
-                            _CACHEDIT_PREPARED[str(getattr(plan, "workflow_hash", ""))] = {
-                                "unet_id": id(models.unet),
-                                "workflow_hash": str(getattr(plan, "workflow_hash", "")),
-                                "cache_dit_inputs": _wf_inputs,
-                            }
-                        print(
-                            f"[v2.cachedit_restore] ok={int(_cd_result.get('ok', False))} "
-                            f"unet_ident={str(_cd_result.get('unet_identity', ''))[:16]}",
-                            flush=True,
-                        )
+                        _plan_wf = _thaw(getattr(plan, "workflow", {}))
+                        for _nid, _node in _plan_wf.items():
+                            if isinstance(_node, Mapping) and _node.get("class_type") == "CacheDiT_Model_Optimizer":
+                                _cd_restore_node_ids.append(str(_nid))
+                        # Require exactly one CacheDiT_Model_Optimizer node
+                        if len(_cd_restore_node_ids) == 1:
+                            _cd_restore_node_id = _cd_restore_node_ids[0]
+                            _cd_restore_inputs = dict(
+                                _plan_wf.get(_cd_restore_node_id, {}).get("inputs", {})
+                            )
+                            _cd_result = state._restore_cachedit_prepare(
+                                unet=models.unet,
+                                workflow_inputs=_cd_restore_inputs,
+                                workflow_hash=str(getattr(plan, "workflow_hash", "")),
+                            )
+                            if _cd_result.get("ok"):
+                                _patched_model = _cd_result.get("patched_model")
+                                if _patched_model is not None:
+                                    # Replace all UNET references with patched model
+                                    state.snapshot_loader_outputs["unet"] = _patched_model
+                                    self._cpu_snapshot_models.unet = _patched_model
+                                    # Re-activate the bridge with patched UNET
+                                    self._use_cpu_snapshot_models_on_bridge(
+                                        plan.model_key,
+                                        plan.prefill_key,
+                                        plan.model_spec,
+                                        _patched_model,
+                                        models.clip,
+                                        trace=trace,
+                                    )
+                                    # Re-register forward probe after replacement
+                                    register_unet_forward_probe(_patched_model, source="cachedit_restore")
+                                _CACHEDIT_PREPARED[str(getattr(plan, "workflow_hash", ""))] = {
+                                    "unet_id": id(_patched_model) if _patched_model is not None else id(models.unet),
+                                    "workflow_hash": str(getattr(plan, "workflow_hash", "")),
+                                    "cache_dit_inputs": _cd_restore_inputs,
+                                }
+                                if _patched_model is not None:
+                                    print(
+                                        f"[v2.cachedit_restore] decision=prepared "
+                                        f"node_id={_cd_restore_node_id} "
+                                        f"unet_match=1",
+                                        flush=True,
+                                    )
                     except Exception as _cd_exc:
                         print(f"[v2.cachedit_restore] error={_cd_exc}", flush=True)
                     # RES4LYF restore preparation
@@ -3121,19 +3469,36 @@ class ModalRuntimeEntrypoint:
                         )
                         if _r4_result.get("ok"):
                             _installed = _install_res4lyf_parser_hook()
-                            if _installed and state._res4lyf_static_prepared:
-                                for _r4_node_id, _r4_inputs in state._res4lyf_static_prepared:
-                                    _elem = dict(_r4_inputs)
-                                    _RES4LYF_PREPARED[str(getattr(plan, "workflow_hash", ""))] = {
-                                        "extra_options": _elem.get("extra_options", ""),
-                                        "static_inputs": _elem,
-                                    }
-                        print(
-                            f"[v2.res4lyf_restore] ok={int(_r4_result.get('ok', False))} "
-                            f"nodes={_r4_result.get('sampler_nodes', 0)} "
-                            f"hook_installed={int(_RES4LYF_HOOK_INSTALLED)}",
-                            flush=True,
-                        )
+                            _prepared_records = []
+                            for _record in _r4_result.get("prepared_records", ()):
+                                _parser = _record.get("parser")
+                                if _parser is None:
+                                    continue
+                                _prepared_records.append(MappingProxyType({
+                                    "node_id": str(_record.get("node_id", "")),
+                                    "raw_options": str(_record.get("raw_extra_options", "")).strip(),
+                                    "parser_state": MappingProxyType(dict(_parser.__dict__)),
+                                }))
+                            if _installed and _prepared_records:
+                                _wf_hash_key = str(getattr(plan, "workflow_hash", ""))
+                                _RES4LYF_PREPARED[_wf_hash_key] = {
+                                    "records": tuple(_prepared_records),
+                                }
+                                _r4_node_ids = ",".join(
+                                    str(record["node_id"]) for record in _prepared_records
+                                )
+                                print(
+                                    f"[v2.res4lyf_restore] decision=prepared "
+                                    f"node_id={_r4_node_ids} "
+                                    f"hook_installed={int(_RES4LYF_HOOK_INSTALLED)}",
+                                    flush=True,
+                                )
+                        else:
+                            _reason = _r4_result.get("reason", "unknown")
+                            print(
+                                f"[v2.res4lyf_restore] ok=0 reason={_reason}",
+                                flush=True,
+                            )
                     except Exception as _r4_exc:
                         print(f"[v2.res4lyf_restore] error={_r4_exc}", flush=True)
                     _activation_duration_ms = round(
@@ -3456,6 +3821,26 @@ class ModalRuntimeEntrypoint:
                 for _stage, _dur_ms in state.stage_durations.items():
                     if _dur_ms is not None and _dur_ms > 0:
                         _restore_timing[f"{_stage}_ms"] = round(float(_dur_ms), 3)
+            # Merge restore-stage timers (reload_runtime_state, reload_models,
+            # restore_gpu_state, initialize_cuda, snapshot_identity_checks,
+            # cpu_snapshot_retargeting) collected by _wrap_restore_stage and
+            # direct inline timing in restore().
+            _REQUIRED_RESTORE_STAGES = (
+                "reload_runtime_state", "reload_models", "restore_gpu_state",
+                "initialize_cuda", "snapshot_identity_checks", "cpu_snapshot_retargeting",
+            )
+            for _stage in _REQUIRED_RESTORE_STAGES:
+                _dur_ms = _RESTORE_STAGE_TIMERS.get(_stage, 0.0)
+                _restore_timing[f"{_stage}_ms"] = round(_dur_ms, 3)
+                _restore_timing[f"{_stage}_invoked"] = _dur_ms > 0.0
+                _restore_timing[f"{_stage}_reason"] = (
+                    "ok" if _dur_ms > 0.0 else "not_invoked"
+                )
+            # Merge any additional non-required stage timers present
+            if _RESTORE_STAGE_TIMERS:
+                for _stage, _dur_ms in _RESTORE_STAGE_TIMERS.items():
+                    if _stage not in _REQUIRED_RESTORE_STAGES and _dur_ms > 0:
+                        _restore_timing[f"{_stage}_ms"] = round(_dur_ms, 3)
             self._restore_timing = _restore_timing
             _LATEST_LIFECYCLE_TIMING = _restore_timing
 
@@ -3554,6 +3939,10 @@ class ModalRuntimeEntrypoint:
             )
             return _restore_result
         finally:
+            # Clear process-global restore-stage timers to prevent stale
+            # accumulation on the next restore.  This finally runs regardless
+            # of success or cancellation.
+            _RESTORE_STAGE_TIMERS.clear()
             if _restore_end_wall_ns is None:
                 _restore_end_wall_ns = int(time.time() * 1_000_000_000)
                 _restore_end_mono_ns = time.monotonic_ns()
@@ -3632,10 +4021,11 @@ class ModalRuntimeEntrypoint:
                 request_model_spec = build_restore_model_spec(workflow, model_stack)
                 snapshot_key = self._cpu_snapshot_models.model_key
                 snapshot_spec = self._cpu_snapshot_models.model_spec
-                if (
-                    _cpu_snapshot_model_keys_match(request_model_key, snapshot_key)
-                    and _cpu_snapshot_specs_match(request_model_spec, snapshot_spec)
-                ):
+                _role_report = _canonical_role_match_report(
+                    request_model_spec=request_model_spec,
+                    snapshot_model_spec=snapshot_spec,
+                )
+                if _role_report["compatible"]:
                     _flags = plan.execution_options.compatibility_flags
                     _bypass_snapshot_unet = isinstance(_flags, Mapping) and _flags.get("diagnostic_bypass_cpu_snapshot_unet") is True
                     if _bypass_snapshot_unet:
@@ -3968,6 +4358,10 @@ class ModalRuntimeEntrypoint:
         authorization, output collection, and result packaging. ComfyUI still
         owns its actual PromptExecutor and node execution semantics.
         """
+        # Reset the per-request unet_first_cuda_op dedup so the first forward
+        # pass of this request emits the event.  Must fire before any CUDA op.
+        reset_first_cuda_dedup()
+
         if context.cancelled and context.cancelled():
             raise RuntimeError("execution cancelled before PromptExecutor start")
 
@@ -4076,7 +4470,7 @@ class ModalRuntimeEntrypoint:
             # deployment identity, repair mode, and custom-nodes generation
             # are all complete and recognised.
             if _V2_VALIDATION_CERT_ENABLED:
-                _cert_wf_hash = plan.workflow_hash or plan.source_workflow_hash or ""
+                _cert_wf_hash = plan.workflow_hash or ""
                 if _cert_wf_hash:
                     _v2_dep_hash = _V2_DEPLOYMENT_COMBINED_HASH
 
@@ -4100,9 +4494,10 @@ class ModalRuntimeEntrypoint:
                         _diag_cert_identity_build_ms = round((time.perf_counter() - _cert_identity_build_start) * 1000, 3)
 
                         # -- Snapshot-memory certificate check --
-                        # On exact hit, assign outputs/node_errors from stored payload,
-                        # set V2 cert skip flags, zero all volume/file/json diagnostics,
-                        # and do NOT enter process-cache/Volume/dependency preflight/validation.
+                        # On exact hit (full identity_components match or cert_identity),
+                        # assign outputs/node_errors from stored payload, set V2 cert
+                        # skip flags, zero all volume/file/json diagnostics, and do NOT
+                        # enter process-cache/Volume/dependency preflight/validation paths.
                         _snap_cert_source = None
                         _snapshot_valid = False
                         if hasattr(self, 'bootstrap') and self.bootstrap is not None:
@@ -4112,10 +4507,20 @@ class ModalRuntimeEntrypoint:
                                 _sc_components = _sc.get("identity_components", {}) if isinstance(_sc, dict) else {}
                                 _sc_outputs = _sc.get("outputs_to_execute", [])
                                 _sc_errors = _sc.get("node_errors", {})
-                                if (
+                                # Match full identity_components dictionary: workflow_hash,
+                                # deployment_hash, repair_mode, custom_nodes_generation,
+                                # schema_version — or cert_identity — not only workflow_hash
+                                # and custom_nodes_generation.
+                                _sc_identity_ok = (
                                     isinstance(_sc_components, dict)
-                                    and _sc_components.get("workflow_hash", "") == _cert_wf_hash
-                                    and _sc_components.get("custom_nodes_generation", "") == _v2_custom_nodes_gen
+                                    and _sc_components == _v2_cert_components
+                                )
+                                if not _sc_identity_ok:
+                                    # Fallback: match by cert_identity
+                                    _sc_cert_id = str(_sc.get("identity", "") or "")
+                                    _sc_identity_ok = bool(_sc_cert_id and _sc_cert_id == _v2_cert_identity)
+                                if (
+                                    _sc_identity_ok
                                     and _sc.get("preflight_ok") is True
                                     and isinstance(_sc_outputs, list)
                                     and len(_sc_outputs) > 0
@@ -4136,7 +4541,7 @@ class ModalRuntimeEntrypoint:
                                     _diag_cert_total_ms = _diag_cert_identity_build_ms
                                     _snap_cert_source = "snapshot_memory"
                                     print(
-                                        f"[v2.cert] source=snapshot_memory identity={_v2_cert_identity[:16]} "
+                                        f"[v2.cert] source=snapshot_memory hit=1 "
                                         f"outputs={len(outputs_to_execute)}",
                                         flush=True,
                                     )
@@ -4456,7 +4861,7 @@ class ModalRuntimeEntrypoint:
             )
             if valid and outputs_to_execute and _cert_write_eligible:
                 if not _v2_cert_identity:
-                    _cert_wf_hash = plan.workflow_hash or plan.source_workflow_hash or ""
+                    _cert_wf_hash = plan.workflow_hash or ""
                     if _cert_wf_hash and _V2_VALIDATION_CERT_ENABLED:
                         _v2_cert_identity, _v2_cert_components = _compute_v2_cert_identity(
                             _cert_wf_hash,
@@ -4558,10 +4963,14 @@ class ModalRuntimeEntrypoint:
         started = time.time()
         try:
             # ── CacheDiT request verification ──
-            _wf_hash = plan.workflow_hash or plan.source_workflow_hash or ""
+            _wf_hash = plan.workflow_hash or ""
             _cd_prep = _CACHEDIT_PREPARED.get(_wf_hash)
             if _cd_prep is not None:
-                _cd_current_unet = state.snapshot_loader_outputs.get("unet")
+                _bs_state = getattr(getattr(self, 'bootstrap', None), 'state', None)
+                _cd_current_unet = (
+                    _bs_state.snapshot_loader_outputs.get("unet")
+                    if _bs_state is not None else None
+                )
                 _cd_match = (
                     _cd_current_unet is not None
                     and id(_cd_current_unet) == _cd_prep.get("unet_id")
@@ -4686,6 +5095,50 @@ class ModalRuntimeEntrypoint:
                                     _milestones["first_clip_encode_node"] = _node_str
                                     _milestones["first_clip_encode_node_class"] = _class_node
                                     _milestones["first_clip_encode_node_ns"] = _event_ns
+                                # VAE decode node tracking: emit start when VAEDecode first
+                                # executes, end when the next different node or None executes.
+                                if "VAEDecode" in _class_node and "vae_decode_started" not in _milestones:
+                                    _milestones["vae_decode_started"] = _event_ns
+                                    _milestones["vae_decode_node_id"] = _node_str
+                                    trace.emit("vae_decode_start", phase="execution", metadata={
+                                        "node_id": _node_str,
+                                        "node_class": _class_node,
+                                    })
+                                # Production output encode tracking: ComfyModalProductionOutput
+                                # and ComfyModalProductionImageComparerOutput are OUTPUT_NODE=True
+                                # nodes that run after VAE decode to encode images to WebP/PNG.
+                                # We track their execution as the authoritative output encode.
+                                if ("ComfyModalProductionOutput" in _class_node
+                                        or "ComfyModalProductionImageComparerOutput" in _class_node):
+                                    if "output_encode_started" not in _milestones:
+                                        _milestones["output_encode_started"] = _event_ns
+                                        trace.emit("output_encode_start", phase="execution", metadata={
+                                            "node_id": _node_str,
+                                            "node_class": _class_node,
+                                        })
+                                elif "output_encode_started" in _milestones and "output_encode_ended" not in _milestones:
+                                    # End when a different node or None executes after the output node
+                                    if _node is None or (
+                                        "ComfyModalProductionOutput" not in _class_node
+                                        and "ComfyModalProductionImageComparerOutput" not in _class_node
+                                    ):
+                                        _milestones["output_encode_ended"] = _event_ns
+                                        _enc_dur = round(
+                                            (_event_ns - _milestones["output_encode_started"]) / 1_000_000, 3
+                                        )
+                                        trace.emit("output_encode_end", phase="execution", metadata={
+                                            "duration_ms": _enc_dur,
+                                        })
+                                elif "vae_decode_started" in _milestones and "vae_decode_ended" not in _milestones:
+                                    # Track VAE end when a different node or None executes after VAEDecode
+                                    if _node is None or _node_str != _milestones.get("vae_decode_node_id", ""):
+                                        _milestones["vae_decode_ended"] = _event_ns
+                                        _vae_dur = round(
+                                            (_event_ns - _milestones["vae_decode_started"]) / 1_000_000, 3
+                                        )
+                                        trace.emit("vae_decode_end", phase="execution", metadata={
+                                            "duration_ms": _vae_dur,
+                                        })
                                 # First sampler-related node
                                 if ("first_sampler_node" not in _milestones
                                         and ("Sampler" in _class_node or "KSampler" in _class_node)):
@@ -4721,12 +5174,20 @@ class ModalRuntimeEntrypoint:
                             _milestones["first_sampler_stage_event"] = event
                             _milestones["first_sampler_stage_wall_ns"] = time.time_ns()
                             _sampler_node_id = _milestones.get("first_sampler_node", "?")
+                            trace.emit("sampling_start", phase="execution", metadata={
+                                "node_id": _sampler_node_id,
+                                "node_class": _node_class_map.get(_sampler_node_id, ""),
+                                "steps": 8,
+                            })
                             print(
                                 f"[v2.sampler] event=start "
                                 f"node_id={_sampler_node_id} "
                                 f"steps=8",
                                 flush=True,
                             )
+                    # Compatibility fallback: only emit sampling_end if the
+                    # authoritative post-executor path did not already fire it.
+                    # This fallback cannot be authoritative and cannot overwrite.
                     elif event in ("execution_success", "execution_error") and "first_sampler_stage_ns" in _milestones:
                         if "sampler_end_logged" not in _milestones:
                             _milestones["sampler_end_logged"] = True
@@ -4735,13 +5196,28 @@ class ModalRuntimeEntrypoint:
                             _sampler_duration_ms = round(
                                 (time.time_ns() - _sampler_start_wall) / 1_000_000, 3
                             ) if _sampler_start_wall else 0.0
-                            print(
-                                f"[v2.sampler] event=end "
-                                f"node_id={_sampler_node_id} "
-                                f"steps=8 "
-                                f"duration_ms={_sampler_duration_ms}",
-                                flush=True,
-                            )
+                            _sampler_duration_mono: float | None = None
+                            _ss_ns = _milestones.get("first_sampler_stage_ns")
+                            if _ss_ns:
+                                _sampler_duration_mono = round(
+                                    (time.monotonic_ns() - _ss_ns) / 1_000_000, 3
+                                )
+                            # Only emit if the authoritative path did not already emit
+                            if not _milestones.get("_authoritative_sampler_end_emitted", False):
+                                trace.emit("sampling_end", phase="execution", metadata={
+                                    "node_id": _sampler_node_id,
+                                    "node_class": _node_class_map.get(_sampler_node_id, ""),
+                                    "duration_ms": _sampler_duration_mono or _sampler_duration_ms,
+                                    "steps": 8,
+                                    "source": "execution_success_fallback",
+                                })
+                                print(
+                                    f"[v2.sampler] event=end (fallback) "
+                                    f"node_id={_sampler_node_id} "
+                                    f"steps=8 "
+                                    f"duration_ms={_sampler_duration_ms}",
+                                    flush=True,
+                                )
                     return _orig_send_sync(*args, **kwargs)
                 setattr(_send_sync_wrapper, "_comfy_modal_send_sync", True)
                 _server.send_sync = _send_sync_wrapper
@@ -4776,6 +5252,7 @@ class ModalRuntimeEntrypoint:
                 "sampler_node_count": len(_sampler_node_ids),
                 "total_nodes": len(_node_class_map),
             })
+            _wf_hash_token = _V2_WORKFLOW_HASH.set(_wf_hash)
             try:
                 with pre_sampler_instrumentation_scope() as _pre_sampler_state:
                     if callable(execute_async):
@@ -4785,6 +5262,7 @@ class ModalRuntimeEntrypoint:
                     else:
                         executor.execute(**execute_kwargs)
             finally:
+                _V2_WORKFLOW_HASH.reset(_wf_hash_token)
                 try:
                     # Restore original add_message
                     if _milestone_wrapper_ok and _orig_add_message is not None:
@@ -4800,6 +5278,29 @@ class ModalRuntimeEntrypoint:
                     })
 
             # â”€â”€ Compute derived milestone intervals â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ---- Authoritative sampling_end (before VAE decode, before derived milestones) ----
+            if _milestones and "first_sampler_stage_ns" in _milestones and "sampler_end_logged" not in _milestones:
+                _milestones["_authoritative_sampler_end_emitted"] = True
+                _sampler_node_id = _milestones.get("first_sampler_node", "?")
+                _ss_ns = _milestones.get("first_sampler_stage_ns")
+                if _ss_ns:
+                    _auth_sampler_duration_ms = round(
+                        (time.monotonic_ns() - _ss_ns) / 1_000_000, 3
+                    )
+                    trace.emit("sampling_end", phase="execution", metadata={
+                        "node_id": _sampler_node_id,
+                        "node_class": _node_class_map.get(_sampler_node_id, ""),
+                        "duration_ms": _auth_sampler_duration_ms,
+                        "steps": 8,
+                        "source": "authoritative_post_executor",
+                    })
+                    print(
+                        f"[v2.sampler] event=end (authoritative) "
+                        f"node_id={_sampler_node_id} "
+                        f"steps=8 "
+                        f"duration_ms={_auth_sampler_duration_ms}",
+                        flush=True,
+                    )
             _exec_st_ns = _milestones.get("execution_start") if _milestones else None
             _cached_ns = _milestones.get("execution_cached") if _milestones else None
             _first_ns = _milestones.get("executing") if _milestones else None
@@ -5243,6 +5744,14 @@ class ModalRuntimeEntrypoint:
                         ) if hasattr(selected, "metrics") and isinstance(selected.metrics, Mapping) else False,
                     },
                 )
+            # output_persist_start/end: wraps actual volume persistence + descriptor
+            # construction.  Distinguished from output_encode_start/end which wrap
+            # the actual image encoding inside the executor (ComfyModalProductionOutput).
+            trace.emit("output_persist_start", phase="output", metadata={
+                "prompt_id": prompt_id,
+                "strategy": selected.strategy,
+                "items": selected.total_items,
+            })
             _descriptor_start_mono_ns = time.monotonic_ns()
             selected, _asset_commit_task, _asset_diag = await self._persist_output_assets(selected)
             if selected_index is not None:
@@ -5256,6 +5765,12 @@ class ModalRuntimeEntrypoint:
                 legacy_data=False,
             )
             _descriptor_end_mono_ns = time.monotonic_ns()
+            trace.emit("output_persist_end", phase="output", metadata={
+                "duration_ms": round((_descriptor_end_mono_ns - _descriptor_start_mono_ns) / 1_000_000, 3),
+                "items": selected.total_items,
+                "hashes": selected.output_hash_count,
+                "serialized_bytes": result.get("output_diagnostics", {}).get("serialized_result_bytes", 0),
+            })
             if _asset_commit_task is not None:
                 _asset_commit_diag = await _asset_commit_task
                 _asset_diag.update(_asset_commit_diag)
@@ -5301,6 +5816,17 @@ class ModalRuntimeEntrypoint:
                 result["output_attempts"][selected_index]["metrics"]["serialized_result_bytes"] = payload_bytes
             if isinstance(result.get("output_diagnostics"), dict):
                 result["output_diagnostics"]["serialized_result_bytes"] = payload_bytes
+            # Exactly one per-request output summary (after serialized_result_bytes is real)
+            print(
+                f"[v2.output] "
+                f"hashes={result['output_diagnostics']['output_hash_count']} "
+                f"base64_encode={result['output_diagnostics']['base64_encode_count']} "
+                f"base64_decode={result['output_diagnostics']['base64_decode_count']} "
+                f"commit_ms={result['output_diagnostics']['output_volume_commit_ms']} "
+                f"overlap_ms={result['output_diagnostics']['output_commit_overlap_ms']} "
+                f"serialized_bytes={result['output_diagnostics']['serialized_result_bytes']}",
+                flush=True,
+            )
 
             trace.emit(
                 "output_collect_end",
@@ -5399,64 +5925,58 @@ class ModalRuntimeEntrypoint:
         state = getattr(getattr(self, "bootstrap", None), "state", None)
         if state is None or not state.snapshot_loader_outputs:
             return None
-        # Derive request model identity from workflow (not plan.model_key)
+        # Derive request model identity from workflow (not plan.model_key).
+        # Compare against complete snapshot plan.model_key from
+        # self._cpu_snapshot_models — no partial ModelRestoreKey reconstruction.
         _wf = _thaw(workflow)
         request_model_key = derive_model_key(_wf)
-        # Compare snapshot identity using existing helpers (ignoring VAE)
-        _snap_key = state.snapshot_execution_seed
-        _snap_model_ident = state.snapshot_model_identities
-        if _snap_key is not None and _snap_model_ident:
-            _keys_match = _cpu_snapshot_model_keys_match(
-                request_model_key,
-                ModelRestoreKey(
-                    unet_identity=_snap_model_ident.get("unet", ""),
-                    clip_identity=_snap_model_ident.get("clip", ""),
-                ),
-            )
-            if not _keys_match:
-                trace.emit(
-                    "executor_seed_rejected",
-                    phase="execution",
-                    metadata={"reason": "model_identity_mismatch"},
-                )
-                return None
-            # Compare request model spec against CPU snapshot model spec
-            _request_model_spec = build_restore_model_spec(
-                _wf, dict(plan.model_stack) if hasattr(plan, "model_stack") else {}
-            )
-            _snap_spec = getattr(getattr(self, "_cpu_snapshot_models", None), "model_spec", None)
-            if _snap_spec is not None:
-                _specs_match = _cpu_snapshot_specs_match(_request_model_spec, _snap_spec)
-                if not _specs_match:
-                    trace.emit(
-                        "executor_seed_rejected",
-                        phase="execution",
-                        metadata={"reason": "model_spec_mismatch"},
-                    )
-                    return None
+        _snap_models = getattr(self, "_cpu_snapshot_models", None)
+        _snap_model_key = getattr(_snap_models, "model_key", None) if _snap_models is not None else None
+        _snap_spec = getattr(_snap_models, "model_spec", None) if _snap_models is not None else None
+        _request_model_spec = build_restore_model_spec(
+            _wf, dict(plan.model_stack) if hasattr(plan, "model_stack") else {}
+        )
         caches = getattr(executor, "caches", None)
         outputs_cache = getattr(caches, "outputs", None) if caches is not None else None
         original_set_prompt = getattr(outputs_cache, "set_prompt", None)
         if not callable(original_set_prompt):
             return None
-        loader_types = {
-            "UNETLoader": "unet",
-            "CLIPLoader": "clip",
-            "DualCLIPLoader": "clip",
-            "VAELoader": "vae",
-            "CheckpointLoaderSimple": "checkpoint",
+        # Build candidate loader node list with class types
+        _loader_types_allowed = {
+            "UNETLoader", "CLIPLoader", "DualCLIPLoader",
+            "VAELoader", "CheckpointLoader", "CheckpointLoaderSimple",
         }
-        loader_nodes = [
-            (str(node_id), loader_types.get(str(node.get("class_type", ""))))
-            for node_id, node in workflow.items()
-            if isinstance(node, Mapping) and str(node.get("class_type", "")) in loader_types
-        ]
-        loader_nodes = [
-            (node_id, role) for node_id, role in loader_nodes
-            if role in state.snapshot_loader_outputs
-        ]
-        if not loader_nodes:
+        _candidate_nodes: list[tuple[str, str]] = []
+        _class_type_map: dict[str, str] = {}
+        for _nid, _node in _wf.items():
+            if isinstance(_node, Mapping):
+                _ct = str(_node.get("class_type", ""))
+                if _ct in _loader_types_allowed:
+                    _candidate_nodes.append((str(_nid), _ct))
+                    _class_type_map[str(_nid)] = _ct
+        if not _candidate_nodes:
             return None
+
+        # Build actual node outputs per role from snapshot models.
+        # UNET=(model,), CLIP=(clip,), DualCLIP→one CLIP, VAE only real,
+        # checkpoint=(model,clip,vae) only all present.
+        _snap_unet = state.snapshot_loader_outputs.get("unet")
+        _snap_clip = state.snapshot_loader_outputs.get("clip")
+        _snap_vae = state.snapshot_loader_outputs.get("vae")
+        _loader_outputs: dict[str, Any] = {}
+        for _nid, _ct in _class_type_map.items():
+            if _ct == "UNETLoader" and _snap_unet is not None:
+                _loader_outputs[_nid] = _snap_unet
+            elif _ct in ("CLIPLoader", "DualCLIPLoader") and _snap_clip is not None:
+                _loader_outputs[_nid] = _snap_clip
+            elif _ct == "VAELoader" and _snap_vae is not None:
+                _vae = _snap_vae
+                _vae_class = type(_vae).__name__ if _vae is not None else ""
+                if _vae_class == "VAE":
+                    _loader_outputs[_nid] = _vae
+            elif _ct in ("CheckpointLoader", "CheckpointLoaderSimple"):
+                if _snap_unet is not None and _snap_clip is not None and _snap_vae is not None:
+                    _loader_outputs[_nid] = (_snap_unet, _snap_clip, _snap_vae)
 
         async def seeded_set_prompt(*args: Any, **kwargs: Any) -> Any:
             # Let set_prompt initialize cache keys
@@ -5464,40 +5984,58 @@ class ModalRuntimeEntrypoint:
             trace.emit(
                 "executor_seed_apply_start",
                 phase="execution",
-                metadata={"loader_count": len(loader_nodes), "workflow_hash": plan.workflow_hash},
+                metadata={"loader_count": len(_candidate_nodes), "workflow_hash": plan.workflow_hash},
             )
-            from execution import CacheEntry as _CE
-            diagnostics: dict[str, str] = {}
-            for node_id, role in loader_nodes:
-                try:
-                    loader_output = state.snapshot_loader_outputs.get(role if role != "checkpoint" else "unet")
-                    if loader_output is None:
-                        diagnostics[node_id] = "rejected:model_identity_missing"
-                        continue
-                    cache_key = outputs_cache.cache_key_set.get_data_key(node_id)
-                    if not cache_key:
-                        diagnostics[node_id] = "rejected:no_signature"
-                        continue
-                    entry = _CE(ui={}, outputs=[loader_output])
-                    await outputs_cache.set(node_id, entry)
-                    # Verify get
-                    retrieved = await outputs_cache.get(node_id)
-                    if retrieved is None:
-                        diagnostics[node_id] = "rejected:cache_entry_unavailable"
-                        continue
-                    diagnostics[node_id] = f"seeded:{str(cache_key)[:16]}"
-                except Exception as exc:
-                    diagnostics[node_id] = f"error:{str(exc)[:60]}"
+            # Build authoritative model spec from complete snapshot identities
+            _wf_hash = plan.workflow_hash or ""
+            _cn_gen = state.snapshot_custom_node_generation or ""
+            _dep_hash = _V2_DEPLOYMENT_COMBINED_HASH or getattr(state, "deployment_combined_hash", "")
+            _seeded = await state.seed_loader_cache_signatures(
+                executor=executor,
+                loader_node_ids=[nid for nid, _ in _candidate_nodes],
+                loader_node_class_types=_class_type_map,
+                loader_outputs=_loader_outputs,
+                request_model_key=request_model_key.to_dict(),
+                snapshot_model_key=_snap_model_key.to_dict() if _snap_model_key is not None else {},
+                request_model_spec=_request_model_spec,
+                snapshot_model_spec=_thaw(_snap_spec) if _snap_spec is not None else {},
+                workflow_hash=_wf_hash,
+                custom_node_generation=_cn_gen,
+                deployment_combined_hash=_dep_hash,
+                allow_cache=True,
+            )
+            # Print every candidate exactly once with canonical format.
+            # Format: [v2.executor_seed] node=<id> class=<class> role=<unet|clip|vae>
+            #   decision=<seeded|missing_snapshot_output|identity_mismatch|unsupported>
+            #   expected_identity=<short hash> actual_identity=<short hash>
+            #   mismatch_fields=<exact comma-separated fields or none>
+            for _node_id, _outcome in _seeded.items():
+                _ct = _class_type_map.get(_node_id, "?")
+                _d = _outcome.get("decision", "?") if isinstance(_outcome, dict) else str(_outcome)
+                _r = _outcome.get("role", "?") if isinstance(_outcome, dict) else "?"
+                _ei = _outcome.get("expected_identity", "") if isinstance(_outcome, dict) else ""
+                _ai = _outcome.get("actual_identity", "") if isinstance(_outcome, dict) else ""
+                _mf = _outcome.get("mismatch_fields", "none") if isinstance(_outcome, dict) else "none"
+                print(
+                    f"[v2.executor_seed] node={_node_id} "
+                    f"class={_ct} role={_r} decision={_d} "
+                    f"expected_identity={_ei} actual_identity={_ai} "
+                    f"mismatch_fields={_mf}",
+                    flush=True,
+                )
             trace.emit(
                 "executor_loader_cache_seed_end",
                 phase="execution",
-                metadata={"diagnostics": diagnostics},
+                metadata={"diagnostics": _seeded},
             )
             trace.emit(
                 "executor_seed_apply_end",
                 phase="execution",
                 metadata={
-                    "seeded": sum(1 for v in diagnostics.values() if v.startswith("seeded:")),
+                    "seeded": sum(
+                        1 for v in _seeded.values()
+                        if isinstance(v, dict) and v.get("decision") == "seeded"
+                    ),
                 },
             )
             return result
@@ -5590,8 +6128,7 @@ class ModalRuntimeEntrypoint:
         commit = getattr(volume, "commit", None)
         commit_aio = getattr(commit, "aio", None) if commit is not None else None
         if not callable(commit_aio):
-            diag["commit_error"] = "commit_aio_unavailable"
-            return dataclasses.replace(attempt, items=tuple(persisted)), None, diag
+            raise RuntimeError("output volume commit.aio is unavailable")
         commit_start_ns = time.monotonic_ns()
         diag["commit_start_mono_ns"] = commit_start_ns
 
@@ -6535,6 +7072,8 @@ if _modal is not None and _MODAL_RESOURCES.get("app") is not None:
         memory=4096,
         timeout=300,
         startup_timeout=120,
+        retries=0,
+        env={_PUBLISHER_MARKER: "1"},
         min_containers=MIN_CONTAINERS,
         max_containers=1,
         scaledown_window=SCALEDOWN_WINDOW,

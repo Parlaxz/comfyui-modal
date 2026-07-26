@@ -381,78 +381,260 @@ class BootstrapState:
         executor: Any,
         *,
         loader_node_ids: Sequence[str] = (),
+        loader_node_class_types: dict[str, str] | None = None,
         loader_outputs: dict[str, Any] | None = None,
+        request_model_key: dict[str, Any] | None = None,
+        snapshot_model_key: dict[str, Any] | None = None,
+        request_model_spec: dict[str, Any] | None = None,
+        snapshot_model_spec: dict[str, Any] | None = None,
         workflow_hash: str = "",
         custom_node_generation: str = "",
         deployment_combined_hash: str = "",
         allow_cache: bool = True,
-    ) -> dict[str, Any]:
+    ) -> dict[str, dict[str, str]]:
         """Seed immutable loader outputs into executor.caches.outputs.
 
-        Only seeds outputs from loader nodes (CLIPLoader, UNETLoader, VAELoader,
-        CheckpointLoader, etc.) — nodes that produce deterministic model objects
-        from file names.  Skips samplers, latents, random, prompt-dependent nodes.
+        Every candidate loader node gets exactly one outcome dict with keys:
+          decision    — ``seeded`` | ``missing_snapshot_output`` | ``identity_mismatch`` | ``unsupported``
+          role        — ``unet`` | ``clip`` | ``vae`` | ``checkpoint`` | ``?``
+          expected_identity  — short hash of request role identity (or ``""``)
+          actual_identity    — short hash of snapshot role identity (or ``""``)
+          mismatch_fields    — comma-separated differing fields (or ``"none"``)
 
-        Returns diagnostics mapping node_id -> outcome.
+        Changes from prior gating:
+          - No global rejection on workflow_hash, model_key, model_spec,
+            custom_node_generation, or deployment_combined_hash.
+          - Each loader role is independently compared using canonical
+            per-role identity (``compute_loader_role_identity``).
+          - VAE always reports ``missing_snapshot_output`` (snapshot lacks VAE).
+          - CheckpointLoader/CheckpointLoaderSimple report ``unsupported``
+            unless safely role-separated.
+          - UNET and CLIP report ``identity_mismatch`` with exact mismatched
+            fields when request vs. snapshot role identity differs.
         """
         import hashlib
-        results: dict[str, Any] = {}
+        from .contracts import (
+            compute_loader_role_identity,
+            find_role_identity_mismatch_fields,
+        )
+
+        results: dict[str, dict[str, str]] = {}
+        _unsupported_decision = lambda mf: {"decision": "unsupported", "role": "?", "expected_identity": "", "actual_identity": "", "mismatch_fields": mf}
         if not allow_cache:
-            return results
+            return {str(nid): _unsupported_decision("cache_insert_failed") for nid in loader_node_ids}
         caches = getattr(executor, "caches", None)
         if caches is None:
-            return results
+            return {str(nid): _unsupported_decision("cache_insert_failed") for nid in loader_node_ids}
         outputs_cache = getattr(caches, "outputs", None)
         if outputs_cache is None:
-            return results
+            return {str(nid): _unsupported_decision("cache_insert_failed") for nid in loader_node_ids}
+        # set_prompt must have already run — verify via cache_key_set
+        cache_key_set = getattr(outputs_cache, "cache_key_set", None)
+        if cache_key_set is None or not getattr(outputs_cache, "initialized", False):
+            return {str(nid): _unsupported_decision("cache_key_missing") for nid in loader_node_ids}
 
         seed = self.snapshot_execution_seed
         if not seed:
-            return results
+            return {str(nid): {"decision": "missing_snapshot_output", "role": "?", "expected_identity": "", "actual_identity": "", "mismatch_fields": "none"} for nid in loader_node_ids}
 
-        if workflow_hash and seed.workflow_hash and workflow_hash != seed.workflow_hash:
-            return {str(node_id): "rejected:workflow_hash_mismatch" for node_id in loader_node_ids}
-        if custom_node_generation and seed.custom_node_generation != custom_node_generation:
-            return {str(node_id): "rejected:custom_node_generation_mismatch" for node_id in loader_node_ids}
-        if deployment_combined_hash and seed.deployment_combined_hash != deployment_combined_hash:
-            return {str(node_id): "rejected:deployment_hash_mismatch" for node_id in loader_node_ids}
-        loader_sigs = {
-            str(e.get("node_id", "")): e
-            for e in seed.loader_cache_signatures
-        }
         loader_outputs = loader_outputs or self.snapshot_loader_outputs
+        _class_types = dict(loader_node_class_types or {})
+
+        # ── Allowed loader types ────────────────────────────────────────
+        _ALLOWED_CLASS_TYPES: set[str] = {
+            "UNETLoader",
+            "CLIPLoader",
+            "DualCLIPLoader",
+            "VAELoader",
+            "CheckpointLoader",
+            "CheckpointLoaderSimple",
+        }
+
+        # ── Role mapping ────────────────────────────────────────────────
+        _ROLE_MAP: dict[str, str] = {
+            "UNETLoader": "unet",
+            "CLIPLoader": "clip",
+            "DualCLIPLoader": "clip",
+            "VAELoader": "vae",
+            "CheckpointLoader": "checkpoint",
+            "CheckpointLoaderSimple": "checkpoint",
+        }
+
+        # ── Build per-role canonical identities ─────────────────────────
+        # Compute once per role; all nodes of the same role share the same
+        # identity comparison.
+        _snap_cn_gen = self.snapshot_custom_node_generation or ""
+        _snap_dep_hash = self.deployment_combined_hash or ""
+        # Static patch hash: use explicit "none" when no patch metadata exists
+        # in the cached snapshot output (general V2 fast path without CacheDiT/RES4LYF).
+        _req_static_patch = "none"
+        _snap_static_patch = "none"
+        # If static patches were populated in the snapshot output, use that identity;
+        # otherwise the canonical "none" ensures no false-positive patch-matching.
+        _sp = self.snapshot_execution_seed
+        if _sp is not None:
+            _snap_static_patch = getattr(_sp, "static_model_patches_hash", "") or "none"
+
+        _req_role_identity: dict[str, dict[str, str]] = {}
+        _snap_role_identity: dict[str, dict[str, str]] = {}
+        for _role in ("unet", "clip", "vae"):
+            _req_role_identity[_role] = compute_loader_role_identity(
+                _role, request_model_spec or {},
+                custom_node_generation=custom_node_generation,
+                deployment_combined_hash=deployment_combined_hash,
+                static_model_patches_hash=_req_static_patch,
+            )
+            _snap_role_identity[_role] = compute_loader_role_identity(
+                _role, snapshot_model_spec or {},
+                custom_node_generation=_snap_cn_gen,
+                deployment_combined_hash=_snap_dep_hash,
+                static_model_patches_hash=_snap_static_patch,
+            )
+
         try:
-            from execution import CacheEntry
+            from execution import CacheEntry as _CacheEntry
         except Exception:
-            CacheEntry = None
-        for node_id in loader_node_ids:
-            node_id = str(node_id)
-            if node_id not in loader_outputs or loader_outputs[node_id] is None:
-                results[node_id] = "rejected:model_identity_missing"
+            _CacheEntry = None
+
+        for _raw_nid in loader_node_ids:
+            node_id = str(_raw_nid)
+            _ct = _class_types.get(node_id, "")
+            _role = _ROLE_MAP.get(_ct, "?")
+
+            # 1. Check class type is allowed
+            if _ct not in _ALLOWED_CLASS_TYPES:
+                results[node_id] = {
+                    "decision": "unsupported",
+                    "role": _role,
+                    "expected_identity": "",
+                    "actual_identity": "",
+                    "mismatch_fields": "none",
+                }
                 continue
-            entry = loader_sigs.get(node_id)
-            if entry is None:
-                results[node_id] = "no_signature"
+
+            # 2. Checkpoint loaders: unsupported unless safely role-separated
+            if _role == "checkpoint":
+                results[node_id] = {
+                    "decision": "unsupported",
+                    "role": _role,
+                    "expected_identity": "",
+                    "actual_identity": "",
+                    "mismatch_fields": "none",
+                }
                 continue
-            expected_signature = entry.get("signature", entry.get("cache_key"))
-            cache_key = outputs_cache.cache_key_set.get_data_key(node_id)
-            if expected_signature not in (None, "") and str(cache_key) != str(expected_signature):
-                results[node_id] = "rejected:loader_signature_mismatch"
+
+            # 3. VAE: always missing_snapshot_output (snapshot has no VAE)
+            if _role == "vae":
+                results[node_id] = {
+                    "decision": "missing_snapshot_output",
+                    "role": _role,
+                    "expected_identity": "",
+                    "actual_identity": "",
+                    "mismatch_fields": "none",
+                }
                 continue
+
+            # 4. Check output availability
+            _out = loader_outputs.get(node_id)
+            if _out is None:
+                # Clear any stale cache entry for this node
+                try:
+                    await outputs_cache.delete(node_id)
+                except Exception:
+                    pass
+                results[node_id] = {
+                    "decision": "missing_snapshot_output",
+                    "role": _role,
+                    "expected_identity": "",
+                    "actual_identity": "",
+                    "mismatch_fields": "none",
+                }
+                continue
+
+            # 5. Per-role identity comparison (UNET / CLIP)
+            _req_id = _req_role_identity.get(_role, {})
+            _snap_id = _snap_role_identity.get(_role, {})
+            _req_hash = _req_id.get("stable_id", "")
+            _snap_hash = _snap_id.get("stable_id", "")
+
+            # Short hashes for diagnostics
+            _req_short = _req_hash[:16] if _req_hash else ""
+            _snap_short = _snap_hash[:16] if _snap_hash else ""
+
+            if _req_hash and _snap_hash and _req_hash != _snap_hash:
+                # Clear any stale cache entry for this node before reporting mismatch
+                try:
+                    await outputs_cache.delete(node_id)
+                except Exception:
+                    pass
+                _mismatch_fields = find_role_identity_mismatch_fields(_req_id, _snap_id)
+                results[node_id] = {
+                    "decision": "identity_mismatch",
+                    "role": _role,
+                    "expected_identity": _req_short,
+                    "actual_identity": _snap_short,
+                    "mismatch_fields": ",".join(_mismatch_fields) if _mismatch_fields else "unknown",
+                }
+                continue
+
+            # 6. Cache key must already exist (set_prompt already ran)
+            _data_key = cache_key_set.get_data_key(node_id)
+            if _data_key is None:
+                results[node_id] = {
+                    "decision": "unsupported",
+                    "role": _role,
+                    "expected_identity": _req_short,
+                    "actual_identity": _snap_short,
+                    "mismatch_fields": "cache_key_missing",
+                }
+                continue
+
+            # 7. Insert into outputs cache
             try:
-                cached_entry = (
-                    CacheEntry(ui={}, outputs=[loader_outputs[node_id]])
-                    if CacheEntry is not None
-                    else entry.get("cached_outputs")
+                _outputs_list = list(_out) if isinstance(_out, (tuple, list)) else [_out]
+                _entry_obj = (
+                    _CacheEntry(ui={}, outputs=_outputs_list)
+                    if _CacheEntry is not None
+                    else None
                 )
-                if cached_entry is None:
-                    results[node_id] = "rejected:cache_entry_unavailable"
+                if _entry_obj is None:
+                    results[node_id] = {
+                        "decision": "unsupported",
+                        "role": _role,
+                        "expected_identity": _req_short,
+                        "actual_identity": _snap_short,
+                        "mismatch_fields": "cache_insert_failed",
+                    }
                     continue
-                await outputs_cache.set(node_id, cached_entry)
-                identity_digest = hashlib.sha256(str(cache_key).encode("utf-8")).hexdigest()[:16]
-                results[node_id] = f"seeded:{identity_digest}"
-            except Exception as exc:
-                results[node_id] = f"error:{str(exc)[:60]}"
+                await outputs_cache.set(node_id, _entry_obj)
+                # Verify insertion — immediate get
+                _retrieved = await outputs_cache.get(node_id)
+                if _retrieved is None:
+                    results[node_id] = {
+                        "decision": "unsupported",
+                        "role": _role,
+                        "expected_identity": _req_short,
+                        "actual_identity": _snap_short,
+                        "mismatch_fields": "cache_insert_failed",
+                    }
+                    continue
+                _digest = hashlib.sha256(str(_data_key).encode("utf-8")).hexdigest()[:16]
+                results[node_id] = {
+                    "decision": "seeded",
+                    "role": _role,
+                    "expected_identity": _req_short,
+                    "actual_identity": _snap_short,
+                    "mismatch_fields": "none",
+                }
+            except Exception:
+                results[node_id] = {
+                    "decision": "unsupported",
+                    "role": _role,
+                    "expected_identity": _req_short,
+                    "actual_identity": _snap_short,
+                    "mismatch_fields": "cache_insert_failed",
+                }
+
         return results
 
     def _restore_cachedit_prepare(
@@ -462,14 +644,28 @@ class BootstrapState:
         workflow_inputs: dict[str, Any] | None = None,
         workflow_hash: str = "",
     ) -> dict[str, Any]:
-        """Resolve the actual CacheDiT_Model_Optimizer node class and call its
-        deterministic ``optimize`` FUNCTION with the exact restored snapshot
-        UNET and exact workflow inputs.  The node checks ``_cache_dit_config``
-        on the transformer and is idempotent (returns early if config matches).
-        No forward/dummy/config change.
-        Returns diagnostics dict.
+        """Resolve CacheDiT_Model_Optimizer dynamically, invoke its declared
+        FUNCTION exactly once (no TypeError retry), passing only
+        scalar/static inputs (rejecting connection-shaped list/tuple values),
+        plus ``model=restored_snapshot_unet``, and return patched model +
+        diagnostics.
+
+        Uses FUNCTION attribute on the node class.  Single invocation via
+        instantiated node instance for bound-method compatibility.  Filters
+        ``workflow_inputs`` to keys matching the node's declared INPUT_TYPES
+        whose values are not connection tuples (``(node_id, output_index)``).
+        Returns ``patched_model`` for caller to replace active UNET.
         """
-        results: dict[str, Any] = {"ok": False}
+        def _is_connection_link(val: Any) -> bool:
+            """Detect ComfyUI-style connection tuples ``(node_id, output_index)``."""
+            return (
+                isinstance(val, (tuple, list))
+                and len(val) == 2
+                and isinstance(val[0], (str, int))
+                and isinstance(val[1], int)
+            )
+
+        results: dict[str, Any] = {"ok": False, "patched_model": None}
         try:
             import nodes as _cd_nodes
             _mappings = getattr(_cd_nodes, "NODE_CLASS_MAPPINGS", {})
@@ -477,22 +673,51 @@ class BootstrapState:
             if _cachedit_cls is None:
                 results["error"] = "CacheDiT_Model_Optimizer node class not found"
                 return results
-            # Call the node's FUNCTION = "optimize" with the restored UNET model
-            # and the exact workflow inputs.  The node clones the model, attaches
-            # config to transformer._cache_dit_config, and installs wrappers.
-            # If config already matches, the node returns (model,) as a no-op.
-            _inputs = dict(workflow_inputs or {})
-            _optimize = getattr(_cachedit_cls, "optimize", None)
-            if _optimize is None:
-                results["error"] = "CacheDiT_Model_Optimizer has no optimize method"
+            # Resolve FUNCTION name dynamically from the node class
+            _func_name = getattr(_cachedit_cls, "FUNCTION", "optimize")
+            _fn = getattr(_cachedit_cls, _func_name, None)
+            if _fn is None:
+                results["error"] = (
+                    f"CacheDiT_Model_Optimizer has no FUNCTION {_func_name!r}"
+                )
                 return results
-            _result = _optimize(unet, **_inputs)
+            # Gather declared scalar/static input names from INPUT_TYPES
+            _declared: set[str] = set()
+            try:
+                _it = _cachedit_cls.INPUT_TYPES()
+                for _cat in ("required", "optional"):
+                    for _k in (_it.get(_cat, {}) if isinstance(_it, dict) else ()):
+                        _declared.add(str(_k))
+            except Exception:
+                pass  # fall back to no filter — all non-connection values pass
+            # Build scalar/static-only inputs (no graph model key, no connections)
+            _inputs: dict[str, Any] = {}
+            for _k, _v in (workflow_inputs or {}).items():
+                if _k == "model":
+                    continue  # will be passed explicitly
+                if _is_connection_link(_v):
+                    continue  # reject connection-shaped values
+                # If declared set is non-empty, only accept matching keys
+                if _declared and _k not in _declared:
+                    continue
+                _inputs[_k] = _v
+            # Instantiate node and invoke FUNCTION once as ComfyUI does
+            _instance = _cachedit_cls()
+            _raw_output = _fn(_instance, model=unet, **_inputs)
+            # RETURN_TYPES = ("MODEL",) — first output is the patched model
+            if isinstance(_raw_output, (list, tuple)) and len(_raw_output) > 0:
+                _patched_model = _raw_output[0]
+            else:
+                _patched_model = _raw_output
             # Mark identity/workflow hash/inputs prepared
             _transformer = getattr(getattr(unet, "model", None), "diffusion_model", None)
-            self._cachedit_unet_identity = str(getattr(_transformer, "_cache_dit_identity", str(id(unet))))
+            self._cachedit_unet_identity = str(
+                getattr(_transformer, "_cache_dit_identity", str(id(unet)))
+            )
             self._cachedit_workflow_hash = workflow_hash
             self._cachedit_inputs_prepared = True
             results["cache_dit_applied"] = True
+            results["patched_model"] = _patched_model
             results["unet_identity"] = self._cachedit_unet_identity
             results["workflow_hash"] = workflow_hash[:16] if workflow_hash else ""
             results["ok"] = True
@@ -506,48 +731,120 @@ class BootstrapState:
         sampler_node_inputs: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Extract static RES4LYF (ClownsharKSampler_Beta) inputs excluding
-        seed/noise/latent/positive/negative, invoke the same existing parser
-        for static extra options, and store immutable parsed structure.
-        No unsafe sampler construction.
-        Returns diagnostics dict.
+        connection-shaped dynamic values, invoke the exact ExtraOptions parser
+        used by ClownsharKSampler_Beta.main (resolved through its module
+        globals, never via a hardcoded import path), and cache an immutable
+        prepared record per sampler.
+
+        Zero sampler nodes → ``ok=0`` with ``reason=no_sampler_node``.
+        Parser failure never swallowed — propagates as error.
+
+        Returned ``prepared_records`` is a list of dicts each containing:
+          node_id, raw_extra_options (str), parser (ExtraOptions instance
+          when safe for read-only reuse, else None), static_inputs (frozen
+          dict).  Caller keys by workflow hash for identity comparison.
+
+        Returns diagnostics dict with ``ok``, ``reason``,
+        ``res4lyf_static_prepared``, ``prepared_records``, ``sampler_nodes``,
+        and optional ``parser_import_warning`` if exact parser could not be
+        resolved from node module.
         """
+        def _is_connection_link(val: Any) -> bool:
+            """Detect ComfyUI-style connection tuples ``(node_id, output_index)``."""
+            return (
+                isinstance(val, (tuple, list))
+                and len(val) == 2
+                and isinstance(val[0], (str, int))
+                and isinstance(val[1], int)
+            )
+
         results: dict[str, Any] = {"ok": False, "res4lyf_static_prepared": False}
         try:
             if not sampler_node_inputs:
-                results["reason"] = "no_sampler_node_inputs"
-                results["ok"] = True
+                results["reason"] = "no_sampler_node"
+                results["ok"] = False
                 return results
-            _parsed = []
+
+            # Determine exact ExtraOptions constructor from the actual
+            # ClownsharKSampler_Beta.main module globals — NOT by assuming
+            # an import package name like "RES4LYF.helper".
+            _ExtraOptions = None
+            _parser_source = ""
+            try:
+                import nodes as _r4_nodes
+                _r4_cls = getattr(_r4_nodes, "NODE_CLASS_MAPPINGS", {}).get(
+                    "ClownsharKSampler_Beta"
+                )
+                if _r4_cls is not None:
+                    _mod_name = getattr(_r4_cls, "__module__", "")
+                    if _mod_name:
+                        import importlib
+                        _r4_mod = importlib.import_module(_mod_name)
+                        _ExtraOptions = getattr(_r4_mod, "ExtraOptions", None)
+                        if _ExtraOptions is not None:
+                            _parser_source = f"module={_mod_name}.ExtraOptions"
+            except Exception:
+                pass
+
+            if _ExtraOptions is None:
+                results["parser_import_warning"] = (
+                    "ExtraOptions could not be resolved from "
+                    "ClownsharKSampler_Beta module — parser reuse unavailable"
+                )
+
+            _prepared_records: list[dict[str, Any]] = []
             for _entry in sampler_node_inputs:
                 _node_id = _entry.get("node_id", "")
                 _inputs = dict(_entry.get("inputs", {}))
-                # Exclude runtime-varying inputs
-                for _exclude in ("seed", "noise_seed", "latent_image", "positive", "negative"):
-                    _inputs.pop(_exclude, None)
-                # Invoke existing ClownsharKSampler_Beta extra_options parsing
-                import nodes as _r4_nodes
-                _res4lyf_cls = getattr(_r4_nodes, "NODE_CLASS_MAPPINGS", {}).get(
-                    "ClownsharKSampler_Beta"
+
+                # Exclude runtime-varying and connection-shaped inputs
+                _exclude_prefixes = (
+                    "seed", "noise_", "latent_", "positive", "negative"
                 )
-                if _res4lyf_cls is not None:
-                    _parser = getattr(_res4lyf_cls, "parse_extra_options", None)
-                    if _parser is not None:
-                        try:
-                            _parsed_options = _parser(_inputs.get("extra_options", ""))
-                            _inputs["_parsed_extra_options"] = _parsed_options
-                        except Exception:
-                            pass
-                # Preserve disable_dummy_sampler_init if present
+                _keys_to_drop = [
+                    k for k in _inputs
+                    if any(k.startswith(p) or k == p for p in _exclude_prefixes)
+                    or _is_connection_link(_inputs[k])
+                ]
+                for _k in _keys_to_drop:
+                    _inputs.pop(_k, None)
+
+                # Extract raw extra_options string
+                _eo_str = str(_inputs.pop("extra_options", ""))
+
+                # Cache the parser result object only if it's safe to treat
+                # as immutable/read-only for request reuse.  ExtraOptions is
+                # immutable after construction (stores the string, __call__
+                # does regex lookups only).  NEVER claim parsing was avoided
+                # if we only validate the raw string — we instantiate the
+                # full parser here.
+                _parser: Any = None
+                if _ExtraOptions is not None:
+                    _parser = _ExtraOptions(_eo_str)
+                    # Verify parseability — never swallow failure
+                    _parser("test_parse", default=None)
+
+                # Preserve disable_dummy_sampler_init if absent
                 if "disable_dummy_sampler_init" not in _inputs:
                     _inputs["disable_dummy_sampler_init"] = True
-                # Freeze as immutable tuple of frozenset items
+
+                # Freeze static inputs (non-underscore keys)
                 _frozen = {k: v for k, v in _inputs.items() if not k.startswith("_")}
-                _parsed.append({"node_id": _node_id, "static_inputs": _frozen})
+
+                _prepared_records.append({
+                    "node_id": _node_id,
+                    "raw_extra_options": _eo_str,
+                    "parser": _parser,
+                    "static_inputs": _frozen,
+                })
+
             self._res4lyf_static_prepared = tuple(
-                (p["node_id"], p["static_inputs"]) for p in _parsed
+                (p["node_id"], p["static_inputs"]) for p in _prepared_records
             )
             results["res4lyf_static_prepared"] = True
-            results["sampler_nodes"] = len(_parsed)
+            results["prepared_records"] = _prepared_records
+            results["sampler_nodes"] = len(_prepared_records)
+            results["parser_source"] = _parser_source
             results["ok"] = True
         except Exception as exc:
             results["error"] = str(exc)[:120]

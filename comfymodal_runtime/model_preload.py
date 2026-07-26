@@ -49,6 +49,43 @@ if _PREFILL_LANE_MODE not in ("critical", "all", "none"):
     _PREFILL_LANE_MODE = "critical"
 _PREFILL_CRITICAL_ROLES: frozenset[str] = frozenset({"positive", "negative"})
 
+# ── Page-fault delta tracking for model-path instrumentation ─────
+# Uses resource.getrusage (RUSAGE_SELF) to measure major/minor page
+# faults around actual first access to restored CLIP/UNET CPU state.
+# Deliberately wraps the OUTERMOST invocation of each operation so
+# inner nested calls do not double-count.
+
+_PAGEFAULT_TRACKING: bool = (
+    os.environ.get("COMFYMODAL_V2_PAGEFAULT_TRACKING", "1") == "1"
+)
+
+
+@dataclass
+class _PageFaultSnapshot:
+    """Snapshot of process page-fault counters at a given moment.
+    Uses resource.getrusage (Linux-only; returns zeros on other platforms).
+    """
+    major: int = 0
+    minor: int = 0
+
+    @classmethod
+    def now(cls) -> "_PageFaultSnapshot":
+        try:
+            import resource as _r
+            ru = _r.getrusage(_r.RUSAGE_SELF)
+            return cls(major=ru.ru_majflt, minor=ru.ru_minflt)
+        except Exception:
+            return cls()
+
+
+def _pagefault_delta(before: _PageFaultSnapshot, after: _PageFaultSnapshot) -> dict[str, int]:
+    """Return major/minor fault deltas from two snapshots."""
+    return {
+        "major_faults": max(0, after.major - before.major),
+        "minor_faults": max(0, after.minor - before.minor),
+    }
+
+
 # ── V2 prefill overlap: wait-for-UNET policy ─────────────────────
 # Default behaviour (recommended): prefill waits for CLIP only and
 # begins encoding without blocking on UNET.  The UNET restore runs
@@ -455,10 +492,14 @@ def _make_torch_file_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
         _slow_ru_before: dict[str, Any] | None = None
         _slow_io_before: dict[str, int] | None = None
         _read_outer_ns: int = 0
+        _pf_before: _PageFaultSnapshot | None = None
         if before == 0:
             lane = _ACTIVE_LANE_TRACE.get()
             if lane is not None:
                 _read_outer_ns = time.monotonic_ns()
+                # Capture page-fault snapshot before actual read (CLIP/UNET page-in)
+                if _PAGEFAULT_TRACKING and lane._lane in ("CLIP", "UNET"):
+                    _pf_before = _PageFaultSnapshot.now()
                 lane.read_start()
                 if lane._lane == "CLIP":
                     _slow_read_state = _capture_slow_read_before()
@@ -512,6 +553,21 @@ def _make_torch_file_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                             phase=lane._phase,
                             metadata={"lane": lane._lane, "path_hash": stable_hash(str(ckpt))[:16]},
                         )
+                    # Emit page-fault deltas for CLIP/UNET page-in after first access
+                    if _pf_before is not None and lane._lane in ("CLIP", "UNET"):
+                        _pf_after = _PageFaultSnapshot.now()
+                        _delta = _pagefault_delta(_pf_before, _pf_after)
+                        _metric_name = "clip_snapshot_pagein_ms" if lane._lane == "CLIP" else "unet_snapshot_pagein_ms"
+                        lane._trace.emit(
+                            _metric_name.replace("_ms", ""),
+                            phase=lane._phase,
+                            metadata={
+                                "lane": lane._lane,
+                                "major_faults": _delta["major_faults"],
+                                "minor_faults": _delta["minor_faults"],
+                                "duration_ms": _read_dur_ms if _read_outer_ns else 0.0,
+                            },
+                        )
     wrapper._comfy_modal_read_wrapper = True  # sentinel for idempotence
     return wrapper
 
@@ -538,6 +594,8 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
         _lane_start_ns = 0
         _lane_thread_start_ns = None
         _model_identity_hash = ""
+        _pf_h2d_before: _PageFaultSnapshot | None = None
+        _h2d_metric_name: str = ""
         if before == 0:
             count = _gpu_request_call_count_var.get()
             _gpu_request_call_count_var.set(count + 1)
@@ -583,6 +641,10 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 _get_mutation_lane().acquire(lane._lane if lane else None)
                 lane.gpu_lane_wait_start()
                 lane.gpu_lane_wait_end()
+                # Capture page-fault snapshot before H2D commit
+                if _PAGEFAULT_TRACKING:
+                    _pf_h2d_before = _PageFaultSnapshot.now()
+                    _h2d_metric_name = "clip_h2d_ms" if lane._lane == "CLIP" else "unet_h2d_ms"
                 # Compute metadata for lane-owned commit events
                 _lane_start_ns = time.monotonic_ns()
                 _lane_thread_start_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
@@ -616,6 +678,21 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                 if lane is not None:
                     _lane_end_ns = time.monotonic_ns()
                     _lane_thread_end_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
+                    # Emit H2D page-fault deltas for lane-owned GPU commits
+                    if _pf_h2d_before is not None and _h2d_metric_name:
+                        _pf_h2d_after = _PageFaultSnapshot.now()
+                        _delta = _pagefault_delta(_pf_h2d_before, _pf_h2d_after)
+                        lane._trace.emit(
+                            _h2d_metric_name.replace("_ms", ""),
+                            phase=lane._phase,
+                            metadata={
+                                "lane": lane._lane,
+                                "major_faults": _delta["major_faults"],
+                                "minor_faults": _delta["minor_faults"],
+                                "duration_ms": round((_lane_end_ns - _lane_start_ns) / 1_000_000, 3),
+                                "caller_classification": _caller,
+                            },
+                        )
                     lane.gpu_commit_end(
                         host_wall_duration_ms=round((_lane_end_ns - _lane_start_ns) / 1_000_000, 3),
                         thread_cpu_duration_ms=round((_lane_thread_end_ns - _lane_thread_start_ns) / 1_000_000, 3) if _lane_thread_end_ns is not None and _lane_thread_start_ns is not None else None,
@@ -648,6 +725,29 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                     })
                 if _diag_ok:
                     emit_post_load_models_gpu_event(models)
+                    # load_models_gpu duration measurement (complementary to the
+                    # forward-probe-based unet_first_cuda_op emitted from the
+                    # actual diffusion model forward).
+                    if _caller in ("graph_model_loading", "sampler_setup"):
+                        _op_duration_ms: float | None = None
+                        if _lane_start_ns:
+                            _op_duration_ms = round((time.monotonic_ns() - _lane_start_ns) / 1_000_000, 3)
+                        elif _graph_start_ns:
+                            _op_duration_ms = round((time.monotonic_ns() - _graph_start_ns) / 1_000_000, 3)
+                        if _op_duration_ms is not None:
+                            _rt = _ACTIVE_REQUEST_TRACE.get()
+                            if _rt is not None:
+                                _rt.emit(
+                                    "load_models_gpu_duration",
+                                    phase="execution",
+                                    metadata={
+                                        "caller_classification": _caller,
+                                        "duration_ms": _op_duration_ms,
+                                        "gpu_request_invocation_count": _gpu_request_call_count_var.get(),
+                                        "model_identity_hash": _model_identity_hash,
+                                        "memory_required": memory_required,
+                                    },
+                                )
     wrapper._comfy_modal_gpu_wrapper = True
     return wrapper
 
