@@ -1854,6 +1854,225 @@ def _detect_gpu_allocation(requested_gpu_order: tuple[str, ...]) -> dict[str, An
     return info
 
 
+def _read_cgroup_cpu_usage_usec(cgroup_base: str) -> int | None:
+    try:
+        with open(posixpath.join(cgroup_base, "cpu.stat")) as cpu_stat:
+            for line in cpu_stat:
+                key, _, value = line.partition(" ")
+                if key == "usage_usec":
+                    usage = int(value.strip())
+                    return usage if usage >= 0 else None
+    except Exception:
+        pass
+    return None
+
+
+def _emit_cgroup_spike_summary(peak: float, intervals: list[dict[str, Any]]) -> None:
+    parts = [
+        f"peak_effective_cores={peak:.3f}",
+        f"interval_count={len(intervals)}",
+    ]
+    for index, interval in enumerate(intervals):
+        parts.extend(
+            (
+                f"i{index}_start_unix_ns={interval['start_unix_ns']}",
+                f"i{index}_end_unix_ns={interval['end_unix_ns']}",
+                f"i{index}_start_elapsed_ms={interval['start_elapsed_ms']:.3f}",
+                f"i{index}_end_elapsed_ms={interval['end_elapsed_ms']:.3f}",
+                f"i{index}_duration_ms={interval['duration_ms']:.3f}",
+                f"i{index}_mean_effective_cores={interval['mean_effective_cores']:.3f}",
+                f"i{index}_peak_effective_cores={interval['peak_effective_cores']:.3f}",
+                f"i{index}_phase={interval['phase']}",
+            )
+        )
+    print(f"[v2.cgroup_cpu_spike] {' '.join(parts)}", flush=True)
+
+
+class _CgroupCpuSample:
+    __slots__ = (
+        "timestamp_unix_ns",
+        "elapsed_request_ms",
+        "effective_cgroup_cores",
+        "phase",
+    )
+
+    def __init__(
+        self,
+        timestamp_unix_ns: int,
+        elapsed_request_ms: float,
+        effective_cgroup_cores: float,
+        phase: str,
+    ) -> None:
+        self.timestamp_unix_ns = timestamp_unix_ns
+        self.elapsed_request_ms = elapsed_request_ms
+        self.effective_cgroup_cores = effective_cgroup_cores
+        self.phase = phase
+
+
+class _CgroupCpuSampler:
+    _INTERVAL_SECONDS = 0.050
+
+    def __init__(self, method_entry_mono_ns: int) -> None:
+        self._method_entry_mono_ns = method_entry_mono_ns
+        self._samples: list[_CgroupCpuSample] = []
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._phase = "method"
+        self._phase_source: Callable[[], str] | None = None
+        resolved = _resolve_cgroup_v2_base()
+        self._cgroup_base = resolved[0] if resolved else None
+        self._prev_usage_usec: int | None = None
+        self._prev_mono_ns: int | None = None
+
+    def start(self) -> None:
+        if not self._cgroup_base or self._thread is not None:
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        self._sample()
+        while not self._stop_event.wait(self._INTERVAL_SECONDS):
+            self._sample()
+
+    def _current_phase(self) -> str:
+        source = self._phase_source
+        if source is not None:
+            try:
+                phase = source()
+                if phase:
+                    return str(phase)
+            except Exception:
+                pass
+        return self._phase
+
+    def _sample(self) -> None:
+        if not self._cgroup_base:
+            return
+        usage_usec = _read_cgroup_cpu_usage_usec(self._cgroup_base)
+        if usage_usec is None:
+            return
+        now_mono_ns = time.monotonic_ns()
+        now_unix_ns = time.time_ns()
+        with self._lock:
+            if self._prev_usage_usec is None or self._prev_mono_ns is None:
+                effective_cores = 0.0
+            else:
+                delta_usage_usec = usage_usec - self._prev_usage_usec
+                delta_wall_usec = (now_mono_ns - self._prev_mono_ns) / 1_000.0
+                effective_cores = (
+                    max(0.0, delta_usage_usec / delta_wall_usec)
+                    if delta_wall_usec > 0.0
+                    else 0.0
+                )
+            self._samples.append(
+                _CgroupCpuSample(
+                    timestamp_unix_ns=now_unix_ns,
+                    elapsed_request_ms=round(
+                        (now_mono_ns - self._method_entry_mono_ns) / 1_000_000.0,
+                        3,
+                    ),
+                    effective_cgroup_cores=round(effective_cores, 3),
+                    phase=self._current_phase(),
+                )
+            )
+            self._prev_usage_usec = usage_usec
+            self._prev_mono_ns = now_mono_ns
+
+    def set_phase_source(self, source: Callable[[], str]) -> None:
+        self._phase_source = source
+
+    def stop(self) -> None:
+        thread = self._thread
+        if thread is None:
+            return
+        self._stop_event.set()
+        thread.join()
+        self._thread = None
+        self._sample()
+
+    def _snapshot(self) -> list[_CgroupCpuSample]:
+        with self._lock:
+            return list(self._samples)
+
+    def compute_peak_cores(self) -> float:
+        samples = self._snapshot()
+        return max(
+            (sample.effective_cgroup_cores for sample in samples),
+            default=0.0,
+        )
+
+    def compute_spike_intervals(self, threshold: float = 12.0) -> list[dict[str, Any]]:
+        samples = self._snapshot()
+        intervals: list[dict[str, Any]] = []
+        current: list[tuple[_CgroupCpuSample, _CgroupCpuSample]] = []
+        previous_index = -2
+        current_phase = ""
+        for index in range(1, len(samples)):
+            previous = samples[index - 1]
+            sample = samples[index]
+            if sample.effective_cgroup_cores <= threshold:
+                if current:
+                    intervals.append(_summarize_cgroup_interval(current))
+                    current = []
+                previous_index = -2
+                current_phase = ""
+                continue
+            if current and (index != previous_index + 1 or sample.phase != current_phase):
+                intervals.append(_summarize_cgroup_interval(current))
+                current = []
+            current.append((previous, sample))
+            previous_index = index
+            current_phase = sample.phase
+        if current:
+            intervals.append(_summarize_cgroup_interval(current))
+        return intervals
+
+
+def _summarize_cgroup_interval(
+    sample_intervals: list[tuple[_CgroupCpuSample, _CgroupCpuSample]],
+) -> dict[str, Any]:
+    first_previous, _ = sample_intervals[0]
+    _, last_sample = sample_intervals[-1]
+    weighted_core_ms = 0.0
+    for previous, sample in sample_intervals:
+        interval_ms = max(0.0, sample.elapsed_request_ms - previous.elapsed_request_ms)
+        weighted_core_ms += sample.effective_cgroup_cores * interval_ms
+    duration_ms = max(
+        0.0,
+        last_sample.elapsed_request_ms - first_previous.elapsed_request_ms,
+    )
+    return {
+        "start_unix_ns": first_previous.timestamp_unix_ns,
+        "end_unix_ns": last_sample.timestamp_unix_ns,
+        "start_elapsed_ms": first_previous.elapsed_request_ms,
+        "end_elapsed_ms": last_sample.elapsed_request_ms,
+        "duration_ms": round(duration_ms, 3),
+        "mean_effective_cores": round(
+            weighted_core_ms / duration_ms if duration_ms > 0.0 else 0.0,
+            3,
+        ),
+        "peak_effective_cores": max(
+            sample.effective_cgroup_cores for _, sample in sample_intervals
+        ),
+        "phase": sample_intervals[0][1].phase,
+    }
+
+
+async def _with_cgroup_sampler_cleanup(
+    stream: AsyncIterator[dict[str, Any]],
+    sampler: _CgroupCpuSampler | None,
+) -> AsyncIterator[dict[str, Any]]:
+    try:
+        async for event in stream:
+            yield event
+    finally:
+        if sampler is not None:
+            sampler.stop()
+
+
 class ModalRuntimeEntrypoint:
     """Real v2 runtime facade backed by the existing ComfyUI executor."""
 
@@ -5827,7 +6046,6 @@ class ModalRuntimeEntrypoint:
                 # recalculating from sampler_stage_start_perf_ns (T3).
                 "sampler_node_to_sampler_start_ms": _pre_sampler_state.get("sampler_node_to_sampler_start_ms"),
             }
-
             # â”€â”€ Write validation certificate after successful execution â”€â”€
             # Schema v2 certs include preflight_ok=True to attest that
             # deterministic preflight completed successfully for this identity.
@@ -6159,6 +6377,10 @@ class ModalRuntimeEntrypoint:
         modal_method_entry_mono_ns: int = _method_first_line_ns
         modal_method_entry_wall_ns: int = _method_first_line_wall_ns
         _method_restore_marker = get_restore_return_marker()
+        _cgroup_sampler: _CgroupCpuSampler | None = None
+        if _method_restore_marker is not None:
+            _cgroup_sampler = _CgroupCpuSampler(_method_first_line_ns)
+            _cgroup_sampler.start()
         _entry_host = _capture_host_info()
 
         identity = _capture_remote_identity()
@@ -6228,6 +6450,11 @@ class ModalRuntimeEntrypoint:
             _method_entry_gap_results["identity_mismatch_reasons"] = [f"identity_check_error:{type(exc).__name__}"]
 
         # â”€â”€ Continue with normal setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+        if not _method_entry_gap_results.get("same_process", False):
+            if _cgroup_sampler is not None:
+                _cgroup_sampler.stop()
+            _cgroup_sampler = None
         # Use a local event buffer until trace exists
         _pre_trace_events: list[dict[str, Any]] = [
             {"name": "run_plan_method_first_line", "phase": "method",
@@ -6253,6 +6480,14 @@ class ModalRuntimeEntrypoint:
             **_entry_host,
             **_resource_identity(),
         )
+        if _cgroup_sampler is not None:
+            _cgroup_sampler.set_phase_source(
+                lambda: (
+                    context.trace.events[-1].phase
+                    if context.trace.events and context.trace.events[-1].phase
+                    else "method"
+                )
+            )
 
         if isinstance(_request_origin_info, dict):
             _origin_events = (
@@ -6426,7 +6661,11 @@ class ModalRuntimeEntrypoint:
             "request_id": request_id,
             "trace_id": context.trace.trace_id if context.trace else "",
         }
-        async for event in self.executor.stream(plan, context=context):
+        _execution_stream = _with_cgroup_sampler_cleanup(
+            self.executor.stream(plan, context=context),
+            _cgroup_sampler,
+        )
+        async for event in _execution_stream:
             if event.get("type") == "result" and isinstance(event.get("data"), dict):
                 data = dict(event["data"])
                 _exec_trace = data.get("trace", {})
@@ -6669,6 +6908,12 @@ class ModalRuntimeEntrypoint:
                 )
                 print(_format_v2_critical_path(_critical_path_values), flush=True)
                 event = {**event, "data": data}
+                if _cgroup_sampler is not None:
+                    _cgroup_sampler.stop()
+                    _peak = _cgroup_sampler.compute_peak_cores()
+                    _intervals = _cgroup_sampler.compute_spike_intervals()
+                    _emit_cgroup_spike_summary(_peak, _intervals)
+                    _cgroup_sampler = None
             yield event
 
     async def run_prompt_stream(
