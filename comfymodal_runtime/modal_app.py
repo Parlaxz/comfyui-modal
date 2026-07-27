@@ -40,6 +40,7 @@ from .model_preload import (
     V2LoaderBridge,
     RestorePreparation,
     _collect_restore_events_for_summary,
+    _PREFILL_LANE_MODE,
     get_restore_return_marker,
     gpu_not_observed_summary,
     request_execution_trace_scope,
@@ -3554,6 +3555,13 @@ class ModalRuntimeEntrypoint:
                     flush=True,
                 )
                 # Fall through to the existing preload branch.
+        # ── Prefill-configuration diagnostic (after CPU snapshot state is final) ──
+        _prefill_env_raw = os.environ.get("COMFYMODAL_V2_PREFILL_LANES", "critical")
+        print(
+            f"[v2.prefill_config] env={_prefill_env_raw} parsed={_PREFILL_LANE_MODE} "
+            f"cpu_snapshot_active={int(bool(_cpu_snapshot_activated))}",
+            flush=True,
+        )
         try:
             # Pre-initialize for Plan C gating
             preparation: RestorePreparation | None = None
@@ -4128,7 +4136,10 @@ class ModalRuntimeEntrypoint:
         # UNET and CLIP preparation futures before encoding, preventing
         # GPU model-load/encode overlap.  Idempotent and thread-safe.
         if not self._cpu_snapshot_models_active:
-            self._preload_bridge.schedule_execution_prefill(trace=trace)
+            _scheduled = self._preload_bridge.schedule_execution_prefill(trace=trace)
+            print(f"[v2.execution_prefill] scheduled={1 if _scheduled else 0}", flush=True)
+        else:
+            print(f"[v2.execution_prefill] scheduled=0", flush=True)
         try:
             with request_execution_trace_scope(trace):
                 with self._preload_bridge.request_scope():

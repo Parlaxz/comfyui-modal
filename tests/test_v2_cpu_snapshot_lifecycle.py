@@ -2769,13 +2769,15 @@ class CpuSnapshotPrefillGuardTests(unittest.TestCase):
         """Minimal _execute_v2_prompt_executor replacement."""
         return {"images": [], "videos": [], "outputs": {}}
 
-    def _run_scenario(self, *, snapshot_active: bool, simulate_exact_hit: bool) -> int:
+    def _run_scenario(self, *, snapshot_active: bool, simulate_exact_hit: bool):
         """Run _run_in_process under the given snapshot state.
 
-        Returns the number of times ``schedule_execution_prefill`` was
-        called during the run.
+        Returns ``(prefill_call_count, prefill_diag_lines)`` where
+        *prefill_diag_lines* is a list of ``[v2.execution_prefill]``
+        print call arguments.
         """
         prefill_called: list[bool] = []
+        prefill_diag_lines: list[str] = []
 
         self.entrypoint._cpu_snapshot_models_active = snapshot_active
         self.entrypoint._cpu_snapshot_models = (
@@ -2797,6 +2799,15 @@ class CpuSnapshotPrefillGuardTests(unittest.TestCase):
         )
         context = ExecutionContext(request_id="test-prefill-guard")
 
+        _real_print = print  # capture before patch
+
+        def _capture_print(*args, **kwargs):
+            msg = str(args[0]) if args else ""
+            if msg.startswith("[v2.execution_prefill]"):
+                prefill_diag_lines.append(msg)
+            # Forward to real print so other diagnostics still reach stderr
+            _real_print(*args, file=sys.stderr, **kwargs)
+
         try:
             if simulate_exact_hit:
                 with patch(
@@ -2804,13 +2815,15 @@ class CpuSnapshotPrefillGuardTests(unittest.TestCase):
                     return_value={"compatible": True},
                 ):
                     with patch.object(self.entrypoint, "_use_cpu_snapshot_models_on_bridge"):
-                        asyncio.run(self.entrypoint._run_in_process(plan, context))
+                        with patch("builtins.print", side_effect=_capture_print):
+                            asyncio.run(self.entrypoint._run_in_process(plan, context))
             else:
-                asyncio.run(self.entrypoint._run_in_process(plan, context))
+                with patch("builtins.print", side_effect=_capture_print):
+                    asyncio.run(self.entrypoint._run_in_process(plan, context))
         finally:
             self.entrypoint._preload_bridge.schedule_execution_prefill = original_prefill
 
-        return len(prefill_called)
+        return len(prefill_called), prefill_diag_lines
 
     def test_prefill_guard_with_snapshot_state(self):
         for label, snapshot_active, simulate_exact_hit, expected_calls in [
@@ -2819,7 +2832,7 @@ class CpuSnapshotPrefillGuardTests(unittest.TestCase):
             ("no_snapshot",        False, False, 1),
         ]:
             with self.subTest(case=label):
-                count = self._run_scenario(
+                count, diag_lines = self._run_scenario(
                     snapshot_active=snapshot_active,
                     simulate_exact_hit=simulate_exact_hit,
                 )
@@ -2827,6 +2840,18 @@ class CpuSnapshotPrefillGuardTests(unittest.TestCase):
                     count, expected_calls,
                     f"[{label}] schedule_execution_prefill called {count} time(s), "
                     f"expected {expected_calls}",
+                )
+                # Assert the execution-prefill diagnostic line is emitted exactly once
+                # with the correct scheduled= value (0 when snapshot is active, 0 when
+                # prefill returns False in test setup, never 1 in this harness).
+                self.assertEqual(
+                    len(diag_lines), 1,
+                    f"[{label}] expected exactly 1 [v2.execution_prefill] line, "
+                    f"got {len(diag_lines)}: {diag_lines}",
+                )
+                self.assertIn(
+                    "scheduled=0", diag_lines[0],
+                    f"[{label}] expected scheduled=0 in diagnostic line: {diag_lines[0]}",
                 )
 
 
