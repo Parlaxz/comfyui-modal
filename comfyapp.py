@@ -1770,6 +1770,7 @@ def _log_cold_start_waterfall(s, label=""):
         if v is not None:
             items.append(("local_sub", dl, "mixed", v))
     # submit_to_remote_entry_ms: use actual Modal submit timestamp
+    submit2entry_raw = None
     if t2 is not None and t3 is not None:
         submit2entry_raw = _d(t2, t3)
         if restore_incl_in_submit2entry and rt is not None and submit2entry_raw is not None:
@@ -1902,7 +1903,7 @@ def _log_cold_start_waterfall(s, label=""):
     # SUM: non-overlapping critical-path spans computed from raw
     # timestamps.  The wall trace's submit2entry includes restore;
     # subtract it when both are available.
-    _critical_items = [item for c, name, source, value in items if "_sub" not in c]
+    _critical_items = [item for item in items if "_sub" not in item[0]]
     _critical_values = {name: value for c, name, source, value in _critical_items}
     crit_total = 0.0
     _client_to_entry = _d(t0, t3)
@@ -7338,13 +7339,6 @@ def _build_gpu_volumes() -> dict:
 custom_nodes_vol = modal.Volume.from_name(CUSTOM_NODES_VOLUME_NAME, create_if_missing=True)
 
 
-@app.function(
-    image=download_image,
-    cpu=2,
-    memory=512,
-    timeout=1800,
-    volumes={MODELS_PATH: vol},
-)
 def _ensure_url_scheme(url: str) -> str:
     """Prepend https:// if url is missing a scheme."""
     if url and not url.startswith(("http://", "https://")):
@@ -9349,11 +9343,11 @@ class _ComfyAPIMixin:
                     source="persistent_manifest",
                     identity_match=True,
                     manifest_load_ms=_manifest_load_ms,
-                    cheap_check_ms=_cheap_check_ms,
-                    fingerprint_ms=0.0,
-                    full_validation_ms=0.0,
-                    total_ms=_v2_total,
-                    refresh_performed=False,
+                    manifest_identity_check_ms=_cheap_check_ms,
+                    fallback_fingerprint_ms=0.0,
+                    fallback_validation_ms=0.0,
+                    preflight_total_ms=_v2_total,
+                    fallback_validation_called=False,
                     reason="manifest_identity_match",
                 )
             else:
@@ -9390,11 +9384,11 @@ class _ComfyAPIMixin:
                     source="request_rebuild",
                     identity_match=False,
                     manifest_load_ms=_manifest_load_ms,
-                    cheap_check_ms=_cheap_check_ms,
-                    fingerprint_ms=_fingerprint_ms,
-                    full_validation_ms=_full_val_ms,
-                    total_ms=_v2_total,
-                    refresh_performed=_refresh_performed,
+                    manifest_identity_check_ms=_cheap_check_ms,
+                    fallback_fingerprint_ms=_fingerprint_ms,
+                    fallback_validation_ms=_full_val_ms,
+                    preflight_total_ms=_v2_total,
+                    fallback_validation_called=True,
                     reason=_identity_check.get("reason", "manifest_mismatch"),
                 )
 
