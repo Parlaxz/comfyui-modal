@@ -2198,5 +2198,128 @@ class TestCertProcessCacheInvalidation(unittest.TestCase):
         modal_app._V2_CERT_PROCESS_CACHE.clear()
 
 
+class TestCgroupCpuSampler(unittest.TestCase):
+    def _make_sample(
+        self,
+        timestamp_unix_ns=1_000_000_000,
+        elapsed_request_ms=100.0,
+        effective_cgroup_cores=0.0,
+        phase="method",
+    ):
+        return modal_app._CgroupCpuSample(
+            timestamp_unix_ns=timestamp_unix_ns,
+            elapsed_request_ms=elapsed_request_ms,
+            effective_cgroup_cores=effective_cgroup_cores,
+            phase=phase,
+        )
+
+    def test_sample_has_required_fields(self):
+        sample = self._make_sample(
+            timestamp_unix_ns=1_234_000_000,
+            elapsed_request_ms=567.8,
+            effective_cgroup_cores=3.14,
+            phase="execution",
+        )
+        self.assertEqual(
+            set(sample.__slots__),
+            {
+                "timestamp_unix_ns",
+                "elapsed_request_ms",
+                "effective_cgroup_cores",
+                "phase",
+            },
+        )
+        self.assertEqual(sample.timestamp_unix_ns, 1_234_000_000)
+        self.assertEqual(sample.elapsed_request_ms, 567.8)
+        self.assertEqual(sample.effective_cgroup_cores, 3.14)
+        self.assertEqual(sample.phase, "execution")
+
+    def test_effective_cores_formula(self):
+        sampler = modal_app._CgroupCpuSampler(method_entry_mono_ns=1_000_000_000)
+        sampler._cgroup_base = "/sys/fs/cgroup/test"
+        usage_values = iter((1_000_000, 1_100_000))
+        monotonic_values = iter((1_000_000_000, 1_050_000_000))
+        unix_values = iter((2_000_000_000, 2_050_000_000))
+        with patch.object(
+            modal_app,
+            "_read_cgroup_cpu_usage_usec",
+            side_effect=lambda _base: next(usage_values),
+        ), patch.object(
+            modal_app.time,
+            "monotonic_ns",
+            side_effect=lambda: next(monotonic_values),
+        ), patch.object(
+            modal_app.time,
+            "time_ns",
+            side_effect=lambda: next(unix_values),
+        ):
+            sampler._sample()
+            sampler._sample()
+        self.assertEqual(sampler._samples[0].effective_cgroup_cores, 0.0)
+        self.assertEqual(sampler._samples[1].effective_cgroup_cores, 2.0)
+        self.assertEqual(sampler._samples[1].elapsed_request_ms, 50.0)
+
+    def test_single_interval_above_threshold(self):
+        sampler = modal_app._CgroupCpuSampler(method_entry_mono_ns=0)
+        sampler._samples = [
+            self._make_sample(1_100_000_000, 100.0, 5.0, "execution"),
+            self._make_sample(1_150_000_000, 150.0, 13.0, "execution"),
+            self._make_sample(1_200_000_000, 200.0, 15.0, "execution"),
+            self._make_sample(1_250_000_000, 250.0, 8.0, "execution"),
+        ]
+        intervals = sampler.compute_spike_intervals()
+        self.assertEqual(len(intervals), 1)
+        interval = intervals[0]
+        self.assertEqual(interval["start_unix_ns"], 1_100_000_000)
+        self.assertEqual(interval["end_unix_ns"], 1_200_000_000)
+        self.assertEqual(interval["start_elapsed_ms"], 100.0)
+        self.assertEqual(interval["end_elapsed_ms"], 200.0)
+        self.assertEqual(interval["duration_ms"], 100.0)
+        self.assertEqual(interval["mean_effective_cores"], 14.0)
+        self.assertEqual(interval["peak_effective_cores"], 15.0)
+        self.assertEqual(interval["phase"], "execution")
+
+    def test_phase_splitting_within_spike(self):
+        sampler = modal_app._CgroupCpuSampler(method_entry_mono_ns=0)
+        sampler._samples = [
+            self._make_sample(1_000_000_000, 0.0, 0.0, "method"),
+            self._make_sample(1_050_000_000, 50.0, 14.0, "execution"),
+            self._make_sample(1_100_000_000, 100.0, 13.0, "execution"),
+            self._make_sample(1_150_000_000, 150.0, 15.0, "output"),
+            self._make_sample(1_200_000_000, 200.0, 12.0, "output"),
+        ]
+        intervals = sampler.compute_spike_intervals()
+        self.assertEqual(len(intervals), 2)
+        self.assertEqual(intervals[0]["phase"], "execution")
+        self.assertEqual(intervals[0]["duration_ms"], 100.0)
+        self.assertEqual(intervals[1]["phase"], "output")
+        self.assertEqual(intervals[1]["duration_ms"], 50.0)
+
+    def test_cleanup_stops_sampler_on_stream_error(self):
+        class FakeSampler:
+            def __init__(self):
+                self.stop_count = 0
+
+            def stop(self):
+                self.stop_count += 1
+
+        async def failing_stream():
+            yield {"type": "status"}
+            raise RuntimeError("boom")
+
+        async def consume(sampler):
+            events = []
+            with self.assertRaises(RuntimeError):
+                async for event in modal_app._with_cgroup_sampler_cleanup(
+                    failing_stream(), sampler
+                ):
+                    events.append(event)
+            return events
+
+        sampler = FakeSampler()
+        self.assertEqual(asyncio.run(consume(sampler)), [{"type": "status"}])
+        self.assertEqual(sampler.stop_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
