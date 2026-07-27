@@ -4127,7 +4127,8 @@ class ModalRuntimeEntrypoint:
         # concurrently with execution setup.  The callback waits for both
         # UNET and CLIP preparation futures before encoding, preventing
         # GPU model-load/encode overlap.  Idempotent and thread-safe.
-        self._preload_bridge.schedule_execution_prefill(trace=trace)
+        if not self._cpu_snapshot_models_active:
+            self._preload_bridge.schedule_execution_prefill(trace=trace)
         try:
             with request_execution_trace_scope(trace):
                 with self._preload_bridge.request_scope():
