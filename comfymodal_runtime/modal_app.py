@@ -34,6 +34,7 @@ from .runtime_executor import (
     RuntimeExecutor,
     pre_sampler_instrumentation_scope,
     set_lock_wait_ms,
+    _attach_structured_report,
 )
 from .runtime_state import CommitCoordinator, ModalMountedStateVolume
 from .model_preload import (
@@ -6046,6 +6047,9 @@ class ModalRuntimeEntrypoint:
                 # recalculating from sampler_stage_start_perf_ns (T3).
                 "sampler_node_to_sampler_start_ms": _pre_sampler_state.get("sampler_node_to_sampler_start_ms"),
             }
+            # Attach structured pre-sampler report from live instrumentation
+            _attach_structured_report(result, _pre_sampler_state)
+
             # â”€â”€ Write validation certificate after successful execution â”€â”€
             # Schema v2 certs include preflight_ok=True to attest that
             # deterministic preflight completed successfully for this identity.
