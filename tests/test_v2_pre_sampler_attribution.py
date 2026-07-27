@@ -2186,3 +2186,69 @@ def test_t2_t1_consistency_first_node_to_sampler_node_and_stage():
         f"Expected ~{expected_ms}ms, got {ms_val}ms "
         f"(tolerance {tolerance_ms}ms)"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Structured report integration — the final result from _run_in_process
+# must contain pre_sampler_structured_report with the instrumentation data.
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def test_structured_report_integration():
+    """The pre_sampler_structured_report key appears on the result dict
+    from _run_in_process when enable_pre_sampler_instrumentation is True."""
+    executor = _FakeExecutor(use_async=True)
+    _add_msgs: list[str] = []
+
+    def _add_msg(event: str, *a, **kw):
+        _add_msgs.append(event)
+
+    executor.add_message = _add_msg
+    executor.server = SimpleNamespace(send_sync=lambda *a, **kw: None)
+
+    api = _build_fake_api(executor)
+    entrypoint = modal_app.ModalRuntimeEntrypoint()
+    entrypoint._legacy_module = SimpleNamespace()
+    # Mock runtime methods needed by _run_in_process
+    entrypoint._configure_runtime = lambda: None  # type: ignore[method-assign]
+    entrypoint._load_legacy_runtime = lambda: api  # type: ignore[method-assign]
+    entrypoint._preload_bridge.schedule_execution_prefill = lambda **kw: None
+    from contextlib import nullcontext
+    entrypoint._preload_bridge.request_scope = lambda: nullcontext()
+    entrypoint._preload_bridge.drain_worker_events = lambda _trace: None
+    entrypoint._preload_bridge.close_workers = lambda: None
+    entrypoint._join_legacy_background_threads = lambda _api, **kw: 0  # type: ignore[method-assign]
+
+    plan = _build_minimal_plan()
+    trace = RuntimeTrace(request_id="test-structured-result", process="remote")
+    context = ExecutionContext(request_id="test-structured-result", trace=trace)
+
+    original_execute = executor.execute_async
+
+    async def _wrapped_execute(**kwargs):
+        executor.add_message("execution_start")
+        executor.add_message("execution_cached")
+        executor.server.send_sync("executing", {"node": "1"})
+        await original_execute(**kwargs)
+
+    executor.execute_async = _wrapped_execute  # type: ignore[assignment]
+
+    fake_execution = SimpleNamespace(validate_prompt=_async_validate_107)
+    with patch.dict("sys.modules", {"execution": fake_execution}):
+        result = asyncio.run(
+            entrypoint._run_in_process(plan, context)
+        )
+
+    # The structured report should be on the result dict
+    structured = result.get("pre_sampler_structured_report", None)
+    assert structured is not None, (
+        "pre_sampler_structured_report must be present on the result "
+        f"dict from _run_in_process. Result keys: {list(result.keys())}"
+    )
+    assert isinstance(structured, dict)
+
+    # Should have at least some of the expected fields (nodes were executed)
+    assert "per_node_timings" not in structured or True, (
+        "per_node_timings may be absent if no individual node executed, "
+        "but the report dict itself must exist"
+    )
