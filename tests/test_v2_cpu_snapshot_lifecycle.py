@@ -7,6 +7,7 @@ ComfyUI.  Tests skip cleanly when optional imports are unavailable.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import io
 import os
@@ -18,9 +19,10 @@ from types import SimpleNamespace, MappingProxyType
 from typing import Any
 from collections.abc import Mapping
 
-from comfymodal_runtime.contracts import ModelRestoreKey, PrefillKey, RestorePlan, stable_hash
+from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, ModelRestoreKey, PrefillKey, RestorePlan, stable_hash
 from comfymodal_runtime.model_preload import V2LoaderBridge, RestorePreparation
 from comfymodal_runtime.restore_plan import derive_model_key, derive_prefill_key, build_restore_model_spec
+from comfymodal_runtime.runtime_executor import ExecutionContext
 from comfymodal_runtime.trace import RuntimeTrace
 from comfymodal_runtime.cpu_snapshot_models import (
     CpuSnapshotModels,
@@ -2740,6 +2742,92 @@ class CpuSnapshotUnetStatePropagationTests(unittest.TestCase):
         self.entrypoint._cpu_snapshot_models_active = False
         self.entrypoint._cpu_snapshot_unet_runtime_state = None
         self.assertIsNone(self.entrypoint._cpu_snapshot_unet_runtime_state)
+
+
+class CpuSnapshotPrefillGuardTests(unittest.TestCase):
+    """schedule_execution_prefill guard at the production call site in
+    ``_run_in_process`` (modal_app.py:~4130).
+
+    When ``_cpu_snapshot_models_active`` is True and Plan C binding
+    succeeds (exact hit), the prefill must be skipped because the
+    bridge was already prepared with snapshot models.  On mismatch
+    fallback or when no snapshot is active the prefill must run.
+    """
+
+    def setUp(self):
+        _clean_env()
+        self.entrypoint = ModalRuntimeEntrypoint()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
+        self.entrypoint._runtime_configured = True
+        self.entrypoint._legacy_api = SimpleNamespace(
+            _executor=SimpleNamespace(success=True, history_result={}),
+        )
+        self.entrypoint._legacy_module = SimpleNamespace()
+
+    @staticmethod
+    async def _execute_stub(_plan, _context, _api, _trace):
+        """Minimal _execute_v2_prompt_executor replacement."""
+        return {"images": [], "videos": [], "outputs": {}}
+
+    def _run_scenario(self, *, snapshot_active: bool, simulate_exact_hit: bool) -> int:
+        """Run _run_in_process under the given snapshot state.
+
+        Returns the number of times ``schedule_execution_prefill`` was
+        called during the run.
+        """
+        prefill_called: list[bool] = []
+
+        self.entrypoint._cpu_snapshot_models_active = snapshot_active
+        self.entrypoint._cpu_snapshot_models = (
+            _make_snapshot_models() if snapshot_active else None
+        )
+        self.entrypoint._execute_v2_prompt_executor = self._execute_stub
+
+        original_prefill = self.entrypoint._preload_bridge.schedule_execution_prefill
+
+        def _tracking_prefill(*args: Any, **kwargs: Any) -> Any:
+            prefill_called.append(True)
+            return original_prefill(*args, **kwargs)
+
+        self.entrypoint._preload_bridge.schedule_execution_prefill = _tracking_prefill  # type: ignore[assignment]
+
+        plan = ExecutionPlan(
+            workflow={"1": {"class_type": "KSampler", "inputs": {}}},
+            execution_options=ExecutionOptions(production_enabled=False),
+        )
+        context = ExecutionContext(request_id="test-prefill-guard")
+
+        try:
+            if simulate_exact_hit:
+                with patch(
+                    "comfymodal_runtime.modal_app._canonical_role_match_report",
+                    return_value={"compatible": True},
+                ):
+                    with patch.object(self.entrypoint, "_use_cpu_snapshot_models_on_bridge"):
+                        asyncio.run(self.entrypoint._run_in_process(plan, context))
+            else:
+                asyncio.run(self.entrypoint._run_in_process(plan, context))
+        finally:
+            self.entrypoint._preload_bridge.schedule_execution_prefill = original_prefill
+
+        return len(prefill_called)
+
+    def test_prefill_guard_with_snapshot_state(self):
+        for label, snapshot_active, simulate_exact_hit, expected_calls in [
+            ("exact_hit",          True,  True,  0),
+            ("mismatch_fallback",  True,  False, 1),
+            ("no_snapshot",        False, False, 1),
+        ]:
+            with self.subTest(case=label):
+                count = self._run_scenario(
+                    snapshot_active=snapshot_active,
+                    simulate_exact_hit=simulate_exact_hit,
+                )
+                self.assertEqual(
+                    count, expected_calls,
+                    f"[{label}] schedule_execution_prefill called {count} time(s), "
+                    f"expected {expected_calls}",
+                )
 
 
 if __name__ == "__main__":
