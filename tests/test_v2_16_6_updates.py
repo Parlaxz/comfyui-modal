@@ -300,6 +300,26 @@ class ImageBaseEnvTest(unittest.TestCase):
         self.assertIn('"COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "0"', source)
         self.assertIn('"COMFYMODAL_RESTORE_BACKGROUND_UNET": "0"', source)
 
+    def test_image_base_forwards_prefill_lanes(self):
+        """_image_base.env() forwards COMFYMODAL_V2_PREFILL_LANES from os.environ (not hardcoded)."""
+        comfyapp_path = REPO_ROOT / "comfyapp.py"
+        source = comfyapp_path.read_text(encoding="utf-8")
+        # Locate the .env({...}) block's key-value list
+        env_block_start = source.find("_image_base = (")
+        self.assertGreater(env_block_start, 0, "_image_base block not found")
+        env_block = source[env_block_start:]
+        # The env dict must reference os.environ.get with the default "critical"
+        self.assertIn(
+            '"COMFYMODAL_V2_PREFILL_LANES": os.environ.get("COMFYMODAL_V2_PREFILL_LANES", "critical")',
+            env_block,
+        )
+        # Must not be a hardcoded "none" — the deployment command sets it to "none"
+        # dynamically, not baked into the image.
+        self.assertNotIn(
+            '"COMFYMODAL_V2_PREFILL_LANES": "none"',
+            env_block,
+        )
+
 
 class DefaultValueTests(unittest.TestCase):
     """Test that module-level defaults are now 0 (disabled by default)."""

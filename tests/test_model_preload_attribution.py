@@ -47,6 +47,12 @@ from comfymodal_runtime.model_preload import (
     _child_durations,
     _unet_subfn_nesting_depth,
     _clip_subfn_depth,
+    _model_patcher_breakdown,
+    _model_patcher_load_depth,
+    _make_model_patcher_load_wrapper,
+    _make_model_patcher_load_list_wrapper,
+    _make_model_patcher_patch_weight_wrapper,
+    _make_cast_to_device_wrapper,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4179,3 +4185,227 @@ class TestBgUnetIntegration:
 
         finally:
             self._restore_saved_modules()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 21. ModelPatcher.load aggregate-timing breakdown
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestModelPatcherLoadBreakdown:
+    """Four narrow aggregate-timing wrappers for ModelPatcher.load, _load_list,
+    patch_weight_to_device, and cast_to_device.  Produce one
+    ``model_patcher_load_breakdown`` event on outer load exit under request scope.
+    No events outside active request trace.  Preserve return values."""
+
+    def test_breakdown_event_emitted_under_request_trace(self):
+        """When active request trace is set, outer ModelPatcher.load wrapper
+        emits ``model_patcher_load_breakdown`` with wall/thread/process, traversal,
+        patch_weight count/wall/process, cast count/wall/process, and residual."""
+        trace = RuntimeTrace(request_id="mp-bd-test", process="remote")
+
+        def fake_load(*args, **kwargs):
+            # Simulate _load_list called once
+            ll_wrapper = _make_model_patcher_load_list_wrapper(
+                lambda self: ["a", "b"]
+            )
+            ll_wrapper(SimpleNamespace())
+            # Simulate patch_weight_to_device called multiple times
+            pw_wrapper = _make_model_patcher_patch_weight_wrapper(
+                lambda self, key, **kw: None
+            )
+            for k in ["w1", "w2", "w3"]:
+                pw_wrapper(SimpleNamespace(), k)
+            # Simulate cast_to_device called inside patch_weight
+            cast_wrapper = _make_cast_to_device_wrapper(
+                lambda tensor, device, dtype, **kw: None
+            )
+            for _ in range(5):
+                cast_wrapper(None, "cpu", None)
+            return {"result": "loaded"}
+
+        wrapper = _make_model_patcher_load_wrapper(fake_load)
+        with request_execution_trace_scope(trace):
+            result = wrapper(SimpleNamespace())
+
+        assert result == {"result": "loaded"}
+        events = list(trace.events)
+        bd = [e for e in events if e.name == "model_patcher_load_breakdown"]
+        assert len(bd) == 1, f"Expected 1 breakdown, got {len(bd)}"
+        meta = bd[0].metadata
+        assert meta["request_id"] == "mp-bd-test"
+        # Total fields
+        assert isinstance(meta["wall_ms"], (int, float)) and meta["wall_ms"] >= 0
+        assert meta["thread_cpu_ms"] is None or (isinstance(meta["thread_cpu_ms"], (int, float)) and meta["thread_cpu_ms"] >= 0)
+        assert meta["process_cpu_ms"] is None or (isinstance(meta["process_cpu_ms"], (int, float)) and meta["process_cpu_ms"] >= 0)
+        # Traversal
+        assert isinstance(meta["traversal_wall_ms"], (int, float)) and meta["traversal_wall_ms"] >= 0
+        # Patch weight aggregate
+        assert meta["patch_weight_count"] == 3
+        assert isinstance(meta["patch_weight_wall_ms"], (int, float)) and meta["patch_weight_wall_ms"] >= 0
+        # Cast aggregate
+        assert meta["cast_count"] == 5
+        assert isinstance(meta["cast_wall_ms"], (int, float)) and meta["cast_wall_ms"] >= 0
+        # Residual
+        assert isinstance(meta["residual_wall_ms"], (int, float)) and meta["residual_wall_ms"] >= 0
+        # All expected keys present
+        for key in ("wall_ms", "traversal_wall_ms", "patch_weight_count", "patch_weight_wall_ms",
+                     "cast_count", "cast_wall_ms", "residual_wall_ms"):
+            assert key in meta, f"Missing key {key} in breakdown metadata"
+
+    def test_no_event_outside_request_scope(self):
+        """Outside any active request trace, no breakdown event is emitted."""
+        trace = RuntimeTrace(request_id="no-scope", process="remote")
+
+        def fake_load(*args, **kwargs):
+            return None
+
+        wrapper = _make_model_patcher_load_wrapper(fake_load)
+        wrapper(SimpleNamespace())
+
+        events = list(trace.events)
+        bd = [e for e in events if e.name == "model_patcher_load_breakdown"]
+        assert len(bd) == 0, "Should emit no breakdown outside request scope"
+
+    def test_nested_load_produces_single_breakdown(self):
+        """Nested ModelPatcher.load does not produce a second breakdown."""
+        trace = RuntimeTrace(request_id="mp-nested", process="remote")
+        call_log: list[str] = []
+
+        def inner_load(*args, **kwargs):
+            call_log.append("inner")
+            return "inner-result"
+
+        # Wrap inner_load with the breakdown wrapper, then call it from outer
+        inner_wrapped = _make_model_patcher_load_wrapper(inner_load)
+
+        def outer_load(*args, **kwargs):
+            call_log.append("outer")
+            inner_wrapped(SimpleNamespace())  # nested wrapped call
+            return "outer-result"
+
+        outer_wrapped = _make_model_patcher_load_wrapper(outer_load)
+        with request_execution_trace_scope(trace):
+            result = outer_wrapped(SimpleNamespace())
+
+        assert result == "outer-result"
+        assert call_log == ["outer", "inner"]
+        events = list(trace.events)
+        bd = [e for e in events if e.name == "model_patcher_load_breakdown"]
+        assert len(bd) == 1, f"Expected 1 breakdown, got {len(bd)}"
+
+    def test_cast_wrapper_accumulates_under_breakdown(self):
+        """cast_to_device wrapper increments count and accumulates wall/process
+        time only when ``_model_patcher_breakdown`` is set."""
+        _bd = {"cast_count": 0, "cast_wall_ns": 0, "cast_process_ns": 0}
+        token = _model_patcher_breakdown.set(_bd)
+        try:
+            wrapper = _make_cast_to_device_wrapper(
+                lambda tensor, device, dtype, copy=False: tensor
+            )
+            result = wrapper(None, "cpu", None)
+            assert result is None
+            assert _bd["cast_count"] == 1, f"Expected 1, got {_bd['cast_count']}"
+            assert _bd["cast_wall_ns"] >= 0, "Expected non-negative wall time"
+        finally:
+            _model_patcher_breakdown.reset(token)
+
+    def test_cast_wrapper_no_accumulation_without_breakdown(self):
+        """Outside breakdown context, cast wrapper passes through without
+        error and does not crash."""
+        wrapper = _make_cast_to_device_wrapper(
+            lambda tensor, device, dtype, copy=False: tensor
+        )
+        result = wrapper(None, "cpu", None)
+        assert result is None
+
+    def test_patch_weight_wrapper_accumulates(self):
+        """patch_weight_to_device wrapper increments count and accumulates
+        wall/process time when inside breakdown context."""
+        _bd = {"patch_weight_count": 0, "patch_weight_wall_ns": 0,
+               "patch_weight_process_ns": 0, "cast_count": 0,
+               "cast_wall_ns": 0, "cast_process_ns": 0}
+        token = _model_patcher_breakdown.set(_bd)
+        try:
+            wrapper = _make_model_patcher_patch_weight_wrapper(
+                lambda self, key, **kw: key
+            )
+            r1 = wrapper(SimpleNamespace(), "k1")
+            r2 = wrapper(SimpleNamespace(), "k2")
+            assert r1 == "k1"
+            assert r2 == "k2"
+            assert _bd["patch_weight_count"] == 2
+            assert _bd["patch_weight_wall_ns"] >= 0
+        finally:
+            _model_patcher_breakdown.reset(token)
+
+    def test_load_list_wrapper_measures_single_call(self):
+        """_load_list wrapper measures wall/process for the single call."""
+        _bd = {"load_list_wall_ns": 0, "load_list_process_start_ns": None,
+               "load_list_process_end_ns": None}
+        token = _model_patcher_breakdown.set(_bd)
+        try:
+            wrapper = _make_model_patcher_load_list_wrapper(
+                lambda self: ["loaded"]
+            )
+            result = wrapper(SimpleNamespace())
+            assert result == ["loaded"]
+            assert _bd["load_list_wall_ns"] >= 0
+            if _bd["load_list_process_start_ns"] is None:
+                # process_time_ns may not be available on all platforms
+                pass
+            else:
+                assert _bd["load_list_process_end_ns"] is not None
+        finally:
+            _model_patcher_breakdown.reset(token)
+
+    def test_return_values_preserved(self):
+        """All aggregate-timing wrappers preserve original return values."""
+        def fake_load(*args, **kwargs):
+            return {"model": "ready"}
+        load_wrapper = _make_model_patcher_load_wrapper(fake_load)
+        assert load_wrapper(SimpleNamespace()) == {"model": "ready"}
+
+        ll_wrapper = _make_model_patcher_load_list_wrapper(
+            lambda self: [1, 2, 3]
+        )
+        assert ll_wrapper(SimpleNamespace()) == [1, 2, 3]
+
+        pw_wrapper = _make_model_patcher_patch_weight_wrapper(
+            lambda self, key, **kw: key.upper()
+        )
+        assert pw_wrapper(SimpleNamespace(), "abc") == "ABC"
+
+        cast_wrapper = _make_cast_to_device_wrapper(
+            lambda tensor, device, dtype, copy=False: tensor
+        )
+        assert cast_wrapper(42, "cpu", None) == 42
+
+    def test_all_metadata_fields_present(self):
+        """model_patcher_load_breakdown includes all expected metadata keys."""
+        trace = RuntimeTrace(request_id="mp-meta", process="remote")
+
+        def fake_load(*args, **kwargs):
+            return None
+
+        wrapper = _make_model_patcher_load_wrapper(fake_load)
+        with request_execution_trace_scope(trace):
+            wrapper(SimpleNamespace())
+
+        events = list(trace.events)
+        bd = [e for e in events if e.name == "model_patcher_load_breakdown"]
+        assert len(bd) == 1
+        meta = bd[0].metadata
+        required_keys = {
+            "request_id", "wall_ms", "thread_cpu_ms", "process_cpu_ms",
+            "traversal_wall_ms", "traversal_process_cpu_ms",
+            "patch_weight_count", "patch_weight_wall_ms", "patch_weight_process_cpu_ms",
+            "cast_count", "cast_wall_ms", "cast_process_cpu_ms",
+            "residual_wall_ms", "residual_process_cpu_ms",
+        }
+        meta_keys = set(meta.keys())
+        missing = required_keys - meta_keys
+        assert not missing, f"Missing keys in breakdown metadata: {missing}"
+        assert isinstance(meta["wall_ms"], (int, float))
+        assert isinstance(meta["patch_weight_count"], (int, float))
+        assert isinstance(meta["cast_count"], (int, float))

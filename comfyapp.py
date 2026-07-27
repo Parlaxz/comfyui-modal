@@ -7065,6 +7065,7 @@ _image_base = (
             "COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "0",
             "COMFYMODAL_RESTORE_BACKGROUND_UNET": "0",
             "COMFYMODAL_V2_RUNTIME_REVISION": _V2_RUNTIME_REVISION,
+            "COMFYMODAL_V2_PREFILL_LANES": os.environ.get("COMFYMODAL_V2_PREFILL_LANES", "critical"),
         }
     )
 )
