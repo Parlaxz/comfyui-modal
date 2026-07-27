@@ -3128,7 +3128,10 @@ async def _run_workspace_swap_job(swap_id: str, workspace: dict, plan: dict):
             }
 
         # Phase 1: Ensure workspace is deployed before downloading
-        deploy_decision = _ensure_modal_deploy_current(workspace, None)
+        if plan.get("force_deploy"):
+            deploy_decision = _start_background_deploy(workspace, None, reason="workspace_not_deployed")
+        else:
+            deploy_decision = _ensure_modal_deploy_current(workspace, None)
         if deploy_decision.get("started"):
             with _swap_jobs_lock:
                 _swap_jobs[swap_id]["deploy_message"] = f"Deploying workspace ({deploy_decision['reason']})..."
@@ -3323,20 +3326,28 @@ async def _scan_swap_plan(workspace: dict) -> dict:
     manifest = _workspace_manifest()
     issues = _model_manifest.scan_local_models_issues(_COMFYUI_ROOT, manifest)
     blocking = [item for item in issues if item["kind"] in {"missing_url", "missing_source_kind", "invalid_folder", "duplicate_key"}]
+    remote_status = "available"
+    remote_error = ""
     try:
         remote = await get_sync_status(workspace=workspace)
         remote_models = remote.get("models", [])
     except Exception as e:
-        return {
-            "manifest_issues": issues,
-            "blocking_issues": blocking + [{"kind": "remote_unavailable", "detail": str(e)}],
-            "already_present": [],
-            "to_install": [],
-            "unresolved": [],
-            "to_remove": [],
-            "remote_status": "unavailable",
-            "remote_error": str(e),
-        }
+        err_str = str(e)
+        if "Lookup failed for Function" in err_str and "App '" in err_str and "not found in environment" in err_str:
+            remote_status = "not_deployed"
+            remote_error = err_str
+            remote_models = []
+        else:
+            return {
+                "manifest_issues": issues,
+                "blocking_issues": blocking,
+                "already_present": [],
+                "to_install": [],
+                "unresolved": [],
+                "to_remove": [],
+                "remote_status": "unavailable",
+                "remote_error": err_str,
+            }
     plan = _model_manifest.build_workspace_swap_plan(manifest, remote_models)
     return {
         "manifest_issues": issues,
@@ -3345,7 +3356,8 @@ async def _scan_swap_plan(workspace: dict) -> dict:
         "to_install": plan.get("to_install", []),
         "unresolved": plan.get("unresolved", []),
         "to_remove": plan.get("to_remove", []),
-        "remote_status": "available",
+        "remote_status": remote_status,
+        "remote_error": remote_error,
     }
 
 
@@ -4238,6 +4250,14 @@ if _server:
 
             if body.get("confirm"):
                 scan = await _scan_swap_plan(workspace)
+                if scan.get("remote_status") == "unavailable":
+                    remote_error = scan.get("remote_error", "")
+                    return web.json_response({
+                        "status": "error",
+                        "remote_error": remote_error,
+                        "workspace_label": workspace["label"],
+                        "message": f"Remote workspace unavailable: {remote_error}" if remote_error else "Remote workspace unavailable — check sync status and try again",
+                    })
                 if scan["blocking_issues"]:
                     return web.json_response({
                         "status": "repair_required",
@@ -4269,10 +4289,20 @@ if _server:
                     "already_present": scan.get("already_present", []),
                     "to_remove": scan.get("to_remove", []),
                 }
+                if scan.get("remote_status") == "not_deployed":
+                    plan["force_deploy"] = True
                 asyncio.create_task(_run_workspace_swap_job(swap_id, workspace, plan))
                 return web.json_response({"status": "started", "swap_id": swap_id, "workspace_label": workspace["label"]})
 
             scan = await _scan_swap_plan(workspace)
+            if scan.get("remote_status") == "unavailable":
+                remote_error = scan.get("remote_error", "")
+                return web.json_response({
+                    "status": "error",
+                    "remote_error": remote_error,
+                    "workspace_label": workspace["label"],
+                    "message": f"Remote workspace unavailable: {remote_error}" if remote_error else "Remote workspace unavailable — check sync status and try again",
+                })
             if scan["blocking_issues"]:
                 return web.json_response({
                     "status": "repair_required",

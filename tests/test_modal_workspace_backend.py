@@ -36,6 +36,9 @@ class _Routes:
     def delete(self, path):
         return self._register("DELETE", path)
 
+    def patch(self, path):
+        return self._register("PATCH", path)
+
 
 def _make_modal_stub():
     stub = types.ModuleType("modal")
@@ -231,6 +234,168 @@ class ModalWorkspaceBackendTests(unittest.TestCase):
         self.assertEqual(plan["to_install"], [{"url": "https://example.com/a", "filename": "a.safetensors", "save_path": "loras"}])
         self.assertEqual(plan["already_present"], [{"folder": "vae", "filename": "kept.safetensors"}])
         self.assertEqual(plan["to_remove"], [{"folder": "loras", "filename": "old.safetensors"}])
+
+    def test_swap_scan_returns_error_when_remote_unavailable(self):
+        module, handlers = _load_init_module()
+        handler = handlers[("POST", "/comfymodal/workspaces/swap")]
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(module, "_WORKSPACES_FILE", str(Path(tmp) / ".modal_workspaces.json")):
+                registry = module._workspace_store.upsert_workspace(module._WORKSPACES_FILE, "Studio A", "ak-a", "as-a", set_active=True)
+                workspace_id = registry["workspaces"][0]["id"]
+                with patch.object(module, "_scan_swap_plan", return_value={
+                    "blocking_issues": [],
+                    "unresolved": [],
+                    "already_present": [],
+                    "to_install": [],
+                    "to_remove": [],
+                    "remote_status": "unavailable",
+                    "remote_error": "Connection refused",
+                }):
+                    response = asyncio.run(handler(_Request({"workspace_id": workspace_id})))
+                    payload = json.loads(response.text)
+
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("remote_error", payload)
+        self.assertEqual(payload["remote_error"], "Connection refused")
+        self.assertIn("Connection refused", payload["message"])
+        self.assertNotEqual(payload["status"], "repair_required")
+
+    def test_swap_confirm_returns_error_when_remote_unavailable(self):
+        module, handlers = _load_init_module()
+        handler = handlers[("POST", "/comfymodal/workspaces/swap")]
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch.object(module, "_WORKSPACES_FILE", str(Path(tmp) / ".modal_workspaces.json")),
+                patch.object(module, "_ACTIVE_REQUEST_IDS", {}),
+            ):
+                registry = module._workspace_store.upsert_workspace(module._WORKSPACES_FILE, "Studio A", "ak-a", "as-a", set_active=True)
+                workspace_id = registry["workspaces"][0]["id"]
+                with patch.object(module, "_scan_swap_plan", return_value={
+                    "blocking_issues": [],
+                    "unresolved": [],
+                    "already_present": [],
+                    "to_install": [],
+                    "to_remove": [],
+                    "remote_status": "unavailable",
+                    "remote_error": "get_sync_status timed out",
+                }):
+                    response = asyncio.run(handler(_Request({
+                        "workspace_id": workspace_id,
+                        "confirm": True,
+                        "selected_keys": [],
+                    })))
+                    payload = json.loads(response.text)
+
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("remote_error", payload)
+        self.assertEqual(payload["remote_error"], "get_sync_status timed out")
+        self.assertIn("get_sync_status timed out", payload["message"])
+        self.assertNotEqual(payload["status"], "repair_required")
+
+    def test_scan_plan_returns_not_deployed_on_missing_app(self):
+        module, _ = _load_init_module()
+        workspace = {"id": "ws-1", "label": "Studio A", "token_id": "ak-test", "token_secret": "as-test"}
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / ".model_manifest.json"
+            manifest_path.write_text(json.dumps({
+                "manifest_version": 1,
+                "entries": [{
+                    "folder": "vae",
+                    "filename": "new-vae.safetensors",
+                    "url": "https://example.com/new-vae.safetensors",
+                    "source_kind": "direct",
+                }],
+            }), encoding="utf-8")
+            with (
+                patch.object(module, "_MODEL_MANIFEST_FILE", str(manifest_path)),
+                patch.object(module, "get_sync_status", side_effect=RuntimeError(
+                    "Modal error: Lookup failed for Function 'get_volume_status' "
+                    "from the 'comfyui' app: App 'comfyui' not found in environment 'main'."
+                )),
+            ):
+                result = asyncio.run(module._scan_swap_plan(workspace))
+
+        self.assertEqual(result["remote_status"], "not_deployed")
+        self.assertIn("Lookup failed", result["remote_error"])
+        self.assertIn("not found", result["remote_error"])
+        self.assertEqual(result["to_install"][0]["filename"], "new-vae.safetensors")
+        self.assertEqual(result["already_present"], [])
+
+    def test_scan_plan_remains_unavailable_on_other_errors(self):
+        module, _ = _load_init_module()
+        workspace = {"id": "ws-1", "label": "Studio A", "token_id": "ak-test", "token_secret": "as-test"}
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / ".model_manifest.json"
+            manifest_path.write_text(json.dumps({
+                "manifest_version": 1, "entries": [],
+            }), encoding="utf-8")
+            with (
+                patch.object(module, "_MODEL_MANIFEST_FILE", str(manifest_path)),
+                patch.object(module, "get_sync_status", side_effect=TimeoutError("connection timed out")),
+            ):
+                result = asyncio.run(module._scan_swap_plan(workspace))
+
+        self.assertEqual(result["remote_status"], "unavailable")
+        self.assertEqual(result["remote_error"], "connection timed out")
+
+    def test_swap_review_returns_not_deployed_as_review_required(self):
+        module, handlers = _load_init_module()
+        handler = handlers[("POST", "/comfymodal/workspaces/swap")]
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(module, "_WORKSPACES_FILE", str(Path(tmp) / ".modal_workspaces.json")):
+                registry = module._workspace_store.upsert_workspace(module._WORKSPACES_FILE, "Studio A", "ak-a", "as-a", set_active=True)
+                workspace_id = registry["workspaces"][0]["id"]
+                with patch.object(module, "_scan_swap_plan", return_value={
+                    "blocking_issues": [],
+                    "unresolved": [],
+                    "already_present": [],
+                    "to_install": [],
+                    "to_remove": [],
+                    "remote_status": "not_deployed",
+                    "remote_error": "App 'comfyui' not found in environment 'main'",
+                }):
+                    response = asyncio.run(handler(_Request({"workspace_id": workspace_id})))
+                    payload = json.loads(response.text)
+
+        self.assertEqual(payload["status"], "review_required")
+        self.assertNotEqual(payload["status"], "error")
+
+    def test_swap_confirm_passes_force_deploy_when_not_deployed(self):
+        module, handlers = _load_init_module()
+        handler = handlers[("POST", "/comfymodal/workspaces/swap")]
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch.object(module, "_WORKSPACES_FILE", str(Path(tmp) / ".modal_workspaces.json")),
+                patch.object(module, "_ACTIVE_REQUEST_IDS", {}),
+            ):
+                registry = module._workspace_store.upsert_workspace(module._WORKSPACES_FILE, "Studio A", "ak-a", "as-a", set_active=True)
+                workspace_id = registry["workspaces"][0]["id"]
+                scan_plan = {
+                    "blocking_issues": [],
+                    "unresolved": [],
+                    "already_present": [],
+                    "to_install": [],
+                    "to_remove": [],
+                    "remote_status": "not_deployed",
+                    "remote_error": "App 'comfyui' not found",
+                }
+                with (
+                    patch.object(module, "_scan_swap_plan", return_value=scan_plan),
+                    patch.object(module, "_run_workspace_swap_job", new=MagicMock(return_value=None)) as run_job,
+                    patch("asyncio.create_task") as create_task,
+                ):
+                    response = asyncio.run(handler(_Request({
+                        "workspace_id": workspace_id,
+                        "confirm": True,
+                        "selected_keys": [],
+                    })))
+                    payload = json.loads(response.text)
+
+        self.assertEqual(payload["status"], "started")
+        create_task.assert_called_once()
+        run_job.assert_called_once()
+        _, _, plan = run_job.call_args.args
+        self.assertTrue(plan.get("force_deploy"))
 
     def test_ensure_modal_deploy_current_ignores_missing_fingerprint(self):
         module, _ = _load_init_module()
