@@ -1855,16 +1855,94 @@ def _detect_gpu_allocation(requested_gpu_order: tuple[str, ...]) -> dict[str, An
     return info
 
 
-def _read_cgroup_cpu_usage_usec(cgroup_base: str) -> int | None:
+def _resolve_cgroup_cpu_stat_path() -> tuple[str | None, list[str], list[str]]:
+    """Resolve a readable cpu.stat path using CPU-specific probing.
+
+    Probes in order:
+      1. ``_resolve_cgroup_v2_base()[0]/cpu.stat`` when the resolver returns a base.
+      2. ``/sys/fs/cgroup/cpu.stat``
+      3. Parse the unified ``0::...`` line from ``/proc/self/cgroup``, join the
+         relative path below ``/sys/fs/cgroup``, and probe its ``cpu.stat``.
+
+    Returns ``(path, candidates, errors)`` where *path* is the first readable
+    absolute path or ``None``, *candidates* lists every attempted path, and
+    *errors* lists per-probe diagnostic messages with exception type+message.
+    """
+    candidates: list[str] = []
+    errors: list[str] = []
+
+    def _probe(path: str, label: str) -> str | None:
+        if path in candidates:
+            return None
+        candidates.append(path)
+        try:
+            with open(path) as _f:
+                _f.read(1)
+        except Exception as exc:
+            errors.append(f"{label} path={path}: {type(exc).__name__}: {exc}")
+            return None
+        return path
+
+    # Probe 1: _resolve_cgroup_v2_base()[0] + "/cpu.stat"
     try:
-        with open(posixpath.join(cgroup_base, "cpu.stat")) as cpu_stat:
-            for line in cpu_stat:
-                key, _, value = line.partition(" ")
-                if key == "usage_usec":
-                    usage = int(value.strip())
-                    return usage if usage >= 0 else None
-    except Exception:
-        pass
+        base = _resolve_cgroup_v2_base()
+    except Exception as exc:
+        errors.append(f"resolve_cgroup_v2_base: {type(exc).__name__}: {exc}")
+        base = None
+    if base is None:
+        errors.append("resolve_cgroup_v2_base: returned no readable cgroup base")
+    else:
+        path = _probe(posixpath.join(base[0], "cpu.stat"), "probe1")
+        if path is not None:
+            return path, candidates, errors
+
+    # Probe 2: /sys/fs/cgroup/cpu.stat
+    path = _probe("/sys/fs/cgroup/cpu.stat", "probe2")
+    if path is not None:
+        return path, candidates, errors
+
+    # Probe 3: parse /proc/self/cgroup unified line, join below /sys/fs/cgroup
+    _cgroup_rel: str | None = None
+    try:
+        with open("/proc/self/cgroup") as _f:
+            for _line in _f:
+                _stripped = _line.strip()
+                if _stripped.startswith("0::"):
+                    _cgroup_rel = _stripped[3:]
+                    break
+    except Exception as exc:
+        errors.append(f"parse_proc_cgroup: {type(exc).__name__}: {exc}")
+    if _cgroup_rel is None:
+        errors.append("parse_proc_cgroup: no unified 0:: entry")
+    else:
+        _rel = _cgroup_rel if _cgroup_rel.startswith("/") else f"/{_cgroup_rel}"
+        _components = [component for component in _rel.split("/") if component]
+        if any(component in {".", ".."} for component in _components):
+            errors.append(f"parse_proc_cgroup: unsafe unified path {_cgroup_rel!r}")
+        else:
+            path = _probe(
+                posixpath.join("/sys/fs/cgroup", *_components, "cpu.stat"),
+                "probe3",
+            )
+            if path is not None:
+                return path, candidates, errors
+
+    return None, candidates, errors
+
+
+def _read_cgroup_cpu_usage_usec(cpu_stat_path: str) -> int | None:
+    """Read ``usage_usec`` from an already-resolved ``cpu.stat`` file.
+
+    Takes the full absolute path directly.  Does NOT swallow exceptions —
+    callers that need resilience (e.g. the sampler background thread) must
+    catch at their own boundary.
+    """
+    with open(cpu_stat_path) as cpu_stat:
+        for line in cpu_stat:
+            key, _, value = line.partition(" ")
+            if key == "usage_usec":
+                usage = int(value.strip())
+                return usage if usage >= 0 else None
     return None
 
 
@@ -1887,6 +1965,20 @@ def _emit_cgroup_spike_summary(peak: float, intervals: list[dict[str, Any]]) -> 
             )
         )
     print(f"[v2.cgroup_cpu_spike] {' '.join(parts)}", flush=True)
+
+
+def _emit_cgroup_cpu_unavailable(
+    reason: str,
+    candidates: list[str],
+    errors: list[str],
+) -> None:
+    candidate_text = ";".join(candidates) or "none"
+    error_text = ";".join(errors) or "none"
+    print(
+        f"[v2.cgroup_cpu_spike] status=unavailable "
+        f"reason={reason} candidates={candidate_text} errors={error_text}",
+        flush=True,
+    )
 
 
 class _CgroupCpuSample:
@@ -1921,13 +2013,18 @@ class _CgroupCpuSampler:
         self._lock = threading.Lock()
         self._phase = "method"
         self._phase_source: Callable[[], str] | None = None
-        resolved = _resolve_cgroup_v2_base()
-        self._cgroup_base = resolved[0] if resolved else None
+        self._cpu_stat_path, self._resolution_candidates, self._resolution_errors = (
+            _resolve_cgroup_cpu_stat_path()
+        )
+        self._resolution_failure = (
+            "no readable cpu.stat" if self._cpu_stat_path is None else None
+        )
+        self._failure_reason: str | None = None
         self._prev_usage_usec: int | None = None
         self._prev_mono_ns: int | None = None
 
     def start(self) -> None:
-        if not self._cgroup_base or self._thread is not None:
+        if not self._cpu_stat_path or self._thread is not None:
             return
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -1950,10 +2047,17 @@ class _CgroupCpuSampler:
         return self._phase
 
     def _sample(self) -> None:
-        if not self._cgroup_base:
+        if not self._cpu_stat_path:
             return
-        usage_usec = _read_cgroup_cpu_usage_usec(self._cgroup_base)
+        try:
+            usage_usec = _read_cgroup_cpu_usage_usec(self._cpu_stat_path)
+        except Exception as exc:
+            self._failure_reason = f"read_error: {type(exc).__name__}: {exc}"
+            return
         if usage_usec is None:
+            self._failure_reason = (
+                f"read_error: {self._cpu_stat_path}: missing usage_usec"
+            )
             return
         now_mono_ns = time.monotonic_ns()
         now_unix_ns = time.time_ns()
@@ -1984,6 +2088,31 @@ class _CgroupCpuSampler:
 
     def set_phase_source(self, source: Callable[[], str]) -> None:
         self._phase_source = source
+
+    def set_phase(self, phase: str) -> None:
+        self._phase = phase
+
+    def report(self) -> None:
+        samples = self._snapshot()
+        if not samples:
+            reason_parts: list[str] = []
+            if self._resolution_failure:
+                reason_parts.append(self._resolution_failure)
+            if self._failure_reason:
+                reason_parts.append(self._failure_reason)
+            if not reason_parts:
+                reason_parts.append("zero_samples")
+            _emit_cgroup_cpu_unavailable(
+                reason=" | ".join(reason_parts),
+                candidates=self._resolution_candidates,
+                errors=self._resolution_errors + (
+                    [self._failure_reason] if self._failure_reason else []
+                ),
+            )
+            return
+        _emit_cgroup_spike_summary(
+            self.compute_peak_cores(), self.compute_spike_intervals()
+        )
 
     def stop(self) -> None:
         thread = self._thread
@@ -2103,6 +2232,7 @@ class ModalRuntimeEntrypoint:
         self._restore_count: int = 0
         self._request_count: int = 0
         self._restore_timing: dict[str, Any] | None = None
+        self._cgroup_sampler: _CgroupCpuSampler | None = None
         # CPU snapshot model state (Plan C lifecycle)
         self._cpu_snapshot_models: CpuSnapshotModels | None = None
         self._cpu_snapshot_models_active: bool = False
@@ -2980,6 +3110,9 @@ class ModalRuntimeEntrypoint:
         }
 
     def restore(self) -> dict[str, Any]:
+        self._cgroup_sampler = _CgroupCpuSampler(time.monotonic_ns())
+        self._cgroup_sampler.set_phase("restore")
+        self._cgroup_sampler.start()
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
         _report_host_memory("restore_start")
         # Reset per-request counter so first request after every fresh restore
@@ -6381,10 +6514,7 @@ class ModalRuntimeEntrypoint:
         modal_method_entry_mono_ns: int = _method_first_line_ns
         modal_method_entry_wall_ns: int = _method_first_line_wall_ns
         _method_restore_marker = get_restore_return_marker()
-        _cgroup_sampler: _CgroupCpuSampler | None = None
-        if _method_restore_marker is not None:
-            _cgroup_sampler = _CgroupCpuSampler(_method_first_line_ns)
-            _cgroup_sampler.start()
+        _cgroup_sampler: _CgroupCpuSampler | None = getattr(self, '_cgroup_sampler', None)
         _entry_host = _capture_host_info()
 
         identity = _capture_remote_identity()
@@ -6455,10 +6585,6 @@ class ModalRuntimeEntrypoint:
 
         # â”€â”€ Continue with normal setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-        if not _method_entry_gap_results.get("same_process", False):
-            if _cgroup_sampler is not None:
-                _cgroup_sampler.stop()
-            _cgroup_sampler = None
         # Use a local event buffer until trace exists
         _pre_trace_events: list[dict[str, Any]] = [
             {"name": "run_plan_method_first_line", "phase": "method",
@@ -6484,7 +6610,7 @@ class ModalRuntimeEntrypoint:
             **_entry_host,
             **_resource_identity(),
         )
-        if _cgroup_sampler is not None:
+        if _cgroup_sampler is not None and _method_entry_gap_results.get("same_process", False):
             _cgroup_sampler.set_phase_source(
                 lambda: (
                     context.trace.events[-1].phase
@@ -6665,10 +6791,7 @@ class ModalRuntimeEntrypoint:
             "request_id": request_id,
             "trace_id": context.trace.trace_id if context.trace else "",
         }
-        _execution_stream = _with_cgroup_sampler_cleanup(
-            self.executor.stream(plan, context=context),
-            _cgroup_sampler,
-        )
+        _execution_stream = self.executor.stream(plan, context=context)
         async for event in _execution_stream:
             if event.get("type") == "result" and isinstance(event.get("data"), dict):
                 data = dict(event["data"])
@@ -6914,9 +7037,8 @@ class ModalRuntimeEntrypoint:
                 event = {**event, "data": data}
                 if _cgroup_sampler is not None:
                     _cgroup_sampler.stop()
-                    _peak = _cgroup_sampler.compute_peak_cores()
-                    _intervals = _cgroup_sampler.compute_spike_intervals()
-                    _emit_cgroup_spike_summary(_peak, _intervals)
+                    _cgroup_sampler.report()
+                    self._cgroup_sampler = None
                     _cgroup_sampler = None
             yield event
 
@@ -7024,6 +7146,7 @@ def _build_decorated_v2_class() -> type:
         self.container_session_id = _V2_CONTAINER_SESSION_ID
         self._restore_count = 0
         self._restore_timing = None
+        self._cgroup_sampler = None
         self._cpu_snapshot_unet_runtime_state = None
         self._v2_initialized = True
 
