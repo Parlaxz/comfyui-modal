@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 import sys
@@ -43,6 +42,8 @@ def _load_workspace() -> dict[str, Any]:
         if workspace.get("id") == active_id:
             if not workspace.get("token_id") or not workspace.get("token_secret"):
                 raise RuntimeError("active Modal workspace has no credentials")
+            os.environ["MODAL_TOKEN_ID"] = str(workspace["token_id"])
+            os.environ["MODAL_TOKEN_SECRET"] = str(workspace["token_secret"])
             return workspace
     raise RuntimeError("active Modal workspace was not found")
 
@@ -147,6 +148,236 @@ def _capture_ts() -> tuple[int, int]:
     return (int(time.time() * 1_000_000_000), time.monotonic_ns())
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Full trace bundle download handoff
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _find_in_dir(directory: Path, pattern: str) -> Path | None:
+    """Find first file matching *pattern* in *directory* (recursive)."""
+    matches = list(directory.rglob(pattern))
+    return matches[0] if matches else None
+
+
+async def _run_downloader_cli(
+    *,
+    volume_name: str,
+    remote_bundle_path: str,
+    bundle_sha256: str,
+    trace_id: str,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Invoke ``tools/download_v2_full_trace.py`` via subprocess.
+
+    The CLI outputs 6 ``KEY=VALUE`` lines on success.  This function parses
+    those lines, discovers additional file paths inside the extract directory,
+    times the operation, and returns a full metadata dict with all required
+    keys for ``full_trace_download.json``.
+
+    Raises ``RuntimeError`` on any failure (CLI not found, nonzero exit,
+    timeout, or parse error).
+    """
+    downloader_path = ROOT / "tools" / "download_v2_full_trace.py"
+    if not downloader_path.is_file():
+        raise RuntimeError(
+            f"Trace downloader not found at {downloader_path}"
+        )
+
+    t0 = time.perf_counter()
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(downloader_path),
+            "--volume", str(volume_name),
+            "--remote-path", str(remote_bundle_path),
+            "--sha256", str(bundle_sha256),
+            "--trace-id", str(trace_id),
+            "--output-dir", str(output_dir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=120.0,
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError("Trace downloader timed out after 120s")
+    except Exception as exc:
+        raise RuntimeError(f"Trace downloader subprocess failed: {exc}") from exc
+
+    download_ms = (time.perf_counter() - t0) * 1000.0
+
+    if proc.returncode != 0:
+        stderr_text = (
+            stderr_bytes.decode("utf-8", errors="replace")[:500]
+            if stderr_bytes else ""
+        )
+        raise RuntimeError(
+            f"Trace downloader exited code={proc.returncode}: {stderr_text}"
+        )
+
+    # Parse the 6 FULL_TRACE_* KEY=VALUE output lines from the downloader CLI.
+    # Keys are: FULL_TRACE_BUNDLE, FULL_TRACE_REPORT, FULL_TRACE_VIZTRACER,
+    #           FULL_TRACE_TORCH, FULL_TRACE_MANIFEST, FULL_TRACE_EXTRACT_DIR
+    stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+    parsed: dict[str, str] = {}
+    for line in stdout_text.strip().splitlines():
+        line = line.strip()
+        if "=" in line:
+            k, _, v = line.partition("=")
+            parsed[k.strip()] = v.strip()
+
+    required_keys = {
+        "FULL_TRACE_BUNDLE",
+        "FULL_TRACE_REPORT",
+        "FULL_TRACE_VIZTRACER",
+        "FULL_TRACE_TORCH",
+        "FULL_TRACE_MANIFEST",
+        "FULL_TRACE_EXTRACT_DIR",
+    }
+    missing_keys = sorted(key for key in required_keys if key not in parsed)
+    if missing_keys:
+        raise RuntimeError(
+            "Trace downloader output missing keys: " + ", ".join(missing_keys)
+        )
+
+    # Extract the known keys, then map to the required metadata schema
+    extract_dir = Path(parsed.get("FULL_TRACE_EXTRACT_DIR", str(output_dir / f"full_trace_{trace_id}")))
+    torch_val = parsed.get("FULL_TRACE_TORCH", "")
+    if torch_val.lower() == "absent":
+        torch_trace_path_val = "absent"
+    else:
+        torch_trace_path_val = torch_val
+
+    meta: dict[str, Any] = {
+        "trace_id": trace_id,
+        "remote_bundle_path": remote_bundle_path,
+        "local_bundle_path": parsed.get("FULL_TRACE_BUNDLE", ""),
+        "extract_dir": str(extract_dir),
+        "bundle_sha256": bundle_sha256,
+        "verified": True,
+        "report_path": parsed.get("FULL_TRACE_REPORT", ""),
+        "viztracer_path": parsed.get("FULL_TRACE_VIZTRACER", ""),
+        "torch_trace_path": torch_trace_path_val,
+        "manifest_path": parsed.get("FULL_TRACE_MANIFEST", ""),
+        "download_ms": round(download_ms, 1),
+    }
+    return meta
+
+
+async def _handle_full_trace_artifact(
+    result: dict[str, Any],
+    output_dir: Path,
+    workspace: dict[str, Any],
+    transport: ModalTransport,
+    *,
+    _test_trace_downloader: Any = None,
+) -> dict[str, Any] | None:
+    """Handle ``full_trace_artifact`` from a remote result.
+
+    Descriptor contract (the artifact dict):
+      - ``status == 'ready'`` plus ``volume_name``, ``remote_bundle_path``,
+        ``bundle_sha256``, ``trace_id`` → invoke the downloader exactly once,
+        write ``full_trace_download.json`` beside the run file.
+      - ``status == 'error'`` with ``error_type`` and optional ``error`` →
+        raise ``RuntimeError`` with a sanitised message; the caller is
+        expected to preserve the run file.
+      - Absent artifact (no ``full_trace_artifact`` key or non-dict value)
+        → return ``None``, no-op.
+      - Unknown status → treated as absent (no-op).
+
+    The caller **must** write ``run_<index>.json`` to disk *before* calling
+    this function.
+
+    Raises ``RuntimeError`` on error artifacts and on any download /
+    verification / extraction / CLI failure.
+    """
+    full_trace_artifact = (
+        result.get("full_trace_artifact")
+        if isinstance(result, dict)
+        else None
+    )
+    if not isinstance(full_trace_artifact, dict):
+        return None  # absent
+
+    status = full_trace_artifact.get("status", "")
+
+    # ── Error artifact ──────────────────────────────────────────────────
+    if status == "error":
+        error_type = str(full_trace_artifact.get("error_type", "unknown_error"))[:100]
+        error_msg = str(full_trace_artifact.get("error", ""))[:200]
+        sanitized = (
+            f"({error_type}) {error_msg}"
+            if error_msg
+            else f"({error_type})"
+        )
+        raise RuntimeError(f"Trace bundle error: {sanitized}")
+
+    # ── Unknown status — treat as absent ────────────────────────────────
+    if status != "ready":
+        return None
+
+    # ── Ready artifact — validate required fields ───────────────────────
+    volume_name = str(full_trace_artifact.get("volume_name", ""))
+    remote_bundle_path = str(full_trace_artifact.get("remote_bundle_path", ""))
+    bundle_sha256 = str(full_trace_artifact.get("bundle_sha256", ""))
+    trace_id = str(full_trace_artifact.get("trace_id", ""))
+
+    if not all([volume_name, remote_bundle_path, bundle_sha256, trace_id]):
+        raise RuntimeError(
+            "Trace bundle error: ready artifact missing required fields "
+            "(volume_name, remote_bundle_path, bundle_sha256, trace_id)"
+        )
+
+    # ── Invoke downloader exactly once ─────────────────────────────────
+    if _test_trace_downloader is not None:
+        download_meta = await _test_trace_downloader(
+            volume_name=volume_name,
+            remote_bundle_path=remote_bundle_path,
+            bundle_sha256=bundle_sha256,
+            trace_id=trace_id,
+            output_dir=output_dir,
+            workspace=workspace,
+            transport=transport,
+        )
+    else:
+        download_meta = await _run_downloader_cli(
+            volume_name=volume_name,
+            remote_bundle_path=remote_bundle_path,
+            bundle_sha256=bundle_sha256,
+            trace_id=trace_id,
+            output_dir=output_dir,
+        )
+
+    if not isinstance(download_meta, dict):
+        raise RuntimeError("Trace downloader returned invalid metadata")
+    required_meta_keys = {
+        "trace_id",
+        "remote_bundle_path",
+        "local_bundle_path",
+        "extract_dir",
+        "bundle_sha256",
+        "verified",
+        "report_path",
+        "viztracer_path",
+        "torch_trace_path",
+        "manifest_path",
+        "download_ms",
+    }
+    missing_meta_keys = sorted(required_meta_keys - set(download_meta))
+    if missing_meta_keys:
+        raise RuntimeError(
+            "Trace downloader metadata missing keys: "
+            + ", ".join(missing_meta_keys)
+        )
+
+    # Write download metadata beside run file
+    (output_dir / "full_trace_download.json").write_text(
+        json.dumps(download_meta, default=str, indent=2), encoding="utf-8",
+    )
+    return download_meta
+
+
 async def _run_one(
     *,
     index: int,
@@ -160,6 +391,7 @@ async def _run_one(
     _test_restore_publisher: Any = None,
     _test_profile_setter: Any = None,
     _test_profile_checker: Any = None,
+    _test_trace_downloader: Any = None,
 ) -> dict[str, Any]:
     # T0: benchmark iteration origin (literal first line)
     _req_id = f"v2-benchmark-{index}-{uuid.uuid4().hex[:12]}"
@@ -301,6 +533,25 @@ async def _run_one(
     (output_dir / f"run_{index}.json").write_text(
         json.dumps(artifact, default=str, indent=2), encoding="utf-8"
     )
+
+    # ── Full trace bundle download handoff ─────────────────────────────
+    # Run file is safely committed to disk.  Now process any
+    # full_trace_artifact from the remote result:
+    #   - status == "ready"   → invoke downloader, write full_trace_download.json
+    #   - status == "error"   → raise RuntimeError (caught below, run file preserved)
+    #   - absent              → no-op (preserves existing behaviour)
+    #
+    # Errors are caught and stored in the artifact so they do not abort
+    # remaining benchmark runs.  The main loop collects all errors and
+    # exits non-zero at the end.
+    try:
+        await _handle_full_trace_artifact(
+            result, output_dir, workspace, transport,
+            _test_trace_downloader=_test_trace_downloader,
+        )
+    except Exception as exc:
+        artifact["_trace_handoff_error"] = str(exc)[:300]
+
     print(json.dumps({"run_index": index, "identity": identity, "timing": artifact["timing"]}, default=str))
     return artifact
 
@@ -1595,14 +1846,28 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
         ))
         if index + 1 < RUN_COUNT:
             await asyncio.sleep(GAP_SECONDS)
+    trace_errors = [
+        a for a in artifacts if a.get("_trace_handoff_error")
+    ]
     summary = {
         "target": {"app_name": APP_NAME, "class_name": CLASS_NAME, "gpu": GPU},
         "run_count": len(artifacts),
         "gap_seconds": GAP_SECONDS,
+        "trace_handoff_errors": len(trace_errors),
         "runs": [{"run_index": item["run_index"], "identity": item["identity"], "timing": item["timing"]} for item in artifacts],
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, default=str, indent=2), encoding="utf-8")
     print(json.dumps({"output_dir": str(output_dir), **summary}, default=str, indent=2))
+
+    # Signal failure if any trace handoff failed (run files are preserved)
+    if trace_errors:
+        error_details = "; ".join(
+            f"run_{a['run_index']}: {a['_trace_handoff_error']}"
+            for a in trace_errors
+        )
+        raise RuntimeError(
+            f"{len(trace_errors)} trace handoff error(s): {error_details}"
+        )
 
 
 if __name__ == "__main__":
