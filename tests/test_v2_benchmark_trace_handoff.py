@@ -25,6 +25,7 @@ from unittest import mock
 from tools.benchmark_v2_direct import (
     _handle_full_trace_artifact,
     _find_in_dir,
+    _run_one,
 )
 
 # ============================================================================
@@ -402,6 +403,148 @@ class TestHandleFullTraceArtifact(unittest.IsolatedAsyncioTestCase):
                 _test_trace_downloader=counting_downloader,
             )
         self.assertEqual(call_count, 0)
+
+
+# ============================================================================
+# _run_one — handoff error persistence to disk
+# ============================================================================
+
+
+class TestRunOneTraceHandoffPersistence(unittest.IsolatedAsyncioTestCase):
+    """_run_one must rewrite the run file with ``_trace_handoff_error`` when
+    ``_handle_full_trace_artifact`` raises, preserving result/identity/timing."""
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp())
+        self.output_dir = self._tmp
+        self.workspace = {"token_id": "t", "token_secret": "s"}
+        self.transport = mock.AsyncMock()
+        self.workflow = {"test": "workflow"}
+        self.modal_options = {"test": "options"}
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    async def test_handoff_error_persisted_to_run_file(self):
+        """``_trace_handoff_error`` key appears in ``run_{index}.json``."""
+        result = {
+            "trace": {"events": [], "metadata": {}},
+            "full_trace_artifact": {
+                "status": "error",
+                "error_type": "trace_collection_failed",
+                "error": "Something went wrong",
+            },
+        }
+
+        async def mock_execute_plan(plan: Any, **kw: Any) -> dict[str, Any]:
+            return result
+
+        with (
+            mock.patch("tools.benchmark_v2_direct.normalize_production_options", return_value={}),
+            mock.patch("tools.benchmark_v2_direct.build_execution_plan", return_value={}),
+            mock.patch("tools.benchmark_v2_direct.execute_plan", mock_execute_plan),
+        ):
+            await _run_one(
+                index=0,
+                workflow=self.workflow,
+                modal_options=self.modal_options,
+                workspace=self.workspace,
+                transport=self.transport,
+                output_dir=self.output_dir,
+            )
+
+        run_file = self.output_dir / "run_0.json"
+        self.assertTrue(run_file.is_file(), "run file must exist")
+        data = json.loads(run_file.read_text(encoding="utf-8"))
+        self.assertIn("_trace_handoff_error", data)
+        self.assertIn("Something went wrong", data["_trace_handoff_error"])
+        self.assertEqual(data["run_index"], 0)
+
+    async def test_original_fields_preserved_after_handoff_error(self):
+        """result, identity, timing survive alongside ``_trace_handoff_error``."""
+        result = {
+            "trace": {
+                "events": [
+                    {
+                        "name": "remote_method_entry",
+                        "metadata": {
+                            "method_name": "run_plan_stream",
+                            "app_name": "stable-modal-comfy-v2-shadow",
+                            "class_name": "ModalRuntimeEntrypointV2",
+                            "gpu": "rtx-pro-6000",
+                        },
+                    },
+                ],
+                "deltas_ms": {},
+                "derived_ms": {},
+            },
+            "full_trace_artifact": {
+                "status": "error",
+                "error_type": "disk_full",
+                "error": "No space left on volume",
+            },
+        }
+
+        async def mock_execute_plan(plan: Any, **kw: Any) -> dict[str, Any]:
+            return result
+
+        with (
+            mock.patch("tools.benchmark_v2_direct.normalize_production_options", return_value={}),
+            mock.patch("tools.benchmark_v2_direct.build_execution_plan", return_value={}),
+            mock.patch("tools.benchmark_v2_direct.execute_plan", mock_execute_plan),
+        ):
+            art = await _run_one(
+                index=1,
+                workflow=self.workflow,
+                modal_options=self.modal_options,
+                workspace=self.workspace,
+                transport=self.transport,
+                output_dir=self.output_dir,
+            )
+
+        run_file = self.output_dir / "run_1.json"
+        data = json.loads(run_file.read_text(encoding="utf-8"))
+        # Identity preserved
+        self.assertEqual(data["identity"]["app_name"], "stable-modal-comfy-v2-shadow")
+        self.assertEqual(data["identity"]["class_name"], "ModalRuntimeEntrypointV2")
+        # Timing present
+        self.assertIn("timing", data)
+        self.assertIn("wall_ms", data["timing"])
+        # Error key present with meaningful content
+        self.assertIn("_trace_handoff_error", data)
+        self.assertIn("disk_full", data["_trace_handoff_error"])
+        # Returned artifact matches on-disk artifact
+        self.assertEqual(art, data)
+
+    async def test_successful_handoff_no_error_key(self):
+        """No ``_trace_handoff_error`` when handoff succeeds or is absent."""
+        result = {
+            "trace": {"events": [], "metadata": {}},
+            # absent artifact — no handoff needed
+        }
+
+        async def mock_execute_plan(plan: Any, **kw: Any) -> dict[str, Any]:
+            return result
+
+        with (
+            mock.patch("tools.benchmark_v2_direct.normalize_production_options", return_value={}),
+            mock.patch("tools.benchmark_v2_direct.build_execution_plan", return_value={}),
+            mock.patch("tools.benchmark_v2_direct.execute_plan", mock_execute_plan),
+        ):
+            await _run_one(
+                index=2,
+                workflow=self.workflow,
+                modal_options=self.modal_options,
+                workspace=self.workspace,
+                transport=self.transport,
+                output_dir=self.output_dir,
+            )
+
+        run_file = self.output_dir / "run_2.json"
+        data = json.loads(run_file.read_text(encoding="utf-8"))
+        self.assertNotIn("_trace_handoff_error", data)
+        self.assertEqual(data["run_index"], 2)
 
 
 # ============================================================================
