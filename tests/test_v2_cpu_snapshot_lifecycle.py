@@ -7,6 +7,7 @@ ComfyUI.  Tests skip cleanly when optional imports are unavailable.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import io
 import os
@@ -18,9 +19,10 @@ from types import SimpleNamespace, MappingProxyType
 from typing import Any
 from collections.abc import Mapping
 
-from comfymodal_runtime.contracts import ModelRestoreKey, PrefillKey, RestorePlan, stable_hash
+from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, ModelRestoreKey, PrefillKey, RestorePlan, stable_hash
 from comfymodal_runtime.model_preload import V2LoaderBridge, RestorePreparation
 from comfymodal_runtime.restore_plan import derive_model_key, derive_prefill_key, build_restore_model_spec
+from comfymodal_runtime.runtime_executor import ExecutionContext
 from comfymodal_runtime.trace import RuntimeTrace
 from comfymodal_runtime.cpu_snapshot_models import (
     CpuSnapshotModels,
@@ -2816,6 +2818,117 @@ class TestBuildAfterCacheDiT(unittest.TestCase):
         ep._lazy_init_snapshot_state()
         self.assertTrue(hasattr(ep, "_cpu_snapshot_unet_storage_registry"))
         self.assertTrue(hasattr(ep, "_cpu_snapshot_clip_storage_registry"))
+
+
+class CpuSnapshotPrefillGuardTests(unittest.TestCase):
+    """schedule_execution_prefill guard at the production call site in
+    ``_run_in_process`` (modal_app.py:~4130).
+
+    When ``_cpu_snapshot_models_active`` is True and Plan C binding
+    succeeds (exact hit), the prefill must be skipped because the
+    bridge was already prepared with snapshot models.  On mismatch
+    fallback or when no snapshot is active the prefill must run.
+    """
+
+    def setUp(self):
+        _clean_env()
+        self.entrypoint = ModalRuntimeEntrypoint()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
+        self.entrypoint._runtime_configured = True
+        self.entrypoint._legacy_api = SimpleNamespace(
+            _executor=SimpleNamespace(success=True, history_result={}),
+        )
+        self.entrypoint._legacy_module = SimpleNamespace()
+
+    @staticmethod
+    async def _execute_stub(_plan, _context, _api, _trace, *, activation_diagnostic_state=None):
+        """Minimal _execute_v2_prompt_executor replacement."""
+        return {"images": [], "videos": [], "outputs": {}}
+
+    def _run_scenario(self, *, snapshot_active: bool, simulate_exact_hit: bool):
+        """Run _run_in_process under the given snapshot state.
+
+        Returns ``(prefill_call_count, prefill_diag_lines)`` where
+        *prefill_diag_lines* is a list of ``[v2.execution_prefill]``
+        print call arguments.
+        """
+        prefill_called: list[bool] = []
+        prefill_diag_lines: list[str] = []
+
+        self.entrypoint._cpu_snapshot_models_active = snapshot_active
+        self.entrypoint._cpu_snapshot_models = (
+            _make_snapshot_models() if snapshot_active else None
+        )
+        self.entrypoint._execute_v2_prompt_executor = self._execute_stub
+
+        original_prefill = self.entrypoint._preload_bridge.schedule_execution_prefill
+
+        def _tracking_prefill(*args: Any, **kwargs: Any) -> Any:
+            prefill_called.append(True)
+            return original_prefill(*args, **kwargs)
+
+        self.entrypoint._preload_bridge.schedule_execution_prefill = _tracking_prefill  # type: ignore[assignment]
+
+        plan = ExecutionPlan(
+            workflow={"1": {"class_type": "KSampler", "inputs": {}}},
+            execution_options=ExecutionOptions(production_enabled=False),
+        )
+        context = ExecutionContext(request_id="test-prefill-guard")
+
+        _real_print = print  # capture before patch
+
+        def _capture_print(*args, **kwargs):
+            msg = str(args[0]) if args else ""
+            if msg.startswith("[v2.execution_prefill]"):
+                prefill_diag_lines.append(msg)
+            # Forward to real print so other diagnostics still reach stderr
+            _real_print(*args, file=sys.stderr, **kwargs)
+
+        try:
+            if simulate_exact_hit:
+                with patch(
+                    "comfymodal_runtime.modal_app._canonical_role_match_report",
+                    return_value={"compatible": True},
+                ):
+                    with patch.object(self.entrypoint, "_use_cpu_snapshot_models_on_bridge"):
+                        with patch("builtins.print", side_effect=_capture_print):
+                            asyncio.run(self.entrypoint._run_in_process(plan, context))
+            else:
+                with patch("builtins.print", side_effect=_capture_print):
+                    asyncio.run(self.entrypoint._run_in_process(plan, context))
+        finally:
+            self.entrypoint._preload_bridge.schedule_execution_prefill = original_prefill
+
+        return len(prefill_called), prefill_diag_lines
+
+    def test_prefill_guard_with_snapshot_state(self):
+        for label, snapshot_active, simulate_exact_hit, expected_calls in [
+            ("exact_hit",          True,  True,  0),
+            ("mismatch_fallback",  True,  False, 1),
+            ("no_snapshot",        False, False, 1),
+        ]:
+            with self.subTest(case=label):
+                count, diag_lines = self._run_scenario(
+                    snapshot_active=snapshot_active,
+                    simulate_exact_hit=simulate_exact_hit,
+                )
+                self.assertEqual(
+                    count, expected_calls,
+                    f"[{label}] schedule_execution_prefill called {count} time(s), "
+                    f"expected {expected_calls}",
+                )
+                # Assert the execution-prefill diagnostic line is emitted exactly once
+                # with the correct scheduled= value (0 when snapshot is active, 0 when
+                # prefill returns False in test setup, never 1 in this harness).
+                self.assertEqual(
+                    len(diag_lines), 1,
+                    f"[{label}] expected exactly 1 [v2.execution_prefill] line, "
+                    f"got {len(diag_lines)}: {diag_lines}",
+                )
+                self.assertIn(
+                    "scheduled=0", diag_lines[0],
+                    f"[{label}] expected scheduled=0 in diagnostic line: {diag_lines[0]}",
+                )
 
 
 if __name__ == "__main__":
