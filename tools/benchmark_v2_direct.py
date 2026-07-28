@@ -551,6 +551,9 @@ async def _run_one(
         )
     except Exception as exc:
         artifact["_trace_handoff_error"] = str(exc)[:300]
+        (output_dir / f"run_{index}.json").write_text(
+            json.dumps(artifact, default=str, indent=2), encoding="utf-8"
+        )
 
     print(json.dumps({"run_index": index, "identity": identity, "timing": artifact["timing"]}, default=str))
     return artifact

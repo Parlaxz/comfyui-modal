@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import concurrent.futures
+import datetime
 import hashlib
 import importlib
 import inspect
+import json
 import os
 import platform
 import posixpath
@@ -196,6 +198,8 @@ MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
 RUNTIME_STATE_PATH = "/mnt/comfymodal_runtime_state"
 V2_RESTORE_STATE_FILE = "v2_restore_plan.json"
+PROFILE_VOLUME_NAME = os.environ.get("COMFYMODAL_V2_PROFILE_VOLUME", "comfymodal-v2-profiles")
+PROFILE_PATH = "/mnt/comfymodal_profiles"
 MIN_CONTAINERS = 0
 SCALEDOWN_WINDOW = 4
 _PUBLISHER_MARKER = "COMFYMODAL_PUBLISHER_CONTAINER"
@@ -1272,50 +1276,57 @@ def _build_full_trace_bundle(session: Any) -> tuple[str, str, bytes, str, list[d
 
 
 def _upload_full_trace_bundle(
-    volume: Any,
+    profile_volume: Any,
     trace_id: str,
     tar_bytes: bytes,
     bundle_sha256: str,
+    *,
+    remote_bundle_path: str,
 ) -> str | None:
-    """Upload a full-trace bundle to the runtime-state Volume.
+    """Upload a full-trace bundle to the profile Volume at *remote_bundle_path*.
 
-    Writes to ``full_trace/<trace_id>/bundle.tar.gz`` using an atomic temp-file
-    rename and commits the mounted volume synchronously.
+    Uses atomic temp-file semantics.  Does NOT commit — the caller must
+    commit exactly once after uploading both bundle and descriptor.
 
-    Returns the remote bundle path on success, ``None`` on any error.
+    Returns the same *remote_bundle_path* on success, ``None`` on any error.
     """
     try:
-        from .runtime_state import ModalMountedStateVolume
         if not trace_id or "/" in trace_id or "\\" in trace_id or trace_id in {".", ".."}:
             return None
-        _state_volume = ModalMountedStateVolume(RUNTIME_STATE_PATH, volume)
-        _remote_dir = f"full_trace/{trace_id}"
-        _remote_path = f"{_remote_dir}/bundle.tar.gz"
-        # MountedStateVolume.write_bytes performs an atomic temp-file rename.
-        _state_volume.write_bytes(_remote_path, tar_bytes)
-        # Commit synchronously here; callers invoke this helper in a worker
-        # thread so a native Modal async commit is never discarded.
-        _state_volume.commit()
-        return _remote_path
+        # Write through the Modal Volume's filesystem handle directly.
+        # MountedStateVolume.write_bytes uses atomic temp-file rename.
+        profile_volume.write_bytes(remote_bundle_path, tar_bytes)
+        return remote_bundle_path
     except Exception:
         return None
 
 
 def _finalize_full_trace(
     session: Any,
-    volume: Any,
+    profile_volume: Any,
     request_id: str,
     result_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Finalize a full-trace session exactly once.
 
-    Writes result summary, stops tracing, generates report, packages
-    bundle, uploads to volume, and returns a JSON-safe
-    ``full_trace_artifact`` descriptor.
+    Correct finalization order:
+      1. Final milestone
+      2. Close semantic operations
+      3. Stop Torch profiler
+      4. Stop resource sampler
+      5. Stop VizTracer
+      6. Write sanitized runtime summary
+      7. Generate report (not traced)
+      8. Package bundle (not traced)
+      9. Persist bundle and descriptor to profile Volume, commit once
+     10. Attach ``full_trace_artifact`` with exact descriptor fields
+
+    Never captures a milestone after ``stop_tracing()``.
 
     Returns ``{"status": "absent"}`` when the session is None or already
     finalized.  Never raises -- errors produce ``{"status": "error", ...}``.
     """
+    _finalize_start = time.perf_counter()
     if session is None:
         return {"status": "absent"}
     _trace_id = session.trace_id
@@ -1324,54 +1335,242 @@ def _finalize_full_trace(
         if _trace_id in _FULL_TRACE_FINALIZED_IDS:
             return {"status": "absent", "detail": "already_finalized"}
         _FULL_TRACE_FINALIZED_IDS.add(_trace_id)
+    _viztracer_status: str = "absent"
+    _torch_profiler_status: str = "absent"
+    _resource_sampler_status: str = "absent"
+    _report_status: str = "absent"
+    _trace_truncated: bool = False
+    _trace_entry_count: int = 0
+    _trace_entry_capacity: int = 0
     try:
-        # 1. Write result summary
+        # Wrap raw Modal Volume for atomic write+commit persistence
+        # ── 1. Final milestone (BEFORE stop_tracing) ──
+        session.capture_milestone("trace_finalize")
+        # ── 2. Close semantic operations ──
+        _close_semantic_ops(session)
+        # ── 3+4+5: stop_tracing handles Torch, resource sampler, VizTracer ──
+        _stop_result = session.stop_tracing()
+        if isinstance(_stop_result, dict):
+            _v = _stop_result.get("viztracer", {})
+            if isinstance(_v, dict):
+                _viztracer_status = "ok" if _v.get("saved") else "error"
+                _trace_entry_count = _v.get("entry_count", 0)
+                _trace_entry_capacity = _v.get("entry_capacity", 0)
+            _t = _stop_result.get("torch_profiler", {})
+            if isinstance(_t, dict) and _t.get("exported"):
+                _torch_profiler_status = "ok"
+            _r = _stop_result.get("resource_sampler", {})
+            if isinstance(_r, dict) and "sample_count" in _r:
+                _resource_sampler_status = "ok"
+        # ── 6. Write sanitized runtime summary (allowlist only, write after stop) ──
         _summary = dict(result_summary or {})
-        _summary["finalized_at"] = time.time()
-        _summary["request_id"] = request_id
-        session.set_result_summary(_summary)
-        # 2. Stop tracing
-        session.stop_tracing()
-        session.capture_milestone("trace_stop")
-        # 3. Generate report
-        from .full_trace_report import generate_full_trace_report as _gen_report
-        _report = _gen_report(session.base_dir)
-        if not isinstance(_report, dict) or _report.get("status") == "error":
-            return {
-                "status": "error",
-                "error_type": "ReportError",
-                "error": "failed to generate trace report",
-            }
-        # 4. Package bundle
+        _allowlist = {"status", "error", "correlation_id", "request_id",
+                       "finalized_at", "trace_id", "elapsed_seconds"}
+        _sanitized = {k: v for k, v in _summary.items() if k in _allowlist
+                      and isinstance(v, (str, int, float, bool, type(None)))}
+        _sanitized["finalized_at"] = time.time()
+        _sanitized["request_id"] = request_id
+        _sanitized["trace_id"] = _trace_id
+        session.set_result_summary(_sanitized)
+        # Overwrite the summary file (stop_tracing wrote the pre-sanitized version)
+        _summary_path = session.base_dir / "raw" / "runtime_result_summary.json"
+        try:
+            _summary_path.write_text(
+                json.dumps(dict(session._result_summary), indent=2, default=str),
+                encoding="utf-8",
+            )
+        except OSError as _se:
+            print(
+                f"[v2.full_trace_artifact] status=error "
+                f"trace_id={_trace_id} error_type=SummaryWriteError",
+                flush=True,
+            )
+        # ── 7. Generate report (not traced) ──
+        _report_ok = False
+        try:
+            from .full_trace_report import generate_full_trace_report as _gen_report
+            _report = _gen_report(session.base_dir)
+            if isinstance(_report, dict) and _report.get("status") != "error":
+                _report_ok = True
+                _report_status = "ok"
+            else:
+                _report_status = "error"
+        except Exception as _report_exc:
+            _report_status = "error"
+            print(
+                f"[v2.full_trace] stage=report status=error "
+                f"error_type={type(_report_exc).__name__} trace_id={_trace_id}",
+                flush=True,
+            )
+            print(
+                f"[v2.full_trace_artifact] status=error "
+                f"trace_id={_trace_id} error_type=ReportError",
+                flush=True,
+            )
+        # ── 8. Package bundle (not traced) ──
         _bundle = _build_full_trace_bundle(session)
         if _bundle is None:
+            print(
+                f"[v2.full_trace] stage=bundle status=error "
+                f"error_type=BundleError trace_id={_trace_id}",
+                flush=True,
+            )
+            print(
+                f"[v2.full_trace_artifact] status=error "
+                f"trace_id={_trace_id} error_type=BundleError",
+                flush=True,
+            )
             return {
-                "status": "error",
+                "status": "error", "trace_id": _trace_id,
                 "error_type": "BundleError",
                 "error": "failed to build trace bundle",
             }
         _tid, _base_dir, _tar_bytes, _sha256, _manifest_entries = _bundle
-        # 5. Upload to volume
-        _remote_path = _upload_full_trace_bundle(volume, _trace_id, _tar_bytes, _sha256)
-        if _remote_path is None:
+        # ── 9. Persist bundle and descriptor to profile Volume ──
+        if profile_volume is None:
+            print(
+                f"[v2.full_trace] stage=persistence status=error "
+                f"error_type=ProfileVolumeUnavailable trace_id={_trace_id}",
+                flush=True,
+            )
+            print(
+                f"[v2.full_trace_artifact] status=error "
+                f"trace_id={_trace_id} error_type=ProfileVolumeUnavailable",
+                flush=True,
+            )
             return {
                 "status": "error",
-                "error_type": "UploadError",
-                "error": "failed to upload trace bundle to volume",
+                "trace_id": _trace_id,
+                "error_type": "ProfileVolumeUnavailable",
+                "error": "profile volume unavailable",
             }
-        return {
+        if (
+            not callable(getattr(profile_volume, "write_bytes", None))
+            or not callable(getattr(profile_volume, "commit", None))
+        ):
+            from .runtime_state import ModalMountedStateVolume as _MSV
+            profile_volume = _MSV(PROFILE_PATH, profile_volume)
+        _utc_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        _remote_dir = f"v2-full-trace/{_utc_date}/{_trace_id}"
+        _remote_bundle_path = f"{_remote_dir}/bundle.tar.gz"
+        _remote_descriptor_path = f"{_remote_dir}/artifact.json"
+        _uploaded = _upload_full_trace_bundle(
+            profile_volume, _trace_id, _tar_bytes, _sha256,
+            remote_bundle_path=_remote_bundle_path,
+        )
+        if _uploaded is None:
+            print(
+                f"[v2.full_trace] stage=persistence status=error "
+                f"error_type=UploadError trace_id={_trace_id}",
+                flush=True,
+            )
+            print(
+                f"[v2.full_trace_artifact] status=error "
+                f"trace_id={_trace_id} error_type=UploadError",
+                flush=True,
+            )
+            return {
+                "status": "error", "trace_id": _trace_id,
+                "error_type": "UploadError",
+                "error": "failed to upload trace bundle to profile volume",
+            }
+        _bundle_size = len(_tar_bytes)
+        _finalize_ms = round((time.perf_counter() - _finalize_start) * 1000, 3)
+        # Build and write artifact descriptor
+        _descriptor = {
             "status": "ready",
-            "volume_name": RUNTIME_STATE_VOLUME_NAME,
-            "remote_bundle_path": _remote_path,
-            "bundle_sha256": _sha256,
             "trace_id": _trace_id,
+            "volume_name": PROFILE_VOLUME_NAME,
+            "remote_bundle_path": _remote_bundle_path,
+            "remote_descriptor_path": _remote_descriptor_path,
+            "bundle_size_bytes": _bundle_size,
+            "bundle_sha256": _sha256,
+            "report_status": _report_status,
+            "viztracer_status": _viztracer_status,
+            "torch_profiler_status": _torch_profiler_status,
+            "resource_sampler_status": _resource_sampler_status,
+            "trace_truncated": _trace_truncated,
+            "trace_entry_count": _trace_entry_count,
+            "trace_entry_capacity": _trace_entry_capacity,
+            "finalize_ms": _finalize_ms,
         }
+        _descriptor_bytes = json.dumps(_descriptor, separators=(",", ":")).encode("utf-8")
+        # Write both files, then commit exactly once
+        try:
+            profile_volume.write_bytes(_remote_descriptor_path, _descriptor_bytes)
+        except Exception as _desc_exc:
+            print(
+                f"[v2.full_trace] stage=descriptor status=error "
+                f"error_type=DescriptorWriteError trace_id={_trace_id}",
+                flush=True,
+            )
+            print(
+                f"[v2.full_trace_artifact] status=error "
+                f"trace_id={_trace_id} error_type=DescriptorWriteError",
+                flush=True,
+            )
+            return {
+                "status": "error", "trace_id": _trace_id,
+                "error_type": "DescriptorWriteError",
+                "error": "failed to write artifact descriptor",
+            }
+        # Single commit after both files
+        try:
+            profile_volume.commit()
+        except Exception as _commit_exc:
+            print(
+                f"[v2.full_trace] stage=persistence status=error "
+                f"error_type=CommitError trace_id={_trace_id}",
+                flush=True,
+            )
+            print(
+                f"[v2.full_trace_artifact] status=error "
+                f"trace_id={_trace_id} error_type=CommitError",
+                flush=True,
+            )
+            return {
+                "status": "error", "trace_id": _trace_id,
+                "error_type": "CommitError",
+                "error": "profile volume commit failed",
+            }
+        print(
+            f"[v2.full_trace_artifact] status=ready "
+            f"trace_id={_trace_id} "
+            f"volume={PROFILE_VOLUME_NAME} "
+            f"remote_bundle_path={_remote_bundle_path}",
+            flush=True,
+        )
+        return _descriptor
     except Exception as _exc:
-        return {
+        _finalize_ms = round((time.perf_counter() - _finalize_start) * 1000, 3)
+        _error_type = type(_exc).__name__
+        _error_result = {
             "status": "error",
-            "error_type": type(_exc).__name__,
-            "error": str(_exc)[:200],
+            "trace_id": _trace_id,
+            "error_type": _error_type,
+            "error": f"finalization failed: {_error_type}",
+            "finalize_ms": _finalize_ms,
         }
+        print(
+            f"[v2.full_trace_artifact] status=error "
+            f"trace_id={_trace_id} error_type={_error_type}",
+            flush=True,
+        )
+        return _error_result
+
+
+def _close_semantic_ops(session: Any) -> None:
+    """Close any remaining open semantic operations (no-op guard)."""
+    if hasattr(session, "_op_cache") and isinstance(session._op_cache, dict):
+        try:
+            remaining = list(session._op_cache.keys())
+            for _op_id in remaining:
+                try:
+                    session.operation_end(_op_id, status="closed")
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 def _safe_full_trace_artifact(
@@ -1381,13 +1580,26 @@ def _safe_full_trace_artifact(
     result_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Safe wrapper: returns ``{"status": "absent"}`` when disabled, else
-    delegates to ``_finalize_full_trace``.  Never raises."""
+    delegates to ``_finalize_full_trace``.  Returns error descriptor on
+    exception.  Never raises."""
     if not _V2_FULL_TRACE_ENABLED or session is None:
         return {"status": "absent"}
     try:
         return _finalize_full_trace(session, volume, request_id, result_summary=result_summary)
-    except Exception:
-        return {"status": "absent"}
+    except Exception as _safe_exc:
+        _trace_id = getattr(session, "trace_id", "")
+        _error_type = type(_safe_exc).__name__
+        print(
+            f"[v2.full_trace_artifact] status=error "
+            f"trace_id={_trace_id} error_type={_error_type}",
+            flush=True,
+        )
+        return {
+            "status": "error",
+            "trace_id": _trace_id,
+            "error_type": _error_type,
+            "error": f"safe wrapper: {_error_type}",
+        }
 
 
 def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
@@ -1417,12 +1629,15 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
         "models_volume": actual.models_volume_name,
         "runtime_state_volume": actual.runtime_state_volume_name,
         "custom_nodes_volume": actual.custom_nodes_volume_name,
+        "profile_volume_name": actual.profile_volume_name,
+        "profile_path": actual.profile_path,
         "volume_mount_paths": {
             actual.models_volume_name: actual.models_path,
             actual.custom_nodes_volume_name: actual.custom_nodes_path,
             actual.runtime_state_volume_name: actual.runtime_state_path,
+            actual.profile_volume_name: actual.profile_path,
         },
-        # â”€â”€ Snapshot target fingerprint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Snapshot target fingerprint ──
         "fingerprint": _snapshot_target_fingerprint(actual),
     }
 
@@ -1495,6 +1710,7 @@ def _snapshot_target_fingerprint(
         actual.models_volume_name: actual.models_path,
         actual.custom_nodes_volume_name: actual.custom_nodes_path,
         actual.runtime_state_volume_name: actual.runtime_state_path,
+        actual.profile_volume_name: actual.profile_path,
     }
 
     _fingerprint_fields: dict[str, Any] = {
@@ -1516,6 +1732,7 @@ def _snapshot_target_fingerprint(
         "models_volume": actual.models_volume_name,
         "custom_nodes_volume": actual.custom_nodes_volume_name,
         "runtime_state_volume": actual.runtime_state_volume_name,
+        "profile_volume_name": actual.profile_volume_name,
         "volume_mount_paths": _vol_mount_paths,
         # ── Source / env (static deployment config only) ─────────────────
         "source_combined_hash": _combined,
@@ -1548,9 +1765,11 @@ class ModalRuntimeSpec:
     models_volume_name: str = MODELS_VOLUME_NAME
     custom_nodes_volume_name: str = CUSTOM_NODES_VOLUME_NAME
     runtime_state_volume_name: str = RUNTIME_STATE_VOLUME_NAME
+    profile_volume_name: str = PROFILE_VOLUME_NAME
     models_path: str = MODELS_PATH
     custom_nodes_path: str = CUSTOM_NODES_PATH
     runtime_state_path: str = RUNTIME_STATE_PATH
+    profile_path: str = PROFILE_PATH
     gpu: tuple[str, ...] = dataclasses.field(default_factory=parse_gpu_request)
     cpu: int = 4
     memory: int = dataclasses.field(default_factory=_parse_memory_mb)
@@ -1605,8 +1824,9 @@ def _runtime_env() -> dict[str, str]:
     Contains ``COMFYMODAL_V2_CPU_MODEL_SNAPSHOT`` and
     ``COMFYMODAL_ENABLE_GPU_SNAPSHOT`` (both defaulting to ``"0"`` when
     absent from the local process environment), optional
-    ``COMFYMODAL_V2_MEMORY_MB`` when present, and any ``COMFYMODAL_WARMUP_*``
-    keys that are set in the current environment.
+    ``COMFYMODAL_V2_MEMORY_MB`` when present, full-trace/profile env keys
+    with their defaults, and any ``COMFYMODAL_WARMUP_*`` keys that are set
+    in the current environment.
 
     This is used at deploy time via ``resources["app"].cls(..., env=...)``
     rather than as a build step on the Image, so Modal's requirement that
@@ -1621,6 +1841,25 @@ def _runtime_env() -> dict[str, str]:
         ),
         "COMFYMODAL_V2_UNET_FORWARD_DIAG": os.environ.get(
             "COMFYMODAL_V2_UNET_FORWARD_DIAG", "0"
+        ),
+        # Full-trace and profile env keys (always present with defaults)
+        "COMFYMODAL_V2_FULL_TRACE": os.environ.get(
+            "COMFYMODAL_V2_FULL_TRACE", "0"
+        ),
+        "COMFYMODAL_V2_FULL_TRACE_ENTRIES": os.environ.get(
+            "COMFYMODAL_V2_FULL_TRACE_ENTRIES", "8000000"
+        ),
+        "COMFYMODAL_V2_FULL_TRACE_RESOURCE_INTERVAL_MS": os.environ.get(
+            "COMFYMODAL_V2_FULL_TRACE_RESOURCE_INTERVAL_MS", "50"
+        ),
+        "COMFYMODAL_V2_FULL_TRACE_MAX_STACK_DEPTH": os.environ.get(
+            "COMFYMODAL_V2_FULL_TRACE_MAX_STACK_DEPTH", "64"
+        ),
+        "COMFYMODAL_V2_FULL_TRACE_TORCH": os.environ.get(
+            "COMFYMODAL_V2_FULL_TRACE_TORCH", "1"
+        ),
+        "COMFYMODAL_V2_PROFILE_VOLUME": os.environ.get(
+            "COMFYMODAL_V2_PROFILE_VOLUME", "comfymodal-v2-profiles"
         ),
     }
     memory_mb = os.environ.get("COMFYMODAL_V2_MEMORY_MB")
@@ -1739,8 +1978,12 @@ def _reference_image() -> Any:
     precede ``.add_local_python_source()``, and ``_image_base`` already
     satisfies that constraint.
 
-    Environment variables (snapshot flags, warmup profile, memory) are
-    **not** set here via ``image.env()`` — they are propagated at deploy
+    When ``COMFYMODAL_V2_FULL_TRACE=1`` is set in the deploy-time environment,
+    installs ``viztracer==1.1.1`` via ``image.pip_install()`` **before** any
+    ``add_local_python_source`` calls.  Disabled (default) does not install it.
+
+    Environment variables (snapshot flags, full-trace, warmup profile, memory)
+    are **not** set here via ``image.env()`` — they are propagated at deploy
     time via the class-level ``env=`` parameter in
     ``_register_remote_entrypoint`` using ``_runtime_env()``.  This avoids
     adding build steps to an image whose base may already contain
@@ -1759,6 +2002,9 @@ def _reference_image() -> Any:
             if base is None:
                 raise RuntimeError("comfyapp._image_base and .image are unavailable")
         image = base
+        # Install viztracer before add_local_python_source when full-trace is enabled
+        if _V2_FULL_TRACE_ENABLED:
+            image = image.pip_install("viztracer==1.1.1")
         for module_name in V2_SOURCE_MODULES:
             image = image.add_local_python_source(module_name)
         return image
@@ -1780,6 +2026,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
             "models_volume": None,
             "custom_nodes_volume": None,
             "runtime_state_volume": None,
+            "profile_volume": None,
             "source_identity": None,
             "spec": runtime_spec,
         }
@@ -1793,6 +2040,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
             "models_volume": None,
             "custom_nodes_volume": None,
             "runtime_state_volume": None,
+            "profile_volume": None,
             "source_identity": identity,
             "spec": runtime_spec,
         }
@@ -1801,6 +2049,14 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
     models_volume = _modal.Volume.from_name(runtime_spec.models_volume_name, create_if_missing=True)
     custom_nodes_volume = _modal.Volume.from_name(runtime_spec.custom_nodes_volume_name, create_if_missing=True)
     runtime_state_volume = _modal.Volume.from_name(runtime_spec.runtime_state_volume_name, create_if_missing=True)
+    profile_volume = None
+    if _V2_FULL_TRACE_ENABLED:
+        profile_volume = _modal.Volume.from_name(runtime_spec.profile_volume_name, create_if_missing=True)
+        if profile_volume is None:
+            raise RuntimeError(
+                f"profile Volume '{runtime_spec.profile_volume_name}' is None "
+                f"after from_name(create_if_missing=True); cannot create full-trace session"
+            )
     app = _modal.App(runtime_spec.app_name, image=image)
     return {
         "app": app,
@@ -1808,6 +2064,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
         "models_volume": models_volume,
         "custom_nodes_volume": custom_nodes_volume,
         "runtime_state_volume": runtime_state_volume,
+        "profile_volume": profile_volume,
         "source_identity": identity,
         "spec": runtime_spec,
     }
@@ -3864,6 +4121,61 @@ class ModalRuntimeEntrypoint:
         }
 
     def restore(self) -> dict[str, Any]:
+        global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
+        # ── Full-trace session: FIRST executable operation (before timestamp
+        #    capture, residency log, sampler, memory report, _configure_runtime,
+        #    identity capture, reload, GPU state, CUDA work).  Start with only
+        #    container identity; update_identity is called after restore_session_id
+        #    exists. ──
+        if _V2_FULL_TRACE_ENABLED:
+            try:
+                from .full_execution_trace import FullExecutionTraceSession as _FT
+                _ft = self._full_trace_session
+                if _ft is not None:
+                    try:
+                        if _ft.state not in ("trace_stopped", "failed"):
+                            _ft.stop_tracing()
+                    except Exception:
+                        pass
+                _FT.reset_instance()
+                _ft = _FT.create_if_enabled(
+                    container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
+                )
+                self._full_trace_session = _ft
+                if _ft is not None:
+                    try:
+                        _ft.start_restore()
+                        print(
+                            f"[v2.full_trace] stage=restore_entry "
+                            f"status=started trace_id={_ft.trace_id}",
+                            flush=True,
+                        )
+                    except Exception as _ft_start_exc:
+                        print(
+                            f"[v2.full_trace] stage=restore_entry "
+                            f"status=error error_type={type(_ft_start_exc).__name__}",
+                            flush=True,
+                        )
+                        self._full_trace_session = None
+            except Exception as _ft_exc:
+                print(
+                    f"[v2.full_trace] stage=restore_entry "
+                    f"status=error error_type={type(_ft_exc).__name__}",
+                    flush=True,
+                )
+                self._full_trace_session = None
+        _full_trace_started = False
+        _full_trace_error: str | None = None
+        # ── Remote resume / restore method boundary timestamps ──────────
+        remote_python_resume_wall_ns: int = int(time.time() * 1_000_000_000)
+        remote_python_resume_mono_ns: int = time.monotonic_ns()
+        restore_method_start_wall_ns: int = remote_python_resume_wall_ns
+        restore_method_start_mono_ns: int = remote_python_resume_mono_ns
+        _restore_status: str = "unknown"
+        _restore_end_wall_ns: int | None = None
+        _restore_end_mono_ns: int | None = None
+        _restore_perf_start = time.perf_counter()
+        # Continue with standard restore preamble
         print(
             "[v2.residency_config] "
             f"enabled={int(_RESIDENCY_DIAGNOSTICS_ENABLED)}",
@@ -3872,7 +4184,6 @@ class ModalRuntimeEntrypoint:
         self._cgroup_sampler = _CgroupCpuSampler(time.monotonic_ns())
         self._cgroup_sampler.set_phase("restore")
         self._cgroup_sampler.start()
-        global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
         _report_host_memory("restore_start")
         # Reset per-request counter so first request after every fresh restore
         # is exactly 1.  Snapshotted state cannot carry request count.
@@ -3883,15 +4194,6 @@ class ModalRuntimeEntrypoint:
         _RESTORE_STAGE_TIMERS.clear()
         _RESTORE_STAGE_TIMERS["snapshot_identity_checks"] = 0.0
         _RESTORE_STAGE_TIMERS["cpu_snapshot_retargeting"] = 0.0
-        # â”€â”€ Remote resume / restore method boundary timestamps â”€â”€â”€â”€â”€â”€â”€â”€
-        remote_python_resume_wall_ns: int = int(time.time() * 1_000_000_000)
-        remote_python_resume_mono_ns: int = time.monotonic_ns()
-        restore_method_start_wall_ns: int = remote_python_resume_wall_ns
-        restore_method_start_mono_ns: int = remote_python_resume_mono_ns
-        _restore_status: str = "unknown"
-        _restore_end_wall_ns: int | None = None
-        _restore_end_mono_ns: int | None = None
-        _restore_perf_start = time.perf_counter()
         try:
             identity = _capture_remote_identity()
             self._configure_runtime()
@@ -3907,40 +4209,30 @@ class ModalRuntimeEntrypoint:
             self._restored_instance_id = restored_instance_id
             _LATEST_RESTORED_INSTANCE_ID = restored_instance_id
             set_model_load_identity(restored_instance_id, restore_session_id)
-            # â”€â”€ Full-trace session: create at restore entry when enabled â”€â”€
-            _full_trace_started = False
-            if _V2_FULL_TRACE_ENABLED:
+            # â”€â”€ Full-trace session: update identity now that IDs exist â”€â”€
+            if _V2_FULL_TRACE_ENABLED and self._full_trace_session is not None:
                 try:
-                    from .full_execution_trace import FullExecutionTraceSession as _FT
                     _ft = self._full_trace_session
-                    if _ft is not None:
-                        try:
-                            if _ft.state not in ("trace_stopped", "failed"):
-                                _ft.stop_tracing()
-                        except Exception:
-                            pass
-                    _FT.reset_instance()
-                    _ft = _FT.create_if_enabled(
-                        container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
+                    _ft.update_identity(
                         restored_instance_id=restored_instance_id,
                         restore_session_id=restore_session_id,
+                        modal_task_id=identity.get("container_task_id", ""),
+                        image_id=identity.get("image_id", ""),
+                        cloud=identity.get("cloud", ""),
+                        region=identity.get("region", ""),
                     )
-                    self._full_trace_session = _ft
-                    if _ft is not None:
-                        _ft.start_restore()
-                        _ft.update_identity(
-                            restored_instance_id=restored_instance_id,
-                            restore_session_id=restore_session_id,
-                            modal_task_id=identity.get("container_task_id", ""),
-                            image_id=identity.get("image_id", ""),
-                            cloud=identity.get("cloud", ""),
-                            region=identity.get("region", ""),
-                        )
-                        _bridge_snap = self._preload_bridge.diagnostic_snapshot()
-                        _ft.capture_milestone("restore_start", bridge_snapshot=_bridge_snap)
-                        _full_trace_started = True
-                except Exception:
-                    pass
+                    _bridge_snap = self._preload_bridge.diagnostic_snapshot()
+                    _ft.capture_milestone("restore_start", bridge_snapshot=_bridge_snap)
+                    _full_trace_started = True
+                except Exception as _ft_upd_exc:
+                    _full_trace_error = str(type(_ft_upd_exc).__name__)
+                    print(
+                        f"[v2.full_trace] stage=restore_entry "
+                        f"status=error error_type={_full_trace_error}",
+                        flush=True,
+                    )
+                    self._full_trace_session = None
+                    _full_trace_started = False
             # Legacy identity: rename old container_session_id internally
             legacy_container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
             trace.set_metadata(
@@ -4077,12 +4369,20 @@ class ModalRuntimeEntrypoint:
                     )
                     _ft_failed.stop_tracing()
                 except Exception:
-                    pass
+                    print(
+                        f"[v2.full_trace] stage=trace_stop status=error "
+                        f"error_type={type(sys.exc_info()[1]).__name__}",
+                        flush=True,
+                    )
                 try:
                     from .full_execution_trace import FullExecutionTraceSession as _FT
                     _FT.reset_instance()
                 except Exception:
-                    pass
+                    print(
+                        f"[v2.full_trace] stage=trace_reset status=error "
+                        f"error_type={type(sys.exc_info()[1]).__name__}",
+                        flush=True,
+                    )
                 self._full_trace_session = None
             # Method-level guard: captures end timestamps for exceptions that
             # escape before the preload/finalize try block (e.g. identity
@@ -7844,8 +8144,24 @@ class ModalRuntimeEntrypoint:
                         if _op_id:
                             _full_trace_op_id = _op_id
                         _full_trace_claimed = True
-            except Exception:
+            except Exception as _ft_claim_exc:
                 _full_trace_claimed = False
+                print(
+                    f"[v2.full_trace] stage=claim_first_request "
+                    f"status=error error_type={type(_ft_claim_exc).__name__}",
+                    flush=True,
+                )
+
+        # Start Torch profiler at first claimed request when COMFYMODAL_V2_FULL_TRACE_TORCH != "0"
+        if _full_trace_claimed:
+            try:
+                _ft.start_torch_profiler()
+            except Exception as _ft_torch_exc:
+                print(
+                    f"[v2.full_trace] stage=start_torch_profiler "
+                    f"status=error error_type={type(_ft_torch_exc).__name__}",
+                    flush=True,
+                )
 
         if context.trace is not None:
             _auth_cid = self.container_session_id or _V2_CONTAINER_SESSION_ID
@@ -7941,10 +8257,11 @@ class ModalRuntimeEntrypoint:
                                 status="error",
                                 error_type="ExecutionError",
                             )
+                        _profile_volume = globals().get("_MODAL_RESOURCES", {}).get("profile_volume")
                         _error_artifact = await asyncio.to_thread(
                             _safe_full_trace_artifact,
                             _ft_error,
-                            globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume"),
+                            _profile_volume,
                             _t4_request_id or request_id,
                             {"status": "error", "error": str(event.get("message", ""))[:200]},
                         )
@@ -8202,7 +8519,7 @@ class ModalRuntimeEntrypoint:
                             if _full_trace_op_id:
                                 _ft_fin.operation_end(_full_trace_op_id, status="ok")
                             resources = globals().get("_MODAL_RESOURCES", {})
-                            _vol_fin = resources.get("runtime_state_volume")
+                            _vol_fin = resources.get("profile_volume")
                             _artifact_fin = await asyncio.to_thread(
                                 _safe_full_trace_artifact,
                                 _ft_fin,
@@ -8401,6 +8718,20 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
     _enable_gpu_snapshot = os.environ.get("COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0") == "1"
     # Pass ordered GPU list for Modal's native ordered-GPU fallback.
     _gpu_arg: str | list[str] = list(spec.gpu) if len(spec.gpu) > 1 else spec.gpu[0]
+    _volumes: dict[str, Any] = {
+        spec.models_path: resources["models_volume"],
+        spec.custom_nodes_path: resources["custom_nodes_volume"],
+        spec.runtime_state_path: resources["runtime_state_volume"],
+    }
+    # Add profile volume mount when full-trace is enabled
+    if _V2_FULL_TRACE_ENABLED:
+        _pv = resources.get("profile_volume")
+        if _pv is None:
+            raise RuntimeError(
+                "V2 full-trace is enabled but profile_volume is None in Modal resources. "
+                "Ensure COMFYMODAL_V2_PROFILE_VOLUME names an existing Volume."
+            )
+        _volumes[spec.profile_path] = _pv
     return resources["app"].cls(
         gpu=_gpu_arg,
         cpu=spec.cpu,
@@ -8408,11 +8739,7 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
         timeout=spec.timeout,
         min_containers=spec.min_containers,
         scaledown_window=spec.scaledown_window,
-        volumes={
-            spec.models_path: resources["models_volume"],
-            spec.custom_nodes_path: resources["custom_nodes_volume"],
-            spec.runtime_state_path: resources["runtime_state_volume"],
-        },
+        volumes=_volumes,
         enable_memory_snapshot=spec.enable_memory_snapshot,
         env=_runtime_env(),
         **({"experimental_options": {"enable_gpu_snapshot": True}} if _enable_gpu_snapshot else {}),
@@ -8561,6 +8888,7 @@ except Exception:
         "models_volume": None,
         "custom_nodes_volume": None,
         "runtime_state_volume": None,
+        "profile_volume": None,
         "source_identity": None,
         "spec": ModalRuntimeSpec(),
     }

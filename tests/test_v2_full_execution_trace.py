@@ -1652,12 +1652,12 @@ class TestStopTracing(unittest.TestCase):
         session.claim_first_request("req_1")
         result = session.stop_tracing()
         keys = list(result.keys())
-        res_idx = keys.index("resource_sampler")
         torch_idx = keys.index("torch_profiler")
+        res_idx = keys.index("resource_sampler")
         viz_idx = keys.index("viztracer")
         summary_idx = keys.index("summary")
-        self.assertLess(res_idx, torch_idx)
-        self.assertLess(torch_idx, viz_idx)
+        self.assertLess(torch_idx, res_idx)
+        self.assertLess(res_idx, viz_idx)
         self.assertLess(viz_idx, summary_idx)
 
     def test_stop_without_viztracer(self):

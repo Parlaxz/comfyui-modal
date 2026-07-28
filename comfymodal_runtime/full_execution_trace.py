@@ -46,6 +46,7 @@ _TEST_CGROUP_V2: str | None = None        # set by tests to mock cgroup v2 dir
 _ENV_ENABLE = "COMFYMODAL_V2_FULL_TRACE"
 _ENV_ENTRIES = "COMFYMODAL_V2_FULL_TRACE_ENTRIES"
 _ENV_RESOURCE_INTERVAL = "COMFYMODAL_V2_FULL_TRACE_RESOURCE_INTERVAL_MS"
+_ENV_TORCH = "COMFYMODAL_V2_FULL_TRACE_TORCH"
 
 # Legacy compat fallback names (private, checked only when new names are absent)
 _LEGACY_ENV_ENTRIES = "FULL_TRACE_VIZTRACER_ENTRIES"
@@ -1265,6 +1266,7 @@ class FullExecutionTraceSession:
         container_session_id: str,
         restored_instance_id: str = "",
         restore_session_id: str = "",
+        _trace_id_override: str | None = None,
     ) -> Optional[FullExecutionTraceSession]:
         """Create and return a singleton session when the env flag is ``'1'``.
 
@@ -1278,6 +1280,8 @@ class FullExecutionTraceSession:
             Initial restored instance ID (optional, may be updated later).
         restore_session_id:
             Initial restore session ID (optional, may be updated later).
+        _trace_id_override:
+            Internal test hook to set a deterministic trace ID.
         """
         if os.environ.get(_ENV_ENABLE) != "1":
             return None
@@ -1288,6 +1292,7 @@ class FullExecutionTraceSession:
                 container_session_id=container_session_id,
                 restored_instance_id=restored_instance_id,
                 restore_session_id=restore_session_id,
+                _trace_id_override=_trace_id_override,
             )
             cls._instance = instance
             return instance
@@ -1454,6 +1459,12 @@ class FullExecutionTraceSession:
         and lazily initialises VizTracer.
         """
         if not self._transition("restore_tracing"):
+            print(
+                f"[v2.full_trace] stage=start_restore "
+                f"status=skipped reason=invalid_state({self._state}) "
+                f"trace_id={self.trace_id}",
+                flush=True,
+            )
             return
 
         entries = _env_int_chain(
@@ -1477,7 +1488,13 @@ class FullExecutionTraceSession:
             )
             self._resource_sampler.start()
         except Exception as exc:
-            log.warning("Resource sampler start failed: %s", exc)
+            log.warning("Resource sampler start failed")
+            print(
+                f"[v2.full_trace] stage=start_restore "
+                f"status=error error_type=ResourceSampler "
+                f"trace_id={self.trace_id}",
+                flush=True,
+            )
             self._resource_sampler = None
 
         # Lazy VizTracer start — import only here, never at module/construction time
@@ -1525,9 +1542,7 @@ class FullExecutionTraceSession:
             try:
                 self._viztracer = _VT(**viz_kwargs)
             except TypeError as te:
-                log.warning(
-                    "VizTracer keyword rejection (%s); retrying with minimal kwargs", te,
-                )
+                log.warning("VizTracer keyword rejection; retrying with minimal kwargs")
                 minimal_kwargs: dict[str, Any] = dict(
                     tracer_entries=entries,
                     max_stack_depth=stack,
@@ -1543,8 +1558,20 @@ class FullExecutionTraceSession:
 
         except ImportError:
             log.info("VizTracer not available; continuing without function tracing")
+            print(
+                f"[v2.full_trace] stage=start_restore "
+                f"status=skipped reason=viztracer_not_available "
+                f"trace_id={self.trace_id}",
+                flush=True,
+            )
         except Exception as exc:
-            log.warning("VizTracer start failed: %s", exc)
+            log.warning("VizTracer start failed")
+            print(
+                f"[v2.full_trace] stage=start_restore "
+                f"status=error error_type={type(exc).__name__} "
+                f"trace_id={self.trace_id}",
+                flush=True,
+            )
 
         self._write_event("restore_started", {
             "tracer_entries": entries,
@@ -1608,9 +1635,21 @@ class FullExecutionTraceSession:
                 "reason": "already_claimed",
                 "existing_request_id": self._claimed_request_id,
             })
+            print(
+                f"[v2.full_trace] stage=claim_first_request "
+                f"status=skipped reason=already_claimed "
+                f"trace_id={self.trace_id}",
+                flush=True,
+            )
             return False
 
         if not self._transition("request_claimed"):
+            print(
+                f"[v2.full_trace] stage=claim_first_request "
+                f"status=skipped reason=invalid_state({self._state}) "
+                f"trace_id={self.trace_id}",
+                flush=True,
+            )
             return False
 
         self._claimed = True
@@ -1843,6 +1882,15 @@ class FullExecutionTraceSession:
         extra:
             Extra metadata (validated and redacted).
         """
+        # No-op after trace is stopped (post-stop milestone guard)
+        if self._state == "trace_stopped":
+            print(
+                f"[v2.full_trace] stage=capture_milestone "
+                f"status=skipped reason=already_stopped "
+                f"stage={stage} trace_id={self.trace_id}",
+                flush=True,
+            )
+            return
         milestone: dict[str, Any] = {
             "milestone_type": stage,
             "timestamp": time.time(),
@@ -1880,7 +1928,9 @@ class FullExecutionTraceSession:
             )
             milestone["wrapper_inventory"] = wrapper_inv
         except Exception as exc:
-            milestone["wrapper_inventory"] = {"error": str(exc)}
+            milestone["wrapper_inventory"] = {
+                "error_type": type(exc).__name__,
+            }
 
         # Persist milestone
         milestones_path = self._base_dir / "raw" / "milestones.jsonl"
@@ -1980,8 +2030,18 @@ class FullExecutionTraceSession:
         ``with_stack=True``.  No automatic start/schedule/sync.
 
         Gracefully handles missing CUDA and global Kineto state conflicts.
+        Reports sanitized diagnostics on failure.
         """
         if self._torch_profiler_active or self._torch_profiler is not None:
+            return
+        # Disabled when COMFYMODAL_V2_FULL_TRACE_TORCH is "0"
+        if os.environ.get(_ENV_TORCH, "1") == "0":
+            print(
+                f"[v2.full_trace] stage=start_torch_profiler "
+                f"status=skipped reason=torch_disabled "
+                f"trace_id={self.trace_id}",
+                flush=True,
+            )
             return
         try:
             import torch.profiler
@@ -1991,6 +2051,12 @@ class FullExecutionTraceSession:
                 from torch._C._profiler import _kineto_profiler_running
                 if _kineto_profiler_running():
                     log.warning("Kineto profiler already running; skipping torch profiler")
+                    print(
+                        f"[v2.full_trace] stage=start_torch_profiler "
+                        f"status=skipped reason=kineto_conflict "
+                        f"trace_id={self.trace_id}",
+                        flush=True,
+                    )
                     return
             except (ImportError, AttributeError):
                 pass
@@ -2016,14 +2082,27 @@ class FullExecutionTraceSession:
             })
         except ImportError:
             log.info("torch.profiler not available; skipping")
+            print(
+                f"[v2.full_trace] stage=start_torch_profiler "
+                f"status=skipped reason=not_available "
+                f"trace_id={self.trace_id}",
+                flush=True,
+            )
         except Exception as exc:
-            log.warning("torch profiler start failed: %s", exc)
+            log.warning("torch profiler start failed")
+            print(
+                f"[v2.full_trace] stage=start_torch_profiler "
+                f"status=error error_type={type(exc).__name__} "
+                f"trace_id={self.trace_id}",
+                flush=True,
+            )
 
     def stop_torch_profiler(self) -> None:
         """Stop and export the torch profiler.
 
         Exports Chrome trace, gzips it, cleans up temp files.
         Safe to call even if profiler was never started or already stopped.
+        Reports sanitized diagnostics on failure.
         """
         if self._torch_profiler is None and not self._torch_profiler_active:
             return
@@ -2040,8 +2119,17 @@ class FullExecutionTraceSession:
                     "path": str(trace_path.with_name("torch_trace.json.gz")),
                 })
             except Exception as exc:
-                log.warning("Torch profiler export error: %s", exc)
-                self._write_event("torch_profiler_error", {"error": str(exc)})
+                log.warning("Torch profiler export error")
+                print(
+                    f"[v2.full_trace] stage=stop_torch_profiler "
+                    f"status=error error_type={type(exc).__name__} "
+                    f"trace_id={self.trace_id}",
+                    flush=True,
+                )
+                self._write_event(
+                    "torch_profiler_error",
+                    {"error_type": type(exc).__name__},
+                )
         # Clean up
         try:
             self._torch_profiler = None
@@ -2053,7 +2141,8 @@ class FullExecutionTraceSession:
     def stop_tracing(self) -> dict[str, Any]:
         """Stop all tracing in order: resource → torch → VizTracer → metadata.
 
-        Idempotent and safe.
+        Idempotent and safe.  Reports sanitized diagnostics on failure.
+        Once stopped, no further milestones may be captured.
         """
         if self._trace_stopped_result is not None:
             return dict(self._trace_stopped_result)
@@ -2063,17 +2152,7 @@ class FullExecutionTraceSession:
             "state_before": self._state,
         }
 
-        # ── 1. Stop resource sampler ────────────────────────────────────────────────
-        sampler_result: dict[str, Any] = {}
-        if self._resource_sampler is not None:
-            try:
-                sampler_result = self._resource_sampler.stop()
-            except Exception as exc:
-                sampler_result = {"error": str(exc)}
-                log.warning("Resource sampler stop error: %s", exc)
-        result["resource_sampler"] = sampler_result
-
-        # ── 2. Stop torch profiler ──────────────────────────────────────────────────
+        # ── 1. Stop torch profiler ──────────────────────────────────────────────────
         torch_result: dict[str, Any] = {}
         if self._torch_profiler is not None or self._torch_profiler_active:
             try:
@@ -2084,14 +2163,45 @@ class FullExecutionTraceSession:
                     "path": str(torch_trace) if torch_trace.exists() else "",
                 }
             except Exception as exc:
-                torch_result = {"exported": False, "error": str(exc)}
+                torch_result = {"exported": False, "error_type": type(exc).__name__}
+                print(
+                    f"[v2.full_trace] stage=stop_torch_profiler "
+                    f"status=error error_type={type(exc).__name__} "
+                    f"trace_id={self.trace_id}",
+                    flush=True,
+                )
         result["torch_profiler"] = torch_result
+
+        # ── 2. Stop resource sampler ────────────────────────────────────────────────
+        sampler_result: dict[str, Any] = {}
+        if self._resource_sampler is not None:
+            try:
+                sampler_result = self._resource_sampler.stop()
+            except Exception as exc:
+                sampler_result = {"error_type": type(exc).__name__}
+                log.warning("Resource sampler stop error")
+                print(
+                    f"[v2.full_trace] stage=stop_resource_sampler "
+                    f"status=error error_type={type(exc).__name__} "
+                    f"trace_id={self.trace_id}",
+                    flush=True,
+                )
+        result["resource_sampler"] = sampler_result
 
         # ── 3. Stop & save VizTracer ───────────────────────────────────────────────
         viz_result: dict[str, Any] = {}
         if self._viztracer is not None:
             try:
+                _entry_capacity = getattr(self._viztracer, "tracer_entries", 0) or 0
                 self._viztracer.stop()
+                _entry_count = getattr(self._viztracer, "data", None)
+                if _entry_count is None:
+                    try:
+                        _entry_count = len(self._viztracer.parse())
+                    except Exception:
+                        _entry_count = 0
+                else:
+                    _entry_count = len(_entry_count) if hasattr(_entry_count, "__len__") else 0
                 viz_path = self._base_dir / "raw" / "viztracer.json"
                 self._viztracer.save(str(viz_path))
                 self._gzip_file(viz_path)
@@ -2099,10 +2209,18 @@ class FullExecutionTraceSession:
                 viz_result = {
                     "saved": True,
                     "path": str(viz_path.with_name("viztracer.json.gz")),
+                    "entry_count": _entry_count,
+                    "entry_capacity": _entry_capacity,
                 }
             except Exception as exc:
-                viz_result = {"saved": False, "error": str(exc)}
-                log.warning("VizTracer save error: %s", exc)
+                viz_result = {"saved": False, "error_type": type(exc).__name__}
+                log.warning("VizTracer save error")
+                print(
+                    f"[v2.full_trace] stage=stop_viztracer "
+                    f"status=error error_type={type(exc).__name__} "
+                    f"trace_id={self.trace_id}",
+                    flush=True,
+                )
             finally:
                 try:
                     self._viztracer = None
