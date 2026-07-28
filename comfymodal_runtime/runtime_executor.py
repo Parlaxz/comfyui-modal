@@ -25,6 +25,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import inspect
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -1054,6 +1055,22 @@ def attach_pre_sampler_critical_path(
     if _found_sampling_start_ns is not None:
         summary["sampling_start_authoritative"] = True
 
+    # Merge structured report data from live instrumentation
+    structured = result.get("pre_sampler_structured_report")
+    if isinstance(structured, dict):
+        for _field in (
+            "per_node_timings", "clip_text_encode_nodes",
+            "clip_raw_encode_ms", "clip_raw_encode_calls",
+            "load_model_calls", "slowest_pre_sampler_nodes",
+        ):
+            _val = structured.get(_field)
+            if _val is not None:
+                summary[_field] = _val
+        # Propagate clipped node ids for diagnostics
+        _clipped = structured.get("_clipped_node_ids")
+        if _clipped:
+            summary["_clipped_node_ids"] = list(_clipped)
+
     # Attach to result
     if summary:
         if isinstance(trace_data, dict):
@@ -1088,6 +1105,27 @@ _instrumentation_var: contextvars.ContextVar[
 # Bridge for sampler lane lock wait time from modal_app
 _lock_wait_bridge: contextvars.ContextVar[float] = contextvars.ContextVar(
     "pre_sampler_lock_wait_bridge", default=0.0
+)
+
+# Authoritative sampling_start perf_counter_ns cutoff.
+# Set by _build_sampling_wrapper when sampling_start fires;
+# consumed by _patched_exec_node to clip node-wall at the boundary.
+_sampling_cutoff_perf_ns: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "sampling_cutoff_perf_ns", default=None
+)
+
+# Current node context for nested load_models_gpu attribution.
+# Set by _patched_exec_node during node execution; consumed by
+# _patched_load_models_gpu and _patched_encode_from_tokens to
+# record which node triggered the load/encode operation.
+_current_node_context: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "current_node_context", default=None
+)
+
+# Set to True while inside CLIP.encode_from_tokens so nested
+# load_models_gpu calls can construct an accurate call_path.
+_encode_from_tokens_active: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "encode_from_tokens_active", default=False
 )
 
 # Originals saved once by install_hooks()
@@ -1129,6 +1167,307 @@ def _fmt_or_absent(v: Any) -> str:
     return str(v)
 
 
+def _model_role_from_patcher(model: Any) -> str:
+    """Classify a model's role as CLIP, UNET, VAE, or other.
+
+    Uses strong object evidence in order:
+    1. ``model.is_clip`` attribute (set by CLIP.__init__ on ModelPatcher)
+    2. Inner ``model.model.forward_module`` shape (VAE autoencoder, UNET diffusion)
+    3. ``model.model_type`` attribute (ComfyUI's standard role)
+    4. Inner ``model.model`` class name and model_type
+    5. Fallback class name heuristics
+
+    ``model_type='Model'`` is classified as ``other`` (not UNET).
+    Returns ``"other"`` when none provides a clear signal.  Never raises.
+    """
+    # 1. Strongest: is_clip attribute (set by CLIP.__init__ on ModelPatcher)
+    try:
+        if getattr(model, "is_clip", False) is True:
+            return "CLIP"
+    except Exception:
+        pass
+    # 2. Check inner model forward_module for VAE/UNET shape
+    try:
+        inner = getattr(model, "model", None)
+        if inner is not None and inner is not model:
+            fwd = getattr(inner, "forward_module", None)
+            if fwd is not None:
+                fwd_name = fwd.__class__.__name__.lower()
+                if "autoencoder" in fwd_name or "vae" in fwd_name:
+                    return "VAE"
+                if "dit" in fwd_name or "diffusion" in fwd_name or "unet" in fwd_name:
+                    return "UNET"
+    except Exception:
+        pass
+    # 3. Check model_type on patcher
+    try:
+        mt = getattr(model, "model_type", None)
+        if mt is not None:
+            mt_str = str(mt).lower()
+            if "clip" in mt_str:
+                return "CLIP"
+            if mt_str == "model":
+                return "other"
+            if "unet" in mt_str or "diffusion" in mt_str:
+                return "UNET"
+            if "vae" in mt_str or "autoencoder" in mt_str:
+                return "VAE"
+    except Exception:
+        pass
+    # 4. Check inner model attributes
+    try:
+        inner = getattr(model, "model", None)
+        if inner is not None and inner is not model:
+            mt = getattr(inner, "model_type", None)
+            if mt is not None:
+                mt_str = str(mt).lower()
+                if "clip" in mt_str:
+                    return "CLIP"
+                if "vae" in mt_str or "autoencoder" in mt_str:
+                    return "VAE"
+                if mt_str == "model":
+                    return "other"
+                if "unet" in mt_str or "diffusion" in mt_str:
+                    return "UNET"
+            inner_name = inner.__class__.__name__.lower()
+            if "autoencoder" in inner_name or "vae" in inner_name:
+                return "VAE"
+            if "dit" in inner_name or "diffusion" in inner_name or "unet" in inner_name:
+                return "UNET"
+    except Exception:
+        pass
+    # 5. Fallback: class name on patcher itself
+    try:
+        name = model.__class__.__name__.lower()
+        if "clip" in name:
+            return "CLIP"
+        if "unet" in name or "diffusion" in name:
+            return "UNET"
+        if "vae" in name:
+            return "VAE"
+    except Exception:
+        pass
+    return "other"
+
+
+# ── CPU-owner attribution infrastructure ──────────────────────────────
+# Native thread count reading (/proc first, psutil fallback)
+# Per-operation _CpuTimer context manager with peak-thread sampler
+# [v2.cpu_owner] line emission and cutoff signaling
+
+
+def _read_native_thread_count() -> int:
+    """Read native thread count from /proc/self/task first; fallback psutil.
+
+    ``/proc/self/task`` is a directory on Linux with one entry per thread.
+    On platforms without ``/proc`` (Windows, macOS), falls back to
+    ``psutil.Process().num_threads()``.  Returns 0 if both mechanisms fail.
+    """
+    try:
+        task_entries = os.listdir("/proc/self/task")
+        if task_entries:
+            return len(task_entries)
+    except (FileNotFoundError, PermissionError, OSError):
+        pass
+    try:
+        import psutil as _psutil
+        return _psutil.Process().num_threads()
+    except (ImportError, Exception):
+        pass
+    return 0
+
+
+class _PeakThreadSampler:
+    """Samples native thread count every 10ms during a timed operation.
+
+    Stores the peak observed count.  The sampler thread is daemon so it
+    never blocks process exit.  Always call ``stop()`` in a ``finally``
+    block to join the sampler thread.
+    """
+
+    __slots__ = ("_peak", "_stop_event", "_thread")
+
+    def __init__(self) -> None:
+        self._peak: int = 0
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self, initial: int) -> None:
+        """Start the sampler with *initial* as the baseline peak."""
+        self._peak = initial
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._sample, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> int:
+        """Signal stop and join the sampler thread.  Returns peak."""
+        if self._thread is not None and self._thread.is_alive():
+            self._stop_event.set()
+            self._thread.join(timeout=1.0)
+        return self._peak
+
+    def _sample(self) -> None:
+        while not self._stop_event.is_set():
+            count = _read_native_thread_count()
+            if count > self._peak:
+                self._peak = count
+            self._stop_event.wait(0.01)
+
+
+# Active CPU timers registry for cutoff signaling from _build_sampling_wrapper
+_active_cpu_timers: list["_CpuTimer"] = []
+_active_cpu_timers_lock = threading.Lock()
+
+
+class _CpuTimer:
+    """Context manager for per-operation CPU-owner attribution.
+
+    Records wall time (``perf_counter_ns``), process CPU time
+    (``process_time_ns``), and native thread count.  Starts a
+    ``_PeakThreadSampler`` for peak thread tracking.
+
+    On exit, emits exactly one ``[v2.cpu_owner]`` parseable line and
+    appends the data dict to ``_cpu_owner_records`` in instrumentation
+    state (if active).
+
+    Handles the ``sampling_start`` cutoff:
+    * ``signal_cutoff()`` (called from ``_build_sampling_wrapper``)
+      freezes intermediate measurements at the cutoff boundary.
+    * If the operation started **after** the cutoff, no line is emitted.
+    * If the cutoff fires mid-operation, wall/CPU/thread measurements
+      are clipped to the signal time rather than the exit time.
+    """
+
+    __slots__ = (
+        "operation", "role",
+        "_wall_start", "_cpu_start", "_threads_start",
+        "_peak_sampler", "_lock",
+        "_cutoff_ns", "_cutoff_wall", "_cutoff_cpu", "_cutoff_threads",
+    )
+
+    def __init__(self, operation: str, role: str) -> None:
+        self.operation = operation
+        self.role = role
+        self._wall_start: int = 0
+        self._cpu_start: int = 0
+        self._threads_start: int = 0
+        self._peak_sampler = _PeakThreadSampler()
+        self._lock = threading.Lock()
+        self._cutoff_ns: int | None = None
+        self._cutoff_wall: int = 0
+        self._cutoff_cpu: int = 0
+        self._cutoff_threads: int = 0
+
+    def __enter__(self) -> "_CpuTimer":
+        self._wall_start = time.perf_counter_ns()
+        self._cpu_start = time.process_time_ns()
+        self._threads_start = _read_native_thread_count()
+        self._peak_sampler.start(self._threads_start)
+        with _active_cpu_timers_lock:
+            _active_cpu_timers.append(self)
+        return self
+
+    def signal_cutoff(self, cutoff_ns: int) -> None:
+        """Record intermediate measurements at the sampling_start boundary.
+
+        Called from ``_build_sampling_wrapper`` the instant the first
+        ``sampling_start`` event fires.  These measurements replace the
+        ``__exit__`` readings so no post-cutoff time leaks in.
+        Only the first call has effect (subsequent signals are no-ops).
+        """
+        with self._lock:
+            if self._cutoff_ns is None:
+                self._cutoff_ns = cutoff_ns
+                self._cutoff_wall = time.perf_counter_ns()
+                self._cutoff_cpu = time.process_time_ns()
+                self._cutoff_threads = _read_native_thread_count()
+
+    def __exit__(self, *args: Any) -> None:
+        # 1. Freeze peak (stop sampler first so no more samples arrive).
+        #    Use try/finally so unregister happens even if stop() raises.
+        try:
+            peak = self._peak_sampler.stop()
+        except Exception:
+            peak = 0
+
+        # 2. Unregister from active timers (prevents late signal_cutoff).
+        #    Always runs, even if stop() raised above.
+        with _active_cpu_timers_lock:
+            try:
+                _active_cpu_timers.remove(self)
+            except ValueError:
+                pass
+
+        # 3. Read cutoff data under lock
+        with self._lock:
+            _cutoff = self._cutoff_ns
+            if _cutoff is not None:
+                wall_end_ns = self._cutoff_wall
+                cpu_end_ns = self._cutoff_cpu
+                threads_end = self._cutoff_threads
+            else:
+                wall_end_ns = time.perf_counter_ns()
+                cpu_end_ns = time.process_time_ns()
+                threads_end = _read_native_thread_count()
+
+        # 4. If operation started after cutoff, emit nothing.
+        #    Check both the explicit signal (mid-op cutoff) and the contextvar
+        #    (cutoff was set before this operation started — no signal sent).
+        if _cutoff is not None and _cutoff <= self._wall_start:
+            return
+        if _cutoff is None:
+            _ctx_cutoff = _sampling_cutoff_perf_ns.get()
+            if _ctx_cutoff is not None and _ctx_cutoff <= self._wall_start:
+                return
+
+        wall_ms = (wall_end_ns - self._wall_start) / 1_000_000
+        if wall_ms <= 0:
+            return
+
+        process_cpu_ms = (cpu_end_ns - self._cpu_start) / 1_000_000
+        effective_cores = process_cpu_ms / wall_ms if wall_ms > 0 else 0.0
+
+        data: dict[str, Any] = {
+            "operation": self.operation,
+            "role": self.role,
+            "wall_ms": round(wall_ms, 3),
+            "process_cpu_ms": round(process_cpu_ms, 3),
+            "effective_cores": round(effective_cores, 3),
+            "native_threads_start": self._threads_start,
+            "native_threads_peak": peak,
+            "native_threads_end": threads_end,
+        }
+
+        # 5. Store in instrumentation state for structured report
+        _state = _instrumentation_var.get()
+        if _state is not None:
+            _state.setdefault("_cpu_owner_records", []).append(data)
+
+        # 6. Emit parseable line
+        _emit_cpu_owner_line(data)
+
+
+def _emit_cpu_owner_line(data: dict[str, Any]) -> None:
+    """Emit exactly one ``[v2.cpu_owner]`` parseable line."""
+    parts = ["[v2.cpu_owner]"]
+    fields = (
+        "operation", "role", "wall_ms", "process_cpu_ms",
+        "effective_cores", "native_threads_start",
+        "native_threads_peak", "native_threads_end",
+    )
+    for f in fields:
+        parts.append(f"{f}={_fmt_or_absent(data.get(f))}")
+    print(" ".join(parts), flush=True)
+
+
+def _signal_cpu_timers(cutoff_ns: int) -> None:
+    """Signal all active CPU timers that sampling_start has fired."""
+    with _active_cpu_timers_lock:
+        timers = list(_active_cpu_timers)
+    for t in timers:
+        t.signal_cutoff(cutoff_ns)
+
+
 def set_lock_wait_ms(ms: float) -> None:
     """Bridge the sampler lane lock wait duration into instrumentation state.
 
@@ -1152,6 +1491,86 @@ def _pop_lock_wait_ms(state: dict[str, Any]) -> None:
         state.setdefault("_lw_count", 0)
         state["_lw_count"] += 1
         _lock_wait_bridge.set(0.0)
+
+
+def _attach_structured_report(result: dict[str, Any], state: dict[str, Any]) -> None:
+    """Attach structured pre-sampler report fields from instrumentation *state*
+    onto *result* for consumption by ``attach_pre_sampler_critical_path``.
+
+    Adds the following keys to ``result["pre_sampler_structured_report"]``:
+
+    * ``per_node_timings`` — every pre-sampler node with ``node_id``,
+      ``class_type``, ``duration_ms``
+    * ``clip_text_encode_nodes`` — complete wall time per CLIPTextEncode node
+    * ``clip_raw_encode_ms`` — aggregate underlying ``CLIP.encode_from_tokens``
+      wall time
+    * ``clip_raw_encode_calls`` — per-call breakdown
+    * ``load_model_calls`` — each ``load_models_gpu`` invocation with
+      ``duration_ms``, ``model_count``, ``roles`` (CLIP/UNET/VAE/other)
+    * ``slowest_pre_sampler_nodes`` — up to five slowest pre-sampler node
+      entries (clipped at ``_sampling_cutoff_perf_ns``)
+    * ``_clipped_node_ids`` — nodes whose measurement was truncated by the
+      sampling-start cutoff
+    * ``pre_sampler_total_ms`` — authoritative pre-sampler wall window
+      (clipped at sampling_start when available)
+    * ``non_overlapping_measured_total`` — ``node_execution_ms + future_wait_ms``
+      (excludes nested diagnostics: input_resolution, model_patch,
+      lock_wait, conditioning, clip_raw_encode).
+      Always satisfies ``non_overlapping_measured_total <= pre_sampler_total_ms``.
+
+    All fields are additive — existing keys on *result* are preserved.
+    """
+    structured: dict[str, Any] = {}
+
+    node_timings = state.get("_pre_sampler_node_timings", [])
+    if node_timings:
+        structured["per_node_timings"] = list(node_timings)
+
+    clip_nodes = state.get("_clip_text_encode_nodes", [])
+    if clip_nodes:
+        structured["clip_text_encode_nodes"] = list(clip_nodes)
+
+    clip_raw_ms = state.get("_clip_raw_encode_ms", 0.0)
+    if clip_raw_ms > 0:
+        structured["clip_raw_encode_ms"] = round(clip_raw_ms, 3)
+
+    clip_calls = state.get("_clip_raw_encode_calls", [])
+    if clip_calls:
+        structured["clip_raw_encode_calls"] = list(clip_calls)
+
+    load_calls = state.get("_load_model_calls", [])
+    if load_calls:
+        structured["load_model_calls"] = list(load_calls)
+
+    if node_timings:
+        # Top 5 by duration_ms (pre-sampler only already — already clipped)
+        sorted_nodes = sorted(
+            node_timings, key=lambda n: n["duration_ms"], reverse=True
+        )
+        structured["slowest_pre_sampler_nodes"] = sorted_nodes[:5]
+
+    clipped_ids = state.get("_clipped_node_ids", [])
+    if clipped_ids:
+        structured["_clipped_node_ids"] = list(clipped_ids)
+
+    # Authoritative pre-sampler total and non-overlapping measured total.
+    # These invariant fields allow consumers to verify
+    # non_overlapping_measured_total <= pre_sampler_total_ms.
+    _pre_total = state.get("pre_sampler_total_ms")
+    if _pre_total is not None:
+        structured["pre_sampler_total_ms"] = round(float(_pre_total), 3)
+    _no_total = state.get("non_overlapping_measured_total")
+    if _no_total is not None:
+        structured["non_overlapping_measured_total"] = round(float(_no_total), 3)
+
+    # CPU-owner attribution records (diagnostic, not part of measured-total)
+    cpu_records = state.get("_cpu_owner_records", [])
+    if cpu_records:
+        structured["cpu_owner_records"] = list(cpu_records)
+
+    # Always set the key so consumers can reliably detect its presence.
+    # When empty, it indicates no live instrumentation data was collected.
+    result["pre_sampler_structured_report"] = structured
 
 
 def _emit_pre_sampler_line(state: dict[str, Any]) -> None:
@@ -1203,22 +1622,13 @@ def install_pre_sampler_hooks() -> None:
         _ORIGINAL_FUNCTIONS["get_input_data"] = _orig_get_input_data
         _installed_execution_hooks = True
 
-        def _patched_get_input_data(
-            inputs, class_def, unique_id,
-            execution_list=None, dynprompt=None, extra_data=None,
-        ):
+        def _patched_get_input_data(*args: Any, **kwargs: Any) -> Any:
             state = _instrumentation_var.get()
             if state is None:
-                return _orig_get_input_data(
-                    inputs, class_def, unique_id,
-                    execution_list, dynprompt, extra_data,
-                )
+                return _orig_get_input_data(*args, **kwargs)
             _t0 = time.perf_counter_ns()
             try:
-                return _orig_get_input_data(
-                    inputs, class_def, unique_id,
-                    execution_list, dynprompt, extra_data,
-                )
+                return _orig_get_input_data(*args, **kwargs)
             finally:
                 _elapsed = _ns_ms(_t0)
                 if state is not None:
@@ -1234,26 +1644,26 @@ def install_pre_sampler_hooks() -> None:
         _ORIGINAL_FUNCTIONS["execute"] = _orig_exec_node
         _installed_execution_hooks = True
 
-        async def _patched_exec_node(
-            server, dynprompt, caches, current_item, extra_data,
-            executed, prompt_id, execution_list,
-            pending_subgraph_results, pending_async_nodes, ui_outputs,
-        ):
+        async def _patched_exec_node(*args: Any, **kwargs: Any) -> Any:
             state = _instrumentation_var.get()
             if state is None:
-                return await _orig_exec_node(
-                    server, dynprompt, caches, current_item, extra_data,
-                    executed, prompt_id, execution_list,
-                    pending_subgraph_results, pending_async_nodes, ui_outputs,
-                )
+                return await _orig_exec_node(*args, **kwargs)
+
+            # Extract needed arguments for classification (indices match excution.py signature:
+            # server, dynprompt, caches, current_item, extra_data, executed, prompt_id, ...)
+            _server = args[0] if len(args) > 0 else kwargs.get("server")
+            _dynprompt = args[1] if len(args) > 1 else kwargs.get("dynprompt")
+            _current_item = args[3] if len(args) > 3 else kwargs.get("current_item")
+            _extra_data = args[4] if len(args) > 4 else kwargs.get("extra_data")
+            _prompt_id = args[6] if len(args) > 6 else kwargs.get("prompt_id")
 
             # Resolve node identity — fall back to state prompt when dynprompt
             # is unavailable (e.g. test or simplified execution paths).
             node_class = ""
-            node_id = str(current_item) if current_item is not None else ""
+            node_id = str(_current_item) if _current_item is not None else ""
             try:
-                if dynprompt is not None:
-                    node_info = dynprompt.get_node(current_item)
+                if _dynprompt is not None:
+                    node_info = _dynprompt.get_node(_current_item)
                     if isinstance(node_info, dict):
                         node_class = str(node_info.get("class_type", "") or "")
             except Exception:
@@ -1261,7 +1671,7 @@ def install_pre_sampler_hooks() -> None:
             if not node_class:
                 # Fallback: look up class_type from the stored prompt dict
                 _prompt = state.get("_prompt", {})
-                _entry = _prompt.get(node_id) or _prompt.get(str(current_item))
+                _entry = _prompt.get(node_id) or _prompt.get(str(_current_item))
                 if isinstance(_entry, dict):
                     node_class = str(_entry.get("class_type", "") or "")
 
@@ -1275,6 +1685,10 @@ def install_pre_sampler_hooks() -> None:
                 and ("loader" in _class_lower or "checkpoint" in _class_lower)
             )
 
+            # Set current node context for nested load_models_gpu attribution
+            _ctx_token = _current_node_context.set((node_id, node_class))
+            _encode_ctx_token = _encode_from_tokens_active.set(False)
+
             # Capture node-entry perf counter before span boundary recording
             _t0 = time.perf_counter_ns()
 
@@ -1287,24 +1701,61 @@ def install_pre_sampler_hooks() -> None:
             state["last_node_id"] = node_id
             state["last_class_type"] = node_class
 
-            try:
-                result = await _orig_exec_node(
-                    server, dynprompt, caches, current_item, extra_data,
-                    executed, prompt_id, execution_list,
-                    pending_subgraph_results, pending_async_nodes, ui_outputs,
-                )
-                return result
-            finally:
-                _elapsed = _ns_ms(_t0)
-                if state is None:
-                    return
-                state["node_execution_ms"] = state.get("node_execution_ms", 0.0) + _elapsed
-                state.setdefault("_ne_count", 0)
-                state["_ne_count"] += 1
+            # CPU timer for CLIPTextEncode nodes only (exact operation name)
+            _cpu_node_timer: _CpuTimer | None = None
+            if _is_clip_text_encode:
+                _cpu_node_timer = _CpuTimer("CLIPTextEncode", "CLIP")
+                _cpu_node_timer.__enter__()
 
-                # Conditioning sub-tracking
-                if _is_clip_text_encode:
-                    state["conditioning_ms"] = state.get("conditioning_ms", 0.0) + _elapsed
+            try:
+                return await _orig_exec_node(*args, **kwargs)
+            finally:
+                if _cpu_node_timer is not None:
+                    _cpu_node_timer.__exit__()
+                _elapsed = _ns_ms(_t0)
+                _current_node_context.reset(_ctx_token)
+                _encode_from_tokens_active.reset(_encode_ctx_token)
+
+                # ── Hard cutoff at authoritative sampling_start ──────────────
+                cutoff_ns = _sampling_cutoff_perf_ns.get()
+                if cutoff_ns is not None:
+                    if cutoff_ns > _t0:
+                        # Clip: node contribution stops at sampling_start
+                        _clipped_elapsed = round(
+                            (cutoff_ns - _t0) / 1_000_000, 3
+                        )
+                        _clipped = _elapsed - _clipped_elapsed > 0.001
+                        _elapsed = _clipped_elapsed
+                    else:
+                        # Node started after sampling already began — skip
+                        _elapsed = 0.0
+                        _clipped = False
+                else:
+                    _clipped = False
+
+                if _elapsed > 0:
+                    state["node_execution_ms"] = state.get("node_execution_ms", 0.0) + _elapsed
+                    state.setdefault("_ne_count", 0)
+                    state["_ne_count"] += 1
+
+                    # Per-node timing list for structured report
+                    state.setdefault("_pre_sampler_node_timings", []).append({
+                        "node_id": node_id,
+                        "class_type": node_class,
+                        "duration_ms": round(_elapsed, 3),
+                    })
+
+                    # Record as clipped when the measurement was truncated
+                    if _clipped:
+                        state.setdefault("_clipped_node_ids", []).append(node_id)
+
+                    # Conditioning sub-tracking
+                    if _is_clip_text_encode:
+                        state["conditioning_ms"] = state.get("conditioning_ms", 0.0) + _elapsed
+                        state.setdefault("_clip_text_encode_nodes", []).append({
+                            "node_id": node_id,
+                            "duration_ms": round(_elapsed, 3),
+                        })
 
                 # Sampler node-entry tracking (perf_counter, NOT actual sampler start)
                 if _is_sampler and "sampler_node_enter_perf_ns" not in state:
@@ -1318,20 +1769,151 @@ def install_pre_sampler_hooks() -> None:
 
         _execution.execute = _patched_exec_node
 
-    # ── 3. (removed) comfy.model_management.load_models_gpu ────────────
-    # The load_models_gpu wrapper is owned by model_preload.py
-    # (_make_gpu_loader_wrapper).  The former duplicate timing patch /
-    # capture / wrapper / assignment / restore has been removed to avoid
-    # double-wrapping.  Old aggregate is unavailable; remove authority.
+    # ── 3. comfy.model_management.load_models_gpu ──────────────────────
+    # Patched with _CpuTimer for CPU-owner attribution, role classification,
+    # and hard cutoff support.  Keep in sync with model_preload.py's
+    # _make_gpu_loader_wrapper to avoid double-wrapping at the model level.
+    _orig_load_models = getattr(_mm, "load_models_gpu", None)
+    if _orig_load_models is not None:
+        _ORIGINAL_FUNCTIONS["load_models_gpu"] = _orig_load_models
 
-    # ── 4. PromptExecutor.execute_async ────────────────────────────────
+        def _patched_load_models_gpu(*args: Any, **kwargs: Any) -> Any:
+            state = _instrumentation_var.get()
+            if state is None:
+                return _orig_load_models(*args, **kwargs)
+
+            # Read current node context for metadata
+            _node_ctx = _current_node_context.get()
+            _in_encode = _encode_from_tokens_active.get()
+            _load_node_id = _node_ctx[0] if _node_ctx is not None else ""
+            _load_node_class = _node_ctx[1] if _node_ctx is not None else ""
+
+            # Build call_path: chain of operations that led to this load
+            _call_parts: list[str] = []
+            if _load_node_class:
+                _call_parts.append(_load_node_class)
+            if _in_encode:
+                _call_parts.append("CLIP.encode_from_tokens")
+            _call_path = "→".join(_call_parts) if _call_parts else ""
+
+            # Extract models for role classification
+            _models = args[0] if len(args) > 0 else kwargs.get("models", [])
+
+            # ── Hard cutoff check ──────────────────────────────────────────
+            _cutoff_ns = _sampling_cutoff_perf_ns.get()
+            _t0 = time.perf_counter_ns()
+            if _cutoff_ns is not None and _t0 >= _cutoff_ns:
+                # Entirely post-cutoff — skip instrumentation, no record
+                return _orig_load_models(*args, **kwargs)
+
+            # Classify roles before timing (deterministic sorted comma-separated)
+            _load_roles: list[str] = []
+            for _m in _models:
+                _load_roles.append(_model_role_from_patcher(_m))
+            if not _load_roles:
+                _load_roles.append("other")
+            _roles_str = ",".join(sorted(_load_roles))
+            _cpu_timer_load = _CpuTimer("load_models_gpu", _roles_str)
+            _cpu_timer_load.__enter__()
+            try:
+                return _orig_load_models(*args, **kwargs)
+            finally:
+                _cpu_timer_load.__exit__()
+                _elapsed = _ns_ms(_t0)
+
+                # Clip if cutoff fired mid-operation
+                if _cutoff_ns is not None and _cutoff_ns > _t0:
+                    _clipped_elapsed = round(
+                        (_cutoff_ns - _t0) / 1_000_000, 3
+                    )
+                    if _elapsed > _clipped_elapsed:
+                        _elapsed = _clipped_elapsed
+
+                if state is not None and _elapsed > 0:
+                    state["model_patch_ms"] = state.get("model_patch_ms", 0.0) + _elapsed
+                    state.setdefault("_mp_count", 0)
+                    state["_mp_count"] += 1
+
+                    # Per-call load_models_gpu record with role classification and metadata
+                    _load_record: dict[str, Any] = {
+                        "duration_ms": round(_elapsed, 3),
+                        "model_count": len(_models),
+                        "roles": sorted(_load_roles),
+                    }
+                    if _load_node_id:
+                        _load_record["node_id"] = _load_node_id
+                    if _load_node_class:
+                        _load_record["node_class"] = _load_node_class
+                    if _call_path:
+                        _load_record["call_path"] = _call_path
+                    state.setdefault("_load_model_calls", []).append(_load_record)
+
+        _mm.load_models_gpu = _patched_load_models_gpu
+
+    # ── 4. comfy.sd.CLIP.encode_from_tokens (raw CLIP encode wall time) ─
+    try:
+        import comfy.sd as _comfy_sd
+        _orig_encode_from_tokens = getattr(
+            _comfy_sd.CLIP, "encode_from_tokens", None
+        )
+        if _orig_encode_from_tokens is not None:
+            _ORIGINAL_FUNCTIONS["encode_from_tokens"] = _orig_encode_from_tokens
+            _installed_execution_hooks = True
+
+            def _patched_encode_from_tokens(*args: Any, **kwargs: Any) -> Any:
+                state = _instrumentation_var.get()
+                if state is None:
+                    return _orig_encode_from_tokens(*args, **kwargs)
+
+                # ── Hard cutoff check ──────────────────────────────────────
+                _cutoff_ns = _sampling_cutoff_perf_ns.get()
+                _t0 = time.perf_counter_ns()
+                if _cutoff_ns is not None and _t0 >= _cutoff_ns:
+                    # Entirely post-cutoff — skip instrumentation, no record
+                    return _orig_encode_from_tokens(*args, **kwargs)
+
+                _encode_token = _encode_from_tokens_active.set(True)
+                _cpu_timer_enc = _CpuTimer("CLIP.encode_from_tokens", "CLIP")
+                _cpu_timer_enc.__enter__()
+                try:
+                    return _orig_encode_from_tokens(*args, **kwargs)
+                finally:
+                    _cpu_timer_enc.__exit__()
+                    _encode_from_tokens_active.reset(_encode_token)
+                    _elapsed = _ns_ms(_t0)
+
+                    # Clip if cutoff fired mid-operation
+                    if _cutoff_ns is not None and _cutoff_ns > _t0:
+                        _clipped_elapsed = round(
+                            (_cutoff_ns - _t0) / 1_000_000, 3
+                        )
+                        if _elapsed > _clipped_elapsed:
+                            _elapsed = _clipped_elapsed
+
+                    if state is not None and _elapsed > 0:
+                        state["_clip_raw_encode_ms"] = (
+                            state.get("_clip_raw_encode_ms", 0.0) + _elapsed
+                        )
+                        state.setdefault("_clip_raw_encode_count", 0)
+                        state["_clip_raw_encode_count"] += 1
+                        self_in_args = args[0] if len(args) > 0 else None
+                        state.setdefault("_clip_raw_encode_calls", []).append({
+                            "duration_ms": round(_elapsed, 3),
+                            "clip_id": str(id(self_in_args)),
+                        })
+
+            _comfy_sd.CLIP.encode_from_tokens = _patched_encode_from_tokens
+    except (ImportError, AttributeError):
+        pass
+
+    # ── 5. PromptExecutor.execute_async ────────────────────────────────
     _prompt_executor_cls = getattr(_execution, "PromptExecutor", None)
     _orig_exec_async = getattr(_prompt_executor_cls, "execute_async", None) if _prompt_executor_cls is not None else None
     if _orig_exec_async is not None:
         _ORIGINAL_FUNCTIONS["execute_async"] = _orig_exec_async
         _installed_execution_hooks = True
 
-        async def _patched_exec_async(self, prompt, prompt_id, extra_data=None, execute_outputs=None):
+        async def _patched_exec_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
             state = _instrumentation_var.get()
             if state is None:
                 return await _orig_exec_async(
@@ -1355,11 +1937,17 @@ def install_pre_sampler_hooks() -> None:
                     self, prompt, prompt_id, extra_data, execute_outputs,
                 )
             finally:
-                if state is None:
-                    return
-                # Finalize aggregate state after execution completes
+                # Finalize aggregate state after execution completes.
+                # Compute local pre-sampler window using authoritative
+                # first _sampling_cutoff_perf_ns when present; only fall
+                # back to end when no authoritative sampling event exists.
                 _t_end = time.perf_counter_ns()
-                _total_wall_ms = _ns_ms(_t_start)
+                _cutoff_ns = _sampling_cutoff_perf_ns.get()
+                if _cutoff_ns is not None and _cutoff_ns > _t_start:
+                    _total_wall_ns = _cutoff_ns - _t_start
+                else:
+                    _total_wall_ns = _t_end - _t_start
+                _total_wall_ms = _total_wall_ns / 1_000_000
 
                 # Consume lock_wait from bridge (set by modal_app send_sync wrapper)
                 _pop_lock_wait_ms(state)
@@ -1384,29 +1972,40 @@ def install_pre_sampler_hooks() -> None:
                 state.setdefault("end_node_id", state.get("sampler_node_id", state.get("last_node_id", "")))
                 state.setdefault("end_class_type", state.get("sampler_class_type", state.get("last_class_type", "")))
 
-                # Compute pre_sampler_unattributed_ms from what we observed:
-                # residual wall time not covered by the measured operations below.
+                # ── Non-overlap accounting ─────────────────────────────────
+                # input_resolution_ms, model_patch_ms, lock_wait_ms,
+                # conditioning_ms, clip_raw_encode_ms are nested/subset
+                # diagnostics inside node_execution.  They are NOT added to
+                # the non-overlapping measured total.  The non-overlapping
+                # base is node_execution_ms (sequential node intervals) plus
+                # future_wait_ms (truly disjoint outside-node interval).
                 _ne = state.get("node_execution_ms", 0.0)
-                _ir = state.get("input_resolution_ms", 0.0)
-                _mp = state.get("model_patch_ms", 0.0)
-                _measured = _ne + _ir + _mp
-                _pre_sampler_unattributed = max(0.0, _total_wall_ms - _measured)
+                _fw = state.get("future_wait_ms", 0.0)
+                _non_overlap_base = _ne + _fw
+
+                # Enforce invariant: non_overlap_base <= total_wall_ms.
+                # Clamp and flag breaches so they can be detected in tests.
+                if _non_overlap_base > _total_wall_ms:
+                    state["_overlap_breach"] = round(_non_overlap_base - _total_wall_ms, 3)
+                    _non_overlap_base = _total_wall_ms
+
+                # pre_sampler_unattributed_ms = residual after non-overlapping base.
+                # This represents the wall time gap NOT covered by any node
+                # execution or future-wait, bounded by the authoritative
+                # pre-sampler window.
+                _pre_sampler_unattributed = max(0.0, _total_wall_ms - _non_overlap_base)
                 state["pre_sampler_unattributed_ms"] = (
                     state.get("pre_sampler_unattributed_ms", 0.0)
                     + _pre_sampler_unattributed
                 )
 
-                # unattributed = wall minus sum of all measured operations.
-                # conditioning_ms is a subset of node_execution_ms (already in _ne),
-                # so we do NOT add it again here to avoid double-counting.
-                _sum_measured = (
-                    _ne + _ir + _mp
-                    + state.get("cache_lookup_ms", 0.0)
-                    + state.get("future_wait_ms", 0.0)
-                    + state.get("lock_wait_ms", 0.0)
-                    + state.get("pre_sampler_unattributed_ms", 0.0)
-                )
-                _unattr = max(0.0, _total_wall_ms - _sum_measured)
+                # unattributed_ms = residual after also including cache_lookup_ms
+                # (partially outside node execution) for full accounting.
+                _cl = state.get("cache_lookup_ms", 0.0)
+                _all_non_overlap = _non_overlap_base + _cl
+                if _all_non_overlap > _total_wall_ms:
+                    _all_non_overlap = _total_wall_ms
+                _unattr = max(0.0, _total_wall_ms - _all_non_overlap)
                 if _unattr > 0.001:
                     state["unattributed_ms"] = state.get("unattributed_ms", 0.0) + _unattr
 
@@ -1414,6 +2013,17 @@ def install_pre_sampler_hooks() -> None:
                 state.setdefault("background_future_exists", state.get("_model_loaded", False))
                 state.setdefault("background_future_done", state.get("_model_loaded", False))
                 state.setdefault("model_cache_hit", state.get("_mp_count", 0) == 0)
+
+                # ── Expose authoritative totals for structured report ──────
+                # pre_sampler_total_ms = the authoritative pre-sampler window
+                # (clipped at sampling_start when available).
+                # non_overlapping_measured_total = node_execution_ms + future_wait_ms
+                # (excludes nested diagnostics: input_resolution, model_patch,
+                #  lock_wait, conditioning, clip_raw_encode).
+                # These invariant fields allow consumers to verify
+                # measured <= pre_sampler_total.
+                state["pre_sampler_total_ms"] = round(_total_wall_ms, 3)
+                state["non_overlapping_measured_total"] = round(_non_overlap_base, 3)
 
                 # ── Emit exactly one line ──────────────────────────────────
                 _emit_pre_sampler_line(state)
@@ -1511,6 +2121,10 @@ def uninstall_pre_sampler_hooks() -> None:
     if _orig_exec is not None:
         _execution.execute = _orig_exec
 
+    _orig_load = _ORIGINAL_FUNCTIONS.get("load_models_gpu")
+    if _orig_load is not None:
+        _mm.load_models_gpu = _orig_load
+
     _orig_exec_async = _ORIGINAL_FUNCTIONS.get("execute_async")
     if _orig_exec_async is not None:
         _execution.PromptExecutor.execute_async = _orig_exec_async
@@ -1524,6 +2138,15 @@ def uninstall_pre_sampler_hooks() -> None:
     _orig_resolve = _ORIGINAL_FUNCTIONS.get("resolve_map_node_over_list_results")
     if _orig_resolve is not None:
         _execution.resolve_map_node_over_list_results = _orig_resolve
+
+    # Restore encode_from_tokens hook
+    _orig_encode = _ORIGINAL_FUNCTIONS.get("encode_from_tokens")
+    if _orig_encode is not None:
+        try:
+            import comfy.sd as _comfy_sd
+            _comfy_sd.CLIP.encode_from_tokens = _orig_encode
+        except (ImportError, AttributeError):
+            pass
 
     _ORIGINAL_FUNCTIONS.clear()
     _hooks_installed = False
@@ -1540,10 +2163,13 @@ def pre_sampler_instrumentation_scope(state_override: dict[str, Any] | None = No
     """
     state = state_override if state_override is not None else {}
     token = _instrumentation_var.set(state)
+    # Reset sampling cutoff contextvar to prevent cross-request leakage
+    _cutoff_token = _sampling_cutoff_perf_ns.set(None)
     install_pre_sampler_hooks()
     try:
         yield state
     finally:
+        _sampling_cutoff_perf_ns.reset(_cutoff_token)
         _instrumentation_var.reset(token)
 
 
@@ -1611,10 +2237,13 @@ class RuntimeExecutor:
 
             # ── Pre-sampler live instrumentation scope ─────────────
             async def _run_with_instrumentation() -> dict[str, Any]:
-                with pre_sampler_instrumentation_scope():
+                _inst_state: dict[str, Any] = {}
+                with pre_sampler_instrumentation_scope(_inst_state):
                     result = runner(plan, ctx)
                     if inspect.isawaitable(result):
                         result = await result
+                    # Capture structured report data from instrumentation state
+                    _attach_structured_report(result, _inst_state)
                     return result  # type: ignore[return-value]
 
             if enable_pre_sampler_instrumentation:
@@ -1780,6 +2409,16 @@ def _build_sampling_wrapper() -> Callable:
             "node_class": node_class,
             "steps": steps,
         })
+        # Set the authoritative pre-sampler hard cutoff: every node-wall
+        # measurement is clipped at this perf_counter_ns timestamp so that
+        # no sampler/VAE/output wall time leaks into pre-sampler metrics.
+        # Idempotent: only the first caller sets the cutoff; subsequent
+        # sampler invocations within the same request do NOT overwrite it.
+        _cutoff_ns = time.perf_counter_ns()
+        if _sampling_cutoff_perf_ns.get() is None:
+            _sampling_cutoff_perf_ns.set(_cutoff_ns)
+            # Signal all active CPU-owner timers to freeze measurements at cutoff
+            _signal_cpu_timers(_cutoff_ns)
         try:
             return executor(*args, **kwargs)
         finally:
@@ -1839,10 +2478,3 @@ def ensure_sampling_timing_wrapper(model_patcher: Any) -> bool:
             flush=True,
         )
         return False
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# (removed) Structured pre-sampler report attachment
-# ═══════════════════════════════════════════════════════════════════════
-# _attach_structured_report has been removed.  Use the existing
-# pre_sampler_critical_path facility in RuntimeExecutor instead.

@@ -288,6 +288,10 @@ _SENTINEL_MODEL_PATCHER = "_comfy_modal_model_patcher_wrapper"
 _SENTINEL_MODEL_TO = "_comfy_modal_model_to_wrapper"
 _SENTINEL_CLIP_CONSTRUCTOR = "_comfy_modal_clip_constructor_wrapper"
 _SENTINEL_CLIP_LOAD_SD = "_comfy_modal_clip_load_sd_wrapper"
+_SENTINEL_MODEL_PATCHER_LOAD = "_comfy_modal_model_patcher_load_wrapper"
+_SENTINEL_MODEL_PATCHER_LOAD_LIST = "_comfy_modal_model_patcher_load_list_wrapper"
+_SENTINEL_MODEL_PATCHER_PATCH_WEIGHT = "_comfy_modal_model_patcher_patch_weight_wrapper"
+_SENTINEL_CAST_TO_DEVICE = "_comfy_modal_cast_to_device_wrapper"
 
 _read_wrapper_installed: bool = False
 _gpu_wrapper_installed: bool = False
@@ -308,6 +312,15 @@ _deep_tl_depth: ContextVar[int] = ContextVar("_deep_tl_depth", default=0)
 _clip_depth: ContextVar[int] = ContextVar("_clip_depth", default=0)
 _clip_subfn_depth: ContextVar[int] = ContextVar("_clip_subfn_depth", default=0)
 _clip_constructor_depth: ContextVar[int] = ContextVar("_clip_constructor_depth", default=0)
+
+# ModelPatcher.load aggregate-timing breakdown contexts
+_model_patcher_load_depth: ContextVar[int] = ContextVar("_model_patcher_load_depth", default=0)
+# Breakdown accumulator dict set only during outer ModelPatcher.load under request trace.
+# Keys: outer_start_ns, outer_thread_start_ns, outer_process_start_ns,
+#       load_list_wall_ns, load_list_process_start_ns, load_list_process_end_ns,
+#       patch_weight_count, patch_weight_wall_ns, patch_weight_process_ns,
+#       cast_count, cast_wall_ns, cast_process_ns
+_model_patcher_breakdown: ContextVar[dict | None] = ContextVar("_model_patcher_breakdown", default=None)
 
 # ── Deep-diagnostic target path (thread-local) ──────────────────────
 # Set by the background UNET worker before the load body; used by the
@@ -1615,6 +1628,183 @@ def _make_model_to_wrapper(original):
     return wrapper
 
 
+# ── ModelPatcher.load aggregate-timing wrappers (narrow timers) ──────
+# Four narrow wrappers installed alongside existing core/model_patcher
+# wrappers.  Only active during an active request trace AND outer
+# ModelPatcher.load scope.  Produce one summary event on outer exit:
+#   model_patcher_load_breakdown
+# with wall_ms, thread_cpu_ms, process_cpu_ms for total, plus traversal,
+# patch_weight (count/wall/process), cast (count/wall/process), and
+# residual wall/process.
+
+
+def _make_model_patcher_load_breakdown_wrapper(original):
+    """Wrap ModelPatcher.load / ModelPatcherDynamic.load with breakdown timing.
+
+    Only emits ``model_patcher_load_breakdown`` when ``_ACTIVE_REQUEST_TRACE``
+    is set and this is the outermost invocation.  Sets up a thread-local
+    ``_model_patcher_breakdown`` dict consumed by the inner _load_list,
+    patch_weight_to_device, and cast_to_device wrappers.
+    """
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(self, *args, **kwargs):
+        before = _model_patcher_load_depth.get()
+        _model_patcher_load_depth.set(before + 1)
+        request_trace = _ACTIVE_REQUEST_TRACE.get()
+        emit = (before == 0 and request_trace is not None)
+        _breakdown = None
+        if emit:
+            _breakdown = {
+                "outer_start_ns": time.monotonic_ns(),
+                "outer_thread_start_ns": time.thread_time_ns() if hasattr(time, "thread_time_ns") else None,
+                "outer_process_start_ns": time.process_time_ns() if hasattr(time, "process_time_ns") else None,
+                "load_list_wall_ns": 0,
+                "load_list_process_start_ns": None,
+                "load_list_process_end_ns": None,
+                "patch_weight_count": 0,
+                "patch_weight_wall_ns": 0,
+                "patch_weight_process_ns": 0,
+                "cast_count": 0,
+                "cast_wall_ns": 0,
+                "cast_process_ns": 0,
+            }
+            _model_patcher_breakdown.set(_breakdown)
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            after = _model_patcher_load_depth.get()
+            _model_patcher_load_depth.set(after - 1)
+            if emit and _breakdown is not None:
+                _outer_end_ns = time.monotonic_ns()
+                _outer_thread_end_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
+                _outer_process_end_ns = time.process_time_ns() if hasattr(time, "process_time_ns") else None
+                _wall_ms = round((_outer_end_ns - _breakdown["outer_start_ns"]) / 1_000_000, 3)
+                _thread_ms = round((_outer_thread_end_ns - _breakdown["outer_thread_start_ns"]) / 1_000_000, 3) if _breakdown.get("outer_thread_start_ns") is not None and _outer_thread_end_ns is not None else None
+                _process_ms = round((_outer_process_end_ns - _breakdown["outer_process_start_ns"]) / 1_000_000, 3) if _breakdown.get("outer_process_start_ns") is not None and _outer_process_end_ns is not None else None
+                # Traversal (_load_list)
+                _traversal_wall = round(_breakdown["load_list_wall_ns"] / 1_000_000, 3) if _breakdown["load_list_wall_ns"] else 0.0
+                _traversal_process: float | None = None
+                if _breakdown["load_list_process_start_ns"] is not None and _breakdown["load_list_process_end_ns"] is not None:
+                    _traversal_process = round((_breakdown["load_list_process_end_ns"] - _breakdown["load_list_process_start_ns"]) / 1_000_000, 3)
+                # Patch-weight aggregate
+                _pw_wall = round(_breakdown["patch_weight_wall_ns"] / 1_000_000, 3) if _breakdown["patch_weight_wall_ns"] else 0.0
+                _pw_process: float | None = None
+                if _breakdown["patch_weight_process_ns"]:
+                    _pw_process = round(_breakdown["patch_weight_process_ns"] / 1_000_000, 3)
+                # Cast aggregate
+                _cast_wall = round(_breakdown["cast_wall_ns"] / 1_000_000, 3) if _breakdown["cast_wall_ns"] else 0.0
+                _cast_process: float | None = None
+                if _breakdown["cast_process_ns"]:
+                    _cast_process = round(_breakdown["cast_process_ns"] / 1_000_000, 3)
+                # Residual
+                _residual_wall = round(max(0.0, _wall_ms - _traversal_wall - _pw_wall), 3)
+                _residual_process: float | None = None
+                if _process_ms is not None and _traversal_process is not None and _pw_process is not None:
+                    _residual_process = round(max(0.0, _process_ms - _traversal_process - _pw_process), 3)
+                request_trace.emit("model_patcher_load_breakdown", phase="execution", metadata={
+                    "request_id": str(request_trace.request_id),
+                    "wall_ms": _wall_ms,
+                    "thread_cpu_ms": _thread_ms,
+                    "process_cpu_ms": _process_ms,
+                    "traversal_wall_ms": _traversal_wall,
+                    "traversal_process_cpu_ms": _traversal_process,
+                    "patch_weight_count": _breakdown["patch_weight_count"],
+                    "patch_weight_wall_ms": _pw_wall,
+                    "patch_weight_process_cpu_ms": _pw_process,
+                    "cast_count": _breakdown["cast_count"],
+                    "cast_wall_ms": _cast_wall,
+                    "cast_process_cpu_ms": _cast_process,
+                    "residual_wall_ms": _residual_wall,
+                    "residual_process_cpu_ms": _residual_process,
+                })
+                _model_patcher_breakdown.set(None)
+
+    setattr(wrapper, _SENTINEL_MODEL_PATCHER_LOAD, True)
+    return wrapper
+
+
+def _make_model_patcher_load_list_breakdown_wrapper(original):
+    """Wrap ``ModelPatcher._load_list`` with wall/process timing.
+
+    Only accumulates when ``_model_patcher_breakdown`` is set (inside outer
+    ModelPatcher.load under request trace).
+    """
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(self, *args, **kwargs):
+        _bd = _model_patcher_breakdown.get()
+        if _bd is not None:
+            _bd["load_list_process_start_ns"] = time.process_time_ns() if hasattr(time, "process_time_ns") else None
+            _load_list_start_ns = time.monotonic_ns()
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            if _bd is not None:
+                _bd["load_list_wall_ns"] = time.monotonic_ns() - _load_list_start_ns
+                _bd["load_list_process_end_ns"] = time.process_time_ns() if hasattr(time, "process_time_ns") else None
+
+    setattr(wrapper, _SENTINEL_MODEL_PATCHER_LOAD_LIST, True)
+    return wrapper
+
+
+def _make_model_patcher_patch_weight_breakdown_wrapper(original):
+    """Wrap ``ModelPatcher.patch_weight_to_device`` with count/wall/process aggregation.
+
+    Accumulates into ``_model_patcher_breakdown`` when set (inside outer
+    ModelPatcher.load under request trace).
+    """
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(self, key, device_to=None, inplace_update=False, return_weight=False, force_cast=False):
+        _bd = _model_patcher_breakdown.get()
+        if _bd is not None:
+            _pw_start = time.monotonic_ns()
+            _pw_process_start = time.process_time_ns() if hasattr(time, "process_time_ns") else None
+        try:
+            return original(self, key, device_to=device_to, inplace_update=inplace_update, return_weight=return_weight, force_cast=force_cast)
+        finally:
+            if _bd is not None:
+                _bd["patch_weight_count"] += 1
+                _bd["patch_weight_wall_ns"] += time.monotonic_ns() - _pw_start
+                if _pw_process_start is not None:
+                    _bd["patch_weight_process_ns"] += time.process_time_ns() - _pw_process_start
+
+    setattr(wrapper, _SENTINEL_MODEL_PATCHER_PATCH_WEIGHT, True)
+    return wrapper
+
+
+def _make_cast_to_device_breakdown_wrapper(original):
+    """Wrap ``comfy.model_management.cast_to_device`` with count/wall/process aggregation.
+
+    Only accumulates when ``_model_patcher_breakdown`` is set (inside outer
+    ModelPatcher.load under request trace).  Installed on the live
+    ``comfy.model_management`` module.
+    """
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(tensor, device, dtype, copy=False):
+        _bd = _model_patcher_breakdown.get()
+        if _bd is not None:
+            _cast_start = time.monotonic_ns()
+            _cast_process_start = time.process_time_ns() if hasattr(time, "process_time_ns") else None
+        try:
+            return original(tensor, device, dtype, copy=copy)
+        finally:
+            if _bd is not None:
+                _bd["cast_count"] += 1
+                _bd["cast_wall_ns"] += time.monotonic_ns() - _cast_start
+                if _cast_process_start is not None:
+                    _bd["cast_process_ns"] += time.process_time_ns() - _cast_process_start
+
+    setattr(wrapper, _SENTINEL_CAST_TO_DEVICE, True)
+    return wrapper
+
+
 # ── Model patcher wrapper installer ─────────────────────────────────
 
 _model_patcher_wrappers_installed: bool = False
@@ -1669,6 +1859,43 @@ def _install_model_patcher_wrappers(trace: RuntimeTrace | None = None) -> dict[s
                     result["nn.Module.to"] = "installed"
                 else:
                     result["nn.Module.to"] = "already_installed" if _orig_to else "unavailable"
+
+    # Wrap ModelPatcher.load (aggregate-timing breakdown)
+    if _ModelPatcher_cls is not None:
+        _orig_load = getattr(_ModelPatcher_cls, "load", None)
+        if callable(_orig_load) and not getattr(_orig_load, _SENTINEL_MODEL_PATCHER_LOAD, False):
+            setattr(_ModelPatcher_cls, "load", _make_model_patcher_load_breakdown_wrapper(_orig_load))
+            result["ModelPatcher.load"] = "installed"
+        else:
+            result["ModelPatcher.load"] = "already_installed" if _orig_load else "unavailable"
+
+    # Wrap ModelPatcherDynamic.load
+    _MPDynamic_cls = getattr(mp_mod, "ModelPatcherDynamic", None)
+    if _MPDynamic_cls is not None:
+        _orig_dyn_load = getattr(_MPDynamic_cls, "load", None)
+        if callable(_orig_dyn_load) and not getattr(_orig_dyn_load, _SENTINEL_MODEL_PATCHER_LOAD, False):
+            setattr(_MPDynamic_cls, "load", _make_model_patcher_load_breakdown_wrapper(_orig_dyn_load))
+            result["ModelPatcherDynamic.load"] = "installed"
+        else:
+            result["ModelPatcherDynamic.load"] = "already_installed" if _orig_dyn_load else "unavailable"
+
+    # Wrap ModelPatcher._load_list (traversal aggregate)
+    if _ModelPatcher_cls is not None:
+        _orig_load_list = getattr(_ModelPatcher_cls, "_load_list", None)
+        if callable(_orig_load_list) and not getattr(_orig_load_list, _SENTINEL_MODEL_PATCHER_LOAD_LIST, False):
+            setattr(_ModelPatcher_cls, "_load_list", _make_model_patcher_load_list_breakdown_wrapper(_orig_load_list))
+            result["ModelPatcher._load_list"] = "installed"
+        else:
+            result["ModelPatcher._load_list"] = "already_installed" if _orig_load_list else "unavailable"
+
+    # Wrap ModelPatcher.patch_weight_to_device (aggregate)
+    if _ModelPatcher_cls is not None:
+        _orig_pw = getattr(_ModelPatcher_cls, "patch_weight_to_device", None)
+        if callable(_orig_pw) and not getattr(_orig_pw, _SENTINEL_MODEL_PATCHER_PATCH_WEIGHT, False):
+            setattr(_ModelPatcher_cls, "patch_weight_to_device", _make_model_patcher_patch_weight_breakdown_wrapper(_orig_pw))
+            result["ModelPatcher.patch_weight_to_device"] = "installed"
+        else:
+            result["ModelPatcher.patch_weight_to_device"] = "already_installed" if _orig_pw else "unavailable"
 
     if trace:
         for comp, status in result.items():
@@ -2300,6 +2527,36 @@ def _install_gpu_wrapper(*, mm_module: Any, trace: RuntimeTrace | None = None) -
     return "installed"
 
 
+_cast_to_device_wrapper_installed: bool = False
+
+
+def _install_cast_to_device_wrapper(*, mm_module: Any, trace: RuntimeTrace | None = None) -> str:
+    """Install the ``cast_to_device`` wrapper on *mm_module* (comfy.model_management).
+
+    Idempotent via sentinel.  Wrapper aggregates count + wall/process time
+    into ``_model_patcher_breakdown`` when set (inside outer ModelPatcher.load
+    under request trace).  Returns status string.
+    """
+    global _cast_to_device_wrapper_installed
+    if _cast_to_device_wrapper_installed:
+        return "already_installed"
+    func = getattr(mm_module, "cast_to_device", None)
+    if not callable(func):
+        return "unavailable"
+    if getattr(func, _SENTINEL_CAST_TO_DEVICE, False):
+        _cast_to_device_wrapper_installed = True
+        return "already_installed"
+    with _wrappers_lock:
+        if _cast_to_device_wrapper_installed:
+            return "already_installed"
+        if getattr(mm_module.cast_to_device, _SENTINEL_CAST_TO_DEVICE, False):
+            _cast_to_device_wrapper_installed = True
+            return "already_installed"
+        mm_module.cast_to_device = _make_cast_to_device_breakdown_wrapper(mm_module.cast_to_device)
+        _cast_to_device_wrapper_installed = True
+    return "installed"
+
+
 def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
     """Idempotent per-component installation using live modules.
 
@@ -2326,8 +2583,12 @@ def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
     mm_mod = _get_live_module("comfy.model_management")
     if mm_mod is not None:
         result["load_models_gpu"] = _install_gpu_wrapper(mm_module=mm_mod, trace=trace)
+        result["cast_to_device"] = _install_cast_to_device_wrapper(mm_module=mm_mod, trace=trace)
     else:
         result["load_models_gpu"] = "unavailable"
+        result["cast_to_device"] = "unavailable"
+
+    result.update(_install_model_patcher_wrappers(trace=trace))
 
     # ── Install deep diag wrappers (idempotent, path-filtered) ────
     if _DIAGNOSTIC_FLAG:
@@ -6424,3 +6685,17 @@ class V2LoaderBridge:
                     "error": str(exc)[:200],
                 })
             raise
+
+
+# ── Backward-compatible aliases for test imports ─────────────────────
+# The four factories below were renamed with ``_breakdown`` suffix to
+# avoid name conflicts with later diagnostic wrappers having the same
+# public names.  Tests import the old names and expect the breakdown
+# (``model_patcher_load_breakdown``) behavior, not the diagnostic
+# (``mp_load_start/end``) behavior.  These aliases preserve backward
+# compatibility so that ``from comfymodal_runtime.model_preload import
+# _make_model_patcher_load_wrapper`` resolves to the breakdown version.
+_make_model_patcher_load_wrapper = _make_model_patcher_load_breakdown_wrapper
+_make_model_patcher_load_list_wrapper = _make_model_patcher_load_list_breakdown_wrapper
+_make_model_patcher_patch_weight_wrapper = _make_model_patcher_patch_weight_breakdown_wrapper
+_make_cast_to_device_wrapper = _make_cast_to_device_breakdown_wrapper

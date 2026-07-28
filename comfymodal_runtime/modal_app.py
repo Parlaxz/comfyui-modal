@@ -35,6 +35,7 @@ from .runtime_executor import (
     RuntimeExecutor,
     pre_sampler_instrumentation_scope,
     set_lock_wait_ms,
+    _attach_structured_report,
 )
 from .runtime_state import CommitCoordinator, ModalMountedStateVolume
 from .model_preload import (
@@ -1908,6 +1909,7 @@ def _resolve_cgroup_cpu_stat_path() -> tuple[str | None, list[str], list[str]]:
             return None
         return path
 
+    # Probe 1: _resolve_cgroup_v2_base()[0] + "/cpu.stat"
     try:
         base = _resolve_cgroup_v2_base()
     except Exception as exc:
@@ -1920,10 +1922,12 @@ def _resolve_cgroup_cpu_stat_path() -> tuple[str | None, list[str], list[str]]:
         if path is not None:
             return path, candidates, errors
 
+    # Probe 2: /sys/fs/cgroup/cpu.stat
     path = _probe("/sys/fs/cgroup/cpu.stat", "probe2")
     if path is not None:
         return path, candidates, errors
 
+    # Probe 3: parse /proc/self/cgroup unified line, join below /sys/fs/cgroup
     _cgroup_rel: str | None = None
     try:
         with open("/proc/self/cgroup") as _f:
@@ -1948,11 +1952,17 @@ def _resolve_cgroup_cpu_stat_path() -> tuple[str | None, list[str], list[str]]:
             )
             if path is not None:
                 return path, candidates, errors
+
     return None, candidates, errors
 
 
 def _read_cgroup_cpu_usage_usec(cpu_stat_path: str) -> int | None:
-    """Read ``usage_usec`` from an already-resolved ``cpu.stat`` file."""
+    """Read ``usage_usec`` from an already-resolved ``cpu.stat`` file.
+
+    Takes the full absolute path directly.  Does NOT swallow exceptions —
+    callers that need resilience (e.g. the sampler background thread) must
+    catch at their own boundary.
+    """
     with open(cpu_stat_path) as cpu_stat:
         for line in cpu_stat:
             key, _, value = line.partition(" ")
@@ -1968,20 +1978,26 @@ def _emit_cgroup_spike_summary(peak: float, intervals: list[dict[str, Any]]) -> 
         f"interval_count={len(intervals)}",
     ]
     for index, interval in enumerate(intervals):
-        parts.extend((
-            f"i{index}_start_unix_ns={interval['start_unix_ns']}",
-            f"i{index}_end_unix_ns={interval['end_unix_ns']}",
-            f"i{index}_start_elapsed_ms={interval['start_elapsed_ms']:.3f}",
-            f"i{index}_end_elapsed_ms={interval['end_elapsed_ms']:.3f}",
-            f"i{index}_duration_ms={interval['duration_ms']:.3f}",
-            f"i{index}_mean_effective_cores={interval['mean_effective_cores']:.3f}",
-            f"i{index}_peak_effective_cores={interval['peak_effective_cores']:.3f}",
-            f"i{index}_phase={interval['phase']}",
-        ))
+        parts.extend(
+            (
+                f"i{index}_start_unix_ns={interval['start_unix_ns']}",
+                f"i{index}_end_unix_ns={interval['end_unix_ns']}",
+                f"i{index}_start_elapsed_ms={interval['start_elapsed_ms']:.3f}",
+                f"i{index}_end_elapsed_ms={interval['end_elapsed_ms']:.3f}",
+                f"i{index}_duration_ms={interval['duration_ms']:.3f}",
+                f"i{index}_mean_effective_cores={interval['mean_effective_cores']:.3f}",
+                f"i{index}_peak_effective_cores={interval['peak_effective_cores']:.3f}",
+                f"i{index}_phase={interval['phase']}",
+            )
+        )
     print(f"[v2.cgroup_cpu_spike] {' '.join(parts)}", flush=True)
 
 
-def _emit_cgroup_cpu_unavailable(reason: str, candidates: list[str], errors: list[str]) -> None:
+def _emit_cgroup_cpu_unavailable(
+    reason: str,
+    candidates: list[str],
+    errors: list[str],
+) -> None:
     candidate_text = ";".join(candidates) or "none"
     error_text = ";".join(errors) or "none"
     print(
@@ -1992,9 +2008,20 @@ def _emit_cgroup_cpu_unavailable(reason: str, candidates: list[str], errors: lis
 
 
 class _CgroupCpuSample:
-    __slots__ = ("timestamp_unix_ns", "elapsed_request_ms", "effective_cgroup_cores", "phase")
-    def __init__(self, timestamp_unix_ns: int, elapsed_request_ms: float,
-                 effective_cgroup_cores: float, phase: str) -> None:
+    __slots__ = (
+        "timestamp_unix_ns",
+        "elapsed_request_ms",
+        "effective_cgroup_cores",
+        "phase",
+    )
+
+    def __init__(
+        self,
+        timestamp_unix_ns: int,
+        elapsed_request_ms: float,
+        effective_cgroup_cores: float,
+        phase: str,
+    ) -> None:
         self.timestamp_unix_ns = timestamp_unix_ns
         self.elapsed_request_ms = elapsed_request_ms
         self.effective_cgroup_cores = effective_cgroup_cores
@@ -2012,8 +2039,12 @@ class _CgroupCpuSampler:
         self._lock = threading.Lock()
         self._phase = "method"
         self._phase_source: Callable[[], str] | None = None
-        self._cpu_stat_path, self._resolution_candidates, self._resolution_errors = _resolve_cgroup_cpu_stat_path()
-        self._resolution_failure = "no readable cpu.stat" if self._cpu_stat_path is None else None
+        self._cpu_stat_path, self._resolution_candidates, self._resolution_errors = (
+            _resolve_cgroup_cpu_stat_path()
+        )
+        self._resolution_failure = (
+            "no readable cpu.stat" if self._cpu_stat_path is None else None
+        )
         self._failure_reason: str | None = None
         self._prev_usage_usec: int | None = None
         self._prev_mono_ns: int | None = None
@@ -2050,7 +2081,9 @@ class _CgroupCpuSampler:
             self._failure_reason = f"read_error: {type(exc).__name__}: {exc}"
             return
         if usage_usec is None:
-            self._failure_reason = f"read_error: {self._cpu_stat_path}: missing usage_usec"
+            self._failure_reason = (
+                f"read_error: {self._cpu_stat_path}: missing usage_usec"
+            )
             return
         now_mono_ns = time.monotonic_ns()
         now_unix_ns = time.time_ns()
@@ -2060,13 +2093,22 @@ class _CgroupCpuSampler:
             else:
                 delta_usage_usec = usage_usec - self._prev_usage_usec
                 delta_wall_usec = (now_mono_ns - self._prev_mono_ns) / 1_000.0
-                effective_cores = max(0.0, delta_usage_usec / delta_wall_usec) if delta_wall_usec > 0.0 else 0.0
-            self._samples.append(_CgroupCpuSample(
-                timestamp_unix_ns=now_unix_ns,
-                elapsed_request_ms=round((now_mono_ns - self._method_entry_mono_ns) / 1_000_000.0, 3),
-                effective_cgroup_cores=round(effective_cores, 3),
-                phase=self._current_phase(),
-            ))
+                effective_cores = (
+                    max(0.0, delta_usage_usec / delta_wall_usec)
+                    if delta_wall_usec > 0.0
+                    else 0.0
+                )
+            self._samples.append(
+                _CgroupCpuSample(
+                    timestamp_unix_ns=now_unix_ns,
+                    elapsed_request_ms=round(
+                        (now_mono_ns - self._method_entry_mono_ns) / 1_000_000.0,
+                        3,
+                    ),
+                    effective_cgroup_cores=round(effective_cores, 3),
+                    phase=self._current_phase(),
+                )
+            )
             self._prev_usage_usec = usage_usec
             self._prev_mono_ns = now_mono_ns
 
@@ -2089,10 +2131,14 @@ class _CgroupCpuSampler:
             _emit_cgroup_cpu_unavailable(
                 reason=" | ".join(reason_parts),
                 candidates=self._resolution_candidates,
-                errors=self._resolution_errors + ([self._failure_reason] if self._failure_reason else []),
+                errors=self._resolution_errors + (
+                    [self._failure_reason] if self._failure_reason else []
+                ),
             )
             return
-        _emit_cgroup_spike_summary(self.compute_peak_cores(), self.compute_spike_intervals())
+        _emit_cgroup_spike_summary(
+            self.compute_peak_cores(), self.compute_spike_intervals()
+        )
 
     def stop(self) -> None:
         thread = self._thread
@@ -2109,7 +2155,10 @@ class _CgroupCpuSampler:
 
     def compute_peak_cores(self) -> float:
         samples = self._snapshot()
-        return max((s.effective_cgroup_cores for s in samples), default=0.0)
+        return max(
+            (sample.effective_cgroup_cores for sample in samples),
+            default=0.0,
+        )
 
     def compute_spike_intervals(self, threshold: float = 12.0) -> list[dict[str, Any]]:
         samples = self._snapshot()
@@ -2230,22 +2279,32 @@ class _CgroupCpuSampler:
         }
 
 
-def _summarize_cgroup_interval(sample_intervals: list[tuple[_CgroupCpuSample, _CgroupCpuSample]]) -> dict[str, Any]:
+def _summarize_cgroup_interval(
+    sample_intervals: list[tuple[_CgroupCpuSample, _CgroupCpuSample]],
+) -> dict[str, Any]:
     first_previous, _ = sample_intervals[0]
     _, last_sample = sample_intervals[-1]
     weighted_core_ms = 0.0
     for previous, sample in sample_intervals:
         interval_ms = max(0.0, sample.elapsed_request_ms - previous.elapsed_request_ms)
         weighted_core_ms += sample.effective_cgroup_cores * interval_ms
-    duration_ms = max(0.0, last_sample.elapsed_request_ms - first_previous.elapsed_request_ms)
+    duration_ms = max(
+        0.0,
+        last_sample.elapsed_request_ms - first_previous.elapsed_request_ms,
+    )
     return {
         "start_unix_ns": first_previous.timestamp_unix_ns,
         "end_unix_ns": last_sample.timestamp_unix_ns,
         "start_elapsed_ms": first_previous.elapsed_request_ms,
         "end_elapsed_ms": last_sample.elapsed_request_ms,
         "duration_ms": round(duration_ms, 3),
-        "mean_effective_cores": round(weighted_core_ms / duration_ms if duration_ms > 0.0 else 0.0, 3),
-        "peak_effective_cores": max(s.effective_cgroup_cores for _, s in sample_intervals),
+        "mean_effective_cores": round(
+            weighted_core_ms / duration_ms if duration_ms > 0.0 else 0.0,
+            3,
+        ),
+        "peak_effective_cores": max(
+            sample.effective_cgroup_cores for _, sample in sample_intervals
+        ),
         "phase": sample_intervals[0][1].phase,
     }
 
@@ -2658,6 +2717,18 @@ def _persist_v2_dependency_manifest(
     )
 
     return _manifest
+
+
+async def _with_cgroup_sampler_cleanup(
+    stream: AsyncIterator[dict[str, Any]],
+    sampler: _CgroupCpuSampler | None,
+) -> AsyncIterator[dict[str, Any]]:
+    try:
+        async for event in stream:
+            yield event
+    finally:
+        if sampler is not None:
+            sampler.stop()
 
 
 class ModalRuntimeEntrypoint:
@@ -3120,11 +3191,12 @@ class ModalRuntimeEntrypoint:
             # requirements but never persisted the manifest, causing
             # manifest_missing preflight failures when no V1 snapshot
             # had created the shared manifest.
-            _persist_v2_dependency_manifest(
-                state,
-                self._legacy_module,
-                self._legacy_api,
-            )
+            if self._legacy_module is not None and self._legacy_api is not None:
+                _persist_v2_dependency_manifest(
+                    state,
+                    self._legacy_module,
+                    self._legacy_api,
+                )
 
             # ── V2 snapshot certificate: build from RestorePlan ──
             # Reads snapshot_plan via read_current_plan(), requires nonempty
@@ -7323,6 +7395,7 @@ class ModalRuntimeEntrypoint:
             _method_entry_gap_results["identity_mismatch_reasons"] = [f"identity_check_error:{type(exc).__name__}"]
 
         # â”€â”€ Continue with normal setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
         # Use a local event buffer until trace exists
         _pre_trace_events: list[dict[str, Any]] = [
             {"name": "run_plan_method_first_line", "phase": "method",
@@ -7348,6 +7421,14 @@ class ModalRuntimeEntrypoint:
             **_entry_host,
             **_resource_identity(),
         )
+        if _cgroup_sampler is not None and _method_entry_gap_results.get("same_process", False):
+            _cgroup_sampler.set_phase_source(
+                lambda: (
+                    context.trace.events[-1].phase
+                    if context.trace.events and context.trace.events[-1].phase
+                    else "method"
+                )
+            )
 
         if isinstance(_request_origin_info, dict):
             _origin_events = (
@@ -7529,7 +7610,8 @@ class ModalRuntimeEntrypoint:
             "request_id": request_id,
             "trace_id": context.trace.trace_id if context.trace else "",
         }
-        async for event in self.executor.stream(plan, context=context):
+        _execution_stream = self.executor.stream(plan, context=context)
+        async for event in _execution_stream:
             if event.get("type") == "result" and isinstance(event.get("data"), dict):
                 data = dict(event["data"])
                 _exec_trace = data.get("trace", {})
