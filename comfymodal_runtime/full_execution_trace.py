@@ -1,0 +1,2214 @@
+"""V2 full-execution trace engine.
+
+Provides ``FullExecutionTraceSession``, ``ContainerResourceSampler``, and
+wrapper-inventory utilities for comprehensive container-side tracing of
+Model restore, prompt execution, and resource samples.
+
+Fully inert when ``COMFYMODAL_V2_FULL_TRACE != '1'`` -- no VizTracer import,
+no torch import, no session allocation, no file operations.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import atexit
+import copy
+import functools
+import gzip
+import hashlib
+import json
+import logging
+import os
+import re
+import sys
+import threading
+import time
+import uuid
+from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
+from datetime import datetime, timezone
+from pathlib import Path
+from types import FrameType
+from typing import Any, Optional
+
+log = logging.getLogger(__name__)
+
+# ── Schema constant ──────────────────────────────────────────────────────────────────
+SCHEMA_VERSION = "v2-full-trace/1"
+_TRACE_BASE = "/tmp/comfymodal_full_trace"
+
+# ── Internal test override hook ──────────────────────────────────────────────────────
+_TEST_TRACE_BASE: str | None = None       # set by tests to redirect trace root
+_TEST_PROC_SELF: str | None = None        # set by tests to mock /proc/self dir
+_TEST_PROC_ROOT: str | None = None        # set by tests to mock /proc root
+_TEST_CGROUP_V2: str | None = None        # set by tests to mock cgroup v2 dir
+
+# ── Environment variable names (new v2 names) ────────────────────────────────────────
+_ENV_ENABLE = "COMFYMODAL_V2_FULL_TRACE"
+_ENV_ENTRIES = "COMFYMODAL_V2_FULL_TRACE_ENTRIES"
+_ENV_RESOURCE_INTERVAL = "COMFYMODAL_V2_FULL_TRACE_RESOURCE_INTERVAL_MS"
+
+# Legacy compat fallback names (private, checked only when new names are absent)
+_LEGACY_ENV_ENTRIES = "FULL_TRACE_VIZTRACER_ENTRIES"
+_LEGACY_ENV_RESOURCE_INTERVAL = "FULL_TRACE_RESOURCE_INTERVAL_MS"
+
+_DEFAULT_VIZTRACER_ENTRIES = 8_000_000
+_DEFAULT_MAX_STACK_DEPTH = 64
+_DEFAULT_RESOURCE_INTERVAL_MS = 50
+
+# ── Raw file names ───────────────────────────────────────────────────────────────────
+_REQUIRED_RAW_FILES: tuple[str, ...] = (
+    "viztracer.json.gz",
+    "torch_trace.json.gz",
+    "resource_samples.jsonl.gz",
+    "milestones.jsonl",
+    "wrapper_snapshots.json",
+    "session_events.jsonl",
+    "trace_config.json",
+    "runtime_result_summary.json",
+)
+
+_SUBDIRS: tuple[str, ...] = ("raw", "derived", "logs")
+
+# ── Security redaction patterns (broadened) ──────────────────────────────────────────
+_REDACT_KEYS: re.Pattern = re.compile(
+    r"(MODAL[_\s]*TOKEN|MODAL[_\s]*TOKEN[_\s]*ID|MODAL[_\s]*TOKEN[_\s]*SECRET|"
+    r"AUTHORIZATION|COOKIE|PASSWORD|API[_\s]*KEY|API[_\s]*SECRET|"
+    r"ACCESS[_\s]*KEY|ACCESS[_\s]*TOKEN|ACCESS[_\s]*SECRET|"
+    r"BEARER|SESSION[_\s]*KEY|SESSION[_\s]*TOKEN|SECRET|TOKEN|AUTH)",
+    re.IGNORECASE,
+)
+
+_SANITIZE_FLAG_PATTERNS: tuple[str, ...] = (
+    "--token", "-t", "--secret", "--password", "--key",
+    "--api-key", "--api_key", "--access-key", "--access_key",
+    "--bearer", "--auth", "--session-key", "--session_key",
+    "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "COMFYMODAL_TOKEN",
+)
+
+# ── State machine ────────────────────────────────────────────────────────────────────
+_VALID_TRANSITIONS: dict[str, set[str]] = {
+    "created": {"restore_tracing", "failed"},
+    "restore_tracing": {"restore_complete", "failed"},
+    "restore_complete": {"request_claimed", "failed"},
+    "request_claimed": {"request_tracing", "failed"},
+    "request_tracing": {"trace_stopped", "failed"},
+    "trace_stopped": set(),
+    "failed": set(),
+}
+
+# ── Allowed wrapper inspection attrs ─────────────────────────────────────────────────
+_ALLOWED_WRAPPER_ORIGINAL_ATTRS: frozenset[str] = frozenset({
+    "__name__", "__qualname__", "__module__", "__doc__",
+    "__code__", "__defaults__", "__kwdefaults__",
+})
+_ALLOWED_WRAPPER_PREFIXES: tuple[str, ...] = ("__wrapped__", "_wrap_", "_orig_")
+
+# ── Known wrapper symbol names for direct discovery ──────────────────────────────────
+_KNOWN_WRAPPER_SYMBOLS: tuple[str, ...] = (
+    "comfy.utils.load_torch_file",
+    "comfy.model_management.load_models_gpu",
+    "comfy.model_management.cast_to_device",
+    "comfy.model_patcher.ModelPatcher.__init__",
+    "comfy.model_patcher.ModelPatcher.clone",
+    "comfy.model_patcher.ModelPatcher.load",
+    "comfy.model_patcher.ModelPatcher.patch_model",
+    "comfy.model_patcher.ModelPatcher.patch_weight_to_device",
+    "comfy.sd.load_clip",
+    "comfy.sd.CLIP.encode_from_tokens",
+    "nodes.CLIPTextEncode.encode",
+    "nodes.VAELoader.load_vae",
+    "nodes.UNETLoader.load_unet",
+    "execution.PromptExecutor.execute",
+    "execution.execute",
+    "execution.get_input_data",
+    "comfy.samplers.SAMPLER_SAMPLE",
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════
+# Utility helpers
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+def _redact_sensitive(value: Any, _depth: int = 0) -> Any:
+    """Deep-redact sensitive keys from JSON-safe data.
+
+    Matches keys that *contain* any of the broadened patterns (case-insensitive).
+    """
+    if _depth > 40:
+        return "<max depth>"
+    if isinstance(value, dict):
+        return {
+            k: "***REDACTED***" if _REDACT_KEYS.search(k) else _redact_sensitive(v, _depth + 1)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive(v, _depth + 1) for v in value]
+    return value
+
+
+def _safe_json_serialize(value: Any, **kwargs: Any) -> str:
+    """JSON-serialize with redaction and safe fallback."""
+    redacted = _redact_sensitive(value)
+    return json.dumps(redacted, default=_json_fallback, **kwargs)
+
+
+def _json_fallback(obj: Any) -> str:
+    """Fallback for types json.dumps cannot handle natively."""
+    if isinstance(obj, (Path, datetime)):
+        return str(obj)
+    if isinstance(obj, (set, frozenset)):
+        return list(obj)
+    if isinstance(obj, bytes):
+        return f"<{len(obj)} bytes>"
+    if hasattr(obj, "shape") and hasattr(obj, "dtype"):
+        try:
+            return f"<tensor shape={list(obj.shape)} dtype={obj.dtype}>"
+        except Exception:
+            return f"<{type(obj).__name__}>"
+    try:
+        return str(obj)
+    except Exception:
+        return "<unserializable>"
+
+
+def _stable_hash(value: Any) -> str:
+    """Deterministic SHA-256 hex digest of JSON-normalised *value*."""
+    raw = json.dumps(
+        _redact_sensitive(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_json_fallback,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int from env, falling back to *default* on missing/invalid."""
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int_chain(*names: str, default: int) -> int:
+    """Try each env name in order, falling back to *default*."""
+    for name in names:
+        val = os.environ.get(name)
+        if val is not None:
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                continue
+    return default
+
+
+def _sanitize_cmdline(cmdline: str) -> str:
+    """Strip sensitive argument values from a process cmdline.
+
+    Handles both null-separated (``/proc/pid/cmdline``) and space-separated.
+    Broadened to cover more flag patterns.
+    """
+    separator = "\x00" if "\x00" in cmdline else " "
+    parts = cmdline.split(separator)
+    safe: list[str] = []
+    skip_next = False
+    for part in parts:
+        if skip_next:
+            skip_next = False
+            safe.append("***")
+            continue
+        stripped = part.strip()
+        matched = False
+        for flag in _SANITIZE_FLAG_PATTERNS:
+            if stripped.lower().startswith(flag.lower()):
+                if "=" in stripped:
+                    key, _ = stripped.split("=", 1)
+                    safe.append(f"{key}=***")
+                else:
+                    safe.append(stripped)
+                    skip_next = True
+                matched = True
+                break
+        if matched:
+            continue
+        safe.append(part)
+    return separator.join(safe)
+
+
+def _safe_repr(value: Any) -> str:
+    """Repr that never leaks tensor data, model contents, or prompt text."""
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        try:
+            return f"<tensor shape={list(value.shape)} dtype={value.dtype}>"
+        except Exception:
+            return f"<{type(value).__name__}>"
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        return f"<{len(value)} items>" if len(value) > 5 else repr(value)
+    if isinstance(value, dict):
+        return f"<{len(value)} keys>"
+    return f"<{type(value).__name__}>"
+
+
+def _is_jsonable(value: Any) -> bool:
+    """Check whether *value* can be natively JSON-serialized."""
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_is_jsonable(v) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _is_jsonable(v) for k, v in value.items())
+    return False
+
+
+def _safe_json_value(value: Any, _depth: int = 0) -> Any:
+    """Convert a value to a JSON-safe form, dropping unsafe types.
+
+    Scalars pass through.  Containers are recursed.  Non-JSONable objects
+    are replaced with a safe type-name string.
+    """
+    if _depth > 40:
+        return "<max depth>"
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_safe_json_value(v, _depth + 1) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _safe_json_value(v, _depth + 1) for k, v in value.items()}
+    if isinstance(value, (Path, datetime)):
+        return str(value)
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        try:
+            return f"<tensor shape={list(value.shape)} dtype={value.dtype}>"
+        except Exception:
+            return f"<{type(value).__name__}>"
+    try:
+        return f"<{type(value).__name__}>"
+    except Exception:
+        return "<unknown>"
+
+
+def _numeric_or_none(raw: str) -> int | None:
+    """Parse an integer from *raw*; return None on failure."""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════
+# Cgroup v2 resolution helpers
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+def _get_proc_self() -> Path:
+    """Return /proc/self path, respecting test override."""
+    if _TEST_PROC_SELF:
+        return Path(_TEST_PROC_SELF)
+    return Path("/proc/self")
+
+
+def _get_proc_root() -> Path:
+    """Return /proc root, respecting test override."""
+    if _TEST_PROC_ROOT:
+        return Path(_TEST_PROC_ROOT)
+    return Path("/proc")
+
+
+def _resolve_cgroup_v2_path() -> Path | None:
+    """Resolve the cgroup v2 directory from mountinfo + cgroup entries.
+
+    Returns None when not in a cgroup v2 environment or on error.
+    """
+    # Test override
+    if _TEST_CGROUP_V2:
+        return Path(_TEST_CGROUP_V2)
+
+    proc_self = _get_proc_self()
+    try:
+        mountinfo_path = proc_self / "mountinfo"
+        if not mountinfo_path.exists():
+            return None
+        cgroup_mount_point: str | None = None
+        for line in mountinfo_path.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 5:
+                mount_point = parts[4]
+                # Look for cgroup2 or cgroup v2 unified mount at /sys/fs/cgroup
+                rest = " ".join(parts[5:])
+                if "cgroup2" in rest or ("cgroup" in rest and mount_point == "/sys/fs/cgroup"):
+                    cgroup_mount_point = mount_point
+                    break
+        if not cgroup_mount_point:
+            return None
+
+        cgroup_file = proc_self / "cgroup"
+        if not cgroup_file.exists():
+            return None
+        lines = cgroup_file.read_text().strip().splitlines()
+        if not lines:
+            return None
+        # Last line (or only line for v2): "0::/path"
+        cg_line = lines[-1]
+        parts = cg_line.split(":")
+        if len(parts) < 3:
+            return None
+        cg_rel_path = parts[-1]  # e.g., "/system.slice/docker-xxx.scope"
+        return Path(cgroup_mount_point + cg_rel_path)
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _read_cgroup_stat(cgroup_dir: Path) -> dict[str, int | None]:
+    """Read cpu.stat from a cgroup v2 directory.
+
+    Returns dict with keys: usage_usec, user_usec, system_usec,
+    nr_periods, nr_throttled, throttled_usec (all nullable).
+    """
+    result: dict[str, int | None] = {
+        "usage_usec": None, "user_usec": None, "system_usec": None,
+        "nr_periods": None, "nr_throttled": None, "throttled_usec": None,
+    }
+    try:
+        stat_path = cgroup_dir / "cpu.stat"
+        if stat_path.exists():
+            for line in stat_path.read_text().splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    key = parts[0]
+                    val = _numeric_or_none(parts[1])
+                    if key in result:
+                        result[key] = val
+    except OSError:
+        pass
+    return result
+
+
+def _read_cgroup_memory(cgroup_dir: Path) -> dict[str, int | None]:
+    """Read memory.current, memory.peak, and memory.stat from cgroup v2.
+
+    Returns dict with keys: current_bytes, peak_bytes, anon_bytes,
+    file_bytes, inactive_file_bytes, active_file_bytes, pgfault, pgmajfault.
+    """
+    result: dict[str, int | None] = {
+        "current_bytes": None, "peak_bytes": None,
+        "anon_bytes": None, "file_bytes": None,
+        "inactive_file_bytes": None, "active_file_bytes": None,
+        "pgfault": None, "pgmajfault": None,
+    }
+    try:
+        cur = cgroup_dir / "memory.current"
+        if cur.exists():
+            result["current_bytes"] = _numeric_or_none(cur.read_text().strip())
+
+        peak = cgroup_dir / "memory.peak"
+        if peak.exists():
+            result["peak_bytes"] = _numeric_or_none(peak.read_text().strip())
+
+        stat = cgroup_dir / "memory.stat"
+        if stat.exists():
+            for line in stat.read_text().splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    k, v = parts[0], _numeric_or_none(parts[1])
+                    mapping = {
+                        "anon": "anon_bytes",
+                        "file": "file_bytes",
+                        "inactive_file": "inactive_file_bytes",
+                        "active_file": "active_file_bytes",
+                        "pgfault": "pgfault",
+                        "pgmajfault": "pgmajfault",
+                    }
+                    if k in mapping:
+                        result[mapping[k]] = v
+    except OSError:
+        pass
+    return result
+
+
+def _read_cgroup_io(cgroup_dir: Path) -> dict[str, int | None]:
+    """Read io.stat from cgroup v2.
+
+    Returns dict with keys: rbytes, wbytes (aggregated across devices).
+    """
+    result: dict[str, int | None] = {"rbytes": None, "wbytes": None}
+    try:
+        io_path = cgroup_dir / "io.stat"
+        if io_path.exists():
+            total_rbytes = 0
+            total_wbytes = 0
+            for line in io_path.read_text().splitlines():
+                # Format: "major:minor rbytes=123 wbytes=456 rios=..."
+                for token in line.split():
+                    if "=" in token:
+                        k, v_str = token.split("=", 1)
+                        v = _numeric_or_none(v_str) or 0
+                        if k == "rbytes":
+                            total_rbytes += v
+                        elif k == "wbytes":
+                            total_wbytes += v
+            result["rbytes"] = total_rbytes
+            result["wbytes"] = total_wbytes
+    except OSError:
+        pass
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════
+# Proc parsing helpers
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+def _parse_stat_fields(stat_text: str) -> dict[str, int | None]:
+    """Parse relevant fields from /proc/pid/stat.
+
+    Handles the parenthesised comm field.  Returns:
+      utime, stime, minflt, majflt, num_threads, rss
+    All nullable.
+    """
+    result: dict[str, int | None] = {
+        "utime": None, "stime": None, "minflt": None, "majflt": None,
+        "num_threads": None, "rss": None,
+    }
+    try:
+        # Find the closing paren of the comm field
+        rparen = stat_text.rfind(")")
+        if rparen == -1:
+            return result
+        rest = stat_text[rparen + 2:].split()  # skip ") "
+        if len(rest) < 24:
+            return result
+        # After the comm field, rest is space-split. Fields (0-indexed):
+        # 0:state, 1:ppid, ..., 7:minflt, 8:cminflt, 9:majflt, 10:cmajflt,
+        # 11:utime, 12:stime, ..., 17:num_threads, ..., 21:rss
+        result["minflt"] = _numeric_or_none(rest[7]) if len(rest) > 7 else None
+        result["majflt"] = _numeric_or_none(rest[9]) if len(rest) > 9 else None
+        result["utime"] = _numeric_or_none(rest[11]) if len(rest) > 11 else None
+        result["stime"] = _numeric_or_none(rest[12]) if len(rest) > 12 else None
+        result["num_threads"] = _numeric_or_none(rest[17]) if len(rest) > 17 else None
+        result["rss"] = _numeric_or_none(rest[21]) if len(rest) > 21 else None
+    except (IndexError, ValueError):
+        pass
+    return result
+
+
+def _read_proc_io(io_path: Path) -> dict[str, int | None]:
+    """Read IO stats from /proc/pid/io."""
+    result: dict[str, int | None] = {
+        "read_bytes": None, "write_bytes": None, "cancelled_write_bytes": None,
+    }
+    try:
+        if io_path.exists():
+            for line in io_path.read_text().splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    key = parts[0].rstrip(":")
+                    val = _numeric_or_none(parts[1])
+                    if key in result:
+                        result[key] = val
+    except OSError:
+        pass
+    return result
+
+
+def _read_proc_comm(comm_path: Path) -> str | None:
+    """Read a trimmed comm value."""
+    try:
+        if comm_path.exists():
+            return comm_path.read_text().strip()
+    except OSError:
+        pass
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════
+# ContainerResourceSampler
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+class ContainerResourceSampler:
+    """Periodically samples container resource metrics.
+
+    Each sample is a flat JSON object with nullable top-level cgroup/memory/io
+    fields plus process and thread inventory lists.  Written incrementally
+    gzipped JSONL to ``resource_samples.jsonl.gz``.
+
+    Parameters
+    ----------
+    trace_dir:
+        Session base directory (raw/ subdirectory will be used).
+    interval_ms:
+        Sampling interval in milliseconds.
+    session_phase:
+        Phase label included in each sample (set by session).
+    """
+
+    def __init__(
+        self,
+        trace_dir: str,
+        interval_ms: int | None = None,
+        session_phase: str = "unknown",
+    ) -> None:
+        self._trace_dir = Path(trace_dir)
+        self._interval_s = (interval_ms or _env_int_chain(
+            _ENV_RESOURCE_INTERVAL, _LEGACY_ENV_RESOURCE_INTERVAL,
+            default=_DEFAULT_RESOURCE_INTERVAL_MS,
+        )) / 1000.0
+        self._session_phase = session_phase
+        self._pid = os.getpid()
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._sample_count = 0
+        self._gz_path: Path | None = None
+        self._gz_file: Any = None
+        self._stopped = threading.Event()
+        # Resolve cgroup v2 path once at init
+        self._cgroup_dir = _resolve_cgroup_v2_path()
+
+    # ── Lifecycle ────────────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._stopped.clear()
+        raw_dir = self._trace_dir / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        self._gz_path = raw_dir / "resource_samples.jsonl.gz"
+        self._gz_file = gzip.open(self._gz_path, "wt", encoding="utf-8")
+        self._thread = threading.Thread(target=self._run, daemon=True, name="res-sampler")
+        self._thread.start()
+
+    def stop(self) -> dict[str, Any]:
+        self._running = False
+        self._stopped.wait(timeout=10)
+        self._close_gz()
+        return {
+            "sample_count": self._sample_count,
+            "path": str(self._gz_path) if self._gz_path else "",
+        }
+
+    def _close_gz(self) -> None:
+        if self._gz_file is not None:
+            try:
+                self._gz_file.close()
+            except Exception:
+                pass
+            self._gz_file = None
+
+    def close(self) -> None:
+        self._running = False
+        self._close_gz()
+
+    # ── Sampling loop ────────────────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        while self._running:
+            try:
+                sample = self._collect_sample()
+                with self._lock:
+                    if self._gz_file is not None and not self._gz_file.closed:
+                        self._gz_file.write(json.dumps(sample, default=_json_fallback) + "\n")
+                        self._gz_file.flush()
+                        self._sample_count += 1
+            except Exception as exc:
+                log.warning("ResourceSampler sample error: %s", exc)
+            time.sleep(self._interval_s)
+        self._stopped.set()
+
+    def collect_sample(self) -> dict[str, Any]:
+        """Collect one resource sample snapshot immediately (thread-safe)."""
+        with self._lock:
+            return self._collect_sample()
+
+    # ── Core sample collection ───────────────────────────────────────────────────────
+
+    def _collect_sample(self) -> dict[str, Any]:
+        sample: dict[str, Any] = {
+            "wall_unix_ns": int(time.time() * 1_000_000_000),
+            "monotonic_ns": time.monotonic_ns(),
+            "session_phase": self._session_phase,
+        }
+        self._add_cgroup_fields(sample)
+        self._add_memory_fields(sample)
+        self._add_io_fields(sample)
+        sample["process_inventory"] = self._read_process_inventory()
+        sample["thread_inventory"] = self._read_thread_inventory()
+        return sample
+
+    def _add_cgroup_fields(self, sample: dict[str, Any]) -> None:
+        if self._cgroup_dir is None:
+            sample.update({
+                "cgroup_cpu_usage_usec": None,
+                "cgroup_user_usec": None,
+                "cgroup_system_usec": None,
+                "cgroup_nr_periods": None,
+                "cgroup_nr_throttled": None,
+                "cgroup_throttled_usec": None,
+            })
+            return
+        stat = _read_cgroup_stat(self._cgroup_dir)
+        sample.update({
+            "cgroup_cpu_usage_usec": stat.get("usage_usec"),
+            "cgroup_user_usec": stat.get("user_usec"),
+            "cgroup_system_usec": stat.get("system_usec"),
+            "cgroup_nr_periods": stat.get("nr_periods"),
+            "cgroup_nr_throttled": stat.get("nr_throttled"),
+            "cgroup_throttled_usec": stat.get("throttled_usec"),
+        })
+
+    def _add_memory_fields(self, sample: dict[str, Any]) -> None:
+        if self._cgroup_dir is None:
+            sample.update({
+                "memory_current_bytes": None,
+                "memory_peak_bytes": None,
+                "memory_stat_anon_bytes": None,
+                "memory_stat_file_bytes": None,
+                "memory_stat_inactive_file_bytes": None,
+                "memory_stat_active_file_bytes": None,
+                "memory_stat_pgfault": None,
+                "memory_stat_pgmajfault": None,
+            })
+            return
+        mem = _read_cgroup_memory(self._cgroup_dir)
+        sample.update({
+            "memory_current_bytes": mem.get("current_bytes"),
+            "memory_peak_bytes": mem.get("peak_bytes"),
+            "memory_stat_anon_bytes": mem.get("anon_bytes"),
+            "memory_stat_file_bytes": mem.get("file_bytes"),
+            "memory_stat_inactive_file_bytes": mem.get("inactive_file_bytes"),
+            "memory_stat_active_file_bytes": mem.get("active_file_bytes"),
+            "memory_stat_pgfault": mem.get("pgfault"),
+            "memory_stat_pgmajfault": mem.get("pgmajfault"),
+        })
+
+    def _add_io_fields(self, sample: dict[str, Any]) -> None:
+        if self._cgroup_dir is None:
+            sample.update({
+                "io_rbytes": None,
+                "io_wbytes": None,
+            })
+            return
+        io = _read_cgroup_io(self._cgroup_dir)
+        sample.update({
+            "io_rbytes": io.get("rbytes"),
+            "io_wbytes": io.get("wbytes"),
+        })
+
+    # ── Process inventory ────────────────────────────────────────────────────────────
+
+    def _read_process_inventory(self) -> list[dict[str, Any]]:
+        """Enumerate /proc/<pid> directories and collect per-process stats."""
+        inventory: list[dict[str, Any]] = []
+        proc_root = _get_proc_root()
+        try:
+            for entry in proc_root.iterdir():
+                if not entry.is_dir() or not entry.name.isdigit():
+                    continue
+                pid = int(entry.name)
+                info = self._read_single_process(entry, pid)
+                if info is not None:
+                    inventory.append(info)
+        except OSError:
+            pass
+        return inventory
+
+    def _read_single_process(self, proc_dir: Path, pid: int) -> dict[str, Any] | None:
+        """Read stats for a single process from its /proc/<pid> directory."""
+        try:
+            stat_path = proc_dir / "stat"
+            if not stat_path.exists():
+                return None
+
+            stat_text = stat_path.read_text()
+            fields = _parse_stat_fields(stat_text)
+
+            status_path = proc_dir / "status"
+            comm: str | None = None
+            state: str | None = None
+            ppid: int | None = None
+            if status_path.exists():
+                for line in status_path.read_text().splitlines():
+                    if line.startswith("Name:"):
+                        comm = line.split(":", 1)[1].strip()
+                    elif line.startswith("State:"):
+                        state = line.split(":", 1)[1].strip()
+                    elif line.startswith("PPid:"):
+                        ppid = _numeric_or_none(line.split(":", 1)[1].strip())
+
+            if comm is None:
+                comm = _read_proc_comm(proc_dir / "comm")
+
+            cmdline_path = proc_dir / "cmdline"
+            sanitized_cmdline: str | None = None
+            if cmdline_path.exists():
+                sanitized_cmdline = _sanitize_cmdline(cmdline_path.read_text())
+
+            io = _read_proc_io(proc_dir / "io")
+
+            return {
+                "pid": pid,
+                "ppid": ppid,
+                "comm": comm,
+                "sanitized_cmdline": sanitized_cmdline,
+                "state": state,
+                "user_ticks": fields.get("utime"),
+                "system_ticks": fields.get("stime"),
+                "minor_faults": fields.get("minflt"),
+                "major_faults": fields.get("majflt"),
+                "rss_pages": fields.get("rss"),
+                "thread_count": fields.get("num_threads"),
+                "read_bytes": io.get("read_bytes"),
+                "write_bytes": io.get("write_bytes"),
+                "cancelled_write_bytes": io.get("cancelled_write_bytes"),
+            }
+        except (OSError, ValueError) as exc:
+            # Return a partial error record rather than None
+            return {
+                "pid": pid,
+                "error": str(exc),
+            }
+
+    # ── Thread inventory ─────────────────────────────────────────────────────────────
+
+    def _read_thread_inventory(self) -> list[dict[str, Any]]:
+        """Enumerate /proc/self/task/<tid> directories for the calling process."""
+        inventory: list[dict[str, Any]] = []
+        proc_self = _get_proc_self()
+        task_dir = proc_self / "task"
+        try:
+            if not task_dir.exists():
+                return inventory
+            for entry in task_dir.iterdir():
+                if not entry.is_dir() or not entry.name.isdigit():
+                    continue
+                tid = int(entry.name)
+                info = self._read_single_thread(entry, tid)
+                if info is not None:
+                    inventory.append(info)
+        except OSError:
+            pass
+        return inventory
+
+    def _read_single_thread(self, task_dir: Path, tid: int) -> dict[str, Any] | None:
+        """Read stats for a single thread from a /proc/self/task/<tid> dir."""
+        try:
+            stat_path = task_dir / "stat"
+            if not stat_path.exists():
+                return None
+            stat_text = stat_path.read_text()
+            fields = _parse_stat_fields(stat_text)
+
+            # For threads, comm comes from stat or /proc/<tid>/comm (same as task)
+            comm = _read_proc_comm(task_dir / "comm")
+
+            status_path = task_dir / "status"
+            state: str | None = None
+            if status_path.exists():
+                for line in status_path.read_text().splitlines():
+                    if line.startswith("State:"):
+                        state = line.split(":", 1)[1].strip()
+                        break
+
+            return {
+                "tid": tid,
+                "comm": comm,
+                "state": state,
+                "user_ticks": fields.get("utime"),
+                "system_ticks": fields.get("stime"),
+                "minor_faults": fields.get("minflt"),
+                "major_faults": fields.get("majflt"),
+            }
+        except (OSError, ValueError):
+            return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════
+# Wrapper / symbol discovery
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+def _resolve_qualified_callable(qualified_name: str) -> Any:
+    """Resolve a dotted qualified name to its callable, or None.
+
+    Walks ``sys.modules`` for increasingly deeper module prefixes,
+    then traverses remaining attribute segments.  Never invokes
+    descriptors or monkeypatches.
+    """
+    parts = qualified_name.split(".")
+    if len(parts) < 2:
+        return None
+    for i in range(1, len(parts)):
+        module_name = ".".join(parts[:i])
+        mod = sys.modules.get(module_name)
+        if mod is None:
+            continue
+        obj: Any = mod
+        ok = True
+        for attr in parts[i:]:
+            try:
+                obj = getattr(obj, attr, None)
+            except Exception:
+                obj = None
+            if obj is None:
+                ok = False
+                break
+        if ok and callable(obj):
+            return obj
+    return None
+
+
+def _discover_wrapper_symbols() -> dict[str, Any]:
+    """Try to discover known wrapper callables by qualified name resolution.
+
+    Returns ``{qualified_name: callable_or_None}``.  Does not monkeypatch
+    or invoke descriptors.
+    """
+    result: dict[str, Any] = {}
+    for qualified_name in _KNOWN_WRAPPER_SYMBOLS:
+        result[qualified_name] = _resolve_qualified_callable(qualified_name)
+    return result
+
+
+def _inspect_wrapper_callable(func: Callable | None, stage: str = "") -> dict[str, Any]:
+    """Inspect one wrapper callable with full metadata.
+
+    Traverses ``__wrapped__`` chain (max 32) with cycle detection.
+    Records sentinel attributes, closure callable references, known original
+    attributes, chain metadata.
+    """
+    if func is None:
+        return {
+            "available": False,
+            "callable_object_id": None,
+            "type": None,
+        }
+
+    info: dict[str, Any] = {
+        "available": True,
+        "callable_object_id": id(func),
+        "type": type(func).__name__,
+        "module": getattr(func, "__module__", None),
+        "qualname": getattr(func, "__qualname__", None),
+        "source_file": None,
+        "source_first_line": None,
+    }
+
+    # Source location
+    try:
+        code = getattr(func, "__code__", None)
+        if code is not None:
+            info["source_file"] = getattr(code, "co_filename", None)
+            info["source_first_line"] = getattr(code, "co_firstlineno", None)
+    except Exception:
+        pass
+
+    # Allowed original attrs
+    for attr in _ALLOWED_WRAPPER_ORIGINAL_ATTRS:
+        try:
+            val = getattr(func, attr, None)
+            if val is not None:
+                if attr == "__code__":
+                    info[attr] = _safe_repr(val)
+                else:
+                    info[attr] = str(val)
+        except Exception:
+            pass
+
+    # Sentinel attributes (known wrapper markers like __wrapped__, _is_wrapper, etc.)
+    sentinel_attrs: dict[str, str] = {}
+    try:
+        for k, v in vars(func).items():
+            for prefix in _ALLOWED_WRAPPER_PREFIXES:
+                if k.startswith(prefix):
+                    sentinel_attrs[k] = str(type(v).__name__)
+                    break
+    except Exception:
+        pass
+    if sentinel_attrs:
+        info["sentinel_attributes"] = sentinel_attrs
+
+    # Traverse __wrapped__ chain
+    chain: list[str] = []
+    visited: set[int] = set()
+    current: Any = func
+    depth = 0
+    chain_cycle_detected = False
+    while depth < 32:
+        obj_id = id(current)
+        if obj_id in visited:
+            chain.append(f"<cycle id={obj_id}>")
+            chain_cycle_detected = True
+            break
+        visited.add(obj_id)
+        wrapped = getattr(current, "__wrapped__", None)
+        if wrapped is None or wrapped is current:
+            break
+        wrapped_name = getattr(wrapped, "__qualname__", None) or getattr(wrapped, "__name__", "")
+        chain.append(f"{type(wrapped).__name__} {wrapped_name}")
+        current = wrapped
+        depth += 1
+    info["wrapped_chain"] = chain
+    info["chain_cycle_detected"] = chain_cycle_detected
+    info["chain_depth"] = depth
+
+    # known_original_attribute
+    try:
+        orig = getattr(func, "__wrapped__", None)
+        if orig is not None:
+            info["known_original_attribute"] = (
+                getattr(orig, "__qualname__", None) or getattr(orig, "__name__", "")
+            )
+    except Exception:
+        pass
+
+    # Closure callable references (just identities, no content)
+    closure = getattr(func, "__closure__", None)
+    if closure is not None:
+        callable_refs: list[int] = []
+        for cell in closure:
+            try:
+                contents = cell.cell_contents
+                if callable(contents):
+                    callable_refs.append(id(contents))
+            except ValueError:
+                pass
+        info["closure_callable_references"] = callable_refs
+        info["closure_count"] = len(closure)
+    else:
+        info["closure_callable_references"] = []
+        info["closure_count"] = 0
+
+    return info
+
+
+def capture_wrapper_inventory(
+    stage: str,
+    session: Any = None,
+    extra_symbols: dict[str, Callable | None] | None = None,
+    asyncio_loop: Any = None,
+) -> dict[str, Any]:
+    """Capture JSON-safe snapshot of discovered wrapper callables.
+
+    Directly discovers symbols by scanning sys.modules — no monkeypatch app.
+    """
+    inventory: dict[str, Any] = {
+        "stage": stage,
+        "timestamp": time.time(),
+        "timestamp_iso": datetime.fromtimestamp(time.time(), tz=timezone.utc).isoformat(),
+        "monotonic_ns": time.monotonic_ns(),
+        "wrappers": {},
+    }
+
+    symbols = _discover_wrapper_symbols()
+    if extra_symbols:
+        symbols.update(extra_symbols)
+
+    for name, func in symbols.items():
+        inventory["wrappers"][name] = _inspect_wrapper_callable(func, stage=stage)
+
+    # Active functions from session
+    if session is not None and hasattr(session, "_active_functions"):
+        active = getattr(session, "_active_functions", {})
+        if isinstance(active, dict):
+            for name, func in active.items():
+                if name not in inventory["wrappers"]:
+                    inventory["wrappers"][name] = _inspect_wrapper_callable(func, stage=stage)
+
+    # Asyncio tasks
+    if asyncio_loop is not None:
+        tasks: list[dict[str, Any]] = []
+        try:
+            all_tasks_fn = getattr(asyncio_loop, "all_tasks", None)
+            if all_tasks_fn is None:
+                all_tasks_fn = lambda: asyncio.all_tasks(asyncio_loop)
+            for task in all_tasks_fn():
+                try:
+                    tasks.append(_inspect_asyncio_task(task))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        inventory["asyncio_tasks"] = tasks
+
+    return inventory
+
+
+def _inspect_asyncio_task(task: asyncio.Task) -> dict[str, Any]:
+    """Inspect an asyncio Task for milestone inventory."""
+    info: dict[str, Any] = {
+        "task_id": id(task),
+        "task_name": task.get_name() if hasattr(task, "get_name") else "",
+        "done": task.done(),
+        "cancelled": task.cancelled(),
+        "coroutine_qualname": None,
+        "top_stack_file": None,
+        "top_stack_line": None,
+        "top_stack_function": None,
+    }
+    # Get coroutine qualname
+    try:
+        coro = task.get_coro()
+        if coro is not None:
+            info["coroutine_qualname"] = getattr(coro, "__qualname__", None) or getattr(coro, "__name__", None)
+    except Exception:
+        pass
+    # Get top of stack
+    try:
+        stack = task.get_stack(limit=1)
+        if stack:
+            frame = stack[-1]
+            info["top_stack_file"] = frame.f_code.co_filename
+            info["top_stack_line"] = frame.f_lineno
+            info["top_stack_function"] = frame.f_code.co_name
+    except Exception:
+        pass
+    return info
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════
+# Include-path resolution for trace_config.json
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+def _resolve_trace_include_paths() -> dict[str, Any]:
+    """Resolve VizTracer include file paths from known project layout.
+
+    Returns dict with: requested, resolved, missing, excluded.
+    """
+    requested: list[str] = [
+        # V2-owned
+        "comfymodal_runtime/",
+        "comfyapp.py",
+        "canonical_execution.py",
+        "production_workflow.py",
+        "profiler_trace_v4.py",
+        "timing_trace.py",
+        "wall_clock_trace_v3.py",
+        "warmup_profile.py",
+        "run_prompt_options.py",
+        "optimizations.py",
+        # ComfyUI core
+        "execution.py",
+        "nodes.py",
+        "comfy/model_management.py",
+        "comfy/model_patcher.py",
+        "comfy/sd.py",
+        "comfy/samplers.py",
+        "comfy/sample.py",
+        "comfy/utils.py",
+        # Loaded custom-node modules (symbolic)
+        "CacheDiT",
+        "RES4LYF",
+        "ClownsharKSampler",
+        "rgthree",
+        "KJNodes",
+        "ComfyUI-Easy-Use",
+        "FeatureInjLatent",
+    ]
+
+    excluded: list[str] = [
+        "torch",
+        "transformers",
+        "diffusers",
+        "numpy",
+        "site-packages",
+        "comfy/ldm",
+    ]
+
+    resolved: list[str] = []
+    missing: list[str] = []
+
+    # Build search roots from module location
+    search_roots: list[Path] = []
+    try:
+        here = Path(__file__).resolve().parent
+        search_roots.append(here)                    # comfymodal_runtime/
+        custom_node_root = here.parent               # comfyui-modal/
+        search_roots.append(custom_node_root)
+        comfyui_root = custom_node_root.parent.parent  # ComfyUI/ (if it exists)
+        if comfyui_root.name == "ComfyUI":
+            search_roots.append(comfyui_root)
+            # Also comfy/ subdirectory
+            search_roots.append(comfyui_root / "comfy")
+    except Exception:
+        pass
+
+    # Custom node search roots (from known installed paths)
+    try:
+        import site
+        for sp in site.getsitepackages():
+            search_roots.append(Path(sp))
+    except Exception:
+        pass
+
+    searched_dirs = set()
+    for root in search_roots:
+        try:
+            searched_dirs.add(str(root.resolve()))
+        except Exception:
+            pass
+
+    for pattern in requested:
+        found = False
+        for root in search_roots:
+            candidate = root / pattern
+            if candidate.exists():
+                resolved.append(str(candidate.resolve()))
+                found = True
+                break
+            # Try glob for partial matches
+            if "*" not in pattern:
+                for ext in (".py", ""):
+                    candidate_ext = root / (pattern + ext) if ext else root / pattern
+                    if candidate_ext.exists():
+                        resolved.append(str(candidate_ext.resolve()))
+                        found = True
+                        break
+                if found:
+                    break
+        if not found:
+            missing.append(pattern)
+
+    return {
+        "requested": requested,
+        "resolved": resolved,
+        "missing": missing,
+        "excluded": excluded,
+        "search_roots": sorted(searched_dirs),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════
+# FullExecutionTraceSession
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+class FullExecutionTraceSession:
+    """Container-side full-execution trace session.
+
+    Lifecycle states (exact):
+        created → restore_tracing → restore_complete → request_claimed
+                                              ↓              ↓
+                                             failed         failed
+                                      request_tracing → trace_stopped
+                                             ↓               ↓
+                                           failed          failed
+
+    Thread-safe state transitions.  Invalid/repeated transitions are recorded
+    in ``session_events.jsonl`` but never raised.
+
+    Module is fully inert when ``COMFYMODAL_V2_FULL_TRACE != '1'``.
+    """
+
+    _instance: Optional[FullExecutionTraceSession] = None
+    _instance_lock = threading.Lock()
+
+    def __init__(
+        self,
+        *,
+        container_session_id: str,
+        restored_instance_id: str = "",
+        restore_session_id: str = "",
+        _trace_id_override: str | None = None,     # internal test hook
+    ) -> None:
+        """Private constructor.  Use ``create_if_enabled`` factory."""
+        # Identity fields stored at construction
+        self._container_session_id = container_session_id
+        self._restored_instance_id = restored_instance_id
+        self._restore_session_id = restore_session_id
+        self._modal_task_id: str = ""
+        self._image_id: str = ""
+        self._cloud: str = ""
+        self._region: str = ""
+
+        self.trace_id = _trace_id_override or uuid.uuid4().hex
+        self.schema_version = SCHEMA_VERSION
+        self._base_dir = self._resolve_base_dir()
+        self._state: str = "created"
+        self._state_lock = threading.Lock()
+        self._events: list[dict[str, Any]] = []
+        self._events_path: Path | None = None
+        self._claimed = False
+        self._claimed_request_id: str | None = None
+        self._resource_sampler: ContainerResourceSampler | None = None
+        self._viztracer: Any = None
+        self._viztracer_version: str | None = None
+        self._torch_profiler: Any = None
+        self._torch_profiler_active = False
+        self._active_functions: dict[str, Callable] = {}
+        self._stopped = threading.Event()
+        self._start_time = time.time()
+        self._start_mono_ns = time.monotonic_ns()
+        self._result_summary: dict[str, Any] = {}
+        self._trace_stopped_result: dict[str, Any] | None = None
+
+        # Operation tracking (nested stacks, thread/task-safe)
+        self._op_lock = threading.Lock()
+        self._op_stacks: dict[tuple[int, int | None], list[str]] = {}  # (thread_id, asyncio_task_id) -> [operation_id]
+        self._op_cache: dict[str, dict[str, Any]] = {}  # operation_id -> cached start metadata
+
+        self._setup_directories()
+        self._write_event("created", {"state": self._state})
+
+    def _resolve_base_dir(self) -> Path:
+        """Determine the trace root directory.
+
+        Respects ``_TEST_TRACE_BASE`` for test isolation —
+        does not expose this via public factory parameters.
+        """
+        base = _TEST_TRACE_BASE if _TEST_TRACE_BASE else _TRACE_BASE
+        return Path(base) / self.trace_id
+
+    # ── Factory ──────────────────────────────────────────────────────────────────────
+
+    @classmethod
+    def create_if_enabled(
+        cls,
+        *,
+        container_session_id: str,
+        restored_instance_id: str = "",
+        restore_session_id: str = "",
+    ) -> Optional[FullExecutionTraceSession]:
+        """Create and return a singleton session when the env flag is ``'1'``.
+
+        Returns ``None`` when tracing is disabled — no files, no imports.
+
+        Parameters
+        ----------
+        container_session_id:
+            The Modal container session identifier.
+        restored_instance_id:
+            Initial restored instance ID (optional, may be updated later).
+        restore_session_id:
+            Initial restore session ID (optional, may be updated later).
+        """
+        if os.environ.get(_ENV_ENABLE) != "1":
+            return None
+        with cls._instance_lock:
+            if cls._instance is not None:
+                return cls._instance
+            instance = cls(
+                container_session_id=container_session_id,
+                restored_instance_id=restored_instance_id,
+                restore_session_id=restore_session_id,
+            )
+            cls._instance = instance
+            return instance
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        """Reset the singleton (used by tests)."""
+        with cls._instance_lock:
+            cls._instance = None
+
+    # ── Directory scaffolding ────────────────────────────────────────────────────────
+
+    def _setup_directories(self) -> None:
+        self._base_dir.mkdir(parents=True, exist_ok=True)
+        for subdir in _SUBDIRS:
+            (self._base_dir / subdir).mkdir(exist_ok=True)
+
+        self._events_path = self._base_dir / "raw" / "session_events.jsonl"
+
+        # Build and write trace_config.json
+        config = self._build_config()
+        self._write_json("trace_config.json", config)
+
+        # Empty placeholders
+        self._write_json("runtime_result_summary.json", {})
+        self._write_json("wrapper_snapshots.json", [])
+        for name in _REQUIRED_RAW_FILES:
+            path = self._base_dir / "raw" / name
+            if not path.exists():
+                if name.endswith(".gz"):
+                    import gzip as _gz
+                    with _gz.open(path, "wb") as f:
+                        f.write(b"")
+                elif name.endswith(".json"):
+                    path.write_text("{}")
+                elif name.endswith(".jsonl"):
+                    path.write_text("")
+
+    def _build_config(self) -> dict[str, Any]:
+        """Build the trace_config.json content."""
+        inc = _resolve_trace_include_paths()
+        entries = _env_int_chain(
+            _ENV_ENTRIES, _LEGACY_ENV_ENTRIES,
+            default=_DEFAULT_VIZTRACER_ENTRIES,
+        )
+        stack_depth = _env_int(
+            "COMFYMODAL_V2_FULL_TRACE_MAX_STACK_DEPTH",
+            _DEFAULT_MAX_STACK_DEPTH,
+        )
+
+        # VizTracer version detection is deferred to start_restore (lazy import)
+        viz_version: str | None = None
+
+        return {
+            "schema_version": self.schema_version,
+            "trace_id": self.trace_id,
+            "container_session_id": self._container_session_id,
+            "identity": {
+                "restored_instance_id": self._restored_instance_id,
+                "restore_session_id": self._restore_session_id,
+                "modal_task_id": self._modal_task_id,
+                "image_id": self._image_id,
+                "cloud": self._cloud,
+                "region": self._region,
+            },
+            "include_paths": {
+                "requested": inc["requested"],
+                "resolved": inc["resolved"],
+                "missing": inc["missing"],
+            },
+            "exclusions": inc["excluded"],
+            "search_roots": inc["search_roots"],
+            "viztracer_version": viz_version,
+            "entry_capacity": entries,
+            "config": {
+                "viztracer_entries": entries,
+                "viztracer_max_stack_depth": stack_depth,
+                "resource_interval_ms": _env_int_chain(
+                    _ENV_RESOURCE_INTERVAL, _LEGACY_ENV_RESOURCE_INTERVAL,
+                    default=_DEFAULT_RESOURCE_INTERVAL_MS,
+                ),
+                "env_entries_var": _ENV_ENTRIES,
+                "env_resource_interval_var": _ENV_RESOURCE_INTERVAL,
+            },
+            "created_at": self._start_time,
+            "created_at_iso": datetime.fromtimestamp(
+                self._start_time, tz=timezone.utc,
+            ).isoformat(),
+        }
+
+    def _update_trace_config_viz_version(self) -> None:
+        """Re-read ``trace_config.json``, update ``viztracer_version``, rewrite."""
+        config_path = self._base_dir / "raw" / "trace_config.json"
+        try:
+            if config_path.exists():
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                config["viztracer_version"] = self._viztracer_version
+                config_path.write_text(
+                    _safe_json_serialize(config, indent=2), encoding="utf-8",
+                )
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("Cannot update trace_config viztracer_version: %s", exc)
+
+    def _write_json(self, name: str, data: Any) -> Path:
+        path = self._base_dir / "raw" / name
+        path.write_text(_safe_json_serialize(data, indent=2))
+        return path
+
+    # ── State management ─────────────────────────────────────────────────────────────
+
+    @property
+    def state(self) -> str:
+        with self._state_lock:
+            return self._state
+
+    def _transition(self, target: str) -> bool:
+        """Attempt a state transition.
+
+        Returns ``True`` on success.  Invalid/repeated transitions are
+        recorded in the session events log but **never raised**.
+        """
+        with self._state_lock:
+            current = self._state
+            allowed = _VALID_TRANSITIONS.get(current, set())
+            if target in allowed:
+                self._state = target
+                self._write_event("state_transition", {
+                    "from": current,
+                    "to": target,
+                    "valid": True,
+                })
+                return True
+
+            self._write_event("state_transition", {
+                "from": current,
+                "to": target,
+                "valid": False,
+                "reason": f"Invalid transition from {current!r} to {target!r}",
+            })
+            return False
+
+    def _write_event(self, event_type: str, data: dict[str, Any]) -> None:
+        event: dict[str, Any] = {
+            "timestamp": time.time(),
+            "timestamp_iso": datetime.fromtimestamp(time.time(), tz=timezone.utc).isoformat(),
+            "monotonic_ns": time.monotonic_ns(),
+            "event": event_type,
+            "data": data,
+        }
+        self._events.append(event)
+        if self._events_path is not None:
+            try:
+                with open(self._events_path, "a", encoding="utf-8") as f:
+                    f.write(_safe_json_serialize(event) + "\n")
+            except OSError as exc:
+                log.warning("Cannot write session event: %s", exc)
+
+    # ── Lifecycle API ────────────────────────────────────────────────────────────────
+
+    def start_restore(self) -> None:
+        """Start restore-time tracing.
+
+        Transitions to ``restore_tracing``, starts the resource sampler,
+        and lazily initialises VizTracer.
+        """
+        if not self._transition("restore_tracing"):
+            return
+
+        entries = _env_int_chain(
+            _ENV_ENTRIES, _LEGACY_ENV_ENTRIES,
+            default=_DEFAULT_VIZTRACER_ENTRIES,
+        )
+        stack = _env_int(
+            "COMFYMODAL_V2_FULL_TRACE_MAX_STACK_DEPTH",
+            _DEFAULT_MAX_STACK_DEPTH,
+        )
+
+        # Start resource sampler
+        try:
+            self._resource_sampler = ContainerResourceSampler(
+                str(self._base_dir),
+                interval_ms=_env_int_chain(
+                    _ENV_RESOURCE_INTERVAL, _LEGACY_ENV_RESOURCE_INTERVAL,
+                    default=_DEFAULT_RESOURCE_INTERVAL_MS,
+                ),
+                session_phase="restore_tracing",
+            )
+            self._resource_sampler.start()
+        except Exception as exc:
+            log.warning("Resource sampler start failed: %s", exc)
+            self._resource_sampler = None
+
+        # Lazy VizTracer start — import only here, never at module/construction time
+        try:
+            inc = _resolve_trace_include_paths()
+            from viztracer import VizTracer as _VT
+
+            # Detect version
+            try:
+                self._viztracer_version = (
+                    getattr(_VT, "__version__", None)
+                    or getattr(_VT, "VERSION", None)
+                    or "unknown"
+                )
+            except Exception:
+                self._viztracer_version = "unknown"
+
+            # Build intended configuration
+            viz_kwargs: dict[str, Any] = dict(
+                tracer_entries=entries,
+                verbose=0,
+                max_stack_depth=stack,
+                ignore_c_function=True,
+                ignore_frozen=True,
+                log_func_args=False,
+                log_func_retval=False,
+                log_print=False,
+                log_gc=True,
+                log_async=True,
+                log_torch=False,
+                pid_suffix=False,
+                file_info=True,
+                register_global=True,
+                trace_self=False,
+                min_duration=0,
+                minimize_memory=True,
+                output_file=str(self._base_dir / "raw" / "viztracer.json"),
+            )
+            if inc["resolved"]:
+                viz_kwargs["include_files"] = inc["resolved"]
+            else:
+                viz_kwargs["exclude_files"] = inc["excluded"]
+
+            # Attempt creation with full kwargs; fall back on keyword rejection
+            try:
+                self._viztracer = _VT(**viz_kwargs)
+            except TypeError as te:
+                log.warning(
+                    "VizTracer keyword rejection (%s); retrying with minimal kwargs", te,
+                )
+                minimal_kwargs: dict[str, Any] = dict(
+                    tracer_entries=entries,
+                    max_stack_depth=stack,
+                )
+                if inc["resolved"]:
+                    minimal_kwargs["include_files"] = inc["resolved"]
+                self._viztracer = _VT(**minimal_kwargs)
+
+            self._viztracer.start()
+
+            # Update trace_config with detected version
+            self._update_trace_config_viz_version()
+
+        except ImportError:
+            log.info("VizTracer not available; continuing without function tracing")
+        except Exception as exc:
+            log.warning("VizTracer start failed: %s", exc)
+
+        self._write_event("restore_started", {
+            "tracer_entries": entries,
+            "max_stack_depth": stack,
+        })
+
+    def set_restore_complete(self) -> None:
+        """Mark the restore phase as complete.
+
+        Transitions to ``restore_complete``.  Required before claiming
+        a request.
+        """
+        self._transition("restore_complete")
+        # Update resource sampler phase
+        if self._resource_sampler is not None:
+            self._resource_sampler._session_phase = "restore_complete"
+
+    def update_identity(
+        self,
+        *,
+        restored_instance_id: str,
+        restore_session_id: str,
+        modal_task_id: str = "",
+        image_id: str = "",
+        cloud: str = "",
+        region: str = "",
+    ) -> None:
+        """Update container identity metadata.
+
+        All parameters are keyword-only.  Updates are persisted to the
+        session events log.
+        """
+        self._restored_instance_id = restored_instance_id
+        self._restore_session_id = restore_session_id
+        self._modal_task_id = modal_task_id
+        self._image_id = image_id
+        self._cloud = cloud
+        self._region = region
+        self._write_event("identity_updated", {
+            "restored_instance_id": restored_instance_id,
+            "restore_session_id": restore_session_id,
+            "modal_task_id": modal_task_id,
+            "image_id": image_id,
+            "cloud": cloud,
+            "region": region,
+        })
+
+    def claim_first_request(self, request_id: str) -> bool:
+        """Claim the first inference request *exactly once*.
+
+        Returns ``True`` if this call successfully claimed the request.
+        Subsequent calls return ``False`` and are logged.
+
+        On success the session transitions through
+        ``restore_complete → request_claimed`` and automatically
+        begins request tracing.
+        """
+        if self._claimed:
+            self._write_event("claim_skipped", {
+                "request_id": request_id,
+                "reason": "already_claimed",
+                "existing_request_id": self._claimed_request_id,
+            })
+            return False
+
+        if not self._transition("request_claimed"):
+            return False
+
+        self._claimed = True
+        self._claimed_request_id = request_id
+        self._write_event("request_claimed", {
+            "request_id": request_id,
+            "request_id_hash": _stable_hash(request_id),
+        })
+
+        # Begin request tracing phase (silent internal transition)
+        if self._resource_sampler is not None:
+            self._resource_sampler._session_phase = "request_tracing"
+
+        # Transition to request_tracing so mark/operations can proceed
+        self._transition("request_tracing")
+
+        return True
+
+    def mark(self, name: str, **metadata: Any) -> None:
+        """Record a trace mark event with safe metadata.
+
+        Allowed in ``request_claimed`` and ``request_tracing`` states.
+        Metadata is redacted for sensitive keys.
+        """
+        # Allow in both request_claimed and request_tracing
+        with self._state_lock:
+            if self._state not in ("request_claimed", "request_tracing"):
+                self._write_event("mark_skipped", {
+                    "name": name,
+                    "reason": f"invalid_state:{self._state}",
+                })
+                return
+
+        safe_metadata = {k: _safe_json_value(v) for k, v in metadata.items()}
+        self._write_event("mark", {
+            "name": name,
+            "metadata": safe_metadata,
+            "monotonic_ns": time.monotonic_ns(),
+        })
+
+    def operation_start(
+        self,
+        operation_type: str,
+        semantic_key: str,
+        **metadata: Any,
+    ) -> str:
+        """Record the start of a semantic operation.
+
+        Returns a new opaque ``operation_id`` that must be passed to
+        ``operation_end``.
+
+        Allowed in ``request_claimed`` and ``request_tracing`` states.
+        Thread/task-safe nested stacks.  Never stores raw semantic key.
+        """
+        with self._state_lock:
+            if self._state not in ("request_claimed", "request_tracing"):
+                self._write_event("operation_start_skipped", {
+                    "operation_type": operation_type,
+                    "reason": f"invalid_state:{self._state}",
+                })
+                return ""
+
+        operation_id = uuid.uuid4().hex
+        semantic_key_hash = _stable_hash(semantic_key)
+
+        # Thread and asyncio task identity
+        thread_id = threading.get_ident()
+        native_thread_id: int | None = None
+        try:
+            native_thread_id = threading.current_thread().native_id
+        except AttributeError:
+            pass
+        asyncio_task_id: int | None = None
+        try:
+            loop = asyncio.get_running_loop()
+            task = asyncio.current_task(loop)
+            if task is not None:
+                asyncio_task_id = id(task)
+        except RuntimeError:
+            pass
+
+        stack_key = (thread_id, asyncio_task_id)
+
+        # Determine parent operation from stack
+        parent_op_id: str | None = None
+        with self._op_lock:
+            stack = self._op_stacks.get(stack_key, [])
+            if stack:
+                parent_op_id = stack[-1]
+            stack.append(operation_id)
+            self._op_stacks[stack_key] = stack
+
+        safe_metadata = {k: _safe_json_value(v) for k, v in metadata.items()}
+        start_mono = time.monotonic_ns()
+
+        # Cache start metadata for later operation_end (full schema)
+        start_record: dict[str, Any] = {
+            "operation_id": operation_id,
+            "operation_type": operation_type,
+            "semantic_key_hash": semantic_key_hash,
+            "parent_operation_id": parent_op_id,
+            "request_id": self._claimed_request_id,
+            "restore_session_id": self._restore_session_id,
+            "restored_instance_id": self._restored_instance_id,
+            "pid": os.getpid(),
+            "native_thread_id": native_thread_id,
+            "asyncio_task_id": asyncio_task_id,
+            "start_monotonic_ns": start_mono,
+            "end_monotonic_ns": None,
+            "wall_ms": None,
+            "status": "started",
+            "metadata": safe_metadata,
+        }
+        with self._op_lock:
+            self._op_cache[operation_id] = start_record
+
+        self._write_event("operation_start", start_record)
+
+        return operation_id
+
+    def operation_end(
+        self,
+        operation_id: str,
+        *,
+        status: str = "ok",
+        **metadata: Any,
+    ) -> None:
+        """Record the end of a semantic operation.
+
+        Matches the ``operation_id`` from a prior ``operation_start``.
+        Safe against mismatched ends (logs warning, does not raise).
+        """
+        with self._state_lock:
+            if self._state not in ("request_claimed", "request_tracing"):
+                self._write_event("operation_end_skipped", {
+                    "operation_id": operation_id,
+                    "reason": f"invalid_state:{self._state}",
+                })
+                return
+
+        if not operation_id:
+            return
+
+        # Look up cached start metadata
+        with self._op_lock:
+            cached = self._op_cache.get(operation_id)
+
+        if cached is None:
+            self._write_event("operation_end_mismatch", {
+                "operation_id": operation_id,
+                "reason": "not_found_in_cache",
+            })
+            return
+
+        # Pop from stack (task-aware key)
+        thread_id = threading.get_ident()
+        asyncio_task_id: int | None = None
+        try:
+            loop = asyncio.get_running_loop()
+            task = asyncio.current_task(loop)
+            if task is not None:
+                asyncio_task_id = id(task)
+        except RuntimeError:
+            pass
+        stack_key = (thread_id, asyncio_task_id)
+
+        with self._op_lock:
+            stack = self._op_stacks.get(stack_key, [])
+            if stack and stack[-1] == operation_id:
+                stack.pop()
+                self._op_stacks[stack_key] = stack
+            elif operation_id in stack:
+                try:
+                    stack.remove(operation_id)
+                    self._op_stacks[stack_key] = stack
+                except ValueError:
+                    pass
+
+        end_mono = time.monotonic_ns()
+        wall_ms = (end_mono - cached["start_monotonic_ns"]) / 1_000_000
+
+        safe_metadata = {k: _safe_json_value(v) for k, v in metadata.items()}
+        # Preserve safe metadata from start, merge with end metadata
+        combined_metadata = dict(cached.get("metadata", {}))
+        combined_metadata.update(safe_metadata)
+
+        # Clean up cache entry
+        with self._op_lock:
+            self._op_cache.pop(operation_id, None)
+
+        self._write_event("operation_end", {
+            "operation_id": operation_id,
+            "operation_type": cached["operation_type"],
+            "semantic_key_hash": cached["semantic_key_hash"],
+            "parent_operation_id": cached["parent_operation_id"],
+            "request_id": cached["request_id"],
+            "restore_session_id": cached["restore_session_id"],
+            "restored_instance_id": cached["restored_instance_id"],
+            "pid": cached["pid"],
+            "native_thread_id": cached["native_thread_id"],
+            "asyncio_task_id": cached["asyncio_task_id"],
+            "start_monotonic_ns": cached["start_monotonic_ns"],
+            "end_monotonic_ns": end_mono,
+            "wall_ms": wall_ms,
+            "status": status,
+            "metadata": combined_metadata,
+        })
+
+    # ── Milestones ───────────────────────────────────────────────────────────────────
+
+    def capture_milestone(
+        self,
+        stage: str,
+        *,
+        loop: asyncio.AbstractEventLoop | None = None,
+        bridge_snapshot: Mapping[str, Any] | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Record a milestone with thread inventory, asyncio tasks, bridge state,
+        wrapper inventory, and extra metadata.
+
+        Parameters
+        ----------
+        stage:
+            Label for this milestone (e.g. ``"restore_start"``).
+        loop:
+            Optional event loop for asyncio task enumeration.
+        bridge_snapshot:
+            JSON-safe bridge state (validated and redacted).
+        extra:
+            Extra metadata (validated and redacted).
+        """
+        milestone: dict[str, Any] = {
+            "milestone_type": stage,
+            "timestamp": time.time(),
+            "timestamp_iso": datetime.fromtimestamp(time.time(), tz=timezone.utc).isoformat(),
+            "monotonic_ns": time.monotonic_ns(),
+            "state": self._state,
+            "trace_id": self.trace_id,
+        }
+
+        # Thread inventory
+        milestone["thread_inventory"] = self._capture_thread_inventory()
+
+        # Asyncio tasks
+        if loop is not None:
+            milestone["asyncio_tasks"] = self._capture_milestone_asyncio_tasks(loop)
+        else:
+            milestone["asyncio_tasks"] = []
+
+        # Bridge snapshot — validate JSON safety, drop unsafe
+        if bridge_snapshot is not None:
+            validated = self._validate_bridge_snapshot(dict(bridge_snapshot))
+            milestone["bridge_snapshot"] = _redact_sensitive(validated)
+        else:
+            milestone["bridge_snapshot"] = None
+
+        # Extra — redacted
+        milestone["extra"] = _redact_sensitive(dict(extra) if extra else {})
+
+        # Wrapper inventory
+        try:
+            wrapper_inv = capture_wrapper_inventory(
+                stage=stage,
+                session=self,
+                asyncio_loop=loop,
+            )
+            milestone["wrapper_inventory"] = wrapper_inv
+        except Exception as exc:
+            milestone["wrapper_inventory"] = {"error": str(exc)}
+
+        # Persist milestone
+        milestones_path = self._base_dir / "raw" / "milestones.jsonl"
+        try:
+            with open(milestones_path, "a", encoding="utf-8") as f:
+                f.write(_safe_json_serialize(milestone) + "\n")
+        except OSError as exc:
+            log.warning("Cannot write milestone: %s", exc)
+
+        self._write_event("milestone", {"stage": stage})
+
+        # Also persist wrapper snapshot to dedicated file
+        if "wrapper_inventory" in milestone and isinstance(milestone["wrapper_inventory"], dict):
+            self._append_wrapper_snapshot(milestone["wrapper_inventory"])
+
+    def _validate_bridge_snapshot(self, snapshot: dict[str, Any], _depth: int = 0) -> dict[str, Any]:
+        """Validate a bridge snapshot, dropping or replacing unsafe values.
+
+        Returns a JSON-safe copy.  Non-JSONable leaf values are replaced
+        with their type name.  Recursion depth is limited to 20 to prevent
+        stack overflow from malicious or deeply nested metadata.
+        """
+        if _depth > 20:
+            return {"<max_depth>": True}
+        result: dict[str, Any] = {}
+        for k, v in snapshot.items():
+            if isinstance(v, (str, int, float, bool, type(None))):
+                result[k] = v
+            elif isinstance(v, (list, tuple)):
+                result[k] = [_safe_json_value(item) for item in v]
+            elif isinstance(v, dict):
+                result[k] = self._validate_bridge_snapshot(v, _depth + 1)
+            else:
+                result[k] = _safe_json_value(v)
+        return result
+
+    def _append_wrapper_snapshot(self, wrapper_data: dict[str, Any]) -> None:
+        """Append a wrapper inventory snapshot to wrapper_snapshots.json."""
+        wrapper_path = self._base_dir / "raw" / "wrapper_snapshots.json"
+        try:
+            existing: list[dict[str, Any]] = []
+            if wrapper_path.exists():
+                try:
+                    raw = wrapper_path.read_text(encoding="utf-8")
+                    if raw.strip():
+                        existing = json.loads(raw)
+                        if not isinstance(existing, list):
+                            existing = []
+                except (json.JSONDecodeError, OSError):
+                    existing = []
+            existing.append(wrapper_data)
+            wrapper_path.write_text(
+                _safe_json_serialize(existing, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            log.warning("Cannot write wrapper snapshot: %s", exc)
+
+    def _capture_thread_inventory(self) -> list[dict[str, Any]]:
+        """Capture safe Python thread inventory."""
+        threads: list[dict[str, Any]] = []
+        for thread in threading.enumerate():
+            try:
+                threads.append({
+                    "name": thread.name or "",
+                    "ident": thread.ident,
+                    "native_id": getattr(thread, "native_id", None),
+                    "daemon": thread.daemon,
+                    "alive": thread.is_alive(),
+                })
+            except Exception:
+                pass
+        return threads
+
+    def _capture_milestone_asyncio_tasks(self, loop: asyncio.AbstractEventLoop) -> list[dict[str, Any]]:
+        """Capture asyncio task inventory with detailed fields."""
+        tasks: list[dict[str, Any]] = []
+        try:
+            all_tasks_fn = getattr(loop, "all_tasks", None)
+            if all_tasks_fn is None:
+                all_tasks_fn = lambda: asyncio.all_tasks(loop)
+            for task in all_tasks_fn():
+                try:
+                    tasks.append(_inspect_asyncio_task(task))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return tasks
+
+    # ── Torch Profiler ───────────────────────────────────────────────────────────────
+
+    def start_torch_profiler(self) -> None:
+        """Lazily start the ``torch.profiler.profile`` context manager.
+
+        Uses exact args: ``record_shapes=False``, ``profile_memory=True``,
+        ``with_stack=True``.  No automatic start/schedule/sync.
+
+        Gracefully handles missing CUDA and global Kineto state conflicts.
+        """
+        if self._torch_profiler_active or self._torch_profiler is not None:
+            return
+        try:
+            import torch.profiler
+
+            # Check for global Kineto conflicts
+            try:
+                from torch._C._profiler import _kineto_profiler_running
+                if _kineto_profiler_running():
+                    log.warning("Kineto profiler already running; skipping torch profiler")
+                    return
+            except (ImportError, AttributeError):
+                pass
+
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+            self._torch_profiler = torch.profiler.profile(
+                activities=activities,
+                record_shapes=False,
+                profile_memory=True,
+                with_stack=True,
+                with_modules=False,
+            )
+            self._torch_profiler.__enter__()
+            self._torch_profiler_active = True
+            self._write_event("torch_profiler_started", {
+                "activities": [str(a) for a in activities],
+                "record_shapes": False,
+                "profile_memory": True,
+                "with_stack": True,
+            })
+        except ImportError:
+            log.info("torch.profiler not available; skipping")
+        except Exception as exc:
+            log.warning("torch profiler start failed: %s", exc)
+
+    def stop_torch_profiler(self) -> None:
+        """Stop and export the torch profiler.
+
+        Exports Chrome trace, gzips it, cleans up temp files.
+        Safe to call even if profiler was never started or already stopped.
+        """
+        if self._torch_profiler is None and not self._torch_profiler_active:
+            return
+        if self._torch_profiler_active and self._torch_profiler is not None:
+            try:
+                self._torch_profiler.__exit__(None, None, None)
+                self._torch_profiler_active = False
+                trace_path = self._base_dir / "raw" / "torch_trace.json"
+                self._torch_profiler.export_chrome_trace(str(trace_path))
+                self._gzip_file(trace_path)
+                trace_path.unlink(missing_ok=True)
+                self._write_event("torch_profiler_stopped", {
+                    "exported": True,
+                    "path": str(trace_path.with_name("torch_trace.json.gz")),
+                })
+            except Exception as exc:
+                log.warning("Torch profiler export error: %s", exc)
+                self._write_event("torch_profiler_error", {"error": str(exc)})
+        # Clean up
+        try:
+            self._torch_profiler = None
+        except Exception:
+            pass
+
+    # ── Stop Tracing ─────────────────────────────────────────────────────────────────
+
+    def stop_tracing(self) -> dict[str, Any]:
+        """Stop all tracing in order: resource → torch → VizTracer → metadata.
+
+        Idempotent and safe.
+        """
+        if self._trace_stopped_result is not None:
+            return dict(self._trace_stopped_result)
+
+        result: dict[str, Any] = {
+            "trace_id": self.trace_id,
+            "state_before": self._state,
+        }
+
+        # ── 1. Stop resource sampler ────────────────────────────────────────────────
+        sampler_result: dict[str, Any] = {}
+        if self._resource_sampler is not None:
+            try:
+                sampler_result = self._resource_sampler.stop()
+            except Exception as exc:
+                sampler_result = {"error": str(exc)}
+                log.warning("Resource sampler stop error: %s", exc)
+        result["resource_sampler"] = sampler_result
+
+        # ── 2. Stop torch profiler ──────────────────────────────────────────────────
+        torch_result: dict[str, Any] = {}
+        if self._torch_profiler is not None or self._torch_profiler_active:
+            try:
+                self.stop_torch_profiler()
+                torch_trace = self._base_dir / "raw" / "torch_trace.json.gz"
+                torch_result = {
+                    "exported": torch_trace.exists(),
+                    "path": str(torch_trace) if torch_trace.exists() else "",
+                }
+            except Exception as exc:
+                torch_result = {"exported": False, "error": str(exc)}
+        result["torch_profiler"] = torch_result
+
+        # ── 3. Stop & save VizTracer ───────────────────────────────────────────────
+        viz_result: dict[str, Any] = {}
+        if self._viztracer is not None:
+            try:
+                self._viztracer.stop()
+                viz_path = self._base_dir / "raw" / "viztracer.json"
+                self._viztracer.save(str(viz_path))
+                self._gzip_file(viz_path)
+                viz_path.unlink(missing_ok=True)
+                viz_result = {
+                    "saved": True,
+                    "path": str(viz_path.with_name("viztracer.json.gz")),
+                }
+            except Exception as exc:
+                viz_result = {"saved": False, "error": str(exc)}
+                log.warning("VizTracer save error: %s", exc)
+            finally:
+                try:
+                    self._viztracer = None
+                except Exception:
+                    pass
+        result["viztracer"] = viz_result
+
+        # ── 4. Transition to trace_stopped ──────────────────────────────────────────
+        self._transition("trace_stopped")
+        self._stopped.set()
+
+        # ── 5. Write runtime_result_summary.json ────────────────────────────────────
+        summary = dict(self._result_summary)
+        end_time = time.time()
+        summary.update({
+            "trace_id": self.trace_id,
+            "schema_version": self.schema_version,
+            "trace_stopped_at": end_time,
+            "trace_stopped_at_iso": datetime.fromtimestamp(
+                end_time, tz=timezone.utc,
+            ).isoformat(),
+            "elapsed_seconds": end_time - self._start_time,
+            "final_state": self._state,
+        })
+        self._write_json("runtime_result_summary.json", summary)
+        result["summary"] = {
+            "path": str(self._base_dir / "raw" / "runtime_result_summary.json"),
+        }
+
+        result["final_state"] = self._state
+        self._trace_stopped_result = result
+        return dict(result)
+
+    def _gzip_file(self, path: Path) -> None:
+        """Gzip *path* in-place; removes original and leaves ``.gz``."""
+        gz_path = path.with_suffix(path.suffix + ".gz")
+        try:
+            with open(path, "rb") as src, gzip.open(gz_path, "wb") as dst:
+                dst.write(src.read())
+        except OSError as exc:
+            log.warning("Gzip failed for %s: %s", path.name, exc)
+
+    # ── Result summary ───────────────────────────────────────────────────────────────
+
+    def set_result_summary(self, data: dict[str, Any]) -> None:
+        """Update the result summary that will be written at stop time."""
+        self._result_summary.update(data)
+
+    def register_active_function(self, name: str, func: Callable) -> None:
+        """Register an active wrapper function for snapshot inclusion."""
+        self._active_functions[name] = func
+
+    # ── Properties ───────────────────────────────────────────────────────────────────
+
+    def raw_session_dir(self) -> Path:
+        """Return the ``raw/`` subdirectory path."""
+        return self._base_dir / "raw"
+
+    def status_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe status summary of the current session state."""
+        return {
+            "trace_id": self.trace_id,
+            "schema_version": self.schema_version,
+            "state": self._state,
+            "container_session_id": self._container_session_id,
+            "identity": {
+                "restored_instance_id": self._restored_instance_id,
+                "restore_session_id": self._restore_session_id,
+                "modal_task_id": self._modal_task_id,
+                "image_id": self._image_id,
+                "cloud": self._cloud,
+                "region": self._region,
+            },
+            "claimed": self._claimed,
+            "claimed_request_id": self._claimed_request_id,
+            "has_viztracer": self._viztracer is not None,
+            "has_torch_profiler": self._torch_profiler is not None,
+            "has_resource_sampler": self._resource_sampler is not None,
+            "start_time": self._start_time,
+            "start_monotonic_ns": self._start_mono_ns,
+            "elapsed_seconds": time.time() - self._start_time,
+            "base_dir": str(self._base_dir),
+            "raw_dir": str(self._base_dir / "raw"),
+        }
+
+    @property
+    def base_dir(self) -> Path:
+        return self._base_dir
+
+    @property
+    def events_path(self) -> Path | None:
+        return self._events_path
+
+    @property
+    def events(self) -> list[dict[str, Any]]:
+        return list(self._events)
+
+    @property
+    def resource_sampler(self) -> ContainerResourceSampler | None:
+        return self._resource_sampler
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════
+# Module-level re-exports for backward compat
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+# Private compat aliases (not in public API spec, but harmless)
+# complete_restore = set_restore_complete  # not exported
+# start_request_tracing handled internally

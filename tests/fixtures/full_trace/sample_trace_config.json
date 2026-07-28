@@ -1,0 +1,74 @@
+{
+  "schema_version": "v2-full-trace/1",
+  "trace_id": "abc123def4567890abcdef1234567890",
+  "container_session_id": "cs_test_001",
+  "identity": {
+    "restored_instance_id": "inst_001",
+    "restore_session_id": "rs_001",
+    "modal_task_id": "task_abc",
+    "image_id": "img_v3",
+    "cloud": "aws",
+    "region": "us-east-1"
+  },
+  "include_paths": {
+    "requested": [
+      "comfymodal_runtime/",
+      "comfyapp.py",
+      "canonical_execution.py",
+      "production_workflow.py",
+      "profiler_trace_v4.py",
+      "timing_trace.py",
+      "wall_clock_trace_v3.py",
+      "warmup_profile.py",
+      "run_prompt_options.py",
+      "optimizations.py",
+      "execution.py",
+      "nodes.py",
+      "comfy/model_management.py",
+      "comfy/model_patcher.py",
+      "comfy/sd.py",
+      "comfy/samplers.py",
+      "comfy/sample.py",
+      "comfy/utils.py",
+      "CacheDiT",
+      "RES4LYF",
+      "ClownsharKSampler",
+      "rgthree",
+      "KJNodes",
+      "ComfyUI-Easy-Use",
+      "FeatureInjLatent"
+    ],
+    "resolved": [
+      "/app/comfymodal_runtime",
+      "/app/comfyapp.py"
+    ],
+    "missing": [
+      "CacheDiT",
+      "RES4LYF",
+      "ClownsharKSampler",
+      "rgthree",
+      "KJNodes",
+      "ComfyUI-Easy-Use",
+      "FeatureInjLatent"
+    ]
+  },
+  "exclusions": [
+    "torch",
+    "transformers",
+    "diffusers",
+    "numpy",
+    "site-packages",
+    "comfy/ldm"
+  ],
+  "viztracer_version": "0.16.4",
+  "entry_capacity": 8000000,
+  "config": {
+    "viztracer_entries": 8000000,
+    "viztracer_max_stack_depth": 64,
+    "resource_interval_ms": 50,
+    "env_entries_var": "COMFYMODAL_V2_FULL_TRACE_ENTRIES",
+    "env_resource_interval_var": "COMFYMODAL_V2_FULL_TRACE_RESOURCE_INTERVAL_MS"
+  },
+  "created_at": 1785267457.9065254,
+  "created_at_iso": "2026-07-28T19:37:37.906525+00:00"
+}
