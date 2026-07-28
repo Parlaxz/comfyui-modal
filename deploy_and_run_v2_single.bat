@@ -2,6 +2,8 @@
 setlocal enabledelayedexpansion
 
 chcp 65001 >nul
+
+REM -- Pin environment variables ------------------------------------
 set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-shadow"
 set "COMFYMODAL_V2_CLASS_NAME=ModalRuntimeEntrypointV2"
 set "COMFYMODAL_V2_GPU=rtx-pro-6000"
@@ -16,32 +18,38 @@ if not defined COMFYMODAL_V2_MEMORY_MB set "COMFYMODAL_V2_MEMORY_MB=49152"
 set "REPO_ROOT=%~dp0"
 cd /d "%REPO_ROOT%" || exit /b 1
 
+REM -- Workspace loading -------------------------------------------
 echo === Loading active workspace ===
-set "IDX=0"
-for /f "usebackq delims=" %%a in (`python -c "import json,sys;d=json.load(open('.modal_workspaces.json'));aid=d.get('active_workspace_id');ws=next((w for w in d.get('workspaces',[]) if w.get('id')==aid),None);tid=ws and ws.get('token_id') or '';ts=ws and ws.get('token_secret') or '';label=ws and ws.get('label','') or '';sys.exit(1) if not(aid and ws and tid and ts) else None;print(tid);print(ts);print(label)"`) do (
-    if !IDX! equ 0 set "MODAL_TOKEN_ID=%%a"
-    if !IDX! equ 1 set "MODAL_TOKEN_SECRET=%%a"
-    if !IDX! equ 2 set "MODAL_WORKSPACE_LABEL=%%a"
-    set /a IDX+=1
+set "WS_FILE=%TEMP%\_ws_%RANDOM%.txt"
+python -c "import json,sys;d=json.load(open('.modal_workspaces.json'));aid=d.get('active_workspace_id');ws=next((w for w in d.get('workspaces',[])if w.get('id')==aid),None);tid=ws and ws.get('token_id')or'';ts=ws and ws.get('token_secret')or'';label=ws and ws.get('label','')or'';open(sys.argv[1],'w').write('MODAL_TOKEN_ID='+tid+'\nMODAL_TOKEN_SECRET='+ts+'\nMODAL_WORKSPACE_LABEL='+label)" "%WS_FILE%"
+if errorlevel 1 (
+    echo === ERROR: Python workspace extraction failed ===
+    if defined WS_FILE if exist "%WS_FILE%" del /q "%WS_FILE%"
+    exit /b 1
 )
-if !IDX! lss 3 (
+for /f "usebackq tokens=1,* delims==" %%a in ("%WS_FILE%") do set "%%a=%%b"
+if defined WS_FILE if exist "%WS_FILE%" del /q "%WS_FILE%"
+if not defined MODAL_TOKEN_ID (
     echo === ERROR: Could not load active workspace credentials ===
     exit /b 1
 )
 echo === Active workspace: !MODAL_WORKSPACE_LABEL! ===
 
+REM -- Warmup profile ----------------------------------------------
 echo === Extracting warmup profile from benchmark workflow ===
-python tools\extract_warmup_profile.py > "%TEMP%\_v2_warmup_profile.txt"
+set "WARMUP_FILE=%TEMP%\_v2warm_%RANDOM%.txt"
+python tools\extract_warmup_profile.py > "%WARMUP_FILE%"
 if errorlevel 1 (
-    type "%TEMP%\_v2_warmup_profile.txt"
+    type "%WARMUP_FILE%"
     echo === ERROR: Warmup profile derivation failed ===
-    del "%TEMP%\_v2_warmup_profile.txt" 2>nul
+    if defined WARMUP_FILE if exist "%WARMUP_FILE%" del /q "%WARMUP_FILE%"
     exit /b 1
 )
-for /f "usebackq delims=" %%a in ("%TEMP%\_v2_warmup_profile.txt") do set "%%a"
-del "%TEMP%\_v2_warmup_profile.txt" 2>nul
+for /f "usebackq delims=" %%a in ("%WARMUP_FILE%") do set "%%a"
+if defined WARMUP_FILE if exist "%WARMUP_FILE%" del /q "%WARMUP_FILE%"
 echo === Warmup profile loaded ===
 
+REM -- Modal CLI detection -----------------------------------------
 where modal >nul 2>nul
 if not errorlevel 1 (
     set "MODAL_CLI=modal"
@@ -49,113 +57,184 @@ if not errorlevel 1 (
     set "MODAL_CLI=python -m modal"
 )
 
-REM ── Concurrent deployment via Python helper ────────────────────────────
-set "V1_CMD_FILE=%TEMP%\_v1_deploy_cmd_%RANDOM%.bat"
-set "V2_CMD_FILE=%TEMP%\_v2_deploy_cmd_%RANDOM%.bat"
-set "V1_DEPLOY_LOG=%TEMP%\_v1_deploy.txt"
-set "V2_DEPLOY_LOG=%TEMP%\_v2_deploy.txt"
-set "DEPLOY_RESULT_LOG=%TEMP%\_deploy_result_%RANDOM%.txt"
-
-REM Write tiny command files so the Python helper receives pre-resolved args.
-REM Escape percent signs so each worker evaluates its own exit code at runtime.
-> "%V1_CMD_FILE%" echo @echo off
->>"%V1_CMD_FILE%" echo %MODAL_CLI% deploy comfyapp.py
->>"%V1_CMD_FILE%" echo exit /b %%errorlevel%%
-> "%V2_CMD_FILE%" echo @echo off
->>"%V2_CMD_FILE%" echo %MODAL_CLI% deploy -m comfymodal_runtime.modal_app
->>"%V2_CMD_FILE%" echo exit /b %%errorlevel%%
-
-if not defined COMFYMODAL_DEPLOY_TIMEOUT_SECONDS set "COMFYMODAL_DEPLOY_TIMEOUT_SECONDS=3600"
-
-echo === Deploying V1 (comfyui) and V2 (shadow) concurrently (timeout=%COMFYMODAL_DEPLOY_TIMEOUT_SECONDS%s) ===
-python tools\run_deploys_concurrent.py ^
-    "%V1_CMD_FILE%" "%V2_CMD_FILE%" ^
-    "%V1_DEPLOY_LOG%" "%V2_DEPLOY_LOG%" ^
-    "%COMFYMODAL_DEPLOY_TIMEOUT_SECONDS%" ^
-    > "%DEPLOY_RESULT_LOG%"
-set "PARALLEL_EXIT=%errorlevel%"
-
-REM Remove command-file artifacts immediately (no longer needed)
-del "%V1_CMD_FILE%" 2>nul
-del "%V2_CMD_FILE%" 2>nul
-
-REM Parse the key=value lines produced by the Python helper
-set "V1_DEPLOY_EXIT="
-set "V2_DEPLOY_EXIT="
-set "TIMED_OUT="
-for /f "usebackq tokens=1,* delims==" %%a in ("%DEPLOY_RESULT_LOG%") do (
-    if "%%a"=="V1_EXIT" set "V1_DEPLOY_EXIT=%%b"
-    if "%%a"=="V2_EXIT" set "V2_DEPLOY_EXIT=%%b"
-    if "%%a"=="TIMED_OUT" set "TIMED_OUT=%%b"
-)
-del "%DEPLOY_RESULT_LOG%" 2>nul
-
-REM Surface both deployment logs
-echo.
-echo === V1 deploy log ===
-type "%V1_DEPLOY_LOG%" 2>nul
-echo.
-echo === V2 deploy log ===
-type "%V2_DEPLOY_LOG%" 2>nul
-echo.
-
-REM Validate: timeout
-if /i "!TIMED_OUT!"=="true" (
-    echo === ERROR: Concurrent deploy timed out after %COMFYMODAL_DEPLOY_TIMEOUT_SECONDS%s ===
-    del "%V1_DEPLOY_LOG%" 2>nul
-    del "%V2_DEPLOY_LOG%" 2>nul
-    exit /b 1
-)
-
-REM Validate: V1 exit code
-if not defined V1_DEPLOY_EXIT set "V1_DEPLOY_EXIT=-1"
-if !V1_DEPLOY_EXIT! neq 0 (
-    echo === ERROR: V1 deploy failed with exit code !V1_DEPLOY_EXIT! ===
-    del "%V1_DEPLOY_LOG%" 2>nul
-    del "%V2_DEPLOY_LOG%" 2>nul
-    exit /b !V1_DEPLOY_EXIT!
-)
-
-REM Validate: V2 exit code
-if not defined V2_DEPLOY_EXIT set "V2_DEPLOY_EXIT=-1"
-if !V2_DEPLOY_EXIT! neq 0 (
-    echo === ERROR: V2 deploy failed with exit code !V2_DEPLOY_EXIT! ===
-    del "%V1_DEPLOY_LOG%" 2>nul
-    del "%V2_DEPLOY_LOG%" 2>nul
-    exit /b !V2_DEPLOY_EXIT!
-)
-
-REM Validate: V1 output contains app identifier
-findstr /C:"comfyui" "%V1_DEPLOY_LOG%" >nul 2>nul
+REM -- Check existing V1 deployment via modal app list --json -------
+echo === Checking for existing V1 deployment: comfyui ===
+set "V1_CHECK_FILE=%TEMP%\_v1chk_%RANDOM%.txt"
+python -c "import json,subprocess,sys;out=subprocess.check_output(sys.argv[1].split()+['app','list','--json'],timeout=30);open(sys.argv[2],'w').write('1'if any(a.get('Description')=='comfyui'and a.get('State','').lower()=='deployed'for a in json.loads(out))else'0')" "!MODAL_CLI!" "%V1_CHECK_FILE%" 2>nul
 if errorlevel 1 (
-    echo === ERROR: V1 deploy output missing 'comfyui' app identifier ===
-    del "%V1_DEPLOY_LOG%" 2>nul
-    del "%V2_DEPLOY_LOG%" 2>nul
+    echo === ERROR: Could not determine whether V1 is deployed ===
+    if defined V1_CHECK_FILE if exist "!V1_CHECK_FILE!" del /q "!V1_CHECK_FILE!"
+    exit /b 1
+)
+if not exist "%V1_CHECK_FILE%" (
+    echo === ERROR: V1 deployment check produced no result ===
+    exit /b 1
+)
+if exist "%V1_CHECK_FILE%" (
+    set /p "V1_EXISTS=" < "%V1_CHECK_FILE%"
+    if defined V1_CHECK_FILE if exist "%V1_CHECK_FILE%" del /q "%V1_CHECK_FILE%"
+) else (
+    echo === ERROR: V1 deployment check result disappeared ===
+    exit /b 1
+)
+if not defined V1_EXISTS (
+    echo === ERROR: V1 deployment check result was empty ===
     exit /b 1
 )
 
-REM Validate: V2 output contains app and class identifiers
-findstr /C:"stable-modal-comfy-v2-shadow" "%V2_DEPLOY_LOG%" >nul 2>nul
-if errorlevel 1 (
-    echo === ERROR: V2 deploy output missing shadow app identifier ===
-    del "%V1_DEPLOY_LOG%" 2>nul
-    del "%V2_DEPLOY_LOG%" 2>nul
-    exit /b 1
+REM -- Conditional deploy -------------------------------------------
+if "!V1_EXISTS!"=="1" (
+
+    REM ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    REM V1 already deployed: deploy V2 only
+    REM ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    echo === V1 comfyui already deployed. Deploying V2 only ===
+
+    set "V2_LOG=%TEMP%\_v2dpl_%RANDOM%.txt"
+    !MODAL_CLI! deploy -m comfymodal_runtime.modal_app > "!V2_LOG!" 2>&1
+    set "V2_EXIT=!errorlevel!"
+
+    echo.
+    echo === V2 deploy log ===
+    type "!V2_LOG!"
+    echo.
+
+    if !V2_EXIT! neq 0 (
+        echo === ERROR: V2 deploy failed with exit code !V2_EXIT! ===
+        if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
+        exit /b !V2_EXIT!
+    )
+
+    REM Validate V2 identifiers
+    findstr /C:"stable-modal-comfy-v2-shadow" "!V2_LOG!" >nul 2>nul
+    if errorlevel 1 (
+        echo === ERROR: V2 deploy output missing shadow app identifier ===
+        if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
+        exit /b 1
+    )
+    findstr /C:"ModalRuntimeEntrypointV2" "!V2_LOG!" >nul 2>nul
+    if errorlevel 1 (
+        echo === ERROR: V2 deploy output missing V2 class identifier ===
+        if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
+        exit /b 1
+    )
+
+    if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
+    echo === V2 deploy verified OK ===
+
+) else (
+
+    REM ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    REM No V1 deployed: deploy V1 and V2 concurrently
+    REM ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    echo === No existing V1 found. Deploying V1 and V2 concurrently ===
+
+    set "V1_CMD_FILE=%TEMP%\_v1cmd_%RANDOM%.bat"
+    set "V2_CMD_FILE=%TEMP%\_v2cmd_%RANDOM%.bat"
+    set "V1_LOG=%TEMP%\_v1dpl_%RANDOM%.txt"
+    set "V2_LOG=%TEMP%\_v2dpl_%RANDOM%.txt"
+    set "DEPLOY_RESULT=%TEMP%\_dplres_%RANDOM%.txt"
+
+    if not defined COMFYMODAL_DEPLOY_TIMEOUT_SECONDS set "COMFYMODAL_DEPLOY_TIMEOUT_SECONDS=3600"
+
+    > "!V1_CMD_FILE!" echo @echo off
+    >>"!V1_CMD_FILE!" echo !MODAL_CLI! deploy comfyapp.py
+    >>"!V1_CMD_FILE!" echo exit /b %%errorlevel%%
+    > "!V2_CMD_FILE!" echo @echo off
+    >>"!V2_CMD_FILE!" echo !MODAL_CLI! deploy -m comfymodal_runtime.modal_app
+    >>"!V2_CMD_FILE!" echo exit /b %%errorlevel%%
+
+    echo === Deploying V1 and V2 concurrently. Timeout=!COMFYMODAL_DEPLOY_TIMEOUT_SECONDS!s ===
+    python tools\run_deploys_concurrent.py ^
+        "!V1_CMD_FILE!" "!V2_CMD_FILE!" ^
+        "!V1_LOG!" "!V2_LOG!" ^
+        "!COMFYMODAL_DEPLOY_TIMEOUT_SECONDS!" ^
+        > "!DEPLOY_RESULT!"
+    set "PARALLEL_EXIT=!errorlevel!"
+
+    REM Clean command files immediately
+    if defined V1_CMD_FILE if exist "!V1_CMD_FILE!" del /q "!V1_CMD_FILE!"
+    if defined V2_CMD_FILE if exist "!V2_CMD_FILE!" del /q "!V2_CMD_FILE!"
+
+    REM Parse result
+    set "V1_DEPLOY_EXIT="
+    set "V2_DEPLOY_EXIT="
+    set "TIMED_OUT="
+    for /f "usebackq tokens=1,* delims==" %%a in ("!DEPLOY_RESULT!") do (
+        if "%%a"=="V1_EXIT" set "V1_DEPLOY_EXIT=%%b"
+        if "%%a"=="V2_EXIT" set "V2_DEPLOY_EXIT=%%b"
+        if "%%a"=="TIMED_OUT" set "TIMED_OUT=%%b"
+    )
+    if defined DEPLOY_RESULT if exist "!DEPLOY_RESULT!" del /q "!DEPLOY_RESULT!"
+
+    REM Surface logs
+    echo.
+    echo === V1 deploy log ===
+    type "!V1_LOG!" 2>nul
+    echo.
+    echo === V2 deploy log ===
+    type "!V2_LOG!" 2>nul
+    echo.
+
+    REM Validate: timeout
+    if /i "!TIMED_OUT!"=="true" (
+        echo === ERROR: Concurrent deploy timed out after !COMFYMODAL_DEPLOY_TIMEOUT_SECONDS!s ===
+        if defined V1_LOG if exist "!V1_LOG!" del /q "!V1_LOG!"
+        if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
+        exit /b 1
+    )
+
+    REM Validate V1 exit code for this deploy
+    if not defined V1_DEPLOY_EXIT set "V1_DEPLOY_EXIT=-1"
+    if !V1_DEPLOY_EXIT! neq 0 (
+        echo === ERROR: V1 deploy failed with exit code !V1_DEPLOY_EXIT! ===
+        if defined V1_LOG if exist "!V1_LOG!" del /q "!V1_LOG!"
+        if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
+        exit /b !V1_DEPLOY_EXIT!
+    )
+
+    REM Validate V1 output contains comfyui app identifier
+    findstr /C:"comfyui" "!V1_LOG!" >nul 2>nul
+    if errorlevel 1 (
+        echo === ERROR: V1 deploy output missing 'comfyui' app identifier ===
+        if defined V1_LOG if exist "!V1_LOG!" del /q "!V1_LOG!"
+        if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
+        exit /b 1
+    )
+
+    REM Validate V2 exit code
+    if not defined V2_DEPLOY_EXIT set "V2_DEPLOY_EXIT=-1"
+    if !V2_DEPLOY_EXIT! neq 0 (
+        echo === ERROR: V2 deploy failed with exit code !V2_DEPLOY_EXIT! ===
+        if defined V1_LOG if exist "!V1_LOG!" del /q "!V1_LOG!"
+        if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
+        exit /b !V2_DEPLOY_EXIT!
+    )
+
+    REM Validate V2 identifiers
+    findstr /C:"stable-modal-comfy-v2-shadow" "!V2_LOG!" >nul 2>nul
+    if errorlevel 1 (
+        echo === ERROR: V2 deploy output missing shadow app identifier ===
+        if defined V1_LOG if exist "!V1_LOG!" del /q "!V1_LOG!"
+        if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
+        exit /b 1
+    )
+    findstr /C:"ModalRuntimeEntrypointV2" "!V2_LOG!" >nul 2>nul
+    if errorlevel 1 (
+        echo === ERROR: V2 deploy output missing V2 class identifier ===
+        if defined V1_LOG if exist "!V1_LOG!" del /q "!V1_LOG!"
+        if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
+        exit /b 1
+    )
+
+    REM Clean deploy logs
+    if defined V1_LOG if exist "!V1_LOG!" del /q "!V1_LOG!"
+    if defined V2_LOG if exist "!V2_LOG!" del /q "!V2_LOG!"
+
+    echo === V1 and V2 deploys both verified OK ===
 )
-findstr /C:"ModalRuntimeEntrypointV2" "%V2_DEPLOY_LOG%" >nul 2>nul
-if errorlevel 1 (
-    echo === ERROR: V2 deploy output missing V2 class identifier ===
-    del "%V1_DEPLOY_LOG%" 2>nul
-    del "%V2_DEPLOY_LOG%" 2>nul
-    exit /b 1
-)
 
-REM Clean deploy logs
-del "%V1_DEPLOY_LOG%" 2>nul
-del "%V2_DEPLOY_LOG%" 2>nul
-
-echo === V1 and V2 deploys both verified OK ===
-
+REM -- Acceptance benchmark (unchanged) -----------------------------
 echo === Running V2 acceptance benchmark ===
 python tools\benchmark_v2_direct.py --acceptance
 if errorlevel 1 (

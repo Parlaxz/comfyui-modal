@@ -7093,20 +7093,20 @@ if not _INSIDE_MODAL_CONTAINER:
         '  _total_req=$((_total_req+1)); '
         '  local t0; t0=$(__ts_ms); '
         '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name start_ts=$t0"; '
-        '  cd "$d" && python -m pip install --disable-pip-version-check --no-input -r requirements.txt -c "$_lock" --quiet; '
+        '  cd "$d" && python -m pip install --disable-pip-version-check --no-input -r requirements.txt -c "$_lock" --quiet || { echo "CUSTOM_NODE_PREREQ_PIP_FAILED name=$name"; return 1; }; '
         '  local t1; t1=$(__ts_ms); '
         '  local dur; dur=$((t1 - t0)); '
         '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name end_ts=$t1 duration_ms=$dur"; '
         '  _total_installed=$((_total_installed+1)); '
         '}; '
         'for d in /root/comfy-build/custom_node_requirements/*/; do '
-        '  _pip_node "$d"; '
+        '  _pip_node "$d" || exit 1; '
         'done; '
         '_end_ts=$(__ts_ms); '
         'echo "CUSTOM_NODE_PREREQ_INSTALL_END ts_ms=$_end_ts total_nodes=$_total_req installed=$_total_installed skipped_no_req=$_total_skipped"; '
         # CacheDiT final family reinstall (after all custom-node reqs)
         'echo "CACHEDIT_LOCK_FAMILY_ENSURE_START ts_ms=$(__ts_ms)"; '
-        'python -m pip install --disable-pip-version-check --no-input --no-deps -r "$_lock" --quiet; '
+        'python -m pip install --disable-pip-version-check --no-input --no-deps -r "$_lock" --quiet || { echo "CACHEDIT_LOCK_FAMILY_FAILED"; exit 1; }; '
         'echo "CACHEDIT_LOCK_FAMILY_ENSURE_END ts_ms=$(__ts_ms)"; '
         # CacheDiT image-build import gate
         # Override compiler cache envs to /tmp paths — the image env sets
@@ -7271,7 +7271,7 @@ if not _INSIDE_MODAL_CONTAINER:
         copy=True,
     )
 
-_COMFYMODAL_LOCAL_PYTHON_SOURCES = (
+_GPU_COMFYMODAL_PYTHON_SOURCES = (
     "gpu_catalog",
     "timing_trace",
     "wall_clock_trace_v3",
@@ -7280,22 +7280,57 @@ _COMFYMODAL_LOCAL_PYTHON_SOURCES = (
     "failure_summary",
     "production_workflow",
     "optimizations",
-    "comfymodal_runtime",
+    "worker_control",
 )
 
-def _add_comfymodal_local_python_sources(img):
-    for _module_name in _COMFYMODAL_LOCAL_PYTHON_SOURCES:
-        img = img.add_local_python_source(_module_name)
+_CPU_COMFYMODAL_PYTHON_SOURCES = (
+    "gpu_catalog",
+    "timing_trace",
+    "wall_clock_trace_v3",
+    "profiler_trace_v4",
+    "api_prompt_validator",
+    "failure_summary",
+    "production_workflow",
+    "worker_control",
+)
+
+_COMFYAPP_SOURCE = Path(__file__).read_text(encoding="utf-8-sig")
+_COMFYMODAL_INCLUDE_SOURCE = False
+_GPU_SOURCE_BYTES = sum(
+    os.path.getsize(os.path.join(os.path.dirname(__file__), f"{m}.py"))
+    for m in _GPU_COMFYMODAL_PYTHON_SOURCES
+    if os.path.isfile(os.path.join(os.path.dirname(__file__), f"{m}.py"))
+)
+_APP_SOURCE_BYTES = os.path.getsize(__file__)
+
+def _add_gpu_python_sources(img):
+    for _module_name in _GPU_COMFYMODAL_PYTHON_SOURCES:
+        img = img.add_local_python_source(_module_name, copy=True)
     return img
 
-image = _add_comfymodal_local_python_sources(_image_base)
 
-download_image = _add_comfymodal_local_python_sources(
+def _add_cpu_python_sources(img):
+    for _module_name in _CPU_COMFYMODAL_PYTHON_SOURCES:
+        img = img.add_local_python_source(_module_name, copy=True)
+    return img
+
+
+def _add_comfymodal_local_python_sources(img):
+    """Legacy wrapper: includes all CPU sources + optimizations + comfymodal_runtime."""
+    img = _add_cpu_python_sources(img)
+    img = img.add_local_python_source("optimizations", copy=True)
+    img = img.add_local_python_source("comfymodal_runtime", copy=True)
+    return img
+
+
+image = _add_gpu_python_sources(_image_base).add_local_python_source("comfymodal_runtime", copy=True)
+
+download_image = _add_cpu_python_sources(
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("httpx>=0.27.0")
-)
+).add_local_python_source("comfymodal_runtime", copy=True)
 
-app = modal.App(APP_NAME, image=image)
+app = modal.App(APP_NAME, image=image, include_source=False)
 vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 # P2: dedicated prompt-encoding cache volume. Independent of the
 # models and custom-nodes volumes so a bundle change cannot perturb

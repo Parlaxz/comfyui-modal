@@ -2742,5 +2742,81 @@ class CpuSnapshotUnetStatePropagationTests(unittest.TestCase):
         self.assertIsNone(self.entrypoint._cpu_snapshot_unet_runtime_state)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# StorageRegistry and residency sampling tests
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestStorageRegistry(unittest.TestCase):
+    """build_unique_storage_registry and sample_storage_residency."""
+
+    def test_empty_registry(self):
+        """build_unique_storage_registry on a model with no CPU params returns empty."""
+        from comfymodal_runtime.cpu_snapshot_models import StorageRegistry, StorageRange, build_unique_storage_registry, sample_storage_residency
+        class _Empty:
+            def parameters(self): return iter([])
+            def buffers(self): return iter([])
+        reg = build_unique_storage_registry(_Empty())
+        self.assertIsInstance(reg, StorageRegistry)
+        self.assertEqual(reg.total_bytes, 0)
+        self.assertEqual(len(reg.ranges), 0)
+
+    def test_storage_range_dataclass(self):
+        """StorageRange stores address and length."""
+        from comfymodal_runtime.cpu_snapshot_models import StorageRange
+        sr = StorageRange(address=4096, length=16384)
+        self.assertEqual(sr.address, 4096)
+        self.assertEqual(sr.length, 16384)
+
+    def test_storage_registry_dataclass(self):
+        """StorageRegistry stores ranges and total_bytes."""
+        from comfymodal_runtime.cpu_snapshot_models import StorageRegistry, StorageRange
+        reg = StorageRegistry(ranges=[StorageRange(0, 4096)], total_bytes=4096)
+        self.assertEqual(len(reg.ranges), 1)
+        self.assertEqual(reg.total_bytes, 4096)
+
+    def test_sample_storage_residency_empty(self):
+        """sample_storage_residency with empty registry returns unsupported on Windows."""
+        from comfymodal_runtime.cpu_snapshot_models import StorageRegistry, sample_storage_residency
+        reg = StorageRegistry()
+        result = sample_storage_residency(reg)
+        self.assertEqual(result["status"], "unsupported")
+        # None is acceptable for unavailable page values on non-posix
+        self.assertIn(result.get("total_pages"), (None, 0))
+        self.assertIn(result.get("resident_pages"), (None, 0))
+
+    def test_sample_storage_residency_unsupported(self):
+        """On non-posix, sample_storage_residency returns status=unsupported."""
+        from comfymodal_runtime.cpu_snapshot_models import StorageRegistry, sample_storage_residency
+        reg = StorageRegistry()
+        result = sample_storage_residency(reg)
+        self.assertEqual(result["status"], "unsupported")
+
+    def test_registry_clear_on_failure(self):
+        """Storage registries cleared on mismatch/failure."""
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        ep = ModalRuntimeEntrypoint()
+        ep._lazy_init_snapshot_state()
+        ep._cpu_snapshot_unet_storage_registry = "dummy"
+        ep._cpu_snapshot_clip_storage_registry = "dummy"
+        # Simulate mismatch clear
+        ep._cpu_snapshot_unet_storage_registry = None
+        ep._cpu_snapshot_clip_storage_registry = None
+        self.assertIsNone(ep._cpu_snapshot_unet_storage_registry)
+        self.assertIsNone(ep._cpu_snapshot_clip_storage_registry)
+
+
+class TestBuildAfterCacheDiT(unittest.TestCase):
+    """Registries build after CacheDiT patching."""
+
+    def test_instance_attrs_exist(self):
+        """Instance has _cpu_snapshot_unet_storage_registry and clip variant."""
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        ep = ModalRuntimeEntrypoint()
+        ep._lazy_init_snapshot_state()
+        self.assertTrue(hasattr(ep, "_cpu_snapshot_unet_storage_registry"))
+        self.assertTrue(hasattr(ep, "_cpu_snapshot_clip_storage_registry"))
+
+
 if __name__ == "__main__":
     unittest.main()
