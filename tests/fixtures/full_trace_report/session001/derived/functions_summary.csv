@@ -1,0 +1,8 @@
+﻿source_file,function,call_count,inclusive_ms,exclusive_ms,mean_ms,median_ms,p95_ms,max_ms,thread_count,task_count,first_start_ms,last_end_ms
+None,long_async_init,1,5500.0,5500.0,5500.0,5500.0,5500.0,5500.0,1,0,500.0,6000.0
+None,clip_graph_encode,1,1200.0,1200.0,1200.0,1200.0,1200.0,1200.0,1,0,800.0,2000.0
+None,volume_reload:models,1,500.0,500.0,500.0,500.0,500.0,500.0,1,0,100.0,600.0
+None,cachedit_restore_prepare,1,300.0,300.0,300.0,300.0,300.0,300.0,1,0,4000.0,4300.0
+None,unet_gpu_activation,1,200.0,200.0,200.0,200.0,200.0,200.0,1,0,5000.0,5200.0
+None,output_encode,1,150.0,150.0,150.0,150.0,150.0,150.0,1,0,9000.0,9150.0
+None,executor_seed,1,50.0,50.0,50.0,50.0,50.0,50.0,1,0,3200.0,3250.0

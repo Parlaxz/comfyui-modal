@@ -1,0 +1,5 @@
+{"operation_type":"volume_reload:models","start_ms":100.0,"duration_ms":500.0,"pid":1,"tid":1}
+{"operation_type":"clip_graph_encode","start_ms":800.0,"duration_ms":1200.0,"pid":1,"tid":1}
+{"operation_type":"clip_prefill_encode","start_ms":2100.0,"duration_ms":300.0,"pid":1,"tid":1}
+{"operation_type":"unet_gpu_activation","start_ms":5000.0,"duration_ms":200.0,"pid":1,"tid":2}
+{"operation_type":"runtime_state_commit","start_ms":9000.0,"duration_ms":50.0,"pid":1,"tid":1}
