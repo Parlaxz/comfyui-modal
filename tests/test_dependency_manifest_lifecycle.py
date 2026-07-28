@@ -2173,3 +2173,239 @@ class TestStep0WithPersistentManifestDiagnosticFields:
         assert "full_validation_ms=0.0" in captured.out
         assert "refresh_performed=0" in captured.out
         assert "reason=manifest_identity_match" in captured.out
+
+
+# ── Test: V2 _persist_v2_dependency_manifest helper ──────────────────────
+
+
+class FakeState:
+    """Minimal stand-in for BootstrapState with custom_node_generation."""
+    def __init__(self, custom_node_generation="test_gen_v2"):
+        self.custom_node_generation = custom_node_generation
+
+
+class FakeLegacyAPI:
+    """Minimal stand-in for the legacy ComfyAPI repair-mode resolver."""
+    def __init__(self, repair_mode="fail_fast"):
+        self._repair_mode = repair_mode
+
+    def _resolve_requirements_repair_mode(self):
+        return self._repair_mode
+
+
+class FakeLegacyModule:
+    """Minimal stand-in for the comfyapp module with manifest helpers."""
+    def __init__(self, baked_mft=None, gen_record=None, volume="vol"):
+        if baked_mft is None:
+            self._baked_mft = {"overall_dependency_hash": "baked_hash_v2"}
+        else:
+            self._baked_mft = baked_mft
+        self._gen_record = gen_record
+        self._volume = volume
+        self._build_calls = []
+        self.runtime_config_vol = object() if volume else None
+
+    def load_baked_custom_node_dependency_manifest(self):
+        return self._baked_mft
+
+    def _read_custom_nodes_generation_record(self):
+        return self._gen_record
+
+    def _build_and_persist_dependency_manifest(self, **kwargs):
+        self._build_calls.append(kwargs)
+        combined_hash = kwargs.get("combined_hash", "")
+        ident = f"mft_{combined_hash[:8]}_{kwargs.get('custom_node_generation', '')[:8]}"
+        return {"identity": ident, **kwargs}
+
+
+class TestV2ManifestPersistence:
+    """_persist_v2_dependency_manifest: V2 startup manifest persistence.
+
+    Proves:
+    - Helper persists with exact inputs and commit=True.
+    - Production missing input (baked hash, deployment hash, generation,
+      volume, identity) fails closed.
+    - Dev mode does not fail closed.
+    - In-memory state fallback to persisted generation record.
+    """
+
+    @patch("comfymodal_runtime.modal_app._V2_DEPLOYMENT_COMBINED_HASH", "deploy_hash_v2_abc123")
+    def test_persists_with_exact_inputs_and_commit_true(self):
+        """Helper delegates to _build_and_persist_dependency_manifest
+        with exact inputs and commit=True."""
+        from comfymodal_runtime.modal_app import _persist_v2_dependency_manifest
+
+        state = FakeState(custom_node_generation="gen_v2_001")
+        api = FakeLegacyAPI(repair_mode="fail_fast")
+        module = FakeLegacyModule()
+
+        result = _persist_v2_dependency_manifest(state, module, api)
+
+        assert "identity" in result
+        assert result["identity"]  # non-empty
+        assert len(module._build_calls) == 1
+        call_kwargs = module._build_calls[0]
+        assert call_kwargs["combined_hash"] == "deploy_hash_v2_abc123"
+        assert call_kwargs["custom_node_fingerprint"] == {"overall_dependency_hash": "baked_hash_v2"}
+        assert call_kwargs["custom_node_generation"] == "gen_v2_001"
+        assert call_kwargs["repair_mode"] == "fail_fast"
+        assert call_kwargs["commit"] is True
+        assert call_kwargs["volume"] is module.runtime_config_vol
+
+    @patch("comfymodal_runtime.modal_app._V2_DEPLOYMENT_COMBINED_HASH", "deploy_hash")
+    def test_production_missing_baked_hash_fails(self):
+        """Production mode (fail_fast) raises RuntimeError when baked
+        manifest is missing."""
+        from comfymodal_runtime.modal_app import _persist_v2_dependency_manifest
+
+        state = FakeState(custom_node_generation="gen")
+        api = FakeLegacyAPI(repair_mode="fail_fast")
+        # Empty baked manifest
+        module = FakeLegacyModule(baked_mft={})
+
+        with pytest.raises(RuntimeError, match="baked.*manifest.*missing"):
+            _persist_v2_dependency_manifest(state, module, api)
+
+    @patch("comfymodal_runtime.modal_app._V2_DEPLOYMENT_COMBINED_HASH", "deploy_hash")
+    def test_production_missing_baked_hash_incomplete_fails(self):
+        """Production mode (fail_fast) raises when baked manifest lacks
+        overall_dependency_hash."""
+        from comfymodal_runtime.modal_app import _persist_v2_dependency_manifest
+
+        state = FakeState(custom_node_generation="gen")
+        api = FakeLegacyAPI(repair_mode="fail_fast")
+        # Baked manifest exists but lacks overall_dependency_hash
+        module = FakeLegacyModule(baked_mft={"schema_version": 2})
+
+        with pytest.raises(RuntimeError, match="baked.*manifest.*missing"):
+            _persist_v2_dependency_manifest(state, module, api)
+
+    @patch("comfymodal_runtime.modal_app._V2_DEPLOYMENT_COMBINED_HASH", "")
+    def test_production_empty_deployment_hash_fails(self):
+        """Production mode (fail_fast) raises when _V2_DEPLOYMENT_COMBINED_HASH
+        is empty."""
+        from comfymodal_runtime.modal_app import _persist_v2_dependency_manifest
+
+        state = FakeState(custom_node_generation="gen")
+        api = FakeLegacyAPI(repair_mode="fail_fast")
+        module = FakeLegacyModule()
+
+        with pytest.raises(RuntimeError, match="DEPLOYMENT_COMBINED_HASH.*empty"):
+            _persist_v2_dependency_manifest(state, module, api)
+
+    @patch("comfymodal_runtime.modal_app._V2_DEPLOYMENT_COMBINED_HASH", "deploy_hash")
+    def test_production_missing_generation_fails(self):
+        """Production mode (fail_fast) raises when custom_node_generation
+        is empty and no persisted record."""
+        from comfymodal_runtime.modal_app import _persist_v2_dependency_manifest
+
+        state = FakeState(custom_node_generation="")
+        api = FakeLegacyAPI(repair_mode="fail_fast")
+        module = FakeLegacyModule(gen_record=None)
+
+        with pytest.raises(RuntimeError, match="custom_node_generation.*empty"):
+            _persist_v2_dependency_manifest(state, module, api)
+
+    @patch("comfymodal_runtime.modal_app._V2_DEPLOYMENT_COMBINED_HASH", "deploy_hash")
+    def test_production_missing_volume_fails(self):
+        """Production mode (fail_fast) raises when runtime_config_vol is
+        not available."""
+        from comfymodal_runtime.modal_app import _persist_v2_dependency_manifest
+
+        state = FakeState(custom_node_generation="gen")
+        api = FakeLegacyAPI(repair_mode="fail_fast")
+        module = FakeLegacyModule(volume=None)
+
+        with pytest.raises(RuntimeError, match="runtime_config_vol.*not available"):
+            _persist_v2_dependency_manifest(state, module, api)
+
+    @patch("comfymodal_runtime.modal_app._V2_DEPLOYMENT_COMBINED_HASH", "deploy_hash")
+    def test_production_commit_failure_no_identity_fails(self):
+        """Production mode (fail_fast) raises when _build_and_persist_dependency_manifest
+        returns no identity (commit failure)."""
+        from comfymodal_runtime.modal_app import _persist_v2_dependency_manifest
+
+        state = FakeState(custom_node_generation="gen")
+        api = FakeLegacyAPI(repair_mode="fail_fast")
+
+        # Module that returns empty identity
+        class FailingModule:
+            def load_baked_custom_node_dependency_manifest(self):
+                return {"overall_dependency_hash": "baked"}
+            def _read_custom_nodes_generation_record(self):
+                return None
+            def _build_and_persist_dependency_manifest(self, **kwargs):
+                return {"identity": "", "error": "commit failed"}
+            runtime_config_vol = object()
+
+        module = FailingModule()
+        with pytest.raises(RuntimeError, match="no identity"):
+            _persist_v2_dependency_manifest(state, module, api)
+
+    @patch("comfymodal_runtime.modal_app._V2_DEPLOYMENT_COMBINED_HASH", "deploy_hash")
+    def test_dev_mode_does_not_fail_closed(self):
+        """Dev mode does not raise on missing baked hash or generation."""
+        from comfymodal_runtime.modal_app import _persist_v2_dependency_manifest
+
+        state = FakeState(custom_node_generation="")
+        api = FakeLegacyAPI(repair_mode="dev")
+        module = FakeLegacyModule(
+            baked_mft={},  # missing baked hash
+            gen_record={"generation": "persisted_gen", "schema_version": 1},
+        )
+
+        # Should not raise in dev mode
+        result = _persist_v2_dependency_manifest(state, module, api)
+        assert isinstance(result, dict)
+        # Dev mode still persists
+        assert len(module._build_calls) == 1
+
+    @patch("comfymodal_runtime.modal_app._V2_DEPLOYMENT_COMBINED_HASH", "deploy_hash")
+    def test_off_mode_fails_closed_like_fail_fast(self):
+        """Off mode fails closed like fail_fast."""
+        from comfymodal_runtime.modal_app import _persist_v2_dependency_manifest
+
+        state = FakeState(custom_node_generation="")
+        api = FakeLegacyAPI(repair_mode="off")
+        module = FakeLegacyModule(gen_record=None)
+
+        with pytest.raises(RuntimeError, match="custom_node_generation.*empty"):
+            _persist_v2_dependency_manifest(state, module, api)
+
+    @patch("comfymodal_runtime.modal_app._V2_DEPLOYMENT_COMBINED_HASH", "deploy_hash")
+    def test_fallback_to_persisted_generation_record(self):
+        """When state.custom_node_generation is empty, falls back to the
+        persisted generation record."""
+        from comfymodal_runtime.modal_app import _persist_v2_dependency_manifest
+
+        state = FakeState(custom_node_generation="")
+        api = FakeLegacyAPI(repair_mode="fail_fast")
+        module = FakeLegacyModule(
+            gen_record={"generation": "persisted_gen_abc", "schema_version": 1},
+        )
+
+        result = _persist_v2_dependency_manifest(state, module, api)
+        assert result["custom_node_generation"] == "persisted_gen_abc"
+        call_kwargs = module._build_calls[0]
+        assert call_kwargs["custom_node_generation"] == "persisted_gen_abc"
+
+    @patch("comfymodal_runtime.modal_app._V2_DEPLOYMENT_COMBINED_HASH", "deploy_hash")
+    def test_emits_diagnostic_on_success(self, capsys):
+        """Successful persistence emits [v2.dep_manifest] diagnostic."""
+        from comfymodal_runtime.modal_app import _persist_v2_dependency_manifest
+
+        state = FakeState(custom_node_generation="gen_diag")
+        api = FakeLegacyAPI(repair_mode="fail_fast")
+        module = FakeLegacyModule()
+
+        _persist_v2_dependency_manifest(state, module, api)
+        captured = capsys.readouterr()
+
+        assert "[v2.dep_manifest]" in captured.out
+        assert "startup build/persist done" in captured.out
+        assert "identity=" in captured.out
+        assert "combined_hash=deploy_hash" in captured.out
+        assert "cn_gen=gen_diag" in captured.out
+        assert "repair_mode=fail_fast" in captured.out
+        assert "baked_ok=1" in captured.out
+        assert "ident_ok=1" in captured.out

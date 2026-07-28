@@ -154,6 +154,102 @@ def _parse_slow_read_threshold() -> float:
 
 _SLOW_READ_THRESHOLD_MS: float = _parse_slow_read_threshold()
 
+# ── Activation diagnostics state ────────────────────────────────────
+# Three-function API: begin_activation_diagnostics(request_id) creates a
+# state dict, get_activation_diagnostics() returns it, end_activation_diagnostics(token)
+# clears it.  Keys: request_id, clip_encode_calls (list), gpu_load_calls (list),
+# model_patcher_calls (list), first_forward (dict), residency (dict).
+# No tensors/models/paths.
+
+_ACTIVATION_DIAGNOSTIC_STATE: ContextVar[dict[str, Any] | None] = ContextVar(
+    "comfymodal_activation_diagnostic_state", default=None
+)
+
+
+def begin_activation_diagnostics(
+    request_id: str,
+    *,
+    cpu_snapshot_active: bool | None = None,
+    execution_prefill_scheduled: bool | None = None,
+) -> "contextvars.Token":
+    """Create and set a fresh activation-diagnostic state dict.
+    Returns the ContextVar token for end_activation_diagnostics()."""
+    state: dict[str, Any] = {
+        "request_id": request_id,
+        "clip_encode_calls": [],
+        "gpu_load_calls": [],
+        "model_patcher_calls": [],
+        "first_forward": {},
+        "residency": {},
+    }
+    if cpu_snapshot_active is not None:
+        state["cpu_snapshot_active"] = bool(cpu_snapshot_active)
+    if execution_prefill_scheduled is not None:
+        state["execution_prefill_scheduled"] = bool(execution_prefill_scheduled)
+    return _ACTIVATION_DIAGNOSTIC_STATE.set(state)
+
+
+def get_activation_diagnostics() -> dict[str, Any] | None:
+    """Return the current activation-diagnostic state dict or None."""
+    return _ACTIVATION_DIAGNOSTIC_STATE.get()
+
+
+def end_activation_diagnostics(token: "contextvars.Token") -> dict[str, Any]:
+    """Reset the ContextVar and return the final state dict (empty dict fallback)."""
+    try:
+        state = _ACTIVATION_DIAGNOSTIC_STATE.get()
+        return state if state is not None else {}
+    finally:
+        _ACTIVATION_DIAGNOSTIC_STATE.reset(token)
+
+
+def _record_clip_encode(
+    caller: str, clip: Any, text: str, callback: Callable[[], Any],
+    *,
+    _explicit_state: dict[str, Any] | None = None,
+) -> Any:
+    """Record a CLIP encode call into activation diagnostics.
+
+    Invokes *callback* in try and records metadata in finally.
+    Emits ``clip_encode_diagnostic`` trace event.
+    When *_explicit_state* is provided (e.g. from a worker thread where
+    ContextVars do not propagate), records into that dict instead of the
+    ContextVar state.
+    """
+    start_wall = time.monotonic_ns()
+    start_thread = time.thread_time_ns() if hasattr(time, "thread_time_ns") else 0
+    start_process = time.process_time_ns() if hasattr(time, "process_time_ns") else 0
+    try:
+        result = callback()
+        return result
+    finally:
+        end_wall = time.monotonic_ns()
+        end_thread = time.thread_time_ns() if hasattr(time, "thread_time_ns") else 0
+        end_process = time.process_time_ns() if hasattr(time, "process_time_ns") else 0
+        record = {
+            "caller": caller,
+            "clip_object_id": str(id(clip)),
+            "text_hash": stable_hash(str(text))[:16],
+            "text_length": len(str(text)),
+            "start_monotonic_ns": start_wall,
+            "end_monotonic_ns": end_wall,
+            "wall_ms": round((end_wall - start_wall) / 1_000_000, 3),
+            "thread_cpu_ms": round((end_thread - start_thread) / 1_000_000, 3),
+            "process_cpu_ms": round((end_process - start_process) / 1_000_000, 3),
+        }
+        if _explicit_state is not None:
+            _explicit_state.setdefault("clip_encode_calls", []).append(record)
+            _explicit_state["clip_encode_instrumentation_attached"] = True
+        else:
+            state = _ACTIVATION_DIAGNOSTIC_STATE.get()
+            if state is not None:
+                state["clip_encode_calls"].append(record)
+                state["clip_encode_instrumentation_attached"] = True
+        request_trace = _ACTIVE_REQUEST_TRACE.get()
+        if request_trace is not None:
+            request_trace.emit("clip_encode_diagnostic", phase="execution", metadata=dict(record))
+
+
 # ── Per-worker lane context (set around worker callback) ─────────────
 
 _ACTIVE_LANE_TRACE: ContextVar["ModelLaneTrace | None"] = ContextVar(
@@ -234,6 +330,20 @@ _unet_subfn_nesting_depth: ContextVar[int] = ContextVar("_unet_subfn_nesting_dep
 
 # Accumulator for "not_observed" GPU wrapper calls (no lane/request scope).
 _not_observed_gpu_calls: int = 0
+
+# ── Residency sampler callback (request-scoped, separate from activation state) ──
+# ContextVar for a callable that _make_gpu_loader_wrapper and unet_forward_probe
+# invoke at UNET GPU load before/after and first_unet_forward respectively.
+_RESIDENCY_SAMPLER_CALLBACK: ContextVar[Any] = ContextVar(
+    "_residency_sampler_callback", default=None
+)
+
+def set_residency_sampler_callback(cb: Any) -> None:
+    """Set a callable(stage: str, trace: RuntimeTrace | None) -> None for residency sampling."""
+    _RESIDENCY_SAMPLER_CALLBACK.set(cb)
+
+def clear_residency_sampler_callback() -> None:
+    _RESIDENCY_SAMPLER_CALLBACK.set(None)
 
 # ── UNET effective-dtype resolver (shared by snapshot and normal paths) ──
 # Resolution strategy depends on context:
@@ -591,6 +701,7 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
         _gpu_depth.set(before + 1)
         _graph_start_ns = 0
         _graph_thread_start_ns = None
+        _graph_process_start_ns = None
         _caller = "not_observed"
         _wrapper_status = "installed"
         _lane_start_ns = 0
@@ -598,6 +709,8 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
         _model_identity_hash = ""
         _pf_h2d_before: _PageFaultSnapshot | None = None
         _h2d_metric_name: str = ""
+        # Activation diagnostics record (captured on outermost entry)
+        _gpu_record: dict[str, Any] | None = None
         if before == 0:
             count = _gpu_request_call_count_var.get()
             _gpu_request_call_count_var.set(count + 1)
@@ -605,6 +718,44 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
             request_trace = _ACTIVE_REQUEST_TRACE.get()
             _graph_start_ns = time.monotonic_ns()
             _graph_thread_start_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else None
+            _graph_process_start_ns = time.process_time_ns() if hasattr(time, "process_time_ns") else None
+            # Prepare activation diagnostic record.
+            _start_minflt = 0
+            _start_majflt = 0
+            try:
+                try:
+                    import resource as _r_gpu
+                    _start_ru = _r_gpu.getrusage(_r_gpu.RUSAGE_SELF)
+                    _start_minflt = _start_ru.ru_minflt
+                    _start_majflt = _start_ru.ru_majflt
+                except (ImportError, AttributeError):
+                    pass
+            except Exception:
+                pass
+            _gpu_alloc_before = None
+            _gpu_reserved_before = None
+            try:
+                import torch as _torch_gpu
+                if _torch_gpu.cuda.is_available():
+                    _gpu_alloc_before = int(_torch_gpu.cuda.memory_allocated())
+                    _gpu_reserved_before = int(_torch_gpu.cuda.memory_reserved())
+            except Exception:
+                pass
+            _gpu_record = {
+                "call_index": _gpu_request_call_count_var.get(),
+                "caller": "",
+                "model_count": len(models),
+                "model_types": [type(model).__module__ + "." + type(model).__qualname__ for model in models],
+                "model_object_ids": [str(id(model)) for model in models],
+                "contains_registered_unet": int(_has_registered_unet_in_models(models)),
+                "gpu_allocated_before": _gpu_alloc_before,
+                "gpu_reserved_before": _gpu_reserved_before,
+                "start_monotonic_ns": _graph_start_ns,
+                "_thread_start_ns": _graph_thread_start_ns,
+                "_process_start_ns": _graph_process_start_ns,
+                "_minor_faults_before": _start_minflt,
+                "_major_faults_before": _start_majflt,
+            }
             if lane is not None and lane._lane == "UNET":
                 _caller = "background_unet_preparation"
             elif lane is not None and lane._lane == "CLIP":
@@ -676,6 +827,16 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                     gpu_wrapper_status=_wrapper_status,
                     gpu_request_invocation_count=_gpu_request_call_count_var.get(),
                 )
+        # ── Residency sampler: unet_gpu_load_before (around first UNET-containing call) ──
+        _residency_sampler_fired = False
+        if before == 0 and request_trace is not None and _has_registered_unet_in_models(models):
+            _res_cb = _RESIDENCY_SAMPLER_CALLBACK.get()
+            if _res_cb is not None:
+                try:
+                    _res_cb("unet_gpu_load_before", request_trace)
+                except Exception:
+                    pass
+                _residency_sampler_fired = True
         _diag_ok = False
         try:
             _retval = original(models, memory_required=memory_required,
@@ -763,6 +924,72 @@ def _make_gpu_loader_wrapper(original: Callable[..., Any]) -> Callable[..., Any]
                                         "memory_required": memory_required,
                                     },
                                 )
+                # ── Append GPU record to activation diagnostics state ──
+                if _gpu_record is not None and _diag_ok:
+                    try:
+                        try:
+                            import resource as _r_end
+                            _has_res_end = True
+                            _end_ru = _r_end.getrusage(_r_end.RUSAGE_SELF)
+                        except ImportError:
+                            _has_res_end = False
+                            _end_ru = None
+                        _end_wall_ns = time.monotonic_ns()
+                        _end_thread_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else 0
+                        _end_process_ns = time.process_time_ns() if hasattr(time, "process_time_ns") else 0
+                        # GPU alloc/reserved after
+                        _gpu_alloc_after = None
+                        _gpu_reserved_after = None
+                        try:
+                            import torch as _torch_after
+                            if _torch_after.cuda.is_available():
+                                _gpu_alloc_after = int(_torch_after.cuda.memory_allocated())
+                                _gpu_reserved_after = int(_torch_after.cuda.memory_reserved())
+                        except Exception:
+                            pass
+                        _gpu_record["caller"] = _caller
+                        _gpu_record["end_monotonic_ns"] = _end_wall_ns
+                        _gpu_record["gpu_allocated_after"] = _gpu_alloc_after
+                        _gpu_record["gpu_reserved_after"] = _gpu_reserved_after
+                        if _end_ru is not None:
+                            _end_minflt = _end_ru.ru_minflt
+                            _end_majflt = _end_ru.ru_majflt
+                        else:
+                            _end_minflt = 0
+                            _end_majflt = 0
+                        _gpu_record["wall_ms"] = round((_end_wall_ns - _gpu_record["start_monotonic_ns"]) / 1_000_000, 3)
+                        _process_start = _gpu_record.get("_process_start_ns")
+                        _thread_start = _gpu_record.get("_thread_start_ns")
+                        _gpu_record["process_cpu_ms"] = round((_end_process_ns - _process_start) / 1_000_000, 3) if _process_start is not None else None
+                        _gpu_record["thread_cpu_ms"] = round((_end_thread_ns - _thread_start) / 1_000_000, 3) if _thread_start is not None else None
+                        _gpu_record["minor_faults"] = max(0, _end_minflt - _gpu_record.get("_minor_faults_before", 0))
+                        _gpu_record["major_faults"] = max(0, _end_majflt - _gpu_record.get("_major_faults_before", 0))
+                        _gpu_record["gpu_allocated_delta_bytes"] = (
+                            _gpu_alloc_after - _gpu_record["gpu_allocated_before"]
+                            if _gpu_alloc_after is not None and _gpu_record.get("gpu_allocated_before") is not None
+                            else None
+                        )
+                        for _k in ("_thread_start_ns", "_process_start_ns", "_minor_faults_before", "_major_faults_before"):
+                            _gpu_record.pop(_k, None)
+                        _diag_state = _ACTIVATION_DIAGNOSTIC_STATE.get()
+                        if _diag_state is not None:
+                            _diag_state["gpu_load_calls"].append(dict(_gpu_record))
+                        if request_trace is not None:
+                            request_trace.emit(
+                                "load_models_gpu_diagnostic",
+                                phase="execution",
+                                metadata=dict(_gpu_record),
+                            )
+                    except Exception:
+                        pass
+                # ── Residency sampler: unet_gpu_load_after ──
+                if _residency_sampler_fired:
+                    _res_cb_after = _RESIDENCY_SAMPLER_CALLBACK.get()
+                    if _res_cb_after is not None:
+                        try:
+                            _res_cb_after("unet_gpu_load_after", request_trace)
+                        except Exception:
+                            pass
     wrapper._comfy_modal_gpu_wrapper = True
     return wrapper
 
@@ -1451,6 +1678,392 @@ def _install_model_patcher_wrappers(trace: RuntimeTrace | None = None) -> dict[s
     return result
 
 
+# ── ModelPatcher load wrappers (idempotent, conditional on symbol presence) ──
+
+# ModelPatcher sentinels — exact names per user contract
+_SENTINEL_MODEL_PATCHER_LOAD_DIAG = "_comfy_modal_model_patcher_load_diag"
+_SENTINEL_MODEL_PATCHER_LOAD_LIST_DIAG = "_comfy_modal_model_patcher_load_list_diag"
+_SENTINEL_PATCH_WEIGHT_DIAG = "_comfy_modal_patch_weight_diag"
+_SENTINEL_CAST_TO_DEVICE_DIAG = "_comfy_modal_cast_to_device_diag"
+_SENTINEL_MP_LOAD = _SENTINEL_MODEL_PATCHER_LOAD_DIAG
+_SENTINEL_MPD_LOAD = _SENTINEL_MODEL_PATCHER_LOAD_DIAG
+_SENTINEL_LOAD_LIST = _SENTINEL_MODEL_PATCHER_LOAD_LIST_DIAG
+_SENTINEL_PTW_DEVICE = _SENTINEL_PATCH_WEIGHT_DIAG
+_SENTINEL_CTD = _SENTINEL_CAST_TO_DEVICE_DIAG
+
+# ModelPatcher scope tracking — one aggregate record per outer load
+_MODEL_PATCHER_LOAD_DEPTH: ContextVar[int] = ContextVar(
+    "comfymodal_model_patcher_load_depth", default=0
+)
+_MODEL_PATCHER_BREAKDOWN: ContextVar[dict[str, Any] | None] = ContextVar(
+    "comfymodal_model_patcher_breakdown", default=None
+)
+
+_mp_load_wrapper_installed: bool = False
+_mpd_load_wrapper_installed: bool = False
+_load_list_wrapper_installed: bool = False
+_ptw_device_wrapper_installed: bool = False
+_ctd_wrapper_installed: bool = False
+
+_MP_WRAPPER_LOCK = RLock()
+
+
+def _make_model_patcher_load_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``ModelPatcher.load`` with outermost aggregate timing.
+
+    Records ``mp_load_start/end`` on the active request trace at outermost
+    reentrancy only.  No tensor/model/path storage.  No CUDA synchronize.
+    """
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False):
+        before = getattr(wrapper, "_mp_load_depth", 0)
+        setattr(wrapper, "_mp_load_depth", before + 1)
+        request_trace = _ACTIVE_REQUEST_TRACE.get()
+        _outer = before == 0 and request_trace is not None
+        _start_ns = time.monotonic_ns() if _outer else 0
+        if _outer:
+            request_trace.emit("mp_load_start", phase="execution", metadata={
+                "model_type": type(self).__qualname__,
+            })
+        try:
+            return original(self, device_to=device_to, lowvram_model_memory=lowvram_model_memory,
+                            force_patch_weights=force_patch_weights, full_load=full_load)
+        finally:
+            after = getattr(wrapper, "_mp_load_depth", 1)
+            setattr(wrapper, "_mp_load_depth", after - 1)
+            if _outer:
+                _dur = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+                request_trace.emit("mp_load_end", phase="execution", metadata={
+                    "model_type": type(self).__qualname__,
+                    "duration_ms": _dur,
+                })
+    setattr(wrapper, "_mp_load_depth", 0)
+    setattr(wrapper, _SENTINEL_MP_LOAD, True)
+    return wrapper
+
+
+def _make_model_patcher_dynamic_load_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``ModelPatcherDynamic.load`` with outermost aggregate timing."""
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False, dirty=False):
+        before = getattr(wrapper, "_mpd_load_depth", 0)
+        setattr(wrapper, "_mpd_load_depth", before + 1)
+        request_trace = _ACTIVE_REQUEST_TRACE.get()
+        _outer = before == 0 and request_trace is not None
+        _start_ns = time.monotonic_ns() if _outer else 0
+        if _outer:
+            request_trace.emit("mpd_load_start", phase="execution", metadata={
+                "model_type": type(self).__qualname__,
+            })
+        try:
+            return original(self, device_to=device_to, lowvram_model_memory=lowvram_model_memory,
+                            force_patch_weights=force_patch_weights, full_load=full_load, dirty=dirty)
+        finally:
+            after = getattr(wrapper, "_mpd_load_depth", 1)
+            setattr(wrapper, "_mpd_load_depth", after - 1)
+            if _outer:
+                _dur = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+                request_trace.emit("mpd_load_end", phase="execution", metadata={
+                    "model_type": type(self).__qualname__,
+                    "duration_ms": _dur,
+                })
+    setattr(wrapper, "_mpd_load_depth", 0)
+    setattr(wrapper, _SENTINEL_MPD_LOAD, True)
+    return wrapper
+
+
+def _make_load_list_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``ModelPatcher._load_list`` with outermost aggregate timing."""
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(self, for_dynamic=False, default_device=None):
+        before = getattr(wrapper, "_load_list_depth", 0)
+        setattr(wrapper, "_load_list_depth", before + 1)
+        request_trace = _ACTIVE_REQUEST_TRACE.get()
+        _outer = before == 0 and request_trace is not None
+        _start_ns = time.monotonic_ns() if _outer else 0
+        if _outer:
+            request_trace.emit("load_list_start", phase="execution", metadata={
+                "for_dynamic": for_dynamic,
+            })
+        try:
+            return original(self, for_dynamic=for_dynamic, default_device=default_device)
+        finally:
+            after = getattr(wrapper, "_load_list_depth", 1)
+            setattr(wrapper, "_load_list_depth", after - 1)
+            if _outer:
+                _dur = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+                request_trace.emit("load_list_end", phase="execution", metadata={
+                    "duration_ms": _dur,
+                })
+    setattr(wrapper, "_load_list_depth", 0)
+    setattr(wrapper, _SENTINEL_LOAD_LIST, True)
+    return wrapper
+
+
+def _make_patch_weight_to_device_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``ModelPatcher.patch_weight_to_device`` with aggregate timing."""
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(self, key, device_to=None, inplace_update=False, return_weight=False, force_cast=False):
+        before = getattr(wrapper, "_ptw_depth", 0)
+        setattr(wrapper, "_ptw_depth", before + 1)
+        request_trace = _ACTIVE_REQUEST_TRACE.get()
+        _outer = before == 0 and request_trace is not None
+        _start_ns = time.monotonic_ns() if _outer else 0
+        if _outer:
+            request_trace.emit("ptw_device_start", phase="execution", metadata={
+                "key_hash": stable_hash(str(key))[:16],
+            })
+        try:
+            return original(self, key, device_to=device_to, inplace_update=inplace_update,
+                            return_weight=return_weight, force_cast=force_cast)
+        finally:
+            after = getattr(wrapper, "_ptw_depth", 1)
+            setattr(wrapper, "_ptw_depth", after - 1)
+            if _outer:
+                _dur = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+                request_trace.emit("ptw_device_end", phase="execution", metadata={
+                    "duration_ms": _dur,
+                })
+    setattr(wrapper, "_ptw_depth", 0)
+    setattr(wrapper, _SENTINEL_PTW_DEVICE, True)
+    return wrapper
+
+
+def _make_cast_to_device_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``ModelPatcher.cast_to_device`` with aggregate timing."""
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(self, device=None, dtype=None, non_blocking=False, copy=False):
+        before = getattr(wrapper, "_ctd_depth", 0)
+        setattr(wrapper, "_ctd_depth", before + 1)
+        request_trace = _ACTIVE_REQUEST_TRACE.get()
+        _outer = before == 0 and request_trace is not None
+        _start_ns = time.monotonic_ns() if _outer else 0
+        if _outer:
+            request_trace.emit("ctd_start", phase="execution", metadata={
+                "device_str": str(device),
+                "dtype_str": str(dtype),
+            })
+        try:
+            return original(self, device=device, dtype=dtype, non_blocking=non_blocking, copy=copy)
+        finally:
+            after = getattr(wrapper, "_ctd_depth", 1)
+            setattr(wrapper, "_ctd_depth", after - 1)
+            if _outer:
+                _dur = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+                request_trace.emit("ctd_end", phase="execution", metadata={
+                    "duration_ms": _dur,
+                })
+    setattr(wrapper, "_ctd_depth", 0)
+    setattr(wrapper, _SENTINEL_CTD, True)
+    return wrapper
+
+
+def _make_model_patcher_load_diagnostic_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``ModelPatcher.load`` / ``ModelPatcherDynamic.load`` with outermost
+    aggregate diagnostic timing and activation-diagnostic recording.
+
+    Uses ``_MODEL_PATCHER_LOAD_DEPTH`` ContextVar for reentrancy so the same
+    factory works for both ``ModelPatcher`` and ``ModelPatcherDynamic``.
+    Emits one ``mp_load_start`` / ``mp_load_end`` event pair on the active
+    request trace per outermost call.  Records one entry in
+    ``_ACTIVATION_DIAGNOSTIC_STATE.model_patcher_calls`` per outermost call.
+    No per-weight events.
+    """
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(self, *args, **kwargs):
+        depth = _MODEL_PATCHER_LOAD_DEPTH.get()
+        _MODEL_PATCHER_LOAD_DEPTH.set(depth + 1)
+        _outer = depth == 0
+        request_trace = _ACTIVE_REQUEST_TRACE.get()
+        _start_ns = time.monotonic_ns() if _outer else 0
+        if _outer and request_trace is not None:
+            request_trace.emit("mp_load_start", phase="execution", metadata={
+                "model_type": type(self).__qualname__,
+            })
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            _MODEL_PATCHER_LOAD_DEPTH.set(depth)
+            if _outer:
+                _dur = round((time.monotonic_ns() - _start_ns) / 1_000_000, 3)
+                if request_trace is not None:
+                    request_trace.emit("mp_load_end", phase="execution", metadata={
+                        "model_type": type(self).__qualname__,
+                        "duration_ms": _dur,
+                    })
+                # Record one aggregate entry into activation diagnostics
+                _ad_state = _ACTIVATION_DIAGNOSTIC_STATE.get()
+                if _ad_state is not None:
+                    _mp_calls: list = _ad_state.setdefault("model_patcher_calls", [])
+                    _mp_calls.append({
+                        "model_type": type(self).__qualname__,
+                        "wall_ms": _dur,
+                    })
+    setattr(wrapper, _SENTINEL_MP_LOAD, True)
+    setattr(wrapper, _SENTINEL_MPD_LOAD, True)
+    return wrapper
+
+
+def _make_breakdown_accumulator_wrapper(
+    original: Callable[..., Any], *, kind: str
+) -> Callable[..., Any]:
+    """Accumulate child ModelPatcher timing into the active outer load."""
+    import functools as _ft
+
+    @_ft.wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        breakdown = _MODEL_PATCHER_BREAKDOWN.get()
+        wall_start = time.monotonic_ns() if breakdown is not None else 0
+        process_start = (
+            time.process_time_ns()
+            if breakdown is not None and hasattr(time, "process_time_ns")
+            else None
+        )
+        try:
+            return original(*args, **kwargs)
+        finally:
+            if breakdown is not None:
+                wall_ns = max(0, time.monotonic_ns() - wall_start)
+                process_ns = (
+                    max(0, time.process_time_ns() - process_start)
+                    if process_start is not None and hasattr(time, "process_time_ns")
+                    else 0
+                )
+                if kind == "load_list":
+                    breakdown["load_list_wall_ns"] += wall_ns
+                    breakdown["load_list_process_ns"] += process_ns
+                elif kind == "patch_weight":
+                    breakdown["patch_weight_count"] += 1
+                    breakdown["patch_weight_wall_ns"] += wall_ns
+                    breakdown["patch_weight_process_ns"] += process_ns
+                elif kind == "cast":
+                    breakdown["cast_count"] += 1
+                    breakdown["cast_wall_ns"] += wall_ns
+                    breakdown["cast_process_ns"] += process_ns
+
+    sentinel = {
+        "load_list": _SENTINEL_MODEL_PATCHER_LOAD_LIST_DIAG,
+        "patch_weight": _SENTINEL_PATCH_WEIGHT_DIAG,
+        "cast": _SENTINEL_CAST_TO_DEVICE_DIAG,
+    }.get(kind)
+    if sentinel is not None:
+        setattr(wrapper, sentinel, True)
+    return wrapper
+
+
+def _install_mp_load_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
+    """Install wrappers on ModelPatcher.load / ModelPatcherDynamic.load / etc.
+
+    Conditionally wraps each symbol if present in the live module.
+    Idempotent via sentinel flags.  Returns ``{component: status}``.
+    """
+    global _mp_load_wrapper_installed, _mpd_load_wrapper_installed
+    global _load_list_wrapper_installed, _ptw_device_wrapper_installed
+    global _ctd_wrapper_installed
+
+    result: dict[str, str] = {}
+    if all((_mp_load_wrapper_installed, _mpd_load_wrapper_installed,
+            _load_list_wrapper_installed, _ptw_device_wrapper_installed,
+            _ctd_wrapper_installed)):
+        return result
+
+    mp_mod = _get_live_module("comfy.model_patcher")
+    if mp_mod is None:
+        return {"ModelPatcher.load": "unavailable"}
+
+    # ── ModelPatcher.load ──
+    MP_cls = getattr(mp_mod, "ModelPatcher", None)
+    if MP_cls is not None and not _mp_load_wrapper_installed:
+        _orig = getattr(MP_cls, "load", None)
+        if callable(_orig) and not getattr(_orig, _SENTINEL_MP_LOAD, False):
+            setattr(MP_cls, "load", _make_model_patcher_load_diagnostic_wrapper(_orig))
+            _mp_load_wrapper_installed = True
+            result["ModelPatcher.load"] = "installed"
+        else:
+            status = "already_installed" if _orig else "unavailable"
+            result["ModelPatcher.load"] = status
+    elif MP_cls is not None:
+        result["ModelPatcher.load"] = "already_installed"
+
+    # ── ModelPatcherDynamic.load (conditionally present) ──
+    MPD_cls = getattr(mp_mod, "ModelPatcherDynamic", None)
+    if MPD_cls is not None and not _mpd_load_wrapper_installed:
+        _orig = getattr(MPD_cls, "load", None)
+        if callable(_orig) and not getattr(_orig, _SENTINEL_MPD_LOAD, False):
+            setattr(MPD_cls, "load", _make_model_patcher_load_diagnostic_wrapper(_orig))
+            _mpd_load_wrapper_installed = True
+            result["ModelPatcherDynamic.load"] = "installed"
+        else:
+            result["ModelPatcherDynamic.load"] = "already_installed" if _orig else "unavailable"
+    elif MPD_cls is not None:
+        result["ModelPatcherDynamic.load"] = "already_installed"
+    else:
+        result["ModelPatcherDynamic.load"] = "absent"
+        _mpd_load_wrapper_installed = True  # don't retry absent symbol
+
+    # ── _load_list (present on ModelPatcher) ──
+    if MP_cls is not None and not _load_list_wrapper_installed:
+        _orig = getattr(MP_cls, "_load_list", None)
+        if callable(_orig) and not getattr(_orig, _SENTINEL_LOAD_LIST, False):
+            setattr(MP_cls, "_load_list", _make_breakdown_accumulator_wrapper(_orig, kind="load_list"))
+            _load_list_wrapper_installed = True
+            result["_load_list"] = "installed"
+        else:
+            result["_load_list"] = "already_installed" if _orig else "unavailable"
+    elif MP_cls is not None:
+        result["_load_list"] = "already_installed"
+
+    # ── patch_weight_to_device ──
+    if MP_cls is not None and not _ptw_device_wrapper_installed:
+        _orig = getattr(MP_cls, "patch_weight_to_device", None)
+        if callable(_orig) and not getattr(_orig, _SENTINEL_PTW_DEVICE, False):
+            setattr(MP_cls, "patch_weight_to_device", _make_breakdown_accumulator_wrapper(_orig, kind="patch_weight"))
+            _ptw_device_wrapper_installed = True
+            result["patch_weight_to_device"] = "installed"
+        else:
+            result["patch_weight_to_device"] = "already_installed" if _orig else "unavailable"
+    elif MP_cls is not None:
+        result["patch_weight_to_device"] = "already_installed"
+
+    # ── comfy.model_management.cast_to_device ──
+    mm_mod = _get_live_module("comfy.model_management")
+    if mm_mod is not None and not _ctd_wrapper_installed:
+        _orig = getattr(mm_mod, "cast_to_device", None)
+        if callable(_orig) and not getattr(_orig, _SENTINEL_CTD, False):
+            setattr(mm_mod, "cast_to_device", _make_breakdown_accumulator_wrapper(_orig, kind="cast"))
+            _ctd_wrapper_installed = True
+            result["cast_to_device"] = "installed"
+        else:
+            result["cast_to_device"] = "already_installed" if _orig else "unavailable"
+    elif mm_mod is not None:
+        result["cast_to_device"] = "already_installed"
+
+    if trace:
+        for comp, status in result.items():
+            trace.emit("mp_load_wrapper_install", phase="restore",
+                       metadata={"component": comp, "status": status})
+    return result
+
+
+# ── (removed) CPU storage registry ──────────────────────────────────
+# The _build_cpu_storage_registry / _sample_cpu_storage_mincore /
+# _CPU_STORAGE_REGISTRY globals were noncompliant and have been removed.
+# Use cpu_snapshot_models.py StorageRegistry / sample_storage_residency
+# for identical-ranged page-residency sampling.
+
+
 def _install_clip_load_sd_wrapper(sd_mod, trace=None):
     """Install CLIP.load_sd wrapper on live comfy.sd.CLIP class.
 
@@ -1744,6 +2357,11 @@ def _ensure_core_wrappers(trace: RuntimeTrace | None = None) -> dict[str, str]:
                     "status": status,
                 },
             )
+
+    # Install ModelPatcher load wrappers (ModelPatcher.load, _load_list, patch_weight_to_device, cast_to_device).
+    _mp_load_result = _install_mp_load_wrappers(trace=trace)
+    for comp, status in _mp_load_result.items():
+        result[f"mp_load.{comp}"] = status
 
     # Install NextDiT forward pre-hook for forward-probe diagnostics.
     result["nextdit_forward_pre_hook"] = "installed" if install_nextdit_forward_pre_hook() else "unavailable"
@@ -4706,7 +5324,13 @@ class V2LoaderBridge:
             return {}
         return self.coordinator.diagnostics(self._preparation)
 
-    def schedule_execution_prefill(self, *, trace: RuntimeTrace | None = None) -> bool:
+    def schedule_execution_prefill(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+        request_id: str = "",
+        activation_diagnostic_state: dict[str, Any] | None = None,
+    ) -> bool:
         """Schedule execution-phase CLIP prefill single-flight.
 
         Called after ``graph_execution_start`` in ``_run_in_process``.
@@ -4789,6 +5413,17 @@ class V2LoaderBridge:
                                  "wait_for_unet": wait_for_unet,
                                  "unet_future_exists": prep.unet_future is not None})
 
+        _request_id = str(
+            request_id
+            or (trace.request_id if trace is not None else "")
+        )
+        _worker_state = activation_diagnostic_state
+        if _worker_state is None:
+            _worker_state = {
+                "request_id": _request_id,
+                "clip_encode_calls": [],
+            }
+
         def _execution_prefill() -> dict[tuple[int, str], Any] | None:
             """Internal prefill callback — runs in coordinator's worker pool.
 
@@ -4859,13 +5494,19 @@ class V2LoaderBridge:
                                    "unet_resolved": not unet_skipped and not unet_pending,
                                })
 
-            # Encode eligible entries using original CLIPTextEncode
+            # Encode eligible entries using original CLIPTextEncode. The
+            # request-owned state is explicitly captured because ContextVars
+            # do not propagate to the coordinator's thread pool.
             results: dict[tuple[int, str], Any] = {}
             for entry in filtered:
                 text = str(entry.get("text", ""))
                 try:
-                    result = self._invoke_original(
-                        "CLIPTextEncode", {"clip": clip, "text": text}
+                    result = _record_clip_encode(
+                        caller="execution_prefill", clip=clip, text=text,
+                        _explicit_state=_worker_state,
+                        callback=lambda c=clip, t=text: self._invoke_original(
+                            "CLIPTextEncode", {"clip": c, "text": t}
+                        ),
                     )
                     results[(id(clip), text)] = result
                 except Exception as exc:
@@ -4874,7 +5515,6 @@ class V2LoaderBridge:
                                    phase="execution",
                                    metadata={"error": str(exc)[:200],
                                              "text_length": len(text)})
-
             # Store results for graph consumption
             with self._prefill_lock:
                 self._prefill_results.update(results)
@@ -5140,6 +5780,25 @@ class V2LoaderBridge:
                     if result is not _LOADER_MISS:
                         return result
                 return original(node, *args, **kwargs)
+        elif class_name == "CLIPTextEncode":
+            def wrapped(node: Any, *args: Any, **kwargs: Any) -> Any:
+                active = current_v2_loader_bridge()
+                if active is not None:
+                    _diag_state = _ACTIVATION_DIAGNOSTIC_STATE.get()
+                    if _diag_state is not None:
+                        _diag_state["clip_encode_instrumentation_attached"] = True
+                    result = active._consume_prefill(args, kwargs)
+                    if result is not _LOADER_MISS:
+                        return result
+                # Graph fallback: instrument with caller='graph'
+                _clip = kwargs.get("clip", args[0] if args else None)
+                _text = str(kwargs.get("text", args[1] if len(args) > 1 else ""))
+                if _clip is not None and _text:
+                    return _record_clip_encode(
+                        caller="graph", clip=_clip, text=_text,
+                        callback=lambda: original(node, *args, **kwargs),
+                    )
+                return original(node, *args, **kwargs)
         else:
             def wrapped(node: Any, *args: Any, **kwargs: Any) -> Any:
                 active = current_v2_loader_bridge()
@@ -5341,9 +6000,11 @@ class V2LoaderBridge:
         )
         for entry in filtered:
             text = str(entry.get("text", ""))
-            result = self._invoke_original(
-                "CLIPTextEncode",
-                {"clip": clip, "text": text},
+            result = _record_clip_encode(
+                caller="execution_prefill", clip=clip, text=text,
+                callback=lambda c=clip, t=text: self._invoke_original(
+                    "CLIPTextEncode", {"clip": c, "text": t}
+                ),
             )
             results[(id(clip), text)] = result
         if self._preparation is not None:

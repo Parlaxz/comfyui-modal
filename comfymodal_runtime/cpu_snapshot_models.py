@@ -66,6 +66,217 @@ class CpuSnapshotModels:
 
 
 # ---------------------------------------------------------------------------
+# CPU storage registry (deduplicated, mincore-based residency sampling)
+# ---------------------------------------------------------------------------
+# Uses ctypes mincore syscall on Linux to report pages resident in RAM.
+# Unsupported/error-safe: returns empty result on non-Linux or failure.
+
+
+@dataclass(frozen=True)
+class StorageRange:
+    """A page-aligned byte range for one storage object."""
+    address: int    # page-aligned start address
+    length: int     # total bytes (may span multiple pages)
+
+
+@dataclass
+class StorageRegistry:
+    """Deduplicated registry of CPU storage ranges for one model.
+
+    ``ranges`` — tuple of ``StorageRange`` for each unique storage object.
+    ``total_bytes`` — sum of ``length`` across all ranges.
+    Registry stores underlying unaligned storage data pointer + exact byte length,
+    deduplicating by storage identity and byte range, merging identical ranges.
+    """
+    ranges: tuple[StorageRange, ...] = ()
+    total_bytes: int = 0
+
+
+def _resolve_inner_model(model: Any) -> Any:
+    """Resolve the inner torch.nn.Module from a ModelPatcher wrapper or raw model.
+
+    Inspects ``model.model.diffusion_model`` (ModelPatcher pattern),
+    ``model.model`` (wrapper pattern), then falls back to ``model`` directly.
+    Does NOT mutate or import.
+    """
+    _inner = getattr(model, "model", None)
+    if _inner is not None:
+        _dm = getattr(_inner, "diffusion_model", None)
+        if _dm is not None:
+            return _dm
+        return _inner
+    if hasattr(model, "diffusion_model"):
+        return model.diffusion_model
+    return model
+
+
+def build_unique_storage_registry(model: Any) -> StorageRegistry:
+    """Build a deduplicated ``StorageRegistry`` from *model* parameters and buffers.
+
+    Iterates all parameters/buffers using existing UNET/CLIP helpers,
+    reads ``untyped_storage().data_ptr()`` and ``nbytes()`` (fallback to
+    ``storage().data_ptr()`` / ``numel() * element_size()``).
+    Deduplicates by storage identity (``id(storage)``) and identical
+    byte ranges.  CPU-only, non-meta, nonzero usable tensors only.
+    No reads/copy/contiguous/cpu/numpy.  Resolves model modules via
+    existing UNET/CLIP helpers before parameters/buffers.
+    Catches per tensor, not whole enumeration.
+    Returns ``StorageRegistry`` with page-aligned ``StorageRange`` entries.
+    """
+    import torch as _torch
+    # Resolve inner module via helper before accessing parameters/buffers
+    _inner = _resolve_inner_model(model)
+    _ranges: list[StorageRange] = []
+    _total_bytes: int = 0
+    seen_ids: set[int] = set()
+    seen_ranges: set[tuple[int, int]] = set()
+
+    # Iterate parameters (per-tensor try/except)
+    for _p in _inner.parameters():
+        try:
+            if _p.device.type != "cpu" or _p.is_meta or _p.numel() == 0:
+                continue
+            _st = _p.untyped_storage() if hasattr(_p, "untyped_storage") else _p.storage()
+            _sid = id(_st)
+            if _sid in seen_ids:
+                continue
+            seen_ids.add(_sid)
+            _ptr = _st.data_ptr()
+            _nbytes = _st.nbytes() if hasattr(_st, "nbytes") else _p.numel() * _p.element_size()
+            if _nbytes <= 0:
+                continue
+            _key = (_ptr, _nbytes)
+            if _key in seen_ranges:
+                continue
+            seen_ranges.add(_key)
+            _ranges.append(StorageRange(address=_ptr, length=_nbytes))
+            _total_bytes += _nbytes
+        except Exception:
+            continue
+
+    # Iterate buffers (per-tensor try/except)
+    for _b in _inner.buffers():
+        try:
+            if _b.device.type != "cpu" or _b.is_meta or _b.numel() == 0:
+                continue
+            _st = _b.untyped_storage() if hasattr(_b, "untyped_storage") else _b.storage()
+            _sid = id(_st)
+            if _sid in seen_ids:
+                continue
+            seen_ids.add(_sid)
+            _ptr = _st.data_ptr()
+            _nbytes = _st.nbytes() if hasattr(_st, "nbytes") else _b.numel() * _b.element_size()
+            if _nbytes <= 0:
+                continue
+            _key = (_ptr, _nbytes)
+            if _key in seen_ranges:
+                continue
+            seen_ranges.add(_key)
+            _ranges.append(StorageRange(address=_ptr, length=_nbytes))
+            _total_bytes += _nbytes
+        except Exception:
+            continue
+
+    return StorageRegistry(ranges=tuple(_ranges), total_bytes=_total_bytes)
+
+
+def sample_storage_residency(registry: StorageRegistry) -> dict[str, Any]:
+    """Sample Linux mincore for all ranges in *registry*.
+
+    Uses ``ctypes`` ``mincore()`` syscall.  Returns a dict with exact keys:
+      status, storage_count, total_bytes, total_pages, resident_pages,
+      resident_bytes, resident_percent, duration_ms.
+
+    Non-posix or unavailable mincore => status="unsupported".
+    Syscall/pointer errors => status="error" (not "unsupported").
+    Do not return invented zero for unsupported/error (None acceptable).
+    No reads/copies.
+    """
+    _start_mono = time.monotonic_ns()
+    import os as _os
+    if _os.name != "posix":
+        return {
+            "status": "unsupported",
+            "storage_count": len(registry.ranges),
+            "total_bytes": registry.total_bytes,
+            "total_pages": None,
+            "resident_pages": None,
+            "resident_bytes": None,
+            "resident_percent": None,
+            "duration_ms": round((time.monotonic_ns() - _start_mono) / 1_000_000, 3),
+        }
+    try:
+        import ctypes as _ctypes
+        _libc = _ctypes.CDLL("libc.so.6", use_errno=True)
+        _mincore_fn = _libc.mincore
+        _mincore_fn.argtypes = [_ctypes.c_void_p, _ctypes.c_size_t, _ctypes.POINTER(_ctypes.c_ubyte)]
+        _mincore_fn.restype = _ctypes.c_int
+
+        page_size = _os.sysconf("SC_PAGE_SIZE")
+        if page_size <= 0:
+            page_size = 4096
+
+        total_pages = 0
+        resident_pages = 0
+        storage_count = 0
+
+        for _range in registry.ranges:
+            # Sample aligns down/start and up/end for mincore
+            _start_aligned = _range.address & ~(page_size - 1)
+            _end = _range.address + _range.length
+            _end_aligned = (_end + page_size - 1) & ~(page_size - 1)
+            _aligned_length = _end_aligned - _start_aligned
+            n_pages = _aligned_length // page_size
+            if n_pages <= 0:
+                continue
+            vec = (_ctypes.c_ubyte * n_pages)()
+            _ret = _mincore_fn(
+                _ctypes.c_void_p(_start_aligned),
+                _ctypes.c_size_t(_aligned_length),
+                vec,
+            )
+            if _ret == 0:
+                storage_count += 1
+                total_pages += n_pages
+                resident_pages += sum(1 for b in vec if b & 0x01)
+            elif _ret != 0:
+                # syscall error -> return error status
+                return {
+                    "status": "error",
+                    "storage_count": len(registry.ranges),
+                    "total_bytes": registry.total_bytes,
+                    "total_pages": None,
+                    "resident_pages": None,
+                    "resident_bytes": None,
+                    "resident_percent": None,
+                    "duration_ms": round((time.monotonic_ns() - _start_mono) / 1_000_000, 3),
+                }
+
+        _resident_percent = round(resident_pages / total_pages * 100, 2) if total_pages > 0 else 0.0
+        return {
+            "status": "ok",
+            "storage_count": storage_count,
+            "total_bytes": registry.total_bytes,
+            "total_pages": total_pages,
+            "resident_pages": resident_pages,
+            "resident_bytes": resident_pages * page_size,
+            "resident_percent": _resident_percent,
+            "duration_ms": round((time.monotonic_ns() - _start_mono) / 1_000_000, 3),
+        }
+    except Exception:
+        return {
+            "status": "error",
+            "storage_count": len(registry.ranges),
+            "total_bytes": registry.total_bytes,
+            "total_pages": None,
+            "resident_pages": None,
+            "resident_bytes": None,
+            "resident_percent": None,
+            "duration_ms": round((time.monotonic_ns() - _start_mono) / 1_000_000, 3),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 

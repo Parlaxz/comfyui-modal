@@ -18,10 +18,11 @@ import copy
 from types import MappingProxyType
 
 import dataclasses
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, ContextManager, Mapping, cast
+from typing import Any, AsyncIterator, Callable, ContextManager, Iterator, Mapping, cast
 
 from gpu_catalog import parse_gpu_request, normalize_gpu_value, GPU_CATALOG, GPU_BY_VALUE
 
@@ -40,6 +41,7 @@ from .model_preload import (
     V2LoaderBridge,
     RestorePreparation,
     _collect_restore_events_for_summary,
+    _PREFILL_LANE_MODE,
     get_restore_return_marker,
     gpu_not_observed_summary,
     request_execution_trace_scope,
@@ -48,6 +50,11 @@ from .model_preload import (
     set_restore_return_marker,
     _capture_host_info,
     _DIAGNOSTIC_FLAG as _MP_DIAGNOSTIC_FLAG,
+    begin_activation_diagnostics,
+    end_activation_diagnostics,
+    get_activation_diagnostics,
+    set_residency_sampler_callback,
+    clear_residency_sampler_callback,
 )
 from .cpu_snapshot_models import (
     CpuSnapshotModels,
@@ -59,6 +66,9 @@ from .cpu_snapshot_models import (
     validate_snapshot_unet_bf16_native,
     retarget_cpu_snapshot_models,
     _COMPUTE_POLICY_BF16_NATIVE,
+    StorageRegistry,
+    build_unique_storage_registry,
+    sample_storage_residency,
 )
 from .unet_forward_probe import (
     register_unet_forward_probe,
@@ -270,6 +280,19 @@ _CACHEDIT_PREPARED: dict[str, dict[str, Any]] = {}
 # execution and reset in finally.  Read by the RES4LYF hook to avoid
 # passing undeclared kwargs through the graph node interface.
 _V2_WORKFLOW_HASH: ContextVar[str] = ContextVar("_v2_workflow_hash", default="")
+
+# ── Residency diagnostics gate (default-off) ─────────────────────────
+# When False, _sample_snapshot_residency and all UNET/CLIP storage
+# registries are disabled; no [v2.snapshot_residency] lines are printed.
+# Set COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS=1 to enable.
+_RESIDENCY_DIAGNOSTICS_ENABLED: bool = (
+    os.environ.get("COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS", "0") == "1"
+)
+
+# ── Activation diagnostics ContextVar ─────────────────────────────────
+# Activation diagnostics use _ACTIVATION_DIAGNOSTIC_STATE from model_preload.
+# begin_activation_diagnostics(request_id)/get_activation_diagnostics()/
+# end_activation_diagnostics(token) control the scope.
 
 # Import SAMPLER_SAMPLE wrapper from runtime_executor (neutral module).
 from comfymodal_runtime.runtime_executor import _COMFYMODAL_V2_SAMPLING_WRAPPER, _sampler_wrapper_dedup, _sampler_wrapper_dedup_lock
@@ -1853,6 +1876,790 @@ def _detect_gpu_allocation(requested_gpu_order: tuple[str, ...]) -> dict[str, An
     return info
 
 
+# ── Cgroup CPU recorder (restore-spanning sampler) ────────────────────
+# Ported from commit 433341b9, preserving sample interval + resolution
+# helpers.  One-shot first CUDA record without synchronize.
+
+def _resolve_cgroup_cpu_stat_path() -> tuple[str | None, list[str], list[str]]:
+    """Resolve a readable cpu.stat path using CPU-specific probing.
+
+    Probes in order:
+      1. ``_resolve_cgroup_v2_base()[0]/cpu.stat`` when the resolver returns a base.
+      2. ``/sys/fs/cgroup/cpu.stat``
+      3. Parse the unified ``0::...`` line from ``/proc/self/cgroup``, join the
+         relative path below ``/sys/fs/cgroup``, and probe its ``cpu.stat``.
+
+    Returns ``(path, candidates, errors)`` where *path* is the first readable
+    absolute path or ``None``, *candidates* lists every attempted path, and
+    *errors* lists per-probe diagnostic messages with exception type+message.
+    """
+    candidates: list[str] = []
+    errors: list[str] = []
+
+    def _probe(path: str, label: str) -> str | None:
+        if path in candidates:
+            return None
+        candidates.append(path)
+        try:
+            with open(path) as _f:
+                _f.read(1)
+        except Exception as exc:
+            errors.append(f"{label} path={path}: {type(exc).__name__}: {exc}")
+            return None
+        return path
+
+    try:
+        base = _resolve_cgroup_v2_base()
+    except Exception as exc:
+        errors.append(f"resolve_cgroup_v2_base: {type(exc).__name__}: {exc}")
+        base = None
+    if base is None:
+        errors.append("resolve_cgroup_v2_base: returned no readable cgroup base")
+    else:
+        path = _probe(posixpath.join(base[0], "cpu.stat"), "probe1")
+        if path is not None:
+            return path, candidates, errors
+
+    path = _probe("/sys/fs/cgroup/cpu.stat", "probe2")
+    if path is not None:
+        return path, candidates, errors
+
+    _cgroup_rel: str | None = None
+    try:
+        with open("/proc/self/cgroup") as _f:
+            for _line in _f:
+                _stripped = _line.strip()
+                if _stripped.startswith("0::"):
+                    _cgroup_rel = _stripped[3:]
+                    break
+    except Exception as exc:
+        errors.append(f"parse_proc_cgroup: {type(exc).__name__}: {exc}")
+    if _cgroup_rel is None:
+        errors.append("parse_proc_cgroup: no unified 0:: entry")
+    else:
+        _rel = _cgroup_rel if _cgroup_rel.startswith("/") else f"/{_cgroup_rel}"
+        _components = [component for component in _rel.split("/") if component]
+        if any(component in {".", ".."} for component in _components):
+            errors.append(f"parse_proc_cgroup: unsafe unified path {_cgroup_rel!r}")
+        else:
+            path = _probe(
+                posixpath.join("/sys/fs/cgroup", *_components, "cpu.stat"),
+                "probe3",
+            )
+            if path is not None:
+                return path, candidates, errors
+    return None, candidates, errors
+
+
+def _read_cgroup_cpu_usage_usec(cpu_stat_path: str) -> int | None:
+    """Read ``usage_usec`` from an already-resolved ``cpu.stat`` file."""
+    with open(cpu_stat_path) as cpu_stat:
+        for line in cpu_stat:
+            key, _, value = line.partition(" ")
+            if key == "usage_usec":
+                usage = int(value.strip())
+                return usage if usage >= 0 else None
+    return None
+
+
+def _emit_cgroup_spike_summary(peak: float, intervals: list[dict[str, Any]]) -> None:
+    parts = [
+        f"peak_effective_cores={peak:.3f}",
+        f"interval_count={len(intervals)}",
+    ]
+    for index, interval in enumerate(intervals):
+        parts.extend((
+            f"i{index}_start_unix_ns={interval['start_unix_ns']}",
+            f"i{index}_end_unix_ns={interval['end_unix_ns']}",
+            f"i{index}_start_elapsed_ms={interval['start_elapsed_ms']:.3f}",
+            f"i{index}_end_elapsed_ms={interval['end_elapsed_ms']:.3f}",
+            f"i{index}_duration_ms={interval['duration_ms']:.3f}",
+            f"i{index}_mean_effective_cores={interval['mean_effective_cores']:.3f}",
+            f"i{index}_peak_effective_cores={interval['peak_effective_cores']:.3f}",
+            f"i{index}_phase={interval['phase']}",
+        ))
+    print(f"[v2.cgroup_cpu_spike] {' '.join(parts)}", flush=True)
+
+
+def _emit_cgroup_cpu_unavailable(reason: str, candidates: list[str], errors: list[str]) -> None:
+    candidate_text = ";".join(candidates) or "none"
+    error_text = ";".join(errors) or "none"
+    print(
+        f"[v2.cgroup_cpu_spike] status=unavailable "
+        f"reason={reason} candidates={candidate_text} errors={error_text}",
+        flush=True,
+    )
+
+
+class _CgroupCpuSample:
+    __slots__ = ("timestamp_unix_ns", "elapsed_request_ms", "effective_cgroup_cores", "phase")
+    def __init__(self, timestamp_unix_ns: int, elapsed_request_ms: float,
+                 effective_cgroup_cores: float, phase: str) -> None:
+        self.timestamp_unix_ns = timestamp_unix_ns
+        self.elapsed_request_ms = elapsed_request_ms
+        self.effective_cgroup_cores = effective_cgroup_cores
+        self.phase = phase
+
+
+class _CgroupCpuSampler:
+    _INTERVAL_SECONDS = 0.050
+
+    def __init__(self, method_entry_mono_ns: int) -> None:
+        self._method_entry_mono_ns = method_entry_mono_ns
+        self._samples: list[_CgroupCpuSample] = []
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._phase = "method"
+        self._phase_source: Callable[[], str] | None = None
+        self._cpu_stat_path, self._resolution_candidates, self._resolution_errors = _resolve_cgroup_cpu_stat_path()
+        self._resolution_failure = "no readable cpu.stat" if self._cpu_stat_path is None else None
+        self._failure_reason: str | None = None
+        self._prev_usage_usec: int | None = None
+        self._prev_mono_ns: int | None = None
+
+    def start(self) -> None:
+        if not self._cpu_stat_path or self._thread is not None:
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        self._sample()
+        while not self._stop_event.wait(self._INTERVAL_SECONDS):
+            self._sample()
+
+    def _current_phase(self) -> str:
+        source = self._phase_source
+        if source is not None:
+            try:
+                phase = source()
+                if phase:
+                    return str(phase)
+            except Exception:
+                pass
+        return self._phase
+
+    def _sample(self) -> None:
+        if not self._cpu_stat_path:
+            return
+        try:
+            usage_usec = _read_cgroup_cpu_usage_usec(self._cpu_stat_path)
+        except Exception as exc:
+            self._failure_reason = f"read_error: {type(exc).__name__}: {exc}"
+            return
+        if usage_usec is None:
+            self._failure_reason = f"read_error: {self._cpu_stat_path}: missing usage_usec"
+            return
+        now_mono_ns = time.monotonic_ns()
+        now_unix_ns = time.time_ns()
+        with self._lock:
+            if self._prev_usage_usec is None or self._prev_mono_ns is None:
+                effective_cores = 0.0
+            else:
+                delta_usage_usec = usage_usec - self._prev_usage_usec
+                delta_wall_usec = (now_mono_ns - self._prev_mono_ns) / 1_000.0
+                effective_cores = max(0.0, delta_usage_usec / delta_wall_usec) if delta_wall_usec > 0.0 else 0.0
+            self._samples.append(_CgroupCpuSample(
+                timestamp_unix_ns=now_unix_ns,
+                elapsed_request_ms=round((now_mono_ns - self._method_entry_mono_ns) / 1_000_000.0, 3),
+                effective_cgroup_cores=round(effective_cores, 3),
+                phase=self._current_phase(),
+            ))
+            self._prev_usage_usec = usage_usec
+            self._prev_mono_ns = now_mono_ns
+
+    def set_phase_source(self, source: Callable[[], str]) -> None:
+        self._phase_source = source
+
+    def set_phase(self, phase: str) -> None:
+        self._phase = phase
+
+    def report(self) -> None:
+        samples = self._snapshot()
+        if not samples:
+            reason_parts: list[str] = []
+            if self._resolution_failure:
+                reason_parts.append(self._resolution_failure)
+            if self._failure_reason:
+                reason_parts.append(self._failure_reason)
+            if not reason_parts:
+                reason_parts.append("zero_samples")
+            _emit_cgroup_cpu_unavailable(
+                reason=" | ".join(reason_parts),
+                candidates=self._resolution_candidates,
+                errors=self._resolution_errors + ([self._failure_reason] if self._failure_reason else []),
+            )
+            return
+        _emit_cgroup_spike_summary(self.compute_peak_cores(), self.compute_spike_intervals())
+
+    def stop(self) -> None:
+        thread = self._thread
+        if thread is None:
+            return
+        self._stop_event.set()
+        thread.join()
+        self._thread = None
+        self._sample()
+
+    def _snapshot(self) -> list[_CgroupCpuSample]:
+        with self._lock:
+            return list(self._samples)
+
+    def compute_peak_cores(self) -> float:
+        samples = self._snapshot()
+        return max((s.effective_cgroup_cores for s in samples), default=0.0)
+
+    def compute_spike_intervals(self, threshold: float = 12.0) -> list[dict[str, Any]]:
+        samples = self._snapshot()
+        intervals: list[dict[str, Any]] = []
+        current: list[tuple[_CgroupCpuSample, _CgroupCpuSample]] = []
+        previous_index = -2
+        current_phase = ""
+        for index in range(1, len(samples)):
+            previous = samples[index - 1]
+            sample = samples[index]
+            if sample.effective_cgroup_cores <= threshold:
+                if current:
+                    intervals.append(_summarize_cgroup_interval(current))
+                    current = []
+                previous_index = -2
+                current_phase = ""
+                continue
+            if current and (index != previous_index + 1 or sample.phase != current_phase):
+                intervals.append(_summarize_cgroup_interval(current))
+                current = []
+            current.append((previous, sample))
+            previous_index = index
+            current_phase = sample.phase
+        if current:
+            intervals.append(_summarize_cgroup_interval(current))
+        return intervals
+
+    def activation_summary(self, diagnostics: Mapping[str, Any]) -> dict[str, Any]:
+        samples = self._snapshot()
+        if len(samples) < 2:
+            return {
+                "peak_effective_cores": None,
+                "duration_above_8_cores_ms": None,
+                "duration_above_16_cores_ms": None,
+                "duration_above_19_cores_ms": None,
+                "longest_above_19_plateau_ms": None,
+                "plateau_start_relative_ms": None,
+                "plateau_end_relative_ms": None,
+                "overlap_clip_encode_ms": None,
+                "overlap_load_models_gpu_ms": None,
+                "overlap_model_patcher_ms": None,
+                "overlap_first_forward_ms": None,
+            }
+
+        def _intervals(threshold: float) -> list[tuple[float, float]]:
+            result: list[tuple[float, float]] = []
+            start: float | None = None
+            end: float | None = None
+            for index in range(1, len(samples)):
+                previous = samples[index - 1]
+                current = samples[index]
+                if current.effective_cgroup_cores > threshold:
+                    if start is None:
+                        start = previous.elapsed_request_ms
+                    end = current.elapsed_request_ms
+                elif start is not None and end is not None:
+                    result.append((start, end))
+                    start = None
+                    end = None
+            if start is not None and end is not None:
+                result.append((start, end))
+            return result
+
+        def _duration(values: list[tuple[float, float]]) -> float:
+            return round(sum(max(0.0, end - start) for start, end in values), 3)
+
+        above_8 = _intervals(8.0)
+        above_16 = _intervals(16.0)
+        above_19 = _intervals(19.0)
+        longest = max(above_19, key=lambda value: value[1] - value[0], default=None)
+
+        def _record_interval(record: Any) -> tuple[float, float] | None:
+            if not isinstance(record, Mapping):
+                return None
+            start_ns = record.get("start_monotonic_ns", record.get("enter_monotonic_ns"))
+            end_ns = record.get("end_monotonic_ns", record.get("exit_monotonic_ns"))
+            if not isinstance(start_ns, int) or not isinstance(end_ns, int) or end_ns <= start_ns:
+                return None
+            return (
+                (start_ns - self._method_entry_mono_ns) / 1_000_000.0,
+                (end_ns - self._method_entry_mono_ns) / 1_000_000.0,
+            )
+
+        def _overlap(records: list[Any]) -> float | None:
+            if longest is None:
+                return None
+            ranges: list[tuple[float, float]] = []
+            for record in records:
+                interval = _record_interval(record)
+                if interval is None:
+                    continue
+                start = max(longest[0], interval[0])
+                end = min(longest[1], interval[1])
+                if end > start:
+                    ranges.append((start, end))
+            ranges.sort()
+            merged: list[list[float]] = []
+            for start, end in ranges:
+                if not merged or start > merged[-1][1]:
+                    merged.append([start, end])
+                else:
+                    merged[-1][1] = max(merged[-1][1], end)
+            return round(sum(end - start for start, end in merged), 3)
+
+        first_forward = diagnostics.get("first_forward")
+        return {
+            "peak_effective_cores": round(self.compute_peak_cores(), 3),
+            "duration_above_8_cores_ms": _duration(above_8),
+            "duration_above_16_cores_ms": _duration(above_16),
+            "duration_above_19_cores_ms": _duration(above_19),
+            "longest_above_19_plateau_ms": round(longest[1] - longest[0], 3) if longest else 0.0,
+            "plateau_start_relative_ms": longest[0] if longest else None,
+            "plateau_end_relative_ms": longest[1] if longest else None,
+            "overlap_clip_encode_ms": _overlap(list(diagnostics.get("clip_encode_calls") or [])),
+            "overlap_load_models_gpu_ms": _overlap(list(diagnostics.get("gpu_load_calls") or [])),
+            "overlap_model_patcher_ms": _overlap(list(diagnostics.get("model_patcher_calls") or [])),
+            "overlap_first_forward_ms": _overlap([first_forward]),
+        }
+
+
+def _summarize_cgroup_interval(sample_intervals: list[tuple[_CgroupCpuSample, _CgroupCpuSample]]) -> dict[str, Any]:
+    first_previous, _ = sample_intervals[0]
+    _, last_sample = sample_intervals[-1]
+    weighted_core_ms = 0.0
+    for previous, sample in sample_intervals:
+        interval_ms = max(0.0, sample.elapsed_request_ms - previous.elapsed_request_ms)
+        weighted_core_ms += sample.effective_cgroup_cores * interval_ms
+    duration_ms = max(0.0, last_sample.elapsed_request_ms - first_previous.elapsed_request_ms)
+    return {
+        "start_unix_ns": first_previous.timestamp_unix_ns,
+        "end_unix_ns": last_sample.timestamp_unix_ns,
+        "start_elapsed_ms": first_previous.elapsed_request_ms,
+        "end_elapsed_ms": last_sample.elapsed_request_ms,
+        "duration_ms": round(duration_ms, 3),
+        "mean_effective_cores": round(weighted_core_ms / duration_ms if duration_ms > 0.0 else 0.0, 3),
+        "peak_effective_cores": max(s.effective_cgroup_cores for _, s in sample_intervals),
+        "phase": sample_intervals[0][1].phase,
+    }
+
+
+# ── Process-based CPU sampler (replaces cgroup as primary) ────────────
+# Uses time.process_time_ns() / time.monotonic_ns() for cross-platform
+# CPU sampling.  No dependency on /sys/fs/cgroup/cpu.stat.
+# Aggregates: peak_effective_cores, durations above 8/16/19 thresholds,
+# longest >19 plateau with start/end monotonic ns, sample_count.
+# Calculates overlap intervals for graph CLIP, execution-prefill CLIP,
+# and request-path load_models_gpu only.
+
+class _ProcessCpuSampler:
+    """Process-time-based CPU utilization sampler.
+
+    Starts at remote request method entry, stops at result completion.
+    Uses 50ms sampling cadence.
+    """
+
+    _INTERVAL_SECONDS = 0.050
+
+    def __init__(self, method_entry_mono_ns: int) -> None:
+        self._method_entry_mono_ns = method_entry_mono_ns
+        self._samples: list[dict[str, Any]] = []
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._failure_reason: str | None = None
+        self._prev_mono_ns: int | None = None
+        self._prev_process_ns: int | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        self._sample()
+        while not self._stop_event.wait(self._INTERVAL_SECONDS):
+            self._sample()
+
+    def _sample(self) -> None:
+        try:
+            now_mono_ns = time.monotonic_ns()
+            now_process_ns = time.process_time_ns()
+        except Exception as exc:
+            self._failure_reason = f"sample_error: {type(exc).__name__}: {exc}"
+            return
+
+        with self._lock:
+            if self._prev_mono_ns is not None and self._prev_process_ns is not None:
+                delta_wall_ns = now_mono_ns - self._prev_mono_ns
+                delta_process_ns = now_process_ns - self._prev_process_ns
+                if delta_wall_ns > 0:
+                    effective_cores = max(0.0, delta_process_ns / delta_wall_ns)
+                else:
+                    effective_cores = 0.0
+            else:
+                effective_cores = 0.0
+
+            self._samples.append({
+                "effective_cores": round(effective_cores, 3),
+                "elapsed_request_ms": round((now_mono_ns - self._method_entry_mono_ns) / 1_000_000.0, 3),
+                "monotonic_ns": now_mono_ns,
+            })
+            self._prev_mono_ns = now_mono_ns
+            self._prev_process_ns = now_process_ns
+
+    def stop(self) -> None:
+        thread = self._thread
+        if thread is None:
+            return
+        self._stop_event.set()
+        thread.join()
+        self._thread = None
+        self._sample()
+
+    def report(self) -> None:
+        samples = self._snapshot()
+        if len(samples) < 2:
+            _reason = "insufficient_samples" if self._failure_reason is None else self._failure_reason
+            print(
+                f"[v2.process_cpu_spike] status=unavailable reason={_reason} "
+                f"sample_count={len(samples)}",
+                flush=True,
+            )
+            return
+
+        peak = max(s["effective_cores"] for s in samples)
+        above_8 = self._duration_above_threshold(8.0, samples)
+        above_16 = self._duration_above_threshold(16.0, samples)
+        above_19 = self._duration_above_threshold(19.0, samples)
+        longest = max(
+            (s for s in self._plateaus_above_threshold(19.0, samples)),
+            key=lambda p: p[1] - p[0],
+            default=None,
+        )
+
+        print(
+            f"[v2.process_cpu_spike] status=ok "
+            f"peak_effective_cores={peak:.3f} "
+            f"duration_above_16_ms={above_16:.3f} "
+            f"duration_above_19_ms={above_19:.3f} "
+            f"longest_above_19_ms={round((longest[1] - longest[0]) / 1_000_000, 3) if longest else 0.0:.3f} "
+            f"sample_count={len(samples)}",
+            flush=True,
+        )
+
+    def activation_summary(self, diagnostics: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Return compact activation summary for diagnosis fields."""
+        samples = self._snapshot()
+        if len(samples) < 2:
+            return {
+                "peak_effective_cores": None,
+                "duration_above_16_cores_ms": None,
+                "duration_above_19_cores_ms": None,
+                "longest_above_19_plateau_ms": None,
+                "longest_plateau_start_monotonic_ns": None,
+                "longest_plateau_end_monotonic_ns": None,
+                "cpu_overlap_graph_clip_ms": None,
+                "cpu_overlap_prefill_clip_ms": None,
+                "cpu_overlap_gpu_load_ms": None,
+            }
+
+        peak = max(s["effective_cores"] for s in samples)
+        above_16 = self._duration_above_threshold(16.0, samples)
+        above_19 = self._duration_above_threshold(19.0, samples)
+        longest = max(
+            (s for s in self._plateaus_above_threshold(19.0, samples)),
+            key=lambda p: p[1] - p[0],
+            default=None,
+        )
+
+        def _record_interval(record: Any) -> tuple[int, int] | None:
+            if not isinstance(record, Mapping):
+                return None
+            start_ns = record.get("start_monotonic_ns")
+            end_ns = record.get("end_monotonic_ns")
+            if not isinstance(start_ns, int) or not isinstance(end_ns, int) or end_ns <= start_ns:
+                return None
+            return start_ns, end_ns
+
+        def _overlap_ms(records: list[Any]) -> float:
+            if longest is None:
+                return 0.0
+            ranges: list[tuple[int, int]] = []
+            plateau_start_ns, plateau_end_ns = longest
+            for record in records:
+                interval = _record_interval(record)
+                if interval is None:
+                    continue
+                start_ns = max(plateau_start_ns, interval[0])
+                end_ns = min(plateau_end_ns, interval[1])
+                if end_ns > start_ns:
+                    ranges.append((start_ns, end_ns))
+            ranges.sort()
+            merged: list[list[int]] = []
+            for start_ns, end_ns in ranges:
+                if not merged or start_ns > merged[-1][1]:
+                    merged.append([start_ns, end_ns])
+                else:
+                    merged[-1][1] = max(merged[-1][1], end_ns)
+            return round(sum(end_ns - start_ns for start_ns, end_ns in merged) / 1_000_000, 3)
+
+        _diagnostics = diagnostics if isinstance(diagnostics, Mapping) else {}
+        _clip_calls = list(_diagnostics.get("clip_encode_calls") or [])
+        _gpu_calls = list(_diagnostics.get("gpu_load_calls") or [])
+        _graph_clip_calls = [call for call in _clip_calls if isinstance(call, Mapping) and call.get("caller") == "graph"]
+        _prefill_clip_calls = [call for call in _clip_calls if isinstance(call, Mapping) and call.get("caller") == "execution_prefill"]
+
+        _longest_start_ns = longest[0] if longest else None
+        _longest_end_ns = longest[1] if longest else None
+
+        return {
+            "peak_effective_cores": round(peak, 3),
+            "duration_above_16_cores_ms": round(above_16, 3),
+            "duration_above_19_cores_ms": round(above_19, 3),
+            "longest_above_19_plateau_ms": round((longest[1] - longest[0]) / 1_000_000, 3) if longest else None,
+            "longest_plateau_start_monotonic_ns": _longest_start_ns,
+            "longest_plateau_end_monotonic_ns": _longest_end_ns,
+            "cpu_overlap_graph_clip_ms": _overlap_ms(_graph_clip_calls),
+            "cpu_overlap_prefill_clip_ms": _overlap_ms(_prefill_clip_calls),
+            "cpu_overlap_gpu_load_ms": _overlap_ms(_gpu_calls),
+        }
+
+    def _snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._samples)
+
+    @staticmethod
+    def _duration_above_threshold(threshold: float, samples: list[dict[str, Any]]) -> float:
+        total_ns = 0
+        for previous, current in zip(samples, samples[1:]):
+            if current["effective_cores"] > threshold:
+                total_ns += max(0, int(current["monotonic_ns"]) - int(previous["monotonic_ns"]))
+        return round(total_ns / 1_000_000, 3)
+
+    @staticmethod
+    def _plateaus_above_threshold(threshold: float, samples: list[dict[str, Any]]) -> list[tuple[int, int]]:
+        plateaus: list[tuple[int, int]] = []
+        start_ns: int | None = None
+        end_ns: int | None = None
+        for previous, current in zip(samples, samples[1:]):
+            if current["effective_cores"] > threshold:
+                if start_ns is None:
+                    start_ns = int(previous["monotonic_ns"])
+                end_ns = int(current["monotonic_ns"])
+            elif start_ns is not None and end_ns is not None:
+                plateaus.append((start_ns, end_ns))
+                start_ns = None
+                end_ns = None
+        if start_ns is not None and end_ns is not None:
+            plateaus.append((start_ns, end_ns))
+        return plateaus
+
+
+def _aggregate_clip_encode_diagnostics(
+    diagnosis: dict[str, Any],
+    extra_records: list[Any] | None = None,
+) -> None:
+    records = list(diagnosis.get("_clip_encode_records") or [])
+    if extra_records:
+        existing = {
+            (
+                record.get("caller"),
+                record.get("clip_object_id"),
+                record.get("text_hash"),
+                record.get("start_monotonic_ns"),
+                record.get("end_monotonic_ns"),
+            )
+            for record in records
+            if isinstance(record, Mapping)
+        }
+        for record in extra_records:
+            if not isinstance(record, Mapping):
+                continue
+            identity = (
+                record.get("caller"),
+                record.get("clip_object_id"),
+                record.get("text_hash"),
+                record.get("start_monotonic_ns"),
+                record.get("end_monotonic_ns"),
+            )
+            if identity not in existing:
+                records.append(record)
+                existing.add(identity)
+    diagnosis["_clip_encode_records"] = records
+    attached = bool(diagnosis.get("clip_encode_instrumentation_attached")) or bool(records)
+    if not attached:
+        for key in (
+            "clip_encode_calls",
+            "clip_encode_graph_calls",
+            "clip_encode_prefill_calls",
+            "clip_encode_wall_ms",
+            "clip_encode_graph_wall_ms",
+            "clip_encode_prefill_wall_ms",
+            "clip_encode_process_cpu_ms",
+        ):
+            diagnosis[key] = None
+        return
+    diagnosis["clip_encode_instrumentation_attached"] = True
+    diagnosis["clip_encode_calls"] = len(records)
+    graph_records = [record for record in records if record.get("caller") == "graph"]
+    prefill_records = [
+        record for record in records if record.get("caller") == "execution_prefill"
+    ]
+    diagnosis["clip_encode_graph_calls"] = len(graph_records)
+    diagnosis["clip_encode_prefill_calls"] = len(prefill_records)
+    diagnosis["clip_encode_wall_ms"] = round(
+        sum(record.get("wall_ms", 0) or 0 for record in records),
+        3,
+    )
+    diagnosis["clip_encode_graph_wall_ms"] = round(
+        sum(record.get("wall_ms", 0) or 0 for record in graph_records),
+        3,
+    )
+    diagnosis["clip_encode_prefill_wall_ms"] = round(
+        sum(record.get("wall_ms", 0) or 0 for record in prefill_records),
+        3,
+    )
+    diagnosis["clip_encode_process_cpu_ms"] = round(
+        sum(record.get("process_cpu_ms", 0) or 0 for record in records),
+        3,
+    )
+
+
+def _persist_v2_dependency_manifest(
+    state: Any,
+    legacy_module: Any,
+    legacy_api: Any,
+) -> dict[str, Any]:
+    """Persist the immutable dependency manifest after V2 bootstrap startup.
+
+    Called immediately after ``bootstrap.startup(snapshot=True)`` and before
+    any certificate preflight, so that the startup certificate preflight finds
+    the persisted manifest (fixes the ``manifest_missing`` preflight failure
+    that occurs when a V1 snapshot-startup did not create the shared manifest).
+
+    Loads the baked custom-node manifest from *legacy_module*, resolves repair
+    mode via *legacy_api*, uses the module-level ``_V2_DEPLOYMENT_COMBINED_HASH``
+    and ``state.custom_node_generation`` (falling back to the persisted
+    generation record), and delegates to
+    ``legacy_module._build_and_persist_dependency_manifest(... commit=True)``.
+
+    In production modes (``off``, ``fail_fast``), fails closed with
+    ``RuntimeError`` if the baked hash, deployment hash, generation, runtime
+    volume, or resulting manifest identity is missing.  Does **not** run full
+    dependency fingerprint validation or pip install — bootstrap already did
+    preparation.
+
+    Returns the manifest dict.  Never returns an empty/missing identity in
+    production modes (raises instead).  Emits a concise startup diagnostic.
+    """
+    _t0 = time.time()
+
+    # 1. Load baked custom-node dependency manifest (no I/O beyond file read)
+    _baked_mft = legacy_module.load_baked_custom_node_dependency_manifest()
+    _baked_ok = bool(_baked_mft and _baked_mft.get("overall_dependency_hash"))
+
+    # 2. Resolve repair mode via the legacy API
+    _repair_mode = "fail_fast"
+    try:
+        _repair_mode = str(legacy_api._resolve_requirements_repair_mode() or "fail_fast")
+    except Exception:
+        pass
+    _repair_mode = _repair_mode.strip().lower()
+    if _repair_mode not in ("off", "fail_fast", "dev"):
+        _repair_mode = "fail_fast"
+
+    # 3. Custom-node generation: prefer in-memory state, fall back to persisted record
+    _cn_gen = str(state.custom_node_generation or "")
+    if not _cn_gen:
+        try:
+            _rec = legacy_module._read_custom_nodes_generation_record()
+            if _rec and _rec.get("generation"):
+                _cn_gen = str(_rec["generation"])
+        except Exception:
+            pass
+
+    # 4. Module-level deployment combined hash
+    _deploy_hash = _V2_DEPLOYMENT_COMBINED_HASH
+
+    # 5. Runtime config volume from the legacy module
+    _volume = getattr(legacy_module, "runtime_config_vol", None)
+
+    # ── Fail-closed checks for production modes ──
+    _is_production = _repair_mode in ("off", "fail_fast")
+
+    if _is_production:
+        if not _baked_ok:
+            raise RuntimeError(
+                "V2 startup manifest persistence failed: "
+                "baked dependency manifest is missing or incomplete "
+                f"(repair_mode={_repair_mode})"
+            )
+        if not _deploy_hash:
+            raise RuntimeError(
+                "V2 startup manifest persistence failed: "
+                "_V2_DEPLOYMENT_COMBINED_HASH is empty "
+                f"(repair_mode={_repair_mode})"
+            )
+        if not _cn_gen:
+            raise RuntimeError(
+                "V2 startup manifest persistence failed: "
+                "custom_node_generation is empty "
+                f"(repair_mode={_repair_mode})"
+            )
+        if _volume is None:
+            raise RuntimeError(
+                "V2 startup manifest persistence failed: "
+                "runtime_config_vol is not available "
+                f"(repair_mode={_repair_mode})"
+            )
+
+    # 6. Build and persist the manifest (delegates to legacy, no fingerprint/validation)
+    _manifest = legacy_module._build_and_persist_dependency_manifest(
+        combined_hash=_deploy_hash,
+        custom_node_fingerprint=_baked_mft if _baked_mft else None,
+        custom_node_generation=_cn_gen,
+        repair_mode=_repair_mode,
+        volume=_volume,
+        commit=True,
+    )
+
+    _mft_identity = _manifest.get("identity", "")
+    _mft_ident_match = bool(_mft_identity)
+    _manifest_ms = round((time.time() - _t0) * 1000, 1)
+
+    # 7. Fail closed in production if identity is missing (volume commit failure, etc.)
+    if _is_production and not _mft_ident_match:
+        raise RuntimeError(
+            "V2 startup manifest persistence failed: "
+            "manifest has no identity (volume commit failure or "
+            "missing identity components). "
+            f"repair_mode={_repair_mode}"
+        )
+
+    # 8. Concise startup diagnostic (V2-specific prefix)
+    print(
+        f"[v2.dep_manifest] startup build/persist done in {_manifest_ms}ms "
+        f"identity={_mft_identity[:16] if _mft_identity else '<empty>'} "
+        f"combined_hash={_deploy_hash[:16] if _deploy_hash else '<empty>'} "
+        f"cn_gen={_cn_gen[:16] if _cn_gen else '<empty>'} "
+        f"repair_mode={_repair_mode} "
+        f"baked_ok={int(_baked_ok)} "
+        f"ident_ok={int(_mft_ident_match)}",
+        flush=True,
+    )
+
+    return _manifest
+
+
 class ModalRuntimeEntrypoint:
     """Real v2 runtime facade backed by the existing ComfyUI executor."""
 
@@ -1882,11 +2689,16 @@ class ModalRuntimeEntrypoint:
         self._restore_count: int = 0
         self._request_count: int = 0
         self._restore_timing: dict[str, Any] | None = None
+        self._cgroup_sampler: _CgroupCpuSampler | None = None
+        self._process_cpu_sampler: _ProcessCpuSampler | None = None
         # CPU snapshot model state (Plan C lifecycle)
         self._cpu_snapshot_models: CpuSnapshotModels | None = None
         self._cpu_snapshot_models_active: bool = False
         # Propagated UNET runtime state from restore() to request trace.
         self._cpu_snapshot_unet_runtime_state: dict[str, Any] | None = None
+        # CPU storage registries for page-residency sampling
+        self._cpu_snapshot_unet_storage_registry: Any | None = None
+        self._cpu_snapshot_clip_storage_registry: Any | None = None
 
     def _remember_lifecycle_trace(self, trace: RuntimeTrace) -> None:
         if self._lifecycle_trace is None:
@@ -2299,6 +3111,19 @@ class ModalRuntimeEntrypoint:
                 f"api_object_id={_boot_api_id} "
                 f"deployment_combined_hash={_V2_DEPLOYMENT_COMBINED_HASH[:16] if _V2_DEPLOYMENT_COMBINED_HASH else '<empty>'}",
                 flush=True,
+            )
+
+            # ── V2 dependency manifest persistence (before cert preflight) ──
+            # Persist the immutable dependency manifest so the startup
+            # certificate preflight finds a valid manifest.  This was
+            # missing from V2 startup — bootstrap.startup() prepares
+            # requirements but never persisted the manifest, causing
+            # manifest_missing preflight failures when no V1 snapshot
+            # had created the shared manifest.
+            _persist_v2_dependency_manifest(
+                state,
+                self._legacy_module,
+                self._legacy_api,
             )
 
             # ── V2 snapshot certificate: build from RestorePlan ──
@@ -2759,6 +3584,14 @@ class ModalRuntimeEntrypoint:
         }
 
     def restore(self) -> dict[str, Any]:
+        print(
+            "[v2.residency_config] "
+            f"enabled={int(_RESIDENCY_DIAGNOSTICS_ENABLED)}",
+            flush=True,
+        )
+        self._cgroup_sampler = _CgroupCpuSampler(time.monotonic_ns())
+        self._cgroup_sampler.set_phase("restore")
+        self._cgroup_sampler.start()
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
         _report_host_memory("restore_start")
         # Reset per-request counter so first request after every fresh restore
@@ -3066,6 +3899,8 @@ class ModalRuntimeEntrypoint:
                     self._preload_bridge.clear()
                     self._cpu_snapshot_models_active = False
                     self._cpu_snapshot_unet_runtime_state = None
+                    self._cpu_snapshot_unet_storage_registry = None
+                    self._cpu_snapshot_clip_storage_registry = None
                     _cpu_snapshot_activated = False
                     _role_reason = "; ".join(
                         p for p in [
@@ -3446,6 +4281,32 @@ class ModalRuntimeEntrypoint:
                                     )
                     except Exception as _cd_exc:
                         print(f"[v2.cachedit_restore] error={_cd_exc}", flush=True)
+                    # ── Build CPU storage registries after final CacheDiT-patched UNET ──
+                    self._cpu_snapshot_unet_storage_registry = None
+                    self._cpu_snapshot_clip_storage_registry = None
+                    if _RESIDENCY_DIAGNOSTICS_ENABLED:
+                        try:
+                            from .cpu_snapshot_models import build_unique_storage_registry
+                            _final_unet = (
+                                _patched_model if _patched_model is not None
+                                else (models.unet if models is not None else None)
+                            )
+                            _final_clip = models.clip if models is not None else None
+                            if _final_unet is not None and hasattr(_final_unet, "parameters"):
+                                self._cpu_snapshot_unet_storage_registry = build_unique_storage_registry(_final_unet)
+                            if _final_clip is not None:
+                                _clip_model = getattr(_final_clip, "cond_stage_model", None) or getattr(_final_clip, "model", None) or _final_clip
+                                if hasattr(_clip_model, "parameters"):
+                                    self._cpu_snapshot_clip_storage_registry = build_unique_storage_registry(_clip_model)
+                        except Exception:
+                            self._cpu_snapshot_unet_storage_registry = None
+                            self._cpu_snapshot_clip_storage_registry = None
+                    # ── restore_ready residency sample (gated) ──
+                    if _RESIDENCY_DIAGNOSTICS_ENABLED:
+                        try:
+                            self._sample_snapshot_residency(stage="restore_ready", trace=trace)
+                        except Exception:
+                            pass
                     # RES4LYF restore preparation
                     try:
                         _sampler_nodes_r4 = [
@@ -3523,6 +4384,8 @@ class ModalRuntimeEntrypoint:
                 self._preload_bridge.clear()
                 self._cpu_snapshot_models_active = False
                 self._cpu_snapshot_unet_runtime_state = None
+                self._cpu_snapshot_unet_storage_registry = None
+                self._cpu_snapshot_clip_storage_registry = None
                 _cpu_snapshot_activated = False
                 _cpu_snapshot_activate_error = str(_act_exc)[:80]
                 _activation_duration_ms = round(
@@ -3554,6 +4417,13 @@ class ModalRuntimeEntrypoint:
                     flush=True,
                 )
                 # Fall through to the existing preload branch.
+        # ── Prefill-configuration diagnostic (after CPU snapshot state is final) ──
+        _prefill_env_raw = os.environ.get("COMFYMODAL_V2_PREFILL_LANES", "critical")
+        print(
+            f"[v2.prefill_config] env={_prefill_env_raw} parsed={_PREFILL_LANE_MODE} "
+            f"cpu_snapshot_active={int(bool(_cpu_snapshot_activated))}",
+            flush=True,
+        )
         try:
             # Pre-initialize for Plan C gating
             preparation: RestorePreparation | None = None
@@ -3976,6 +4846,9 @@ class ModalRuntimeEntrypoint:
     async def _run_in_process(self, plan: ExecutionPlan, context: ExecutionContext) -> dict[str, Any]:
         if context.cancelled and context.cancelled():
             raise RuntimeError("execution cancelled before PromptExecutor start")
+        # Start process CPU sampler at method entry
+        self._process_cpu_sampler = _ProcessCpuSampler(time.monotonic_ns())
+        self._process_cpu_sampler.start()
         _report_host_memory("prompt_executor_start")
         trace = context.trace or RuntimeTrace(request_id=context.request_id, process="remote")
         trace.emit("runtime_config_start", phase="execution")
@@ -3987,6 +4860,9 @@ class ModalRuntimeEntrypoint:
         # Attach stable container identity to execution trace
         _cid = self.container_session_id or _V2_CONTAINER_SESSION_ID
         trace.container_session_id = _cid
+        # ── Snapshot residency: request_entry (gated) ──
+        if _RESIDENCY_DIAGNOSTICS_ENABLED:
+            self._sample_snapshot_residency(stage="request_entry", trace=trace)
         trace.emit("graph_execution_start", phase="execution")
         # Stash the execution trace on the legacy API so the patched UNET
         # loader (_cached_unet_load) can emit V2 cache-hit events even
@@ -4127,11 +5003,45 @@ class ModalRuntimeEntrypoint:
         # concurrently with execution setup.  The callback waits for both
         # UNET and CLIP preparation futures before encoding, preventing
         # GPU model-load/encode overlap.  Idempotent and thread-safe.
-        self._preload_bridge.schedule_execution_prefill(trace=trace)
+        _cpu_snapshot_active = bool(self._cpu_snapshot_models_active)
+        _activation_diagnostic_state: dict[str, Any] = {
+            "request_id": str(context.request_id),
+            "clip_encode_calls": [],
+        }
+
+        if _cpu_snapshot_active:
+            _execution_prefill_scheduled = False
+        else:
+            _execution_prefill_scheduled = bool(
+                self._preload_bridge.schedule_execution_prefill(
+                    trace=trace,
+                    request_id=str(context.request_id),
+                    activation_diagnostic_state=_activation_diagnostic_state,
+                )
+            )
+
+        print(
+            "[v2.execution_prefill] "
+            f"snapshot_active={int(_cpu_snapshot_active)} "
+            f"env_raw={os.environ.get('COMFYMODAL_V2_PREFILL_LANES', 'critical')} "
+            f"scheduled={int(_execution_prefill_scheduled)}",
+            flush=True,
+        )
+        # Carry prefill booleans on trace metadata for _execute_v2_prompt_executor
+        trace.set_metadata(
+            _cpu_snapshot_active=_cpu_snapshot_active,
+            _execution_prefill_scheduled=_execution_prefill_scheduled,
+        )
         try:
             with request_execution_trace_scope(trace):
                 with self._preload_bridge.request_scope():
-                    result: dict[str, Any] = await self._execute_v2_prompt_executor(plan, context, api, trace)
+                    result: dict[str, Any] = await self._execute_v2_prompt_executor(
+                        plan,
+                        context,
+                        api,
+                        trace,
+                        activation_diagnostic_state=_activation_diagnostic_state,
+                    )
                 _gpu_summary = gpu_not_observed_summary()
                 trace.set_metadata(gpu_observation_summary=_gpu_summary)
                 # â”€â”€ Build GPU observation classification from helper + trace events â”€â”€
@@ -4158,6 +5068,16 @@ class ModalRuntimeEntrypoint:
             # preparation into the execution trace so they are not lost.
             self._preload_bridge.drain_worker_events(trace)
             self._preload_bridge.close_workers()
+            _completed_diagnosis = (
+                result.get("trace", {}).get("activation_diagnosis")
+                if isinstance(result.get("trace"), dict)
+                else None
+            )
+            if isinstance(_completed_diagnosis, dict):
+                _aggregate_clip_encode_diagnostics(
+                    _completed_diagnosis,
+                    list(_activation_diagnostic_state.get("clip_encode_calls") or []),
+                )
             # Ensure any remaining legacy API background loader threads
             # for this request are terminal before result delivery.
             # MUST happen before the _BG_UNET_DIAG_STORE drain so
@@ -4199,7 +5119,12 @@ class ModalRuntimeEntrypoint:
                 _gpu_locations = ["not_observed"]
             trace.set_metadata(gpu_loading_observed=_gpu_locations)
             result["gpu_loading_observed"] = _gpu_locations
+            _activation_diagnosis = None
+            if isinstance(result.get("trace"), dict):
+                _activation_diagnosis = result["trace"].get("activation_diagnosis")
             result["trace"] = trace.to_dict()
+            if isinstance(_activation_diagnosis, dict):
+                result["trace"]["activation_diagnosis"] = _activation_diagnosis
             if "_stage_timings" in result:
                 result["trace"]["stages"] = result.pop("_stage_timings")
             result["container_session_id"] = _cid
@@ -4210,6 +5135,37 @@ class ModalRuntimeEntrypoint:
             result["_snapshot_target_fingerprint"] = _snapshot_target_fingerprint()
             result["phase_durations_ms"] = trace.export_phase_durations()
             _report_host_memory("result_complete")
+            # ── Activation diagnosis: read from result (assembled by _execute_v2_prompt_executor) ──
+            _ad_from_result = result.get("trace", {}).get("activation_diagnosis") if isinstance(result.get("trace"), dict) else None
+            if isinstance(_ad_from_result, dict):
+                _ad_fields: list[str] = []
+                _AD_FIELD_SPEC = (
+                    "request_id", "cpu_snapshot_active", "execution_prefill_scheduled",
+                    "residency_diagnostics_enabled",
+                    "clip_encode_calls", "clip_encode_graph_calls", "clip_encode_prefill_calls",
+                    "clip_encode_wall_ms", "clip_encode_graph_wall_ms",
+                    "clip_encode_prefill_wall_ms", "clip_encode_process_cpu_ms",
+                    "load_models_gpu_calls", "unet_gpu_load_calls",
+                    "load_models_gpu_wall_ms",
+                    "gpu_allocated_delta_bytes",
+                    "cpu_peak_cores", "cpu_above_16_ms", "cpu_above_19_ms",
+                    "cpu_longest_above_19_ms",
+                    "cpu_overlap_graph_clip_ms", "cpu_overlap_prefill_clip_ms",
+                    "cpu_overlap_gpu_load_ms",
+                    "clip_to_sampler_node_ms", "sampler_node_to_sampler_start_ms",
+                    "diagnostic_accounted_ms", "diagnostic_unattributed_ms",
+                )
+                for _f in _AD_FIELD_SPEC:
+                    _v = _ad_from_result.get(_f)
+                    _ad_fields.append(f"{_f}={_v if _v is not None else 'absent'}")
+                print(f"[v2.activation_diagnosis] {' '.join(_ad_fields)}", flush=True)
+            # Stop process CPU sampler at result completion
+            try:
+                if self._process_cpu_sampler is not None:
+                    self._process_cpu_sampler.stop()
+                    self._process_cpu_sampler.report()
+            except Exception:
+                pass
             return result
         except Exception as exc:
             trace.emit("graph_execution_end", phase="execution", metadata={"status": "error", "error": str(exc)[:200]})
@@ -4251,6 +5207,13 @@ class ModalRuntimeEntrypoint:
                         _bg_events = _BG_UNET_DIAG_STORE.pop(_ck, [])
                         if _bg_events:
                             trace.extend(_bg_events)
+            except Exception:
+                pass
+            # Stop process CPU sampler on exception path too
+            try:
+                if self._process_cpu_sampler is not None:
+                    self._process_cpu_sampler.stop()
+                    self._process_cpu_sampler.report()
             except Exception:
                 pass
             raise
@@ -4327,6 +5290,60 @@ class ModalRuntimeEntrypoint:
             return round((end_ns - start_ns) / 1_000_000, 3)
         return None
 
+    def _sample_snapshot_residency(self, *, stage: str, trace: RuntimeTrace | None) -> dict[str, Any] | None:
+        """Sample CPU snapshot storage residency, return dict, emit trace event and one-line.
+
+        Stages: request_entry, executor_invoke, unet_gpu_load_before/after, first_unet_forward.
+        Samples existing ``_cpu_snapshot_unet_storage_registry`` and
+        ``_cpu_snapshot_clip_storage_registry``.  Stores into activation state when active.
+        Never rebuilds registries.  Returns None when registries are absent or residency
+        diagnostics are disabled (``_RESIDENCY_DIAGNOSTICS_ENABLED`` is False).
+        Every call returns dict with keys: stage, unet_*, clip_* (status et al).
+        """
+        if not _RESIDENCY_DIAGNOSTICS_ENABLED:
+            return None
+        from .cpu_snapshot_models import sample_storage_residency
+        regs = {
+            "unet": getattr(self, "_cpu_snapshot_unet_storage_registry", None),
+            "clip": getattr(self, "_cpu_snapshot_clip_storage_registry", None),
+        }
+        if not regs["unet"] and not regs["clip"]:
+            return None
+        result: dict[str, Any] = {"stage": stage}
+        for role, reg in regs.items():
+            if reg is not None:
+                try:
+                    r = sample_storage_residency(reg)
+                    result[f"{role}_status"] = r.get("status", "error")
+                    result[f"{role}_storage_count"] = r.get("storage_count")
+                    result[f"{role}_total_bytes"] = r.get("total_bytes")
+                    result[f"{role}_total_pages"] = r.get("total_pages")
+                    result[f"{role}_resident_pages"] = r.get("resident_pages")
+                    result[f"{role}_resident_bytes"] = r.get("resident_bytes")
+                    result[f"{role}_resident_percent"] = r.get("resident_percent")
+                    result[f"{role}_duration_ms"] = r.get("duration_ms")
+                except Exception:
+                    result[f"{role}_status"] = "error"
+            else:
+                result[f"{role}_status"] = "absent"
+        # Emit trace event when trace is available
+        if trace is not None:
+            _meta = dict(result)
+            _meta.pop("stage", None)
+            trace.emit("snapshot_residency", phase="execution", metadata=_meta)
+        # Emit one-line
+        _parts = [f"[v2.snapshot_residency]", f"stage={stage}"]
+        for k, v in result.items():
+            if k != "stage":
+                _parts.append(f"{k}={v}")
+        print(" ".join(_parts), flush=True)
+        # Store into activation state when active
+        from .model_preload import get_activation_diagnostics
+        _ad = get_activation_diagnostics()
+        if _ad is not None:
+            _ad.setdefault("residency", {})[stage] = dict(result)
+        return result
+
     @staticmethod
     def _fmt_or_absent(v: float | int | None) -> str:
         """Format a numeric interval for the one-line summary.
@@ -4341,6 +5358,8 @@ class ModalRuntimeEntrypoint:
         context: ExecutionContext,
         api: Any,
         trace: RuntimeTrace,
+        *,
+        activation_diagnostic_state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Run the live ComfyUI PromptExecutor without the legacy wrapper.
 
@@ -4355,6 +5374,10 @@ class ModalRuntimeEntrypoint:
         # sampling_start/sampling_end events.
         with _sampler_wrapper_dedup_lock:
             _sampler_wrapper_dedup.clear()
+
+        # ── Snapshot residency: executor_invoke (gated) ──
+        if _RESIDENCY_DIAGNOSTICS_ENABLED:
+            self._sample_snapshot_residency(stage="executor_invoke", trace=trace)
 
         if context.cancelled and context.cancelled():
             raise RuntimeError("execution cancelled before PromptExecutor start")
@@ -5207,6 +6230,23 @@ class ModalRuntimeEntrypoint:
                 "total_nodes": len(_node_class_map),
             })
             _wf_hash_token = _V2_WORKFLOW_HASH.set(_wf_hash)
+            # ── Activation diagnostics: begin immediately before PromptExecutor ──
+            _ad_metadata = getattr(trace, "_metadata", {})
+            _ad_cpu_snapshot_active = bool(_ad_metadata.get("_cpu_snapshot_active", False))
+            _ad_prefill_scheduled = bool(_ad_metadata.get("_execution_prefill_scheduled", False))
+            _activation_token = begin_activation_diagnostics(
+                str(context.request_id),
+                cpu_snapshot_active=_ad_cpu_snapshot_active,
+                execution_prefill_scheduled=_ad_prefill_scheduled,
+            )
+            _ad_state = get_activation_diagnostics()
+            # ── Set residency sampler callback for this request scope ──
+            _residency_sampler = self._sample_snapshot_residency
+            if _RESIDENCY_DIAGNOSTICS_ENABLED:
+                set_residency_sampler_callback(_residency_sampler)
+            else:
+                clear_residency_sampler_callback()
+            _final_diag: dict[str, Any] | None = None
             try:
                 with pre_sampler_instrumentation_scope() as _pre_sampler_state:
                     if callable(execute_async):
@@ -5217,6 +6257,13 @@ class ModalRuntimeEntrypoint:
                         executor.execute(**execute_kwargs)
             finally:
                 _V2_WORKFLOW_HASH.reset(_wf_hash_token)
+                # Clear residency sampler callback (must happen before end_activation_diagnostics)
+                clear_residency_sampler_callback()
+                # End activation diagnostics — always runs on execution raise too
+                try:
+                    _final_diag = end_activation_diagnostics(_activation_token)
+                except Exception:
+                    _final_diag = None
                 try:
                     # Restore original add_message
                     if _milestone_wrapper_ok and _orig_add_message is not None:
@@ -5225,7 +6272,7 @@ class ModalRuntimeEntrypoint:
                     if _send_sync_wrapper_ok and _orig_send_sync is not None and _server is not None:
                         _server.send_sync = _orig_send_sync
                 finally:
-                    # Always emit invoke_end â€” even if restore/release raises
+                    # Always emit invoke_end — even if restore/release raises
                     _invoke_elapsed_ms = round((time.monotonic_ns() - _execute_call_ns) / 1_000_000, 3)
                     trace.emit("prompt_executor_invoke_end", phase="execution", metadata={
                         "invoke_elapsed_ms": _invoke_elapsed_ms,
@@ -5369,7 +6416,7 @@ class ModalRuntimeEntrypoint:
             ]
             _leaf_milestone_ms = sum(v for v in _leaf_milestone if v is not None)
             _total_children_val = _leaf_setup_ms + _leaf_milestone_ms
-            _measured_children_ms = round(_total_children_val, 3) if _total_children_val > 0 else None
+            _measured_children_ms = round(_total_children_val, 3) if _total_children_val > 0 else 0.0
 
             # â”€â”€ Build named interval map for overlap diagnostics â”€â”€
             _overlap_interval_map: dict[str, float | None] = {
@@ -5810,11 +6857,9 @@ class ModalRuntimeEntrypoint:
                 "sampler_node_enter_perf_ns": _pre_sampler_state.get("sampler_node_enter_perf_ns"),
                 "sampler_stage_start_perf_ns": _sampler_stage_start_perf_ns,
                 "pre_sampler_unattributed_ms": _pre_sampler_state.get("pre_sampler_unattributed_ms"),
-                # Pre-computed authoritative value from milestone calculation;
-                # _build_v2_critical_path reads this directly rather than
-                # recalculating from sampler_stage_start_perf_ns (T3).
                 "sampler_node_to_sampler_start_ms": _pre_sampler_state.get("sampler_node_to_sampler_start_ms"),
             }
+            # Structured pre-sampler report removed — use _v2_critical_path_data instead
 
             # â”€â”€ Write validation certificate after successful execution â”€â”€
             # Schema v2 certs include preflight_ok=True to attest that
@@ -5830,6 +6875,67 @@ class ModalRuntimeEntrypoint:
                     preflight_ok=True,
                 )
 
+
+            # Stop sampling at result completion before assembling request diagnostics.
+            _cpu_sampler_for_result = getattr(self, "_process_cpu_sampler", None)
+            if _cpu_sampler_for_result is not None:
+                _cpu_sampler_for_result.stop()
+
+            # ── Activation diagnosis: assemble from _final_diag into result ──
+            if isinstance(_final_diag, dict) and _final_diag.get("request_id"):
+                # Compute aggregate fields from raw diagnostic data
+                _ad = dict(_final_diag)
+                _clip_calls: list = _ad.get("clip_encode_calls") or []
+                _gpu_calls: list = _ad.get("gpu_load_calls") or []
+                _ad["_clip_encode_records"] = list(_clip_calls)
+                _aggregate_clip_encode_diagnostics(
+                    _ad,
+                    list((activation_diagnostic_state or {}).get("clip_encode_calls") or []),
+                )
+
+                # Residency diagnostics enabled flag
+                _ad["residency_diagnostics_enabled"] = int(_RESIDENCY_DIAGNOSTICS_ENABLED)
+
+                # Aggregate GPU loads
+                _ad["load_models_gpu_calls"] = len(_gpu_calls)
+                _ad["unet_gpu_load_calls"] = sum(1 for g in _gpu_calls if g.get("contains_registered_unet"))
+                _ad["load_models_gpu_wall_ms"] = round(sum(g.get("wall_ms", 0) or 0 for g in _gpu_calls), 3)
+
+                # GPU allocated delta
+                _gpu_alloc_sum = sum(g.get("gpu_allocated_delta_bytes", 0) or 0 for g in _gpu_calls)
+                _ad["gpu_allocated_delta_bytes"] = _gpu_alloc_sum if _gpu_calls else None
+
+                # Node-interval fields from milestone computations already done above
+                _ad["clip_to_sampler_node_ms"] = _clip_to_sampler_node_ms
+                _ad["sampler_node_to_sampler_start_ms"] = _sampler_node_to_sampler_start_ms
+
+                # Process CPU sampler summary
+                _cpu_sampler = getattr(self, "_process_cpu_sampler", None)
+                if _cpu_sampler is not None:
+                    try:
+                        _cpu_summary = _cpu_sampler.activation_summary(_ad)
+                    except Exception:
+                        _cpu_summary = {}
+                else:
+                    _cpu_summary = {}
+                _ad["cpu_peak_cores"] = _cpu_summary.get("peak_effective_cores")
+                _ad["cpu_above_16_ms"] = _cpu_summary.get("duration_above_16_cores_ms")
+                _ad["cpu_above_19_ms"] = _cpu_summary.get("duration_above_19_cores_ms")
+                _ad["cpu_longest_above_19_ms"] = _cpu_summary.get("longest_above_19_plateau_ms")
+                _ad["cpu_longest_above_19_start_monotonic_ns"] = _cpu_summary.get(
+                    "longest_plateau_start_monotonic_ns"
+                )
+                _ad["cpu_longest_above_19_end_monotonic_ns"] = _cpu_summary.get(
+                    "longest_plateau_end_monotonic_ns"
+                )
+                _ad["cpu_overlap_graph_clip_ms"] = _cpu_summary.get("cpu_overlap_graph_clip_ms")
+                _ad["cpu_overlap_prefill_clip_ms"] = _cpu_summary.get("cpu_overlap_prefill_clip_ms")
+                _ad["cpu_overlap_gpu_load_ms"] = _cpu_summary.get("cpu_overlap_gpu_load_ms")
+
+                # Attach to result trace
+                result.setdefault("trace", {})
+                if isinstance(result["trace"], dict):
+                    result["trace"]["activation_diagnosis"] = _ad
 
             return result
         finally:
@@ -6147,6 +7253,7 @@ class ModalRuntimeEntrypoint:
         modal_method_entry_mono_ns: int = _method_first_line_ns
         modal_method_entry_wall_ns: int = _method_first_line_wall_ns
         _method_restore_marker = get_restore_return_marker()
+        _cgroup_sampler: _CgroupCpuSampler | None = getattr(self, '_cgroup_sampler', None)
         _entry_host = _capture_host_info()
 
         identity = _capture_remote_identity()
@@ -6354,6 +7461,14 @@ class ModalRuntimeEntrypoint:
                 request_origin_info=_request_origin_info,
                 **_resource_identity(),
             )
+            if _cgroup_sampler is not None and _method_entry_gap_results.get("same_process", False):
+                _cgroup_sampler.set_phase_source(
+                    lambda: (
+                        context.trace.events[-1].phase
+                        if context.trace.events and context.trace.events[-1].phase
+                        else "method"
+                    )
+                )
             _wf_hash_prefix = plan.workflow_hash[:16] if plan.workflow_hash else ""
             _src_wf_hash_prefix = plan.source_workflow_hash[:16] if plan.source_workflow_hash else ""
             try:
@@ -6657,6 +7772,11 @@ class ModalRuntimeEntrypoint:
                 )
                 print(_format_v2_critical_path(_critical_path_values), flush=True)
                 event = {**event, "data": data}
+                if _cgroup_sampler is not None:
+                    _cgroup_sampler.stop()
+                    _cgroup_sampler.report()
+                    self._cgroup_sampler = None
+                    _cgroup_sampler = None
             yield event
 
     async def run_prompt_stream(
@@ -6763,6 +7883,7 @@ def _build_decorated_v2_class() -> type:
         self.container_session_id = _V2_CONTAINER_SESSION_ID
         self._restore_count = 0
         self._restore_timing = None
+        self._cgroup_sampler = None
         self._cpu_snapshot_unet_runtime_state = None
         self._v2_initialized = True
 

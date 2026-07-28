@@ -201,15 +201,18 @@ def register_unet_forward_probe(unet: Any, source: str = "cpu_snapshot") -> None
         from comfymodal_runtime.runtime_executor import ensure_sampling_timing_wrapper
         ensure_sampling_timing_wrapper(patcher)
 
-    # Install forward pre-hook on this specific diffusion model immediately.
-    # This ensures the hook is in place before load_models_gpu or forward.
+    # Install forward pre-hook and post-hook on this specific diffusion model.
+    # This ensures the hooks are in place before load_models_gpu or forward.
     try:
         import torch
         # Skip NextDiT (handled by install_nextdit_forward_pre_hook)
         if "NextDiT" in type(dm).__name__:
             return
-        handle = dm.register_forward_pre_hook(_forward_pre_hook, with_kwargs=True)
-        _installed_hook_handles.append(handle)
+        pre_handle = dm.register_forward_pre_hook(_forward_pre_hook, with_kwargs=True)
+        _installed_hook_handles.append(pre_handle)
+        # Install forward post-hook for completion recording
+        post_handle = dm.register_forward_hook(_forward_post_hook)
+        _installed_hook_handles.append(post_handle)
         global _unet_forward_hooks_installed
         _unet_forward_hooks_installed = True
     except Exception as _hook_exc:
@@ -266,6 +269,103 @@ _DEDUP_MAX = 1024
 # Separate dedup for unet_first_cuda_op (one per request)
 _first_cuda_dedup: set[str] = set()
 _first_cuda_dedup_lock = threading.RLock()
+# ── Forward post hook registry ─────────────────────────────────────────────
+# A single post-hook handle is stored so we can remove/replace it.
+_forward_post_handle: Any = None
+
+
+def _forward_post_hook(module: Any, args: tuple[Any, ...], output: Any) -> None:
+    """Instance-level forward post-hook on diffusion model.
+
+    Completes the first CUDA forward record: captures wall/thread/process/faults,
+    GPU alloc/reserved before+after, and emits ``unet_first_cuda_forward_complete``.
+    Only the first matching CUDA forward produces a record (one per request).
+    Uses active diagnostics state['first_forward'] instead of module-global.
+    """
+    _ensure_context_vars()
+    request_trace = _ACTIVE_REQUEST_TRACE.get() if _ACTIVE_REQUEST_TRACE is not None else None
+    if request_trace is None:
+        return
+    request_id = request_trace.request_id
+    with _first_cuda_dedup_lock:
+        if request_id not in _first_cuda_dedup:
+            return  # pre-hook didn't mark this request_id yet
+
+    from .model_preload import _ACTIVATION_DIAGNOSTIC_STATE, _RESIDENCY_SAMPLER_CALLBACK
+    _diag = _ACTIVATION_DIAGNOSTIC_STATE.get()
+    if _diag is None:
+        return
+    _state = _diag.get("first_forward")
+    if not isinstance(_state, dict) or not _state.get("enter_monotonic_ns"):
+        return
+
+    # Compute post-forward deltas
+    end_wall_ns = time.monotonic_ns()
+    end_thread_ns = time.thread_time_ns() if hasattr(time, "thread_time_ns") else 0
+    end_process_ns = time.process_time_ns() if hasattr(time, "process_time_ns") else 0
+    end_minor_faults = 0
+    end_major_faults = 0
+    try:
+        import resource as _r
+        _end_ru = _r.getrusage(_r.RUSAGE_SELF)
+        end_minor_faults = _end_ru.ru_minflt
+        end_major_faults = _end_ru.ru_majflt
+    except Exception:
+        pass
+
+    begin_wall = _state["enter_monotonic_ns"]
+    begin_thread = _state.get("thread_enter_ns", 0) or 0
+    begin_process = _state.get("process_enter_ns", 0) or 0
+    faults_before = _state.get("faults_before") or {}
+    begin_minor = faults_before.get("minor_faults", 0) or 0
+    begin_major = faults_before.get("major_faults", 0) or 0
+
+    wall_ms = round((end_wall_ns - begin_wall) / 1_000_000, 3)
+    thread_ms = round((end_thread_ns - begin_thread) / 1_000_000, 3)
+    process_ms = round((end_process_ns - begin_process) / 1_000_000, 3)
+    minor_faults = max(0, end_minor_faults - begin_minor)
+    major_faults = max(0, end_major_faults - begin_major)
+
+    # GPU alloc/reserved after
+    _gpu_alloc_after = 0
+    _gpu_reserved_after = 0
+    try:
+        import torch as _torch2
+        if _torch2.cuda.is_available():
+            _gpu_alloc_after = _torch2.cuda.memory_allocated()
+            _gpu_reserved_after = _torch2.cuda.memory_reserved()
+    except Exception:
+        pass
+
+    metadata: dict[str, Any] = {
+        "wall_ms": wall_ms,
+        "thread_cpu_ms": thread_ms,
+        "process_cpu_ms": process_ms,
+        "minor_faults": minor_faults,
+        "major_faults": major_faults,
+        "gpu_allocated_before": _state.get("gpu_allocated_before"),
+        "gpu_reserved_before": _state.get("gpu_reserved_before"),
+        "gpu_allocated_after": _gpu_alloc_after,
+        "gpu_reserved_after": _gpu_reserved_after,
+        "x_device": _state.get("x_device", ""),
+        "x_dtype": _state.get("x_dtype", ""),
+        "enter_monotonic_ns": begin_wall,
+        "exit_monotonic_ns": end_wall_ns,
+    }
+    request_trace.emit(
+        "unet_first_cuda_forward_complete", phase="execution", metadata=metadata
+    )
+
+    # Finalize first_forward in activation diagnostics
+    _diag["first_forward"] = dict(metadata)
+
+    # ── Residency sampler: first_unet_forward ──
+    _res_cb = _RESIDENCY_SAMPLER_CALLBACK.get()
+    if _res_cb is not None:
+        try:
+            _res_cb("first_unet_forward", request_trace)
+        except Exception:
+            pass
 
 
 def _forward_pre_hook(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any] | None = None) -> None:
@@ -301,7 +401,7 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
 
     # ── Always-on: unet_first_cuda_op once per request ─────────────────
     # Only consumes the dedup slot when the input is CUDA, so a non-CUDA
-    # first forward does not prevent a later CUDA forward from emitting.
+    # first forward does NOT consume the dedup (CPU pre must not consume).
     _first_cuda_emitted = False
     with _first_cuda_dedup_lock:
         if request_id not in _first_cuda_dedup:
@@ -319,6 +419,41 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
                 else:
                     elapsed_ms = "absent"
 
+                # Capture begin timestamps for post-hook completion, store in activation diagnostics
+                _first_forward_state = {
+                    "enter_monotonic_ns": time.monotonic_ns(),
+                    "thread_enter_ns": time.thread_time_ns() if hasattr(time, "thread_time_ns") else 0,
+                    "process_enter_ns": time.process_time_ns() if hasattr(time, "process_time_ns") else 0,
+                    "faults_before": {"minor_faults": 0, "major_faults": 0},
+                    "request_id": request_id,
+                    "x_device": x_device,
+                    "x_dtype": str(x.dtype) if x is not None else "",
+                    "demand_elapsed_ms": elapsed_ms,
+                    "gpu_allocated_before": None,
+                    "gpu_reserved_before": None,
+                }
+                try:
+                    import resource as _r
+                    _start_ru = _r.getrusage(_r.RUSAGE_SELF)
+                    _first_forward_state["faults_before"] = {
+                        "minor_faults": _start_ru.ru_minflt,
+                        "major_faults": _start_ru.ru_majflt,
+                    }
+                except Exception:
+                    pass
+                try:
+                    import torch as _torch
+                    if _torch.cuda.is_available():
+                        _first_forward_state["gpu_allocated_before"] = int(_torch.cuda.memory_allocated())
+                        _first_forward_state["gpu_reserved_before"] = int(_torch.cuda.memory_reserved())
+                except Exception:
+                    pass
+                # Store in activation diagnostics state['first_forward'] instead of module-global
+                from .model_preload import _ACTIVATION_DIAGNOSTIC_STATE
+                _ad_state = _ACTIVATION_DIAGNOSTIC_STATE.get()
+                if _ad_state is not None:
+                    _ad_state["first_forward"] = dict(_first_forward_state)
+
                 metadata: dict[str, Any] = {
                     "event_semantics": "first_unet_forward_with_cuda_input",
                     "demand_start_present": demand_present,
@@ -334,6 +469,11 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
 
                 # Clean up demand start storage (no longer needed for this request)
                 _clear_demand_start_ns(request_id)
+
+    # CPU input: do NOT consume the dedup slot.  Return None so forward proceeds.
+    # The CUDA-capable forward will consume the slot later if it arrives.
+    if _first_cuda_emitted is False:
+        return None
 
     # ── Diagnostic-only: unet_forward_probe (gated by COMFYMODAL_V2_UNET_FORWARD_DIAG) ────────
     if not _is_enabled():

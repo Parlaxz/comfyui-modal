@@ -1318,35 +1318,11 @@ def install_pre_sampler_hooks() -> None:
 
         _execution.execute = _patched_exec_node
 
-    # ── 3. comfy.model_management.load_models_gpu ──────────────────────
-    _orig_load_models = getattr(_mm, "load_models_gpu", None)
-    if _orig_load_models is not None:
-        _ORIGINAL_FUNCTIONS["load_models_gpu"] = _orig_load_models
-
-        def _patched_load_models_gpu(
-            models, memory_required=0, force_patch_weights=False,
-            minimum_memory_required=None, force_full_load=False,
-        ):
-            state = _instrumentation_var.get()
-            if state is None:
-                return _orig_load_models(
-                    models, memory_required, force_patch_weights,
-                    minimum_memory_required, force_full_load,
-                )
-            _t0 = time.perf_counter_ns()
-            try:
-                return _orig_load_models(
-                    models, memory_required, force_patch_weights,
-                    minimum_memory_required, force_full_load,
-                )
-            finally:
-                _elapsed = _ns_ms(_t0)
-                if state is not None:
-                    state["model_patch_ms"] = state.get("model_patch_ms", 0.0) + _elapsed
-                    state.setdefault("_mp_count", 0)
-                    state["_mp_count"] += 1
-
-        _mm.load_models_gpu = _patched_load_models_gpu
+    # ── 3. (removed) comfy.model_management.load_models_gpu ────────────
+    # The load_models_gpu wrapper is owned by model_preload.py
+    # (_make_gpu_loader_wrapper).  The former duplicate timing patch /
+    # capture / wrapper / assignment / restore has been removed to avoid
+    # double-wrapping.  Old aggregate is unavailable; remove authority.
 
     # ── 4. PromptExecutor.execute_async ────────────────────────────────
     _prompt_executor_cls = getattr(_execution, "PromptExecutor", None)
@@ -1534,10 +1510,6 @@ def uninstall_pre_sampler_hooks() -> None:
     _orig_exec = _ORIGINAL_FUNCTIONS.get("execute")
     if _orig_exec is not None:
         _execution.execute = _orig_exec
-
-    _orig_load = _ORIGINAL_FUNCTIONS.get("load_models_gpu")
-    if _orig_load is not None:
-        _mm.load_models_gpu = _orig_load
 
     _orig_exec_async = _ORIGINAL_FUNCTIONS.get("execute_async")
     if _orig_exec_async is not None:
@@ -1867,3 +1839,10 @@ def ensure_sampling_timing_wrapper(model_patcher: Any) -> bool:
             flush=True,
         )
         return False
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# (removed) Structured pre-sampler report attachment
+# ═══════════════════════════════════════════════════════════════════════
+# _attach_structured_report has been removed.  Use the existing
+# pre_sampler_critical_path facility in RuntimeExecutor instead.
