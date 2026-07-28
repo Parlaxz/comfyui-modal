@@ -5585,6 +5585,155 @@ class V2LoaderBridge:
             return {}
         return self.coordinator.diagnostics(self._preparation)
 
+    def diagnostic_snapshot(self) -> dict[str, Any]:
+        """Return a read-only diagnostic snapshot of the bridge's current state.
+
+        Returns exactly the documented keys with no extras.  Never raises,
+        never logs, never blocks on future results/exceptions/wait, and
+        never returns full model keys, paths, or repr identities.
+        """
+        # Acquire bridge lock once, copy references/scalars, release quickly.
+        prep = model_key = prefill_key = coordinator = None
+        try:
+            with self._prefill_lock:
+                prep = self._preparation
+                model_key = self._model_key
+                prefill_key = self._prefill_key
+                coordinator = self.coordinator
+        except Exception:
+            pass
+
+        # Bridge identity
+        bridge_object_id = str(id(self))
+
+        # Preparation exists
+        current_preparation_exists = prep is not None
+
+        # Key hashes — compact stable hashes via canonical helper, None when absent.
+        try:
+            model_key_hash = (
+                model_key.stable_hash if model_key is not None else None
+            )
+            current_model_key_hash = model_key_hash if isinstance(model_key_hash, str) else None
+        except Exception:
+            current_model_key_hash = None
+
+        try:
+            prefill_key_hash = (
+                prefill_key.stable_hash if prefill_key is not None else None
+            )
+            current_prefill_key_hash = prefill_key_hash if isinstance(prefill_key_hash, str) else None
+        except Exception:
+            current_prefill_key_hash = None
+
+        # ── Future status helper (read-only, no result/exception/wait/cancel) ──
+        def _future_status(
+            future: Any,
+        ) -> tuple[bool, bool | None, bool | None, bool | None]:
+            if future is None:
+                return (False, None, None, None)
+            f_exists = True
+            f_done: bool | None = None
+            f_running: bool | None = None
+            f_cancelled: bool | None = None
+            try:
+                status = future.done()
+                f_done = status if isinstance(status, bool) else None
+            except Exception:
+                f_done = None
+            try:
+                status = future.running()
+                f_running = status if isinstance(status, bool) else None
+            except Exception:
+                f_running = None
+            try:
+                status = future.cancelled()
+                f_cancelled = status if isinstance(status, bool) else None
+            except Exception:
+                f_cancelled = None
+            return (f_exists, f_done, f_running, f_cancelled)
+
+        if prep is not None:
+            # Access future fields safely — prep may not be a real
+            # RestorePreparation (e.g. in corrupt-state scenarios).
+            try:
+                unet_future = prep.unet_future  # type: ignore[union-attr]
+            except Exception:
+                unet_future = _LOADER_MISS
+            try:
+                clip_future = prep.clip_future  # type: ignore[union-attr]
+            except Exception:
+                clip_future = _LOADER_MISS
+            try:
+                prefill_future = prep.prefill_future  # type: ignore[union-attr]
+            except Exception:
+                prefill_future = _LOADER_MISS
+
+            unet_exists, unet_done, unet_running, unet_cancelled = _future_status(
+                unet_future if unet_future is not _LOADER_MISS else None
+            )
+            clip_exists, clip_done, clip_running, clip_cancelled = _future_status(
+                clip_future if clip_future is not _LOADER_MISS else None
+            )
+            prefill_exists, prefill_done, prefill_running, prefill_cancelled = _future_status(
+                prefill_future if prefill_future is not _LOADER_MISS else None
+            )
+        else:
+            unet_exists = clip_exists = prefill_exists = False
+            unet_done = unet_running = unet_cancelled = None
+            clip_done = clip_running = clip_cancelled = None
+            prefill_done = prefill_running = prefill_cancelled = None
+
+        # ── Executor state (read-only, via coordinator lock) ─────────────────
+        pool = None
+        executor_exists: bool | None = None
+        try:
+            with coordinator._pool_lock:
+                pool = coordinator._pool
+            executor_exists = pool is not None
+        except Exception:
+            pass
+
+        if pool is not None:
+            try:
+                executor_threads = getattr(pool, "_threads")
+                executor_thread_count = len(executor_threads)
+            except Exception:
+                executor_thread_count = None
+            try:
+                executor_work_queue_size = pool._work_queue.qsize()
+            except Exception:
+                executor_work_queue_size = None
+        else:
+            executor_thread_count = None
+            executor_work_queue_size = None
+
+        # Pending lane count — no authoritative tracking exists on this bridge.
+        pending_lane_count: int | None = None
+
+        return {
+            "bridge_object_id": bridge_object_id,
+            "current_preparation_exists": current_preparation_exists,
+            "current_model_key_hash": current_model_key_hash,
+            "current_prefill_key_hash": current_prefill_key_hash,
+            "unet_future_exists": unet_exists,
+            "unet_future_done": unet_done,
+            "unet_future_running": unet_running,
+            "unet_future_cancelled": unet_cancelled,
+            "clip_future_exists": clip_exists,
+            "clip_future_done": clip_done,
+            "clip_future_running": clip_running,
+            "clip_future_cancelled": clip_cancelled,
+            "prefill_future_exists": prefill_exists,
+            "prefill_future_done": prefill_done,
+            "prefill_future_running": prefill_running,
+            "prefill_future_cancelled": prefill_cancelled,
+            "executor_exists": executor_exists,
+            "executor_thread_count": executor_thread_count,
+            "executor_work_queue_size": executor_work_queue_size,
+            "pending_lane_count": pending_lane_count,
+        }
+
     def schedule_execution_prefill(
         self,
         *,
