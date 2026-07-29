@@ -301,12 +301,6 @@ _RESIDENCY_DIAGNOSTICS_ENABLED: bool = (
 _V2_FULL_TRACE_ENABLED: bool = (
     os.environ.get("COMFYMODAL_V2_FULL_TRACE", "") == "1"
 )
-# ── CPU isolation diagnostic gate ─────────────────────────────────────
-# Inert when COMFYMODAL_V2_CPU_ISOLATION != '1'.
-_V2_CPU_ISOLATION: bool = (
-    os.environ.get("COMFYMODAL_V2_CPU_ISOLATION", "") == "1"
-)
-
 # Process-local set of trace IDs that have been finalized.  Guards against
 # duplicate finalization under repeated result/error paths.
 _FULL_TRACE_FINALIZED_IDS: set[str] = set()
@@ -318,7 +312,7 @@ _FULL_TRACE_FINALIZED_LOCK = threading.Lock()
 # end_activation_diagnostics(token) control the scope.
 
 # Import SAMPLER_SAMPLE wrapper from runtime_executor (neutral module).
-from comfymodal_runtime.runtime_executor import _COMFYMODAL_V2_SAMPLING_WRAPPER, _sampler_wrapper_dedup, _sampler_wrapper_dedup_lock
+from comfymodal_runtime.runtime_executor import _COMFYMODAL_V2_SAMPLING_WRAPPER, _sampler_wrapper_dedup, _sampler_wrapper_dedup_lock, _restore_isolation_scope
 
 # ── Canonical per-role identity comparison for restore + request binding ──
 
@@ -1867,7 +1861,7 @@ def _runtime_env() -> dict[str, str]:
         "COMFYMODAL_V2_PROFILE_VOLUME": os.environ.get(
             "COMFYMODAL_V2_PROFILE_VOLUME", "comfymodal-v2-profiles"
         ),
-        "COMFYMODAL_V2_CPU_ISOLATION": os.environ.get("COMFYMODAL_V2_CPU_ISOLATION", "0"),
+
     }
     memory_mb = os.environ.get("COMFYMODAL_V2_MEMORY_MB")
     if memory_mb is not None:
@@ -4129,6 +4123,21 @@ class ModalRuntimeEntrypoint:
 
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
+        # ── V2 restore isolation entry gap (first snap=False restore only) ──
+        _restore_isolation_enabled = (_v2_container_restore_count == 0)
+        if _restore_isolation_enabled:
+            print(
+                f"[v2.restore_isolation] started GAP_RESTORE_ENTRY "
+                f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                flush=True,
+            )
+            time.sleep(5)
+            print(
+                f"[v2.restore_isolation] ended GAP_RESTORE_ENTRY "
+                f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
+                flush=True,
+            )
+
         # ── Full-trace session: FIRST executable operation (before timestamp
         #    capture, residency log, sampler, memory report, _configure_runtime,
         #    identity capture, reload, GPU state, CUDA work).  Start with only
@@ -4295,7 +4304,7 @@ class ModalRuntimeEntrypoint:
                 _RES4LYF_PREPARED.clear()
                 _CACHEDIT_PREPARED.clear()
                 trace.emit("v2_bootstrap_restore_start", phase="restore")
-                state = self.bootstrap.restore(trace=trace)
+                state = self.bootstrap.restore(trace=trace, _restore_isolation_enabled=_restore_isolation_enabled)
                 trace.emit("v2_bootstrap_restore_end", phase="restore")
 
                 # [v2.generation_identity] bootstrap diagnostic
@@ -4506,15 +4515,19 @@ class ModalRuntimeEntrypoint:
 
                 plan = self._restore_plan
 
-                # Step 1: Compatibility check using non-VAE key matcher
-                #          + projected spec matcher (no canonical role identity).
-                _identity_check_start_ns = time.monotonic_ns()
-                _keys_match = _cpu_snapshot_model_keys_match(plan.model_key, models.model_key)
-                _specs_match = _cpu_snapshot_specs_match(plan.model_spec, models.model_spec)
-                _key_reason = _cpu_snapshot_key_mismatch_reason(plan.model_key, models.model_key) if not _keys_match else None
-                _spec_reason = _cpu_snapshot_spec_mismatch_reason(plan.model_spec, models.model_spec) if not _specs_match else None
-                _RESTORE_STAGE_TIMERS["snapshot_identity_checks"] = round(
-                    (time.monotonic_ns() - _identity_check_start_ns) / 1_000_000, 3
+                # ── 5. cpu_snapshot_identity_match ──
+                def _do_identity_match():
+                    _identity_check_start_ns = time.monotonic_ns()
+                    km = _cpu_snapshot_model_keys_match(plan.model_key, models.model_key)
+                    sm = _cpu_snapshot_specs_match(plan.model_spec, models.model_spec)
+                    kr = _cpu_snapshot_key_mismatch_reason(plan.model_key, models.model_key) if not km else None
+                    sr = _cpu_snapshot_spec_mismatch_reason(plan.model_spec, models.model_spec) if not sm else None
+                    _RESTORE_STAGE_TIMERS["snapshot_identity_checks"] = round(
+                        (time.monotonic_ns() - _identity_check_start_ns) / 1_000_000, 3
+                    )
+                    return km, sm, kr, sr
+                _keys_match, _specs_match, _key_reason, _spec_reason = _restore_isolation_scope(
+                    "cpu_snapshot_identity_match", _do_identity_match, enabled=_restore_isolation_enabled,
                 )
                 _request_key_hash = stable_hash(plan.model_key.to_dict())[:16] if plan.model_key else ""
                 _request_spec_hash = stable_hash(models.model_spec)[:16] if models.model_spec else ""
@@ -4577,12 +4590,16 @@ class ModalRuntimeEntrypoint:
                         flush=True,
                     )
                 else:
-                    # Step 2: Full validation against models' own key/spec
-                    _valid, _reason = validate_cpu_snapshot_models(
-                        models,
-                        expected_key=models.model_key,
-                        expected_spec=models.model_spec,
-                        resolve_path=_validate_resolve_path,
+                    # ── 6. validate_cpu_snapshot_models ──
+                    def _do_validate_models():
+                        return validate_cpu_snapshot_models(
+                            models,
+                            expected_key=models.model_key,
+                            expected_spec=models.model_spec,
+                            resolve_path=_validate_resolve_path,
+                        )
+                    _valid, _reason = _restore_isolation_scope(
+                        "validate_cpu_snapshot_models", _do_validate_models, enabled=_restore_isolation_enabled,
                     )
                     if not _valid:
                         raise RuntimeError(
@@ -4692,8 +4709,13 @@ class ModalRuntimeEntrypoint:
                     except Exception:
                         raise
 
-                    retarget_ok, retarget_reason = retarget_cpu_snapshot_models(
-                        models, model_management=_mm,
+                    # ── 8. retarget_cpu_snapshot_models ──
+                    def _do_retarget():
+                        return retarget_cpu_snapshot_models(
+                            models, model_management=_mm,
+                        )
+                    retarget_ok, retarget_reason = _restore_isolation_scope(
+                        "retarget_cpu_snapshot_models", _do_retarget, enabled=_restore_isolation_enabled,
                     )
                     if not retarget_ok:
                         raise RuntimeError(f"retarget failed: {retarget_reason}")
@@ -4816,10 +4838,8 @@ class ModalRuntimeEntrypoint:
                     except Exception:
                         pass
 
-                    # ── BF16-native validation before bridge publication ──
-                    # Uses models.compute_policy (not plan.model_spec) since
-                    # compute_policy is stored separately from model_spec.
-                    if models.compute_policy == _COMPUTE_POLICY_BF16_NATIVE:
+                    # ── 7. validate_snapshot_unet_bf16_native ──
+                    def _do_validate_bf16():
                         validate_snapshot_unet_bf16_native(
                             models.unet,
                             context="restore_pre_bridge.",
@@ -4828,16 +4848,28 @@ class ModalRuntimeEntrypoint:
                             effective_weight_dtype=_post_effective_label,
                             effective_compute_dtype=_post_effective_label,
                         )
+                    if models.compute_policy == _COMPUTE_POLICY_BF16_NATIVE:
+                        _restore_isolation_scope(
+                            "validate_snapshot_unet_bf16_native", _do_validate_bf16,
+                            enabled=_restore_isolation_enabled,
+                        )
 
-                    # Activate on the bridge.
-                    _retarget_start_ns = time.monotonic_ns()
-                    self._use_cpu_snapshot_models_on_bridge(
-                        plan.model_key,
-                        plan.prefill_key,
-                        plan.model_spec,
-                        models.unet,
-                        models.clip,
-                        trace=trace,
+                    # ── 9. activate_snapshot_bridge ──
+                    _retarget_start_ns = 0
+                    def _do_activate_bridge():
+                        nonlocal _retarget_start_ns
+                        _retarget_start_ns = time.monotonic_ns()
+                        self._use_cpu_snapshot_models_on_bridge(
+                            plan.model_key,
+                            plan.prefill_key,
+                            plan.model_spec,
+                            models.unet,
+                            models.clip,
+                            trace=trace,
+                        )
+                    _restore_isolation_scope(
+                        "activate_snapshot_bridge", _do_activate_bridge,
+                        enabled=_restore_isolation_enabled,
                     )
                     _RESTORE_STAGE_TIMERS["cpu_snapshot_retargeting"] = round(
                         (time.monotonic_ns() - _retarget_start_ns) / 1_000_000, 3
@@ -4861,63 +4893,64 @@ class ModalRuntimeEntrypoint:
                     from comfymodal_runtime.runtime_executor import ensure_sampling_timing_wrapper
                     ensure_sampling_timing_wrapper(models.unet)
                     install_registered_unet_forward_hooks()
-                    # CacheDiT restore preparation: locate exactly one
-                    # CacheDiT_Model_Optimizer node from snapshot plan.workflow,
-                    # pass ONLY its node inputs (helper removes 'model'), consume
-                    # patched_model and replace all UNET references.
+                    # ── 10. cachedit_restore_prepare ──
                     _cd_restore_node_ids: list[str] = []
                     _cd_restore_inputs: dict[str, Any] = {}
-                    try:
-                        _plan_wf = _thaw(getattr(plan, "workflow", {}))
-                        for _nid, _node in _plan_wf.items():
-                            if isinstance(_node, Mapping) and _node.get("class_type") == "CacheDiT_Model_Optimizer":
-                                _cd_restore_node_ids.append(str(_nid))
-                        # Require exactly one CacheDiT_Model_Optimizer node
-                        if len(_cd_restore_node_ids) == 1:
-                            _cd_restore_node_id = _cd_restore_node_ids[0]
-                            _cd_restore_inputs = dict(
-                                _plan_wf.get(_cd_restore_node_id, {}).get("inputs", {})
-                            )
-                            _cd_result = state._restore_cachedit_prepare(
-                                unet=models.unet,
-                                workflow_inputs=_cd_restore_inputs,
-                                workflow_hash=str(getattr(plan, "workflow_hash", "")),
-                            )
-                            if _cd_result.get("ok"):
-                                _patched_model = _cd_result.get("patched_model")
-                                if _patched_model is not None:
-                                    # Replace all UNET references with patched model
-                                    state.snapshot_loader_outputs["unet"] = _patched_model
-                                    self._cpu_snapshot_models.unet = _patched_model
-                                    # Re-activate the bridge with patched UNET
-                                    self._use_cpu_snapshot_models_on_bridge(
-                                        plan.model_key,
-                                        plan.prefill_key,
-                                        plan.model_spec,
-                                        _patched_model,
-                                        models.clip,
-                                        trace=trace,
-                                    )
-                                    # Re-register forward probe after replacement
-                                    register_unet_forward_probe(_patched_model, source="cachedit_restore")
-                                    # Also explicitly install timing wrapper on the
-                                    # CacheDiT-patched model.
-                                    from comfymodal_runtime.runtime_executor import ensure_sampling_timing_wrapper
-                                    ensure_sampling_timing_wrapper(_patched_model)
-                                _CACHEDIT_PREPARED[str(getattr(plan, "workflow_hash", ""))] = {
-                                    "unet_id": id(_patched_model) if _patched_model is not None else id(models.unet),
-                                    "workflow_hash": str(getattr(plan, "workflow_hash", "")),
-                                    "cache_dit_inputs": _cd_restore_inputs,
-                                }
-                                if _patched_model is not None:
-                                    print(
-                                        f"[v2.cachedit_restore] decision=prepared "
-                                        f"node_id={_cd_restore_node_id} "
-                                        f"unet_match=1",
-                                        flush=True,
-                                    )
-                    except Exception as _cd_exc:
-                        print(f"[v2.cachedit_restore] error={_cd_exc}", flush=True)
+                    _patched_model = None
+
+                    def _do_cachedit_restore_prepare():
+                        nonlocal _cd_restore_inputs, _patched_model
+                        try:
+                            _plan_wf = _thaw(getattr(plan, "workflow", {}))
+                            for _nid, _node in _plan_wf.items():
+                                if isinstance(_node, Mapping) and _node.get("class_type") == "CacheDiT_Model_Optimizer":
+                                    _cd_restore_node_ids.append(str(_nid))
+                            if len(_cd_restore_node_ids) == 1:
+                                _cd_restore_node_id = _cd_restore_node_ids[0]
+                                _cd_restore_inputs = dict(
+                                    _plan_wf.get(_cd_restore_node_id, {}).get("inputs", {})
+                                )
+                                _cd_result = state._restore_cachedit_prepare(
+                                    unet=models.unet,
+                                    workflow_inputs=_cd_restore_inputs,
+                                    workflow_hash=str(getattr(plan, "workflow_hash", "")),
+                                )
+                                if _cd_result.get("ok"):
+                                    _patched_model = _cd_result.get("patched_model")
+                                    if _patched_model is not None:
+                                        state.snapshot_loader_outputs["unet"] = _patched_model
+                                        self._cpu_snapshot_models.unet = _patched_model
+                                        self._use_cpu_snapshot_models_on_bridge(
+                                            plan.model_key,
+                                            plan.prefill_key,
+                                            plan.model_spec,
+                                            _patched_model,
+                                            models.clip,
+                                            trace=trace,
+                                        )
+                                        register_unet_forward_probe(_patched_model, source="cachedit_restore")
+                                        from comfymodal_runtime.runtime_executor import ensure_sampling_timing_wrapper
+                                        ensure_sampling_timing_wrapper(_patched_model)
+                                    _CACHEDIT_PREPARED[str(getattr(plan, "workflow_hash", ""))] = {
+                                        "unet_id": id(_patched_model) if _patched_model is not None else id(models.unet),
+                                        "workflow_hash": str(getattr(plan, "workflow_hash", "")),
+                                        "cache_dit_inputs": _cd_restore_inputs,
+                                    }
+                                    if _patched_model is not None:
+                                        print(
+                                            f"[v2.cachedit_restore] decision=prepared "
+                                            f"node_id={_cd_restore_node_id} "
+                                            f"unet_match=1",
+                                            flush=True,
+                                        )
+                        except Exception as _cd_exc:
+                            print(f"[v2.cachedit_restore] error={_cd_exc}", flush=True)
+
+                    _restore_isolation_scope(
+                        "cachedit_restore_prepare",
+                        _do_cachedit_restore_prepare,
+                        enabled=_restore_isolation_enabled,
+                    )
                     # ── Build CPU storage registries after final CacheDiT-patched UNET ──
                     self._cpu_snapshot_unet_storage_registry = None
                     self._cpu_snapshot_clip_storage_registry = None
@@ -4944,51 +4977,58 @@ class ModalRuntimeEntrypoint:
                             self._sample_snapshot_residency(stage="restore_ready", trace=trace)
                         except Exception:
                             pass
-                    # RES4LYF restore preparation
-                    try:
-                        _sampler_nodes_r4 = [
-                            {"node_id": str(nid), "inputs": dict(node.get("inputs", {}))}
-                            for nid, node in getattr(plan, "workflow", {}).items()
-                            if isinstance(node, Mapping)
-                            and node.get("class_type") == "ClownsharKSampler_Beta"
-                        ]
-                        _r4_result = state._restore_res4lyf_prepare(
-                            sampler_node_inputs=_sampler_nodes_r4,
-                        )
-                        if _r4_result.get("ok"):
-                            _installed = _install_res4lyf_parser_hook()
-                            _prepared_records = []
-                            for _record in _r4_result.get("prepared_records", ()):
-                                _parser = _record.get("parser")
-                                if _parser is None:
-                                    continue
-                                _prepared_records.append(MappingProxyType({
-                                    "node_id": str(_record.get("node_id", "")),
-                                    "raw_options": str(_record.get("raw_extra_options", "")).strip(),
-                                    "parser_state": MappingProxyType(dict(_parser.__dict__)),
-                                }))
-                            if _installed and _prepared_records:
-                                _wf_hash_key = str(getattr(plan, "workflow_hash", ""))
-                                _RES4LYF_PREPARED[_wf_hash_key] = {
-                                    "records": tuple(_prepared_records),
-                                }
-                                _r4_node_ids = ",".join(
-                                    str(record["node_id"]) for record in _prepared_records
-                                )
+                    # ── 11. res4lyf_restore_prepare ──
+                    def _do_res4lyf_restore_prepare():
+                        try:
+                            _sampler_nodes_r4 = [
+                                {"node_id": str(nid), "inputs": dict(node.get("inputs", {}))}
+                                for nid, node in getattr(plan, "workflow", {}).items()
+                                if isinstance(node, Mapping)
+                                and node.get("class_type") == "ClownsharKSampler_Beta"
+                            ]
+                            _r4_result = state._restore_res4lyf_prepare(
+                                sampler_node_inputs=_sampler_nodes_r4,
+                            )
+                            if _r4_result.get("ok"):
+                                _installed = _install_res4lyf_parser_hook()
+                                _prepared_records = []
+                                for _record in _r4_result.get("prepared_records", ()):
+                                    _parser = _record.get("parser")
+                                    if _parser is None:
+                                        continue
+                                    _prepared_records.append(MappingProxyType({
+                                        "node_id": str(_record.get("node_id", "")),
+                                        "raw_options": str(_record.get("raw_extra_options", "")).strip(),
+                                        "parser_state": MappingProxyType(dict(_parser.__dict__)),
+                                    }))
+                                if _installed and _prepared_records:
+                                    _wf_hash_key = str(getattr(plan, "workflow_hash", ""))
+                                    _RES4LYF_PREPARED[_wf_hash_key] = {
+                                        "records": tuple(_prepared_records),
+                                    }
+                                    _r4_node_ids = ",".join(
+                                        str(record["node_id"]) for record in _prepared_records
+                                    )
+                                    print(
+                                        f"[v2.res4lyf_restore] decision=prepared "
+                                        f"node_id={_r4_node_ids} "
+                                        f"hook_installed={int(_RES4LYF_HOOK_INSTALLED)}",
+                                        flush=True,
+                                    )
+                            else:
+                                _reason = _r4_result.get("reason", "unknown")
                                 print(
-                                    f"[v2.res4lyf_restore] decision=prepared "
-                                    f"node_id={_r4_node_ids} "
-                                    f"hook_installed={int(_RES4LYF_HOOK_INSTALLED)}",
+                                    f"[v2.res4lyf_restore] ok=0 reason={_reason}",
                                     flush=True,
                                 )
-                        else:
-                            _reason = _r4_result.get("reason", "unknown")
-                            print(
-                                f"[v2.res4lyf_restore] ok=0 reason={_reason}",
-                                flush=True,
-                            )
-                    except Exception as _r4_exc:
-                        print(f"[v2.res4lyf_restore] error={_r4_exc}", flush=True)
+                        except Exception as _r4_exc:
+                            print(f"[v2.res4lyf_restore] error={_r4_exc}", flush=True)
+
+                    _restore_isolation_scope(
+                        "res4lyf_restore_prepare",
+                        _do_res4lyf_restore_prepare,
+                        enabled=_restore_isolation_enabled,
+                    )
                     _activation_duration_ms = round(
                         (time.perf_counter() - _activation_perf_start) * 1000.0,
                         3,
@@ -5285,63 +5325,85 @@ class ModalRuntimeEntrypoint:
                 },
             )
             # â”€â”€ v2 restore finalize â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            trace.emit("v2_restore_finalize_start", phase="restore")
+            # ── 12. restore_finalization ──
+            def _do_restore_finalization():
+                global _LATEST_LIFECYCLE_TIMING
 
-            trace.emit("remote_lifecycle_end", phase="restore", metadata={"status": "restored"})
-            self._remember_lifecycle_trace(trace)
-            trace = self._lifecycle_trace or trace
-
-            restore_total_ms = round((time.perf_counter() - _restore_perf_start) * 1000.0, 3)
-            # Capture end timestamps BEFORE constructing _restore_timing
-            _restore_status = "success"
-            _restore_end_wall_ns = int(time.time() * 1_000_000_000)
-            _restore_end_mono_ns = time.monotonic_ns()
-            _restore_timing: dict[str, Any] = {
-                "restore_total_ms": restore_total_ms,
-                "restore_session_id": restore_session_id,
-                "restored_instance_id": restored_instance_id,
-                "legacy_container_session_id": legacy_container_session_id,
-                "container_session_id": self.container_session_id,
-                "restore_count": self._restore_count,
-                "lifecycle_status": "ok",
-                "lifecycle_method": "restore",
-                "remote_python_resume_wall_unix_ns": remote_python_resume_wall_ns,
-                "remote_python_resume_mono_ns": remote_python_resume_mono_ns,
-                "restore_method_start_wall_unix_ns": restore_method_start_wall_ns,
-                "restore_method_start_mono_ns": restore_method_start_mono_ns,
-                "restore_method_end_wall_unix_ns": _restore_end_wall_ns,
-                "restore_method_end_mono_ns": _restore_end_mono_ns,
-                "restore_method_status": "success",
-            }
-            # Include available stage timings from bootstrap state (only when present)
-            if state.stage_durations:
-                for _stage, _dur_ms in state.stage_durations.items():
-                    if _dur_ms is not None and _dur_ms > 0:
-                        _restore_timing[f"{_stage}_ms"] = round(float(_dur_ms), 3)
-            # Merge restore-stage timers (reload_runtime_state, reload_models,
-            # restore_gpu_state, initialize_cuda, snapshot_identity_checks,
-            # cpu_snapshot_retargeting) collected by _wrap_restore_stage and
-            # direct inline timing in restore().
-            _REQUIRED_RESTORE_STAGES = (
-                "reload_runtime_state", "reload_models", "restore_gpu_state",
-                "initialize_cuda", "snapshot_identity_checks", "cpu_snapshot_retargeting",
-            )
-            for _stage in _REQUIRED_RESTORE_STAGES:
-                _dur_ms = _RESTORE_STAGE_TIMERS.get(_stage, 0.0)
-                _restore_timing[f"{_stage}_ms"] = round(_dur_ms, 3)
-                _restore_timing[f"{_stage}_invoked"] = _dur_ms > 0.0
-                _restore_timing[f"{_stage}_reason"] = (
-                    "ok" if _dur_ms > 0.0 else "not_invoked"
+                trace_local = trace
+                trace_local.emit("v2_restore_finalize_start", phase="restore")
+                trace_local.emit(
+                    "remote_lifecycle_end",
+                    phase="restore",
+                    metadata={"status": "restored"},
                 )
-            # Merge any additional non-required stage timers present
-            if _RESTORE_STAGE_TIMERS:
-                for _stage, _dur_ms in _RESTORE_STAGE_TIMERS.items():
-                    if _stage not in _REQUIRED_RESTORE_STAGES and _dur_ms > 0:
-                        _restore_timing[f"{_stage}_ms"] = round(_dur_ms, 3)
-            self._restore_timing = _restore_timing
-            _LATEST_LIFECYCLE_TIMING = _restore_timing
+                self._remember_lifecycle_trace(trace_local)
+                trace_local = self._lifecycle_trace or trace_local
 
-            trace.emit("v2_restore_finalize_end", phase="restore")
+                restore_total_ms_local = round(
+                    (time.perf_counter() - _restore_perf_start) * 1000.0,
+                    3,
+                )
+                restore_end_wall_ns_local = int(time.time() * 1_000_000_000)
+                restore_end_mono_ns_local = time.monotonic_ns()
+                restore_timing_local: dict[str, Any] = {
+                    "restore_total_ms": restore_total_ms_local,
+                    "restore_session_id": restore_session_id,
+                    "restored_instance_id": restored_instance_id,
+                    "legacy_container_session_id": legacy_container_session_id,
+                    "container_session_id": self.container_session_id,
+                    "restore_count": self._restore_count,
+                    "lifecycle_status": "ok",
+                    "lifecycle_method": "restore",
+                    "remote_python_resume_wall_unix_ns": remote_python_resume_wall_ns,
+                    "remote_python_resume_mono_ns": remote_python_resume_mono_ns,
+                    "restore_method_start_wall_unix_ns": restore_method_start_wall_ns,
+                    "restore_method_start_mono_ns": restore_method_start_mono_ns,
+                    "restore_method_end_wall_unix_ns": restore_end_wall_ns_local,
+                    "restore_method_end_mono_ns": restore_end_mono_ns_local,
+                    "restore_method_status": "success",
+                }
+                if state.stage_durations:
+                    for _stage, _dur_ms in state.stage_durations.items():
+                        if _dur_ms is not None and _dur_ms > 0:
+                            restore_timing_local[f"{_stage}_ms"] = round(float(_dur_ms), 3)
+                _REQUIRED_RESTORE_STAGES = (
+                    "reload_runtime_state", "reload_models", "restore_gpu_state",
+                    "initialize_cuda", "snapshot_identity_checks", "cpu_snapshot_retargeting",
+                )
+                for _stage in _REQUIRED_RESTORE_STAGES:
+                    _dur_ms = _RESTORE_STAGE_TIMERS.get(_stage, 0.0)
+                    restore_timing_local[f"{_stage}_ms"] = round(_dur_ms, 3)
+                    restore_timing_local[f"{_stage}_invoked"] = _dur_ms > 0.0
+                    restore_timing_local[f"{_stage}_reason"] = (
+                        "ok" if _dur_ms > 0.0 else "not_invoked"
+                    )
+                if _RESTORE_STAGE_TIMERS:
+                    for _stage, _dur_ms in _RESTORE_STAGE_TIMERS.items():
+                        if _stage not in _REQUIRED_RESTORE_STAGES and _dur_ms > 0:
+                            restore_timing_local[f"{_stage}_ms"] = round(_dur_ms, 3)
+                self._restore_timing = restore_timing_local
+                _LATEST_LIFECYCLE_TIMING = restore_timing_local
+                trace_local.emit("v2_restore_finalize_end", phase="restore")
+                return (
+                    trace_local,
+                    restore_total_ms_local,
+                    restore_timing_local,
+                    restore_end_wall_ns_local,
+                    restore_end_mono_ns_local,
+                )
+
+            (
+                trace,
+                restore_total_ms,
+                _restore_timing,
+                _restore_end_wall_ns,
+                _restore_end_mono_ns,
+            ) = _restore_isolation_scope(
+                "restore_finalization",
+                _do_restore_finalization,
+                enabled=_restore_isolation_enabled,
+            )
+            _restore_status = "success"
             _restore_result = {
                 "backend": state.backend,
                 "cuda": dict(state.cuda),
@@ -6759,19 +6821,6 @@ class ModalRuntimeEntrypoint:
                                     _milestones["first_executing_node"] = _node_str
                                     _milestones["first_executing_node_class"] = _class_node
                                     _milestones["first_executing_node_ns"] = _event_ns
-                                    # CPU isolation: executor_cache_and_dependency_setup ended
-                                    if _V2_CPU_ISOLATION:
-                                        print(
-                                            f"[v2.cpu_isolation] marker=ended operation=executor_cache_and_dependency_setup "
-                                            f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
-                                            flush=True,
-                                        )
-                                        time.sleep(5)
-                                        print(
-                                            f"[v2.cpu_isolation] marker=after operation=executor_cache_and_dependency_setup "
-                                            f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
-                                            flush=True,
-                                        )
                                 # First model-loader node: *Loader, Checkpoint, UNETLoader,
                                 # VAELoader, CLIPLoader/DualCLIPLoader/LoraLoader; exclude CLIPTextEncode
                                 _class_lower = _class_node.lower()
@@ -6946,19 +6995,6 @@ class ModalRuntimeEntrypoint:
                     flush=True,
                 )
 
-            # ── CPU isolation: executor_cache_and_dependency_setup ──
-            if _V2_CPU_ISOLATION:
-                print(
-                    f"[v2.cpu_isolation] marker=before operation=executor_cache_and_dependency_setup "
-                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
-                    flush=True,
-                )
-                await asyncio.sleep(5)
-                print(
-                    f"[v2.cpu_isolation] marker=started operation=executor_cache_and_dependency_setup "
-                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
-                    flush=True,
-                )
             try:
                 with pre_sampler_instrumentation_scope() as _pre_sampler_state:
                     if callable(execute_async):
@@ -7762,32 +7798,7 @@ class ModalRuntimeEntrypoint:
                     _loader_outputs[_nid] = (_snap_unet, _snap_clip, _snap_vae)
 
         async def seeded_set_prompt(*args: Any, **kwargs: Any) -> Any:
-            # Let set_prompt initialize cache keys
-            if _V2_CPU_ISOLATION:
-                print(
-                    f"[v2.cpu_isolation] marker=before operation=executor_set_prompt "
-                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
-                    flush=True,
-                )
-                await asyncio.sleep(5)
-                print(
-                    f"[v2.cpu_isolation] marker=started operation=executor_set_prompt "
-                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
-                    flush=True,
-                )
             result = await original_set_prompt(*args, **kwargs)
-            if _V2_CPU_ISOLATION:
-                print(
-                    f"[v2.cpu_isolation] marker=ended operation=executor_set_prompt "
-                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
-                    flush=True,
-                )
-                await asyncio.sleep(5)
-                print(
-                    f"[v2.cpu_isolation] marker=after operation=executor_set_prompt "
-                    f"wall_unix_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
-                    flush=True,
-                )
             trace.emit(
                 "executor_seed_apply_start",
                 phase="execution",
