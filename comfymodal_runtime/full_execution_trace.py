@@ -1233,6 +1233,8 @@ class FullExecutionTraceSession:
         self._viztracer_version: str | None = None
         self._torch_profiler: Any = None
         self._torch_profiler_active = False
+        self._torch_profiler_lock = threading.Lock()
+        self._torch_profiler_thread_id: int | None = None
         self._active_functions: dict[str, Callable] = {}
         self._stopped = threading.Event()
         self._start_time = time.time()
@@ -2034,6 +2036,7 @@ class FullExecutionTraceSession:
         """
         if self._torch_profiler_active or self._torch_profiler is not None:
             return
+        _start_thread_id = threading.get_ident()
         # Disabled when COMFYMODAL_V2_FULL_TRACE_TORCH is "0"
         if os.environ.get(_ENV_TORCH, "1") == "0":
             print(
@@ -2074,11 +2077,19 @@ class FullExecutionTraceSession:
             )
             self._torch_profiler.__enter__()
             self._torch_profiler_active = True
+            self._torch_profiler_thread_id = _start_thread_id
+            print(
+                f"[v2.full_trace] stage=start_torch_profiler "
+                f"status=started thread_id={_start_thread_id} "
+                f"trace_id={self.trace_id}",
+                flush=True,
+            )
             self._write_event("torch_profiler_started", {
                 "activities": [str(a) for a in activities],
                 "record_shapes": False,
                 "profile_memory": True,
                 "with_stack": True,
+                "thread_id": _start_thread_id,
             })
         except ImportError:
             log.info("torch.profiler not available; skipping")
@@ -2098,25 +2109,48 @@ class FullExecutionTraceSession:
             )
 
     def stop_torch_profiler(self) -> None:
-        """Stop and export the torch profiler.
+        """Stop and export the torch profiler.  Exactly-once under lock.
 
-        Exports Chrome trace, gzips it, cleans up temp files.
-        Safe to call even if profiler was never started or already stopped.
-        Reports sanitized diagnostics on failure.
+        Detaches the profiler under the session lock, calls ``__exit__()``
+        once, and repeated stops are no-ops.  Exports Chrome trace, gzips it.
         """
-        if self._torch_profiler is None and not self._torch_profiler_active:
-            return
-        if self._torch_profiler_active and self._torch_profiler is not None:
+        _profiler = None
+        with self._torch_profiler_lock:
+            if self._torch_profiler is None:
+                return
+            _profiler = self._torch_profiler
+            self._torch_profiler = None
+            _was_active = self._torch_profiler_active
+            self._torch_profiler_active = False
+
+        _stop_thread_id = threading.get_ident()
+        _start_thread_id = getattr(self, "_torch_profiler_thread_id", None)
+        _same_thread = (
+            _start_thread_id is not None and _start_thread_id == _stop_thread_id
+        )
+
+        print(
+            f"[v2.full_trace] stage=stop_torch_profiler "
+            f"start_thread_id={_start_thread_id} "
+            f"stop_thread_id={_stop_thread_id} "
+            f"same_thread={_same_thread} "
+            f"trace_id={self.trace_id}",
+            flush=True,
+        )
+
+        if _was_active and _profiler is not None:
             try:
-                self._torch_profiler.__exit__(None, None, None)
-                self._torch_profiler_active = False
+                _profiler.__exit__(None, None, None)
                 trace_path = self._base_dir / "raw" / "torch_trace.json"
-                self._torch_profiler.export_chrome_trace(str(trace_path))
+                _profiler.export_chrome_trace(str(trace_path))
                 self._gzip_file(trace_path)
                 trace_path.unlink(missing_ok=True)
                 self._write_event("torch_profiler_stopped", {
                     "exported": True,
                     "path": str(trace_path.with_name("torch_trace.json.gz")),
+                    "start_thread_id": _start_thread_id,
+                    "stop_thread_id": _stop_thread_id,
+                    "same_thread": _same_thread,
                 })
             except Exception as exc:
                 log.warning("Torch profiler export error")
@@ -2130,18 +2164,24 @@ class FullExecutionTraceSession:
                     "torch_profiler_error",
                     {"error_type": type(exc).__name__},
                 )
-        # Clean up
-        try:
-            self._torch_profiler = None
-        except Exception:
-            pass
+
+        if not _same_thread and _start_thread_id is not None:
+            log.warning(
+                "Torch profiler started on thread %s but stopped on thread %s",
+                _start_thread_id,
+                _stop_thread_id,
+            )
 
     # ── Stop Tracing ─────────────────────────────────────────────────────────────────
 
     def stop_tracing(self) -> dict[str, Any]:
-        """Stop all tracing in order: resource → torch → VizTracer → metadata.
+        """Stop all tracing in order: resource sampler → VizTracer → metadata.
 
-        Idempotent and safe.  Reports sanitized diagnostics on failure.
+        Idempotent and safe.  Torch profiler must be explicitly stopped
+        on the PromptExecutor thread before ``stop_tracing()`` is called
+        from the async artifact worker.
+
+        Reports sanitized diagnostics on failure.
         Once stopped, no further milestones may be captured.
         """
         if self._trace_stopped_result is not None:
@@ -2152,24 +2192,8 @@ class FullExecutionTraceSession:
             "state_before": self._state,
         }
 
-        # ── 1. Stop torch profiler ──────────────────────────────────────────────────
+        # ── 1. Torch profiler (stopped explicitly before stop_tracing) ──
         torch_result: dict[str, Any] = {}
-        if self._torch_profiler is not None or self._torch_profiler_active:
-            try:
-                self.stop_torch_profiler()
-                torch_trace = self._base_dir / "raw" / "torch_trace.json.gz"
-                torch_result = {
-                    "exported": torch_trace.exists(),
-                    "path": str(torch_trace) if torch_trace.exists() else "",
-                }
-            except Exception as exc:
-                torch_result = {"exported": False, "error_type": type(exc).__name__}
-                print(
-                    f"[v2.full_trace] stage=stop_torch_profiler "
-                    f"status=error error_type={type(exc).__name__} "
-                    f"trace_id={self.trace_id}",
-                    flush=True,
-                )
         result["torch_profiler"] = torch_result
 
         # ── 2. Stop resource sampler ────────────────────────────────────────────────

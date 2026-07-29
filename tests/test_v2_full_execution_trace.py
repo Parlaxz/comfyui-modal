@@ -1784,6 +1784,196 @@ class TestTorchProfiler(unittest.TestCase):
         self.assertEqual(params[0].name, "self")
 
 
+class TestTorchProfilerThreadSafety(unittest.TestCase):
+    """Focused tests: exactly-once __exit__, same-thread start/stop, stop_tracing
+    no-ops after explicit stop, partial artifact on Torch failure."""
+
+    def setUp(self):
+        FullExecutionTraceSession.reset_instance()
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self._sessions: list[FullExecutionTraceSession] = []
+
+    def tearDown(self):
+        for s in self._sessions:
+            try:
+                s.stop_tracing()
+            except Exception:
+                pass
+
+    def _make_session(self) -> FullExecutionTraceSession:
+        s = _create_test_session(self.td.name)
+        self._sessions.append(s)
+        return s
+
+    # ── Same-thread start/stop ─────────────────────────────────────────────────
+
+    def test_start_stop_same_native_thread(self):
+        """start and stop capture matching native thread IDs."""
+        session = self._make_session()
+        session.start_torch_profiler()
+
+        start_tid = getattr(session, "_torch_profiler_thread_id", None)
+        self.assertIsNotNone(start_tid, "start must record the thread ID")
+
+        current_tid = threading.get_ident()
+        self.assertEqual(
+            current_tid, start_tid,
+            "start_torch_profiler must record the calling thread",
+        )
+
+        session.stop_torch_profiler()
+        # After exactly-once stop, profiler is detached
+        self.assertIsNone(session._torch_profiler)
+        self.assertFalse(session._torch_profiler_active)
+
+    def test_stop_torch_profiler_preserves_thread_id(self):
+        """The thread_id recorded at start survives the exact-once detach."""
+        session = self._make_session()
+        session.start_torch_profiler()
+        start_tid = session._torch_profiler_thread_id
+        session.stop_torch_profiler()
+        # stop_torch_profiler reads it via getattr before lock clears refs
+        self.assertEqual(session._torch_profiler_thread_id, start_tid)
+
+    # ── Exactly-once __exit__ ──────────────────────────────────────────────────
+
+    def test_exit_runs_exactly_once(self):
+        """__exit__() is called exactly once across repeated stop calls."""
+        session = self._make_session()
+        session.start_torch_profiler()
+
+        # Instrument: wrap __exit__ to count calls
+        _counter = [0]
+        _orig_exit = session._torch_profiler.__exit__
+        def _counting_exit(*args, **kwargs):
+            _counter[0] += 1
+            return _orig_exit(*args, **kwargs)
+        session._torch_profiler.__exit__ = _counting_exit
+
+        session.stop_torch_profiler()
+        session.stop_torch_profiler()   # 2nd call — must be no-op
+        session.stop_torch_profiler()   # 3rd call — must be no-op
+
+        self.assertEqual(_counter[0], 1, "__exit__ must run exactly once")
+
+    def test_stop_torch_profiler_repeated_noop(self):
+        """Repeated stop_torch_profiler after explicit stop is a no-op."""
+        session = self._make_session()
+        session.start_torch_profiler()
+        session.stop_torch_profiler()
+
+        self.assertIsNone(session._torch_profiler)
+        self.assertFalse(session._torch_profiler_active)
+
+        # Second stop — should not raise
+        session.stop_torch_profiler()
+        self.assertIsNone(session._torch_profiler)
+
+    # ── stop_tracing cannot double-stop Torch ──────────────────────────────────
+
+    def test_stop_tracing_does_not_stop_torch_again(self):
+        """stop_tracing() no-ops on Torch after explicit stop_torch_profiler()."""
+        session = self._make_session()
+        session.start_restore()
+        session.set_restore_complete()
+        session.claim_first_request("req_1")
+        session.start_torch_profiler()
+
+        # Stop torch explicitly on the request thread (simulating PromptExecutor wrapper)
+        session.stop_torch_profiler()
+        self.assertIsNone(session._torch_profiler)
+
+        # Now stop_tracing — must not touch Torch again
+        result = session.stop_tracing()
+        self.assertIsNotNone(result, "stop_tracing must complete normally")
+        torch_result = result.get("torch_profiler", {})
+        # Torch section is empty since it was already stopped explicitly
+        self.assertEqual(torch_result, {})
+
+    def test_stop_tracing_without_explicit_torch_stop(self):
+        """stop_tracing() still completes when Torch was never started."""
+        session = self._make_session()
+        session.start_restore()
+        session.set_restore_complete()
+        session.claim_first_request("req_1")
+
+        # No torch start — stop_tracing must not crash
+        result = session.stop_tracing()
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("torch_profiler", {}), {})
+
+    # ── Torch failure still produces partial artifact ──────────────────────────
+
+    def test_torch_failure_still_saves_viztracer(self):
+        """When Torch start/stop fails, VizTracer and resource data are still saved."""
+        session = self._make_session()
+        session.start_restore()
+        session.set_restore_complete()
+        session.claim_first_request("req_1")
+
+        # Corrupt the profiler before stop to simulate Torch failure
+        session._torch_profiler = MagicMock()
+        session._torch_profiler_active = True
+        session._torch_profiler.__exit__ = MagicMock(side_effect=RuntimeError("Torch failure"))
+        session._torch_profiler.export_chrome_trace = MagicMock()
+        session._torch_profiler_thread_id = threading.get_ident()
+
+        # stop_tracing must complete and record the error
+        result = session.stop_tracing()
+        self.assertIsNotNone(result)
+        # VizTracer and resource sampler results should still be present
+        self.assertIn("viztracer", result)
+        self.assertIn("resource_sampler", result)
+        self.assertIn("summary", result)
+        self.assertEqual(result.get("final_state"), "trace_stopped")
+
+    def test_torch_start_failure_allows_stop_tracing(self):
+        """When start_torch_profiler fails, stop_tracing still works."""
+        session = self._make_session()
+        session.start_restore()
+        session.set_restore_complete()
+        session.claim_first_request("req_1")
+
+        # Simulate failed start — profiler was never initialized
+        session._torch_profiler = None
+        session._torch_profiler_active = False
+
+        # stop_tracing must complete without error
+        result = session.stop_tracing()
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("torch_profiler", {}), {})
+
+    # ── Artifact worker never receives a live profiler ─────────────────────────
+
+    def test_artifact_worker_sees_null_profiler_after_explicit_stop(self):
+        """After explicit stop_torch_profiler, _torch_profiler is None for the async worker."""
+        session = self._make_session()
+        session.start_torch_profiler()
+        self.assertIsNotNone(session._torch_profiler)
+        self.assertTrue(session._torch_profiler_active)
+
+        # Simulate PromptExecutor thread stopping the profiler
+        session.stop_torch_profiler()
+
+        # The async artifact worker sees None
+        self.assertIsNone(session._torch_profiler)
+        self.assertFalse(session._torch_profiler_active)
+
+        # status_dict confirms no live profiler
+        status = session.status_dict()
+        self.assertFalse(status["has_torch_profiler"])
+
+    def test_status_dict_reports_torch_profiler_absent_after_stop(self):
+        """status_dict has_torch_profiler is False after stop."""
+        session = self._make_session()
+        session.start_torch_profiler()
+        self.assertTrue(session.status_dict()["has_torch_profiler"])
+
+        session.stop_torch_profiler()
+        self.assertFalse(session.status_dict()["has_torch_profiler"])
+
+
 class TestEnvInt(unittest.TestCase):
     """_env_int and _env_int_chain helpers."""
 
