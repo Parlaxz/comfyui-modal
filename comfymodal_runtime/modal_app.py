@@ -1680,6 +1680,29 @@ def _parse_evict_models_before_snapshot() -> bool:
     )
 
 
+def _parse_evict_retain_role() -> str:
+    """Strict parse COMFYMODAL_V2_EVICT_RETAIN_ROLE.
+
+    Use the raw environment value exactly — no strip, no lowercasing.
+    Absent or empty → ``"none"``.
+    Exact ``"none"``, ``"clip"``, or ``"unet"`` accepted (case-sensitive).
+    Uppercase, whitespace-wrapped, comma-separated, ``both``, ``1``, ``true``,
+    or any other nonempty value → RuntimeError.
+    Error message shows the raw malformed value without normalizing it.
+
+    The selector has no effect when the eviction gate is disabled.
+    """
+    raw = os.environ.get("COMFYMODAL_V2_EVICT_RETAIN_ROLE", "")
+    if not raw:
+        return "none"
+    if raw in ("none", "clip", "unet"):
+        return raw
+    raise RuntimeError(
+        f"COMFYMODAL_V2_EVICT_RETAIN_ROLE={raw!r} is invalid; "
+        f"expected absent, empty, 'none', 'clip', or 'unet'"
+    )
+
+
 def _parse_evict_restore_idle_seconds() -> int:
     """Strict parse COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS.
 
@@ -1918,7 +1941,8 @@ def _runtime_env() -> dict[str, str]:
         env["COMFYMODAL_V2_RESTORE_TORCH_THREADS"] = os.environ["COMFYMODAL_V2_RESTORE_TORCH_THREADS"]
     # Propagate eviction env vars (absent → absent in remote env).
     for _ev_key in ("COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT",
-                    "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS"):
+                    "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS",
+                    "COMFYMODAL_V2_EVICT_RETAIN_ROLE"):
         if _ev_key in os.environ:
             env[_ev_key] = os.environ[_ev_key]
     # Propagate externally-supplied warmup profile env vars so startup
@@ -3443,6 +3467,17 @@ class ModalRuntimeEntrypoint:
         # reconciliation.  Populated with primitive-only fields; empty dict
         # by default.
         self._snapshot_eviction_metadata: dict[str, Any] = {}
+        # ── Snapshot eviction retained-model experiment (role-based) ──────
+        # Role to retain: "none" (default), "clip", or "unet".
+        self._snapshot_eviction_retained_role: str = "none"
+        # Strong reference to the retained model (clip or unet) after eviction.
+        self._snapshot_eviction_retained_model: Any = None
+        # Primitive identity of the retained model (id() as int, 0 when none).
+        self._snapshot_eviction_retained_model_id: int = 0
+        # Type name of the retained model ("" when none).
+        self._snapshot_eviction_retained_model_type: str = ""
+        # Release status: "not_run", "released", "skipped", "not_present", "error".
+        self._snapshot_eviction_retained_release_status: str = "not_run"
 
     def _remember_lifecycle_trace(self, trace: RuntimeTrace) -> None:
         if self._lifecycle_trace is None:
@@ -3544,6 +3579,16 @@ class ModalRuntimeEntrypoint:
             self._cpu_snapshot_unet_storage_registry = None
         if not hasattr(self, "_cpu_snapshot_clip_storage_registry"):
             self._cpu_snapshot_clip_storage_registry = None
+        if not hasattr(self, "_snapshot_eviction_retained_role"):
+            self._snapshot_eviction_retained_role = "none"
+        if not hasattr(self, "_snapshot_eviction_retained_model"):
+            self._snapshot_eviction_retained_model = None
+        if not hasattr(self, "_snapshot_eviction_retained_model_id"):
+            self._snapshot_eviction_retained_model_id = 0
+        if not hasattr(self, "_snapshot_eviction_retained_model_type"):
+            self._snapshot_eviction_retained_model_type = ""
+        if not hasattr(self, "_snapshot_eviction_retained_release_status"):
+            self._snapshot_eviction_retained_release_status = "not_run"
 
     def _evict_snapshot_models(
         self,
@@ -3627,6 +3672,40 @@ class ModalRuntimeEntrypoint:
         self._snapshot_eviction_metadata["torch_interop_threads"] = _pre_interop
         self._snapshot_eviction_metadata["native_thread_count"] = _pre_native
         self._snapshot_eviction_metadata["loaded_module_count"] = _pre_modules
+
+        # ── 1b. Retained model selection (role-based experiment) ──
+        _retained_role = _parse_evict_retain_role() if _parse_evict_models_before_snapshot() else "none"
+        self._snapshot_eviction_retained_role = _retained_role
+        _retained_obj: Any = None
+        if _retained_role == "clip":
+            _retained_obj = _clip_obj
+            if _retained_obj is None:
+                print(
+                    f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
+                    f"enabled=1 status=error failure=retained_model_missing "
+                    f"retain_role=clip retained_model_present=0 retained_model_id=0 "
+                    f"retained_model_type=absent clip_original_id={_clip_id} "
+                    f"unet_original_id={_unet_id}",
+                    flush=True,
+                )
+                raise RuntimeError(
+                    "Eviction retain role is 'clip' but clip object is None"
+                )
+        elif _retained_role == "unet":
+            _retained_obj = _unet_obj
+            if _retained_obj is None:
+                print(
+                    f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
+                    f"enabled=1 status=error failure=retained_model_missing "
+                    f"retain_role=unet retained_model_present=0 retained_model_id=0 "
+                    f"retained_model_type=absent clip_original_id={_clip_id} "
+                    f"unet_original_id={_unet_id}",
+                    flush=True,
+                )
+                raise RuntimeError(
+                    "Eviction retain role is 'unet' but unet object is None"
+                )
+        # retained_role == "none": _retained_obj remains None
 
         # ── 2. Weakref CLIP and UNET (fail clearly if unsupported) ──
         if _unet_obj is not None:
@@ -3715,6 +3794,20 @@ class ModalRuntimeEntrypoint:
         del cpu_models
         # Delete local object references
         del _unet_obj, _clip_obj
+
+        # ── 8b. Retained model: assign to dedicated attr after normal ownership gone ──
+        if _retained_obj is not None:
+            self._snapshot_eviction_retained_model = _retained_obj
+            self._snapshot_eviction_retained_model_id = id(_retained_obj)
+            self._snapshot_eviction_retained_model_type = type(_retained_obj).__name__
+            _retained_obj_wr = _wr.ref(_retained_obj) if _retained_obj is not None else None
+            # Delete temporary strong ref; the dedicated attr now owns it.
+            del _retained_obj
+        else:
+            self._snapshot_eviction_retained_model = None
+            self._snapshot_eviction_retained_model_id = 0
+            self._snapshot_eviction_retained_model_type = ""
+            _retained_obj_wr = None
 
         # ── 9. gc.collect() × 2 ──
         _gc.collect()
@@ -3822,15 +3915,19 @@ class ModalRuntimeEntrypoint:
         )
 
         # ── 12. Verify weakrefs dead ──
+        # Retained model (role=clip/unet) is held by dedicated attr; it is
+        # checked separately in section 12b below — exclude it here.
         _unet_alive = _unet_wr() is not None if _unet_wr is not None else False
         _clip_alive = _clip_wr() is not None if _clip_wr is not None else False
         _clip_alive_flag = 1 if _clip_alive else 0
         _unet_alive_flag = 1 if _unet_alive else 0
-        if _unet_alive or _clip_alive:
+        _unexpected_unet_alive = _unet_alive and not (_retained_role == "unet")
+        _unexpected_clip_alive = _clip_alive and not (_retained_role == "clip")
+        if _unexpected_unet_alive or _unexpected_clip_alive:
             _alive_parts = []
-            if _unet_alive:
+            if _unexpected_unet_alive:
                 _alive_parts.append(f"UNET(id={_unet_id})")
-            if _clip_alive:
+            if _unexpected_clip_alive:
                 _alive_parts.append(f"CLIP(id={_clip_id})")
             _alive_msg = "; ".join(_alive_parts)
             _known_ref_state = {
@@ -3864,6 +3961,43 @@ class ModalRuntimeEntrypoint:
             raise RuntimeError(
                 f"Model eviction failed: weakrefs still alive: {_alive_msg}"
             )
+
+        # ── 12b. Verify retained model weakref liveness and identity ──
+        if _retained_role != "none" and _retained_obj_wr is not None:
+            if _retained_obj_wr() is None:
+                print(
+                    f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
+                    f"enabled=1 status=error failure=retained_model_dead "
+                    f"retain_role={_retained_role} retained_model_present=0 "
+                    f"retained_model_id={self._snapshot_eviction_retained_model_id} "
+                    f"retained_model_type={self._snapshot_eviction_retained_model_type or 'absent'} "
+                    f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
+                    f"clip_alive_after_cleanup={_clip_alive_flag} "
+                    f"unet_alive_after_cleanup={_unet_alive_flag}",
+                    flush=True,
+                )
+                raise RuntimeError(
+                    f"Eviction retained model (role={_retained_role}) weakref "
+                    f"is dead after gc/trim — model was lost"
+                )
+            _retained_model = self._snapshot_eviction_retained_model
+            if _retained_model is None or id(_retained_model) != self._snapshot_eviction_retained_model_id:
+                print(
+                    f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
+                    f"enabled=1 status=error failure=retained_model_identity_mismatch "
+                    f"retain_role={_retained_role} retained_model_present={int(_retained_model is not None)} "
+                    f"retained_model_id={self._snapshot_eviction_retained_model_id} "
+                    f"retained_model_type={self._snapshot_eviction_retained_model_type or 'absent'} "
+                    f"clip_original_id={_clip_id} unet_original_id={_unet_id}",
+                    flush=True,
+                )
+                raise RuntimeError(
+                    f"Eviction retained model (role={_retained_role}) identity "
+                    f"mismatch after gc/trim"
+                )
+            del _retained_model
+        # Clean up retained weakref
+        del _retained_obj_wr
 
         # ── 13. Fail if memory evidence unavailable ──
         if _pre_rss_mib == "absent" or _after_trim_rss_mib == "absent":
@@ -3901,7 +4035,9 @@ class ModalRuntimeEntrypoint:
         if isinstance(_pre_priv_dirty_mib, (int, float)) and isinstance(_after_trim_priv_dirty_mib, (int, float)):
             _private_dirty_drop_mib = float(_pre_priv_dirty_mib) - float(_after_trim_priv_dirty_mib)
 
-        if _rss_drop_mib < 8192.0:
+        # Role-specific RSS floor: none/clip=8192 MiB, unet=4096 MiB
+        _rss_floor_mib = 8192.0 if _retained_role in ("none", "clip") else 4096.0
+        if _rss_drop_mib < _rss_floor_mib:
             print(
                 f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
                 f"enabled=1 status=insufficient_rss_drop "
@@ -3924,15 +4060,41 @@ class ModalRuntimeEntrypoint:
             )
             raise RuntimeError(
                 f"Model eviction failed: RSS drop {_rss_drop_mib:.1f} MiB "
-                f"< 8192 MiB threshold"
+                f"< {_rss_floor_mib:.0f} MiB threshold "
+                f"(retained_role={_retained_role})"
             )
 
         # ── 15. Emit final success line ──
+        _retained_model_present = (
+            1 if _retained_role != "none" and self._snapshot_eviction_retained_model is not None
+            else 0
+        )
+        _retained_model_matches_original = (
+            1
+            if (
+                _retained_model_present
+                and (
+                    (_retained_role == "clip" and str(self._snapshot_eviction_retained_model_id) == _clip_id)
+                    or (_retained_role == "unet" and str(self._snapshot_eviction_retained_model_id) == _unet_id)
+                )
+            )
+            else 0
+        )
+        _rss_drop_required_mib = _rss_floor_mib
+        _rss_drop_requirement_met = 1 if _rss_drop_mib >= _rss_floor_mib else 0
         print(
             f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
             f"enabled=1 status=evicted "
+            f"retain_role={_retained_role} "
+            f"retained_model_present={_retained_model_present} "
+            f"retained_model_id={self._snapshot_eviction_retained_model_id} "
+            f"retained_model_type={self._snapshot_eviction_retained_model_type or 'absent'} "
+            f"retained_model_matches_original={_retained_model_matches_original} "
             f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
             f"clip_alive_after_cleanup={_clip_alive_flag} unet_alive_after_cleanup={_unet_alive_flag} "
+            f"rss_drop_required_mib={_rss_drop_required_mib} "
+            f"rss_drop_requirement_met={_rss_drop_requirement_met} "
+            f"cpu_snapshot_models_present=0 "
             f"bridge_active_preparation={_bridge_active_prep} "
             f"snapshot_loader_output_count={0} snapshot_seed_present={0} "
             f"rss_before_mib={_pre_rss_mib} rss_after_gc_mib={_after_rss_mib} "
@@ -3952,38 +4114,51 @@ class ModalRuntimeEntrypoint:
         # Store primitive marker on entrypoint (no objects/weakrefs/dicts)
         self._eviction_marker = {
             "status": "evicted",
-            "rss_before_mib": _pre_rss_mib,
-            "rss_after_trim_mib": _after_trim_rss_mib,
-            "rss_drop_mib": _rss_drop_mib,
+            "retain_role": _retained_role,
+            "retained_model_present": _retained_model_present,
+            "retained_model_id": self._snapshot_eviction_retained_model_id,
+            "retained_model_type": self._snapshot_eviction_retained_model_type,
+            "retained_model_matches_original": _retained_model_matches_original,
             "clip_original_id": _clip_id,
             "unet_original_id": _unet_id,
             "clip_alive_after_cleanup": _clip_alive_flag,
             "unet_alive_after_cleanup": _unet_alive_flag,
+            "rss_before_mib": _pre_rss_mib,
+            "rss_after_trim_mib": _after_trim_rss_mib,
+            "rss_drop_mib": _rss_drop_mib,
+            "rss_drop_required_mib": _rss_drop_required_mib,
+            "rss_drop_requirement_met": _rss_drop_requirement_met,
         }
         self._snapshot_models_evicted_before_capture = True
         return self._eviction_marker
 
     def _restore_eviction_boundary(self) -> None:
-        """Earliest executable restore point: inspect marker and apply idle.
+        """Earliest executable restore point: inspect marker, apply idle,
+        release retained model.
 
-        Emits ``[v2.snapshot_model_eviction] stage=restore_observed``,
-        then if marker present and configured idle > 0, emits idle
-        start/end lines with time.sleep().  Must precede all other
-        restore work (torch thread limit, full-trace, GPU, etc.).
+        Actual ordering:
+          1. marker/state → observed RSS/thread  (``restore_observed``)
+          2. idle start → sleep → idle end        (``snapshot_model_eviction_idle``)
+          3. retained model: release, gc/malloc_trim/gc, verify, emit
+             (``restore_release_retained``)
+          4. return (caller applies _apply_torch_thread_limit after this)
+
+        Must precede all other restore work (torch thread limit, full-trace,
+        GPU, CUDA, bootstrap, sampler).
         """
         _marker_present = 1 if getattr(self, "_snapshot_models_evicted_before_capture", False) else 0
         _ev_marker = getattr(self, "_eviction_marker", None)
         if _marker_present == 0 and _ev_marker is not None:
             _marker_present = 1
         _cpu_snap_models_present = 1 if getattr(self, "_cpu_snapshot_models", None) is not None else 0
+        # clip_present/unet_present are ALWAYS 0 — the retained model
+        # is tracked via retain_role / retained_model_id / retained_model_type.
         _clip_present_flag = 0
         _unet_present_flag = 0
-        if _ev_marker is not None:
-            _clip_present_flag = _ev_marker.get("clip_alive_after_cleanup", 0)
-            _unet_present_flag = _ev_marker.get("unet_alive_after_cleanup", 0)
-        elif _marker_present == 1 or getattr(self, "_snapshot_eviction_metadata", {}):
-            _clip_present_flag = self._snapshot_eviction_metadata.get("clip_present", 0)
-            _unet_present_flag = self._snapshot_eviction_metadata.get("unet_present", 0)
+        # Retained model state
+        _retained_role: str = getattr(self, "_snapshot_eviction_retained_role", "none")
+        _retained_id: int = getattr(self, "_snapshot_eviction_retained_model_id", 0)
+        _retained_type: str = getattr(self, "_snapshot_eviction_retained_model_type", "")
         _restore_obs_mem = _collect_process_memory(fields=(
             "vm_rss_mib", "native_thread_count",
             "torch_intraop_threads", "torch_interop_threads",
@@ -3992,20 +4167,26 @@ class ModalRuntimeEntrypoint:
         _native_count = _restore_obs_mem.get("native_thread_count", "absent")
         _torch_intraop = _restore_obs_mem.get("torch_intraop_threads", "absent")
         _torch_interop = _restore_obs_mem.get("torch_interop_threads", "absent")
+        # Emit restore_observed with retained fields; clip_present/unet_present
+        # are always 0 as required.
+        _obs_wall_ns = time.time_ns()
         print(
             f"[v2.snapshot_model_eviction] stage=restore_observed "
             f"marker={_marker_present} "
             f"cpu_snapshot_models_present={_cpu_snap_models_present} "
             f"clip_present={_clip_present_flag} "
             f"unet_present={_unet_present_flag} "
+            f"retained_role={_retained_role} "
+            f"retained_model_id={_retained_id} "
+            f"retained_model_type={_retained_type} "
             f"rss_after_restore_mib={_rss_after_mib} "
             f"native_thread_count={_native_count} "
             f"torch_intraop={_torch_intraop} "
             f"torch_interop={_torch_interop} "
-            f"wall_unix_ns={time.time_ns()}",
+            f"wall_unix_ns={_obs_wall_ns}",
             flush=True,
         )
-        # Apply idle if marker present AND configured idle > 0.
+        # ── Idle (after restore_observed, before retained model release) ──
         if _marker_present == 1:
             _idle_seconds = _parse_evict_restore_idle_seconds()
             if _idle_seconds > 0:
@@ -4026,6 +4207,155 @@ class ModalRuntimeEntrypoint:
                     f"monotonic_ns={time.monotonic_ns()}",
                     flush=True,
                 )
+
+        # ── Retained model release (after idle, before thread limit) ──
+        import gc as _gc_retain
+
+        def _release_rss(memory: Mapping[str, Any]) -> Any:
+            return _numeric_value(
+                memory.get("smaps_rss_mib"),
+                _numeric_value(memory.get("vm_rss_mib"), "absent"),
+            )
+
+        _retained_model = getattr(self, "_snapshot_eviction_retained_model", None)
+        _retained_release_status = "not_run"
+        if _retained_role == "none":
+            _retained_release_status = "not_present"
+            _release_start_ns = time.time_ns()
+            _release_end_ns = _release_start_ns
+            print(
+                f"[v2.snapshot_model_eviction] stage=restore_release_retained "
+                f"retain_role=none "
+                f"status=not_present "
+                f"retained_model_id=0 "
+                f"retained_alive_after_release=0 "
+                f"rss_before_release_mib=absent "
+                f"rss_after_gc_mib=absent "
+                f"rss_after_trim_mib=absent "
+                f"rss_drop_mib=absent "
+                f"malloc_trim_status=absent "
+                f"malloc_trim_result=absent "
+                f"restore_release_start_wall_unix_ns={_release_start_ns} "
+                f"restore_release_end_wall_unix_ns={_release_end_ns} "
+                f"wall_unix_ns={_release_end_ns}",
+                flush=True,
+            )
+        elif _retained_model is not None:
+            import weakref as _wr_retain
+            _release_start_ns = time.time_ns()
+            # ── Capture RSS before release ──
+            _rss_before = _collect_process_memory(fields=("smaps_rss_mib", "vm_rss_mib"))
+            _rss_before_mib = _release_rss(_rss_before)
+            _retain_wr = _wr_retain.ref(_retained_model)
+
+            # Release on dedicated attr
+            self._snapshot_eviction_retained_model = None
+            self._snapshot_eviction_retained_model_id = 0
+            self._snapshot_eviction_retained_model_type = ""
+            del _retained_model
+
+            # gc × 2
+            _gc_retain.collect()
+            _gc_retain.collect()
+            _rss_after_gc = _collect_process_memory(fields=("smaps_rss_mib", "vm_rss_mib"))
+            _rss_after_gc_mib = _release_rss(_rss_after_gc)
+
+            # malloc_trim(0)
+            _trim_retain_status = "unsupported"
+            _trim_retain_result: Any = "absent"
+            try:
+                import ctypes as _ct_retain
+                _libc_retain = _ct_retain.CDLL("libc.so.6", use_errno=True)
+                _libc_retain.malloc_trim.argtypes = [_ct_retain.c_size_t]
+                _libc_retain.malloc_trim.restype = _ct_retain.c_int
+                _trim_ret = _libc_retain.malloc_trim(0)
+                _trim_retain_status = "applied"
+                _trim_retain_result = _trim_ret
+            except (AttributeError, OSError):
+                _trim_retain_status = "unsupported"
+            except Exception:
+                _trim_retain_status = "error"
+
+            # Final gc after trim
+            _gc_retain.collect()
+            _rss_after_trim = _collect_process_memory(fields=("smaps_rss_mib", "vm_rss_mib"))
+            _rss_after_trim_mib = _release_rss(_rss_after_trim)
+
+            # Compute RSS drop
+            _rss_drop_mib: Any = "absent"
+            if isinstance(_rss_before_mib, (int, float)) and isinstance(_rss_after_trim_mib, (int, float)):
+                _rss_drop_mib = round(float(_rss_before_mib) - float(_rss_after_trim_mib), 1)
+
+            # Verify weakref dead
+            _retained_alive = _retain_wr() is not None
+            _retained_alive_flag = 1 if _retained_alive else 0
+            _release_end_ns = time.time_ns()
+            if _retained_alive:
+                _retained_release_status = "object_still_alive"
+                print(
+                    f"[v2.snapshot_model_eviction] stage=restore_release_retained "
+                    f"retain_role={_retained_role} "
+                    f"status=object_still_alive "
+                    f"retained_model_id={_retained_id} "
+                    f"retained_alive_after_release={_retained_alive_flag} "
+                    f"rss_before_release_mib={_rss_before_mib} "
+                    f"rss_after_gc_mib={_rss_after_gc_mib} "
+                    f"rss_after_trim_mib={_rss_after_trim_mib} "
+                    f"rss_drop_mib={_rss_drop_mib} "
+                    f"malloc_trim_status={_trim_retain_status} "
+                    f"malloc_trim_result={_trim_retain_result} "
+                    f"restore_release_start_wall_unix_ns={_release_start_ns} "
+                    f"restore_release_end_wall_unix_ns={_release_end_ns} "
+                    f"wall_unix_ns={_release_end_ns}",
+                    flush=True,
+                )
+                self._snapshot_eviction_retained_release_status = _retained_release_status
+                raise RuntimeError(
+                    f"Retained model release failed (role={_retained_role}): "
+                    f"weakref is still alive after gc/trim"
+                )
+
+            _retained_release_status = "released"
+            print(
+                f"[v2.snapshot_model_eviction] stage=restore_release_retained "
+                f"retain_role={_retained_role} "
+                f"status=released "
+                f"retained_model_id={_retained_id} "
+                f"retained_alive_after_release={_retained_alive_flag} "
+                f"rss_before_release_mib={_rss_before_mib} "
+                f"rss_after_gc_mib={_rss_after_gc_mib} "
+                f"rss_after_trim_mib={_rss_after_trim_mib} "
+                f"rss_drop_mib={_rss_drop_mib} "
+                f"malloc_trim_status={_trim_retain_status} "
+                f"malloc_trim_result={_trim_retain_result} "
+                f"restore_release_start_wall_unix_ns={_release_start_ns} "
+                f"restore_release_end_wall_unix_ns={_release_end_ns} "
+                f"wall_unix_ns={_release_end_ns}",
+                flush=True,
+            )
+            del _retain_wr
+        else:
+            _retained_release_status = "error"
+            _release_start_ns = time.time_ns()
+            _release_end_ns = _release_start_ns
+            print(
+                f"[v2.snapshot_model_eviction] stage=restore_release_retained "
+                f"retain_role={_retained_role} status=error "
+                f"retained_model_id={_retained_id} retained_alive_after_release=0 "
+                f"rss_before_release_mib=absent rss_after_gc_mib=absent "
+                f"rss_after_trim_mib=absent rss_drop_mib=absent "
+                f"malloc_trim_status=absent malloc_trim_result=absent "
+                f"restore_release_start_wall_unix_ns={_release_start_ns} "
+                f"restore_release_end_wall_unix_ns={_release_end_ns} "
+                f"wall_unix_ns={_release_end_ns}",
+                flush=True,
+            )
+            self._snapshot_eviction_retained_release_status = _retained_release_status
+            raise RuntimeError(
+                f"Retained model release failed (role={_retained_role}): "
+                "retained model is absent at restore"
+            )
+        self._snapshot_eviction_retained_release_status = _retained_release_status
 
     def _cpu_snapshot_profile(self, api: Any) -> Mapping[str, Any] | None:
         """Derive a validated warmup profile for a CPU model snapshot.
@@ -9782,6 +10112,11 @@ def _build_decorated_v2_class() -> type:
         self._restore_actual_torch_intraop_threads = None
         self._restore_torch_interop_threads = None
         self._restore_torch_thread_limit_status = None
+        self._snapshot_eviction_retained_role = "none"
+        self._snapshot_eviction_retained_model = None
+        self._snapshot_eviction_retained_model_id = 0
+        self._snapshot_eviction_retained_model_type = ""
+        self._snapshot_eviction_retained_release_status = "not_run"
         self._v2_initialized = True
 
     # Wrap each Modal-exposed method to lazy-init first.
