@@ -4389,7 +4389,7 @@ class ModalRuntimeEntrypoint:
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
         # ── V2 entry CPU probe (first snap=False restore only) ──
-        _V2EntryProbe.fire()
+        self._V2EntryProbe.fire()
 
         # ── Full-trace session: FIRST executable operation (before timestamp
         #    capture, residency log, sampler, memory report, _configure_runtime,
