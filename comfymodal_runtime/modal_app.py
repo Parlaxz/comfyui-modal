@@ -1,4 +1,4 @@
-﻿"""Deployable v2 Modal application and its runtime entrypoint."""
+"""Deployable v2 Modal application and its runtime entrypoint."""
 
 from __future__ import annotations
 
@@ -53,7 +53,6 @@ from .model_preload import (
     set_model_load_identity,
     set_restore_return_marker,
     _capture_host_info,
-    _DIAGNOSTIC_FLAG as _MP_DIAGNOSTIC_FLAG,
     begin_activation_diagnostics,
     end_activation_diagnostics,
     get_activation_diagnostics,
@@ -89,6 +88,17 @@ from .output_delivery import (
 )
 from .result_delivery import ConversionFailedError, convert_output_items
 from .trace import RuntimeTrace, _emit_breakdown_line, merge_runtime_traces
+from .restore_worker_probe import (
+    capture_runtime_fingerprint,
+    start_restore_worker_probe,
+    set_restore_worker_probe_phase,
+    set_restore_fingerprint,
+    finish_restore_worker_probe,
+    claim_restore_entry,
+    _V2_SNAPSHOT_CAPTURE_FINGERPRINT,
+    _fingerprint_summary,
+    _diff_fingerprints,
+)
 
 _V2_STAGE_MAP: tuple[tuple[str, str, str], ...] = (
     ("unet_load",      "t4b_unet_load_start",      "t4b_unet_load_end"),
@@ -3219,6 +3229,8 @@ class ModalRuntimeEntrypoint:
         self._lifecycle_trace: RuntimeTrace | None = None
         # Stable module-level identity so snapshot boundaries cannot erase identity.
         self.container_session_id: str = _V2_CONTAINER_SESSION_ID
+        # Propagate container_session_id to env so capture_runtime_fingerprint can read it
+        os.environ["COMFYMODAL_CONTAINER_SESSION_ID"] = self.container_session_id
         self._restore_count: int = 0
         self._request_count: int = 0
         self._restore_timing: dict[str, Any] | None = None
@@ -3565,6 +3577,67 @@ class ModalRuntimeEntrypoint:
             getattr(api, "_sage_runtime_mode", "triton_fallback") == "baked_cuda"
         )
         self._runtime_configured = True
+
+    def _capture_coordinator_state(self) -> dict[str, Any]:
+        """Capture coordinator state from the bridge's coordinator (best-effort)."""
+        state: dict[str, Any] = {}
+        try:
+            coord = getattr(self._preload_bridge, "coordinator", None)
+            if coord is None:
+                return state
+            state["max_workers"] = getattr(coord, "_max_workers", None)
+            pool = getattr(coord, "_pool", None)
+            state["pool_exists"] = pool is not None
+            if pool is not None:
+                try:
+                    from concurrent.futures import ThreadPoolExecutor
+                    state["pool_worker_count"] = getattr(pool, "_max_workers", 0)
+                    # Thread names/IDs - best effort via threading.enumerate()
+                    worker_tids = []
+                    for t in threading.enumerate():
+                        if t.name and "comfymodal-restore" in t.name:
+                            worker_tids.append({
+                                "name": str(t.name)[:40],
+                                "native_id": t.native_id,
+                                "ident": t.ident,
+                            })
+                    state["pool_threads"] = worker_tids
+                    # Work queue size (approximate via _work_queue)
+                    try:
+                        wq = getattr(pool, "_work_queue", None)
+                        if wq is not None:
+                            state["work_queue_size"] = wq.qsize()
+                    except Exception:
+                        pass
+                except Exception:
+                    state["pool_worker_count"] = 0
+            else:
+                state["pool_worker_count"] = 0
+            # Active preparation and future states
+            prep = getattr(coord, "_active", None)
+            state["active_preparation_exists"] = prep is not None
+            if prep is not None:
+                for lane_name in ("unet", "clip", "vae", "prefill"):
+                    future = getattr(prep, f"{lane_name}_future", None)
+                    if future is not None:
+                        try:
+                            if future.done():
+                                if future.cancelled():
+                                    state[f"{lane_name}_future"] = "cancelled"
+                                else:
+                                    # done — exception status inferred from known diagnostics
+                                    state[f"{lane_name}_future"] = "done"
+                            elif future.running():
+                                state[f"{lane_name}_future"] = "running"
+                            else:
+                                state[f"{lane_name}_future"] = "pending"
+                        except Exception:
+                            state[f"{lane_name}_future"] = "absent"
+                    else:
+                        state[f"{lane_name}_future"] = "absent"
+        except Exception:
+            pass
+        return state
 
     def startup(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING
@@ -4105,6 +4178,20 @@ class ModalRuntimeEntrypoint:
                 flush=True,
             )
 
+        # ── Capture startup snapshot fingerprint ─────────────────────
+        _snap_fp = capture_runtime_fingerprint(
+            coordinator_state=self._capture_coordinator_state(),
+            bridge_snapshot=self._preload_bridge.diagnostic_snapshot(),
+        )
+        _V2_SNAPSHOT_CAPTURE_FINGERPRINT.clear()
+        _V2_SNAPSHOT_CAPTURE_FINGERPRINT["_fp_object"] = _snap_fp
+        _V2_SNAPSHOT_CAPTURE_FINGERPRINT["stage"] = "capture"
+        self._snapshot_capture_fingerprint = _snap_fp
+        print(
+            f"[v2.snapshot_fingerprint] stage=capture {_fingerprint_summary(_snap_fp)}",
+            flush=True,
+        )
+
         print(
             f"[v2.lifecycle] method=startup snap=True "
             f"container_session={_V2_CONTAINER_SESSION_ID} "
@@ -4121,275 +4208,40 @@ class ModalRuntimeEntrypoint:
             "_cachedit_preimport": _cd_preimport,
         }
 
-    class _V2EntryProbe:
-        """One-shot CPU-usage sampler for first post-snapshot V2 restore entry.
-
-        Samples every 0.2 s for 15 s via /proc, using only stdlib.
-        Main thread idles via threading.Event().wait(15.0).
-        Prints a started line, per-sample lines, and a summary with classification.
-        """
-
-        _FIRED: bool = False
-
-        @classmethod
-        def fire(cls) -> None:
-            if cls._FIRED:
-                return
-            cls._FIRED = True
-            cls._run()
-
-        @classmethod
-        def _run(cls) -> None:
-            pid = os.getpid()
-            started_wall = time.time_ns()
-            started_mono = time.monotonic_ns()
-            try:
-                clk_tck = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-            except Exception:
-                clk_tck = 100
-            ms_per_tick = 1000.0 / clk_tck
-
-            try:
-                affinity = os.sched_getaffinity(0)
-                affinity_count = len(affinity)
-            except Exception:
-                affinity_count = os.cpu_count() or 0
-
-            print(
-                f"[v2.entry_cpu_probe] marker=started "
-                f"wall_unix_ns={started_wall} "
-                f"monotonic_ns={started_mono} "
-                f"pid={pid} "
-                f"os_cpu_count={os.cpu_count() or 0} "
-                f"affinity_count={affinity_count}",
-                flush=True,
-            )
-
-            def _read_proc_stat(path: str):
-                """Parse /proc/.../stat robustly.
-                comm may contain spaces and parentheses; find last ')'.
-                Returns (utime, stime) in clock ticks or None.
-                """
-                try:
-                    with open(path) as f:
-                        text = f.read()
-                except Exception:
-                    return None
-                close_paren = text.rfind(")")
-                if close_paren == -1:
-                    return None
-                body = text[close_paren + 2:]
-                parts = body.split()
-                if len(parts) < 13:
-                    return None
-                try:
-                    return (int(parts[11]), int(parts[12]))
-                except (ValueError, IndexError):
-                    return None
-
-            def _read_cmdline(path: str) -> str:
-                try:
-                    with open(path, "rb") as f:
-                        raw = f.read(256)
-                    cmd = raw.replace(b"\x00", b" ").decode("ascii", errors="replace")
-                    cmd = " ".join(cmd.split())
-                    if len(cmd) > 80:
-                        cmd = cmd[:77] + "..."
-                    return cmd
-                except Exception:
-                    return ""
-
-            def _snapshot(pid: int):
-                """Return a snapshot dict of CPU ticks for process/threads/others."""
-                now_wall = time.time_ns()
-                now_mono = time.monotonic_ns()
-
-                pt = _read_proc_stat("/proc/self/stat")
-                proc_ticks = (pt[0] + pt[1]) if pt else 0
-
-                thread_ticks: dict[str, int] = {}
-                try:
-                    for entry in os.listdir(f"/proc/{pid}/task"):
-                        tt = _read_proc_stat(f"/proc/{pid}/task/{entry}/stat")
-                        if tt:
-                            thread_ticks[entry] = tt[0] + tt[1]
-                except Exception:
-                    pass
-
-                other_ticks: dict[str, int] = {}
-                other_cmdlines: dict[str, str] = {}
-                try:
-                    for entry in os.listdir("/proc/"):
-                        if entry.isdigit() and entry != str(pid):
-                            ot = _read_proc_stat(f"/proc/{entry}/stat")
-                            if ot:
-                                other_ticks[entry] = ot[0] + ot[1]
-                                other_cmdlines[entry] = _read_cmdline(f"/proc/{entry}/cmdline")
-                except Exception:
-                    pass
-
-                return {
-                    "wall_ns": now_wall,
-                    "mono_ns": now_mono,
-                    "proc_ticks": proc_ticks,
-                    "thread_ticks": thread_ticks,
-                    "other_ticks": other_ticks,
-                    "other_cmdlines": other_cmdlines,
-                }
-
-            baseline = _snapshot(pid)
-            previous = baseline
-            stop_event = threading.Event()
-            samples: list[dict] = []
-
-            def _sampler() -> None:
-                nonlocal previous
-                idx = 1
-                while not stop_event.wait(0.2):
-                    cur = _snapshot(pid)
-                    elapsed_ms = (cur["mono_ns"] - started_mono) / 1_000_000.0
-                    wall_delta_ns = cur["mono_ns"] - previous["mono_ns"]
-
-                    proc_delta = max(0, cur["proc_ticks"] - previous["proc_ticks"])
-                    proc_cpu_ms = proc_delta * ms_per_tick
-                    proc_eff = (proc_cpu_ms * 1_000_000.0) / wall_delta_ns if wall_delta_ns > 0 else 0.0
-
-                    all_tids = set(previous["thread_ticks"]) | set(cur["thread_ticks"])
-                    td_list: list[tuple[str, float]] = []
-                    for tid in all_tids:
-                        d = max(0, cur["thread_ticks"].get(tid, 0) - previous["thread_ticks"].get(tid, 0)) * ms_per_tick
-                        if d > 0:
-                            td_list.append((tid, d))
-                    td_list.sort(key=lambda x: x[1], reverse=True)
-                    top_td = td_list[:5]
-
-                    all_pids = set(previous["other_ticks"]) | set(cur["other_ticks"])
-                    od_list: list[tuple[str, float, str]] = []
-                    for opid in all_pids:
-                        d = max(0, cur["other_ticks"].get(opid, 0) - previous["other_ticks"].get(opid, 0)) * ms_per_tick
-                        if d > 0:
-                            cmd = cur.get("other_cmdlines", {}).get(opid, "") or previous.get("other_cmdlines", {}).get(opid, "")
-                            od_list.append((opid, d, cmd))
-                    od_list.sort(key=lambda x: x[1], reverse=True)
-
-                    other_total = sum(d for _, d, _ in od_list)
-                    total_cpu = proc_cpu_ms + other_total
-                    total_eff = (total_cpu * 1_000_000.0) / wall_delta_ns if wall_delta_ns > 0 else 0.0
-
-                    top_t_str = ",".join(
-                        f"{tid}:{cpu:.3f}" for tid, cpu in top_td
-                    )
-                    op_str = ",".join(
-                        f"{p}:{c:.3f}:{cmd[:80]}" for p, c, cmd in od_list
-                    )
-
-                    print(
-                        f"[v2.entry_cpu_sample] "
-                        f"sample={idx} "
-                        f"wall_unix_ns={cur['wall_ns']} "
-                        f"elapsed_ms={elapsed_ms:.1f} "
-                        f"current_process_cpu_ms={proc_cpu_ms:.1f} "
-                        f"current_process_effective_cores={proc_eff:.1f} "
-                        f"top_threads={top_t_str} "
-                        f"other_processes={op_str} "
-                        f"visible_total_cpu_ms={total_cpu:.1f} "
-                        f"visible_total_effective_cores={total_eff:.1f}",
-                        flush=True,
-                    )
-
-                    samples.append({
-                        "proc_cpu_ms": proc_cpu_ms,
-                        "proc_eff": proc_eff,
-                        "total_eff": total_eff,
-                        "other_total": other_total,
-                        "thread_deltas": td_list,
-                        "other_deltas": od_list,
-                    })
-                    idx += 1
-                    previous = cur
-
-            sampler_t = threading.Thread(target=_sampler, daemon=True)
-            sampler_t.start()
-
-            threading.Event().wait(15.0)
-
-            stop_event.set()
-            sampler_t.join()
-
-            duration_ms = (time.monotonic_ns() - started_mono) / 1_000_000.0
-
-            if samples:
-                f_proc_cpu = sum(s["proc_cpu_ms"] for s in samples)
-                peak_proc = max(s["proc_eff"] for s in samples)
-                f_other = sum(s["other_total"] for s in samples)
-                peak_total = max(s["total_eff"] for s in samples)
-
-                tc: dict[str, float] = {}
-                for s in samples:
-                    for tid, c in s["thread_deltas"]:
-                        tc[tid] = tc.get(tid, 0) + c
-                top_tids = sorted(tc.items(), key=lambda x: x[1], reverse=True)[:5]
-
-                oc: dict[str, dict] = {}
-                for s in samples:
-                    for pid_, c, cmd_ in s["other_deltas"]:
-                        if pid_ not in oc:
-                            oc[pid_] = {"cpu": 0.0, "cmd": ""}
-                        oc[pid_]["cpu"] += c
-                        if cmd_:
-                            oc[pid_]["cmd"] = cmd_
-                top_others = sorted(oc.items(), key=lambda x: x[1]["cpu"], reverse=True)[:5]
-
-                visible = f_proc_cpu + f_other
-                if visible <= 0.01:
-                    classification = "no_cpu_spike_observed"
-                elif f_proc_cpu / max(visible, 0.001) >= 0.80:
-                    classification = "current_process_native_threads"
-                else:
-                    max_other = max((v["cpu"] for v in oc.values()), default=0.0)
-                    if max_other / max(visible, 0.001) >= 0.80:
-                        classification = "visible_child_or_other_process"
-                    else:
-                        material = visible * 0.10
-                        material_count = sum(
-                            1 for value in [f_proc_cpu, *[v["cpu"] for v in oc.values()]]
-                            if value >= material
-                        )
-                        if material_count >= 2:
-                            classification = "mixed_visible_processes"
-                        else:
-                            classification = "outside_pid_namespace_or_unattributed"
-            else:
-                f_proc_cpu = 0.0
-                peak_proc = 0.0
-                f_other = 0.0
-                peak_total = 0.0
-                top_tids = []
-                top_others = []
-                classification = "no_cpu_spike_observed"
-
-            tt_str = ",".join(f"{tid}:{c:.3f}" for tid, c in top_tids)
-            to_str = ",".join(
-                f"{p}:{d['cpu']:.3f}:{d['cmd'][:80]}" for p, d in top_others
-            )
-
-            print(
-                f"[v2.entry_cpu_summary] "
-                f"duration_ms={duration_ms:.1f} "
-                f"current_process_cpu_ms={f_proc_cpu:.1f} "
-                f"current_process_peak_cores={peak_proc:.1f} "
-                f"visible_other_process_cpu_ms={f_other:.1f} "
-                f"visible_total_peak_cores={peak_total:.1f} "
-                f"top_threads={tt_str} "
-                f"top_other_processes={to_str} "
-                f"classification={classification}",
-                flush=True,
-            )
-
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
-        # ── V2 entry CPU probe (first snap=False restore only) ──
-        self._V2EntryProbe.fire()
+
+        # ── V2 snapshot-restore fingerprint (one-shot, before anything else) ──
+        if claim_restore_entry():
+            _rst_wall = time.time_ns()
+            _rst_mono = time.monotonic_ns()
+            _rst_fp = capture_runtime_fingerprint(
+                coordinator_state=self._capture_coordinator_state(),
+                bridge_snapshot=self._preload_bridge.diagnostic_snapshot(),
+            )
+            self._snapshot_restore_fingerprint = _rst_fp
+            set_restore_fingerprint(_rst_fp)
+            print(
+                f"[v2.snapshot_fingerprint] stage=restore {_fingerprint_summary(_rst_fp)}",
+                flush=True,
+            )
+            # Diff against startup capture (module fallback authoritatively)
+            # Prefer module-level _V2_SNAPSHOT_CAPTURE_FINGERPRINT, then instance attr
+            _capture_obj: Any = _V2_SNAPSHOT_CAPTURE_FINGERPRINT.get("_fp_object")
+            if _capture_obj is None:
+                _capture_obj = getattr(self, "_snapshot_capture_fingerprint", None)
+            if _capture_obj is not None:
+                try:
+                    print(
+                        f"[v2.snapshot_fingerprint_diff] {_diff_fingerprints(_capture_obj, _rst_fp)}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+            # Start watcher before normal restore immediately (no sleep/Event.wait)
+            _watcher = start_restore_worker_probe()
+        else:
+            _watcher = None
 
         # ── Full-trace session: FIRST executable operation (before timestamp
         #    capture, residency log, sampler, memory report, _configure_runtime,
@@ -4466,6 +4318,7 @@ class ModalRuntimeEntrypoint:
         try:
             identity = _capture_remote_identity()
             self._configure_runtime()
+            set_restore_worker_probe_phase("configure_runtime")
             trace = RuntimeTrace(process="remote")
             trace.container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
             trace.set_metadata(**identity)
@@ -4537,6 +4390,7 @@ class ModalRuntimeEntrypoint:
             trace.emit("restore_plan_read_start", phase="restore")
             try:
                 self._restore_plan = self._get_remote_restore_publisher().read_current_plan()
+                set_restore_worker_probe_phase("restore_plan_read")
                 trace.emit(
                     "restore_plan_read_end",
                     phase="restore",
@@ -4557,6 +4411,7 @@ class ModalRuntimeEntrypoint:
                 _RES4LYF_PREPARED.clear()
                 _CACHEDIT_PREPARED.clear()
                 trace.emit("v2_bootstrap_restore_start", phase="restore")
+                set_restore_worker_probe_phase("bootstrap_restore")
                 state = self.bootstrap.restore(trace=trace)
                 trace.emit("v2_bootstrap_restore_end", phase="restore")
 
@@ -4769,6 +4624,7 @@ class ModalRuntimeEntrypoint:
                 plan = self._restore_plan
 
                 # ── 5. cpu_snapshot_identity_match ──
+                set_restore_worker_probe_phase("snapshot_identity_validation")
                 def _do_identity_match():
                     _identity_check_start_ns = time.monotonic_ns()
                     km = _cpu_snapshot_model_keys_match(plan.model_key, models.model_key)
@@ -4959,6 +4815,7 @@ class ModalRuntimeEntrypoint:
                         raise
 
                     # ── 8. retarget_cpu_snapshot_models ──
+                    set_restore_worker_probe_phase("snapshot_retarget")
                     def _do_retarget():
                         return retarget_cpu_snapshot_models(
                             models, model_management=_mm,
@@ -5099,6 +4956,7 @@ class ModalRuntimeEntrypoint:
                         _do_validate_bf16()
 
                     # ── 9. activate_snapshot_bridge ──
+                    set_restore_worker_probe_phase("snapshot_bridge_activation")
                     _retarget_start_ns = 0
                     def _do_activate_bridge():
                         nonlocal _retarget_start_ns
@@ -5559,6 +5417,7 @@ class ModalRuntimeEntrypoint:
             )
             # â”€â”€ v2 restore finalize â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # ── 12. restore_finalization ──
+            set_restore_worker_probe_phase("restore_finalization")
             def _do_restore_finalization():
                 global _LATEST_LIFECYCLE_TIMING
 
@@ -5741,6 +5600,7 @@ class ModalRuntimeEntrypoint:
 
             trace.emit("v2_restore_return", phase="restore")
             _restore_result["trace"] = trace.to_dict()
+            set_restore_worker_probe_phase("restore_returned")
             set_restore_return_marker(
                 restored_instance_id=restored_instance_id,
                 restore_session_id=restore_session_id,
@@ -5801,6 +5661,7 @@ class ModalRuntimeEntrypoint:
         self._process_cpu_sampler = _ProcessCpuSampler(time.monotonic_ns())
         self._process_cpu_sampler.start()
         _report_host_memory("prompt_executor_start")
+        set_restore_worker_probe_phase("prompt_executor_entry")
         trace = context.trace or RuntimeTrace(request_id=context.request_id, process="remote")
         trace.emit("runtime_config_start", phase="execution")
         self._configure_runtime()
@@ -5983,9 +5844,11 @@ class ModalRuntimeEntrypoint:
             _cpu_snapshot_active=_cpu_snapshot_active,
             _execution_prefill_scheduled=_execution_prefill_scheduled,
         )
+        set_restore_worker_probe_phase("clip_encode")
         try:
             with request_execution_trace_scope(trace):
                 with self._preload_bridge.request_scope():
+                    set_restore_worker_probe_phase("sampler")
                     result: dict[str, Any] = await self._execute_v2_prompt_executor(
                         plan,
                         context,
@@ -6079,6 +5942,7 @@ class ModalRuntimeEntrypoint:
             if "_stage_timings" in result:
                 result["trace"]["stages"] = result.pop("_stage_timings")
             result["container_session_id"] = _cid
+            set_restore_worker_probe_phase("probe_complete")
             result["restore_plan_generation"] = str(self._restore_plan.generation if self._restore_plan else "")
             _rt = self._restore_timing or _LATEST_LIFECYCLE_TIMING
             if _rt is not None:
@@ -7203,6 +7067,7 @@ class ModalRuntimeEntrypoint:
                 execution_prefill_scheduled=_ad_prefill_scheduled,
             )
             _ad_state = get_activation_diagnostics()
+            set_restore_worker_probe_phase("unet_gpu_activation")
             # ── Set residency sampler callback for this request scope ──
             _residency_sampler = self._sample_snapshot_residency
             if _RESIDENCY_DIAGNOSTICS_ENABLED:
@@ -8264,7 +8129,8 @@ class ModalRuntimeEntrypoint:
         request_id: str = "",
         cancelled: Callable[[], bool] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        # â”€â”€ TRUE METHOD FIRST LINE (before any identity or trace exists) â”€â”€
+        # ── TRUE METHOD FIRST LINE (before any identity or trace exists) ──
+        set_restore_worker_probe_phase("run_plan_stream_entry")
         _method_first_line_ns = time.monotonic_ns()
         _method_first_line_wall_ns = int(time.time() * 1_000_000_000)
         _method_first_line_pid = os.getpid()
@@ -8294,6 +8160,7 @@ class ModalRuntimeEntrypoint:
 
         plan = ExecutionPlan.from_dict(_safe_payload if isinstance(_safe_payload, dict) else plan_payload)
         _deserialize_end_ns = time.monotonic_ns()
+        set_restore_worker_probe_phase("plan_materialization")
 
         # â”€â”€ Compute method entry gap before any trace output â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _method_entry_gap_results: dict[str, Any] = {}
