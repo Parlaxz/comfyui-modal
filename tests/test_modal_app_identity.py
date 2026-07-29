@@ -2321,5 +2321,141 @@ class TestCgroupCpuSampler(unittest.TestCase):
         self.assertEqual(sampler.stop_count, 1)
 
 
+class TestRunPlanStreamWrapperErrorHandling(unittest.TestCase):
+    """Verify the run_plan_stream public wrapper catches exceptions
+    and emits a structured error event instead of crashing."""
+
+    def test_wrapper_catches_exception_and_emits_error_event(self):
+        async def run():
+            ep = modal_app.ModalRuntimeEntrypoint(
+                executor=modal_app.RuntimeExecutor(in_process_runner=lambda plan, ctx: {"ok": True}),
+            )
+            # Monkey-patch _run_plan_stream_impl to raise before any yield
+            _orig = ep._run_plan_stream_impl
+            async def _failing_impl(*args, **kwargs):
+                raise RuntimeError("early-setup-boom")
+                yield  # pragma: no cover
+            ep._run_plan_stream_impl = _failing_impl
+            messages = [
+                msg async for msg in ep.run_plan_stream(
+                    {"workflow": {"1": {"class_type": "KSampler"}}},
+                    request_id="test-wrap-err",
+                )
+            ]
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0]["type"], "error")
+            self.assertEqual(messages[0]["phase"], "setup_failed")
+            self.assertIn("early-setup-boom", messages[0]["message"])
+            self.assertEqual(messages[0]["request_id"], "test-wrap-err")
+        import asyncio
+        asyncio.run(run())
+
+    def test_wrapper_catches_exception_during_iteration(self):
+        async def run():
+            ep = modal_app.ModalRuntimeEntrypoint(
+                executor=modal_app.RuntimeExecutor(in_process_runner=lambda plan, ctx: {"ok": True}),
+            )
+            _orig = ep._run_plan_stream_impl
+            async def _failing_after_yield(*args, **kwargs):
+                yield {"type": "status", "phase": "plan_received", "request_id": "test-wrap-iter"}
+                raise RuntimeError("mid-stream-boom")
+            ep._run_plan_stream_impl = _failing_after_yield
+            messages = [
+                msg async for msg in ep.run_plan_stream(
+                    {"workflow": {"1": {"class_type": "KSampler"}}},
+                    request_id="test-wrap-iter",
+                )
+            ]
+            self.assertEqual(len(messages), 2)
+            self.assertEqual(messages[0]["type"], "status")
+            self.assertEqual(messages[1]["type"], "error")
+            self.assertIn("mid-stream-boom", messages[1]["message"])
+        import asyncio
+        asyncio.run(run())
+
+    def test_wrapper_returns_empty_when_impl_raises_before_first_yield(self):
+        """No events before the raise — wrapper still emits one error."""
+        async def run():
+            ep = modal_app.ModalRuntimeEntrypoint(
+                executor=modal_app.RuntimeExecutor(in_process_runner=lambda plan, ctx: {"ok": True}),
+            )
+            # Must contain yield syntactically to be an async generator
+            async def _failing_impl(*args, **kwargs):
+                if False:
+                    yield  # pragma: no cover  # make this an async generator
+                raise RuntimeError("no-yield-boom")
+            ep._run_plan_stream_impl = _failing_impl
+            messages = [
+                msg async for msg in ep.run_plan_stream(
+                    {"workflow": {"1": {"class_type": "KSampler"}}},
+                    request_id="test-no-yield",
+                )
+            ]
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0]["type"], "error")
+            self.assertIn("no-yield-boom", messages[0]["message"])
+        import asyncio
+        asyncio.run(run())
+
+
+class TestPregraphCleanupLocals(unittest.TestCase):
+    """Verify production cleanup locals are initialized before the guarded
+    pregraph try block so an early setup exception cannot cause NameError."""
+
+    def _find_pregraph_initialization(self) -> list[str]:
+        """Parse modal_app.py source to find the pregraph local
+        initializations before the guarded try block."""
+        import ast as _ast
+        source = open(_MODAL_APP_PATH, encoding="utf-8-sig").read()
+        tree = _ast.parse(source)
+
+        class _PregraphFinder(_ast.NodeVisitor):
+            def __init__(self):
+                self.found: list[str] = []
+
+            def visit_AsyncFunctionDef(self, node):
+                if node.name == "_execute_v2_prompt_executor":
+                    # Find the pregraph_setup_start expression statement
+                    # and verify the initializations precede the first try
+                    for i, child in enumerate(node.body):
+                        # Look for the initialization block
+                        if (isinstance(child, _ast.AnnAssign)
+                            and child.target.id == "_pregraph_error"):
+                            # Check that the previous statements contain
+                            # the 5 local initializations
+                            before = node.body[:i]
+                            for target in (
+                                "production_enabled",
+                                "register_request",
+                                "cleanup_request",
+                                "cleanup_registry",
+                                "pop_outputs",
+                            ):
+                                found = False
+                                for stmt in before:
+                                    if (isinstance(stmt, _ast.Assign)
+                                        and stmt.targets
+                                        and isinstance(stmt.targets[0], _ast.Name)
+                                        and stmt.targets[0].id == target):
+                                        found = True
+                                        self.found.append(target)
+                                        break
+                                if not found:
+                                    self.found.append(f"MISSING:{target}")
+                    return  # stop traversal
+                self.generic_visit(node)
+
+        finder = _PregraphFinder()
+        finder.visit(tree)
+        return finder.found
+
+    def test_pregraph_cleanup_locals_initialized_before_try(self):
+        found = self._find_pregraph_initialization()
+        for name in ("production_enabled", "register_request",
+                      "cleanup_request", "cleanup_registry", "pop_outputs"):
+            self.assertIn(name, found,
+                          f"{name} must be initialized before pregraph try block")
+
+
 if __name__ == "__main__":
     unittest.main()

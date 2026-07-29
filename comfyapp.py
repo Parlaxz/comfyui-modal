@@ -16877,6 +16877,8 @@ class _ComfyAPIMixin:
                     name.endswith("_cuda")
                     or name.startswith("cuda_")
                     or "_cuda_" in name
+                    or name.startswith("sageattn._")
+                    or name.startswith("sageattention._")
                 )
 
         blocker = _BlockCudaModuleImport()
@@ -16942,6 +16944,8 @@ class _ComfyAPIMixin:
                 name.endswith("_cuda")
                 or name.startswith("cuda_")
                 or "_cuda_" in name
+                or name.startswith("sageattn._")
+                or name.startswith("sageattention._")
             )
 
         blocker = _BlockCudaModuleImport()
